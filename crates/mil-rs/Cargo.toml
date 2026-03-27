@@ -1,11 +1,14 @@
 [package]
 name = "mil-rs"
-description = "Rust implementation of Apple's Model Intermediate Language (MIL) IR and CoreML protobuf format"
+description = "Read, write, and manipulate Apple CoreML models in Rust — no Python required"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["coreml", "apple", "machine-learning", "protobuf", "mil"]
+categories = ["science", "encoding", "parser-implementations"]
 
 [dependencies]
 prost = { workspace = true }

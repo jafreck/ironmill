@@ -1,107 +1,70 @@
 # coreml-kit
 
-A Rust-native CoreML model converter for Apple Silicon.
+Rust-native tools for working with Apple CoreML models — no Python required.
 
-**Convert ONNX models to CoreML format — no Python required.**
+## Crates
 
-## The Problem
+| Crate | Description | Status |
+|-------|-------------|--------|
+| [`mil-rs`](crates/mil-rs/) | Read, write, and manipulate CoreML `.mlmodel`/`.mlpackage` files; MIL IR types; proto ↔ IR conversion | **v0.1** — usable |
+| [`coreml-kit-cli`](crates/coreml-kit-cli/) | CLI for ONNX → CoreML conversion and model inspection | scaffold (not yet functional) |
 
-Apple's CoreML framework can run models on the Neural Engine (ANE), GPU, or CPU.
-The ANE offers meaningful power savings (40-65% less than GPU) and frees the GPU for
-rendering — important for shipped apps on battery-powered devices.
+## Motivation
 
-But the only tool to *create* CoreML models (`coremltools`) requires Python. Running
-models on the ANE from Rust already works via `coreml-native`. Converting models to
-CoreML format does not — that's the gap this project fills.
+Apple's CoreML framework runs models on the Neural Engine (ANE), GPU, or CPU.
+The ANE offers significant power savings and frees the GPU for rendering — but
+the only tool to *create* CoreML models (`coremltools`) requires Python.
 
-Every other NPU vendor provides native conversion tools:
+`coreml-kit` fills this gap for Rust.
 
-| Vendor   | Tool             | Language |
-|----------|------------------|----------|
-| NVIDIA   | TensorRT         | C++      |
-| Qualcomm | qairt-converter  | C++ CLI  |
-| Intel    | OpenVINO         | C++      |
-| Google   | IREE             | C++      |
-| **Apple**| **coremltools**  | **Python only** |
+## Using mil-rs as a library
 
-`coreml-kit` fills this gap for Rust (and via C FFI, for everyone else).
+```rust,no_run
+use mil_rs::{read_mlmodel, model_to_program, write_mlpackage, program_to_model};
 
-## Architecture
-
-This project is a Cargo workspace with two crates:
-
-- **`mil-rs`** — The foundation: MIL (Model Intermediate Language) IR, CoreML protobuf
-  types, and graph manipulation primitives. The "serde of CoreML."
-- **`coreml-kit-cli`** — The user-facing tool: ONNX → CoreML conversion with
-  ANE-targeted optimizations.
-
-```
-ONNX model ──▶ mil-rs (IR) ──▶ optimize ──▶ CoreML .mlpackage ──▶ ANE
+let model = read_mlmodel("input.mlmodel").unwrap();
+let program = model_to_program(&model).unwrap();
+// ... inspect or transform ...
+let out = program_to_model(&program, model.specification_version as i32).unwrap();
+write_mlpackage(&out, "output.mlpackage").unwrap();
 ```
 
-## Quick Start
+## Building
 
 ```bash
-# Install the CLI
-cargo install coreml-kit-cli
-
-# Convert an ONNX model to CoreML
-coreml-kit compile model.onnx --target cpu-and-ne --quantize fp16
-
-# Inspect a CoreML model
-coreml-kit inspect model.mlpackage
-
-# Validate ANE compatibility
-coreml-kit validate model.mlpackage
-```
-
-### As a library (in `build.rs`)
-
-```rust
-// Cargo.toml: [build-dependencies] mil-rs = "0.1"
-fn main() {
-    // TODO: API not yet implemented
-    // mil_rs::from_onnx("models/whisper.onnx")
-    //     .optimize_for_ane()
-    //     .save_mlpackage("resources/whisper.mlpackage")
-    //     .unwrap();
-}
+cargo build --workspace
+cargo test --workspace
 ```
 
 ## Roadmap
 
 ### Phase 1 — Foundation (current)
-- [x] Project scaffold and workspace structure
-- [ ] MIL IR data structures (graph, operations, types, tensors)
-- [ ] CoreML protobuf reader/writer (via `prost`)
-- [ ] Load and inspect pre-compiled `.mlmodelc` files
+- [x] MIL IR data structures (graph, operations, types, tensors)
+- [x] CoreML protobuf reader/writer (via `prost`)
+- [x] `.mlmodel` and `.mlpackage` round-trip
+- [x] Proto ↔ IR bidirectional conversion
 
 ### Phase 2 — Conversion
-- [ ] ONNX → MIL converter (top 50 ops)
+- [ ] ONNX → MIL converter (common ops)
 - [ ] Basic optimization passes (constant folding, dead code elimination)
-- [ ] `xcrun coremlcompiler` integration
 - [ ] CLI: `coreml-kit compile model.onnx`
 
 ### Phase 3 — ANE Optimization
 - [ ] Op fusion passes (conv+bn+relu, etc.)
 - [ ] FP16/INT8 quantization pipeline
-- [ ] Shape materialization for dynamic models
 - [ ] ANE compatibility validator
 
 ### Phase 4 — Ecosystem
-- [ ] `candle` integration crate
-- [ ] `burn` backend
-- [ ] C API via `cbindgen` for non-Rust consumers
-- [ ] Benchmark suite (GPU vs ANE)
+- [ ] `candle` / `burn` integration
+- [ ] C API via `cbindgen`
 
 ## Documentation
 
-See [`docs/research/`](docs/research/) for the full research that led to this project:
+See [`docs/research/`](docs/research/) for background research:
 
-- [ANE Gap Analysis](docs/research/ane-research.md) — The macOS AI landscape, honest benchmarks, and what's actually missing
-- [Competitive Analysis](docs/research/competitive-analysis.md) — Every competitor examined
-- [Value Proposition](docs/research/value-proposition.md) — Why this matters, with honest assessment of overstated claims
-- [Integration Strategy](docs/research/integration-strategy.md) — How this fits with candle, burn, and the Rust ecosystem (the `prost`→`tonic` pattern)
+- [ANE Gap Analysis](docs/research/ane-research.md)
+- [Competitive Analysis](docs/research/competitive-analysis.md)
+- [Integration Strategy](docs/research/integration-strategy.md)
 
 ## License
 
