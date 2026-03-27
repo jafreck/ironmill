@@ -19,6 +19,10 @@ pub enum MilError {
     #[error("protobuf error: {0}")]
     Protobuf(String),
 
+    /// An `.mlpackage` directory is malformed or missing required files.
+    #[error("invalid package: {0}")]
+    InvalidPackage(String),
+
     /// An I/O error occurred reading or writing model files.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

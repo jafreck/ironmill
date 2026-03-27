@@ -21,4 +21,4 @@ pub use error::MilError;
 pub use ir::{Block, Function, Graph, Operation, Pass, Program, TensorType, Value};
 #[cfg(not(doctest))]
 pub use proto::specification::Model;
-pub use reader::read_mlmodel;
+pub use reader::{read_mlmodel, read_mlpackage};
