@@ -34,3 +34,9 @@ mod generated {
 pub use generated::core_ml::specification;
 pub use specification::core_ml_models;
 pub use specification::mil_spec;
+
+/// Auto-generated types from the ONNX `.proto3` specification.
+#[allow(clippy::all, non_camel_case_types, rustdoc::all)]
+pub mod onnx {
+    include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
+}

@@ -68,6 +68,8 @@ pub use proto::specification::Model;
 pub use reader::read_mlmodel;
 /// Read a `.mlpackage` directory into a protobuf [`Model`].
 pub use reader::read_mlpackage;
+/// Read an ONNX `.onnx` file into an ONNX [`proto::onnx::ModelProto`].
+pub use reader::read_onnx;
 
 /// Write a protobuf [`Model`] to a `.mlmodel` file.
 pub use writer::write_mlmodel;
