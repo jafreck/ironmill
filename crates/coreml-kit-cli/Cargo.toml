@@ -1,0 +1,17 @@
+[package]
+name = "coreml-kit-cli"
+description = "CLI tool for converting and optimizing ML models for Apple's Neural Engine via CoreML"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "coreml-kit"
+path = "src/main.rs"
+
+[dependencies]
+mil-rs = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

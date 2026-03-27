@@ -1,0 +1,15 @@
+[package]
+name = "mil-rs"
+description = "Rust implementation of Apple's Model Intermediate Language (MIL) IR and CoreML protobuf format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
