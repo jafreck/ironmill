@@ -1,0 +1,11 @@
+{
+    "fileFormatVersion": "2.0.0",
+    "itemInfoEntries": {
+        "com.apple.CoreML/model.mlmodel": {
+            "path": "com.apple.CoreML/model.mlmodel",
+            "author": "coreml-kit test fixture",
+            "description": "Minimal test model"
+        }
+    },
+    "rootModelIdentifier": "com.apple.CoreML/model.mlmodel"
+}

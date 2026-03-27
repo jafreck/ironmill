@@ -165,3 +165,60 @@ A task is done when:
 3. Unit tests exist for the happy path and at least one error case
 4. Existing tests still pass (`cargo test`)
 5. The implementation matches what the IMPLEMENTATION_PLAN.md describes
+
+## Test Fixtures
+
+Sample models are in `tests/fixtures/`. Large binary files (`.onnx`, `.mlmodel`) are
+gitignored — run `./scripts/download-fixtures.sh` to fetch them.
+
+| File | Format | Size | Purpose |
+|------|--------|------|---------|
+| `mnist.onnx` | ONNX | 26KB | Tiny model for ONNX reader/conversion tests |
+| `squeezenet1.1.onnx` | ONNX | 4.7MB | Real CNN for conversion validation |
+| `MobileNet.mlmodel` | CoreML | 16MB | Real CoreML model for reader/writer tests |
+| `simple.mlpackage/` | CoreML dir | <1KB | Minimal .mlpackage structure for reader tests |
+
+## Agent Dispatch Rules
+
+### Sequencing
+Tasks have dependencies tracked externally. Within each phase, tasks must be done in
+dependency order. The dependency chain for Phase 1 is:
+
+```
+p1-vendor-protos
+  └─▶ p1-prost-codegen
+        ├─▶ p1-mlmodel-reader
+        │     ├─▶ p1-mlpackage-reader
+        │     ├─▶ p1-writer
+        │     └─▶ p1-proto-ir-conv ◀── p1-ir-types
+        └─▶ p1-ir-types
+              └─▶ p1-proto-ir-conv
+                    └─▶ p1-tests-ci ◀── p1-writer, p1-mlpackage-reader
+                          └─▶ p1-publish
+```
+
+### Parallelism
+- **Safe to parallelize**: Tasks in different phases (if all deps are met). Also:
+  `p1-ir-types` and `p1-mlmodel-reader` can run in parallel (different files).
+  `p1-writer` and `p1-mlpackage-reader` can run in parallel (different files).
+- **NOT safe to parallelize**: Tasks that modify the same files (`lib.rs`, `Cargo.toml`,
+  `mod.rs`). Most Phase 1 tasks touch `lib.rs` to add module declarations — run them
+  sequentially or have the later task check for/merge the module declarations.
+
+### Context for each agent
+When dispatching a task to a sub-agent, provide:
+1. The task ID and full description from the task database
+2. A pointer to `docs/AGENT_GUIDE.md` for conventions and structure
+3. A pointer to `docs/IMPLEMENTATION_PLAN.md` for the specific task section
+4. Which files the previous task created (so the agent knows what exists)
+
+### Commit convention
+Each task should be a single commit with message format:
+```
+feat(mil-rs): <short description>
+
+<what was implemented and why>
+
+Task: <task-id>
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+```
