@@ -8,29 +8,28 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use prost::Message;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{MilError, Result};
 use crate::proto::specification::Model;
 
 /// Parsed representation of an `.mlpackage` `Manifest.json`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Manifest {
-    #[allow(dead_code)]
-    file_format_version: String,
-    item_info_entries: HashMap<String, ItemInfo>,
-    root_model_identifier: String,
+pub(crate) struct Manifest {
+    pub(crate) file_format_version: String,
+    pub(crate) item_info_entries: HashMap<String, ItemInfo>,
+    pub(crate) root_model_identifier: String,
 }
 
 /// A single item entry inside a `Manifest.json`.
-#[derive(Debug, Deserialize)]
-struct ItemInfo {
-    path: String,
-    #[allow(dead_code)]
-    author: Option<String>,
-    #[allow(dead_code)]
-    description: Option<String>,
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ItemInfo {
+    pub(crate) path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
 }
 
 /// Read a `.mlpackage` directory and extract the CoreML model.
