@@ -3,56 +3,102 @@
 ## The Landscape (March 2026)
 
 ### Hardware: Apple Neural Engine (ANE)
-- **M4/M5 chips**: ~38 TOPS (INT8), ~19 TFLOPS (FP16 real-world)
-- **Efficiency**: 6.6 TFLOPS/W — 80x more power-efficient than NVIDIA A100 for some workloads
+- **M4/M5 chips**: ~38 TOPS (INT8 marketing), ~19 TFLOPS (FP16 real-world)
+- **Efficiency**: ~1.5-2x more power-efficient than the local Metal GPU for supported models
+  (often cited as "80x vs A100" but that's a cherry-picked cross-class comparison)
 - **Present on**: Every Apple Silicon Mac, iPhone, iPad, Vision Pro (~2B+ devices)
 
-### The Problem: A Locked-Down Accelerator
-The ANE is the most power-efficient AI accelerator in consumer hardware, but Apple treats it as a black box:
+### What Actually Works Today
 
-| What you can do | What you can't do |
+**Models CAN access the ANE.** This is not theoretical — CoreML routes supported operations
+to the ANE through its public API. From Rust, the `coreml-native` crate can load compiled
+CoreML models (`.mlmodelc`) and run inference with `ComputeUnits::CpuAndNeuralEngine`.
+This works today.
+
+The real constraints are:
+
+| What works | What doesn't |
 |---|---|
-| Submit a CoreML model and *hope* it runs on ANE | Guarantee ANE execution for any specific op |
-| Use FP16/INT8 with fixed input shapes | Use dynamic shapes, custom ops, or train |
-| Get fast vision/audio inference | Debug why your model fell back to GPU |
-| Profile at the CoreML level | See ANE-specific bottlenecks or schedules |
+| CoreML routes supported ops to ANE automatically | You can't guarantee which ops run on ANE vs CPU |
+| FP16/INT8 models with fixed input shapes run well | Dynamic shapes force fallback to CPU |
+| `coreml-native` (Rust) loads and runs `.mlmodelc` files | No Rust tool can *create* `.mlmodelc` files |
+| Xcode Instruments can profile ANE usage | No programmatic way to query "did this op use ANE?" |
+| ANE uses 40-65% less power than Metal GPU | ANE speed is only ~20-33% faster (not a dramatic gap) |
+
+### ANE vs Metal GPU: Honest Benchmarks
+
+The ANE advantage is **real but modest** for speed, and **significant** for power:
+
+| Workload | ANE | Metal GPU | Speed gap | Power gap |
+|---|---|---|---|---|
+| LLaMA 7B Q4 | ~80 tok/s | ~60 tok/s | ANE ~33% faster | ANE ~40% less power |
+| Whisper encoder | ~3x vs CPU | ~2.5-3x vs CPU | Roughly equal | ANE ~50% less power |
+| YOLOv8 INT8 | ~92 FPS | ~70 FPS | ANE ~30% faster | ANE ~65% less power |
+
+**Caveat**: ANE has a multi-minute cold compilation penalty on first load. whisper.cpp
+actually defaults the encoder to Metal GPU to avoid this. For interactive use, Metal GPU
+often provides a better experience.
+
+### When ANE Actually Matters
+
+ANE's advantage is decisive in specific scenarios:
+- **Battery-constrained devices** (iPhone, iPad, MacBook on battery)
+- **Always-on background inference** (dictation, accessibility, health monitoring)
+- **GPU-busy workloads** (games, video editing, AR) where inference must not compete for GPU
+- **Thermal-constrained environments** (fanless devices, sustained workloads)
+
+For a Rust developer running inference on a plugged-in Mac, Metal GPU via candle/burn
+is often "good enough." The ANE story is strongest for shipping apps to end users.
 
 ### Current Frameworks
 
 | Framework | Language | ANE? | Strengths | Weaknesses |
 |---|---|---|---|---|
-| **CoreML** | Swift/ObjC | Yes (opaque) | Only public ANE path | Black box, fixed shapes, inference-only |
+| **CoreML** | Swift/ObjC | Yes (opaque) | Only public ANE path | Black box scheduling, fixed shapes |
 | **MLX** | Python/C++ | No (GPU only) | Flexible, NumPy-like | Cannot use ANE at all |
 | **ONNX Runtime** | C/Python/Rust(FFI) | Via CoreML EP | Cross-platform | CoreML EP is bolted-on, limited control |
-| **Orion** | C/C++ | Yes (direct!) | Reverse-engineered private APIs, training | Fragile, may break on OS updates |
-| **ANEMLL** | Python/Swift/C++ | Via CoreML | LLM-focused, open source | Python toolchain, CoreML constraints |
+| **Orion** | C/C++ | Yes (direct!) | Reverse-engineered private APIs | Fragile, may break on OS updates |
+| **ANEMLL** | Python/Swift/C++ | Via CoreML | LLM-focused, open source | Python toolchain required |
 
 ### Rust-Specific Ecosystem
 
 | Crate | Status | What it does | What it doesn't do |
 |---|---|---|---|
+| `coreml-native` | Pre-1.0, low adoption | Load `.mlmodelc`, run inference with ANE | Create, convert, or optimize models |
 | `coreml-rs` | Barely maintained | Basic model loading | No async, poor API, requires Swift |
-| `coreml-native` | Pre-1.0, low adoption | Safe CoreML bindings via objc2 | No model conversion, no ANE control |
-| `candle` + `candle-coreml` | Active | ML framework + CoreML inference bridge | No ANE guarantees, no model conversion |
-| `ort` (ONNX Runtime) | Active | ONNX inference | No native CoreML EP from Rust |
-| `burn` | Active | ONNX import → Rust code | No CoreML output, no ANE path |
+| `candle` | Active, large community | ML framework, Metal GPU inference | No CoreML/ANE path |
+| `burn` | Active | ONNX import, multi-backend | No CoreML output, no ANE path |
+| `ort` (ONNX Runtime) | Active | ONNX inference | CoreML EP not exposed to Rust |
+| `tract` | Production-used | Pure Rust ONNX inference | CPU-only on Apple |
 
-## The Critical Gap
+## The Actual Gap
 
-**There is no Rust-native toolchain for preparing, optimizing, and deploying models to the ANE.**
+**The gap is in model conversion, not model execution.**
 
-Every Rust project wanting ANE acceleration today must:
-1. **Drop into Python** to convert models via `coremltools` (no Rust alternative)
-2. Use immature CoreML bindings with **zero control** over compute unit dispatch
-3. Accept that CoreML may **silently fall back** to GPU/CPU with no diagnostics
-4. Deal with the **MIL IR and CoreML protobuf format** entirely in Python
+Rust can already *run* CoreML models on the ANE via `coreml-native`. What's missing is
+the ability to *create* CoreML models without Python. Today's workflow:
 
-This Python dependency is the #1 friction point in the entire chain. It breaks Rust's value proposition of a self-contained, reproducible toolchain.
+```
+Train (Python ✅) → Convert to .mlpackage (Python-only ❌) → Compile (xcrun ✅) → Run (Rust ✅)
+                         ↑ THIS is the gap
+```
 
-## Recommended Project: `coreml-compiler` — A Rust-native CoreML Model Compiler
+Every Rust project wanting CoreML deployment must:
+1. Install Python + `coremltools` + numpy + protobuf + torch (~1.5GB)
+2. Write a Python conversion script
+3. Run it to produce `.mlpackage`
+4. Compile with `xcrun coremlcompiler`
+5. Ship the `.mlmodelc` in their app
+
+This Python dependency breaks Rust's self-contained toolchain promise. It's the same
+problem for C++, Swift (without Xcode), and Go developers.
+
+## Project: `coreml-kit` — Rust-native CoreML Model Conversion
 
 ### Vision
-A foundational Rust crate that eliminates the Python dependency for CoreML/ANE deployment. It would be the "missing link" between Rust ML frameworks and Apple's hardware accelerators.
+Eliminate the Python dependency in the CoreML model conversion pipeline. Not a
+reimplementation of all of `coremltools` — a focused tool that converts common model
+formats to CoreML and applies basic optimizations.
 
 ### Architecture
 

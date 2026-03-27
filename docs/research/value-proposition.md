@@ -5,25 +5,21 @@
 
 ## 1. Training or Inference?
 
-**Primarily inference — but with a meaningful training/fine-tuning story.**
+**Inference deployment — specifically, model conversion for deployment.**
 
-### The inference case (core value)
-The ANE is fundamentally an inference accelerator. The entire value chain looks like:
+### What's actually missing
+The ANE is accessible today. `coreml-native` (Rust) can load compiled CoreML models and
+run inference with ANE acceleration. Candle and burn provide solid Metal GPU inference.
+The Rust inference story is reasonable.
+
+What's missing is the **conversion pipeline**:
 
 ```
-Train (Python/GPU cloud)  →  Convert (???)  →  Deploy (device, ANE)
-         ✅ solved              ❌ GAP             ✅ partially solved
+Train (Python ✅)  →  Convert to CoreML (Python-only ❌)  →  Run on ANE (Rust ✅)
+                           ↑ THIS is the gap
 ```
 
-Our project fills the "Convert" gap. Today, every Rust (or C++, or Swift, or Go) project
-that wants to deploy a model to the ANE must:
-1. Install Python + coremltools
-2. Write a Python conversion script
-3. Run it to produce .mlpackage
-4. Compile with xcrun
-5. Ship the .mlmodelc in their app
-
-With `coreml-kit`, steps 1-4 collapse into:
+With `coreml-kit`, the conversion step becomes native Rust:
 ```
 coreml-kit compile model.onnx --target ane --quantize fp16
 ```
@@ -36,56 +32,17 @@ optimized.save_mlpackage("model.mlpackage")?;
 
 ### The training/fine-tuning angle
 CoreML's public API now supports on-device fine-tuning and personalization (as of
-WWDC 2024+). Models can be updated with user data on-device without data leaving the
-device. This means:
-
-- **Updatable models** can be prepared with our tool (mark layers as updatable in the
-  CoreML protobuf)
-- **Fine-tuning runtime** is CoreML's job (we don't reimplement backprop)
-- Our role: prepare models that *are structured for* on-device adaptation
-
-So: **we enable inference deployment and fine-tuning preparation, not training from scratch.**
-Training from scratch stays in Python/PyTorch where it belongs.
+WWDC 2024+). Our role would be to prepare models that are *structured for* on-device
+adaptation (marking layers as updatable in the CoreML protobuf). We don't reimplement
+backprop — training from scratch stays in Python/PyTorch where it belongs.
 
 ---
 
 ## 2. Where It Fits in the Wider AI Tooling Ecosystem
 
-### The AI deployment pipeline (all languages)
+### The real problem in context
+Every NPU vendor provides native model conversion tools — except Apple, which requires Python:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    MODEL LIFECYCLE                               │
-│                                                                 │
-│  ┌──────────┐    ┌──────────────┐    ┌───────────────────────┐  │
-│  │ TRAINING │    │  CONVERSION  │    │      DEPLOYMENT       │  │
-│  │          │    │  & OPTIMIZE  │    │                       │  │
-│  │ PyTorch  │    │              │    │  ┌─────────────────┐  │  │
-│  │ JAX      │───▶│  coremltools │───▶│  │ CoreML Runtime  │  │  │
-│  │ TF       │    │  (Python)    │    │  │ → ANE / GPU /CPU│  │  │
-│  │          │    │              │    │  └─────────────────┘  │  │
-│  │          │    │  TVM/IREE    │───▶│  ┌─────────────────┐  │  │
-│  │          │    │  (C++/Python)│    │  │ Custom runtime  │  │  │
-│  │          │    │              │    │  │ → GPU / CPU     │  │  │
-│  │          │    │  OpenVINO    │───▶│  └─────────────────┘  │  │
-│  │          │    │  (C++/Python)│    │  ┌─────────────────┐  │  │
-│  │          │    │              │    │  │ ONNX Runtime    │  │  │
-│  │          │    │  QAIRT       │───▶│  │ → various HW    │  │  │
-│  │          │    │  (C++ CLI)   │    │  └─────────────────┘  │  │
-│  └──────────┘    │              │    │                       │  │
-│                  │  ┌─────────┐ │    │                       │  │
-│                  │  │coreml-  │ │    │  All of the above     │  │
-│                  │  │kit(Rust)│─│───▶│  but from Rust        │  │
-│                  │  └─────────┘ │    │  without Python       │  │
-│                  └──────────────┘    └───────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-The key insight: **every hardware accelerator vendor has a conversion tool —
-except Apple requires you to use Python for theirs.** We fix this for the
-non-Python world.
-
-### Analogues in other ecosystems
 | Vendor | Accelerator | Native conversion tool | Language |
 |--------|------------|----------------------|----------|
 | Qualcomm | Hexagon NPU | qairt-converter | C++ CLI |
@@ -94,7 +51,17 @@ non-Python world.
 | NVIDIA | GPU/DLA | TensorRT | C++ |
 | **Apple** | **ANE** | **coremltools** | **Python only** ❌ |
 
-We provide what every other vendor already has: a native tool.
+We provide what every other vendor already has: a native conversion tool.
+
+### Honest scope
+This is **not** "unlocking stranded hardware that nobody can use." CoreML + ANE works
+today via Python conversion → xcrun compile → native runtime. The value is removing
+Python from that pipeline — which matters most for:
+
+- **CI/CD pipelines** that don't want a Python environment
+- **Rust/C++ apps** that want self-contained build systems
+- **Tauri/desktop apps** where `cargo build` should be sufficient
+- **iOS/macOS Rust developers** who want `build.rs` integration
 
 ---
 
@@ -114,48 +81,39 @@ The Rust AI ecosystem has matured around a clear pattern:
 │  ┌────────┐        │      │         └──────────────────┘   │
 │  │ candle │──uses──▶│ Safe │                                │
 │  │        │        │Tensor│         ┌──────────────────┐   │
-│  └────────┘        │      │──load──▶│ candle (Metal)    │   │
+│  └────────┘        │      │──load──▶│ candle (Metal GPU)│   │
 │                    └──────┘         └──────────────────┘   │
 │                    ┌──────┐                                 │
 │                    │ GGUF │──load──▶ llama.cpp (via FFI)    │
 │                    └──────┘                                 │
 │                                                             │
-│  ════════════════════════════════════════════════════════    │
-│  THE GAP: None of the above can target ANE.                 │
-│  They all use Metal GPU or CPU on Apple Silicon.            │
-│  ════════════════════════════════════════════════════════    │
+│  Metal GPU works well for most workloads today.             │
+│  ANE adds: lower power, frees GPU, ~20-33% faster          │
+│  for quantized models. Worth it for shipped apps.           │
 │                                                             │
 │  WITH coreml-kit:                                           │
 │                                                             │
 │  ┌──────┐   ┌──────┐   ┌───────────┐   ┌──────────────┐   │
 │  │ ONNX │──▶│mil-rs│──▶│ coreml-kit│──▶│ CoreML + ANE │   │
-│  │ Safe │   │(IR)  │   │(optimize) │   │ 38 TOPS      │   │
-│  │ GGUF │   └──────┘   └───────────┘   │ 80x eff/watt │   │
-│  └──────┘                               └──────────────┘   │
-│                                                             │
-│  burn ──export──▶ ONNX ──▶ coreml-kit ──▶ ANE ✅           │
-│  candle ─export─▶ ONNX ──▶ coreml-kit ──▶ ANE ✅           │
-│  tract ──reads──▶ ONNX ──▶ coreml-kit ──▶ ANE ✅           │
-│  any framework ─▶ ONNX ──▶ coreml-kit ──▶ ANE ✅           │
+│  │      │   │(IR)  │   │(convert)  │   │              │   │
+│  └──────┘   └──────┘   └───────────┘   └──────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### What each Rust project gains:
 
-| Project | Today | With coreml-kit |
-|---------|-------|-----------------|
-| **candle** | Metal GPU on Mac, CPU elsewhere | +ANE (3-10x perf/watt for supported models) |
-| **burn** | WGPU/Metal GPU, CPU | +ANE as a deployment target via ONNX export |
-| **tract** | CPU only on Apple | +ANE acceleration path |
-| **ort** | CoreML EP exists in C++ but not exposed to Rust | Native Rust CoreML path, no FFI gymnastics |
-| **Tauri apps** | Ship Python to convert models, or pre-convert | `build.rs` integration, no Python in build |
-| **murmur** (this repo) | whisper.cpp C bridge for CoreML | Pure Rust CoreML model loading + inference |
-| **CLI tools** | Can't `cargo install` and target ANE | Self-contained, no external deps |
+| Project | Today (Metal GPU) | With coreml-kit (adds ANE option) |
+|---------|-------------------|-----------------------------------|
+| **candle** | Metal GPU works well | +ANE for lower power, frees GPU for rendering |
+| **burn** | WGPU/Metal GPU, CPU | +CoreML as a deployment target via ONNX export |
+| **tract** | CPU only on Apple | +CoreML/ANE acceleration path |
+| **Tauri apps** | Must use Python to convert models | `build.rs` integration, no Python |
+| **CLI tools** | Pre-convert models with Python | Self-contained `cargo install` |
 
-### The critical value for Rust specifically:
+### The critical Rust-specific value
 
 **Rust's promise is self-contained binaries with no runtime dependencies.**
-Python in the model conversion pipeline breaks this promise completely.
+Python in the model conversion pipeline breaks this promise.
 
 A Tauri app developer today must:
 1. Ensure Python 3.x is installed in CI
@@ -180,39 +138,45 @@ fn main() {
 }
 ```
 
-**That's the value: the entire conversion pipeline becomes a Rust build dependency.**
-
 ---
 
 ## 4. Who Specifically Would Use This?
 
-### Immediate users (high confidence)
-1. **whisper.cpp / murmur** — Rust speech-to-text projects that currently bridge to C
-   for CoreML. Pure Rust path to ANE.
-2. **Tauri AI apps** — Desktop apps shipping on-device models. No Python in CI.
-3. **candle users on Mac** — HuggingFace ecosystem developers wanting ANE speedup.
-4. **iOS/macOS Rust developers** — Growing community using Rust for Swift interop.
+### Strongest use cases
+1. **Tauri/desktop AI apps** — No Python in CI, self-contained builds
+2. **iOS/macOS Rust developers** — `build.rs` model conversion
+3. **CI/CD pipelines** — Reproducible model compilation without Python env
+4. **CLI tool authors** — `cargo install`-able tools that include model conversion
 
-### Medium-term users (as ecosystem matures)
-5. **burn** — Could add a CoreML backend using mil-rs as foundation.
-6. **tract** — Could optionally target ANE for Apple platforms.
-7. **Enterprise Rust shops** — Companies using Rust for performance-critical inference
-   (fintech, real-time audio/video, robotics).
+### Moderate use cases
+5. **candle/burn users** — ANE path for power-sensitive deployments (mobile, laptop)
+6. **Embedded Rust on Apple** — IoT, kiosk, always-on inference
 
-### Broader ecosystem impact
-8. **C/C++ projects via FFI** — mil-rs could be called from C/C++ too, providing the
-   first non-Python CoreML model generation for ANY native language.
-9. **Swift projects** — Via swift-bridge or similar, Rust crate could replace coremltools
-   in Xcode build pipelines.
+### Weaker use cases (Metal GPU is fine)
+7. **Server-side Rust on Mac** — Plugged in, GPU available, power doesn't matter
+8. **Dev/prototyping** — Metal GPU via candle is fast enough
 
 ---
+
+## 5. Honest Assessment
+
+| Claim | Reality |
+|-------|---------|
+| "Models can't access ANE from Rust" | **Wrong.** `coreml-native` does this today. |
+| "ANE is 80x more efficient than GPU" | **Misleading.** That's vs data-center A100. Vs local Metal GPU it's ~1.5-2x. |
+| "38 TOPS of stranded hardware" | **Overstated.** Real throughput is ~19 TFLOPS. ANE is used by CoreML automatically. |
+| "No way to convert models without Python" | **True.** This is the real gap. |
+| "Python breaks Rust's toolchain promise" | **True.** This matters for app developers and CI. |
+| "ANE is faster than GPU" | **Sometimes.** ~20-33% for quantized models, but GPU avoids cold-compile penalty. |
+| "ANE saves significant power" | **True.** 40-65% less power. Matters for battery and thermal. |
+| "The GPU can do other work while ANE infers" | **True.** Important for games, AR, video editing. |
 
 ## Summary
 
 | Question | Answer |
 |----------|--------|
-| Training or inference? | **Inference deployment** + fine-tuning preparation. Training stays in Python. |
-| Novel? | Yes — no non-Python CoreML model compiler exists in any language. |
-| Wide ecosystem fit? | Fills the same role as TensorRT (NVIDIA), OpenVINO (Intel), QAIRT (Qualcomm) — but for Apple. |
-| Rust-specific value? | Eliminates Python from the build pipeline, preserving Rust's self-contained binary promise. Unlocks ANE for every Rust ML framework. |
-| Addressable audience? | Every Rust developer on Mac (large), every non-Python developer targeting ANE (very large), every Tauri/desktop AI app (growing fast). |
+| Training or inference? | **Model conversion for inference deployment.** Training stays in Python. |
+| What's truly missing? | Native (non-Python) model conversion to CoreML format. |
+| Is ANE access broken? | **No.** Runtime access works. Conversion pipeline requires Python. |
+| Is this worth building? | Yes — for the toolchain story and the shipped-app power/GPU-freedom benefits. Not for dramatic speed gains. |
+| Addressable audience? | Rust app developers shipping on Apple platforms, CI/CD pipelines, anyone wanting Python-free CoreML conversion. |

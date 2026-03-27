@@ -190,6 +190,22 @@ op-mapping logic** that `coremltools` has built up over years.
 | ANE-targeted optimizations | Partially novel | Very hard | Apple's internal heuristics are undocumented; community knowledge is scattered |
 | Full pipeline (convert + optimize + run) | ✅ Novel outside Python | Hard | Integration testing across model zoo is huge |
 
+### Reality check on the problem statement
+
+Some claims from the initial research were overstated:
+
+| Original claim | Reality |
+|---|---|
+| "Models can't access ANE from Rust" | **Wrong.** `coreml-native` loads `.mlmodelc` and runs on ANE today. |
+| "ANE is 80x more efficient" | **Misleading.** That's vs data-center A100. Vs local Metal GPU: ~1.5-2x. |
+| "38 TOPS of stranded hardware" | **Overstated.** CoreML uses ANE automatically for supported ops. |
+| "No way to convert models without Python" | **True.** This is the real, verified gap. |
+| "Metal GPU is leaving performance on the table" | **Mostly false.** Metal GPU is within 20-33% of ANE for speed. ANE wins on power (40-65% less). |
+
+The project is justified, but by the **toolchain argument** (Python-free conversion)
+and the **shipped-app argument** (power efficiency, GPU freedom), not by dramatic
+performance gaps.
+
 ---
 
 ## Risk Assessment

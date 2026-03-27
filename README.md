@@ -1,18 +1,20 @@
 # coreml-kit
 
-A Rust-native CoreML model compiler and optimizer for Apple's Neural Engine.
+A Rust-native CoreML model converter for Apple Silicon.
 
 **Convert ONNX models to CoreML format — no Python required.**
 
 ## The Problem
 
-Apple's Neural Engine (ANE) delivers up to 38 TOPS of AI inference power on every
-Apple Silicon device — but the only tool to prepare models for it (`coremltools`)
-requires Python. This forces every Rust, C++, Swift, and Go developer through a
-Python bottleneck just to deploy models to the most efficient AI accelerator in
-consumer hardware.
+Apple's CoreML framework can run models on the Neural Engine (ANE), GPU, or CPU.
+The ANE offers meaningful power savings (40-65% less than GPU) and frees the GPU for
+rendering — important for shipped apps on battery-powered devices.
 
-Every other NPU vendor provides native tools:
+But the only tool to *create* CoreML models (`coremltools`) requires Python. Running
+models on the ANE from Rust already works via `coreml-native`. Converting models to
+CoreML format does not — that's the gap this project fills.
+
+Every other NPU vendor provides native conversion tools:
 
 | Vendor   | Tool             | Language |
 |----------|------------------|----------|
@@ -22,7 +24,7 @@ Every other NPU vendor provides native tools:
 | Google   | IREE             | C++      |
 | **Apple**| **coremltools**  | **Python only** |
 
-`coreml-kit` fills this gap.
+`coreml-kit` fills this gap for Rust (and via C FFI, for everyone else).
 
 ## Architecture
 
