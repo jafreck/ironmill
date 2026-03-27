@@ -21,6 +21,7 @@ fn main() {
     );
 
     prost_build::Config::new()
+        .disable_comments(["."])
         .compile_protos(&proto_files, &[&proto_dir])
         .expect("failed to compile protobuf files");
 }
