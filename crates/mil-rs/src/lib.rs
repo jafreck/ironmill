@@ -8,11 +8,15 @@
 //! ## Modules
 //!
 //! - [`ir`] — The MIL intermediate representation (graph, operations, types, tensors)
+//! - [`proto`] — Auto-generated protobuf types for the CoreML specification
 //! - [`error`] — Error types for the crate
 
 pub mod error;
 pub mod ir;
+pub mod proto;
 
 /// Re-export key types at crate root for convenience.
 pub use error::MilError;
 pub use ir::{Graph, Operation, TensorType, Value};
+#[cfg(not(doctest))]
+pub use proto::specification::Model;
