@@ -98,9 +98,10 @@ fn main() {
 
 See [`docs/research/`](docs/research/) for the full research that led to this project:
 
-- [ANE Gap Analysis](docs/research/ane-research.md) — The macOS AI landscape and what's missing
+- [ANE Gap Analysis](docs/research/ane-research.md) — The macOS AI landscape, honest benchmarks, and what's actually missing
 - [Competitive Analysis](docs/research/competitive-analysis.md) — Every competitor examined
-- [Value Proposition](docs/research/value-proposition.md) — Why this matters for Rust and beyond
+- [Value Proposition](docs/research/value-proposition.md) — Why this matters, with honest assessment of overstated claims
+- [Integration Strategy](docs/research/integration-strategy.md) — How this fits with candle, burn, and the Rust ecosystem (the `prost`→`tonic` pattern)
 
 ## License
 
