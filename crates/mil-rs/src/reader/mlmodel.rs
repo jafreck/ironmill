@@ -129,7 +129,10 @@ mod tests {
         let model = read_mlmodel(&path).expect("failed to read MobileNet.mlmodel");
 
         assert!(model.specification_version > 0);
-        let desc = model.description.as_ref().expect("model has no description");
+        let desc = model
+            .description
+            .as_ref()
+            .expect("model has no description");
         assert!(!desc.input.is_empty(), "model should have inputs");
         assert!(!desc.output.is_empty(), "model should have outputs");
     }

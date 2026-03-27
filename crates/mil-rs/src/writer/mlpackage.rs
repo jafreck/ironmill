@@ -28,7 +28,7 @@ const MODEL_IDENTIFIER: &str = "com.apple.CoreML/model.mlmodel";
 ///
 /// # Errors
 ///
-/// Returns [`MilError::Io`](crate::error::MilError::Io) if directories or
+/// Returns [`MilError::Io`] if directories or
 /// files cannot be created or written.
 ///
 /// # Examples
@@ -104,12 +104,13 @@ mod tests {
 
         // Verify directory structure
         assert!(pkg_path.join("Manifest.json").is_file());
-        assert!(pkg_path
-            .join("Data/com.apple.CoreML/model.mlmodel")
-            .is_file());
+        assert!(
+            pkg_path
+                .join("Data/com.apple.CoreML/model.mlmodel")
+                .is_file()
+        );
 
-        let reloaded =
-            read_mlpackage(&pkg_path).expect("failed to read back written mlpackage");
+        let reloaded = read_mlpackage(&pkg_path).expect("failed to read back written mlpackage");
 
         assert_eq!(
             original.specification_version,

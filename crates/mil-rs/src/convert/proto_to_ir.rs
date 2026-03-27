@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 
 use crate::error::{MilError, Result};
-use crate::ir::{Block, Function, Operation, Program, TensorType, Value};
 use crate::ir::ScalarType;
+use crate::ir::{Block, Function, Operation, Program, TensorType, Value};
 use crate::proto::mil_spec;
-use crate::proto::specification::{model, Model};
+use crate::proto::specification::{Model, model};
 
 /// Convert a protobuf [`Model`] into a MIL IR [`Program`].
 ///
@@ -21,12 +21,12 @@ pub fn model_to_program(model: &Model) -> Result<Program> {
             return Err(MilError::UnsupportedOp(
                 "only ML Program models are supported; this model uses a different type"
                     .to_string(),
-            ))
+            ));
         }
         None => {
             return Err(MilError::Protobuf(
                 "model has no type field set".to_string(),
-            ))
+            ));
         }
     };
 
@@ -153,9 +153,7 @@ fn convert_binding(binding: &mil_spec::argument::Binding) -> Result<Value> {
     match &binding.binding {
         Some(Binding::Name(name)) => Ok(Value::Reference(name.clone())),
         Some(Binding::Value(v)) => convert_value(v),
-        None => Err(MilError::Protobuf(
-            "argument binding is empty".to_string(),
-        )),
+        None => Err(MilError::Protobuf("argument binding is empty".to_string())),
     }
 }
 
@@ -271,9 +269,7 @@ fn convert_value_type_to_value(vt: &mil_spec::ValueType) -> Result<Value> {
     use mil_spec::value_type;
 
     match &vt.r#type {
-        Some(value_type::Type::TensorType(tt)) => {
-            Ok(Value::Type(convert_tensor_type(tt)?))
-        }
+        Some(value_type::Type::TensorType(tt)) => Ok(Value::Type(convert_tensor_type(tt)?)),
         Some(_) => Err(MilError::UnsupportedOp(
             "only tensor value types are currently supported".to_string(),
         )),
@@ -284,9 +280,10 @@ fn convert_value_type_to_value(vt: &mil_spec::ValueType) -> Result<Value> {
 }
 
 fn convert_named_value_type_to_tensor(nvt: &mil_spec::NamedValueType) -> Result<TensorType> {
-    let vt = nvt.r#type.as_ref().ok_or_else(|| {
-        MilError::Protobuf(format!("named value '{}' has no type", nvt.name))
-    })?;
+    let vt = nvt
+        .r#type
+        .as_ref()
+        .ok_or_else(|| MilError::Protobuf(format!("named value '{}' has no type", nvt.name)))?;
 
     match &vt.r#type {
         Some(mil_spec::value_type::Type::TensorType(tt)) => convert_tensor_type(tt),
@@ -451,9 +448,7 @@ mod tests {
                     "x".to_string(),
                     Argument {
                         arguments: vec![argument::Binding {
-                            binding: Some(argument::binding::Binding::Name(
-                                "input".to_string(),
-                            )),
+                            binding: Some(argument::binding::Binding::Name("input".to_string())),
                         }],
                     },
                 );
@@ -557,15 +552,13 @@ mod tests {
 
     #[test]
     fn converts_immediate_scalar_values() {
-        use mil_spec::{tensor_value, TensorValue};
+        use mil_spec::{TensorValue, tensor_value};
 
         // Float scalar
         let float_tv = TensorValue {
-            value: Some(tensor_value::Value::Floats(
-                tensor_value::RepeatedFloats {
-                    values: vec![3.14],
-                },
-            )),
+            value: Some(tensor_value::Value::Floats(tensor_value::RepeatedFloats {
+                values: vec![3.14],
+            })),
         };
         let v = convert_tensor_value(&float_tv).unwrap();
         assert!(matches!(v, Value::Float(f) if (f - 3.14_f64).abs() < 1e-5));
@@ -581,11 +574,9 @@ mod tests {
 
         // Bool scalar
         let bool_tv = TensorValue {
-            value: Some(tensor_value::Value::Bools(
-                tensor_value::RepeatedBools {
-                    values: vec![true],
-                },
-            )),
+            value: Some(tensor_value::Value::Bools(tensor_value::RepeatedBools {
+                values: vec![true],
+            })),
         };
         let v = convert_tensor_value(&bool_tv).unwrap();
         assert!(matches!(v, Value::Bool(true)));
@@ -593,7 +584,7 @@ mod tests {
 
     #[test]
     fn converts_immediate_vector_values() {
-        use mil_spec::{tensor_value, TensorValue};
+        use mil_spec::{TensorValue, tensor_value};
 
         let float_tv = TensorValue {
             value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {

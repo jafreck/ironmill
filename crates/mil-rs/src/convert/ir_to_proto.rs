@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::ir::ScalarType;
 use crate::ir::{Block, Function, Operation, Program, TensorType, Value};
 use crate::proto::mil_spec;
-use crate::proto::specification::{model, Model};
+use crate::proto::specification::{Model, model};
 
 /// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
 ///
@@ -51,9 +51,9 @@ fn convert_function(func: &Function) -> Result<mil_spec::Function> {
         .map(|(name, tt)| mil_spec::NamedValueType {
             name: name.clone(),
             r#type: Some(mil_spec::ValueType {
-                r#type: Some(mil_spec::value_type::Type::TensorType(
-                    convert_tensor_type(tt),
-                )),
+                r#type: Some(mil_spec::value_type::Type::TensorType(convert_tensor_type(
+                    tt,
+                ))),
             }),
         })
         .collect();
@@ -197,9 +197,7 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
         Value::Bool(v) => {
             let tv = mil_spec::TensorValue {
                 value: Some(mil_spec::tensor_value::Value::Bools(
-                    mil_spec::tensor_value::RepeatedBools {
-                        values: vec![*v],
-                    },
+                    mil_spec::tensor_value::RepeatedBools { values: vec![*v] },
                 )),
             };
             (
@@ -231,11 +229,9 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
                 .collect::<Result<Vec<_>>>()?;
             (
                 Some(value::Value::ImmediateValue(value::ImmediateValue {
-                    value: Some(value::immediate_value::Value::List(
-                        mil_spec::ListValue {
-                            values: proto_items,
-                        },
-                    )),
+                    value: Some(value::immediate_value::Value::List(mil_spec::ListValue {
+                        values: proto_items,
+                    })),
                 })),
                 None,
             )
@@ -245,9 +241,9 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
             (
                 None,
                 Some(mil_spec::ValueType {
-                    r#type: Some(mil_spec::value_type::Type::TensorType(
-                        convert_tensor_type(tt),
-                    )),
+                    r#type: Some(mil_spec::value_type::Type::TensorType(convert_tensor_type(
+                        tt,
+                    ))),
                 }),
             )
         }
@@ -274,9 +270,7 @@ fn convert_tensor_type(tt: &TensorType) -> mil_spec::TensorType {
         .map(|dim| match dim {
             Some(size) => mil_spec::Dimension {
                 dimension: Some(mil_spec::dimension::Dimension::Constant(
-                    mil_spec::dimension::ConstantDimension {
-                        size: *size as u64,
-                    },
+                    mil_spec::dimension::ConstantDimension { size: *size as u64 },
                 )),
             },
             None => mil_spec::Dimension {

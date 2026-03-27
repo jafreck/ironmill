@@ -52,8 +52,7 @@ mod tests {
 
         write_mlmodel(&original, &out_path).expect("failed to write mlmodel");
 
-        let reloaded =
-            read_mlmodel(&out_path).expect("failed to read back written mlmodel");
+        let reloaded = read_mlmodel(&out_path).expect("failed to read back written mlmodel");
 
         assert_eq!(
             original.specification_version,

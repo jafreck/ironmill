@@ -96,9 +96,8 @@ fn read_manifest(package_dir: &Path) -> Result<Manifest> {
     }
 
     let contents = std::fs::read_to_string(&manifest_path)?;
-    let manifest: Manifest = serde_json::from_str(&contents).map_err(|e| {
-        MilError::InvalidPackage(format!("failed to parse Manifest.json: {e}"))
-    })?;
+    let manifest: Manifest = serde_json::from_str(&contents)
+        .map_err(|e| MilError::InvalidPackage(format!("failed to parse Manifest.json: {e}")))?;
 
     Ok(manifest)
 }
@@ -127,9 +126,11 @@ mod tests {
             manifest.root_model_identifier,
             "com.apple.CoreML/model.mlmodel"
         );
-        assert!(manifest
-            .item_info_entries
-            .contains_key("com.apple.CoreML/model.mlmodel"));
+        assert!(
+            manifest
+                .item_info_entries
+                .contains_key("com.apple.CoreML/model.mlmodel")
+        );
 
         let item = &manifest.item_info_entries["com.apple.CoreML/model.mlmodel"];
         assert_eq!(item.path, "com.apple.CoreML/model.mlmodel");
