@@ -18,7 +18,7 @@ pub mod reader;
 
 /// Re-export key types at crate root for convenience.
 pub use error::MilError;
-pub use ir::{Graph, Operation, TensorType, Value};
+pub use ir::{Block, Function, Graph, Operation, Pass, Program, TensorType, Value};
 #[cfg(not(doctest))]
 pub use proto::specification::Model;
 pub use reader::read_mlmodel;
