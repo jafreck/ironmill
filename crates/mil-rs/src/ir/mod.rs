@@ -17,5 +17,5 @@ pub use graph::Graph;
 pub use operation::Operation;
 pub use pass::Pass;
 pub use program::{Block, Function, Program};
-pub use tensor::TensorType;
+pub use tensor::{ScalarType, TensorType};
 pub use types::Value;
