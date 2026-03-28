@@ -850,8 +850,8 @@ mod tests {
 
         // MIL text should reference the weight blob
         assert!(
-            first.mil_text.contains("blob("),
-            "MIL text should contain blob reference for weight: {}",
+            first.mil_text.contains("BLOBFILE("),
+            "MIL text should contain BLOBFILE reference for weight: {}",
             first.mil_text
         );
 
