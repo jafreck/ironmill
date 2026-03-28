@@ -171,7 +171,9 @@ for model_file in "${MODELS[@]}"; do
 
         log "  Running inference ($ITERATIONS iterations)…"
         json_out="$out_dir/results.json"
-        if "$HARNESS" "$mlmodelc" --iterations "$ITERATIONS" --warmup "$WARMUP" --json > "$json_out" 2>&1; then
+        # Redirect stderr to a separate log — framework warnings (BNNS, MPS)
+        # must not corrupt the JSON on stdout.
+        if "$HARNESS" "$mlmodelc" --iterations "$ITERATIONS" --warmup "$WARMUP" --json > "$json_out" 2>"$out_dir/stderr.log"; then
             p50=$(python3 -c "import json,sys; d=json.load(open('$json_out')); print(d.get('median_ms',0))" 2>/dev/null || echo "0")
             p95=$(python3 -c "import json,sys; d=json.load(open('$json_out')); print(d.get('p95_ms',0))" 2>/dev/null || echo "0")
             p99=$(python3 -c "import json,sys; d=json.load(open('$json_out')); print(d.get('p99_ms',0))" 2>/dev/null || echo "0")

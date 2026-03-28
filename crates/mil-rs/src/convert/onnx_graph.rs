@@ -212,10 +212,18 @@ fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Bloc
         for (i, name) in op.outputs.iter().enumerate() {
             if let Some(Some(tt)) = op.output_types.get(i) {
                 type_map.insert(name.clone(), tt.clone());
-            } else if op.op_type == "const" {
+            }
+            // Always capture const tensor data (needed for reshape shape
+            // resolution), even when output_types is already set.
+            if op.op_type == "const" {
+                if !type_map.contains_key(name) {
+                    let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+                    if let Some(Value::Tensor { shape, dtype, .. }) = val {
+                        type_map.insert(name.clone(), TensorType::new(*dtype, shape.clone()));
+                    }
+                }
                 let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
-                if let Some(Value::Tensor { shape, dtype, data }) = val {
-                    type_map.insert(name.clone(), TensorType::new(*dtype, shape.clone()));
+                if let Some(Value::Tensor { dtype, data, .. }) = val {
                     if *dtype == ScalarType::Int32 && data.len() % 4 == 0 {
                         let dims: Vec<usize> = data
                             .chunks_exact(4)
@@ -271,14 +279,29 @@ fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Bloc
             }
         }
 
-        // For flatten (reshape with flatten_axis), compute and insert the
-        // target shape from the input dimensions.
-        if op.op_type == "reshape"
-            && op.attributes.contains_key("flatten_axis")
-            && !op.inputs.contains_key("shape")
-        {
-            if let Some(Value::Reference(n)) = op.inputs.get("x") {
-                if let Some(in_tt) = type_map.get(n) {
+        // For reshape ops, resolve the shape input to concrete values.
+        // MPS crashes on [0,-1] patterns, so we always resolve them.
+        // Prefer the declared output_types (from ONNX type info) when
+        // available; fall back to computing from input dims.
+        if op.op_type == "reshape" {
+            // Try to get the shape from the already-set output_type first.
+            let from_output_type: Option<Vec<i32>> = op
+                .output_types
+                .first()
+                .and_then(|ot| ot.as_ref())
+                .map(|tt| tt.shape.iter().map(|d| d.unwrap_or(1) as i32).collect());
+
+            let resolved: Option<Vec<i32>> = if from_output_type.is_some() {
+                from_output_type
+            } else if op.attributes.contains_key("flatten_axis") {
+                let xn = op.inputs.get("x").and_then(|v| {
+                    if let Value::Reference(n) = v {
+                        Some(n.clone())
+                    } else {
+                        None
+                    }
+                });
+                xn.and_then(|n| type_map.get(&n)).map(|in_tt| {
                     let axis = op
                         .attributes
                         .get("flatten_axis")
@@ -293,19 +316,63 @@ fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Bloc
                     let dims: Vec<usize> = in_tt.shape.iter().map(|d| d.unwrap_or(1)).collect();
                     let batch: usize = dims[..axis].iter().product();
                     let rest: usize = dims[axis..].iter().product();
-                    let shape_data: Vec<u8> = [batch as i32, rest as i32]
-                        .iter()
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect();
-                    op.inputs.insert(
-                        "shape".into(),
-                        Value::Tensor {
-                            data: shape_data,
-                            shape: vec![2],
-                            dtype: ScalarType::Int32,
-                        },
-                    );
-                }
+                    vec![batch as i32, rest as i32]
+                })
+            } else {
+                let sn = op.inputs.get("shape").and_then(|v| {
+                    if let Value::Reference(n) = v {
+                        Some(n.clone())
+                    } else {
+                        None
+                    }
+                });
+                let xn = op.inputs.get("x").and_then(|v| {
+                    if let Value::Reference(n) = v {
+                        Some(n.clone())
+                    } else {
+                        None
+                    }
+                });
+                sn.and_then(|sn| {
+                    let raw = const_values.get(&sn)?;
+                    if !raw.iter().any(|&d| {
+                        let s = d as i64;
+                        s == 0 || s == -1
+                    }) {
+                        return None;
+                    }
+                    let in_tt = xn.as_ref().and_then(|xn| type_map.get(xn))?;
+                    let in_numel: usize = in_tt.shape.iter().map(|d| d.unwrap_or(1)).product();
+                    let mut out: Vec<usize> = raw.clone();
+                    let mut infer_idx = None;
+                    let mut known: usize = 1;
+                    for (i, &d) in raw.iter().enumerate() {
+                        let s = d as i64;
+                        if s == 0 {
+                            out[i] = in_tt.shape.get(i).and_then(|v| *v).unwrap_or(1);
+                            known *= out[i];
+                        } else if s == -1 {
+                            infer_idx = Some(i);
+                        } else {
+                            known *= d;
+                        }
+                    }
+                    if let Some(idx) = infer_idx {
+                        out[idx] = if known > 0 { in_numel / known } else { 1 };
+                    }
+                    Some(out.iter().map(|&v| v as i32).collect())
+                })
+            };
+            if let Some(vals) = resolved {
+                let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                op.inputs.insert(
+                    "shape".into(),
+                    Value::Tensor {
+                        data,
+                        shape: vec![vals.len()],
+                        dtype: ScalarType::Int32,
+                    },
+                );
             }
         }
 
