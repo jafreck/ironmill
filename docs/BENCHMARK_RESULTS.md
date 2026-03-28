@@ -153,6 +153,28 @@ FP16 delivers a **4.3× speedup** (1.2ms → 281µs).  The always-on fusion
 passes (conv-relu) cut model load time from 2.5s to 682ms by reducing the
 number of ops the CoreML compiler must process.
 
+### Backend Comparison: CPU vs GPU vs ANE
+
+All results above use `.all` compute units (CoreML picks the fastest backend).
+The table below isolates each backend on MobileNetV2 to show where the
+speedups actually come from.
+
+| Quantization | CPU | GPU (Metal) | ANE |
+|---|---|---|---|
+| FP32 | 5.7ms | 2.8ms | 2.4ms |
+| **FP16** | 3.2ms | 2.3ms | **861µs** |
+| INT8 | 5.6ms | 4.6ms | 2.1ms |
+| Palettize 4-bit | 7.3ms | 2.5ms | 2.0ms |
+
+- **ANE is fastest across all quantizations**, but FP16 unlocks its full
+  potential — 2.8× faster than FP32 on the same ANE hardware (861µs vs 2.4ms).
+- **GPU (Metal)** is ~2× faster than CPU at FP32, but FP16 barely helps it
+  (2.3ms vs 2.8ms).
+- **INT8 hurts GPU** (4.6ms vs 2.8ms FP32) — the dequantization overhead
+  exceeds any compute savings.
+- **Palettize** doesn't speed up inference on any backend — it primarily
+  reduces model size and load time.
+
 ---
 
 ## Running the Benchmarks
