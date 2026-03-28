@@ -176,8 +176,7 @@ mod tests {
 
         let mut program = Program::new("1.0.0");
         let mut func = Function::new("main");
-        func.body
-            .add_op(const_tensor_op("idx", "idx_out", int_val));
+        func.body.add_op(const_tensor_op("idx", "idx_out", int_val));
         // Also add a non-tensor const.
         func.body.add_op(
             Operation::new("const", "bool_c")
@@ -221,8 +220,7 @@ mod tests {
 
         let mut program = Program::new("1.0.0");
         let mut func = Function::new("main");
-        func.body
-            .add_op(const_tensor_op("w", "w_out", tensor_val));
+        func.body.add_op(const_tensor_op("w", "w_out", tensor_val));
         func.body.outputs.push("w_out".into());
         program.add_function(func);
 

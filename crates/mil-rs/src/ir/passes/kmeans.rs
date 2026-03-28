@@ -115,12 +115,7 @@ fn assign(data: &[f32], centroids: &[f32]) -> Vec<usize> {
 /// Recompute centroids as the mean of assigned points.
 /// Handles empty clusters by reassigning them to the data point farthest
 /// from its own assigned centroid, updating assignments to avoid duplicates.
-fn update_centroids(
-    data: &[f32],
-    centroids: &mut [f32],
-    assignments: &mut [usize],
-    k: usize,
-) {
+fn update_centroids(data: &[f32], centroids: &mut [f32], assignments: &mut [usize], k: usize) {
     let mut sums = vec![0.0f64; k];
     let mut counts = vec![0usize; k];
 

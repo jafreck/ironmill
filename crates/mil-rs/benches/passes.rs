@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mil_rs::ir::passes::{
     AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass,
     ConvReluFusionPass, DeadCodeEliminationPass, IdentityEliminationPass, LayoutOptimizationPass,
     OpSubstitutionPass,
 };
-use mil_rs::{onnx_to_program, read_onnx, Pass, Program};
+use mil_rs::{Pass, Program, onnx_to_program, read_onnx};
 
 fn fixture_path(name: &str) -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");

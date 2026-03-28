@@ -66,7 +66,10 @@ fn detect_identity(op: &crate::ir::operation::Operation) -> Option<(String, Stri
         }
         "transpose" => {
             // Identity transpose has perm = [0, 1, 2, …].
-            let perm = op.inputs.get("perm").or_else(|| op.attributes.get("perm"))?;
+            let perm = op
+                .inputs
+                .get("perm")
+                .or_else(|| op.attributes.get("perm"))?;
             if is_identity_perm(perm) {
                 let input_ref = op.inputs.get("x")?;
                 if let Value::Reference(input_name) = input_ref {

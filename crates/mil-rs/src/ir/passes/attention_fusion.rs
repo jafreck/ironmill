@@ -366,18 +366,9 @@ mod tests {
         assert_eq!(ops[0].op_type, "scaled_dot_product_attention");
 
         // Verify inputs.
-        assert_eq!(
-            ops[0].inputs.get("Q"),
-            Some(&Value::Reference("Q".into()))
-        );
-        assert_eq!(
-            ops[0].inputs.get("K"),
-            Some(&Value::Reference("K".into()))
-        );
-        assert_eq!(
-            ops[0].inputs.get("V"),
-            Some(&Value::Reference("V".into()))
-        );
+        assert_eq!(ops[0].inputs.get("Q"), Some(&Value::Reference("Q".into())));
+        assert_eq!(ops[0].inputs.get("K"), Some(&Value::Reference("K".into())));
+        assert_eq!(ops[0].inputs.get("V"), Some(&Value::Reference("V".into())));
 
         // Block output should reference the fused op's output.
         let block_outputs = &program.functions["main"].body.outputs;
@@ -535,10 +526,13 @@ mod tests {
         // Combine heads (not part of attention pattern).
         block.add_op(
             Operation::new("concat", "concat_heads")
-                .with_input("x", Value::List(vec![
-                    Value::Reference("attn_output_0".into()),
-                    Value::Reference("attn_output_1".into()),
-                ]))
+                .with_input(
+                    "x",
+                    Value::List(vec![
+                        Value::Reference("attn_output_0".into()),
+                        Value::Reference("attn_output_1".into()),
+                    ]),
+                )
                 .with_output("combined"),
         );
         block.outputs.push("combined".into());
@@ -548,7 +542,11 @@ mod tests {
 
         let ops = block_ops(&program);
         // 2 fused attention ops + 1 concat = 3 ops.
-        assert_eq!(ops.len(), 3, "expected 3 ops after fusing two heads, got {ops:?}");
+        assert_eq!(
+            ops.len(),
+            3,
+            "expected 3 ops after fusing two heads, got {ops:?}"
+        );
 
         let attn_ops: Vec<_> = ops
             .iter()

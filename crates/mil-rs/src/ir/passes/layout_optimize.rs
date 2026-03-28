@@ -124,12 +124,11 @@ fn insert_transposes(block: &mut Block) {
 
             if !nhwc_inputs.is_empty() && !nchw_inputs.is_empty() {
                 // Mixed layouts — normalize minority inputs to match majority.
-                let (targets, target_layout, perm) =
-                    if nhwc_inputs.len() >= nchw_inputs.len() {
-                        (nchw_inputs, Layout::NHWC, &NCHW_TO_NHWC)
-                    } else {
-                        (nhwc_inputs, Layout::NCHW, &NHWC_TO_NCHW)
-                    };
+                let (targets, target_layout, perm) = if nhwc_inputs.len() >= nchw_inputs.len() {
+                    (nchw_inputs, Layout::NHWC, &NCHW_TO_NHWC)
+                } else {
+                    (nhwc_inputs, Layout::NCHW, &NHWC_TO_NCHW)
+                };
 
                 for input_name in &targets {
                     let t_out = format!("_layout_norm_{counter}");
@@ -303,8 +302,7 @@ fn cancel_inverse_transposes(block: &mut Block) {
 
         // Find the producer transpose.
         let producer = block.operations.iter().enumerate().find(|(_, op)| {
-            op.op_type == "transpose"
-                && op.outputs.first().map(|s| s.as_str()) == Some(&b_input)
+            op.op_type == "transpose" && op.outputs.first().map(|s| s.as_str()) == Some(&b_input)
         });
 
         let (ai, op_a) = match producer {
@@ -348,7 +346,10 @@ fn cancel_inverse_transposes(block: &mut Block) {
 
 /// Extract the permutation from a transpose op as a `Vec<usize>`.
 fn get_perm(op: &Operation) -> Option<Vec<usize>> {
-    let perm_val = op.inputs.get("perm").or_else(|| op.attributes.get("perm"))?;
+    let perm_val = op
+        .inputs
+        .get("perm")
+        .or_else(|| op.attributes.get("perm"))?;
     if let Value::List(items) = perm_val {
         let mut perm = Vec::with_capacity(items.len());
         for item in items {

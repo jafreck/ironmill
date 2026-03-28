@@ -71,9 +71,10 @@ fn find_const_tensor<'a>(block: &'a Block, output_name: &str) -> Option<&'a Valu
 
 /// Find the index of the const op producing `output_name`.
 fn find_const_op_index(block: &Block, output_name: &str) -> Option<usize> {
-    block.operations.iter().position(|op| {
-        op.op_type == "const" && op.outputs.iter().any(|o| o == output_name)
-    })
+    block
+        .operations
+        .iter()
+        .position(|op| op.op_type == "const" && op.outputs.iter().any(|o| o == output_name))
 }
 
 /// Check whether `value_name` has exactly one consumer at `consumer_idx`.
@@ -168,13 +169,11 @@ fn find_fold_candidate(block: &Block) -> Option<(usize, usize)> {
         }
 
         // All BN params must be const tensors.
-        let all_bn_const = ["mean", "variance", "gamma", "beta"]
-            .iter()
-            .all(|p| {
-                resolve_ref(&block.operations[bi], p)
-                    .and_then(|name| find_const_tensor(block, &name))
-                    .is_some()
-            });
+        let all_bn_const = ["mean", "variance", "gamma", "beta"].iter().all(|p| {
+            resolve_ref(&block.operations[bi], p)
+                .and_then(|name| find_const_tensor(block, &name))
+                .is_some()
+        });
         if !all_bn_const {
             continue;
         }
@@ -379,14 +378,39 @@ mod tests {
         let mut block = Block::new();
 
         // Const ops for conv
-        block.add_op(const_tensor_op("w_const", "w_val", &[1.0, 2.0], vec![2, 1, 1, 1]));
+        block.add_op(const_tensor_op(
+            "w_const",
+            "w_val",
+            &[1.0, 2.0],
+            vec![2, 1, 1, 1],
+        ));
         block.add_op(const_tensor_op("b_const", "b_val", &[0.5, 0.5], vec![2]));
 
         // Const ops for BN
-        block.add_op(const_tensor_op("gamma_const", "gamma_val", &[1.0, 2.0], vec![2]));
-        block.add_op(const_tensor_op("beta_const", "beta_val", &[0.0, 1.0], vec![2]));
-        block.add_op(const_tensor_op("mean_const", "mean_val", &[0.0, 1.0], vec![2]));
-        block.add_op(const_tensor_op("var_const", "var_val", &[1.0, 1.0], vec![2]));
+        block.add_op(const_tensor_op(
+            "gamma_const",
+            "gamma_val",
+            &[1.0, 2.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "beta_const",
+            "beta_val",
+            &[0.0, 1.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "mean_const",
+            "mean_val",
+            &[0.0, 1.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "var_const",
+            "var_val",
+            &[1.0, 1.0],
+            vec![2],
+        ));
 
         // Conv op
         block.add_op(
@@ -456,13 +480,33 @@ mod tests {
     fn skip_non_const_bn_params() {
         let mut block = Block::new();
 
-        block.add_op(const_tensor_op("w_const", "w_val", &[1.0, 2.0], vec![2, 1, 1, 1]));
+        block.add_op(const_tensor_op(
+            "w_const",
+            "w_val",
+            &[1.0, 2.0],
+            vec![2, 1, 1, 1],
+        ));
         block.add_op(const_tensor_op("b_const", "b_val", &[0.5, 0.5], vec![2]));
 
         // Only gamma/beta/variance are const — mean is dynamic (not a const op).
-        block.add_op(const_tensor_op("gamma_const", "gamma_val", &[1.0, 2.0], vec![2]));
-        block.add_op(const_tensor_op("beta_const", "beta_val", &[0.0, 1.0], vec![2]));
-        block.add_op(const_tensor_op("var_const", "var_val", &[1.0, 1.0], vec![2]));
+        block.add_op(const_tensor_op(
+            "gamma_const",
+            "gamma_val",
+            &[1.0, 2.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "beta_const",
+            "beta_val",
+            &[0.0, 1.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "var_const",
+            "var_val",
+            &[1.0, 1.0],
+            vec![2],
+        ));
 
         // mean_val comes from a non-const op (simulating a dynamic value).
         block.add_op(
@@ -498,7 +542,11 @@ mod tests {
 
         // Nothing should be folded — all ops remain.
         assert_eq!(block_ops(&program).len(), op_count_before);
-        assert!(block_ops(&program).iter().any(|op| op.op_type == "batch_norm"));
+        assert!(
+            block_ops(&program)
+                .iter()
+                .any(|op| op.op_type == "batch_norm")
+        );
     }
 
     // ---- Test 3: skip when conv has multiple consumers ----------------------
@@ -519,7 +567,9 @@ mod tests {
 
         // batch_norm should still be present — no fold happened.
         assert!(
-            block_ops(&program).iter().any(|op| op.op_type == "batch_norm"),
+            block_ops(&program)
+                .iter()
+                .any(|op| op.op_type == "batch_norm"),
             "batch_norm should remain when conv has multiple consumers"
         );
     }
@@ -565,12 +615,37 @@ mod tests {
         let mut block = Block::new();
 
         // Conv without a bias input.
-        block.add_op(const_tensor_op("w_const", "w_val", &[1.0, 2.0], vec![2, 1, 1, 1]));
+        block.add_op(const_tensor_op(
+            "w_const",
+            "w_val",
+            &[1.0, 2.0],
+            vec![2, 1, 1, 1],
+        ));
 
-        block.add_op(const_tensor_op("gamma_const", "gamma_val", &[1.0, 2.0], vec![2]));
-        block.add_op(const_tensor_op("beta_const", "beta_val", &[0.0, 1.0], vec![2]));
-        block.add_op(const_tensor_op("mean_const", "mean_val", &[0.0, 1.0], vec![2]));
-        block.add_op(const_tensor_op("var_const", "var_val", &[1.0, 1.0], vec![2]));
+        block.add_op(const_tensor_op(
+            "gamma_const",
+            "gamma_val",
+            &[1.0, 2.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "beta_const",
+            "beta_val",
+            &[0.0, 1.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "mean_const",
+            "mean_val",
+            &[0.0, 1.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "var_const",
+            "var_val",
+            &[1.0, 1.0],
+            vec![2],
+        ));
 
         block.add_op(
             Operation::new("conv", "conv_0")
@@ -631,19 +706,39 @@ mod tests {
     fn skip_mismatched_bn_param_lengths() {
         let mut block = Block::new();
 
-        block.add_op(const_tensor_op("w_const", "w_val", &[1.0, 2.0], vec![2, 1, 1, 1]));
+        block.add_op(const_tensor_op(
+            "w_const",
+            "w_val",
+            &[1.0, 2.0],
+            vec![2, 1, 1, 1],
+        ));
         block.add_op(const_tensor_op("b_const", "b_val", &[0.5, 0.5], vec![2]));
 
         // gamma has 2 elements but mean has 3 — lengths don't match.
-        block.add_op(const_tensor_op("gamma_const", "gamma_val", &[1.0, 2.0], vec![2]));
-        block.add_op(const_tensor_op("beta_const", "beta_val", &[0.0, 1.0], vec![2]));
+        block.add_op(const_tensor_op(
+            "gamma_const",
+            "gamma_val",
+            &[1.0, 2.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "beta_const",
+            "beta_val",
+            &[0.0, 1.0],
+            vec![2],
+        ));
         block.add_op(const_tensor_op(
             "mean_const",
             "mean_val",
             &[0.0, 1.0, 2.0],
             vec![3],
         ));
-        block.add_op(const_tensor_op("var_const", "var_val", &[1.0, 1.0], vec![2]));
+        block.add_op(const_tensor_op(
+            "var_const",
+            "var_val",
+            &[1.0, 1.0],
+            vec![2],
+        ));
 
         block.add_op(
             Operation::new("conv", "conv_0")
@@ -669,7 +764,9 @@ mod tests {
 
         // No fold — batch_norm should still be present.
         assert!(
-            block_ops(&program).iter().any(|op| op.op_type == "batch_norm"),
+            block_ops(&program)
+                .iter()
+                .any(|op| op.op_type == "batch_norm"),
             "batch_norm should remain when BN param lengths mismatch"
         );
     }
@@ -687,12 +784,37 @@ mod tests {
             &[1.0, 2.0, 3.0],
             vec![3, 1, 1, 1],
         ));
-        block.add_op(const_tensor_op("b_const", "b_val", &[0.5, 0.5, 0.5], vec![3]));
+        block.add_op(const_tensor_op(
+            "b_const",
+            "b_val",
+            &[0.5, 0.5, 0.5],
+            vec![3],
+        ));
 
-        block.add_op(const_tensor_op("gamma_const", "gamma_val", &[1.0, 2.0], vec![2]));
-        block.add_op(const_tensor_op("beta_const", "beta_val", &[0.0, 1.0], vec![2]));
-        block.add_op(const_tensor_op("mean_const", "mean_val", &[0.0, 1.0], vec![2]));
-        block.add_op(const_tensor_op("var_const", "var_val", &[1.0, 1.0], vec![2]));
+        block.add_op(const_tensor_op(
+            "gamma_const",
+            "gamma_val",
+            &[1.0, 2.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "beta_const",
+            "beta_val",
+            &[0.0, 1.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "mean_const",
+            "mean_val",
+            &[0.0, 1.0],
+            vec![2],
+        ));
+        block.add_op(const_tensor_op(
+            "var_const",
+            "var_val",
+            &[1.0, 1.0],
+            vec![2],
+        ));
 
         block.add_op(
             Operation::new("conv", "conv_0")
@@ -718,7 +840,9 @@ mod tests {
 
         // No fold — batch_norm should still be present.
         assert!(
-            block_ops(&program).iter().any(|op| op.op_type == "batch_norm"),
+            block_ops(&program)
+                .iter()
+                .any(|op| op.op_type == "batch_norm"),
             "batch_norm should remain when weight shape[0] != c_out"
         );
     }

@@ -77,12 +77,18 @@ impl Pass for Int8QuantizePass {
                 // frontend (ONNX import puts it in attributes).
                 let in_inputs = matches!(
                     op.inputs.get("val"),
-                    Some(Value::Tensor { dtype: ScalarType::Float32, .. })
+                    Some(Value::Tensor {
+                        dtype: ScalarType::Float32,
+                        ..
+                    })
                 );
                 let in_attrs = !in_inputs
                     && matches!(
                         op.attributes.get("val"),
-                        Some(Value::Tensor { dtype: ScalarType::Float32, .. })
+                        Some(Value::Tensor {
+                            dtype: ScalarType::Float32,
+                            ..
+                        })
                     );
 
                 if !in_inputs && !in_attrs {
@@ -95,7 +101,12 @@ impl Pass for Int8QuantizePass {
                     op.attributes.remove("val").unwrap()
                 };
 
-                if let Value::Tensor { data, shape, dtype: _ } = val {
+                if let Value::Tensor {
+                    data,
+                    shape,
+                    dtype: _,
+                } = val
+                {
                     let floats = tensor_as_f32_slice(&data);
                     let (quantized, scale, zero_point) = quantize_f32_to_uint8(&floats);
 
@@ -257,8 +268,7 @@ mod tests {
 
         let mut program = Program::new("1.0.0");
         let mut func = Function::new("main");
-        func.body
-            .add_op(const_tensor_op("w", "w_out", tensor_val));
+        func.body.add_op(const_tensor_op("w", "w_out", tensor_val));
         func.body.outputs.push("w_out".into());
         program.add_function(func);
 
@@ -305,8 +315,7 @@ mod tests {
 
         let mut program = Program::new("1.0.0");
         let mut func = Function::new("main");
-        func.body
-            .add_op(const_tensor_op("w", "w_out", tensor_val));
+        func.body.add_op(const_tensor_op("w", "w_out", tensor_val));
         func.body.outputs.push("w_out".into());
         program.add_function(func);
 
@@ -336,8 +345,7 @@ mod tests {
 
         let mut program = Program::new("1.0.0");
         let mut func = Function::new("main");
-        func.body
-            .add_op(const_tensor_op("w", "w_out", tensor_val));
+        func.body.add_op(const_tensor_op("w", "w_out", tensor_val));
         func.body.outputs.push("w_out".into());
         program.add_function(func);
 
@@ -363,8 +371,7 @@ mod tests {
 
         let mut program = Program::new("1.0.0");
         let mut func = Function::new("main");
-        func.body
-            .add_op(const_tensor_op("idx", "idx_out", int_val));
+        func.body.add_op(const_tensor_op("idx", "idx_out", int_val));
         func.body.outputs.push("idx_out".into());
         program.add_function(func);
 

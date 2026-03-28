@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use half::f16;
 use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
-use mil_rs::{onnx_to_program, read_onnx, PassPipeline, Program, ScalarType, Value};
+use mil_rs::{PassPipeline, Program, ScalarType, Value, onnx_to_program, read_onnx};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -82,11 +82,7 @@ fn main() -> anyhow::Result<()> {
             .first()
             .map(|r| r.ops_before)
             .unwrap_or(0);
-        let ops_after = report
-            .pass_results
-            .last()
-            .map(|r| r.ops_after)
-            .unwrap_or(0);
+        let ops_after = report.pass_results.last().map(|r| r.ops_after).unwrap_or(0);
 
         // Collect const tensor values from both programs.
         let base_tensors = collect_const_tensors(&baseline);

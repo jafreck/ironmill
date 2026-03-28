@@ -69,10 +69,10 @@ pub use compiler::is_compiler_available;
 
 /// Convert a protobuf [`Model`] into a MIL IR [`Program`].
 pub use convert::model_to_program;
-/// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
-pub use convert::program_to_model;
 /// Convert an ONNX [`proto::onnx::ModelProto`] into a MIL IR [`Program`].
 pub use convert::onnx_to_program;
+/// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
+pub use convert::program_to_model;
 
 /// Error type for all operations in this crate.
 pub use error::MilError;
@@ -82,10 +82,10 @@ pub use ir::{
     ScalarType, TensorType, Value,
 };
 
-/// Validate a MIL [`Program`] for Apple Neural Engine compatibility.
-pub use validate::validate_ane_compatibility;
 /// Result of ANE compatibility analysis.
 pub use validate::ValidationReport;
+/// Validate a MIL [`Program`] for Apple Neural Engine compatibility.
+pub use validate::validate_ane_compatibility;
 
 #[cfg(not(doctest))]
 pub use proto::specification::Model;

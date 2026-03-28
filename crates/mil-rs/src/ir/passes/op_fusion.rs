@@ -29,7 +29,12 @@ impl Pass for ConvBatchNormFusionPass {
 
     fn run(&self, program: &mut Program) -> Result<()> {
         for function in program.functions.values_mut() {
-            fuse_activation_pattern(&mut function.body, "conv", "batch_norm", FusionKind::BatchNorm);
+            fuse_activation_pattern(
+                &mut function.body,
+                "conv",
+                "batch_norm",
+                FusionKind::BatchNorm,
+            );
         }
         Ok(())
     }
@@ -132,7 +137,8 @@ fn fuse_activation_pattern(
 
         // Find the producer whose output matches the consumer's input.
         let producer = block.operations.iter().enumerate().find(|(_, op)| {
-            op.op_type == producer_type && op.outputs.first().map(|s| s.as_str()) == Some(&input_ref)
+            op.op_type == producer_type
+                && op.outputs.first().map(|s| s.as_str()) == Some(&input_ref)
         });
 
         let (pi, _) = match producer {
@@ -169,7 +175,10 @@ fn fuse_activation_pattern(
         let attr_value = match kind {
             FusionKind::Activation => {
                 let consumer_op_type = block.operations[ci].op_type.clone();
-                ("fused_activation".to_string(), Value::String(consumer_op_type))
+                (
+                    "fused_activation".to_string(),
+                    Value::String(consumer_op_type),
+                )
             }
             FusionKind::BatchNorm => ("has_fused_bn".to_string(), Value::Bool(true)),
         };

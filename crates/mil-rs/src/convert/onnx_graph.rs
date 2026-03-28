@@ -17,8 +17,8 @@ use crate::convert::onnx_to_mil::convert_node;
 use crate::error::{MilError, Result};
 use crate::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 use crate::proto::onnx::{
-    tensor_shape_proto::dimension, type_proto, GraphProto, ModelProto, TensorProto, TypeProto,
-    ValueInfoProto,
+    GraphProto, ModelProto, TensorProto, TypeProto, ValueInfoProto, tensor_shape_proto::dimension,
+    type_proto,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,17 +64,10 @@ pub fn onnx_to_program(model: &ModelProto) -> Result<ConversionResult> {
 // ---------------------------------------------------------------------------
 
 /// Convert an ONNX [`GraphProto`] into a MIL [`Function`].
-fn convert_graph(
-    graph: &GraphProto,
-    _opset: i64,
-    warnings: &mut Vec<String>,
-) -> Result<Function> {
+fn convert_graph(graph: &GraphProto, _opset: i64, warnings: &mut Vec<String>) -> Result<Function> {
     // 1. Collect initializer names for fast lookup.
-    let initializer_names: HashSet<&str> = graph
-        .initializer
-        .iter()
-        .map(|t| t.name.as_str())
-        .collect();
+    let initializer_names: HashSet<&str> =
+        graph.initializer.iter().map(|t| t.name.as_str()).collect();
 
     // 2. Real inputs are graph inputs that are NOT initializers.
     let real_inputs: Vec<&ValueInfoProto> = graph
@@ -120,8 +113,7 @@ fn convert_graph(
             Err(MilError::UnsupportedOp(op_type)) => {
                 warnings.push(format!("unsupported op: {op_type}"));
                 // Emit a placeholder so downstream references still resolve.
-                let mut placeholder =
-                    Operation::new("unsupported", node.name.clone());
+                let mut placeholder = Operation::new("unsupported", node.name.clone());
                 placeholder
                     .attributes
                     .insert("original_op".into(), Value::String(op_type));
@@ -155,11 +147,7 @@ fn convert_graph(
 /// Convert an ONNX [`TensorProto`] (initializer/weight) to a MIL `const` [`Operation`].
 fn initializer_to_const(tensor: &TensorProto) -> Result<Operation> {
     let dtype = onnx_dtype_to_scalar(tensor.data_type)?;
-    let shape: Vec<usize> = tensor
-        .dims
-        .iter()
-        .map(|&d| d as usize)
-        .collect();
+    let shape: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
 
     let raw_bytes = extract_tensor_raw_data(tensor, dtype);
 
@@ -459,10 +447,7 @@ mod tests {
         let main = program.main().expect("should have a main function");
 
         // SqueezeNet has a single image input.
-        assert!(
-            !main.inputs.is_empty(),
-            "should have inputs"
-        );
+        assert!(!main.inputs.is_empty(), "should have inputs");
         let (_, input_ty) = &main.inputs[0];
         assert_eq!(input_ty.rank(), 4, "input should be 4-D (NCHW)");
 
@@ -535,11 +520,7 @@ mod tests {
         let model = read_onnx(fixture("mnist.onnx")).unwrap();
         let graph = model.graph.as_ref().unwrap();
 
-        let init_names: HashSet<&str> = graph
-            .initializer
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect();
+        let init_names: HashSet<&str> = graph.initializer.iter().map(|t| t.name.as_str()).collect();
 
         let result = onnx_to_program(&model).unwrap();
         let main = result.program.main().unwrap();

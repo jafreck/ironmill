@@ -608,8 +608,10 @@ fn convert_split(node: &NodeProto) -> Result<Vec<Operation>> {
 
     // Input form (opset ≥ 13): split sizes as second input
     if let Some(split_input) = node.input.get(1).filter(|s| !s.is_empty()) {
-        op.inputs
-            .insert("split_sizes".to_string(), Value::Reference(split_input.clone()));
+        op.inputs.insert(
+            "split_sizes".to_string(),
+            Value::Reference(split_input.clone()),
+        );
     }
     // Attribute form
     if let Some(split) = get_int_list_attr(node, "split") {
@@ -780,8 +782,7 @@ mod tests {
     #[test]
     fn test_get_int_list_attr() {
         let mut node = make_node("Test", &[], &[]);
-        node.attribute
-            .push(make_int_list_attr("strides", &[2, 2]));
+        node.attribute.push(make_int_list_attr("strides", &[2, 2]));
         assert_eq!(get_int_list_attr(&node, "strides"), Some(vec![2, 2]));
         assert_eq!(get_int_list_attr(&node, "missing"), None);
     }
@@ -789,20 +790,15 @@ mod tests {
     #[test]
     fn test_get_string_attr() {
         let mut node = make_node("Test", &[], &[]);
-        node.attribute
-            .push(make_string_attr("mode", "constant"));
-        assert_eq!(
-            get_string_attr(&node, "mode"),
-            Some("constant".to_string())
-        );
+        node.attribute.push(make_string_attr("mode", "constant"));
+        assert_eq!(get_string_attr(&node, "mode"), Some("constant".to_string()));
         assert_eq!(get_string_attr(&node, "missing"), None);
     }
 
     #[test]
     fn test_get_tensor_attr() {
         let mut node = make_node("Test", &[], &[]);
-        node.attribute
-            .push(make_tensor_attr("value", &[2, 3], 1));
+        node.attribute.push(make_tensor_attr("value", &[2, 3], 1));
         let t = get_tensor_attr(&node, "value").unwrap();
         assert_eq!(t.dims, vec![2, 3]);
         assert_eq!(t.data_type, 1);
@@ -929,8 +925,7 @@ mod tests {
     #[test]
     fn test_conv_full() {
         let mut node = make_node("Conv", &["input", "W", "B"], &["Y"]);
-        node.attribute
-            .push(make_int_list_attr("strides", &[2, 2]));
+        node.attribute.push(make_int_list_attr("strides", &[2, 2]));
         node.attribute
             .push(make_int_list_attr("pads", &[1, 1, 1, 1]));
         node.attribute
@@ -972,7 +967,10 @@ mod tests {
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "linear");
-        assert!(matches!(op.attributes.get("transpose_y"), Some(Value::Bool(true))));
+        assert!(matches!(
+            op.attributes.get("transpose_y"),
+            Some(Value::Bool(true))
+        ));
     }
 
     #[test]
@@ -1013,7 +1011,10 @@ mod tests {
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "reshape");
-        assert!(matches!(op.attributes.get("flatten_axis"), Some(Value::Int(1))));
+        assert!(matches!(
+            op.attributes.get("flatten_axis"),
+            Some(Value::Int(1))
+        ));
     }
 
     #[test]
@@ -1022,7 +1023,10 @@ mod tests {
         node.attribute.push(make_int_attr("axis", 2));
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
-        assert!(matches!(op.attributes.get("flatten_axis"), Some(Value::Int(2))));
+        assert!(matches!(
+            op.attributes.get("flatten_axis"),
+            Some(Value::Int(2))
+        ));
     }
 
     #[test]
@@ -1030,8 +1034,7 @@ mod tests {
         let mut node = make_node("MaxPool", &["X"], &["Y"]);
         node.attribute
             .push(make_int_list_attr("kernel_shape", &[2, 2]));
-        node.attribute
-            .push(make_int_list_attr("strides", &[2, 2]));
+        node.attribute.push(make_int_list_attr("strides", &[2, 2]));
         node.attribute
             .push(make_int_list_attr("pads", &[0, 0, 0, 0]));
 
@@ -1046,8 +1049,7 @@ mod tests {
     #[test]
     fn test_transpose_perm() {
         let mut node = make_node("Transpose", &["X"], &["Y"]);
-        node.attribute
-            .push(make_int_list_attr("perm", &[0, 2, 1]));
+        node.attribute.push(make_int_list_attr("perm", &[0, 2, 1]));
 
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
@@ -1089,8 +1091,7 @@ mod tests {
     #[test]
     fn test_constant_float() {
         let mut node = make_node("Constant", &[], &["val"]);
-        node.attribute
-            .push(make_float_attr("value_float", 3.14));
+        node.attribute.push(make_float_attr("value_float", 3.14));
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "const");
@@ -1103,8 +1104,7 @@ mod tests {
     #[test]
     fn test_constant_tensor() {
         let mut node = make_node("Constant", &[], &["val"]);
-        node.attribute
-            .push(make_tensor_attr("value", &[2, 3], 1));
+        node.attribute.push(make_tensor_attr("value", &[2, 3], 1));
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "const");
@@ -1125,8 +1125,7 @@ mod tests {
     #[test]
     fn test_unsqueeze_attr_form() {
         let mut node = make_node("Unsqueeze", &["X"], &["Y"]);
-        node.attribute
-            .push(make_int_list_attr("axes", &[0, 2]));
+        node.attribute.push(make_int_list_attr("axes", &[0, 2]));
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "expand_dims");
@@ -1148,14 +1147,16 @@ mod tests {
     #[test]
     fn test_reduce_mean_attr_form() {
         let mut node = make_node("ReduceMean", &["X"], &["Y"]);
-        node.attribute
-            .push(make_int_list_attr("axes", &[2, 3]));
+        node.attribute.push(make_int_list_attr("axes", &[2, 3]));
         node.attribute.push(make_int_attr("keepdims", 1));
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "reduce_mean");
         assert!(op.attributes.contains_key("axes"));
-        assert!(matches!(op.attributes.get("keep_dims"), Some(Value::Bool(true))));
+        assert!(matches!(
+            op.attributes.get("keep_dims"),
+            Some(Value::Bool(true))
+        ));
     }
 
     #[test]
@@ -1184,7 +1185,11 @@ mod tests {
 
     #[test]
     fn test_slice() {
-        let node = make_node("Slice", &["data", "starts", "ends", "axes", "steps"], &["out"]);
+        let node = make_node(
+            "Slice",
+            &["data", "starts", "ends", "axes", "steps"],
+            &["out"],
+        );
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "slice_by_index");
@@ -1207,8 +1212,7 @@ mod tests {
     #[test]
     fn test_conv_transpose() {
         let mut node = make_node("ConvTranspose", &["X", "W"], &["Y"]);
-        node.attribute
-            .push(make_int_list_attr("strides", &[2, 2]));
+        node.attribute.push(make_int_list_attr("strides", &[2, 2]));
         node.attribute.push(make_int_attr("group", 1));
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
@@ -1220,8 +1224,7 @@ mod tests {
     #[test]
     fn test_resize_with_mode() {
         let mut node = make_node("Resize", &["X", "", "scales"], &["Y"]);
-        node.attribute
-            .push(make_string_attr("mode", "linear"));
+        node.attribute.push(make_string_attr("mode", "linear"));
         node.attribute.push(make_string_attr(
             "coordinate_transformation_mode",
             "align_corners",
@@ -1231,15 +1234,17 @@ mod tests {
         assert_eq!(op.op_type, "upsample_bilinear");
         assert!(matches!(op.inputs.get("scales"), Some(Value::Reference(s)) if s == "scales"));
         assert!(!op.inputs.contains_key("roi")); // empty input skipped
-        assert!(matches!(op.attributes.get("align_corners"), Some(Value::Bool(true))));
+        assert!(matches!(
+            op.attributes.get("align_corners"),
+            Some(Value::Bool(true))
+        ));
     }
 
     #[test]
     fn test_split_with_axis() {
         let mut node = make_node("Split", &["X"], &["out1", "out2"]);
         node.attribute.push(make_int_attr("axis", 1));
-        node.attribute
-            .push(make_int_list_attr("split", &[3, 5]));
+        node.attribute.push(make_int_list_attr("split", &[3, 5]));
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "split");

@@ -260,14 +260,21 @@ mod tests {
 
         // gelu expands to 13 ops:
         // mul, mul, const, mul, add, const, mul, tanh, const, add, mul, const, mul
-        assert_eq!(ops.len(), 13, "expected 13 replacement ops, got {}", ops.len());
+        assert_eq!(
+            ops.len(),
+            13,
+            "expected 13 replacement ops, got {}",
+            ops.len()
+        );
 
         // Verify op types in order.
         let types: Vec<&str> = ops.iter().map(|o| o.op_type.as_str()).collect();
         assert_eq!(
             types,
-            vec!["mul", "mul", "const", "mul", "add", "const", "mul", "tanh",
-                 "const", "add", "mul", "const", "mul"]
+            vec![
+                "mul", "mul", "const", "mul", "add", "const", "mul", "tanh", "const", "add", "mul",
+                "const", "mul"
+            ]
         );
 
         // The last op should produce the original output name.

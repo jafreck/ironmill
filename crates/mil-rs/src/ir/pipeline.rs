@@ -209,8 +209,7 @@ mod tests {
     fn program_with_ops(n: usize) -> Program {
         let mut func = Function::new("main");
         for i in 0..n {
-            let op = Operation::new("relu", &format!("op_{i}"))
-                .with_output(format!("out_{i}"));
+            let op = Operation::new("relu", &format!("op_{i}")).with_output(format!("out_{i}"));
             func.body.add_op(op);
         }
         if n > 0 {
@@ -268,7 +267,11 @@ mod tests {
 
     #[test]
     fn fp16_plus_palettize_is_allowed() {
-        let pipeline = PassPipeline::new().with_fp16().unwrap().with_palettize(4).unwrap();
+        let pipeline = PassPipeline::new()
+            .with_fp16()
+            .unwrap()
+            .with_palettize(4)
+            .unwrap();
         let names = pipeline.pass_names();
         assert!(names.contains(&"fp16-quantization"));
         assert!(names.contains(&"palettization"));

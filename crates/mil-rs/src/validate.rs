@@ -78,10 +78,7 @@ pub fn validate_ane_compatibility(program: &Program) -> ValidationReport {
         .iter()
         .filter(|r| r.op_type != "const")
         .count();
-    let non_const_fallback = fallback_ops
-        .iter()
-        .filter(|r| r.op_type != "const")
-        .count();
+    let non_const_fallback = fallback_ops.iter().filter(|r| r.op_type != "const").count();
     let non_const_total = non_const_compatible + non_const_fallback;
 
     let compatibility_pct = if non_const_total == 0 {
@@ -102,18 +99,9 @@ pub fn validate_ane_compatibility(program: &Program) -> ValidationReport {
 pub fn print_validation_report(report: &ValidationReport) {
     println!("ANE Compatibility Report");
     println!("========================");
-    println!(
-        "  Compatible ops : {}",
-        report.ane_compatible.len()
-    );
-    println!(
-        "  Fallback ops   : {}",
-        report.fallback_ops.len()
-    );
-    println!(
-        "  Compatibility  : {:.1}%",
-        report.compatibility_pct
-    );
+    println!("  Compatible ops : {}", report.ane_compatible.len());
+    println!("  Fallback ops   : {}", report.fallback_ops.len());
+    println!("  Compatibility  : {:.1}%", report.compatibility_pct);
 
     if !report.fallback_ops.is_empty() {
         println!();
@@ -252,8 +240,10 @@ mod tests {
     /// Build a minimal program with the given operations in a single function.
     fn make_program(ops: Vec<Operation>) -> Program {
         let mut func = Function::new("main");
-        func.inputs
-            .push(("input".into(), TensorType::new(ScalarType::Float32, vec![1, 3, 224, 224])));
+        func.inputs.push((
+            "input".into(),
+            TensorType::new(ScalarType::Float32, vec![1, 3, 224, 224]),
+        ));
         func.body = Block {
             operations: ops,
             outputs: vec!["out".into()],
@@ -289,7 +279,11 @@ mod tests {
         assert_eq!(report.ane_compatible.len(), 1);
         assert_eq!(report.fallback_ops.len(), 2);
 
-        let names: Vec<&str> = report.fallback_ops.iter().map(|r| r.op_type.as_str()).collect();
+        let names: Vec<&str> = report
+            .fallback_ops
+            .iter()
+            .map(|r| r.op_type.as_str())
+            .collect();
         assert!(names.contains(&"erf"));
         assert!(names.contains(&"custom_op"));
 
@@ -350,9 +344,7 @@ mod tests {
 
     #[test]
     fn const_ops_counted_as_compatible() {
-        let ops = vec![
-            Operation::new("const", "c0").with_output("c0_out"),
-        ];
+        let ops = vec![Operation::new("const", "c0").with_output("c0_out")];
         let report = validate_ane_compatibility(&make_program(ops));
 
         assert_eq!(report.ane_compatible.len(), 1);
@@ -377,7 +369,10 @@ mod tests {
 
         let report = validate_ane_compatibility(&program);
         assert!(
-            report.warnings.iter().any(|w| w.contains("exceeds ANE limit")),
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("exceeds ANE limit")),
             "expected an oversized-dimension warning, got: {:?}",
             report.warnings
         );

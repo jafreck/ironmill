@@ -106,9 +106,8 @@ impl Pass for PalettizePass {
                     dtype: ScalarType::UInt8,
                 };
 
-                let shape_value = Value::List(
-                    shape.iter().map(|&d| Value::Int(d as i64)).collect(),
-                );
+                let shape_value =
+                    Value::List(shape.iter().map(|&d| Value::Int(d as i64)).collect());
 
                 // Transform the op.
                 op.op_type = "constexpr_lut_to_dense".to_string();
@@ -349,8 +348,7 @@ mod tests {
 
         let mut program = Program::new("1.0.0");
         let mut func = Function::new("main");
-        func.body
-            .add_op(const_tensor_op("idx", "idx_out", int_val));
+        func.body.add_op(const_tensor_op("idx", "idx_out", int_val));
         func.body.outputs.push("idx_out".into());
         program.add_function(func);
 

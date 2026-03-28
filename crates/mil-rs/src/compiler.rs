@@ -41,10 +41,7 @@ pub fn is_compiler_available() -> bool {
 /// This function is only available on macOS with Xcode or Command Line Tools
 /// installed.  On other platforms it returns a descriptive error instead of
 /// using `#[cfg]` gates.
-pub fn compile_model(
-    input: impl AsRef<Path>,
-    output_dir: impl AsRef<Path>,
-) -> Result<PathBuf> {
+pub fn compile_model(input: impl AsRef<Path>, output_dir: impl AsRef<Path>) -> Result<PathBuf> {
     let input = input.as_ref();
     let output_dir = output_dir.as_ref();
 
@@ -112,8 +109,7 @@ mod tests {
     #[test]
     #[ignore] // Requires macOS with Xcode
     fn compile_mlmodel_roundtrip() {
-        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
         let mlmodel = fixtures.join("MobileNet.mlmodel");
         if !mlmodel.exists() {
             eprintln!("skipping: MobileNet.mlmodel fixture not found");
@@ -121,8 +117,7 @@ mod tests {
         }
 
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
-        let compiled = compile_model(&mlmodel, tmp.path())
-            .expect("compile_model failed");
+        let compiled = compile_model(&mlmodel, tmp.path()).expect("compile_model failed");
 
         assert!(compiled.exists(), "compiled .mlmodelc should exist");
         assert!(
@@ -136,8 +131,7 @@ mod tests {
     fn compile_mlpackage_roundtrip() {
         use crate::{read_mlmodel, write_mlpackage};
 
-        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
         let mlmodel = fixtures.join("MobileNet.mlmodel");
         if !mlmodel.exists() {
             eprintln!("skipping: MobileNet.mlmodel fixture not found");
@@ -151,8 +145,7 @@ mod tests {
         let pkg_path = tmp.path().join("MobileNet.mlpackage");
         write_mlpackage(&model, &pkg_path).expect("write_mlpackage failed");
 
-        let compiled = compile_model(&pkg_path, tmp.path())
-            .expect("compile_model failed");
+        let compiled = compile_model(&pkg_path, tmp.path()).expect("compile_model failed");
 
         assert!(compiled.exists(), "compiled .mlmodelc should exist");
         assert!(

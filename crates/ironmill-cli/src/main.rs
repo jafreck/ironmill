@@ -5,12 +5,12 @@ use std::process;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mil_rs::ir::PassPipeline;
+use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::validate::print_validation_report;
 use mil_rs::{
     compile_model, is_compiler_available, onnx_to_program, program_to_model, read_mlmodel,
     read_mlpackage, read_onnx, validate_ane_compatibility, write_mlpackage,
 };
-use mil_rs::reader::{print_model_summary, print_onnx_summary};
 
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
 ///
@@ -95,15 +95,18 @@ fn run() -> Result<()> {
             palettize,
             no_fusion,
             input_shapes,
-        } => cmd_compile(&input, CompileOpts {
-            output,
-            target,
-            quantize,
-            cal_data,
-            palettize,
-            no_fusion,
-            input_shapes,
-        }),
+        } => cmd_compile(
+            &input,
+            CompileOpts {
+                output,
+                target,
+                quantize,
+                cal_data,
+                palettize,
+                no_fusion,
+                input_shapes,
+            },
+        ),
         Commands::Inspect { input } => cmd_inspect(&input),
         Commands::Validate { input } => cmd_validate(&input),
     }
@@ -111,9 +114,9 @@ fn run() -> Result<()> {
 
 /// Parse an `--input-shape` value like `"input:1,3,224,224"` into `(name, dims)`.
 fn parse_input_shape(s: &str) -> Result<(String, Vec<usize>)> {
-    let (name, dims_str) = s
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("invalid --input-shape format: expected 'name:d0,d1,...', got '{s}'"))?;
+    let (name, dims_str) = s.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("invalid --input-shape format: expected 'name:d0,d1,...', got '{s}'")
+    })?;
     let dims: Vec<usize> = dims_str
         .split(',')
         .map(|d| {
@@ -148,32 +151,48 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
         .to_lowercase();
 
     if opts.target != "all" {
-        println!("Note: --target '{}' will be fully supported in Phase 3. Proceeding with default target.", opts.target);
+        println!(
+            "Note: --target '{}' will be fully supported in Phase 3. Proceeding with default target.",
+            opts.target
+        );
     }
 
     match ext.as_str() {
-        "onnx" => compile_from_onnx(input_path, opts.output, &opts.quantize, opts.cal_data, opts.palettize, opts.no_fusion, &opts.input_shapes),
-        "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext),
-        _ => bail!(
-            "Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"
+        "onnx" => compile_from_onnx(
+            input_path,
+            opts.output,
+            &opts.quantize,
+            opts.cal_data,
+            opts.palettize,
+            opts.no_fusion,
+            &opts.input_shapes,
         ),
+        "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext),
+        _ => bail!("Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"),
     }
 }
 
-fn compile_from_onnx(input_path: &Path, output: Option<String>, quantize: &str, cal_data: Option<PathBuf>, palettize: Option<u8>, no_fusion: bool, input_shapes: &[String]) -> Result<()> {
+fn compile_from_onnx(
+    input_path: &Path,
+    output: Option<String>,
+    quantize: &str,
+    cal_data: Option<PathBuf>,
+    palettize: Option<u8>,
+    no_fusion: bool,
+    input_shapes: &[String],
+) -> Result<()> {
     let input_display = input_path.display();
 
     // 1. Read ONNX model
     println!("Reading ONNX model: {input_display}");
-    let onnx_model =
-        read_onnx(input_path).with_context(|| format!("Failed to read ONNX model: {input_display}"))?;
+    let onnx_model = read_onnx(input_path)
+        .with_context(|| format!("Failed to read ONNX model: {input_display}"))?;
     print_onnx_summary(&onnx_model);
     println!();
 
     // 2. Convert to MIL IR
     println!("Converting to CoreML MIL IR...");
-    let result =
-        onnx_to_program(&onnx_model).context("Failed to convert ONNX model to MIL IR")?;
+    let result = onnx_to_program(&onnx_model).context("Failed to convert ONNX model to MIL IR")?;
     let mut program = result.program;
     let warnings = result.warnings;
     println!(
@@ -213,7 +232,9 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>, quantize: &str, 
                 .context("Failed to configure INT8 quantization")?;
         }
         "none" => {}
-        other => bail!("Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', or 'int8'."),
+        other => {
+            bail!("Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', or 'int8'.")
+        }
     }
 
     // Add palettization
@@ -241,8 +262,8 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>, quantize: &str, 
     println!();
 
     // 6. Convert IR to proto
-    let model = program_to_model(&program, 7)
-        .context("Failed to convert MIL IR to CoreML protobuf")?;
+    let model =
+        program_to_model(&program, 7).context("Failed to convert MIL IR to CoreML protobuf")?;
 
     // 7. Write as .mlpackage
     let output_path = output.unwrap_or_else(|| {
@@ -259,9 +280,7 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>, quantize: &str, 
     // 8. Optionally compile with xcrun
     if is_compiler_available() {
         println!("Compiling with xcrun coremlcompiler...");
-        let output_dir = Path::new(&output_path)
-            .parent()
-            .unwrap_or(Path::new("."));
+        let output_dir = Path::new(&output_path).parent().unwrap_or(Path::new("."));
         match compile_model(&output_path, output_dir) {
             Ok(compiled) => println!("Done: {}", compiled.display()),
             Err(e) => println!("Warning: compilation failed: {e}"),
@@ -275,10 +294,7 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>, quantize: &str, 
     if !warnings.is_empty() {
         println!();
         println!("Warnings:");
-        let unsupported: Vec<&str> = warnings
-            .iter()
-            .map(|w| w.as_str())
-            .collect();
+        let unsupported: Vec<&str> = warnings.iter().map(|w| w.as_str()).collect();
         println!(
             "  {} unsupported op(s) skipped: {:?}",
             unsupported.len(),
@@ -296,9 +312,7 @@ fn compile_coreml(input_path: &Path, ext: &str) -> Result<()> {
     println!("Input is already CoreML format (.{ext}): {input_display}");
 
     if !is_compiler_available() {
-        bail!(
-            "xcrun coremlcompiler is not available. Install Xcode to compile CoreML models."
-        );
+        bail!("xcrun coremlcompiler is not available. Install Xcode to compile CoreML models.");
     }
 
     println!("Compiling with xcrun coremlcompiler...");
@@ -337,9 +351,7 @@ fn cmd_inspect(input: &str) -> Result<()> {
                 .with_context(|| format!("Failed to read mlpackage: {input}"))?;
             print_model_summary(&model);
         }
-        _ => bail!(
-            "Unsupported format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"
-        ),
+        _ => bail!("Unsupported format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"),
     }
 
     Ok(())
@@ -367,8 +379,8 @@ fn cmd_validate(input: &str) -> Result<()> {
             println!("✓ ONNX model parsed successfully");
 
             println!("  Converting to MIL IR...");
-            let result = onnx_to_program(&onnx_model)
-                .context("Failed to convert ONNX model to MIL IR")?;
+            let result =
+                onnx_to_program(&onnx_model).context("Failed to convert ONNX model to MIL IR")?;
 
             let op_count = count_ops(&result.program);
             println!(
@@ -402,12 +414,8 @@ fn cmd_validate(input: &str) -> Result<()> {
                 }
                 Err(e) => {
                     println!();
-                    println!(
-                        "Note: Could not convert to MIL IR for ANE analysis: {e}"
-                    );
-                    println!(
-                        "  ANE validation requires an ML Program model (spec v7+)."
-                    );
+                    println!("Note: Could not convert to MIL IR for ANE analysis: {e}");
+                    println!("  ANE validation requires an ML Program model (spec v7+).");
                 }
             }
         }
@@ -424,18 +432,12 @@ fn cmd_validate(input: &str) -> Result<()> {
                 }
                 Err(e) => {
                     println!();
-                    println!(
-                        "Note: Could not convert to MIL IR for ANE analysis: {e}"
-                    );
-                    println!(
-                        "  ANE validation requires an ML Program model (spec v7+)."
-                    );
+                    println!("Note: Could not convert to MIL IR for ANE analysis: {e}");
+                    println!("  ANE validation requires an ML Program model (spec v7+).");
                 }
             }
         }
-        _ => bail!(
-            "Unsupported format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"
-        ),
+        _ => bail!("Unsupported format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"),
     }
 
     Ok(())

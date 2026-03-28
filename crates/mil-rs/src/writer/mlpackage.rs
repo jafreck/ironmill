@@ -71,7 +71,7 @@ fn build_manifest() -> Manifest {
     );
 
     Manifest {
-        file_format_version: "2.0.0".to_string(),
+        file_format_version: "1.0.0".to_string(),
         item_info_entries: entries,
         root_model_identifier: MODEL_IDENTIFIER.to_string(),
     }
@@ -142,7 +142,7 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_str(&contents).expect("Manifest.json should be valid JSON");
 
-        assert_eq!(manifest["fileFormatVersion"], "2.0.0");
+        assert_eq!(manifest["fileFormatVersion"], "1.0.0");
         assert_eq!(
             manifest["rootModelIdentifier"],
             "com.apple.CoreML/model.mlmodel"

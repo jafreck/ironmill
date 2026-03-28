@@ -68,10 +68,7 @@ fn try_fold(op: &Operation, constants: &HashMap<String, Value>) -> Option<Operat
 }
 
 /// Fold a binary arithmetic op with two scalar-constant operands.
-fn fold_binary_arithmetic(
-    op: &Operation,
-    constants: &HashMap<String, Value>,
-) -> Option<Operation> {
+fn fold_binary_arithmetic(op: &Operation, constants: &HashMap<String, Value>) -> Option<Operation> {
     let lhs = resolve_scalar(op.inputs.get("x")?, constants)?;
     let rhs = resolve_scalar(op.inputs.get("y")?, constants)?;
     let result = eval_binary(op.op_type.as_str(), lhs, rhs)?;
@@ -142,8 +139,12 @@ fn eval_binary(op_type: &str, lhs: Scalar, rhs: Scalar) -> Option<Value> {
             Some(Value::Float(result))
         }
         // Mixed int/float: promote to float.
-        (Scalar::Int(a), Scalar::Float(b)) => eval_binary(op_type, Scalar::Float(a as f64), Scalar::Float(b)),
-        (Scalar::Float(a), Scalar::Int(b)) => eval_binary(op_type, Scalar::Float(a), Scalar::Float(b as f64)),
+        (Scalar::Int(a), Scalar::Float(b)) => {
+            eval_binary(op_type, Scalar::Float(a as f64), Scalar::Float(b))
+        }
+        (Scalar::Float(a), Scalar::Int(b)) => {
+            eval_binary(op_type, Scalar::Float(a), Scalar::Float(b as f64))
+        }
     }
 }
 
@@ -194,10 +195,8 @@ mod tests {
         let mut program = Program::new("1.0.0");
         let mut func = Function::new("main");
 
-        func.body
-            .add_op(const_op("c1", "a", Value::Float(2.5)));
-        func.body
-            .add_op(const_op("c2", "b", Value::Float(4.0)));
+        func.body.add_op(const_op("c1", "a", Value::Float(2.5)));
+        func.body.add_op(const_op("c2", "b", Value::Float(4.0)));
         func.body.add_op(
             Operation::new("mul", "mul_0")
                 .with_input("x", Value::Reference("a".into()))

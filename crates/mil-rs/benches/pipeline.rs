@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use mil_rs::{onnx_to_program, read_onnx, PassPipeline};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use mil_rs::{PassPipeline, onnx_to_program, read_onnx};
 
 fn fixture_path(name: &str) -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");

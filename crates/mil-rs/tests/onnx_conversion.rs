@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use mil_rs::convert::onnx_graph::ConversionResult;
 use mil_rs::ir::passes::{ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass};
 use mil_rs::{
-    compile_model, is_compiler_available, onnx_to_program, program_to_model, read_mlpackage,
-    read_onnx, write_mlpackage, Pass, Program,
+    Pass, Program, compile_model, is_compiler_available, onnx_to_program, program_to_model,
+    read_mlpackage, read_onnx, write_mlpackage,
 };
 
 /// CoreML spec version used for ONNX conversions (matches CLI).
@@ -52,10 +52,9 @@ fn count_ops(program: &Program) -> usize {
 
 /// Convert an ONNX fixture to a MIL Program, returning the ConversionResult.
 fn convert_fixture(name: &str) -> ConversionResult {
-    let onnx = read_onnx(fixture_path(name))
-        .unwrap_or_else(|e| panic!("failed to read {name}: {e}"));
-    onnx_to_program(&onnx)
-        .unwrap_or_else(|e| panic!("failed to convert {name} to MIL IR: {e}"))
+    let onnx =
+        read_onnx(fixture_path(name)).unwrap_or_else(|e| panic!("failed to read {name}: {e}"));
+    onnx_to_program(&onnx).unwrap_or_else(|e| panic!("failed to convert {name} to MIL IR: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -82,8 +81,8 @@ fn convert_mnist_onnx_to_mlpackage() {
     run_optimization_passes(&mut program);
 
     // 5. Convert to proto Model
-    let model = program_to_model(&program, SPEC_VERSION)
-        .expect("program_to_model failed for MNIST");
+    let model =
+        program_to_model(&program, SPEC_VERSION).expect("program_to_model failed for MNIST");
 
     // 6. Write .mlpackage to temp dir
     let dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -126,8 +125,8 @@ fn convert_squeezenet_onnx_to_mlpackage() {
     run_optimization_passes(&mut program);
 
     // 5. Convert to proto Model
-    let model = program_to_model(&program, SPEC_VERSION)
-        .expect("program_to_model failed for SqueezeNet");
+    let model =
+        program_to_model(&program, SPEC_VERSION).expect("program_to_model failed for SqueezeNet");
 
     // 6. Write .mlpackage
     let dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -166,7 +165,10 @@ fn optimization_reduces_graph() {
 
     // 2. Count ops before optimization
     let before = count_ops(&program);
-    assert!(before > 0, "MNIST program should have operations before optimization");
+    assert!(
+        before > 0,
+        "MNIST program should have operations before optimization"
+    );
 
     // 3. Run all three passes
     run_optimization_passes(&mut program);
@@ -210,9 +212,7 @@ fn compile_mnist_end_to_end() {
         "compiled model directory should exist at {compiled:?}"
     );
     assert!(
-        compiled
-            .extension()
-            .is_some_and(|ext| ext == "mlmodelc"),
+        compiled.extension().is_some_and(|ext| ext == "mlmodelc"),
         "compiled output should have .mlmodelc extension, got: {compiled:?}"
     );
 }
@@ -244,9 +244,7 @@ fn compile_squeezenet_end_to_end() {
         "compiled model directory should exist at {compiled:?}"
     );
     assert!(
-        compiled
-            .extension()
-            .is_some_and(|ext| ext == "mlmodelc"),
+        compiled.extension().is_some_and(|ext| ext == "mlmodelc"),
         "compiled output should have .mlmodelc extension, got: {compiled:?}"
     );
 }
@@ -263,11 +261,8 @@ fn conversion_preserves_io_shapes() {
     let graph = onnx.graph.as_ref().expect("ONNX model should have a graph");
 
     // Collect ONNX input names (excluding initializers)
-    let initializer_names: std::collections::HashSet<&str> = graph
-        .initializer
-        .iter()
-        .map(|t| t.name.as_str())
-        .collect();
+    let initializer_names: std::collections::HashSet<&str> =
+        graph.initializer.iter().map(|t| t.name.as_str()).collect();
 
     let onnx_input_names: Vec<&str> = graph
         .input
@@ -300,7 +295,9 @@ fn conversion_preserves_io_shapes() {
     let mil_input_names: Vec<&str> = main_fn.inputs.iter().map(|(n, _)| n.as_str()).collect();
     for onnx_name in &onnx_input_names {
         assert!(
-            mil_input_names.iter().any(|n| n.contains(onnx_name) || onnx_name.contains(n)),
+            mil_input_names
+                .iter()
+                .any(|n| n.contains(onnx_name) || onnx_name.contains(n)),
             "ONNX input '{onnx_name}' should have a corresponding MIL input \
              (MIL inputs: {mil_input_names:?})"
         );
@@ -428,9 +425,7 @@ fn squeezenet_program_has_expected_structure() {
 #[test]
 fn cli_inspect_mnist_onnx() {
     let output = std::process::Command::new("cargo")
-        .args([
-            "run", "-p", "ironmill-cli", "--quiet", "--", "inspect",
-        ])
+        .args(["run", "-p", "ironmill-cli", "--quiet", "--", "inspect"])
         .arg(fixture_path("mnist.onnx"))
         .output()
         .expect("failed to run CLI inspect");
@@ -452,9 +447,7 @@ fn cli_inspect_mnist_onnx() {
 #[test]
 fn cli_inspect_squeezenet_onnx() {
     let output = std::process::Command::new("cargo")
-        .args([
-            "run", "-p", "ironmill-cli", "--quiet", "--", "inspect",
-        ])
+        .args(["run", "-p", "ironmill-cli", "--quiet", "--", "inspect"])
         .arg(fixture_path("squeezenet1.1.onnx"))
         .output()
         .expect("failed to run CLI inspect");
