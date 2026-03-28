@@ -19,7 +19,7 @@ pub mod proto_to_ir;
 
 pub use ir_to_proto::{
     LossFunction, UpdatableModelConfig, UpdateOptimizer, program_to_model,
-    program_to_updatable_model,
+    program_to_multi_function_model, program_to_updatable_model,
 };
 pub use lora::{LoraAdapter, detect_lora_adapters, lora_initializer_names, merge_lora};
 pub use onnx_graph::{ConversionConfig, onnx_to_program, onnx_to_program_with_config};

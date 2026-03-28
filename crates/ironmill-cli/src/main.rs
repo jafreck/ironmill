@@ -14,8 +14,8 @@ use mil_rs::{
     ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer, compile_model,
     compile_model_with_backend, convert_pipeline, is_compiler_available,
     onnx_to_program_with_config, parse_pipeline_manifest, program_to_model,
-    program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx,
-    validate_ane_compatibility, write_mlpackage,
+    program_to_multi_function_model, program_to_updatable_model, read_mlmodel, read_mlpackage,
+    read_onnx, validate_ane_compatibility, write_mlpackage,
 };
 
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
@@ -145,6 +145,11 @@ enum Commands {
         #[arg(long = "moe-split")]
         moe_split: bool,
 
+        /// Detect MoE architecture and bundle experts as functions in a single .mlpackage.
+        /// Uses CoreML 8+ multi-function model support.
+        #[arg(long = "moe-bundle", conflicts_with = "moe_split")]
+        moe_bundle: bool,
+
         /// Path to a TOML pipeline configuration file.
         /// When provided, overrides default pass selection and --no-fusion.
         #[arg(long = "pipeline-config", value_name = "PATH")]
@@ -238,6 +243,7 @@ fn run() -> Result<()> {
             optimizer_type,
             split_draft_layers,
             moe_split,
+            moe_bundle,
             pipeline_config,
             annotate_compute_units,
             ane_memory_budget,
@@ -263,6 +269,7 @@ fn run() -> Result<()> {
                 optimizer_type,
                 split_draft_layers,
                 moe_split,
+                moe_bundle,
                 pipeline_config,
                 annotate_compute_units,
                 ane_memory_budget,
@@ -317,6 +324,7 @@ struct CompileOpts {
     optimizer_type: String,
     split_draft_layers: Option<usize>,
     moe_split: bool,
+    moe_bundle: bool,
     pipeline_config: Option<PathBuf>,
     annotate_compute_units: bool,
     ane_memory_budget: Option<String>,
@@ -344,8 +352,10 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
     match ext.as_str() {
         "onnx" => compile_from_onnx(input_path, &opts),
         "mlmodel" | "mlpackage" => {
-            if opts.moe_split {
-                println!("Note: --moe-split is only supported for ONNX input. Ignoring.");
+            if opts.moe_split || opts.moe_bundle {
+                println!(
+                    "Note: --moe-split/--moe-bundle is only supported for ONNX input. Ignoring."
+                );
             }
             compile_coreml(input_path, &ext, opts.backend)
         }
@@ -538,6 +548,62 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         } else {
             println!(
                 "Note: --moe-split specified but no MoE pattern detected. Producing single output."
+            );
+        }
+    }
+
+    // 5b. MoE bundle (if requested) — single multi-function .mlpackage
+    if opts.moe_bundle {
+        use mil_rs::{detect_moe, split_moe};
+
+        if let Some(topology) = detect_moe(&program) {
+            println!(
+                "MoE architecture detected: {} experts",
+                topology.expert_count
+            );
+            let split_result = split_moe(&program, &topology);
+
+            let stem = input_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+
+            // Bundle all experts as functions in a single model.
+            let bundle_model = program_to_multi_function_model(&split_result, 9)
+                .context("Failed to convert MoE programs to multi-function CoreML model")?;
+
+            let bundle_path = opts
+                .output
+                .clone()
+                .unwrap_or_else(|| format!("{stem}-bundle.mlpackage"));
+            println!(
+                "  Writing multi-function bundle ({} experts): {bundle_path}",
+                topology.expert_count
+            );
+            write_mlpackage(&bundle_model, &bundle_path)
+                .with_context(|| format!("Failed to write {bundle_path}"))?;
+
+            // Write manifest alongside the bundle
+            let manifest_path = format!(
+                "{}-manifest.json",
+                bundle_path
+                    .strip_suffix(".mlpackage")
+                    .unwrap_or(&bundle_path)
+            );
+            let manifest_json = serde_json::to_string_pretty(&split_result.manifest)
+                .context("Failed to serialize MoE manifest")?;
+            std::fs::write(&manifest_path, &manifest_json)
+                .with_context(|| format!("Failed to write {manifest_path}"))?;
+            println!("  Wrote manifest: {manifest_path}");
+
+            compile_output(&bundle_path, opts.backend);
+
+            println!();
+            println!("MoE bundle complete.");
+            return Ok(());
+        } else {
+            println!(
+                "Note: --moe-bundle specified but no MoE pattern detected. Producing single output."
             );
         }
     }

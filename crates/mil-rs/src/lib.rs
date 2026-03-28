@@ -86,6 +86,8 @@ pub use convert::onnx_to_program_with_config;
 pub use convert::pipeline::{PipelineManifest, convert_pipeline, parse_pipeline_manifest};
 /// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
 pub use convert::program_to_model;
+/// Convert a MoE split result into a single multi-function [`Model`].
+pub use convert::program_to_multi_function_model;
 /// Convert a MIL IR [`Program`] into an updatable protobuf [`Model`].
 pub use convert::program_to_updatable_model;
 /// Configuration for producing an updatable CoreML model.

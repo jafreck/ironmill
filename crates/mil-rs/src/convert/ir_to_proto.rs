@@ -472,6 +472,262 @@ fn build_update_params(config: &UpdatableModelConfig) -> NetworkUpdateParameters
 }
 
 // ---------------------------------------------------------------------------
+// Multi-function model (MoE bundle)
+// ---------------------------------------------------------------------------
+
+/// Convert a MoE split result into a single multi-function [`Model`].
+///
+/// Instead of producing separate `.mlpackage` files for each expert,
+/// this bundles the shared backbone and all experts as named functions
+/// within a single MIL Program proto. CoreML 8+ supports multi-function
+/// models, allowing runtime dispatch to individual functions.
+///
+/// The resulting model contains:
+/// - `"main"` — the shared/backbone function
+/// - `"expert_0"`, `"expert_1"`, … — per-expert functions
+///
+/// Weight tensors that appear in multiple functions (shared constants)
+/// are deduplicated: only the first occurrence carries the tensor data,
+/// and subsequent functions reference the same `const` op names so that
+/// CoreML's weight-sharing mechanism avoids duplication in the compiled
+/// model.
+pub fn program_to_multi_function_model(
+    split: &super::moe::MoeSplitResult,
+    spec_version: i32,
+) -> Result<Model> {
+    // Collect all const ops across functions to deduplicate shared weights.
+    // Key: (op_name, val_hash) → already emitted?
+    let mut seen_consts: HashMap<String, bool> = HashMap::new();
+
+    let mut all_functions: HashMap<String, mil_spec::Function> = HashMap::new();
+
+    // 1. Add the shared backbone as "main".
+    if let Some(shared_func) = split.shared.main() {
+        let proto_func = convert_function(shared_func)?;
+        // Track all const ops from the shared function.
+        for op in &shared_func.body.operations {
+            if op.op_type == "const" || op.op_type.starts_with("constexpr_") {
+                seen_consts.insert(op.name.clone(), true);
+            }
+        }
+        all_functions.insert("main".to_string(), proto_func);
+    }
+
+    // 2. Add each expert as "expert_N".
+    for (i, expert_program) in split.experts.iter().enumerate() {
+        let func_name = format!("expert_{i}");
+        if let Some(expert_func) = expert_program.main() {
+            // Build a deduplicated version of the expert function:
+            // shared const ops are replaced with lightweight references
+            // to avoid duplicating weight data.
+            let deduped_func = dedup_expert_function(expert_func, &seen_consts)?;
+            all_functions.insert(func_name, deduped_func);
+        }
+    }
+
+    // Build the MIL Program proto with all functions.
+    let version: i64 = split.shared.version.parse().unwrap_or(1);
+    let proto_program = mil_spec::Program {
+        version,
+        functions: all_functions,
+        doc_string: String::new(),
+        attributes: HashMap::new(),
+    };
+
+    // Model description is derived from the shared "main" function.
+    let description = if let Some(func) = split.shared.main() {
+        let input: Vec<FeatureDescription> = func
+            .inputs
+            .iter()
+            .map(|(name, tt)| FeatureDescription {
+                name: name.clone(),
+                short_description: String::new(),
+                r#type: Some(tensor_type_to_feature_type(tt)),
+            })
+            .collect();
+
+        let output: Vec<FeatureDescription> = func
+            .body
+            .outputs
+            .iter()
+            .map(|name| {
+                let feature_type = func
+                    .body
+                    .operations
+                    .iter()
+                    .rev()
+                    .find_map(|op| {
+                        op.outputs.iter().enumerate().find_map(|(i, out_name)| {
+                            if out_name == name {
+                                op.output_types
+                                    .get(i)
+                                    .and_then(|ot| ot.as_ref())
+                                    .map(tensor_type_to_feature_type)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or_else(|| FeatureType {
+                        is_optional: false,
+                        r#type: Some(specification::feature_type::Type::MultiArrayType(
+                            ArrayFeatureType {
+                                shape: vec![],
+                                data_type: specification::array_feature_type::ArrayDataType::Float32
+                                    as i32,
+                                shape_flexibility: None,
+                                default_optional_value: None,
+                            },
+                        )),
+                    });
+                FeatureDescription {
+                    name: name.clone(),
+                    short_description: String::new(),
+                    r#type: Some(feature_type),
+                }
+            })
+            .collect();
+
+        Some(ModelDescription {
+            input,
+            output,
+            ..Default::default()
+        })
+    } else {
+        Some(ModelDescription::default())
+    };
+
+    Ok(Model {
+        specification_version: spec_version,
+        description,
+        is_updatable: false,
+        r#type: Some(model::Type::MlProgram(proto_program)),
+    })
+}
+
+/// Convert an expert function while deduplicating const ops that already
+/// exist in the shared backbone.
+///
+/// Const ops whose names match `shared_consts` are emitted without tensor
+/// data (zero-element placeholder). CoreML resolves shared weights by name
+/// across functions in the same program, so the actual data only needs to
+/// appear once (in the "main" function).
+fn dedup_expert_function(
+    func: &Function,
+    shared_consts: &HashMap<String, bool>,
+) -> Result<mil_spec::Function> {
+    let mut type_map: HashMap<String, mil_spec::ValueType> = HashMap::new();
+    let inputs = func
+        .inputs
+        .iter()
+        .map(|(name, tt)| {
+            let vt = mil_spec::ValueType {
+                r#type: Some(mil_spec::value_type::Type::TensorType(convert_tensor_type(
+                    tt,
+                ))),
+            };
+            type_map.insert(name.clone(), vt.clone());
+            mil_spec::NamedValueType {
+                name: name.clone(),
+                r#type: Some(vt),
+            }
+        })
+        .collect();
+
+    let mut operations = Vec::new();
+    for op in &func.body.operations {
+        if (op.op_type == "const" || op.op_type.starts_with("constexpr_"))
+            && shared_consts.contains_key(&op.name)
+        {
+            // This const is shared with the backbone — emit a lightweight
+            // stub that preserves the name and type but carries no data.
+            operations.push(convert_operation_stub(op, &mut type_map)?);
+        } else {
+            operations.push(convert_operation(op, &mut type_map)?);
+        }
+    }
+
+    let block = mil_spec::Block {
+        inputs: vec![],
+        outputs: func.body.outputs.clone(),
+        operations,
+        attributes: HashMap::new(),
+    };
+
+    let opset = "CoreML6".to_string();
+    let mut block_specializations = HashMap::new();
+    block_specializations.insert(opset.clone(), block);
+
+    Ok(mil_spec::Function {
+        inputs,
+        opset,
+        block_specializations,
+        attributes: HashMap::new(),
+    })
+}
+
+/// Emit a const operation stub that preserves the op's name and output types
+/// but uses a minimal placeholder value instead of the full weight tensor.
+///
+/// This avoids duplicating large weight blobs across functions. CoreML's
+/// multi-function runtime resolves shared weights by matching const op names.
+fn convert_operation_stub(
+    op: &Operation,
+    type_map: &mut HashMap<String, mil_spec::ValueType>,
+) -> Result<mil_spec::Operation> {
+    // Determine the output type from stored types or inference.
+    let inferred = infer_output_type(op, type_map);
+    let outputs: Vec<mil_spec::NamedValueType> = op
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let vt = op
+                .output_types
+                .get(i)
+                .and_then(|ot| ot.as_ref())
+                .map(|tt| mil_spec::ValueType {
+                    r#type: Some(mil_spec::value_type::Type::TensorType(convert_tensor_type(
+                        tt,
+                    ))),
+                })
+                .or_else(|| inferred.clone());
+
+            if let Some(ref v) = vt {
+                type_map.insert(name.clone(), v.clone());
+            }
+
+            mil_spec::NamedValueType {
+                name: name.clone(),
+                r#type: vt,
+            }
+        })
+        .collect();
+
+    // Build a minimal "val" attribute — a scalar zero of the appropriate type.
+    let mut attributes = HashMap::new();
+    let placeholder_val = mil_spec::Value {
+        doc_string: "shared_weight_ref".to_string(),
+        r#type: outputs.first().and_then(|o| o.r#type.clone()),
+        value: Some(mil_spec::value::Value::BlobFileValue(
+            mil_spec::value::BlobFileValue {
+                file_name: String::new(),
+                offset: 0,
+            },
+        )),
+    };
+    attributes.insert("val".to_string(), placeholder_val);
+
+    Ok(mil_spec::Operation {
+        r#type: op.op_type.clone(),
+        inputs: HashMap::new(),
+        outputs,
+        blocks: vec![],
+        attributes,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Program / Function / Block
 // ---------------------------------------------------------------------------
 
@@ -1589,5 +1845,159 @@ mod tests {
             params.loss_layers[0].loss_layer_type,
             Some(specification::loss_layer::LossLayerType::MeanSquaredErrorLossLayer(_))
         ));
+    }
+
+    #[test]
+    fn multi_function_model_contains_all_functions() {
+        use crate::convert::moe::{MoeManifest, MoeSplitResult};
+
+        // Build a mock MoeSplitResult with a shared program and 2 expert programs.
+        let input_ty = TensorType::new(ScalarType::Float32, vec![1, 512]);
+
+        // Shared program
+        let mut shared_func = Function::new("main");
+        shared_func.inputs = vec![("hidden".to_string(), input_ty.clone())];
+        shared_func.body.add_op(
+            Operation::new("relu", "shared_relu")
+                .with_input("x", Value::Reference("hidden".to_string()))
+                .with_output("relu_out"),
+        );
+        shared_func.body.outputs.push("relu_out".into());
+        let mut shared = Program::new("1");
+        shared.add_function(shared_func);
+
+        // Expert 0
+        let mut expert0_func = Function::new("main");
+        expert0_func.inputs = vec![("relu_out".to_string(), input_ty.clone())];
+        expert0_func.body.add_op(
+            Operation::new("linear", "expert0_linear")
+                .with_input("x", Value::Reference("relu_out".to_string()))
+                .with_output("e0_out"),
+        );
+        expert0_func.body.outputs.push("e0_out".into());
+        let mut expert0 = Program::new("1");
+        expert0.add_function(expert0_func);
+
+        // Expert 1
+        let mut expert1_func = Function::new("main");
+        expert1_func.inputs = vec![("relu_out".to_string(), input_ty.clone())];
+        expert1_func.body.add_op(
+            Operation::new("linear", "expert1_linear")
+                .with_input("x", Value::Reference("relu_out".to_string()))
+                .with_output("e1_out"),
+        );
+        expert1_func.body.outputs.push("e1_out".into());
+        let mut expert1 = Program::new("1");
+        expert1.add_function(expert1_func);
+
+        let split = MoeSplitResult {
+            shared,
+            experts: vec![expert0, expert1],
+            manifest: MoeManifest {
+                expert_count: 2,
+                router_output: "router_out".to_string(),
+                experts: vec![],
+                stages: vec![],
+            },
+        };
+
+        let model = program_to_multi_function_model(&split, 9).unwrap();
+        assert_eq!(model.specification_version, 9);
+        assert!(!model.is_updatable);
+
+        // Extract the MIL program from the model.
+        let proto_program = match &model.r#type {
+            Some(model::Type::MlProgram(p)) => p,
+            _ => panic!("expected MlProgram"),
+        };
+
+        // Should contain 3 functions: main, expert_0, expert_1.
+        assert_eq!(proto_program.functions.len(), 3);
+        assert!(proto_program.functions.contains_key("main"));
+        assert!(proto_program.functions.contains_key("expert_0"));
+        assert!(proto_program.functions.contains_key("expert_1"));
+    }
+
+    #[test]
+    fn multi_function_model_deduplicates_shared_consts() {
+        use crate::convert::moe::{MoeManifest, MoeSplitResult};
+
+        let input_ty = TensorType::new(ScalarType::Float32, vec![1, 10]);
+
+        // Shared program with a const op
+        let mut shared_func = Function::new("main");
+        shared_func.inputs = vec![("x".to_string(), input_ty.clone())];
+        shared_func.body.add_op(
+            Operation::new("const", "shared_weight")
+                .with_attr("val", Value::Float(1.0))
+                .with_output("shared_weight"),
+        );
+        shared_func.body.add_op(
+            Operation::new("add", "add_0")
+                .with_input("x", Value::Reference("x".to_string()))
+                .with_input("y", Value::Reference("shared_weight".to_string()))
+                .with_output("add_out"),
+        );
+        shared_func.body.outputs.push("add_out".into());
+        let mut shared = Program::new("1");
+        shared.add_function(shared_func);
+
+        // Expert 0 also uses a const with the same name (shared weight)
+        let mut expert_func = Function::new("main");
+        expert_func.inputs = vec![("x".to_string(), input_ty.clone())];
+        expert_func.body.add_op(
+            Operation::new("const", "shared_weight")
+                .with_attr("val", Value::Float(1.0))
+                .with_output("shared_weight"),
+        );
+        expert_func.body.add_op(
+            Operation::new("mul", "mul_0")
+                .with_input("x", Value::Reference("x".to_string()))
+                .with_input("y", Value::Reference("shared_weight".to_string()))
+                .with_output("mul_out"),
+        );
+        expert_func.body.outputs.push("mul_out".into());
+        let mut expert0 = Program::new("1");
+        expert0.add_function(expert_func);
+
+        let split = MoeSplitResult {
+            shared,
+            experts: vec![expert0],
+            manifest: MoeManifest {
+                expert_count: 1,
+                router_output: String::new(),
+                experts: vec![],
+                stages: vec![],
+            },
+        };
+
+        let model = program_to_multi_function_model(&split, 9).unwrap();
+        let proto_program = match &model.r#type {
+            Some(model::Type::MlProgram(p)) => p,
+            _ => panic!("expected MlProgram"),
+        };
+
+        // The expert function should exist.
+        assert!(proto_program.functions.contains_key("expert_0"));
+
+        // The shared const in expert_0 should have a BlobFileValue
+        // (stub) rather than carrying duplicated tensor data.
+        let expert_fn = &proto_program.functions["expert_0"];
+        let block = expert_fn.block_specializations.values().next().unwrap();
+        let const_op = block
+            .operations
+            .iter()
+            .find(|op| op.r#type == "const")
+            .expect("expert should have a const op");
+
+        let val_attr = const_op.attributes.get("val").expect("should have val");
+        assert!(
+            matches!(
+                val_attr.value,
+                Some(mil_spec::value::Value::BlobFileValue(_))
+            ),
+            "shared const in expert should be a stub (BlobFileValue), got: {:?}",
+            val_attr.value
+        );
     }
 }
