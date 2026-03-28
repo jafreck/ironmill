@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mil_rs::ir::passes::{
     AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass,
-    ConvReluFusionPass, DeadCodeEliminationPass, IdentityEliminationPass, LayoutOptimizationPass,
-    OpSubstitutionPass,
+    ConvReluFusionPass, DeadCodeEliminationPass, GeluLinearFusionPass, GqaFusionPass,
+    IdentityEliminationPass, LayerNormLinearFusionPass, LayoutOptimizationPass, OpSubstitutionPass,
+    ResidualAddFusionPass,
 };
 use mil_rs::{Pass, Program, onnx_to_program, read_onnx};
 
@@ -43,7 +44,11 @@ fn bench_passes(c: &mut Criterion) {
         Box::new(ConvBatchNormWeightFoldPass),
         Box::new(ConvBatchNormFusionPass),
         Box::new(ConvReluFusionPass),
+        Box::new(LayerNormLinearFusionPass),
+        Box::new(GeluLinearFusionPass),
+        Box::new(ResidualAddFusionPass),
         Box::new(AttentionFusionPass),
+        Box::new(GqaFusionPass),
         Box::new(OpSubstitutionPass),
         Box::new(LayoutOptimizationPass),
     ];

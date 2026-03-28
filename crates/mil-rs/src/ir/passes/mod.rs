@@ -21,7 +21,7 @@ pub mod palettize;
 pub mod shape_materialize;
 pub mod tensor_utils;
 
-pub use attention_fusion::AttentionFusionPass;
+pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
 pub use codebook::CodebookOptimizationPass;
 pub use constant_fold::ConstantFoldPass;
@@ -32,7 +32,10 @@ pub use int8_quantize::{Granularity, Int8QuantizePass};
 pub use layout_optimize::LayoutOptimizationPass;
 pub use mixed_precision::{MixedPrecisionConfig, MixedPrecisionPass, OpPrecision};
 pub use model_split::{ModelSplitPass, SplitResult};
-pub use op_fusion::{ConvBatchNormFusionPass, ConvReluFusionPass, LinearReluFusionPass};
+pub use op_fusion::{
+    ConvBatchNormFusionPass, ConvReluFusionPass, GeluLinearFusionPass, LayerNormLinearFusionPass,
+    LinearReluFusionPass, ResidualAddFusionPass,
+};
 pub use op_substitute::OpSubstitutionPass;
 pub use palettize::{GroupedPalettizePass, PalettizePass};
 pub use shape_materialize::ShapeMaterializePass;

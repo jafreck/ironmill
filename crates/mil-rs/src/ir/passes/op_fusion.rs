@@ -75,12 +75,81 @@ impl Pass for LinearReluFusionPass {
     }
 }
 
+/// Fuses LayerNorm + Linear into a single LayerNorm with a fused linear attribute.
+///
+/// This pattern is extremely common in transformer architectures, where
+/// layer normalization is immediately followed by a linear projection.
+/// Fusing eliminates the intermediate materialization.
+pub struct LayerNormLinearFusionPass;
+
+impl Pass for LayerNormLinearFusionPass {
+    fn name(&self) -> &str {
+        "layernorm-linear-fusion"
+    }
+
+    fn run(&self, program: &mut Program) -> Result<()> {
+        for function in program.functions.values_mut() {
+            fuse_activation_pattern(
+                &mut function.body,
+                "layer_norm",
+                "linear",
+                FusionKind::Linear,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Fuses GELU + Linear into a single GELU with a fused linear attribute.
+///
+/// Complements the GELU expansion in `op_substitute`: this pass runs
+/// *before* substitution and fuses the high-level `gelu` op with a
+/// following `linear`, avoiding both the intermediate write and the
+/// subsequent expansion into 13 ops.
+pub struct GeluLinearFusionPass;
+
+impl Pass for GeluLinearFusionPass {
+    fn name(&self) -> &str {
+        "gelu-linear-fusion"
+    }
+
+    fn run(&self, program: &mut Program) -> Result<()> {
+        for function in program.functions.values_mut() {
+            fuse_activation_pattern(&mut function.body, "gelu", "linear", FusionKind::Linear);
+        }
+        Ok(())
+    }
+}
+
+/// Fuses skip-connection add ops into `residual_add` ops.
+///
+/// Detects the residual/skip-connection pattern common in ResNets and
+/// transformers: `output = F(x) + x`, where one input to an `add` op
+/// is also an input (directly or transitively) to the computation chain
+/// producing the other input.
+pub struct ResidualAddFusionPass;
+
+impl Pass for ResidualAddFusionPass {
+    fn name(&self) -> &str {
+        "residual-add-fusion"
+    }
+
+    fn run(&self, program: &mut Program) -> Result<()> {
+        for function in program.functions.values_mut() {
+            fuse_residual_add_pattern(&mut function.body);
+        }
+        Ok(())
+    }
+}
+
 /// The kind of fusion to apply when merging two ops.
 enum FusionKind {
     /// Fuse an activation function (e.g., relu) — sets `fused_activation`.
     Activation,
     /// Fuse batch normalization — sets `has_fused_bn`.
     BatchNorm,
+    /// Fuse a following linear op — sets `has_fused_linear`.
+    Linear,
 }
 
 /// Check if a value name is only consumed by a single operation in the block.
@@ -197,6 +266,7 @@ fn fuse_activation_pattern(
                 )
             }
             FusionKind::BatchNorm => ("has_fused_bn".to_string(), Value::Bool(true)),
+            FusionKind::Linear => ("has_fused_linear".to_string(), Value::Bool(true)),
         };
         block.operations[pi]
             .attributes
@@ -208,6 +278,76 @@ fn fuse_activation_pattern(
     remove_indices.sort_unstable();
     for idx in remove_indices.into_iter().rev() {
         block.operations.remove(idx);
+    }
+}
+
+/// Trace backwards from a value through the block's operations, collecting
+/// all transitive input references up to `max_depth` levels. Returns `true`
+/// if `target` is found among the transitive inputs of `start`.
+fn has_transitive_input(block: &Block, start: &str, target: &str, max_depth: usize) -> bool {
+    if max_depth == 0 {
+        return false;
+    }
+    // Find the producer of `start`.
+    let producer = block
+        .operations
+        .iter()
+        .find(|op| op.outputs.first().map(|s| s.as_str()) == Some(start));
+
+    let producer_op = match producer {
+        Some(op) => op,
+        None => return false,
+    };
+
+    for input_val in producer_op.inputs.values() {
+        if let Value::Reference(name) = input_val {
+            if name == target {
+                return true;
+            }
+            if has_transitive_input(block, name, target, max_depth - 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Scan the block for residual add patterns and mark them.
+///
+/// A residual add is an `add` op where one input is a "skip connection" —
+/// i.e., the same value also feeds (directly or transitively) into the
+/// computation chain that produces the other input.
+fn fuse_residual_add_pattern(block: &mut Block) {
+    let mut residual_indices: Vec<usize> = Vec::new();
+
+    for (ai, add_op) in block.operations.iter().enumerate() {
+        if add_op.op_type != "add" {
+            continue;
+        }
+
+        let x_ref = match add_op.inputs.get("x") {
+            Some(Value::Reference(name)) => name.clone(),
+            _ => continue,
+        };
+        let y_ref = match add_op.inputs.get("y") {
+            Some(Value::Reference(name)) => name.clone(),
+            _ => continue,
+        };
+
+        // Check both directions: is y a transitive input of x's producer,
+        // or is x a transitive input of y's producer?
+        const MAX_TRACE_DEPTH: usize = 16;
+        let is_residual = has_transitive_input(block, &x_ref, &y_ref, MAX_TRACE_DEPTH)
+            || has_transitive_input(block, &y_ref, &x_ref, MAX_TRACE_DEPTH);
+
+        if is_residual {
+            residual_indices.push(ai);
+        }
+    }
+
+    // Mark each identified add as a residual_add.
+    for &ai in &residual_indices {
+        block.operations[ai].op_type = "residual_add".to_string();
     }
 }
 
@@ -608,5 +748,214 @@ mod tests {
 
         let ops = block_ops(&program);
         assert_eq!(ops.len(), 1, "conv without causal attr should still fuse");
+    }
+
+    // ---- LayerNorm + Linear fusion -----------------------------------------
+
+    #[test]
+    fn layernorm_linear_fused() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("layer_norm", "ln_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("ln_out"),
+        );
+        block.add_op(
+            Operation::new("linear", "linear_0")
+                .with_input("x", Value::Reference("ln_out".into()))
+                .with_output("linear_out"),
+        );
+        block.outputs.push("linear_out".into());
+
+        let mut program = program_with_block(block);
+        LayerNormLinearFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_type, "layer_norm");
+        assert_eq!(ops[0].name, "ln_0");
+        assert_eq!(
+            ops[0].attributes.get("has_fused_linear"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(program.functions["main"].body.outputs, vec!["ln_out"]);
+    }
+
+    #[test]
+    fn layernorm_linear_no_fusion_when_multi_consumer() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("layer_norm", "ln_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("ln_out"),
+        );
+        block.add_op(
+            Operation::new("linear", "linear_0")
+                .with_input("x", Value::Reference("ln_out".into()))
+                .with_output("linear_out"),
+        );
+        // ln_out is also used elsewhere.
+        block.add_op(
+            Operation::new("add", "add_0")
+                .with_input("x", Value::Reference("ln_out".into()))
+                .with_input("y", Value::Reference("linear_out".into()))
+                .with_output("add_out"),
+        );
+        block.outputs.push("add_out".into());
+
+        let mut program = program_with_block(block);
+        LayerNormLinearFusionPass.run(&mut program).unwrap();
+
+        assert_eq!(block_ops(&program).len(), 3);
+    }
+
+    // ---- GELU + Linear fusion ----------------------------------------------
+
+    #[test]
+    fn gelu_linear_fused() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("gelu", "gelu_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("gelu_out"),
+        );
+        block.add_op(
+            Operation::new("linear", "linear_0")
+                .with_input("x", Value::Reference("gelu_out".into()))
+                .with_output("linear_out"),
+        );
+        block.outputs.push("linear_out".into());
+
+        let mut program = program_with_block(block);
+        GeluLinearFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_type, "gelu");
+        assert_eq!(ops[0].name, "gelu_0");
+        assert_eq!(
+            ops[0].attributes.get("has_fused_linear"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(program.functions["main"].body.outputs, vec!["gelu_out"]);
+    }
+
+    #[test]
+    fn gelu_linear_downstream_rewired() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("gelu", "gelu_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("gelu_out"),
+        );
+        block.add_op(
+            Operation::new("linear", "linear_0")
+                .with_input("x", Value::Reference("gelu_out".into()))
+                .with_output("linear_out"),
+        );
+        block.add_op(
+            Operation::new("softmax", "softmax_0")
+                .with_input("x", Value::Reference("linear_out".into()))
+                .with_output("softmax_out"),
+        );
+        block.outputs.push("softmax_out".into());
+
+        let mut program = program_with_block(block);
+        GeluLinearFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].name, "gelu_0");
+        assert_eq!(ops[1].name, "softmax_0");
+        if let Some(Value::Reference(name)) = ops[1].inputs.get("x") {
+            assert_eq!(name, "gelu_out");
+        } else {
+            panic!("expected softmax input to be a reference");
+        }
+    }
+
+    // ---- Residual add fusion -----------------------------------------------
+
+    #[test]
+    fn residual_add_fused() {
+        let mut block = Block::new();
+        // Skip connection pattern: input → conv → relu → add(relu_out, input)
+        block.add_op(
+            Operation::new("conv", "conv_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("conv_out"),
+        );
+        block.add_op(
+            Operation::new("relu", "relu_0")
+                .with_input("x", Value::Reference("conv_out".into()))
+                .with_output("relu_out"),
+        );
+        block.add_op(
+            Operation::new("add", "add_0")
+                .with_input("x", Value::Reference("relu_out".into()))
+                .with_input("y", Value::Reference("input".into()))
+                .with_output("add_out"),
+        );
+        block.outputs.push("add_out".into());
+
+        let mut program = program_with_block(block);
+        ResidualAddFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[2].op_type, "residual_add");
+        assert_eq!(ops[2].name, "add_0");
+    }
+
+    #[test]
+    fn residual_add_reversed_inputs() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("conv", "conv_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("conv_out"),
+        );
+        block.add_op(
+            Operation::new("add", "add_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_input("y", Value::Reference("conv_out".into()))
+                .with_output("add_out"),
+        );
+        block.outputs.push("add_out".into());
+
+        let mut program = program_with_block(block);
+        ResidualAddFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops[1].op_type, "residual_add");
+    }
+
+    #[test]
+    fn non_residual_add_not_fused() {
+        let mut block = Block::new();
+        // Two independent inputs added — not a residual pattern.
+        block.add_op(
+            Operation::new("conv", "conv_0")
+                .with_input("x", Value::Reference("input_a".into()))
+                .with_output("conv_out"),
+        );
+        block.add_op(
+            Operation::new("linear", "linear_0")
+                .with_input("x", Value::Reference("input_b".into()))
+                .with_output("linear_out"),
+        );
+        block.add_op(
+            Operation::new("add", "add_0")
+                .with_input("x", Value::Reference("conv_out".into()))
+                .with_input("y", Value::Reference("linear_out".into()))
+                .with_output("add_out"),
+        );
+        block.outputs.push("add_out".into());
+
+        let mut program = program_with_block(block);
+        ResidualAddFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops[2].op_type, "add");
     }
 }

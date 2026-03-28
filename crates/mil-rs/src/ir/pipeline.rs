@@ -7,9 +7,10 @@ use super::pass::Pass;
 use super::passes::{
     AttentionFusionPass, CodebookOptimizationPass, ConstantFoldPass, ConvBatchNormFusionPass,
     ConvBatchNormWeightFoldPass, ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass,
-    Granularity, IdentityEliminationPass, Int8QuantizePass, LayoutOptimizationPass,
-    LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass, OpSubstitutionPass,
-    PalettizePass, ShapeMaterializePass,
+    GeluLinearFusionPass, GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass,
+    LayerNormLinearFusionPass, LayoutOptimizationPass, LinearReluFusionPass, MixedPrecisionConfig,
+    MixedPrecisionPass, OpSubstitutionPass, PalettizePass, ResidualAddFusionPass,
+    ShapeMaterializePass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -48,8 +49,9 @@ impl PassPipeline {
     /// Create the default pipeline with all always-on passes.
     ///
     /// Includes cleanup (DCE, identity elimination, constant folding),
-    /// fusion (conv-bn weight fold, conv-bn fusion, conv-relu, linear-relu),
-    /// and optimization (attention fusion, op substitution).
+    /// fusion (conv-bn weight fold, conv-bn fusion, conv-relu, linear-relu,
+    /// layernorm-linear, gelu-linear, residual-add), and optimization
+    /// (attention fusion, GQA fusion, op substitution).
     pub fn new() -> Self {
         Self {
             passes: vec![
@@ -57,13 +59,17 @@ impl PassPipeline {
                 Box::new(DeadCodeEliminationPass),
                 Box::new(IdentityEliminationPass),
                 Box::new(ConstantFoldPass),
-                // Fusion passes (4-7)
+                // Fusion passes (4-10)
                 Box::new(ConvBatchNormWeightFoldPass),
                 Box::new(ConvBatchNormFusionPass),
                 Box::new(ConvReluFusionPass),
                 Box::new(LinearReluFusionPass),
-                // Optimization passes (8-10)
+                Box::new(LayerNormLinearFusionPass),
+                Box::new(GeluLinearFusionPass),
+                Box::new(ResidualAddFusionPass),
+                // Optimization passes
                 Box::new(AttentionFusionPass),
+                Box::new(GqaFusionPass),
                 Box::new(CodebookOptimizationPass),
                 Box::new(OpSubstitutionPass),
                 Box::new(LayoutOptimizationPass),
@@ -173,7 +179,11 @@ impl PassPipeline {
             "conv-batchnorm-fusion",
             "conv-relu-fusion",
             "linear-relu-fusion",
+            "layernorm-linear-fusion",
+            "gelu-linear-fusion",
+            "residual-add-fusion",
             "attention-fusion",
+            "gqa-fusion",
             "codebook-optimization",
             "op-substitution",
             "layout-optimization",
@@ -259,7 +269,11 @@ mod tests {
                 "conv-batchnorm-fusion",
                 "conv-relu-fusion",
                 "linear-relu-fusion",
+                "layernorm-linear-fusion",
+                "gelu-linear-fusion",
+                "residual-add-fusion",
                 "attention-fusion",
+                "gqa-fusion",
                 "codebook-optimization",
                 "op-substitution",
                 "layout-optimization",
@@ -361,7 +375,7 @@ mod tests {
     #[test]
     fn default_trait_works() {
         let pipeline = PassPipeline::default();
-        assert_eq!(pipeline.pass_names().len(), 10);
+        assert_eq!(pipeline.pass_names().len(), 15);
     }
 
     #[test]
