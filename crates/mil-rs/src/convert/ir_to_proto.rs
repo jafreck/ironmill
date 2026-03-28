@@ -953,6 +953,8 @@ fn convert_operation(
                 | "flatten_axis"
                 | "bn_folded"
                 | "compute_unit"
+                | "causal"
+                | "is_residual"
         ) {
             continue;
         }

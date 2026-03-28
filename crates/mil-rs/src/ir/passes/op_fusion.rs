@@ -345,9 +345,14 @@ fn fuse_residual_add_pattern(block: &mut Block) {
         }
     }
 
-    // Mark each identified add as a residual_add.
+    // Tag each identified add with a residual metadata attribute.
+    // The op_type stays as "add" (a valid CoreML op); the attribute is
+    // internal-only and filtered during serialization — consistent with
+    // how every other fusion pass marks ops (fused_activation, has_fused_bn, etc.).
     for &ai in &residual_indices {
-        block.operations[ai].op_type = "residual_add".to_string();
+        block.operations[ai]
+            .attributes
+            .insert("is_residual".to_string(), Value::Bool(true));
     }
 }
 
@@ -903,8 +908,13 @@ mod tests {
 
         let ops = block_ops(&program);
         assert_eq!(ops.len(), 3);
-        assert_eq!(ops[2].op_type, "residual_add");
+        assert_eq!(ops[2].op_type, "add");
         assert_eq!(ops[2].name, "add_0");
+        assert_eq!(
+            ops[2].attributes.get("is_residual"),
+            Some(&Value::Bool(true)),
+            "residual add should be tagged with is_residual attribute"
+        );
     }
 
     #[test]
@@ -927,7 +937,12 @@ mod tests {
         ResidualAddFusionPass.run(&mut program).unwrap();
 
         let ops = block_ops(&program);
-        assert_eq!(ops[1].op_type, "residual_add");
+        assert_eq!(ops[1].op_type, "add");
+        assert_eq!(
+            ops[1].attributes.get("is_residual"),
+            Some(&Value::Bool(true)),
+            "reversed-input residual add should be tagged"
+        );
     }
 
     #[test]

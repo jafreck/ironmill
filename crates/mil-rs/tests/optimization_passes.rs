@@ -805,11 +805,16 @@ fn full_transformer_block_fusion() {
         );
     }
 
-    // Residual add: the add should become residual_add.
-    let residual_ops: Vec<_> = ops.iter().filter(|o| o.op_type == "residual_add").collect();
+    // Residual add: the add should be tagged with is_residual attribute.
+    let residual_ops: Vec<_> = ops
+        .iter()
+        .filter(|o| {
+            o.op_type == "add" && o.attributes.get("is_residual") == Some(&Value::Bool(true))
+        })
+        .collect();
     assert!(
         !residual_ops.is_empty(),
-        "should have at least one residual_add op"
+        "should have at least one add op tagged with is_residual"
     );
 
     // GQA fusion: should produce a grouped_query_attention op.
