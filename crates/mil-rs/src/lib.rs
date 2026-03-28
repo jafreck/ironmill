@@ -55,6 +55,8 @@ pub mod writer;
 pub use convert::model_to_program;
 /// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
 pub use convert::program_to_model;
+/// Convert an ONNX [`proto::onnx::ModelProto`] into a MIL IR [`Program`].
+pub use convert::onnx_to_program;
 
 /// Error type for all operations in this crate.
 pub use error::MilError;

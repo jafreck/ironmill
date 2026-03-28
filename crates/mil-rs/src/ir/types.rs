@@ -1,4 +1,4 @@
-use super::tensor::TensorType;
+use super::tensor::{ScalarType, TensorType};
 
 /// A value in the MIL IR — can be a reference to another op's output,
 /// a literal constant, or a tensor type descriptor.
@@ -24,4 +24,14 @@ pub enum Value {
 
     /// A tensor type descriptor (used in type annotations).
     Type(TensorType),
+
+    /// Raw tensor data (for weights/constants from ONNX initializers).
+    Tensor {
+        /// Raw bytes of the tensor data.
+        data: Vec<u8>,
+        /// Dimensions of the tensor.
+        shape: Vec<usize>,
+        /// Element data type.
+        dtype: ScalarType,
+    },
 }

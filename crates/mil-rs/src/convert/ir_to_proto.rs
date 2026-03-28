@@ -247,6 +247,22 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
                 }),
             )
         }
+        Value::Tensor { data, .. } => {
+            // Raw tensor data — encode as a bytes immediate.
+            let tv = mil_spec::TensorValue {
+                value: Some(mil_spec::tensor_value::Value::Bytes(
+                    mil_spec::tensor_value::RepeatedBytes {
+                        values: data.clone(),
+                    },
+                )),
+            };
+            (
+                Some(value::Value::ImmediateValue(value::ImmediateValue {
+                    value: Some(value::immediate_value::Value::Tensor(tv)),
+                })),
+                None,
+            )
+        }
     };
 
     Ok(mil_spec::Value {
