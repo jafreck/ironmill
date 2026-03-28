@@ -10,8 +10,9 @@ use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::validate::print_validation_report;
 use mil_rs::{
     ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer, compile_model,
-    compile_model_with_backend, is_compiler_available, onnx_to_program_with_config,
-    program_to_model, program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx,
+    compile_model_with_backend, convert_pipeline, is_compiler_available,
+    onnx_to_program_with_config, parse_pipeline_manifest, program_to_model,
+    program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx,
     validate_ane_compatibility, write_mlpackage,
 };
 
@@ -140,6 +141,16 @@ enum Commands {
         /// Path to the model to validate.
         input: String,
     },
+
+    /// Convert a multi-ONNX pipeline to coordinated .mlpackage outputs.
+    CompilePipeline {
+        /// Path to the pipeline manifest (.toml).
+        manifest: String,
+
+        /// Output directory for .mlpackage files and pipeline.json.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 /// Count total operations across all functions in a program.
@@ -197,6 +208,9 @@ fn run() -> Result<()> {
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
         Commands::Validate { input } => cmd_validate(&input),
+        Commands::CompilePipeline { manifest, output } => {
+            cmd_compile_pipeline(&manifest, output.as_deref())
+        }
     }
 }
 
@@ -590,6 +604,68 @@ fn cmd_validate(input: &str) -> Result<()> {
         _ => bail!("Unsupported format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"),
     }
 
+    Ok(())
+}
+
+fn cmd_compile_pipeline(manifest_path: &str, output: Option<&str>) -> Result<()> {
+    let manifest_file = Path::new(manifest_path);
+    if !manifest_file.exists() {
+        bail!("Pipeline manifest not found: {manifest_path}");
+    }
+
+    println!("Reading pipeline manifest: {manifest_path}");
+    let toml_str = std::fs::read_to_string(manifest_file)
+        .with_context(|| format!("Failed to read manifest: {manifest_path}"))?;
+
+    let manifest =
+        parse_pipeline_manifest(&toml_str).context("Failed to parse pipeline manifest")?;
+
+    println!(
+        "Pipeline '{}': {} stage(s)",
+        manifest.pipeline.name,
+        manifest.stages.len()
+    );
+    for stage in &manifest.stages {
+        let deps = if stage.depends_on.is_empty() {
+            String::new()
+        } else {
+            format!(" (depends on: {})", stage.depends_on.join(", "))
+        };
+        println!(
+            "  - {} [{}] quantize={}{deps}",
+            stage.name, stage.onnx, stage.quantize
+        );
+    }
+    println!();
+
+    let base_dir = manifest_file
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let output_dir = PathBuf::from(output.unwrap_or("."));
+
+    let result = convert_pipeline(&manifest, &base_dir, &output_dir)
+        .context("Pipeline conversion failed")?;
+
+    // Print per-stage warnings.
+    for (stage_name, warnings) in &result.stage_warnings {
+        if !warnings.is_empty() {
+            println!(
+                "Warnings for stage '{stage_name}': {} unsupported op(s): {:?}",
+                warnings.len(),
+                warnings
+            );
+        }
+    }
+
+    println!(
+        "Pipeline manifest written: {}",
+        output_dir.join("pipeline.json").display()
+    );
+    println!(
+        "Pipeline conversion complete: {} stage(s) converted.",
+        result.manifest.stages.len()
+    );
     Ok(())
 }
 

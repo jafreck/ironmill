@@ -82,6 +82,8 @@ pub use convert::model_to_program;
 pub use convert::onnx_to_program;
 /// Convert an ONNX model with explicit configuration (e.g. LoRA merge control).
 pub use convert::onnx_to_program_with_config;
+/// Parse and convert a multi-ONNX pipeline from a TOML manifest.
+pub use convert::pipeline::{PipelineManifest, convert_pipeline, parse_pipeline_manifest};
 /// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
 pub use convert::program_to_model;
 /// Convert a MIL IR [`Program`] into an updatable protobuf [`Model`].
