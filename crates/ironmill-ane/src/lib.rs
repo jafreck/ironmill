@@ -123,6 +123,8 @@ pub struct AneModel {
     cache: ProgramCache,
     #[allow(dead_code)]
     config: AneConfig,
+    /// Temp directory for BLOBFILE artifacts. Cleaned up on drop.
+    _work_dir: tempfile::TempDir,
 }
 
 struct LoadedSubProgram {
@@ -188,7 +190,8 @@ impl AneModel {
         // 4. Process each sub-program
         let mil_config = MilTextConfig::default();
         let mut loaded_subs = Vec::new();
-        let tmp_dir = std::env::temp_dir().join("ironmill-ane");
+        let work_dir = tempfile::tempdir()
+            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to create work dir: {e}")))?;
 
         for sub in &model_split.programs {
             // 4a. Emit MIL text + weight entries
@@ -205,7 +208,7 @@ impl AneModel {
             for entry in &weight_entries {
                 blob_writer.add_weight(&entry.name, &entry.data, entry.dtype);
             }
-            let weight_dir = tmp_dir.join(&sub.name);
+            let weight_dir = work_dir.path().join(&sub.name);
             std::fs::create_dir_all(&weight_dir)
                 .map_err(|e| AneError::Other(anyhow::anyhow!("failed to create dir: {e}")))?;
             let weight_path = weight_dir.join("weights.blob");
@@ -283,6 +286,7 @@ impl AneModel {
             sub_programs: loaded_subs,
             cache,
             config,
+            _work_dir: work_dir,
         })
     }
 
@@ -598,11 +602,13 @@ mod tests {
     /// Returns `None` if the ANE runtime isn't available (e.g. CI).
     fn test_model(sub_programs: Vec<LoadedSubProgram>) -> Option<AneModel> {
         let runtime = AneRuntime::new().ok()?;
+        let work_dir = tempfile::tempdir().ok()?;
         Some(AneModel {
             runtime,
             sub_programs,
             cache: ProgramCache::default(),
             config: AneConfig::default(),
+            _work_dir: work_dir,
         })
     }
 
