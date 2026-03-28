@@ -173,6 +173,11 @@ fn convert_operation(
 ) -> Result<mil_spec::Operation> {
     let mut inputs = HashMap::new();
     for (param, value) in &op.inputs {
+        // For const ops, `val` must be a proto attribute (not an input).
+        // Some passes (bn_weight_fold, constant_fold) store it in inputs.
+        if (op.op_type == "const" || op.op_type.starts_with("constexpr_")) && param == "val" {
+            continue; // handled below in the attributes section
+        }
         inputs.insert(param.clone(), convert_value_to_argument(value)?);
     }
 
@@ -259,6 +264,15 @@ fn convert_operation(
         .collect();
 
     let mut attributes = HashMap::new();
+    // For const ops, `val` might be in inputs (from optimization passes).
+    // Promote it to a proto attribute.
+    if op.op_type == "const" || op.op_type.starts_with("constexpr_") {
+        if let Some(val) = op.inputs.get("val") {
+            if !op.attributes.contains_key("val") {
+                attributes.insert("val".to_string(), convert_value_to_proto(val)?);
+            }
+        }
+    }
     for (attr_name, attr_val) in &op.attributes {
         if op.op_type == "const" || op.op_type.starts_with("constexpr_") {
             // For const and constexpr ops, all attributes stay as proto
@@ -269,7 +283,13 @@ fn convert_operation(
         // Skip internal-only attributes from optimization passes.
         if matches!(
             attr_name.as_str(),
-            "fused_activation" | "has_fused_bn" | "original_op" | "kernel_shape"
+            "fused_activation"
+                | "has_fused_bn"
+                | "original_op"
+                | "kernel_shape"
+                | "global_pool"
+                | "flatten_axis"
+                | "bn_folded"
         ) {
             continue;
         }

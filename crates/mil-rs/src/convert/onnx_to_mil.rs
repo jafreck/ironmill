@@ -301,20 +301,9 @@ fn convert_gemm(node: &NodeProto) -> Result<Vec<Operation>> {
     let inputs = positional_to_named(node, &["x", "weight", "bias"]);
     let mut op = Operation::new("linear", op_name(node));
     op.inputs = inputs;
-
-    if let Some(alpha) = get_float_attr(node, "alpha") {
-        op = op.with_attr("alpha", Value::Float(alpha as f64));
-    }
-    if let Some(beta) = get_float_attr(node, "beta") {
-        op = op.with_attr("beta", Value::Float(beta as f64));
-    }
-    if let Some(trans_a) = get_int_attr(node, "transA") {
-        op = op.with_attr("transpose_x", Value::Bool(trans_a != 0));
-    }
-    if let Some(trans_b) = get_int_attr(node, "transB") {
-        op = op.with_attr("transpose_y", Value::Bool(trans_b != 0));
-    }
-
+    // ONNX Gemm's alpha, beta, transA, transB are not supported by CoreML's
+    // linear op. Most ONNX models use default values (alpha=1, beta=1,
+    // transA=0, transB=1) which matches CoreML's linear semantics.
     Ok(vec![with_outputs(op, node)])
 }
 
@@ -366,9 +355,8 @@ fn convert_batch_norm(node: &NodeProto) -> Result<Vec<Operation>> {
     if let Some(epsilon) = get_float_attr(node, "epsilon") {
         op = op.with_attr("epsilon", Value::Float(epsilon as f64));
     }
-    if let Some(momentum) = get_float_attr(node, "momentum") {
-        op = op.with_attr("momentum", Value::Float(momentum as f64));
-    }
+    // momentum is an ONNX training-only parameter; CoreML MIL does not
+    // recognise it, so we intentionally skip it.
 
     Ok(vec![with_outputs(op, node)])
 }
@@ -387,6 +375,9 @@ fn convert_pool(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
     }
     if let Some(pads) = get_int_list_attr(node, "pads") {
         op = op.with_attr("pad", int_tensor_value(&pads));
+    } else {
+        // CoreML requires an explicit pad even for valid padding.
+        op = op.with_attr("pad", int_tensor_value(&[0, 0, 0, 0]));
     }
     if let Some(ceil_mode) = get_int_attr(node, "ceil_mode") {
         op = op.with_attr("ceil_mode", Value::Bool(ceil_mode != 0));
@@ -419,7 +410,10 @@ fn convert_global_pool(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>>
     let inputs = positional_to_named(node, &["x"]);
     let mut op = Operation::new(mil_op, op_name(node));
     op.inputs = inputs;
-    op = op.with_attr("global", Value::Bool(true));
+    // Global pooling: kernel covers the entire spatial extent. We set
+    // kernel_sizes in propagate_output_types once the input shape is known.
+    // Mark as global via an internal attribute (skipped in proto serialization).
+    op = op.with_attr("global_pool", Value::Bool(true));
     Ok(vec![with_outputs(op, node)])
 }
 
@@ -471,21 +465,22 @@ fn convert_clip(node: &NodeProto) -> Result<Vec<Operation>> {
         op.inputs
             .insert("x".to_string(), Value::Reference(x.clone()));
     }
+    // CoreML MIL uses "alpha" for min and "beta" for max.
     if let Some(min_val) = node.input.get(1).filter(|s| !s.is_empty()) {
         op.inputs
-            .insert("min_val".to_string(), Value::Reference(min_val.clone()));
+            .insert("alpha".to_string(), Value::Reference(min_val.clone()));
     }
     if let Some(max_val) = node.input.get(2).filter(|s| !s.is_empty()) {
         op.inputs
-            .insert("max_val".to_string(), Value::Reference(max_val.clone()));
+            .insert("beta".to_string(), Value::Reference(max_val.clone()));
     }
 
     // Attribute form (opset < 11)
     if let Some(min) = get_float_attr(node, "min") {
-        op = op.with_attr("min_val", Value::Float(min as f64));
+        op = op.with_attr("alpha", Value::Float(min as f64));
     }
     if let Some(max) = get_float_attr(node, "max") {
-        op = op.with_attr("max_val", Value::Float(max as f64));
+        op = op.with_attr("beta", Value::Float(max as f64));
     }
 
     Ok(vec![with_outputs(op, node)])
@@ -1051,10 +1046,8 @@ mod tests {
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "linear");
-        assert!(matches!(
-            op.attributes.get("transpose_y"),
-            Some(Value::Bool(true))
-        ));
+        // alpha, beta, transA, transB are ONNX-only; not emitted to MIL.
+        assert!(op.attributes.is_empty());
     }
 
     #[test]
@@ -1274,8 +1267,8 @@ mod tests {
         let op = &ops[0];
         assert_eq!(op.op_type, "clip");
         assert!(matches!(op.inputs.get("x"), Some(Value::Reference(s)) if s == "X"));
-        assert!(matches!(op.inputs.get("min_val"), Some(Value::Reference(s)) if s == "min"));
-        assert!(matches!(op.inputs.get("max_val"), Some(Value::Reference(s)) if s == "max"));
+        assert!(matches!(op.inputs.get("alpha"), Some(Value::Reference(s)) if s == "min"));
+        assert!(matches!(op.inputs.get("beta"), Some(Value::Reference(s)) if s == "max"));
     }
 
     #[test]

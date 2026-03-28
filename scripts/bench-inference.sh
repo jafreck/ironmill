@@ -16,7 +16,7 @@ WARMUP="${BENCH_WARMUP:-20}"
 WORK_DIR="$ROOT_DIR/target/bench-inference"
 
 MODELS=(
-    "mnist.onnx"
+    "mobilenetv2.onnx"
     "squeezenet1.1.onnx"
 )
 

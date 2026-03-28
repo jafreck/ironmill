@@ -17,6 +17,13 @@ fn fixture_path(name: &str) -> PathBuf {
 
 const MODELS: &[&str] = &["mnist.onnx", "squeezenet1.1.onnx"];
 
+/// Whisper Medium encoder (~1.5GB) — only included in benchmarks when
+/// the fixture file is present. Download with `./scripts/download-fixtures.sh`.
+fn whisper_fixture() -> Option<PathBuf> {
+    let path = fixture_path("whisper-medium-encoder.onnx");
+    path.exists().then_some(path)
+}
+
 fn bench_onnx_to_program(c: &mut Criterion) {
     let mut group = c.benchmark_group("onnx_to_program");
     for &model in MODELS {
@@ -100,6 +107,54 @@ fn bench_pipeline_palettize_4bit(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_whisper_pipeline(c: &mut Criterion) {
+    let path = match whisper_fixture() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "Skipping whisper benchmarks — fixture not found. Run ./scripts/download-fixtures.sh"
+            );
+            return;
+        }
+    };
+    let onnx = read_onnx(&path).expect("read whisper onnx");
+    let base = onnx_to_program(&onnx).expect("onnx_to_program whisper");
+
+    let mut group = c.benchmark_group("whisper_medium_encoder");
+    group.sample_size(10);
+
+    group.bench_function("default", |b| {
+        b.iter(|| {
+            let mut p = base.program.clone();
+            PassPipeline::new().run(&mut p).expect("pipeline");
+        });
+    });
+
+    group.bench_function("fp16", |b| {
+        b.iter(|| {
+            let mut p = base.program.clone();
+            PassPipeline::new()
+                .with_fp16()
+                .expect("with_fp16")
+                .run(&mut p)
+                .expect("pipeline");
+        });
+    });
+
+    group.bench_function("int8", |b| {
+        b.iter(|| {
+            let mut p = base.program.clone();
+            PassPipeline::new()
+                .with_int8(None)
+                .expect("with_int8")
+                .run(&mut p)
+                .expect("pipeline");
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_onnx_to_program,
@@ -107,5 +162,6 @@ criterion_group!(
     bench_pipeline_fp16,
     bench_pipeline_int8,
     bench_pipeline_palettize_4bit,
+    bench_whisper_pipeline,
 );
 criterion_main!(benches);

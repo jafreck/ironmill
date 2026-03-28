@@ -386,6 +386,75 @@ bundle experts as separate functions within a single `.mlpackage`:
 
 ---
 
+## 6. Multi-Stage Model Pipeline Conversion
+
+Some models are not monolithic — they consist of multiple interdependent stages
+that must be converted and deployed together. Qwen3-TTS is the motivating
+example, but this applies broadly to encoder-decoder models, cascaded
+pipelines, and any model with separately-exported ONNX components.
+
+### 6a. Multi-ONNX Pipeline Conversion
+
+**Ironmill opportunity:** Support converting a set of related ONNX files into a
+coordinated set of `.mlpackage` outputs:
+
+- Accept a pipeline manifest (JSON/TOML) describing the stages, their ONNX
+  files, and their I/O connections
+- Convert each stage independently but validate that output tensor
+  shapes/types from stage N match input expectations of stage N+1
+- Apply stage-appropriate optimization: e.g., aggressive quantization for the
+  codec decoder, FP16 for the autoregressive LM
+- Emit a pipeline manifest alongside the `.mlpackage` files for runtime
+  orchestration
+
+### 6b. Autoregressive Model Support
+
+**Research context:** Current ironmill passes assume static, feed-forward
+graphs (encoder-style). Autoregressive models (decoders, LMs) require
+special handling for KV cache state and dynamic sequence lengths.
+
+**Ironmill opportunity:** Extend the pipeline for autoregressive models:
+
+- Detect autoregressive patterns in ONNX (past_key_values inputs/outputs)
+- Insert KV cache management ops with statically-sized ring buffers
+- Materialize sequence length dimensions to fixed max values for ANE
+  compatibility (ties into existing shape materialization pass)
+- Support CoreML stateful model export — persist KV cache state across
+  inference calls without re-passing as explicit I/O
+- This is prerequisite for any LLM or TTS decoder running on ANE
+
+### 6c. Causal Convolution Support
+
+**Research context:** Streaming TTS models (Qwen3-TTS 12Hz, Mimi codec) use
+causal convolutions for real-time inference — future audio samples must not
+depend on future input.
+
+**Ironmill opportunity:** Ensure causal conv patterns are preserved and
+ANE-optimized:
+
+- Detect causal padding patterns in ONNX (asymmetric left-only padding)
+- Verify these map to ANE-compatible conv ops after fusion passes
+- Avoid fusion patterns that would break causality (e.g., merging causal +
+  non-causal convs)
+
+### 6d. Vector Quantization / Codebook Ops
+
+**Research context:** Neural audio codecs (Mimi, EnCodec, SoundStream) use
+Residual Vector Quantization (RVQ) with learned codebooks. These appear in
+ONNX as gather/embedding ops with specific patterns.
+
+**Ironmill opportunity:**
+
+- Detect RVQ decode patterns (codebook lookup → sum across quantization levels)
+- Optimize codebook gather ops for ANE (static embedding tables are
+  ANE-friendly when properly shaped)
+- Support multi-codebook models where 8–16 codebooks are summed
+  (Qwen3-TTS uses 16 RVQ codebooks)
+- Palettize codebook weights if memory-constrained (codebooks are themselves
+  small, but many of them add up)
+
+---
+
 ## Priority Ranking
 
 | Pri | Item | Impact | Effort | Risk |
@@ -396,11 +465,15 @@ bundle experts as separate functions within a single `.mlpackage`:
 | **P1** | 2b. Additional fusion patterns | Medium | Medium | Low |
 | **P1** | 3a. LoRA adapter merge at conversion | High | Medium | Low |
 | **P1** | 1a. KV cache layout pass | High | Medium | Medium |
+| **P1** | 6b. Autoregressive model support | High | High | Medium |
 | **P2** | 4c. Compute unit annotations | Medium | Low | Low |
 | **P2** | 3c. Updatable model export | Medium | Medium | Low |
 | **P2** | 4e. Op splitting for large models | High | High | Medium |
 | **P2** | 2a. Layer-wise pipeline scheduling | Medium | High | Medium |
 | **P2** | 1b. Model splitting for spec. decoding | Medium | Medium | Medium |
+| **P2** | 6a. Multi-ONNX pipeline conversion | Medium | Medium | Low |
+| **P2** | 6c. Causal convolution support | Medium | Low | Low |
+| **P2** | 6d. Vector quantization / codebook ops | Medium | Medium | Low |
 | **P3** | 3b. Sub-2-bit / grouped quantization | Medium | High | Medium |
 | **P2** | 5a. MoE-aware model splitting | High | High | Medium |
 | **P2** | 5d. Multi-function CoreML bundle | Medium | Medium | Medium |
@@ -412,6 +485,89 @@ bundle experts as separate functions within a single `.mlpackage`:
 ---
 
 ## Key References
+
+### Validation Target: Whisper Medium Encoder
+
+**Model:** OpenAI Whisper Medium (encoder), 769M parameters
+
+**Why this model:**
+- Fits fully within ANE's memory budget (~1.5GB ONNX, smaller after quantization)
+- Standard transformer encoder with fixed-length input (30s audio → 80-bin mel
+  spectrogram → 1500 frames) — no autoregressive decoding complexity
+- Exercises all of ironmill's core optimization passes: attention fusion,
+  conv+relu fusion, FP16/INT8 quantization, palettization
+- Established baselines exist via WhisperKit and whisper.cpp CoreML for
+  direct A/B comparison of ironmill's output quality
+- Real-world production use case — speech recognition is one of the most
+  common ANE workloads
+
+**Benchmark plan:**
+- **Compile-time:** ONNX → MIL IR → optimized IR across default/FP16/INT8
+  pipeline configurations (added to `benches/pipeline.rs`)
+- **Model size:** Compare `.mlpackage` output size across configurations
+  against the original 1.5GB ONNX and against WhisperKit's coremltools output
+- **Numerical quality:** Weight-level MSE/cosine similarity/SNR vs FP32
+  baseline, same methodology as existing SqueezeNet benchmarks
+- **Inference latency (future):** Compare CoreML inference speed of
+  ironmill-produced `.mlmodelc` vs WhisperKit's on real audio (requires Xcode)
+- **ANE validation report:** Run `ironmill validate` on the output to verify
+  all ops are ANE-eligible after optimization
+
+**Download:** `./scripts/download-fixtures.sh` (pass `--skip-whisper` to skip
+the ~1.5GB download)
+
+### Future Validation Target: Qwen3-TTS 0.6B (12Hz)
+
+**Model:** Qwen3-TTS-12Hz-0.6B, 600M parameters across multiple stages
+
+**Why this model:**
+- Multi-stage pipeline that stress-tests ironmill beyond single-model
+  conversion: Talker (28-layer autoregressive transformer) → Code Predictor
+  (5-layer parallel transformer) → Mimi Codec Decoder (RVQ + ConvNet +
+  upsampling) → Speaker Encoder (ConvNet)
+- Exercises optimizations that Whisper does not: autoregressive KV cache
+  management, shape materialization for dynamic sequence lengths, causal
+  convolution handling, RVQ codebook ops, multi-stage pipeline conversion
+- 0.6B total params (~2.5GB) is within ANE's memory budget with quantization
+- ONNX exports already available on HuggingFace (`sivasub987/Qwen3-TTS-0.6B-ONNX-INT8`,
+  `xkos/Qwen3-TTS-12Hz-1.7B-ONNX`)
+- No existing CoreML conversion — ironmill would be **first to market** for
+  on-device TTS via ANE
+- Real-world use case with high demand: private, low-latency text-to-speech on
+  Apple devices
+
+**Architecture stages requiring conversion:**
+
+| Stage | Architecture | Params | ANE Fit | Key Challenges |
+|-------|-------------|--------|---------|----------------|
+| Talker | 28-layer transformer (autoregressive) | ~400M | ⚠️ Needs KV cache + shape materialization | Autoregressive loop, dynamic seq len |
+| Code Predictor | 5-layer transformer (parallel) | ~50M | ✅ Static graph | Parallel multi-codebook prediction |
+| Mimi Codec Decoder | RVQ + ConvNet + upsample | ~100M | ✅ Conv-heavy, ANE-native | 16 RVQ codebooks, causal convs |
+| Speaker Encoder | ConvNet | ~50M | ✅ Static, small | Standard conv pipeline |
+
+**Prerequisite optimizations (must be implemented first):**
+- 6b. Autoregressive model support (KV cache, stateful CoreML export)
+- 6a. Multi-ONNX pipeline conversion (coordinated multi-stage output)
+- 6c. Causal convolution support (streaming codec decoder)
+- 6d. Vector quantization / codebook ops (16 RVQ codebooks)
+- 1a. KV cache layout pass (Talker's autoregressive inference)
+- Shape materialization for dynamic sequence lengths (existing pass, needs
+  extension for autoregressive patterns)
+
+**Benchmark plan (when prerequisites are ready):**
+- **Per-stage conversion:** Convert each ONNX stage independently, validate
+  I/O tensor compatibility between stages
+- **Compile-time:** Measure pipeline throughput for each stage
+- **Model size:** Compare total `.mlpackage` size across all stages vs
+  original ONNX set
+- **Numerical quality:** Per-stage weight fidelity, plus end-to-end audio
+  quality assessment (UTMOS/PESQ scores on reference utterances)
+- **Inference latency:** First-packet latency target of <200ms on M3+ (the
+  original model achieves 97ms on GPU)
+- **ANE validation:** Verify per-stage ANE eligibility, flag any ops that
+  fall back to CPU/GPU
+
+---
 
 - [Orion: Characterizing and Programming Apple's Neural Engine for LLM Inference and Training](https://arxiv.org/abs/2603.06728) — March 2026
 - [NeuralForge: On-device LLM fine-tuning via ANE private APIs](https://agent-wars.com/news/2026-03-13-neuralforge-on-device-llm-fine-tuning-on-mac-using-apple-neural-engine) — March 2026
@@ -427,3 +583,7 @@ bundle experts as separate functions within a single `.mlpackage`:
 - [Apple Roster of Experts (RoE): Hyper-Parallel MoE Inference](https://machinelearning.apple.com/research/roe) — 2026
 - [M1MoE: MoE inference on Apple Silicon via Metal](https://github.com/koaWood/M1MoE)
 - [Comprehensive Survey of Mixture-of-Experts (2025)](https://arxiv.org/abs/2503.07137)
+- [Qwen3-TTS Technical Report](https://arxiv.org/abs/2601.15621) — January 2026
+- [Qwen3-TTS GitHub](https://github.com/QwenLM/Qwen3-TTS)
+- [Qwen3-TTS 0.6B ONNX INT8 (HuggingFace)](https://huggingface.co/sivasub987/Qwen3-TTS-0.6B-ONNX-INT8)
+- [Qwen3-TTS 1.7B ONNX (HuggingFace)](https://huggingface.co/xkos/Qwen3-TTS-12Hz-1.7B-ONNX)

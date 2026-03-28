@@ -234,8 +234,81 @@ fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Bloc
         }
     }
 
-    // Second pass: infer missing output types from the type map.
+    // Second pass: infer missing output types and fill in global pool params.
     for op in &mut block.operations {
+        // For global pool ops, set kernel_sizes from the input shape.
+        if matches!(op.op_type.as_str(), "max_pool" | "avg_pool")
+            && op
+                .attributes
+                .get("global_pool")
+                .is_some_and(|v| matches!(v, Value::Bool(true)))
+            && !op.inputs.contains_key("kernel_sizes")
+        {
+            if let Some(Value::Reference(n)) = op.inputs.get("x") {
+                if let Some(in_tt) = type_map.get(n) {
+                    if in_tt.shape.len() == 4 {
+                        let h = in_tt.shape[2].unwrap_or(1);
+                        let w = in_tt.shape[3].unwrap_or(1);
+                        let to_i32_tensor = |vals: &[i32]| -> Value {
+                            let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            Value::Tensor {
+                                data,
+                                shape: vec![vals.len()],
+                                dtype: ScalarType::Int32,
+                            }
+                        };
+                        op.inputs
+                            .insert("kernel_sizes".into(), to_i32_tensor(&[h as i32, w as i32]));
+                        op.inputs.insert("strides".into(), to_i32_tensor(&[1, 1]));
+                        op.inputs
+                            .insert("pad_type".into(), Value::String("valid".into()));
+                        op.inputs.insert("pad".into(), to_i32_tensor(&[0, 0, 0, 0]));
+                        op.inputs
+                            .insert("exclude_padding_from_average".into(), Value::Bool(true));
+                        op.inputs.insert("ceil_mode".into(), Value::Bool(false));
+                    }
+                }
+            }
+        }
+
+        // For flatten (reshape with flatten_axis), compute and insert the
+        // target shape from the input dimensions.
+        if op.op_type == "reshape"
+            && op.attributes.contains_key("flatten_axis")
+            && !op.inputs.contains_key("shape")
+        {
+            if let Some(Value::Reference(n)) = op.inputs.get("x") {
+                if let Some(in_tt) = type_map.get(n) {
+                    let axis = op
+                        .attributes
+                        .get("flatten_axis")
+                        .and_then(|v| {
+                            if let Value::Int(a) = v {
+                                Some(*a as usize)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(1);
+                    let dims: Vec<usize> = in_tt.shape.iter().map(|d| d.unwrap_or(1)).collect();
+                    let batch: usize = dims[..axis].iter().product();
+                    let rest: usize = dims[axis..].iter().product();
+                    let shape_data: Vec<u8> = [batch as i32, rest as i32]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    op.inputs.insert(
+                        "shape".into(),
+                        Value::Tensor {
+                            data: shape_data,
+                            shape: vec![2],
+                            dtype: ScalarType::Int32,
+                        },
+                    );
+                }
+            }
+        }
+
         for (i, out_name) in op.outputs.iter().enumerate() {
             if op.output_types.get(i).is_some_and(|ot| ot.is_some()) {
                 continue;
@@ -366,7 +439,18 @@ fn infer_pool_output(op: &Operation, type_map: &HashMap<String, TensorType>) -> 
     let in_h = in_shape[2]?;
     let in_w = in_shape[3]?;
 
-    let kernels = get_int_list(op, "kernel_sizes").unwrap_or_else(|| vec![1, 1]);
+    let is_global = op
+        .attributes
+        .get("global_pool")
+        .is_some_and(|v| matches!(v, Value::Bool(true)));
+
+    let kernels = if is_global {
+        // Global pool: kernel covers entire spatial extent → output is 1×1.
+        Some(vec![in_h as i64, in_w as i64])
+    } else {
+        get_int_list(op, "kernel_sizes")
+    }
+    .unwrap_or_else(|| vec![1, 1]);
     let strides = get_int_list(op, "strides").unwrap_or_else(|| vec![1, 1]);
     let pads = get_int_list(op, "pad").unwrap_or_else(|| vec![0, 0, 0, 0]);
 
