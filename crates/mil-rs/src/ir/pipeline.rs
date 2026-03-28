@@ -12,9 +12,9 @@ use super::passes::{
     AttentionFusionPass, CodebookOptimizationPass, ComputeUnitAnnotationPass, ConstantFoldPass,
     ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
     DeadCodeEliminationPass, Fp16QuantizePass, GeluLinearFusionPass, GqaFusionPass, Granularity,
-    IdentityEliminationPass, Int8QuantizePass, LayerNormLinearFusionPass, LayoutOptimizationPass,
-    LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass, OpSubstitutionPass,
-    PalettizePass, ResidualAddFusionPass, ShapeMaterializePass,
+    IdentityEliminationPass, Int8QuantizePass, KvCachePass, LayerNormLinearFusionPass,
+    LayoutOptimizationPass, LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass,
+    OpSubstitutionPass, PalettizePass, ResidualAddFusionPass, ShapeMaterializePass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -71,6 +71,7 @@ const KNOWN_PASSES: &[&str] = &[
     "residual-add-fusion",
     "attention-fusion",
     "gqa-fusion",
+    "kv-cache",
     "codebook-optimization",
     "op-substitution",
     "layout-optimization",
@@ -97,6 +98,14 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
         "residual-add-fusion" => Ok(Box::new(ResidualAddFusionPass)),
         "attention-fusion" => Ok(Box::new(AttentionFusionPass)),
         "gqa-fusion" => Ok(Box::new(GqaFusionPass)),
+        "kv-cache" => {
+            let max_seq = params
+                .get("max_seq_length")
+                .and_then(|v| v.as_integer())
+                .map(|i| i as usize)
+                .unwrap_or(2048);
+            Ok(Box::new(KvCachePass::new(max_seq)))
+        }
         "codebook-optimization" => Ok(Box::new(CodebookOptimizationPass)),
         "op-substitution" => Ok(Box::new(OpSubstitutionPass)),
         "layout-optimization" => Ok(Box::new(LayoutOptimizationPass)),
@@ -206,6 +215,7 @@ impl PassPipeline {
                 // Optimization passes
                 Box::new(AttentionFusionPass),
                 Box::new(GqaFusionPass),
+                Box::new(KvCachePass::default()),
                 Box::new(CodebookOptimizationPass),
                 Box::new(OpSubstitutionPass),
                 Box::new(LayoutOptimizationPass),
@@ -415,6 +425,7 @@ impl PassPipeline {
             "residual-add-fusion",
             "attention-fusion",
             "gqa-fusion",
+            "kv-cache",
             "codebook-optimization",
             "op-substitution",
             "layout-optimization",
@@ -700,6 +711,7 @@ mod tests {
                 "residual-add-fusion",
                 "attention-fusion",
                 "gqa-fusion",
+                "kv-cache",
                 "codebook-optimization",
                 "op-substitution",
                 "layout-optimization",
@@ -801,7 +813,7 @@ mod tests {
     #[test]
     fn default_trait_works() {
         let pipeline = PassPipeline::default();
-        assert_eq!(pipeline.pass_names().len(), 15);
+        assert_eq!(pipeline.pass_names().len(), 16);
     }
 
     #[test]
@@ -955,6 +967,9 @@ name = "attention-fusion"
 
 [[passes]]
 name = "gqa-fusion"
+
+[[passes]]
+name = "kv-cache"
 
 [[passes]]
 name = "codebook-optimization"
