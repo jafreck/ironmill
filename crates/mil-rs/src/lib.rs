@@ -77,7 +77,10 @@ pub use convert::onnx_to_program;
 /// Error type for all operations in this crate.
 pub use error::MilError;
 
-pub use ir::{Block, Function, Graph, Operation, Pass, Program, ScalarType, TensorType, Value};
+pub use ir::{
+    Block, Function, Graph, Operation, Pass, PassPipeline, PassResult, PipelineReport, Program,
+    ScalarType, TensorType, Value,
+};
 
 /// Validate a MIL [`Program`] for Apple Neural Engine compatibility.
 pub use validate::validate_ane_compatibility;

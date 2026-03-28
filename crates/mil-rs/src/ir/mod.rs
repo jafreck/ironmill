@@ -10,6 +10,7 @@ mod graph;
 mod operation;
 mod pass;
 pub mod passes;
+mod pipeline;
 mod program;
 mod tensor;
 mod types;
@@ -23,6 +24,7 @@ pub use passes::{
     IdentityEliminationPass, Int8QuantizePass, LayoutOptimizationPass, LinearReluFusionPass,
     OpSubstitutionPass, PalettizePass, ShapeMaterializePass,
 };
+pub use pipeline::{PassPipeline, PassResult, PipelineReport};
 pub use program::{Block, Function, Program};
 pub use tensor::{ScalarType, TensorType};
 pub use types::Value;

@@ -1,12 +1,10 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mil_rs::ir::{
-    ConstantFoldPass, DeadCodeEliminationPass, Fp16QuantizePass, IdentityEliminationPass, Pass,
-    ShapeMaterializePass,
-};
+use mil_rs::ir::PassPipeline;
 use mil_rs::validate::print_validation_report;
 use mil_rs::{
     compile_model, is_compiler_available, onnx_to_program, program_to_model, read_mlmodel,
@@ -43,6 +41,18 @@ enum Commands {
         /// Quantization mode: "none", "fp16", "int8".
         #[arg(short, long, default_value = "none")]
         quantize: String,
+
+        /// Calibration data directory (for int8 quantization).
+        #[arg(long = "cal-data", value_name = "DIR")]
+        cal_data: Option<PathBuf>,
+
+        /// Weight palettization bit-width (2, 4, 6, or 8).
+        #[arg(long, value_name = "BITS")]
+        palettize: Option<u8>,
+
+        /// Disable fusion and optimization passes.
+        #[arg(long)]
+        no_fusion: bool,
 
         /// Set a concrete shape for a named input (for ANE compatibility).
         /// Format: "name:d0,d1,d2,...". May be repeated.
@@ -81,8 +91,11 @@ fn run() -> Result<()> {
             output,
             target,
             quantize,
+            cal_data,
+            palettize,
+            no_fusion,
             input_shapes,
-        } => cmd_compile(&input, output, &target, &quantize, &input_shapes),
+        } => cmd_compile(&input, output, &target, &quantize, cal_data, palettize, no_fusion, &input_shapes),
         Commands::Inspect { input } => cmd_inspect(&input),
         Commands::Validate { input } => cmd_validate(&input),
     }
@@ -104,7 +117,7 @@ fn parse_input_shape(s: &str) -> Result<(String, Vec<usize>)> {
     Ok((name.to_string(), dims))
 }
 
-fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str, input_shapes: &[String]) -> Result<()> {
+fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str, cal_data: Option<PathBuf>, palettize: Option<u8>, no_fusion: bool, input_shapes: &[String]) -> Result<()> {
     let input_path = Path::new(input);
     if !input_path.exists() {
         bail!("Input file not found: {input}");
@@ -121,7 +134,7 @@ fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str
     }
 
     match ext.as_str() {
-        "onnx" => compile_from_onnx(input_path, output, quantize, input_shapes),
+        "onnx" => compile_from_onnx(input_path, output, quantize, cal_data, palettize, no_fusion, input_shapes),
         "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext),
         _ => bail!(
             "Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"
@@ -129,7 +142,7 @@ fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str
     }
 }
 
-fn compile_from_onnx(input_path: &Path, output: Option<String>, quantize: &str, input_shapes: &[String]) -> Result<()> {
+fn compile_from_onnx(input_path: &Path, output: Option<String>, quantize: &str, cal_data: Option<PathBuf>, palettize: Option<u8>, no_fusion: bool, input_shapes: &[String]) -> Result<()> {
     let input_display = input_path.display();
 
     // 1. Read ONNX model
@@ -152,56 +165,62 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>, quantize: &str, 
     );
     println!();
 
-    // 3. Run shape materialization if --input-shape was provided.
-    if !input_shapes.is_empty() {
-        let mut shape_pass = ShapeMaterializePass::new();
-        for raw in input_shapes {
-            let (name, dims) = parse_input_shape(raw)?;
-            shape_pass = shape_pass.with_shape(name, dims);
-        }
-        println!("Materializing input shapes...");
-        shape_pass
-            .run(&mut program)
-            .context("Shape materialization failed")?;
-        println!("  shape-materialization: done");
-        println!();
+    // 3. Build the pass pipeline
+    let mut pipeline = PassPipeline::new();
+
+    if no_fusion {
+        pipeline = pipeline.without_fusion();
     }
 
-    // 4. Run optimization passes
-    println!("Running optimization passes...");
-    let passes: Vec<Box<dyn Pass>> = vec![
-        Box::new(DeadCodeEliminationPass),
-        Box::new(IdentityEliminationPass),
-        Box::new(ConstantFoldPass),
-    ];
+    // Parse and add input shapes
+    if !input_shapes.is_empty() {
+        let mut shapes = HashMap::new();
+        for raw in input_shapes {
+            let (name, dims) = parse_input_shape(raw)?;
+            shapes.insert(name, dims);
+        }
+        pipeline = pipeline.with_shapes(shapes);
+    }
 
-    for pass in &passes {
-        let before = count_ops(&program);
-        pass.run(&mut program)
-            .with_context(|| format!("Optimization pass '{}' failed", pass.name()))?;
-        let after = count_ops(&program);
-        let diff = before.saturating_sub(after);
+    // Add quantization
+    match quantize {
+        "fp16" => {
+            pipeline = pipeline
+                .with_fp16()
+                .context("Failed to configure FP16 quantization")?;
+        }
+        "int8" => {
+            pipeline = pipeline
+                .with_int8(cal_data)
+                .context("Failed to configure INT8 quantization")?;
+        }
+        "none" => {}
+        other => bail!("Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', or 'int8'."),
+    }
+
+    // Add palettization
+    if let Some(bits) = palettize {
+        pipeline = pipeline
+            .with_palettize(bits)
+            .context("Failed to configure palettization")?;
+    }
+
+    // 4. Run the pipeline
+    println!("Running optimization passes...");
+    let report = pipeline
+        .run(&mut program)
+        .context("Optimization pipeline failed")?;
+
+    for result in &report.pass_results {
+        let diff = result.ops_before.saturating_sub(result.ops_after);
         if diff > 0 {
             let label = if diff == 1 { "op" } else { "ops" };
-            println!("  {}: removed {diff} {label}", pass.name());
+            println!("  {}: removed {diff} {label}", result.name);
         } else {
-            println!("  {}: no changes", pass.name());
+            println!("  {}: no changes", result.name);
         }
     }
     println!();
-
-    // 5. Quantization
-    if quantize == "fp16" {
-        println!("Quantizing to FP16...");
-        Fp16QuantizePass
-            .run(&mut program)
-            .context("FP16 quantization pass failed")?;
-        println!("  fp16-quantization: done");
-        println!();
-    } else if quantize != "none" {
-        println!("Note: --quantize '{quantize}' is not yet supported. Proceeding without quantization.");
-        println!();
-    }
 
     // 6. Convert IR to proto
     let model = program_to_model(&program, 7)
