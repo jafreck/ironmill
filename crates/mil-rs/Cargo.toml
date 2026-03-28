@@ -21,6 +21,15 @@ half = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 tempfile = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "passes"
+harness = false
 
 [build-dependencies]
 prost-build = { workspace = true }

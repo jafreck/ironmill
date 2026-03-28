@@ -1,0 +1,111 @@
+//! End-to-end ONNX → MIL IR → optimised pipeline benchmarks.
+
+use std::path::{Path, PathBuf};
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use mil_rs::{onnx_to_program, read_onnx, PassPipeline};
+
+fn fixture_path(name: &str) -> PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    Path::new(manifest)
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
+
+const MODELS: &[&str] = &["mnist.onnx", "squeezenet1.1.onnx"];
+
+fn bench_onnx_to_program(c: &mut Criterion) {
+    let mut group = c.benchmark_group("onnx_to_program");
+    for &model in MODELS {
+        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        group.bench_with_input(BenchmarkId::new("parse", model), &onnx, |b, onnx| {
+            b.iter(|| onnx_to_program(onnx).expect("onnx_to_program"));
+        });
+    }
+    group.finish();
+}
+
+fn bench_pipeline_default(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pipeline_default");
+    for &model in MODELS {
+        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        let base = onnx_to_program(&onnx).expect("onnx_to_program");
+        group.bench_with_input(BenchmarkId::new("run", model), &base.program, |b, prog| {
+            b.iter(|| {
+                let mut p = prog.clone();
+                PassPipeline::new().run(&mut p).expect("pipeline");
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_pipeline_fp16(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pipeline_fp16");
+    for &model in MODELS {
+        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        let base = onnx_to_program(&onnx).expect("onnx_to_program");
+        group.bench_with_input(BenchmarkId::new("run", model), &base.program, |b, prog| {
+            b.iter(|| {
+                let mut p = prog.clone();
+                PassPipeline::new()
+                    .with_fp16()
+                    .expect("with_fp16")
+                    .run(&mut p)
+                    .expect("pipeline");
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_pipeline_int8(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pipeline_int8");
+    for &model in MODELS {
+        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        let base = onnx_to_program(&onnx).expect("onnx_to_program");
+        group.bench_with_input(BenchmarkId::new("run", model), &base.program, |b, prog| {
+            b.iter(|| {
+                let mut p = prog.clone();
+                PassPipeline::new()
+                    .with_int8(None)
+                    .expect("with_int8")
+                    .run(&mut p)
+                    .expect("pipeline");
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_pipeline_palettize_4bit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pipeline_palettize_4bit");
+    for &model in MODELS {
+        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        let base = onnx_to_program(&onnx).expect("onnx_to_program");
+        group.bench_with_input(BenchmarkId::new("run", model), &base.program, |b, prog| {
+            b.iter(|| {
+                let mut p = prog.clone();
+                PassPipeline::new()
+                    .with_palettize(4)
+                    .expect("with_palettize")
+                    .run(&mut p)
+                    .expect("pipeline");
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_onnx_to_program,
+    bench_pipeline_default,
+    bench_pipeline_fp16,
+    bench_pipeline_int8,
+    bench_pipeline_palettize_4bit,
+);
+criterion_main!(benches);
