@@ -185,6 +185,37 @@ fn float_list_value(values: &[f32]) -> Value {
     Value::List(values.iter().map(|&v| Value::Float(v as f64)).collect())
 }
 
+/// Check whether ONNX padding represents a causal (left-only) convolution.
+///
+/// ONNX `pads` are laid out as `[begin_d0, begin_d1, …, end_d0, end_d1, …]`.
+/// For a causal 1-D conv the pattern is `[0, K-1, 0, 0]` — only the
+/// second-to-last spatial dimension gets left padding equal to
+/// `(kernel_size - 1) * dilation` and zero right padding.  For 2-D the
+/// equivalent is `[0, K_w-1, 0, 0]` (height already zero) or the more
+/// general form where each spatial dim has left = (ks-1)*d, right = 0.
+fn is_causal_padding(pads: &[i64], kernel_shape: &[i64], dilations: &[i64]) -> bool {
+    let ndim = kernel_shape.len();
+    // pads must have 2 * ndim entries: [begin_d0 .. begin_dN, end_d0 .. end_dN].
+    if pads.len() != 2 * ndim {
+        return false;
+    }
+    // At least one spatial dimension must have non-zero causal padding.
+    let mut has_causal_dim = false;
+    for i in 0..ndim {
+        let dilation = if i < dilations.len() { dilations[i] } else { 1 };
+        let expected_left = (kernel_shape[i] - 1) * dilation;
+        let left = pads[i];
+        let right = pads[ndim + i];
+        if left == expected_left && right == 0 && expected_left > 0 {
+            has_causal_dim = true;
+        } else if left != 0 || right != 0 {
+            // Non-causal non-zero padding in this dimension.
+            return false;
+        }
+    }
+    has_causal_dim
+}
+
 /// Map an ONNX `TensorProto::DataType` integer to a MIL scalar-type name.
 fn onnx_dtype_to_mil(dtype: i32) -> Result<&'static str> {
     match dtype {
@@ -282,6 +313,17 @@ fn convert_conv(node: &NodeProto) -> Result<Vec<Operation>> {
     // ONNX pads are [top, left, bottom, right]; MIL expects the same order.
     let pad = pads.unwrap_or_else(|| vec![0, 0, 0, 0]);
     op = op.with_attr("pad", int_tensor_value(&pad));
+
+    // Detect causal (left-only) padding used in streaming TTS/audio models.
+    // Causal convolution: for each spatial dimension the left pad equals
+    // kernel_size - 1 and the right pad is 0.
+    let kernel_shape = get_int_list_attr(node, "kernel_shape");
+    if pad_type == "custom" {
+        if let Some(ref ks) = kernel_shape {
+            let is_causal = is_causal_padding(&pad, ks, &dilations);
+            op = op.with_attr("causal", Value::Bool(is_causal));
+        }
+    }
 
     Ok(vec![with_outputs(op, node)])
 }
@@ -1392,5 +1434,99 @@ mod tests {
         let ops = convert_node(&node).unwrap();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].op_type, "slice_by_index");
+    }
+
+    // -- Causal convolution detection ---------------------------------------
+
+    #[test]
+    fn test_conv_causal_1d() {
+        // kernel_size=3, dilation=1 → left=2, right=0 → pads=[0, 2, 0, 0]
+        let mut node = make_node("Conv", &["input", "W"], &["Y"]);
+        node.attribute
+            .push(make_int_list_attr("kernel_shape", &[1, 3]));
+        node.attribute
+            .push(make_int_list_attr("pads", &[0, 2, 0, 0]));
+        node.attribute
+            .push(make_int_list_attr("dilations", &[1, 1]));
+
+        let ops = convert_node(&node).unwrap();
+        let op = &ops[0];
+        assert_eq!(
+            op.attributes.get("causal"),
+            Some(&Value::Bool(true)),
+            "expected causal=true for left-only padding"
+        );
+    }
+
+    #[test]
+    fn test_conv_causal_dilated() {
+        // kernel_size=3, dilation=2 → left=(3-1)*2=4, right=0 → pads=[0, 4, 0, 0]
+        let mut node = make_node("Conv", &["input", "W"], &["Y"]);
+        node.attribute
+            .push(make_int_list_attr("kernel_shape", &[1, 3]));
+        node.attribute
+            .push(make_int_list_attr("pads", &[0, 4, 0, 0]));
+        node.attribute
+            .push(make_int_list_attr("dilations", &[1, 2]));
+
+        let ops = convert_node(&node).unwrap();
+        let op = &ops[0];
+        assert_eq!(
+            op.attributes.get("causal"),
+            Some(&Value::Bool(true)),
+            "expected causal=true for dilated causal conv"
+        );
+    }
+
+    #[test]
+    fn test_conv_symmetric_padding_not_causal() {
+        // Symmetric padding [1, 1, 1, 1] should NOT be flagged causal.
+        let mut node = make_node("Conv", &["input", "W"], &["Y"]);
+        node.attribute
+            .push(make_int_list_attr("kernel_shape", &[3, 3]));
+        node.attribute
+            .push(make_int_list_attr("pads", &[1, 1, 1, 1]));
+        node.attribute
+            .push(make_int_list_attr("dilations", &[1, 1]));
+
+        let ops = convert_node(&node).unwrap();
+        let op = &ops[0];
+        assert_eq!(
+            op.attributes.get("causal"),
+            Some(&Value::Bool(false)),
+            "symmetric padding should not be causal"
+        );
+    }
+
+    #[test]
+    fn test_conv_no_kernel_shape_no_causal_attr() {
+        // Without kernel_shape, causal cannot be determined.
+        let mut node = make_node("Conv", &["input", "W"], &["Y"]);
+        node.attribute
+            .push(make_int_list_attr("pads", &[1, 1, 1, 1]));
+
+        let ops = convert_node(&node).unwrap();
+        let op = &ops[0];
+        assert!(
+            !op.attributes.contains_key("causal"),
+            "causal attr should not be set without kernel_shape"
+        );
+    }
+
+    #[test]
+    fn test_conv_auto_pad_no_causal_attr() {
+        // auto_pad modes don't get a causal attribute (pad_type != "custom").
+        let mut node = make_node("Conv", &["input", "W"], &["Y"]);
+        node.attribute
+            .push(make_string_attr("auto_pad", "SAME_UPPER"));
+        node.attribute
+            .push(make_int_list_attr("kernel_shape", &[3, 3]));
+
+        let ops = convert_node(&node).unwrap();
+        let op = &ops[0];
+        assert!(
+            !op.attributes.contains_key("causal"),
+            "causal attr should not be set for auto_pad modes"
+        );
     }
 }

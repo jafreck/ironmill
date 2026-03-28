@@ -112,6 +112,11 @@ fn references_name(value: &Value, name: &str) -> bool {
     }
 }
 
+/// Returns `true` if the operation is tagged as a causal convolution.
+fn is_causal_conv(op: &crate::ir::operation::Operation) -> bool {
+    matches!(op.attributes.get("causal"), Some(Value::Bool(true)))
+}
+
 /// Generic fusion of a *producer* op followed by a *consumer* op.
 ///
 /// Scans the block for pairs where `consumer.inputs["x"]` references
@@ -153,6 +158,17 @@ fn fuse_activation_pattern(
         // Don't fuse a producer that was already claimed by an earlier fusion.
         if fusions.iter().any(|(p, _)| *p == pi) {
             continue;
+        }
+
+        // Defensive guard: prevent fusing same-type ops (e.g., conv→conv) with
+        // mismatched causality. No current fusion passes match this pattern, but
+        // this protects against future same-type fusion passes.
+        if producer_type == consumer_type {
+            let p_causal = is_causal_conv(&block.operations[pi]);
+            let c_causal = is_causal_conv(&block.operations[ci]);
+            if p_causal != c_causal {
+                continue;
+            }
         }
 
         fusions.push((pi, ci));
@@ -473,5 +489,124 @@ mod tests {
         } else {
             panic!("expected softmax input to be a reference");
         }
+    }
+
+    // ---- Causal convolution fusion tests -----------------------------------
+
+    #[test]
+    fn causal_conv_relu_fused() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("conv", "conv_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_attr("causal", Value::Bool(true))
+                .with_attr("pad", Value::Int(2))
+                .with_output("conv_out"),
+        );
+        block.add_op(
+            Operation::new("relu", "relu_0")
+                .with_input("x", Value::Reference("conv_out".into()))
+                .with_output("relu_out"),
+        );
+        block.outputs.push("relu_out".into());
+
+        let mut program = program_with_block(block);
+        ConvReluFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 1, "causal conv + relu should still fuse");
+        assert_eq!(ops[0].op_type, "conv");
+        assert_eq!(
+            ops[0].attributes.get("fused_activation"),
+            Some(&Value::String("relu".into()))
+        );
+        assert_eq!(
+            ops[0].attributes.get("causal"),
+            Some(&Value::Bool(true)),
+            "causal attribute must be preserved after fusion"
+        );
+    }
+
+    #[test]
+    fn causal_conv_batchnorm_fused() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("conv", "conv_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_attr("causal", Value::Bool(true))
+                .with_output("conv_out"),
+        );
+        block.add_op(
+            Operation::new("batch_norm", "bn_0")
+                .with_input("x", Value::Reference("conv_out".into()))
+                .with_output("bn_out"),
+        );
+        block.outputs.push("bn_out".into());
+
+        let mut program = program_with_block(block);
+        ConvBatchNormFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 1, "causal conv + BN should still fuse");
+        assert_eq!(
+            ops[0].attributes.get("has_fused_bn"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            ops[0].attributes.get("causal"),
+            Some(&Value::Bool(true)),
+            "causal attribute must survive BN fusion"
+        );
+    }
+
+    #[test]
+    fn non_causal_conv_relu_still_fuses() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("conv", "conv_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_attr("causal", Value::Bool(false))
+                .with_output("conv_out"),
+        );
+        block.add_op(
+            Operation::new("relu", "relu_0")
+                .with_input("x", Value::Reference("conv_out".into()))
+                .with_output("relu_out"),
+        );
+        block.outputs.push("relu_out".into());
+
+        let mut program = program_with_block(block);
+        ConvReluFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 1, "non-causal conv + relu should fuse normally");
+        assert_eq!(
+            ops[0].attributes.get("fused_activation"),
+            Some(&Value::String("relu".into()))
+        );
+    }
+
+    #[test]
+    fn conv_without_causal_attr_still_fuses() {
+        // Convs that predate the causal attribute (no `causal` key at all)
+        // must continue to fuse as before.
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("conv", "conv_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("conv_out"),
+        );
+        block.add_op(
+            Operation::new("relu", "relu_0")
+                .with_input("x", Value::Reference("conv_out".into()))
+                .with_output("relu_out"),
+        );
+        block.outputs.push("relu_out".into());
+
+        let mut program = program_with_block(block);
+        ConvReluFusionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 1, "conv without causal attr should still fuse");
     }
 }
