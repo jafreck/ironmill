@@ -519,6 +519,9 @@ name = "codebook-optimization"
 name = "op-substitution"
 
 [[passes]]
+name = "layout-optimization"
+
+[[passes]]
 name = "type-repropagation"
 
 [[passes]]

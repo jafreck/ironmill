@@ -282,10 +282,7 @@ impl PassPipeline {
                 Box::new(KvCachePass::default()),
                 Box::new(CodebookOptimizationPass),
                 Box::new(OpSubstitutionPass),
-                // LayoutOptimizationPass (NCHW→NHWC) is not included in the
-                // default pipeline because MIL's conv op validates assuming
-                // NCHW layout. Enable via TOML config once the pass handles
-                // weight transposition.
+                Box::new(LayoutOptimizationPass),
                 // Re-propagate output types after all transformations so that
                 // newly-created ops (transposes, tiles, etc.) get concrete types.
                 Box::new(TypeRepropagationPass),
@@ -805,6 +802,7 @@ mod tests {
                 "kv-cache",
                 "codebook-optimization",
                 "op-substitution",
+                "layout-optimization",
                 "type-repropagation",
             ]
         );
@@ -905,7 +903,7 @@ mod tests {
     #[test]
     fn default_trait_works() {
         let pipeline = PassPipeline::default();
-        assert_eq!(pipeline.pass_names().len(), 16);
+        assert_eq!(pipeline.pass_names().len(), 17);
     }
 
     #[test]
@@ -1068,6 +1066,9 @@ name = "codebook-optimization"
 
 [[passes]]
 name = "op-substitution"
+
+[[passes]]
+name = "layout-optimization"
 
 [[passes]]
 name = "type-repropagation"
