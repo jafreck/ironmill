@@ -831,13 +831,32 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
             RuntimeArg::AneDirect => {
                 #[cfg(feature = "ane-direct")]
                 {
+                    use ironmill_ane::CompiledArtifacts;
+
                     println!("  Using ANE direct runtime");
-                    let ane_config = ironmill_ane::AneConfig::default();
-                    let _model = ironmill_ane::AneModel::compile_and_load(&program, ane_config)
+
+                    // Run the full pre-compilation pipeline
+                    let artifacts = CompiledArtifacts::prepare(&program)
                         .context("ANE direct compilation failed")?;
+
+                    // Validate artifacts
+                    let warnings = artifacts
+                        .validate()
+                        .context("ANE artifact validation failed")?;
+                    for w in &warnings {
+                        println!("  ⚠ {w}");
+                    }
+
+                    // Persist artifacts alongside the .mlpackage
+                    let ane_dir = std::path::Path::new(&output_path).with_extension("ane");
+                    artifacts
+                        .save(&ane_dir)
+                        .context("failed to save ANE artifacts")?;
+
                     println!(
-                        "  ✓ ANE model compiled and loaded ({} sub-programs)",
-                        _model.num_sub_programs()
+                        "  ✓ ANE model compiled ({} sub-programs) → {}",
+                        artifacts.num_sub_programs(),
+                        ane_dir.display()
                     );
                 }
                 #[cfg(not(feature = "ane-direct"))]

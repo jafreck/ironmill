@@ -416,6 +416,7 @@ dependencies = [
  "anyhow",
  "half",
  "mil-rs",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
