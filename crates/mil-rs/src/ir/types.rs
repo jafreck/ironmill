@@ -2,7 +2,7 @@ use super::tensor::{ScalarType, TensorType};
 
 /// A value in the MIL IR — can be a reference to another op's output,
 /// a literal constant, or a tensor type descriptor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// Reference to another operation's output by name.
     Reference(String),
