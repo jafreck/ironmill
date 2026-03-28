@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Repo-local pre-commit hook: enforce cargo fmt and clippy before each commit.
+set -e
+
+echo "pre-commit: checking formatting..."
+cargo fmt --all -- --check || {
+    echo "error: cargo fmt found diffs. Run 'cargo fmt --all' and re-commit."
+    exit 1
+}
+
+echo "pre-commit: running clippy..."
+cargo clippy --workspace -- -D warnings || {
+    echo "error: clippy found warnings. Fix them and re-commit."
+    exit 1
+}
