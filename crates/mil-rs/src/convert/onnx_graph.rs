@@ -118,9 +118,23 @@ fn convert_graph(graph: &GraphProto, _opset: i64, warnings: &mut Vec<String>) ->
     }
 
     // 4. Convert initializers to const operations.
+    //    Detect pre-quantized weight formats (GPTQ/AWQ/QLoRA) and preserve
+    //    their quantization rather than emitting plain `const` ops that would
+    //    later be re-quantized.
     let mut block = Block::new();
+    let prequant = detect_prequantized_weights(&initializer_names);
     for tensor in &graph.initializer {
-        match initializer_to_const(tensor) {
+        // Skip auxiliary tensors that are part of a pre-quantized group —
+        // they are folded into the primary op by `prequantized_to_op`.
+        if is_prequant_auxiliary(&tensor.name, &prequant) {
+            continue;
+        }
+        let result = if let Some(fmt) = prequant.get(tensor.name.as_str()) {
+            prequantized_to_op(tensor, *fmt, &graph.initializer)
+        } else {
+            initializer_to_const(tensor)
+        };
+        match result {
             Ok(mut op) => {
                 stamp_output_types(&mut op, &onnx_type_map);
                 block.add_op(op);
@@ -761,6 +775,158 @@ pub(crate) fn extract_tensor_raw_data(tensor: &TensorProto, dtype: ScalarType) -
 }
 
 // ---------------------------------------------------------------------------
+// Pre-quantized weight detection and import
+// ---------------------------------------------------------------------------
+
+/// Recognised pre-quantized formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreQuantFormat {
+    /// QLoRA: base weight + `<name>.quant_state.*` side tensors.
+    QLoRA,
+    /// GPTQ: `<name>.qweight` + `<name>.qzeros` + `<name>.scales` + optional `<name>.g_idx`.
+    Gptq,
+    /// AWQ: same structure as GPTQ with activation-aware scaling.
+    Awq,
+}
+
+/// GPTQ/AWQ auxiliary suffixes (relative to the base name).
+const GPTQ_AWQ_SUFFIXES: &[&str] = &[".qweight", ".qzeros", ".scales", ".g_idx"];
+
+/// QLoRA auxiliary suffixes.
+const QLORA_SUFFIXES: &[&str] = &[
+    ".quant_state.bitsandbytes__nf4",
+    ".quant_state.absmax",
+    ".quant_state.nested_absmax",
+    ".quant_state.nested_quant_map",
+];
+
+/// Scan initializer names and return a map from *primary* weight name to its
+/// detected [`PreQuantFormat`].
+///
+/// A primary name is the base tensor that downstream nodes reference (e.g.
+/// `model.layers.0.mlp.gate_proj.weight`). Auxiliary tensors (scales, qzeros, …)
+/// are not returned as keys.
+fn detect_prequantized_weights<'a>(names: &'a HashSet<&str>) -> HashMap<&'a str, PreQuantFormat> {
+    let mut result = HashMap::new();
+
+    for &name in names {
+        // --- QLoRA detection ---
+        if name.ends_with(".quant_state.bitsandbytes__nf4") {
+            let base = name.trim_end_matches(".quant_state.bitsandbytes__nf4");
+            if names.contains(base) {
+                result.insert(base, PreQuantFormat::QLoRA);
+            }
+            continue;
+        }
+
+        // --- GPTQ detection ---
+        if name.ends_with(".qweight") {
+            let base = name.trim_end_matches(".qweight");
+            let scales_name = format!("{base}.scales");
+            let qzeros_name = format!("{base}.qzeros");
+            let has_scales = names.contains(scales_name.as_str());
+            let has_qzeros = names.contains(qzeros_name.as_str());
+            if has_scales && has_qzeros {
+                // Distinguish AWQ from GPTQ by the presence of a naming hint;
+                // in practice AWQ models use `awq` in the base name or are
+                // identical in structure. We check for an `awq` substring as
+                // a heuristic; otherwise fall back to GPTQ.
+                let fmt = if base.contains("awq") {
+                    PreQuantFormat::Awq
+                } else {
+                    PreQuantFormat::Gptq
+                };
+                // Use the base name as key so that lookups in the conversion
+                // loop match the weight tensor name (not the `.qweight` tensor).
+                // However the *primary* tensor in GPTQ graphs is the qweight
+                // itself, so we key on that.
+                result.insert(name.as_ref(), fmt);
+            }
+        }
+    }
+
+    result
+}
+
+/// Returns `true` if `name` is an auxiliary tensor belonging to a detected
+/// pre-quantized group and should be skipped during normal const emission.
+fn is_prequant_auxiliary(name: &str, prequant: &HashMap<&str, PreQuantFormat>) -> bool {
+    for (&primary, &fmt) in prequant {
+        let suffixes: &[&str] = match fmt {
+            PreQuantFormat::QLoRA => QLORA_SUFFIXES,
+            PreQuantFormat::Gptq | PreQuantFormat::Awq => GPTQ_AWQ_SUFFIXES,
+        };
+        let base = match fmt {
+            PreQuantFormat::QLoRA => primary,
+            // For GPTQ/AWQ the primary key is `<base>.qweight`.
+            PreQuantFormat::Gptq | PreQuantFormat::Awq => primary.trim_end_matches(".qweight"),
+        };
+        for &suffix in suffixes {
+            let aux_name = format!("{base}{suffix}");
+            if name == aux_name && name != primary {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Convert a pre-quantized initializer into a `const` operation that
+/// preserves the original quantization metadata as attributes.
+///
+/// The emitted op has `op_type = "const"` with an extra `quantization_format`
+/// attribute so that downstream passes know not to re-quantize it.
+fn prequantized_to_op(
+    tensor: &TensorProto,
+    fmt: PreQuantFormat,
+    all_initializers: &[TensorProto],
+) -> Result<Operation> {
+    let mut op = initializer_to_const(tensor)?;
+
+    let fmt_str = match fmt {
+        PreQuantFormat::QLoRA => "qlora",
+        PreQuantFormat::Gptq => "gptq",
+        PreQuantFormat::Awq => "awq",
+    };
+    op.attributes.insert(
+        "quantization_format".to_string(),
+        Value::String(fmt_str.to_string()),
+    );
+
+    let base = match fmt {
+        PreQuantFormat::QLoRA => tensor.name.as_str(),
+        PreQuantFormat::Gptq | PreQuantFormat::Awq => tensor.name.trim_end_matches(".qweight"),
+    };
+
+    let suffixes: &[&str] = match fmt {
+        PreQuantFormat::QLoRA => QLORA_SUFFIXES,
+        PreQuantFormat::Gptq | PreQuantFormat::Awq => GPTQ_AWQ_SUFFIXES,
+    };
+
+    // Attach auxiliary tensors as attributes keyed by their suffix.
+    for &suffix in suffixes {
+        let aux_name = format!("{base}{suffix}");
+        if let Some(aux_tensor) = all_initializers.iter().find(|t| t.name == aux_name) {
+            if let Ok(aux_dtype) = onnx_dtype_to_scalar(aux_tensor.data_type) {
+                let shape: Vec<usize> = aux_tensor.dims.iter().map(|&d| d as usize).collect();
+                let raw = extract_tensor_raw_data(aux_tensor, aux_dtype);
+                let attr_key = suffix.trim_start_matches('.').replace('.', "_");
+                op.attributes.insert(
+                    attr_key,
+                    Value::Tensor {
+                        data: raw,
+                        shape,
+                        dtype: aux_dtype,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(op)
+}
+
+// ---------------------------------------------------------------------------
 // Type conversion helpers
 // ---------------------------------------------------------------------------
 
@@ -1147,5 +1313,80 @@ mod tests {
         assert_eq!(onnx_dtype_to_scalar(9).unwrap(), ScalarType::Bool);
         assert_eq!(onnx_dtype_to_scalar(10).unwrap(), ScalarType::Float16);
         assert!(onnx_dtype_to_scalar(99).is_err());
+    }
+
+    // ---- Pre-quantized weight detection tests -----------------------------
+
+    #[test]
+    fn detect_gptq_format() {
+        let names: HashSet<&str> = [
+            "layer.0.weight.qweight",
+            "layer.0.weight.qzeros",
+            "layer.0.weight.scales",
+            "layer.0.weight.g_idx",
+        ]
+        .into_iter()
+        .collect();
+        let detected = detect_prequantized_weights(&names);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(
+            *detected.get("layer.0.weight.qweight").unwrap(),
+            PreQuantFormat::Gptq
+        );
+    }
+
+    #[test]
+    fn detect_awq_format() {
+        let names: HashSet<&str> = [
+            "layer.awq.0.weight.qweight",
+            "layer.awq.0.weight.qzeros",
+            "layer.awq.0.weight.scales",
+        ]
+        .into_iter()
+        .collect();
+        let detected = detect_prequantized_weights(&names);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(
+            *detected.get("layer.awq.0.weight.qweight").unwrap(),
+            PreQuantFormat::Awq
+        );
+    }
+
+    #[test]
+    fn detect_qlora_format() {
+        let names: HashSet<&str> = [
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4",
+            "model.layers.0.mlp.gate_proj.weight.quant_state.absmax",
+        ]
+        .into_iter()
+        .collect();
+        let detected = detect_prequantized_weights(&names);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(
+            *detected.get("model.layers.0.mlp.gate_proj.weight").unwrap(),
+            PreQuantFormat::QLoRA
+        );
+    }
+
+    #[test]
+    fn detect_no_prequantized_formats() {
+        let names: HashSet<&str> = ["weight", "bias", "running_mean"].into_iter().collect();
+        let detected = detect_prequantized_weights(&names);
+        assert!(detected.is_empty());
+    }
+
+    #[test]
+    fn is_prequant_auxiliary_identifies_gptq_parts() {
+        let mut prequant = HashMap::new();
+        prequant.insert("layer.0.weight.qweight", PreQuantFormat::Gptq);
+
+        assert!(is_prequant_auxiliary("layer.0.weight.scales", &prequant));
+        assert!(is_prequant_auxiliary("layer.0.weight.qzeros", &prequant));
+        assert!(is_prequant_auxiliary("layer.0.weight.g_idx", &prequant));
+        // The primary tensor itself is NOT auxiliary.
+        assert!(!is_prequant_auxiliary("layer.0.weight.qweight", &prequant));
+        // Unrelated tensors are not auxiliary.
+        assert!(!is_prequant_auxiliary("other_weight", &prequant));
     }
 }

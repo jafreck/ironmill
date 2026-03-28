@@ -28,7 +28,7 @@ pub use int8_quantize::{Granularity, Int8QuantizePass};
 pub use layout_optimize::LayoutOptimizationPass;
 pub use op_fusion::{ConvBatchNormFusionPass, ConvReluFusionPass, LinearReluFusionPass};
 pub use op_substitute::OpSubstitutionPass;
-pub use palettize::PalettizePass;
+pub use palettize::{GroupedPalettizePass, PalettizePass};
 pub use shape_materialize::ShapeMaterializePass;
 
 use super::program::Block;
