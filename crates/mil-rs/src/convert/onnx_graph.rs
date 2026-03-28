@@ -223,10 +223,6 @@ fn initializer_to_const(tensor: &TensorProto) -> Result<Operation> {
             dtype,
         },
     );
-    op.attributes.insert(
-        "shape".into(),
-        Value::List(shape.iter().map(|&d| Value::Int(d as i64)).collect()),
-    );
     Ok(op)
 }
 

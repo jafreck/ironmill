@@ -6,7 +6,7 @@
 //! the ONNX-standard NCHW format and then cancels redundant transpose pairs in
 //! linear chains.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::Result;
 use crate::ir::operation::Operation;
@@ -64,7 +64,10 @@ impl Pass for LayoutOptimizationPass {
                 continue;
             }
 
-            insert_transposes(block);
+            // Seed layout map: function inputs are always NCHW.
+            let func_input_names: Vec<String> =
+                function.inputs.iter().map(|(n, _)| n.clone()).collect();
+            insert_transposes(block, &func_input_names);
             cancel_inverse_transposes(block);
         }
         Ok(())
@@ -79,8 +82,14 @@ impl Pass for LayoutOptimizationPass {
 /// spatial ops that receive NCHW inputs, let non-spatial (element-wise) ops
 /// inherit their input layout transparently, and insert NHWC→NCHW transposes
 /// only at block output boundaries where the value is still in NHWC.
-fn insert_transposes(block: &mut Block) {
+fn insert_transposes(block: &mut Block, func_input_names: &[String]) {
     let mut layout_map: HashMap<String, Layout> = HashMap::new();
+    // Function inputs are NCHW by convention.
+    for name in func_input_names {
+        layout_map.insert(name.clone(), Layout::NCHW);
+    }
+    // Track names produced by const ops (broadcast-compatible, skip transposes).
+    let mut const_outputs: HashSet<String> = HashSet::new();
     let mut counter: usize = 0;
 
     // Rebuild the operations list so we can splice transposes in.
@@ -88,6 +97,17 @@ fn insert_transposes(block: &mut Block) {
     let mut new_ops: Vec<Operation> = Vec::with_capacity(original_ops.len() * 2);
 
     for op in original_ops {
+        // Const ops produce layout-neutral values (rank may be 1, 2, etc.).
+        // Register them as NCHW but don't insert transposes for them.
+        if op.op_type == "const" {
+            for out in &op.outputs {
+                layout_map.insert(out.clone(), Layout::NCHW);
+                const_outputs.insert(out.clone());
+            }
+            new_ops.push(op);
+            continue;
+        }
+
         if is_spatial_op(&op.op_type) {
             // --- spatial op: wants NHWC input ---
             let mut new_op = op;
@@ -154,10 +174,19 @@ fn insert_transposes(block: &mut Block) {
 
                 if !nhwc_inputs.is_empty() && !nchw_inputs.is_empty() {
                     // Mixed layouts — normalize minority inputs to match majority.
+                    // Skip const outputs (they broadcast and can't be transposed).
                     let (targets, target_layout, perm) = if nhwc_inputs.len() >= nchw_inputs.len() {
-                        (nchw_inputs, Layout::NHWC, &NCHW_TO_NHWC)
+                        let filtered: Vec<String> = nchw_inputs
+                            .into_iter()
+                            .filter(|n| !const_outputs.contains(n))
+                            .collect();
+                        (filtered, Layout::NHWC, &NCHW_TO_NHWC)
                     } else {
-                        (nhwc_inputs, Layout::NCHW, &NHWC_TO_NCHW)
+                        let filtered: Vec<String> = nhwc_inputs
+                            .into_iter()
+                            .filter(|n| !const_outputs.contains(n))
+                            .collect();
+                        (filtered, Layout::NCHW, &NHWC_TO_NCHW)
                     };
 
                     for input_name in &targets {

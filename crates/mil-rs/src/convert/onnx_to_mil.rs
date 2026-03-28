@@ -402,6 +402,15 @@ fn convert_pool(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
     };
     op = op.with_attr("pad_type", Value::String(pad_type.to_string()));
 
+    // avg_pool requires exclude_padding_from_average.
+    if mil_op == "avg_pool" {
+        let count_include_pad = get_int_attr(node, "count_include_pad").unwrap_or(0);
+        op = op.with_attr(
+            "exclude_padding_from_average",
+            Value::Bool(count_include_pad == 0),
+        );
+    }
+
     Ok(vec![with_outputs(op, node)])
 }
 
@@ -430,6 +439,7 @@ fn convert_concat(node: &NodeProto) -> Result<Vec<Operation>> {
     if let Some(axis) = get_int_attr(node, "axis") {
         op = op.with_attr("axis", Value::Int(axis));
     }
+    op = op.with_attr("interleave", Value::Bool(false));
 
     Ok(vec![with_outputs(op, node)])
 }

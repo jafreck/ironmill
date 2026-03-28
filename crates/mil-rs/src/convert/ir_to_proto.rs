@@ -6,7 +6,9 @@ use crate::error::Result;
 use crate::ir::ScalarType;
 use crate::ir::{Block, Function, Operation, Program, TensorType, Value};
 use crate::proto::mil_spec;
-use crate::proto::specification::{Model, model};
+use crate::proto::specification::{
+    self, ArrayFeatureType, FeatureDescription, FeatureType, Model, ModelDescription, model,
+};
 
 /// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
 ///
@@ -16,9 +18,53 @@ use crate::proto::specification::{Model, model};
 pub fn program_to_model(program: &Program, spec_version: i32) -> Result<Model> {
     let proto_program = convert_program(program)?;
 
+    // Build model description from the main function's inputs/outputs.
+    let description =
+        if let Some(func) = program.main().or_else(|| program.functions.values().next()) {
+            let input: Vec<FeatureDescription> = func
+                .inputs
+                .iter()
+                .map(|(name, tt)| FeatureDescription {
+                    name: name.clone(),
+                    short_description: String::new(),
+                    r#type: Some(tensor_type_to_feature_type(tt)),
+                })
+                .collect();
+
+            let output: Vec<FeatureDescription> = func
+                .body
+                .outputs
+                .iter()
+                .map(|name| FeatureDescription {
+                    name: name.clone(),
+                    short_description: String::new(),
+                    r#type: Some(FeatureType {
+                        is_optional: false,
+                        r#type: Some(specification::feature_type::Type::MultiArrayType(
+                            ArrayFeatureType {
+                                shape: vec![],
+                                data_type: specification::array_feature_type::ArrayDataType::Float32
+                                    as i32,
+                                shape_flexibility: None,
+                                default_optional_value: None,
+                            },
+                        )),
+                    }),
+                })
+                .collect();
+
+            Some(ModelDescription {
+                input,
+                output,
+                ..Default::default()
+            })
+        } else {
+            Some(ModelDescription::default())
+        };
+
     Ok(Model {
         specification_version: spec_version,
-        description: None,
+        description,
         is_updatable: false,
         r#type: Some(model::Type::MlProgram(proto_program)),
     })
@@ -111,7 +157,55 @@ fn convert_operation(
 
     // Determine output type for this operation: prefer stored types, fall back
     // to inference from the type_map.
-    let inferred_type = infer_output_type(op, type_map);
+    // Shape-changing ops (conv, pool) produce outputs with different dimensions
+    // than their inputs, so inferred types (based on input type) would be wrong.
+    // For these ops, use just the element type with unknown dimensions.
+    let shape_changes = matches!(
+        op.op_type.as_str(),
+        "conv"
+            | "conv_transpose"
+            | "max_pool"
+            | "avg_pool"
+            | "reshape"
+            | "matmul"
+            | "linear"
+            | "concat"
+            | "split"
+            | "gather"
+            | "slice_by_index"
+            | "pad"
+            | "reduce_mean"
+            | "upsample_bilinear"
+            | "flatten"
+    );
+    let inferred_type = if shape_changes {
+        // Use the input's element type and rank but with unknown dimensions.
+        infer_output_type(op, type_map).map(|vt| {
+            if let Some(mil_spec::value_type::Type::TensorType(tt)) = &vt.r#type {
+                let unknown_dims: Vec<mil_spec::Dimension> = (0..tt.rank)
+                    .map(|_| mil_spec::Dimension {
+                        dimension: Some(mil_spec::dimension::Dimension::Unknown(
+                            mil_spec::dimension::UnknownDimension { variadic: false },
+                        )),
+                    })
+                    .collect();
+                mil_spec::ValueType {
+                    r#type: Some(mil_spec::value_type::Type::TensorType(
+                        mil_spec::TensorType {
+                            data_type: tt.data_type,
+                            rank: tt.rank,
+                            dimensions: unknown_dims,
+                            attributes: HashMap::new(),
+                        },
+                    )),
+                }
+            } else {
+                vt
+            }
+        })
+    } else {
+        infer_output_type(op, type_map)
+    };
 
     let outputs: Vec<mil_spec::NamedValueType> = op
         .outputs
@@ -657,6 +751,34 @@ fn convert_scalar_type(st: ScalarType) -> mil_spec::DataType {
         ScalarType::UInt32 => mil_spec::DataType::Uint32,
         ScalarType::UInt64 => mil_spec::DataType::Uint64,
         ScalarType::Bool => mil_spec::DataType::Bool,
+    }
+}
+
+/// Map IR `ScalarType` → feature array data type.
+fn scalar_to_array_data_type(st: ScalarType) -> specification::array_feature_type::ArrayDataType {
+    use specification::array_feature_type::ArrayDataType;
+    match st {
+        ScalarType::Float32 => ArrayDataType::Float32,
+        ScalarType::Float64 => ArrayDataType::Double,
+        ScalarType::Int32 => ArrayDataType::Int32,
+        ScalarType::Float16 => ArrayDataType::Float16,
+        _ => ArrayDataType::Float32,
+    }
+}
+
+/// Convert an IR `TensorType` to a CoreML `FeatureType` (MultiArray).
+fn tensor_type_to_feature_type(tt: &TensorType) -> FeatureType {
+    let shape: Vec<i64> = tt.shape.iter().map(|d| d.unwrap_or(1) as i64).collect();
+    FeatureType {
+        is_optional: false,
+        r#type: Some(specification::feature_type::Type::MultiArrayType(
+            ArrayFeatureType {
+                shape,
+                data_type: scalar_to_array_data_type(tt.scalar_type) as i32,
+                shape_flexibility: None,
+                default_optional_value: None,
+            },
+        )),
     }
 }
 
