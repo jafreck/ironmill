@@ -100,14 +100,25 @@ impl Pass for PalettizePass {
                 // Pack indices into n-bit representation.
                 let packed_indices = pack_indices(&assignments, self.n_bits);
 
+                // CoreML expects the indices as a 1D (rank 1) tensor of
+                // packed bytes; the output shape comes from the `shape` attr.
                 let indices_value = Value::Tensor {
-                    data: packed_indices,
-                    shape: vec![floats.len()],
+                    data: packed_indices.clone(),
+                    shape: vec![packed_indices.len()],
                     dtype: ScalarType::UInt8,
                 };
 
-                let shape_value =
-                    Value::List(shape.iter().map(|&d| Value::Int(d as i64)).collect());
+                // Shape must be a UInt32 tensor per the CoreML spec for
+                // constexpr_lut_to_dense.
+                let shape_bytes: Vec<u8> = shape
+                    .iter()
+                    .flat_map(|&d| (d as u32).to_le_bytes())
+                    .collect();
+                let shape_value = Value::Tensor {
+                    data: shape_bytes,
+                    shape: vec![shape.len()],
+                    dtype: ScalarType::UInt32,
+                };
 
                 // Transform the op.
                 op.op_type = "constexpr_lut_to_dense".to_string();
@@ -224,22 +235,24 @@ mod tests {
             other => panic!("expected lut tensor, got {other:?}"),
         }
 
-        // Indices: 64 values packed at 4 bits = 32 bytes.
+        // Indices: 64 values packed at 4 bits = 32 packed bytes.
         match op.attributes.get("indices") {
             Some(Value::Tensor { data, shape, .. }) => {
-                assert_eq!(*shape, vec![64]);
+                assert_eq!(*shape, vec![32]); // packed byte count
                 assert_eq!(data.len(), 32); // 64 × 4 bits / 8
             }
             other => panic!("expected indices tensor, got {other:?}"),
         }
 
-        // Shape attribute preserved.
+        // Shape attribute preserved as UInt32 tensor.
         match op.attributes.get("shape") {
-            Some(Value::List(dims)) => {
-                assert_eq!(dims.len(), 1);
-                assert_eq!(dims[0], Value::Int(64));
+            Some(Value::Tensor { data, shape, dtype }) => {
+                assert_eq!(*dtype, ScalarType::UInt32);
+                assert_eq!(*shape, vec![1]);
+                let dim = u32::from_le_bytes(data[..4].try_into().unwrap());
+                assert_eq!(dim, 64);
             }
-            other => panic!("expected shape list, got {other:?}"),
+            other => panic!("expected shape tensor, got {other:?}"),
         }
     }
 
@@ -272,10 +285,10 @@ mod tests {
             other => panic!("expected lut with 4 centroids, got {other:?}"),
         }
 
-        // 32 values × 2 bits = 8 bytes.
+        // 32 values × 2 bits = 8 packed bytes.
         match op.attributes.get("indices") {
             Some(Value::Tensor { data, shape, .. }) => {
-                assert_eq!(*shape, vec![32]);
+                assert_eq!(*shape, vec![8]); // packed byte count
                 assert_eq!(data.len(), 8);
             }
             other => panic!("expected indices tensor, got {other:?}"),

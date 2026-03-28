@@ -19,26 +19,42 @@ pub fn program_to_model(program: &Program, spec_version: i32) -> Result<Model> {
     let proto_program = convert_program(program)?;
 
     // Build model description from the main function's inputs/outputs.
-    let description =
-        if let Some(func) = program.main().or_else(|| program.functions.values().next()) {
-            let input: Vec<FeatureDescription> = func
-                .inputs
-                .iter()
-                .map(|(name, tt)| FeatureDescription {
-                    name: name.clone(),
-                    short_description: String::new(),
-                    r#type: Some(tensor_type_to_feature_type(tt)),
-                })
-                .collect();
+    let description = if let Some(func) =
+        program.main().or_else(|| program.functions.values().next())
+    {
+        let input: Vec<FeatureDescription> = func
+            .inputs
+            .iter()
+            .map(|(name, tt)| FeatureDescription {
+                name: name.clone(),
+                short_description: String::new(),
+                r#type: Some(tensor_type_to_feature_type(tt)),
+            })
+            .collect();
 
-            let output: Vec<FeatureDescription> = func
-                .body
-                .outputs
-                .iter()
-                .map(|name| FeatureDescription {
-                    name: name.clone(),
-                    short_description: String::new(),
-                    r#type: Some(FeatureType {
+        let output: Vec<FeatureDescription> = func
+            .body
+            .outputs
+            .iter()
+            .map(|name| {
+                let feature_type = func
+                    .body
+                    .operations
+                    .iter()
+                    .rev()
+                    .find_map(|op| {
+                        op.outputs.iter().enumerate().find_map(|(i, out_name)| {
+                            if out_name == name {
+                                op.output_types
+                                    .get(i)
+                                    .and_then(|ot| ot.as_ref())
+                                    .map(tensor_type_to_feature_type)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or_else(|| FeatureType {
                         is_optional: false,
                         r#type: Some(specification::feature_type::Type::MultiArrayType(
                             ArrayFeatureType {
@@ -49,18 +65,23 @@ pub fn program_to_model(program: &Program, spec_version: i32) -> Result<Model> {
                                 default_optional_value: None,
                             },
                         )),
-                    }),
-                })
-                .collect();
-
-            Some(ModelDescription {
-                input,
-                output,
-                ..Default::default()
+                    });
+                FeatureDescription {
+                    name: name.clone(),
+                    short_description: String::new(),
+                    r#type: Some(feature_type),
+                }
             })
-        } else {
-            Some(ModelDescription::default())
-        };
+            .collect();
+
+        Some(ModelDescription {
+            input,
+            output,
+            ..Default::default()
+        })
+    } else {
+        Some(ModelDescription::default())
+    };
 
     Ok(Model {
         specification_version: spec_version,
@@ -239,8 +260,9 @@ fn convert_operation(
 
     let mut attributes = HashMap::new();
     for (attr_name, attr_val) in &op.attributes {
-        if op.op_type == "const" {
-            // For const ops, all attributes stay as proto attributes.
+        if op.op_type == "const" || op.op_type.starts_with("constexpr_") {
+            // For const and constexpr ops, all attributes stay as proto
+            // attributes (lut, indices, quantized_data, etc.).
             attributes.insert(attr_name.clone(), convert_value_to_proto(attr_val)?);
             continue;
         }
@@ -273,6 +295,90 @@ fn infer_output_type(
     if op.op_type == "const" {
         let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
         return val.and_then(value_type_for);
+    }
+
+    // For constexpr_lut_to_dense the compressed indices are smaller than the
+    // original tensor, so we derive the output type from the stored `shape`
+    // (original dimensions) and the `lut` dtype (element type).
+    if op.op_type == "constexpr_lut_to_dense" {
+        if let Some(Value::Tensor {
+            dtype: lut_dtype, ..
+        }) = op.attributes.get("lut")
+        {
+            let data_type = convert_scalar_type(*lut_dtype) as i32;
+
+            // shape is stored as a UInt32 tensor with the original dimensions.
+            let dimensions: Vec<mil_spec::Dimension> = if let Some(Value::Tensor {
+                data,
+                dtype: ScalarType::UInt32,
+                ..
+            }) = op.attributes.get("shape")
+            {
+                data.chunks_exact(4)
+                    .map(|c| {
+                        let d = u32::from_le_bytes(c.try_into().unwrap());
+                        mil_spec::Dimension {
+                            dimension: Some(mil_spec::dimension::Dimension::Constant(
+                                mil_spec::dimension::ConstantDimension { size: d as u64 },
+                            )),
+                        }
+                    })
+                    .collect()
+            } else if let Some(Value::List(dims)) = op.attributes.get("shape") {
+                // Fallback for List representation.
+                dims.iter()
+                    .filter_map(|d| {
+                        if let Value::Int(i) = d {
+                            Some(mil_spec::Dimension {
+                                dimension: Some(mil_spec::dimension::Dimension::Constant(
+                                    mil_spec::dimension::ConstantDimension { size: *i as u64 },
+                                )),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            return Some(mil_spec::ValueType {
+                r#type: Some(mil_spec::value_type::Type::TensorType(
+                    mil_spec::TensorType {
+                        data_type,
+                        rank: dimensions.len() as i64,
+                        dimensions,
+                        attributes: HashMap::new(),
+                    },
+                )),
+            });
+        }
+    }
+
+    // For constexpr_affine_dequantize, derive from quantized_data shape.
+    if op.op_type == "constexpr_affine_dequantize" {
+        if let Some(Value::Tensor { shape, dtype, .. }) = op.attributes.get("quantized_data") {
+            let data_type = convert_scalar_type(*dtype) as i32;
+            let dimensions: Vec<mil_spec::Dimension> = shape
+                .iter()
+                .map(|&d| mil_spec::Dimension {
+                    dimension: Some(mil_spec::dimension::Dimension::Constant(
+                        mil_spec::dimension::ConstantDimension { size: d as u64 },
+                    )),
+                })
+                .collect();
+            return Some(mil_spec::ValueType {
+                r#type: Some(mil_spec::value_type::Type::TensorType(
+                    mil_spec::TensorType {
+                        data_type,
+                        rank: dimensions.len() as i64,
+                        dimensions,
+                        attributes: HashMap::new(),
+                    },
+                )),
+            });
+        }
     }
 
     // Try to resolve a type from a reference Value.
@@ -515,7 +621,7 @@ fn convert_tensor_data(value: &Value) -> mil_spec::TensorValue {
                 values: doubles,
             })
         }
-        ScalarType::Int32 | ScalarType::UInt32 => {
+        ScalarType::Int32 => {
             let ints: Vec<i32> = data
                 .chunks_exact(4)
                 .map(|c| i32::from_le_bytes(c.try_into().unwrap()))

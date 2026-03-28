@@ -8,7 +8,7 @@ use half::f16;
 use crate::error::Result;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
-use crate::ir::tensor::ScalarType;
+use crate::ir::tensor::{ScalarType, TensorType};
 use crate::ir::types::Value;
 
 /// Convert FP32 weights and activations to FP16.
@@ -40,6 +40,34 @@ impl Pass for Fp16QuantizePass {
                 }
                 for value in op.attributes.values_mut() {
                     quantize_value(value);
+                }
+                // Update output type annotations to match the new dtype.
+                for tt in op.output_types.iter_mut().flatten() {
+                    if tt.scalar_type == ScalarType::Float32 {
+                        tt.scalar_type = ScalarType::Float16;
+                    }
+                }
+
+                // For const ops, ensure output_types is set even when it was
+                // initially None (e.g. ONNX Constant nodes without type info).
+                if op.op_type == "const" {
+                    let needs_type = op.output_types.first().is_none_or(|ot| ot.is_none());
+                    if needs_type {
+                        let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+                        if let Some(Value::Tensor {
+                            shape,
+                            dtype: ScalarType::Float16,
+                            ..
+                        }) = val
+                        {
+                            let tt = TensorType::new(ScalarType::Float16, shape.clone());
+                            if let Some(slot) = op.output_types.get_mut(0) {
+                                *slot = Some(tt);
+                            } else {
+                                op.output_types.push(Some(tt));
+                            }
+                        }
+                    }
                 }
             }
         }
