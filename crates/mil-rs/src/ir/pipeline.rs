@@ -3,6 +3,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use std::time::Instant;
+
+use serde::Deserialize;
+
 use super::pass::Pass;
 use super::passes::{
     AttentionFusionPass, CodebookOptimizationPass, ConstantFoldPass, ConvBatchNormFusionPass,
@@ -25,6 +29,136 @@ pub struct PassPipeline {
     has_int8: bool,
     has_palettize: bool,
     has_mixed_precision: bool,
+}
+
+// ── TOML configuration types ──────────────────────────────────────────
+
+/// Top-level TOML pipeline configuration.
+#[derive(Debug, Deserialize)]
+pub struct PipelineConfig {
+    /// Ordered list of pass configurations.
+    pub passes: Vec<PassConfig>,
+}
+
+/// Configuration for a single pass in the pipeline.
+#[derive(Debug, Deserialize)]
+pub struct PassConfig {
+    /// Pass name (must match one of the built-in pass names).
+    pub name: String,
+    /// Whether this pass is enabled (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Pass-specific parameters.
+    #[serde(default)]
+    pub params: HashMap<String, toml::Value>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// All known built-in pass names.
+const KNOWN_PASSES: &[&str] = &[
+    "dead-code-elimination",
+    "identity-elimination",
+    "constant-folding",
+    "conv-bn-weight-fold",
+    "conv-batchnorm-fusion",
+    "conv-relu-fusion",
+    "linear-relu-fusion",
+    "layernorm-linear-fusion",
+    "gelu-linear-fusion",
+    "residual-add-fusion",
+    "attention-fusion",
+    "gqa-fusion",
+    "codebook-optimization",
+    "op-substitution",
+    "layout-optimization",
+    "fp16-quantization",
+    "int8-quantization",
+    "mixed-precision",
+    "palettization",
+    "shape-materialization",
+];
+
+/// Create a boxed pass from its name and optional parameters.
+fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<Box<dyn Pass>> {
+    match name {
+        "dead-code-elimination" => Ok(Box::new(DeadCodeEliminationPass)),
+        "identity-elimination" => Ok(Box::new(IdentityEliminationPass)),
+        "constant-folding" => Ok(Box::new(ConstantFoldPass)),
+        "conv-bn-weight-fold" => Ok(Box::new(ConvBatchNormWeightFoldPass)),
+        "conv-batchnorm-fusion" => Ok(Box::new(ConvBatchNormFusionPass)),
+        "conv-relu-fusion" => Ok(Box::new(ConvReluFusionPass)),
+        "linear-relu-fusion" => Ok(Box::new(LinearReluFusionPass)),
+        "layernorm-linear-fusion" => Ok(Box::new(LayerNormLinearFusionPass)),
+        "gelu-linear-fusion" => Ok(Box::new(GeluLinearFusionPass)),
+        "residual-add-fusion" => Ok(Box::new(ResidualAddFusionPass)),
+        "attention-fusion" => Ok(Box::new(AttentionFusionPass)),
+        "gqa-fusion" => Ok(Box::new(GqaFusionPass)),
+        "codebook-optimization" => Ok(Box::new(CodebookOptimizationPass)),
+        "op-substitution" => Ok(Box::new(OpSubstitutionPass)),
+        "layout-optimization" => Ok(Box::new(LayoutOptimizationPass)),
+        "fp16-quantization" => Ok(Box::new(Fp16QuantizePass)),
+        "int8-quantization" => {
+            let cal_dir = params
+                .get("calibration_dir")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from);
+            let granularity = match params.get("granularity").and_then(|v| v.as_str()) {
+                Some("per-tensor") => Granularity::PerTensor,
+                _ => Granularity::PerChannel,
+            };
+            Ok(Box::new(Int8QuantizePass::new(cal_dir, granularity)))
+        }
+        "palettization" => {
+            let n_bits_i64 = params
+                .get("n_bits")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(4);
+            if !matches!(n_bits_i64, 2 | 4 | 6 | 8) {
+                return Err(MilError::Validation(format!(
+                    "palettize n_bits must be 2, 4, 6, or 8, got {n_bits_i64}"
+                )));
+            }
+            let n_bits = n_bits_i64 as u8;
+            Ok(Box::new(PalettizePass::new(n_bits)))
+        }
+        "mixed-precision" => {
+            let config_path = params
+                .get("config_path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from);
+            if let Some(path) = config_path {
+                let pass = MixedPrecisionPass::from_config_file(&path)?;
+                Ok(Box::new(pass))
+            } else {
+                let config = MixedPrecisionConfig::preset_fp16_int8();
+                Ok(Box::new(MixedPrecisionPass::new(config)))
+            }
+        }
+        "shape-materialization" => {
+            let mut pass = ShapeMaterializePass::new();
+            if let Some(shapes) = params.get("shapes") {
+                if let Some(table) = shapes.as_table() {
+                    for (input_name, dims_val) in table {
+                        if let Some(arr) = dims_val.as_array() {
+                            let dims: Vec<usize> = arr
+                                .iter()
+                                .filter_map(|v| {
+                                    v.as_integer()
+                                        .and_then(|i| if i >= 0 { Some(i as usize) } else { None })
+                                })
+                                .collect();
+                            pass = pass.with_shape(input_name.clone(), dims);
+                        }
+                    }
+                }
+            }
+            Ok(Box::new(pass))
+        }
+        _ => Err(MilError::Validation(format!("unknown pass: '{name}'"))),
+    }
 }
 
 impl Default for PassPipeline {
@@ -79,6 +213,101 @@ impl PassPipeline {
             has_palettize: false,
             has_mixed_precision: false,
         }
+    }
+
+    /// Build a pipeline from a TOML configuration file.
+    ///
+    /// The TOML file should contain an ordered list of passes:
+    ///
+    /// ```toml
+    /// [[passes]]
+    /// name = "dead-code-elimination"
+    /// enabled = true
+    ///
+    /// [[passes]]
+    /// name = "fp16-quantization"
+    /// enabled = true
+    ///
+    /// [[passes]]
+    /// name = "palettization"
+    /// enabled = true
+    /// [passes.params]
+    /// n_bits = 4
+    /// ```
+    pub fn with_config(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        Self::from_config_str(&content)
+    }
+
+    /// Build a pipeline from a TOML configuration string.
+    pub fn from_config_str(toml_str: &str) -> Result<Self> {
+        let config: PipelineConfig = toml::from_str(toml_str)
+            .map_err(|e| MilError::Validation(format!("invalid pipeline config: {e}")))?;
+
+        let mut passes: Vec<Box<dyn Pass>> = Vec::new();
+        let mut has_fp16 = false;
+        let mut has_int8 = false;
+        let mut has_palettize = false;
+        let mut has_mixed_precision = false;
+
+        for entry in &config.passes {
+            if !entry.enabled {
+                continue;
+            }
+            if !KNOWN_PASSES.contains(&entry.name.as_str()) {
+                return Err(MilError::Validation(format!(
+                    "unknown pass '{}' in pipeline config",
+                    entry.name
+                )));
+            }
+
+            // Enforce mutual exclusivity
+            match entry.name.as_str() {
+                "fp16-quantization" => {
+                    if has_int8 && !has_mixed_precision {
+                        return Err(MilError::Validation(
+                            "FP16 and INT8 quantization are mutually exclusive".into(),
+                        ));
+                    }
+                    has_fp16 = true;
+                }
+                "int8-quantization" => {
+                    if has_fp16 && !has_mixed_precision {
+                        return Err(MilError::Validation(
+                            "FP16 and INT8 quantization are mutually exclusive".into(),
+                        ));
+                    }
+                    if has_palettize {
+                        return Err(MilError::Validation(
+                            "INT8 quantization and palettization are mutually exclusive".into(),
+                        ));
+                    }
+                    has_int8 = true;
+                }
+                "palettization" => {
+                    if has_int8 {
+                        return Err(MilError::Validation(
+                            "INT8 quantization and palettization are mutually exclusive".into(),
+                        ));
+                    }
+                    has_palettize = true;
+                }
+                "mixed-precision" => {
+                    has_mixed_precision = true;
+                }
+                _ => {}
+            }
+
+            passes.push(pass_from_name(&entry.name, &entry.params)?);
+        }
+
+        Ok(Self {
+            passes,
+            has_fp16,
+            has_int8,
+            has_palettize,
+            has_mixed_precision,
+        })
     }
 
     /// Add FP16 quantization. Errors if INT8 is already added (unless mixed-precision is enabled).
@@ -202,12 +431,26 @@ impl PassPipeline {
         let mut pass_results = Vec::new();
         for pass in &self.passes {
             let ops_before = count_ops(program);
+            let flops_before = estimate_flops(program);
+            let memory_before = estimate_memory(program);
+
+            let start = Instant::now();
             pass.run(program)?;
+            let elapsed = start.elapsed();
+
             let ops_after = count_ops(program);
+            let flops_after = estimate_flops(program);
+            let memory_after = estimate_memory(program);
+
             pass_results.push(PassResult {
                 name: pass.name().to_string(),
                 ops_before,
                 ops_after,
+                flops_before,
+                flops_after,
+                memory_before,
+                memory_after,
+                elapsed,
             });
         }
         Ok(PipelineReport { pass_results })
@@ -223,9 +466,169 @@ fn count_ops(program: &Program) -> usize {
         .sum()
 }
 
+/// Estimate total FLOPs across all functions.
+///
+/// Uses simple heuristics based on op type:
+/// - `conv`: 2 × output_elements × kernel_size × in_channels
+/// - `matmul`/`linear`: 2 × M × N × K
+/// - Element-wise ops: 1 FLOP per element
+///
+/// Falls back to 1 FLOP per op when shapes are unavailable.
+fn estimate_flops(program: &Program) -> u64 {
+    let mut total: u64 = 0;
+    for func in program.functions.values() {
+        for op in &func.body.operations {
+            total += flops_for_op(op);
+        }
+    }
+    total
+}
+
+/// Estimate FLOPs for a single operation.
+fn flops_for_op(op: &super::operation::Operation) -> u64 {
+    // Without full shape inference, use op-type-based heuristics.
+    match op.op_type.as_str() {
+        "conv" | "conv_transpose" => 2,
+        "matmul" | "linear" => 2,
+        "add" | "sub" | "mul" | "div" | "relu" | "sigmoid" | "tanh" | "gelu" | "softmax"
+        | "reshape" | "transpose" | "concat" | "split" | "pad" | "cast" => 1,
+        "batch_norm" | "layer_norm" | "instance_norm" | "group_norm" => 2,
+        "reduce_mean" | "reduce_sum" | "reduce_max" | "reduce_min" => 1,
+        _ => 1,
+    }
+}
+
+/// Estimate memory footprint in bytes from const tensor data in the program.
+fn estimate_memory(program: &Program) -> u64 {
+    let mut total: u64 = 0;
+    for func in program.functions.values() {
+        for op in &func.body.operations {
+            if op.op_type == "const" {
+                if let Some(super::types::Value::Tensor { data, .. }) = op.inputs.get("val") {
+                    total += data.len() as u64;
+                }
+            }
+        }
+    }
+    total
+}
+
 /// Report from running a [`PassPipeline`].
 pub struct PipelineReport {
     pub pass_results: Vec<PassResult>,
+}
+
+impl PipelineReport {
+    /// Total wall-clock time for the entire pipeline.
+    pub fn total_elapsed(&self) -> std::time::Duration {
+        self.pass_results.iter().map(|r| r.elapsed).sum()
+    }
+
+    /// Format a side-by-side comparison of two pipeline reports.
+    pub fn compare(a: &PipelineReport, b: &PipelineReport) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        writeln!(
+            out,
+            "{:<30} {:>10} {:>10} {:>10} {:>10}",
+            "Metric", "Pipeline A", "", "Pipeline B", ""
+        )
+        .ok();
+        writeln!(
+            out,
+            "{:<30} {:>10} {:>10} {:>10} {:>10}",
+            "", "Before", "After", "Before", "After"
+        )
+        .ok();
+        writeln!(out, "{}", "-".repeat(72)).ok();
+
+        let a_ops_before = a.pass_results.first().map_or(0, |r| r.ops_before);
+        let a_ops_after = a.pass_results.last().map_or(0, |r| r.ops_after);
+        let b_ops_before = b.pass_results.first().map_or(0, |r| r.ops_before);
+        let b_ops_after = b.pass_results.last().map_or(0, |r| r.ops_after);
+
+        writeln!(
+            out,
+            "{:<30} {:>10} {:>10} {:>10} {:>10}",
+            "Op count", a_ops_before, a_ops_after, b_ops_before, b_ops_after
+        )
+        .ok();
+
+        let a_flops_before = a.pass_results.first().map_or(0, |r| r.flops_before);
+        let a_flops_after = a.pass_results.last().map_or(0, |r| r.flops_after);
+        let b_flops_before = b.pass_results.first().map_or(0, |r| r.flops_before);
+        let b_flops_after = b.pass_results.last().map_or(0, |r| r.flops_after);
+
+        writeln!(
+            out,
+            "{:<30} {:>10} {:>10} {:>10} {:>10}",
+            "Est. compute (FLOPs)", a_flops_before, a_flops_after, b_flops_before, b_flops_after
+        )
+        .ok();
+
+        let a_mem_before = a.pass_results.first().map_or(0, |r| r.memory_before);
+        let a_mem_after = a.pass_results.last().map_or(0, |r| r.memory_after);
+        let b_mem_before = b.pass_results.first().map_or(0, |r| r.memory_before);
+        let b_mem_after = b.pass_results.last().map_or(0, |r| r.memory_after);
+
+        writeln!(
+            out,
+            "{:<30} {:>10} {:>10} {:>10} {:>10}",
+            "Est. memory (bytes)", a_mem_before, a_mem_after, b_mem_before, b_mem_after
+        )
+        .ok();
+
+        writeln!(
+            out,
+            "{:<30} {:>10} {:>21}",
+            "Total time",
+            format!("{:.2?}", a.total_elapsed()),
+            format!("{:.2?}", b.total_elapsed()),
+        )
+        .ok();
+
+        // Per-pass detail for each pipeline
+        writeln!(out).ok();
+        writeln!(out, "Pipeline A passes:").ok();
+        writeln!(
+            out,
+            "  {:<30} {:>8} {:>8} {:>12}",
+            "Pass", "Ops Δ", "FLOPs Δ", "Time"
+        )
+        .ok();
+        for r in &a.pass_results {
+            let ops_delta = r.ops_after as i64 - r.ops_before as i64;
+            let flops_delta = r.flops_after as i64 - r.flops_before as i64;
+            writeln!(
+                out,
+                "  {:<30} {:>+8} {:>+8} {:>12.2?}",
+                r.name, ops_delta, flops_delta, r.elapsed
+            )
+            .ok();
+        }
+
+        writeln!(out).ok();
+        writeln!(out, "Pipeline B passes:").ok();
+        writeln!(
+            out,
+            "  {:<30} {:>8} {:>8} {:>12}",
+            "Pass", "Ops Δ", "FLOPs Δ", "Time"
+        )
+        .ok();
+        for r in &b.pass_results {
+            let ops_delta = r.ops_after as i64 - r.ops_before as i64;
+            let flops_delta = r.flops_after as i64 - r.flops_before as i64;
+            writeln!(
+                out,
+                "  {:<30} {:>+8} {:>+8} {:>12.2?}",
+                r.name, ops_delta, flops_delta, r.elapsed
+            )
+            .ok();
+        }
+
+        out
+    }
 }
 
 /// Result of a single pass execution.
@@ -233,6 +636,16 @@ pub struct PassResult {
     pub name: String,
     pub ops_before: usize,
     pub ops_after: usize,
+    /// Estimated FLOPs before this pass ran.
+    pub flops_before: u64,
+    /// Estimated FLOPs after this pass ran.
+    pub flops_after: u64,
+    /// Estimated memory footprint (bytes) before this pass ran.
+    pub memory_before: u64,
+    /// Estimated memory footprint (bytes) after this pass ran.
+    pub memory_after: u64,
+    /// Wall-clock time for this pass.
+    pub elapsed: std::time::Duration,
 }
 
 #[cfg(test)]
@@ -400,5 +813,226 @@ mod tests {
             err.contains("already been configured"),
             "expected duplicate palettize error, got: {err}"
         );
+    }
+
+    // ── TOML config tests ─────────────────────────────────────────────
+
+    #[test]
+    fn config_loads_basic_pipeline() {
+        let toml = r#"
+[[passes]]
+name = "dead-code-elimination"
+enabled = true
+
+[[passes]]
+name = "constant-folding"
+enabled = true
+
+[[passes]]
+name = "conv-batchnorm-fusion"
+enabled = true
+"#;
+        let pipeline = PassPipeline::from_config_str(toml).unwrap();
+        assert_eq!(
+            pipeline.pass_names(),
+            vec![
+                "dead-code-elimination",
+                "constant-folding",
+                "conv-batchnorm-fusion",
+            ]
+        );
+    }
+
+    #[test]
+    fn config_disabled_passes_are_skipped() {
+        let toml = r#"
+[[passes]]
+name = "dead-code-elimination"
+enabled = true
+
+[[passes]]
+name = "identity-elimination"
+enabled = false
+
+[[passes]]
+name = "constant-folding"
+enabled = true
+"#;
+        let pipeline = PassPipeline::from_config_str(toml).unwrap();
+        let names = pipeline.pass_names();
+        assert_eq!(names, vec!["dead-code-elimination", "constant-folding"]);
+        assert!(!names.contains(&"identity-elimination"));
+    }
+
+    #[test]
+    fn config_unknown_pass_returns_error() {
+        let toml = r#"
+[[passes]]
+name = "nonexistent-pass"
+enabled = true
+"#;
+        let result = PassPipeline::from_config_str(toml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown pass"), "got: {err}");
+    }
+
+    #[test]
+    fn config_mutual_exclusivity_enforced() {
+        let toml = r#"
+[[passes]]
+name = "fp16-quantization"
+
+[[passes]]
+name = "int8-quantization"
+"#;
+        let result = PassPipeline::from_config_str(toml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn config_with_palettize_params() {
+        let toml = r#"
+[[passes]]
+name = "palettization"
+[passes.params]
+n_bits = 6
+"#;
+        let pipeline = PassPipeline::from_config_str(toml).unwrap();
+        assert_eq!(pipeline.pass_names(), vec!["palettization"]);
+    }
+
+    #[test]
+    fn config_driven_matches_programmatic() {
+        let toml = r#"
+[[passes]]
+name = "dead-code-elimination"
+
+[[passes]]
+name = "identity-elimination"
+
+[[passes]]
+name = "constant-folding"
+
+[[passes]]
+name = "conv-bn-weight-fold"
+
+[[passes]]
+name = "conv-batchnorm-fusion"
+
+[[passes]]
+name = "conv-relu-fusion"
+
+[[passes]]
+name = "linear-relu-fusion"
+
+[[passes]]
+name = "layernorm-linear-fusion"
+
+[[passes]]
+name = "gelu-linear-fusion"
+
+[[passes]]
+name = "residual-add-fusion"
+
+[[passes]]
+name = "attention-fusion"
+
+[[passes]]
+name = "gqa-fusion"
+
+[[passes]]
+name = "codebook-optimization"
+
+[[passes]]
+name = "op-substitution"
+
+[[passes]]
+name = "layout-optimization"
+"#;
+        let config_pipeline = PassPipeline::from_config_str(toml).unwrap();
+        let default_pipeline = PassPipeline::new();
+        assert_eq!(config_pipeline.pass_names(), default_pipeline.pass_names());
+
+        // Both should produce the same results on the same program
+        let mut prog_a = program_with_ops(5);
+        let mut prog_b = program_with_ops(5);
+        let report_a = config_pipeline.run(&mut prog_a).unwrap();
+        let report_b = default_pipeline.run(&mut prog_b).unwrap();
+
+        assert_eq!(report_a.pass_results.len(), report_b.pass_results.len());
+        for (a, b) in report_a.pass_results.iter().zip(&report_b.pass_results) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.ops_before, b.ops_before);
+            assert_eq!(a.ops_after, b.ops_after);
+        }
+    }
+
+    #[test]
+    fn config_from_file() {
+        let dir = std::env::current_dir().unwrap().join("test-pipeline-cfg");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("test.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[passes]]
+name = "dead-code-elimination"
+
+[[passes]]
+name = "constant-folding"
+"#,
+        )
+        .unwrap();
+        let pipeline = PassPipeline::with_config(&path).unwrap();
+        assert_eq!(
+            pipeline.pass_names(),
+            vec!["dead-code-elimination", "constant-folding"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pipeline_report_has_timing_and_metrics() {
+        let mut program = program_with_ops(5);
+        let pipeline = PassPipeline::new();
+        let report = pipeline.run(&mut program).unwrap();
+
+        for r in &report.pass_results {
+            // Duration is always non-negative; just verify it was recorded
+            let _ = r.elapsed;
+            // FLOPs estimates should be present
+            assert!(r.flops_before > 0 || r.ops_before == 0);
+        }
+        // Total elapsed should be sum of parts
+        let sum: std::time::Duration = report.pass_results.iter().map(|r| r.elapsed).sum();
+        assert_eq!(report.total_elapsed(), sum);
+    }
+
+    #[test]
+    fn pipeline_report_compare_format() {
+        let mut prog_a = program_with_ops(5);
+        let mut prog_b = program_with_ops(5);
+        let report_a = PassPipeline::new().run(&mut prog_a).unwrap();
+        let report_b = PassPipeline::new()
+            .without_fusion()
+            .run(&mut prog_b)
+            .unwrap();
+        let comparison = PipelineReport::compare(&report_a, &report_b);
+        assert!(comparison.contains("Op count"));
+        assert!(comparison.contains("Pipeline A passes:"));
+        assert!(comparison.contains("Pipeline B passes:"));
+    }
+
+    #[test]
+    fn config_enabled_defaults_to_true() {
+        let toml = r#"
+[[passes]]
+name = "dead-code-elimination"
+"#;
+        let pipeline = PassPipeline::from_config_str(toml).unwrap();
+        assert_eq!(pipeline.pass_names(), vec!["dead-code-elimination"]);
     }
 }

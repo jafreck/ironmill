@@ -25,7 +25,7 @@ pub use passes::{
     LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass, ModelSplitPass, OpPrecision,
     OpSubstitutionPass, PalettizePass, ShapeMaterializePass, SplitResult,
 };
-pub use pipeline::{PassPipeline, PassResult, PipelineReport};
+pub use pipeline::{PassPipeline, PassResult, PipelineConfig, PipelineReport};
 pub use program::{Block, Function, Program};
 pub use tensor::{ScalarType, TensorType};
 pub use types::Value;

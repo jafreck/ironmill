@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use mil_rs::compiler::Backend;
 use mil_rs::ir::ModelSplitPass;
 use mil_rs::ir::PassPipeline;
+use mil_rs::ir::PipelineReport;
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::validate::{print_validation_report, validation_report_to_json};
 use mil_rs::{
@@ -143,6 +144,11 @@ enum Commands {
         /// Detect MoE architecture and split into per-expert .mlpackage files.
         #[arg(long = "moe-split")]
         moe_split: bool,
+
+        /// Path to a TOML pipeline configuration file.
+        /// When provided, overrides default pass selection and --no-fusion.
+        #[arg(long = "pipeline-config", value_name = "PATH")]
+        pipeline_config: Option<PathBuf>,
     },
 
     /// Inspect a model and show its structure.
@@ -169,6 +175,20 @@ enum Commands {
         /// Output directory for .mlpackage files and pipeline.json.
         #[arg(short, long)]
         output: Option<String>,
+    },
+
+    /// Compare two pipeline configurations on a model and report metrics.
+    PipelineReport {
+        /// Path to the input ONNX model.
+        input: String,
+
+        /// Path to the first pipeline config (TOML).
+        #[arg(long = "config-a", value_name = "PATH")]
+        config_a: PathBuf,
+
+        /// Path to the second pipeline config (TOML).
+        #[arg(long = "config-b", value_name = "PATH")]
+        config_b: PathBuf,
     },
 }
 
@@ -207,6 +227,7 @@ fn run() -> Result<()> {
             optimizer_type,
             split_draft_layers,
             moe_split,
+            pipeline_config,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -229,6 +250,7 @@ fn run() -> Result<()> {
                 optimizer_type,
                 split_draft_layers,
                 moe_split,
+                pipeline_config,
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -236,6 +258,11 @@ fn run() -> Result<()> {
         Commands::CompilePipeline { manifest, output } => {
             cmd_compile_pipeline(&manifest, output.as_deref())
         }
+        Commands::PipelineReport {
+            input,
+            config_a,
+            config_b,
+        } => cmd_pipeline_report(&input, &config_a, &config_b),
     }
 }
 
@@ -275,6 +302,7 @@ struct CompileOpts {
     optimizer_type: String,
     split_draft_layers: Option<usize>,
     moe_split: bool,
+    pipeline_config: Option<PathBuf>,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -348,61 +376,68 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     println!();
 
     // 3. Build the pass pipeline
-    let mut pipeline = PassPipeline::new();
-
-    if opts.no_fusion {
-        pipeline = pipeline.without_fusion();
-    }
-
-    // Parse and add input shapes
-    if !opts.input_shapes.is_empty() {
-        let mut shapes = HashMap::new();
-        for raw in &opts.input_shapes {
-            let (name, dims) = parse_input_shape(raw)?;
-            shapes.insert(name, dims);
-        }
-        pipeline = pipeline.with_shapes(shapes);
-    }
-
-    // Add quantization. If a quantize-config file is provided it takes
-    // precedence over the --quantize flag to avoid double quantization.
-    if let Some(ref config_path) = opts.quantize_config {
-        pipeline = pipeline
-            .with_mixed_precision(config_path)
-            .context("Failed to configure mixed-precision from config file")?;
+    let pipeline = if let Some(ref config_path) = opts.pipeline_config {
+        PassPipeline::with_config(config_path)
+            .with_context(|| format!("Failed to load pipeline config: {}", config_path.display()))?
     } else {
-        match opts.quantize.as_str() {
-            "fp16" => {
-                pipeline = pipeline
-                    .with_fp16()
-                    .context("Failed to configure FP16 quantization")?;
+        let mut pipeline = PassPipeline::new();
+
+        if opts.no_fusion {
+            pipeline = pipeline.without_fusion();
+        }
+
+        // Parse and add input shapes
+        if !opts.input_shapes.is_empty() {
+            let mut shapes = HashMap::new();
+            for raw in &opts.input_shapes {
+                let (name, dims) = parse_input_shape(raw)?;
+                shapes.insert(name, dims);
             }
-            "int8" => {
-                pipeline = pipeline
-                    .with_int8(opts.cal_data.clone())
-                    .context("Failed to configure INT8 quantization")?;
-            }
-            "mixed-fp16-int8" => {
-                let config = mil_rs::MixedPrecisionConfig::preset_fp16_int8();
-                pipeline = pipeline
-                    .with_mixed_precision_config(config)
-                    .context("Failed to configure mixed-precision quantization")?;
-            }
-            "none" => {}
-            other => {
-                bail!(
-                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int8', or 'mixed-fp16-int8'."
-                )
+            pipeline = pipeline.with_shapes(shapes);
+        }
+
+        // Add quantization. If a quantize-config file is provided it takes
+        // precedence over the --quantize flag to avoid double quantization.
+        if let Some(ref config_path) = opts.quantize_config {
+            pipeline = pipeline
+                .with_mixed_precision(config_path)
+                .context("Failed to configure mixed-precision from config file")?;
+        } else {
+            match opts.quantize.as_str() {
+                "fp16" => {
+                    pipeline = pipeline
+                        .with_fp16()
+                        .context("Failed to configure FP16 quantization")?;
+                }
+                "int8" => {
+                    pipeline = pipeline
+                        .with_int8(opts.cal_data.clone())
+                        .context("Failed to configure INT8 quantization")?;
+                }
+                "mixed-fp16-int8" => {
+                    let config = mil_rs::MixedPrecisionConfig::preset_fp16_int8();
+                    pipeline = pipeline
+                        .with_mixed_precision_config(config)
+                        .context("Failed to configure mixed-precision quantization")?;
+                }
+                "none" => {}
+                other => {
+                    bail!(
+                        "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int8', or 'mixed-fp16-int8'."
+                    )
+                }
             }
         }
-    }
 
-    // Add palettization
-    if let Some(bits) = opts.palettize {
-        pipeline = pipeline
-            .with_palettize(bits)
-            .context("Failed to configure palettization")?;
-    }
+        // Add palettization
+        if let Some(bits) = opts.palettize {
+            pipeline = pipeline
+                .with_palettize(bits)
+                .context("Failed to configure palettization")?;
+        }
+
+        pipeline
+    };
 
     // 4. Run the pipeline
     println!("Running optimization passes...");
@@ -411,14 +446,18 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         .context("Optimization pipeline failed")?;
 
     for result in &report.pass_results {
-        let diff = result.ops_before.saturating_sub(result.ops_after);
-        if diff > 0 {
-            let label = if diff == 1 { "op" } else { "ops" };
-            println!("  {}: removed {diff} {label}", result.name);
+        let ops_diff = result.ops_before.saturating_sub(result.ops_after);
+        if ops_diff > 0 {
+            let label = if ops_diff == 1 { "op" } else { "ops" };
+            println!(
+                "  {}: removed {ops_diff} {label} ({:.2?})",
+                result.name, result.elapsed
+            );
         } else {
-            println!("  {}: no changes", result.name);
+            println!("  {}: no changes ({:.2?})", result.name, result.elapsed);
         }
     }
+    println!("  Total pipeline time: {:.2?}", report.total_elapsed());
     println!();
 
     // 5. MoE split (if requested)
@@ -859,6 +898,61 @@ fn cmd_compile_pipeline(manifest_path: &str, output: Option<&str>) -> Result<()>
         "Pipeline conversion complete: {} stage(s) converted.",
         result.manifest.stages.len()
     );
+    Ok(())
+}
+
+fn cmd_pipeline_report(input: &str, config_a: &Path, config_b: &Path) -> Result<()> {
+    let input_path = Path::new(input);
+    if !input_path.exists() {
+        bail!("Input file not found: {input}");
+    }
+
+    let ext = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if ext != "onnx" {
+        bail!("pipeline-report currently only supports ONNX models, got '.{ext}'");
+    }
+
+    println!("Reading ONNX model: {input}");
+    let onnx_model =
+        read_onnx(input_path).with_context(|| format!("Failed to read ONNX model: {input}"))?;
+
+    println!("Converting to MIL IR...");
+    let result_a = onnx_to_program_with_config(&onnx_model, &ConversionConfig::default())
+        .context("Failed to convert ONNX model")?;
+    let result_b = onnx_to_program_with_config(&onnx_model, &ConversionConfig::default())
+        .context("Failed to convert ONNX model")?;
+    let mut program_a = result_a.program;
+    let mut program_b = result_b.program;
+
+    println!("Loading config A: {}", config_a.display());
+    let pipeline_a = PassPipeline::with_config(config_a)
+        .with_context(|| format!("Failed to load config A: {}", config_a.display()))?;
+    println!("  Passes: {:?}", pipeline_a.pass_names());
+
+    println!("Loading config B: {}", config_b.display());
+    let pipeline_b = PassPipeline::with_config(config_b)
+        .with_context(|| format!("Failed to load config B: {}", config_b.display()))?;
+    println!("  Passes: {:?}", pipeline_b.pass_names());
+    println!();
+
+    println!("Running pipeline A...");
+    let report_a = pipeline_a
+        .run(&mut program_a)
+        .context("Pipeline A failed")?;
+
+    println!("Running pipeline B...");
+    let report_b = pipeline_b
+        .run(&mut program_b)
+        .context("Pipeline B failed")?;
+
+    println!();
+    println!("{}", PipelineReport::compare(&report_a, &report_b));
+
     Ok(())
 }
 
