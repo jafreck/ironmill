@@ -60,6 +60,41 @@ pub fn compile_model(
     Ok(compiled_path)
 }
 
+/// Build the optimized MIL IR program for a model without compiling to CoreML.
+///
+/// This is used by the ANE direct runtime path which takes the IR program
+/// directly rather than going through .mlpackage compilation.
+#[cfg(feature = "ane-direct")]
+pub fn build_optimized_program(
+    model: &ModelConfig,
+    opt: &OptConfig,
+) -> Result<mil_rs::ir::Program> {
+    let onnx = mil_rs::read_onnx(&model.path)?;
+    let conversion_result = mil_rs::onnx_to_program(&onnx)?;
+    let mut program = conversion_result.program;
+
+    let mut pipeline = mil_rs::PassPipeline::default();
+    if opt.no_fusion {
+        pipeline = pipeline.without_fusion();
+    }
+    match opt.quantize.as_deref() {
+        Some("fp16") => {
+            pipeline = pipeline.with_fp16()?;
+        }
+        Some("int8") => {
+            pipeline = pipeline.with_int8(None)?;
+        }
+        _ => {}
+    }
+    if let Some(bits) = opt.palettize {
+        pipeline = pipeline.with_palettize(bits)?;
+    }
+
+    pipeline.run(&mut program)?;
+
+    Ok(program)
+}
+
 /// Remove all cached compilation artifacts.
 pub fn clean_cache(cache_dir: &Path) -> Result<()> {
     if cache_dir.exists() {

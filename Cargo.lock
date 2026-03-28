@@ -426,6 +426,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ironmill-ane",
  "ironmill-coreml",
  "mil-rs",
  "serde",

@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
+    /// Also benchmark the ANE direct runtime (experimental, requires --features ane-direct).
+    #[arg(long)]
+    ane_direct: bool,
+
     /// Remove all cached compilation artifacts
     #[arg(long)]
     clean_cache: bool,
@@ -156,6 +160,80 @@ fn main() -> Result<()> {
                     significance: None,
                 });
             }
+        }
+    }
+
+    if cli.ane_direct {
+        #[cfg(feature = "ane-direct")]
+        {
+            eprintln!("\n  ANE Direct Runtime Benchmark");
+            eprintln!("  {}", "─".repeat(40));
+            eprintln!("  ⚠ ANE direct benchmarking requires runtime verification");
+            eprintln!("    (private API selectors must be validated on this macOS version)");
+
+            for model_cfg in &matrix.models {
+                for opt_cfg in &matrix.optimizations {
+                    eprintln!(
+                        "  Compiling {} with {} (ANE direct)...",
+                        model_cfg.name, opt_cfg.name
+                    );
+
+                    let program = match compiler::build_optimized_program(model_cfg, opt_cfg) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("  ✗ failed to build program: {e}");
+                            continue;
+                        }
+                    };
+
+                    let config = ironmill_ane::AneConfig::default();
+
+                    let mut run_results = Vec::new();
+                    for run_idx in 0..matrix.settings.runs {
+                        let result = match inference::run_ane_direct_inference(
+                            &program,
+                            config.clone(),
+                            matrix.settings.warmup,
+                            matrix.settings.iterations,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("  ✗ ANE direct inference failed: {e}");
+                                continue;
+                            }
+                        };
+
+                        let latencies_ms: Vec<f64> = result
+                            .latencies
+                            .iter()
+                            .map(|d| d.as_secs_f64() * 1000.0)
+                            .collect();
+
+                        let label = format!(
+                            "{}/{}/ane-direct/run{}",
+                            model_cfg.name, opt_cfg.name, run_idx
+                        );
+                        run_results.push(compute_stats(&label, &latencies_ms));
+                    }
+
+                    if !run_results.is_empty() {
+                        let label = format!("{}/{}/ane-direct", model_cfg.name, opt_cfg.name);
+                        let aggregated = aggregate_runs(&label, &run_results);
+
+                        report_rows.push(ReportRow {
+                            model: model_cfg.name.clone(),
+                            optimization: opt_cfg.name.clone(),
+                            backend: "ane-direct".to_string(),
+                            result: aggregated,
+                            significance: None,
+                        });
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "ane-direct"))]
+        {
+            eprintln!("warning: --ane-direct requires --features ane-direct, skipping");
         }
     }
 
