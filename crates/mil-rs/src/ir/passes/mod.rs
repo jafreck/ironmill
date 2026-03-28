@@ -49,7 +49,7 @@ pub use op_fusion::{
 pub use op_split::{OpSplittingPass, parse_memory_size};
 pub use op_substitute::OpSubstitutionPass;
 pub use palettize::{GroupedPalettizePass, PalettizePass};
-pub use shape_materialize::ShapeMaterializePass;
+pub use shape_materialize::{AutoregressiveShapeMaterializePass, ShapeMaterializePass};
 
 use super::program::Block;
 use super::types::Value;

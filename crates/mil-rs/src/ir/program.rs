@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use indexmap::IndexMap;
 
 use super::operation::Operation;
@@ -13,6 +15,8 @@ pub struct Program {
     pub version: String,
     /// Named functions in this program. Key is the function name.
     pub functions: IndexMap<String, Function>,
+    /// Program-level attributes (e.g., `autoregressive`, `max_seq_length`).
+    pub attributes: HashMap<String, String>,
 }
 
 impl Program {
@@ -21,6 +25,7 @@ impl Program {
         Self {
             version: version.into(),
             functions: IndexMap::new(),
+            attributes: HashMap::new(),
         }
     }
 
@@ -35,6 +40,21 @@ impl Program {
         self.functions
             .get("main")
             .or_else(|| self.functions.values().next())
+    }
+
+    /// Set a program-level attribute.
+    pub fn set_attribute(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.attributes.insert(key.into(), value.into());
+    }
+
+    /// Check whether a program-level attribute equals a given value.
+    pub fn has_attribute(&self, key: &str, value: &str) -> bool {
+        self.attributes.get(key).is_some_and(|v| v == value)
+    }
+
+    /// Returns `true` if this program has been tagged as autoregressive.
+    pub fn is_autoregressive(&self) -> bool {
+        self.has_attribute("autoregressive", "true")
     }
 }
 
@@ -163,5 +183,23 @@ mod tests {
         assert_eq!(block.operations[0].name, "relu_0");
         assert_eq!(block.operations[1].name, "softmax_0");
         assert_eq!(block.outputs, vec!["softmax_out"]);
+    }
+
+    #[test]
+    fn program_attributes() {
+        let mut program = Program::new("1.0.0");
+        assert!(!program.is_autoregressive());
+        assert!(!program.has_attribute("autoregressive", "true"));
+
+        program.set_attribute("autoregressive", "true");
+        assert!(program.is_autoregressive());
+        assert!(program.has_attribute("autoregressive", "true"));
+        assert!(!program.has_attribute("autoregressive", "false"));
+    }
+
+    #[test]
+    fn program_attributes_default_empty() {
+        let program = Program::new("1.0.0");
+        assert!(program.attributes.is_empty());
     }
 }

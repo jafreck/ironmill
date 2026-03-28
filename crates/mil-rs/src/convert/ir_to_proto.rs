@@ -8,7 +8,8 @@ use crate::ir::{Block, Function, Operation, Program, TensorType, Value};
 use crate::proto::mil_spec;
 use crate::proto::specification::{
     self, ArrayFeatureType, DoubleParameter, FeatureDescription, FeatureType, Int64Parameter,
-    LossLayer, Model, ModelDescription, NetworkUpdateParameters, Optimizer, model,
+    LossLayer, Model, ModelDescription, NetworkUpdateParameters, Optimizer, StateFeatureType,
+    model,
 };
 
 /// Which optimizer to use for on-device training.
@@ -65,6 +66,10 @@ impl Default for UpdatableModelConfig {
 /// Creates an ML Program model wrapping the converted program.
 /// `spec_version` sets the `specification_version` field on the
 /// resulting [`Model`] (use 7 or 8 for modern CoreML specs).
+///
+/// When the program is tagged as autoregressive, the model description
+/// includes state descriptors for KV cache tensors, enabling CoreML to
+/// persist cache state across inference calls.
 pub fn program_to_model(program: &Program, spec_version: i32) -> Result<Model> {
     let proto_program = convert_program(program)?;
 
@@ -124,9 +129,17 @@ pub fn program_to_model(program: &Program, spec_version: i32) -> Result<Model> {
             })
             .collect();
 
+        // Emit state descriptors for autoregressive models.
+        let state = if program.is_autoregressive() {
+            build_state_descriptors(func)
+        } else {
+            Vec::new()
+        };
+
         Some(ModelDescription {
             input,
             output,
+            state,
             ..Default::default()
         })
     } else {
@@ -1589,6 +1602,100 @@ fn tensor_type_to_feature_type(tt: &TensorType) -> FeatureType {
 }
 
 // ---------------------------------------------------------------------------
+// State descriptor support for autoregressive models
+// ---------------------------------------------------------------------------
+
+/// Name fragments that identify KV cache tensors for state descriptors.
+const STATE_CACHE_PATTERNS: &[&str] = &[
+    "past_key_values",
+    "past_key",
+    "past_value",
+    "key_cache",
+    "value_cache",
+    "kv_cache",
+];
+
+/// Build CoreML state descriptors for KV cache tensors in an autoregressive
+/// function.
+///
+/// State descriptors tell CoreML to persist these tensors across inference
+/// calls, enabling efficient autoregressive decoding without re-sending the
+/// full KV cache from the host.
+fn build_state_descriptors(func: &Function) -> Vec<FeatureDescription> {
+    let mut descriptors = Vec::new();
+
+    // Scan function inputs for cache tensors.
+    for (name, tt) in &func.inputs {
+        if is_state_cache_name(name) {
+            descriptors.push(tensor_type_to_state_descriptor(name, tt));
+        }
+    }
+
+    // Also scan for kv_cache_read/kv_cache_update ops that may have been
+    // inserted by the KV cache pass.
+    let mut seen: std::collections::HashSet<String> =
+        descriptors.iter().map(|d| d.name.clone()).collect();
+
+    for op in &func.body.operations {
+        if op.op_type == "kv_cache_read" || op.op_type == "kv_cache_update" {
+            // The cache input reference points to the state tensor.
+            if let Some(Value::Reference(cache_name)) = op.inputs.get("cache") {
+                if !seen.contains(cache_name) {
+                    // Infer type from the operation's input or fall back to a default.
+                    let tt = func
+                        .inputs
+                        .iter()
+                        .find(|(n, _)| n == cache_name)
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or_else(|| {
+                            TensorType::new(ScalarType::Float32, vec![1, 1, 2048, 64])
+                        });
+                    descriptors.push(tensor_type_to_state_descriptor(cache_name, &tt));
+                    seen.insert(cache_name.clone());
+                }
+            }
+        }
+    }
+
+    descriptors
+}
+
+/// Returns `true` if the name matches a KV cache naming pattern.
+fn is_state_cache_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    STATE_CACHE_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Convert a tensor type into a CoreML state feature descriptor.
+///
+/// The state descriptor uses `StateFeatureType` wrapping an `ArrayFeatureType`,
+/// which tells CoreML to persist this tensor across inference calls.
+fn tensor_type_to_state_descriptor(name: &str, tt: &TensorType) -> FeatureDescription {
+    let shape: Vec<i64> = tt.shape.iter().map(|d| d.unwrap_or(1) as i64).collect();
+    let array_type = ArrayFeatureType {
+        shape,
+        data_type: scalar_to_array_data_type(tt.scalar_type) as i32,
+        shape_flexibility: None,
+        default_optional_value: None,
+    };
+
+    FeatureDescription {
+        name: name.to_string(),
+        short_description: format!("KV cache state for {name}"),
+        r#type: Some(FeatureType {
+            is_optional: false,
+            r#type: Some(specification::feature_type::Type::StateType(
+                StateFeatureType {
+                    r#type: Some(specification::state_feature_type::Type::ArrayType(
+                        array_type,
+                    )),
+                },
+            )),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2010,6 +2117,133 @@ mod tests {
             ),
             "shared const in expert should be a stub (BlobFileValue), got: {:?}",
             val_attr.value
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Autoregressive state descriptor tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ar_model_has_state_descriptors() {
+        let mut program = Program::new("1");
+        program.set_attribute("autoregressive", "true");
+
+        let func = Function::new("main")
+            .with_input("input_ids", TensorType::new(ScalarType::Int32, vec![1, 1]))
+            .with_input(
+                "past_key_values.0.key",
+                TensorType::new(ScalarType::Float32, vec![1, 8, 128, 64]),
+            )
+            .with_input(
+                "past_key_values.0.value",
+                TensorType::new(ScalarType::Float32, vec![1, 8, 128, 64]),
+            );
+        program.add_function(func);
+
+        let model = program_to_model(&program, 8).unwrap();
+        let desc = model.description.as_ref().unwrap();
+
+        // Should have state descriptors for cache inputs.
+        assert_eq!(desc.state.len(), 2, "expected 2 state descriptors");
+
+        // State descriptors should use StateFeatureType.
+        for state_desc in &desc.state {
+            let ft = state_desc.r#type.as_ref().unwrap();
+            assert!(
+                matches!(
+                    ft.r#type,
+                    Some(specification::feature_type::Type::StateType(_))
+                ),
+                "state descriptor should use StateType, got: {:?}",
+                ft.r#type
+            );
+        }
+
+        // Check names.
+        let names: Vec<&str> = desc.state.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"past_key_values.0.key"));
+        assert!(names.contains(&"past_key_values.0.value"));
+    }
+
+    #[test]
+    fn non_ar_model_has_no_state_descriptors() {
+        let mut program = Program::new("1");
+        let func = Function::new("main").with_input(
+            "image",
+            TensorType::new(ScalarType::Float32, vec![1, 3, 224, 224]),
+        );
+        program.add_function(func);
+
+        let model = program_to_model(&program, 8).unwrap();
+        let desc = model.description.as_ref().unwrap();
+
+        assert!(desc.state.is_empty(), "non-AR model should have no state");
+    }
+
+    #[test]
+    fn ar_state_descriptor_has_correct_shape() {
+        let mut program = Program::new("1");
+        program.set_attribute("autoregressive", "true");
+
+        let func = Function::new("main").with_input(
+            "past_key",
+            TensorType::new(ScalarType::Float32, vec![1, 8, 2048, 64]),
+        );
+        program.add_function(func);
+
+        let model = program_to_model(&program, 8).unwrap();
+        let desc = model.description.as_ref().unwrap();
+
+        assert_eq!(desc.state.len(), 1);
+        let state = &desc.state[0];
+        assert_eq!(state.name, "past_key");
+
+        // Extract the array type from the state descriptor.
+        let ft = state.r#type.as_ref().unwrap();
+        if let Some(specification::feature_type::Type::StateType(st)) = &ft.r#type {
+            if let Some(specification::state_feature_type::Type::ArrayType(arr)) = &st.r#type {
+                assert_eq!(arr.shape, vec![1, 8, 2048, 64]);
+            } else {
+                panic!("expected ArrayType in StateFeatureType");
+            }
+        } else {
+            panic!("expected StateType in FeatureType");
+        }
+    }
+
+    #[test]
+    fn ar_state_descriptors_from_kv_cache_ops() {
+        let mut program = Program::new("1");
+        program.set_attribute("autoregressive", "true");
+
+        let kv_read = Operation::new("kv_cache_read", "kv_read_0")
+            .with_input("cache", Value::Reference("my_cache".into()))
+            .with_output("kv_read_out");
+
+        let mut block = Block::new();
+        block.add_op(kv_read);
+        block.outputs.push("kv_read_out".into());
+
+        // Add the cache as a function input so it can be resolved.
+        let func = Function {
+            name: "main".into(),
+            inputs: vec![(
+                "my_cache".into(),
+                TensorType::new(ScalarType::Float32, vec![1, 4, 512, 64]),
+            )],
+            body: block,
+        };
+        program.add_function(func);
+
+        let model = program_to_model(&program, 8).unwrap();
+        let desc = model.description.as_ref().unwrap();
+
+        // Should find a state descriptor for "my_cache".
+        let names: Vec<&str> = desc.state.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"my_cache"),
+            "should have state descriptor for my_cache, got: {names:?}"
         );
     }
 }

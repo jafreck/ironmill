@@ -22,7 +22,9 @@ pub use ir_to_proto::{
     program_to_multi_function_model, program_to_updatable_model,
 };
 pub use lora::{LoraAdapter, detect_lora_adapters, lora_initializer_names, merge_lora};
-pub use onnx_graph::{ConversionConfig, onnx_to_program, onnx_to_program_with_config};
+pub use onnx_graph::{
+    ConversionConfig, detect_autoregressive_pattern, onnx_to_program, onnx_to_program_with_config,
+};
 pub use onnx_to_mil::convert_node;
 pub use pipeline::{PipelineManifest, convert_pipeline, parse_pipeline_manifest};
 pub use proto_to_ir::model_to_program;

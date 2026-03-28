@@ -86,6 +86,11 @@ pub fn onnx_to_program_with_config(
     let mut program = Program::new("1.0.0");
     program.add_function(function);
 
+    // Detect autoregressive patterns and tag the program accordingly.
+    if detect_autoregressive_pattern(&program) {
+        program.set_attribute("autoregressive", "true");
+    }
+
     Ok(ConversionResult { program, warnings })
 }
 
@@ -315,6 +320,46 @@ fn convert_graph(
 
     function.body = block;
     Ok(function)
+}
+
+// ---------------------------------------------------------------------------
+// Autoregressive pattern detection
+// ---------------------------------------------------------------------------
+
+/// Name fragments that indicate KV cache tensors in ONNX models.
+const AR_CACHE_PATTERNS: &[&str] = &[
+    "past_key_values",
+    "past_key",
+    "past_value",
+    "key_cache",
+    "value_cache",
+];
+
+/// Detect whether a converted program represents an autoregressive model.
+///
+/// Returns `true` if function inputs/outputs contain KV cache tensor names
+/// (e.g. `past_key_values`). Causal mask inputs alone are NOT sufficient —
+/// non-AR models like BERT use `attention_mask` for padding, not causal masking.
+pub fn detect_autoregressive_pattern(program: &Program) -> bool {
+    let Some(func) = program.main() else {
+        return false;
+    };
+
+    // Check function inputs for cache tensor names.
+    let has_cache_input = func.inputs.iter().any(|(name, _)| is_ar_cache_name(name));
+
+    // Check block outputs for cache tensor names (models that output updated caches).
+    let has_cache_output = func.body.outputs.iter().any(|name| is_ar_cache_name(name));
+
+    // Only tag as autoregressive if we found cache tensors.
+    // Causal mask alone is insufficient (BERT has attention_mask but isn't AR).
+    has_cache_input || has_cache_output
+}
+
+/// Returns `true` if `name` matches a KV cache tensor naming pattern.
+fn is_ar_cache_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    AR_CACHE_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 /// Fill in `op.output_types` from the ONNX type map for every output that
@@ -1513,5 +1558,120 @@ mod tests {
         assert!(!is_prequant_auxiliary("layer.0.weight.qweight", &prequant));
         // Unrelated tensors are not auxiliary.
         assert!(!is_prequant_auxiliary("other_weight", &prequant));
+    }
+
+    // -----------------------------------------------------------------------
+    // Autoregressive pattern detection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detects_ar_from_past_key_values_input() {
+        let mut program = Program::new("1.0.0");
+        let func = Function::new("main")
+            .with_input(
+                "input_ids",
+                TensorType::new(ScalarType::Int32, vec![1, 128]),
+            )
+            .with_input(
+                "past_key_values.0.key",
+                TensorType::new(ScalarType::Float32, vec![1, 8, 128, 64]),
+            );
+        program.add_function(func);
+
+        assert!(detect_autoregressive_pattern(&program));
+    }
+
+    #[test]
+    fn detects_ar_from_cache_output() {
+        let mut program = Program::new("1.0.0");
+        let mut block = Block::new();
+        block.outputs.push("past_key_values.0.key".into());
+        block.outputs.push("logits".into());
+
+        let func = Function {
+            name: "main".into(),
+            inputs: vec![(
+                "input_ids".into(),
+                TensorType::new(ScalarType::Int32, vec![1, 128]),
+            )],
+            body: block,
+        };
+        program.add_function(func);
+
+        assert!(detect_autoregressive_pattern(&program));
+    }
+
+    #[test]
+    fn no_ar_from_causal_mask_alone() {
+        // attention_mask alone should NOT trigger AR detection (BERT uses it for padding).
+        let mut program = Program::new("1.0.0");
+        let func = Function::new("main")
+            .with_input(
+                "input_ids",
+                TensorType::new(ScalarType::Int32, vec![1, 128]),
+            )
+            .with_input(
+                "attention_mask",
+                TensorType::new(ScalarType::Float32, vec![1, 128]),
+            );
+        program.add_function(func);
+
+        assert!(!detect_autoregressive_pattern(&program));
+    }
+
+    #[test]
+    fn no_ar_for_feedforward_model() {
+        let mut program = Program::new("1.0.0");
+        let func = Function::new("main").with_input(
+            "image",
+            TensorType::new(ScalarType::Float32, vec![1, 3, 224, 224]),
+        );
+        program.add_function(func);
+
+        assert!(!detect_autoregressive_pattern(&program));
+    }
+
+    #[test]
+    fn no_ar_for_empty_program() {
+        let program = Program::new("1.0.0");
+        assert!(!detect_autoregressive_pattern(&program));
+    }
+
+    #[test]
+    fn detects_ar_from_key_cache_input() {
+        let mut program = Program::new("1.0.0");
+        let func = Function::new("main")
+            .with_input(
+                "key_cache",
+                TensorType::new(ScalarType::Float32, vec![1, 8, 128, 64]),
+            )
+            .with_input(
+                "value_cache",
+                TensorType::new(ScalarType::Float32, vec![1, 8, 128, 64]),
+            );
+        program.add_function(func);
+
+        assert!(detect_autoregressive_pattern(&program));
+    }
+
+    #[test]
+    fn ar_cache_name_patterns() {
+        assert!(is_ar_cache_name("past_key_values.0.key"));
+        assert!(is_ar_cache_name("model.decoder.past_key"));
+        assert!(is_ar_cache_name("past_value"));
+        assert!(is_ar_cache_name("key_cache"));
+        assert!(is_ar_cache_name("value_cache"));
+        assert!(!is_ar_cache_name("input_ids"));
+        assert!(!is_ar_cache_name("attention_weight"));
+        assert!(!is_ar_cache_name("logits"));
+    }
+
+    #[test]
+    fn causal_mask_name_patterns() {
+        assert!(is_causal_mask_name("attention_mask"));
+        assert!(is_causal_mask_name("causal_mask"));
+        assert!(is_causal_mask_name("attn_mask"));
+        assert!(!is_causal_mask_name("input_ids"));
+        assert!(!is_causal_mask_name("weight"));
     }
 }

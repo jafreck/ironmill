@@ -46,7 +46,11 @@ fn convert_program(proto: &mil_spec::Program) -> Result<Program> {
         functions.insert(name.clone(), function);
     }
 
-    Ok(Program { version, functions })
+    Ok(Program {
+        version,
+        functions,
+        attributes: std::collections::HashMap::new(),
+    })
 }
 
 fn convert_function(name: &str, proto: &mil_spec::Function) -> Result<Function> {
