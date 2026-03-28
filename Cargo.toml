@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mil-rs", "crates/ironmill-cli", "crates/ironmill-coreml", "crates/ironmill-bench"]
+members = ["crates/mil-rs", "crates/ironmill-cli", "crates/ironmill-coreml", "crates/ironmill-ane", "crates/ironmill-bench"]
 resolver = "2"
 
 [workspace.package]
@@ -11,6 +11,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 mil-rs = { path = "crates/mil-rs", version = "0.1.0" }
+ironmill-ane = { path = "crates/ironmill-ane", version = "0.1.0" }
 prost = "0.13"
 prost-build = "0.13"
 clap = { version = "4", features = ["derive"] }

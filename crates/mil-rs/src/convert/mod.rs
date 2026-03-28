@@ -9,6 +9,8 @@
 //! - [`onnx_graph`](crate::convert::onnx_graph) converts an entire ONNX [`ModelProto`](crate::proto::onnx::ModelProto)
 //!   into a MIL IR [`Program`](crate::ir::Program).
 
+#[cfg(feature = "ane-direct")]
+pub mod ir_to_mil_text;
 pub mod ir_to_proto;
 pub mod lora;
 pub mod moe;

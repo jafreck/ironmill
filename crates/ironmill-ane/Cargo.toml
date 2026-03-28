@@ -1,0 +1,21 @@
+[package]
+name = "ironmill-ane"
+description = "ANE (Apple Neural Engine) direct runtime backend for ironmill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mil-rs = { workspace = true, features = ["ane-direct"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = []
+int4 = []

@@ -26,6 +26,16 @@ pub mod shape_materialize;
 pub mod tensor_utils;
 pub mod type_repropagate;
 
+// ANE-specific passes (feature-gated)
+#[cfg(feature = "ane-direct")]
+pub mod ane_attention_decompose;
+#[cfg(feature = "ane-direct")]
+pub mod ane_concat_elim;
+#[cfg(feature = "ane-direct")]
+pub mod ane_layout;
+#[cfg(feature = "ane-direct")]
+pub mod ane_variable_naming;
+
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
 pub use codebook::CodebookOptimizationPass;
@@ -52,6 +62,15 @@ pub use op_substitute::OpSubstitutionPass;
 pub use palettize::{GroupedPalettizePass, PalettizePass};
 pub use shape_materialize::{AutoregressiveShapeMaterializePass, ShapeMaterializePass};
 pub use type_repropagate::TypeRepropagationPass;
+
+#[cfg(feature = "ane-direct")]
+pub use ane_attention_decompose::AttentionDecomposePass;
+#[cfg(feature = "ane-direct")]
+pub use ane_concat_elim::AneConcatEliminationPass;
+#[cfg(feature = "ane-direct")]
+pub use ane_layout::AneLayoutPass;
+#[cfg(feature = "ane-direct")]
+pub use ane_variable_naming::AneVariableNamingPass;
 
 use super::program::Block;
 use super::types::Value;

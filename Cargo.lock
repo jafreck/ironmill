@@ -410,6 +410,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironmill-ane"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "mil-rs",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ironmill-bench"
 version = "0.1.0"
 dependencies = [
