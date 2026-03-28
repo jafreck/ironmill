@@ -36,8 +36,8 @@ struct Cli {
     #[arg(short, long, default_value = "3")]
     runs: usize,
 
-    /// Backend filter: cpu, gpu, ane, all
-    #[arg(short, long, default_value = "all")]
+    /// Backend filter: cpu, gpu, ane, all (default: cpu,gpu,ane)
+    #[arg(short, long)]
     backend: Vec<String>,
 
     /// Output format
@@ -99,7 +99,9 @@ fn main() -> Result<()> {
         warmup: cli.warmup,
         runs: cli.runs,
         backends: if cli.backend.is_empty() {
-            vec!["all".to_string()]
+            // Default: benchmark on each compute unit individually to show the
+            // performance matrix across hardware targets.
+            vec!["cpu".to_string(), "gpu".to_string(), "ane".to_string()]
         } else {
             cli.backend.clone()
         },

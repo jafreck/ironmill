@@ -51,10 +51,139 @@ fn significance_stars(sig: &Option<SignificanceResult>) -> &'static str {
 }
 
 /// Format as a human-readable table (default output).
+///
+/// When multiple backends are present, displays a cross-tabulated grid with
+/// backends as columns, a speedup column (vs CPU FP32 baseline), and a
+/// significance indicator.
 fn format_table(report: &BenchReport) -> String {
+    let backends: Vec<String> = {
+        let mut b: Vec<String> = report
+            .rows
+            .iter()
+            .map(|r| r.backend.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // Ensure a consistent order: cpu, gpu, ane, all, then anything else.
+        let order = ["cpu", "gpu", "ane", "all"];
+        b.sort_by_key(|name| order.iter().position(|&o| o == name).unwrap_or(order.len()));
+        b
+    };
+
+    let multi_backend = backends.len() > 1 && !backends.contains(&"all".to_string());
+
+    if multi_backend {
+        format_cross_table(report, &backends)
+    } else {
+        format_flat_table(report)
+    }
+}
+
+/// Cross-tabulated table: optimizations × backends with ANE speedup.
+fn format_cross_table(report: &BenchReport, backends: &[String]) -> String {
+    use std::collections::HashMap;
+
     let mut out = String::new();
 
-    // Group rows by model
+    // Group rows by model.
+    let mut models: Vec<String> = Vec::new();
+    for row in &report.rows {
+        if !models.contains(&row.model) {
+            models.push(row.model.clone());
+        }
+    }
+
+    // Index rows by (model, optimization, backend).
+    let mut index: HashMap<(&str, &str, &str), &ReportRow> = HashMap::new();
+    for row in &report.rows {
+        index.insert((&row.model, &row.optimization, &row.backend), row);
+    }
+
+    let has_ane = backends.contains(&"ane".to_string());
+
+    for model in &models {
+        if !out.is_empty() {
+            writeln!(out).unwrap();
+        }
+
+        writeln!(
+            out,
+            "{} — {} runs × {} iterations (median latency)",
+            model, report.settings.runs, report.settings.iterations
+        )
+        .unwrap();
+
+        // Header.
+        let sep = "─".repeat(60 + backends.len() * 10);
+        writeln!(out, "{sep}").unwrap();
+        write!(out, "{:<18}", "Optimization").unwrap();
+        for b in backends {
+            write!(out, "  {:>11}", b.to_uppercase()).unwrap();
+        }
+        if has_ane {
+            write!(out, "  {:>12}", "ANE speedup").unwrap();
+        }
+        writeln!(out).unwrap();
+
+        write!(out, "{:<18}", "─────────────────").unwrap();
+        for _ in backends {
+            write!(out, "  {:>11}", "───────────").unwrap();
+        }
+        if has_ane {
+            write!(out, "  {:>12}", "────────────").unwrap();
+        }
+        writeln!(out).unwrap();
+
+        // Collect unique optimizations in order.
+        let mut opts: Vec<String> = Vec::new();
+        for row in &report.rows {
+            if row.model == *model && !opts.contains(&row.optimization) {
+                opts.push(row.optimization.clone());
+            }
+        }
+
+        // Find the CPU baseline median for speedup calculation.
+        let cpu_baseline_median = opts
+            .first()
+            .and_then(|first_opt| index.get(&(model.as_str(), first_opt.as_str(), "cpu")))
+            .map(|r| r.result.pooled.median);
+
+        for opt in &opts {
+            write!(out, "{:<18}", opt).unwrap();
+            for b in backends {
+                if let Some(row) = index.get(&(model.as_str(), opt.as_str(), b.as_str())) {
+                    let stars = significance_stars(&row.significance);
+                    write!(out, "  {:>5.1}ms{:<3}", row.result.pooled.median, stars).unwrap();
+                } else {
+                    write!(out, "  {:>11}", "—").unwrap();
+                }
+            }
+            if has_ane {
+                if let (Some(cpu_base), Some(ane_row)) = (
+                    cpu_baseline_median,
+                    index.get(&(model.as_str(), opt.as_str(), "ane")),
+                ) {
+                    let ane_med = ane_row.result.pooled.median;
+                    if ane_med > 0.0 {
+                        write!(out, "  {:>10.1}×", cpu_base / ane_med).unwrap();
+                    } else {
+                        write!(out, "  {:>12}", "—").unwrap();
+                    }
+                } else {
+                    write!(out, "  {:>12}", "—").unwrap();
+                }
+            }
+            writeln!(out).unwrap();
+        }
+    }
+
+    out
+}
+
+/// Flat table (single backend or "all").
+fn format_flat_table(report: &BenchReport) -> String {
+    let mut out = String::new();
+
     let mut current_model: Option<&str> = None;
 
     for row in &report.rows {
