@@ -3,6 +3,8 @@
 //! Each pass implements the [`Pass`](super::Pass) trait and transforms a
 //! [`Program`](super::Program) in place.
 
+pub mod attention_fusion;
+pub mod bn_weight_fold;
 pub mod constant_fold;
 pub mod dead_code;
 pub mod fp16_quantize;
@@ -11,10 +13,13 @@ pub mod int8_quantize;
 pub mod kmeans;
 pub mod layout_optimize;
 pub mod op_fusion;
+pub mod op_substitute;
 pub mod palettize;
 pub mod shape_materialize;
-pub(crate) mod tensor_utils;
+pub mod tensor_utils;
 
+pub use attention_fusion::AttentionFusionPass;
+pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
 pub use constant_fold::ConstantFoldPass;
 pub use dead_code::DeadCodeEliminationPass;
 pub use fp16_quantize::Fp16QuantizePass;
@@ -22,6 +27,7 @@ pub use identity_elim::IdentityEliminationPass;
 pub use int8_quantize::{Granularity, Int8QuantizePass};
 pub use layout_optimize::LayoutOptimizationPass;
 pub use op_fusion::{ConvBatchNormFusionPass, ConvReluFusionPass, LinearReluFusionPass};
+pub use op_substitute::OpSubstitutionPass;
 pub use palettize::PalettizePass;
 pub use shape_materialize::ShapeMaterializePass;
 

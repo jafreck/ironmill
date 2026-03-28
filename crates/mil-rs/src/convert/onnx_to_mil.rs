@@ -1282,4 +1282,22 @@ mod tests {
         assert_eq!(onnx_dtype_to_mil(9).unwrap(), "bool");
         assert!(onnx_dtype_to_mil(99).is_err());
     }
+
+    // -- Op name mapping: ANE-specific names --------------------------------
+
+    #[test]
+    fn unsqueeze_converts_to_expand_dims() {
+        let node = make_node("Unsqueeze", &["x", "axes"], &["out"]);
+        let ops = convert_node(&node).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_type, "expand_dims");
+    }
+
+    #[test]
+    fn slice_converts_to_slice_by_index() {
+        let node = make_node("Slice", &["data", "starts", "ends"], &["out"]);
+        let ops = convert_node(&node).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_type, "slice_by_index");
+    }
 }

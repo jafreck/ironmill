@@ -2,9 +2,9 @@
 
 ## Overview
 
-Add six advanced ANE-targeted optimization passes to `mil-rs`. These fall into two
-categories: **always-on** passes that are safe to apply unconditionally, and **opt-in**
-passes that trade accuracy or require user-provided data.
+Add seven ANE-targeted optimization passes to `mil-rs`, plus a shared prerequisite
+module. Passes fall into two categories: **always-on** passes that are safe to apply
+unconditionally, and **opt-in** passes that trade accuracy or require user-provided data.
 
 ### Pass Pipeline (proposed order)
 
@@ -31,7 +31,9 @@ passes that trade accuracy or require user-provided data.
 - `Int8QuantizePass` and `PalettizePass` are **mutually exclusive** — both compress
   weights, applying both degrades quality for no benefit
 - `Fp16QuantizePass` and `PalettizePass` can stack (FP16 activations + palettized weights)
-- All always-on passes are composable and order-independent (but the listed order is optimal)
+- Always-on passes are composable but **order-dependent** in some cases — notably
+  `ConvBatchNormWeightFoldPass` must run before `ConvBatchNormFusionPass`. The listed
+  pipeline order is the required execution order.
 
 ### CLI Changes
 
@@ -43,6 +45,57 @@ coreml-kit compile model.onnx --palettize 4                      # 4-bit weight 
 coreml-kit compile model.onnx --quantize fp16 --palettize 6      # FP16 activations + 6-bit palettes
 coreml-kit compile model.onnx --no-fusion                        # disable always-on fusion passes
 ```
+
+---
+
+## Task 0: Shared Tensor Utilities & Op Name Fixes (Prerequisite)
+
+**Goal**: Extract shared tensor arithmetic helpers needed by Tasks 1, 5, and 6, and
+fix existing op name mismatches between the ONNX converter and ANE validator.
+
+**Files**:
+- `crates/mil-rs/src/ir/passes/tensor_utils.rs` (new)
+- `crates/mil-rs/src/convert/onnx_to_mil.rs` (fix op names)
+- `crates/mil-rs/src/validate.rs` (make `is_ane_supported` public)
+
+### Tensor Utilities
+
+```rust
+/// Reinterpret raw tensor bytes as an f32 slice (little-endian, must be aligned).
+pub fn tensor_as_f32_slice(data: &[u8]) -> &[f32];
+
+/// Convert an f32 slice back to raw tensor bytes (little-endian).
+pub fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8>;
+
+/// Reinterpret raw tensor bytes as a mutable f32 slice.
+pub fn tensor_as_f32_slice_mut(data: &mut [u8]) -> &mut [f32];
+```
+
+These consolidate the pattern already used ad-hoc in `fp32_to_fp16_bytes()`.
+
+### Op Name Fixes
+
+The ONNX converter currently emits op names that don't match the ANE validator's
+supported list:
+
+| Converter emits | Validator expects | Fix |
+|---|---|---|
+| `unsqueeze` | `expand_dims` | Change converter to emit `expand_dims` |
+| `slice` | `slice_by_index` | Change converter to emit `slice_by_index` |
+
+Without this fix, these ops are incorrectly flagged as ANE-incompatible.
+
+### `is_ane_supported` Visibility
+
+Change `fn is_ane_supported(op_type: &str) -> bool` in `validate.rs` from private
+to `pub fn` so that `OpSubstitutionPass` (Task 3) can call it.
+
+### Tests
+
+- `tensor_as_f32_slice` round-trips correctly with known byte patterns
+- `unsqueeze` ONNX node converts to `expand_dims` MIL op
+- `slice` ONNX node converts to `slice_by_index` MIL op
+- `is_ane_supported("expand_dims")` returns true
 
 ---
 
@@ -62,6 +115,10 @@ W_folded = W * γ / √(σ² + ε)
 b_folded = (b - μ) * γ / √(σ² + ε) + β
 ```
 
+Note: W is 4D `(Cout, Cin, kH, kW)` while γ, μ, σ², β are 1D `(Cout,)`. The
+folding must broadcast along the output-channel axis — multiply each `W[c, :, :, :]`
+slice by `γ[c] / √(σ²[c] + ε)`.
+
 ### Implementation
 
 ```rust
@@ -74,6 +131,7 @@ impl Pass for ConvBatchNormWeightFoldPass {
         // 1. Extract conv weight tensor (from the "weight" const op feeding conv)
         // 2. Extract BN parameters: gamma (scale), beta (bias), mean, variance, epsilon
         // 3. Compute folded weights and bias using the formulas above
+        //    (broadcast γ/σ along the Cout axis of the 4D weight tensor)
         // 4. Replace the conv's weight const with the folded weights
         // 5. Replace the conv's bias const with the folded bias (create one if absent)
         // 6. Remove the batch_norm op, rewire outputs
@@ -85,9 +143,7 @@ impl Pass for ConvBatchNormWeightFoldPass {
 
 - Must find the `const` ops that feed into the conv's "weight" and "bias" inputs
 - Must find the `const` ops for BN's gamma, beta, mean, variance
-- Operates on `Value::Tensor` data — needs FP32 arithmetic on raw byte buffers
-- Add helper: `fn tensor_as_f32_slice(data: &[u8]) -> &[f32]`
-- Add helper: `fn f32_slice_to_tensor(data: &[f32]) -> Vec<u8>`
+- Operates on `Value::Tensor` data — use helpers from `tensor_utils.rs` (Task 0)
 - **Ordering**: Must run BEFORE `ConvBatchNormFusionPass` (this does the real work,
   then fusion cleans up the graph structure)
 - **Safety**: Only fold when both conv weights and all BN params are available as
@@ -108,6 +164,10 @@ impl Pass for ConvBatchNormWeightFoldPass {
 single `scaled_dot_product_attention` op that ANE handles natively.
 
 **File**: `crates/mil-rs/src/ir/passes/attention_fusion.rs`
+
+**Also modify**: `crates/mil-rs/src/validate.rs` — add `scaled_dot_product_attention`
+to the `is_ane_supported()` list, otherwise the fused op will be flagged as
+ANE-incompatible.
 
 ### Pattern to detect
 
@@ -175,7 +235,7 @@ impl Pass for AttentionFusionPass {
 | Unsupported Op | Replacement | Notes |
 |---|---|---|
 | `erf` | `tanh`-based GELU approx | `erf(x) ≈ tanh(√(2/π) * (x + 0.044715 * x³))` — expands to mul/add/tanh |
-| `upsample_bilinear` (some modes) | `resize_bilinear` | ANE prefers specific resize variants |
+| `resize` (unsupported modes) | `resize` (ANE-friendly mode) | ANE prefers specific resize align_corners configurations |
 | `conv_transpose` | `upsample` + `conv` | Decompose transposed conv for ANE compatibility |
 | `shape` (dynamic) | Materialized const | Replace with const if shape is known from context |
 
@@ -201,8 +261,9 @@ impl Pass for OpSubstitutionPass {
 - Each substitution is a function: `fn substitute_erf(op: &Operation) -> Vec<Operation>`
 - The substitution may expand one op into multiple (e.g., erf → 5 ops for tanh approx)
 - Use unique name generation for intermediate ops (e.g., `"{original_name}_sub_0"`)
-- **Auto-detect**: Check against `is_ane_supported()` from validate.rs — only substitute
-  ops that would fall back. If an op is already supported, skip it.
+- **Auto-detect**: Check against `is_ane_supported()` from validate.rs (made `pub` in
+  Task 0) — only substitute ops that would fall back. If an op is already supported,
+  skip it.
 
 ### Tests
 
@@ -254,6 +315,12 @@ impl Pass for LayoutOptimizationPass {
 - **Conservative**: Start by only handling conv/pool/batch_norm. Expand to other ops later.
 - Track layout per-value using a `HashMap<String, Layout>` where `Layout` is `NCHW | NHWC`.
 - **Ordering**: Run after fusion passes (fused ops may change layout requirements).
+- **Fan-out complexity**: When an op's output feeds multiple consumers that prefer
+  different layouts, the pass must insert per-edge transposes rather than a single
+  output transpose. The `HashMap<String, Layout>` tracking must account for values
+  with mixed consumer layout preferences — use a per-edge layout model if needed.
+  Consider a phased approach: Phase 1 handles linear chains only, Phase 2 adds
+  fan-out support.
 
 ### Tests
 
@@ -273,8 +340,9 @@ maximum ANE performance.
 
 ### Background
 
-INT8 gives ~2x speedup and ~4x memory reduction over FP32 on ANE, but requires
-**calibration data** to compute per-tensor or per-channel scale and zero-point values.
+INT8 gives ~4x memory reduction over FP32 on ANE (speedup is model-dependent), but
+requires **calibration data** to compute per-tensor or per-channel scale and zero-point
+values.
 
 ### Implementation
 
@@ -323,6 +391,9 @@ impl Pass for Int8QuantizePass {
 - **Mutual exclusivity**: Error if both `--quantize fp16` and `--quantize int8` are specified.
 
 ### CLI
+
+The CLI already accepts `--quantize int8` (parsed but not implemented). Only the
+`--cal-data` flag needs to be added:
 
 ```
 coreml-kit compile model.onnx --quantize int8                    # weight-only INT8
@@ -380,7 +451,7 @@ impl Pass for PalettizePass {
     fn name(&self) -> &str { "palettization" }
     fn run(&self, program: &mut Program) -> Result<()> {
         // For each const op with FP32/FP16 tensor data:
-        // 1. Extract weight values as f32
+        // 1. Extract weight values as f32 (use tensor_utils from Task 0)
         // 2. Run k-means with k = 2^n_bits centroids
         // 3. Replace weight data with:
         //    a. Palette: Vec<f32> of k centroids
@@ -485,23 +556,26 @@ pub struct PassResult {
 ## Dependency Graph
 
 ```
-Task 1 (BN Weight Fold)     ──┐
-Task 2 (Attention Fusion)   ──┤
-Task 3 (Op Substitution)    ──┼──▶ Task 7 (Pipeline Manager + CLI)
-Task 4 (Layout Optimization)──┤
-Task 5 (INT8 Quantization)  ──┤
-Task 6 (Palettization)      ──┘
+Task 0 (Tensor Utils + Fixes)───┬──▶ Task 1 (BN Weight Fold)     ──┐
+                                ├──▶ Task 3 (Op Substitution)    ──┤
+                                ├──▶ Task 5 (INT8 Quantization)  ──┤
+                                └──▶ Task 6 (Palettization)      ──┼──▶ Task 7 (Pipeline + CLI)
+                                                                   │
+Task 2 (Attention Fusion)       ───────────────────────────────────┤
+Task 4 (Layout Optimization)    ───────────────────────────────────┘
 ```
 
-Tasks 1–6 are independent and can be built in any order (or in parallel).
-Task 7 integrates them all and must come last.
+Task 0 is a prerequisite for Tasks 1, 3, 5, and 6 (shared tensor utilities and
+public `is_ane_supported`). Tasks 2 and 4 have no dependencies on Task 0 and can
+start immediately. Task 7 integrates them all and must come last.
 
 ## Suggested Order
 
-1. **Task 1** — Conv+BN weight fold (builds on existing fusion infra, highest perf impact)
-2. **Task 3** — Op substitution (relatively simple, immediate ANE compatibility improvement)
-3. **Task 2** — Attention fusion (high value for transformer models)
-4. **Task 4** — Layout optimization (complex but important for CNN models)
-5. **Task 5** — INT8 quantization (weight-only first, then calibration)
-6. **Task 6** — Palettization (most complex — k-means impl)
-7. **Task 7** — Pipeline manager + CLI integration
+1. **Task 0** — Shared tensor utilities, op name fixes, `is_ane_supported` visibility (prerequisite)
+2. **Task 1** — Conv+BN weight fold (builds on existing fusion infra, highest perf impact)
+3. **Task 3** — Op substitution (relatively simple, immediate ANE compatibility improvement)
+4. **Task 2** — Attention fusion (high value for transformer models)
+5. **Task 4** — Layout optimization (complex — consider Phase 1 linear chains, Phase 2 fan-out)
+6. **Task 5** — INT8 quantization (weight-only first, then calibration)
+7. **Task 6** — Palettization (most complex — k-means impl)
+8. **Task 7** — Pipeline manager + CLI integration

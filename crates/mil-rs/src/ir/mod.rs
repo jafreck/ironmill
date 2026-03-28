@@ -18,9 +18,10 @@ pub use graph::Graph;
 pub use operation::Operation;
 pub use pass::Pass;
 pub use passes::{
-    ConstantFoldPass, ConvBatchNormFusionPass, ConvReluFusionPass, DeadCodeEliminationPass,
-    Fp16QuantizePass, Granularity, IdentityEliminationPass, Int8QuantizePass, LinearReluFusionPass,
-    ShapeMaterializePass,
+    AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass,
+    ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass, Granularity,
+    IdentityEliminationPass, Int8QuantizePass, LayoutOptimizationPass, LinearReluFusionPass,
+    OpSubstitutionPass, PalettizePass, ShapeMaterializePass,
 };
 pub use program::{Block, Function, Program};
 pub use tensor::{ScalarType, TensorType};

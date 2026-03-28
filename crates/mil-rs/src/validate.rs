@@ -194,7 +194,7 @@ fn check_tensor_type(
 }
 
 /// Returns `true` if the MIL operation type is known to run on the ANE.
-fn is_ane_supported(op_type: &str) -> bool {
+pub fn is_ane_supported(op_type: &str) -> bool {
     matches!(
         op_type,
         "conv"
@@ -228,6 +228,7 @@ fn is_ane_supported(op_type: &str) -> bool {
             | "pow"
             | "sqrt"
             | "select"
+            | "scaled_dot_product_attention"
     )
 }
 
@@ -403,5 +404,15 @@ mod tests {
             "expected a dtype warning, got: {:?}",
             report.warnings
         );
+    }
+
+    #[test]
+    fn expand_dims_is_ane_supported() {
+        assert!(is_ane_supported("expand_dims"));
+    }
+
+    #[test]
+    fn slice_by_index_is_ane_supported() {
+        assert!(is_ane_supported("slice_by_index"));
     }
 }
