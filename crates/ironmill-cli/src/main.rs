@@ -768,64 +768,65 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         compile_output(&verifier_path, opts.backend);
     } else {
         // Normal single-model output.
-        let model = if let Some(ref layers) = opts.updatable_layers {
-            let layer_names: Vec<String> = layers
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            anyhow::ensure!(
-                opts.epochs > 0,
-                "--epochs must be a positive integer, got {}",
-                opts.epochs
-            );
-            anyhow::ensure!(
-                opts.learning_rate > 0.0 && opts.learning_rate.is_finite(),
-                "--learning-rate must be a positive finite number, got {}",
-                opts.learning_rate
-            );
-
-            let loss_fn = match opts.loss_function.as_str() {
-                "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,
-                _ => LossFunction::CategoricalCrossEntropy,
-            };
-            let opt = match opts.optimizer_type.as_str() {
-                "adam" => UpdateOptimizer::Adam,
-                _ => UpdateOptimizer::Sgd,
-            };
-
-            let config = UpdatableModelConfig {
-                updatable_layers: layer_names.clone(),
-                learning_rate: opts.learning_rate,
-                epochs: opts.epochs,
-                loss_function: loss_fn,
-                optimizer: opt,
-            };
-
-            println!(
-                "Updatable model: {} layer(s) marked for on-device training",
-                layer_names.len()
-            );
-            program_to_updatable_model(&program, 9, &config)
-                .context("Failed to convert MIL IR to updatable CoreML protobuf")?
-        } else {
-            program_to_model(&program, 9).context("Failed to convert MIL IR to CoreML protobuf")?
-        };
-
-        let output_path = opts.output.clone().unwrap_or_else(|| {
-            let stem = input_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("model");
-            format!("{stem}.mlpackage")
-        });
-        println!("Writing CoreML package: {output_path}");
-        write_mlpackage(&model, &output_path)
-            .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
-
         match opts.runtime {
             RuntimeArg::CoreMl => {
+                let model = if let Some(ref layers) = opts.updatable_layers {
+                    let layer_names: Vec<String> = layers
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+
+                    anyhow::ensure!(
+                        opts.epochs > 0,
+                        "--epochs must be a positive integer, got {}",
+                        opts.epochs
+                    );
+                    anyhow::ensure!(
+                        opts.learning_rate > 0.0 && opts.learning_rate.is_finite(),
+                        "--learning-rate must be a positive finite number, got {}",
+                        opts.learning_rate
+                    );
+
+                    let loss_fn = match opts.loss_function.as_str() {
+                        "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,
+                        _ => LossFunction::CategoricalCrossEntropy,
+                    };
+                    let opt = match opts.optimizer_type.as_str() {
+                        "adam" => UpdateOptimizer::Adam,
+                        _ => UpdateOptimizer::Sgd,
+                    };
+
+                    let config = UpdatableModelConfig {
+                        updatable_layers: layer_names.clone(),
+                        learning_rate: opts.learning_rate,
+                        epochs: opts.epochs,
+                        loss_function: loss_fn,
+                        optimizer: opt,
+                    };
+
+                    println!(
+                        "Updatable model: {} layer(s) marked for on-device training",
+                        layer_names.len()
+                    );
+                    program_to_updatable_model(&program, 9, &config)
+                        .context("Failed to convert MIL IR to updatable CoreML protobuf")?
+                } else {
+                    program_to_model(&program, 9)
+                        .context("Failed to convert MIL IR to CoreML protobuf")?
+                };
+
+                let output_path = opts.output.clone().unwrap_or_else(|| {
+                    let stem = input_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("model");
+                    format!("{stem}.mlpackage")
+                });
+                println!("Writing CoreML package: {output_path}");
+                write_mlpackage(&model, &output_path)
+                    .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
+
                 compile_output(&output_path, opts.backend);
             }
             RuntimeArg::AneDirect => {
@@ -833,13 +834,19 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                 {
                     use ironmill_ane::CompiledArtifacts;
 
-                    println!("  Using ANE direct runtime");
+                    let output_dir = opts.output.clone().unwrap_or_else(|| {
+                        let stem = input_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("model");
+                        format!("{stem}.ane")
+                    });
 
-                    // Run the full pre-compilation pipeline
+                    println!("Compiling for ANE direct runtime → {output_dir}");
+
                     let artifacts = CompiledArtifacts::prepare(&program)
                         .context("ANE direct compilation failed")?;
 
-                    // Validate artifacts
                     let warnings = artifacts
                         .validate()
                         .context("ANE artifact validation failed")?;
@@ -847,16 +854,13 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                         println!("  ⚠ {w}");
                     }
 
-                    // Persist artifacts alongside the .mlpackage
-                    let ane_dir = std::path::Path::new(&output_path).with_extension("ane");
                     artifacts
-                        .save(&ane_dir)
+                        .save(std::path::Path::new(&output_dir))
                         .context("failed to save ANE artifacts")?;
 
                     println!(
-                        "  ✓ ANE model compiled ({} sub-programs) → {}",
+                        "  ✓ {} sub-program(s) written to {output_dir}",
                         artifacts.num_sub_programs(),
-                        ane_dir.display()
                     );
                 }
                 #[cfg(not(feature = "ane-direct"))]
