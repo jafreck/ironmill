@@ -748,8 +748,22 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     } else {
         // Normal single-model output.
         let model = if let Some(ref layers) = opts.updatable_layers {
-            let layer_names: Vec<String> =
-                layers.split(',').map(|s| s.trim().to_string()).collect();
+            let layer_names: Vec<String> = layers
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            anyhow::ensure!(
+                opts.epochs > 0,
+                "--epochs must be a positive integer, got {}",
+                opts.epochs
+            );
+            anyhow::ensure!(
+                opts.learning_rate > 0.0 && opts.learning_rate.is_finite(),
+                "--learning-rate must be a positive finite number, got {}",
+                opts.learning_rate
+            );
 
             let loss_fn = match opts.loss_function.as_str() {
                 "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,

@@ -222,7 +222,7 @@ pub fn program_to_updatable_model(
     };
 
     // Build the update parameters (optimizer, loss, epochs).
-    let update_params = build_update_params(config);
+    let update_params = build_update_params(config, func);
 
     // Store update params as a serialized attribute on the MIL program.
     // CoreML's isUpdatable flag and training inputs are on Model/ModelDescription
@@ -378,7 +378,13 @@ fn build_training_inputs(func: &Function, updatable_layers: &[String]) -> Vec<Fe
 }
 
 /// Build a [`NetworkUpdateParameters`] from the config.
-fn build_update_params(config: &UpdatableModelConfig) -> NetworkUpdateParameters {
+///
+/// When `func` is provided, the loss layer's input is resolved to the
+/// operation's output tensor name rather than its operation name.
+fn build_update_params(
+    config: &UpdatableModelConfig,
+    func: Option<&Function>,
+) -> NetworkUpdateParameters {
     let lr_param = DoubleParameter {
         default_value: config.learning_rate,
         allowed_values: None,
@@ -426,8 +432,14 @@ fn build_update_params(config: &UpdatableModelConfig) -> NetworkUpdateParameters
     };
 
     // Pick a loss input/target name from the updatable layers.
+    // CoreML expects the output tensor name, not the operation name.
     let (loss_input, loss_target) = if let Some(first_layer) = config.updatable_layers.first() {
-        (first_layer.clone(), format!("{first_layer}_target"))
+        let output_name = func
+            .and_then(|f| f.body.operations.iter().find(|op| op.name == *first_layer))
+            .and_then(|op| op.outputs.first())
+            .cloned()
+            .unwrap_or_else(|| first_layer.clone());
+        (output_name.clone(), format!("{output_name}_target"))
     } else {
         ("output".to_string(), "target".to_string())
     };
@@ -1810,7 +1822,7 @@ mod tests {
             loss_function: LossFunction::CategoricalCrossEntropy,
             optimizer: UpdateOptimizer::Sgd,
         };
-        let params = build_update_params(&config);
+        let params = build_update_params(&config, None);
 
         assert_eq!(params.loss_layers.len(), 1);
         assert_eq!(params.loss_layers[0].name, "loss");
@@ -1832,7 +1844,7 @@ mod tests {
             loss_function: LossFunction::MeanSquaredError,
             optimizer: UpdateOptimizer::Adam,
         };
-        let params = build_update_params(&config);
+        let params = build_update_params(&config, None);
 
         let opt = params.optimizer.as_ref().unwrap();
         assert!(matches!(
