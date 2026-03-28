@@ -10,7 +10,7 @@ repository = "https://github.com/jafreck/ironmill"
 rust-version = "1.85"
 
 [workspace.dependencies]
-mil-rs = { path = "crates/mil-rs" }
+mil-rs = { path = "crates/mil-rs", version = "0.1.0" }
 prost = "0.13"
 prost-build = "0.13"
 clap = { version = "4", features = ["derive"] }

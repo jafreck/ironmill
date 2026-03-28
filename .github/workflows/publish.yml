@@ -1,0 +1,53 @@
+name: Publish to crates.io
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify version matches release tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          WORKSPACE_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].version')
+          if [ "$VERSION" != "$WORKSPACE_VERSION" ]; then
+            echo "::error::Release tag ($TAG) does not match workspace version ($WORKSPACE_VERSION)"
+            exit 1
+          fi
+
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish mil-rs
+        run: cargo publish -p mil-rs
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      # Wait for crates.io index to update before publishing the dependent crate
+      - name: Wait for index propagation
+        run: sleep 30
+
+      - name: Publish ironmill-cli
+        run: cargo publish -p ironmill-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
