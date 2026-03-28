@@ -1,8 +1,9 @@
 //! FFI bindings for direct Apple Neural Engine compilation.
 //!
-//! This module provides Rust wrappers around Apple's private `_ANECompiler`
-//! Objective-C class, enabling direct ANE compilation without shelling out to
-//! `xcrun coremlcompiler`.
+//! This module provides Rust wrappers around Apple's private
+//! `_ANEInMemoryModelDescriptor` and `_ANEInMemoryModel` Objective-C classes,
+//! enabling direct ANE compilation and execution following the same approach
+//! as the Orion project.
 //!
 //! # ⚠️ Private API Warning
 //!

@@ -1,8 +1,9 @@
 //! ANE (Apple Neural Engine) direct runtime backend for ironmill.
 //!
 //! This crate provides a Rust-native interface to Apple's private ANE APIs
-//! (`_ANEClient`, `_ANECompiler`) for compiling and executing models directly
-//! on the Neural Engine, bypassing CoreML's `MLModel` path.
+//! (`_ANEInMemoryModel`, `_ANERequest`, `_ANEIOSurfaceObject`) for compiling
+//! and executing models directly on the Neural Engine, bypassing CoreML's
+//! `MLModel` path. Follows the same approach as the Orion project.
 //!
 //! # ⚠️ Private API Warning
 //!
@@ -18,7 +19,7 @@
 //! |-------------|--------------------------------------------|
 //! | `blobfile`  | BLOBFILE weight format writer               |
 //! | `tensor`    | IOSurface-backed tensor I/O                 |
-//! | `runtime`   | `_ANEClient` lifecycle and program execution|
+//! | `runtime`   | ANE lifecycle and program execution          |
 //! | `cache`     | Compiled program cache with disk persistence|
 //! | `split`     | Model → ANE-sized sub-program splitter      |
 //! | `program`   | Compiled program handle types               |
@@ -229,7 +230,7 @@ impl AneModel {
                     }
                 })?;
                 cache.record_compilation();
-                CompiledProgram { inner: ptr }
+                CompiledProgram { model: ptr }
             } else {
                 let ptr = AneCompiler::compile_mil_text(&mil_text, &weight_path).map_err(|e| {
                     AneError::CompileFailed {
@@ -242,7 +243,7 @@ impl AneModel {
                     std::fs::create_dir_all(&disk_path).ok();
                     cache.insert(cache_key, disk_path);
                 }
-                CompiledProgram { inner: ptr }
+                CompiledProgram { model: ptr }
             };
 
             // 4e. Load into runtime
@@ -1040,7 +1041,7 @@ mod tests {
                 assert!(
                     msg.contains("ANE")
                         || msg.contains("compilation")
-                        || msg.contains("_ANEClient")
+                        || msg.contains("dlopen")
                         || msg.contains("compile"),
                     "expected compilation failure, got: {msg}"
                 );
@@ -1073,7 +1074,7 @@ mod tests {
                 assert!(
                     msg.contains("ANE")
                         || msg.contains("compilation")
-                        || msg.contains("_ANEClient")
+                        || msg.contains("dlopen")
                         || msg.contains("compile"),
                     "expected compilation failure, got: {msg}"
                 );
