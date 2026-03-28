@@ -119,66 +119,66 @@ FP16 is nearly lossless (73+ dB SNR). INT8 provides strong compression with good
 
 ## Inference Latency
 
-End-to-end inference on Apple Silicon (arm64), measured with the Swift
-`InferenceBench` harness.  Each configuration compiles the ONNX model with
-`ironmill`, runs `coremlcompiler compile`, then loads the `.mlmodelc` via
-`MLModel` and times 200 predictions after 20 warmup iterations.
+End-to-end inference on Apple Silicon (arm64), measured with the Rust
+`ironmill-bench` harness.  Each configuration compiles the ONNX model with
+ironmill's optimization pipeline, runs `coremlcompiler compile`, then loads the
+`.mlmodelc` via CoreML's `MLModel` API and times 200 predictions after 20
+warmup iterations across 3 runs.
 
 ### MobileNetV2 (14M ONNX, 155 nodes)
 
-| Configuration | p50 | p95 | p99 | Load |
+| Optimization | CPU | GPU (Metal) | ANE | ANE speedup |
 |---|---|---|---|---|
-| No optimization (`--no-fusion`) | 1.9ms | 2.3ms | 2.4ms | 6.93s |
-| Default (always-on) | 1.9ms | 2.4ms | 2.7ms | 7.99s |
-| **+ FP16** | **515µs** | **555µs** | **595µs** | 9.95s |
-| + INT8 | 1.8ms | 2.4ms | 2.6ms | 4.52s |
-| + Palettize 4-bit | 1.9ms | 2.5ms | 2.9ms | 866ms |
-
-FP16 delivers a **3.7× speedup** (1.9ms → 515µs) by enabling native half-precision
-compute on the Neural Engine.  INT8 shows a modest improvement.  Palettize
-reduces model load time significantly (866ms vs 7s) but doesn't improve
-inference speed since weights are decompressed at load time.
+| FP32 baseline | 7.4ms | 2.2ms | 6.0ms | 1.2× |
+| Default (fusion) | 4.7ms | 2.6ms | 4.8ms | 1.5× |
+| **FP16** | 3.0ms | 2.1ms | **1.0ms** | **7.4×** |
+| INT8 | 5.2ms | 1.8ms | 4.7ms | 1.6× |
+| Palettize 4-bit | 4.6ms | 1.5ms | 4.9ms | 1.5× |
 
 ### SqueezeNet 1.1 (4.7M ONNX, 66 nodes)
 
-| Configuration | p50 | p95 | p99 | Load |
+| Optimization | CPU | GPU (Metal) | ANE | ANE speedup |
 |---|---|---|---|---|
-| No optimization (`--no-fusion`) | 1.2ms | 1.7ms | 1.9ms | 2.48s |
-| Default (always-on) | 1.2ms | 1.6ms | 1.8ms | 682ms |
-| **+ FP16** | **281µs** | **337µs** | **382µs** | 4.02s |
-| + INT8 | 2.4ms | 7.1ms | 10.4ms | 1.22s |
-| + Palettize 4-bit | 1.8ms | 2.5ms | 3.9ms | 563ms |
+| FP32 baseline | 2.1ms | 1.6ms | 2.0ms | 1.1× |
+| Default (fusion) | 1.9ms | 1.6ms | 1.9ms | 1.1× |
+| **FP16** | 2.0ms | 1.6ms | **0.3ms** | **7.7×** |
+| INT8 | 2.3ms | 1.6ms | 1.9ms | 1.1× |
+| Palettize 4-bit | 1.9ms | 1.7ms | 1.9ms | 1.1× |
 
-FP16 delivers a **4.3× speedup** (1.2ms → 281µs).  The always-on fusion
-passes (conv-relu) cut model load time from 2.5s to 682ms by reducing the
-number of ops the CoreML compiler must process.
+ANE speedup is measured as CPU FP32 baseline median ÷ ANE median for each
+optimization.  All values are median latency across 3 runs × 200 iterations.
 
-### Backend Comparison: CPU vs GPU vs ANE
+### Key Findings
 
-All results above use `.all` compute units (CoreML picks the fastest backend).
-The table below isolates each backend on MobileNetV2 to show where the
-speedups actually come from.
-
-| Quantization | CPU | GPU (Metal) | ANE |
-|---|---|---|---|
-| FP32 | 5.7–10.6ms | 2.8–5.8ms | 2.4–11.0ms |
-| **FP16** | 3.2–3.6ms | 2.3–4.6ms | **0.9–1.3ms** |
-| INT8 | 5.4–5.6ms | 1.8–4.6ms | 2.1–2.2ms |
-| Palettize 4-bit | 5.0–7.3ms | 2.1–2.5ms | 2.0–5.2ms |
-
-Results vary across runs due to system load and CoreML's runtime scheduling.
-Two consistent findings:
-
-- **FP16 + ANE is the fastest configuration** — consistently under 1.5ms,
-  well ahead of all other backend × quantization combinations.
-- **INT8 and palettization don't reliably improve inference speed** on any
-  backend — they primarily reduce model size and load time.
+- **FP16 + ANE is the fastest configuration** — 7–8× faster than unoptimized
+  CPU inference.  The Neural Engine's FP16 data path is specifically optimized
+  for half-precision arithmetic, which is why ironmill's FP16 quantization pass
+  unlocks performance that other optimizations cannot.
+- **INT8 and palettization reduce model size but don't improve inference** on
+  any backend — their value is in deployment size and load time, not throughput.
+- **GPU (Metal) provides consistent ~2ms latency** across all optimizations,
+  making it the most predictable backend for latency-sensitive applications.
+- **Without FP16, the ANE is no faster than CPU** — the 6ms FP32 ANE latency
+  shows that the Neural Engine cannot efficiently execute full-precision models.
+  Ironmill's optimization pipeline is what makes ANE deployment practical.
 
 ---
 
 ## Running the Benchmarks
 
 ```bash
+# Inference latency (cross-tabulated: optimizations × cpu/gpu/ane)
+cargo run --release -p ironmill-bench
+
+# With significance tests against baseline
+cargo run --release -p ironmill-bench -- --baseline baseline
+
+# Single backend only (flat table format)
+cargo run --release -p ironmill-bench -- -b all
+
+# Custom model
+cargo run --release -p ironmill-bench -- -m path/to/model.onnx
+
 # Compile-time performance (Criterion)
 cargo bench
 
@@ -187,7 +187,4 @@ cargo bench
 
 # Numerical quality report
 ./scripts/bench-quality.sh
-
-# Inference latency (requires Xcode)
-./scripts/bench-inference.sh
 ```
