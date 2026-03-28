@@ -1,7 +1,7 @@
 # Benchmark Results
 
 **Date**: 2026-03-28
-**Hardware**: Apple Silicon Mac (arm64)
+**Hardware**: M2 Max Apple Silicon Mac (arm64) 64GB
 **Models**: MobileNetV2 (14M ONNX), SqueezeNet 1.1 (4.7M ONNX)
 **Tool**: ironmill v0.1.0 (Rust, release build)
 
@@ -161,19 +161,18 @@ speedups actually come from.
 
 | Quantization | CPU | GPU (Metal) | ANE |
 |---|---|---|---|
-| FP32 | 5.7ms | 2.8ms | 2.4ms |
-| **FP16** | 3.2ms | 2.3ms | **861µs** |
-| INT8 | 5.6ms | 4.6ms | 2.1ms |
-| Palettize 4-bit | 7.3ms | 2.5ms | 2.0ms |
+| FP32 | 5.7–10.6ms | 2.8–5.8ms | 2.4–11.0ms |
+| **FP16** | 3.2–3.6ms | 2.3–4.6ms | **0.9–1.3ms** |
+| INT8 | 5.4–5.6ms | 1.8–4.6ms | 2.1–2.2ms |
+| Palettize 4-bit | 5.0–7.3ms | 2.1–2.5ms | 2.0–5.2ms |
 
-- **ANE is fastest across all quantizations**, but FP16 unlocks its full
-  potential — 2.8× faster than FP32 on the same ANE hardware (861µs vs 2.4ms).
-- **GPU (Metal)** is ~2× faster than CPU at FP32, but FP16 barely helps it
-  (2.3ms vs 2.8ms).
-- **INT8 hurts GPU** (4.6ms vs 2.8ms FP32) — the dequantization overhead
-  exceeds any compute savings.
-- **Palettize** doesn't speed up inference on any backend — it primarily
-  reduces model size and load time.
+Results vary across runs due to system load and CoreML's runtime scheduling.
+Two consistent findings:
+
+- **FP16 + ANE is the fastest configuration** — consistently under 1.5ms,
+  well ahead of all other backend × quantization combinations.
+- **INT8 and palettization don't reliably improve inference speed** on any
+  backend — they primarily reduce model size and load time.
 
 ---
 
