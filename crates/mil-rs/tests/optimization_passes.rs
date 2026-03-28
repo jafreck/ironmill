@@ -22,6 +22,8 @@ use mil_rs::{
 
 #[test]
 fn nhwc_pipeline_produces_valid_proto() {
+    use mil_rs::ir::passes::layout_optimize::LayoutOptimizationPass;
+
     let input_ty = TensorType::new(ScalarType::Float32, vec![1, 3, 224, 224]);
     let func = Function::new("main").with_input("input", input_ty);
     let mut program = Program::new("1");
@@ -39,6 +41,11 @@ fn nhwc_pipeline_produces_valid_proto() {
         prev = out;
     }
     block.outputs.push(prev);
+
+    // Run layout optimization explicitly (not in default pipeline).
+    LayoutOptimizationPass
+        .run(&mut program)
+        .expect("layout pass should succeed");
 
     let pipeline = PassPipeline::new();
     pipeline.run(&mut program).expect("pipeline should succeed");
@@ -83,15 +90,7 @@ fn nhwc_pipeline_produces_valid_proto() {
         let vt = out.r#type.as_ref().expect("output should have type");
         if let Some(mil_rs::proto::mil_spec::value_type::Type::TensorType(tt)) = &vt.r#type {
             assert_eq!(tt.rank, 4, "transpose output should have rank 4");
-            for dim in &tt.dimensions {
-                assert!(
-                    matches!(
-                        dim.dimension,
-                        Some(mil_rs::proto::mil_spec::dimension::Dimension::Unknown(_))
-                    ),
-                    "transpose dims should be unknown"
-                );
-            }
+            assert_eq!(tt.dimensions.len(), 4, "should have 4 dimensions");
         } else {
             panic!("expected TensorType for transpose output");
         }

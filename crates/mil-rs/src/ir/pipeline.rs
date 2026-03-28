@@ -15,7 +15,7 @@ use super::passes::{
     GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass, KvCachePass,
     LayerNormLinearFusionPass, LayerSchedulePass, LayoutOptimizationPass, LinearReluFusionPass,
     MixedPrecisionConfig, MixedPrecisionPass, OpSplittingPass, OpSubstitutionPass, PalettizePass,
-    PerExpertQuantPass, ResidualAddFusionPass, ShapeMaterializePass,
+    PerExpertQuantPass, ResidualAddFusionPass, ShapeMaterializePass, TypeRepropagationPass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -76,6 +76,7 @@ const KNOWN_PASSES: &[&str] = &[
     "codebook-optimization",
     "op-substitution",
     "layout-optimization",
+    "type-repropagation",
     "fp16-quantization",
     "int8-quantization",
     "mixed-precision",
@@ -113,6 +114,7 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
         "codebook-optimization" => Ok(Box::new(CodebookOptimizationPass)),
         "op-substitution" => Ok(Box::new(OpSubstitutionPass)),
         "layout-optimization" => Ok(Box::new(LayoutOptimizationPass)),
+        "type-repropagation" => Ok(Box::new(TypeRepropagationPass)),
         "fp16-quantization" => Ok(Box::new(Fp16QuantizePass)),
         "int8-quantization" => {
             let cal_dir = params
@@ -280,7 +282,13 @@ impl PassPipeline {
                 Box::new(KvCachePass::default()),
                 Box::new(CodebookOptimizationPass),
                 Box::new(OpSubstitutionPass),
-                Box::new(LayoutOptimizationPass),
+                // LayoutOptimizationPass (NCHW→NHWC) is not included in the
+                // default pipeline because MIL's conv op validates assuming
+                // NCHW layout. Enable via TOML config once the pass handles
+                // weight transposition.
+                // Re-propagate output types after all transformations so that
+                // newly-created ops (transposes, tiles, etc.) get concrete types.
+                Box::new(TypeRepropagationPass),
             ],
             has_fp16: false,
             has_int8: false,
@@ -797,7 +805,7 @@ mod tests {
                 "kv-cache",
                 "codebook-optimization",
                 "op-substitution",
-                "layout-optimization",
+                "type-repropagation",
             ]
         );
     }
@@ -859,6 +867,7 @@ mod tests {
                 "dead-code-elimination",
                 "identity-elimination",
                 "constant-folding",
+                "type-repropagation",
             ]
         );
         // Make sure fusion passes are gone
@@ -1061,7 +1070,7 @@ name = "codebook-optimization"
 name = "op-substitution"
 
 [[passes]]
-name = "layout-optimization"
+name = "type-repropagation"
 "#;
         let config_pipeline = PassPipeline::from_config_str(toml).unwrap();
         let default_pipeline = PassPipeline::new();
