@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-28
 **Hardware**: Apple Silicon Mac (arm64)
-**Models**: MNIST (28K ONNX), SqueezeNet 1.1 (4.7M ONNX)
+**Models**: MobileNetV2 (14M ONNX), SqueezeNet 1.1 (4.7M ONNX)
 **Tool**: ironmill v0.1.0 (Rust, release build)
 
 ## Methodology
@@ -15,7 +15,7 @@ Three benchmark suites measure different aspects of ironmill's optimization pipe
 
 3. **Numerical quality** — compares weight tensor values between baseline (unoptimized) and optimized models. FP16 values are converted back to FP32; INT8 values are dequantized via stored scale/zero-point; palettized values are reconstructed from LUT + indices. All comparisons are element-wise against the original FP32 weights.
 
-Inference latency benchmarks require full Xcode installation and are not yet included.
+4. **Inference latency** — end-to-end inference on Apple Silicon using the Swift `InferenceBench` harness. Models are compiled to `.mlmodelc` via `xcrun coremlcompiler` and loaded with `MLModel`. Latencies are measured over 200 iterations after 20 warmup runs.
 
 ---
 
@@ -114,6 +114,44 @@ Compares reconstructed weight values against original FP32 weights to quantify p
 - **SNR < 20 dB**: Significant precision loss. Requires task-specific accuracy testing before deployment.
 
 FP16 is nearly lossless (73+ dB SNR). INT8 provides strong compression with good fidelity (~40 dB). 4-bit palettization shows meaningful error that warrants task-level validation — recommended for size-constrained deployments where slight accuracy loss is acceptable.
+
+---
+
+## Inference Latency
+
+End-to-end inference on Apple Silicon (arm64), measured with the Swift
+`InferenceBench` harness.  Each configuration compiles the ONNX model with
+`ironmill`, runs `coremlcompiler compile`, then loads the `.mlmodelc` via
+`MLModel` and times 200 predictions after 20 warmup iterations.
+
+### MobileNetV2 (14M ONNX, 155 nodes)
+
+| Configuration | p50 | p95 | p99 | Load |
+|---|---|---|---|---|
+| No optimization (`--no-fusion`) | 1.9ms | 2.3ms | 2.4ms | 6.93s |
+| Default (always-on) | 1.9ms | 2.4ms | 2.7ms | 7.99s |
+| **+ FP16** | **515µs** | **555µs** | **595µs** | 9.95s |
+| + INT8 | 1.8ms | 2.4ms | 2.6ms | 4.52s |
+| + Palettize 4-bit | 1.9ms | 2.5ms | 2.9ms | 866ms |
+
+FP16 delivers a **3.7× speedup** (1.9ms → 515µs) by enabling native half-precision
+compute on the Neural Engine.  INT8 shows a modest improvement.  Palettize
+reduces model load time significantly (866ms vs 7s) but doesn't improve
+inference speed since weights are decompressed at load time.
+
+### SqueezeNet 1.1 (4.7M ONNX, 66 nodes)
+
+| Configuration | p50 | p95 | p99 | Load |
+|---|---|---|---|---|
+| No optimization (`--no-fusion`) | 1.2ms | 1.7ms | 1.9ms | 2.48s |
+| Default (always-on) | 1.2ms | 1.6ms | 1.8ms | 682ms |
+| **+ FP16** | **281µs** | **337µs** | **382µs** | 4.02s |
+| + INT8 | 2.4ms | 7.1ms | 10.4ms | 1.22s |
+| + Palettize 4-bit | 1.8ms | 2.5ms | 3.9ms | 563ms |
+
+FP16 delivers a **4.3× speedup** (1.2ms → 281µs).  The always-on fusion
+passes (conv-relu) cut model load time from 2.5s to 682ms by reducing the
+number of ops the CoreML compiler must process.
 
 ---
 
