@@ -45,20 +45,26 @@ fn convert_program(program: &Program) -> Result<mil_spec::Program> {
 }
 
 fn convert_function(func: &Function) -> Result<mil_spec::Function> {
+    // Build a type map from function inputs so we can propagate output types.
+    let mut type_map: HashMap<String, mil_spec::ValueType> = HashMap::new();
     let inputs = func
         .inputs
         .iter()
-        .map(|(name, tt)| mil_spec::NamedValueType {
-            name: name.clone(),
-            r#type: Some(mil_spec::ValueType {
+        .map(|(name, tt)| {
+            let vt = mil_spec::ValueType {
                 r#type: Some(mil_spec::value_type::Type::TensorType(convert_tensor_type(
                     tt,
                 ))),
-            }),
+            };
+            type_map.insert(name.clone(), vt.clone());
+            mil_spec::NamedValueType {
+                name: name.clone(),
+                r#type: Some(vt),
+            }
         })
         .collect();
 
-    let block = convert_block(&func.body)?;
+    let block = convert_block(&func.body, &mut type_map)?;
 
     let opset = "CoreML6".to_string();
     let mut block_specializations = HashMap::new();
@@ -72,11 +78,14 @@ fn convert_function(func: &Function) -> Result<mil_spec::Function> {
     })
 }
 
-fn convert_block(block: &Block) -> Result<mil_spec::Block> {
+fn convert_block(
+    block: &Block,
+    type_map: &mut HashMap<String, mil_spec::ValueType>,
+) -> Result<mil_spec::Block> {
     let operations = block
         .operations
         .iter()
-        .map(convert_operation)
+        .map(|op| convert_operation(op, type_map))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(mil_spec::Block {
@@ -91,33 +100,65 @@ fn convert_block(block: &Block) -> Result<mil_spec::Block> {
 // Operation
 // ---------------------------------------------------------------------------
 
-fn convert_operation(op: &Operation) -> Result<mil_spec::Operation> {
+fn convert_operation(
+    op: &Operation,
+    type_map: &mut HashMap<String, mil_spec::ValueType>,
+) -> Result<mil_spec::Operation> {
     let mut inputs = HashMap::new();
     for (param, value) in &op.inputs {
         inputs.insert(param.clone(), convert_value_to_argument(value)?);
     }
 
-    // For const ops, determine the output type from the val value so
-    // coremlcompiler knows the type produced by this constant.
-    let const_val = if op.op_type == "const" {
-        op.inputs.get("val").or_else(|| op.attributes.get("val"))
-    } else {
-        None
-    };
-    let const_output_type = const_val.and_then(value_type_for);
+    // Determine output type for this operation: prefer stored types, fall back
+    // to inference from the type_map.
+    let inferred_type = infer_output_type(op, type_map);
 
-    let outputs = op
+    let outputs: Vec<mil_spec::NamedValueType> = op
         .outputs
         .iter()
-        .map(|name| mil_spec::NamedValueType {
-            name: name.clone(),
-            r#type: const_output_type.clone(),
+        .enumerate()
+        .map(|(i, name)| {
+            // Use the stored type for this specific output if available,
+            // otherwise fall back to the inferred type.
+            let vt = op
+                .output_types
+                .get(i)
+                .and_then(|ot| ot.as_ref())
+                .map(|tt| mil_spec::ValueType {
+                    r#type: Some(mil_spec::value_type::Type::TensorType(convert_tensor_type(
+                        tt,
+                    ))),
+                })
+                .or_else(|| inferred_type.clone());
+
+            // Register in the type map for downstream ops.
+            if let Some(ref v) = vt {
+                type_map.insert(name.clone(), v.clone());
+            }
+
+            mil_spec::NamedValueType {
+                name: name.clone(),
+                r#type: vt,
+            }
         })
         .collect();
 
     let mut attributes = HashMap::new();
     for (attr_name, attr_val) in &op.attributes {
-        attributes.insert(attr_name.clone(), convert_value_to_proto(attr_val)?);
+        if op.op_type == "const" {
+            // For const ops, all attributes stay as proto attributes.
+            attributes.insert(attr_name.clone(), convert_value_to_proto(attr_val)?);
+            continue;
+        }
+        // Skip internal-only attributes from optimization passes.
+        if matches!(
+            attr_name.as_str(),
+            "fused_activation" | "has_fused_bn" | "original_op" | "kernel_shape"
+        ) {
+            continue;
+        }
+        // Non-const: MIL expects parameters as proto inputs.
+        inputs.insert(attr_name.clone(), convert_value_to_argument(attr_val)?);
     }
 
     Ok(mil_spec::Operation {
@@ -129,12 +170,77 @@ fn convert_operation(op: &Operation) -> Result<mil_spec::Operation> {
     })
 }
 
+/// Infer the output type of an operation from its inputs and the type map.
+fn infer_output_type(
+    op: &Operation,
+    type_map: &HashMap<String, mil_spec::ValueType>,
+) -> Option<mil_spec::ValueType> {
+    // For const ops, derive the type from the val attribute/input.
+    if op.op_type == "const" {
+        let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+        return val.and_then(value_type_for);
+    }
+
+    // Try to resolve a type from a reference Value.
+    let resolve = |v: &Value| -> Option<mil_spec::ValueType> {
+        match v {
+            Value::Reference(name) => type_map.get(name).cloned(),
+            Value::List(items) => {
+                // For list inputs (e.g., concat's "values"), use the
+                // first reference's type.
+                items.iter().find_map(|item| {
+                    if let Value::Reference(name) = item {
+                        type_map.get(name).cloned()
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        }
+    };
+
+    // For most ops, the output type matches the primary input's type.
+    let primary_params = ["x", "data", "input", "values"];
+    let first_input_type = primary_params
+        .iter()
+        .filter_map(|&param| op.inputs.get(param))
+        .find_map(resolve);
+
+    if first_input_type.is_some() {
+        return first_input_type;
+    }
+
+    // Fallback: try any input.
+    op.inputs.values().find_map(resolve)
+}
+
 // ---------------------------------------------------------------------------
 // Arguments & Values
 // ---------------------------------------------------------------------------
 
 /// Convert an IR `Value` into a proto `Argument`.
 fn convert_value_to_argument(value: &Value) -> Result<mil_spec::Argument> {
+    // A list of references becomes multiple bindings (e.g., concat's "values").
+    if let Value::List(items) = value {
+        if items.iter().all(|v| matches!(v, Value::Reference(_))) {
+            let bindings = items
+                .iter()
+                .map(|v| {
+                    let Value::Reference(name) = v else {
+                        unreachable!()
+                    };
+                    mil_spec::argument::Binding {
+                        binding: Some(mil_spec::argument::binding::Binding::Name(name.clone())),
+                    }
+                })
+                .collect();
+            return Ok(mil_spec::Argument {
+                arguments: bindings,
+            });
+        }
+    }
+
     let binding = match value {
         Value::Reference(name) => mil_spec::argument::binding::Binding::Name(name.clone()),
         other => {
@@ -216,6 +322,75 @@ fn value_type_for(value: &Value) -> Option<mil_spec::ValueType> {
         // Type-only values and references have their type handled separately.
         Value::Type(_) | Value::Reference(_) => None,
     }
+}
+
+/// Try to encode a list of scalar `Value`s as a 1D `TensorValue`.
+///
+/// Returns `Some((tensor_value, data_type))` if all items are the same
+/// scalar type (Int, Float, or Bool), `None` otherwise.
+fn try_list_as_tensor(items: &[Value]) -> Option<(mil_spec::TensorValue, mil_spec::DataType)> {
+    if items.is_empty() {
+        return None;
+    }
+
+    // Check if all items are ints.
+    if items.iter().all(|v| matches!(v, Value::Int(_))) {
+        let ints: Vec<i32> = items
+            .iter()
+            .map(|v| {
+                let Value::Int(i) = v else { unreachable!() };
+                *i as i32
+            })
+            .collect();
+        return Some((
+            mil_spec::TensorValue {
+                value: Some(mil_spec::tensor_value::Value::Ints(
+                    mil_spec::tensor_value::RepeatedInts { values: ints },
+                )),
+            },
+            mil_spec::DataType::Int32,
+        ));
+    }
+
+    // Check if all items are floats.
+    if items.iter().all(|v| matches!(v, Value::Float(_))) {
+        let floats: Vec<f32> = items
+            .iter()
+            .map(|v| {
+                let Value::Float(f) = v else { unreachable!() };
+                *f as f32
+            })
+            .collect();
+        return Some((
+            mil_spec::TensorValue {
+                value: Some(mil_spec::tensor_value::Value::Floats(
+                    mil_spec::tensor_value::RepeatedFloats { values: floats },
+                )),
+            },
+            mil_spec::DataType::Float32,
+        ));
+    }
+
+    // Check if all items are bools.
+    if items.iter().all(|v| matches!(v, Value::Bool(_))) {
+        let bools: Vec<bool> = items
+            .iter()
+            .map(|v| {
+                let Value::Bool(b) = v else { unreachable!() };
+                *b
+            })
+            .collect();
+        return Some((
+            mil_spec::TensorValue {
+                value: Some(mil_spec::tensor_value::Value::Bools(
+                    mil_spec::tensor_value::RepeatedBools { values: bools },
+                )),
+            },
+            mil_spec::DataType::Bool,
+        ));
+    }
+
+    None
 }
 
 /// Encode a `Value::Tensor` into the appropriate typed `TensorValue`.
@@ -363,18 +538,45 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
             )
         }
         Value::List(items) => {
-            let proto_items = items
-                .iter()
-                .map(convert_value_to_proto)
-                .collect::<Result<Vec<_>>>()?;
-            (
-                Some(value::Value::ImmediateValue(value::ImmediateValue {
-                    value: Some(value::immediate_value::Value::List(mil_spec::ListValue {
-                        values: proto_items,
+            // In MIL, homogeneous lists of scalars are represented as 1D
+            // tensors. Only use a proto ListValue for heterogeneous/nested
+            // lists or lists of references.
+            if let Some((tv, dt)) = try_list_as_tensor(items) {
+                let len = items.len();
+                let tensor_type = mil_spec::ValueType {
+                    r#type: Some(mil_spec::value_type::Type::TensorType(
+                        mil_spec::TensorType {
+                            data_type: dt as i32,
+                            rank: 1,
+                            dimensions: vec![mil_spec::Dimension {
+                                dimension: Some(mil_spec::dimension::Dimension::Constant(
+                                    mil_spec::dimension::ConstantDimension { size: len as u64 },
+                                )),
+                            }],
+                            attributes: HashMap::new(),
+                        },
+                    )),
+                };
+                (
+                    Some(value::Value::ImmediateValue(value::ImmediateValue {
+                        value: Some(value::immediate_value::Value::Tensor(tv)),
                     })),
-                })),
-                value_type_for(value),
-            )
+                    Some(tensor_type),
+                )
+            } else {
+                let proto_items = items
+                    .iter()
+                    .map(convert_value_to_proto)
+                    .collect::<Result<Vec<_>>>()?;
+                (
+                    Some(value::Value::ImmediateValue(value::ImmediateValue {
+                        value: Some(value::immediate_value::Value::List(mil_spec::ListValue {
+                            values: proto_items,
+                        })),
+                    })),
+                    value_type_for(value),
+                )
+            }
         }
         Value::Type(tt) => {
             // Type-only value — no immediate payload, just the type field.
@@ -565,6 +767,8 @@ mod tests {
         let model = program_to_model(&program, 7).unwrap();
         let recovered = model_to_program(&model).unwrap();
 
+        // const ops keep their params as proto attributes, so they
+        // round-trip back as attributes in the IR.
         let attrs = &recovered.functions["main"].body.operations[0].attributes;
         assert!(matches!(attrs.get("val"), Some(Value::Int(42))));
         assert!(matches!(attrs.get("training"), Some(Value::Bool(false))));

@@ -97,9 +97,19 @@ fn convert_block(proto: &mil_spec::Block) -> Result<Block> {
 // ---------------------------------------------------------------------------
 
 fn convert_operation(proto: &mil_spec::Operation) -> Result<Operation> {
-    // The proto operation's `outputs` are `NamedValueType`s.  Our IR only
-    // keeps the names in `outputs`; the type info is discarded for now.
     let output_names: Vec<String> = proto.outputs.iter().map(|nvt| nvt.name.clone()).collect();
+
+    // Preserve output types from the proto NamedValueType entries.
+    let output_types: Vec<Option<TensorType>> = proto
+        .outputs
+        .iter()
+        .map(|nvt| {
+            nvt.r#type.as_ref().and_then(|vt| match &vt.r#type {
+                Some(mil_spec::value_type::Type::TensorType(tt)) => convert_tensor_type(tt).ok(),
+                _ => None,
+            })
+        })
+        .collect();
 
     // Derive a stable name: use the first output name (which is the SSA name
     // in MIL) or fall back to the op type with a placeholder.
@@ -123,6 +133,7 @@ fn convert_operation(proto: &mil_spec::Operation) -> Result<Operation> {
         name,
         inputs,
         outputs: output_names,
+        output_types,
         attributes,
     })
 }

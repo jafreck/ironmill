@@ -236,21 +236,41 @@ fn convert_conv(node: &NodeProto) -> Result<Vec<Operation>> {
     let mut op = Operation::new("conv", op_name(node));
     op.inputs = inputs;
 
-    if let Some(strides) = get_int_list_attr(node, "strides") {
-        op = op.with_attr("strides", int_list_value(&strides));
-    }
-    if let Some(pads) = get_int_list_attr(node, "pads") {
-        op = op.with_attr("pad", int_list_value(&pads));
-    }
-    if let Some(dilations) = get_int_list_attr(node, "dilations") {
-        op = op.with_attr("dilations", int_list_value(&dilations));
-    }
-    if let Some(group) = get_int_attr(node, "group") {
-        op = op.with_attr("groups", Value::Int(group));
-    }
-    if let Some(kernel_shape) = get_int_list_attr(node, "kernel_shape") {
-        op = op.with_attr("kernel_shape", int_list_value(&kernel_shape));
-    }
+    let strides = get_int_list_attr(node, "strides").unwrap_or_else(|| vec![1, 1]);
+    op = op.with_attr("strides", int_list_value(&strides));
+
+    let dilations = get_int_list_attr(node, "dilations").unwrap_or_else(|| vec![1, 1]);
+    op = op.with_attr("dilations", int_list_value(&dilations));
+
+    let group = get_int_attr(node, "group").unwrap_or(1);
+    op = op.with_attr("groups", Value::Int(group));
+
+    // MIL requires pad_type; use "custom" when explicit pads are provided.
+    let pads = get_int_list_attr(node, "pads");
+    let pad_type = if pads.is_some() {
+        "custom"
+    } else {
+        let auto_pad = node
+            .attribute
+            .iter()
+            .find(|a| a.name == "auto_pad")
+            .and_then(|a| {
+                if a.s.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(&a.s).to_string())
+                }
+            });
+        match auto_pad.as_deref() {
+            Some("SAME_UPPER") | Some("SAME_LOWER") => "same",
+            _ => "valid",
+        }
+    };
+    op = op.with_attr("pad_type", Value::String(pad_type.to_string()));
+
+    // ONNX pads are [top, left, bottom, right]; MIL expects the same order.
+    let pad = pads.unwrap_or_else(|| vec![0, 0, 0, 0]);
+    op = op.with_attr("pad", int_list_value(&pad));
 
     Ok(vec![with_outputs(op, node)])
 }
@@ -285,17 +305,35 @@ fn convert_gemm(node: &NodeProto) -> Result<Vec<Operation>> {
     Ok(vec![with_outputs(op, node)])
 }
 
-/// Reshape: map shape input.
+/// Reshape: map shape input, casting shape to int32 if needed.
 fn convert_reshape(node: &NodeProto) -> Result<Vec<Operation>> {
     let inputs = positional_to_named(node, &["x", "shape"]);
+    let mut ops = Vec::new();
+
+    // CoreML MIL reshape requires shape as int32; ONNX uses int64.
+    // Insert a cast if the shape comes from a reference.
+    let shape_input = if let Some(Value::Reference(shape_name)) = inputs.get("shape") {
+        let cast_name = format!("{}_shape_cast", op_name(node));
+        let cast_op = Operation::new("cast", &cast_name)
+            .with_input("x", Value::Reference(shape_name.clone()))
+            .with_attr("dtype", Value::String("int32".to_string()))
+            .with_output(&cast_name);
+        ops.push(cast_op);
+        Value::Reference(cast_name)
+    } else {
+        inputs.get("shape").cloned().unwrap_or(Value::Int(0))
+    };
+
     let mut op = Operation::new("reshape", op_name(node));
     op.inputs = inputs;
+    op.inputs.insert("shape".to_string(), shape_input);
 
     if let Some(allowzero) = get_int_attr(node, "allowzero") {
         op = op.with_attr("allowzero", Value::Bool(allowzero != 0));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    ops.push(with_outputs(op, node));
+    Ok(ops)
 }
 
 /// Transpose: map perm attribute.
@@ -357,7 +395,17 @@ fn convert_pool(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
     }
     if let Some(ceil_mode) = get_int_attr(node, "ceil_mode") {
         op = op.with_attr("ceil_mode", Value::Bool(ceil_mode != 0));
+    } else {
+        op = op.with_attr("ceil_mode", Value::Bool(false));
     }
+
+    // MIL requires pad_type for pool ops.
+    let pad_type = if get_int_list_attr(node, "pads").is_some() {
+        "custom"
+    } else {
+        "valid"
+    };
+    op = op.with_attr("pad_type", Value::String(pad_type.to_string()));
 
     Ok(vec![with_outputs(op, node)])
 }
@@ -972,7 +1020,7 @@ mod tests {
         assert!(op.attributes.contains_key("strides"));
         assert!(op.attributes.contains_key("pad"));
         assert!(op.attributes.contains_key("groups"));
-        assert!(op.attributes.contains_key("kernel_shape"));
+        assert!(op.attributes.contains_key("pad_type"));
     }
 
     #[test]
@@ -980,8 +1028,12 @@ mod tests {
         let node = make_node("Conv", &["input", "W"], &["Y"]);
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
-        assert_eq!(op.inputs.len(), 2);
+        assert!(op.inputs.contains_key("x"));
+        assert!(op.inputs.contains_key("weight"));
         assert!(!op.inputs.contains_key("bias"));
+        // groups and pad_type are always set
+        assert!(op.attributes.contains_key("groups"));
+        assert!(op.attributes.contains_key("pad_type"));
     }
 
     #[test]

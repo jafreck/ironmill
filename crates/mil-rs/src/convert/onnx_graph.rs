@@ -89,11 +89,38 @@ fn convert_graph(graph: &GraphProto, _opset: i64, warnings: &mut Vec<String>) ->
         }
     }
 
+    // Build a type map from ONNX value_info, graph inputs, and graph outputs
+    // so we can attach output types to every operation.
+    let mut onnx_type_map: HashMap<String, TensorType> = HashMap::new();
+    for vi in graph
+        .input
+        .iter()
+        .chain(graph.output.iter())
+        .chain(graph.value_info.iter())
+    {
+        if let Ok(tt) = value_info_to_tensor_type(vi) {
+            onnx_type_map.insert(vi.name.clone(), tt);
+        }
+    }
+    // Initializers also have known types.
+    for tensor in &graph.initializer {
+        if let Ok(dtype) = onnx_dtype_to_scalar(tensor.data_type) {
+            let shape: Vec<Option<usize>> = tensor.dims.iter().map(|&d| Some(d as usize)).collect();
+            onnx_type_map.insert(
+                tensor.name.clone(),
+                TensorType::with_dynamic_shape(dtype, shape),
+            );
+        }
+    }
+
     // 4. Convert initializers to const operations.
     let mut block = Block::new();
     for tensor in &graph.initializer {
         match initializer_to_const(tensor) {
-            Ok(op) => block.add_op(op),
+            Ok(mut op) => {
+                stamp_output_types(&mut op, &onnx_type_map);
+                block.add_op(op);
+            }
             Err(e) => {
                 warnings.push(format!("skipping initializer '{}': {e}", tensor.name));
             }
@@ -106,7 +133,8 @@ fn convert_graph(graph: &GraphProto, _opset: i64, warnings: &mut Vec<String>) ->
         let node = &graph.node[*node_idx];
         match convert_node(node) {
             Ok(ops) => {
-                for op in ops {
+                for mut op in ops {
+                    stamp_output_types(&mut op, &onnx_type_map);
                     block.add_op(op);
                 }
             }
@@ -120,6 +148,7 @@ fn convert_graph(graph: &GraphProto, _opset: i64, warnings: &mut Vec<String>) ->
                 for out in &node.output {
                     placeholder = placeholder.with_output(out.clone());
                 }
+                stamp_output_types(&mut placeholder, &onnx_type_map);
                 block.add_op(placeholder);
             }
             Err(e) => {
@@ -138,6 +167,20 @@ fn convert_graph(graph: &GraphProto, _opset: i64, warnings: &mut Vec<String>) ->
 
     function.body = block;
     Ok(function)
+}
+
+/// Fill in `op.output_types` from the ONNX type map for every output that
+/// currently has `None` as its type.
+fn stamp_output_types(op: &mut Operation, type_map: &HashMap<String, TensorType>) {
+    // Ensure output_types vec is the right length.
+    op.output_types.resize(op.outputs.len(), None);
+    for (i, name) in op.outputs.iter().enumerate() {
+        if op.output_types[i].is_none() {
+            if let Some(tt) = type_map.get(name) {
+                op.output_types[i] = Some(tt.clone());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

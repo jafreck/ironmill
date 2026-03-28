@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::tensor::TensorType;
 use super::types::Value;
 
 /// A single operation in the MIL graph.
@@ -20,6 +21,10 @@ pub struct Operation {
     /// Named outputs produced by this operation.
     pub outputs: Vec<String>,
 
+    /// Type information for each output (parallel to `outputs`).
+    /// Entries are `None` when the type is unknown and must be inferred.
+    pub output_types: Vec<Option<TensorType>>,
+
     /// Operation-specific attributes (e.g., kernel size, stride, padding).
     pub attributes: HashMap<String, Value>,
 }
@@ -32,6 +37,7 @@ impl Operation {
             name: name.into(),
             inputs: HashMap::new(),
             outputs: Vec::new(),
+            output_types: Vec::new(),
             attributes: HashMap::new(),
         }
     }
@@ -45,6 +51,7 @@ impl Operation {
     /// Add a named output to this operation.
     pub fn with_output(mut self, name: impl Into<String>) -> Self {
         self.outputs.push(name.into());
+        self.output_types.push(None);
         self
     }
 
