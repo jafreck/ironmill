@@ -358,14 +358,10 @@ pub fn build_autoregressive_program(max_seq_len: usize) -> Program {
             ScalarType::Float32,
             vec![Some(1), Some(heads), None, Some(head_dim)],
         );
-        func.inputs.push((
-            format!("past_key_values.{layer}.key"),
-            key_ty,
-        ));
-        func.inputs.push((
-            format!("past_key_values.{layer}.value"),
-            value_ty,
-        ));
+        func.inputs
+            .push((format!("past_key_values.{layer}.key"), key_ty));
+        func.inputs
+            .push((format!("past_key_values.{layer}.value"), value_ty));
     }
 
     let mut program = Program::new("1");
@@ -528,7 +524,9 @@ pub fn build_const_program(shape: &[usize], dtype: ScalarType) -> Program {
 /// Run default pipeline and return the report.
 pub fn run_default_pipeline(program: &mut Program) -> PipelineReport {
     let pipeline = PassPipeline::new();
-    pipeline.run(program).expect("default pipeline should succeed")
+    pipeline
+        .run(program)
+        .expect("default pipeline should succeed")
 }
 
 /// Serialize program to Model proto and back, verify round-trip.
