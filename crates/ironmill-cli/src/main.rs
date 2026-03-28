@@ -149,6 +149,11 @@ enum Commands {
         /// When provided, overrides default pass selection and --no-fusion.
         #[arg(long = "pipeline-config", value_name = "PATH")]
         pipeline_config: Option<PathBuf>,
+
+        /// Annotate each operation with its preferred compute unit (ANE, GPU,
+        /// CPU, or Any) based on shape-aware ANE constraints.
+        #[arg(long = "annotate-compute-units")]
+        annotate_compute_units: bool,
     },
 
     /// Inspect a model and show its structure.
@@ -228,6 +233,7 @@ fn run() -> Result<()> {
             split_draft_layers,
             moe_split,
             pipeline_config,
+            annotate_compute_units,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -251,6 +257,7 @@ fn run() -> Result<()> {
                 split_draft_layers,
                 moe_split,
                 pipeline_config,
+                annotate_compute_units,
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -303,6 +310,7 @@ struct CompileOpts {
     split_draft_layers: Option<usize>,
     moe_split: bool,
     pipeline_config: Option<PathBuf>,
+    annotate_compute_units: bool,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -434,6 +442,11 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
             pipeline = pipeline
                 .with_palettize(bits)
                 .context("Failed to configure palettization")?;
+        }
+
+        // Add compute unit annotations (should run last, after all transforms).
+        if opts.annotate_compute_units {
+            pipeline = pipeline.with_compute_unit_annotations();
         }
 
         pipeline

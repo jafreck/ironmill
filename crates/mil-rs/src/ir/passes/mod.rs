@@ -6,6 +6,7 @@
 pub mod attention_fusion;
 pub mod bn_weight_fold;
 pub mod codebook;
+pub mod compute_unit;
 pub mod constant_fold;
 pub mod dead_code;
 pub mod fp16_quantize;
@@ -24,6 +25,7 @@ pub mod tensor_utils;
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
 pub use codebook::CodebookOptimizationPass;
+pub use compute_unit::ComputeUnitAnnotationPass;
 pub use constant_fold::ConstantFoldPass;
 pub use dead_code::DeadCodeEliminationPass;
 pub use fp16_quantize::Fp16QuantizePass;

@@ -671,11 +671,42 @@ fn convert_operation(
                 | "global_pool"
                 | "flatten_axis"
                 | "bn_folded"
+                | "compute_unit"
         ) {
             continue;
         }
         // Non-const: MIL expects parameters as proto inputs.
         inputs.insert(attr_name.clone(), convert_value_to_argument(attr_val)?);
+    }
+
+    // Emit compute unit preference as a proto attribute when set.
+    if let Some(cu) = &op.compute_unit {
+        use crate::ir::ComputeUnit;
+        let cu_str = match cu {
+            ComputeUnit::Ane => "ane",
+            ComputeUnit::Gpu => "gpu",
+            ComputeUnit::Cpu => "cpu",
+            ComputeUnit::Any => "any",
+        };
+        let tv = mil_spec::TensorValue {
+            value: Some(mil_spec::tensor_value::Value::Strings(
+                mil_spec::tensor_value::RepeatedStrings {
+                    values: vec![cu_str.to_string()],
+                },
+            )),
+        };
+        attributes.insert(
+            "compute_unit".to_string(),
+            mil_spec::Value {
+                doc_string: String::new(),
+                r#type: None,
+                value: Some(mil_spec::value::Value::ImmediateValue(
+                    mil_spec::value::ImmediateValue {
+                        value: Some(mil_spec::value::immediate_value::Value::Tensor(tv)),
+                    },
+                )),
+            },
+        );
     }
 
     Ok(mil_spec::Operation {

@@ -135,6 +135,7 @@ fn convert_operation(proto: &mil_spec::Operation) -> Result<Operation> {
         outputs: output_names,
         output_types,
         attributes,
+        compute_unit: None,
     })
 }
 

@@ -16,14 +16,15 @@ mod tensor;
 mod types;
 
 pub use graph::Graph;
-pub use operation::Operation;
+pub use operation::{ComputeUnit, Operation};
 pub use pass::Pass;
 pub use passes::{
-    AttentionFusionPass, CodebookOptimizationPass, ConstantFoldPass, ConvBatchNormFusionPass,
-    ConvBatchNormWeightFoldPass, ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass,
-    Granularity, IdentityEliminationPass, Int8QuantizePass, LayoutOptimizationPass,
-    LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass, ModelSplitPass, OpPrecision,
-    OpSubstitutionPass, PalettizePass, ShapeMaterializePass, SplitResult,
+    AttentionFusionPass, CodebookOptimizationPass, ComputeUnitAnnotationPass, ConstantFoldPass,
+    ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
+    DeadCodeEliminationPass, Fp16QuantizePass, Granularity, IdentityEliminationPass,
+    Int8QuantizePass, LayoutOptimizationPass, LinearReluFusionPass, MixedPrecisionConfig,
+    MixedPrecisionPass, ModelSplitPass, OpPrecision, OpSubstitutionPass, PalettizePass,
+    ShapeMaterializePass, SplitResult,
 };
 pub use pipeline::{PassPipeline, PassResult, PipelineConfig, PipelineReport};
 pub use program::{Block, Function, Program};

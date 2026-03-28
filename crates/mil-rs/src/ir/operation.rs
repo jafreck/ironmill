@@ -1,7 +1,37 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use super::tensor::TensorType;
 use super::types::Value;
+
+/// Preferred compute unit for running an operation on Apple hardware.
+///
+/// CoreML supports per-operation compute unit preferences, allowing the
+/// runtime to schedule work on the most appropriate hardware. These
+/// annotations are informational hints — the runtime may override them
+/// when hardware is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComputeUnit {
+    /// Apple Neural Engine — best for supported dense ops with aligned shapes.
+    Ane,
+    /// GPU — fallback for ops the ANE can't handle efficiently.
+    Gpu,
+    /// CPU — general fallback.
+    Cpu,
+    /// Let the runtime decide (no preference).
+    Any,
+}
+
+impl fmt::Display for ComputeUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ComputeUnit::Ane => write!(f, "ane"),
+            ComputeUnit::Gpu => write!(f, "gpu"),
+            ComputeUnit::Cpu => write!(f, "cpu"),
+            ComputeUnit::Any => write!(f, "any"),
+        }
+    }
+}
 
 /// A single operation in the MIL graph.
 ///
@@ -27,6 +57,10 @@ pub struct Operation {
 
     /// Operation-specific attributes (e.g., kernel size, stride, padding).
     pub attributes: HashMap<String, Value>,
+
+    /// Preferred compute unit for this operation.
+    /// Set by [`ComputeUnitAnnotationPass`] based on ANE shape-aware validation.
+    pub compute_unit: Option<ComputeUnit>,
 }
 
 impl Operation {
@@ -39,6 +73,7 @@ impl Operation {
             outputs: Vec::new(),
             output_types: Vec::new(),
             attributes: HashMap::new(),
+            compute_unit: None,
         }
     }
 

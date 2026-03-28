@@ -9,12 +9,12 @@ use serde::Deserialize;
 
 use super::pass::Pass;
 use super::passes::{
-    AttentionFusionPass, CodebookOptimizationPass, ConstantFoldPass, ConvBatchNormFusionPass,
-    ConvBatchNormWeightFoldPass, ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass,
-    GeluLinearFusionPass, GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass,
-    LayerNormLinearFusionPass, LayoutOptimizationPass, LinearReluFusionPass, MixedPrecisionConfig,
-    MixedPrecisionPass, OpSubstitutionPass, PalettizePass, ResidualAddFusionPass,
-    ShapeMaterializePass,
+    AttentionFusionPass, CodebookOptimizationPass, ComputeUnitAnnotationPass, ConstantFoldPass,
+    ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
+    DeadCodeEliminationPass, Fp16QuantizePass, GeluLinearFusionPass, GqaFusionPass, Granularity,
+    IdentityEliminationPass, Int8QuantizePass, LayerNormLinearFusionPass, LayoutOptimizationPass,
+    LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass, OpSubstitutionPass,
+    PalettizePass, ResidualAddFusionPass, ShapeMaterializePass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -79,6 +79,7 @@ const KNOWN_PASSES: &[&str] = &[
     "mixed-precision",
     "palettization",
     "shape-materialization",
+    "compute-unit-annotation",
 ];
 
 /// Create a boxed pass from its name and optional parameters.
@@ -157,6 +158,7 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
             }
             Ok(Box::new(pass))
         }
+        "compute-unit-annotation" => Ok(Box::new(ComputeUnitAnnotationPass)),
         _ => Err(MilError::Validation(format!("unknown pass: '{name}'"))),
     }
 }
@@ -418,6 +420,17 @@ impl PassPipeline {
             "layout-optimization",
         ];
         self.passes.retain(|p| !FUSION_NAMES.contains(&p.name()));
+        self
+    }
+
+    /// Append the compute-unit annotation pass to the pipeline.
+    ///
+    /// This pass annotates each operation with its preferred compute unit
+    /// (ANE, GPU, CPU, or Any) based on shape-aware ANE constraint checks.
+    /// Should be added after all optimization/fusion passes so annotations
+    /// reflect the final graph.
+    pub fn with_compute_unit_annotations(mut self) -> Self {
+        self.passes.push(Box::new(ComputeUnitAnnotationPass));
         self
     }
 

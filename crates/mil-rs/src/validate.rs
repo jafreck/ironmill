@@ -350,7 +350,7 @@ fn is_ane_dtype(scalar_type: ScalarType) -> bool {
 
 /// Build a map from output value name to [`TensorType`] using function inputs
 /// and operation output types.
-fn build_type_map(func: &Function) -> HashMap<String, TensorType> {
+pub fn build_type_map(func: &Function) -> HashMap<String, TensorType> {
     let mut types = HashMap::new();
 
     for (name, ty) in &func.inputs {
@@ -434,7 +434,7 @@ fn get_attr_int_list(op: &Operation, attr_name: &str) -> Option<Vec<i64>> {
 ///
 /// Returns a rejection reason (if the op cannot run on ANE due to shape
 /// constraints) and a list of performance annotations.
-fn check_shape_constraints(
+pub fn check_shape_constraints(
     op: &Operation,
     type_map: &HashMap<String, TensorType>,
 ) -> (Option<String>, Vec<String>) {
@@ -568,7 +568,7 @@ fn check_alignment_constraints(
 
 /// Generate performance annotations for ops that are technically supported
 /// but may perform poorly on the ANE.
-fn check_performance(op: &Operation, type_map: &HashMap<String, TensorType>) -> Vec<String> {
+pub fn check_performance(op: &Operation, type_map: &HashMap<String, TensorType>) -> Vec<String> {
     match op.op_type.as_str() {
         "gather" => check_gather_performance(op, type_map),
         "transpose" => check_transpose_performance(op),
