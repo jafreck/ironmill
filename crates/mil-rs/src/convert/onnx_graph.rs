@@ -169,6 +169,11 @@ fn convert_graph(graph: &GraphProto, _opset: i64, warnings: &mut Vec<String>) ->
         block.outputs.push(output.name.clone());
     }
 
+    // 7. Propagate shapes for ops that still have None output_types.
+    //    Without this, shape-changing ops (conv, pool) get unknown
+    //    dimensions in the proto, which crashes the BNNS backend.
+    propagate_output_types(&function.inputs, &mut block);
+
     function.body = block;
     Ok(function)
 }
@@ -187,9 +192,322 @@ fn stamp_output_types(op: &mut Operation, type_map: &HashMap<String, TensorType>
     }
 }
 
-// ---------------------------------------------------------------------------
-// Initializer → const op
-// ---------------------------------------------------------------------------
+/// Propagate output types through the block for ops that still have `None`.
+///
+/// Builds a type map from function inputs and ops whose output types are
+/// already known, then infers missing types using op-specific shape rules.
+fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Block) {
+    // Seed the type map with function inputs.
+    let mut type_map: HashMap<String, TensorType> = HashMap::new();
+    for (name, tt) in func_inputs {
+        type_map.insert(name.clone(), tt.clone());
+    }
+
+    // Also collect const tensor values so reshape can read target shapes.
+    // Stored as raw usize but preserving bit patterns for signed values
+    // (reshape uses 0 = keep dim, -1 = infer dim).
+    let mut const_values: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for op in &block.operations {
+        for (i, name) in op.outputs.iter().enumerate() {
+            if let Some(Some(tt)) = op.output_types.get(i) {
+                type_map.insert(name.clone(), tt.clone());
+            } else if op.op_type == "const" {
+                let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+                if let Some(Value::Tensor { shape, dtype, data }) = val {
+                    type_map.insert(name.clone(), TensorType::new(*dtype, shape.clone()));
+                    if *dtype == ScalarType::Int32 && data.len() % 4 == 0 {
+                        let dims: Vec<usize> = data
+                            .chunks_exact(4)
+                            .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64 as usize)
+                            .collect();
+                        const_values.insert(name.clone(), dims);
+                    } else if *dtype == ScalarType::Int64 && data.len() % 8 == 0 {
+                        let dims: Vec<usize> = data
+                            .chunks_exact(8)
+                            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
+                            .collect();
+                        const_values.insert(name.clone(), dims);
+                    }
+                }
+            }
+        }
+    }
+
+    // Second pass: infer missing output types from the type map.
+    for op in &mut block.operations {
+        for (i, out_name) in op.outputs.iter().enumerate() {
+            if op.output_types.get(i).is_some_and(|ot| ot.is_some()) {
+                continue;
+            }
+
+            // Resolve the type of a value from the type map.
+            let resolve = |v: &Value| -> Option<&TensorType> {
+                match v {
+                    Value::Reference(name) => type_map.get(name),
+                    Value::List(items) => items.iter().find_map(|item| {
+                        if let Value::Reference(name) = item {
+                            type_map.get(name)
+                        } else {
+                            None
+                        }
+                    }),
+                    _ => None,
+                }
+            };
+
+            let inferred = match op.op_type.as_str() {
+                "conv" => infer_conv_output(op, &type_map),
+                "max_pool" | "avg_pool" => infer_pool_output(op, &type_map),
+                "reshape" | "flatten" => infer_reshape_output(op, &type_map, &const_values),
+                "concat" => infer_concat_output(op, &type_map),
+                _ => {
+                    // Element-wise / pass-through: output type = input type.
+                    ["x", "data", "input", "values"]
+                        .iter()
+                        .filter_map(|&p| op.inputs.get(p))
+                        .find_map(&resolve)
+                        .or_else(|| op.inputs.values().find_map(resolve))
+                        .cloned()
+                }
+            };
+
+            if let Some(out_tt) = inferred {
+                type_map.insert(out_name.clone(), out_tt.clone());
+                while op.output_types.len() <= i {
+                    op.output_types.push(None);
+                }
+                op.output_types[i] = Some(out_tt);
+            }
+        }
+    }
+}
+
+/// Infer conv output shape: `[N, out_channels, out_h, out_w]`.
+fn infer_conv_output(op: &Operation, type_map: &HashMap<String, TensorType>) -> Option<TensorType> {
+    let in_tt = op.inputs.get("x").and_then(|v| {
+        if let Value::Reference(n) = v {
+            type_map.get(n)
+        } else {
+            None
+        }
+    })?;
+    let w_tt = op.inputs.get("weight").and_then(|v| {
+        if let Value::Reference(n) = v {
+            type_map.get(n)
+        } else {
+            None
+        }
+    })?;
+
+    let in_shape = &in_tt.shape; // [N, C_in, H, W]
+    let w_shape = &w_tt.shape; // [C_out, C_in/groups, kH, kW]
+    if in_shape.len() != 4 || w_shape.len() != 4 {
+        return Some(in_tt.clone());
+    }
+
+    let out_channels = w_shape[0]?;
+    let in_h = in_shape[2]?;
+    let in_w = in_shape[3]?;
+    let k_h = w_shape[2]?;
+    let k_w = w_shape[3]?;
+
+    let strides = get_int_list(op, "strides").unwrap_or_else(|| vec![1, 1]);
+    let dilations = get_int_list(op, "dilations").unwrap_or_else(|| vec![1, 1]);
+    let pads = get_int_list(op, "pad").unwrap_or_else(|| vec![0, 0, 0, 0]);
+
+    let pad_top = *pads.first().unwrap_or(&0) as usize;
+    let pad_bottom = *pads.get(1).unwrap_or(&0) as usize;
+    let pad_left = *pads.get(2).unwrap_or(&0) as usize;
+    let pad_right = *pads.get(3).unwrap_or(&0) as usize;
+    let stride_h = *strides.first().unwrap_or(&1) as usize;
+    let stride_w = *strides.get(1).unwrap_or(&1) as usize;
+    let dil_h = *dilations.first().unwrap_or(&1) as usize;
+    let dil_w = *dilations.get(1).unwrap_or(&1) as usize;
+
+    // Check pad_type for "same" padding.
+    let is_same = op
+        .inputs
+        .get("pad_type")
+        .is_some_and(|v| matches!(v, Value::String(s) if s == "same"));
+
+    let (out_h, out_w) = if is_same {
+        (in_h.div_ceil(stride_h), in_w.div_ceil(stride_w))
+    } else {
+        let eff_kh = dil_h * (k_h - 1) + 1;
+        let eff_kw = dil_w * (k_w - 1) + 1;
+        (
+            (in_h + pad_top + pad_bottom).saturating_sub(eff_kh) / stride_h + 1,
+            (in_w + pad_left + pad_right).saturating_sub(eff_kw) / stride_w + 1,
+        )
+    };
+
+    Some(TensorType::new(
+        in_tt.scalar_type,
+        vec![in_shape[0].unwrap_or(1), out_channels, out_h, out_w],
+    ))
+}
+
+/// Infer pool output shape: channels preserved, spatial dims shrink.
+fn infer_pool_output(op: &Operation, type_map: &HashMap<String, TensorType>) -> Option<TensorType> {
+    let in_tt = op.inputs.get("x").and_then(|v| {
+        if let Value::Reference(n) = v {
+            type_map.get(n)
+        } else {
+            None
+        }
+    })?;
+    let in_shape = &in_tt.shape;
+    if in_shape.len() != 4 {
+        return Some(in_tt.clone());
+    }
+
+    let in_c = in_shape[1]?;
+    let in_h = in_shape[2]?;
+    let in_w = in_shape[3]?;
+
+    let kernels = get_int_list(op, "kernel_sizes").unwrap_or_else(|| vec![1, 1]);
+    let strides = get_int_list(op, "strides").unwrap_or_else(|| vec![1, 1]);
+    let pads = get_int_list(op, "pad").unwrap_or_else(|| vec![0, 0, 0, 0]);
+
+    let k_h = *kernels.first().unwrap_or(&1) as usize;
+    let k_w = *kernels.get(1).unwrap_or(&1) as usize;
+    let stride_h = *strides.first().unwrap_or(&1) as usize;
+    let stride_w = *strides.get(1).unwrap_or(&1) as usize;
+    let pad_top = *pads.first().unwrap_or(&0) as usize;
+    let pad_bottom = *pads.get(1).unwrap_or(&0) as usize;
+    let pad_left = *pads.get(2).unwrap_or(&0) as usize;
+    let pad_right = *pads.get(3).unwrap_or(&0) as usize;
+
+    let out_h = (in_h + pad_top + pad_bottom).saturating_sub(k_h) / stride_h + 1;
+    let out_w = (in_w + pad_left + pad_right).saturating_sub(k_w) / stride_w + 1;
+
+    Some(TensorType::new(
+        in_tt.scalar_type,
+        vec![in_shape[0].unwrap_or(1), in_c, out_h, out_w],
+    ))
+}
+
+/// Infer reshape/flatten output from the `shape` input constant.
+fn infer_reshape_output(
+    op: &Operation,
+    type_map: &HashMap<String, TensorType>,
+    const_values: &HashMap<String, Vec<usize>>,
+) -> Option<TensorType> {
+    let in_tt = op.inputs.get("x").and_then(|v| {
+        if let Value::Reference(n) = v {
+            type_map.get(n)
+        } else {
+            None
+        }
+    })?;
+
+    // Read the target shape from the const tensor's raw int data.
+    if let Some(Value::Reference(shape_name)) = op.inputs.get("shape") {
+        // Look up the const op's raw tensor to get signed values (may contain 0 / -1).
+        let raw_dims = const_values.get(shape_name);
+        if let Some(dims) = raw_dims {
+            let in_numel: usize = in_tt.shape.iter().map(|d| d.unwrap_or(1)).product();
+            let mut out: Vec<usize> = dims.clone();
+            let mut infer_idx: Option<usize> = None;
+            let mut known_product: usize = 1;
+
+            for (i, &d) in dims.iter().enumerate() {
+                let signed = d as i64;
+                if signed == 0 {
+                    // 0 means "keep this dim from input".
+                    out[i] = in_tt.shape.get(i).and_then(|s| *s).unwrap_or(1);
+                    known_product *= out[i];
+                } else if signed == -1 {
+                    infer_idx = Some(i);
+                } else {
+                    known_product *= d;
+                }
+            }
+
+            if let Some(idx) = infer_idx {
+                out[idx] = if known_product > 0 {
+                    in_numel / known_product
+                } else {
+                    1
+                };
+            }
+
+            if !out.is_empty() {
+                return Some(TensorType::new(in_tt.scalar_type, out));
+            }
+        }
+    }
+
+    Some(in_tt.clone())
+}
+
+/// Infer concat output: sum along concat axis, other dims preserved.
+fn infer_concat_output(
+    op: &Operation,
+    type_map: &HashMap<String, TensorType>,
+) -> Option<TensorType> {
+    let values = op.inputs.get("values")?;
+    let Value::List(refs) = values else {
+        return None;
+    };
+
+    let input_types: Vec<&TensorType> = refs
+        .iter()
+        .filter_map(|v| {
+            if let Value::Reference(name) = v {
+                type_map.get(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let first = input_types.first()?;
+    let axis = op
+        .inputs
+        .get("axis")
+        .or_else(|| op.attributes.get("axis"))
+        .and_then(|v| {
+            if let Value::Int(a) = v {
+                Some(*a as usize)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    let mut out_shape: Vec<usize> = first.shape.iter().map(|d| d.unwrap_or(1)).collect();
+    if axis < out_shape.len() {
+        out_shape[axis] = input_types
+            .iter()
+            .map(|tt| tt.shape.get(axis).and_then(|d| *d).unwrap_or(0))
+            .sum();
+    }
+
+    Some(TensorType::new(first.scalar_type, out_shape))
+}
+
+/// Extract an integer list from an op input (e.g. strides, pads).
+fn get_int_list(op: &Operation, name: &str) -> Option<Vec<i64>> {
+    let val = op.inputs.get(name).or_else(|| op.attributes.get(name))?;
+    match val {
+        Value::List(items) => {
+            let ints: Vec<i64> = items
+                .iter()
+                .filter_map(|v| {
+                    if let Value::Int(i) = v {
+                        Some(*i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if ints.is_empty() { None } else { Some(ints) }
+        }
+        _ => None,
+    }
+}
 
 /// Convert an ONNX [`TensorProto`] (initializer/weight) to a MIL `const` [`Operation`].
 ///

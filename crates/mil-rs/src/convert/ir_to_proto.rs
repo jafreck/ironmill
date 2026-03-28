@@ -180,7 +180,8 @@ fn convert_operation(
     // to inference from the type_map.
     // Shape-changing ops (conv, pool) produce outputs with different dimensions
     // than their inputs, so inferred types (based on input type) would be wrong.
-    // For these ops, use just the element type with unknown dimensions.
+    // For these ops, preserve the element type and rank but use unknown
+    // dimensions; CoreML resolves them at JIT compile time.
     let shape_changes = matches!(
         op.op_type.as_str(),
         "conv"
@@ -200,7 +201,6 @@ fn convert_operation(
             | "flatten"
     );
     let inferred_type = if shape_changes {
-        // Use the input's element type and rank but with unknown dimensions.
         infer_output_type(op, type_map).map(|vt| {
             if let Some(mil_spec::value_type::Type::TensorType(tt)) = &vt.r#type {
                 let unknown_dims: Vec<mil_spec::Dimension> = (0..tt.rank)

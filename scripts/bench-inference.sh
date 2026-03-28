@@ -43,7 +43,10 @@ cleanup() {
 trap cleanup EXIT
 
 fmt_ms() {
-    # Format a millisecond value for display
+    # Format a millisecond value for display; pass through non-numeric values
+    case "$1" in
+        ''|*[!0-9.]*) printf '%s' "$1"; return ;;
+    esac
     awk "BEGIN { v = $1; if (v < 1) printf \"%.1f\302\265s\", v*1000; else if (v < 1000) printf \"%.1fms\", v; else printf \"%.2fs\", v/1000 }"
 }
 
