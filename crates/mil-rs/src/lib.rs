@@ -96,7 +96,7 @@ pub use error::MilError;
 
 pub use ir::{
     Block, Function, Graph, Operation, Pass, PassPipeline, PassResult, PipelineReport, Program,
-    ScalarType, TensorType, Value,
+    ScalarType, SplitResult, TensorType, Value,
 };
 
 /// Result of ANE compatibility analysis.

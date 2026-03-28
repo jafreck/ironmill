@@ -22,7 +22,8 @@ pub use passes::{
     AttentionFusionPass, CodebookOptimizationPass, ConstantFoldPass, ConvBatchNormFusionPass,
     ConvBatchNormWeightFoldPass, ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass,
     Granularity, IdentityEliminationPass, Int8QuantizePass, LayoutOptimizationPass,
-    LinearReluFusionPass, OpSubstitutionPass, PalettizePass, ShapeMaterializePass,
+    LinearReluFusionPass, ModelSplitPass, OpSubstitutionPass, PalettizePass, ShapeMaterializePass,
+    SplitResult,
 };
 pub use pipeline::{PassPipeline, PassResult, PipelineReport};
 pub use program::{Block, Function, Program};

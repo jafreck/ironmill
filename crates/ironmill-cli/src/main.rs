@@ -5,6 +5,7 @@ use std::process;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use mil_rs::compiler::Backend;
+use mil_rs::ir::ModelSplitPass;
 use mil_rs::ir::PassPipeline;
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::validate::print_validation_report;
@@ -128,6 +129,12 @@ enum Commands {
         /// Optimizer for on-device training: "sgd" or "adam".
         #[arg(long = "optimizer", default_value = "sgd")]
         optimizer_type: String,
+
+        /// Split the model for speculative decoding: produce a draft model
+        /// with the first N transformer layers and a full verifier model.
+        /// Outputs: <name>-draft.mlpackage and <name>-verifier.mlpackage.
+        #[arg(long = "split-draft-layers", value_name = "N")]
+        split_draft_layers: Option<usize>,
     },
 
     /// Inspect a model and show its structure.
@@ -185,6 +192,7 @@ fn run() -> Result<()> {
             epochs,
             loss_function,
             optimizer_type,
+            split_draft_layers,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -204,6 +212,7 @@ fn run() -> Result<()> {
                 epochs,
                 loss_function,
                 optimizer_type,
+                split_draft_layers,
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -247,6 +256,7 @@ struct CompileOpts {
     epochs: i64,
     loss_function: String,
     optimizer_type: String,
+    split_draft_layers: Option<usize>,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -373,72 +383,109 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     }
     println!();
 
-    // 6. Convert IR to proto
-    let model = if let Some(ref layers) = opts.updatable_layers {
-        let layer_names: Vec<String> = layers.split(',').map(|s| s.trim().to_string()).collect();
-
-        let loss_fn = match opts.loss_function.as_str() {
-            "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,
-            _ => LossFunction::CategoricalCrossEntropy,
-        };
-        let opt = match opts.optimizer_type.as_str() {
-            "adam" => UpdateOptimizer::Adam,
-            _ => UpdateOptimizer::Sgd,
-        };
-
-        let config = UpdatableModelConfig {
-            updatable_layers: layer_names.clone(),
-            learning_rate: opts.learning_rate,
-            epochs: opts.epochs,
-            loss_function: loss_fn,
-            optimizer: opt,
-        };
-
-        println!(
-            "Updatable model: {} layer(s) marked for on-device training",
-            layer_names.len()
-        );
-        program_to_updatable_model(&program, 9, &config)
-            .context("Failed to convert MIL IR to updatable CoreML protobuf")?
-    } else {
-        program_to_model(&program, 9).context("Failed to convert MIL IR to CoreML protobuf")?
-    };
-
-    // 7. Write as .mlpackage
-    let output_path = opts.output.clone().unwrap_or_else(|| {
+    // 6. Handle model splitting for speculative decoding, or normal single-model output.
+    if let Some(n_layers) = opts.split_draft_layers {
         let stem = input_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("model");
-        format!("{stem}.mlpackage")
-    });
-    println!("Writing CoreML package: {output_path}");
-    write_mlpackage(&model, &output_path)
-        .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
-    // 8. Compile the model
-    match opts.backend {
-        Backend::AneDirect => {
-            println!("Compiling with ANE direct backend...");
-            let output_dir = Path::new(&output_path).parent().unwrap_or(Path::new("."));
-            match compile_model_with_backend(&output_path, output_dir, Backend::AneDirect) {
-                Ok(compiled) => println!("Done: {}", compiled.display()),
-                Err(e) => println!("Warning: ANE direct compilation failed: {e}"),
-            }
-        }
-        Backend::Xcrun => {
-            if is_compiler_available() {
-                println!("Compiling with xcrun coremlcompiler...");
-                let output_dir = Path::new(&output_path).parent().unwrap_or(Path::new("."));
-                match compile_model(&output_path, output_dir) {
-                    Ok(compiled) => println!("Done: {}", compiled.display()),
-                    Err(e) => println!("Warning: compilation failed: {e}"),
-                }
-            } else {
-                println!("Note: xcrun coremlcompiler not found — skipping compilation step.");
-                println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
-            }
-        }
+        let split_pass = ModelSplitPass::new(n_layers);
+        let split_result = split_pass
+            .split(&program)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("Failed to split model for speculative decoding")?;
+
+        // Write draft model
+        let draft_path = opts
+            .output
+            .as_deref()
+            .map(|o| {
+                let p = Path::new(o);
+                let s = p.file_stem().and_then(|s| s.to_str()).unwrap_or(stem);
+                let parent = p.parent().unwrap_or(Path::new("."));
+                parent
+                    .join(format!("{s}-draft.mlpackage"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| format!("{stem}-draft.mlpackage"));
+
+        let draft_model = program_to_model(&split_result.draft, 9)
+            .context("Failed to convert draft MIL IR to CoreML protobuf")?;
+        println!("Writing draft model ({n_layers} layers): {draft_path}");
+        write_mlpackage(&draft_model, &draft_path)
+            .with_context(|| format!("Failed to write draft mlpackage: {draft_path}"))?;
+
+        // Write verifier model
+        let verifier_path = opts
+            .output
+            .as_deref()
+            .map(|o| {
+                let p = Path::new(o);
+                let s = p.file_stem().and_then(|s| s.to_str()).unwrap_or(stem);
+                let parent = p.parent().unwrap_or(Path::new("."));
+                parent
+                    .join(format!("{s}-verifier.mlpackage"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| format!("{stem}-verifier.mlpackage"));
+
+        let verifier_model = program_to_model(&split_result.verifier, 9)
+            .context("Failed to convert verifier MIL IR to CoreML protobuf")?;
+        println!("Writing verifier model (full): {verifier_path}");
+        write_mlpackage(&verifier_model, &verifier_path)
+            .with_context(|| format!("Failed to write verifier mlpackage: {verifier_path}"))?;
+
+        // Compile both
+        compile_output(&draft_path, opts.backend);
+        compile_output(&verifier_path, opts.backend);
+    } else {
+        // Normal single-model output.
+        let model = if let Some(ref layers) = opts.updatable_layers {
+            let layer_names: Vec<String> =
+                layers.split(',').map(|s| s.trim().to_string()).collect();
+
+            let loss_fn = match opts.loss_function.as_str() {
+                "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,
+                _ => LossFunction::CategoricalCrossEntropy,
+            };
+            let opt = match opts.optimizer_type.as_str() {
+                "adam" => UpdateOptimizer::Adam,
+                _ => UpdateOptimizer::Sgd,
+            };
+
+            let config = UpdatableModelConfig {
+                updatable_layers: layer_names.clone(),
+                learning_rate: opts.learning_rate,
+                epochs: opts.epochs,
+                loss_function: loss_fn,
+                optimizer: opt,
+            };
+
+            println!(
+                "Updatable model: {} layer(s) marked for on-device training",
+                layer_names.len()
+            );
+            program_to_updatable_model(&program, 9, &config)
+                .context("Failed to convert MIL IR to updatable CoreML protobuf")?
+        } else {
+            program_to_model(&program, 9).context("Failed to convert MIL IR to CoreML protobuf")?
+        };
+
+        let output_path = opts.output.clone().unwrap_or_else(|| {
+            let stem = input_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+            format!("{stem}.mlpackage")
+        });
+        println!("Writing CoreML package: {output_path}");
+        write_mlpackage(&model, &output_path)
+            .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
+
+        compile_output(&output_path, opts.backend);
     }
 
     // 9. Print warnings
@@ -456,6 +503,33 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     println!();
     println!("Conversion complete.");
     Ok(())
+}
+
+/// Compile a .mlpackage using the selected backend.
+fn compile_output(output_path: &str, backend: Backend) {
+    match backend {
+        Backend::AneDirect => {
+            println!("Compiling with ANE direct backend...");
+            let output_dir = Path::new(output_path).parent().unwrap_or(Path::new("."));
+            match compile_model_with_backend(output_path, output_dir, Backend::AneDirect) {
+                Ok(compiled) => println!("Done: {}", compiled.display()),
+                Err(e) => println!("Warning: ANE direct compilation failed: {e}"),
+            }
+        }
+        Backend::Xcrun => {
+            if is_compiler_available() {
+                println!("Compiling with xcrun coremlcompiler...");
+                let output_dir = Path::new(output_path).parent().unwrap_or(Path::new("."));
+                match compile_model(output_path, output_dir) {
+                    Ok(compiled) => println!("Done: {}", compiled.display()),
+                    Err(e) => println!("Warning: compilation failed: {e}"),
+                }
+            } else {
+                println!("Note: xcrun coremlcompiler not found — skipping compilation step.");
+                println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
+            }
+        }
+    }
 }
 
 fn compile_coreml(input_path: &Path, ext: &str, backend: Backend) -> Result<()> {
