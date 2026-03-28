@@ -1,67 +1,123 @@
 # mil-rs
 
-Rust implementation of Apple's Model Intermediate Language (MIL) and CoreML
-protobuf format. Read, write, and manipulate CoreML models without any Python
-dependency.
+Read, write, and manipulate Apple CoreML models in Rust — no Python required.
 
-## Features
-
-- **`.mlmodel` reader/writer** — serialize and deserialize single-file CoreML
-  models (protobuf binary)
-- **`.mlpackage` reader/writer** — full directory-based package format with
-  `Manifest.json` handling
-- **MIL IR types** — strongly-typed intermediate representation mirroring
-  Apple's MIL: `Program`, `Function`, `Block`, `Operation`, `Graph`
-- **Proto ↔ IR conversion** — lossless round-trip between protobuf `Model` and
-  the Rust IR
+`mil-rs` provides a strongly-typed MIL (Model Intermediate Language)
+intermediate representation, ONNX-to-CoreML conversion, optimization passes
+targeting the Apple Neural Engine, and protobuf serialization for Apple's
+CoreML on-disk formats.
 
 ## Installation
-
-Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 mil-rs = "0.1"
 ```
 
+## Features
+
+### Model I/O
+
+- **`.mlmodel` reader/writer** — serialize and deserialize single-file CoreML
+  models (protobuf binary)
+- **`.mlpackage` reader/writer** — directory-based package format with
+  `Manifest.json` handling
+- **ONNX reader** — parse `.onnx` files into ONNX protobuf types
+
+### MIL IR
+
+Strongly-typed intermediate representation mirroring Apple's MIL:
+
+- `Program` → `Function` → `Block` → `Operation`
+- `TensorType` and `ScalarType` for shape/dtype tracking
+- `Value` enum for constants, references, and tensor data
+- `Graph` for standalone operation graphs
+
+### ONNX → CoreML conversion
+
+Convert ONNX models to CoreML's MIL IR, then serialize as `.mlpackage`:
+
+- Automatic topological sort of ONNX nodes
+- Initializer lowering to `const` operations
+- Graceful handling of unsupported ops (warnings, not failures)
+
+### Optimization passes
+
+All passes implement the `Pass` trait and transform a `Program` in place:
+
+| Pass | Description |
+|------|-------------|
+| `DeadCodeEliminationPass` | Remove operations whose outputs are unused |
+| `IdentityEliminationPass` | Bypass identity/copy operations |
+| `ConstantFoldPass` | Evaluate constant expressions at compile time |
+| `ConvBatchNormFusionPass` | Fuse `conv` + `batch_norm` into a single `conv` |
+| `ConvReluFusionPass` | Fuse `conv` + `relu` into a single `conv` |
+| `LinearReluFusionPass` | Fuse `linear` + `relu` into a single `linear` |
+| `Fp16QuantizePass` | Quantize Float32 constants and types to Float16 |
+| `ShapeMaterializePass` | Replace dynamic input shapes with concrete dimensions |
+
+### ANE validation
+
+Check whether operations will run on the Apple Neural Engine or fall back to
+CPU/GPU. The validator reports per-operation compatibility, warnings for
+dynamic shapes and oversized dimensions, and an overall compatibility
+percentage.
+
+### Compiler integration
+
+Shell out to `xcrun coremlcompiler` to compile `.mlpackage` / `.mlmodel` into
+`.mlmodelc` bundles loadable at runtime on Apple platforms.
+
 ## Usage
 
-### Read a `.mlmodel` file
+### Read and inspect a CoreML model
 
 ```rust,no_run
-use mil_rs::read_mlmodel;
+use mil_rs::{read_mlmodel, reader::print_model_summary};
 
 let model = read_mlmodel("model.mlmodel").unwrap();
-println!("spec version: {}", model.specification_version);
+print_model_summary(&model);
 ```
 
-### Read a `.mlpackage` directory
+### Convert ONNX to CoreML
 
 ```rust,no_run
-use mil_rs::read_mlpackage;
+use mil_rs::{read_onnx, onnx_to_program, program_to_model, write_mlpackage};
 
-let model = read_mlpackage("model.mlpackage").unwrap();
-println!("spec version: {}", model.specification_version);
+let onnx = read_onnx("model.onnx").unwrap();
+let result = onnx_to_program(&onnx).unwrap();
+let model = program_to_model(&result.program, 7).unwrap();
+write_mlpackage(&model, "model.mlpackage").unwrap();
 ```
 
-### Convert between protobuf and IR
+### Run optimization passes
 
 ```rust,no_run
-use mil_rs::{read_mlmodel, model_to_program, program_to_model, write_mlpackage};
+use mil_rs::ir::{Pass, DeadCodeEliminationPass, ConstantFoldPass, Fp16QuantizePass};
+# use mil_rs::{read_onnx, onnx_to_program};
+# let onnx = read_onnx("m.onnx").unwrap();
+# let result = onnx_to_program(&onnx).unwrap();
+# let mut program = result.program;
 
-// Read a protobuf model and convert to the typed IR
-let model = read_mlmodel("input.mlmodel").unwrap();
-let program = model_to_program(&model).unwrap();
-
-// Inspect or transform the program...
-println!("functions: {}", program.functions.len());
-
-// Convert back to protobuf and write as .mlpackage
-let output_model = program_to_model(&program, model.specification_version as i32).unwrap();
-write_mlpackage(&output_model, "output.mlpackage").unwrap();
+DeadCodeEliminationPass.run(&mut program).unwrap();
+ConstantFoldPass.run(&mut program).unwrap();
+Fp16QuantizePass.run(&mut program).unwrap();
 ```
 
-### Write a model to a different format
+### Validate ANE compatibility
+
+```rust,no_run
+use mil_rs::{validate_ane_compatibility, validate::print_validation_report};
+# use mil_rs::{read_onnx, onnx_to_program};
+# let onnx = read_onnx("m.onnx").unwrap();
+# let result = onnx_to_program(&onnx).unwrap();
+
+let report = validate_ane_compatibility(&result.program);
+print_validation_report(&report);
+println!("ANE compatibility: {:.1}%", report.compatibility_pct);
+```
+
+### Round-trip between formats
 
 ```rust,no_run
 use mil_rs::{read_mlpackage, write_mlmodel};
@@ -72,27 +128,22 @@ write_mlmodel(&model, "output.mlmodel").unwrap();
 
 ## Crate structure
 
-| Module    | Description |
-|-----------|-------------|
-| `ir`      | MIL intermediate representation — `Program`, `Function`, `Block`, `Operation`, `Graph`, tensor types |
-| `proto`   | Auto-generated protobuf types from Apple's CoreML `.proto` spec |
-| `reader`  | Functions to read `.mlmodel` and `.mlpackage` files |
-| `writer`  | Functions to write `.mlmodel` and `.mlpackage` files |
-| `convert` | Bidirectional conversion between protobuf `Model` and IR `Program` |
-| `error`   | `MilError` enum and `Result` type alias |
+| Module | Description |
+|--------|-------------|
+| [`reader`](https://docs.rs/mil-rs/latest/mil_rs/reader/) | Read `.mlmodel`, `.mlpackage`, and `.onnx` files |
+| [`writer`](https://docs.rs/mil-rs/latest/mil_rs/writer/) | Write `.mlmodel` and `.mlpackage` files |
+| [`convert`](https://docs.rs/mil-rs/latest/mil_rs/convert/) | ONNX → MIL, proto ↔ IR conversion |
+| [`ir`](https://docs.rs/mil-rs/latest/mil_rs/ir/) | MIL intermediate representation and optimization passes |
+| [`validate`](https://docs.rs/mil-rs/latest/mil_rs/validate/) | ANE compatibility analysis |
+| [`compiler`](https://docs.rs/mil-rs/latest/mil_rs/compiler/) | `xcrun coremlcompiler` integration |
+| [`proto`](https://docs.rs/mil-rs/latest/mil_rs/proto/) | Auto-generated protobuf types (CoreML + ONNX) |
+| [`error`](https://docs.rs/mil-rs/latest/mil_rs/error/) | `MilError` enum and `Result` type alias |
 
 ## Supported model types
 
-Currently supports **ML Program** models (CoreML spec v7+). Legacy
-`NeuralNetwork` models can be read/written at the protobuf level but cannot be
-converted to the MIL IR.
-
-## Roadmap
-
-- **v0.1** (current) — Read/write CoreML `.mlmodel` and `.mlpackage`, MIL IR,
-  proto ↔ IR conversion
-- **v0.2** — ONNX → MIL conversion for common operators
-- **v0.3** — Optimization passes (constant folding, op fusion)
+The proto ↔ IR conversion supports **ML Program** models (CoreML spec v7+).
+Legacy `NeuralNetwork` models can be read and written at the protobuf level
+but cannot be converted to the MIL IR.
 
 ## License
 

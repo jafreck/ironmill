@@ -43,13 +43,21 @@
 //! Legacy `NeuralNetwork` models can be read and written at the protobuf level
 //! but cannot be converted to the MIL IR.
 
+/// Compile CoreML models to `.mlmodelc` via `xcrun coremlcompiler`.
 pub mod compiler;
+/// Bidirectional conversion between protobuf types, ONNX models, and the MIL IR.
 pub mod convert;
+/// Error types used throughout the crate.
 pub mod error;
+/// MIL Intermediate Representation — programs, functions, operations, and types.
 pub mod ir;
+/// Auto-generated protobuf types for CoreML and ONNX specifications.
 pub mod proto;
+/// Readers for `.mlmodel`, `.mlpackage`, and `.onnx` files.
 pub mod reader;
+/// ANE (Apple Neural Engine) compatibility validation.
 pub mod validate;
+/// Writers for `.mlmodel` and `.mlpackage` files.
 pub mod writer;
 
 // Re-export key types at crate root for convenience.

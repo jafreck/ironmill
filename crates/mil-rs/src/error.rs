@@ -32,4 +32,5 @@ pub enum MilError {
     Validation(String),
 }
 
+/// Convenience alias for `std::result::Result<T, MilError>`.
 pub type Result<T> = std::result::Result<T, MilError>;
