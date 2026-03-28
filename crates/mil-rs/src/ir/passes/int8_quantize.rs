@@ -19,7 +19,7 @@ use super::tensor_utils::tensor_as_f32_slice;
 use crate::error::Result;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
-use crate::ir::tensor::ScalarType;
+use crate::ir::tensor::{ScalarType, TensorType};
 use crate::ir::types::Value;
 
 /// Quantization granularity.
@@ -112,19 +112,30 @@ impl Pass for Int8QuantizePass {
 
                     let quantized_val = Value::Tensor {
                         data: quantized,
-                        shape,
+                        shape: shape.clone(),
                         dtype: ScalarType::UInt8,
                     };
 
-                    if in_inputs {
-                        op.inputs.insert("val".to_string(), quantized_val);
-                    } else {
-                        op.attributes.insert("val".to_string(), quantized_val);
-                    }
+                    // Transform into constexpr_affine_dequantize so that
+                    // downstream ops (conv, matmul, …) see a Float32 output.
+                    op.op_type = "constexpr_affine_dequantize".to_string();
+                    op.inputs.remove("val");
+                    op.attributes.remove("val");
+                    op.attributes
+                        .insert("quantized_data".to_string(), quantized_val);
                     op.attributes
                         .insert("scale".to_string(), Value::Float(scale as f64));
                     op.attributes
                         .insert("zero_point".to_string(), Value::Float(zero_point as f64));
+                    op.attributes.insert("axis".to_string(), Value::Int(0));
+
+                    // Output type stays Float32 (the dequantized result).
+                    let out_type = TensorType::new(ScalarType::Float32, shape);
+                    if let Some(slot) = op.output_types.get_mut(0) {
+                        *slot = Some(out_type);
+                    } else {
+                        op.output_types.push(Some(out_type));
+                    }
                 }
             }
         }
@@ -223,19 +234,17 @@ mod tests {
         Int8QuantizePass::weight_only().run(&mut program).unwrap();
 
         let op = &program.functions["main"].body.operations[0];
-        match op.inputs.get("val") {
+        assert_eq!(op.op_type, "constexpr_affine_dequantize");
+        match op.attributes.get("quantized_data") {
             Some(Value::Tensor { data, shape, dtype }) => {
                 assert_eq!(*dtype, ScalarType::UInt8);
                 assert_eq!(*shape, vec![4]);
-                assert_eq!(data.len(), 4); // 1 byte per element
-                // All values should be in [0, 255]
-                // All u8 values are inherently in [0, 255]; verify non-empty.
+                assert_eq!(data.len(), 4);
                 assert!(!data.is_empty());
             }
             other => panic!("expected UInt8 Tensor, got {other:?}"),
         }
 
-        // scale and zero_point attributes must exist.
         assert!(
             op.attributes.contains_key("scale"),
             "missing 'scale' attribute"
@@ -250,14 +259,13 @@ mod tests {
             other => panic!("expected Float scale, got {other:?}"),
         }
         match op.attributes.get("zero_point") {
-            Some(Value::Float(_)) => {} // zero_point can be outside [0, 255]
+            Some(Value::Float(_)) => {}
             other => panic!("expected Float zero_point, got {other:?}"),
         }
     }
 
     #[test]
     fn quantized_values_within_uint8_range() {
-        // Mix of negative and positive values.
         let vals = [-5.0_f32, -1.0, 0.0, 2.5, 10.0];
         let fp32_data = f32_bytes(&vals);
         let tensor_val = Value::Tensor {
@@ -275,10 +283,8 @@ mod tests {
         Int8QuantizePass::weight_only().run(&mut program).unwrap();
 
         let op = &program.functions["main"].body.operations[0];
-        if let Some(Value::Tensor { data, .. }) = op.inputs.get("val") {
-            // u8 is inherently in [0, 255]; verify correct count.
+        if let Some(Value::Tensor { data, .. }) = op.attributes.get("quantized_data") {
             assert_eq!(data.len(), 5);
-            // min input should map to 0, max to 255.
             assert_eq!(data[0], 0, "min value should map to 0");
             assert_eq!(data[4], 255, "max value should map to 255");
         } else {
@@ -322,9 +328,8 @@ mod tests {
         Int8QuantizePass::weight_only().run(&mut program).unwrap();
 
         let op = &program.functions["main"].body.operations[0];
-        if let Some(Value::Tensor { data, dtype, .. }) = op.inputs.get("val") {
+        if let Some(Value::Tensor { data, dtype, .. }) = op.attributes.get("quantized_data") {
             assert_eq!(*dtype, ScalarType::UInt8);
-            // All quantized values should be the same.
             let first = data[0];
             for &b in data {
                 assert_eq!(b, first, "all-same input should produce all-same output");
@@ -352,7 +357,7 @@ mod tests {
         Int8QuantizePass::weight_only().run(&mut program).unwrap();
 
         let op = &program.functions["main"].body.operations[0];
-        if let Some(Value::Tensor { data, dtype, shape }) = op.inputs.get("val") {
+        if let Some(Value::Tensor { data, dtype, shape }) = op.attributes.get("quantized_data") {
             assert_eq!(*dtype, ScalarType::UInt8);
             assert_eq!(*shape, vec![1]);
             assert_eq!(data.len(), 1);
