@@ -20,16 +20,15 @@ use std::path::Path;
 use mil_rs::ir::ScalarType;
 
 /// Size of the file header in bytes.
+#[allow(dead_code)]
 const FILE_HEADER_SIZE: usize = 64;
 
-/// Size of each chunk header in bytes.
-const CHUNK_HEADER_SIZE: usize = 64;
+/// Size of the chunk descriptor in bytes.
+#[allow(dead_code)]
+const CHUNK_DESC_SIZE: usize = 64;
 
-/// Magic bytes identifying a BLOBFILE.
-const MAGIC: &[u8; 4] = b"BLOB";
-
-/// Current format version.
-const VERSION: u32 = 1;
+/// Offset where weight data begins (after header + chunk descriptor).
+const DATA_START: usize = 128;
 
 /// Metadata for a weight entry in the BLOBFILE.
 #[derive(Debug, Clone)]
@@ -40,72 +39,43 @@ pub struct BlobEntry {
     pub dtype: ScalarType,
 }
 
-/// Builds a BLOBFILE incrementally by adding weight tensors.
+/// Builds a BLOBFILE matching the format used by Orion/ANE.
 ///
-/// Uses a two-pass approach: `add_weight` accumulates entries and raw data,
-/// while `write` / `as_bytes` computes the final layout with file header,
-/// chunk headers, and packed weight data.
+/// Format (from Orion's `orion_make_causal_mask_blob`):
+/// - Bytes 0-63: File header (byte 0=1, byte 4=2)
+/// - Bytes 64-67: Chunk magic `0xDEADBEEF`
+/// - Byte 68: `1`
+/// - Bytes 72-75: Data size (u32 LE)
+/// - Bytes 80-83: Data offset = 128 (u32 LE)
+/// - Bytes 128+: Weight data
 pub struct BlobFileWriter {
-    buffer: Vec<u8>,
+    data: Vec<u8>,
     entries: Vec<BlobEntry>,
 }
 
 impl BlobFileWriter {
-    /// Create a new writer with the 64-byte file header pre-written.
-    ///
-    /// The file header contains magic bytes, version, and a placeholder
-    /// entry count that is updated when the final bytes are produced.
+    /// Create a new writer.
     pub fn new() -> Self {
-        let mut buffer = vec![0u8; FILE_HEADER_SIZE];
-
-        // Magic: bytes 0-3
-        buffer[0..4].copy_from_slice(MAGIC);
-        // Version: bytes 4-7 (u32 LE)
-        buffer[4..8].copy_from_slice(&VERSION.to_le_bytes());
-        // Entry count at bytes 8-11 starts at 0, updated in as_bytes().
-
         Self {
-            buffer,
+            data: Vec::new(),
             entries: Vec::new(),
         }
     }
 
-    /// Add a weight tensor. Returns the offset where the chunk header will
-    /// be placed — this is the value for MIL text `blob(offset=uint64(N))`.
+    /// Add a weight tensor. Returns the chunk descriptor offset (always 64).
     ///
-    /// For the first weight the returned offset is 64 (constraint #8).
+    /// MIL text references use `offset=uint64(64)` pointing to the chunk
+    /// descriptor at byte 64, matching Orion's BLOBFILE format.
     pub fn add_weight(&mut self, name: &str, data: &[u8], dtype: ScalarType) -> u64 {
-        let chunk_header_offset = self.buffer.len() as u64;
-
-        // Write the 64-byte chunk header.
-        // Data offset and size are placeholders — we patch them below once
-        // we know where the data will land.
-        let data_offset = chunk_header_offset + CHUNK_HEADER_SIZE as u64;
-        let data_size = data.len() as u64;
-
-        // Bytes 0-7: absolute data offset (u64 LE)
-        self.buffer.extend_from_slice(&data_offset.to_le_bytes());
-        // Bytes 8-15: data size (u64 LE)
-        self.buffer.extend_from_slice(&data_size.to_le_bytes());
-        // Bytes 16-63: reserved (zeroes)
-        self.buffer
-            .extend_from_slice(&[0u8; CHUNK_HEADER_SIZE - 16]);
-
-        // Append weight data immediately after the chunk header.
-        self.buffer.extend_from_slice(data);
-
         self.entries.push(BlobEntry {
             name: name.to_string(),
-            offset: chunk_header_offset,
-            size: data_size,
+            offset: 64,
+            size: data.len() as u64,
             dtype,
         });
+        self.data.extend_from_slice(data);
 
-        // Update entry count in the file header.
-        let count = self.entries.len() as u32;
-        self.buffer[8..12].copy_from_slice(&count.to_le_bytes());
-
-        chunk_header_offset
+        64
     }
 
     /// Get the list of blob entries (for validation/debugging).
@@ -115,12 +85,41 @@ impl BlobFileWriter {
 
     /// Write the complete BLOBFILE to disk.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path, self.as_bytes())
+        std::fs::write(path, self.build())
     }
 
-    /// Get the raw buffer (for in-memory use).
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buffer
+    /// Get the raw BLOBFILE bytes.
+    pub fn as_bytes(&self) -> Vec<u8> {
+        self.build()
+    }
+
+    /// Build the complete BLOBFILE in Orion's format.
+    fn build(&self) -> Vec<u8> {
+        let data_size = self.data.len();
+        let total = DATA_START + data_size;
+        let mut buf = vec![0u8; total];
+
+        // File header (bytes 0-63)
+        buf[0] = 1;
+        buf[4] = 2;
+
+        // Chunk descriptor (bytes 64-127)
+        // Magic: 0xDEADBEEF at bytes 64-67
+        buf[64] = 0xEF;
+        buf[65] = 0xBE;
+        buf[66] = 0xAD;
+        buf[67] = 0xDE;
+        // Byte 68: 1
+        buf[68] = 1;
+        // Bytes 72-75: data size (u32 LE)
+        buf[72..76].copy_from_slice(&(data_size as u32).to_le_bytes());
+        // Bytes 80-83: data offset = 128 (u32 LE)
+        buf[80..84].copy_from_slice(&(DATA_START as u32).to_le_bytes());
+
+        // Weight data (bytes 128+)
+        buf[DATA_START..].copy_from_slice(&self.data);
+
+        buf
     }
 }
 
@@ -139,20 +138,19 @@ mod tests {
         let writer = BlobFileWriter::new();
         let bytes = writer.as_bytes();
 
-        assert!(bytes.len() >= FILE_HEADER_SIZE);
-        assert_eq!(&bytes[0..4], b"BLOB");
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
-        // Zero entries initially.
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
-        // Remaining header bytes are zero.
-        assert!(bytes[12..FILE_HEADER_SIZE].iter().all(|&b| b == 0));
+        // Empty BLOBFILE has header + chunk descriptor = 128 bytes
+        assert_eq!(bytes.len(), DATA_START);
+        // File header: byte 0 = 1, byte 4 = 2
+        assert_eq!(bytes[0], 1);
+        assert_eq!(bytes[4], 2);
+        // Chunk magic: 0xDEADBEEF at bytes 64-67
+        assert_eq!(&bytes[64..68], &[0xEF, 0xBE, 0xAD, 0xDE]);
     }
 
     #[test]
     fn blobfile_offset_64() {
         let mut writer = BlobFileWriter::new();
         let offset = writer.add_weight("w1", &[1, 2, 3, 4], ScalarType::Float16);
-        // Constraint #8: first chunk header at byte 64.
         assert_eq!(offset, 64);
     }
 
@@ -162,19 +160,15 @@ mod tests {
 
         let off1 = writer.add_weight("w1", &[0u8; 16], ScalarType::Float16);
         let off2 = writer.add_weight("w2", &[0u8; 32], ScalarType::Float32);
-        let off3 = writer.add_weight("w3", &[0u8; 8], ScalarType::Int8);
 
+        // All offsets are 64 (each weight gets its own BLOBFILE in practice)
         assert_eq!(off1, 64);
-        // off2 = 64 (chunk1) + 64 (chunk1 header) + 16 (data1)
-        assert_eq!(off2, 64 + CHUNK_HEADER_SIZE as u64 + 16);
-        // off3 = off2 + 64 (chunk2 header) + 32 (data2)
-        assert_eq!(off3, off2 + CHUNK_HEADER_SIZE as u64 + 32);
+        assert_eq!(off2, 64);
+        assert_eq!(writer.entries().len(), 2);
 
-        assert_eq!(writer.entries().len(), 3);
-
-        // Entry count in header is 3.
+        // Combined BLOBFILE has all data at byte 128
         let bytes = writer.as_bytes();
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
+        assert_eq!(bytes.len(), DATA_START + 16 + 32);
     }
 
     #[test]
@@ -196,9 +190,7 @@ mod tests {
         let writer = BlobFileWriter::new();
         let bytes = writer.as_bytes();
 
-        assert_eq!(bytes.len(), FILE_HEADER_SIZE);
-        assert_eq!(&bytes[0..4], b"BLOB");
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
+        assert_eq!(bytes.len(), DATA_START);
         assert!(writer.entries().is_empty());
     }
 
@@ -206,28 +198,14 @@ mod tests {
     fn blobfile_data_integrity() {
         let mut writer = BlobFileWriter::new();
 
-        let data1: Vec<u8> = (0..128).collect();
-        let data2: Vec<u8> = (128..255).collect();
-
-        let off1 = writer.add_weight("w1", &data1, ScalarType::Float16);
-        let off2 = writer.add_weight("w2", &data2, ScalarType::Float32);
+        let data: Vec<u8> = (0..128).collect();
+        writer.add_weight("w1", &data, ScalarType::Float16);
 
         let bytes = writer.as_bytes();
-
-        // Read back chunk header 1 and verify data offset / size.
-        let hdr1 = off1 as usize;
-        let data1_offset = u64::from_le_bytes(bytes[hdr1..hdr1 + 8].try_into().unwrap()) as usize;
-        let data1_size =
-            u64::from_le_bytes(bytes[hdr1 + 8..hdr1 + 16].try_into().unwrap()) as usize;
-        assert_eq!(data1_size, data1.len());
-        assert_eq!(&bytes[data1_offset..data1_offset + data1_size], &data1[..]);
-
-        // Read back chunk header 2 and verify data offset / size.
-        let hdr2 = off2 as usize;
-        let data2_offset = u64::from_le_bytes(bytes[hdr2..hdr2 + 8].try_into().unwrap()) as usize;
-        let data2_size =
-            u64::from_le_bytes(bytes[hdr2 + 8..hdr2 + 16].try_into().unwrap()) as usize;
-        assert_eq!(data2_size, data2.len());
-        assert_eq!(&bytes[data2_offset..data2_offset + data2_size], &data2[..]);
+        // Data starts at byte 128
+        assert_eq!(&bytes[DATA_START..DATA_START + data.len()], &data[..]);
+        // Data size recorded in chunk descriptor at bytes 72-75
+        let size = u32::from_le_bytes(bytes[72..76].try_into().unwrap()) as usize;
+        assert_eq!(size, data.len());
     }
 }

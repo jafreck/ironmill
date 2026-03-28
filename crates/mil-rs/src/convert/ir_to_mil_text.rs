@@ -77,9 +77,14 @@ struct MilTextEmitter<'a> {
     output: String,
     weight_entries: Vec<WeightBlobEntry>,
     /// Running byte offset into the weight blob file.
+    /// Running byte offset into the weight blob file (unused now that
+    /// each weight gets its own BLOBFILE with offset=64).
+    #[allow(dead_code)]
     weight_offset: u64,
     /// Maps original variable names → emitted names for I/O renaming.
     rename_map: HashMap<String, String>,
+    /// Maps variable names → their tensor types (for output type inference).
+    type_map: HashMap<String, TensorType>,
 }
 
 impl<'a> MilTextEmitter<'a> {
@@ -88,8 +93,9 @@ impl<'a> MilTextEmitter<'a> {
             config,
             output: String::new(),
             weight_entries: Vec::new(),
-            weight_offset: 0,
+            weight_offset: 64,
             rename_map: HashMap::new(),
+            type_map: HashMap::new(),
         }
     }
 
@@ -121,9 +127,11 @@ impl<'a> MilTextEmitter<'a> {
     fn emit_function(&mut self, func: &Function) -> Result<()> {
         // Build I/O rename maps for alphabetical ordering.
         self.rename_map.clear();
-        for (i, (name, _ty)) in func.inputs.iter().enumerate() {
+        self.type_map.clear();
+        for (i, (name, ty)) in func.inputs.iter().enumerate() {
             let new_name = format!("a_input{i}");
             self.rename_map.insert(name.clone(), new_name);
+            self.type_map.insert(name.clone(), ty.clone());
         }
         for (i, output_name) in func.body.outputs.iter().enumerate() {
             let new_name = format!("z_output{i}");
@@ -170,12 +178,24 @@ impl<'a> MilTextEmitter<'a> {
             .map(|n| self.resolve_name(n))
             .unwrap_or_else(|| op.name.clone());
 
-        // Determine output type.
-        let output_type = op.output_types.first().and_then(|t| t.as_ref()).cloned();
+        // Determine output type. If not explicitly stored, try to infer from
+        // input types (most element-wise ops preserve the type of their first
+        // tensor input).
+        let output_type = op
+            .output_types
+            .first()
+            .and_then(|t| t.as_ref())
+            .cloned()
+            .or_else(|| self.infer_output_type_from_inputs(op));
         let type_str = match &output_type {
             Some(ty) => self.format_tensor_type(ty),
             None => "tensor<fp16, [1]>".to_string(),
         };
+
+        // Register this output's type for downstream inference.
+        if let (Some(out_name), Some(ty)) = (op.outputs.first(), &output_type) {
+            self.type_map.insert(out_name.clone(), ty.clone());
+        }
 
         let mut params = Vec::new();
         // Sort input keys for deterministic output.
@@ -219,26 +239,31 @@ impl<'a> MilTextEmitter<'a> {
 
         // Check if this is a weight tensor or a scalar const.
         if let Some(Value::Tensor { data, shape, dtype }) = op.inputs.get("val") {
+            // Register the type for downstream ops.
+            if let Some(out_name) = op.outputs.first() {
+                self.type_map
+                    .insert(out_name.clone(), TensorType::new(*dtype, shape.clone()));
+            }
+
             // Weight tensor → collect as blob entry.
-            let offset = self.weight_offset;
-            let aligned_len = align_up(data.len() as u64, 64);
+            // Each weight gets its own BLOBFILE, so offset is always 64
+            // (the standard header size). This matches Orion's approach.
             let weight_path = format!("@model_path/weights/{}.bin", op.name);
             self.weight_entries.push(WeightBlobEntry {
                 name: op.name.clone(),
                 path: weight_path.clone(),
                 data: data.clone(),
-                offset,
+                offset: 64,
                 dtype: *dtype,
                 shape: shape.clone(),
             });
-            self.weight_offset += aligned_len;
 
             let type_str = self.format_tensor_type_from(shape, *dtype);
 
             // TYPE %name = const()[name=string("name"), val=TYPE(BLOBFILE(...))];
             writeln!(
                 self.output,
-                "        {type_str} %{output_name} = const()[name=string(\"{output_name}\"), val={type_str}(BLOBFILE(path=string(\"{weight_path}\"), offset=uint64({offset})))];",
+                "        {type_str} %{output_name} = const()[name=string(\"{output_name}\"), val={type_str}(BLOBFILE(path=string(\"{weight_path}\"), offset=uint64(64)))];",
             )
             .unwrap();
         } else if let Some(val) = op.inputs.get("val") {
@@ -369,6 +394,34 @@ impl<'a> MilTextEmitter<'a> {
         }
         None
     }
+
+    /// Infer output type from input references using the type map.
+    /// Most element-wise ops (add, mul, relu, etc.) preserve the type
+    /// of their first tensor input.
+    fn infer_output_type_from_inputs(&self, op: &Operation) -> Option<TensorType> {
+        // First, check if any input is a reference we can look up in the type map.
+        // Prefer "x" input (the primary operand for most ops).
+        if let Some(Value::Reference(name)) = op.inputs.get("x") {
+            if let Some(ty) = self.type_map.get(name) {
+                return Some(ty.clone());
+            }
+        }
+        // Try any reference input.
+        for val in op.inputs.values() {
+            if let Value::Reference(name) = val {
+                if let Some(ty) = self.type_map.get(name) {
+                    return Some(ty.clone());
+                }
+            }
+        }
+        // Check for inline Tensor values.
+        for val in op.inputs.values() {
+            if let Value::Tensor { shape, dtype, .. } = val {
+                return Some(TensorType::new(*dtype, shape.clone()));
+            }
+        }
+        None
+    }
 }
 
 /// Format a [`ScalarType`] as a MIL type string.
@@ -399,6 +452,7 @@ fn format_float(f: f64) -> String {
 }
 
 /// Align a byte count up to the given alignment boundary.
+#[allow(dead_code)]
 fn align_up(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
 }
@@ -545,23 +599,23 @@ mod tests {
         let config = MilTextConfig::default();
         let (text, weights) = program_to_mil_text(&program, &config).unwrap();
 
-        // Two weight entries collected.
+        // Two weight entries collected — each with its own BLOBFILE, offset=64.
         assert_eq!(weights.len(), 2);
         assert_eq!(weights[0].name, "layer0_w");
-        assert_eq!(weights[0].offset, 0);
+        assert_eq!(weights[0].offset, 64);
         assert_eq!(weights[0].data.len(), 100);
         assert_eq!(weights[0].path, "@model_path/weights/layer0_w.bin");
         assert_eq!(weights[1].name, "layer1_w");
-        assert_eq!(weights[1].offset, 128);
+        assert_eq!(weights[1].offset, 64);
         assert_eq!(weights[1].data.len(), 200);
         assert_eq!(weights[1].path, "@model_path/weights/layer1_w.bin");
 
-        // BLOBFILE references in text.
+        // BLOBFILE references in text (all offset=64).
         assert!(text.contains(
-            "BLOBFILE(path=string(\"@model_path/weights/layer0_w.bin\"), offset=uint64(0))"
+            "BLOBFILE(path=string(\"@model_path/weights/layer0_w.bin\"), offset=uint64(64))"
         ));
         assert!(text.contains(
-            "BLOBFILE(path=string(\"@model_path/weights/layer1_w.bin\"), offset=uint64(128))"
+            "BLOBFILE(path=string(\"@model_path/weights/layer1_w.bin\"), offset=uint64(64))"
         ));
     }
 
@@ -664,12 +718,12 @@ mod tests {
         assert!(text.contains("tensor<fp16, [1, 768, 1, 32]> a_input0"));
         assert!(text.contains("tensor<fp16, [1, 1, 1, 32]> a_input1"));
 
-        // Weight BLOBFILE refs.
+        // Weight BLOBFILE refs (each with offset=64, separate files).
         assert!(text.contains(
-            "BLOBFILE(path=string(\"@model_path/weights/layer0_w.bin\"), offset=uint64(0))"
+            "BLOBFILE(path=string(\"@model_path/weights/layer0_w.bin\"), offset=uint64(64))"
         ));
         assert!(text.contains(
-            "BLOBFILE(path=string(\"@model_path/weights/layer0_b.bin\"), offset=uint64(512))"
+            "BLOBFILE(path=string(\"@model_path/weights/layer0_b.bin\"), offset=uint64(64))"
         ));
 
         // Regular ops reference renamed inputs.

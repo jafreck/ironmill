@@ -204,26 +204,31 @@ impl AneModel {
                     ))
                 })?;
 
-            // 4b. Write BLOBFILE
-            let mut blob_writer = BlobFileWriter::new();
+            // 4b. Build per-weight BLOBFILEs
+            let mut weight_blobs: Vec<(String, Vec<u8>)> = Vec::new();
             for entry in &weight_entries {
+                let mut blob_writer = BlobFileWriter::new();
                 blob_writer.add_weight(&entry.name, &entry.data, entry.dtype);
+                weight_blobs.push((entry.path.clone(), blob_writer.as_bytes().to_vec()));
             }
-            let weight_dir = work_dir.path().join(&sub.name);
-            std::fs::create_dir_all(&weight_dir)
-                .map_err(|e| AneError::Other(anyhow::anyhow!("failed to create dir: {e}")))?;
-            let weight_path = weight_dir.join("weights.blob");
-            blob_writer
-                .write(&weight_path)
-                .map_err(|e| AneError::Other(anyhow::anyhow!("BLOBFILE write failed: {e}")))?;
 
             // 4c. Check cache and 4d. Compile (or load from cache)
-            let cache_key = ProgramCache::make_key(&mil_text, blob_writer.as_bytes());
+            let cache_key = ProgramCache::make_key(
+                &mil_text,
+                &weight_blobs
+                    .iter()
+                    .flat_map(|(_, d)| d.iter())
+                    .copied()
+                    .collect::<Vec<_>>(),
+            );
+
+            let weight_refs: Vec<(&str, &[u8])> = weight_blobs
+                .iter()
+                .map(|(path, data)| (path.as_str(), data.as_slice()))
+                .collect();
 
             let compiled = if cache.contains(&cache_key) {
-                // Cache hit — still compile for now (disk deserialization not yet
-                // implemented), but skip re-inserting into cache.
-                let ptr = AneCompiler::compile_mil_text(&mil_text, &weight_path).map_err(|e| {
+                let ptr = AneCompiler::compile_mil_text(&mil_text, &weight_refs).map_err(|e| {
                     AneError::CompileFailed {
                         status: 0,
                         context: format!("{e}"),
@@ -232,7 +237,7 @@ impl AneModel {
                 cache.record_compilation();
                 CompiledProgram { model: ptr }
             } else {
-                let ptr = AneCompiler::compile_mil_text(&mil_text, &weight_path).map_err(|e| {
+                let ptr = AneCompiler::compile_mil_text(&mil_text, &weight_refs).map_err(|e| {
                     AneError::CompileFailed {
                         status: 0,
                         context: format!("{e}"),
@@ -572,12 +577,14 @@ impl CompiledArtifacts {
                 });
             }
 
-            // BLOBFILE must have valid header (at least 64 bytes with BLOB magic)
-            if sub.weight_blob.len() >= 4 && &sub.weight_blob[0..4] != b"BLOB" {
+            // BLOBFILE must have valid header (Orion format: byte 0=1, 0xDEADBEEF at byte 64)
+            if sub.weight_blob.len() >= 68
+                && (sub.weight_blob[0] != 1 || sub.weight_blob[64..68] != [0xEF, 0xBE, 0xAD, 0xDE])
+            {
                 return Err(AneError::CompileFailed {
                     status: 0,
                     context: format!(
-                        "sub-program '{}': BLOBFILE has invalid magic bytes",
+                        "sub-program '{}': BLOBFILE has invalid header format",
                         sub.name
                     ),
                 });
@@ -838,14 +845,15 @@ mod tests {
 
         // Should have a BLOBFILE with weight data
         assert!(
-            first.weight_blob.len() >= 64,
-            "BLOBFILE should have at least a header (got {} bytes)",
+            first.weight_blob.len() >= 128,
+            "BLOBFILE should have at least header + chunk desc (got {} bytes)",
             first.weight_blob.len()
         );
+        assert_eq!(first.weight_blob[0], 1, "BLOBFILE byte 0 should be 1");
         assert_eq!(
-            &first.weight_blob[0..4],
-            b"BLOB",
-            "BLOBFILE should start with BLOB magic"
+            &first.weight_blob[64..68],
+            &[0xEF, 0xBE, 0xAD, 0xDE],
+            "BLOBFILE should have 0xDEADBEEF chunk magic at byte 64"
         );
 
         // MIL text should reference the weight blob
@@ -926,11 +934,16 @@ mod tests {
 
     #[test]
     fn e2e_validate_catches_bad_mil_text() {
+        // Use a small valid-ish BLOBFILE header (byte 0=1, 0xDEADBEEF at 64)
+        let mut blob = vec![0u8; 128];
+        blob[0] = 1;
+        blob[64..68].copy_from_slice(&[0xEF, 0xBE, 0xAD, 0xDE]);
+
         let bad = CompiledArtifacts {
             sub_programs: vec![SubProgramArtifact {
                 name: "broken".into(),
                 mil_text: "not a valid MIL program".into(),
-                weight_blob: b"BLOB".to_vec(),
+                weight_blob: blob,
                 inputs: vec![],
                 outputs: vec![],
             }],
@@ -944,11 +957,15 @@ mod tests {
 
     #[test]
     fn e2e_validate_catches_bad_blobfile() {
+        // 68+ bytes but wrong magic
+        let mut blob = vec![0u8; 128];
+        blob[0] = 99; // wrong
+
         let bad = CompiledArtifacts {
             sub_programs: vec![SubProgramArtifact {
                 name: "broken".into(),
                 mil_text: "program(1.0)\nfunc main() { } -> ()".into(),
-                weight_blob: b"JUNK_NOT_BLOB_HEADER_LONG_ENOUGH".to_vec(),
+                weight_blob: blob,
                 inputs: vec![],
                 outputs: vec![],
             }],
@@ -957,7 +974,7 @@ mod tests {
         let result = bad.validate();
         assert!(result.is_err(), "should reject invalid BLOBFILE");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("invalid magic"), "{msg}");
+        assert!(msg.contains("invalid header"), "{msg}");
     }
 
     #[test]
@@ -1001,8 +1018,8 @@ mod tests {
         let first = &artifacts.sub_programs[0];
         let sub_dir = tmp.path().join(format!("00_{}", first.name));
         let blob = std::fs::read(sub_dir.join("weights.blob")).expect("read BLOBFILE");
-        assert!(blob.len() >= 64, "BLOBFILE should be at least 64 bytes");
-        assert_eq!(&blob[0..4], b"BLOB", "BLOBFILE magic should match");
+        assert!(blob.len() >= 128, "BLOBFILE should be at least 128 bytes");
+        assert_eq!(blob[0], 1, "BLOBFILE byte 0 should be 1");
     }
 
     #[test]
@@ -1079,6 +1096,26 @@ mod tests {
                     "expected compilation failure, got: {msg}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn e2e_debug_mil_text_output() {
+        // Dump the MIL text for debugging ANE compilation failures.
+        use mil_rs::convert::ir_to_mil_text::{MilTextConfig, program_to_mil_text};
+
+        for (label, program) in [
+            ("add (no weights)", build_add_program()),
+            ("weighted", build_weighted_program()),
+        ] {
+            let config = MilTextConfig::default();
+            let (text, entries) = program_to_mil_text(&program, &config).unwrap();
+            eprintln!(
+                "=== {label}: {len} bytes, {n} weight entries ===",
+                len = text.len(),
+                n = entries.len()
+            );
+            eprintln!("{text}");
         }
     }
 }
