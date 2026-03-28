@@ -14,7 +14,8 @@ use super::passes::{
     DeadCodeEliminationPass, Fp16QuantizePass, GeluLinearFusionPass, GqaFusionPass, Granularity,
     IdentityEliminationPass, Int8QuantizePass, KvCachePass, LayerNormLinearFusionPass,
     LayoutOptimizationPass, LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass,
-    OpSubstitutionPass, PalettizePass, ResidualAddFusionPass, ShapeMaterializePass,
+    OpSplittingPass, OpSubstitutionPass, PalettizePass, ResidualAddFusionPass,
+    ShapeMaterializePass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -81,6 +82,7 @@ const KNOWN_PASSES: &[&str] = &[
     "palettization",
     "shape-materialization",
     "compute-unit-annotation",
+    "op-splitting",
 ];
 
 /// Create a boxed pass from its name and optional parameters.
@@ -168,6 +170,24 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
             Ok(Box::new(pass))
         }
         "compute-unit-annotation" => Ok(Box::new(ComputeUnitAnnotationPass)),
+        "op-splitting" => {
+            let budget = params
+                .get("memory_budget")
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    super::passes::op_split::parse_memory_size(s)
+                        .map_err(|e| MilError::Validation(format!("invalid memory budget: {e}")))
+                })
+                .transpose()?
+                .or_else(|| {
+                    params
+                        .get("memory_budget_bytes")
+                        .and_then(|v| v.as_integer())
+                        .map(|i| i as usize)
+                })
+                .unwrap_or(super::passes::op_split::DEFAULT_MEMORY_BUDGET);
+            Ok(Box::new(OpSplittingPass::new(budget)))
+        }
         _ => Err(MilError::Validation(format!("unknown pass: '{name}'"))),
     }
 }
@@ -410,6 +430,16 @@ impl PassPipeline {
             })
             .unwrap_or(self.passes.len());
         self.passes.insert(insert_pos, Box::new(shape_pass));
+        self
+    }
+
+    /// Add operator splitting with the given ANE memory budget (in bytes).
+    ///
+    /// Ops whose estimated memory exceeds the budget are decomposed into
+    /// smaller tiles that each fit within the ANE's on-chip memory.
+    pub fn with_op_splitting(mut self, memory_budget_bytes: usize) -> Self {
+        self.passes
+            .push(Box::new(OpSplittingPass::new(memory_budget_bytes)));
         self
     }
 

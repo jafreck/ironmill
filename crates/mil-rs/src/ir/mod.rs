@@ -23,8 +23,8 @@ pub use passes::{
     ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
     DeadCodeEliminationPass, Fp16QuantizePass, Granularity, IdentityEliminationPass,
     Int8QuantizePass, KvCachePass, LayoutOptimizationPass, LinearReluFusionPass,
-    MixedPrecisionConfig, MixedPrecisionPass, ModelSplitPass, OpPrecision, OpSubstitutionPass,
-    PalettizePass, ShapeMaterializePass, SplitResult,
+    MixedPrecisionConfig, MixedPrecisionPass, ModelSplitPass, OpPrecision, OpSplittingPass,
+    OpSubstitutionPass, PalettizePass, ShapeMaterializePass, SplitResult,
 };
 pub use pipeline::{PassPipeline, PassResult, PipelineConfig, PipelineReport};
 pub use program::{Block, Function, Program};

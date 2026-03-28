@@ -18,6 +18,7 @@ pub mod layout_optimize;
 pub mod mixed_precision;
 pub mod model_split;
 pub mod op_fusion;
+pub mod op_split;
 pub mod op_substitute;
 pub mod palettize;
 pub mod shape_materialize;
@@ -40,6 +41,7 @@ pub use op_fusion::{
     ConvBatchNormFusionPass, ConvReluFusionPass, GeluLinearFusionPass, LayerNormLinearFusionPass,
     LinearReluFusionPass, ResidualAddFusionPass,
 };
+pub use op_split::{OpSplittingPass, parse_memory_size};
 pub use op_substitute::OpSubstitutionPass;
 pub use palettize::{GroupedPalettizePass, PalettizePass};
 pub use shape_materialize::ShapeMaterializePass;

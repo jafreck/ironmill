@@ -154,6 +154,12 @@ enum Commands {
         /// CPU, or Any) based on shape-aware ANE constraints.
         #[arg(long = "annotate-compute-units")]
         annotate_compute_units: bool,
+
+        /// ANE memory budget per operation (e.g. "1GB", "2GB", "512MB").
+        /// Operations exceeding this budget are split into smaller tiles.
+        /// Default: 1GB (iOS). Use 2GB for macOS.
+        #[arg(long = "ane-memory-budget", value_name = "SIZE")]
+        ane_memory_budget: Option<String>,
     },
 
     /// Inspect a model and show its structure.
@@ -234,6 +240,7 @@ fn run() -> Result<()> {
             moe_split,
             pipeline_config,
             annotate_compute_units,
+            ane_memory_budget,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -258,6 +265,7 @@ fn run() -> Result<()> {
                 moe_split,
                 pipeline_config,
                 annotate_compute_units,
+                ane_memory_budget,
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -311,6 +319,7 @@ struct CompileOpts {
     moe_split: bool,
     pipeline_config: Option<PathBuf>,
     annotate_compute_units: bool,
+    ane_memory_budget: Option<String>,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -447,6 +456,14 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         // Add compute unit annotations (should run last, after all transforms).
         if opts.annotate_compute_units {
             pipeline = pipeline.with_compute_unit_annotations();
+        }
+
+        // Add op splitting for ANE memory budget
+        if let Some(ref budget_str) = opts.ane_memory_budget {
+            let budget = mil_rs::ir::passes::op_split::parse_memory_size(budget_str)
+                .map_err(|e| anyhow::anyhow!("invalid --ane-memory-budget: {e}"))?;
+            pipeline = pipeline.with_op_splitting(budget);
+            println!("  ANE memory budget: {budget_str} ({budget} bytes)");
         }
 
         pipeline

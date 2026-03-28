@@ -102,8 +102,8 @@ pub use error::MilError;
 
 pub use ir::{
     Block, ComputeUnit, Function, Graph, MixedPrecisionConfig, MixedPrecisionPass, OpPrecision,
-    Operation, Pass, PassPipeline, PassResult, PipelineReport, Program, ScalarType, SplitResult,
-    TensorType, Value,
+    OpSplittingPass, Operation, Pass, PassPipeline, PassResult, PipelineReport, Program,
+    ScalarType, SplitResult, TensorType, Value,
 };
 
 /// Result of ANE compatibility analysis.
