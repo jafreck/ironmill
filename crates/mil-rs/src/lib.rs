@@ -95,9 +95,13 @@ pub use convert::{LossFunction, UpdatableModelConfig, UpdateOptimizer};
 
 /// Detect Mixture-of-Experts architecture in a MIL [`Program`].
 pub use convert::moe::detect_moe;
+/// Fuse top-K most frequently activated experts into a single dense program.
+pub use convert::moe::fuse_top_k_experts;
 /// Split a MoE program into shared layers and per-expert programs.
 pub use convert::moe::split_moe;
-pub use convert::moe::{MoeManifest, MoeSplitResult, MoeTopology};
+pub use convert::moe::{
+    ExpertFrequencyProfile, MoeFuseResult, MoeManifest, MoeSplitResult, MoeTopology,
+};
 
 /// Error type for all operations in this crate.
 pub use error::MilError;

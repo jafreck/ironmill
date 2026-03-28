@@ -92,6 +92,73 @@ pub struct Stage {
     pub outputs: Vec<String>,
 }
 
+/// Activation frequency profile for expert fusion.
+///
+/// Maps expert names or indices to their observed activation frequency or
+/// raw activation count.  Deserialized from a JSON file produced by a
+/// calibration run.
+///
+/// ```json
+/// {
+///   "expert_frequencies": {
+///     "0": 0.45,
+///     "1": 0.30,
+///     "2": 0.15,
+///     "3": 0.10
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpertFrequencyProfile {
+    /// Maps expert name/index (as string) to activation frequency (0.0–1.0)
+    /// or raw activation count.  Keys are matched against expert indices
+    /// from [`MoeTopology`].
+    pub expert_frequencies: HashMap<String, f64>,
+}
+
+impl ExpertFrequencyProfile {
+    /// Load a profile from a JSON file.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// Return the top-K expert indices sorted by descending frequency.
+    ///
+    /// Expert keys are parsed as `usize`.  Keys that don't parse are
+    /// silently ignored.
+    pub fn top_k(&self, k: usize) -> Vec<usize> {
+        let mut entries: Vec<(usize, f64)> = self
+            .expert_frequencies
+            .iter()
+            .filter_map(|(key, &freq)| key.parse::<usize>().ok().map(|id| (id, freq)))
+            .collect();
+        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        entries.into_iter().take(k).map(|(id, _)| id).collect()
+    }
+
+    /// Build a uniform profile where every expert has equal frequency.
+    pub fn uniform(expert_count: usize) -> Self {
+        let freq = if expert_count > 0 {
+            1.0 / expert_count as f64
+        } else {
+            0.0
+        };
+        let expert_frequencies = (0..expert_count).map(|i| (i.to_string(), freq)).collect();
+        ExpertFrequencyProfile { expert_frequencies }
+    }
+}
+
+/// Result of fusing top-K experts into a single dense program.
+#[derive(Debug)]
+pub struct MoeFuseResult {
+    /// The fused dense program — router and non-selected experts removed.
+    pub program: Program,
+    /// Indices of the experts that were kept (sorted by frequency, descending).
+    pub kept_expert_indices: Vec<usize>,
+    /// Indices of the experts that were discarded.
+    pub discarded_expert_indices: Vec<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
@@ -177,6 +244,233 @@ pub fn split_moe(program: &Program, topology: &MoeTopology) -> MoeSplitResult {
         shared,
         experts,
         manifest,
+    }
+}
+
+/// Fuse the top-K most frequently activated experts into a single dense program.
+///
+/// Given a MoE [`Program`] and an [`ExpertFrequencyProfile`], this function:
+///
+/// 1. Detects MoE topology via [`detect_moe`].
+/// 2. Selects the top-K experts by activation frequency.
+/// 3. Builds a new dense program that keeps only shared ops plus the
+///    selected expert ops, wired together with a weighted-average
+///    combination layer (weights proportional to activation frequency).
+/// 4. Removes router/gating ops since expert selection is now static.
+///
+/// Returns `None` if no MoE pattern is detected or if K is zero.
+pub fn fuse_top_k_experts(
+    program: &Program,
+    k: usize,
+    profile: &ExpertFrequencyProfile,
+) -> Option<MoeFuseResult> {
+    if k == 0 {
+        return None;
+    }
+
+    let topology = detect_moe(program)?;
+    let func = program.main()?;
+    let ops = &func.body.operations;
+
+    // Select top-K expert indices
+    let mut selected = profile.top_k(k);
+    // Clamp to available experts
+    selected.retain(|&id| id < topology.expert_count);
+    if selected.is_empty() {
+        // Fallback: take the first K experts
+        selected = (0..k.min(topology.expert_count)).collect();
+    }
+
+    let selected_set: HashSet<usize> = selected.iter().copied().collect();
+    let discarded: Vec<usize> = (0..topology.expert_count)
+        .filter(|i| !selected_set.contains(i))
+        .collect();
+
+    // Compute per-expert frequency weights for averaging, normalised to sum=1
+    let raw_weights: Vec<f64> = selected
+        .iter()
+        .map(|&id| {
+            profile
+                .expert_frequencies
+                .get(&id.to_string())
+                .copied()
+                .unwrap_or(1.0)
+        })
+        .collect();
+    let weight_sum: f64 = raw_weights.iter().sum();
+    let norm_weights: Vec<f64> = if weight_sum > 0.0 {
+        raw_weights.iter().map(|w| w / weight_sum).collect()
+    } else {
+        vec![1.0 / selected.len() as f64; selected.len()]
+    };
+
+    // Collect operation indices to keep:
+    //  - shared ops (excluding router ops)
+    //  - selected expert ops
+    let router_set: HashSet<usize> = topology.router_op_indices.iter().copied().collect();
+    let mut keep_indices: Vec<usize> = topology
+        .shared_op_indices
+        .iter()
+        .filter(|i| !router_set.contains(i))
+        .copied()
+        .collect();
+    for &expert_id in &selected {
+        keep_indices.extend(&topology.expert_op_indices[expert_id]);
+    }
+    keep_indices.sort();
+    keep_indices.dedup();
+
+    // Build a new block with the kept ops
+    let mut block = Block::new();
+    for &idx in &keep_indices {
+        block.add_op(ops[idx].clone());
+    }
+
+    // Add combination ops: weighted average of selected expert outputs
+    if selected.len() == 1 {
+        // Single expert — its output is the fused output directly
+        let expert_id = selected[0];
+        let expert_output = topology.expert_output_names[expert_id].clone();
+        block.outputs.push(expert_output);
+    } else {
+        // Multiple experts — weighted sum
+        let mut prev_acc: Option<String> = None;
+        for (i, &expert_id) in selected.iter().enumerate() {
+            let expert_output = &topology.expert_output_names[expert_id];
+            let weight = norm_weights[i];
+
+            // Scale: mul(expert_output, weight)
+            let scale_name = format!("fuse_scale_{expert_id}");
+            let scale_out = format!("fuse_scaled_{expert_id}");
+            let scale_op = Operation::new("const_mul", &scale_name)
+                .with_input("x", Value::Reference(expert_output.clone()))
+                .with_attr("scale", Value::Float(weight))
+                .with_output(&scale_out);
+            block.add_op(scale_op);
+
+            if let Some(ref acc) = prev_acc {
+                // Accumulate: add(prev, scaled)
+                let add_name = format!("fuse_add_{expert_id}");
+                let add_out = format!("fuse_acc_{expert_id}");
+                let add_op = Operation::new("add", &add_name)
+                    .with_input("x", Value::Reference(acc.clone()))
+                    .with_input("y", Value::Reference(scale_out.clone()))
+                    .with_output(&add_out);
+                block.add_op(add_op);
+                prev_acc = Some(add_out);
+            } else {
+                prev_acc = Some(scale_out);
+            }
+        }
+
+        // Find any downstream ops that consumed expert outputs or the
+        // combination output and see if they should be appended.  For now
+        // we surface the fused accumulator as the block output.
+        if let Some(acc) = prev_acc {
+            block.outputs.push(acc);
+        }
+    }
+
+    // Append any shared post-expert ops (e.g. lm_head) that consumed
+    // the original combination output.  We detect these by looking for
+    // shared ops that are NOT yet in keep_indices.
+    let keep_set: HashSet<usize> = keep_indices.iter().copied().collect();
+    let produced: HashSet<String> = block
+        .operations
+        .iter()
+        .flat_map(|op| op.outputs.clone())
+        .collect();
+
+    // Find shared ops that depend on produced values but are not yet included
+    let mut post_ops: Vec<usize> = Vec::new();
+    for &idx in &topology.shared_op_indices {
+        if keep_set.contains(&idx) || router_set.contains(&idx) {
+            continue;
+        }
+        let refs = collect_references(&ops[idx]);
+        if refs.iter().any(|r| produced.contains(r)) {
+            post_ops.push(idx);
+        }
+    }
+
+    if !post_ops.is_empty() {
+        // We need to rewire: replace references to the old combination
+        // output with our fused output.
+        let fused_output = block.outputs.last().cloned().unwrap_or_default();
+
+        // Collect the set of output names produced by ops already in the block.
+        let all_kept_outputs: HashSet<String> = block
+            .operations
+            .iter()
+            .flat_map(|op| op.outputs.clone())
+            .collect();
+
+        // Replace the block outputs with the final downstream ops' outputs
+        block.outputs.clear();
+
+        // Prepare rewired ops before adding them to the block
+        let mut rewired_ops: Vec<Operation> = Vec::new();
+        for &idx in &post_ops {
+            let mut op = ops[idx].clone();
+            let available: HashSet<&str> = all_kept_outputs.iter().map(|s| s.as_str()).collect();
+            for value in op.inputs.values_mut() {
+                rewire_value(value, &available, &fused_output);
+            }
+            rewired_ops.push(op);
+        }
+        for op in rewired_ops {
+            block.add_op(op);
+        }
+
+        // Use original function outputs if they appear in the block
+        let block_outputs: HashSet<String> = block
+            .operations
+            .iter()
+            .flat_map(|op| op.outputs.clone())
+            .collect();
+        for out in &func.body.outputs {
+            if block_outputs.contains(out) {
+                block.outputs.push(out.clone());
+            }
+        }
+        if block.outputs.is_empty() {
+            // Fallback: last op's outputs
+            if let Some(last) = block.operations.last() {
+                block.outputs = last.outputs.clone();
+            }
+        }
+    }
+
+    // Build the fused function and program
+    let mut fused_func = Function::new("main");
+    fused_func.inputs = func.inputs.clone();
+    fused_func.body = block;
+
+    let mut fused_program = Program::new(&program.version);
+    fused_program.add_function(fused_func);
+
+    Some(MoeFuseResult {
+        program: fused_program,
+        kept_expert_indices: selected,
+        discarded_expert_indices: discarded,
+    })
+}
+
+/// Rewire a [`Value`] reference: if it points to a name not in
+/// `available`, replace it with `replacement`.
+fn rewire_value(value: &mut Value, available: &HashSet<&str>, replacement: &str) {
+    match value {
+        Value::Reference(name) => {
+            if !available.contains(name.as_str()) {
+                *name = replacement.to_string();
+            }
+        }
+        Value::List(items) => {
+            for item in items {
+                rewire_value(item, available, replacement);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1063,5 +1357,248 @@ mod tests {
         assert!(json.contains("\"expert_count\": 2"));
         assert!(json.contains("\"router_output\""));
         assert!(json.contains("\"shared\""));
+    }
+
+    // -- ExpertFrequencyProfile -------------------------------------------
+
+    #[test]
+    fn profile_from_json() {
+        let json = r#"{"expert_frequencies": {"0": 0.45, "1": 0.30, "2": 0.15, "3": 0.10}}"#;
+        let profile = ExpertFrequencyProfile::from_json(json).unwrap();
+        assert_eq!(profile.expert_frequencies.len(), 4);
+        assert!((profile.expert_frequencies["0"] - 0.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn profile_top_k_ordering() {
+        let json = r#"{"expert_frequencies": {"0": 0.10, "1": 0.45, "2": 0.30, "3": 0.15}}"#;
+        let profile = ExpertFrequencyProfile::from_json(json).unwrap();
+        let top2 = profile.top_k(2);
+        assert_eq!(top2, vec![1, 2]);
+    }
+
+    #[test]
+    fn profile_top_k_clamps_to_available() {
+        let json = r#"{"expert_frequencies": {"0": 0.5, "1": 0.5}}"#;
+        let profile = ExpertFrequencyProfile::from_json(json).unwrap();
+        let top5 = profile.top_k(5);
+        assert_eq!(top5.len(), 2);
+    }
+
+    #[test]
+    fn profile_uniform() {
+        let profile = ExpertFrequencyProfile::uniform(4);
+        assert_eq!(profile.expert_frequencies.len(), 4);
+        for v in profile.expert_frequencies.values() {
+            assert!((v - 0.25).abs() < 1e-9);
+        }
+    }
+
+    // -- fuse_top_k_experts -----------------------------------------------
+
+    /// Build a 4-expert MoE program for fusion tests.
+    fn make_four_expert_program() -> Program {
+        let mut program = Program::new("1.0.0");
+        let input_ty = TensorType::new(ScalarType::Float32, vec![1, 512]);
+        let mut func = Function::new("main").with_input("hidden", input_ty);
+
+        // Shared: embedding
+        func.body.add_op(
+            Operation::new("linear", "embedding")
+                .with_input("x", Value::Reference("hidden".into()))
+                .with_output("embed_out"),
+        );
+
+        // Router
+        func.body.add_op(
+            Operation::new("linear", "router_gate")
+                .with_input("x", Value::Reference("embed_out".into()))
+                .with_output("gate_logits"),
+        );
+        func.body.add_op(
+            Operation::new("softmax", "router_softmax")
+                .with_input("x", Value::Reference("gate_logits".into()))
+                .with_output("gate_weights"),
+        );
+
+        // 4 experts: each is linear → relu → linear
+        for i in 0..4 {
+            func.body.add_op(
+                Operation::new("linear", &format!("expert_{i}_w1"))
+                    .with_input("x", Value::Reference("embed_out".into()))
+                    .with_output(&format!("expert_{i}_h")),
+            );
+            func.body.add_op(
+                Operation::new("relu", &format!("expert_{i}_act"))
+                    .with_input("x", Value::Reference(format!("expert_{i}_h")))
+                    .with_output(&format!("expert_{i}_a")),
+            );
+            func.body.add_op(
+                Operation::new("linear", &format!("expert_{i}_w2"))
+                    .with_input("x", Value::Reference(format!("expert_{i}_a")))
+                    .with_output(&format!("expert_{i}_out")),
+            );
+        }
+
+        // Combination (simplified: just add all)
+        func.body.add_op(
+            Operation::new("add", "combine_01")
+                .with_input("x", Value::Reference("expert_0_out".into()))
+                .with_input("y", Value::Reference("expert_1_out".into()))
+                .with_output("sum_01"),
+        );
+        func.body.add_op(
+            Operation::new("add", "combine_23")
+                .with_input("x", Value::Reference("expert_2_out".into()))
+                .with_input("y", Value::Reference("expert_3_out".into()))
+                .with_output("sum_23"),
+        );
+        func.body.add_op(
+            Operation::new("add", "combine_all")
+                .with_input("x", Value::Reference("sum_01".into()))
+                .with_input("y", Value::Reference("sum_23".into()))
+                .with_output("moe_out"),
+        );
+
+        // Output head
+        func.body.add_op(
+            Operation::new("linear", "lm_head")
+                .with_input("x", Value::Reference("moe_out".into()))
+                .with_output("logits"),
+        );
+
+        func.body.outputs.push("logits".into());
+        program.add_function(func);
+        program
+    }
+
+    #[test]
+    fn fuse_top_2_from_4_experts() {
+        let program = make_four_expert_program();
+        let profile_json =
+            r#"{"expert_frequencies": {"0": 0.10, "1": 0.45, "2": 0.30, "3": 0.15}}"#;
+        let profile = ExpertFrequencyProfile::from_json(profile_json).unwrap();
+
+        let result = fuse_top_k_experts(&program, 2, &profile).expect("should fuse");
+
+        // Kept experts 1 and 2 (highest freq)
+        assert_eq!(result.kept_expert_indices, vec![1, 2]);
+        assert_eq!(result.discarded_expert_indices, vec![0, 3]);
+
+        // Fused program should have a main function
+        let fused_func = result.program.main().expect("should have main");
+
+        // Should NOT contain router ops
+        for op in &fused_func.body.operations {
+            assert_ne!(op.op_type, "softmax", "router softmax should be removed");
+            let name_lower = op.name.to_lowercase();
+            assert!(
+                !name_lower.contains("router"),
+                "router ops should be removed: {}",
+                op.name
+            );
+        }
+
+        // Should NOT contain discarded experts
+        for op in &fused_func.body.operations {
+            let name_lower = op.name.to_lowercase();
+            assert!(
+                !name_lower.contains("expert_0"),
+                "expert 0 should be discarded: {}",
+                op.name
+            );
+            assert!(
+                !name_lower.contains("expert_3"),
+                "expert 3 should be discarded: {}",
+                op.name
+            );
+        }
+
+        // Should contain kept expert ops
+        let op_names: Vec<&str> = fused_func
+            .body
+            .operations
+            .iter()
+            .map(|op| op.name.as_str())
+            .collect();
+        assert!(op_names.contains(&"expert_1_w1"));
+        assert!(op_names.contains(&"expert_2_w1"));
+
+        // Should have fusion combination ops
+        let has_fuse_ops = op_names.iter().any(|n| n.starts_with("fuse_"));
+        assert!(has_fuse_ops, "should have fuse_ combination ops");
+    }
+
+    #[test]
+    fn fuse_single_expert() {
+        let program = make_named_moe_program();
+        let profile_json = r#"{"expert_frequencies": {"0": 0.7, "1": 0.3}}"#;
+        let profile = ExpertFrequencyProfile::from_json(profile_json).unwrap();
+
+        let result = fuse_top_k_experts(&program, 1, &profile).expect("should fuse");
+        assert_eq!(result.kept_expert_indices, vec![0]);
+        assert_eq!(result.discarded_expert_indices, vec![1]);
+
+        let fused_func = result.program.main().unwrap();
+        // Single expert — no fuse_ combination ops needed
+        let has_fuse_scale = fused_func
+            .body
+            .operations
+            .iter()
+            .any(|op| op.name.starts_with("fuse_scale"));
+        assert!(!has_fuse_scale, "single expert should not need scaling ops");
+    }
+
+    #[test]
+    fn fuse_returns_none_for_non_moe() {
+        let mut program = Program::new("1.0.0");
+        let input_ty = TensorType::new(ScalarType::Float32, vec![1, 10]);
+        let mut func = Function::new("main").with_input("x", input_ty);
+        func.body.add_op(
+            Operation::new("relu", "relu_0")
+                .with_input("x", Value::Reference("x".into()))
+                .with_output("out"),
+        );
+        func.body.outputs.push("out".into());
+        program.add_function(func);
+
+        let profile = ExpertFrequencyProfile::uniform(2);
+        assert!(fuse_top_k_experts(&program, 1, &profile).is_none());
+    }
+
+    #[test]
+    fn fuse_returns_none_for_k_zero() {
+        let program = make_named_moe_program();
+        let profile = ExpertFrequencyProfile::uniform(2);
+        assert!(fuse_top_k_experts(&program, 0, &profile).is_none());
+    }
+
+    #[test]
+    fn fuse_with_uniform_profile() {
+        let program = make_named_moe_program();
+        let profile = ExpertFrequencyProfile::uniform(2);
+
+        let result = fuse_top_k_experts(&program, 2, &profile).expect("should fuse");
+        // Both experts kept
+        assert_eq!(result.kept_expert_indices.len(), 2);
+        assert!(result.discarded_expert_indices.is_empty());
+    }
+
+    #[test]
+    fn fuse_preserves_shared_ops() {
+        let program = make_named_moe_program();
+        let profile_json = r#"{"expert_frequencies": {"0": 0.6, "1": 0.4}}"#;
+        let profile = ExpertFrequencyProfile::from_json(profile_json).unwrap();
+
+        let result = fuse_top_k_experts(&program, 1, &profile).expect("should fuse");
+        let fused_func = result.program.main().unwrap();
+
+        // The shared embedding op should still be present
+        let has_embedding = fused_func
+            .body
+            .operations
+            .iter()
+            .any(|op| op.name == "embedding");
+        assert!(has_embedding, "shared embedding op should be preserved");
     }
 }

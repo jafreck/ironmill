@@ -150,6 +150,13 @@ enum Commands {
         #[arg(long = "moe-bundle", conflicts_with = "moe_split")]
         moe_bundle: bool,
 
+        /// Fuse the top-K most frequently activated MoE experts into a single
+        /// dense .mlpackage, removing router overhead. Requires --cal-data
+        /// pointing to a directory containing an `expert_profile.json` file,
+        /// or a uniform profile is used when --cal-data is omitted.
+        #[arg(long = "moe-fuse-topk", value_name = "K")]
+        moe_fuse_topk: Option<usize>,
+
         /// Path to a TOML pipeline configuration file.
         /// When provided, overrides default pass selection and --no-fusion.
         #[arg(long = "pipeline-config", value_name = "PATH")]
@@ -244,6 +251,7 @@ fn run() -> Result<()> {
             split_draft_layers,
             moe_split,
             moe_bundle,
+            moe_fuse_topk,
             pipeline_config,
             annotate_compute_units,
             ane_memory_budget,
@@ -270,6 +278,7 @@ fn run() -> Result<()> {
                 split_draft_layers,
                 moe_split,
                 moe_bundle,
+                moe_fuse_topk,
                 pipeline_config,
                 annotate_compute_units,
                 ane_memory_budget,
@@ -325,6 +334,7 @@ struct CompileOpts {
     split_draft_layers: Option<usize>,
     moe_split: bool,
     moe_bundle: bool,
+    moe_fuse_topk: Option<usize>,
     pipeline_config: Option<PathBuf>,
     annotate_compute_units: bool,
     ane_memory_budget: Option<String>,
@@ -352,9 +362,9 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
     match ext.as_str() {
         "onnx" => compile_from_onnx(input_path, &opts),
         "mlmodel" | "mlpackage" => {
-            if opts.moe_split || opts.moe_bundle {
+            if opts.moe_split || opts.moe_bundle || opts.moe_fuse_topk.is_some() {
                 println!(
-                    "Note: --moe-split/--moe-bundle is only supported for ONNX input. Ignoring."
+                    "Note: --moe-split/--moe-bundle/--moe-fuse-topk is only supported for ONNX input. Ignoring."
                 );
             }
             compile_coreml(input_path, &ext, opts.backend)
@@ -604,6 +614,75 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         } else {
             println!(
                 "Note: --moe-bundle specified but no MoE pattern detected. Producing single output."
+            );
+        }
+    }
+
+    // 5c. MoE top-K fusion (if requested)
+    if let Some(k) = opts.moe_fuse_topk {
+        use mil_rs::{ExpertFrequencyProfile, fuse_top_k_experts};
+
+        // Load or build frequency profile
+        let profile = if let Some(ref cal_dir) = opts.cal_data {
+            let profile_path = cal_dir.join("expert_profile.json");
+            if profile_path.exists() {
+                let json = std::fs::read_to_string(&profile_path)
+                    .with_context(|| format!("Failed to read {}", profile_path.display()))?;
+                ExpertFrequencyProfile::from_json(&json)
+                    .with_context(|| format!("Failed to parse {}", profile_path.display()))?
+            } else {
+                println!(
+                    "  Note: {} not found, using uniform profile.",
+                    profile_path.display()
+                );
+                // Detect expert count to build uniform profile
+                let expert_count = mil_rs::detect_moe(&program)
+                    .map(|t| t.expert_count)
+                    .unwrap_or(k);
+                ExpertFrequencyProfile::uniform(expert_count)
+            }
+        } else {
+            println!("  Note: --cal-data not provided, using uniform profile.");
+            let expert_count = mil_rs::detect_moe(&program)
+                .map(|t| t.expert_count)
+                .unwrap_or(k);
+            ExpertFrequencyProfile::uniform(expert_count)
+        };
+
+        if let Some(fuse_result) = fuse_top_k_experts(&program, k, &profile) {
+            println!(
+                "MoE top-{k} fusion: kept experts {:?}, discarded {:?}",
+                fuse_result.kept_expert_indices, fuse_result.discarded_expert_indices
+            );
+            println!(
+                "  Fused program: {} ops (was {} ops)",
+                count_ops(&fuse_result.program),
+                count_ops(&program)
+            );
+
+            let stem = input_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+
+            let output_path = opts
+                .output
+                .clone()
+                .unwrap_or_else(|| format!("{stem}-fused.mlpackage"));
+            let model = program_to_model(&fuse_result.program, 9)
+                .context("Failed to convert fused program to CoreML")?;
+            println!("  Writing fused model: {output_path}");
+            write_mlpackage(&model, &output_path)
+                .with_context(|| format!("Failed to write {output_path}"))?;
+
+            compile_output(&output_path, opts.backend);
+
+            println!();
+            println!("MoE top-{k} fusion complete.");
+            return Ok(());
+        } else {
+            println!(
+                "Note: --moe-fuse-topk specified but no MoE pattern detected. Producing single output."
             );
         }
     }
