@@ -19,10 +19,10 @@ pub use graph::Graph;
 pub use operation::Operation;
 pub use pass::Pass;
 pub use passes::{
-    AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass,
-    ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass, Granularity,
-    IdentityEliminationPass, Int8QuantizePass, LayoutOptimizationPass, LinearReluFusionPass,
-    OpSubstitutionPass, PalettizePass, ShapeMaterializePass,
+    AttentionFusionPass, CodebookOptimizationPass, ConstantFoldPass, ConvBatchNormFusionPass,
+    ConvBatchNormWeightFoldPass, ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass,
+    Granularity, IdentityEliminationPass, Int8QuantizePass, LayoutOptimizationPass,
+    LinearReluFusionPass, OpSubstitutionPass, PalettizePass, ShapeMaterializePass,
 };
 pub use pipeline::{PassPipeline, PassResult, PipelineReport};
 pub use program::{Block, Function, Program};

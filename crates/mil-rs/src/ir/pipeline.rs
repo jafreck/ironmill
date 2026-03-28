@@ -5,10 +5,10 @@ use std::path::PathBuf;
 
 use super::pass::Pass;
 use super::passes::{
-    AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass,
-    ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass, Granularity,
-    IdentityEliminationPass, Int8QuantizePass, LinearReluFusionPass, OpSubstitutionPass,
-    PalettizePass, ShapeMaterializePass,
+    AttentionFusionPass, CodebookOptimizationPass, ConstantFoldPass, ConvBatchNormFusionPass,
+    ConvBatchNormWeightFoldPass, ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass,
+    Granularity, IdentityEliminationPass, Int8QuantizePass, LinearReluFusionPass,
+    OpSubstitutionPass, PalettizePass, ShapeMaterializePass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -59,8 +59,9 @@ impl PassPipeline {
                 Box::new(ConvBatchNormFusionPass),
                 Box::new(ConvReluFusionPass),
                 Box::new(LinearReluFusionPass),
-                // Optimization passes (8-9)
+                // Optimization passes (8-10)
                 Box::new(AttentionFusionPass),
+                Box::new(CodebookOptimizationPass),
                 Box::new(OpSubstitutionPass),
                 // NOTE: LayoutOptimizationPass disabled — it inserts transpose ops
                 // that cause CoreML to segfault at runtime. Re-enable once transpose
@@ -152,6 +153,7 @@ impl PassPipeline {
             "conv-relu-fusion",
             "linear-relu-fusion",
             "attention-fusion",
+            "codebook-optimization",
             "op-substitution",
             "layout-optimization",
         ];
@@ -238,6 +240,7 @@ mod tests {
                 "conv-relu-fusion",
                 "linear-relu-fusion",
                 "attention-fusion",
+                "codebook-optimization",
                 "op-substitution",
             ]
         );
@@ -337,7 +340,7 @@ mod tests {
     #[test]
     fn default_trait_works() {
         let pipeline = PassPipeline::default();
-        assert_eq!(pipeline.pass_names().len(), 9);
+        assert_eq!(pipeline.pass_names().len(), 10);
     }
 
     #[test]
