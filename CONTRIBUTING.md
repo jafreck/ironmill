@@ -114,4 +114,4 @@ Passes live in `crates/mil-rs/src/ir/passes/`.
 ## License
 
 By contributing, you agree that your contributions will be licensed under the
-same dual MIT / Apache-2.0 license as the project.
+Apache-2.0 license as the project.
