@@ -69,33 +69,47 @@ impl Pass for Int8QuantizePass {
     fn run(&self, program: &mut Program) -> Result<()> {
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
-                // Only touch const ops whose "val" input is an FP32 tensor.
                 if op.op_type != "const" {
                     continue;
                 }
 
-                let needs_quant = matches!(
+                // val may live in inputs or attributes depending on the
+                // frontend (ONNX import puts it in attributes).
+                let in_inputs = matches!(
                     op.inputs.get("val"),
                     Some(Value::Tensor { dtype: ScalarType::Float32, .. })
                 );
-                if !needs_quant {
+                let in_attrs = !in_inputs
+                    && matches!(
+                        op.attributes.get("val"),
+                        Some(Value::Tensor { dtype: ScalarType::Float32, .. })
+                    );
+
+                if !in_inputs && !in_attrs {
                     continue;
                 }
 
-                // Take ownership of the tensor value to transform it.
-                let val = op.inputs.remove("val").unwrap();
+                let val = if in_inputs {
+                    op.inputs.remove("val").unwrap()
+                } else {
+                    op.attributes.remove("val").unwrap()
+                };
+
                 if let Value::Tensor { data, shape, dtype: _ } = val {
                     let floats = tensor_as_f32_slice(&data);
                     let (quantized, scale, zero_point) = quantize_f32_to_uint8(&floats);
 
-                    op.inputs.insert(
-                        "val".to_string(),
-                        Value::Tensor {
-                            data: quantized,
-                            shape,
-                            dtype: ScalarType::UInt8,
-                        },
-                    );
+                    let quantized_val = Value::Tensor {
+                        data: quantized,
+                        shape,
+                        dtype: ScalarType::UInt8,
+                    };
+
+                    if in_inputs {
+                        op.inputs.insert("val".to_string(), quantized_val);
+                    } else {
+                        op.attributes.insert("val".to_string(), quantized_val);
+                    }
                     op.attributes
                         .insert("scale".to_string(), Value::Float(scale as f64));
                     op.attributes

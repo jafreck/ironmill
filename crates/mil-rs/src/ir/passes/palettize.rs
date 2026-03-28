@@ -53,7 +53,9 @@ impl Pass for PalettizePass {
                     continue;
                 }
 
-                let val = match op.inputs.get("val") {
+                // val may live in inputs or attributes depending on the
+                // frontend (ONNX import puts it in attributes).
+                let val = match op.inputs.get("val").or_else(|| op.attributes.get("val")) {
                     Some(v) => v,
                     None => continue,
                 };
@@ -111,6 +113,7 @@ impl Pass for PalettizePass {
                 // Transform the op.
                 op.op_type = "constexpr_lut_to_dense".to_string();
                 op.inputs.remove("val");
+                op.attributes.remove("val");
                 op.attributes.insert("lut".to_string(), lut_value);
                 op.attributes.insert("indices".to_string(), indices_value);
                 op.attributes.insert("shape".to_string(), shape_value);
