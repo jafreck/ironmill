@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mil-rs", "crates/ironmill-cli"]
+members = ["crates/mil-rs", "crates/ironmill-cli", "crates/ironmill-coreml"]
 resolver = "2"
 
 [workspace.package]

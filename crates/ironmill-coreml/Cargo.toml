@@ -1,0 +1,15 @@
+[package]
+name = "ironmill-coreml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+objc2 = "0.6"
+objc2-core-ml = { version = "0.3", features = ["MLModel", "MLModelConfiguration", "MLModelDescription", "MLFeatureDescription", "MLFeatureValue", "MLFeatureType", "MLMultiArray", "MLMultiArrayConstraint", "MLDictionaryFeatureProvider", "MLModelError", "MLFeatureProvider", "block2"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSArray", "NSDictionary", "NSError", "NSObject", "NSValue", "NSObjCRuntime"] }
+block2 = "0.6"
+anyhow = { workspace = true }
+serde = { workspace = true }
