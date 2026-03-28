@@ -26,6 +26,7 @@ use common::{
 fn layout_plus_mixed_precision_pipeline() {
     let mut program = build_conv_program(3);
 
+    // Layout optimization is included in the default pipeline (cancel-only).
     let config = MixedPrecisionConfig::preset_fp16_int8();
     let pipeline = PassPipeline::new()
         .with_mixed_precision_config(config)
