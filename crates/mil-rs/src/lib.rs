@@ -27,14 +27,15 @@
 //!
 //! ## Modules
 //!
-//! | Module      | Description |
-//! |-------------|-------------|
-//! | [`ir`]      | MIL intermediate representation — [`Program`], [`Function`], [`Block`], [`Operation`], [`Graph`], tensor types |
-//! | [`proto`]   | Auto-generated protobuf types from Apple's CoreML `.proto` specification |
-//! | [`reader`]  | Read `.mlmodel` and `.mlpackage` files into a protobuf [`Model`] |
-//! | [`writer`]  | Write a protobuf [`Model`] to `.mlmodel` or `.mlpackage` |
-//! | [`convert`] | Bidirectional conversion between protobuf [`Model`] and IR [`Program`] |
-//! | [`error`]   | [`MilError`] enum and [`Result`](error::Result) type alias |
+//! | Module       | Description |
+//! |--------------|-------------|
+//! | [`compiler`] | Compile models to `.mlmodelc` via `xcrun coremlcompiler` |
+//! | [`convert`]  | Bidirectional conversion between protobuf [`Model`] and IR [`Program`] |
+//! | [`error`]    | [`MilError`] enum and [`Result`](error::Result) type alias |
+//! | [`ir`]       | MIL intermediate representation — [`Program`], [`Function`], [`Block`], [`Operation`], [`Graph`], tensor types |
+//! | [`proto`]    | Auto-generated protobuf types from Apple's CoreML `.proto` specification |
+//! | [`reader`]   | Read `.mlmodel` and `.mlpackage` files into a protobuf [`Model`] |
+//! | [`writer`]   | Write a protobuf [`Model`] to `.mlmodel` or `.mlpackage` |
 //!
 //! ## Supported model types
 //!
@@ -42,6 +43,7 @@
 //! Legacy `NeuralNetwork` models can be read and written at the protobuf level
 //! but cannot be converted to the MIL IR.
 
+pub mod compiler;
 pub mod convert;
 pub mod error;
 pub mod ir;
@@ -50,6 +52,11 @@ pub mod reader;
 pub mod writer;
 
 // Re-export key types at crate root for convenience.
+
+/// Compile a `.mlpackage` or `.mlmodel` to `.mlmodelc` using `xcrun coremlcompiler`.
+pub use compiler::compile_model;
+/// Check whether `xcrun coremlcompiler` is available on this system.
+pub use compiler::is_compiler_available;
 
 /// Convert a protobuf [`Model`] into a MIL IR [`Program`].
 pub use convert::model_to_program;
