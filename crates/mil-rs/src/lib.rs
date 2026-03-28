@@ -49,6 +49,7 @@ pub mod error;
 pub mod ir;
 pub mod proto;
 pub mod reader;
+pub mod validate;
 pub mod writer;
 
 // Re-export key types at crate root for convenience.
@@ -69,6 +70,11 @@ pub use convert::onnx_to_program;
 pub use error::MilError;
 
 pub use ir::{Block, Function, Graph, Operation, Pass, Program, ScalarType, TensorType, Value};
+
+/// Validate a MIL [`Program`] for Apple Neural Engine compatibility.
+pub use validate::validate_ane_compatibility;
+/// Result of ANE compatibility analysis.
+pub use validate::ValidationReport;
 
 #[cfg(not(doctest))]
 pub use proto::specification::Model;
