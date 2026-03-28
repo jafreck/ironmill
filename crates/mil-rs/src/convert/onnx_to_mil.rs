@@ -71,6 +71,9 @@ pub fn convert_node(node: &NodeProto) -> Result<Vec<Operation>> {
         "ConvTranspose" => convert_conv_transpose(node),
         "Resize" => convert_resize(node),
 
+        // Dropout is an identity in inference mode.
+        "Dropout" => convert_identity(node),
+
         other => Err(MilError::UnsupportedOp(other.to_string())),
     }
 }
@@ -202,6 +205,21 @@ fn convert_unary(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
     let mut op = Operation::new(mil_op, op_name(node));
     op.inputs = inputs;
     Ok(vec![with_outputs(op, node)])
+}
+
+/// Convert a node to an identity op (pass-through).
+///
+/// Used for ops like Dropout that are identity in inference mode.
+/// Only the first output is wired; extra outputs (e.g. mask) are ignored.
+fn convert_identity(node: &NodeProto) -> Result<Vec<Operation>> {
+    let inputs = positional_to_named(node, &["x"]);
+    let mut op = Operation::new("identity", op_name(node));
+    op.inputs = inputs;
+    // Only take the first output (the pass-through data).
+    if let Some(out) = node.output.first() {
+        op = op.with_output(out.clone());
+    }
+    Ok(vec![op])
 }
 
 /// Convert a generic binary op (add, mul, sub, div, pow).
@@ -578,8 +596,17 @@ fn convert_constant(node: &NodeProto) -> Result<Vec<Operation>> {
     let mut op = Operation::new("const", op_name(node));
 
     if let Some(tensor) = get_tensor_attr(node, "value") {
-        op = op.with_attr("dims", int_list_value(&tensor.dims));
-        op = op.with_attr("data_type", Value::Int(tensor.data_type as i64));
+        let dtype = super::onnx_graph::onnx_dtype_to_scalar(tensor.data_type)?;
+        let shape: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
+        let raw_bytes = super::onnx_graph::extract_tensor_raw_data(tensor, dtype);
+        op = op.with_attr(
+            "val",
+            Value::Tensor {
+                data: raw_bytes,
+                shape,
+                dtype,
+            },
+        );
     } else if let Some(f) = get_float_attr(node, "value_float") {
         op = op.with_attr("val", Value::Float(f as f64));
     } else if let Some(i) = get_int_attr(node, "value_int") {
@@ -1108,8 +1135,19 @@ mod tests {
         let ops = convert_node(&node).unwrap();
         let op = &ops[0];
         assert_eq!(op.op_type, "const");
-        assert!(op.attributes.contains_key("dims"));
-        assert!(op.attributes.contains_key("data_type"));
+        assert!(
+            op.attributes.contains_key("val"),
+            "tensor constants should store data in 'val' attribute"
+        );
+        if let Some(Value::Tensor { shape, dtype, .. }) = op.attributes.get("val") {
+            assert_eq!(shape, &[2, 3]);
+            assert_eq!(*dtype, crate::ir::ScalarType::Float32);
+        } else {
+            panic!(
+                "expected Value::Tensor for val, got {:?}",
+                op.attributes.get("val")
+            );
+        }
     }
 
     #[test]

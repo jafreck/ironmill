@@ -97,13 +97,21 @@ fn convert_operation(op: &Operation) -> Result<mil_spec::Operation> {
         inputs.insert(param.clone(), convert_value_to_argument(value)?);
     }
 
+    // For const ops, determine the output type from the val value so
+    // coremlcompiler knows the type produced by this constant.
+    let const_val = if op.op_type == "const" {
+        op.inputs.get("val").or_else(|| op.attributes.get("val"))
+    } else {
+        None
+    };
+    let const_output_type = const_val.and_then(value_type_for);
+
     let outputs = op
         .outputs
         .iter()
         .map(|name| mil_spec::NamedValueType {
             name: name.clone(),
-            // Output type info is not preserved in the IR — omit it.
-            r#type: None,
+            r#type: const_output_type.clone(),
         })
         .collect();
 
@@ -142,6 +150,138 @@ fn convert_value_to_argument(value: &Value) -> Result<mil_spec::Argument> {
     })
 }
 
+/// Build a scalar (rank-0) `ValueType` for the given `DataType`.
+fn scalar_value_type(dt: mil_spec::DataType) -> mil_spec::ValueType {
+    mil_spec::ValueType {
+        r#type: Some(mil_spec::value_type::Type::TensorType(
+            mil_spec::TensorType {
+                data_type: dt as i32,
+                rank: 0,
+                dimensions: vec![],
+                attributes: HashMap::new(),
+            },
+        )),
+    }
+}
+
+/// Derive the `ValueType` that describes an IR `Value`.
+fn value_type_for(value: &Value) -> Option<mil_spec::ValueType> {
+    match value {
+        Value::Int(_) => Some(scalar_value_type(mil_spec::DataType::Int32)),
+        Value::Float(_) => Some(scalar_value_type(mil_spec::DataType::Float32)),
+        Value::Bool(_) => Some(scalar_value_type(mil_spec::DataType::Bool)),
+        Value::String(_) => Some(scalar_value_type(mil_spec::DataType::String)),
+        Value::Tensor { shape, dtype, .. } => {
+            let data_type = convert_scalar_type(*dtype) as i32;
+            let dimensions = shape
+                .iter()
+                .map(|&d| mil_spec::Dimension {
+                    dimension: Some(mil_spec::dimension::Dimension::Constant(
+                        mil_spec::dimension::ConstantDimension { size: d as u64 },
+                    )),
+                })
+                .collect::<Vec<_>>();
+            Some(mil_spec::ValueType {
+                r#type: Some(mil_spec::value_type::Type::TensorType(
+                    mil_spec::TensorType {
+                        data_type,
+                        rank: dimensions.len() as i64,
+                        dimensions,
+                        attributes: HashMap::new(),
+                    },
+                )),
+            })
+        }
+        Value::List(items) => {
+            // Infer element type from the first item; fall back to int32.
+            let elem_type = items
+                .first()
+                .and_then(value_type_for)
+                .unwrap_or_else(|| scalar_value_type(mil_spec::DataType::Int32));
+            Some(mil_spec::ValueType {
+                r#type: Some(mil_spec::value_type::Type::ListType(Box::new(
+                    mil_spec::ListType {
+                        r#type: Some(Box::new(elem_type)),
+                        length: Some(mil_spec::Dimension {
+                            dimension: Some(mil_spec::dimension::Dimension::Constant(
+                                mil_spec::dimension::ConstantDimension {
+                                    size: items.len() as u64,
+                                },
+                            )),
+                        }),
+                    },
+                ))),
+            })
+        }
+        // Type-only values and references have their type handled separately.
+        Value::Type(_) | Value::Reference(_) => None,
+    }
+}
+
+/// Encode a `Value::Tensor` into the appropriate typed `TensorValue`.
+///
+/// Uses typed repeated fields (floats, ints, etc.) so that `coremlcompiler`
+/// can verify element counts against the declared tensor type.
+fn convert_tensor_data(value: &Value) -> mil_spec::TensorValue {
+    let Value::Tensor { data, dtype, .. } = value else {
+        unreachable!("convert_tensor_data called with non-Tensor value");
+    };
+
+    let tv_value = match dtype {
+        ScalarType::Float32 => {
+            let floats: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            mil_spec::tensor_value::Value::Floats(mil_spec::tensor_value::RepeatedFloats {
+                values: floats,
+            })
+        }
+        ScalarType::Float64 => {
+            let doubles: Vec<f64> = data
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            mil_spec::tensor_value::Value::Doubles(mil_spec::tensor_value::RepeatedDoubles {
+                values: doubles,
+            })
+        }
+        ScalarType::Int32 | ScalarType::UInt32 => {
+            let ints: Vec<i32> = data
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            mil_spec::tensor_value::Value::Ints(mil_spec::tensor_value::RepeatedInts {
+                values: ints,
+            })
+        }
+        ScalarType::Int64 | ScalarType::UInt64 => {
+            let longs: Vec<i64> = data
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            mil_spec::tensor_value::Value::LongInts(mil_spec::tensor_value::RepeatedLongInts {
+                values: longs,
+            })
+        }
+        ScalarType::Bool => {
+            let bools: Vec<bool> = data.iter().map(|&b| b != 0).collect();
+            mil_spec::tensor_value::Value::Bools(mil_spec::tensor_value::RepeatedBools {
+                values: bools,
+            })
+        }
+        // For types without a dedicated repeated field (fp16, int8, etc.)
+        // fall back to raw bytes.
+        _ => mil_spec::tensor_value::Value::Bytes(mil_spec::tensor_value::RepeatedBytes {
+            values: data.clone(),
+        }),
+    };
+
+    mil_spec::TensorValue {
+        value: Some(tv_value),
+    }
+}
+
 /// Convert an IR `Value` into a proto `Value`.
 fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
     use mil_spec::value;
@@ -176,7 +316,7 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
                 Some(value::Value::ImmediateValue(value::ImmediateValue {
                     value: Some(value::immediate_value::Value::Tensor(tv)),
                 })),
-                None,
+                value_type_for(value),
             )
         }
         Value::Float(v) => {
@@ -191,7 +331,7 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
                 Some(value::Value::ImmediateValue(value::ImmediateValue {
                     value: Some(value::immediate_value::Value::Tensor(tv)),
                 })),
-                None,
+                value_type_for(value),
             )
         }
         Value::Bool(v) => {
@@ -204,7 +344,7 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
                 Some(value::Value::ImmediateValue(value::ImmediateValue {
                     value: Some(value::immediate_value::Value::Tensor(tv)),
                 })),
-                None,
+                value_type_for(value),
             )
         }
         Value::String(s) => {
@@ -219,7 +359,7 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
                 Some(value::Value::ImmediateValue(value::ImmediateValue {
                     value: Some(value::immediate_value::Value::Tensor(tv)),
                 })),
-                None,
+                value_type_for(value),
             )
         }
         Value::List(items) => {
@@ -233,7 +373,7 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
                         values: proto_items,
                     })),
                 })),
-                None,
+                value_type_for(value),
             )
         }
         Value::Type(tt) => {
@@ -247,20 +387,15 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
                 }),
             )
         }
-        Value::Tensor { data, .. } => {
-            // Raw tensor data — encode as a bytes immediate.
-            let tv = mil_spec::TensorValue {
-                value: Some(mil_spec::tensor_value::Value::Bytes(
-                    mil_spec::tensor_value::RepeatedBytes {
-                        values: data.clone(),
-                    },
-                )),
-            };
+        Value::Tensor { .. } => {
+            // Encode tensor using the typed storage that matches its dtype,
+            // so coremlcompiler can verify element counts correctly.
+            let tv = convert_tensor_data(value);
             (
                 Some(value::Value::ImmediateValue(value::ImmediateValue {
                     value: Some(value::immediate_value::Value::Tensor(tv)),
                 })),
-                None,
+                value_type_for(value),
             )
         }
     };

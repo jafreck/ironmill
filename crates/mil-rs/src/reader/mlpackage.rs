@@ -30,6 +30,8 @@ pub(crate) struct ItemInfo {
     pub(crate) author: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
 }
 
 /// Read a `.mlpackage` directory and extract the CoreML model.

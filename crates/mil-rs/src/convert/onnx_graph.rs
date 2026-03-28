@@ -173,7 +173,7 @@ fn initializer_to_const(tensor: &TensorProto) -> Result<Operation> {
 /// ONNX tensors store data either in `raw_data` or in typed fields
 /// (`float_data`, `int32_data`, etc.). This function normalises both
 /// representations into a single `Vec<u8>`.
-fn extract_tensor_raw_data(tensor: &TensorProto, dtype: ScalarType) -> Vec<u8> {
+pub(crate) fn extract_tensor_raw_data(tensor: &TensorProto, dtype: ScalarType) -> Vec<u8> {
     if !tensor.raw_data.is_empty() {
         return tensor.raw_data.clone();
     }
@@ -238,7 +238,7 @@ fn extract_tensor_raw_data(tensor: &TensorProto, dtype: ScalarType) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Map an ONNX `TensorProto::DataType` integer to a MIL [`ScalarType`].
-fn onnx_dtype_to_scalar(dtype: i32) -> Result<ScalarType> {
+pub(crate) fn onnx_dtype_to_scalar(dtype: i32) -> Result<ScalarType> {
     match dtype {
         1 => Ok(ScalarType::Float32),
         2 => Ok(ScalarType::UInt8),

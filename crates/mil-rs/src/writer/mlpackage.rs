@@ -19,7 +19,7 @@ use crate::error::{MilError, Result};
 use crate::proto::specification::Model;
 use crate::reader::mlpackage::{ItemInfo, Manifest};
 
-const MODEL_IDENTIFIER: &str = "com.apple.CoreML/model.mlmodel";
+const MODEL_PATH: &str = "com.apple.CoreML/model.mlmodel";
 
 /// Write a CoreML [`Model`] to a `.mlpackage` directory.
 ///
@@ -58,22 +58,64 @@ pub fn write_mlpackage(model: &Model, path: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+/// Generate a random UUID v4 string (uppercase, no external dependency).
+fn random_uuid() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    // Simple xorshift-based PRNG seeded from the clock.
+    let mut state = seed as u64 | 1;
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_exact_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        chunk.copy_from_slice(&state.to_le_bytes());
+    }
+    // Set version (4) and variant (RFC 4122).
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
 /// Build a default `Manifest` for a single-model package.
 fn build_manifest() -> Manifest {
+    let model_id = random_uuid();
     let mut entries = HashMap::new();
     entries.insert(
-        MODEL_IDENTIFIER.to_string(),
+        model_id.clone(),
         ItemInfo {
-            path: MODEL_IDENTIFIER.to_string(),
-            author: Some("mil-rs".to_string()),
-            description: Some("CoreML model".to_string()),
+            path: MODEL_PATH.to_string(),
+            author: Some("com.apple.CoreML".to_string()),
+            description: Some("CoreML Model Specification".to_string()),
+            name: Some("model.mlmodel".to_string()),
         },
     );
 
     Manifest {
         file_format_version: "1.0.0".to_string(),
         item_info_entries: entries,
-        root_model_identifier: MODEL_IDENTIFIER.to_string(),
+        root_model_identifier: model_id,
     }
 }
 
@@ -143,11 +185,13 @@ mod tests {
             serde_json::from_str(&contents).expect("Manifest.json should be valid JSON");
 
         assert_eq!(manifest["fileFormatVersion"], "1.0.0");
-        assert_eq!(
-            manifest["rootModelIdentifier"],
-            "com.apple.CoreML/model.mlmodel"
-        );
-        assert!(manifest["itemInfoEntries"]["com.apple.CoreML/model.mlmodel"].is_object());
+
+        let root_id = manifest["rootModelIdentifier"].as_str().unwrap();
+        let entry = &manifest["itemInfoEntries"][root_id];
+        assert!(entry.is_object(), "root model entry should exist");
+        assert_eq!(entry["path"], "com.apple.CoreML/model.mlmodel");
+        assert_eq!(entry["name"], "model.mlmodel");
+        assert_eq!(entry["author"], "com.apple.CoreML");
     }
 
     #[test]
