@@ -8,7 +8,7 @@ use mil_rs::compiler::Backend;
 use mil_rs::ir::ModelSplitPass;
 use mil_rs::ir::PassPipeline;
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
-use mil_rs::validate::print_validation_report;
+use mil_rs::validate::{print_validation_report, validation_report_to_json};
 use mil_rs::{
     ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer, compile_model,
     compile_model_with_backend, convert_pipeline, is_compiler_available,
@@ -151,6 +151,10 @@ enum Commands {
     Validate {
         /// Path to the model to validate.
         input: String,
+
+        /// Output format: "text" (default) or "json".
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 
     /// Convert a multi-ONNX pipeline to coordinated .mlpackage outputs.
@@ -222,7 +226,7 @@ fn run() -> Result<()> {
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
-        Commands::Validate { input } => cmd_validate(&input),
+        Commands::Validate { input, format } => cmd_validate(&input, &format),
         Commands::CompilePipeline { manifest, output } => {
             cmd_compile_pipeline(&manifest, output.as_deref())
         }
@@ -659,7 +663,7 @@ fn cmd_inspect(input: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_validate(input: &str) -> Result<()> {
+fn cmd_validate(input: &str, format: &str) -> Result<()> {
     let input_path = Path::new(input);
     if !input_path.exists() {
         bail!("Input file not found: {input}");
@@ -671,75 +675,104 @@ fn cmd_validate(input: &str) -> Result<()> {
         .unwrap_or("")
         .to_lowercase();
 
-    println!("Validating: {input}");
-    println!();
+    let is_text = format == "text";
 
-    match ext.as_str() {
+    if is_text {
+        println!("Validating: {input}");
+        println!();
+    }
+
+    let report = match ext.as_str() {
         "onnx" => {
             let onnx_model = read_onnx(input_path)
                 .with_context(|| format!("Failed to read ONNX model: {input}"))?;
-            println!("✓ ONNX model parsed successfully");
+            if is_text {
+                println!("✓ ONNX model parsed successfully");
+                println!("  Converting to MIL IR...");
+            }
 
-            println!("  Converting to MIL IR...");
             let result = onnx_to_program_with_config(&onnx_model, &ConversionConfig::default())
                 .context("Failed to convert ONNX model to MIL IR")?;
 
-            let op_count = count_ops(&result.program);
-            println!(
-                "✓ Converted: {} functions, {} ops",
-                result.program.functions.len(),
-                op_count
-            );
-
-            if !result.warnings.is_empty() {
+            if is_text {
+                let op_count = count_ops(&result.program);
                 println!(
-                    "⚠ {} unsupported op(s) during conversion: {:?}",
-                    result.warnings.len(),
-                    result.warnings
+                    "✓ Converted: {} functions, {} ops",
+                    result.program.functions.len(),
+                    op_count
                 );
+
+                if !result.warnings.is_empty() {
+                    println!(
+                        "⚠ {} unsupported op(s) during conversion: {:?}",
+                        result.warnings.len(),
+                        result.warnings
+                    );
+                }
+
+                println!();
             }
 
-            println!();
-            let report = validate_ane_compatibility(&result.program);
-            print_validation_report(&report);
+            validate_ane_compatibility(&result.program)
         }
         "mlmodel" => {
             let model = read_mlmodel(input_path)
                 .with_context(|| format!("Failed to read mlmodel: {input}"))?;
-            println!("✓ CoreML model (.mlmodel) parsed successfully");
+            if is_text {
+                println!("✓ CoreML model (.mlmodel) parsed successfully");
+            }
 
             match mil_rs::model_to_program(&model) {
                 Ok(program) => {
-                    println!();
-                    let report = validate_ane_compatibility(&program);
-                    print_validation_report(&report);
+                    if is_text {
+                        println!();
+                    }
+                    validate_ane_compatibility(&program)
                 }
                 Err(e) => {
-                    println!();
-                    println!("Note: Could not convert to MIL IR for ANE analysis: {e}");
-                    println!("  ANE validation requires an ML Program model (spec v7+).");
+                    if is_text {
+                        println!();
+                        println!("Note: Could not convert to MIL IR for ANE analysis: {e}");
+                        println!("  ANE validation requires an ML Program model (spec v7+).");
+                    }
+                    return Ok(());
                 }
             }
         }
         "mlpackage" => {
             let model = read_mlpackage(input_path)
                 .with_context(|| format!("Failed to read mlpackage: {input}"))?;
-            println!("✓ CoreML package (.mlpackage) parsed successfully");
+            if is_text {
+                println!("✓ CoreML package (.mlpackage) parsed successfully");
+            }
 
             match mil_rs::model_to_program(&model) {
                 Ok(program) => {
-                    println!();
-                    let report = validate_ane_compatibility(&program);
-                    print_validation_report(&report);
+                    if is_text {
+                        println!();
+                    }
+                    validate_ane_compatibility(&program)
                 }
                 Err(e) => {
-                    println!();
-                    println!("Note: Could not convert to MIL IR for ANE analysis: {e}");
-                    println!("  ANE validation requires an ML Program model (spec v7+).");
+                    if is_text {
+                        println!();
+                        println!("Note: Could not convert to MIL IR for ANE analysis: {e}");
+                        println!("  ANE validation requires an ML Program model (spec v7+).");
+                    }
+                    return Ok(());
                 }
             }
         }
         _ => bail!("Unsupported format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"),
+    };
+
+    match format {
+        "text" => print_validation_report(&report),
+        "json" => {
+            let json = validation_report_to_json(&report);
+            println!("{json}");
+        }
+        _ => bail!("Unsupported --format '{format}'. Expected 'text' or 'json'."),
     }
 
     Ok(())

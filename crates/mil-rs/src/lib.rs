@@ -109,6 +109,8 @@ pub use ir::{
 pub use validate::ValidationReport;
 /// Validate a MIL [`Program`] for Apple Neural Engine compatibility.
 pub use validate::validate_ane_compatibility;
+/// Serialize a [`ValidationReport`] to JSON.
+pub use validate::validation_report_to_json;
 
 #[cfg(not(doctest))]
 pub use proto::specification::Model;
