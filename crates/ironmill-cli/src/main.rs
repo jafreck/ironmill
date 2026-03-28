@@ -9,9 +9,9 @@ use mil_rs::ir::PassPipeline;
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::validate::print_validation_report;
 use mil_rs::{
-    compile_model, compile_model_with_backend, is_compiler_available, onnx_to_program,
-    program_to_model, read_mlmodel, read_mlpackage, read_onnx, validate_ane_compatibility,
-    write_mlpackage,
+    ConversionConfig, compile_model, compile_model_with_backend, is_compiler_available,
+    onnx_to_program_with_config, program_to_model, read_mlmodel, read_mlpackage, read_onnx,
+    validate_ane_compatibility, write_mlpackage,
 };
 
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
@@ -86,6 +86,24 @@ enum Commands {
         /// feature flag at build time.
         #[arg(long, value_enum, default_value_t = BackendArg::Xcrun)]
         backend: BackendArg,
+
+        /// Merge LoRA adapter weights into the base model during conversion (default).
+        /// LoRA A/B weight pairs found in the ONNX initializers are automatically
+        /// detected and merged. Disable with --no-merge-lora.
+        #[arg(long = "merge-lora", default_value_t = true, action = clap::ArgAction::SetTrue)]
+        merge_lora: bool,
+
+        /// Disable automatic LoRA adapter merging.
+        #[arg(long = "no-merge-lora", conflicts_with = "merge_lora")]
+        no_merge_lora: bool,
+
+        /// Emit a separate adapter .mlpackage instead of merging LoRA weights.
+        #[arg(long = "emit-adapter")]
+        emit_adapter: bool,
+
+        /// Path to an external adapter file (e.g. .safetensors). May be repeated.
+        #[arg(long = "adapter", value_name = "PATH")]
+        adapters: Vec<PathBuf>,
     },
 
     /// Inspect a model and show its structure.
@@ -124,6 +142,10 @@ fn run() -> Result<()> {
             no_fusion,
             input_shapes,
             backend,
+            merge_lora,
+            no_merge_lora,
+            emit_adapter,
+            adapters,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -135,6 +157,9 @@ fn run() -> Result<()> {
                 no_fusion,
                 input_shapes,
                 backend: backend.into(),
+                merge_lora: merge_lora && !no_merge_lora,
+                emit_adapter,
+                adapters,
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -167,6 +192,9 @@ struct CompileOpts {
     no_fusion: bool,
     input_shapes: Vec<String>,
     backend: Backend,
+    merge_lora: bool,
+    emit_adapter: bool,
+    adapters: Vec<PathBuf>,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -189,32 +217,13 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
     }
 
     match ext.as_str() {
-        "onnx" => compile_from_onnx(
-            input_path,
-            opts.output,
-            &opts.quantize,
-            opts.cal_data,
-            opts.palettize,
-            opts.no_fusion,
-            &opts.input_shapes,
-            opts.backend,
-        ),
+        "onnx" => compile_from_onnx(input_path, &opts),
         "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext, opts.backend),
         _ => bail!("Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compile_from_onnx(
-    input_path: &Path,
-    output: Option<String>,
-    quantize: &str,
-    cal_data: Option<PathBuf>,
-    palettize: Option<u8>,
-    no_fusion: bool,
-    input_shapes: &[String],
-    backend: Backend,
-) -> Result<()> {
+fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     let input_display = input_path.display();
 
     // 1. Read ONNX model
@@ -222,11 +231,28 @@ fn compile_from_onnx(
     let onnx_model = read_onnx(input_path)
         .with_context(|| format!("Failed to read ONNX model: {input_display}"))?;
     print_onnx_summary(&onnx_model);
+
+    if opts.merge_lora {
+        println!("  LoRA merge: enabled (use --no-merge-lora to disable)");
+    }
+    if opts.emit_adapter {
+        println!("  Note: --emit-adapter is reserved for future adapter export support.");
+    }
+    if !opts.adapters.is_empty() {
+        println!(
+            "  Note: --adapter is reserved for future external adapter loading ({} path(s) provided).",
+            opts.adapters.len()
+        );
+    }
     println!();
 
     // 2. Convert to MIL IR
     println!("Converting to CoreML MIL IR...");
-    let result = onnx_to_program(&onnx_model).context("Failed to convert ONNX model to MIL IR")?;
+    let config = ConversionConfig {
+        merge_lora: opts.merge_lora,
+    };
+    let result = onnx_to_program_with_config(&onnx_model, &config)
+        .context("Failed to convert ONNX model to MIL IR")?;
     let mut program = result.program;
     let warnings = result.warnings;
     println!(
@@ -239,14 +265,14 @@ fn compile_from_onnx(
     // 3. Build the pass pipeline
     let mut pipeline = PassPipeline::new();
 
-    if no_fusion {
+    if opts.no_fusion {
         pipeline = pipeline.without_fusion();
     }
 
     // Parse and add input shapes
-    if !input_shapes.is_empty() {
+    if !opts.input_shapes.is_empty() {
         let mut shapes = HashMap::new();
-        for raw in input_shapes {
+        for raw in &opts.input_shapes {
             let (name, dims) = parse_input_shape(raw)?;
             shapes.insert(name, dims);
         }
@@ -254,7 +280,7 @@ fn compile_from_onnx(
     }
 
     // Add quantization
-    match quantize {
+    match opts.quantize.as_str() {
         "fp16" => {
             pipeline = pipeline
                 .with_fp16()
@@ -262,7 +288,7 @@ fn compile_from_onnx(
         }
         "int8" => {
             pipeline = pipeline
-                .with_int8(cal_data)
+                .with_int8(opts.cal_data.clone())
                 .context("Failed to configure INT8 quantization")?;
         }
         "none" => {}
@@ -272,7 +298,7 @@ fn compile_from_onnx(
     }
 
     // Add palettization
-    if let Some(bits) = palettize {
+    if let Some(bits) = opts.palettize {
         pipeline = pipeline
             .with_palettize(bits)
             .context("Failed to configure palettization")?;
@@ -300,7 +326,7 @@ fn compile_from_onnx(
         program_to_model(&program, 9).context("Failed to convert MIL IR to CoreML protobuf")?;
 
     // 7. Write as .mlpackage
-    let output_path = output.unwrap_or_else(|| {
+    let output_path = opts.output.clone().unwrap_or_else(|| {
         let stem = input_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -312,7 +338,7 @@ fn compile_from_onnx(
         .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
     // 8. Compile the model
-    match backend {
+    match opts.backend {
         Backend::AneDirect => {
             println!("Compiling with ANE direct backend...");
             let output_dir = Path::new(&output_path).parent().unwrap_or(Path::new("."));
@@ -438,8 +464,8 @@ fn cmd_validate(input: &str) -> Result<()> {
             println!("✓ ONNX model parsed successfully");
 
             println!("  Converting to MIL IR...");
-            let result =
-                onnx_to_program(&onnx_model).context("Failed to convert ONNX model to MIL IR")?;
+            let result = onnx_to_program_with_config(&onnx_model, &ConversionConfig::default())
+                .context("Failed to convert ONNX model to MIL IR")?;
 
             let op_count = count_ops(&result.program);
             println!(

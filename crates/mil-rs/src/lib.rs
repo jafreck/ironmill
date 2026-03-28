@@ -74,10 +74,14 @@ pub use compiler::compile_model_with_backend;
 /// Check whether `xcrun coremlcompiler` is available on this system.
 pub use compiler::is_compiler_available;
 
+/// Configuration options for ONNX → MIL conversion.
+pub use convert::ConversionConfig;
 /// Convert a protobuf [`Model`] into a MIL IR [`Program`].
 pub use convert::model_to_program;
 /// Convert an ONNX [`proto::onnx::ModelProto`] into a MIL IR [`Program`].
 pub use convert::onnx_to_program;
+/// Convert an ONNX model with explicit configuration (e.g. LoRA merge control).
+pub use convert::onnx_to_program_with_config;
 /// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
 pub use convert::program_to_model;
 
