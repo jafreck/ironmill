@@ -440,6 +440,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ironmill-ane",
  "mil-rs",
  "serde_json",
  "tempfile",

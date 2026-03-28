@@ -47,6 +47,17 @@ impl From<BackendArg> for Backend {
     }
 }
 
+/// Runtime backend for inference.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum RuntimeArg {
+    /// Use CoreML MLModel for inference (default, stable).
+    #[value(name = "coreml")]
+    CoreMl,
+    /// Use ANE direct backend for inference (experimental).
+    #[value(name = "ane-direct")]
+    AneDirect,
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
@@ -172,6 +183,13 @@ enum Commands {
         /// Default: 1GB (iOS). Use 2GB for macOS.
         #[arg(long = "ane-memory-budget", value_name = "SIZE")]
         ane_memory_budget: Option<String>,
+
+        /// Runtime backend for inference: "coreml" (default) or "ane-direct" (experimental).
+        ///
+        /// When set to "ane-direct", uses the direct ANE runtime instead of CoreML,
+        /// bypassing MLModel for potentially lower latency. Requires --features ane-direct.
+        #[arg(long, value_enum, default_value_t = RuntimeArg::CoreMl)]
+        runtime: RuntimeArg,
     },
 
     /// Inspect a model and show its structure.
@@ -255,6 +273,7 @@ fn run() -> Result<()> {
             pipeline_config,
             annotate_compute_units,
             ane_memory_budget,
+            runtime,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -282,6 +301,7 @@ fn run() -> Result<()> {
                 pipeline_config,
                 annotate_compute_units,
                 ane_memory_budget,
+                runtime,
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -338,6 +358,7 @@ struct CompileOpts {
     pipeline_config: Option<PathBuf>,
     annotate_compute_units: bool,
     ane_memory_budget: Option<String>,
+    runtime: RuntimeArg,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -803,7 +824,28 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         write_mlpackage(&model, &output_path)
             .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
-        compile_output(&output_path, opts.backend);
+        match opts.runtime {
+            RuntimeArg::CoreMl => {
+                compile_output(&output_path, opts.backend);
+            }
+            RuntimeArg::AneDirect => {
+                #[cfg(feature = "ane-direct")]
+                {
+                    println!("  Using ANE direct runtime");
+                    let ane_config = ironmill_ane::AneConfig::default();
+                    let _model = ironmill_ane::AneModel::compile_and_load(&program, ane_config)
+                        .context("ANE direct compilation failed")?;
+                    println!(
+                        "  ✓ ANE model compiled and loaded ({} sub-programs)",
+                        _model.num_sub_programs()
+                    );
+                }
+                #[cfg(not(feature = "ane-direct"))]
+                {
+                    anyhow::bail!("ANE direct runtime requires --features ane-direct");
+                }
+            }
+        }
     }
 
     // 9. Print warnings

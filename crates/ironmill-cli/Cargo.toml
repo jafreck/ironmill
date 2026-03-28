@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 mil-rs = { workspace = true }
+ironmill-ane = { workspace = true, optional = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
@@ -22,4 +23,4 @@ toml = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-ane-direct = ["mil-rs/ane-direct"]
+ane-direct = ["mil-rs/ane-direct", "dep:ironmill-ane"]
