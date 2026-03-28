@@ -1,14 +1,15 @@
 //! Pass pipeline manager for ordering, mutual exclusivity, and builder API.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::pass::Pass;
 use super::passes::{
     AttentionFusionPass, CodebookOptimizationPass, ConstantFoldPass, ConvBatchNormFusionPass,
     ConvBatchNormWeightFoldPass, ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass,
     Granularity, IdentityEliminationPass, Int8QuantizePass, LayoutOptimizationPass,
-    LinearReluFusionPass, OpSubstitutionPass, PalettizePass, ShapeMaterializePass,
+    LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass, OpSubstitutionPass,
+    PalettizePass, ShapeMaterializePass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -22,6 +23,7 @@ pub struct PassPipeline {
     has_fp16: bool,
     has_int8: bool,
     has_palettize: bool,
+    has_mixed_precision: bool,
 }
 
 impl Default for PassPipeline {
@@ -37,6 +39,7 @@ impl std::fmt::Debug for PassPipeline {
             .field("has_fp16", &self.has_fp16)
             .field("has_int8", &self.has_int8)
             .field("has_palettize", &self.has_palettize)
+            .field("has_mixed_precision", &self.has_mixed_precision)
             .finish()
     }
 }
@@ -68,12 +71,13 @@ impl PassPipeline {
             has_fp16: false,
             has_int8: false,
             has_palettize: false,
+            has_mixed_precision: false,
         }
     }
 
-    /// Add FP16 quantization. Errors if INT8 is already added.
+    /// Add FP16 quantization. Errors if INT8 is already added (unless mixed-precision is enabled).
     pub fn with_fp16(mut self) -> Result<Self> {
-        if self.has_int8 {
+        if self.has_int8 && !self.has_mixed_precision {
             return Err(MilError::Validation(
                 "FP16 and INT8 quantization are mutually exclusive".into(),
             ));
@@ -83,9 +87,9 @@ impl PassPipeline {
         Ok(self)
     }
 
-    /// Add INT8 quantization. Errors if FP16 is already added.
+    /// Add INT8 quantization. Errors if FP16 is already added (unless mixed-precision is enabled).
     pub fn with_int8(mut self, cal_dir: Option<PathBuf>) -> Result<Self> {
-        if self.has_fp16 {
+        if self.has_fp16 && !self.has_mixed_precision {
             return Err(MilError::Validation(
                 "FP16 and INT8 quantization are mutually exclusive".into(),
             ));
@@ -120,6 +124,24 @@ impl PassPipeline {
         Ok(self)
     }
 
+    /// Add mixed-precision quantization from a TOML config file.
+    ///
+    /// When mixed-precision is configured, the normal FP16/INT8 mutual exclusivity
+    /// constraints are relaxed since the mixed-precision pass handles per-op routing.
+    pub fn with_mixed_precision(mut self, config_path: &Path) -> Result<Self> {
+        let pass = MixedPrecisionPass::from_config_file(config_path)?;
+        self.has_mixed_precision = true;
+        self.passes.push(Box::new(pass));
+        Ok(self)
+    }
+
+    /// Add mixed-precision quantization from a [`MixedPrecisionConfig`].
+    pub fn with_mixed_precision_config(mut self, config: MixedPrecisionConfig) -> Result<Self> {
+        self.has_mixed_precision = true;
+        self.passes.push(Box::new(MixedPrecisionPass::new(config)));
+        Ok(self)
+    }
+
     /// Add shape materialization with user-provided shapes.
     ///
     /// The shape pass is inserted before any quantization/palettization passes.
@@ -137,6 +159,7 @@ impl PassPipeline {
                 name == "fp16-quantization"
                     || name == "int8-quantization"
                     || name == "palettization"
+                    || name == "mixed-precision-quantization"
             })
             .unwrap_or(self.passes.len());
         self.passes.insert(insert_pos, Box::new(shape_pass));

@@ -62,13 +62,17 @@ enum Commands {
         #[arg(short, long, default_value = "all")]
         target: String,
 
-        /// Quantization mode: "none", "fp16", "int8".
+        /// Quantization mode: "none", "fp16", "int8", "mixed-fp16-int8".
         #[arg(short, long, default_value = "none")]
         quantize: String,
 
         /// Calibration data directory (for int8 quantization).
         #[arg(long = "cal-data", value_name = "DIR")]
         cal_data: Option<PathBuf>,
+
+        /// Path to a TOML config for mixed-precision quantization.
+        #[arg(long = "quantize-config", value_name = "PATH")]
+        quantize_config: Option<PathBuf>,
 
         /// Weight palettization bit-width (2, 4, 6, or 8).
         #[arg(long, value_name = "BITS")]
@@ -187,6 +191,7 @@ fn run() -> Result<()> {
             target,
             quantize,
             cal_data,
+            quantize_config,
             palettize,
             no_fusion,
             input_shapes,
@@ -209,6 +214,7 @@ fn run() -> Result<()> {
                 target,
                 quantize,
                 cal_data,
+                quantize_config,
                 palettize,
                 no_fusion,
                 input_shapes,
@@ -254,6 +260,7 @@ struct CompileOpts {
     target: String,
     quantize: String,
     cal_data: Option<PathBuf>,
+    quantize_config: Option<PathBuf>,
     palettize: Option<u8>,
     no_fusion: bool,
     input_shapes: Vec<String>,
@@ -357,21 +364,36 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         pipeline = pipeline.with_shapes(shapes);
     }
 
-    // Add quantization
-    match opts.quantize.as_str() {
-        "fp16" => {
-            pipeline = pipeline
-                .with_fp16()
-                .context("Failed to configure FP16 quantization")?;
-        }
-        "int8" => {
-            pipeline = pipeline
-                .with_int8(opts.cal_data.clone())
-                .context("Failed to configure INT8 quantization")?;
-        }
-        "none" => {}
-        other => {
-            bail!("Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', or 'int8'.")
+    // Add quantization. If a quantize-config file is provided it takes
+    // precedence over the --quantize flag to avoid double quantization.
+    if let Some(ref config_path) = opts.quantize_config {
+        pipeline = pipeline
+            .with_mixed_precision(config_path)
+            .context("Failed to configure mixed-precision from config file")?;
+    } else {
+        match opts.quantize.as_str() {
+            "fp16" => {
+                pipeline = pipeline
+                    .with_fp16()
+                    .context("Failed to configure FP16 quantization")?;
+            }
+            "int8" => {
+                pipeline = pipeline
+                    .with_int8(opts.cal_data.clone())
+                    .context("Failed to configure INT8 quantization")?;
+            }
+            "mixed-fp16-int8" => {
+                let config = mil_rs::MixedPrecisionConfig::preset_fp16_int8();
+                pipeline = pipeline
+                    .with_mixed_precision_config(config)
+                    .context("Failed to configure mixed-precision quantization")?;
+            }
+            "none" => {}
+            other => {
+                bail!(
+                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int8', or 'mixed-fp16-int8'."
+                )
+            }
         }
     }
 

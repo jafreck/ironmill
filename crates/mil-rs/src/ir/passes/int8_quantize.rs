@@ -108,33 +108,96 @@ impl Pass for Int8QuantizePass {
                 } = val
                 {
                     let floats = tensor_as_f32_slice(&data);
-                    let (quantized, scale, zero_point) = quantize_f32_to_uint8(&floats);
 
-                    let quantized_val = Value::Tensor {
-                        data: quantized,
-                        shape: shape.clone(),
-                        dtype: ScalarType::UInt8,
-                    };
+                    let use_per_channel = self.granularity == Granularity::PerChannel
+                        && shape.len() >= 2
+                        && shape[0] > 1;
 
-                    // Transform into constexpr_affine_dequantize so that
-                    // downstream ops (conv, matmul, …) see a Float32 output.
-                    op.op_type = "constexpr_affine_dequantize".to_string();
-                    op.inputs.remove("val");
-                    op.attributes.remove("val");
-                    op.attributes
-                        .insert("quantized_data".to_string(), quantized_val);
-                    op.attributes
-                        .insert("scale".to_string(), Value::Float(scale as f64));
-                    op.attributes
-                        .insert("zero_point".to_string(), Value::Float(zero_point as f64));
-                    op.attributes.insert("axis".to_string(), Value::Int(0));
+                    if use_per_channel {
+                        let num_channels = shape[0];
+                        let channel_size: usize = shape[1..].iter().product();
+                        let mut all_quantized = Vec::with_capacity(floats.len());
+                        let mut scales = Vec::with_capacity(num_channels);
+                        let mut zero_points = Vec::with_capacity(num_channels);
 
-                    // Output type stays Float32 (the dequantized result).
-                    let out_type = TensorType::new(ScalarType::Float32, shape);
-                    if let Some(slot) = op.output_types.get_mut(0) {
-                        *slot = Some(out_type);
+                        for ch in 0..num_channels {
+                            let start = ch * channel_size;
+                            let end = start + channel_size;
+                            let channel_slice = &floats[start..end];
+                            let (q, s, zp) = quantize_f32_to_uint8(channel_slice);
+                            all_quantized.extend_from_slice(&q);
+                            scales.push(s);
+                            zero_points.push(zp);
+                        }
+
+                        let quantized_val = Value::Tensor {
+                            data: all_quantized,
+                            shape: shape.clone(),
+                            dtype: ScalarType::UInt8,
+                        };
+
+                        op.op_type = "constexpr_affine_dequantize".to_string();
+                        op.inputs.remove("val");
+                        op.attributes.remove("val");
+                        op.attributes
+                            .insert("quantized_data".to_string(), quantized_val);
+
+                        let scale_bytes: Vec<u8> =
+                            scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+                        op.attributes.insert(
+                            "scale".to_string(),
+                            Value::Tensor {
+                                data: scale_bytes,
+                                shape: vec![num_channels],
+                                dtype: ScalarType::Float32,
+                            },
+                        );
+
+                        let zp_bytes: Vec<u8> =
+                            zero_points.iter().flat_map(|z| z.to_le_bytes()).collect();
+                        op.attributes.insert(
+                            "zero_point".to_string(),
+                            Value::Tensor {
+                                data: zp_bytes,
+                                shape: vec![num_channels],
+                                dtype: ScalarType::Float32,
+                            },
+                        );
+                        op.attributes.insert("axis".to_string(), Value::Int(0));
+
+                        let out_type = TensorType::new(ScalarType::Float32, shape);
+                        if let Some(slot) = op.output_types.get_mut(0) {
+                            *slot = Some(out_type);
+                        } else {
+                            op.output_types.push(Some(out_type));
+                        }
                     } else {
-                        op.output_types.push(Some(out_type));
+                        // Per-tensor quantization (original behavior).
+                        let (quantized, scale, zero_point) = quantize_f32_to_uint8(&floats);
+
+                        let quantized_val = Value::Tensor {
+                            data: quantized,
+                            shape: shape.clone(),
+                            dtype: ScalarType::UInt8,
+                        };
+
+                        op.op_type = "constexpr_affine_dequantize".to_string();
+                        op.inputs.remove("val");
+                        op.attributes.remove("val");
+                        op.attributes
+                            .insert("quantized_data".to_string(), quantized_val);
+                        op.attributes
+                            .insert("scale".to_string(), Value::Float(scale as f64));
+                        op.attributes
+                            .insert("zero_point".to_string(), Value::Float(zero_point as f64));
+                        op.attributes.insert("axis".to_string(), Value::Int(0));
+
+                        let out_type = TensorType::new(ScalarType::Float32, shape);
+                        if let Some(slot) = op.output_types.get_mut(0) {
+                            *slot = Some(out_type);
+                        } else {
+                            op.output_types.push(Some(out_type));
+                        }
                     }
                 }
             }
@@ -409,6 +472,98 @@ mod tests {
         let op = &program.functions["main"].body.operations[0];
         assert_eq!(op.op_type, "relu");
         assert!(op.attributes.is_empty());
+    }
+
+    #[test]
+    fn per_channel_quantization_produces_per_channel_scales() {
+        // 2 channels, 3 elements each → shape [2, 3]
+        let channel_0 = [0.0_f32, 1.0, 2.0];
+        let channel_1 = [-3.0_f32, 0.0, 6.0];
+        let mut all_vals = Vec::new();
+        all_vals.extend_from_slice(&channel_0);
+        all_vals.extend_from_slice(&channel_1);
+        let fp32_data = f32_bytes(&all_vals);
+
+        let tensor_val = Value::Tensor {
+            data: fp32_data,
+            shape: vec![2, 3],
+            dtype: ScalarType::Float32,
+        };
+
+        let mut program = Program::new("1.0.0");
+        let mut func = Function::new("main");
+        func.body
+            .add_op(const_tensor_op("weight", "w_out", tensor_val));
+        func.body.outputs.push("w_out".into());
+        program.add_function(func);
+
+        Int8QuantizePass::new(None, Granularity::PerChannel)
+            .run(&mut program)
+            .unwrap();
+
+        let op = &program.functions["main"].body.operations[0];
+        assert_eq!(op.op_type, "constexpr_affine_dequantize");
+
+        // Scale should be a Tensor with shape [2] (one per channel).
+        match op.attributes.get("scale") {
+            Some(Value::Tensor { shape, dtype, data }) => {
+                assert_eq!(*shape, vec![2]);
+                assert_eq!(*dtype, ScalarType::Float32);
+                assert_eq!(data.len(), 8); // 2 floats * 4 bytes
+            }
+            other => panic!("expected per-channel scale Tensor, got {other:?}"),
+        }
+
+        // Zero-point should also be a Tensor with shape [2].
+        match op.attributes.get("zero_point") {
+            Some(Value::Tensor { shape, dtype, data }) => {
+                assert_eq!(*shape, vec![2]);
+                assert_eq!(*dtype, ScalarType::Float32);
+                assert_eq!(data.len(), 8);
+            }
+            other => panic!("expected per-channel zero_point Tensor, got {other:?}"),
+        }
+
+        // Quantized data should be 6 bytes (2 channels * 3 elements).
+        match op.attributes.get("quantized_data") {
+            Some(Value::Tensor { data, shape, dtype }) => {
+                assert_eq!(*dtype, ScalarType::UInt8);
+                assert_eq!(*shape, vec![2, 3]);
+                assert_eq!(data.len(), 6);
+            }
+            other => panic!("expected UInt8 Tensor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_channel_falls_back_to_per_tensor_for_1d() {
+        // 1D tensor: per-channel not applicable, should use per-tensor.
+        let fp32_data = f32_bytes(&[1.0, 2.0, 3.0]);
+        let tensor_val = Value::Tensor {
+            data: fp32_data,
+            shape: vec![3],
+            dtype: ScalarType::Float32,
+        };
+
+        let mut program = Program::new("1.0.0");
+        let mut func = Function::new("main");
+        func.body
+            .add_op(const_tensor_op("weight", "w_out", tensor_val));
+        func.body.outputs.push("w_out".into());
+        program.add_function(func);
+
+        Int8QuantizePass::new(None, Granularity::PerChannel)
+            .run(&mut program)
+            .unwrap();
+
+        let op = &program.functions["main"].body.operations[0];
+        assert_eq!(op.op_type, "constexpr_affine_dequantize");
+
+        // Should fall back to per-tensor (scalar scale).
+        match op.attributes.get("scale") {
+            Some(Value::Float(s)) => assert!(*s > 0.0),
+            other => panic!("expected per-tensor Float scale, got {other:?}"),
+        }
     }
 
     #[test]

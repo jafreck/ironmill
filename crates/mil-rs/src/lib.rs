@@ -101,8 +101,8 @@ pub use convert::moe::{MoeManifest, MoeSplitResult, MoeTopology};
 pub use error::MilError;
 
 pub use ir::{
-    Block, Function, Graph, Operation, Pass, PassPipeline, PassResult, PipelineReport, Program,
-    ScalarType, SplitResult, TensorType, Value,
+    Block, Function, Graph, MixedPrecisionConfig, MixedPrecisionPass, OpPrecision, Operation, Pass,
+    PassPipeline, PassResult, PipelineReport, Program, ScalarType, SplitResult, TensorType, Value,
 };
 
 /// Result of ANE compatibility analysis.
