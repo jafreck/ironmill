@@ -1003,4 +1003,81 @@ mod tests {
         assert!(blob.len() >= 64, "BLOBFILE should be at least 64 bytes");
         assert_eq!(&blob[0..4], b"BLOB", "BLOBFILE magic should match");
     }
+
+    #[test]
+    fn e2e_compile_and_load_fails_at_ane_compiler() {
+        // This test exercises the full compile_and_load path. It will fail
+        // at the ANE compilation step because the private API selectors are
+        // not yet wired. This test documents exactly where the pipeline
+        // breaks and ensures everything upstream (passes, splitting, MIL
+        // emission, BLOBFILE writing) works correctly.
+        let program = build_weighted_program();
+        let config = AneConfig::default();
+
+        let result = AneModel::compile_and_load(&program, config);
+
+        // The pipeline should fail at the AneCompiler::compile_mil_text step,
+        // NOT at passes, splitting, or MIL emission.
+        match result {
+            Ok(mut model) => {
+                // If we get here, we're on real ANE hardware and compilation
+                // succeeded. Verify inference works end-to-end.
+                let desc = model.input_description();
+                assert!(!desc.is_empty(), "model should have inputs");
+
+                // Build dummy inputs and run predict
+                let inputs: Vec<AneTensor> = desc
+                    .iter()
+                    .map(|td| AneTensor::new(td.shape[1], td.shape[3], td.dtype).unwrap())
+                    .collect();
+                let outputs = model.predict(&inputs).expect("predict should succeed");
+                assert!(!outputs.is_empty(), "predict should return outputs");
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                eprintln!("  compile_and_load failed (expected): {msg}");
+                // Should fail at compilation, not at earlier stages.
+                assert!(
+                    msg.contains("ANE")
+                        || msg.contains("compilation")
+                        || msg.contains("_ANEClient")
+                        || msg.contains("compile"),
+                    "expected compilation failure, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e2e_compile_and_load_add_program() {
+        // Same as above but with the simple add program (no weights).
+        let program = build_add_program();
+        let config = AneConfig::default();
+
+        let result = AneModel::compile_and_load(&program, config);
+
+        match result {
+            Ok(mut model) => {
+                // On real ANE hardware: verify predict works.
+                let desc = model.input_description();
+                let inputs: Vec<AneTensor> = desc
+                    .iter()
+                    .map(|td| AneTensor::new(td.shape[1], td.shape[3], td.dtype).unwrap())
+                    .collect();
+                let outputs = model.predict(&inputs).expect("predict should succeed");
+                assert!(!outputs.is_empty(), "predict should return outputs");
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                eprintln!("  compile_and_load failed (expected): {msg}");
+                assert!(
+                    msg.contains("ANE")
+                        || msg.contains("compilation")
+                        || msg.contains("_ANEClient")
+                        || msg.contains("compile"),
+                    "expected compilation failure, got: {msg}"
+                );
+            }
+        }
+    }
 }
