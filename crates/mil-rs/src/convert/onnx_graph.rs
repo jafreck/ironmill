@@ -1666,12 +1666,7 @@ mod tests {
         assert!(!is_ar_cache_name("logits"));
     }
 
-    #[test]
-    fn causal_mask_name_patterns() {
-        assert!(is_causal_mask_name("attention_mask"));
-        assert!(is_causal_mask_name("causal_mask"));
-        assert!(is_causal_mask_name("attn_mask"));
-        assert!(!is_causal_mask_name("input_ids"));
-        assert!(!is_causal_mask_name("weight"));
-    }
+    // causal_mask_name_patterns test removed — is_causal_mask_name was removed
+    // since attention_mask alone is insufficient for AR detection (false positives
+    // with BERT-like models). AR detection now relies solely on KV cache tensors.
 }
