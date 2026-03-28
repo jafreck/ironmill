@@ -10,3 +10,4 @@ tests/fixtures/*.mlmodel
 # Swift Package Manager build artifacts
 .build/
 test-vt/
+test-q/
