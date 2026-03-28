@@ -22,10 +22,10 @@ pub use passes::{
     AttentionFusionPass, CodebookOptimizationPass, ComputeUnitAnnotationPass, ConstantFoldPass,
     ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
     DeadCodeEliminationPass, ExpertQuantConfig, ExpertQuantStrategy, Fp16QuantizePass, Granularity,
-    IdentityEliminationPass, Int8QuantizePass, KvCachePass, LayoutOptimizationPass,
-    LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass, ModelSplitPass, OpPrecision,
-    OpSplittingPass, OpSubstitutionPass, PalettizePass, PerExpertQuantPass, ShapeMaterializePass,
-    SplitResult,
+    IdentityEliminationPass, Int8QuantizePass, KvCachePass, LayerScheduleConfig, LayerSchedulePass,
+    LayerType, LayoutOptimizationPass, LinearReluFusionPass, MixedPrecisionConfig,
+    MixedPrecisionPass, ModelSplitPass, OpPrecision, OpSplittingPass, OpSubstitutionPass,
+    PalettizePass, PerExpertQuantPass, ShapeMaterializePass, SplitResult,
 };
 pub use pipeline::{PassPipeline, PassResult, PipelineConfig, PipelineReport};
 pub use program::{Block, Function, Program};

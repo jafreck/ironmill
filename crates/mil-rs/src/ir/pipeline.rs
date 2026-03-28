@@ -13,9 +13,9 @@ use super::passes::{
     ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
     DeadCodeEliminationPass, ExpertQuantConfig, Fp16QuantizePass, GeluLinearFusionPass,
     GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass, KvCachePass,
-    LayerNormLinearFusionPass, LayoutOptimizationPass, LinearReluFusionPass, MixedPrecisionConfig,
-    MixedPrecisionPass, OpSplittingPass, OpSubstitutionPass, PalettizePass, PerExpertQuantPass,
-    ResidualAddFusionPass, ShapeMaterializePass,
+    LayerNormLinearFusionPass, LayerSchedulePass, LayoutOptimizationPass, LinearReluFusionPass,
+    MixedPrecisionConfig, MixedPrecisionPass, OpSplittingPass, OpSubstitutionPass, PalettizePass,
+    PerExpertQuantPass, ResidualAddFusionPass, ShapeMaterializePass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -79,6 +79,7 @@ const KNOWN_PASSES: &[&str] = &[
     "fp16-quantization",
     "int8-quantization",
     "mixed-precision",
+    "layer-schedule",
     "palettization",
     "per-expert-quantization",
     "shape-materialization",
@@ -148,6 +149,19 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
             } else {
                 let config = MixedPrecisionConfig::preset_fp16_int8();
                 Ok(Box::new(MixedPrecisionPass::new(config)))
+            }
+        }
+        "layer-schedule" => {
+            let config_path = params
+                .get("config_path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from);
+            if let Some(path) = config_path {
+                let pass = LayerSchedulePass::from_config_file(&path)?;
+                Ok(Box::new(pass))
+            } else {
+                let pass = LayerSchedulePass::from_params(params)?;
+                Ok(Box::new(pass))
             }
         }
         "shape-materialization" => {

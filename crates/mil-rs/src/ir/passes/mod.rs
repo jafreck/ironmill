@@ -14,6 +14,7 @@ pub mod identity_elim;
 pub mod int8_quantize;
 pub mod kmeans;
 pub mod kv_cache;
+pub mod layer_schedule;
 pub mod layout_optimize;
 pub mod mixed_precision;
 pub mod model_split;
@@ -34,6 +35,7 @@ pub use fp16_quantize::Fp16QuantizePass;
 pub use identity_elim::IdentityEliminationPass;
 pub use int8_quantize::{Granularity, Int8QuantizePass};
 pub use kv_cache::KvCachePass;
+pub use layer_schedule::{LayerScheduleConfig, LayerSchedulePass, LayerType};
 pub use layout_optimize::LayoutOptimizationPass;
 pub use mixed_precision::{
     ExpertQuantConfig, ExpertQuantStrategy, MixedPrecisionConfig, MixedPrecisionPass, OpPrecision,
