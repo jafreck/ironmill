@@ -19,7 +19,8 @@ pub use operation::Operation;
 pub use pass::Pass;
 pub use passes::{
     ConstantFoldPass, ConvBatchNormFusionPass, ConvReluFusionPass, DeadCodeEliminationPass,
-    Fp16QuantizePass, IdentityEliminationPass, LinearReluFusionPass, ShapeMaterializePass,
+    Fp16QuantizePass, Granularity, IdentityEliminationPass, Int8QuantizePass, LinearReluFusionPass,
+    ShapeMaterializePass,
 };
 pub use program::{Block, Function, Program};
 pub use tensor::{ScalarType, TensorType};

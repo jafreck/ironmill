@@ -7,14 +7,17 @@ pub mod constant_fold;
 pub mod dead_code;
 pub mod fp16_quantize;
 pub mod identity_elim;
+pub mod int8_quantize;
 pub mod layout_optimize;
 pub mod op_fusion;
 pub mod shape_materialize;
+pub(crate) mod tensor_utils;
 
 pub use constant_fold::ConstantFoldPass;
 pub use dead_code::DeadCodeEliminationPass;
 pub use fp16_quantize::Fp16QuantizePass;
 pub use identity_elim::IdentityEliminationPass;
+pub use int8_quantize::{Granularity, Int8QuantizePass};
 pub use layout_optimize::LayoutOptimizationPass;
 pub use op_fusion::{ConvBatchNormFusionPass, ConvReluFusionPass, LinearReluFusionPass};
 pub use shape_materialize::ShapeMaterializePass;
