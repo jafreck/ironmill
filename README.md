@@ -60,28 +60,17 @@ The project is a Cargo workspace with two crates:
 
 ### How conversion works
 
-```
-ONNX (.onnx)  ──read_onnx──▶  ONNX Proto
-                                  │
-                           onnx_to_program
-                                  │
-                                  ▼
-                              MIL IR (Program)
-                                  │
-                           optimization passes
-                           (dead code, fusion,
-                            weight fold, attention,
-                            layout, quantization, …)
-                                  │
-                           program_to_model
-                                  │
-                                  ▼
-CoreML (.mlmodel)           CoreML Proto  ──write_mlpackage──▶  CoreML (.mlpackage)
-       │                        ▲                                      │
-  read_mlmodel            model_to_program               xcrun coremlcompiler
-       │                                                               │
-       ▼                                                               ▼
-  CoreML Proto                                            Compiled (.mlmodelc)
+```mermaid
+graph TD
+    A["ONNX (.onnx)"] -->|read_onnx| B["ONNX Proto"]
+    B -->|onnx_to_program| C["MIL IR (Program)"]
+    C -->|"optimization passes<br/>(fusion, weight fold, attention,<br/>layout, quantization, …)"| C
+    C -->|program_to_model| D["CoreML Proto"]
+    D -->|write_mlpackage| E["CoreML (.mlpackage)"]
+    D -->|write_mlmodel| F["CoreML (.mlmodel)"]
+    F -->|read_mlmodel| G["CoreML Proto"]
+    G -->|model_to_program| C
+    E -->|xcrun coremlcompiler| H["Compiled (.mlmodelc)"]
 ```
 
 ## Using `mil-rs` as a library
