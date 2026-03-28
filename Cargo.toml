@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mil-rs", "crates/ironmill-cli", "crates/ironmill-coreml"]
+members = ["crates/mil-rs", "crates/ironmill-cli", "crates/ironmill-coreml", "crates/ironmill-bench"]
 resolver = "2"
 
 [workspace.package]
@@ -23,3 +23,4 @@ tempfile = "3"
 half = "2"
 toml = "0.8"
 glob-match = "0.2"
+statrs = "0.18"
