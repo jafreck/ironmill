@@ -384,7 +384,7 @@ fn cancel_inverse_transposes(block: &mut Block) {
             None => continue,
         };
 
-        if compose_perms(&perm_a, &perm_b) == [0, 1, 2, 3] {
+        if compose_perms(&perm_a, &perm_b).as_deref() == Some(&[0, 1, 2, 3]) {
             // Check single-consumer: op_a's output should only be consumed by op_b.
             if is_single_consumer(block, &b_input, bi) {
                 let a_input = match op_a.inputs.get("x") {
@@ -424,7 +424,7 @@ fn get_perm(op: &Operation) -> Option<Vec<usize>> {
             let mut perm = Vec::with_capacity(items.len());
             for item in items {
                 match item {
-                    Value::Int(n) => perm.push(*n as usize),
+                    Value::Int(n) if *n >= 0 => perm.push(*n as usize),
                     _ => return None,
                 }
             }
@@ -434,18 +434,23 @@ fn get_perm(op: &Operation) -> Option<Vec<usize>> {
             data,
             dtype: super::super::tensor::ScalarType::Int32,
             ..
-        } => Some(
-            data.chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as usize)
-                .collect(),
-        ),
+        } => Some({
+            let vals: Option<Vec<usize>> = data
+                .chunks_exact(4)
+                .map(|c| {
+                    let v = i32::from_le_bytes(c.try_into().unwrap());
+                    if v >= 0 { Some(v as usize) } else { None }
+                })
+                .collect();
+            vals?
+        }),
         _ => None,
     }
 }
 
 /// Compose two permutations: `result[i] = a[b[i]]`.
-fn compose_perms(a: &[usize], b: &[usize]) -> Vec<usize> {
-    b.iter().map(|&bi| a[bi]).collect()
+fn compose_perms(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+    b.iter().map(|&bi| a.get(bi).copied()).collect()
 }
 
 /// Check if `value_name` is consumed only by the operation at `consumer_idx`.

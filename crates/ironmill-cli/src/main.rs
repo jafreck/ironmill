@@ -278,7 +278,7 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
         .unwrap_or("")
         .to_lowercase();
 
-    if opts.target != "all" {
+    if opts.target != "all" && opts.target != "cpu-and-ne" {
         println!(
             "Note: --target '{}' will be fully supported in Phase 3. Proceeding with default target.",
             opts.target

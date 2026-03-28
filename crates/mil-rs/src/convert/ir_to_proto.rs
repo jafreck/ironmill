@@ -584,6 +584,7 @@ fn convert_operation(
             | "reduce_mean"
             | "upsample_bilinear"
             | "flatten"
+            | "transpose"
     );
     let inferred_type = if shape_changes {
         infer_output_type(op, type_map).map(|vt| {
