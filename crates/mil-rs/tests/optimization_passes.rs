@@ -21,9 +21,7 @@ use mil_rs::{
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn nhwc_pipeline_produces_valid_proto() {
-    use mil_rs::ir::passes::layout_optimize::LayoutOptimizationPass;
-
+fn pipeline_on_conv_model_produces_valid_proto() {
     let input_ty = TensorType::new(ScalarType::Float32, vec![1, 3, 224, 224]);
     let func = Function::new("main").with_input("input", input_ty);
     let mut program = Program::new("1");
@@ -42,17 +40,12 @@ fn nhwc_pipeline_produces_valid_proto() {
     }
     block.outputs.push(prev);
 
-    // Run layout optimization explicitly (not in default pipeline).
-    LayoutOptimizationPass
-        .run(&mut program)
-        .expect("layout pass should succeed");
-
     let pipeline = PassPipeline::new();
     pipeline.run(&mut program).expect("pipeline should succeed");
 
     let model = program_to_model(&program, 8).expect("program_to_model should succeed");
 
-    // Decode the proto and verify transpose ops.
+    // Decode the proto and verify the model is valid.
     use prost::Message;
     let bytes = model.encode_to_vec();
     let decoded =
@@ -69,32 +62,13 @@ fn nhwc_pipeline_produces_valid_proto() {
         .next()
         .expect("block");
 
-    let proto_transposes: Vec<_> = proto_block
+    // Conv ops should be preserved.
+    let conv_ops: Vec<_> = proto_block
         .operations
         .iter()
-        .filter(|op| op.r#type == "transpose")
+        .filter(|op| op.r#type == "conv")
         .collect();
-    assert!(
-        proto_transposes.len() >= 2,
-        "should have at least 2 transposes, got {}",
-        proto_transposes.len()
-    );
-
-    for t in &proto_transposes {
-        assert!(
-            t.inputs.contains_key("perm"),
-            "transpose needs 'perm' input"
-        );
-        assert_eq!(t.outputs.len(), 1);
-        let out = &t.outputs[0];
-        let vt = out.r#type.as_ref().expect("output should have type");
-        if let Some(mil_rs::proto::mil_spec::value_type::Type::TensorType(tt)) = &vt.r#type {
-            assert_eq!(tt.rank, 4, "transpose output should have rank 4");
-            assert_eq!(tt.dimensions.len(), 4, "should have 4 dimensions");
-        } else {
-            panic!("expected TensorType for transpose output");
-        }
-    }
+    assert_eq!(conv_ops.len(), 3, "should have 3 conv ops");
 }
 
 #[test]
@@ -112,42 +86,29 @@ fn nhwc_layout_idempotent() {
     );
     block.outputs.push("conv_out".into());
 
-    // First run.
+    // First run — no transpose pairs to cancel, so the pass is a no-op.
     LayoutOptimizationPass.run(&mut program).unwrap();
-    let non_transpose_first: Vec<String> = program.functions["main"]
+    let ops_first: Vec<String> = program.functions["main"]
         .body
         .operations
         .iter()
-        .filter(|op| op.op_type != "transpose")
         .map(|op| format!("{}:{}", op.op_type, op.name))
         .collect();
-    let transpose_count_first = program.functions["main"]
-        .body
-        .operations
-        .iter()
-        .filter(|op| op.op_type == "transpose")
-        .count();
-    assert!(
-        transpose_count_first >= 2,
-        "first run should insert at least 2 transposes"
-    );
-
-    // Second run.
-    LayoutOptimizationPass.run(&mut program).unwrap();
-    let non_transpose_second: Vec<String> = program.functions["main"]
-        .body
-        .operations
-        .iter()
-        .filter(|op| op.op_type != "transpose")
-        .map(|op| format!("{}:{}", op.op_type, op.name))
-        .collect();
-
-    // Core ops (conv) are preserved across runs — no double insertion of
-    // spatial ops.
     assert_eq!(
-        non_transpose_first, non_transpose_second,
-        "non-transpose ops should be preserved across layout pass runs"
+        ops_first,
+        vec!["conv:conv_0"],
+        "pass should be no-op on a conv without transpose pairs"
     );
+
+    // Second run — still a no-op, idempotent.
+    LayoutOptimizationPass.run(&mut program).unwrap();
+    let ops_second: Vec<String> = program.functions["main"]
+        .body
+        .operations
+        .iter()
+        .map(|op| format!("{}:{}", op.op_type, op.name))
+        .collect();
+    assert_eq!(ops_first, ops_second, "layout pass should be idempotent");
 
     // Program remains serializable after two runs.
     program_to_model(&program, 8).expect("should serialize after second layout run");

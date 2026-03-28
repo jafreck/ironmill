@@ -522,6 +522,9 @@ name = "op-substitution"
 name = "type-repropagation"
 
 [[passes]]
+name = "type-repropagation"
+
+[[passes]]
 name = "fp16-quantization"
 "#;
     let config_pipeline =

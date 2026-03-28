@@ -23,17 +23,10 @@ use common::{
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn nhwc_plus_mixed_precision_pipeline() {
-    use mil_rs::ir::passes::layout_optimize::LayoutOptimizationPass;
-
+fn layout_plus_mixed_precision_pipeline() {
     let mut program = build_conv_program(3);
 
-    // Run layout optimization explicitly (not in default pipeline because MIL
-    // conv validates assuming NCHW) then the standard pipeline with mixed precision.
-    LayoutOptimizationPass
-        .run(&mut program)
-        .expect("layout pass should succeed");
-
+    // Layout optimization is included in the default pipeline (cancel-only).
     let config = MixedPrecisionConfig::preset_fp16_int8();
     let pipeline = PassPipeline::new()
         .with_mixed_precision_config(config)
@@ -41,15 +34,11 @@ fn nhwc_plus_mixed_precision_pipeline() {
 
     pipeline.run(&mut program).expect("pipeline should succeed");
 
-    // Layout pass (from default pipeline) should have inserted transposes.
-    let ops = &program.functions["main"].body.operations;
-    let has_transpose = ops.iter().any(|op| op.op_type == "transpose");
-    assert!(has_transpose, "NHWC layout pass should insert transposes");
-
-    // Mixed-precision quantization should have been applied after layout.
+    // Mixed-precision quantization should have been applied.
     // The preset_fp16_int8 config converts const ops to constexpr_affine_dequantize
     // (INT8 default) or converts FP32 tensors to FP16 (for attention-like ops).
     // After fusion, the surviving const ops (conv weights) should be quantized.
+    let ops = &program.functions["main"].body.operations;
     let has_int8_ops = ops
         .iter()
         .any(|op| op.op_type == "constexpr_affine_dequantize");
@@ -84,7 +73,7 @@ fn nhwc_plus_mixed_precision_pipeline() {
     });
     assert!(
         has_int8_ops || has_fp16_tensors || no_remaining_fp32_consts,
-        "quantization should have been applied after layout change"
+        "quantization should have been applied"
     );
 
     // Output must be serializable.

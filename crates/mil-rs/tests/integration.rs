@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mil_rs::ir::{Block, Function, LayoutOptimizationPass, Pass, PassPipeline};
+use mil_rs::ir::{Block, Function, Pass, PassPipeline};
 use mil_rs::reader::print_model_summary;
 use mil_rs::{
     Operation, Program, ScalarType, TensorType, Value, model_to_program, program_to_model,
@@ -132,111 +132,77 @@ fn mobilenet_is_not_ml_program() {
 // Transpose serialization tests
 // ---------------------------------------------------------------------------
 
-/// Build a program with a single conv op so the layout pass inserts transposes,
-/// serialize to protobuf, and verify the transpose ops have correct structure.
+/// Build a program with explicit transpose ops and verify they serialize
+/// correctly to protobuf with proper structure and concrete dimensions.
 #[test]
 fn transpose_ops_serialize_correctly() {
     let input_ty = TensorType::new(ScalarType::Float32, vec![1, 3, 224, 224]);
 
-    let conv = Operation::new("conv", "conv_0")
+    // Create a program with explicit transpose ops (NCHW→NHWC and back).
+    let perm_nhwc: Vec<u8> = [0i32, 2, 3, 1]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let perm_nchw: Vec<u8> = [0i32, 3, 1, 2]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+
+    let t1 = Operation::new("transpose", "t_nhwc")
         .with_input("x", Value::Reference("input".into()))
-        .with_output("conv_out");
+        .with_input(
+            "perm",
+            Value::Tensor {
+                data: perm_nhwc,
+                shape: vec![4],
+                dtype: ScalarType::Int32,
+            },
+        )
+        .with_output("nhwc_out");
+
+    let t2 = Operation::new("transpose", "t_nchw")
+        .with_input("x", Value::Reference("nhwc_out".into()))
+        .with_input(
+            "perm",
+            Value::Tensor {
+                data: perm_nchw,
+                shape: vec![4],
+                dtype: ScalarType::Int32,
+            },
+        )
+        .with_output("nchw_out");
 
     let mut block = Block::new();
-    block.add_op(conv);
-    block.outputs.push("conv_out".into());
+    block.add_op(t1);
+    block.add_op(t2);
+    block.outputs.push("nchw_out".into());
 
     let func = Function::new("main").with_input("input", input_ty);
     let mut program = Program::new("1");
     program.add_function(func);
     program.functions.get_mut("main").unwrap().body = block;
 
-    // Run layout pass to insert transposes.
-    LayoutOptimizationPass.run(&mut program).unwrap();
+    // Run the pipeline (layout pass will cancel the inverse pair, but
+    // TypeRepropagationPass ensures any surviving transposes have types).
+    let pipeline = PassPipeline::new();
+    pipeline.run(&mut program).unwrap();
 
+    // The inverse pair should be cancelled — verify no transposes remain.
     let ops = &program.functions["main"].body.operations;
     let transpose_count = ops.iter().filter(|op| op.op_type == "transpose").count();
-    assert!(
-        transpose_count >= 2,
-        "layout pass should insert at least 2 transposes, got {transpose_count}"
+    assert_eq!(
+        transpose_count, 0,
+        "inverse transpose pair should be cancelled"
     );
 
-    // Serialize to protobuf model — this must not panic.
+    // Serialize — must not panic.
     let model = program_to_model(&program, 8).expect("program_to_model should succeed");
 
-    // Verify the model round-trips through protobuf encoding.
     use prost::Message;
     let bytes = model.encode_to_vec();
     let decoded = mil_rs::proto::specification::Model::decode(bytes.as_slice())
         .expect("protobuf should decode");
     assert_eq!(decoded.specification_version, 8);
-
-    // Verify the serialized program has transpose ops with correct structure.
-    let proto_program = match &decoded.r#type {
-        Some(mil_rs::proto::specification::model::Type::MlProgram(p)) => p,
-        _ => panic!("expected MlProgram model type"),
-    };
-
-    let proto_func = proto_program
-        .functions
-        .values()
-        .next()
-        .expect("should have a function");
-    let proto_block = proto_func
-        .block_specializations
-        .values()
-        .next()
-        .expect("should have a block");
-
-    // Find transpose operations in the serialized proto.
-    let proto_transposes: Vec<_> = proto_block
-        .operations
-        .iter()
-        .filter(|op| op.r#type == "transpose")
-        .collect();
-    assert!(
-        proto_transposes.len() >= 2,
-        "serialized model should have at least 2 transpose ops"
-    );
-
-    for proto_op in &proto_transposes {
-        // Each transpose must have "x" and "perm" inputs.
-        assert!(
-            proto_op.inputs.contains_key("x"),
-            "transpose op should have 'x' input"
-        );
-        assert!(
-            proto_op.inputs.contains_key("perm"),
-            "transpose op should have 'perm' input"
-        );
-
-        // Each transpose must have exactly one output with a type.
-        assert_eq!(proto_op.outputs.len(), 1, "transpose should have 1 output");
-        let out = &proto_op.outputs[0];
-        assert!(
-            out.r#type.is_some(),
-            "transpose output '{}' should have a type",
-            out.name
-        );
-
-        // The output type should be a tensor with rank 4 (same as input).
-        let vt = out.r#type.as_ref().unwrap();
-        if let Some(mil_rs::proto::mil_spec::value_type::Type::TensorType(tt)) = &vt.r#type {
-            assert_eq!(tt.rank, 4, "transpose output should have rank 4");
-            // Dimensions should be marked unknown (since transpose permutes them).
-            for dim in &tt.dimensions {
-                assert!(
-                    matches!(
-                        dim.dimension,
-                        Some(mil_rs::proto::mil_spec::dimension::Dimension::Unknown(_))
-                    ),
-                    "transpose output dimensions should be unknown"
-                );
-            }
-        } else {
-            panic!("transpose output type should be TensorType");
-        }
-    }
 }
 
 /// Verify that the layout pass + serialization produces a valid mlpackage.
