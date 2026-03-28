@@ -35,7 +35,14 @@ coreml-kit validate model.onnx
 | ONNX → CoreML conversion (common ops) | ✅ |
 | Optimization passes (dead code, identity, constant fold) | ✅ |
 | Op fusion (conv+bn, conv+relu, linear+relu) | ✅ |
+| Conv+BatchNorm weight folding | ✅ |
+| Attention pattern fusion (scaled dot-product) | ✅ |
+| Op substitution for ANE compatibility (GELU expansion) | ✅ |
+| Memory layout optimization (NCHW → NHWC) | ✅ |
 | FP16 quantization | ✅ |
+| INT8 post-training quantization (weight-only) | ✅ |
+| Weight palettization (2/4/6/8-bit k-means) | ✅ |
+| Pass pipeline manager with mutual exclusivity checks | ✅ |
 | Shape materialization for ANE | ✅ |
 | ANE compatibility validator | ✅ |
 | `xcrun coremlcompiler` integration | ✅ |
@@ -63,7 +70,8 @@ ONNX (.onnx)  ──read_onnx──▶  ONNX Proto
                                   │
                            optimization passes
                            (dead code, fusion,
-                            fp16, shape, …)
+                            weight fold, attention,
+                            layout, quantization, …)
                                   │
                            program_to_model
                                   │
@@ -95,12 +103,17 @@ write_mlpackage(&model, "model.mlpackage").unwrap();
 ### `coreml-kit compile`
 
 Convert an ONNX model to a CoreML `.mlpackage`. Automatically runs
-optimization passes and optionally quantizes to FP16.
+optimization passes and optionally quantizes or compresses weights.
 
 ```bash
 coreml-kit compile model.onnx
 coreml-kit compile model.onnx -o output.mlpackage --quantize fp16
+coreml-kit compile model.onnx --quantize int8                        # weight-only INT8
+coreml-kit compile model.onnx --quantize int8 --cal-data imgs/       # INT8 with calibration
+coreml-kit compile model.onnx --palettize 4                          # 4-bit weight palettization
+coreml-kit compile model.onnx --quantize fp16 --palettize 6          # FP16 + 6-bit palettes
 coreml-kit compile model.onnx --input-shape "input:1,3,224,224"
+coreml-kit compile model.onnx --no-fusion                            # disable optimization passes
 ```
 
 If `xcrun coremlcompiler` is available (macOS with Xcode), the output is also
