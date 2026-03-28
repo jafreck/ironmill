@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::error::{MilError, Result};
-use crate::ir::{Operation, Value};
+use crate::ir::{Operation, ScalarType, Value};
 use crate::proto::onnx::{NodeProto, TensorProto};
 
 // ---------------------------------------------------------------------------
@@ -164,9 +164,20 @@ fn with_outputs(mut op: Operation, node: &NodeProto) -> Operation {
     op
 }
 
-/// Create a [`Value::List`] of [`Value::Int`] from a slice.
-fn int_list_value(values: &[i64]) -> Value {
-    Value::List(values.iter().map(|&v| Value::Int(v)).collect())
+/// Create a 1-D int32 tensor [`Value`] from a slice of i64 values.
+///
+/// CoreML MIL ops expect many parameters (perm, strides, pad, axes, etc.)
+/// as 1-D int32 tensors rather than lists.
+fn int_tensor_value(values: &[i64]) -> Value {
+    let data: Vec<u8> = values
+        .iter()
+        .flat_map(|&v| (v as i32).to_le_bytes())
+        .collect();
+    Value::Tensor {
+        data,
+        shape: vec![values.len()],
+        dtype: ScalarType::Int32,
+    }
 }
 
 /// Create a [`Value::List`] of [`Value::Float`] from a slice.
@@ -237,10 +248,10 @@ fn convert_conv(node: &NodeProto) -> Result<Vec<Operation>> {
     op.inputs = inputs;
 
     let strides = get_int_list_attr(node, "strides").unwrap_or_else(|| vec![1, 1]);
-    op = op.with_attr("strides", int_list_value(&strides));
+    op = op.with_attr("strides", int_tensor_value(&strides));
 
     let dilations = get_int_list_attr(node, "dilations").unwrap_or_else(|| vec![1, 1]);
-    op = op.with_attr("dilations", int_list_value(&dilations));
+    op = op.with_attr("dilations", int_tensor_value(&dilations));
 
     let group = get_int_attr(node, "group").unwrap_or(1);
     op = op.with_attr("groups", Value::Int(group));
@@ -270,16 +281,18 @@ fn convert_conv(node: &NodeProto) -> Result<Vec<Operation>> {
 
     // ONNX pads are [top, left, bottom, right]; MIL expects the same order.
     let pad = pads.unwrap_or_else(|| vec![0, 0, 0, 0]);
-    op = op.with_attr("pad", int_list_value(&pad));
+    op = op.with_attr("pad", int_tensor_value(&pad));
 
     Ok(vec![with_outputs(op, node)])
 }
 
-/// MatMul: direct mapping.
+/// MatMul: direct mapping with default transpose flags.
 fn convert_matmul(node: &NodeProto) -> Result<Vec<Operation>> {
     let inputs = positional_to_named(node, &["x", "y"]);
     let mut op = Operation::new("matmul", op_name(node));
     op.inputs = inputs;
+    op = op.with_attr("transpose_x", Value::Bool(false));
+    op = op.with_attr("transpose_y", Value::Bool(false));
     Ok(vec![with_outputs(op, node)])
 }
 
@@ -305,35 +318,17 @@ fn convert_gemm(node: &NodeProto) -> Result<Vec<Operation>> {
     Ok(vec![with_outputs(op, node)])
 }
 
-/// Reshape: map shape input, casting shape to int32 if needed.
+/// Reshape: map shape input.
 fn convert_reshape(node: &NodeProto) -> Result<Vec<Operation>> {
     let inputs = positional_to_named(node, &["x", "shape"]);
-    let mut ops = Vec::new();
-
-    // CoreML MIL reshape requires shape as int32; ONNX uses int64.
-    // Insert a cast if the shape comes from a reference.
-    let shape_input = if let Some(Value::Reference(shape_name)) = inputs.get("shape") {
-        let cast_name = format!("{}_shape_cast", op_name(node));
-        let cast_op = Operation::new("cast", &cast_name)
-            .with_input("x", Value::Reference(shape_name.clone()))
-            .with_attr("dtype", Value::String("int32".to_string()))
-            .with_output(&cast_name);
-        ops.push(cast_op);
-        Value::Reference(cast_name)
-    } else {
-        inputs.get("shape").cloned().unwrap_or(Value::Int(0))
-    };
-
     let mut op = Operation::new("reshape", op_name(node));
     op.inputs = inputs;
-    op.inputs.insert("shape".to_string(), shape_input);
 
     if let Some(allowzero) = get_int_attr(node, "allowzero") {
         op = op.with_attr("allowzero", Value::Bool(allowzero != 0));
     }
 
-    ops.push(with_outputs(op, node));
-    Ok(ops)
+    Ok(vec![with_outputs(op, node)])
 }
 
 /// Transpose: map perm attribute.
@@ -343,7 +338,7 @@ fn convert_transpose(node: &NodeProto) -> Result<Vec<Operation>> {
     op.inputs = inputs;
 
     if let Some(perm) = get_int_list_attr(node, "perm") {
-        op = op.with_attr("perm", int_list_value(&perm));
+        op = op.with_attr("perm", int_tensor_value(&perm));
     }
 
     Ok(vec![with_outputs(op, node)])
@@ -385,13 +380,13 @@ fn convert_pool(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
     op.inputs = inputs;
 
     if let Some(kernel_shape) = get_int_list_attr(node, "kernel_shape") {
-        op = op.with_attr("kernel_sizes", int_list_value(&kernel_shape));
+        op = op.with_attr("kernel_sizes", int_tensor_value(&kernel_shape));
     }
     if let Some(strides) = get_int_list_attr(node, "strides") {
-        op = op.with_attr("strides", int_list_value(&strides));
+        op = op.with_attr("strides", int_tensor_value(&strides));
     }
     if let Some(pads) = get_int_list_attr(node, "pads") {
-        op = op.with_attr("pad", int_list_value(&pads));
+        op = op.with_attr("pad", int_tensor_value(&pads));
     }
     if let Some(ceil_mode) = get_int_attr(node, "ceil_mode") {
         op = op.with_attr("ceil_mode", Value::Bool(ceil_mode != 0));
@@ -515,7 +510,7 @@ fn convert_unsqueeze(node: &NodeProto) -> Result<Vec<Operation>> {
     }
     // Attribute form (opset < 13)
     if let Some(axes) = get_int_list_attr(node, "axes") {
-        op = op.with_attr("axes", int_list_value(&axes));
+        op = op.with_attr("axes", int_tensor_value(&axes));
     }
 
     Ok(vec![with_outputs(op, node)])
@@ -535,7 +530,7 @@ fn convert_squeeze(node: &NodeProto) -> Result<Vec<Operation>> {
             .insert("axes".to_string(), Value::Reference(axes_input.clone()));
     }
     if let Some(axes) = get_int_list_attr(node, "axes") {
-        op = op.with_attr("axes", int_list_value(&axes));
+        op = op.with_attr("axes", int_tensor_value(&axes));
     }
 
     Ok(vec![with_outputs(op, node)])
@@ -570,7 +565,7 @@ fn convert_pad(node: &NodeProto) -> Result<Vec<Operation>> {
 
     // Attribute form (opset < 11)
     if let Some(pads) = get_int_list_attr(node, "pads") {
-        op = op.with_attr("pad", int_list_value(&pads));
+        op = op.with_attr("pad", int_tensor_value(&pads));
     }
     if let Some(mode) = get_string_attr(node, "mode") {
         op = op.with_attr("mode", Value::String(mode));
@@ -593,7 +588,7 @@ fn convert_reduce_mean(node: &NodeProto) -> Result<Vec<Operation>> {
 
     // Attribute form
     if let Some(axes) = get_int_list_attr(node, "axes") {
-        op = op.with_attr("axes", int_list_value(&axes));
+        op = op.with_attr("axes", int_tensor_value(&axes));
     }
     // Input form (opset 18+)
     if let Some(axes_input) = node.input.get(1).filter(|s| !s.is_empty()) {
@@ -662,7 +657,7 @@ fn convert_constant(node: &NodeProto) -> Result<Vec<Operation>> {
     } else if let Some(floats) = get_float_list_attr(node, "value_floats") {
         op = op.with_attr("val", float_list_value(&floats));
     } else if let Some(ints) = get_int_list_attr(node, "value_ints") {
-        op = op.with_attr("val", int_list_value(&ints));
+        op = op.with_attr("val", int_tensor_value(&ints));
     }
 
     Ok(vec![with_outputs(op, node)])
@@ -690,7 +685,7 @@ fn convert_split(node: &NodeProto) -> Result<Vec<Operation>> {
     }
     // Attribute form
     if let Some(split) = get_int_list_attr(node, "split") {
-        op = op.with_attr("split_sizes", int_list_value(&split));
+        op = op.with_attr("split_sizes", int_tensor_value(&split));
     }
     if let Some(axis) = get_int_attr(node, "axis") {
         op = op.with_attr("axis", Value::Int(axis));
@@ -717,22 +712,22 @@ fn convert_conv_transpose(node: &NodeProto) -> Result<Vec<Operation>> {
     op.inputs = inputs;
 
     if let Some(strides) = get_int_list_attr(node, "strides") {
-        op = op.with_attr("strides", int_list_value(&strides));
+        op = op.with_attr("strides", int_tensor_value(&strides));
     }
     if let Some(pads) = get_int_list_attr(node, "pads") {
-        op = op.with_attr("pad", int_list_value(&pads));
+        op = op.with_attr("pad", int_tensor_value(&pads));
     }
     if let Some(dilations) = get_int_list_attr(node, "dilations") {
-        op = op.with_attr("dilations", int_list_value(&dilations));
+        op = op.with_attr("dilations", int_tensor_value(&dilations));
     }
     if let Some(group) = get_int_attr(node, "group") {
         op = op.with_attr("groups", Value::Int(group));
     }
     if let Some(output_shape) = get_int_list_attr(node, "output_shape") {
-        op = op.with_attr("output_shape", int_list_value(&output_shape));
+        op = op.with_attr("output_shape", int_tensor_value(&output_shape));
     }
     if let Some(output_padding) = get_int_list_attr(node, "output_padding") {
-        op = op.with_attr("output_padding", int_list_value(&output_padding));
+        op = op.with_attr("output_padding", int_tensor_value(&output_padding));
     }
 
     Ok(vec![with_outputs(op, node)])

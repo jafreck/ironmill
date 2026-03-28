@@ -263,7 +263,7 @@ fn compile_from_onnx(
 
     // 6. Convert IR to proto
     let model =
-        program_to_model(&program, 7).context("Failed to convert MIL IR to CoreML protobuf")?;
+        program_to_model(&program, 9).context("Failed to convert MIL IR to CoreML protobuf")?;
 
     // 7. Write as .mlpackage
     let output_path = output.unwrap_or_else(|| {

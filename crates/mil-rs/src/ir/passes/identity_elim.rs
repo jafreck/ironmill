@@ -87,13 +87,20 @@ fn detect_identity(op: &crate::ir::operation::Operation) -> Option<(String, Stri
 
 /// Returns `true` if `perm` is the identity permutation `[0, 1, 2, …]`.
 fn is_identity_perm(perm: &Value) -> bool {
-    if let Value::List(items) = perm {
-        items.iter().enumerate().all(|(i, v)| match v {
+    match perm {
+        Value::List(items) => items.iter().enumerate().all(|(i, v)| match v {
             Value::Int(n) => *n as usize == i,
             _ => false,
-        })
-    } else {
-        false
+        }),
+        Value::Tensor {
+            data,
+            dtype: crate::ir::ScalarType::Int32,
+            ..
+        } => data
+            .chunks_exact(4)
+            .enumerate()
+            .all(|(i, c)| i32::from_le_bytes(c.try_into().unwrap()) as usize == i),
+        _ => false,
     }
 }
 

@@ -102,9 +102,13 @@ fn convert_graph(graph: &GraphProto, _opset: i64, warnings: &mut Vec<String>) ->
             onnx_type_map.insert(vi.name.clone(), tt);
         }
     }
-    // Initializers also have known types.
+    // Initializers also have known types.  int64 is narrowed to int32
+    // for CoreML compatibility, so update the type accordingly.
     for tensor in &graph.initializer {
-        if let Ok(dtype) = onnx_dtype_to_scalar(tensor.data_type) {
+        if let Ok(mut dtype) = onnx_dtype_to_scalar(tensor.data_type) {
+            if dtype == ScalarType::Int64 {
+                dtype = ScalarType::Int32;
+            }
             let shape: Vec<Option<usize>> = tensor.dims.iter().map(|&d| Some(d as usize)).collect();
             onnx_type_map.insert(
                 tensor.name.clone(),
@@ -188,11 +192,26 @@ fn stamp_output_types(op: &mut Operation, type_map: &HashMap<String, TensorType>
 // ---------------------------------------------------------------------------
 
 /// Convert an ONNX [`TensorProto`] (initializer/weight) to a MIL `const` [`Operation`].
+///
+/// CoreML MIL does not support int64 tensors in most operations, so int64
+/// initializers are automatically narrowed to int32.
 fn initializer_to_const(tensor: &TensorProto) -> Result<Operation> {
-    let dtype = onnx_dtype_to_scalar(tensor.data_type)?;
+    let mut dtype = onnx_dtype_to_scalar(tensor.data_type)?;
     let shape: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
 
-    let raw_bytes = extract_tensor_raw_data(tensor, dtype);
+    let mut raw_bytes = extract_tensor_raw_data(tensor, dtype);
+
+    // Narrow int64 → int32 for CoreML compatibility.
+    if dtype == ScalarType::Int64 {
+        raw_bytes = raw_bytes
+            .chunks_exact(8)
+            .flat_map(|c| {
+                let v = i64::from_le_bytes(c.try_into().unwrap());
+                (v as i32).to_le_bytes()
+            })
+            .collect();
+        dtype = ScalarType::Int32;
+    }
 
     let mut op = Operation::new("const", &tensor.name);
     op = op.with_output(&tensor.name);

@@ -114,47 +114,78 @@ fn insert_transposes(block: &mut Block) {
             new_ops.push(new_op);
         } else {
             // --- non-spatial op: transparent — inherits input layout ---
-            // Collect layouts for all reference inputs to detect mixed-layout
-            // scenarios (e.g., add with one NHWC and one NCHW operand).
-            let mut nhwc_inputs: Vec<String> = Vec::new();
-            let mut nchw_inputs: Vec<String> = Vec::new();
-            collect_ref_layouts(&op, &layout_map, &mut nhwc_inputs, &mut nchw_inputs);
 
-            let mut op = op;
-
-            if !nhwc_inputs.is_empty() && !nchw_inputs.is_empty() {
-                // Mixed layouts — normalize minority inputs to match majority.
-                let (targets, target_layout, perm) = if nhwc_inputs.len() >= nchw_inputs.len() {
-                    (nchw_inputs, Layout::NHWC, &NCHW_TO_NHWC)
-                } else {
-                    (nhwc_inputs, Layout::NCHW, &NHWC_TO_NCHW)
-                };
-
-                for input_name in &targets {
+            // Rank-changing ops (reshape, matmul, linear) invalidate the
+            // spatial layout assumption.  Force their outputs to NCHW so
+            // downstream transposes are not inserted for rank-2 tensors.
+            let rank_changes = matches!(
+                op.op_type.as_str(),
+                "reshape" | "matmul" | "linear" | "flatten"
+            );
+            if rank_changes {
+                // If any NHWC input is consumed, first transpose it back to
+                // NCHW before the rank-changing op.
+                let mut nhwc_inputs: Vec<String> = Vec::new();
+                collect_ref_layouts(&op, &layout_map, &mut nhwc_inputs, &mut Vec::new());
+                let mut op = op;
+                for input_name in &nhwc_inputs {
                     let t_out = format!("_layout_norm_{counter}");
                     counter += 1;
-                    let t_op = make_transpose(&t_out, input_name, perm, counter);
+                    let t_op = make_transpose(&t_out, input_name, &NHWC_TO_NCHW, counter);
                     counter += 1;
-                    layout_map.insert(t_out.clone(), target_layout);
+                    layout_map.insert(t_out.clone(), Layout::NCHW);
                     new_ops.push(t_op);
-
-                    // Rewrite every occurrence of this input in the op.
                     for value in op.inputs.values_mut() {
                         rename_in_value(value, input_name, &t_out);
                     }
                 }
-
                 for out in &op.outputs {
-                    layout_map.insert(out.clone(), target_layout);
+                    layout_map.insert(out.clone(), Layout::NCHW);
                 }
+                new_ops.push(op);
             } else {
-                let input_layout = infer_input_layout(&op, &layout_map);
-                for out in &op.outputs {
-                    layout_map.insert(out.clone(), input_layout);
-                }
-            }
+                // Collect layouts for all reference inputs to detect mixed-layout
+                // scenarios (e.g., add with one NHWC and one NCHW operand).
+                let mut nhwc_inputs: Vec<String> = Vec::new();
+                let mut nchw_inputs: Vec<String> = Vec::new();
+                collect_ref_layouts(&op, &layout_map, &mut nhwc_inputs, &mut nchw_inputs);
 
-            new_ops.push(op);
+                let mut op = op;
+
+                if !nhwc_inputs.is_empty() && !nchw_inputs.is_empty() {
+                    // Mixed layouts — normalize minority inputs to match majority.
+                    let (targets, target_layout, perm) = if nhwc_inputs.len() >= nchw_inputs.len() {
+                        (nchw_inputs, Layout::NHWC, &NCHW_TO_NHWC)
+                    } else {
+                        (nhwc_inputs, Layout::NCHW, &NHWC_TO_NCHW)
+                    };
+
+                    for input_name in &targets {
+                        let t_out = format!("_layout_norm_{counter}");
+                        counter += 1;
+                        let t_op = make_transpose(&t_out, input_name, perm, counter);
+                        counter += 1;
+                        layout_map.insert(t_out.clone(), target_layout);
+                        new_ops.push(t_op);
+
+                        // Rewrite every occurrence of this input in the op.
+                        for value in op.inputs.values_mut() {
+                            rename_in_value(value, input_name, &t_out);
+                        }
+                    }
+
+                    for out in &op.outputs {
+                        layout_map.insert(out.clone(), target_layout);
+                    }
+                } else {
+                    let input_layout = infer_input_layout(&op, &layout_map);
+                    for out in &op.outputs {
+                        layout_map.insert(out.clone(), input_layout);
+                    }
+                }
+
+                new_ops.push(op);
+            }
         }
     }
 
@@ -263,11 +294,20 @@ fn rename_in_value(value: &mut Value, old_name: &str, new_name: &str) {
 
 /// Build a `transpose` [`Operation`].
 fn make_transpose(output: &str, input: &str, perm: &[i64; 4], id: usize) -> Operation {
+    use super::super::tensor::ScalarType;
+    let perm_data: Vec<u8> = perm
+        .iter()
+        .flat_map(|&v| (v as i32).to_le_bytes())
+        .collect();
     Operation::new("transpose", format!("_layout_transpose_{id}"))
         .with_input("x", Value::Reference(input.to_string()))
         .with_input(
             "perm",
-            Value::List(perm.iter().map(|&p| Value::Int(p)).collect()),
+            Value::Tensor {
+                data: perm_data,
+                shape: vec![perm.len()],
+                dtype: ScalarType::Int32,
+            },
         )
         .with_output(output)
 }
@@ -350,17 +390,27 @@ fn get_perm(op: &Operation) -> Option<Vec<usize>> {
         .inputs
         .get("perm")
         .or_else(|| op.attributes.get("perm"))?;
-    if let Value::List(items) = perm_val {
-        let mut perm = Vec::with_capacity(items.len());
-        for item in items {
-            match item {
-                Value::Int(n) => perm.push(*n as usize),
-                _ => return None,
+    match perm_val {
+        Value::List(items) => {
+            let mut perm = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Int(n) => perm.push(*n as usize),
+                    _ => return None,
+                }
             }
+            Some(perm)
         }
-        Some(perm)
-    } else {
-        None
+        Value::Tensor {
+            data,
+            dtype: super::super::tensor::ScalarType::Int32,
+            ..
+        } => Some(
+            data.chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as usize)
+                .collect(),
+        ),
+        _ => None,
     }
 }
 
@@ -427,16 +477,23 @@ mod tests {
     fn assert_perm(op: &Operation, expected: &[i64]) {
         assert_eq!(op.op_type, "transpose");
         let perm = op.inputs.get("perm").expect("transpose should have perm");
-        let got: Vec<i64> = if let Value::List(items) = perm {
-            items
+        let got: Vec<i64> = match perm {
+            Value::List(items) => items
                 .iter()
                 .map(|v| match v {
                     Value::Int(n) => *n,
                     _ => panic!("perm items should be Int"),
                 })
-                .collect()
-        } else {
-            panic!("perm should be a List");
+                .collect(),
+            Value::Tensor {
+                data,
+                dtype: crate::ir::tensor::ScalarType::Int32,
+                ..
+            } => data
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64)
+                .collect(),
+            _ => panic!("perm should be a List or int32 Tensor, got {:?}", perm),
         };
         assert_eq!(got, expected);
     }
