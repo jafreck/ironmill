@@ -6,3 +6,6 @@ tests/fixtures/*.onnx
 tests/fixtures/*.mlmodel
 # Keep the mlpackage directory structure (it's small)
 # Keep the README
+
+# Swift Package Manager build artifacts
+.build/
