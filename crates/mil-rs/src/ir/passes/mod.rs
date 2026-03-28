@@ -6,10 +6,12 @@
 pub mod constant_fold;
 pub mod dead_code;
 pub mod identity_elim;
+pub mod shape_materialize;
 
 pub use constant_fold::ConstantFoldPass;
 pub use dead_code::DeadCodeEliminationPass;
 pub use identity_elim::IdentityEliminationPass;
+pub use shape_materialize::ShapeMaterializePass;
 
 use super::program::Block;
 use super::types::Value;

@@ -3,7 +3,10 @@ use std::process;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mil_rs::ir::{ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass, Pass};
+use mil_rs::ir::{
+    ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass, Pass,
+    ShapeMaterializePass,
+};
 use mil_rs::validate::print_validation_report;
 use mil_rs::{
     compile_model, is_compiler_available, onnx_to_program, program_to_model, read_mlmodel,
@@ -40,6 +43,11 @@ enum Commands {
         /// Quantization mode: "none", "fp16", "int8".
         #[arg(short, long, default_value = "none")]
         quantize: String,
+
+        /// Set a concrete shape for a named input (for ANE compatibility).
+        /// Format: "name:d0,d1,d2,...". May be repeated.
+        #[arg(long = "input-shape", value_name = "NAME:SHAPE")]
+        input_shapes: Vec<String>,
     },
 
     /// Inspect a model and show its structure.
@@ -73,13 +81,30 @@ fn run() -> Result<()> {
             output,
             target,
             quantize,
-        } => cmd_compile(&input, output, &target, &quantize),
+            input_shapes,
+        } => cmd_compile(&input, output, &target, &quantize, &input_shapes),
         Commands::Inspect { input } => cmd_inspect(&input),
         Commands::Validate { input } => cmd_validate(&input),
     }
 }
 
-fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str) -> Result<()> {
+/// Parse an `--input-shape` value like `"input:1,3,224,224"` into `(name, dims)`.
+fn parse_input_shape(s: &str) -> Result<(String, Vec<usize>)> {
+    let (name, dims_str) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid --input-shape format: expected 'name:d0,d1,...', got '{s}'"))?;
+    let dims: Vec<usize> = dims_str
+        .split(',')
+        .map(|d| {
+            d.trim()
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("invalid dimension '{d}' in --input-shape '{s}'"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((name.to_string(), dims))
+}
+
+fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str, input_shapes: &[String]) -> Result<()> {
     let input_path = Path::new(input);
     if !input_path.exists() {
         bail!("Input file not found: {input}");
@@ -99,7 +124,7 @@ fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str
     }
 
     match ext.as_str() {
-        "onnx" => compile_from_onnx(input_path, output),
+        "onnx" => compile_from_onnx(input_path, output, input_shapes),
         "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext),
         _ => bail!(
             "Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"
@@ -107,7 +132,7 @@ fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str
     }
 }
 
-fn compile_from_onnx(input_path: &Path, output: Option<String>) -> Result<()> {
+fn compile_from_onnx(input_path: &Path, output: Option<String>, input_shapes: &[String]) -> Result<()> {
     let input_display = input_path.display();
 
     // 1. Read ONNX model
@@ -130,7 +155,22 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>) -> Result<()> {
     );
     println!();
 
-    // 3. Run optimization passes
+    // 3. Run shape materialization if --input-shape was provided.
+    if !input_shapes.is_empty() {
+        let mut shape_pass = ShapeMaterializePass::new();
+        for raw in input_shapes {
+            let (name, dims) = parse_input_shape(raw)?;
+            shape_pass = shape_pass.with_shape(name, dims);
+        }
+        println!("Materializing input shapes...");
+        shape_pass
+            .run(&mut program)
+            .context("Shape materialization failed")?;
+        println!("  shape-materialization: done");
+        println!();
+    }
+
+    // 4. Run optimization passes
     println!("Running optimization passes...");
     let passes: Vec<Box<dyn Pass>> = vec![
         Box::new(DeadCodeEliminationPass),
@@ -153,11 +193,11 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>) -> Result<()> {
     }
     println!();
 
-    // 4. Convert IR to proto
+    // 5. Convert IR to proto
     let model = program_to_model(&program, 7)
         .context("Failed to convert MIL IR to CoreML protobuf")?;
 
-    // 5. Write as .mlpackage
+    // 6. Write as .mlpackage
     let output_path = output.unwrap_or_else(|| {
         let stem = input_path
             .file_stem()
@@ -169,7 +209,7 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>) -> Result<()> {
     write_mlpackage(&model, &output_path)
         .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
-    // 6. Optionally compile with xcrun
+    // 7. Optionally compile with xcrun
     if is_compiler_available() {
         println!("Compiling with xcrun coremlcompiler...");
         let output_dir = Path::new(&output_path)
@@ -184,7 +224,7 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>) -> Result<()> {
         println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
     }
 
-    // 7. Print warnings
+    // 8. Print warnings
     if !warnings.is_empty() {
         println!();
         println!("Warnings:");
