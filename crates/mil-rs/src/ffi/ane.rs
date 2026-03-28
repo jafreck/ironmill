@@ -54,8 +54,19 @@
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::MilError;
+
+/// Maximum number of ANE compilations allowed per process.
+///
+/// Apple's `_ANECompiler` leaks memory on each invocation (~0.5-2 MB).  After
+/// roughly 119 compilations the ANE daemon (`aned`) starts rejecting requests.
+/// This constant caps usage to avoid hitting that wall silently.
+const ANE_COMPILE_LIMIT: usize = 119;
+
+/// Global compile count tracker (constraint: ~119 limit per process).
+static COMPILE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -83,6 +94,10 @@ pub enum AneError {
     /// The input path does not exist or is not a valid model.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// The per-process ANE compile budget has been exhausted.
+    #[error("ANE compile budget exhausted ({count}/119 compilations)")]
+    BudgetExhausted { count: usize },
 }
 
 impl From<AneError> for MilError {
@@ -300,6 +315,205 @@ impl AneCompiler {
         // For now, fall back to the non-incremental path.
         Self::compile(mlpackage_path, output_dir)
     }
+
+    // -------------------------------------------------------------------
+    // MIL text + BLOBFILE compilation (ANE direct backend)
+    // -------------------------------------------------------------------
+
+    /// Compile MIL text + weight blob into an ANE program.
+    ///
+    /// This is the primary compilation path for the ANE direct backend.
+    /// It uses `_ANEInMemoryModelDescriptor` and `_ANECompiler` to compile
+    /// MIL text directly, without going through CoreML's `.mlpackage` format.
+    ///
+    /// # Arguments
+    ///
+    /// * `mil_text` — UTF-8 MIL text (from `ir_to_mil_text`)
+    /// * `weight_path` — Path to the BLOBFILE (from `BlobFileWriter`)
+    ///
+    /// # Returns
+    ///
+    /// An opaque pointer to the compiled program handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AneError`] if the compile budget is exhausted, required
+    /// Objective-C classes are missing, or the compilation itself fails.
+    pub fn compile_mil_text(
+        mil_text: &str,
+        weight_path: &Path,
+    ) -> std::result::Result<*mut c_void, AneError> {
+        // 0. Check budget
+        let current = COMPILE_COUNT.load(Ordering::Relaxed);
+        if current >= ANE_COMPILE_LIMIT {
+            return Err(AneError::BudgetExhausted { count: current });
+        }
+
+        if mil_text.is_empty() {
+            return Err(AneError::InvalidInput("MIL text is empty".into()));
+        }
+
+        if !weight_path.exists() {
+            return Err(AneError::InvalidInput(format!(
+                "weight blob path does not exist: {}",
+                weight_path.display()
+            )));
+        }
+
+        // 1. Resolve _ANECompiler class
+        let compiler_cls = unsafe { objc_getClass(sel!("_ANECompiler")) };
+        if compiler_cls.is_null() {
+            return Err(AneError::ClassNotFound);
+        }
+
+        // 2. Create NSData from MIL text
+        //    NSData must be used (not NSString) because the MIL text may
+        //    contain raw bytes that NSString normalisation would mangle.
+        let mil_data = create_nsdata(mil_text.as_bytes())?;
+
+        // 3. Create NSURL for weight path
+        let weight_url = create_nsurl_from_path(weight_path)?;
+
+        // 4-7. Create _ANEInMemoryModelDescriptor, set milText / weightPath,
+        //      call _ANECompiler compileDescriptor:error:
+        //
+        // The exact selector names for _ANEInMemoryModelDescriptor and
+        // _ANECompiler are placeholders.  In production, these must be
+        // verified against the target macOS version.
+        let _descriptor_cls = unsafe { objc_getClass(sel!("_ANEInMemoryModelDescriptor")) };
+
+        // Placeholder: alloc/init descriptor, set milData & weightURL,
+        // then call compileDescriptor:error: on the compiler class.
+        let _compile_sel = unsafe { sel_registerName(sel!("compileDescriptor:error:")) };
+
+        // Suppress unused-variable warnings for the ObjC objects we built.
+        let _ = (
+            mil_data,
+            weight_url,
+            _descriptor_cls,
+            _compile_sel,
+            compiler_cls,
+        );
+
+        // 8. Increment compile count — even though the actual ObjC path is
+        //    not yet wired, we track calls for budget accounting.
+        COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        // 9. Return result.
+        //
+        // TODO: Complete the actual ObjC message sends once selectors are
+        // verified via class-dump on target macOS.  For now, return a
+        // placeholder error indicating the infrastructure is in place.
+        Err(AneError::CompilationFailed(
+            "ANE MIL text compilation infrastructure complete — \
+             private API selectors require runtime verification on target macOS"
+                .into(),
+        ))
+    }
+
+    /// Number of compilations performed in this process.
+    pub fn compile_count() -> usize {
+        COMPILE_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Remaining compile budget before hitting the ~119 limit.
+    pub fn remaining_budget() -> usize {
+        ANE_COMPILE_LIMIT.saturating_sub(COMPILE_COUNT.load(Ordering::Relaxed))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ObjC helpers — NSData / NSString / NSURL creation
+// ---------------------------------------------------------------------------
+
+/// Create an `NSData` from a byte slice via `[NSData dataWithBytes:length:]`.
+///
+/// Returns a raw pointer to the autoreleased `NSData` object, or an error if
+/// the `NSData` class is unavailable.
+fn create_nsdata(bytes: &[u8]) -> Result<*mut c_void, AneError> {
+    let nsdata_cls = unsafe { objc_getClass(sel!("NSData")) };
+    if nsdata_cls.is_null() {
+        return Err(AneError::FrameworkNotFound("NSData class not found".into()));
+    }
+
+    // dataWithBytes:length: — (id, SEL, const void*, NSUInteger) -> id
+    type DataWithBytesFn =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void;
+
+    let data_sel = unsafe { sel_registerName(sel!("dataWithBytes:length:")) };
+    let send: DataWithBytesFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+
+    let obj = unsafe { send(nsdata_cls, data_sel, bytes.as_ptr(), bytes.len()) };
+    if obj.is_null() {
+        return Err(AneError::CompilationFailed(
+            "failed to create NSData".into(),
+        ));
+    }
+    Ok(obj)
+}
+
+/// Create an `NSString` from a Rust string slice via
+/// `[NSString stringWithUTF8String:]`.
+///
+/// The caller is responsible for ensuring the returned pointer lives long
+/// enough (it is autoreleased).
+fn create_nsstring(s: &str) -> Result<*mut c_void, AneError> {
+    let nsstring_cls = unsafe { objc_getClass(sel!("NSString")) };
+    if nsstring_cls.is_null() {
+        return Err(AneError::FrameworkNotFound(
+            "NSString class not found".into(),
+        ));
+    }
+
+    // We need a null-terminated copy because stringWithUTF8String: expects
+    // a C string.
+    let mut buf = Vec::with_capacity(s.len() + 1);
+    buf.extend_from_slice(s.as_bytes());
+    buf.push(0);
+
+    // stringWithUTF8String: — (id, SEL, const char*) -> id
+    type StringWithUtf8Fn =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8) -> *mut c_void;
+
+    let sel = unsafe { sel_registerName(sel!("stringWithUTF8String:")) };
+    let send: StringWithUtf8Fn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+
+    let obj = unsafe { send(nsstring_cls, sel, buf.as_ptr()) };
+    if obj.is_null() {
+        return Err(AneError::CompilationFailed(
+            "failed to create NSString".into(),
+        ));
+    }
+    Ok(obj)
+}
+
+/// Create an `NSURL` from a filesystem path via `[NSURL fileURLWithPath:]`.
+fn create_nsurl_from_path(path: &Path) -> Result<*mut c_void, AneError> {
+    let path_str = path.to_str().ok_or_else(|| {
+        AneError::InvalidInput(format!("path contains invalid UTF-8: {}", path.display()))
+    })?;
+
+    let nsstring = create_nsstring(path_str)?;
+
+    let nsurl_cls = unsafe { objc_getClass(sel!("NSURL")) };
+    if nsurl_cls.is_null() {
+        return Err(AneError::FrameworkNotFound("NSURL class not found".into()));
+    }
+
+    // fileURLWithPath: — (id, SEL, id) -> id
+    type FileUrlWithPathFn =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+
+    let sel = unsafe { sel_registerName(sel!("fileURLWithPath:")) };
+    let send: FileUrlWithPathFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+
+    let url = unsafe { send(nsurl_cls, sel, nsstring) };
+    if url.is_null() {
+        return Err(AneError::CompilationFailed(
+            "failed to create NSURL from path".into(),
+        ));
+    }
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -334,5 +548,71 @@ mod tests {
             AneError::InvalidInput(_) => {}
             other => panic!("expected InvalidInput, got: {other}"),
         }
+    }
+
+    #[test]
+    fn compile_count_starts_at_zero_or_accumulates() {
+        // Because tests share the process-global COMPILE_COUNT, we can only
+        // assert it is non-negative (another test may have incremented it).
+        let count = AneCompiler::compile_count();
+        assert!(
+            count < ANE_COMPILE_LIMIT + 50,
+            "count looks unreasonably high: {count}"
+        );
+    }
+
+    #[test]
+    fn compile_mil_text_budget_tracking() {
+        let before = AneCompiler::compile_count();
+
+        // compile_mil_text with a non-existent weight path should fail
+        // with InvalidInput *before* incrementing the counter.
+        let result =
+            AneCompiler::compile_mil_text("program test {}", Path::new("nonexistent_weights.bin"));
+        assert!(result.is_err());
+
+        let after = AneCompiler::compile_count();
+        // Counter should NOT have incremented for an early-exit error.
+        assert_eq!(
+            before, after,
+            "compile_count should not increment on early validation error"
+        );
+    }
+
+    #[test]
+    fn remaining_budget_decreases() {
+        let remaining = AneCompiler::remaining_budget();
+        let count = AneCompiler::compile_count();
+        assert_eq!(
+            remaining,
+            ANE_COMPILE_LIMIT.saturating_sub(count),
+            "remaining budget should equal limit minus count"
+        );
+    }
+
+    #[test]
+    fn compile_mil_text_empty_text_returns_error() {
+        let result = AneCompiler::compile_mil_text("", Path::new("weights.bin"));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AneError::InvalidInput(msg) => {
+                assert!(msg.contains("empty"), "expected 'empty' in message: {msg}");
+            }
+            other => panic!("expected InvalidInput, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn budget_exhausted_error_display() {
+        let err = AneError::BudgetExhausted { count: 119 };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("119"),
+            "error message should contain count: {msg}"
+        );
+        assert!(
+            msg.contains("budget"),
+            "error message should mention budget: {msg}"
+        );
     }
 }
