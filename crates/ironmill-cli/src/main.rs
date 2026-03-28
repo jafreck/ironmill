@@ -135,6 +135,10 @@ enum Commands {
         /// Outputs: <name>-draft.mlpackage and <name>-verifier.mlpackage.
         #[arg(long = "split-draft-layers", value_name = "N")]
         split_draft_layers: Option<usize>,
+
+        /// Detect MoE architecture and split into per-expert .mlpackage files.
+        #[arg(long = "moe-split")]
+        moe_split: bool,
     },
 
     /// Inspect a model and show its structure.
@@ -193,6 +197,7 @@ fn run() -> Result<()> {
             loss_function,
             optimizer_type,
             split_draft_layers,
+            moe_split,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -213,6 +218,7 @@ fn run() -> Result<()> {
                 loss_function,
                 optimizer_type,
                 split_draft_layers,
+                moe_split,
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -257,6 +263,7 @@ struct CompileOpts {
     loss_function: String,
     optimizer_type: String,
     split_draft_layers: Option<usize>,
+    moe_split: bool,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -280,7 +287,12 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
 
     match ext.as_str() {
         "onnx" => compile_from_onnx(input_path, &opts),
-        "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext, opts.backend),
+        "mlmodel" | "mlpackage" => {
+            if opts.moe_split {
+                println!("Note: --moe-split is only supported for ONNX input. Ignoring.");
+            }
+            compile_coreml(input_path, &ext, opts.backend)
+        }
         _ => bail!("Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"),
     }
 }
@@ -382,6 +394,58 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         }
     }
     println!();
+
+    // 5. MoE split (if requested)
+    if opts.moe_split {
+        use mil_rs::{detect_moe, split_moe};
+
+        if let Some(topology) = detect_moe(&program) {
+            println!(
+                "MoE architecture detected: {} experts",
+                topology.expert_count
+            );
+            let split_result = split_moe(&program, &topology);
+
+            let stem = input_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+
+            // Write shared program
+            let shared_model = program_to_model(&split_result.shared, 9)
+                .context("Failed to convert shared program to CoreML")?;
+            let shared_path = format!("{stem}-shared.mlpackage");
+            println!("  Writing shared layers: {shared_path}");
+            write_mlpackage(&shared_model, &shared_path)
+                .with_context(|| format!("Failed to write {shared_path}"))?;
+
+            // Write per-expert programs
+            for (i, expert) in split_result.experts.iter().enumerate() {
+                let expert_model = program_to_model(expert, 9)
+                    .with_context(|| format!("Failed to convert expert {i} to CoreML"))?;
+                let expert_path = format!("{stem}-expert-{i}.mlpackage");
+                println!("  Writing expert {i}: {expert_path}");
+                write_mlpackage(&expert_model, &expert_path)
+                    .with_context(|| format!("Failed to write {expert_path}"))?;
+            }
+
+            // Write manifest
+            let manifest_path = format!("{stem}-manifest.json");
+            let manifest_json = serde_json::to_string_pretty(&split_result.manifest)
+                .context("Failed to serialize MoE manifest")?;
+            std::fs::write(&manifest_path, &manifest_json)
+                .with_context(|| format!("Failed to write {manifest_path}"))?;
+            println!("  Wrote manifest: {manifest_path}");
+
+            println!();
+            println!("MoE split complete.");
+            return Ok(());
+        } else {
+            println!(
+                "Note: --moe-split specified but no MoE pattern detected. Producing single output."
+            );
+        }
+    }
 
     // 6. Handle model splitting for speculative decoding, or normal single-model output.
     if let Some(n_layers) = opts.split_draft_layers {

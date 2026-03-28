@@ -11,6 +11,7 @@
 
 pub mod ir_to_proto;
 pub mod lora;
+pub mod moe;
 pub mod onnx_graph;
 pub mod onnx_to_mil;
 pub mod pipeline;

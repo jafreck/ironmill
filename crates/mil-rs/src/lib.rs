@@ -91,6 +91,12 @@ pub use convert::program_to_updatable_model;
 /// Configuration for producing an updatable CoreML model.
 pub use convert::{LossFunction, UpdatableModelConfig, UpdateOptimizer};
 
+/// Detect Mixture-of-Experts architecture in a MIL [`Program`].
+pub use convert::moe::detect_moe;
+/// Split a MoE program into shared layers and per-expert programs.
+pub use convert::moe::split_moe;
+pub use convert::moe::{MoeManifest, MoeSplitResult, MoeTopology};
+
 /// Error type for all operations in this crate.
 pub use error::MilError;
 

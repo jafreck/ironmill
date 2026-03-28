@@ -365,6 +365,7 @@ dependencies = [
  "anyhow",
  "clap",
  "mil-rs",
+ "serde_json",
 ]
 
 [[package]]
