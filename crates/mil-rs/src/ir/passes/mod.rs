@@ -35,7 +35,10 @@ pub use identity_elim::IdentityEliminationPass;
 pub use int8_quantize::{Granularity, Int8QuantizePass};
 pub use kv_cache::KvCachePass;
 pub use layout_optimize::LayoutOptimizationPass;
-pub use mixed_precision::{MixedPrecisionConfig, MixedPrecisionPass, OpPrecision};
+pub use mixed_precision::{
+    ExpertQuantConfig, ExpertQuantStrategy, MixedPrecisionConfig, MixedPrecisionPass, OpPrecision,
+    PerExpertQuantPass,
+};
 pub use model_split::{ModelSplitPass, SplitResult};
 pub use op_fusion::{
     ConvBatchNormFusionPass, ConvReluFusionPass, GeluLinearFusionPass, LayerNormLinearFusionPass,

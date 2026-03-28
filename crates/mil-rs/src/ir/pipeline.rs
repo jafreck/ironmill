@@ -11,11 +11,11 @@ use super::pass::Pass;
 use super::passes::{
     AttentionFusionPass, CodebookOptimizationPass, ComputeUnitAnnotationPass, ConstantFoldPass,
     ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
-    DeadCodeEliminationPass, Fp16QuantizePass, GeluLinearFusionPass, GqaFusionPass, Granularity,
-    IdentityEliminationPass, Int8QuantizePass, KvCachePass, LayerNormLinearFusionPass,
-    LayoutOptimizationPass, LinearReluFusionPass, MixedPrecisionConfig, MixedPrecisionPass,
-    OpSplittingPass, OpSubstitutionPass, PalettizePass, ResidualAddFusionPass,
-    ShapeMaterializePass,
+    DeadCodeEliminationPass, ExpertQuantConfig, Fp16QuantizePass, GeluLinearFusionPass,
+    GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass, KvCachePass,
+    LayerNormLinearFusionPass, LayoutOptimizationPass, LinearReluFusionPass, MixedPrecisionConfig,
+    MixedPrecisionPass, OpSplittingPass, OpSubstitutionPass, PalettizePass, PerExpertQuantPass,
+    ResidualAddFusionPass, ShapeMaterializePass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -80,6 +80,7 @@ const KNOWN_PASSES: &[&str] = &[
     "int8-quantization",
     "mixed-precision",
     "palettization",
+    "per-expert-quantization",
     "shape-materialization",
     "compute-unit-annotation",
     "op-splitting",
@@ -187,6 +188,33 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
                 })
                 .unwrap_or(super::passes::op_split::DEFAULT_MEMORY_BUDGET);
             Ok(Box::new(OpSplittingPass::new(budget)))
+        }
+        "per-expert-quantization" => {
+            let config_path = params
+                .get("config_path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from);
+            if let Some(path) = config_path {
+                let pass = PerExpertQuantPass::from_config_file(&path)?;
+                Ok(Box::new(pass))
+            } else {
+                // Default: hot experts 0,1 in FP16, everything else 4-bit palettize.
+                let total = params
+                    .get("total_experts")
+                    .and_then(|v| v.as_integer())
+                    .unwrap_or(8) as usize;
+                let hot: Vec<usize> = params
+                    .get("hot_experts")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_integer().map(|i| i as usize))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec![0, 1]);
+                let config = ExpertQuantConfig::preset_hot_cold(&hot, total);
+                Ok(Box::new(PerExpertQuantPass::new(config)))
+            }
         }
         _ => Err(MilError::Validation(format!("unknown pass: '{name}'"))),
     }
@@ -409,6 +437,16 @@ impl PassPipeline {
         Ok(self)
     }
 
+    /// Add per-expert quantization from an [`ExpertQuantConfig`].
+    ///
+    /// This pass applies different compression strategies to different experts
+    /// in a Mixture-of-Experts model, based on activation frequency profiles.
+    pub fn with_per_expert_quant(mut self, config: ExpertQuantConfig) -> Result<Self> {
+        self.has_mixed_precision = true;
+        self.passes.push(Box::new(PerExpertQuantPass::new(config)));
+        Ok(self)
+    }
+
     /// Add shape materialization with user-provided shapes.
     ///
     /// The shape pass is inserted before any quantization/palettization passes.
@@ -427,6 +465,7 @@ impl PassPipeline {
                     || name == "int8-quantization"
                     || name == "palettization"
                     || name == "mixed-precision-quantization"
+                    || name == "per-expert-quantization"
             })
             .unwrap_or(self.passes.len());
         self.passes.insert(insert_pos, Box::new(shape_pass));
