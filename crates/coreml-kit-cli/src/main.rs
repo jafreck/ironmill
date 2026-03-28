@@ -4,7 +4,7 @@ use std::process;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mil_rs::ir::{
-    ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass, Pass,
+    ConstantFoldPass, DeadCodeEliminationPass, Fp16QuantizePass, IdentityEliminationPass, Pass,
     ShapeMaterializePass,
 };
 use mil_rs::validate::print_validation_report;
@@ -119,12 +119,9 @@ fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str
     if target != "all" {
         println!("Note: --target '{target}' will be fully supported in Phase 3. Proceeding with default target.");
     }
-    if quantize != "none" {
-        println!("Note: --quantize '{quantize}' will be fully supported in Phase 3. Proceeding without quantization.");
-    }
 
     match ext.as_str() {
-        "onnx" => compile_from_onnx(input_path, output, input_shapes),
+        "onnx" => compile_from_onnx(input_path, output, quantize, input_shapes),
         "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext),
         _ => bail!(
             "Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"
@@ -132,7 +129,7 @@ fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str
     }
 }
 
-fn compile_from_onnx(input_path: &Path, output: Option<String>, input_shapes: &[String]) -> Result<()> {
+fn compile_from_onnx(input_path: &Path, output: Option<String>, quantize: &str, input_shapes: &[String]) -> Result<()> {
     let input_display = input_path.display();
 
     // 1. Read ONNX model
@@ -193,11 +190,24 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>, input_shapes: &[
     }
     println!();
 
-    // 5. Convert IR to proto
+    // 5. Quantization
+    if quantize == "fp16" {
+        println!("Quantizing to FP16...");
+        Fp16QuantizePass
+            .run(&mut program)
+            .context("FP16 quantization pass failed")?;
+        println!("  fp16-quantization: done");
+        println!();
+    } else if quantize != "none" {
+        println!("Note: --quantize '{quantize}' is not yet supported. Proceeding without quantization.");
+        println!();
+    }
+
+    // 6. Convert IR to proto
     let model = program_to_model(&program, 7)
         .context("Failed to convert MIL IR to CoreML protobuf")?;
 
-    // 6. Write as .mlpackage
+    // 7. Write as .mlpackage
     let output_path = output.unwrap_or_else(|| {
         let stem = input_path
             .file_stem()
@@ -209,7 +219,7 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>, input_shapes: &[
     write_mlpackage(&model, &output_path)
         .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
-    // 7. Optionally compile with xcrun
+    // 8. Optionally compile with xcrun
     if is_compiler_available() {
         println!("Compiling with xcrun coremlcompiler...");
         let output_dir = Path::new(&output_path)
@@ -224,7 +234,7 @@ fn compile_from_onnx(input_path: &Path, output: Option<String>, input_shapes: &[
         println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
     }
 
-    // 8. Print warnings
+    // 9. Print warnings
     if !warnings.is_empty() {
         println!();
         println!("Warnings:");

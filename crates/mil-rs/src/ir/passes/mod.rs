@@ -5,11 +5,13 @@
 
 pub mod constant_fold;
 pub mod dead_code;
+pub mod fp16_quantize;
 pub mod identity_elim;
 pub mod shape_materialize;
 
 pub use constant_fold::ConstantFoldPass;
 pub use dead_code::DeadCodeEliminationPass;
+pub use fp16_quantize::Fp16QuantizePass;
 pub use identity_elim::IdentityEliminationPass;
 pub use shape_materialize::ShapeMaterializePass;
 
