@@ -7,8 +7,8 @@ use super::pass::Pass;
 use super::passes::{
     AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass,
     ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass, Granularity,
-    IdentityEliminationPass, Int8QuantizePass, LayoutOptimizationPass, LinearReluFusionPass,
-    OpSubstitutionPass, PalettizePass, ShapeMaterializePass,
+    IdentityEliminationPass, Int8QuantizePass, LinearReluFusionPass, OpSubstitutionPass,
+    PalettizePass, ShapeMaterializePass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -46,7 +46,7 @@ impl PassPipeline {
     ///
     /// Includes cleanup (DCE, identity elimination, constant folding),
     /// fusion (conv-bn weight fold, conv-bn fusion, conv-relu, linear-relu),
-    /// and optimization (attention fusion, op substitution, layout optimization).
+    /// and optimization (attention fusion, op substitution).
     pub fn new() -> Self {
         Self {
             passes: vec![
@@ -59,10 +59,12 @@ impl PassPipeline {
                 Box::new(ConvBatchNormFusionPass),
                 Box::new(ConvReluFusionPass),
                 Box::new(LinearReluFusionPass),
-                // Optimization passes (8-10)
+                // Optimization passes (8-9)
                 Box::new(AttentionFusionPass),
                 Box::new(OpSubstitutionPass),
-                Box::new(LayoutOptimizationPass),
+                // NOTE: LayoutOptimizationPass disabled — it inserts transpose ops
+                // that cause CoreML to segfault at runtime. Re-enable once transpose
+                // serialization (output_types + perm encoding) is fixed.
             ],
             has_fp16: false,
             has_int8: false,
@@ -224,6 +226,7 @@ mod tests {
     fn default_pipeline_has_all_always_on_passes() {
         let pipeline = PassPipeline::new();
         let names = pipeline.pass_names();
+        // layout-optimization is intentionally excluded — see note in new()
         assert_eq!(
             names,
             vec![
@@ -236,7 +239,6 @@ mod tests {
                 "linear-relu-fusion",
                 "attention-fusion",
                 "op-substitution",
-                "layout-optimization",
             ]
         );
     }
@@ -335,7 +337,7 @@ mod tests {
     #[test]
     fn default_trait_works() {
         let pipeline = PassPipeline::default();
-        assert_eq!(pipeline.pass_names().len(), 10);
+        assert_eq!(pipeline.pass_names().len(), 9);
     }
 
     #[test]

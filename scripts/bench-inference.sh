@@ -44,7 +44,7 @@ trap cleanup EXIT
 
 fmt_ms() {
     # Format a millisecond value for display
-    awk "BEGIN { v = $1; if (v < 1) printf \"%.1fµs\", v*1000; else if (v < 1000) printf \"%.1fms\", v; else printf \"%.2fs\", v/1000 }"
+    awk "BEGIN { v = $1; if (v < 1) printf \"%.1f\302\265s\", v*1000; else if (v < 1000) printf \"%.1fms\", v; else printf \"%.2fs\", v/1000 }"
 }
 
 # ─── Step 1: Build ironmill ─────────────────────────────────────────────────
