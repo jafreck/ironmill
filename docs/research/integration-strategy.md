@@ -83,7 +83,7 @@ Future (separate repo):
               │                │                │
               ▼                ▼                ▼
    ┌──────────────────┐ ┌───────────┐ ┌───────────────┐
-   │  candle-coreml   │ │ burn-     │ │ coreml-kit    │
+   │  candle-coreml   │ │ burn-     │ │ ironmill    │
    │  (existing,      │ │ coreml   │ │ CLI           │
    │   adds optional  │ │ (future) │ │ (this project)│
    │   mil-rs dep)    │ │          │ │               │
@@ -101,7 +101,7 @@ Future (separate repo):
 | Crate | Owns | Depends on |
 |---|---|---|
 | `mil-rs` | CoreML protobuf types, MIL IR, ONNX→MIL conversion | `prost` (protobuf) |
-| `coreml-kit` CLI | User-facing conversion tool | `mil-rs` |
+| `ironmill` CLI | User-facing conversion tool | `mil-rs` |
 | `candle-coreml` | Candle↔CoreML tensor bridge, inference | `candle-core`, optionally `mil-rs` |
 | `burn-coreml` | Burn `Backend` trait impl for CoreML | `burn-core`, `mil-rs` |
 
@@ -114,10 +114,10 @@ Future (separate repo):
 - Published to crates.io independently
 - **No dependency on candle or burn**
 
-### Phase 2: `coreml-kit` CLI
+### Phase 2: `ironmill` CLI
 - Uses `mil-rs` for conversion
 - Calls `xcrun coremlcompiler` for final compilation
-- `cargo install coreml-kit` — a standalone tool
+- `cargo install ironmill` — a standalone tool
 
 ### Phase 3: Ecosystem bridges (PRs to existing projects)
 - **PR to `candle-coreml`**: Add optional `mil-rs` dependency, enabling

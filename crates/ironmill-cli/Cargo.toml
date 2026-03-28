@@ -1,5 +1,5 @@
 [package]
-name = "coreml-kit-cli"
+name = "ironmill-cli"
 description = "CLI tool for converting and optimizing ML models for Apple's Neural Engine via CoreML"
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "coreml-kit"
+name = "ironmill"
 path = "src/main.rs"
 
 [dependencies]

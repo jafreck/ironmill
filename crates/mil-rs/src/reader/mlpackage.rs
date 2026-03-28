@@ -134,7 +134,7 @@ mod tests {
 
         let item = &manifest.item_info_entries["com.apple.CoreML/model.mlmodel"];
         assert_eq!(item.path, "com.apple.CoreML/model.mlmodel");
-        assert_eq!(item.author.as_deref(), Some("coreml-kit test fixture"));
+        assert_eq!(item.author.as_deref(), Some("ironmill test fixture"));
         assert_eq!(item.description.as_deref(), Some("Minimal test model"));
     }
 

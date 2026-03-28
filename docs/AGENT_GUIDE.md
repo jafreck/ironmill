@@ -1,10 +1,10 @@
 # Agent Implementation Guide
 
-This document provides everything a sub-agent needs to implement tasks on `coreml-kit`.
+This document provides everything a sub-agent needs to implement tasks on `ironmill`.
 
 ## What This Project Is
 
-`coreml-kit` is a Rust-native CoreML model converter. It lets you convert ONNX models to
+`ironmill` is a Rust-native CoreML model converter. It lets you convert ONNX models to
 Apple's CoreML format without Python. Think of it as the Rust equivalent of Apple's
 `coremltools` Python package, but focused on conversion rather than training.
 
@@ -18,7 +18,7 @@ Apple's CoreML format without Python. Think of it as the Rust equivalent of Appl
 ## Project Structure
 
 ```
-coreml-kit/
+ironmill/
 ├── Cargo.toml                    # Workspace root
 ├── crates/
 │   ├── mil-rs/                   # Foundation crate: CoreML protobuf + MIL IR
@@ -50,7 +50,7 @@ coreml-kit/
 │   │           ├── mod.rs
 │   │           ├── proto_to_ir.rs
 │   │           └── ir_to_proto.rs
-│   └── coreml-kit-cli/           # CLI tool
+│   └── ironmill-cli/           # CLI tool
 │       ├── Cargo.toml
 │       └── src/
 │           └── main.rs           # clap-based CLI (exists, scaffold)
@@ -146,9 +146,9 @@ cargo build
 cargo test
 
 # Run the CLI
-cargo run -p coreml-kit-cli -- --help
-cargo run -p coreml-kit-cli -- compile model.onnx
-cargo run -p coreml-kit-cli -- inspect model.mlmodel
+cargo run -p ironmill-cli -- --help
+cargo run -p ironmill-cli -- compile model.onnx
+cargo run -p ironmill-cli -- inspect model.mlmodel
 
 # Check docs compile
 cargo doc --no-deps

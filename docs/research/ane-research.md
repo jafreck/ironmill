@@ -93,7 +93,7 @@ Every Rust project wanting CoreML deployment must:
 This Python dependency breaks Rust's self-contained toolchain promise. It's the same
 problem for C++, Swift (without Xcode), and Go developers.
 
-## Project: `coreml-kit` — Rust-native CoreML Model Conversion
+## Project: `ironmill` — Rust-native CoreML Model Conversion
 
 ### Vision
 Eliminate the Python dependency in the CoreML model conversion pipeline. Not a

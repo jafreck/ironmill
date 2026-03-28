@@ -38,12 +38,12 @@ unconditionally, and **opt-in** passes that trade accuracy or require user-provi
 ### CLI Changes
 
 ```
-coreml-kit compile model.onnx                                    # always-on passes only
-coreml-kit compile model.onnx --quantize fp16                    # + FP16
-coreml-kit compile model.onnx --quantize int8 --cal-data imgs/   # + INT8 (mutual excl. w/ fp16)
-coreml-kit compile model.onnx --palettize 4                      # 4-bit weight palettization
-coreml-kit compile model.onnx --quantize fp16 --palettize 6      # FP16 activations + 6-bit palettes
-coreml-kit compile model.onnx --no-fusion                        # disable always-on fusion passes
+ironmill compile model.onnx                                    # always-on passes only
+ironmill compile model.onnx --quantize fp16                    # + FP16
+ironmill compile model.onnx --quantize int8 --cal-data imgs/   # + INT8 (mutual excl. w/ fp16)
+ironmill compile model.onnx --palettize 4                      # 4-bit weight palettization
+ironmill compile model.onnx --quantize fp16 --palettize 6      # FP16 activations + 6-bit palettes
+ironmill compile model.onnx --no-fusion                        # disable always-on fusion passes
 ```
 
 ---
@@ -396,8 +396,8 @@ The CLI already accepts `--quantize int8` (parsed but not implemented). Only the
 `--cal-data` flag needs to be added:
 
 ```
-coreml-kit compile model.onnx --quantize int8                    # weight-only INT8
-coreml-kit compile model.onnx --quantize int8 --cal-data imgs/   # full INT8 with calibration
+ironmill compile model.onnx --quantize int8                    # weight-only INT8
+ironmill compile model.onnx --quantize int8 --cal-data imgs/   # full INT8 with calibration
 ```
 
 ### Tests

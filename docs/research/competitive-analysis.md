@@ -230,10 +230,10 @@ performance gaps.
 Given this analysis, the project scope should be **narrower and more opinionated** than
 originally proposed. Instead of a general-purpose "coremltools in Rust," consider:
 
-### Option A: `coreml-kit` — Focused Model Compiler
+### Option A: `ironmill` — Focused Model Compiler
 **Target**: ONNX → CoreML with ANE optimization, CLI + library
 **Scope**: Top 50 ONNX ops, FP16 quantization, basic op fusion
-**Differentiator**: `cargo install coreml-kit && coreml-kit compile model.onnx`
+**Differentiator**: `cargo install ironmill && ironmill compile model.onnx`
 **Audience**: Rust developers shipping on-device inference
 
 ### Option B: `mil-rs` — CoreML IR Library (Lower-level, wider impact)
@@ -244,7 +244,7 @@ originally proposed. Instead of a general-purpose "coremltools in Rust," conside
 
 ### Option C: Hybrid — Start with B, build A on top
 **Phase 1**: `mil-rs` crate (IR + protobuf, small, useful immediately)
-**Phase 2**: `coreml-kit` CLI using `mil-rs` + ONNX reader + basic passes
+**Phase 2**: `ironmill` CLI using `mil-rs` + ONNX reader + basic passes
 **Phase 3**: ANE optimizations, quantization, ecosystem integrations
 
 **Option C is strongest.** It creates immediate value (Phase 1 is useful on its own),

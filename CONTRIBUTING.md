@@ -1,15 +1,15 @@
-# Contributing to coreml-kit
+# Contributing to ironmill
 
 Thank you for considering contributing! This guide covers the development
-workflow for both `mil-rs` (library) and `coreml-kit-cli` (CLI tool).
+workflow for both `mil-rs` (library) and `ironmill-cli` (CLI tool).
 
 ## Setting up the development environment
 
 1. **Install Rust 1.85+** via [rustup](https://rustup.rs/).
 2. **Clone the repo** and build:
    ```bash
-   git clone https://github.com/jfreck/coreml-kit.git
-   cd coreml-kit
+   git clone https://github.com/jafreck/ironmill.git
+   cd ironmill
    cargo build --workspace
    cargo test --workspace
    ```
@@ -34,7 +34,7 @@ crates/
       error.rs     # Error types
       proto/       # Generated protobuf code
     examples/      # Runnable examples
-  coreml-kit-cli/  # CLI binary
+  ironmill-cli/  # CLI binary
 tests/
   fixtures/        # Test model files (ONNX, mlmodel, mlpackage)
 ```

@@ -3,7 +3,7 @@
     "itemInfoEntries": {
         "com.apple.CoreML/model.mlmodel": {
             "path": "com.apple.CoreML/model.mlmodel",
-            "author": "coreml-kit test fixture",
+            "author": "ironmill test fixture",
             "description": "Minimal test model"
         }
     },

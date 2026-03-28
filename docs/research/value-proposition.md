@@ -1,4 +1,4 @@
-# Value Proposition: `mil-rs` / `coreml-kit`
+# Value Proposition: `mil-rs` / `ironmill`
 ## Training vs Inference, Ecosystem Fit, and the Rust AI Toolchain
 
 ---
@@ -19,13 +19,13 @@ Train (Python ✅)  →  Convert to CoreML (Python-only ❌)  →  Run on ANE (R
                            ↑ THIS is the gap
 ```
 
-With `coreml-kit`, the conversion step becomes native Rust:
+With `ironmill`, the conversion step becomes native Rust:
 ```
-coreml-kit compile model.onnx --target ane --quantize fp16
+ironmill compile model.onnx --target ane --quantize fp16
 ```
 Or in Rust code:
 ```rust
-let mil = coreml_kit::from_onnx("model.onnx")?;
+let mil = ironmill::from_onnx("model.onnx")?;
 let optimized = mil.optimize_for_ane()?;
 optimized.save_mlpackage("model.mlpackage")?;
 ```
@@ -91,10 +91,10 @@ The Rust AI ecosystem has matured around a clear pattern:
 │  ANE adds: lower power, frees GPU, ~20-33% faster          │
 │  for quantized models. Worth it for shipped apps.           │
 │                                                             │
-│  WITH coreml-kit:                                           │
+│  WITH ironmill:                                           │
 │                                                             │
 │  ┌──────┐   ┌──────┐   ┌───────────┐   ┌──────────────┐   │
-│  │ ONNX │──▶│mil-rs│──▶│ coreml-kit│──▶│ CoreML + ANE │   │
+│  │ ONNX │──▶│mil-rs│──▶│ ironmill│──▶│ CoreML + ANE │   │
 │  │      │   │(IR)  │   │(convert)  │   │              │   │
 │  └──────┘   └──────┘   └───────────┘   └──────────────┘   │
 └─────────────────────────────────────────────────────────────┘
@@ -102,7 +102,7 @@ The Rust AI ecosystem has matured around a clear pattern:
 
 ### What each Rust project gains:
 
-| Project | Today (Metal GPU) | With coreml-kit (adds ANE option) |
+| Project | Today (Metal GPU) | With ironmill (adds ANE option) |
 |---------|-------------------|-----------------------------------|
 | **candle** | Metal GPU works well | +ANE for lower power, frees GPU for rendering |
 | **burn** | WGPU/Metal GPU, CPU | +CoreML as a deployment target via ONNX export |
@@ -121,15 +121,15 @@ A Tauri app developer today must:
 3. Run conversion scripts
 4. Hope the versions don't conflict
 
-With coreml-kit, it's:
+With ironmill, it's:
 ```toml
 [build-dependencies]
-coreml-kit = "0.1"
+ironmill = "0.1"
 ```
 ```rust
 // build.rs
 fn main() {
-    coreml_kit::compile("models/whisper-small.onnx")
+    ironmill::compile("models/whisper-small.onnx")
         .quantize(Fp16)
         .target(ComputeUnit::CpuAndNeuralEngine)
         .output("resources/whisper.mlmodelc")

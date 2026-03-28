@@ -429,7 +429,7 @@ fn squeezenet_program_has_expected_structure() {
 fn cli_inspect_mnist_onnx() {
     let output = std::process::Command::new("cargo")
         .args([
-            "run", "-p", "coreml-kit-cli", "--quiet", "--", "inspect",
+            "run", "-p", "ironmill-cli", "--quiet", "--", "inspect",
         ])
         .arg(fixture_path("mnist.onnx"))
         .output()
@@ -453,7 +453,7 @@ fn cli_inspect_mnist_onnx() {
 fn cli_inspect_squeezenet_onnx() {
     let output = std::process::Command::new("cargo")
         .args([
-            "run", "-p", "coreml-kit-cli", "--quiet", "--", "inspect",
+            "run", "-p", "ironmill-cli", "--quiet", "--", "inspect",
         ])
         .arg(fixture_path("squeezenet1.1.onnx"))
         .output()

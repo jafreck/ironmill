@@ -1,4 +1,4 @@
-# coreml-kit
+# ironmill
 
 Rust-native tools for converting, optimizing, and inspecting Apple CoreML
 models — no Python required.
@@ -7,21 +7,21 @@ models — no Python required.
 
 ```bash
 # Install from source
-cargo install --path crates/coreml-kit-cli
+cargo install --path crates/ironmill-cli
 
 # Convert an ONNX model to CoreML
-coreml-kit compile model.onnx
+ironmill compile model.onnx
 
 # Convert with FP16 quantization and fixed input shapes
-coreml-kit compile model.onnx --quantize fp16 --input-shape "input:1,3,224,224"
+ironmill compile model.onnx --quantize fp16 --input-shape "input:1,3,224,224"
 
 # Inspect any model format
-coreml-kit inspect model.onnx
-coreml-kit inspect model.mlmodel
-coreml-kit inspect model.mlpackage
+ironmill inspect model.onnx
+ironmill inspect model.mlmodel
+ironmill inspect model.mlpackage
 
 # Check ANE compatibility
-coreml-kit validate model.onnx
+ironmill validate model.onnx
 ```
 
 ## Features
@@ -56,7 +56,7 @@ The project is a Cargo workspace with two crates:
 | Crate | Description |
 |-------|-------------|
 | [`mil-rs`](crates/mil-rs/) | Core library — read/write CoreML models, MIL IR, ONNX conversion, optimization passes, ANE validation |
-| [`coreml-kit-cli`](crates/coreml-kit-cli/) | CLI tool wrapping `mil-rs` — `compile`, `inspect`, and `validate` commands |
+| [`ironmill-cli`](crates/ironmill-cli/) | CLI tool wrapping `mil-rs` — `compile`, `inspect`, and `validate` commands |
 
 ### How conversion works
 
@@ -89,48 +89,48 @@ write_mlpackage(&model, "model.mlpackage").unwrap();
 
 ## CLI usage
 
-### `coreml-kit compile`
+### `ironmill compile`
 
 Convert an ONNX model to a CoreML `.mlpackage`. Automatically runs
 optimization passes and optionally quantizes or compresses weights.
 
 ```bash
-coreml-kit compile model.onnx
-coreml-kit compile model.onnx -o output.mlpackage --quantize fp16
-coreml-kit compile model.onnx --quantize int8                        # weight-only INT8
-coreml-kit compile model.onnx --quantize int8 --cal-data imgs/       # INT8 with calibration
-coreml-kit compile model.onnx --palettize 4                          # 4-bit weight palettization
-coreml-kit compile model.onnx --quantize fp16 --palettize 6          # FP16 + 6-bit palettes
-coreml-kit compile model.onnx --input-shape "input:1,3,224,224"
-coreml-kit compile model.onnx --no-fusion                            # disable optimization passes
+ironmill compile model.onnx
+ironmill compile model.onnx -o output.mlpackage --quantize fp16
+ironmill compile model.onnx --quantize int8                        # weight-only INT8
+ironmill compile model.onnx --quantize int8 --cal-data imgs/       # INT8 with calibration
+ironmill compile model.onnx --palettize 4                          # 4-bit weight palettization
+ironmill compile model.onnx --quantize fp16 --palettize 6          # FP16 + 6-bit palettes
+ironmill compile model.onnx --input-shape "input:1,3,224,224"
+ironmill compile model.onnx --no-fusion                            # disable optimization passes
 ```
 
 If `xcrun coremlcompiler` is available (macOS with Xcode), the output is also
 compiled to `.mlmodelc`.
 
-### `coreml-kit inspect`
+### `ironmill inspect`
 
 Print a summary of any model's structure:
 
 ```bash
-coreml-kit inspect model.onnx
-coreml-kit inspect model.mlmodel
-coreml-kit inspect model.mlpackage
+ironmill inspect model.onnx
+ironmill inspect model.mlmodel
+ironmill inspect model.mlpackage
 ```
 
-### `coreml-kit validate`
+### `ironmill validate`
 
 Check whether a model's operations are compatible with Apple's Neural Engine:
 
 ```bash
-coreml-kit validate model.onnx
+ironmill validate model.onnx
 ```
 
 ## Building from source
 
 ```bash
-git clone https://github.com/jfreck/coreml-kit.git
-cd coreml-kit
+git clone https://github.com/jafreck/ironmill.git
+cd ironmill
 
 # Build everything
 cargo build --workspace

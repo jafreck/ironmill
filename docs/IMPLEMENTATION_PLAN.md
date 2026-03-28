@@ -2,7 +2,7 @@
 
 ## Overview
 
-Build `mil-rs` (CoreML IR + protobuf foundation) and `coreml-kit` (CLI conversion tool)
+Build `mil-rs` (CoreML IR + protobuf foundation) and `ironmill` (CLI conversion tool)
 in four phases. Each phase produces a shippable, useful artifact.
 
 ---
@@ -73,7 +73,7 @@ in four phases. Each phase produces a shippable, useful artifact.
 ## Phase 2: ONNX → CoreML Conversion
 
 **Goal**: Convert ONNX models to CoreML format from Rust, no Python.
-**Ship**: `coreml-kit` CLI that converts common ONNX models. `mil-rs` v0.2 with conversion API.
+**Ship**: `ironmill` CLI that converts common ONNX models. `mil-rs` v0.2 with conversion API.
 
 ### 2.1 ONNX protobuf reader
 - Add ONNX `.proto` files (from `onnx/onnx` repo) to the build
@@ -143,9 +143,9 @@ These cover ~80% of common models (vision + transformer inference):
 - Produce `.mlmodelc` directory ready for runtime loading
 
 ### 2.6 Wire up the CLI
-- `coreml-kit compile model.onnx` → runs conversion + xcrun
-- `coreml-kit inspect model.mlmodel` → reads and prints model structure
-- `coreml-kit inspect model.onnx` → reads and prints ONNX structure
+- `ironmill compile model.onnx` → runs conversion + xcrun
+- `ironmill inspect model.mlmodel` → reads and prints model structure
+- `ironmill inspect model.onnx` → reads and prints ONNX structure
 - Progress output showing which ops were mapped, any unsupported ops skipped
 
 ### 2.7 Validation test suite
@@ -156,15 +156,15 @@ These cover ~80% of common models (vision + transformer inference):
 
 ### 2.8 Publish
 - `mil-rs` v0.2 with ONNX conversion API
-- `coreml-kit` v0.1 CLI on crates.io
+- `ironmill` v0.1 CLI on crates.io
 - Blog post / announcement
 
 ---
 
 ## Phase 3: ANE Optimization & Quantization
 
-**Goal**: Models converted by coreml-kit actually run well on the ANE.
-**Ship**: `mil-rs` v0.3 with optimization passes. `coreml-kit` v0.2 with `--quantize` and `--validate`.
+**Goal**: Models converted by ironmill actually run well on the ANE.
+**Ship**: `mil-rs` v0.3 with optimization passes. `ironmill` v0.2 with `--quantize` and `--validate`.
 
 ### 3.1 ANE compatibility validator
 - Analyze a MIL graph and report which ops will run on ANE vs fallback to CPU/GPU
@@ -174,7 +174,7 @@ These cover ~80% of common models (vision + transformer inference):
   - Max tensor sizes and memory limits
   - Supported op set (document which MIL ops ANE handles)
 - Output: human-readable report + machine-readable JSON
-- `coreml-kit validate model.mlpackage`
+- `ironmill validate model.mlpackage`
 
 ### 3.2 Shape materialization pass
 - For models with dynamic shapes, insert concrete dimensions
@@ -186,7 +186,7 @@ These cover ~80% of common models (vision + transformer inference):
 - Convert FP32 weights and activations to FP16
 - Straightforward truncation (no calibration needed for FP16)
 - Update tensor types throughout the graph
-- `coreml-kit compile model.onnx --quantize fp16`
+- `ironmill compile model.onnx --quantize fp16`
 
 ### 3.4 Op fusion passes
 - **Conv + BatchNorm fusion**: Fold BN parameters into conv weights (standard optimization)
@@ -207,7 +207,7 @@ These cover ~80% of common models (vision + transformer inference):
 
 ### 3.7 Publish
 - `mil-rs` v0.3
-- `coreml-kit` v0.2
+- `ironmill` v0.2
 - Benchmark results: before/after optimization, GPU vs ANE
 
 ---
@@ -236,7 +236,7 @@ These cover ~80% of common models (vision + transformer inference):
 ### 4.4 `build.rs` API
 - High-level API for use in `build.rs` scripts:
   ```rust
-  coreml_kit::compile("model.onnx")
+  ironmill::compile("model.onnx")
       .quantize(Fp16)
       .target(ComputeUnit::CpuAndNeuralEngine)
       .output("resources/model.mlmodelc")
@@ -245,7 +245,7 @@ These cover ~80% of common models (vision + transformer inference):
 - Automatically calls xcrun if on macOS, errors clearly on other platforms
 
 ### 4.5 Benchmark suite
-- Compare inference: Metal GPU (candle) vs CoreML+ANE (coreml-kit)
+- Compare inference: Metal GPU (candle) vs CoreML+ANE (ironmill)
 - Models: Whisper encoder, MobileNet, BERT-tiny
 - Metrics: latency, throughput, power (if measurable)
 - Publish results in docs

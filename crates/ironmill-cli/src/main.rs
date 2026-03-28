@@ -12,12 +12,12 @@ use mil_rs::{
 };
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
 
-/// coreml-kit — Convert and optimize ML models for Apple's Neural Engine.
+/// ironmill — Convert and optimize ML models for Apple's Neural Engine.
 ///
 /// A Rust-native alternative to Python's coremltools. Converts ONNX models
 /// to CoreML format with ANE-targeted optimizations, no Python required.
 #[derive(Parser)]
-#[command(name = "coreml-kit", version, about, long_about = None)]
+#[command(name = "ironmill", version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
