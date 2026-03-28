@@ -86,6 +86,17 @@ fn quantize_value(value: &mut Value) {
             *data = fp32_to_fp16_bytes(data);
             *dtype = ScalarType::Float16;
         }
+        Value::Float(f) => {
+            // Convert scalar float to an FP16 scalar tensor so that ops
+            // requiring uniform dtype (e.g. batch_norm's epsilon) stay
+            // consistent with their FP16 inputs.
+            let h = f16::from_f64(*f);
+            *value = Value::Tensor {
+                data: h.to_le_bytes().to_vec(),
+                shape: vec![],
+                dtype: ScalarType::Float16,
+            };
+        }
         Value::Type(ty) if ty.scalar_type == ScalarType::Float32 => {
             ty.scalar_type = ScalarType::Float16;
         }
@@ -288,6 +299,44 @@ mod tests {
                 assert_eq!(ty.shape, vec![Some(1), Some(10)]);
             }
             other => panic!("expected Type(Float16), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converts_float_attribute_to_fp16_scalar() {
+        // batch_norm stores epsilon as Value::Float — it must be converted to
+        // an FP16 scalar tensor for dtype consistency with the FP16 inputs.
+        let mut program = Program::new("1.0.0");
+        let mut func = Function::new("main");
+        func.body.add_op(
+            Operation::new("batch_norm", "bn_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_input("gamma", Value::Reference("gamma".into()))
+                .with_input("beta", Value::Reference("beta".into()))
+                .with_input("mean", Value::Reference("mean".into()))
+                .with_input("variance", Value::Reference("variance".into()))
+                .with_attr("epsilon", Value::Float(1e-5))
+                .with_output("bn_out"),
+        );
+        func.body.outputs.push("bn_out".into());
+        program.add_function(func);
+
+        Fp16QuantizePass.run(&mut program).unwrap();
+
+        let op = &program.functions["main"].body.operations[0];
+        match op.attributes.get("epsilon") {
+            Some(Value::Tensor { dtype, shape, data }) => {
+                assert_eq!(*dtype, ScalarType::Float16, "epsilon should be FP16");
+                assert!(shape.is_empty(), "epsilon should be scalar (rank 0)");
+                assert_eq!(data.len(), 2, "FP16 scalar is 2 bytes");
+                let h = f16::from_le_bytes([data[0], data[1]]);
+                assert!(
+                    (h.to_f64() - 1e-5).abs() < 1e-4,
+                    "epsilon value should be approximately 1e-5, got {}",
+                    h.to_f64()
+                );
+            }
+            other => panic!("expected FP16 scalar Tensor for epsilon, got {other:?}"),
         }
     }
 }

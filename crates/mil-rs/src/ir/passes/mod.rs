@@ -24,6 +24,7 @@ pub mod op_substitute;
 pub mod palettize;
 pub mod shape_materialize;
 pub mod tensor_utils;
+pub mod type_repropagate;
 
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
@@ -50,6 +51,7 @@ pub use op_split::{OpSplittingPass, parse_memory_size};
 pub use op_substitute::OpSubstitutionPass;
 pub use palettize::{GroupedPalettizePass, PalettizePass};
 pub use shape_materialize::{AutoregressiveShapeMaterializePass, ShapeMaterializePass};
+pub use type_repropagate::TypeRepropagationPass;
 
 use super::program::Block;
 use super::types::Value;

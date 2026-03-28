@@ -519,7 +519,7 @@ name = "codebook-optimization"
 name = "op-substitution"
 
 [[passes]]
-name = "layout-optimization"
+name = "type-repropagation"
 
 [[passes]]
 name = "fp16-quantization"

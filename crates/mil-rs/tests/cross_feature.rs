@@ -24,7 +24,15 @@ use common::{
 
 #[test]
 fn nhwc_plus_mixed_precision_pipeline() {
+    use mil_rs::ir::passes::layout_optimize::LayoutOptimizationPass;
+
     let mut program = build_conv_program(3);
+
+    // Run layout optimization explicitly (not in default pipeline because MIL
+    // conv validates assuming NCHW) then the standard pipeline with mixed precision.
+    LayoutOptimizationPass
+        .run(&mut program)
+        .expect("layout pass should succeed");
 
     let config = MixedPrecisionConfig::preset_fp16_int8();
     let pipeline = PassPipeline::new()
