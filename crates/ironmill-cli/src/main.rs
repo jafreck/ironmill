@@ -3,13 +3,15 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use mil_rs::compiler::Backend;
 use mil_rs::ir::PassPipeline;
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::validate::print_validation_report;
 use mil_rs::{
-    compile_model, is_compiler_available, onnx_to_program, program_to_model, read_mlmodel,
-    read_mlpackage, read_onnx, validate_ane_compatibility, write_mlpackage,
+    compile_model, compile_model_with_backend, is_compiler_available, onnx_to_program,
+    program_to_model, read_mlmodel, read_mlpackage, read_onnx, validate_ane_compatibility,
+    write_mlpackage,
 };
 
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
@@ -21,6 +23,24 @@ use mil_rs::{
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Compilation backend selection for the CLI.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendArg {
+    /// Use `xcrun coremlcompiler` (default, stable).
+    Xcrun,
+    /// Use direct ANE FFI (experimental, requires `ane-direct` feature).
+    AneDirect,
+}
+
+impl From<BackendArg> for Backend {
+    fn from(arg: BackendArg) -> Self {
+        match arg {
+            BackendArg::Xcrun => Backend::Xcrun,
+            BackendArg::AneDirect => Backend::AneDirect,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -58,6 +78,14 @@ enum Commands {
         /// Format: "name:d0,d1,d2,...". May be repeated.
         #[arg(long = "input-shape", value_name = "NAME:SHAPE")]
         input_shapes: Vec<String>,
+
+        /// Compilation backend: "xcrun" (default) or "ane-direct" (experimental).
+        ///
+        /// The "ane-direct" backend calls Apple's private _ANECompiler class
+        /// directly via FFI, bypassing xcrun. Requires the `ane-direct`
+        /// feature flag at build time.
+        #[arg(long, value_enum, default_value_t = BackendArg::Xcrun)]
+        backend: BackendArg,
     },
 
     /// Inspect a model and show its structure.
@@ -95,6 +123,7 @@ fn run() -> Result<()> {
             palettize,
             no_fusion,
             input_shapes,
+            backend,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -105,6 +134,7 @@ fn run() -> Result<()> {
                 palettize,
                 no_fusion,
                 input_shapes,
+                backend: backend.into(),
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -136,6 +166,7 @@ struct CompileOpts {
     palettize: Option<u8>,
     no_fusion: bool,
     input_shapes: Vec<String>,
+    backend: Backend,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -166,12 +197,14 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
             opts.palettize,
             opts.no_fusion,
             &opts.input_shapes,
+            opts.backend,
         ),
-        "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext),
+        "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext, opts.backend),
         _ => bail!("Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_from_onnx(
     input_path: &Path,
     output: Option<String>,
@@ -180,6 +213,7 @@ fn compile_from_onnx(
     palettize: Option<u8>,
     no_fusion: bool,
     input_shapes: &[String],
+    backend: Backend,
 ) -> Result<()> {
     let input_display = input_path.display();
 
@@ -277,17 +311,29 @@ fn compile_from_onnx(
     write_mlpackage(&model, &output_path)
         .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
-    // 8. Optionally compile with xcrun
-    if is_compiler_available() {
-        println!("Compiling with xcrun coremlcompiler...");
-        let output_dir = Path::new(&output_path).parent().unwrap_or(Path::new("."));
-        match compile_model(&output_path, output_dir) {
-            Ok(compiled) => println!("Done: {}", compiled.display()),
-            Err(e) => println!("Warning: compilation failed: {e}"),
+    // 8. Compile the model
+    match backend {
+        Backend::AneDirect => {
+            println!("Compiling with ANE direct backend...");
+            let output_dir = Path::new(&output_path).parent().unwrap_or(Path::new("."));
+            match compile_model_with_backend(&output_path, output_dir, Backend::AneDirect) {
+                Ok(compiled) => println!("Done: {}", compiled.display()),
+                Err(e) => println!("Warning: ANE direct compilation failed: {e}"),
+            }
         }
-    } else {
-        println!("Note: xcrun coremlcompiler not found — skipping compilation step.");
-        println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
+        Backend::Xcrun => {
+            if is_compiler_available() {
+                println!("Compiling with xcrun coremlcompiler...");
+                let output_dir = Path::new(&output_path).parent().unwrap_or(Path::new("."));
+                match compile_model(&output_path, output_dir) {
+                    Ok(compiled) => println!("Done: {}", compiled.display()),
+                    Err(e) => println!("Warning: compilation failed: {e}"),
+                }
+            } else {
+                println!("Note: xcrun coremlcompiler not found — skipping compilation step.");
+                println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
+            }
+        }
     }
 
     // 9. Print warnings
@@ -307,19 +353,32 @@ fn compile_from_onnx(
     Ok(())
 }
 
-fn compile_coreml(input_path: &Path, ext: &str) -> Result<()> {
+fn compile_coreml(input_path: &Path, ext: &str, backend: Backend) -> Result<()> {
     let input_display = input_path.display();
     println!("Input is already CoreML format (.{ext}): {input_display}");
 
-    if !is_compiler_available() {
-        bail!("xcrun coremlcompiler is not available. Install Xcode to compile CoreML models.");
+    let output_dir = input_path.parent().unwrap_or(Path::new("."));
+
+    match backend {
+        Backend::AneDirect => {
+            println!("Compiling with ANE direct backend...");
+            let compiled = compile_model_with_backend(input_path, output_dir, Backend::AneDirect)
+                .with_context(|| format!("Failed to compile {input_display}"))?;
+            println!("Done: {}", compiled.display());
+        }
+        Backend::Xcrun => {
+            if !is_compiler_available() {
+                bail!(
+                    "xcrun coremlcompiler is not available. Install Xcode to compile CoreML models."
+                );
+            }
+            println!("Compiling with xcrun coremlcompiler...");
+            let compiled = compile_model(input_path, output_dir)
+                .with_context(|| format!("Failed to compile {input_display}"))?;
+            println!("Done: {}", compiled.display());
+        }
     }
 
-    println!("Compiling with xcrun coremlcompiler...");
-    let output_dir = input_path.parent().unwrap_or(Path::new("."));
-    let compiled = compile_model(input_path, output_dir)
-        .with_context(|| format!("Failed to compile {input_display}"))?;
-    println!("Done: {}", compiled.display());
     Ok(())
 }
 

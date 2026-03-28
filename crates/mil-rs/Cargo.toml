@@ -31,5 +31,8 @@ harness = false
 name = "passes"
 harness = false
 
+[features]
+ane-direct = []
+
 [build-dependencies]
 prost-build = { workspace = true }

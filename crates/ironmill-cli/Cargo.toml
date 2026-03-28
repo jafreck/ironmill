@@ -15,3 +15,6 @@ path = "src/main.rs"
 mil-rs = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+
+[features]
+ane-direct = ["mil-rs/ane-direct"]

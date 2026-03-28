@@ -49,6 +49,9 @@ pub mod compiler;
 pub mod convert;
 /// Error types used throughout the crate.
 pub mod error;
+/// Direct ANE compilation via Objective-C FFI (experimental, private API).
+#[cfg(feature = "ane-direct")]
+pub mod ffi;
 /// MIL Intermediate Representation — programs, functions, operations, and types.
 pub mod ir;
 /// Auto-generated protobuf types for CoreML and ONNX specifications.
@@ -62,8 +65,12 @@ pub mod writer;
 
 // Re-export key types at crate root for convenience.
 
+/// The compilation backend to use.
+pub use compiler::Backend;
 /// Compile a `.mlpackage` or `.mlmodel` to `.mlmodelc` using `xcrun coremlcompiler`.
 pub use compiler::compile_model;
+/// Compile a model using the specified backend.
+pub use compiler::compile_model_with_backend;
 /// Check whether `xcrun coremlcompiler` is available on this system.
 pub use compiler::is_compiler_available;
 
