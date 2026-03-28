@@ -95,7 +95,15 @@ fn run() -> Result<()> {
             palettize,
             no_fusion,
             input_shapes,
-        } => cmd_compile(&input, output, &target, &quantize, cal_data, palettize, no_fusion, &input_shapes),
+        } => cmd_compile(&input, CompileOpts {
+            output,
+            target,
+            quantize,
+            cal_data,
+            palettize,
+            no_fusion,
+            input_shapes,
+        }),
         Commands::Inspect { input } => cmd_inspect(&input),
         Commands::Validate { input } => cmd_validate(&input),
     }
@@ -117,7 +125,17 @@ fn parse_input_shape(s: &str) -> Result<(String, Vec<usize>)> {
     Ok((name.to_string(), dims))
 }
 
-fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str, cal_data: Option<PathBuf>, palettize: Option<u8>, no_fusion: bool, input_shapes: &[String]) -> Result<()> {
+struct CompileOpts {
+    output: Option<String>,
+    target: String,
+    quantize: String,
+    cal_data: Option<PathBuf>,
+    palettize: Option<u8>,
+    no_fusion: bool,
+    input_shapes: Vec<String>,
+}
+
+fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
     let input_path = Path::new(input);
     if !input_path.exists() {
         bail!("Input file not found: {input}");
@@ -129,12 +147,12 @@ fn cmd_compile(input: &str, output: Option<String>, target: &str, quantize: &str
         .unwrap_or("")
         .to_lowercase();
 
-    if target != "all" {
-        println!("Note: --target '{target}' will be fully supported in Phase 3. Proceeding with default target.");
+    if opts.target != "all" {
+        println!("Note: --target '{}' will be fully supported in Phase 3. Proceeding with default target.", opts.target);
     }
 
     match ext.as_str() {
-        "onnx" => compile_from_onnx(input_path, output, quantize, cal_data, palettize, no_fusion, input_shapes),
+        "onnx" => compile_from_onnx(input_path, opts.output, &opts.quantize, opts.cal_data, opts.palettize, opts.no_fusion, &opts.input_shapes),
         "mlmodel" | "mlpackage" => compile_coreml(input_path, &ext),
         _ => bail!(
             "Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"

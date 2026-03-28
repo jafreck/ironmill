@@ -146,7 +146,7 @@ fn pack_indices(indices: &[usize], n_bits: u8) -> Vec<u8> {
 
     let mask = (1u16 << n_bits) - 1;
     let total_bits = indices.len() * n_bits as usize;
-    let n_bytes = (total_bits + 7) / 8;
+    let n_bytes = total_bits.div_ceil(8);
     let mut packed = vec![0u8; n_bytes];
 
     for (i, &idx) in indices.iter().enumerate() {
