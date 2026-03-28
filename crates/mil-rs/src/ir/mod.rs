@@ -9,6 +9,7 @@
 mod graph;
 mod operation;
 mod pass;
+pub mod passes;
 mod program;
 mod tensor;
 mod types;
@@ -16,6 +17,7 @@ mod types;
 pub use graph::Graph;
 pub use operation::Operation;
 pub use pass::Pass;
+pub use passes::{ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass};
 pub use program::{Block, Function, Program};
 pub use tensor::{ScalarType, TensorType};
 pub use types::Value;

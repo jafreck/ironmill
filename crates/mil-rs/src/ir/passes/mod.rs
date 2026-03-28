@@ -1,0 +1,46 @@
+//! Built-in optimization passes for the MIL IR.
+//!
+//! Each pass implements the [`Pass`](super::Pass) trait and transforms a
+//! [`Program`](super::Program) in place.
+
+pub mod constant_fold;
+pub mod dead_code;
+pub mod identity_elim;
+
+pub use constant_fold::ConstantFoldPass;
+pub use dead_code::DeadCodeEliminationPass;
+pub use identity_elim::IdentityEliminationPass;
+
+use super::program::Block;
+use super::types::Value;
+
+/// Replace every [`Value::Reference`] that points to `old_name` with one
+/// pointing to `new_name`, across all operations in `block`.
+pub fn replace_reference(block: &mut Block, old_name: &str, new_name: &str) {
+    for op in &mut block.operations {
+        for value in op.inputs.values_mut() {
+            replace_in_value(value, old_name, new_name);
+        }
+    }
+    // Also update block outputs.
+    for out in &mut block.outputs {
+        if out == old_name {
+            *out = new_name.to_string();
+        }
+    }
+}
+
+/// Recursively replace references inside a [`Value`], handling nested lists.
+fn replace_in_value(value: &mut Value, old_name: &str, new_name: &str) {
+    match value {
+        Value::Reference(name) if name == old_name => {
+            *name = new_name.to_string();
+        }
+        Value::List(items) => {
+            for item in items {
+                replace_in_value(item, old_name, new_name);
+            }
+        }
+        _ => {}
+    }
+}
