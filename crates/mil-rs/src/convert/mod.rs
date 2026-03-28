@@ -15,7 +15,10 @@ pub mod onnx_graph;
 pub mod onnx_to_mil;
 pub mod proto_to_ir;
 
-pub use ir_to_proto::program_to_model;
+pub use ir_to_proto::{
+    LossFunction, UpdatableModelConfig, UpdateOptimizer, program_to_model,
+    program_to_updatable_model,
+};
 pub use lora::{LoraAdapter, detect_lora_adapters, lora_initializer_names, merge_lora};
 pub use onnx_graph::{ConversionConfig, onnx_to_program, onnx_to_program_with_config};
 pub use onnx_to_mil::convert_node;

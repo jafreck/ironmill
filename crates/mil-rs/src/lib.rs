@@ -84,6 +84,10 @@ pub use convert::onnx_to_program;
 pub use convert::onnx_to_program_with_config;
 /// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
 pub use convert::program_to_model;
+/// Convert a MIL IR [`Program`] into an updatable protobuf [`Model`].
+pub use convert::program_to_updatable_model;
+/// Configuration for producing an updatable CoreML model.
+pub use convert::{LossFunction, UpdatableModelConfig, UpdateOptimizer};
 
 /// Error type for all operations in this crate.
 pub use error::MilError;

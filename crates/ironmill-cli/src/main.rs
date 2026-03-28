@@ -9,8 +9,9 @@ use mil_rs::ir::PassPipeline;
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::validate::print_validation_report;
 use mil_rs::{
-    ConversionConfig, compile_model, compile_model_with_backend, is_compiler_available,
-    onnx_to_program_with_config, program_to_model, read_mlmodel, read_mlpackage, read_onnx,
+    ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer, compile_model,
+    compile_model_with_backend, is_compiler_available, onnx_to_program_with_config,
+    program_to_model, program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx,
     validate_ane_compatibility, write_mlpackage,
 };
 
@@ -44,6 +45,7 @@ impl From<BackendArg> for Backend {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Convert an ONNX model to CoreML format (.mlpackage).
     Compile {
@@ -104,6 +106,27 @@ enum Commands {
         /// Path to an external adapter file (e.g. .safetensors). May be repeated.
         #[arg(long = "adapter", value_name = "PATH")]
         adapters: Vec<PathBuf>,
+
+        /// Comma-separated list of layer names to mark as updatable for
+        /// on-device training (e.g. "dense_0,dense_1").
+        #[arg(long = "updatable-layers", value_name = "LAYERS")]
+        updatable_layers: Option<String>,
+
+        /// Learning rate for the on-device training optimizer.
+        #[arg(long, default_value = "0.001")]
+        learning_rate: f64,
+
+        /// Number of training epochs for on-device fine-tuning.
+        #[arg(long, default_value = "10")]
+        epochs: i64,
+
+        /// Loss function for on-device training: "cross-entropy" or "mse".
+        #[arg(long = "loss-function", default_value = "cross-entropy")]
+        loss_function: String,
+
+        /// Optimizer for on-device training: "sgd" or "adam".
+        #[arg(long = "optimizer", default_value = "sgd")]
+        optimizer_type: String,
     },
 
     /// Inspect a model and show its structure.
@@ -146,6 +169,11 @@ fn run() -> Result<()> {
             no_merge_lora,
             emit_adapter,
             adapters,
+            updatable_layers,
+            learning_rate,
+            epochs,
+            loss_function,
+            optimizer_type,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -160,6 +188,11 @@ fn run() -> Result<()> {
                 merge_lora: merge_lora && !no_merge_lora,
                 emit_adapter,
                 adapters,
+                updatable_layers,
+                learning_rate,
+                epochs,
+                loss_function,
+                optimizer_type,
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -195,6 +228,11 @@ struct CompileOpts {
     merge_lora: bool,
     emit_adapter: bool,
     adapters: Vec<PathBuf>,
+    updatable_layers: Option<String>,
+    learning_rate: f64,
+    epochs: i64,
+    loss_function: String,
+    optimizer_type: String,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -322,8 +360,35 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     println!();
 
     // 6. Convert IR to proto
-    let model =
-        program_to_model(&program, 9).context("Failed to convert MIL IR to CoreML protobuf")?;
+    let model = if let Some(ref layers) = opts.updatable_layers {
+        let layer_names: Vec<String> = layers.split(',').map(|s| s.trim().to_string()).collect();
+
+        let loss_fn = match opts.loss_function.as_str() {
+            "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,
+            _ => LossFunction::CategoricalCrossEntropy,
+        };
+        let opt = match opts.optimizer_type.as_str() {
+            "adam" => UpdateOptimizer::Adam,
+            _ => UpdateOptimizer::Sgd,
+        };
+
+        let config = UpdatableModelConfig {
+            updatable_layers: layer_names.clone(),
+            learning_rate: opts.learning_rate,
+            epochs: opts.epochs,
+            loss_function: loss_fn,
+            optimizer: opt,
+        };
+
+        println!(
+            "Updatable model: {} layer(s) marked for on-device training",
+            layer_names.len()
+        );
+        program_to_updatable_model(&program, 9, &config)
+            .context("Failed to convert MIL IR to updatable CoreML protobuf")?
+    } else {
+        program_to_model(&program, 9).context("Failed to convert MIL IR to CoreML protobuf")?
+    };
 
     // 7. Write as .mlpackage
     let output_path = opts.output.clone().unwrap_or_else(|| {
