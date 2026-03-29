@@ -690,10 +690,11 @@ mod tests {
 
         let input_ty = TensorType::new(ScalarType::Float16, vec![1, 4, 1, 8]);
 
-        let add_op = Operation::new("add", "add_0")
+        let mut add_op = Operation::new("add", "add_0")
             .with_input("x", Value::Reference("x".into()))
             .with_input("y", Value::Reference("y".into()))
             .with_output("result");
+        add_op.output_types = vec![Some(input_ty.clone())];
 
         let mut block = Block::new();
         block.add_op(add_op);
@@ -730,10 +731,11 @@ mod tests {
             )
             .with_output("w");
 
-        let add_op = Operation::new("add", "add_0")
+        let mut add_op = Operation::new("add", "add_0")
             .with_input("x", Value::Reference("x".into()))
             .with_input("y", Value::Reference("w".into()))
             .with_output("result");
+        add_op.output_types = vec![Some(input_ty.clone())];
 
         let mut block = Block::new();
         block.add_op(weight_op);

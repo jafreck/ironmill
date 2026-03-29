@@ -155,12 +155,12 @@ impl<'a> MilTextEmitter<'a> {
             self.emit_operation(op)?;
         }
 
-        // Emit block return: } -> (%out1, %out2);
+        // Emit block return: } -> (out1, out2);
         let outputs: Vec<String> = func
             .body
             .outputs
             .iter()
-            .map(|name| format!("%{}", self.resolve_name(name)))
+            .map(|name| self.resolve_name(name))
             .collect();
         writeln!(self.output, "    }} -> ({});", outputs.join(", ")).unwrap();
 
@@ -221,7 +221,7 @@ impl<'a> MilTextEmitter<'a> {
         // TYPE %name = op(params)[name=string("name")];
         writeln!(
             self.output,
-            "        {type_str} %{output_name} = {op_type}({params})[name=string(\"{output_name}\")];",
+            "        {type_str} {output_name} = {op_type}({params})[name=string(\"{output_name}\")];",
             op_type = op.op_type,
             params = params.join(", "),
         )
@@ -263,7 +263,7 @@ impl<'a> MilTextEmitter<'a> {
             // TYPE %name = const()[name=string("name"), val=TYPE(BLOBFILE(...))];
             writeln!(
                 self.output,
-                "        {type_str} %{output_name} = const()[name=string(\"{output_name}\"), val={type_str}(BLOBFILE(path=string(\"{weight_path}\"), offset=uint64(64)))];",
+                "        {type_str} {output_name} = const()[name=string(\"{output_name}\"), val={type_str}(BLOBFILE(path=string(\"{weight_path}\"), offset=uint64(64)))];",
             )
             .unwrap();
         } else if let Some(val) = op.inputs.get("val") {
@@ -273,14 +273,14 @@ impl<'a> MilTextEmitter<'a> {
             // TYPE %name = const()[name=string("name"), val=TYPED_VALUE];
             writeln!(
                 self.output,
-                "        {type_str} %{output_name} = const()[name=string(\"{output_name}\"), val={val_str}];",
+                "        {type_str} {output_name} = const()[name=string(\"{output_name}\"), val={val_str}];",
             )
             .unwrap();
         } else {
             // No val input — emit an empty const.
             writeln!(
                 self.output,
-                "        fp16 %{output_name} = const()[name=string(\"{output_name}\")];",
+                "        fp16 {output_name} = const()[name=string(\"{output_name}\")];",
             )
             .unwrap();
         }
@@ -291,10 +291,7 @@ impl<'a> MilTextEmitter<'a> {
     /// Format a [`Value`] for operation input parameters.
     fn format_value(&self, value: &Value) -> String {
         match value {
-            Value::Reference(name) => {
-                let resolved = self.resolve_name(name);
-                format!("%{resolved}")
-            }
+            Value::Reference(name) => self.resolve_name(name),
             Value::Int(n) => format!("int32({n})"),
             Value::Float(f) => format!("fp16({})", format_float(*f)),
             Value::Bool(b) => {
@@ -518,10 +515,10 @@ mod tests {
         assert!(text.contains("tensor<fp16, [1,768,1,32]> a_input1"));
         // Op with type prefix, name attribute, and semicolon.
         assert!(text.contains(
-            "tensor<fp16, [1,768,1,32]> %z_output0 = add(x=%a_input0, y=%a_input1)[name=string(\"z_output0\")];"
+            "tensor<fp16, [1,768,1,32]> z_output0 = add(x=a_input0, y=a_input1)[name=string(\"z_output0\")];"
         ));
         // Block return with semicolon.
-        assert!(text.contains("} -> (%z_output0);"));
+        assert!(text.contains("} -> (z_output0);"));
         assert!(weights.is_empty());
     }
 
@@ -557,11 +554,11 @@ mod tests {
         assert!(text.contains("tensor<fp32, [1,3,1,224]> a_input1"));
 
         // Outputs renamed with semicolon.
-        assert!(text.contains("} -> (%z_output0, %z_output1);"));
+        assert!(text.contains("} -> (z_output0, z_output1);"));
 
         // References to inputs are also renamed.
-        assert!(text.contains("x=%a_input0"));
-        assert!(text.contains("x=%a_input1"));
+        assert!(text.contains("x=a_input0"));
+        assert!(text.contains("x=a_input1"));
     }
 
     #[test]
@@ -640,7 +637,7 @@ mod tests {
 
         // Bool const with typed syntax.
         assert!(
-            text.contains("bool %my_flag = const()[name=string(\"my_flag\"), val=bool(true)];"),
+            text.contains("bool my_flag = const()[name=string(\"my_flag\"), val=bool(true)];"),
             "got: {text}"
         );
     }
@@ -727,12 +724,12 @@ mod tests {
         ));
 
         // Regular ops reference renamed inputs.
-        assert!(text.contains("x=%a_input0"));
+        assert!(text.contains("x=a_input0"));
         assert!(text.contains("pad_type=string(\"valid\")"));
         assert!(text.contains("relu(x="));
         // Semicolons on ops.
         assert!(text.contains(")[name=string(\"conv_out\")];"));
-        assert!(text.contains("} -> (%z_output0);"));
+        assert!(text.contains("} -> (z_output0);"));
 
         // Weights collected.
         assert_eq!(weights.len(), 2);
@@ -769,10 +766,7 @@ mod tests {
             emitter.format_value(&Value::List(vec![Value::Int(1), Value::Int(2)])),
             "tensor<int32, [2]>([1,2])"
         );
-        assert_eq!(
-            emitter.format_value(&Value::Reference("foo".into())),
-            "%foo"
-        );
+        assert_eq!(emitter.format_value(&Value::Reference("foo".into())), "foo");
     }
 
     #[test]
