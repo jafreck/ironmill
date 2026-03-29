@@ -21,6 +21,18 @@ fn ironmill_cmd() -> Command {
     cmd
 }
 
+/// Skip a test if the fixture file is not present.
+/// Returns the fixture path if it exists.
+fn require_fixture(name: &str) -> PathBuf {
+    let path = fixture_path(name);
+    if !path.exists() {
+        eprintln!("SKIPPING: fixture not found: {}", path.display());
+        eprintln!("Run ./scripts/download-fixtures.sh to download test fixtures");
+        // Return the path anyway — the test will check and return early
+    }
+    path
+}
+
 /// Recursively compute the total size (in bytes) of a directory.
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
@@ -620,5 +632,205 @@ fn cli_compile_invalid_epochs() {
             || stderr.contains("must be")
             || stderr.contains("epoch"),
         "stderr should mention validation error for epochs, got:\n{stderr}"
+    );
+}
+
+// ─── Architecture-Specific Model Tests ─────────────────────────────────
+// These tests require additional fixtures from ./scripts/download-fixtures.sh
+// They are skipped gracefully if fixtures are not present.
+
+#[test]
+fn cli_compile_whisper_tiny_encoder() {
+    let fixture = require_fixture("whisper-tiny-encoder.onnx");
+    if !fixture.exists() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("whisper-enc.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "whisper-tiny-encoder compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+}
+
+#[test]
+fn cli_compile_whisper_tiny_encoder_polar_quant() {
+    let fixture = require_fixture("whisper-tiny-encoder.onnx");
+    if !fixture.exists() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("whisper-enc-polar.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["--polar-quantize", "4"])
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "whisper-tiny-encoder polar-quant compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+    assert!(
+        dir_size(&output) > 0,
+        "polar-quantized output directory must be non-empty"
+    );
+}
+
+#[test]
+fn cli_compile_whisper_tiny_decoder() {
+    let fixture = require_fixture("whisper-tiny-decoder.onnx");
+    if !fixture.exists() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("whisper-dec.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "whisper-tiny-decoder compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+}
+
+#[test]
+fn cli_compile_whisper_tiny_decoder_polar_quant() {
+    let fixture = require_fixture("whisper-tiny-decoder.onnx");
+    if !fixture.exists() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("whisper-dec-polar.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["--polar-quantize", "4"])
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "whisper-tiny-decoder polar-quant compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+    assert!(
+        dir_size(&output) > 0,
+        "polar-quantized output directory must be non-empty"
+    );
+}
+
+#[test]
+fn cli_compile_distilbert() {
+    let fixture = require_fixture("distilbert.onnx");
+    if !fixture.exists() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("distilbert.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "distilbert compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+}
+
+#[test]
+fn cli_compile_distilbert_polar_quant() {
+    let fixture = require_fixture("distilbert.onnx");
+    if !fixture.exists() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("distilbert-polar.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["--polar-quantize", "4"])
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "distilbert polar-quant compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+    assert!(
+        dir_size(&output) > 0,
+        "polar-quantized output directory must be non-empty"
+    );
+}
+
+#[test]
+fn cli_compile_vit_base() {
+    let fixture = require_fixture("vit-base.onnx");
+    if !fixture.exists() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("vit-base.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "vit-base compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+}
+
+#[test]
+fn cli_compile_vit_base_polar_quant() {
+    let fixture = require_fixture("vit-base.onnx");
+    if !fixture.exists() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("vit-base-polar.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["--polar-quantize", "4"])
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "vit-base polar-quant compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+    assert!(
+        dir_size(&output) > 0,
+        "polar-quantized output directory must be non-empty"
     );
 }

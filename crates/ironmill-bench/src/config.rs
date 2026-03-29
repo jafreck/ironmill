@@ -114,6 +114,21 @@ pub fn default_matrix() -> BenchMatrix {
             path: PathBuf::from("tests/fixtures/squeezenet1.1.onnx"),
             input_shapes: vec![],
         },
+        ModelConfig {
+            name: "Whisper-tiny-encoder".to_string(),
+            path: PathBuf::from("tests/fixtures/whisper-tiny-encoder.onnx"),
+            input_shapes: vec![],
+        },
+        ModelConfig {
+            name: "DistilBERT".to_string(),
+            path: PathBuf::from("tests/fixtures/distilbert.onnx"),
+            input_shapes: vec![],
+        },
+        ModelConfig {
+            name: "ViT-base".to_string(),
+            path: PathBuf::from("tests/fixtures/vit-base.onnx"),
+            input_shapes: vec![],
+        },
     ];
 
     let optimizations = vec![
@@ -224,7 +239,7 @@ mod tests {
     #[test]
     fn test_default_matrix() {
         let m = default_matrix();
-        assert_eq!(m.models.len(), 2);
+        assert_eq!(m.models.len(), 5);
         assert_eq!(m.optimizations.len(), 7);
         assert_eq!(m.backends, vec!["all"]);
         assert_eq!(m.settings.iterations, 200);
@@ -237,6 +252,9 @@ mod tests {
         let m = default_matrix();
         assert_eq!(m.models[0].name, "MobileNetV2");
         assert_eq!(m.models[1].name, "SqueezeNet");
+        assert_eq!(m.models[2].name, "Whisper-tiny-encoder");
+        assert_eq!(m.models[3].name, "DistilBERT");
+        assert_eq!(m.models[4].name, "ViT-base");
     }
 
     #[test]

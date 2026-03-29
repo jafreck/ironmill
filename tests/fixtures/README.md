@@ -5,17 +5,56 @@ Sample model files for integration tests. These are NOT checked into git
 
 ## Files
 
-| File | Format | Size | Source | Used by |
-|------|--------|------|--------|---------|
-| `mnist.onnx` | ONNX | ~26KB | ONNX Model Zoo (mnist-12) | ONNX reader tests, conversion tests |
-| `squeezenet1.1.onnx` | ONNX | ~4.7MB | ONNX Model Zoo (squeezenet1.1-7) | Conversion + validation tests |
-| `MobileNet.mlmodel` | CoreML (.mlmodel) | ~16MB | hollance/MobileNet-CoreML | .mlmodel reader/writer round-trip tests |
+### Core fixtures (always downloaded)
+
+| File | Format | Architecture | Size | Source | PolarQuant? |
+|------|--------|-------------|------|--------|-------------|
+| `mnist.onnx` | ONNX | CNN (LeNet) | ~26KB | ONNX Model Zoo | No |
+| `squeezenet1.1.onnx` | ONNX | CNN | ~4.7MB | ONNX Model Zoo | No |
+| `mobilenetv2.onnx` | ONNX | CNN | ~14MB | ONNX Model Zoo | No |
+| `MobileNet.mlmodel` | CoreML | CNN | ~16MB | hollance/MobileNet-CoreML | N/A |
+| `simple.mlpackage/` | CoreML | Minimal | ~1KB | Generated | N/A |
+
+### Transformer fixtures (downloaded by default)
+
+| File | Format | Architecture | Size | Inner dim | PolarQuant? |
+|------|--------|-------------|------|-----------|-------------|
+| `whisper-tiny-encoder.onnx` | ONNX | Encoder-only (audio) | ~33MB | d=384 | Yes |
+| `whisper-tiny-decoder.onnx` | ONNX | Decoder + cross-attn | ~118MB | d=384 | Yes |
+| `distilbert.onnx` | ONNX | Encoder NLU | ~256MB | d=768 | Yes |
+| `vit-base.onnx` | ONNX | Vision Transformer | ~347MB | d=768 | Yes |
+
+### Optional heavyweight fixtures
+
+| File | Format | Architecture | Size | Source |
+|------|--------|-------------|------|--------|
+| `whisper-medium-encoder.onnx` | ONNX | Encoder (audio) | ~1.5GB | onnx-community/whisper-medium |
 
 ## Downloading
 
 ```bash
+# Download core + transformer fixtures (recommended)
 ./scripts/download-fixtures.sh
+
+# Download only core fixtures (fast, <50MB total)
+./scripts/download-fixtures.sh --skip-large
+
+# Download everything including whisper-medium
+./scripts/download-fixtures.sh --all
 ```
+
+## Architecture coverage
+
+The fixture matrix covers diverse model architectures to validate
+ironmill's optimization passes across different op patterns:
+
+- **CNN** — conv + pooling + dense (MobileNetV2, SqueezeNet)
+- **Encoder-only transformer** — self-attention + FFN (DistilBERT, Whisper encoder)
+- **Decoder transformer** — causal self-attention + cross-attention (Whisper decoder)
+- **Vision transformer** — patch embedding + self-attention (ViT)
+
+PolarQuant weight quantization targets transformer architectures where
+the inner dimension (hidden_dim, head_dim) is ≥ 64.
 
 ## Creating new fixtures
 

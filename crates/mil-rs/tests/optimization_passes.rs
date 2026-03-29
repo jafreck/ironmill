@@ -1988,3 +1988,102 @@ fn polar_4bit_round_trip_quality() {
         "4-bit PolarQuant MSE should be < 0.5, got {mse:.6}"
     );
 }
+
+// ─── Architecture-Specific PolarQuant Tests ────────────────────────────
+// Require transformer model fixtures. Skipped if fixtures not present.
+
+#[test]
+fn polar_quant_on_whisper_tiny_encoder() {
+    let path = common::fixture_path("whisper-tiny-encoder.onnx");
+    if !path.exists() {
+        eprintln!("SKIP: whisper-tiny-encoder.onnx not found (run download-fixtures.sh)");
+        return;
+    }
+
+    let onnx = mil_rs::read_onnx(&path).unwrap();
+    let cr = mil_rs::onnx_to_program(&onnx).unwrap();
+    let mut program = cr.program;
+
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let lut_count = program
+        .functions
+        .values()
+        .flat_map(|f| &f.body.operations)
+        .filter(|op| op.op_type == "constexpr_lut_to_dense")
+        .count();
+
+    eprintln!("whisper-tiny-encoder: {lut_count} tensors quantized by PolarQuant");
+    assert!(
+        lut_count > 0,
+        "PolarQuant should quantize at least one tensor in whisper-tiny encoder"
+    );
+
+    let model = program_to_model(&program, 7).unwrap();
+    let _rt = model_to_program(&model).unwrap();
+}
+
+#[test]
+fn polar_quant_on_distilbert() {
+    let path = common::fixture_path("distilbert.onnx");
+    if !path.exists() {
+        eprintln!("SKIP: distilbert.onnx not found (run download-fixtures.sh)");
+        return;
+    }
+
+    let onnx = mil_rs::read_onnx(&path).unwrap();
+    let cr = mil_rs::onnx_to_program(&onnx).unwrap();
+    let mut program = cr.program;
+
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let lut_count = program
+        .functions
+        .values()
+        .flat_map(|f| &f.body.operations)
+        .filter(|op| op.op_type == "constexpr_lut_to_dense")
+        .count();
+
+    eprintln!("distilbert: {lut_count} tensors quantized by PolarQuant");
+    assert!(
+        lut_count > 0,
+        "PolarQuant should quantize at least one tensor in DistilBERT"
+    );
+
+    let model = program_to_model(&program, 7).unwrap();
+    let _rt = model_to_program(&model).unwrap();
+}
+
+#[test]
+fn polar_quant_on_vit_base() {
+    let path = common::fixture_path("vit-base.onnx");
+    if !path.exists() {
+        eprintln!("SKIP: vit-base.onnx not found (run download-fixtures.sh)");
+        return;
+    }
+
+    let onnx = mil_rs::read_onnx(&path).unwrap();
+    let cr = mil_rs::onnx_to_program(&onnx).unwrap();
+    let mut program = cr.program;
+
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let lut_count = program
+        .functions
+        .values()
+        .flat_map(|f| &f.body.operations)
+        .filter(|op| op.op_type == "constexpr_lut_to_dense")
+        .count();
+
+    eprintln!("vit-base: {lut_count} tensors quantized by PolarQuant");
+    assert!(
+        lut_count > 0,
+        "PolarQuant should quantize at least one tensor in ViT-base"
+    );
+
+    let model = program_to_model(&program, 7).unwrap();
+    let _rt = model_to_program(&model).unwrap();
+}
