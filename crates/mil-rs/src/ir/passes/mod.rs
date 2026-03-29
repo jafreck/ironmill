@@ -24,6 +24,7 @@ pub mod op_split;
 pub mod op_substitute;
 pub mod palettize;
 pub mod polar_quantize;
+pub mod polar_rotation_fusion;
 pub mod rotation;
 pub mod shape_materialize;
 pub mod tensor_utils;
@@ -64,6 +65,7 @@ pub use op_split::{OpSplittingPass, parse_memory_size};
 pub use op_substitute::OpSubstitutionPass;
 pub use palettize::{GroupedPalettizePass, PalettizePass};
 pub use polar_quantize::PolarQuantPass;
+pub use polar_rotation_fusion::PolarRotationFusionPass;
 pub use shape_materialize::{AutoregressiveShapeMaterializePass, ShapeMaterializePass};
 pub use type_repropagate::TypeRepropagationPass;
 
