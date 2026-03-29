@@ -130,6 +130,11 @@ pub use reader::read_mlpackage;
 pub use reader::read_onnx;
 /// Read an ONNX `.onnx` file, returning the model and its parent directory.
 pub use reader::read_onnx_with_dir;
+/// Read a SafeTensors model directory into a [`SafeTensorsProvider`].
+pub use reader::read_safetensors;
+
+/// SafeTensors weight provider for HuggingFace model directories.
+pub use convert::SafeTensorsProvider;
 
 /// Write a protobuf [`Model`] to a `.mlmodel` file.
 pub use writer::write_mlmodel;

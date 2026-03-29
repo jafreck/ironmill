@@ -238,6 +238,133 @@ pub fn lora_initializer_names(adapters: &[LoraAdapter]) -> std::collections::Has
     names
 }
 
+/// Format-agnostic LoRA merge kernel.
+///
+/// Applies `W_new = W + (alpha / rank) * B @ A` to the base weight buffer
+/// in-place. This function operates on raw byte buffers and does not depend
+/// on any specific model format (ONNX, SafeTensors, etc.).
+///
+/// # Arguments
+///
+/// * `base` — Mutable base weight buffer (row-major, `[out_features, in_features]`).
+/// * `base_shape` — Shape of the base weight: `[out_features, in_features]`.
+/// * `lora_a` — LoRA A matrix bytes (row-major, `[rank, in_features]`).
+/// * `lora_a_shape` — Shape of A: `[rank, in_features]`.
+/// * `lora_b` — LoRA B matrix bytes (row-major, `[out_features, rank]`).
+/// * `lora_b_shape` — Shape of B: `[out_features, rank]`.
+/// * `dtype` — Element data type (must be `Float32` or `Float16`).
+/// * `alpha` — Optional scaling factor. When `None`, defaults to `rank` (scale = 1.0).
+#[allow(clippy::too_many_arguments)]
+pub fn merge_lora_weights(
+    base: &mut Vec<u8>,
+    base_shape: &[usize],
+    lora_a: &[u8],
+    lora_a_shape: &[usize],
+    lora_b: &[u8],
+    lora_b_shape: &[usize],
+    dtype: ScalarType,
+    alpha: Option<f64>,
+) -> Result<()> {
+    if base_shape.len() != 2 {
+        return Err(MilError::Validation(format!(
+            "LoRA merge requires 2-D base weight, got shape {base_shape:?}"
+        )));
+    }
+    if lora_a_shape.len() != 2 || lora_b_shape.len() != 2 {
+        return Err(MilError::Validation("LoRA A and B must be 2-D".into()));
+    }
+
+    let out_features = base_shape[0];
+    let in_features = base_shape[1];
+    let rank = lora_a_shape[0];
+    let a_in = lora_a_shape[1];
+    let b_out = lora_b_shape[0];
+    let b_rank = lora_b_shape[1];
+
+    if a_in != in_features {
+        return Err(MilError::Validation(format!(
+            "LoRA A in_features ({a_in}) != base in_features ({in_features})"
+        )));
+    }
+    if b_out != out_features {
+        return Err(MilError::Validation(format!(
+            "LoRA B out_features ({b_out}) != base out_features ({out_features})"
+        )));
+    }
+    if b_rank != rank {
+        return Err(MilError::Validation(format!(
+            "LoRA rank mismatch: A has rank {rank}, B has rank {b_rank}"
+        )));
+    }
+
+    let scale = alpha.unwrap_or(rank as f64) / rank as f64;
+
+    let dtype_size = match dtype {
+        ScalarType::Float32 => 4,
+        ScalarType::Float16 => 2,
+        other => {
+            return Err(MilError::Validation(format!(
+                "LoRA merge unsupported for dtype {other:?}"
+            )));
+        }
+    };
+
+    let expected_base = out_features * in_features * dtype_size;
+    if base.len() < expected_base {
+        return Err(MilError::Validation(format!(
+            "base buffer too small: got {} bytes, expected {expected_base}",
+            base.len()
+        )));
+    }
+    let expected_a = rank * a_in * dtype_size;
+    if lora_a.len() < expected_a {
+        return Err(MilError::Validation(format!(
+            "LoRA A buffer too small: got {} bytes, expected {expected_a}",
+            lora_a.len()
+        )));
+    }
+    let expected_b = b_out * b_rank * dtype_size;
+    if lora_b.len() < expected_b {
+        return Err(MilError::Validation(format!(
+            "LoRA B buffer too small: got {} bytes, expected {expected_b}",
+            lora_b.len()
+        )));
+    }
+
+    match dtype {
+        ScalarType::Float32 => {
+            merge_f32_raw(
+                base,
+                out_features,
+                in_features,
+                lora_a,
+                lora_b,
+                rank,
+                scale as f32,
+            );
+        }
+        ScalarType::Float16 => {
+            merge_f16_raw(
+                base,
+                out_features,
+                in_features,
+                lora_a,
+                lora_b,
+                rank,
+                scale as f32,
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    Ok(())
+}
+
+/// Public wrapper around `scalar_from_bytes` for use by other modules.
+pub fn scalar_from_bytes_pub(data: &[u8], dtype: ScalarType) -> Option<f64> {
+    scalar_from_bytes(data, dtype)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -307,6 +434,60 @@ fn merge_f16(
 
     let a = bytes_to_f16_as_f32(&adapter.a_data);
     let b = bytes_to_f16_as_f32(&adapter.b_data);
+    let mut w = bytes_to_f16_as_f32(base_data);
+
+    for i in 0..out_features {
+        for j in 0..in_features {
+            let mut dot = 0.0f32;
+            for r in 0..rank {
+                dot += b[i * rank + r] * a[r * in_features + j];
+            }
+            w[i * in_features + j] += scale * dot;
+        }
+    }
+
+    *base_data = f32_to_f16_bytes(&w);
+}
+
+/// Format-agnostic fp32 merge: W += scale * B @ A, operating on raw byte slices.
+fn merge_f32_raw(
+    base_data: &mut Vec<u8>,
+    out_features: usize,
+    in_features: usize,
+    lora_a: &[u8],
+    lora_b: &[u8],
+    rank: usize,
+    scale: f32,
+) {
+    let a = bytes_to_f32(lora_a);
+    let b = bytes_to_f32(lora_b);
+    let mut w = bytes_to_f32(base_data);
+
+    for i in 0..out_features {
+        for j in 0..in_features {
+            let mut dot = 0.0f32;
+            for r in 0..rank {
+                dot += b[i * rank + r] * a[r * in_features + j];
+            }
+            w[i * in_features + j] += scale * dot;
+        }
+    }
+
+    *base_data = f32_to_bytes(&w);
+}
+
+/// Format-agnostic fp16 merge: W += scale * B @ A, operating on raw byte slices.
+fn merge_f16_raw(
+    base_data: &mut Vec<u8>,
+    out_features: usize,
+    in_features: usize,
+    lora_a: &[u8],
+    lora_b: &[u8],
+    rank: usize,
+    scale: f32,
+) {
+    let a = bytes_to_f16_as_f32(lora_a);
+    let b = bytes_to_f16_as_f32(lora_b);
     let mut w = bytes_to_f16_as_f32(base_data);
 
     for i in 0..out_features {

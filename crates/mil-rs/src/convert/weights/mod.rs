@@ -13,6 +13,8 @@ use crate::ir::ScalarType;
 pub mod gguf;
 pub mod safetensors;
 
+pub use safetensors::SafeTensorsProvider;
+
 /// Supported model architectures for template-based conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
