@@ -4,6 +4,7 @@
 //! [`Program`](super::Program) in place.
 
 pub mod attention_fusion;
+pub mod beta_quantizer;
 pub mod bn_weight_fold;
 pub mod codebook;
 pub mod compute_unit;
@@ -22,6 +23,8 @@ pub mod op_fusion;
 pub mod op_split;
 pub mod op_substitute;
 pub mod palettize;
+pub mod polar_quantize;
+pub mod rotation;
 pub mod shape_materialize;
 pub mod tensor_utils;
 pub mod type_repropagate;
@@ -60,6 +63,7 @@ pub use op_fusion::{
 pub use op_split::{OpSplittingPass, parse_memory_size};
 pub use op_substitute::OpSubstitutionPass;
 pub use palettize::{GroupedPalettizePass, PalettizePass};
+pub use polar_quantize::PolarQuantPass;
 pub use shape_materialize::{AutoregressiveShapeMaterializePass, ShapeMaterializePass};
 pub use type_repropagate::TypeRepropagationPass;
 

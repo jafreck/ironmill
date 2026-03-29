@@ -9,6 +9,7 @@ use mil_rs::ir::passes::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
 use mil_rs::ir::passes::{
     ComputeUnitAnnotationPass, Fp16QuantizePass, Granularity, Int8QuantizePass,
     LayoutOptimizationPass, MixedPrecisionConfig, MixedPrecisionPass, OpSplittingPass,
+    PolarQuantPass,
 };
 use mil_rs::{
     Block, ComputeUnit, Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorType,
@@ -1395,4 +1396,189 @@ fn int8_quantize_uniform_value_tensor() {
             "dequantized[{i}] = {v}, expected ≈ {uniform_val}"
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PolarQuant serialization round-trip
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn polar_quant_serialization_round_trip() {
+    // Build a program with a const op large enough for PolarQuant (>= 1024 elements).
+    let rows = 8;
+    let cols = 128;
+    let num_elements = rows * cols; // 1024
+    let tensor_data: Vec<f32> = (0..num_elements).map(|i| (i as f32 * 0.01).sin()).collect();
+    let tensor_bytes: Vec<u8> = tensor_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let input_ty = TensorType::new(ScalarType::Float32, vec![1, cols]);
+    let mut program = Program::new("1");
+    let func = Function::new("main").with_input("input", input_ty);
+    program.add_function(func);
+
+    let block = &mut program.functions.get_mut("main").unwrap().body;
+    block.add_op(
+        Operation::new("const", "weight_0")
+            .with_input(
+                "val",
+                Value::Tensor {
+                    data: tensor_bytes,
+                    shape: vec![rows, cols],
+                    dtype: ScalarType::Float32,
+                },
+            )
+            .with_output("weight_0_out"),
+    );
+    block.add_op(
+        Operation::new("linear", "linear_0")
+            .with_input("x", Value::Reference("input".into()))
+            .with_input("weight", Value::Reference("weight_0_out".into()))
+            .with_output("linear_out"),
+    );
+    block.outputs.push("linear_out".into());
+
+    // Run PolarQuant pass.
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    // Verify the ops were transformed correctly before serialization.
+    let ops = &program.functions["main"].body.operations;
+    assert_eq!(ops[0].op_type, "constexpr_lut_to_dense");
+    assert_eq!(ops[1].op_type, "const"); // norms
+    assert_eq!(ops[2].op_type, "mul");
+    // linear should reference the mul output now
+    assert_eq!(ops[3].op_type, "linear");
+
+    // Serialize to protobuf.
+    let model = program_to_model(&program, 7).expect("serialization should succeed");
+
+    // Deserialize back.
+    let deserialized = model_to_program(&model).expect("deserialization should succeed");
+
+    // Verify the deserialized program has the same op structure.
+    let rt_ops = &deserialized.functions["main"].body.operations;
+    assert_eq!(
+        rt_ops.len(),
+        ops.len(),
+        "round-trip should preserve op count"
+    );
+    assert_eq!(rt_ops[0].op_type, "constexpr_lut_to_dense");
+    assert_eq!(rt_ops[1].op_type, "const");
+    assert_eq!(rt_ops[2].op_type, "mul");
+    assert_eq!(rt_ops[3].op_type, "linear");
+
+    // Verify the mul op still references the correct inputs.
+    match rt_ops[2].inputs.get("x") {
+        Some(Value::Reference(name)) => assert_eq!(name, "weight_0_out"),
+        other => panic!("expected mul x to reference weight_0_out, got {other:?}"),
+    }
+    match rt_ops[2].inputs.get("y") {
+        Some(Value::Reference(name)) => assert_eq!(name, "weight_0_out_polar_norms"),
+        other => panic!("expected mul y to reference norms, got {other:?}"),
+    }
+
+    // Verify LUT attributes survived serialization.
+    assert!(
+        rt_ops[0].attributes.contains_key("lut"),
+        "constexpr_lut_to_dense should have lut attribute after round-trip"
+    );
+    assert!(
+        rt_ops[0].attributes.contains_key("indices"),
+        "constexpr_lut_to_dense should have indices attribute after round-trip"
+    );
+    assert!(
+        rt_ops[0].attributes.contains_key("shape"),
+        "constexpr_lut_to_dense should have shape attribute after round-trip"
+    );
+}
+
+#[test]
+fn polar_quant_lut_shape_preserved_in_proto() {
+    let rows = 16;
+    let cols = 64;
+    let num_elements = rows * cols; // 1024
+    let tensor_data: Vec<f32> = (0..num_elements).map(|i| (i as f32 * 0.05).cos()).collect();
+    let tensor_bytes: Vec<u8> = tensor_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let input_ty = TensorType::new(ScalarType::Float32, vec![1, cols]);
+    let mut program = Program::new("1");
+    let func = Function::new("main").with_input("input", input_ty);
+    program.add_function(func);
+
+    let block = &mut program.functions.get_mut("main").unwrap().body;
+    block.add_op(
+        Operation::new("const", "weight_0")
+            .with_input(
+                "val",
+                Value::Tensor {
+                    data: tensor_bytes,
+                    shape: vec![rows, cols],
+                    dtype: ScalarType::Float32,
+                },
+            )
+            .with_output("weight_0_out"),
+    );
+    block.outputs.push("weight_0_out".into());
+
+    let n_bits: u8 = 4;
+    let pass = PolarQuantPass::new(n_bits);
+    pass.run(&mut program).unwrap();
+
+    // Check LUT and indices shapes before serialization.
+    let ops = &program.functions["main"].body.operations;
+    let lut_shape_before = match ops[0].attributes.get("lut") {
+        Some(Value::Tensor { shape, .. }) => shape.clone(),
+        other => panic!("expected LUT tensor, got {other:?}"),
+    };
+    let indices_shape_before = match ops[0].attributes.get("indices") {
+        Some(Value::Tensor { shape, .. }) => shape.clone(),
+        other => panic!("expected indices tensor, got {other:?}"),
+    };
+    let orig_shape_before = match ops[0].attributes.get("shape") {
+        Some(Value::Tensor { shape, .. }) => shape.clone(),
+        other => panic!("expected shape tensor, got {other:?}"),
+    };
+
+    // LUT should have 2^n_bits = 16 entries.
+    assert_eq!(lut_shape_before, vec![1 << n_bits]);
+
+    // Original shape tensor records the rank.
+    assert_eq!(orig_shape_before, vec![2]); // rank-2: [rows, cols]
+
+    // Serialize and deserialize.
+    let model = program_to_model(&program, 7).expect("serialization should succeed");
+    let deserialized = model_to_program(&model).expect("deserialization should succeed");
+
+    let rt_ops = &deserialized.functions["main"].body.operations;
+    assert_eq!(rt_ops[0].op_type, "constexpr_lut_to_dense");
+
+    // Verify LUT shape is preserved.
+    let lut_shape_after = match rt_ops[0].attributes.get("lut") {
+        Some(Value::Tensor { shape, .. }) => shape.clone(),
+        other => panic!("expected LUT tensor after round-trip, got {other:?}"),
+    };
+    assert_eq!(
+        lut_shape_before, lut_shape_after,
+        "LUT shape should be preserved through serialization"
+    );
+
+    // Verify indices shape is preserved.
+    let indices_shape_after = match rt_ops[0].attributes.get("indices") {
+        Some(Value::Tensor { shape, .. }) => shape.clone(),
+        other => panic!("expected indices tensor after round-trip, got {other:?}"),
+    };
+    assert_eq!(
+        indices_shape_before, indices_shape_after,
+        "indices shape should be preserved through serialization"
+    );
+
+    // Verify original shape tensor is preserved.
+    let orig_shape_after = match rt_ops[0].attributes.get("shape") {
+        Some(Value::Tensor { shape, .. }) => shape.clone(),
+        other => panic!("expected shape tensor after round-trip, got {other:?}"),
+    };
+    assert_eq!(
+        orig_shape_before, orig_shape_after,
+        "original shape tensor should be preserved through serialization"
+    );
 }

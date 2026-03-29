@@ -12,7 +12,11 @@ use rand::{Rng, SeedableRng};
 /// Each row is rotated independently. `cols` must be a power of two;
 /// pad with zeros if necessary.
 pub fn rotate_rows_hadamard(data: &mut [f32], rows: usize, cols: usize, seed: u64) {
-    assert_eq!(data.len(), rows * cols, "data length must equal rows * cols");
+    assert_eq!(
+        data.len(),
+        rows * cols,
+        "data length must equal rows * cols"
+    );
     assert!(cols.is_power_of_two(), "cols must be a power of two");
 
     let signs = generate_signs(cols, seed);
@@ -51,7 +55,11 @@ pub fn unrotate_rows_hadamard(data: &mut [f32], rows: usize, cols: usize, seed: 
 /// Each row is zero-padded on the right. If `cols` is already a power of
 /// two the data is returned unchanged (copied into a new `Vec`).
 pub fn pad_to_power_of_two(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>, usize) {
-    assert_eq!(data.len(), rows * cols, "data length must equal rows * cols");
+    assert_eq!(
+        data.len(),
+        rows * cols,
+        "data length must equal rows * cols"
+    );
 
     if cols == 0 {
         return (data.to_vec(), 0);
@@ -78,7 +86,9 @@ pub fn pad_to_power_of_two(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>,
 /// Generate a vector of ±1 signs from a seeded PRNG.
 fn generate_signs(n: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
-    (0..n).map(|_| if rng.gen_bool(0.5) { 1.0 } else { -1.0 }).collect()
+    (0..n)
+        .map(|_| if rng.gen_bool(0.5) { 1.0 } else { -1.0 })
+        .collect()
 }
 
 /// Standard in-place Walsh–Hadamard butterfly (unnormalized).
@@ -126,7 +136,9 @@ mod tests {
         // Compute R · R^T and compare with I.
         for i in 0..n {
             for j in 0..n {
-                let dot: f32 = (0..n).map(|k| r_matrix[i * n + k] * r_matrix[j * n + k]).sum();
+                let dot: f32 = (0..n)
+                    .map(|k| r_matrix[i * n + k] * r_matrix[j * n + k])
+                    .sum();
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!(
                     (dot - expected).abs() < TOL,
@@ -150,10 +162,7 @@ mod tests {
         unrotate_rows_hadamard(&mut data, rows, cols, seed);
 
         for (a, b) in data.iter().zip(original.iter()) {
-            assert!(
-                (a - b).abs() < TOL,
-                "mismatch: got {a}, expected {b}"
-            );
+            assert!((a - b).abs() < TOL, "mismatch: got {a}, expected {b}");
         }
     }
 

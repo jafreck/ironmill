@@ -178,7 +178,9 @@ fn convert_value(proto: &mil_spec::Value) -> Result<Value> {
     use mil_spec::value;
 
     match &proto.value {
-        Some(value::Value::ImmediateValue(imm)) => convert_immediate_value(imm),
+        Some(value::Value::ImmediateValue(imm)) => {
+            convert_immediate_value(imm, proto.r#type.as_ref())
+        }
         Some(value::Value::BlobFileValue(blob)) => {
             // Represent blob references as a string for now.
             Ok(Value::String(format!(
@@ -200,11 +202,14 @@ fn convert_value(proto: &mil_spec::Value) -> Result<Value> {
     }
 }
 
-fn convert_immediate_value(imm: &mil_spec::value::ImmediateValue) -> Result<Value> {
+fn convert_immediate_value(
+    imm: &mil_spec::value::ImmediateValue,
+    value_type: Option<&mil_spec::ValueType>,
+) -> Result<Value> {
     use mil_spec::value::immediate_value;
 
     match &imm.value {
-        Some(immediate_value::Value::Tensor(tv)) => convert_tensor_value(tv),
+        Some(immediate_value::Value::Tensor(tv)) => convert_tensor_value(tv, value_type),
         Some(immediate_value::Value::List(lv)) => {
             let items = lv
                 .values
@@ -234,7 +239,12 @@ fn convert_immediate_value(imm: &mil_spec::value::ImmediateValue) -> Result<Valu
 ///
 /// Scalar tensors (single-element) are unwrapped into the corresponding
 /// scalar `Value` variant. Multi-element tensors become `Value::List`.
-fn convert_tensor_value(tv: &mil_spec::TensorValue) -> Result<Value> {
+/// Raw-byte tensors are reconstructed into `Value::Tensor` using the
+/// accompanying `ValueType` for dtype and shape information.
+fn convert_tensor_value(
+    tv: &mil_spec::TensorValue,
+    value_type: Option<&mil_spec::ValueType>,
+) -> Result<Value> {
     use mil_spec::tensor_value;
 
     match &tv.value {
@@ -268,9 +278,36 @@ fn convert_tensor_value(tv: &mil_spec::TensorValue) -> Result<Value> {
                 vals.iter().map(|v| Value::String(v.clone())).collect(),
             )),
         },
-        Some(tensor_value::Value::Bytes(_)) => Err(MilError::UnsupportedOp(
-            "raw byte tensor values are not yet supported".to_string(),
-        )),
+        Some(tensor_value::Value::Bytes(b)) => {
+            // Reconstruct Value::Tensor from raw bytes using the accompanying
+            // type info for dtype and shape.
+            let tt = value_type
+                .and_then(|vt| match &vt.r#type {
+                    Some(mil_spec::value_type::Type::TensorType(tt)) => Some(tt),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    MilError::Protobuf(
+                        "raw byte tensor value has no accompanying tensor type".to_string(),
+                    )
+                })?;
+
+            let dtype = convert_data_type(tt.data_type)?;
+            let shape: Vec<usize> = tt
+                .dimensions
+                .iter()
+                .filter_map(|d| match &d.dimension {
+                    Some(mil_spec::dimension::Dimension::Constant(c)) => Some(c.size as usize),
+                    _ => None,
+                })
+                .collect();
+
+            Ok(Value::Tensor {
+                data: b.values.clone(),
+                shape,
+                dtype,
+            })
+        }
         None => Err(MilError::Protobuf(
             "tensor value has no payload".to_string(),
         )),
@@ -576,7 +613,7 @@ mod tests {
                 values: vec![3.14],
             })),
         };
-        let v = convert_tensor_value(&float_tv).unwrap();
+        let v = convert_tensor_value(&float_tv, None).unwrap();
         assert!(matches!(v, Value::Float(f) if (f - 3.14_f64).abs() < 1e-5));
 
         // Int scalar
@@ -585,7 +622,7 @@ mod tests {
                 values: vec![42],
             })),
         };
-        let v = convert_tensor_value(&int_tv).unwrap();
+        let v = convert_tensor_value(&int_tv, None).unwrap();
         assert!(matches!(v, Value::Int(42)));
 
         // Bool scalar
@@ -594,7 +631,7 @@ mod tests {
                 values: vec![true],
             })),
         };
-        let v = convert_tensor_value(&bool_tv).unwrap();
+        let v = convert_tensor_value(&bool_tv, None).unwrap();
         assert!(matches!(v, Value::Bool(true)));
     }
 
@@ -607,7 +644,7 @@ mod tests {
                 values: vec![1, 2, 3],
             })),
         };
-        let v = convert_tensor_value(&float_tv).unwrap();
+        let v = convert_tensor_value(&float_tv, None).unwrap();
         match v {
             Value::List(items) => {
                 assert_eq!(items.len(), 3);

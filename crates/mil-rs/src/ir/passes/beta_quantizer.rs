@@ -18,7 +18,10 @@ const CONVERGENCE_EPS: f64 = 1e-10;
 /// Returns `2^n_bits` levels as f32, sorted ascending.
 /// These are the Lloyd-Max centroids for the Beta distribution.
 pub fn beta_optimal_levels(dim: usize, n_bits: u8) -> Vec<f32> {
-    assert!(dim >= 2, "dimension must be >= 2 for valid Beta distribution parameters");
+    assert!(
+        dim >= 2,
+        "dimension must be >= 2 for valid Beta distribution parameters"
+    );
     let (alpha, beta_param) = distribution_params(dim);
     let dist = Beta::new(alpha, beta_param).expect("invalid Beta distribution parameters");
     // Auxiliary distribution with alpha+1 for the conditional mean formula.
@@ -38,8 +41,7 @@ pub fn beta_optimal_levels(dim: usize, n_bits: u8) -> Vec<f32> {
     let mean_ratio = alpha / (alpha + beta_param);
     for _ in 0..MAX_ITERATIONS {
         let boundaries = midpoints(&levels);
-        let new_levels =
-            compute_centroids(&dist, &dist_shifted, mean_ratio, &boundaries, n_levels);
+        let new_levels = compute_centroids(&dist, &dist_shifted, mean_ratio, &boundaries, n_levels);
         let max_delta = levels
             .iter()
             .zip(new_levels.iter())
@@ -58,10 +60,7 @@ pub fn beta_optimal_levels(dim: usize, n_bits: u8) -> Vec<f32> {
 /// Length: `2^n_bits - 1`.
 pub fn beta_optimal_boundaries(dim: usize, n_bits: u8) -> Vec<f32> {
     let levels = beta_optimal_levels(dim, n_bits);
-    levels
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect()
+    levels.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect()
 }
 
 /// Quantize a single value to the nearest level index.
@@ -69,10 +68,9 @@ pub fn beta_optimal_boundaries(dim: usize, n_bits: u8) -> Vec<f32> {
 /// Uses binary search on the boundaries array. Returns `0` if `value`
 /// is below the first boundary, `boundaries.len()` if above the last.
 pub fn quantize_to_index(value: f32, boundaries: &[f32]) -> u8 {
-    match boundaries.binary_search_by(|b| {
-        b.partial_cmp(&value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }) {
+    match boundaries
+        .binary_search_by(|b| b.partial_cmp(&value).unwrap_or(std::cmp::Ordering::Equal))
+    {
         Ok(i) => i as u8,
         Err(i) => i as u8,
     }
@@ -90,10 +88,7 @@ fn distribution_params(dim: usize) -> (f64, f64) {
 
 /// Compute midpoints between adjacent levels.
 fn midpoints(levels: &[f64]) -> Vec<f64> {
-    levels
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect()
+    levels.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect()
 }
 
 /// Compute the conditional mean (centroid) within each bin defined by
@@ -126,13 +121,7 @@ fn compute_centroids(
 /// Compute E[X | lo < X < hi] for a Beta(α, β) distribution using the
 /// analytical CDF-based formula, avoiding numerical integration of the
 /// singular PDF near x = 0.
-fn conditional_mean(
-    dist: &Beta,
-    dist_shifted: &Beta,
-    mean_ratio: f64,
-    lo: f64,
-    hi: f64,
-) -> f64 {
+fn conditional_mean(dist: &Beta, dist_shifted: &Beta, mean_ratio: f64, lo: f64, hi: f64) -> f64 {
     if (hi - lo) < 1e-15 {
         return (lo + hi) / 2.0;
     }
@@ -245,9 +234,6 @@ mod tests {
         assert_eq!(quantize_to_index(0.0, &boundaries), 0);
 
         // Value 1.0 should map to the last index.
-        assert_eq!(
-            quantize_to_index(1.0, &boundaries),
-            (n_levels - 1) as u8
-        );
+        assert_eq!(quantize_to_index(1.0, &boundaries), (n_levels - 1) as u8);
     }
 }
