@@ -1,5 +1,14 @@
 # Implementation Plan: SafeTensors + GGUF Input for Ironmill
 
+> **Status: ✅ Completed (2026-03-29)**
+>
+> SafeTensors and GGUF input are fully implemented. Weight providers live in
+> `crates/mil-rs/src/convert/weights/`, architecture templates in
+> `crates/mil-rs/src/convert/templates/`, and readers in
+> `crates/mil-rs/src/reader/`. End-to-end tests exist in
+> `crates/mil-rs/tests/safetensors_e2e.rs` and `gguf_e2e.rs`. This document
+> is retained as historical context.
+
 ## Problem Statement
 
 Ironmill currently accepts only ONNX as a model input format. The LLM ecosystem

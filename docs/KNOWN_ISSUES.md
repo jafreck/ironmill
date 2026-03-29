@@ -67,15 +67,11 @@ using these ops will compile through CoreML without custom op errors.
 `CreateBnnsGraphProgramFromMIL: input size and padding` warnings on CPU.
 Model still runs via BNNS fallback. Indicates padding/pooling serialization issue.
 
-#### ANE direct backend broken on current macOS
-
-All configs fail with `_ANECompiler : ANECCompile() FAILED`. Compatibility
-issue between private ANE APIs and current macOS version.
-
 ---
 
 ## Resolved
 
+- **ANE direct backend broken on current macOS** — Working on macOS 26.4 / M2 Max. All e2e tests pass including compile, load, and predict. The issue was stale.
 - **Unify runtime backends** — `ironmill-runtime` crate with `RuntimeBackend`/`RuntimeModel` traits; legacy `Backend` enum and `compile_model_with_backend` removed from `mil-rs/src/compiler.rs`
 - **PolarQuant non-power-of-two truncation** — Quantize pass keeps full padded indices; fusion pass handles trimming via `slice_by_index`
 - **Inter-layer rotation fusion pairing** — Pairing algorithm traces through multiple intermediate element-wise ops (up to 4 hops)

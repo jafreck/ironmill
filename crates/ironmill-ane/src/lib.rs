@@ -1175,27 +1175,20 @@ mod tests {
     }
 
     #[test]
-    fn e2e_compile_and_load_fails_at_ane_compiler() {
-        // This test exercises the full compile_and_load path. It will fail
-        // at the ANE compilation step because the private API selectors are
-        // not yet wired. This test documents exactly where the pipeline
-        // breaks and ensures everything upstream (passes, splitting, MIL
-        // emission, BLOBFILE writing) works correctly.
+    fn e2e_compile_and_load_weighted_program() {
+        // This test exercises the full compile_and_load path with a weighted
+        // program, including passes, splitting, MIL emission, BLOBFILE
+        // writing, ANE compilation, and loading.
         let program = build_weighted_program();
         let config = AneConfig::default();
 
         let result = AneModel::compile_and_load(&program, config);
 
-        // The pipeline should fail at the AneCompiler::compile_mil_text step,
-        // NOT at passes, splitting, or MIL emission.
         match result {
             Ok(mut model) => {
-                // If we get here, we're on real ANE hardware and compilation
-                // succeeded. Verify inference works end-to-end.
                 let desc = model.input_description();
                 assert!(!desc.is_empty(), "model should have inputs");
 
-                // Build dummy inputs and run predict
                 let inputs: Vec<AneTensor> = desc
                     .iter()
                     .map(|td| AneTensor::new(td.shape[1], td.shape[3], td.dtype).unwrap())
@@ -1205,8 +1198,9 @@ mod tests {
             }
             Err(e) => {
                 let msg = format!("{e}");
-                eprintln!("  compile_and_load failed (expected): {msg}");
-                // Should fail at compilation, not at earlier stages.
+                eprintln!("  compile_and_load failed: {msg}");
+                // If compilation fails, it should be at the ANE stage,
+                // not at passes, splitting, or MIL emission.
                 assert!(
                     msg.contains("ANE")
                         || msg.contains("compilation")

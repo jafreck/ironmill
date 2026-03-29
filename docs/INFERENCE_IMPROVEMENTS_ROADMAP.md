@@ -47,6 +47,10 @@ The repo already contains useful starting points for this work:
 - `docs/TEST_SPEC.md`
 - `docs/ane-direct-runtime-plan.md`
 - `docs/research/optimization-opportunities-2026.md`
+- `crates/mil-rs/src/convert/templates/llama.rs` (prefill/decode split scaffolding)
+- `crates/mil-rs/src/convert/pipeline.rs` (multi-stage pipeline with `pipeline.json` manifests)
+- `crates/mil-rs/src/convert/moe.rs` (multi-artifact MoE splitting)
+- `crates/ironmill-runtime/src/lib.rs` (unified `RuntimeBackend`/`RuntimeModel` traits)
 
 These pieces suggest the right direction already exists in the codebase, but it
 needs to be turned into a coherent inference roadmap.
@@ -81,6 +85,29 @@ inference engine.
 Ironmill should learn from `maderix/ANE`, `Orion`, `Espresso`, and
 `ane-infer`, but it should not try to become another direct-ANE runtime
 framework.
+
+## Prerequisites
+
+These items are not inference improvements themselves, but they block or
+significantly affect multiple Tier 1 improvements. They should be addressed
+first or in parallel with early Tier 1 work.
+
+### Transformer Op Decomposition
+
+`RotaryEmbedding` and `GroupQueryAttention` are currently emitted as opaque
+custom MIL ops that CoreML cannot compile. Until these are decomposed into
+standard MIL ops, stateful autoregressive export (#1) and prefill/decode
+splitting (#2) cannot be validated end-to-end on real transformer models.
+
+See: `KNOWN_ISSUES.md` — "Transformer ops are opaque pass-throughs"
+
+### Remove Legacy Compiler Dispatch
+
+The old `Backend` enum and `compile_model_with_backend()` in
+`mil-rs/src/compiler.rs` should be removed now that `ironmill-runtime` provides
+the trait-based `RuntimeBackend`/`RuntimeModel` abstraction. This cleanup
+simplifies the benchmark overhaul (#4) and avoids confusion about which
+backend abstraction to use.
 
 ## Prioritized Improvements
 
@@ -117,6 +144,14 @@ Recommended direction:
 - generate decode buckets for common fixed shapes instead of relying on one
   generic dynamic path
 - add CLI and library affordances for selecting the correct artifact or bucket
+
+Existing scaffolding:
+
+- `crates/mil-rs/src/convert/templates/llama.rs` already emits separate
+  `prefill` and `decode` functions with single-token decode paths when ANE
+  mode is enabled
+- this work should generalize that approach across architecture templates
+  rather than starting from scratch
 
 Why this matters:
 
@@ -243,6 +278,15 @@ Examples:
 - routing hints for ANE / CPU / GPU
 - benchmark metadata for downstream selection
 
+Existing scaffolding:
+
+- `crates/mil-rs/src/convert/pipeline.rs` already writes one `.mlpackage` per
+  stage with a `pipeline.json` manifest describing stage relationships
+- `crates/mil-rs/src/convert/moe.rs` splits models into shared + expert
+  artifacts with a manifest
+- this item should unify and extend those mechanisms rather than creating a
+  new packaging layer
+
 This is a natural follow-on once the core inference improvements above land.
 
 ### 9. Limited Speculative Decoding Support at the Toolchain Layer
@@ -255,6 +299,12 @@ Recommended scope:
 - emit draft/verifier-compatible artifacts
 - expose metadata needed by a downstream scheduler
 - avoid implementing a full speculative runtime loop inside Ironmill
+
+Existing scaffolding:
+
+- `crates/mil-rs/src/ir/passes/model_split.rs` already implements
+  draft/verifier splitting by detecting transformer layer boundaries and
+  truncating the draft model
 
 This should remain secondary to stateful export and bucketed decode support.
 
@@ -284,6 +334,7 @@ Why these are deferred:
 
 Focus on:
 
+0. transformer op decomposition (prerequisite — unblocks #1 and #2 validation)
 1. stateful autoregressive export and KV cache support
 2. prefill/decode split with shape buckets
 3. better ANE-aware routing and diagnostics

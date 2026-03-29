@@ -1,5 +1,12 @@
 # ANE Optimization Passes — Implementation Plan
 
+> **Status: ✅ Completed (2026-03-29)**
+>
+> All passes described in this plan are implemented and tested. See
+> `crates/mil-rs/src/ir/passes/` for the implementations and
+> `docs/BENCHMARK_RESULTS.md` for measured results. This document is retained
+> as historical context.
+
 ## Overview
 
 Add seven ANE-targeted optimization passes to `mil-rs`, plus a shared prerequisite
