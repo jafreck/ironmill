@@ -1,10 +1,12 @@
 //! Readers for various model formats.
 
+pub mod gguf;
 pub mod mlmodel;
 pub mod mlpackage;
 pub mod onnx;
 pub mod safetensors;
 
+pub use gguf::read_gguf;
 pub use mlmodel::{print_model_summary, read_mlmodel};
 pub use mlpackage::read_mlpackage;
 pub use onnx::{print_onnx_summary, read_onnx, read_onnx_with_dir};

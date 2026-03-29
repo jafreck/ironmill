@@ -122,6 +122,8 @@ pub use validate::validation_report_to_json;
 #[cfg(not(doctest))]
 pub use proto::specification::Model;
 
+/// Read a GGUF model file into a [`GgufProvider`](convert::weights::gguf::GgufProvider).
+pub use reader::read_gguf;
 /// Read a `.mlmodel` file into a protobuf [`Model`].
 pub use reader::read_mlmodel;
 /// Read a `.mlpackage` directory into a protobuf [`Model`].

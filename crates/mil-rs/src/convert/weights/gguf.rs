@@ -1,1 +1,1254 @@
-//! GGUF weight provider — implemented in Milestone 4.
+//! GGUF weight provider.
+//!
+//! Parses GGUF model files and provides dequantized weights as FP16 tensors.
+//! GGUF is a binary format used by llama.cpp and related tooling to distribute
+//! quantized LLM weights. This module implements a minimal parser that:
+//!
+//! 1. Memory-maps the GGUF file
+//! 2. Parses the header, metadata key-value pairs, and tensor descriptors
+//! 3. Extracts [`ModelConfig`] from GGUF metadata keys
+//! 4. Dequantizes tensor data (Q4_0, Q8_0, F16, F32, BF16) into FP16
+//! 5. Remaps GGUF tensor names to HuggingFace-canonical names
+//!
+//! Split-shard files are auto-discovered by filename pattern.
+
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+
+use half::f16;
+use memmap2::Mmap;
+
+use crate::MilError;
+use crate::convert::weights::{Architecture, ModelConfig, WeightProvider, WeightTensor};
+use crate::ir::ScalarType;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// GGUF magic number: bytes "GGUF" read as a little-endian u32.
+const GGUF_MAGIC: u32 = 0x4655_4747;
+/// Only version 3 is supported.
+const GGUF_VERSION: u32 = 3;
+/// Tensor data is aligned to this boundary within the file.
+const ALIGNMENT: usize = 32;
+
+// ---------------------------------------------------------------------------
+// GGML quantization types
+// ---------------------------------------------------------------------------
+
+/// GGML quantization type tags (matches the GGUF spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum GgmlType {
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    Q2K = 10,
+    Q3K = 11,
+    Q4K = 12,
+    Q5K = 13,
+    Q6K = 14,
+    IQ2XXS = 16,
+    IQ2XS = 17,
+    IQ3XXS = 18,
+    IQ1S = 19,
+    IQ4NL = 20,
+    IQ3S = 21,
+    IQ2S = 22,
+    IQ4XS = 23,
+    I8 = 24,
+    I16 = 25,
+    I32 = 26,
+    I64 = 27,
+    F64 = 28,
+    IQ1M = 29,
+    BF16 = 30,
+}
+
+impl GgmlType {
+    fn from_u32(v: u32) -> Result<Self, MilError> {
+        match v {
+            0 => Ok(Self::F32),
+            1 => Ok(Self::F16),
+            2 => Ok(Self::Q4_0),
+            3 => Ok(Self::Q4_1),
+            6 => Ok(Self::Q5_0),
+            7 => Ok(Self::Q5_1),
+            8 => Ok(Self::Q8_0),
+            9 => Ok(Self::Q8_1),
+            10 => Ok(Self::Q2K),
+            11 => Ok(Self::Q3K),
+            12 => Ok(Self::Q4K),
+            13 => Ok(Self::Q5K),
+            14 => Ok(Self::Q6K),
+            16 => Ok(Self::IQ2XXS),
+            17 => Ok(Self::IQ2XS),
+            18 => Ok(Self::IQ3XXS),
+            19 => Ok(Self::IQ1S),
+            20 => Ok(Self::IQ4NL),
+            21 => Ok(Self::IQ3S),
+            22 => Ok(Self::IQ2S),
+            23 => Ok(Self::IQ4XS),
+            24 => Ok(Self::I8),
+            25 => Ok(Self::I16),
+            26 => Ok(Self::I32),
+            27 => Ok(Self::I64),
+            28 => Ok(Self::F64),
+            29 => Ok(Self::IQ1M),
+            30 => Ok(Self::BF16),
+            _ => Err(MilError::Validation(format!("unknown GGML type tag: {v}"))),
+        }
+    }
+
+    /// Number of elements per quantization block.
+    fn block_size(self) -> usize {
+        match self {
+            Self::F32 | Self::F16 | Self::BF16 | Self::F64 => 1,
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 => 1,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 => 32,
+            Self::Q8_0 | Self::Q8_1 => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            _ => 1, // fallback for exotic IQ types
+        }
+    }
+
+    /// Byte size of one quantization block.
+    fn type_size(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 => 2,
+            Self::BF16 => 2,
+            Self::F64 => 8,
+            Self::I8 => 1,
+            Self::I16 => 2,
+            Self::I32 => 4,
+            Self::I64 => 8,
+            Self::Q4_0 => 18,
+            Self::Q4_1 => 20,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
+            Self::Q8_0 => 34,
+            Self::Q8_1 => 36,
+            Self::Q2K => 84,
+            Self::Q3K => 110,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Q6K => 210,
+            _ => 0, // exotic IQ types — will error during dequant
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GGUF metadata value types
+// ---------------------------------------------------------------------------
+
+/// A value read from the GGUF metadata key-value store.
+#[derive(Debug, Clone)]
+enum MetadataValue {
+    UInt8(u8),
+    Int8(i8),
+    UInt16(u16),
+    Int16(i16),
+    UInt32(u32),
+    Int32(i32),
+    Float32(f32),
+    Bool(bool),
+    Str(String),
+    Array(Vec<MetadataValue>),
+    UInt64(u64),
+    Int64(i64),
+    Float64(f64),
+}
+
+impl MetadataValue {
+    fn as_u32(&self) -> Option<u32> {
+        match self {
+            Self::UInt8(v) => Some(*v as u32),
+            Self::UInt16(v) => Some(*v as u32),
+            Self::UInt32(v) => Some(*v),
+            Self::UInt64(v) => Some(*v as u32),
+            Self::Int8(v) => Some(*v as u32),
+            Self::Int16(v) => Some(*v as u32),
+            Self::Int32(v) => Some(*v as u32),
+            Self::Int64(v) => Some(*v as u32),
+            _ => None,
+        }
+    }
+
+    fn as_usize(&self) -> Option<usize> {
+        self.as_u32().map(|v| v as usize)
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Float32(v) => Some(*v as f64),
+            Self::Float64(v) => Some(*v),
+            Self::UInt32(v) => Some(*v as f64),
+            Self::Int32(v) => Some(*v as f64),
+            Self::UInt64(v) => Some(*v as f64),
+            Self::Int64(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&[MetadataValue]> {
+        match self {
+            Self::Array(a) => Some(a.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            Self::UInt8(v) => Some(*v != 0),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary reader helpers
+// ---------------------------------------------------------------------------
+
+/// Minimal cursor-based reader for little-endian binary data.
+struct BinReader<'a> {
+    cursor: Cursor<&'a [u8]>,
+}
+
+impl<'a> BinReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            cursor: Cursor::new(data),
+        }
+    }
+
+    fn position(&self) -> usize {
+        self.cursor.position() as usize
+    }
+
+    fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], MilError> {
+        let pos = self.cursor.position() as usize;
+        let len = self.cursor.get_ref().len();
+        if pos + n > len {
+            return Err(MilError::Validation(format!(
+                "GGUF: unexpected EOF at offset {pos}, need {n} more bytes"
+            )));
+        }
+        let data = *self.cursor.get_ref();
+        self.cursor.set_position((pos + n) as u64);
+        Ok(&data[pos..pos + n])
+    }
+
+    fn read_u8(&mut self) -> Result<u8, MilError> {
+        let b = self.read_bytes(1)?;
+        Ok(b[0])
+    }
+
+    fn read_i8(&mut self) -> Result<i8, MilError> {
+        Ok(self.read_u8()? as i8)
+    }
+
+    fn read_u16(&mut self) -> Result<u16, MilError> {
+        let b = self.read_bytes(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn read_i16(&mut self) -> Result<i16, MilError> {
+        let b = self.read_bytes(2)?;
+        Ok(i16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, MilError> {
+        let b = self.read_bytes(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn read_i32(&mut self) -> Result<i32, MilError> {
+        let b = self.read_bytes(4)?;
+        Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, MilError> {
+        let b = self.read_bytes(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    fn read_i64(&mut self) -> Result<i64, MilError> {
+        let b = self.read_bytes(8)?;
+        Ok(i64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    fn read_f32(&mut self) -> Result<f32, MilError> {
+        let b = self.read_bytes(4)?;
+        Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn read_f64(&mut self) -> Result<f64, MilError> {
+        let b = self.read_bytes(8)?;
+        Ok(f64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    /// Read a GGUF string: u64 length followed by UTF-8 bytes (not null-terminated).
+    fn read_gguf_string(&mut self) -> Result<String, MilError> {
+        let len = self.read_u64()? as usize;
+        let bytes = self.read_bytes(len)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| MilError::Validation(format!("GGUF: invalid UTF-8 in string: {e}")))
+    }
+
+    /// Read a typed metadata value.
+    fn read_metadata_value(&mut self, type_tag: u32) -> Result<MetadataValue, MilError> {
+        match type_tag {
+            0 => Ok(MetadataValue::UInt8(self.read_u8()?)),
+            1 => Ok(MetadataValue::Int8(self.read_i8()?)),
+            2 => Ok(MetadataValue::UInt16(self.read_u16()?)),
+            3 => Ok(MetadataValue::Int16(self.read_i16()?)),
+            4 => Ok(MetadataValue::UInt32(self.read_u32()?)),
+            5 => Ok(MetadataValue::Int32(self.read_i32()?)),
+            6 => Ok(MetadataValue::Float32(self.read_f32()?)),
+            7 => {
+                let v = self.read_u8()?;
+                Ok(MetadataValue::Bool(v != 0))
+            }
+            8 => Ok(MetadataValue::Str(self.read_gguf_string()?)),
+            9 => {
+                // Array: element type (u32) + count (u64) + elements
+                let elem_type = self.read_u32()?;
+                let count = self.read_u64()? as usize;
+                let mut elems = Vec::with_capacity(count.min(1 << 20));
+                for _ in 0..count {
+                    elems.push(self.read_metadata_value(elem_type)?);
+                }
+                Ok(MetadataValue::Array(elems))
+            }
+            10 => Ok(MetadataValue::UInt64(self.read_u64()?)),
+            11 => Ok(MetadataValue::Int64(self.read_i64()?)),
+            12 => Ok(MetadataValue::Float64(self.read_f64()?)),
+            _ => Err(MilError::Validation(format!(
+                "GGUF: unknown metadata value type: {type_tag}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tensor descriptor (parsed from GGUF header, before data is loaded)
+// ---------------------------------------------------------------------------
+
+/// Parsed GGUF tensor info entry.
+struct GgufTensorInfo {
+    name: String,
+    dimensions: Vec<usize>,
+    ggml_type: GgmlType,
+    /// Offset relative to the start of the tensor data section.
+    offset: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Owned dequantized tensor
+// ---------------------------------------------------------------------------
+
+/// A fully dequantized weight tensor stored as owned bytes.
+struct OwnedWeightTensor {
+    data: Vec<u8>,
+    shape: Vec<usize>,
+    dtype: ScalarType,
+}
+
+// ---------------------------------------------------------------------------
+// GgufProvider
+// ---------------------------------------------------------------------------
+
+/// Weight provider backed by one or more GGUF files.
+///
+/// All quantized tensors are dequantized to FP16 at load time and stored
+/// in an in-memory HashMap. The HuggingFace-canonical tensor names are used
+/// as keys so that architecture templates can consume them transparently.
+pub struct GgufProvider {
+    config: ModelConfig,
+    tensors: HashMap<String, OwnedWeightTensor>,
+}
+
+impl GgufProvider {
+    /// Load a GGUF model from `path`.
+    ///
+    /// For split-shard models (e.g. `model-00001-of-00003.gguf`), pass any
+    /// shard path and siblings will be auto-discovered.
+    pub fn load(path: &Path) -> Result<Self, MilError> {
+        let shard_paths = discover_shards(path)?;
+        let mut all_metadata: HashMap<String, MetadataValue> = HashMap::new();
+        let mut all_tensors: HashMap<String, OwnedWeightTensor> = HashMap::new();
+
+        for shard_path in &shard_paths {
+            let file = std::fs::File::open(shard_path)?;
+            // SAFETY: we treat the mmap as read-only and do not mutate it.
+            let mmap = unsafe { Mmap::map(&file)? };
+            let data: &[u8] = &mmap;
+
+            let mut reader = BinReader::new(data);
+
+            // --- Header ---
+            let magic = reader.read_u32()?;
+            if magic != GGUF_MAGIC {
+                return Err(MilError::Validation(format!(
+                    "GGUF: invalid magic 0x{magic:08X} in {}",
+                    shard_path.display()
+                )));
+            }
+
+            let version = reader.read_u32()?;
+            if version != GGUF_VERSION {
+                return Err(MilError::Validation(format!(
+                    "GGUF: unsupported version {version} (expected {GGUF_VERSION}) in {}",
+                    shard_path.display()
+                )));
+            }
+
+            let tensor_count = reader.read_u64()? as usize;
+            let metadata_kv_count = reader.read_u64()? as usize;
+
+            // --- Metadata KV pairs ---
+            for _ in 0..metadata_kv_count {
+                let key = reader.read_gguf_string()?;
+                let value_type = reader.read_u32()?;
+                let value = reader.read_metadata_value(value_type)?;
+                all_metadata.insert(key, value);
+            }
+
+            // --- Tensor info entries ---
+            let mut tensor_infos = Vec::with_capacity(tensor_count);
+            for _ in 0..tensor_count {
+                let name = reader.read_gguf_string()?;
+                let n_dims = reader.read_u32()? as usize;
+                let mut dimensions = Vec::with_capacity(n_dims);
+                for _ in 0..n_dims {
+                    dimensions.push(reader.read_u64()? as usize);
+                }
+                let ggml_type = GgmlType::from_u32(reader.read_u32()?)?;
+                let offset = reader.read_u64()?;
+                tensor_infos.push(GgufTensorInfo {
+                    name,
+                    dimensions,
+                    ggml_type,
+                    offset,
+                });
+            }
+
+            // --- Compute tensor data section start ---
+            // The tensor data section starts at the next ALIGNMENT boundary
+            // after all header/metadata/tensor-info bytes.
+            let header_end = reader.position();
+            let data_section_start = align_offset(header_end, ALIGNMENT)?;
+
+            // --- Dequantize each tensor ---
+            for info in &tensor_infos {
+                let abs_offset = data_section_start
+                    .checked_add(info.offset as usize)
+                    .ok_or_else(|| {
+                        MilError::Validation(format!(
+                            "GGUF: tensor '{}' offset overflow",
+                            info.name
+                        ))
+                    })?;
+                let num_elements: usize = info
+                    .dimensions
+                    .iter()
+                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                    .ok_or_else(|| {
+                        MilError::Validation(format!(
+                            "GGUF: tensor '{}' dimensions overflow",
+                            info.name
+                        ))
+                    })?;
+                if num_elements == 0 {
+                    continue;
+                }
+                let byte_len = tensor_byte_size(num_elements, info.ggml_type)?;
+                let end = abs_offset.checked_add(byte_len).ok_or_else(|| {
+                    MilError::Validation(format!(
+                        "GGUF: tensor '{}' data range overflow",
+                        info.name
+                    ))
+                })?;
+                if end > data.len() {
+                    return Err(MilError::Validation(format!(
+                        "GGUF: tensor '{}' data extends beyond file (offset {abs_offset}, \
+                         need {byte_len} bytes, file is {} bytes)",
+                        info.name,
+                        data.len()
+                    )));
+                }
+
+                let raw = &data[abs_offset..end];
+                let fp16_data = dequantize_to_fp16(raw, num_elements, info.ggml_type)?;
+
+                // GGUF dimensions are stored in row-major order already
+                let hf_name = remap_tensor_name(&info.name);
+                all_tensors.insert(
+                    hf_name,
+                    OwnedWeightTensor {
+                        data: fp16_data,
+                        shape: info.dimensions.clone(),
+                        dtype: ScalarType::Float16,
+                    },
+                );
+            }
+        }
+
+        let config = extract_model_config(&all_metadata)?;
+
+        Ok(Self {
+            config,
+            tensors: all_tensors,
+        })
+    }
+}
+
+impl WeightProvider for GgufProvider {
+    fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError> {
+        let t = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| MilError::Validation(format!("GGUF: tensor not found: {name}")))?;
+        Ok(WeightTensor::borrowed(&t.data, t.shape.clone(), t.dtype))
+    }
+
+    fn tensor_names(&self) -> Vec<&str> {
+        self.tensors.keys().map(|s| s.as_str()).collect()
+    }
+
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split-shard discovery
+// ---------------------------------------------------------------------------
+
+/// Discover all shard files for a split GGUF model.
+///
+/// Recognises the pattern `<stem>-NNNNN-of-NNNNN.gguf`. If the path does
+/// not match this pattern it is treated as a single file.
+fn discover_shards(path: &Path) -> Result<Vec<PathBuf>, MilError> {
+    let path = std::fs::canonicalize(path)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| MilError::Validation("GGUF: invalid file path".into()))?;
+
+    // Pattern: <prefix>-NNNNN-of-NNNNN.gguf
+    if let Some(prefix) = detect_shard_prefix(file_name) {
+        let parent = path.parent().ok_or_else(|| {
+            MilError::Validation("GGUF: cannot determine parent directory".into())
+        })?;
+        let mut shards: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(&prefix)
+                && name_str.ends_with(".gguf")
+                && detect_shard_prefix(&name_str)
+                    .map(|p| p == prefix)
+                    .unwrap_or(false)
+            {
+                shards.push(entry.path());
+            }
+        }
+        shards.sort();
+        if shards.is_empty() {
+            shards.push(path);
+        }
+        Ok(shards)
+    } else {
+        Ok(vec![path])
+    }
+}
+
+/// If `name` matches `<prefix>-NNNNN-of-NNNNN.gguf`, returns `<prefix>`.
+fn detect_shard_prefix(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".gguf")?;
+    // Expect: ...-NNNNN-of-NNNNN
+    let parts: Vec<&str> = stem.rsplitn(4, '-').collect();
+    // parts = [NNNNN, "of", NNNNN, rest...]
+    if parts.len() >= 3 && parts[1] == "of" {
+        let _total: usize = parts[0].parse().ok()?;
+        let _index: usize = parts[2].parse().ok()?;
+        // Reconstruct prefix: everything before the shard numbering
+        let shard_suffix_len = parts[0].len() + parts[1].len() + parts[2].len() + 3; // 3 dashes
+        let prefix = &stem[..stem.len() - shard_suffix_len];
+        Some(prefix.to_string())
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metadata → ModelConfig
+// ---------------------------------------------------------------------------
+
+fn get_meta_str<'a>(
+    meta: &'a HashMap<String, MetadataValue>,
+    key: &str,
+) -> Result<&'a str, MilError> {
+    meta.get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MilError::Validation(format!("GGUF: missing metadata key '{key}'")))
+}
+
+fn get_meta_usize(meta: &HashMap<String, MetadataValue>, key: &str) -> Result<usize, MilError> {
+    meta.get(key)
+        .and_then(|v| v.as_usize())
+        .ok_or_else(|| MilError::Validation(format!("GGUF: missing metadata key '{key}'")))
+}
+
+fn get_meta_f64(meta: &HashMap<String, MetadataValue>, key: &str) -> Result<f64, MilError> {
+    meta.get(key)
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| MilError::Validation(format!("GGUF: missing metadata key '{key}'")))
+}
+
+fn extract_model_config(meta: &HashMap<String, MetadataValue>) -> Result<ModelConfig, MilError> {
+    let arch_str = get_meta_str(meta, "general.architecture")?;
+    let architecture: Architecture = arch_str.parse()?;
+    let arch = arch_str.to_lowercase();
+
+    let hidden_size = get_meta_usize(meta, &format!("{arch}.embedding_length"))?;
+    let intermediate_size = get_meta_usize(meta, &format!("{arch}.feed_forward_length"))?;
+    let num_hidden_layers = get_meta_usize(meta, &format!("{arch}.block_count"))?;
+    let num_attention_heads = get_meta_usize(meta, &format!("{arch}.attention.head_count"))?;
+    let num_key_value_heads = get_meta_usize(meta, &format!("{arch}.attention.head_count_kv"))
+        .unwrap_or(num_attention_heads);
+
+    let rms_norm_eps =
+        get_meta_f64(meta, &format!("{arch}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-5);
+
+    let rope_theta = get_meta_f64(meta, &format!("{arch}.rope.freq_base")).unwrap_or(10000.0);
+
+    let max_position_embeddings =
+        get_meta_usize(meta, &format!("{arch}.context_length")).unwrap_or(4096);
+
+    // Vocab size: prefer metadata key, fall back to tokenizer token array length.
+    let vocab_size = get_meta_usize(meta, &format!("{arch}.vocab_size")).or_else(|_| {
+        meta.get("tokenizer.ggml.tokens")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .ok_or_else(|| MilError::Validation("GGUF: cannot determine vocab_size".into()))
+    })?;
+
+    let head_dim = ModelConfig::default_head_dim(hidden_size, num_attention_heads);
+
+    let tie_word_embeddings = meta
+        .get(&format!("{arch}.tie_word_embeddings"))
+        .or_else(|| meta.get("general.tie_word_embeddings"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    Ok(ModelConfig {
+        architecture,
+        hidden_size,
+        intermediate_size,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        vocab_size,
+        max_position_embeddings,
+        rms_norm_eps,
+        rope_theta,
+        tie_word_embeddings,
+        extra: HashMap::new(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GGUF → HuggingFace tensor name remapping
+// ---------------------------------------------------------------------------
+
+/// Map a GGUF tensor name to the HuggingFace-canonical name used by
+/// architecture templates.
+fn remap_tensor_name(gguf_name: &str) -> String {
+    // Static 1:1 mappings (no layer index)
+    match gguf_name {
+        "token_embd.weight" => return "model.embed_tokens.weight".into(),
+        "output_norm.weight" => return "model.norm.weight".into(),
+        "output.weight" => return "lm_head.weight".into(),
+        _ => {}
+    }
+
+    // Layer-indexed mappings: blk.{n}.<suffix> → model.layers.{n}.<hf_suffix>
+    if let Some(rest) = gguf_name.strip_prefix("blk.") {
+        if let Some(dot_pos) = rest.find('.') {
+            let layer_str = &rest[..dot_pos];
+            let suffix = &rest[dot_pos + 1..];
+            let hf_suffix = match suffix {
+                "attn_q.weight" => "self_attn.q_proj.weight",
+                "attn_k.weight" => "self_attn.k_proj.weight",
+                "attn_v.weight" => "self_attn.v_proj.weight",
+                "attn_output.weight" => "self_attn.o_proj.weight",
+                "ffn_gate.weight" => "mlp.gate_proj.weight",
+                "ffn_up.weight" => "mlp.up_proj.weight",
+                "ffn_down.weight" => "mlp.down_proj.weight",
+                "attn_norm.weight" => "input_layernorm.weight",
+                "ffn_norm.weight" => "post_attention_layernorm.weight",
+                // Pass through unknown suffixes
+                other => other,
+            };
+            return format!("model.layers.{layer_str}.{hf_suffix}");
+        }
+    }
+
+    // Fallback: pass through unrecognised names unchanged
+    gguf_name.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Dequantization
+// ---------------------------------------------------------------------------
+
+/// Compute total byte size for `num_elements` stored in the given GGML type.
+fn tensor_byte_size(num_elements: usize, ggml_type: GgmlType) -> Result<usize, MilError> {
+    let bs = ggml_type.block_size();
+    let ts = ggml_type.type_size();
+    if bs == 0 || ts == 0 {
+        return Err(MilError::Validation(format!(
+            "GGUF: cannot compute byte size for unsupported type {:?}",
+            ggml_type
+        )));
+    }
+    // num_elements must be a multiple of block_size
+    if num_elements % bs != 0 {
+        return Err(MilError::Validation(format!(
+            "GGUF: element count {num_elements} is not a multiple of block size {bs} \
+             for type {:?}",
+            ggml_type
+        )));
+    }
+    (num_elements / bs).checked_mul(ts).ok_or_else(|| {
+        MilError::Validation(format!(
+            "GGUF: tensor byte size overflow ({num_elements} elements, type {:?})",
+            ggml_type
+        ))
+    })
+}
+
+/// Dequantize raw tensor bytes to FP16, returning the FP16 byte buffer.
+fn dequantize_to_fp16(
+    raw: &[u8],
+    num_elements: usize,
+    ggml_type: GgmlType,
+) -> Result<Vec<u8>, MilError> {
+    match ggml_type {
+        GgmlType::F32 => dequant_f32_to_fp16(raw, num_elements),
+        GgmlType::F16 => dequant_f16_passthrough(raw, num_elements),
+        GgmlType::BF16 => dequant_bf16_to_fp16(raw, num_elements),
+        GgmlType::Q4_0 => dequant_q4_0_to_fp16(raw, num_elements),
+        GgmlType::Q8_0 => dequant_q8_0_to_fp16(raw, num_elements),
+        other => Err(MilError::Validation(format!(
+            "GGUF: dequantization not yet implemented for {other:?}. \
+             Supported types: F32, F16, BF16, Q4_0, Q8_0"
+        ))),
+    }
+}
+
+/// F32 → FP16: read f32 values, convert each to f16.
+fn dequant_f32_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
+    let expected_bytes = num_elements
+        .checked_mul(4)
+        .ok_or_else(|| MilError::Validation("GGUF: F32 dequant size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: F32 tensor data too short".into(),
+        ));
+    }
+    let out_capacity = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: F32 dequant output size overflow".into()))?;
+    let mut out = Vec::with_capacity(out_capacity);
+    for i in 0..num_elements {
+        let off = i * 4;
+        let val = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+        let h = f16::from_f32(val);
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// F16 → FP16: passthrough (just copy the bytes).
+fn dequant_f16_passthrough(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
+    let expected = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: F16 dequant size overflow".into()))?;
+    if raw.len() < expected {
+        return Err(MilError::Validation(
+            "GGUF: F16 tensor data too short".into(),
+        ));
+    }
+    Ok(raw[..expected].to_vec())
+}
+
+/// BF16 → FP16: convert each bf16 value to f16.
+///
+/// bf16 has the same exponent range as f32 but only 8 mantissa bits.
+/// We go through f32 as an intermediate: bf16 → f32 → f16.
+fn dequant_bf16_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
+    let expected_bytes = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: BF16 dequant size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: BF16 tensor data too short".into(),
+        ));
+    }
+    let out_capacity = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: BF16 dequant output size overflow".into()))?;
+    let mut out = Vec::with_capacity(out_capacity);
+    for i in 0..num_elements {
+        let off = i * 2;
+        let bf16_bits = u16::from_le_bytes([raw[off], raw[off + 1]]);
+        // bf16 → f32: place bf16 bits in the upper 16 bits of a 32-bit float
+        let f32_val = f32::from_bits((bf16_bits as u32) << 16);
+        let h = f16::from_f32(f32_val);
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Q4_0 → FP16: each block is 32 values.
+///
+/// Block layout (18 bytes):
+///   - 2 bytes: f16 scale factor (`d`)
+///   - 16 bytes: 32 × 4-bit unsigned nibbles packed 2-per-byte (low nibble first)
+///
+/// Dequantization: `value = d * (nibble - 8)`
+fn dequant_q4_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 18;
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let expected_bytes = num_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| MilError::Validation("GGUF: Q4_0 dequant size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: Q4_0 tensor data too short".into(),
+        ));
+    }
+
+    let out_capacity = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: Q4_0 dequant output size overflow".into()))?;
+    let mut out = Vec::with_capacity(out_capacity);
+
+    for block_idx in 0..num_blocks {
+        let block = &raw[block_idx * BLOCK_BYTES..];
+        // Scale factor stored as f16
+        let d = f16::from_le_bytes([block[0], block[1]]);
+        let d_f32 = d.to_f32();
+        let quant_data = &block[2..BLOCK_BYTES];
+
+        for &byte in quant_data.iter().take(16) {
+            // Low nibble → even element, high nibble → odd element
+            let lo = (byte & 0x0F) as i32 - 8;
+            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+
+            let v_lo = f16::from_f32(d_f32 * lo as f32);
+            let v_hi = f16::from_f32(d_f32 * hi as f32);
+            out.extend_from_slice(&v_lo.to_le_bytes());
+            out.extend_from_slice(&v_hi.to_le_bytes());
+        }
+    }
+
+    Ok(out)
+}
+
+/// Q8_0 → FP16: each block is 32 values.
+///
+/// Block layout (34 bytes):
+///   - 2 bytes: f16 scale factor (`d`)
+///   - 32 bytes: 32 × int8 values
+///
+/// Dequantization: `value = d * int8_value`
+fn dequant_q8_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 34;
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let expected_bytes = num_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| MilError::Validation("GGUF: Q8_0 dequant size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: Q8_0 tensor data too short".into(),
+        ));
+    }
+
+    let out_capacity = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: Q8_0 dequant output size overflow".into()))?;
+    let mut out = Vec::with_capacity(out_capacity);
+
+    for block_idx in 0..num_blocks {
+        let block = &raw[block_idx * BLOCK_BYTES..];
+        let d = f16::from_le_bytes([block[0], block[1]]);
+        let d_f32 = d.to_f32();
+        let quant_data = &block[2..BLOCK_BYTES];
+
+        for &q in quant_data {
+            let val = d_f32 * (q as i8) as f32;
+            let h = f16::from_f32(val);
+            out.extend_from_slice(&h.to_le_bytes());
+        }
+    }
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
+
+/// Round `offset` up to the next multiple of `alignment`.
+fn align_offset(offset: usize, alignment: usize) -> Result<usize, MilError> {
+    let aligned = offset
+        .checked_add(alignment - 1)
+        .ok_or_else(|| MilError::Validation("GGUF: alignment offset overflow".into()))?;
+    Ok(aligned & !(alignment - 1))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_align_offset() {
+        assert_eq!(align_offset(0, 32).unwrap(), 0);
+        assert_eq!(align_offset(1, 32).unwrap(), 32);
+        assert_eq!(align_offset(31, 32).unwrap(), 32);
+        assert_eq!(align_offset(32, 32).unwrap(), 32);
+        assert_eq!(align_offset(33, 32).unwrap(), 64);
+    }
+
+    #[test]
+    fn test_ggml_type_from_u32() {
+        assert_eq!(GgmlType::from_u32(0).unwrap(), GgmlType::F32);
+        assert_eq!(GgmlType::from_u32(1).unwrap(), GgmlType::F16);
+        assert_eq!(GgmlType::from_u32(2).unwrap(), GgmlType::Q4_0);
+        assert_eq!(GgmlType::from_u32(8).unwrap(), GgmlType::Q8_0);
+        assert_eq!(GgmlType::from_u32(30).unwrap(), GgmlType::BF16);
+        assert!(GgmlType::from_u32(999).is_err());
+    }
+
+    #[test]
+    fn test_remap_tensor_name() {
+        assert_eq!(
+            remap_tensor_name("token_embd.weight"),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(remap_tensor_name("output_norm.weight"), "model.norm.weight");
+        assert_eq!(remap_tensor_name("output.weight"), "lm_head.weight");
+        assert_eq!(
+            remap_tensor_name("blk.0.attn_q.weight"),
+            "model.layers.0.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            remap_tensor_name("blk.15.ffn_gate.weight"),
+            "model.layers.15.mlp.gate_proj.weight"
+        );
+        assert_eq!(
+            remap_tensor_name("blk.3.attn_norm.weight"),
+            "model.layers.3.input_layernorm.weight"
+        );
+        assert_eq!(
+            remap_tensor_name("blk.7.ffn_norm.weight"),
+            "model.layers.7.post_attention_layernorm.weight"
+        );
+        // Unknown names pass through
+        assert_eq!(remap_tensor_name("custom.tensor"), "custom.tensor");
+    }
+
+    #[test]
+    fn test_detect_shard_prefix() {
+        assert_eq!(
+            detect_shard_prefix("model-00001-of-00003.gguf"),
+            Some("model".into())
+        );
+        assert_eq!(
+            detect_shard_prefix("my-model-00002-of-00005.gguf"),
+            Some("my-model".into())
+        );
+        assert_eq!(detect_shard_prefix("single.gguf"), None);
+        assert_eq!(detect_shard_prefix("model.gguf"), None);
+    }
+
+    #[test]
+    fn test_dequant_f32_to_fp16() {
+        let values: Vec<f32> = vec![1.0, -2.5, 0.0, 3.14];
+        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let result = dequant_f32_to_fp16(&raw, 4).unwrap();
+        assert_eq!(result.len(), 8); // 4 elements × 2 bytes
+        // Verify first value
+        let h = f16::from_le_bytes([result[0], result[1]]);
+        assert!((h.to_f32() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_dequant_f16_passthrough() {
+        let values: Vec<f16> = vec![f16::from_f32(1.0), f16::from_f32(-0.5), f16::from_f32(0.0)];
+        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let result = dequant_f16_passthrough(&raw, 3).unwrap();
+        assert_eq!(result, raw);
+    }
+
+    #[test]
+    fn test_dequant_bf16_to_fp16() {
+        // BF16 for 1.0: same as f32 upper 16 bits → 0x3F80
+        let bf16_one: u16 = 0x3F80;
+        let raw: Vec<u8> = bf16_one.to_le_bytes().to_vec();
+        let result = dequant_bf16_to_fp16(&raw, 1).unwrap();
+        let h = f16::from_le_bytes([result[0], result[1]]);
+        assert!((h.to_f32() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_dequant_q4_0_to_fp16() {
+        // Build a single Q4_0 block (32 elements, 18 bytes)
+        let d = f16::from_f32(0.5);
+        let mut block = Vec::new();
+        block.extend_from_slice(&d.to_le_bytes());
+        // 16 bytes of nibbles: each byte = (hi << 4) | lo
+        // Set all nibbles to 8 → dequant value = 0.5 * (8-8) = 0
+        for _ in 0..16 {
+            block.push(0x88);
+        }
+        let result = dequant_q4_0_to_fp16(&block, 32).unwrap();
+        assert_eq!(result.len(), 64); // 32 × 2 bytes
+        // All values should be 0
+        for i in 0..32 {
+            let h = f16::from_le_bytes([result[i * 2], result[i * 2 + 1]]);
+            assert!(h.to_f32().abs() < 1e-6);
+        }
+
+        // Test with nibble = 12 → dequant = 0.5 * (12-8) = 2.0
+        let mut block2 = Vec::new();
+        block2.extend_from_slice(&d.to_le_bytes());
+        for _ in 0..16 {
+            block2.push(0xCC); // lo=12, hi=12
+        }
+        let result2 = dequant_q4_0_to_fp16(&block2, 32).unwrap();
+        for i in 0..32 {
+            let h = f16::from_le_bytes([result2[i * 2], result2[i * 2 + 1]]);
+            assert!((h.to_f32() - 2.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn test_dequant_q8_0_to_fp16() {
+        // Build a single Q8_0 block (32 elements, 34 bytes)
+        let d = f16::from_f32(0.25);
+        let mut block = Vec::new();
+        block.extend_from_slice(&d.to_le_bytes());
+        // 32 int8 values: all = 4 → dequant = 0.25 * 4 = 1.0
+        for _ in 0..32 {
+            block.push(4u8);
+        }
+        let result = dequant_q8_0_to_fp16(&block, 32).unwrap();
+        assert_eq!(result.len(), 64);
+        for i in 0..32 {
+            let h = f16::from_le_bytes([result[i * 2], result[i * 2 + 1]]);
+            assert!((h.to_f32() - 1.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn test_tensor_byte_size() {
+        assert_eq!(tensor_byte_size(32, GgmlType::Q4_0).unwrap(), 18);
+        assert_eq!(tensor_byte_size(64, GgmlType::Q4_0).unwrap(), 36);
+        assert_eq!(tensor_byte_size(32, GgmlType::Q8_0).unwrap(), 34);
+        assert_eq!(tensor_byte_size(4, GgmlType::F32).unwrap(), 16);
+        assert_eq!(tensor_byte_size(4, GgmlType::F16).unwrap(), 8);
+        // Non-multiple of block size should error
+        assert!(tensor_byte_size(33, GgmlType::Q4_0).is_err());
+    }
+
+    /// Build a minimal valid GGUF v3 file in memory and parse it.
+    #[test]
+    fn test_parse_minimal_gguf() {
+        let gguf_bytes = build_test_gguf();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.gguf");
+        std::fs::write(&path, &gguf_bytes).unwrap();
+
+        let provider = GgufProvider::load(&path).unwrap();
+        let config = provider.config();
+        assert_eq!(config.architecture, Architecture::Llama);
+        assert_eq!(config.hidden_size, 64);
+        assert_eq!(config.num_hidden_layers, 2);
+        assert_eq!(config.num_attention_heads, 4);
+        assert_eq!(config.vocab_size, 3);
+
+        // Verify the test tensor was loaded and remapped
+        assert!(provider.has_tensor("model.embed_tokens.weight"));
+        let t = provider.tensor("model.embed_tokens.weight").unwrap();
+        assert_eq!(t.shape, vec![3, 64]);
+        assert_eq!(t.dtype, ScalarType::Float16);
+    }
+
+    /// Helper: build a minimal GGUF v3 binary with one F32 tensor.
+    fn build_test_gguf() -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // --- Header ---
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes()); // magic
+        buf.extend_from_slice(&GGUF_VERSION.to_le_bytes()); // version
+        buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&8u64.to_le_bytes()); // metadata_kv_count
+
+        // --- Metadata KV pairs ---
+        // Helper closures
+        let write_kv_string = |buf: &mut Vec<u8>, key: &str, val: &str| {
+            // key
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            // type = 8 (string)
+            buf.extend_from_slice(&8u32.to_le_bytes());
+            // value
+            buf.extend_from_slice(&(val.len() as u64).to_le_bytes());
+            buf.extend_from_slice(val.as_bytes());
+        };
+
+        let write_kv_u32 = |buf: &mut Vec<u8>, key: &str, val: u32| {
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&4u32.to_le_bytes()); // type = uint32
+            buf.extend_from_slice(&val.to_le_bytes());
+        };
+
+        let write_kv_f32 = |buf: &mut Vec<u8>, key: &str, val: f32| {
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&6u32.to_le_bytes()); // type = float32
+            buf.extend_from_slice(&val.to_le_bytes());
+        };
+
+        write_kv_string(&mut buf, "general.architecture", "llama");
+        write_kv_u32(&mut buf, "llama.embedding_length", 64);
+        write_kv_u32(&mut buf, "llama.feed_forward_length", 256);
+        write_kv_u32(&mut buf, "llama.block_count", 2);
+        write_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_kv_u32(&mut buf, "llama.attention.head_count_kv", 4);
+        write_kv_f32(&mut buf, "llama.attention.layer_norm_rms_epsilon", 1e-5);
+
+        // tokenizer.ggml.tokens as string array with 3 elements → vocab_size=3
+        {
+            let key = "tokenizer.ggml.tokens";
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&9u32.to_le_bytes()); // type = array
+            buf.extend_from_slice(&8u32.to_le_bytes()); // element type = string
+            buf.extend_from_slice(&3u64.to_le_bytes()); // count
+            for tok in &["<s>", "</s>", "hello"] {
+                buf.extend_from_slice(&(tok.len() as u64).to_le_bytes());
+                buf.extend_from_slice(tok.as_bytes());
+            }
+        }
+
+        // --- Tensor info ---
+        // One tensor: "token_embd.weight", shape [3, 64], type F32, offset 0
+        {
+            let name = "token_embd.weight";
+            buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+            buf.extend_from_slice(&3u64.to_le_bytes()); // dim 0
+            buf.extend_from_slice(&64u64.to_le_bytes()); // dim 1
+            buf.extend_from_slice(&0u32.to_le_bytes()); // type = F32
+            buf.extend_from_slice(&0u64.to_le_bytes()); // offset
+        }
+
+        // --- Pad to alignment ---
+        let header_end = buf.len();
+        let data_start = align_offset(header_end, ALIGNMENT).unwrap();
+        buf.resize(data_start, 0u8);
+
+        // --- Tensor data: 3×64 F32 values ---
+        let num_elements = 3 * 64;
+        for i in 0..num_elements {
+            let val = (i as f32) * 0.01;
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+
+        buf
+    }
+
+    #[test]
+    fn test_bin_reader_read_gguf_string() {
+        let s = "hello";
+        let mut data = Vec::new();
+        data.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        data.extend_from_slice(s.as_bytes());
+        let mut reader = BinReader::new(&data);
+        assert_eq!(reader.read_gguf_string().unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_bin_reader_eof_error() {
+        let data = [0u8; 2];
+        let mut reader = BinReader::new(&data);
+        assert!(reader.read_u32().is_err());
+    }
+
+    #[test]
+    fn test_metadata_value_conversions() {
+        let v = MetadataValue::UInt32(42);
+        assert_eq!(v.as_u32(), Some(42));
+        assert_eq!(v.as_usize(), Some(42));
+        assert_eq!(v.as_f64(), Some(42.0));
+        assert_eq!(v.as_str(), None);
+
+        let v = MetadataValue::Str("test".into());
+        assert_eq!(v.as_str(), Some("test"));
+        assert_eq!(v.as_u32(), None);
+
+        let v = MetadataValue::Float32(3.14);
+        assert!((v.as_f64().unwrap() - 3.14).abs() < 0.001);
+
+        let v = MetadataValue::Bool(true);
+        assert_eq!(v.as_bool(), Some(true));
+
+        let v = MetadataValue::Array(vec![MetadataValue::UInt8(1), MetadataValue::UInt8(2)]);
+        assert_eq!(v.as_array().unwrap().len(), 2);
+    }
+}

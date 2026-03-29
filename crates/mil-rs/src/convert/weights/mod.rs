@@ -13,6 +13,7 @@ use crate::ir::ScalarType;
 pub mod gguf;
 pub mod safetensors;
 
+pub use gguf::GgufProvider;
 pub use safetensors::SafeTensorsProvider;
 
 /// Supported model architectures for template-based conversion.
