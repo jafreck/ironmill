@@ -1020,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_dequant_f32_to_fp16() {
-        let values: Vec<f32> = vec![1.0, -2.5, 0.0, 3.14];
+        let values: Vec<f32> = vec![1.0, -2.5, 0.0, 3.125];
         let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let result = dequant_f32_to_fp16(&raw, 4).unwrap();
         assert_eq!(result.len(), 8); // 4 elements × 2 bytes
@@ -1056,7 +1056,7 @@ mod tests {
         // 16 bytes of nibbles: each byte = (hi << 4) | lo
         // Set all nibbles to 8 → dequant value = 0.5 * (8-8) = 0
         for _ in 0..16 {
-            block.push(0x88);
+            block.push(0x88); // lo=8, hi=8
         }
         let result = dequant_q4_0_to_fp16(&block, 32).unwrap();
         assert_eq!(result.len(), 64); // 32 × 2 bytes
@@ -1247,8 +1247,8 @@ mod tests {
         assert_eq!(v.as_str(), Some("test"));
         assert_eq!(v.as_u32(), None);
 
-        let v = MetadataValue::Float32(3.14);
-        assert!((v.as_f64().unwrap() - 3.14).abs() < 0.001);
+        let v = MetadataValue::Float32(3.125);
+        assert!((v.as_f64().unwrap() - 3.125).abs() < 0.001);
 
         let v = MetadataValue::Bool(true);
         assert_eq!(v.as_bool(), Some(true));
