@@ -569,6 +569,7 @@ dependencies = [
  "indexmap",
  "prost",
  "prost-build",
+ "rand",
  "serde",
  "serde_json",
  "tempfile",
