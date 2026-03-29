@@ -48,7 +48,7 @@ The repo already contains useful starting points for this plan:
 - `crates/mil-rs/src/ir/passes/model_split.rs`
 - `crates/ironmill-coreml/src/lib.rs`
 - `crates/ironmill-bench/src/inference.rs`
-- `docs/TEST_SPEC.md`
+- `docs/development/TEST_SPEC.md`
 - `docs/research/optimization-opportunities-2026.md`
 - `crates/mil-rs/src/convert/templates/llama.rs` (prefill/decode split scaffolding)
 - `crates/mil-rs/src/convert/pipeline.rs` (multi-stage pipeline with `pipeline.json` manifests)
@@ -433,4 +433,4 @@ This plan is succeeding when Ironmill can do all of the following:
 - `docs/research/optimization-opportunities-2026.md`
 - `docs/research/ane-research.md`
 - `docs/research/competitive-analysis.md`
-- `docs/TEST_SPEC.md`
+- `docs/development/TEST_SPEC.md`

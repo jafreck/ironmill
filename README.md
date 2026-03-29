@@ -218,7 +218,7 @@ Requires Rust 1.85+ (edition 2024).
 - [API docs](https://docs.rs/mil-rs) — generated from rustdoc
 - [C API usage guide](docs/C_API.md) — building, linking, and calling from C/Swift
 - [Build.rs example](examples/build_rs_example.rs) — using `CompileBuilder` at build time
-- [Inference improvements plan](docs/INFERENCE_IMPROVEMENTS_PLAN.md)
+- [Inference improvements plan](docs/development/INFERENCE_IMPROVEMENTS_PLAN.md)
 - [`docs/research/`](docs/research/) — background research:
   - [ANE Gap Analysis](docs/research/ane-research.md)
   - [Competitive Analysis](docs/research/competitive-analysis.md)

@@ -299,39 +299,82 @@ fn check_tensor_type(
 
 /// Returns `true` if the MIL operation type is known to run on the ANE.
 pub fn is_ane_supported(op_type: &str) -> bool {
+    // Verified against Apple's private ANE compiler via ane_op_probe.
+    // See docs/research/ane-op-support-matrix.md for full results.
     matches!(
         op_type,
-        "conv"
-            | "matmul"
-            | "linear"
+        // Arithmetic & elementwise
+        "add"
+            | "sub"
+            | "mul"
+            | "real_div"
+            | "maximum"
+            | "minimum"
+            | "floor_div"
+            | "abs"
+            | "sign"
+            | "sqrt"
+            | "square"
+            | "exp"
+            | "exp2"
+            | "erf"
+            | "ceil"
+            | "floor"
+            | "round"
+            | "atan"
+            | "pow"
+            | "clip"
+            // Activations
             | "relu"
+            | "relu6"
             | "sigmoid"
             | "tanh"
             | "softmax"
-            | "batch_norm"
-            | "add"
-            | "mul"
-            | "sub"
-            | "real_div"
-            | "concat"
+            | "silu"
+            | "softsign"
+            | "softplus"
+            // Comparison (returns bool)
+            | "greater"
+            | "greater_equal"
+            | "less"
+            | "less_equal"
+            | "equal"
+            | "not_equal"
+            // Reductions
+            | "reduce_sum"
+            | "reduce_mean"
+            | "reduce_max"
+            | "reduce_min"
+            | "reduce_l2_norm"
+            | "reduce_l1_norm"
+            | "reduce_log_sum"
+            | "reduce_log_sum_exp"
+            | "reduce_sum_square"
+            // Linear algebra & normalization
+            | "conv"
+            | "matmul"
+            | "linear"
+            | "layer_norm"
+            // Shape manipulation
             | "reshape"
             | "transpose"
-            | "max_pool"
-            | "avg_pool"
-            | "reduce_mean"
-            | "layer_norm"
-            | "squeeze"
-            | "expand_dims"
-            | "pad"
-            | "cast"
-            | "const"
-            | "clip"
-            | "gather"
-            | "split"
+            | "concat"
             | "slice_by_index"
-            | "pow"
-            | "sqrt"
+            | "slice_by_size"
+            | "split"
+            | "expand_dims"
+            | "squeeze"
+            | "tile"
+            | "reverse"
+            | "identity"
+            // Conditional & logical
             | "select"
+            | "logical_not"
+            // Type casting & quantization
+            | "cast"
+            | "dequantize"
+            // Constants & attention
+            | "const"
             | "scaled_dot_product_attention"
     )
 }
@@ -858,7 +901,7 @@ mod tests {
     fn unsupported_ops_in_fallback() {
         let ops = vec![
             Operation::new("relu", "relu_0").with_output("r0"),
-            Operation::new("erf", "erf_0").with_output("e0"),
+            Operation::new("scatter", "scatter_0").with_output("s0"),
             Operation::new("custom_op", "custom_0").with_output("out"),
         ];
         let report = validate_ane_compatibility(&make_program(ops));
@@ -871,7 +914,7 @@ mod tests {
             .iter()
             .map(|r| r.op_type.as_str())
             .collect();
-        assert!(names.contains(&"erf"));
+        assert!(names.contains(&"scatter"));
         assert!(names.contains(&"custom_op"));
 
         // 1 compatible out of 3 non-const ops ≈ 33.3%
@@ -1260,18 +1303,11 @@ mod tests {
 
         let report = validate_ane_compatibility(&program);
 
-        let gather_report = report
-            .ane_compatible
-            .iter()
-            .find(|r| r.op_type == "gather")
-            .expect("gather should be compatible");
+        // gather is not ANE-supported (confirmed by compiler probe), so it
+        // should appear in fallback_ops.
         assert!(
-            gather_report
-                .performance_annotations
-                .iter()
-                .any(|a| a.contains("large gather")),
-            "expected large gather annotation, got: {:?}",
-            gather_report.performance_annotations
+            report.fallback_ops.iter().any(|r| r.op_type == "gather"),
+            "gather should be in fallback ops"
         );
     }
 
@@ -1279,7 +1315,7 @@ mod tests {
     fn op_report_has_ane_eligible_field() {
         let ops = vec![
             Operation::new("relu", "relu_0").with_output("r0"),
-            Operation::new("erf", "erf_0").with_output("out"),
+            Operation::new("scatter", "scatter_0").with_output("out"),
         ];
         let report = validate_ane_compatibility(&make_program(ops));
 

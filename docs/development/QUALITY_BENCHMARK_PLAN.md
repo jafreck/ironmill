@@ -43,7 +43,7 @@ ironmill-bench --quality --model model.onnx
                    ▼
          ┌─────────────────┐
          │ Weight Fidelity  │ ← existing quality.rs
-         │ (MSE, PSNR, SNR) │
+         │ (MSE, PSNR, CR)  │
          └────────┬─────────┘
                   │
                   ▼
@@ -76,8 +76,10 @@ runs the compiled CoreML model on reference data (slower, needs fixtures).
 - Compare against FP32 baseline perplexity
 
 **Challenges**:
-- CoreML models output `MLMultiArray` — need to extract logits and compute
-  softmax + cross-entropy in Rust
+- CoreML logit extraction: `Model::extract_outputs()` already returns
+  `Vec<OutputTensorData>` as f32, but the benchmark harness (`inference.rs`)
+  currently discards prediction results — need to wire extraction into a new
+  evaluation pipeline
 - Tokenization: need a tokenizer to convert text → token IDs for input.
   Options: (a) pre-tokenized dataset bundled as fixture, (b) minimal BPE
   tokenizer in Rust, (c) shell out to Python tokenizer
@@ -201,16 +203,25 @@ Palettize 4-bit    19.9 dB      68.3%        -4.9%    ⚠ WARN
 - [x] Wire `quality.rs` into CLI via `--quality` flag
 - [x] Add model-level quality summary (`QualitySummary`)
 - [x] Add SAFE/WARN/RISK status based on worst-case PSNR
-- [ ] Extend `measure_program_quality` to support FP16 and INT8 (not just
-      PolarQuant) — compare reconstructed half/int8 weights against FP32
+- [ ] Extend `measure_program_quality` with a pass selector to support FP16
+      and INT8 (not just PolarQuant) — the comparison logic (MSE/PSNR) is
+      identical; only the quantization pass and reconstruction path differ
 
-### Phase 2 — Dataset Infrastructure
+### Phase 2 — Dataset Infrastructure & Inference Output Extraction
 
+- [ ] Build a "real input → CoreML prediction → extract output" evaluation
+      pipeline using the existing `Model::extract_outputs()` method — the
+      current benchmark path (`inference.rs`) only times `predict()` and
+      discards results; the new pipeline reuses `extract_outputs()` to obtain
+      typed f32 tensors (logits, class probabilities) for metric computation
 - [ ] Create `scripts/prepare-quality-dataset.py` for pre-tokenizing
       reference datasets
 - [ ] Define fixture format for quality datasets
 - [ ] Add dataset download to `scripts/download-fixtures.sh`
-- [ ] Create `tests/fixtures/quality/` directory structure
+- [ ] Create `tests/fixtures/quality/` directory structure (`.gitignore`
+      ImageNet fixtures — they are downloaded on demand, not committed)
+- [ ] Smoke-test `extract_outputs()` → logit pipeline on Qwen3-0.6B with a
+      single hand-crafted input to catch CoreML output-shape surprises early
 
 ### Phase 3 — Perplexity Measurement
 
@@ -219,6 +230,7 @@ Palettize 4-bit    19.9 dB      68.3%        -4.9%    ⚠ WARN
 - [ ] Pre-tokenized dataset loading
 - [ ] Autoregressive evaluation loop
 - [ ] Baseline caching (FP32 perplexity computed once, reused)
+- [ ] Unit tests for cross-entropy and perplexity aggregation
 
 ### Phase 4 — Classification Accuracy
 
@@ -227,19 +239,26 @@ Palettize 4-bit    19.9 dB      68.3%        -4.9%    ⚠ WARN
 - [ ] Support for DistilBERT (text classification) and MobileNetV2
       (image classification) fixture formats
 - [ ] Pre-processed input loading from binary tensor files
+- [ ] Unit tests for top-k accuracy computation
 
 ### Phase 5 — ASR Quality (stretch goal)
 
 - [ ] Pre-computed mel spectrogram fixtures
 - [ ] Minimal greedy decoder for Whisper output tokens
-- [ ] WER computation (Levenshtein distance on word sequences)
+- [ ] WER computation using the `strsim` crate for Levenshtein distance on
+      word sequences
 - [ ] Integration with encoder benchmark results
 
 ### Phase 6 — Cross-Tabulated Report
 
 - [ ] Combine weight fidelity and task accuracy in unified report
 - [ ] JSON schema extension for quality metrics
-- [ ] Regression tracking for quality metrics (extend `baseline.rs`)
+- [ ] Regression tracking for quality metrics via new `QualityBaselineEntry`
+      in a separate `~/.ironmill/quality-baselines/` directory — quality
+      baselines are stored separately from performance baselines since they
+      have different fields, comparison semantics (relative % for perplexity,
+      absolute % for accuracy), and change drivers (optimization config vs.
+      hardware)
 - [ ] `--quality-threshold` CLI flag for configurable WARN/FAIL levels
 
 ## Dependencies
@@ -247,26 +266,41 @@ Palettize 4-bit    19.9 dB      68.3%        -4.9%    ⚠ WARN
 - **Pre-tokenized datasets**: Requires a one-time Python script run (HuggingFace
   `datasets` + `transformers` libraries) to prepare fixtures
 - **CoreML inference**: Task accuracy runs through the compiled model, so it
-  depends on the existing inference pipeline
+  depends on the existing inference pipeline. `Model::extract_outputs()` already
+  supports extracting f32 multi-array outputs; the benchmark harness needs a new
+  evaluation pipeline that uses it instead of discarding prediction results
+  (addressed in Phase 2).
 - **No new Rust crate dependencies** for Phase 1–4 (dataset loading is just
   JSON + binary file I/O)
-- **Phase 5** may need an audio processing crate for mel spectrogram
-  verification, but the recommended approach avoids this by pre-computing
+- **Phase 5** adds `strsim` for Levenshtein distance (WER computation) and may
+  need an audio processing crate for mel spectrogram verification, but the
+  recommended approach avoids the latter by pre-computing spectrograms
+
+## Decisions
+
+1. **Quality benchmarks do not block CI.** Report-only by default. Use
+   `--quality-fail-on-regression` to opt in to CI gating.
+
+2. **Dataset licensing determines fixture strategy.** Open-licensed datasets
+   (WikiText-2 CC-BY-SA, SST-2, LibriSpeech CC-BY-4.0) are committed to the
+   repo as pre-processed fixtures. ImageNet requires registration and cannot
+   be redistributed — ImageNet fixtures are downloaded on demand via
+   `scripts/download-fixtures.sh`, stored under `tests/fixtures/quality/imagenet-500/`,
+   and excluded from version control via `.gitignore`.
+
+3. **FP16/INT8 weight fidelity extends `measure_program_quality`.** The
+   comparison logic (MSE/PSNR) is identical across quantization passes; only
+   the pass applied and reconstruction path differ. A pass selector parameter
+   avoids duplicating the measurement pipeline.
+
+4. **Quality baselines are separate from performance baselines.** Stored under
+   `~/.ironmill/quality-baselines/` with a `QualityBaselineEntry` schema
+   distinct from `BaselineEntry`. Performance baselines change with hardware;
+   quality baselines change with optimization config. Different lifecycle,
+   different fields, different comparison semantics (relative % for perplexity,
+   absolute % for accuracy).
 
 ## Open Questions
 
-1. **Should quality benchmarks block CI?** Suggestion: report-only by default,
-   with `--quality-fail-on-regression` for CI gates.
-
-2. **Baseline management**: Should quality baselines be separate from
-   performance baselines, or combined? Separate is simpler — quality changes
-   are driven by optimization config, not hardware.
-
-3. **Dataset licensing**: WikiText-2 is CC-BY-SA, LibriSpeech is CC-BY-4.0,
-   ImageNet requires registration. SST-2 is open. Should fixtures be committed
-   to the repo or downloaded on demand?
-
-4. **FP16/INT8 weight fidelity**: The current `measure_program_quality` only
-   measures PolarQuant. FP16 and INT8 quantization use different reconstruction
-   paths. Should we extend the existing function or add parallel measurement
-   functions?
+~~1. **Baseline management**: Should quality baselines be separate from
+   performance baselines, or combined?~~ **Resolved** — separate. See Decision 4.

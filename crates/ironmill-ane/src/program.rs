@@ -20,6 +20,18 @@ pub struct CompiledProgram {
     pub(crate) model: *mut c_void,
 }
 
+impl CompiledProgram {
+    /// Create from a raw model pointer returned by
+    /// [`mil_rs::ffi::ane::AneCompiler::compile_mil_text`].
+    ///
+    /// # Safety
+    /// The caller must ensure `ptr` is a valid, retained `_ANEInMemoryModel`
+    /// handle that has been compiled and loaded.
+    pub unsafe fn from_raw(ptr: *mut c_void) -> Self {
+        Self { model: ptr }
+    }
+}
+
 // SAFETY: CompiledProgram can be sent between threads — the handle
 // is an opaque pointer that is not accessed until eval.
 unsafe impl Send for CompiledProgram {}
