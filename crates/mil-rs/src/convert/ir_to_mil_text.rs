@@ -310,7 +310,7 @@ impl<'a> MilTextEmitter<'a> {
                     })
                     .collect();
                 let n = vals.len();
-                format!("tensor<int32, [{n}]>([{}])", vals.join(", "))
+                format!("tensor<int32, [{n}]>([{}])", vals.join(","))
             }
             Value::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| self.format_value(v)).collect();
@@ -344,14 +344,14 @@ impl<'a> MilTextEmitter<'a> {
                 let n = vals.len();
                 (
                     format!("tensor<int32, [{n}]>"),
-                    format!("tensor<int32, [{n}]>([{}])", vals.join(", ")),
+                    format!("tensor<int32, [{n}]>([{}])", vals.join(",")),
                 )
             }
             _ => ("fp16".into(), self.format_value(val)),
         }
     }
 
-    /// Format a [`TensorType`] as MIL text: `tensor<fp16, [1, 768, 1, 32]>`.
+    /// Format a [`TensorType`] as MIL text: `tensor<fp16, [1,768,1,32]>`.
     fn format_tensor_type(&self, ty: &TensorType) -> String {
         let dtype = format_scalar_type(ty.scalar_type, self.config.enable_int4);
         let dims: Vec<String> = ty
@@ -362,14 +362,14 @@ impl<'a> MilTextEmitter<'a> {
                 None => "?".to_string(),
             })
             .collect();
-        format!("tensor<{dtype}, [{}]>", dims.join(", "))
+        format!("tensor<{dtype}, [{}]>", dims.join(","))
     }
 
     /// Format a tensor type from raw shape and dtype (for weight consts).
     fn format_tensor_type_from(&self, shape: &[usize], dtype: ScalarType) -> String {
         let dtype_str = format_scalar_type(dtype, self.config.enable_int4);
         let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
-        format!("tensor<{dtype_str}, [{}]>", dims.join(", "))
+        format!("tensor<{dtype_str}, [{}]>", dims.join(","))
     }
 
     /// Resolve a variable name through the rename map.
@@ -514,11 +514,11 @@ mod tests {
             "should have platform spec"
         );
         // Parameters: TYPE name (no % prefix in signature).
-        assert!(text.contains("tensor<fp16, [1, 768, 1, 32]> a_input0"));
-        assert!(text.contains("tensor<fp16, [1, 768, 1, 32]> a_input1"));
+        assert!(text.contains("tensor<fp16, [1,768,1,32]> a_input0"));
+        assert!(text.contains("tensor<fp16, [1,768,1,32]> a_input1"));
         // Op with type prefix, name attribute, and semicolon.
         assert!(text.contains(
-            "tensor<fp16, [1, 768, 1, 32]> %z_output0 = add(x=%a_input0, y=%a_input1)[name=string(\"z_output0\")];"
+            "tensor<fp16, [1,768,1,32]> %z_output0 = add(x=%a_input0, y=%a_input1)[name=string(\"z_output0\")];"
         ));
         // Block return with semicolon.
         assert!(text.contains("} -> (%z_output0);"));
@@ -553,8 +553,8 @@ mod tests {
         let (text, _) = program_to_mil_text(&program, &config).unwrap();
 
         // Inputs renamed (TYPE name format, no %).
-        assert!(text.contains("tensor<fp32, [1, 3, 1, 224]> a_input0"));
-        assert!(text.contains("tensor<fp32, [1, 3, 1, 224]> a_input1"));
+        assert!(text.contains("tensor<fp32, [1,3,1,224]> a_input0"));
+        assert!(text.contains("tensor<fp32, [1,3,1,224]> a_input1"));
 
         // Outputs renamed with semicolon.
         assert!(text.contains("} -> (%z_output0, %z_output1);"));
@@ -661,7 +661,7 @@ mod tests {
         let config = MilTextConfig::default();
         let (text, _) = program_to_mil_text(&program, &config).unwrap();
 
-        assert!(text.contains("tensor<fp16, [1, 768, 1, 32]>"));
+        assert!(text.contains("tensor<fp16, [1,768,1,32]>"));
     }
 
     #[test]
@@ -715,8 +715,8 @@ mod tests {
         assert!(text.starts_with("program(1.3)\n"));
         assert!(text.contains("[buildInfo = "));
         assert!(text.contains("func main<ios18>("));
-        assert!(text.contains("tensor<fp16, [1, 768, 1, 32]> a_input0"));
-        assert!(text.contains("tensor<fp16, [1, 1, 1, 32]> a_input1"));
+        assert!(text.contains("tensor<fp16, [1,768,1,32]> a_input0"));
+        assert!(text.contains("tensor<fp16, [1,1,1,32]> a_input1"));
 
         // Weight BLOBFILE refs (each with offset=64, separate files).
         assert!(text.contains(
@@ -767,7 +767,7 @@ mod tests {
         );
         assert_eq!(
             emitter.format_value(&Value::List(vec![Value::Int(1), Value::Int(2)])),
-            "tensor<int32, [2]>([1, 2])"
+            "tensor<int32, [2]>([1,2])"
         );
         assert_eq!(
             emitter.format_value(&Value::Reference("foo".into())),
@@ -791,9 +791,6 @@ mod tests {
             TensorType::with_dynamic_shape(ScalarType::Float16, vec![Some(1), None, Some(1), None]);
         let config = MilTextConfig::default();
         let emitter = MilTextEmitter::new(&config);
-        assert_eq!(
-            emitter.format_tensor_type(&ty),
-            "tensor<fp16, [1, ?, 1, ?]>"
-        );
+        assert_eq!(emitter.format_tensor_type(&ty), "tensor<fp16, [1,?,1,?]>");
     }
 }

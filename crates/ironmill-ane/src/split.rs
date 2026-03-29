@@ -116,13 +116,30 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
 // Layer number extraction
 // ---------------------------------------------------------------------------
 
-/// Extract the first numeric component from an operation name.
+/// Extract a layer number from an operation name.
 ///
-/// Matches patterns like `layer_0_attn_q`, `layers.3.ffn.up`, `block_12_norm`.
+/// Only matches names with explicit layer prefixes to avoid false positives
+/// (e.g., `conv_0` is NOT a layer number — it's just a counter).
+///
+/// Recognized patterns: `layer_0_attn_q`, `layers.3.ffn.up`, `block_12_norm`,
+/// `layer0_w`, `layer.0.weight`.
 fn extract_layer_number(op_name: &str) -> Option<usize> {
-    for part in op_name.split(['_', '.']) {
-        if let Ok(n) = part.parse::<usize>() {
-            return Some(n);
+    // Look for "layer", "layers", or "block" prefix followed by a separator and number
+    let lower = op_name.to_ascii_lowercase();
+    for prefix in ["layer_", "layer.", "layers_", "layers.", "block_", "block."] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            // Take the first numeric part after the prefix
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !num_str.is_empty() {
+                return num_str.parse().ok();
+            }
+        }
+    }
+    // Also check for "layerN" without separator (e.g., "layer0_w")
+    if let Some(rest) = lower.strip_prefix("layer") {
+        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !num_str.is_empty() {
+            return num_str.parse().ok();
         }
     }
     None

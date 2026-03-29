@@ -324,6 +324,12 @@ impl AneCompiler {
                     .into(),
             ));
         }
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[ane] creating descriptor from MIL text ({} bytes), {} weight(s)...",
+            mil_text.len(),
+            weights.len()
+        );
         type ModelWithMILTextFn = unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
@@ -351,6 +357,8 @@ impl AneCompiler {
             ));
         }
 
+        #[cfg(debug_assertions)]
+        eprintln!("[ane] descriptor created, creating in-memory model...");
         // 6. Create model: [_ANEInMemoryModel inMemoryModelWithDescriptor:]
         let imm_sel = unsafe { sel_registerName(sel!("inMemoryModelWithDescriptor:")) };
         if !responds_to_selector(imm_cls, imm_sel) {
@@ -401,6 +409,9 @@ impl AneCompiler {
                 let tmp_dir = std::env::temp_dir().join(hex_str);
                 let weights_dir = tmp_dir.join("weights");
 
+                #[cfg(debug_assertions)]
+                eprintln!("[ane] hexId={hex_str}, tmp_dir={}", tmp_dir.display());
+
                 // Pre-populate: write model.mil and weight files
                 if let Ok(()) = std::fs::create_dir_all(&weights_dir) {
                     let _ = std::fs::write(tmp_dir.join("model.mil"), mil_text.as_bytes());
@@ -411,13 +422,23 @@ impl AneCompiler {
                         if let Some(parent) = full_path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        let _ = std::fs::write(&full_path, data);
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[ane] writing weight {} ({} bytes) → {}",
+                            path_key,
+                            data.len(),
+                            full_path.display()
+                        );
+                        let blob = make_blobfile(data);
+                        let _ = std::fs::write(&full_path, &blob);
                     }
                 }
             }
         }
 
         // 8. Compile: [model compileWithQoS:21 options:@{} error:&e]
+        #[cfg(debug_assertions)]
+        eprintln!("[ane] compiling with QoS={ANE_QOS}...");
         let empty_dict = ns_empty_dict()?;
         let compile_sel = unsafe { sel_registerName(sel!("compileWithQoS:options:error:")) };
         if !responds_to_selector(model, compile_sel) {
@@ -512,6 +533,40 @@ impl AneCompiler {
     pub fn remaining_budget() -> usize {
         ANE_COMPILE_LIMIT.saturating_sub(COMPILE_COUNT.load(Ordering::Relaxed))
     }
+}
+
+// ---------------------------------------------------------------------------
+// BLOBFILE helper
+// ---------------------------------------------------------------------------
+
+/// Create a BLOBFILE in Orion's format from raw weight data.
+///
+/// Format: 128-byte header (file header + chunk descriptor) + data.
+/// This is the format expected by the weight dict's `data` field.
+pub(crate) fn make_blobfile(data: &[u8]) -> Vec<u8> {
+    let data_size = data.len();
+    let total = 128 + data_size;
+    let mut buf = vec![0u8; total];
+
+    // File header (bytes 0-63)
+    buf[0] = 1;
+    buf[4] = 2;
+
+    // Chunk descriptor (bytes 64-127)
+    buf[64] = 0xEF; // 0xDEADBEEF magic
+    buf[65] = 0xBE;
+    buf[66] = 0xAD;
+    buf[67] = 0xDE;
+    buf[68] = 1;
+    // Data size (bytes 72-75, u32 LE)
+    buf[72..76].copy_from_slice(&(data_size as u32).to_le_bytes());
+    // Data offset = 128 (bytes 80-83, u32 LE)
+    buf[80..84].copy_from_slice(&128u32.to_le_bytes());
+
+    // Weight data (bytes 128+)
+    buf[128..].copy_from_slice(data);
+
+    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -673,7 +728,11 @@ fn build_multi_weight_dict(weights: &[(&str, &[u8])]) -> Result<*mut c_void, Ane
     let outer_dict = ns_mutable_dict()?;
 
     for (path_key, data) in weights {
-        let data_nsdata = create_nsdata(data)?;
+        // Wrap raw weight data in BLOBFILE format (128-byte header + data).
+        // The offset in the weight dict (64) points to the chunk descriptor
+        // within this BLOBFILE data.
+        let blob = crate::ffi::ane::make_blobfile(data);
+        let data_nsdata = create_nsdata(&blob)?;
         let offset_num = create_nsnumber(64)?;
 
         let inner_dict = ns_mutable_dict()?;

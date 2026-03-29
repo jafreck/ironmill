@@ -21,25 +21,27 @@ impl Pass for AneLayoutPass {
 
     fn run(&self, program: &mut Program) -> Result<()> {
         for function in program.functions.values_mut() {
-            // Reshape function input types.
+            // Reshape function input types (activations).
             for (_name, ty) in &mut function.inputs {
                 reshape_tensor_type(ty);
             }
 
-            // Reshape operation output types and const tensor shapes.
+            // Reshape operation output types (activations).
+            // Skip reshaping const op tensor values — weights use their own
+            // layout convention (e.g., [Cout, Cin, kH, kW] for conv).
             for op in &mut function.body.operations {
                 for t in op.output_types.iter_mut().flatten() {
                     reshape_tensor_type(t);
                 }
 
-                // Reshape const tensor shapes embedded in inputs.
-                for value in op.inputs.values_mut() {
-                    reshape_value_tensor(value);
-                }
-
-                // Reshape const tensor shapes in attributes.
-                for value in op.attributes.values_mut() {
-                    reshape_value_tensor(value);
+                // Only reshape non-const op input tensors.
+                if op.op_type != "const" {
+                    for value in op.inputs.values_mut() {
+                        reshape_value_tensor(value);
+                    }
+                    for value in op.attributes.values_mut() {
+                        reshape_value_tensor(value);
+                    }
                 }
             }
         }
@@ -256,7 +258,9 @@ mod tests {
     }
 
     #[test]
-    fn ane_layout_const_tensor_shape() {
+    fn ane_layout_const_tensor_shape_preserved() {
+        // Const op tensor values (weights) should NOT be reshaped —
+        // they use their own layout convention (e.g., [Cout, Cin, kH, kW]).
         let mut block = Block::new();
         let op = Operation::new("const", "w")
             .with_input(
@@ -279,7 +283,8 @@ mod tests {
             .get("val")
         {
             Some(Value::Tensor { shape, .. }) => {
-                assert_eq!(shape, &vec![1, 4, 1, 4]);
+                // Shape should NOT be reshaped — preserved as-is.
+                assert_eq!(shape, &vec![4, 4]);
             }
             other => panic!("expected Tensor value, got {:?}", other),
         }

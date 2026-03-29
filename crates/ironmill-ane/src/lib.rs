@@ -204,45 +204,47 @@ impl AneModel {
                     ))
                 })?;
 
-            // 4b. Build per-weight BLOBFILEs
-            let mut weight_blobs: Vec<(String, Vec<u8>)> = Vec::new();
-            for entry in &weight_entries {
-                let mut blob_writer = BlobFileWriter::new();
-                blob_writer.add_weight(&entry.name, &entry.data, entry.dtype);
-                weight_blobs.push((entry.path.clone(), blob_writer.as_bytes().to_vec()));
-            }
+            // 4b. Collect raw weight data for the compiler's weight dict.
+            // The weight dict passes raw bytes to the ANE framework.
+            // BLOBFILEs are a disk format — the dict uses raw data directly.
+            let weight_refs: Vec<(String, Vec<u8>)> = weight_entries
+                .iter()
+                .map(|e| (e.path.clone(), e.data.clone()))
+                .collect();
 
             // 4c. Check cache and 4d. Compile (or load from cache)
             let cache_key = ProgramCache::make_key(
                 &mil_text,
-                &weight_blobs
+                &weight_refs
                     .iter()
                     .flat_map(|(_, d)| d.iter())
                     .copied()
                     .collect::<Vec<_>>(),
             );
 
-            let weight_refs: Vec<(&str, &[u8])> = weight_blobs
+            let weight_slices: Vec<(&str, &[u8])> = weight_refs
                 .iter()
                 .map(|(path, data)| (path.as_str(), data.as_slice()))
                 .collect();
 
             let compiled = if cache.contains(&cache_key) {
-                let ptr = AneCompiler::compile_mil_text(&mil_text, &weight_refs).map_err(|e| {
-                    AneError::CompileFailed {
-                        status: 0,
-                        context: format!("{e}"),
-                    }
-                })?;
+                let ptr =
+                    AneCompiler::compile_mil_text(&mil_text, &weight_slices).map_err(|e| {
+                        AneError::CompileFailed {
+                            status: 0,
+                            context: format!("{e}"),
+                        }
+                    })?;
                 cache.record_compilation();
                 CompiledProgram { model: ptr }
             } else {
-                let ptr = AneCompiler::compile_mil_text(&mil_text, &weight_refs).map_err(|e| {
-                    AneError::CompileFailed {
-                        status: 0,
-                        context: format!("{e}"),
-                    }
-                })?;
+                let ptr =
+                    AneCompiler::compile_mil_text(&mil_text, &weight_slices).map_err(|e| {
+                        AneError::CompileFailed {
+                            status: 0,
+                            context: format!("{e}"),
+                        }
+                    })?;
                 cache.record_compilation();
                 if let Some(disk_path) = cache.disk_path_for(&cache_key) {
                     std::fs::create_dir_all(&disk_path).ok();
@@ -805,6 +807,93 @@ mod tests {
 
     // ── CompiledArtifacts tests ──────────────────────────────────
 
+    /// Build a conv-based linear layer program matching Orion's
+    /// `orion_mil_linear` pattern — the known-working minimal ANE program.
+    ///
+    /// Implements: output = conv(weight, input) with 1×1 convolution.
+    /// Shape: input [1, in_dim, 1, seq] → output [1, out_dim, 1, seq].
+    fn build_conv_linear_program() -> mil_rs::ir::Program {
+        use mil_rs::ir::{Block, Function, Operation, Program, TensorType, Value};
+
+        let in_dim = 4;
+        let out_dim = 8;
+        let seq = 16;
+
+        let input_ty = TensorType::new(ScalarType::Float16, vec![1, in_dim, 1, seq]);
+        let output_ty = TensorType::new(ScalarType::Float16, vec![1, out_dim, 1, seq]);
+        let weight_shape = vec![out_dim, in_dim, 1, 1];
+
+        // Weight: out_dim * in_dim fp16 elements = 64 bytes
+        let weight_data = vec![0u8; out_dim * in_dim * 2];
+
+        let mut block = Block::new();
+
+        // Conv constants (matching Orion's CONV_PARAMS exactly)
+        let pt = Operation::new("const", "pt")
+            .with_input("val", Value::String("valid".into()))
+            .with_output("pt");
+        let st = Operation::new("const", "st")
+            .with_input("val", Value::List(vec![Value::Int(1), Value::Int(1)]))
+            .with_output("st");
+        let pd = Operation::new("const", "pd")
+            .with_input(
+                "val",
+                Value::List(vec![
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(0),
+                ]),
+            )
+            .with_output("pd");
+        let dl = Operation::new("const", "dl")
+            .with_input("val", Value::List(vec![Value::Int(1), Value::Int(1)]))
+            .with_output("dl");
+        let gr = Operation::new("const", "gr")
+            .with_input("val", Value::Int(1))
+            .with_output("gr");
+
+        // Weight tensor: [out_dim, in_dim, 1, 1]
+        let w = Operation::new("const", "W")
+            .with_input(
+                "val",
+                Value::Tensor {
+                    data: weight_data,
+                    shape: weight_shape,
+                    dtype: ScalarType::Float16,
+                },
+            )
+            .with_output("W");
+
+        // Conv op
+        let mut conv = Operation::new("conv", "conv_0")
+            .with_input("x", Value::Reference("x".into()))
+            .with_input("weight", Value::Reference("W".into()))
+            .with_input("pad_type", Value::Reference("pt".into()))
+            .with_input("strides", Value::Reference("st".into()))
+            .with_input("pad", Value::Reference("pd".into()))
+            .with_input("dilations", Value::Reference("dl".into()))
+            .with_input("groups", Value::Reference("gr".into()))
+            .with_output("result");
+        conv.output_types = vec![Some(output_ty)];
+
+        block.add_op(pt);
+        block.add_op(st);
+        block.add_op(pd);
+        block.add_op(dl);
+        block.add_op(gr);
+        block.add_op(w);
+        block.add_op(conv);
+        block.outputs.push("result".into());
+
+        let mut func = Function::new("main").with_input("x", input_ty);
+        func.body = block;
+
+        let mut program = Program::new("1.0");
+        program.add_function(func);
+        program
+    }
+
     #[test]
     fn e2e_prepare_simple_add_program() {
         let program = build_add_program();
@@ -1100,6 +1189,56 @@ mod tests {
     }
 
     #[test]
+    fn e2e_compile_and_load_conv_linear() {
+        // Conv-based linear layer — matches Orion's orion_mil_linear,
+        // the known-working minimal ANE program pattern.
+        let program = build_conv_linear_program();
+        let config = AneConfig::default();
+
+        // First, dump the post-pass MIL text for debugging.
+        {
+            use mil_rs::convert::ir_to_mil_text::{MilTextConfig, program_to_mil_text};
+            let artifacts = CompiledArtifacts::prepare(&program).expect("prepare");
+            for sub in &artifacts.sub_programs {
+                eprintln!("  [post-pass MIL for '{}']\n{}", sub.name, sub.mil_text);
+            }
+        }
+
+        let result = AneModel::compile_and_load(&program, config);
+
+        match result {
+            Ok(mut model) => {
+                eprintln!(
+                    "  ✓ ANE compile+load succeeded! ({} sub-programs)",
+                    model.num_sub_programs()
+                );
+
+                let desc = model.input_description();
+                assert!(!desc.is_empty(), "model should have inputs");
+
+                let inputs: Vec<AneTensor> = desc
+                    .iter()
+                    .map(|td| AneTensor::new(td.shape[1], td.shape[3], td.dtype).unwrap())
+                    .collect();
+                let outputs = model.predict(&inputs).expect("predict should succeed");
+                assert!(!outputs.is_empty(), "predict should return outputs");
+                eprintln!("  ✓ predict succeeded with {} output(s)", outputs.len());
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                eprintln!("  compile_and_load (conv) failed: {msg}");
+                assert!(
+                    msg.contains("ANE")
+                        || msg.contains("compilation")
+                        || msg.contains("dlopen")
+                        || msg.contains("compile"),
+                    "expected compilation failure, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn e2e_debug_mil_text_output() {
         // Dump the MIL text for debugging ANE compilation failures.
         use mil_rs::convert::ir_to_mil_text::{MilTextConfig, program_to_mil_text};
@@ -1107,6 +1246,7 @@ mod tests {
         for (label, program) in [
             ("add (no weights)", build_add_program()),
             ("weighted", build_weighted_program()),
+            ("conv linear", build_conv_linear_program()),
         ] {
             let config = MilTextConfig::default();
             let (text, entries) = program_to_mil_text(&program, &config).unwrap();
