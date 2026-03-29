@@ -147,6 +147,7 @@ Requires Rust 1.85+ (edition 2024).
 ## Documentation
 
 - [API docs](https://docs.rs/mil-rs) — generated from rustdoc
+- [Inference improvements roadmap](docs/INFERENCE_IMPROVEMENTS_ROADMAP.md)
 - [`docs/research/`](docs/research/) — background research:
   - [ANE Gap Analysis](docs/research/ane-research.md)
   - [Competitive Analysis](docs/research/competitive-analysis.md)

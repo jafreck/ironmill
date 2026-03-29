@@ -16,6 +16,10 @@ predictions) but have completely different interfaces. `compile_model`
 harness has two duplicated inference paths. Adding a new backend means
 touching multiple crates.
 
+`mil-rs/src/compiler.rs` already has a `Backend` enum (`Xcrun`, `AneDirect`)
+and `compile_model_with_backend()`, but this is a thin dispatch layer, not a
+trait-based abstraction.
+
 **Fix**: Create `ironmill-runtime` with:
 
 ```rust
@@ -64,8 +68,9 @@ rotation. Quality impact depends on the padding ratio (384→512 is 25%;
 #### Inter-layer rotation fusion never fires on real models
 
 The pairing algorithm traces `constexpr_lut_to_dense` → consumer linear op →
-activation → next linear op, but doesn't follow through the norms `const` +
-`mul` ops that PolarQuantPass inserts between the weight and consumer.
+activation → next linear op. `find_polar_source` can trace through a single
+`mul` (norms scaling), but does not recursively trace beyond one level or
+special-case `const(norms)` nodes in the pairing algorithm.
 
 **Impact**: Every PolarQuant'd layer pays R_inv storage + matmul cost. On
 Qwen3-0.6B this means 256 R_inv matrices instead of ~0 for paired layers.
@@ -122,9 +127,9 @@ check — could silently alias different ops.
 
 #### Transformer ops are opaque pass-throughs
 
-`RotaryEmbedding` and `GroupQueryAttention` (ORT contrib ops) are mapped to
-composite MIL ops that CoreML doesn't understand. Models convert through
-ironmill but fail CoreML compilation.
+`RotaryEmbedding` and `GroupQueryAttention` (ORT contrib ops) are emitted as
+single custom MIL ops (`rotary_embedding`, `group_query_attention`) that CoreML
+doesn't understand. Models convert through ironmill but fail CoreML compilation.
 
 **Fix**: Decompose into standard MIL ops (~200-400 lines each).
 

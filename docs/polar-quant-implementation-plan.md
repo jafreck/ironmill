@@ -60,6 +60,9 @@ For each weight tensor W with shape `[M, N]` where `N ≥ 64`:
     - Rotation seed    (single u64, enough to regenerate R)
     - Norm per row     (float16, one per row — the Beta distribution
                         describes the *direction*; magnitude is separate)
+    - Row norms are stored as a float16 const tensor with shape [M, 1]
+      and multiplied back during dequantization:
+        W'_dequant[i,j] = LUT[indices[i,j]] * row_norms[i]
 ```
 
 At inference time, CoreML reconstructs the weight via:
@@ -85,13 +88,16 @@ Two models with the same dimension and bit-width share the exact same LUT.
 ```
 crates/mil-rs/src/ir/passes/
 ├── mod.rs                       # add: pub mod polar_quantize; pub mod rotation;
+│                                #       pub mod beta_quantizer;
+│                                #       pub mod polar_rotation_fusion;
 ├── rotation.rs                  # NEW — Hadamard transform + rotation utilities
 ├── polar_quantize.rs            # NEW — PolarQuantPass implementation
+├── polar_rotation_fusion.rs     # NEW — PolarRotationFusionPass (inter-layer fusion)
 ├── beta_quantizer.rs            # NEW — precomputed Beta-optimal quantizer levels
 └── tensor_utils.rs              # extend: add f16 decode helper if needed
 
 crates/mil-rs/src/ir/
-├── pipeline.rs                  # register "polar-quantization" pass
+├── pipeline.rs                  # register "polar-quantization" pass; add has_polar_quant
 ├── tensor.rs                    # no changes expected
 └── types.rs                     # no changes expected
 
@@ -99,7 +105,7 @@ crates/mil-rs/src/convert/
 └── ir_to_proto.rs               # verify constexpr_lut_to_dense handles our payloads
 
 crates/ironmill-cli/src/
-└── main.rs                      # add --quantize polar-4 / polar-3 / polar-2
+└── main.rs                      # add --polar-quantize <BITS> flag
 
 crates/mil-rs/tests/
 ├── optimization_passes.rs       # add PolarQuant unit tests
@@ -141,8 +147,12 @@ pub fn pad_to_power_of_two(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>,
 - Inverse transform = apply D then H again (Hadamard is self-inverse; D is
   self-inverse). So `unrotate = rotate` with the same seed.
 
-**Dependencies:** `rand` crate (already a transitive dependency via `kmeans.rs`
-which uses `rand::Rng`).
+**Dependencies:** `rand` crate — must be added as a new workspace dependency
+in the root `Cargo.toml` (`[workspace.dependencies]` section) and then
+referenced in `crates/mil-rs/Cargo.toml` as `rand = { workspace = true }`.
+`rand` is not currently a direct or transitive dependency of any workspace
+crate (`kmeans.rs` is explicitly deterministic — max-distance init, no
+randomness).
 
 ---
 
@@ -177,11 +187,13 @@ pub fn quantize_to_index(value: f32, boundaries: &[f32]) -> u8;
   (`betaincinv`) to place initial levels at quantiles, then run a few
   iterations of the Lloyd-Max algorithm on the analytical distribution.
 - The Beta CDF/inverse CDF can be computed via the regularized incomplete
-  beta function. Use the `statrs` crate or implement a standalone
-  approximation (the latter avoids a new dependency).
+  beta function. Use the `statrs` crate, which is already a workspace
+  dependency (used by `ironmill-bench`).
 
-**Dependencies:** Consider adding `statrs` crate for Beta distribution
-functions, or implement a minimal incomplete beta function (~50 lines).
+**Dependencies:** Add `statrs = { workspace = true }` to
+`crates/mil-rs/Cargo.toml`. The crate is already declared in the workspace
+root (`statrs = "0.18"`) and used by `ironmill-bench`, so this adds no new
+external dependency to the lockfile.
 
 ---
 
@@ -227,43 +239,92 @@ for each function in program:
     5. Apply rotate_rows_hadamard(data, rows, padded_cols, seed)
     6. Get Beta-optimal levels and boundaries for (padded_cols, n_bits)
     7. Quantize each element → index; pack indices at n_bits
-    8. Build LUT from the Beta-optimal levels (cast to f16 for storage)
-    9. Mutate op:
+    8. If cols was padded, truncate indices back to original cols
+       (discard the padded columns — they are not part of the original
+       weight and are only needed during rotation)
+    9. Build LUT from the Beta-optimal levels (cast to f16 for storage)
+   10. Store row norms as a separate float16 const tensor [rows, 1]
+   11. Mutate op:
        - op.op_type = "constexpr_lut_to_dense"
        - attrs["lut"] = Value::Tensor { data: lut_bytes, shape: [2^n_bits], dtype: Float16 }
        - attrs["indices"] = Value::Tensor { data: packed_indices, shape: original_shape, dtype: UInt8 }
        - attrs["shape"] = original shape
-       - Store rotation metadata for un-rotation at inference
-   10. Insert un-rotation op after dequantization (see below)
+       - Store rotation seed as op metadata for the fusion pass
+   12. Insert a const op for row_norms and a mul op to scale the
+       dequantized output: dequant * row_norms
 ```
 
-**Un-rotation strategy:**
+**Note:** The PolarQuant pass itself only handles per-tensor rotation and
+quantization. The inter-layer rotation fusion (pairing adjacent linears so
+rotations cancel) is handled by `PolarRotationFusionPass` (Task 7), which
+runs as a mandatory follow-up pass in the pipeline.
+
+**Un-rotation strategy — Layered approach:**
 
 The rotated, quantized weight needs to be un-rotated at inference time.
-Two emission strategies, selectable via a config flag:
+We use a two-tier strategy:
 
-**Strategy A — Explicit matmul (simple, general):**
+- **Primary: Fused inter-layer rotation** — for paired consecutive linear
+  ops, the rotation applied to one layer's output dimension cancels with
+  the rotation applied to the next layer's input dimension. Zero storage
+  overhead, zero load-time cost.
+- **Fallback: Explicit matmul** — for unpaired layers (boundary layers,
+  layers adjacent to non-fusible ops), emit an explicit `matmul` with the
+  inverse rotation matrix. This still gives full PolarQuant compression on
+  those layers instead of leaving them at FP16/INT8.
+
+**Tier 1 — Fused rotation (paired layers):**
+
+For consecutive linear layers `y = W₂ · act(W₁ · x)`:
+- Rotate W₁'s output dimension (rows) with R: `W₁_rot = R · W₁`
+- Rotate W₂'s input dimension (columns) with the same R: `W₂_rot = W₂ · R^T`
+- The rotations cancel through the connecting activation:
+  `W₂_rot · act(W₁_rot · x) = W₂ · R^T · act(R · W₁ · x)`
+  For ReLU-family activations, `act(R · z) ≈ R · act(z)` is a good
+  empirical approximation when R is a Hadamard rotation, because Hadamard
+  rotations distribute energy evenly across coordinates (near-isometry),
+  minimizing the number of sign flips. The product therefore collapses to
+  approximately `W₂ · W₁ · x`.
+- No extra matmul or rotation matrix storage needed.
+
+**Tier 2 — Explicit matmul (unpaired layers):**
+
+For layers that cannot be paired (first/last in a chain, adjacent to
+non-fusible ops):
 ```
-constexpr_lut_to_dense → dequantized W'
-const(R_inv) → rotation matrix
-matmul(dequantized_W', R_inv) → W_approx
+constexpr_lut_to_dense → dequantized W'  (rotated domain)
+const(R_inv)           → rotation matrix  (N×N float16)
+matmul(W', R_inv)      → W_approx         (unrotated)
 ```
-- Replace downstream references to the original const with the matmul output.
-- R_inv is stored as a float16 const (N×N matrix).
-- **Cost**: one extra matmul per weight tensor at model load time (CoreML
-  materializes constexpr ops at load, not per-inference).
+- R_inv is stored as a float16 const. For typical transformer head_dim=128,
+  this is 128×128×2 = 32 KiB per unique dimension — negligible.
+- CoreML materializes `constexpr_*` ops at model load, so the matmul runs
+  once at load time, not per-inference.
 
-**Strategy B — Fused rotation (optimized, limited scope):**
-For consecutive linear layers `y = W₂ · W₁ · x`:
-- Rotate W₁'s output dimension and W₂'s input dimension with the same R.
-- The rotations cancel: `W₂·R^T · R·W₁ = W₂·W₁`.
-- No extra matmul needed.
-- Only applicable when adjacent ops are both linear/matmul.
-- Implement as a follow-up optimization pass (`PolarRotationFusionPass`).
+**Pairing algorithm (`PolarRotationFusionPass`):**
 
-**Recommendation:** Implement Strategy A first. CoreML evaluates `constexpr_*`
-ops at model load time, so the matmul overhead is a one-time cost, not
-per-inference. Strategy B can be added later as a separate pass.
+The pass walks the op graph and pairs adjacent linear ops (matmul, linear,
+conv) that share a connecting dimension. Each pair shares a rotation seed:
+
+```
+1.  Build a dependency graph of linear-family ops.
+2.  Greedily pair consecutive ops: for each linear op L₁, if its sole
+    consumer is another linear op L₂ (possibly through an element-wise
+    activation), pair (L₁, L₂) with a shared seed.
+3.  Unpaired ops at chain boundaries (first input layer, final output
+    layer, or layers adjacent to non-fusible ops like softmax or
+    layer-norm) use the explicit matmul fallback: emit
+    constexpr_lut_to_dense + const(R_inv) + matmul.
+4.  Assign a unique rotation seed per pair.
+```
+
+**Edge cases:**
+- **Unpaired boundary layers:** Use explicit matmul fallback. These are
+  typically the embedding layer and the final projection head — the R_inv
+  overhead is small, and they still get full PolarQuant compression.
+- **Non-fusible ops between linears (softmax, layernorm, etc.):** Break the
+  chain. Each side of the break uses the matmul fallback.
+- **Single isolated linear ops:** Use the matmul fallback.
 
 ---
 
@@ -299,21 +360,46 @@ pub fn with_polar_quant(mut self, n_bits: u8) -> Result<Self> {
             "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
         ));
     }
+    if !matches!(n_bits, 2 | 3 | 4) {
+        return Err(MilError::Validation(format!(
+            "polar-quantize n_bits must be 2, 3, or 4, got {n_bits}"
+        )));
+    }
+    if n_bits == 2 {
+        log::warn!(
+            "2-bit PolarQuant may produce significant quality loss on some \
+             architectures; consider 3- or 4-bit for production use"
+        );
+    }
+    self.has_polar_quant = true;
     self.passes.push(Box::new(PolarQuantPass::new(n_bits)));
+    self.passes.push(Box::new(PolarRotationFusionPass::new()));
     Ok(self)
 }
 ```
 
 #### 4b. CLI integration (`main.rs`)
 
-Extend the `--quantize` flag to accept `polar-2`, `polar-3`, `polar-4`:
+Add a dedicated `--polar-quantize <BITS>` flag, following the same pattern as
+the existing `--palettize <BITS>` flag (separate from `--quantize`):
 
 ```rust
-"polar-2" | "polar-3" | "polar-4" => {
-    let bits: u8 = opts.quantize.strip_prefix("polar-").unwrap().parse().unwrap();
+/// PolarQuant weight quantization bit-width (2, 3, or 4).
+#[arg(long = "polar-quantize", value_name = "BITS")]
+polar_quantize: Option<u8>,
+```
+
+Dispatch logic (after the existing `--palettize` block):
+
+```rust
+if let Some(bits) = opts.polar_quantize {
     pipeline = pipeline.with_polar_quant(bits)?;
 }
 ```
+
+The `with_polar_quant()` builder method handles mutual exclusion with
+`fp16`/`int8`/`palettize` (see §4a), matching how `with_palettize()` rejects
+conflicts with INT8.
 
 #### 4c. TOML config support
 
@@ -350,7 +436,7 @@ Add a round-trip test: IR → protobuf → IR → verify op structure.
 
 | Test | What it verifies |
 |------|-----------------|
-| `polar_quant_converts_const_to_lut` | `const` → `constexpr_lut_to_dense` + rotation matmul chain |
+| `polar_quant_converts_const_to_lut` | `const` → `constexpr_lut_to_dense` with rotation metadata |
 | `polar_quant_preserves_output_shape` | Output tensor shape matches original weight shape |
 | `polar_quant_round_trip_quality` | Dequantized weight MSE is within theoretical bound for the bit-width |
 | `polar_quant_skips_small_tensors` | Tensors below `min_elements` are left as-is |
@@ -358,6 +444,9 @@ Add a round-trip test: IR → protobuf → IR → verify op structure.
 | `polar_quant_handles_non_power_of_two` | Tensors with non-power-of-two inner dim are padded/handled correctly |
 | `polar_quant_deterministic_with_seed` | Same seed produces identical quantized output |
 | `polar_quant_different_seeds_differ` | Different seeds produce different (but equally valid) output |
+| `polar_quant_rejects_invalid_bits` | `n_bits` outside {2, 3, 4} returns an error |
+| `polar_quant_rejects_zero_bits` | `n_bits = 0` is rejected |
+| `polar_quant_handles_empty_program` | Pass is a no-op on programs with no const ops |
 
 #### Quality tests
 
@@ -367,12 +456,26 @@ Add a round-trip test: IR → protobuf → IR → verify op structure.
 | `polar_4bit_comparable_to_int8` | PolarQuant-4 MSE is within 2× of INT8 MSE (half the bits) |
 | `polar_3bit_acceptable_quality` | PolarQuant-3 MSE stays below a defined threshold |
 
+#### Rotation fusion tests (`polar_rotation_fusion.rs`)
+
+| Test | What it verifies |
+|------|-----------------|
+| `fusion_pairs_consecutive_linears` | Two adjacent matmul ops are paired with a shared seed |
+| `fusion_pairs_through_relu` | Linear → ReLU → linear chain is paired |
+| `fusion_breaks_at_softmax` | Softmax between linears breaks the chain |
+| `fusion_breaks_at_layernorm` | LayerNorm between linears breaks the chain |
+| `fusion_unpaired_gets_matmul_fallback` | Unpaired boundary layers emit constexpr + const(R_inv) + matmul |
+| `fusion_handles_branching_graph` | Ops with multiple consumers are not incorrectly paired |
+| `fused_pair_quality_vs_unfused` | Fused pair MSE ≈ unfused pair MSE on random weights |
+| `fallback_matmul_round_trip_correct` | Explicit matmul un-rotation recovers original weight within tolerance |
+
 #### Pipeline composition tests (`cross_feature.rs`)
 
 | Test | What it verifies |
 |------|-----------------|
 | `polar_quant_mutually_exclusive_with_int8` | Pipeline rejects combining both |
 | `polar_quant_mutually_exclusive_with_fp16` | Pipeline rejects combining both |
+| `polar_quant_mutually_exclusive_with_palettize` | Pipeline rejects combining both |
 | `polar_quant_works_with_attention_fusion` | Fusion passes + PolarQuant compose correctly |
 | `polar_quant_works_with_kv_cache_pass` | KV cache pass + PolarQuant compose correctly |
 
@@ -396,12 +499,112 @@ Add a round-trip test: IR → protobuf → IR → verify op structure.
 
 ---
 
+### Task 8 — Benchmarks (`ironmill-bench`)
+
+Add PolarQuant to the existing benchmark harness in `crates/ironmill-bench/`.
+
+#### 8a. Benchmark config (`config.rs`)
+
+Add PolarQuant entries to the default benchmark matrix alongside the existing
+`int8` and `palettize-4` configs:
+
+```rust
+OptConfig {
+    name: "polar-4".to_string(),
+    quantize: None,
+    palettize: None,
+    polar_quantize: Some(4),
+    no_fusion: false,
+    disabled_passes: vec![],
+},
+OptConfig {
+    name: "polar-3".to_string(),
+    quantize: None,
+    palettize: None,
+    polar_quantize: Some(3),
+    no_fusion: false,
+    disabled_passes: vec![],
+},
+```
+
+Add the `polar_quantize: Option<u8>` field to `OptConfig` (defaulting to
+`None` for existing configs).
+
+#### 8b. Compiler integration (`compiler.rs`)
+
+Wire `polar_quantize` into the pipeline construction, following the
+existing `palettize` pattern:
+
+```rust
+if let Some(bits) = opt.polar_quantize {
+    pipeline = pipeline.with_polar_quant(bits)?;
+}
+```
+
+#### 8c. Quality benchmarks (new: `quality.rs`)
+
+Add a quality benchmark module that measures **quantization fidelity**, not
+just inference latency. This enables automated tracking of the quality
+claims in §6 (Tasks 6's quality tests).
+
+```rust
+/// For each (model, bit-width) pair:
+/// 1. Load the original FP32 weights.
+/// 2. Apply PolarQuant at the target bit-width.
+/// 3. Dequantize and compute per-tensor MSE vs. original.
+/// 4. Compare against INT8 and palettize-4 MSE on the same weights.
+/// 5. Report: MSE, PSNR, compression ratio, and relative quality
+///    (polar-4 MSE / int8 MSE).
+pub fn run_quality_benchmarks(matrix: &BenchMatrix, settings: &Settings) -> Vec<QualityResult>;
+```
+
+Extend `report.rs` to include a quality summary table in the benchmark
+output:
+
+| Model | Method | Bits | MSE | PSNR (dB) | vs INT8 | Size ratio |
+|-------|--------|------|-----|-----------|---------|------------|
+
+#### 8d. CLI flag
+
+Add `--quality` flag to `ironmill-bench` to run quality benchmarks in
+addition to (or instead of) latency benchmarks.
+
+---
+
 ## 5. CoreML compatibility
 
 ### Emission format
 
-PolarQuant emits three ops per quantized weight:
+PolarQuant emits different op patterns depending on whether a layer is
+paired (fused) or unpaired (fallback):
 
+**Paired layers (fused rotation — no extra ops):**
+```
+┌─────────────────────────────────────┐
+│ constexpr_lut_to_dense (W₁)        │  W₁ quantized in rotated domain
+│   The rotation is baked into the    │  (rows rotated by R before quantization)
+│   quantized representation itself.  │
+├─────────────────────────────────────┤
+│ const(row_norms₁) [M₁, 1] f16     │  row magnitudes (separated from direction)
+├─────────────────────────────────────┤
+│ mul(W₁_dequant, row_norms₁)        │  restore per-row scale
+├─────────────────────────────────────┤
+│ matmul(x, W₁_scaled)               │  output is in rotated activation space
+├─────────────────────────────────────┤
+│ activation (relu, gelu, etc.)       │  applied in rotated space
+├─────────────────────────────────────┤
+│ constexpr_lut_to_dense (W₂)        │  W₂ quantized with matching input rotation
+│   Input columns rotated by same R.  │  (R^T absorbed into W₂ before quantization)
+├─────────────────────────────────────┤
+│ const(row_norms₂) [M₂, 1] f16     │  row magnitudes for W₂
+├─────────────────────────────────────┤
+│ mul(W₂_dequant, row_norms₂)        │  restore per-row scale
+├─────────────────────────────────────┤
+│ matmul(act_out, W₂_scaled)          │  R^T · R cancels → unrotated output
+└─────────────────────────────────────┘
+```
+
+**Unpaired layers (explicit matmul fallback):**
 ```
 ┌─────────────────────────────────────┐
 │ constexpr_lut_to_dense              │  ← quantized + LUT (existing CoreML op)
@@ -410,28 +613,35 @@ PolarQuant emits three ops per quantized weight:
 │   shape: original weight shape      │
 │   output: W_rotated (float16)       │
 ├─────────────────────────────────────┤
-│ const                               │  ← rotation matrix (existing CoreML op)
+│ const(row_norms) [M, 1] f16        │  ← per-row magnitudes
+├─────────────────────────────────────┤
+│ mul(W_rotated, row_norms)           │  ← restore per-row scale
+├─────────────────────────────────────┤
+│ const                               │  ← inverse rotation matrix
 │   val: R_inv [N, N] float16        │
 ├─────────────────────────────────────┤
-│ matmul                              │  ← un-rotation (existing CoreML op)
-│   x: W_rotated                      │
+│ matmul                              │  ← un-rotation (one-time at model load)
+│   x: W_scaled                       │
 │   y: R_inv                          │
 │   output: W_approx (float16)        │
 └─────────────────────────────────────┘
 ```
 
-All three ops are standard MIL/CoreML operations. No custom ops needed.
+All emitted ops are standard MIL/CoreML operations. No custom ops needed.
 
 ### Memory at load time
 
-CoreML materializes `constexpr_*` ops at model load. The rotation matmul also
-runs at load time if its inputs are all constants. So at inference time, the
-model sees a plain float16 weight tensor — zero runtime overhead.
+CoreML materializes `constexpr_*` ops at model load. For paired layers,
+this is plain LUT dequantization — no extra cost. For unpaired layers,
+the rotation matmul also runs at load time (its inputs are all constants,
+so CoreML constant-folds it). At inference time, both paths see plain
+float16 weight tensors — zero per-inference overhead.
 
 ### ANE compatibility
 
-The materialized float16 weights are ANE-compatible. The matmul during load
-runs on CPU/GPU (it's a one-time const-folding step). No ANE concerns.
+The materialized float16 weights are ANE-compatible for both paths. The
+fallback matmul runs at model load time on CPU/GPU (one-time constant
+folding). No ANE concerns.
 
 ### Storage savings
 
@@ -441,35 +651,42 @@ runs on CPU/GPU (it's a one-time const-folding step). No ANE concerns.
 | 3-bit | 0.375 + LUT amortized | 5.3× smaller | 2.7× smaller |
 | 2-bit | 0.25 + LUT amortized | 8× smaller | 4× smaller |
 
-The rotation matrix R adds N² × 2 bytes per unique inner dimension. For a
-typical transformer with head_dim=128 used across dozens of layers, R is
-shared (same seed → same matrix), so it's 128 × 128 × 2 = 32 KiB — negligible.
+With fused rotation, paired layers have zero storage overhead beyond the
+packed indices and shared LUT. Unpaired layers add one R_inv matrix per
+unique (dimension, seed) pair — typically 32 KiB for head_dim=128.
 
 ---
 
 ## 6. Risks and open questions
 
-### R1 — Rotation matrix storage for large dimensions
+### R1 — Rotation approximation through non-linearities
 
-For inner dimensions > 1024, R is > 2 MiB (stored as dense float16).
-**Mitigation:** Store only the seed and regenerate R at model load time. This
-requires the runtime to implement the Hadamard transform, which breaks the
-"emit only standard CoreML ops" goal. Alternative: use a structured rotation
-(block-diagonal Hadamard) to keep R small.
+Fused rotation assumes `act(R · z) ≈ R · act(z)` for element-wise
+activations. This holds well for Hadamard rotations (which are
+near-isometries that distribute energy evenly) but is an approximation.
+The quality of the approximation varies by activation function: ReLU is
+exact for positive inputs, GELU and SiLU introduce larger errors.
 
-**Decision needed:** Set a dimension threshold above which we switch from
-storing R explicitly to using a structured/block-diagonal approach.
+**Mitigation:** The fusion pass should whitelist activation types that are
+safe to fuse through. Start with `relu` and `leaky_relu` (piecewise linear,
+best approximation). Gate `gelu`, `silu`, and `swish` behind an `--aggressive-fusion` flag
+or quality threshold. Empirically validate quality on representative
+transformer architectures (LLaMA-style, GPT-style). If quality degrades,
+restrict fusion to truly linear pairs (no activation between) and leave
+non-fusible layers using the explicit matmul fallback.
 
-### R2 — Interaction with CoreML's constexpr materialization
+### R2 — Rotation matrix storage for unpaired layers
 
-CoreML materializes `constexpr_*` ops at model load. If the matmul following
-`constexpr_lut_to_dense` is also folded at load time (constant propagation),
-the runtime cost is truly zero. Need to verify this behavior empirically.
+Unpaired layers store an R_inv matrix (N×N float16). For large dimensions
+(N > 1024), this is > 2 MiB per unique dimension.
 
-**Mitigation:** If CoreML doesn't constant-fold through the matmul, add an
-option to pre-materialize: run the dequant + matmul at conversion time and
-store the result as a plain float16 const. This loses the storage benefit
-but confirms correctness.
+**Mitigation:** In practice, transformer models reuse a small number of
+unique inner dimensions (e.g., head_dim=128, hidden_dim=4096). R_inv
+matrices are shared across all layers with the same dimension and seed,
+so only one copy per unique (dim, seed) pair is stored. For head_dim=128,
+R_inv is 32 KiB — negligible. For hidden_dim=4096, R_inv is 32 MiB but
+these layers are typically paired (fused), so the fallback rarely applies
+to large dimensions.
 
 ### R3 — Non-power-of-two inner dimensions
 
@@ -491,12 +708,26 @@ architectures.
 
 ### R5 — `statrs` dependency
 
-Adding a new crate dependency for the Beta distribution functions. The
-alternative is implementing the incomplete beta function from scratch (~50–100
-lines, well-documented algorithm).
+**Decision: use `statrs`.** The crate is already a workspace dependency
+(`statrs = "0.18"` in root `Cargo.toml`) used by `ironmill-bench`. Adding
+`statrs = { workspace = true }` to `crates/mil-rs/Cargo.toml` introduces no
+new external dependency to the lockfile and provides a well-tested Beta CDF
+and inverse CDF implementation.
 
-**Decision needed:** New dependency vs. inline implementation. Inline is
-preferred to keep the dependency tree small.
+### R6 — CoreML constant-folding of fallback matmul
+
+The fallback path emits `constexpr_lut_to_dense → matmul(W', R_inv)` and
+assumes CoreML will constant-fold this chain at model load time (since both
+inputs are constants). While this is the expected behavior for
+`constexpr_*`-derived values, it has not been verified empirically for the
+specific case of a matmul between two `constexpr` outputs.
+
+**Mitigation:** Add a serialization + CoreML validation test (Task 5) that
+loads a model with a fallback matmul layer and verifies the weight tensor is
+fully materialized before first inference. If CoreML does not constant-fold,
+the fallback is to pre-multiply in the pass and emit the unrotated weight
+directly (losing no compression — the packed indices + LUT are still smaller
+than the dense result, and the dense result is only needed at runtime).
 
 ---
 
@@ -506,8 +737,9 @@ preferred to keep the dependency tree small.
 |---|------|-------|------------|
 | 1 | Rotation utilities | `passes/rotation.rs` | — |
 | 2 | Beta-optimal quantizer | `passes/beta_quantizer.rs` | — |
-| 3 | PolarQuant pass | `passes/polar_quantize.rs` | 1, 2 |
-| 4 | Pipeline + CLI integration | `pipeline.rs`, `main.rs`, `passes/mod.rs` | 3 |
+| 3 | PolarQuant pass (per-tensor) | `passes/polar_quantize.rs` | 1, 2 |
+| 4 | Pipeline + CLI integration | `pipeline.rs`, `main.rs`, `passes/mod.rs` | 3, 7 (stub) |
 | 5 | Serialization verification | `ir_to_proto.rs` (verify only) | 3 |
-| 6 | Unit + quality tests | `tests/optimization_passes.rs`, `tests/cross_feature.rs` | 3, 4 |
-| 7 | Inter-layer rotation fusion (follow-up) | `passes/polar_rotation_fusion.rs` | 3 |
+| 6 | Unit + quality tests | `tests/optimization_passes.rs`, `tests/cross_feature.rs` | 3, 4, 7 |
+| 7 | Inter-layer rotation fusion | `passes/polar_rotation_fusion.rs` | 3 |
+| 8 | Benchmarks | `crates/ironmill-bench/` | 3, 7 |
