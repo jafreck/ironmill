@@ -93,8 +93,12 @@ pub use convert::program_to_updatable_model;
 /// Configuration for producing an updatable CoreML model.
 pub use convert::{LossFunction, UpdatableModelConfig, UpdateOptimizer};
 
+/// Options controlling ANE-aware template code generation.
+pub use convert::TemplateOptions;
 /// Build a MIL IR [`Program`] from weight tensors using architecture templates.
 pub use convert::weights_to_program;
+/// Build a MIL IR [`Program`] from weight tensors with explicit template options.
+pub use convert::weights_to_program_with_options;
 /// Weight provider abstraction for SafeTensors/GGUF formats.
 pub use convert::{Architecture, ModelConfig, WeightProvider, WeightTensor};
 

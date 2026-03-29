@@ -12,11 +12,12 @@ use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::validate::{print_validation_report, validation_report_to_json};
 #[allow(unused_imports)]
 use mil_rs::{
-    ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer, compile_model,
-    compile_model_with_backend, convert_pipeline, is_compiler_available,
+    ConversionConfig, LossFunction, TemplateOptions, UpdatableModelConfig, UpdateOptimizer,
+    compile_model, compile_model_with_backend, convert_pipeline, is_compiler_available,
     onnx_to_program_with_config, parse_pipeline_manifest, program_to_model,
     program_to_multi_function_model, program_to_updatable_model, read_mlmodel, read_mlpackage,
-    read_onnx, validate_ane_compatibility, weights_to_program, write_mlpackage,
+    read_onnx, validate_ane_compatibility, weights_to_program, weights_to_program_with_options,
+    write_mlpackage,
 };
 
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
@@ -189,6 +190,11 @@ enum Commands {
         #[arg(long = "ane-memory-budget", value_name = "SIZE")]
         ane_memory_budget: Option<String>,
 
+        /// Emit ANE-optimized ops in weight-based templates (1×1 conv projections,
+        /// decomposed RMSNorm, KV-cache state, prefill/decode split).
+        #[arg(long)]
+        ane: bool,
+
         /// Runtime backend for inference: "coreml" (default) or "ane-direct" (experimental).
         ///
         /// When set to "ane-direct", uses the direct ANE runtime instead of CoreML,
@@ -311,6 +317,7 @@ fn run() -> Result<()> {
             pipeline_config,
             annotate_compute_units,
             ane_memory_budget,
+            ane,
             runtime,
         } => cmd_compile(
             &input,
@@ -340,6 +347,7 @@ fn run() -> Result<()> {
                 pipeline_config,
                 annotate_compute_units,
                 ane_memory_budget,
+                ane,
                 runtime,
             },
         ),
@@ -398,6 +406,8 @@ struct CompileOpts {
     pipeline_config: Option<PathBuf>,
     annotate_compute_units: bool,
     ane_memory_budget: Option<String>,
+    #[allow(dead_code)] // Used in compile_from_weights once SafeTensorsProvider lands.
+    ane: bool,
     runtime: RuntimeArg,
 }
 
@@ -974,7 +984,14 @@ fn compile_from_weights(input_path: &Path, _opts: &CompileOpts) -> Result<()> {
     // When SafeTensorsProvider is implemented, the flow will be:
     //
     //   let provider = SafeTensorsProvider::load(input_path)?;
-    //   let result = weights_to_program(&provider)?;
+    //
+    //   // Derive ANE template options from CLI flags.
+    //   let ane_mode = _opts.ane
+    //       || matches!(_opts.backend, Backend::AneDirect)
+    //       || matches!(_opts.runtime, RuntimeArg::AneDirect);
+    //   let template_opts = TemplateOptions { ane: ane_mode };
+    //
+    //   let result = weights_to_program_with_options(&provider, &template_opts)?;
     //   let mut program = result.program;
     //   let warnings = result.warnings;
     //
