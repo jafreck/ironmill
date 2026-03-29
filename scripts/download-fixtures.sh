@@ -3,30 +3,29 @@
 # Run from the repository root: ./scripts/download-fixtures.sh
 #
 # Flags:
-#   --skip-whisper   Skip the large whisper-medium-encoder download
-#   --skip-large     Skip all large (>100MB) transformer model downloads
-#   --all            Download everything including all transformer models
+#   --skip-llm      Skip Qwen3-0.6B SafeTensors + GGUF downloads (~2GB)
+#   --skip-whisper   Skip whisper-medium-encoder.onnx download (~1.5GB)
+#   --skip-all       Skip all large downloads (LLM + whisper)
 
 set -euo pipefail
 
 FIXTURE_DIR="tests/fixtures"
 mkdir -p "$FIXTURE_DIR"
 
+# Parse flags
+SKIP_LLM=false
 SKIP_WHISPER=false
-SKIP_LARGE=false
 for arg in "$@"; do
     case "$arg" in
-        --skip-whisper) SKIP_WHISPER=true ;;
-        --skip-large)   SKIP_LARGE=true ;;
-        --all)          SKIP_WHISPER=false; SKIP_LARGE=false ;;
+        --skip-llm)     SKIP_LLM=true ;;
+        --skip-whisper)  SKIP_WHISPER=true ;;
+        --skip-all)      SKIP_LLM=true; SKIP_WHISPER=true ;;
     esac
 done
 
 echo "Downloading test fixtures..."
 
-# ── Core fixtures (always downloaded) ─────────────────────────────────
-
-# MobileNetV2 ONNX (~14MB) — CNN classification
+# MobileNetV2 ONNX (~14MB)
 if [ ! -f "$FIXTURE_DIR/mobilenetv2.onnx" ]; then
     echo "  mobilenetv2.onnx..."
     curl -sL -o "$FIXTURE_DIR/mobilenetv2.onnx.tmp" \
@@ -37,7 +36,7 @@ if [ ! -f "$FIXTURE_DIR/mobilenetv2.onnx" ]; then
         || mv "$FIXTURE_DIR/mobilenetv2.onnx.tmp" "$FIXTURE_DIR/mobilenetv2.onnx"
 fi
 
-# SqueezeNet ONNX (~4.7MB) — CNN classification
+# SqueezeNet ONNX (~4.7MB)
 if [ ! -f "$FIXTURE_DIR/squeezenet1.1.onnx" ]; then
     echo "  squeezenet1.1.onnx..."
     curl -sL -o "$FIXTURE_DIR/squeezenet1.1.onnx" \
@@ -51,65 +50,41 @@ if [ ! -f "$FIXTURE_DIR/MobileNet.mlmodel" ]; then
         "https://github.com/hollance/MobileNet-CoreML/raw/master/MobileNet.mlmodel"
 fi
 
-# ── Transformer fixtures (small, <50MB each) ──────────────────────────
-
-# Whisper-tiny encoder (~33MB) — encoder-only audio transformer, d=384
-if [ ! -f "$FIXTURE_DIR/whisper-tiny-encoder.onnx" ]; then
-    echo "  whisper-tiny-encoder.onnx (~33MB)..."
-    curl -sL -o "$FIXTURE_DIR/whisper-tiny-encoder.onnx" \
-        "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/encoder_model.onnx"
-fi
-
-# ── Transformer fixtures (large, >100MB each) ─────────────────────────
-# Use --skip-large to skip these, or --all to include everything.
-
-if [ "$SKIP_LARGE" = false ]; then
-
-    # Whisper-tiny decoder (~118MB) — decoder with cross-attention, d=384
-    if [ ! -f "$FIXTURE_DIR/whisper-tiny-decoder.onnx" ]; then
-        echo "  whisper-tiny-decoder.onnx (~118MB)..."
-        curl -sL -o "$FIXTURE_DIR/whisper-tiny-decoder.onnx" \
-            "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model.onnx"
+# Qwen3-0.6B SafeTensors + GGUF for weight-format benchmarks.
+# Use `--skip-llm` or `--skip-all` to skip these large downloads.
+if [ "$SKIP_LLM" = false ]; then
+    # Qwen3-0.6B SafeTensors (~1.4GB)
+    QWEN_DIR="$FIXTURE_DIR/Qwen3-0.6B"
+    if [ ! -d "$QWEN_DIR" ] || [ ! -f "$QWEN_DIR/model.safetensors" ]; then
+        echo "  Qwen3-0.6B SafeTensors (~1.4GB, this may take a while)..."
+        mkdir -p "$QWEN_DIR"
+        curl -sL -o "$QWEN_DIR/config.json" \
+            "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json"
+        curl -sL -o "$QWEN_DIR/model.safetensors" \
+            "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/model.safetensors"
     fi
 
-    # DistilBERT (~256MB) — encoder-only NLU transformer, d=768
-    if [ ! -f "$FIXTURE_DIR/distilbert.onnx" ]; then
-        echo "  distilbert.onnx (~256MB)..."
-        curl -sL -o "$FIXTURE_DIR/distilbert.onnx" \
-            "https://huggingface.co/philschmid/distilbert-onnx/resolve/main/model.onnx"
+    # Qwen3-0.6B GGUF Q8_0 (~639MB)
+    if [ ! -f "$FIXTURE_DIR/Qwen3-0.6B-Q8_0.gguf" ]; then
+        echo "  Qwen3-0.6B-Q8_0.gguf (~639MB, this may take a while)..."
+        curl -sL -o "$FIXTURE_DIR/Qwen3-0.6B-Q8_0.gguf" \
+            "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
     fi
-
-    # ViT-base-patch16-224 (~347MB) — vision transformer, d=768
-    if [ ! -f "$FIXTURE_DIR/vit-base.onnx" ]; then
-        echo "  vit-base.onnx (~347MB)..."
-        curl -sL -o "$FIXTURE_DIR/vit-base.onnx" \
-            "https://huggingface.co/google/vit-base-patch16-224/resolve/main/model.onnx"
-    fi
-
-    # Qwen3-0.6B (~300MB graph + ~1.9GB external data) — decoder-only LLM, d=1024
-    if [ ! -f "$FIXTURE_DIR/qwen3-0.6b.onnx" ]; then
-        echo "  qwen3-0.6b.onnx (~300MB + ~1.9GB data)..."
-        curl -sL -o "$FIXTURE_DIR/qwen3-0.6b.onnx" \
-            "https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX/resolve/main/onnx/model.onnx"
-        curl -sL -o "$FIXTURE_DIR/model.onnx_data" \
-            "https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX/resolve/main/onnx/model.onnx_data"
-    fi
-
 else
-    echo "  Skipping large transformer models (--skip-large)"
+    echo "  Skipping Qwen3-0.6B downloads (--skip-llm)"
 fi
 
-# ── Optional heavyweight fixtures ─────────────────────────────────────
-
-if [ "$SKIP_WHISPER" = false ] && [ "$SKIP_LARGE" = false ]; then
-    # Whisper Medium encoder ONNX (~769M params, ~1.5GB)
+# Whisper Medium encoder ONNX (~769M params, ~1.5GB)
+# Validation target for ANE optimization — encoder-only (fixed 30s mel input).
+# Use `--skip-whisper` or `--skip-all` to skip this large download.
+if [ "$SKIP_WHISPER" = false ]; then
     if [ ! -f "$FIXTURE_DIR/whisper-medium-encoder.onnx" ]; then
         echo "  whisper-medium-encoder.onnx (~1.5GB, this may take a while)..."
         curl -sL -o "$FIXTURE_DIR/whisper-medium-encoder.onnx" \
             "https://huggingface.co/onnx-community/whisper-medium/resolve/main/encoder_model.onnx"
     fi
 else
-    echo "  Skipping whisper-medium-encoder.onnx"
+    echo "  Skipping whisper-medium-encoder.onnx (--skip-whisper)"
 fi
 
 echo "Done. Fixtures in $FIXTURE_DIR/:"
