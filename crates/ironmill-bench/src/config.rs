@@ -129,6 +129,11 @@ pub fn default_matrix() -> BenchMatrix {
             path: PathBuf::from("tests/fixtures/vit-base.onnx"),
             input_shapes: vec![],
         },
+        ModelConfig {
+            name: "Qwen3-0.6B".to_string(),
+            path: PathBuf::from("tests/fixtures/qwen3-0.6b.onnx"),
+            input_shapes: vec![],
+        },
     ];
 
     let optimizations = vec![
@@ -239,7 +244,7 @@ mod tests {
     #[test]
     fn test_default_matrix() {
         let m = default_matrix();
-        assert_eq!(m.models.len(), 5);
+        assert_eq!(m.models.len(), 6);
         assert_eq!(m.optimizations.len(), 7);
         assert_eq!(m.backends, vec!["all"]);
         assert_eq!(m.settings.iterations, 200);
@@ -255,6 +260,7 @@ mod tests {
         assert_eq!(m.models[2].name, "Whisper-tiny-encoder");
         assert_eq!(m.models[3].name, "DistilBERT");
         assert_eq!(m.models[4].name, "ViT-base");
+        assert_eq!(m.models[5].name, "Qwen3-0.6B");
     }
 
     #[test]

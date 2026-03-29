@@ -834,3 +834,54 @@ fn cli_compile_vit_base_polar_quant() {
         "polar-quantized output directory must be non-empty"
     );
 }
+
+#[test]
+fn cli_compile_qwen3_0_6b() {
+    let fixture = fixture_path("qwen3-0.6b.onnx");
+    if !fixture.exists() {
+        eprintln!("SKIP: qwen3-0.6b.onnx not found (run download-fixtures.sh)");
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("qwen3.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "qwen3-0.6b compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+}
+
+#[test]
+fn cli_compile_qwen3_0_6b_polar_quant() {
+    let fixture = fixture_path("qwen3-0.6b.onnx");
+    if !fixture.exists() {
+        eprintln!("SKIP: qwen3-0.6b.onnx not found");
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    let output = tmp.path().join("qwen3-polar.mlpackage");
+    let result = ironmill_cmd()
+        .args(["compile"])
+        .arg(&fixture)
+        .args(["--polar-quantize", "4"])
+        .args(["-o", output.to_str().unwrap()])
+        .output()
+        .expect("failed to run ironmill compile");
+    assert!(
+        result.status.success(),
+        "qwen3-0.6b polar-quant compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists());
+    assert!(
+        dir_size(&output) > 0,
+        "polar-quantized output directory must be non-empty"
+    );
+}

@@ -86,6 +86,15 @@ if [ "$SKIP_LARGE" = false ]; then
             "https://huggingface.co/google/vit-base-patch16-224/resolve/main/model.onnx"
     fi
 
+    # Qwen3-0.6B (~300MB graph + ~1.9GB external data) — decoder-only LLM, d=1024
+    if [ ! -f "$FIXTURE_DIR/qwen3-0.6b.onnx" ]; then
+        echo "  qwen3-0.6b.onnx (~300MB + ~1.9GB data)..."
+        curl -sL -o "$FIXTURE_DIR/qwen3-0.6b.onnx" \
+            "https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX/resolve/main/onnx/model.onnx"
+        curl -sL -o "$FIXTURE_DIR/model.onnx_data" \
+            "https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX/resolve/main/onnx/model.onnx_data"
+    fi
+
 else
     echo "  Skipping large transformer models (--skip-large)"
 fi

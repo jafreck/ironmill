@@ -28,6 +28,7 @@ Sample model files for integration tests. These are NOT checked into git
 
 | File | Format | Architecture | Size | Source |
 |------|--------|-------------|------|--------|
+| `qwen3-0.6b.onnx` + `model.onnx_data` | ONNX | Decoder-only LLM | ~2.2GB | onnx-community/Qwen3-0.6B-ONNX |
 | `whisper-medium-encoder.onnx` | ONNX | Encoder (audio) | ~1.5GB | onnx-community/whisper-medium |
 
 ## Downloading
@@ -51,6 +52,7 @@ ironmill's optimization passes across different op patterns:
 - **CNN** — conv + pooling + dense (MobileNetV2, SqueezeNet)
 - **Encoder-only transformer** — self-attention + FFN (DistilBERT, Whisper encoder)
 - **Decoder transformer** — causal self-attention + cross-attention (Whisper decoder)
+- **Decoder-only LLM** — causal self-attention + RoPE + GQA (Qwen3-0.6B)
 - **Vision transformer** — patch embedding + self-attention (ViT)
 
 PolarQuant weight quantization targets transformer architectures where
