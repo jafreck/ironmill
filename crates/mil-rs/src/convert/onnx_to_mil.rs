@@ -60,7 +60,7 @@ pub fn convert_node(node: &NodeProto) -> Result<Vec<Operation>> {
         "Constant" => convert_constant(node),
 
         // P2 — Additional ops
-        "Shape" => convert_unary(node, "shape"),
+        "Shape" => convert_shape(node),
         "Split" => convert_split(node),
         "Where" => convert_where(node),
         "Pow" => convert_binary(node, "pow"),
@@ -671,9 +671,9 @@ fn convert_reduce_mean(node: &NodeProto) -> Result<Vec<Operation>> {
             .insert("axes".to_string(), Value::Reference(axes_input.clone()));
     }
 
-    if let Some(keepdims) = get_int_attr(node, "keepdims") {
-        op = op.with_attr("keep_dims", Value::Bool(keepdims != 0));
-    }
+    // ONNX defaults keepdims=1; CoreML requires keep_dims to be present.
+    let keepdims = get_int_attr(node, "keepdims").unwrap_or(1);
+    op = op.with_attr("keep_dims", Value::Bool(keepdims != 0));
 
     Ok(vec![with_outputs(op, node)])
 }
@@ -741,6 +741,20 @@ fn convert_constant(node: &NodeProto) -> Result<Vec<Operation>> {
 // ---------------------------------------------------------------------------
 // P2 — Additional ops
 // ---------------------------------------------------------------------------
+
+/// Shape: returns the shape of the input tensor as an int32 1-D tensor.
+fn convert_shape(node: &NodeProto) -> Result<Vec<Operation>> {
+    let mut op = Operation::new("shape", op_name(node));
+    if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
+        op = op.with_input("x", Value::Reference(x.clone()));
+    }
+    // Force output type to int32 (shape is always integer).
+    use crate::ir::TensorType;
+    let out_name = node.output.first().cloned().unwrap_or_default();
+    op = op.with_output(&out_name);
+    op.output_types = vec![Some(TensorType::new(ScalarType::Int32, vec![0]))];
+    Ok(vec![op])
+}
 
 /// Split: handles both attribute and input forms for split sizes.
 fn convert_split(node: &NodeProto) -> Result<Vec<Operation>> {

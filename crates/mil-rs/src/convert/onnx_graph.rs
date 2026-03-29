@@ -327,7 +327,22 @@ fn convert_graph(
         block.outputs.push(output.name.clone());
     }
 
-    // 8. Propagate shapes for ops that still have None output_types.
+    // 8. Sanitize all operation/output names for CoreML compatibility.
+    //    CoreML MIL identifiers must match [A-Za-z_][A-Za-z0-9_]*.
+    //    ONNX names often contain '/', '.', ':', etc.
+    sanitize_block_names(&mut block);
+
+    // Also sanitize function input names.
+    for (name, _) in &mut function.inputs {
+        let sanitized = sanitize_mil_name(name);
+        if sanitized != *name {
+            // The block references are already updated by sanitize_block_names
+            // which includes input names in its rename map scanning.
+            *name = sanitized;
+        }
+    }
+
+    // 9. Propagate shapes for ops that still have None output_types.
     //    Without this, shape-changing ops (conv, pool) get unknown
     //    dimensions in the proto, which crashes the BNNS backend.
     propagate_output_types(&function.inputs, &mut block);
@@ -1034,6 +1049,101 @@ fn load_external_tensor_data(
             return Vec::new();
         }
         buf
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Name sanitization for CoreML compatibility
+// ---------------------------------------------------------------------------
+
+/// Sanitize a name to be a valid MIL/CoreML identifier.
+///
+/// CoreML expects identifiers matching `[A-Za-z_][A-Za-z0-9_]*`.
+/// ONNX names frequently contain `/`, `.`, `:`, `-` and other characters.
+fn sanitize_mil_name(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            result.push(ch);
+        } else {
+            result.push('_');
+        }
+    }
+    if result.is_empty() {
+        return "_unnamed".to_string();
+    }
+    if result.starts_with(|c: char| c.is_ascii_digit()) {
+        result.insert(0, '_');
+    }
+    result
+}
+
+/// Sanitize all op names, output names, and input references in a block.
+///
+/// Builds a rename map from original → sanitized names, then rewrites
+/// every name and reference in the block consistently.
+fn sanitize_block_names(block: &mut Block) {
+    // Build the rename map from all outputs and all referenced names.
+    let mut renames: HashMap<String, String> = HashMap::new();
+    for op in &block.operations {
+        for out in &op.outputs {
+            let sanitized = sanitize_mil_name(out);
+            if sanitized != *out {
+                renames.insert(out.clone(), sanitized);
+            }
+        }
+    }
+
+    if renames.is_empty() {
+        return;
+    }
+
+    // Apply renames to all ops.
+    for op in &mut block.operations {
+        // Rename op name.
+        let sanitized_name = sanitize_mil_name(&op.name);
+        if sanitized_name != op.name {
+            op.name = sanitized_name;
+        }
+
+        // Rename outputs.
+        for out in &mut op.outputs {
+            if let Some(new_name) = renames.get(out.as_str()) {
+                *out = new_name.clone();
+            }
+        }
+
+        // Rename input references.
+        for value in op.inputs.values_mut() {
+            rename_references(value, &renames);
+        }
+        for value in op.attributes.values_mut() {
+            rename_references(value, &renames);
+        }
+    }
+
+    // Rename block outputs.
+    for out in &mut block.outputs {
+        if let Some(new_name) = renames.get(out.as_str()) {
+            *out = new_name.clone();
+        }
+    }
+}
+
+/// Recursively rename Value::Reference entries using the rename map.
+fn rename_references(value: &mut Value, renames: &HashMap<String, String>) {
+    match value {
+        Value::Reference(name) => {
+            if let Some(new_name) = renames.get(name.as_str()) {
+                *name = new_name.clone();
+            }
+        }
+        Value::List(items) => {
+            for item in items {
+                rename_references(item, renames);
+            }
+        }
+        _ => {}
     }
 }
 

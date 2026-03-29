@@ -196,6 +196,13 @@ impl Pass for PolarQuantPass {
                 op.attributes
                     .insert("polar_quant_seed".to_string(), Value::Int(self.seed as i64));
 
+                // Update output type to Float16 to match the LUT dtype.
+                // CoreML requires constexpr_lut_to_dense output dtype == LUT dtype.
+                use crate::ir::tensor::TensorType;
+                if !op.output_types.is_empty() {
+                    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, shape.clone()));
+                }
+
                 // ── Phase 4: build row-norms const + mul ops ──────────────
                 let norms_output = format!("{original_output}_polar_norms");
                 let mul_output = format!("{original_output}_polar_scaled");
