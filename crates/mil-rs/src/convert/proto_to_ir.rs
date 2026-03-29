@@ -248,12 +248,38 @@ fn convert_tensor_value(
     use mil_spec::tensor_value;
 
     match &tv.value {
-        Some(tensor_value::Value::Floats(f)) => match f.values.as_slice() {
-            [v] => Ok(Value::Float(*v as f64)),
-            vals => Ok(Value::List(
-                vals.iter().map(|v| Value::Float(*v as f64)).collect(),
-            )),
-        },
+        Some(tensor_value::Value::Floats(f)) => {
+            // When type info indicates a tensor with non-scalar shape,
+            // reconstruct as Value::Tensor so that FP32 LUTs (e.g.
+            // constexpr_lut_to_dense) round-trip correctly instead of
+            // being deserialized as Value::List. Scalars (rank-0) stay
+            // as Value::Float for attribute compatibility.
+            if let Some(tt) = value_type.and_then(|vt| match &vt.r#type {
+                Some(mil_spec::value_type::Type::TensorType(tt)) => Some(tt),
+                _ => None,
+            }) {
+                let shape: Vec<usize> = tt
+                    .dimensions
+                    .iter()
+                    .filter_map(|d| match &d.dimension {
+                        Some(mil_spec::dimension::Dimension::Constant(c)) => Some(c.size as usize),
+                        _ => None,
+                    })
+                    .collect();
+                // Only reconstruct as Tensor for non-scalar shapes (rank >= 1).
+                if !shape.is_empty() {
+                    let dtype = convert_data_type(tt.data_type)?;
+                    let data: Vec<u8> = f.values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    return Ok(Value::Tensor { data, shape, dtype });
+                }
+            }
+            match f.values.as_slice() {
+                [v] => Ok(Value::Float(*v as f64)),
+                vals => Ok(Value::List(
+                    vals.iter().map(|v| Value::Float(*v as f64)).collect(),
+                )),
+            }
+        }
         Some(tensor_value::Value::Doubles(d)) => match d.values.as_slice() {
             [v] => Ok(Value::Float(*v)),
             vals => Ok(Value::List(vals.iter().map(|v| Value::Float(*v)).collect())),

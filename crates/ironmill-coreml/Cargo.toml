@@ -13,3 +13,4 @@ objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSArray"
 block2 = "0.6"
 anyhow = { workspace = true }
 serde = { workspace = true }
+ironmill-runtime = { workspace = true }

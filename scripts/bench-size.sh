@@ -67,6 +67,7 @@ CONFIGS=(
     "+ Palettize 4-bit|--palettize 4"
     "+ Palettize 6-bit|--palettize 6"
     "+ FP16 + Palettize 4-bit|--quantize fp16 --palettize 4"
+    "+ PolarQuant 4-bit|--polar-quantize 4"
 )
 
 for model in "${MODELS[@]}"; do

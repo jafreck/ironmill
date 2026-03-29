@@ -434,6 +434,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "ironmill-runtime",
  "mil-rs",
  "serde_json",
  "tempfile",
@@ -446,6 +447,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "half",
  "ironmill-ane",
  "ironmill-coreml",
  "mil-rs",
@@ -474,10 +476,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "block2",
+ "ironmill-runtime",
  "objc2",
  "objc2-core-ml",
  "objc2-foundation",
  "serde",
+]
+
+[[package]]
+name = "ironmill-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
 ]
 
 [[package]]

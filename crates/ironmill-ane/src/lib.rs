@@ -602,6 +602,67 @@ impl CompiledArtifacts {
     }
 }
 
+// ── RuntimeBackend / RuntimeModel ─────────────────────────────────
+
+use ironmill_runtime::{
+    ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor,
+};
+
+fn scalar_to_element(dt: ScalarType) -> ElementType {
+    match dt {
+        ScalarType::Float16 => ElementType::Float16,
+        ScalarType::Float32 => ElementType::Float32,
+        ScalarType::Int32 => ElementType::Int32,
+        _ => ElementType::Float32,
+    }
+}
+
+/// Wraps a loaded [`AneModel`] to implement [`RuntimeModel`].
+pub struct AneRuntimeModel {
+    model: AneModel,
+}
+
+impl RuntimeModel for AneRuntimeModel {
+    fn input_description(&self) -> Vec<InputFeatureDesc> {
+        self.model
+            .input_description()
+            .iter()
+            .map(|d| InputFeatureDesc {
+                name: d.name.clone(),
+                shape: d.shape.to_vec(),
+                dtype: scalar_to_element(d.dtype),
+            })
+            .collect()
+    }
+
+    fn predict(&self, _inputs: &[RuntimeTensor]) -> anyhow::Result<Vec<RuntimeTensor>> {
+        // ANE predict requires &mut self for IOSurface buffer management.
+        // Full implementation would need interior mutability. For now,
+        // the trait enables backend-agnostic code paths in CLI/bench.
+        Err(anyhow::anyhow!(
+            "ANE predict through RuntimeModel requires compile_and_load with a Program"
+        ))
+    }
+}
+
+/// ANE direct backend. Since ANE compilation takes a `Program` (not a file),
+/// this backend is a no-op placeholder that enables uniform backend selection.
+/// Use [`AneModel::compile_and_load`] directly for actual ANE execution.
+pub struct AneDirectBackend;
+
+impl RuntimeBackend for AneDirectBackend {
+    fn name(&self) -> &str {
+        "ane-direct"
+    }
+
+    fn load(&self, _model_path: &std::path::Path) -> anyhow::Result<Box<dyn RuntimeModel>> {
+        Err(anyhow::anyhow!(
+            "ANE direct backend requires a Program, not a file path. \
+             Use AneModel::compile_and_load() directly."
+        ))
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]

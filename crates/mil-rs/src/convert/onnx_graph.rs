@@ -1084,10 +1084,26 @@ fn sanitize_mil_name(name: &str) -> String {
 /// every name and reference in the block consistently.
 fn sanitize_block_names(block: &mut Block) {
     // Build the rename map from all outputs and all referenced names.
+    // Track seen sanitized names to detect collisions and append numeric
+    // suffixes when two distinct ONNX names would otherwise alias
+    // (e.g. `layer/0/conv` and `layer.0.conv` both → `layer_0_conv`).
     let mut renames: HashMap<String, String> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for op in &block.operations {
         for out in &op.outputs {
-            let sanitized = sanitize_mil_name(out);
+            let mut sanitized = sanitize_mil_name(out);
+            if seen.contains(&sanitized) {
+                let base = sanitized.clone();
+                let mut suffix = 1u32;
+                loop {
+                    sanitized = format!("{base}_{suffix}");
+                    if !seen.contains(&sanitized) {
+                        break;
+                    }
+                    suffix += 1;
+                }
+            }
+            seen.insert(sanitized.clone());
             if sanitized != *out {
                 renames.insert(out.clone(), sanitized);
             }
@@ -1873,4 +1889,43 @@ mod tests {
     // causal_mask_name_patterns test removed — is_causal_mask_name was removed
     // since attention_mask alone is insufficient for AR detection (false positives
     // with BERT-like models). AR detection now relies solely on KV cache tensors.
+
+    #[test]
+    fn sanitize_block_names_deduplicates_collisions() {
+        // Two outputs that map to the same sanitized name should get
+        // different suffixed names instead of aliasing.
+        let mut block = Block::new();
+
+        let op1 = Operation::new("relu", "op1")
+            .with_output("layer/0/conv")
+            .with_input("x", Value::Reference("input".to_string()));
+        block.add_op(op1);
+
+        let op2 = Operation::new("relu", "op2")
+            .with_output("layer.0.conv")
+            .with_input("x", Value::Reference("layer/0/conv".to_string()));
+        block.add_op(op2);
+
+        block.outputs.push("layer.0.conv".into());
+
+        sanitize_block_names(&mut block);
+
+        // Both should have different output names.
+        let out0 = &block.operations[0].outputs[0];
+        let out1 = &block.operations[1].outputs[0];
+        assert_ne!(
+            out0, out1,
+            "colliding names should be deduplicated, got {out0} and {out1}"
+        );
+
+        // Both should be valid MIL names (no dots or slashes).
+        assert!(
+            !out0.contains('/') && !out0.contains('.'),
+            "sanitized name should not contain / or .: {out0}"
+        );
+        assert!(
+            !out1.contains('/') && !out1.contains('.'),
+            "sanitized name should not contain / or .: {out1}"
+        );
+    }
 }

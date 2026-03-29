@@ -1,0 +1,12 @@
+[package]
+name = "ironmill-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Common runtime traits for ironmill backends"
+
+[dependencies]
+anyhow = { workspace = true }
+half = { workspace = true }

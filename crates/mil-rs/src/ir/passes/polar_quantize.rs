@@ -53,6 +53,17 @@ impl Pass for PolarQuantPass {
     fn run(&self, program: &mut Program) -> Result<()> {
         let k = 1usize << self.n_bits;
 
+        // CoreML constexpr_lut_to_dense only accepts LUT sizes in
+        // {2, 4, 16, 64, 256}. Reject unsupported sizes early.
+        const VALID_LUT_SIZES: &[usize] = &[2, 4, 16, 64, 256];
+        if !VALID_LUT_SIZES.contains(&k) {
+            return Err(crate::error::MilError::Validation(format!(
+                "PolarQuant: n_bits={} produces LUT size {} which is not supported by CoreML \
+                 (valid LUT sizes: 2, 4, 16, 64, 256 → n_bits ∈ {{1, 2, 4, 6, 8}})",
+                self.n_bits, k
+            )));
+        }
+
         for function in program.functions.values_mut() {
             // Collected post-loop insertions: (original_op_index, new_ops_to_insert_after).
             let mut insertions: Vec<(usize, Vec<Operation>)> = Vec::new();
@@ -218,25 +229,29 @@ impl Pass for PolarQuantPass {
                     _ => row_norms.iter().flat_map(|v| v.to_le_bytes()).collect(),
                 };
 
-                let norms_op = Operation::new("const", format!("{op_name}_polar_norms"))
+                let norms_shape = {
+                    let mut s = shape.clone();
+                    *s.last_mut().unwrap() = 1;
+                    s
+                };
+
+                let mut norms_op = Operation::new("const", format!("{op_name}_polar_norms"))
                     .with_input(
                         "val",
                         Value::Tensor {
                             data: norms_data,
-                            shape: {
-                                let mut s = shape.clone();
-                                *s.last_mut().unwrap() = 1;
-                                s
-                            },
+                            shape: norms_shape.clone(),
                             dtype: original_dtype,
                         },
                     )
                     .with_output(&norms_output);
+                norms_op.output_types[0] = Some(TensorType::new(original_dtype, norms_shape));
 
-                let mul_op = Operation::new("mul", format!("{op_name}_polar_mul"))
+                let mut mul_op = Operation::new("mul", format!("{op_name}_polar_mul"))
                     .with_input("x", Value::Reference(original_output.clone()))
                     .with_input("y", Value::Reference(norms_output))
                     .with_output(&mul_output);
+                mul_op.output_types[0] = Some(TensorType::new(original_dtype, shape.clone()));
 
                 insertions.push((i, vec![norms_op, mul_op]));
                 replacements.push((original_output, mul_output));
@@ -353,8 +368,8 @@ mod tests {
     #[test]
     fn quantises_large_tensor() {
         let rows = 64;
-        let cols = 32;
-        let numel = rows * cols; // 2048 >= 1024
+        let cols = 64;
+        let numel = rows * cols; // 4096 >= 1024, cols >= 64
         let weights: Vec<f32> = (0..numel).map(|i| (i as f32 * 0.1).sin()).collect();
 
         let tensor_val = Value::Tensor {
@@ -380,11 +395,11 @@ mod tests {
         assert_eq!(ops[1].op_type, "const");
         assert_eq!(ops[2].op_type, "mul");
 
-        // LUT should have 16 entries (4-bit).
+        // LUT should have 16 entries (4-bit), matching input dtype (Float32).
         match ops[0].attributes.get("lut") {
             Some(Value::Tensor { shape, dtype, .. }) => {
                 assert_eq!(shape, &[16]);
-                assert_eq!(*dtype, ScalarType::Float16);
+                assert_eq!(*dtype, ScalarType::Float32);
             }
             other => panic!("expected LUT tensor, got {other:?}"),
         }
@@ -395,11 +410,11 @@ mod tests {
             other => panic!("expected seed 42, got {other:?}"),
         }
 
-        // Norms tensor shape is [rows, 1].
+        // Norms tensor shape is [rows, 1], matching input dtype.
         match ops[1].inputs.get("val") {
             Some(Value::Tensor { shape, dtype, .. }) => {
                 assert_eq!(shape, &[rows, 1]);
-                assert_eq!(*dtype, ScalarType::Float16);
+                assert_eq!(*dtype, ScalarType::Float32);
             }
             other => panic!("expected norms tensor, got {other:?}"),
         }
@@ -448,5 +463,75 @@ mod tests {
             }
             other => panic!("expected reference to polar_scaled, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_3_bit_lut_size() {
+        let mut program = Program::new("1.0.0");
+        let func = Function::new("main");
+        program.add_function(func);
+
+        let result = PolarQuantPass::new(3).run(&mut program);
+        assert!(
+            result.is_err(),
+            "n_bits=3 should be rejected (LUT size 8 not valid)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("LUT size 8"),
+            "error should mention LUT size: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_bit_widths() {
+        let mut program = Program::new("1.0.0");
+        let func = Function::new("main");
+        program.add_function(func);
+
+        for bits in [1, 2, 4, 6, 8] {
+            let result = PolarQuantPass::new(bits).run(&mut program);
+            assert!(result.is_ok(), "n_bits={bits} should be accepted");
+        }
+    }
+
+    #[test]
+    fn norms_op_has_output_types() {
+        let rows = 32;
+        let cols = 64;
+        let numel = rows * cols;
+        let weights: Vec<f32> = (0..numel).map(|i| (i as f32).cos()).collect();
+
+        let tensor_val = Value::Tensor {
+            data: f32_bytes(&weights),
+            shape: vec![rows, cols],
+            dtype: ScalarType::Float32,
+        };
+
+        let mut program = Program::new("1.0.0");
+        let mut func = Function::new("main");
+        func.body
+            .add_op(const_tensor_op("weight", "w_out", tensor_val));
+        func.body.outputs.push("w_out".into());
+        program.add_function(func);
+
+        PolarQuantPass::new(4).run(&mut program).unwrap();
+
+        let ops = &program.functions["main"].body.operations;
+        // norms const op (index 1) should have output_types set
+        let norms_op = &ops[1];
+        assert_eq!(norms_op.op_type, "const");
+        assert!(
+            !norms_op.output_types.is_empty() && norms_op.output_types[0].is_some(),
+            "norms const op should have explicit output type"
+        );
+
+        // mul op (index 2) should have output_types set
+        let mul_op = &ops[2];
+        assert_eq!(mul_op.op_type, "mul");
+        assert!(
+            !mul_op.output_types.is_empty() && mul_op.output_types[0].is_some(),
+            "mul op should have explicit output type"
+        );
     }
 }

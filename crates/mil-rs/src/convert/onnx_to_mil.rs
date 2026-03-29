@@ -566,6 +566,23 @@ fn convert_gather(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("axis", Value::Int(axis));
     }
 
+    // ONNX uses int64 for indices; CoreML only accepts int32. Insert a
+    // cast when the indices input is present so that models with int64
+    // indices (e.g. Whisper, Shape→Gather patterns) compile successfully.
+    if let Some(indices_ref) = node.input.get(1).filter(|s| !s.is_empty()) {
+        let cast_output = format!("{}_cast_int32", indices_ref);
+        let cast_op = Operation::new("cast", format!("{}_indices_cast", op_name(node)))
+            .with_input("x", Value::Reference(indices_ref.clone()))
+            .with_attr("dtype", Value::String("int32".to_string()))
+            .with_output(&cast_output);
+
+        // Rewire the gather op to use the casted indices.
+        op.inputs
+            .insert("indices".to_string(), Value::Reference(cast_output));
+
+        return Ok(vec![cast_op, with_outputs(op, node)]);
+    }
+
     Ok(vec![with_outputs(op, node)])
 }
 
@@ -1587,7 +1604,10 @@ mod tests {
         let mut node = make_node("Gather", &["data", "indices"], &["out"]);
         node.attribute.push(make_int_attr("axis", 1));
         let ops = convert_node(&node).unwrap();
-        let op = &ops[0];
+        // A cast(int32) op is inserted before gather for CoreML compatibility.
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].op_type, "cast");
+        let op = &ops[1];
         assert_eq!(op.op_type, "gather");
         assert!(matches!(op.attributes.get("axis"), Some(Value::Int(1))));
     }

@@ -183,6 +183,10 @@ impl Pass for PolarRotationFusionPass {
             let mut insertions: Vec<(usize, Vec<Operation>)> = Vec::new();
             let mut replacements: Vec<(String, String)> = Vec::new();
 
+            // Deduplicate R_inv matrices by (padded_cols, seed) key. Layers
+            // with identical rotation parameters share one R_inv const.
+            let mut r_inv_cache: HashMap<(usize, u64), String> = HashMap::new();
+
             for &pi in &unpaired {
                 let (seed, padded_cols, polar_output) = {
                     let op = &block.operations[pi];
@@ -213,33 +217,9 @@ impl Pass for PolarRotationFusionPass {
                     None => pi, // fallback: insert after the polar op itself
                 };
 
-                // Generate R_inv for un-rotation. Use the original cols (not padded)
-                // because the PolarQuant pass truncated indices back to original cols.
-                // R_inv is computed by: pad identity to power-of-two, rotate, then
-                // take the [cols, cols] submatrix (approximate un-rotation for
-                // non-power-of-two dims).
                 let orig_cols = get_original_cols(&block.operations[pi]);
                 let n_padded = padded_cols;
                 let n = if orig_cols > 0 { orig_cols } else { n_padded };
-
-                let mut identity = vec![0.0f32; n_padded * n_padded];
-                for i in 0..n_padded {
-                    identity[i * n_padded + i] = 1.0;
-                }
-                rotate_rows_hadamard(&mut identity, n_padded, n_padded, seed);
-
-                // Extract the [n, n] submatrix from the [n_padded, n_padded] rotation.
-                let r_inv_f32: Vec<f32> = if n < n_padded {
-                    let mut sub = vec![0.0f32; n * n];
-                    for r in 0..n {
-                        for c in 0..n {
-                            sub[r * n + c] = identity[r * n_padded + c];
-                        }
-                    }
-                    sub
-                } else {
-                    identity
-                };
 
                 // Use the same dtype as the LUT for type consistency.
                 let lut_dtype = match block.operations[pi].attributes.get("lut") {
@@ -247,44 +227,109 @@ impl Pass for PolarRotationFusionPass {
                     _ => ScalarType::Float32,
                 };
 
-                let r_inv_data: Vec<u8> = match lut_dtype {
-                    ScalarType::Float16 => r_inv_f32
-                        .iter()
-                        .flat_map(|&v| f16::from_f32(v).to_le_bytes())
-                        .collect(),
-                    _ => r_inv_f32.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                let cache_key = (n_padded, seed);
+                let mut new_ops: Vec<Operation> = Vec::new();
+
+                // Build or reuse R_inv const at full padded dimensions.
+                let r_inv_output = if let Some(existing) = r_inv_cache.get(&cache_key) {
+                    existing.clone()
+                } else {
+                    let mut identity = vec![0.0f32; n_padded * n_padded];
+                    for i in 0..n_padded {
+                        identity[i * n_padded + i] = 1.0;
+                    }
+                    rotate_rows_hadamard(&mut identity, n_padded, n_padded, seed);
+
+                    let r_inv_data: Vec<u8> = match lut_dtype {
+                        ScalarType::Float16 => identity
+                            .iter()
+                            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+                            .collect(),
+                        _ => identity.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                    };
+
+                    let r_inv_name = format!("{polar_output}_r_inv");
+                    let r_inv_const =
+                        Operation::new("const", format!("{polar_output}_r_inv_const"))
+                            .with_input(
+                                "val",
+                                Value::Tensor {
+                                    data: r_inv_data,
+                                    shape: vec![n_padded, n_padded],
+                                    dtype: lut_dtype,
+                                },
+                            )
+                            .with_output(&r_inv_name);
+                    new_ops.push(r_inv_const);
+                    r_inv_cache.insert(cache_key, r_inv_name.clone());
+                    r_inv_name
                 };
 
-                let r_inv_output = format!("{polar_output}_r_inv");
-                let matmul_output = format!("{polar_output}_unrotated");
-
-                let r_inv_const = Operation::new("const", format!("{polar_output}_r_inv_const"))
-                    .with_input(
-                        "val",
-                        Value::Tensor {
-                            data: r_inv_data,
-                            shape: vec![n, n],
-                            dtype: lut_dtype,
-                        },
-                    )
-                    .with_output(&r_inv_output);
-
                 // The matmul un-rotates the scaled weight: matmul(W_scaled, R_inv).
+                // Use full padded R_inv to avoid lossy truncation.
                 let source_ref = if mul_idx.is_some() {
                     mul_output.clone()
                 } else {
                     polar_output.clone()
                 };
 
-                let matmul_op = Operation::new("matmul", format!("{polar_output}_unrotate_matmul"))
-                    .with_input("x", Value::Reference(source_ref.clone()))
-                    .with_input("y", Value::Reference(r_inv_output))
-                    .with_attr("transpose_x", Value::Bool(false))
-                    .with_attr("transpose_y", Value::Bool(false))
-                    .with_output(&matmul_output);
+                let final_output = if n < n_padded {
+                    // Non-power-of-two: matmul at padded width, then slice
+                    // back to original dims for exact un-rotation.
+                    let matmul_padded_output = format!("{polar_output}_unrotated_padded");
+                    let matmul_op =
+                        Operation::new("matmul", format!("{polar_output}_unrotate_matmul"))
+                            .with_input("x", Value::Reference(source_ref.clone()))
+                            .with_input("y", Value::Reference(r_inv_output))
+                            .with_attr("transpose_x", Value::Bool(false))
+                            .with_attr("transpose_y", Value::Bool(false))
+                            .with_output(&matmul_padded_output);
+                    new_ops.push(matmul_op);
 
-                insertions.push((insert_after, vec![r_inv_const, matmul_op]));
-                replacements.push((source_ref, matmul_output));
+                    // slice_by_index to trim back to [rows, orig_cols].
+                    let slice_output = format!("{polar_output}_unrotated");
+                    let end_data: Vec<u8> = [-1i32, n as i32]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    let slice_op =
+                        Operation::new("slice_by_index", format!("{polar_output}_unrotate_slice"))
+                            .with_input("x", Value::Reference(matmul_padded_output))
+                            .with_attr(
+                                "end",
+                                Value::Tensor {
+                                    data: end_data,
+                                    shape: vec![2],
+                                    dtype: ScalarType::Int32,
+                                },
+                            )
+                            .with_attr(
+                                "end_mask",
+                                Value::Tensor {
+                                    data: vec![1u8, 0],
+                                    shape: vec![2],
+                                    dtype: ScalarType::Bool,
+                                },
+                            )
+                            .with_output(&slice_output);
+                    new_ops.push(slice_op);
+                    slice_output
+                } else {
+                    // Power-of-two: matmul is exact, no slicing needed.
+                    let matmul_output = format!("{polar_output}_unrotated");
+                    let matmul_op =
+                        Operation::new("matmul", format!("{polar_output}_unrotate_matmul"))
+                            .with_input("x", Value::Reference(source_ref.clone()))
+                            .with_input("y", Value::Reference(r_inv_output))
+                            .with_attr("transpose_x", Value::Bool(false))
+                            .with_attr("transpose_y", Value::Bool(false))
+                            .with_output(&matmul_output);
+                    new_ops.push(matmul_op);
+                    matmul_output
+                };
+
+                insertions.push((insert_after, new_ops));
+                replacements.push((source_ref, final_output));
 
                 // Remove the polar_quant_seed attribute — it's been handled.
                 block.operations[pi].attributes.remove("polar_quant_seed");
@@ -303,9 +348,13 @@ impl Pass for PolarRotationFusionPass {
             // Rewire downstream references.
             for (old_name, new_name) in &replacements {
                 replace_reference(block, old_name, new_name);
-                // Fix the matmul op's own `x` input back to the original source.
+                // Fix the matmul/slice op chain's own `x` input back to the
+                // original source. The replace_reference call rewrote ALL
+                // references including the matmul's own x input.
                 for op in &mut block.operations {
-                    if op.op_type == "matmul" && op.outputs.iter().any(|o| o == new_name) {
+                    if op.outputs.iter().any(|o| o == new_name)
+                        || op.name.contains("unrotate_matmul")
+                    {
                         if let Some(x_val) = op.inputs.get_mut("x") {
                             if matches!(x_val, Value::Reference(r) if r == new_name) {
                                 *x_val = Value::Reference(old_name.clone());
@@ -351,7 +400,24 @@ fn collect_references(value: &Value, cb: &mut impl FnMut(&str)) {
 
 /// Trace a reference back to see if it originates from a polar op.
 /// Handles the chain: constexpr_lut_to_dense(output) -> const(norms) -> mul(scaled)
+/// Also traces recursively through `mul` ops (e.g. norms scaling) and
+/// `const(norms)` nodes that appear in the pairing path.
 fn find_polar_source(ops: &[Operation], ref_name: &str, polar_indices: &[usize]) -> Option<usize> {
+    find_polar_source_recursive(ops, ref_name, polar_indices, 0)
+}
+
+/// Recursive helper with depth limit to prevent infinite loops.
+fn find_polar_source_recursive(
+    ops: &[Operation],
+    ref_name: &str,
+    polar_indices: &[usize],
+    depth: usize,
+) -> Option<usize> {
+    const MAX_DEPTH: usize = 8;
+    if depth > MAX_DEPTH {
+        return None;
+    }
+
     // Direct match: ref_name is a polar op's output.
     for &pi in polar_indices {
         if ops[pi].outputs.first().map(|s| s.as_str()) == Some(ref_name) {
@@ -359,20 +425,19 @@ fn find_polar_source(ops: &[Operation], ref_name: &str, polar_indices: &[usize])
         }
     }
 
-    // Indirect: ref_name is a mul output that consumes a polar op output.
     // Find the op that produces ref_name.
     let producer = ops
         .iter()
         .find(|op| op.outputs.first().map(|s| s.as_str()) == Some(ref_name))?;
 
-    if producer.op_type == "mul" {
-        // Check the mul's inputs for a reference to a polar op output.
+    // Trace through mul ops (norms scaling) and const ops (norms values).
+    if producer.op_type == "mul" || producer.op_type == "const" {
         for val in producer.inputs.values() {
             if let Value::Reference(inner_ref) = val {
-                for &pi in polar_indices {
-                    if ops[pi].outputs.first().map(|s| s.as_str()) == Some(inner_ref.as_str()) {
-                        return Some(pi);
-                    }
+                if let Some(pi) =
+                    find_polar_source_recursive(ops, inner_ref, polar_indices, depth + 1)
+                {
+                    return Some(pi);
                 }
             }
         }
@@ -454,9 +519,21 @@ mod tests {
             .iter()
             .flat_map(|&d| d.to_le_bytes())
             .collect();
+        // Include a minimal FP16 LUT so the fusion pass infers the correct dtype.
+        let lut_data: Vec<u8> = (0..16u16)
+            .flat_map(|v| half::f16::from_f32(v as f32).to_le_bytes())
+            .collect();
         Operation::new("constexpr_lut_to_dense", name)
             .with_output(output)
             .with_attr("polar_quant_seed", Value::Int(seed))
+            .with_attr(
+                "lut",
+                Value::Tensor {
+                    data: lut_data,
+                    shape: vec![16],
+                    dtype: ScalarType::Float16,
+                },
+            )
             .with_attr(
                 "shape",
                 Value::Tensor {
@@ -586,11 +663,24 @@ mod tests {
         let ops = &program.functions["main"].body.operations;
 
         // Both should be unpaired, so they get fallback R_inv matmul ops.
+        // With R_inv deduplication by (padded_cols, seed), both layers share
+        // the same R_inv const since they have the same seed and dims.
         let r_inv_ops: Vec<_> = ops.iter().filter(|op| op.name.contains("r_inv")).collect();
         assert!(
-            r_inv_ops.len() >= 2,
-            "softmax break should produce R_inv fallbacks for both, got {}",
-            r_inv_ops.len()
+            !r_inv_ops.is_empty(),
+            "softmax break should produce R_inv fallback(s)"
+        );
+
+        // Should have unrotate matmuls for both unpaired layers.
+        let unrotate_matmuls: Vec<_> = ops
+            .iter()
+            .filter(|op| op.name.contains("unrotate_matmul"))
+            .collect();
+        assert_eq!(
+            unrotate_matmuls.len(),
+            2,
+            "both unpaired layers need unrotate matmuls, got {}",
+            unrotate_matmuls.len()
         );
 
         // All polar_quant_seed attributes should be removed.
