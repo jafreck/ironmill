@@ -15,7 +15,8 @@ use super::passes::{
     GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass, KvCachePass,
     LayerNormLinearFusionPass, LayerSchedulePass, LayoutOptimizationPass, LinearReluFusionPass,
     MixedPrecisionConfig, MixedPrecisionPass, OpSplittingPass, OpSubstitutionPass, PalettizePass,
-    PerExpertQuantPass, ResidualAddFusionPass, ShapeMaterializePass, TypeRepropagationPass,
+    PerExpertQuantPass, PolarQuantPass, PolarRotationFusionPass, ResidualAddFusionPass,
+    ShapeMaterializePass, TypeRepropagationPass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -29,6 +30,7 @@ pub struct PassPipeline {
     has_fp16: bool,
     has_int8: bool,
     has_palettize: bool,
+    has_polar_quant: bool,
     has_mixed_precision: bool,
 }
 
@@ -82,6 +84,7 @@ const KNOWN_PASSES: &[&str] = &[
     "mixed-precision",
     "layer-schedule",
     "palettization",
+    "polar-quantization",
     "per-expert-quantization",
     "shape-materialization",
     "compute-unit-annotation",
@@ -139,6 +142,22 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
             }
             let n_bits = n_bits_i64 as u8;
             Ok(Box::new(PalettizePass::new(n_bits)))
+        }
+        "polar-quantization" => {
+            let n_bits = params.get("bits").and_then(|v| v.as_integer()).unwrap_or(4) as u8;
+            let seed = params
+                .get("seed")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(42) as u64;
+            let min_elements = params
+                .get("min_elements")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(1024) as usize;
+            Ok(Box::new(PolarQuantPass {
+                n_bits,
+                seed,
+                min_elements,
+            }))
         }
         "mixed-precision" => {
             let config_path = params
@@ -249,6 +268,7 @@ impl std::fmt::Debug for PassPipeline {
             .field("has_fp16", &self.has_fp16)
             .field("has_int8", &self.has_int8)
             .field("has_palettize", &self.has_palettize)
+            .field("has_polar_quant", &self.has_polar_quant)
             .field("has_mixed_precision", &self.has_mixed_precision)
             .finish()
     }
@@ -290,6 +310,7 @@ impl PassPipeline {
             has_fp16: false,
             has_int8: false,
             has_palettize: false,
+            has_polar_quant: false,
             has_mixed_precision: false,
         }
     }
@@ -327,6 +348,7 @@ impl PassPipeline {
         let mut has_fp16 = false;
         let mut has_int8 = false;
         let mut has_palettize = false;
+        let mut has_polar_quant = false;
         let mut has_mixed_precision = false;
 
         for entry in &config.passes {
@@ -348,6 +370,12 @@ impl PassPipeline {
                             "FP16 and INT8 quantization are mutually exclusive".into(),
                         ));
                     }
+                    if has_polar_quant {
+                        return Err(MilError::Validation(
+                            "polar-quantization is mutually exclusive with fp16/int8/palettization"
+                                .into(),
+                        ));
+                    }
                     has_fp16 = true;
                 }
                 "int8-quantization" => {
@@ -361,6 +389,12 @@ impl PassPipeline {
                             "INT8 quantization and palettization are mutually exclusive".into(),
                         ));
                     }
+                    if has_polar_quant {
+                        return Err(MilError::Validation(
+                            "polar-quantization is mutually exclusive with fp16/int8/palettization"
+                                .into(),
+                        ));
+                    }
                     has_int8 = true;
                 }
                 "palettization" => {
@@ -369,7 +403,21 @@ impl PassPipeline {
                             "INT8 quantization and palettization are mutually exclusive".into(),
                         ));
                     }
+                    if has_polar_quant {
+                        return Err(MilError::Validation(
+                            "palettization and polar-quantization are mutually exclusive".into(),
+                        ));
+                    }
                     has_palettize = true;
+                }
+                "polar-quantization" => {
+                    if has_fp16 || has_int8 || has_palettize {
+                        return Err(MilError::Validation(
+                            "polar-quantization is mutually exclusive with fp16/int8/palettization"
+                                .into(),
+                        ));
+                    }
+                    has_polar_quant = true;
                 }
                 "mixed-precision" => {
                     has_mixed_precision = true;
@@ -385,6 +433,7 @@ impl PassPipeline {
             has_fp16,
             has_int8,
             has_palettize,
+            has_polar_quant,
             has_mixed_precision,
         })
     }
@@ -394,6 +443,11 @@ impl PassPipeline {
         if self.has_int8 && !self.has_mixed_precision {
             return Err(MilError::Validation(
                 "FP16 and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_polar_quant {
+            return Err(MilError::Validation(
+                "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
             ));
         }
         self.has_fp16 = true;
@@ -406,6 +460,11 @@ impl PassPipeline {
         if self.has_fp16 && !self.has_mixed_precision {
             return Err(MilError::Validation(
                 "FP16 and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_polar_quant {
+            return Err(MilError::Validation(
+                "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
             ));
         }
         self.has_int8 = true;
@@ -428,6 +487,11 @@ impl PassPipeline {
                 "INT8 quantization and palettization are mutually exclusive".into(),
             ));
         }
+        if self.has_polar_quant {
+            return Err(MilError::Validation(
+                "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
+            ));
+        }
         if !matches!(n_bits, 2 | 4 | 6 | 8) {
             return Err(MilError::Validation(format!(
                 "palettize n_bits must be 2, 4, 6, or 8, got {n_bits}"
@@ -435,6 +499,28 @@ impl PassPipeline {
         }
         self.has_palettize = true;
         self.passes.push(Box::new(PalettizePass::new(n_bits)));
+        Ok(self)
+    }
+
+    /// Add PolarQuant weight quantization.
+    ///
+    /// Applies random Hadamard rotation + Beta-optimal scalar quantization
+    /// at the specified bit-width (2, 3, or 4). Automatically schedules
+    /// the rotation fusion pass after quantization.
+    pub fn with_polar_quant(mut self, n_bits: u8) -> Result<Self> {
+        if self.has_fp16 || self.has_int8 || self.has_palettize {
+            return Err(MilError::Validation(
+                "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
+            ));
+        }
+        if !(2..=4).contains(&n_bits) {
+            return Err(MilError::Validation(format!(
+                "polar-quantize n_bits must be 2, 3, or 4, got {n_bits}"
+            )));
+        }
+        self.has_polar_quant = true;
+        self.passes.push(Box::new(PolarQuantPass::new(n_bits)));
+        self.passes.push(Box::new(PolarRotationFusionPass::new()));
         Ok(self)
     }
 
@@ -483,6 +569,7 @@ impl PassPipeline {
                 name == "fp16-quantization"
                     || name == "int8-quantization"
                     || name == "palettization"
+                    || name == "polar-quantization"
                     || name == "mixed-precision-quantization"
                     || name == "per-expert-quantization"
             })

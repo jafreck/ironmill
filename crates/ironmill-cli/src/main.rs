@@ -90,6 +90,10 @@ enum Commands {
         #[arg(long, value_name = "BITS")]
         palettize: Option<u8>,
 
+        /// PolarQuant weight quantization bit-width (2, 3, or 4).
+        #[arg(long = "polar-quantize", value_name = "BITS")]
+        polar_quantize: Option<u8>,
+
         /// Disable fusion and optimization passes.
         #[arg(long)]
         no_fusion: bool,
@@ -254,6 +258,7 @@ fn run() -> Result<()> {
             cal_data,
             quantize_config,
             palettize,
+            polar_quantize,
             no_fusion,
             input_shapes,
             backend,
@@ -283,6 +288,7 @@ fn run() -> Result<()> {
                 cal_data,
                 quantize_config,
                 palettize,
+                polar_quantize,
                 no_fusion,
                 input_shapes,
                 backend: backend.into(),
@@ -340,6 +346,7 @@ struct CompileOpts {
     cal_data: Option<PathBuf>,
     quantize_config: Option<PathBuf>,
     palettize: Option<u8>,
+    polar_quantize: Option<u8>,
     no_fusion: bool,
     input_shapes: Vec<String>,
     backend: Backend,
@@ -492,6 +499,13 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
             pipeline = pipeline
                 .with_palettize(bits)
                 .context("Failed to configure palettization")?;
+        }
+
+        // Add PolarQuant
+        if let Some(bits) = opts.polar_quantize {
+            pipeline = pipeline
+                .with_polar_quant(bits)
+                .context("Failed to configure PolarQuant")?;
         }
 
         // Add compute unit annotations (should run last, after all transforms).
