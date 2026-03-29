@@ -732,3 +732,97 @@ min_elements = 1024
         "pipeline should contain polar-quantization pass, got: {names:?}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// PolarQuant E2E Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Build a program with a large const tensor suitable for PolarQuant
+/// (inner dim >= 64, numel >= 1024).
+fn build_polar_quant_program() -> mil_rs::Program {
+    // Shape [16, 128] → numel=2048, last_dim=128 (≥64)
+    build_const_program(&[16, 128], ScalarType::Float32)
+}
+
+#[test]
+fn polar_quant_e2e_full_pipeline() {
+    let mut program = build_polar_quant_program();
+
+    let pipeline = PassPipeline::new()
+        .with_polar_quant(4)
+        .expect("with_polar_quant should succeed");
+    let report = pipeline.run(&mut program).expect("pipeline should succeed");
+
+    // Verify PolarQuant pass actually did something.
+    let polar_result = report
+        .pass_results
+        .iter()
+        .find(|r| r.name == "polar-quantization")
+        .expect("should have polar-quantization result");
+    assert!(
+        polar_result.ops_before != polar_result.ops_after,
+        "polar-quantization pass should have modified the program (ops_before={}, ops_after={})",
+        polar_result.ops_before,
+        polar_result.ops_after
+    );
+
+    // Verify the program has the expected op structure.
+    let ops: Vec<&str> = program.functions["main"]
+        .body
+        .operations
+        .iter()
+        .map(|op| op.op_type.as_str())
+        .collect();
+    assert!(
+        ops.contains(&"constexpr_lut_to_dense"),
+        "should have constexpr_lut_to_dense op, got: {ops:?}"
+    );
+    assert!(
+        ops.iter().filter(|&&t| t == "const").count() >= 1,
+        "should have const op for row norms"
+    );
+    assert!(ops.contains(&"mul"), "should have mul op for norms scaling");
+}
+
+#[test]
+fn polar_quant_e2e_serialization_round_trip() {
+    let mut program = build_polar_quant_program();
+
+    let pass = mil_rs::ir::passes::PolarQuantPass::new(4);
+    pass.run(&mut program)
+        .expect("PolarQuantPass should succeed");
+
+    // Serialize to protobuf.
+    let model = program_to_model(&program, 7).expect("program_to_model should succeed");
+
+    // Deserialize back.
+    let rt_program = mil_rs::model_to_program(&model).expect("model_to_program should succeed");
+
+    // Verify op structure survived round-trip.
+    let rt_ops: Vec<&str> = rt_program.functions["main"]
+        .body
+        .operations
+        .iter()
+        .map(|op| op.op_type.as_str())
+        .collect();
+    assert!(
+        rt_ops.contains(&"constexpr_lut_to_dense"),
+        "round-tripped program should have constexpr_lut_to_dense, got: {rt_ops:?}"
+    );
+}
+
+#[test]
+fn polar_quant_model_smaller_than_fp32() {
+    let fp32_size = serialized_size(&build_polar_quant_program());
+
+    let mut polar_program = build_polar_quant_program();
+    mil_rs::ir::passes::PolarQuantPass::new(4)
+        .run(&mut polar_program)
+        .expect("PolarQuantPass should succeed");
+    let polar_size = serialized_size(&polar_program);
+
+    assert!(
+        (polar_size as f64) < (fp32_size as f64) * 0.5,
+        "4-bit PolarQuant size ({polar_size}) should be < 50% of FP32 size ({fp32_size})"
+    );
+}

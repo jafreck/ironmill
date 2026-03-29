@@ -106,6 +106,12 @@ impl Pass for PolarQuantPass {
                     (1usize, shape[0])
                 };
 
+                // The Beta distribution requires dim >= 2, and PolarQuant's
+                // statistical guarantees are only meaningful for N >= 64.
+                if cols < 64 {
+                    continue;
+                }
+
                 // Pad columns to next power of two.
                 let (mut padded_data, padded_cols) = pad_to_power_of_two(&floats, rows, cols);
 
