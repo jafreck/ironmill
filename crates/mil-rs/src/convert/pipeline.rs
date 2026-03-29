@@ -1,7 +1,8 @@
-//! Multi-ONNX pipeline conversion.
+//! Multi-source pipeline conversion.
 //!
-//! Converts a set of related ONNX files into coordinated `.mlpackage` outputs
-//! based on a TOML manifest that describes the pipeline topology.
+//! Converts a set of related model files (ONNX, SafeTensors, or GGUF) into
+//! coordinated `.mlpackage` outputs based on a TOML manifest that describes
+//! the pipeline topology.
 //!
 //! # Manifest format
 //!
@@ -19,6 +20,20 @@
 //! onnx = "decoder.onnx"
 //! quantize = "int8"
 //! depends_on = ["encoder"]
+//!
+//! # SafeTensors-based stage
+//! [[stages]]
+//! name = "transformer"
+//! safetensors = "model.safetensors"
+//! component = "transformer"
+//! quantize = "fp16"
+//!
+//! # GGUF-based stage
+//! [[stages]]
+//! name = "embeddings"
+//! gguf = "model.gguf"
+//! component = "embeddings"
+//! quantize = "none"
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -27,6 +42,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::convert::onnx_graph::onnx_to_program;
+use crate::convert::templates::weights_to_program_component;
 use crate::error::{MilError, Result};
 use crate::ir::{PassPipeline, Program};
 use crate::reader::read_onnx;
@@ -58,7 +74,16 @@ pub struct StageConfig {
     /// Unique stage name (used as the output `.mlpackage` stem).
     pub name: String,
     /// Path to the ONNX file (relative to the manifest directory).
-    pub onnx: String,
+    /// Exactly one of `onnx`, `safetensors`, or `gguf` must be specified.
+    pub onnx: Option<String>,
+    /// Path to a SafeTensors file (relative to the manifest directory).
+    pub safetensors: Option<String>,
+    /// Path to a GGUF file (relative to the manifest directory).
+    pub gguf: Option<String>,
+    /// Which model component to extract when using `safetensors` or `gguf`.
+    /// Valid values: `"embeddings"`, `"transformer"`, `"lm_head"`.
+    /// If not specified, the full model is built.
+    pub component: Option<String>,
     /// Quantization mode: `"none"`, `"fp16"`, or `"int8"` (default: `"none"`).
     #[serde(default = "default_quantize")]
     pub quantize: String,
@@ -143,11 +168,11 @@ pub fn parse_pipeline_manifest(toml_str: &str) -> Result<PipelineManifest> {
         .map_err(|e| MilError::Validation(format!("failed to parse pipeline manifest: {e}")))
 }
 
-/// Convert a multi-ONNX pipeline according to the given manifest.
+/// Convert a multi-source pipeline according to the given manifest.
 ///
 /// Each stage is independently converted and optimized:
-/// 1. Read the ONNX model.
-/// 2. Convert to MIL IR via [`onnx_to_program`].
+/// 1. Read the source model (ONNX, SafeTensors, or GGUF).
+/// 2. Convert to MIL IR via the appropriate converter.
 /// 3. Build and run a [`PassPipeline`] with the stage's settings.
 /// 4. Convert to protobuf and write as `.mlpackage`.
 ///
@@ -159,7 +184,7 @@ pub fn parse_pipeline_manifest(toml_str: &str) -> Result<PipelineManifest> {
 /// # Arguments
 ///
 /// * `manifest` – parsed pipeline manifest
-/// * `base_dir` – directory containing the ONNX files (manifest paths are relative to this)
+/// * `base_dir` – directory containing the source files (manifest paths are relative to this)
 /// * `output_dir` – directory where `.mlpackage` outputs and the manifest are written
 pub fn convert_pipeline(
     manifest: &PipelineManifest,
@@ -179,31 +204,15 @@ pub fn convert_pipeline(
     for idx in &order {
         let stage = &manifest.stages[*idx];
 
-        // 1. Read ONNX model
-        let onnx_path = base_dir.join(&stage.onnx);
-        let onnx_model = read_onnx(&onnx_path).map_err(|e| {
-            MilError::Validation(format!(
-                "stage '{}': failed to read ONNX file '{}': {e}",
-                stage.name,
-                onnx_path.display()
-            ))
-        })?;
+        let (mut program, warnings) = convert_stage(stage, base_dir)?;
 
-        // 2. Convert to MIL IR
-        let result = onnx_to_program(&onnx_model).map_err(|e| {
-            MilError::Validation(format!(
-                "stage '{}': ONNX conversion failed: {e}",
-                stage.name
-            ))
-        })?;
-        let mut program = result.program;
-        stage_warnings.push((stage.name.clone(), result.warnings));
+        stage_warnings.push((stage.name.clone(), warnings));
 
-        // 3. Build per-stage pass pipeline
+        // Build per-stage pass pipeline
         let pipeline = build_stage_pipeline(stage, base_dir)?;
         let _report = pipeline.run(&mut program)?;
 
-        // 4. Convert to protobuf and write .mlpackage
+        // Convert to protobuf and write .mlpackage
         let model = crate::convert::ir_to_proto::program_to_model(&program, 9).map_err(|e| {
             MilError::Validation(format!(
                 "stage '{}': failed to convert program to model: {e}",
@@ -218,10 +227,10 @@ pub fn convert_pipeline(
         stage_programs.push((stage.name.clone(), program));
     }
 
-    // 5. Validate inter-stage tensor compatibility
+    // Validate inter-stage tensor compatibility
     validate_inter_stage_tensors(manifest, &stage_programs)?;
 
-    // 6. Build and write the output manifest
+    // Build and write the output manifest
     let output_manifest = build_output_manifest(manifest, &stage_programs);
     let manifest_json = serde_json::to_string_pretty(&output_manifest)
         .map_err(|e| MilError::Validation(format!("failed to serialize pipeline manifest: {e}")))?;
@@ -233,11 +242,83 @@ pub fn convert_pipeline(
     })
 }
 
+/// Convert a single stage from its source format to a MIL IR program.
+/// Returns `(program, warnings)`.
+fn convert_stage(stage: &StageConfig, base_dir: &Path) -> Result<(Program, Vec<String>)> {
+    if let Some(onnx_path) = &stage.onnx {
+        // ONNX source
+        let full_path = base_dir.join(onnx_path);
+        let onnx_model = read_onnx(&full_path).map_err(|e| {
+            MilError::Validation(format!(
+                "stage '{}': failed to read ONNX file '{}': {e}",
+                stage.name,
+                full_path.display()
+            ))
+        })?;
+
+        let result = onnx_to_program(&onnx_model).map_err(|e| {
+            MilError::Validation(format!(
+                "stage '{}': ONNX conversion failed: {e}",
+                stage.name
+            ))
+        })?;
+
+        Ok((result.program, result.warnings))
+    } else if let Some(st_path) = &stage.safetensors {
+        // SafeTensors source
+        let full_path = base_dir.join(st_path);
+        let provider =
+            crate::convert::weights::SafeTensorsProvider::load(&full_path).map_err(|e| {
+                MilError::Validation(format!(
+                    "stage '{}': failed to load SafeTensors '{}': {e}",
+                    stage.name,
+                    full_path.display()
+                ))
+            })?;
+
+        let result =
+            weights_to_program_component(&provider, stage.component.as_deref()).map_err(|e| {
+                MilError::Validation(format!(
+                    "stage '{}': SafeTensors conversion failed: {e}",
+                    stage.name
+                ))
+            })?;
+
+        Ok((result.program, result.warnings))
+    } else if let Some(gguf_path) = &stage.gguf {
+        // GGUF source
+        let full_path = base_dir.join(gguf_path);
+        let provider = crate::convert::weights::GgufProvider::load(&full_path).map_err(|e| {
+            MilError::Validation(format!(
+                "stage '{}': failed to load GGUF '{}': {e}",
+                stage.name,
+                full_path.display()
+            ))
+        })?;
+
+        let result =
+            weights_to_program_component(&provider, stage.component.as_deref()).map_err(|e| {
+                MilError::Validation(format!(
+                    "stage '{}': GGUF conversion failed: {e}",
+                    stage.name
+                ))
+            })?;
+
+        Ok((result.program, result.warnings))
+    } else {
+        Err(MilError::Validation(format!(
+            "stage '{}': no source specified (need exactly one of 'onnx', 'safetensors', or 'gguf')",
+            stage.name
+        )))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Validate the manifest for structural issues (duplicate names, unknown deps, cycles).
+/// Validate the manifest for structural issues (duplicate names, unknown deps, cycles,
+/// source field constraints).
 fn validate_manifest(manifest: &PipelineManifest) -> Result<()> {
     if manifest.stages.is_empty() {
         return Err(MilError::Validation(
@@ -253,6 +334,50 @@ fn validate_manifest(manifest: &PipelineManifest) -> Result<()> {
     }
 
     for stage in &manifest.stages {
+        // Validate exactly one source is specified.
+        let source_count = [
+            stage.onnx.is_some(),
+            stage.safetensors.is_some(),
+            stage.gguf.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+
+        if source_count == 0 {
+            return Err(MilError::Validation(format!(
+                "stage '{}': no source specified (need exactly one of 'onnx', 'safetensors', or 'gguf')",
+                stage.name
+            )));
+        }
+        if source_count > 1 {
+            return Err(MilError::Validation(format!(
+                "stage '{}': multiple sources specified (need exactly one of 'onnx', 'safetensors', or 'gguf')",
+                stage.name
+            )));
+        }
+
+        // Validate component is only used with weight-based sources.
+        if stage.component.is_some() && stage.onnx.is_some() {
+            return Err(MilError::Validation(format!(
+                "stage '{}': 'component' is only valid with 'safetensors' or 'gguf' sources",
+                stage.name
+            )));
+        }
+
+        // Validate component values.
+        if let Some(comp) = &stage.component {
+            match comp.as_str() {
+                "embeddings" | "transformer" | "lm_head" => {}
+                other => {
+                    return Err(MilError::Validation(format!(
+                        "stage '{}': unsupported component '{other}' (expected 'embeddings', 'transformer', or 'lm_head')",
+                        stage.name
+                    )));
+                }
+            }
+        }
+
         for dep in &stage.depends_on {
             if !names.contains(dep.as_str()) {
                 return Err(MilError::Validation(format!(
@@ -531,6 +656,22 @@ fn build_output_manifest(
 mod tests {
     use super::*;
 
+    /// Helper to create a StageConfig with only ONNX source (backward-compat pattern).
+    fn onnx_stage(name: &str, onnx: &str) -> StageConfig {
+        StageConfig {
+            name: name.into(),
+            onnx: Some(onnx.into()),
+            safetensors: None,
+            gguf: None,
+            component: None,
+            quantize: "none".into(),
+            cal_data: None,
+            palettize: None,
+            no_fusion: false,
+            depends_on: vec![],
+        }
+    }
+
     #[test]
     fn parse_simple_manifest() {
         let toml = r#"
@@ -580,6 +721,45 @@ depends_on = []
     }
 
     #[test]
+    fn parse_manifest_safetensors_stage() {
+        let toml = r#"
+[pipeline]
+name = "weight-pipeline"
+
+[[stages]]
+name = "transformer"
+safetensors = "model.safetensors"
+component = "transformer"
+quantize = "fp16"
+"#;
+        let manifest = parse_pipeline_manifest(toml).unwrap();
+        let stage = &manifest.stages[0];
+        assert_eq!(stage.safetensors, Some("model.safetensors".into()));
+        assert_eq!(stage.component, Some("transformer".into()));
+        assert!(stage.onnx.is_none());
+        assert!(stage.gguf.is_none());
+    }
+
+    #[test]
+    fn parse_manifest_gguf_stage() {
+        let toml = r#"
+[pipeline]
+name = "gguf-pipeline"
+
+[[stages]]
+name = "embeddings"
+gguf = "model.gguf"
+component = "embeddings"
+"#;
+        let manifest = parse_pipeline_manifest(toml).unwrap();
+        let stage = &manifest.stages[0];
+        assert_eq!(stage.gguf, Some("model.gguf".into()));
+        assert_eq!(stage.component, Some("embeddings".into()));
+        assert!(stage.onnx.is_none());
+        assert!(stage.safetensors.is_none());
+    }
+
+    #[test]
     fn parse_invalid_toml() {
         let result = parse_pipeline_manifest("not valid toml {{{}}}");
         assert!(result.is_err());
@@ -601,26 +781,7 @@ depends_on = []
     fn validate_duplicate_names() {
         let manifest = PipelineManifest {
             pipeline: PipelineMeta { name: "dup".into() },
-            stages: vec![
-                StageConfig {
-                    name: "a".into(),
-                    onnx: "a.onnx".into(),
-                    quantize: "none".into(),
-                    cal_data: None,
-                    palettize: None,
-                    no_fusion: false,
-                    depends_on: vec![],
-                },
-                StageConfig {
-                    name: "a".into(),
-                    onnx: "b.onnx".into(),
-                    quantize: "none".into(),
-                    cal_data: None,
-                    palettize: None,
-                    no_fusion: false,
-                    depends_on: vec![],
-                },
-            ],
+            stages: vec![onnx_stage("a", "a.onnx"), onnx_stage("a", "b.onnx")],
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(err.to_string().contains("duplicate"));
@@ -628,19 +789,13 @@ depends_on = []
 
     #[test]
     fn validate_unknown_dependency() {
+        let mut stage = onnx_stage("a", "a.onnx");
+        stage.depends_on = vec!["nonexistent".into()];
         let manifest = PipelineManifest {
             pipeline: PipelineMeta {
                 name: "bad-dep".into(),
             },
-            stages: vec![StageConfig {
-                name: "a".into(),
-                onnx: "a.onnx".into(),
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec!["nonexistent".into()],
-            }],
+            stages: vec![stage],
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(err.to_string().contains("unknown stage"));
@@ -648,19 +803,13 @@ depends_on = []
 
     #[test]
     fn validate_self_dependency() {
+        let mut stage = onnx_stage("a", "a.onnx");
+        stage.depends_on = vec!["a".into()];
         let manifest = PipelineManifest {
             pipeline: PipelineMeta {
                 name: "self-dep".into(),
             },
-            stages: vec![StageConfig {
-                name: "a".into(),
-                onnx: "a.onnx".into(),
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec!["a".into()],
-            }],
+            stages: vec![stage],
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(err.to_string().contains("depends on itself"));
@@ -668,14 +817,31 @@ depends_on = []
 
     #[test]
     fn validate_invalid_quantize() {
+        let mut stage = onnx_stage("a", "a.onnx");
+        stage.quantize = "fp64".into();
         let manifest = PipelineManifest {
             pipeline: PipelineMeta {
                 name: "bad-q".into(),
             },
+            stages: vec![stage],
+        };
+        let err = validate_manifest(&manifest).unwrap_err();
+        assert!(err.to_string().contains("unsupported quantize"));
+    }
+
+    #[test]
+    fn validate_no_source() {
+        let manifest = PipelineManifest {
+            pipeline: PipelineMeta {
+                name: "no-src".into(),
+            },
             stages: vec![StageConfig {
                 name: "a".into(),
-                onnx: "a.onnx".into(),
-                quantize: "fp64".into(),
+                onnx: None,
+                safetensors: None,
+                gguf: None,
+                component: None,
+                quantize: "none".into(),
                 cal_data: None,
                 palettize: None,
                 no_fusion: false,
@@ -683,57 +849,104 @@ depends_on = []
             }],
         };
         let err = validate_manifest(&manifest).unwrap_err();
-        assert!(err.to_string().contains("unsupported quantize"));
+        assert!(err.to_string().contains("no source specified"));
+    }
+
+    #[test]
+    fn validate_multiple_sources() {
+        let manifest = PipelineManifest {
+            pipeline: PipelineMeta {
+                name: "multi-src".into(),
+            },
+            stages: vec![StageConfig {
+                name: "a".into(),
+                onnx: Some("a.onnx".into()),
+                safetensors: Some("a.safetensors".into()),
+                gguf: None,
+                component: None,
+                quantize: "none".into(),
+                cal_data: None,
+                palettize: None,
+                no_fusion: false,
+                depends_on: vec![],
+            }],
+        };
+        let err = validate_manifest(&manifest).unwrap_err();
+        assert!(err.to_string().contains("multiple sources"));
+    }
+
+    #[test]
+    fn validate_component_with_onnx_rejected() {
+        let mut stage = onnx_stage("a", "a.onnx");
+        stage.component = Some("transformer".into());
+        let manifest = PipelineManifest {
+            pipeline: PipelineMeta {
+                name: "bad-comp".into(),
+            },
+            stages: vec![stage],
+        };
+        let err = validate_manifest(&manifest).unwrap_err();
+        assert!(err.to_string().contains("only valid with"));
+    }
+
+    #[test]
+    fn validate_invalid_component() {
+        let manifest = PipelineManifest {
+            pipeline: PipelineMeta {
+                name: "bad-comp".into(),
+            },
+            stages: vec![StageConfig {
+                name: "a".into(),
+                onnx: None,
+                safetensors: Some("model.safetensors".into()),
+                gguf: None,
+                component: Some("invalid_component".into()),
+                quantize: "none".into(),
+                cal_data: None,
+                palettize: None,
+                no_fusion: false,
+                depends_on: vec![],
+            }],
+        };
+        let err = validate_manifest(&manifest).unwrap_err();
+        assert!(err.to_string().contains("unsupported component"));
+    }
+
+    #[test]
+    fn validate_component_with_safetensors_accepted() {
+        let manifest = PipelineManifest {
+            pipeline: PipelineMeta {
+                name: "ok-comp".into(),
+            },
+            stages: vec![StageConfig {
+                name: "a".into(),
+                onnx: None,
+                safetensors: Some("model.safetensors".into()),
+                gguf: None,
+                component: Some("transformer".into()),
+                quantize: "none".into(),
+                cal_data: None,
+                palettize: None,
+                no_fusion: false,
+                depends_on: vec![],
+            }],
+        };
+        assert!(validate_manifest(&manifest).is_ok());
     }
 
     #[test]
     fn topological_order_no_deps() {
-        let stages = vec![
-            StageConfig {
-                name: "a".into(),
-                onnx: "a.onnx".into(),
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec![],
-            },
-            StageConfig {
-                name: "b".into(),
-                onnx: "b.onnx".into(),
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec![],
-            },
-        ];
+        let stages = vec![onnx_stage("a", "a.onnx"), onnx_stage("b", "b.onnx")];
         let order = topological_order(&stages).unwrap();
         assert_eq!(order.len(), 2);
     }
 
     #[test]
     fn topological_order_with_deps() {
-        let stages = vec![
-            StageConfig {
-                name: "a".into(),
-                onnx: "a.onnx".into(),
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec!["b".into()],
-            },
-            StageConfig {
-                name: "b".into(),
-                onnx: "b.onnx".into(),
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec![],
-            },
-        ];
+        let mut a = onnx_stage("a", "a.onnx");
+        a.depends_on = vec!["b".into()];
+        let b = onnx_stage("b", "b.onnx");
+        let stages = vec![a, b];
         let order = topological_order(&stages).unwrap();
         // "b" (index 1) must come before "a" (index 0)
         let pos_a = order.iter().position(|&x| x == 0).unwrap();
@@ -743,26 +956,11 @@ depends_on = []
 
     #[test]
     fn topological_order_cycle() {
-        let stages = vec![
-            StageConfig {
-                name: "a".into(),
-                onnx: "a.onnx".into(),
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec!["b".into()],
-            },
-            StageConfig {
-                name: "b".into(),
-                onnx: "b.onnx".into(),
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec!["a".into()],
-            },
-        ];
+        let mut a = onnx_stage("a", "a.onnx");
+        a.depends_on = vec!["b".into()];
+        let mut b = onnx_stage("b", "b.onnx");
+        b.depends_on = vec!["a".into()];
+        let stages = vec![a, b];
         let err = topological_order(&stages).unwrap_err();
         assert!(err.to_string().contains("cycle"));
     }
@@ -775,26 +973,11 @@ depends_on = []
             pipeline: PipelineMeta {
                 name: "test".into(),
             },
-            stages: vec![
-                StageConfig {
-                    name: "enc".into(),
-                    onnx: "enc.onnx".into(),
-                    quantize: "none".into(),
-                    cal_data: None,
-                    palettize: None,
-                    no_fusion: false,
-                    depends_on: vec![],
-                },
-                StageConfig {
-                    name: "dec".into(),
-                    onnx: "dec.onnx".into(),
-                    quantize: "none".into(),
-                    cal_data: None,
-                    palettize: None,
-                    no_fusion: false,
-                    depends_on: vec!["enc".into()],
-                },
-            ],
+            stages: vec![onnx_stage("enc", "enc.onnx"), {
+                let mut s = onnx_stage("dec", "dec.onnx");
+                s.depends_on = vec!["enc".into()];
+                s
+            }],
         };
 
         let input_ty = TensorType::new(ScalarType::Float32, vec![1, 3, 224, 224]);

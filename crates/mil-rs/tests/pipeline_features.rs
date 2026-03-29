@@ -673,7 +673,10 @@ depends_on = ["A"]
         stages: vec![
             StageConfig {
                 name: "A".into(),
-                onnx: "a.onnx".into(),
+                onnx: Some("a.onnx".into()),
+                safetensors: None,
+                gguf: None,
+                component: None,
                 quantize: "none".into(),
                 cal_data: None,
                 palettize: None,
@@ -682,7 +685,10 @@ depends_on = ["A"]
             },
             StageConfig {
                 name: "B".into(),
-                onnx: "b.onnx".into(),
+                onnx: Some("b.onnx".into()),
+                safetensors: None,
+                gguf: None,
+                component: None,
                 quantize: "none".into(),
                 cal_data: None,
                 palettize: None,
@@ -715,7 +721,10 @@ fn pipeline_manifest_missing_dependency() {
         stages: vec![
             StageConfig {
                 name: "A".into(),
-                onnx: "a.onnx".into(),
+                onnx: Some("a.onnx".into()),
+                safetensors: None,
+                gguf: None,
+                component: None,
                 quantize: "none".into(),
                 cal_data: None,
                 palettize: None,
@@ -724,7 +733,10 @@ fn pipeline_manifest_missing_dependency() {
             },
             StageConfig {
                 name: "B".into(),
-                onnx: "b.onnx".into(),
+                onnx: Some("b.onnx".into()),
+                safetensors: None,
+                gguf: None,
+                component: None,
                 quantize: "none".into(),
                 cal_data: None,
                 palettize: None,

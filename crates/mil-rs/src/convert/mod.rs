@@ -34,7 +34,10 @@ pub use onnx_graph::{
 pub use onnx_to_mil::convert_node;
 pub use pipeline::{PipelineManifest, convert_pipeline, parse_pipeline_manifest};
 pub use proto_to_ir::model_to_program;
-pub use templates::{TemplateOptions, weights_to_program, weights_to_program_with_options};
+pub use templates::{
+    TemplateOptions, weights_to_program, weights_to_program_component,
+    weights_to_program_with_options,
+};
 pub use weights::gguf::GgufProvider;
 pub use weights::safetensors::SafeTensorsProvider;
 pub use weights::{Architecture, ModelConfig, WeightProvider, WeightTensor};

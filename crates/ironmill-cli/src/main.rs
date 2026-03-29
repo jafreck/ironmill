@@ -1230,9 +1230,15 @@ fn cmd_compile_pipeline(manifest_path: &str, output: Option<&str>) -> Result<()>
         } else {
             format!(" (depends on: {})", stage.depends_on.join(", "))
         };
+        let source = stage
+            .onnx
+            .as_deref()
+            .or(stage.safetensors.as_deref())
+            .or(stage.gguf.as_deref())
+            .unwrap_or("unknown");
         println!(
             "  - {} [{}] quantize={}{deps}",
-            stage.name, stage.onnx, stage.quantize
+            stage.name, source, stage.quantize
         );
     }
     println!();
