@@ -1,0 +1,18 @@
+[package]
+name = "candle-coreml"
+description = "Bridge between candle and Apple CoreML via mil-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["candle", "coreml", "apple", "machine-learning"]
+
+[dependencies]
+mil-rs = { workspace = true }
+anyhow = { workspace = true }
+half = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ironmill-coreml = { workspace = true }

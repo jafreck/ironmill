@@ -182,6 +182,56 @@ impl Model {
 
         Ok(PredictionOutput { inner: result })
     }
+
+    /// Extract all multi-array outputs from a prediction result as f32 data.
+    ///
+    /// Uses the model's output description to discover output feature names,
+    /// then extracts each multi-array output into an [`OutputTensorData`].
+    /// Non-multi-array outputs (e.g. dictionaries, images) are skipped.
+    pub fn extract_outputs(
+        &self,
+        output: &PredictionOutput,
+    ) -> anyhow::Result<Vec<OutputTensorData>> {
+        let desc = unsafe { self.inner.modelDescription() };
+        let outputs = unsafe { desc.outputDescriptionsByName() };
+        let all_keys = outputs.allKeys();
+
+        let mut result = Vec::new();
+
+        for i in 0..all_keys.count() {
+            let key: &NSString = &all_keys.objectAtIndex(i);
+            let name = key.to_string();
+
+            let feat_value = output
+                .feature_value(&name)
+                .with_context(|| format!("missing output feature: {name}"))?;
+
+            if unsafe { feat_value.r#type() } != MLFeatureType::MultiArray {
+                continue;
+            }
+
+            let multi_array = unsafe { feat_value.multiArrayValue() }
+                .with_context(|| format!("output feature '{name}' has no multi-array value"))?;
+
+            let shape_arr = unsafe { multi_array.shape() };
+            let mut shape = Vec::new();
+            for j in 0..shape_arr.count() {
+                let num: &NSNumber = &shape_arr.objectAtIndex(j);
+                shape.push(num.as_isize() as usize);
+            }
+
+            let count = unsafe { multi_array.count() } as usize;
+            let mut data = Vec::with_capacity(count);
+            for j in 0..count {
+                let val = unsafe { multi_array.objectAtIndexedSubscript(j as isize) };
+                data.push(val.as_f32());
+            }
+
+            result.push(OutputTensorData { name, shape, data });
+        }
+
+        Ok(result)
+    }
 }
 
 // ── PredictionInput ───────────────────────────────────────────────
@@ -387,6 +437,19 @@ impl PredictionOutput {
 
         Ok(outputs)
     }
+}
+
+// ── OutputTensorData ──────────────────────────────────────────────
+
+/// Data from a single output tensor, extracted as f32 values.
+#[derive(Debug, Clone)]
+pub struct OutputTensorData {
+    /// Feature name from the model.
+    pub name: String,
+    /// Tensor shape.
+    pub shape: Vec<usize>,
+    /// Flattened data converted to f32.
+    pub data: Vec<f32>,
 }
 
 // ── build_dummy_input ─────────────────────────────────────────────
