@@ -61,7 +61,7 @@ impl Pass for PolarQuantPass {
 
             for i in 0..function.body.operations.len() {
                 // ── Phase 1: read-only extraction ──────────────────────────
-                let (floats, shape, original_output, op_name) = {
+                let (floats, shape, original_output, op_name, original_dtype) = {
                     let op = &function.body.operations[i];
                     if op.op_type != "const" {
                         continue;
@@ -72,17 +72,17 @@ impl Pass for PolarQuantPass {
                         None => continue,
                     };
 
-                    let (floats, shape) = match val {
+                    let (floats, shape, original_dtype) = match val {
                         Value::Tensor {
                             data,
                             shape,
-                            dtype: ScalarType::Float32,
-                        } => (tensor_as_f32_slice(data), shape.clone()),
+                            dtype: dtype @ ScalarType::Float32,
+                        } => (tensor_as_f32_slice(data), shape.clone(), *dtype),
                         Value::Tensor {
                             data,
                             shape,
-                            dtype: ScalarType::Float16,
-                        } => (fp16_bytes_to_f32(data), shape.clone()),
+                            dtype: dtype @ ScalarType::Float16,
+                        } => (fp16_bytes_to_f32(data), shape.clone(), *dtype),
                         _ => continue,
                     };
 
@@ -93,7 +93,7 @@ impl Pass for PolarQuantPass {
 
                     let original_output = op.outputs.first().cloned().unwrap_or_default();
                     let op_name = op.name.clone();
-                    (floats, shape, original_output, op_name)
+                    (floats, shape, original_output, op_name, original_dtype)
                 };
 
                 // ── Phase 2: compute quantisation ─────────────────────────
@@ -157,15 +157,18 @@ impl Pass for PolarQuantPass {
                 // Pack indices at n_bits per element.
                 let packed = pack_indices(&truncated_indices, self.n_bits);
 
-                // LUT: Beta-optimal levels stored as Float16.
-                let lut_data: Vec<u8> = levels
-                    .iter()
-                    .flat_map(|&v| f16::from_f32(v).to_le_bytes())
-                    .collect();
+                // LUT: Beta-optimal levels stored in the original weight dtype.
+                let lut_data: Vec<u8> = match original_dtype {
+                    ScalarType::Float16 => levels
+                        .iter()
+                        .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+                        .collect(),
+                    _ => levels.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                };
                 let lut_value = Value::Tensor {
                     data: lut_data,
                     shape: vec![k],
-                    dtype: ScalarType::Float16,
+                    dtype: original_dtype,
                 };
 
                 let indices_value = Value::Tensor {
@@ -196,21 +199,24 @@ impl Pass for PolarQuantPass {
                 op.attributes
                     .insert("polar_quant_seed".to_string(), Value::Int(self.seed as i64));
 
-                // Update output type to Float16 to match the LUT dtype.
+                // Update output type to match the LUT dtype.
                 // CoreML requires constexpr_lut_to_dense output dtype == LUT dtype.
                 use crate::ir::tensor::TensorType;
                 if !op.output_types.is_empty() {
-                    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, shape.clone()));
+                    op.output_types[0] = Some(TensorType::new(original_dtype, shape.clone()));
                 }
 
                 // ── Phase 4: build row-norms const + mul ops ──────────────
                 let norms_output = format!("{original_output}_polar_norms");
                 let mul_output = format!("{original_output}_polar_scaled");
 
-                let norms_data: Vec<u8> = row_norms
-                    .iter()
-                    .flat_map(|&v| f16::from_f32(v).to_le_bytes())
-                    .collect();
+                let norms_data: Vec<u8> = match original_dtype {
+                    ScalarType::Float16 => row_norms
+                        .iter()
+                        .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+                        .collect(),
+                    _ => row_norms.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                };
 
                 let norms_op = Operation::new("const", format!("{op_name}_polar_norms"))
                     .with_input(
@@ -222,7 +228,7 @@ impl Pass for PolarQuantPass {
                                 *s.last_mut().unwrap() = 1;
                                 s
                             },
-                            dtype: ScalarType::Float16,
+                            dtype: original_dtype,
                         },
                     )
                     .with_output(&norms_output);

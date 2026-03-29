@@ -213,19 +213,47 @@ impl Pass for PolarRotationFusionPass {
                     None => pi, // fallback: insert after the polar op itself
                 };
 
-                // Generate R_inv: identity rotated by the same Hadamard seed.
-                // Since the transform is self-inverse, R_inv = R.
-                let n = padded_cols;
-                let mut identity = vec![0.0f32; n * n];
-                for i in 0..n {
-                    identity[i * n + i] = 1.0;
-                }
-                rotate_rows_hadamard(&mut identity, n, n, seed);
+                // Generate R_inv for un-rotation. Use the original cols (not padded)
+                // because the PolarQuant pass truncated indices back to original cols.
+                // R_inv is computed by: pad identity to power-of-two, rotate, then
+                // take the [cols, cols] submatrix (approximate un-rotation for
+                // non-power-of-two dims).
+                let orig_cols = get_original_cols(&block.operations[pi]);
+                let n_padded = padded_cols;
+                let n = if orig_cols > 0 { orig_cols } else { n_padded };
 
-                let r_inv_data: Vec<u8> = identity
-                    .iter()
-                    .flat_map(|&v| f16::from_f32(v).to_le_bytes())
-                    .collect();
+                let mut identity = vec![0.0f32; n_padded * n_padded];
+                for i in 0..n_padded {
+                    identity[i * n_padded + i] = 1.0;
+                }
+                rotate_rows_hadamard(&mut identity, n_padded, n_padded, seed);
+
+                // Extract the [n, n] submatrix from the [n_padded, n_padded] rotation.
+                let r_inv_f32: Vec<f32> = if n < n_padded {
+                    let mut sub = vec![0.0f32; n * n];
+                    for r in 0..n {
+                        for c in 0..n {
+                            sub[r * n + c] = identity[r * n_padded + c];
+                        }
+                    }
+                    sub
+                } else {
+                    identity
+                };
+
+                // Use the same dtype as the LUT for type consistency.
+                let lut_dtype = match block.operations[pi].attributes.get("lut") {
+                    Some(Value::Tensor { dtype, .. }) => *dtype,
+                    _ => ScalarType::Float32,
+                };
+
+                let r_inv_data: Vec<u8> = match lut_dtype {
+                    ScalarType::Float16 => r_inv_f32
+                        .iter()
+                        .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+                        .collect(),
+                    _ => r_inv_f32.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                };
 
                 let r_inv_output = format!("{polar_output}_r_inv");
                 let matmul_output = format!("{polar_output}_unrotated");
@@ -236,7 +264,7 @@ impl Pass for PolarRotationFusionPass {
                         Value::Tensor {
                             data: r_inv_data,
                             shape: vec![n, n],
-                            dtype: ScalarType::Float16,
+                            dtype: lut_dtype,
                         },
                     )
                     .with_output(&r_inv_output);
@@ -251,6 +279,8 @@ impl Pass for PolarRotationFusionPass {
                 let matmul_op = Operation::new("matmul", format!("{polar_output}_unrotate_matmul"))
                     .with_input("x", Value::Reference(source_ref.clone()))
                     .with_input("y", Value::Reference(r_inv_output))
+                    .with_attr("transpose_x", Value::Bool(false))
+                    .with_attr("transpose_y", Value::Bool(false))
                     .with_output(&matmul_output);
 
                 insertions.push((insert_after, vec![r_inv_const, matmul_op]));
@@ -349,6 +379,33 @@ fn find_polar_source(ops: &[Operation], ref_name: &str, polar_indices: &[usize])
     }
 
     None
+}
+
+/// Extract the original (unpadded) last dimension from the shape attribute.
+fn get_original_cols(op: &Operation) -> usize {
+    match op.attributes.get("shape") {
+        Some(Value::Tensor {
+            data,
+            shape,
+            dtype: ScalarType::UInt32,
+        }) => {
+            if shape.is_empty() {
+                return 0;
+            }
+            let n_dims = shape[0];
+            if data.len() < n_dims * 4 {
+                return 0;
+            }
+            let last_offset = (n_dims - 1) * 4;
+            u32::from_le_bytes([
+                data[last_offset],
+                data[last_offset + 1],
+                data[last_offset + 2],
+                data[last_offset + 3],
+            ]) as usize
+        }
+        _ => 0,
+    }
 }
 
 /// Extract padded_cols from a constexpr_lut_to_dense op's shape attribute.

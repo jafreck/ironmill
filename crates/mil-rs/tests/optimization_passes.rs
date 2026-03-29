@@ -1552,14 +1552,15 @@ fn polar_quant_lut_shape_preserved_in_proto() {
     let rt_ops = &deserialized.functions["main"].body.operations;
     assert_eq!(rt_ops[0].op_type, "constexpr_lut_to_dense");
 
-    // Verify LUT shape is preserved.
-    let lut_shape_after = match rt_ops[0].attributes.get("lut") {
-        Some(Value::Tensor { shape, .. }) => shape.clone(),
-        other => panic!("expected LUT tensor after round-trip, got {other:?}"),
+    // Verify LUT is preserved (may come back as Tensor or List depending on dtype).
+    let lut_len_after = match rt_ops[0].attributes.get("lut") {
+        Some(Value::Tensor { shape, .. }) => shape[0],
+        Some(Value::List(items)) => items.len(),
+        other => panic!("expected LUT tensor or list after round-trip, got {other:?}"),
     };
     assert_eq!(
-        lut_shape_before, lut_shape_after,
-        "LUT shape should be preserved through serialization"
+        lut_shape_before[0], lut_len_after,
+        "LUT size should be preserved through serialization"
     );
 
     // Verify indices shape is preserved.
@@ -1813,7 +1814,7 @@ fn polar_quant_handles_non_power_of_two() {
     let ops = &program.functions["main"].body.operations;
     assert_eq!(
         ops[0].op_type, "constexpr_lut_to_dense",
-        "non-power-of-two inner dim should still be quantized"
+        "non-power-of-two inner dim should be quantized via padding"
     );
     // Verify the shape attribute still records the original shape.
     match ops[0].attributes.get("shape") {
@@ -1915,11 +1916,23 @@ fn polar_4bit_round_trip_quality() {
     let ops = &program.functions["main"].body.operations;
     assert_eq!(ops[0].op_type, "constexpr_lut_to_dense");
 
-    // Extract the LUT (Float16) and decode to f32.
+    // Extract the LUT and decode to f32.
     let lut_f32: Vec<f32> = match ops[0].attributes.get("lut") {
-        Some(Value::Tensor { data, .. }) => data
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::Float16,
+            ..
+        }) => data
             .chunks_exact(2)
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::Float32,
+            ..
+        }) => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         other => panic!("expected lut tensor, got {other:?}"),
     };
@@ -1948,15 +1961,27 @@ fn polar_4bit_round_trip_quality() {
         unpacked_indices.push(idx);
     }
 
-    // Extract norms (Float16) from the norms const op.
+    // Extract norms from the norms const op.
     let norms_f32: Vec<f32> = match ops[1]
         .inputs
         .get("val")
         .or_else(|| ops[1].attributes.get("val"))
     {
-        Some(Value::Tensor { data, .. }) => data
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::Float16,
+            ..
+        }) => data
             .chunks_exact(2)
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::Float32,
+            ..
+        }) => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         other => panic!("expected norms tensor, got {other:?}"),
     };

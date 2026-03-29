@@ -521,6 +521,8 @@ impl PassPipeline {
         self.has_polar_quant = true;
         self.passes.push(Box::new(PolarQuantPass::new(n_bits)));
         self.passes.push(Box::new(PolarRotationFusionPass::new()));
+        // Re-propagate types after PolarQuant inserts new ops.
+        self.passes.push(Box::new(TypeRepropagationPass));
         Ok(self)
     }
 
