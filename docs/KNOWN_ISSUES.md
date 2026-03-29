@@ -6,6 +6,41 @@ Tracks shortcuts, workarounds, and unresolved issues. Grouped by severity.
 
 ---
 
+## Architecture
+
+### P0 — Unify runtime backends behind a common trait
+
+`ironmill-coreml` and `ironmill-ane` do the same thing (compile IR → run
+predictions) but have completely different interfaces. `compile_model`
+(the `xcrun` call) lives in `mil-rs` where it doesn't belong. The benchmark
+harness has two duplicated inference paths. Adding a new backend means
+touching multiple crates.
+
+**Fix**: Create `ironmill-runtime` with:
+
+```rust
+pub trait Backend {
+    fn compile(&self, program: &Program) -> Result<Box<dyn Model>>;
+}
+pub trait Model {
+    fn predict(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>>;
+}
+```
+
+Then:
+- Move `mil-rs/src/compiler.rs` into a `CoremlBackend` impl
+- Have `ironmill-ane` implement `Backend + Model`
+- Benchmark harness becomes a loop over `&[Box<dyn Backend>]`
+- CLI selects backend at runtime, no feature-flag branching
+
+**Scope**: ~200-300 lines of trait definitions + refactoring. No functional
+changes — just unifying the interface.
+
+**Files**: `mil-rs/src/compiler.rs` (move out), `ironmill-coreml/src/lib.rs`,
+`ironmill-ane/src/lib.rs`, `ironmill-bench/src/inference.rs`
+
+---
+
 ## PolarQuant
 
 ### P0 — Correctness
