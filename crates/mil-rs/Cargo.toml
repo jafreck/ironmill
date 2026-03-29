@@ -43,6 +43,7 @@ harness = false
 
 [features]
 ane-direct = []
+c-api = []
 
 [build-dependencies]
 prost-build = { workspace = true }

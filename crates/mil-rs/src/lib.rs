@@ -43,6 +43,9 @@
 //! Legacy `NeuralNetwork` models can be read and written at the protobuf level
 //! but cannot be converted to the MIL IR.
 
+/// C-compatible FFI API for use from C, Swift, C++, Go, etc.
+#[cfg(feature = "c-api")]
+pub mod c_api;
 /// Compile CoreML models to `.mlmodelc` via `xcrun coremlcompiler`.
 pub mod compiler;
 /// Bidirectional conversion between protobuf types, ONNX models, and the MIL IR.

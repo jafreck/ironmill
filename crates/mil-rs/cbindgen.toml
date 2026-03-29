@@ -1,0 +1,10 @@
+language = "C"
+include_guard = "MIL_RS_H"
+no_includes = true
+sys_includes = ["stdint.h", "stdbool.h", "stddef.h"]
+
+[export]
+prefix = "Mil"
+
+[fn]
+prefix = "mil_"
