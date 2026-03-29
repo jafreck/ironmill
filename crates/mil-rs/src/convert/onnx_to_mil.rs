@@ -94,6 +94,13 @@ pub fn convert_node(node: &NodeProto) -> Result<Vec<Operation>> {
         "CumSum" => convert_cumsum(node),
         "Tile" => convert_tile(node),
         "Expand" => convert_expand(node),
+        "ReduceSum" => convert_reduce_sum(node),
+
+        // P4 — ONNX Runtime contrib ops (com.microsoft domain)
+        "SimplifiedLayerNormalization" => convert_simplified_layer_norm(node),
+        "SkipSimplifiedLayerNormalization" => convert_skip_simplified_layer_norm(node),
+        "RotaryEmbedding" => convert_rotary_embedding(node),
+        "GroupQueryAttention" => convert_group_query_attention(node),
 
         other => Err(MilError::UnsupportedOp(other.to_string())),
     }
@@ -869,6 +876,267 @@ fn convert_expand(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_input("shape", Value::Reference(node.input[1].clone()));
     }
     Ok(vec![with_outputs(op, node)])
+}
+
+// ---------------------------------------------------------------------------
+// P3+ — ReduceSum
+// ---------------------------------------------------------------------------
+
+fn convert_reduce_sum(node: &NodeProto) -> Result<Vec<Operation>> {
+    let mut op = Operation::new("reduce_sum", op_name(node));
+
+    if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
+        op.inputs
+            .insert("x".to_string(), Value::Reference(x.clone()));
+    }
+
+    // axes: input[1] (opset 13+) or attribute form
+    if let Some(axes_input) = node.input.get(1).filter(|s| !s.is_empty()) {
+        op.inputs
+            .insert("axes".to_string(), Value::Reference(axes_input.clone()));
+    } else if let Some(axes) = get_int_list_attr(node, "axes") {
+        op = op.with_attr("axes", int_tensor_value(&axes));
+    }
+
+    let keepdims = get_int_attr(node, "keepdims").unwrap_or(1);
+    op = op.with_attr("keep_dims", Value::Bool(keepdims != 0));
+
+    if let Some(noop) = get_int_attr(node, "noop_with_empty_axes") {
+        op = op.with_attr("noop_with_empty_axes", Value::Bool(noop != 0));
+    }
+
+    Ok(vec![with_outputs(op, node)])
+}
+
+// ---------------------------------------------------------------------------
+// P4 — ONNX Runtime contrib ops (com.microsoft domain)
+// ---------------------------------------------------------------------------
+
+/// SimplifiedLayerNormalization (RMSNorm without bias):
+/// `Y = X / sqrt(mean(X^2, axis) + eps) * scale`
+fn convert_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
+    let name = op_name(node);
+    let eps = get_float_attr(node, "epsilon").unwrap_or(1e-5);
+    let axis = get_int_attr(node, "axis").unwrap_or(-1);
+
+    let x_ref = node.input.first().cloned().unwrap_or_default();
+    let scale_ref = node.input.get(1).cloned().unwrap_or_default();
+
+    // x_sq = x * x
+    let x_sq_name = format!("{name}_sq");
+    let x_sq = Operation::new("mul", &x_sq_name)
+        .with_input("x", Value::Reference(x_ref.clone()))
+        .with_input("y", Value::Reference(x_ref.clone()))
+        .with_output(&x_sq_name);
+
+    // mean_sq = reduce_mean(x_sq, axis, keepdims=true)
+    let mean_name = format!("{name}_mean");
+    let mean_op = Operation::new("reduce_mean", &mean_name)
+        .with_input("x", Value::Reference(x_sq_name.clone()))
+        .with_attr("axes", Value::List(vec![Value::Int(axis)]))
+        .with_attr("keep_dims", Value::Bool(true))
+        .with_output(&mean_name);
+
+    // eps constant
+    let eps_const_name = format!("{name}_eps_const");
+    let mut eps_op = Operation::new("const", &eps_const_name);
+    eps_op
+        .attributes
+        .insert("val".into(), Value::Float(eps as f64));
+    eps_op = eps_op.with_output(&eps_const_name);
+
+    // mean_eps = mean_sq + eps
+    let add_eps_name = format!("{name}_add_eps");
+    let add_eps = Operation::new("add", &add_eps_name)
+        .with_input("x", Value::Reference(mean_name.clone()))
+        .with_input("y", Value::Reference(eps_const_name.clone()))
+        .with_output(&add_eps_name);
+
+    // sqrt_val = sqrt(mean_eps)
+    let sqrt_name = format!("{name}_sqrt");
+    let sqrt_op = Operation::new("sqrt", &sqrt_name)
+        .with_input("x", Value::Reference(add_eps_name.clone()))
+        .with_output(&sqrt_name);
+
+    // rsqrt = 1 / sqrt_val
+    let rsqrt_name = format!("{name}_rsqrt");
+    let rsqrt_op = Operation::new("reciprocal", &rsqrt_name)
+        .with_input("x", Value::Reference(sqrt_name.clone()))
+        .with_output(&rsqrt_name);
+
+    // normalized = x * rsqrt
+    let norm_name = format!("{name}_norm");
+    let norm_op = Operation::new("mul", &norm_name)
+        .with_input("x", Value::Reference(x_ref))
+        .with_input("y", Value::Reference(rsqrt_name.clone()))
+        .with_output(&norm_name);
+
+    // output = normalized * scale
+    let output_name = &node.output[0];
+    let scale_op = Operation::new("mul", output_name)
+        .with_input("x", Value::Reference(norm_name.clone()))
+        .with_input("y", Value::Reference(scale_ref))
+        .with_output(output_name);
+
+    Ok(vec![
+        x_sq, mean_op, eps_op, add_eps, sqrt_op, rsqrt_op, norm_op, scale_op,
+    ])
+}
+
+/// SkipSimplifiedLayerNormalization: residual add then RMSNorm.
+/// `skip_add = X + skip; Y = RMSNorm(skip_add) * scale`
+/// Outputs: (Y, ?, ?, skip_add)
+fn convert_skip_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
+    let name = op_name(node);
+    let eps = get_float_attr(node, "epsilon").unwrap_or(1e-5);
+
+    let x_ref = node.input.first().cloned().unwrap_or_default();
+    let skip_ref = node.input.get(1).cloned().unwrap_or_default();
+    let scale_ref = node.input.get(2).cloned().unwrap_or_default();
+
+    // skip_add = X + skip
+    let skip_add_name = format!("{name}_skip_add");
+    let skip_add = Operation::new("add", &skip_add_name)
+        .with_input("x", Value::Reference(x_ref))
+        .with_input("y", Value::Reference(skip_ref))
+        .with_output(&skip_add_name);
+
+    // x_sq = skip_add * skip_add
+    let x_sq_name = format!("{name}_sq");
+    let x_sq = Operation::new("mul", &x_sq_name)
+        .with_input("x", Value::Reference(skip_add_name.clone()))
+        .with_input("y", Value::Reference(skip_add_name.clone()))
+        .with_output(&x_sq_name);
+
+    // mean_sq = reduce_mean(x_sq, axis=-1, keepdims=true)
+    let mean_name = format!("{name}_mean");
+    let mean_op = Operation::new("reduce_mean", &mean_name)
+        .with_input("x", Value::Reference(x_sq_name.clone()))
+        .with_attr("axes", Value::List(vec![Value::Int(-1)]))
+        .with_attr("keep_dims", Value::Bool(true))
+        .with_output(&mean_name);
+
+    let eps_const_name = format!("{name}_eps_const");
+    let mut eps_op = Operation::new("const", &eps_const_name);
+    eps_op
+        .attributes
+        .insert("val".into(), Value::Float(eps as f64));
+    eps_op = eps_op.with_output(&eps_const_name);
+
+    let add_eps_name = format!("{name}_add_eps");
+    let add_eps = Operation::new("add", &add_eps_name)
+        .with_input("x", Value::Reference(mean_name.clone()))
+        .with_input("y", Value::Reference(eps_const_name.clone()))
+        .with_output(&add_eps_name);
+
+    let sqrt_name = format!("{name}_sqrt");
+    let sqrt_op = Operation::new("sqrt", &sqrt_name)
+        .with_input("x", Value::Reference(add_eps_name.clone()))
+        .with_output(&sqrt_name);
+
+    let rsqrt_name = format!("{name}_rsqrt");
+    let rsqrt_op = Operation::new("reciprocal", &rsqrt_name)
+        .with_input("x", Value::Reference(sqrt_name.clone()))
+        .with_output(&rsqrt_name);
+
+    let norm_name = format!("{name}_norm");
+    let norm_op = Operation::new("mul", &norm_name)
+        .with_input("x", Value::Reference(skip_add_name.clone()))
+        .with_input("y", Value::Reference(rsqrt_name.clone()))
+        .with_output(&norm_name);
+
+    // Output 0: Y = normalized * scale
+    let y_name = node.output.first().cloned().unwrap_or_default();
+    let scale_op = Operation::new("mul", &y_name)
+        .with_input("x", Value::Reference(norm_name.clone()))
+        .with_input("y", Value::Reference(scale_ref))
+        .with_output(&y_name);
+
+    let mut ops = vec![
+        skip_add, x_sq, mean_op, eps_op, add_eps, sqrt_op, rsqrt_op, norm_op, scale_op,
+    ];
+
+    // Output 3: residual = skip_add (identity alias)
+    if let Some(residual_out) = node.output.get(3) {
+        if !residual_out.is_empty() {
+            let identity = Operation::new("identity", residual_out)
+                .with_input("x", Value::Reference(skip_add_name))
+                .with_output(residual_out);
+            ops.push(identity);
+        }
+    }
+
+    Ok(ops)
+}
+
+/// RotaryEmbedding (com.microsoft): apply rotary position embeddings.
+/// Maps to a MIL `rotary_embedding` composite op.
+fn convert_rotary_embedding(node: &NodeProto) -> Result<Vec<Operation>> {
+    let name = op_name(node);
+    let mut op = Operation::new("rotary_embedding", &name);
+
+    let input_names = ["x", "position_ids", "cos_cache", "sin_cache"];
+    for (i, param) in input_names.iter().enumerate() {
+        if let Some(inp) = node.input.get(i).filter(|s| !s.is_empty()) {
+            op = op.with_input(*param, Value::Reference(inp.clone()));
+        }
+    }
+
+    let interleaved = get_int_attr(node, "interleaved").unwrap_or(0);
+    op = op.with_attr("interleaved", Value::Bool(interleaved != 0));
+
+    if let Some(num_heads) = get_int_attr(node, "num_heads") {
+        op = op.with_attr("num_heads", Value::Int(num_heads));
+    }
+
+    Ok(vec![with_outputs(op, node)])
+}
+
+/// GroupQueryAttention (com.microsoft): fused multi-head / grouped-query attention.
+/// Maps to a MIL `group_query_attention` composite op with multiple outputs.
+fn convert_group_query_attention(node: &NodeProto) -> Result<Vec<Operation>> {
+    let name = op_name(node);
+    let mut op = Operation::new("group_query_attention", &name);
+
+    let input_names = [
+        "query",
+        "key",
+        "value",
+        "past_key",
+        "past_value",
+        "seqlens_k",
+        "total_seq_len",
+        "cos_cache",
+        "sin_cache",
+    ];
+    for (i, param) in input_names.iter().enumerate() {
+        if let Some(inp) = node.input.get(i).filter(|s| !s.is_empty()) {
+            op = op.with_input(*param, Value::Reference(inp.clone()));
+        }
+    }
+
+    if let Some(num_heads) = get_int_attr(node, "num_heads") {
+        op = op.with_attr("num_heads", Value::Int(num_heads));
+    }
+    if let Some(kv_num_heads) = get_int_attr(node, "kv_num_heads") {
+        op = op.with_attr("kv_num_heads", Value::Int(kv_num_heads));
+    }
+    if let Some(scale) = get_float_attr(node, "scale") {
+        op = op.with_attr("scale", Value::Float(scale as f64));
+    }
+    let local_window = get_int_attr(node, "local_window_size").unwrap_or(-1);
+    op = op.with_attr("local_window_size", Value::Int(local_window));
+    let do_rotary = get_int_attr(node, "do_rotary").unwrap_or(0);
+    op = op.with_attr("do_rotary", Value::Bool(do_rotary != 0));
+
+    // Multiple outputs (output, present_key, present_value)
+    for out in &node.output {
+        if !out.is_empty() {
+            op = op.with_output(out);
+        }
+    }
+
+    Ok(vec![op])
 }
 
 // ---------------------------------------------------------------------------

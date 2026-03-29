@@ -532,11 +532,18 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         .context("Optimization pipeline failed")?;
 
     for result in &report.pass_results {
-        let ops_diff = result.ops_before.saturating_sub(result.ops_after);
-        if ops_diff > 0 {
-            let label = if ops_diff == 1 { "op" } else { "ops" };
+        if result.ops_after < result.ops_before {
+            let diff = result.ops_before - result.ops_after;
+            let label = if diff == 1 { "op" } else { "ops" };
             println!(
-                "  {}: removed {ops_diff} {label} ({:.2?})",
+                "  {}: removed {diff} {label} ({:.2?})",
+                result.name, result.elapsed
+            );
+        } else if result.ops_after > result.ops_before {
+            let diff = result.ops_after - result.ops_before;
+            let label = if diff == 1 { "op" } else { "ops" };
+            println!(
+                "  {}: added {diff} {label} ({:.2?})",
                 result.name, result.elapsed
             );
         } else {
