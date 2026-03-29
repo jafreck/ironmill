@@ -154,7 +154,11 @@ impl Model {
             let mut shape = Vec::new();
             for j in 0..shape_arr.count() {
                 let num: &NSNumber = &shape_arr.objectAtIndex(j);
-                shape.push(num.as_isize() as usize);
+                let dim = num.as_isize();
+                if dim < 0 {
+                    bail!("invalid negative dimension {} in output shape", dim);
+                }
+                shape.push(dim as usize);
             }
 
             let data_type = MultiArrayDataType::from_objc(unsafe { constraint.dataType() })?;
@@ -208,7 +212,10 @@ impl PredictionInput {
         data_type: MultiArrayDataType,
         data: &[f32],
     ) -> anyhow::Result<()> {
-        let total_elements: usize = shape.iter().product();
+        let total_elements: usize = shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| anyhow::anyhow!("tensor shape {:?} causes size overflow", shape))?;
         if data.len() != total_elements {
             bail!(
                 "data length {} does not match shape {:?} (expected {})",
@@ -295,6 +302,17 @@ pub struct PredictionOutput {
     inner: Retained<ProtocolObject<dyn MLFeatureProvider>>,
 }
 
+/// An extracted multi-array output with name, shape, and f32 data.
+#[derive(Debug, Clone)]
+pub struct ExtractedOutput {
+    /// Output feature name.
+    pub name: String,
+    /// Tensor shape.
+    pub shape: Vec<usize>,
+    /// Tensor data as f32 values.
+    pub data: Vec<f32>,
+}
+
 impl PredictionOutput {
     /// Get the underlying feature provider.
     pub fn as_feature_provider(&self) -> &ProtocolObject<dyn MLFeatureProvider> {
@@ -306,6 +324,69 @@ impl PredictionOutput {
         let ns_name = NSString::from_str(name);
         unsafe { self.inner.featureValueForName(&ns_name) }
     }
+
+    /// Get the names of all output features.
+    pub fn feature_names(&self) -> Vec<String> {
+        let names = unsafe { self.inner.featureNames() };
+        let all_objects = names.allObjects();
+        let mut result = Vec::new();
+        for i in 0..all_objects.count() {
+            let name_ns: &NSString = &all_objects.objectAtIndex(i);
+            result.push(name_ns.to_string());
+        }
+        result
+    }
+
+    /// Extract all multi-array outputs as f32 vectors.
+    ///
+    /// Non-multi-array features are skipped. Each element is extracted
+    /// via indexed subscript from the underlying `MLMultiArray`.
+    pub fn extract_multi_arrays(&self) -> anyhow::Result<Vec<ExtractedOutput>> {
+        let names = self.feature_names();
+        let mut outputs = Vec::new();
+
+        for name in &names {
+            let Some(feature_value) = self.feature_value(name) else {
+                continue;
+            };
+            let ft = unsafe { feature_value.r#type() };
+            if ft != MLFeatureType::MultiArray {
+                continue;
+            }
+            let Some(multi_array) = (unsafe { feature_value.multiArrayValue() }) else {
+                continue;
+            };
+
+            let shape_arr = unsafe { multi_array.shape() };
+            let mut shape = Vec::new();
+            for j in 0..shape_arr.count() {
+                let num: &NSNumber = &shape_arr.objectAtIndex(j);
+                let dim = num.as_isize();
+                if dim < 0 {
+                    bail!("invalid negative dimension {} in output shape", dim);
+                }
+                shape.push(dim as usize);
+            }
+
+            let total: usize = shape
+                .iter()
+                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| anyhow::anyhow!("tensor shape {:?} causes size overflow", shape))?;
+            let mut data = Vec::with_capacity(total);
+            for idx in 0..total {
+                let val = unsafe { multi_array.objectAtIndexedSubscript(idx as isize) };
+                data.push(val.as_f32());
+            }
+
+            outputs.push(ExtractedOutput {
+                name: name.clone(),
+                shape,
+                data,
+            });
+        }
+
+        Ok(outputs)
+    }
 }
 
 // ── build_dummy_input ─────────────────────────────────────────────
@@ -314,7 +395,11 @@ impl PredictionOutput {
 pub fn build_dummy_input(desc: &InputDescription) -> anyhow::Result<PredictionInput> {
     let mut input = PredictionInput::new();
     for feat in &desc.features {
-        let total: usize = feat.shape.iter().product();
+        let total: usize = feat
+            .shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| anyhow::anyhow!("tensor shape {:?} causes size overflow", feat.shape))?;
         let data = vec![0.0f32; total];
         input.add_multi_array(&feat.name, &feat.shape, feat.data_type, &data)?;
     }
