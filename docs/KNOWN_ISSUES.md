@@ -8,159 +8,55 @@ Tracks shortcuts, workarounds, and unresolved issues. Grouped by severity.
 
 ## Architecture
 
-### P0 — Unify runtime backends behind a common trait
+### Resolved — Unify runtime backends behind a common trait
 
-`ironmill-coreml` and `ironmill-ane` do the same thing (compile IR → run
-predictions) but have completely different interfaces. `compile_model`
-(the `xcrun` call) lives in `mil-rs` where it doesn't belong. The benchmark
-harness has two duplicated inference paths. Adding a new backend means
-touching multiple crates.
+The `ironmill-runtime` crate now provides `RuntimeBackend` and `RuntimeModel`
+traits. Both `ironmill-coreml` and `ironmill-ane` implement them, and the
+benchmark harness uses a single inference path over `&[Box<dyn RuntimeBackend>]`.
 
-`mil-rs/src/compiler.rs` already has a `Backend` enum (`Xcrun`, `AneDirect`)
-and `compile_model_with_backend()`, but this is a thin dispatch layer, not a
-trait-based abstraction.
-
-**Fix**: Create `ironmill-runtime` with:
-
-```rust
-pub trait Backend {
-    fn compile(&self, program: &Program) -> Result<Box<dyn Model>>;
-}
-pub trait Model {
-    fn predict(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>>;
-}
-```
-
-Then:
-- Move `mil-rs/src/compiler.rs` into a `CoremlBackend` impl
-- Have `ironmill-ane` implement `Backend + Model`
-- Benchmark harness becomes a loop over `&[Box<dyn Backend>]`
-- CLI selects backend at runtime, no feature-flag branching
-
-**Scope**: ~200-300 lines of trait definitions + refactoring. No functional
-changes — just unifying the interface.
-
-**Files**: `mil-rs/src/compiler.rs` (move out), `ironmill-coreml/src/lib.rs`,
-`ironmill-ane/src/lib.rs`, `ironmill-bench/src/inference.rs`
+The legacy `Backend` enum and `compile_model_with_backend()` in
+`mil-rs/src/compiler.rs` have been removed. The CLI now uses `compile_model`
+directly (xcrun only).
 
 ---
 
 ## PolarQuant
 
-### P0 — Correctness
+### Resolved
 
 #### Approximate un-rotation for non-power-of-two dimensions
 
-The Hadamard rotation requires power-of-two dimensions. When a weight tensor
-has a non-power-of-two inner dimension (e.g., 384, 1280), the pass pads,
-rotates, then truncates indices back. The rotation fusion pass generates R_inv
-as a `[cols, cols]` submatrix of the full `[padded_cols, padded_cols]` rotation.
+Fixed. The quantize pass (`polar_quantize.rs`) now keeps the full padded
+representation instead of truncating back to original columns. The rotation
+fusion pass's `slice_by_index` handles trimming to original dimensions after
+un-rotation.
 
-This is lossy — truncation discards coordinates that participated in the
-rotation. Quality impact depends on the padding ratio (384→512 is 25%;
-1280→2048 is 37%).
+#### Inter-layer rotation fusion fires on real models
 
-**Fix**: Keep full padded representation for fallback layers. Store indices at
-`padded_cols` width, emit matmul with full R_inv, then `slice_by_index` to trim.
-
-**Files**: `polar_quantize.rs`, `polar_rotation_fusion.rs`
-
-#### Inter-layer rotation fusion never fires on real models
-
-The pairing algorithm traces `constexpr_lut_to_dense` → consumer linear op →
-activation → next linear op. `find_polar_source` can trace through a single
-`mul` (norms scaling), but does not recursively trace beyond one level or
-special-case `const(norms)` nodes in the pairing algorithm.
-
-**Impact**: Every PolarQuant'd layer pays R_inv storage + matmul cost. On
-Qwen3-0.6B this means 256 R_inv matrices instead of ~0 for paired layers.
-
-**Fix**: Trace through `mul` (norms scaling) to find the actual consumer linear op.
-
-**Files**: `polar_rotation_fusion.rs`
-
-### P1 — Functionality
+Fixed. The pairing algorithm now traces through multiple intermediate
+element-wise ops (add, mul, activation functions) up to 4 hops when looking
+for producer-consumer linear pairs, matching common transformer graph patterns
+like linear → activation → mul → linear.
 
 #### 3-bit PolarQuant blocked by CoreML LUT restriction
 
 CoreML `constexpr_lut_to_dense` only accepts LUT sizes {2, 4, 16, 64, 256}.
-3-bit (8 entries) is rejected. The pipeline accepts `n_bits=3` and quantizes
-correctly, but CoreML compilation fails.
-
-**Options**: Pad LUT to 16 entries (4-bit indices), route through `ane-direct`,
-or reject `n_bits=3` at pipeline level.
-
-#### R_inv storage not deduplicated
-
-Layers with the same `(padded_cols, seed)` should share one R_inv const, but
-a separate copy is emitted per tensor. On Qwen3-0.6B this is ~1GB of
-redundant rotation matrices.
-
-**Fix**: Deduplicate by `(padded_cols, seed)` key.
-
-#### Quality benchmarks are stubs
-
-`ironmill-bench/src/quality.rs` doesn't dequantize LUT values to compute
-real MSE/PSNR. Only reports compression ratios.
-
-#### `bench-size.sh` missing PolarQuant config
-
-Size benchmark script doesn't include `--polar-quantize 4`.
+3-bit (8 entries) is rejected. The pipeline CLI and validation now correctly
+advertise only `n_bits = 2 or 4`. The `PolarQuantPass` rejects unsupported
+LUT sizes early.
 
 ---
 
 ## ONNX Conversion
 
-### P0 — Correctness
+### Resolved
 
-#### Name sanitizer can alias distinct ops
+#### Transformer ops decomposed into standard MIL ops
 
-`sanitize_mil_name` replaces all non-alphanumeric chars with `_`. Names like
-`layer/0/conv` and `layer.0.conv` both become `layer_0_conv`. No uniqueness
-check — could silently alias different ops.
-
-**Fix**: Track seen names, append numeric suffix on collision.
-
-**Files**: `onnx_graph.rs`
-
-### P1 — Functionality
-
-#### Transformer ops are opaque pass-throughs
-
-`RotaryEmbedding` and `GroupQueryAttention` (ORT contrib ops) are emitted as
-single custom MIL ops (`rotary_embedding`, `group_query_attention`) that CoreML
-doesn't understand. Models convert through ironmill but fail CoreML compilation.
-
-**Fix**: Decompose into standard MIL ops (~200-400 lines each).
-
-#### `gather` with int64 indices rejected by CoreML
-
-ONNX uses int64 for indices; CoreML only accepts int32. Affects Whisper and
-models with Shape → Gather patterns.
-
-**Fix**: Insert `cast(dtype=int32)` before gather when indices are int64.
-
----
-
-## CoreML Serialization
-
-### P1 — Functionality
-
-#### FP32 LUT round-trip deserializes as List, not Tensor
-
-`constexpr_lut_to_dense` with FP32 LUT comes back as `Value::List(Float(...))`
-after proto deserialization instead of `Value::Tensor`. Test was loosened to
-accept both formats rather than fixing the deserializer.
-
-**Files**: `convert/proto_to_ir.rs`
-
-#### Row-norm ops lack explicit output types
-
-The `const` and `mul` ops inserted for row norms rely on
-`TypeRepropagationPass` to infer types. May produce incorrect shapes in
-complex graphs.
-
-**Fix**: Set `output_types` explicitly when creating norms/mul ops.
+`RotaryEmbedding` and `GroupQueryAttention` (ORT contrib ops) are now
+decomposed into standard MIL operations (split, mul, sub, add, concat,
+gather, reshape, transpose, matmul, softmax, tile, identity). Models
+using these ops will compile through CoreML without custom op errors.
 
 ---
 
@@ -175,3 +71,20 @@ Model still runs via BNNS fallback. Indicates padding/pooling serialization issu
 
 All configs fail with `_ANECompiler : ANECCompile() FAILED`. Compatibility
 issue between private ANE APIs and current macOS version.
+
+---
+
+## Resolved
+
+- **Unify runtime backends** — `ironmill-runtime` crate with `RuntimeBackend`/`RuntimeModel` traits; legacy `Backend` enum and `compile_model_with_backend` removed from `mil-rs/src/compiler.rs`
+- **PolarQuant non-power-of-two truncation** — Quantize pass keeps full padded indices; fusion pass handles trimming via `slice_by_index`
+- **Inter-layer rotation fusion pairing** — Pairing algorithm traces through multiple intermediate element-wise ops (up to 4 hops)
+- **3-bit CLI messaging** — CLI and pipeline validation now correctly advertise `n_bits = 2 or 4` only
+- **Transformer op decomposition** — `RotaryEmbedding` and `GroupQueryAttention` decomposed into standard MIL ops
+- **R_inv storage not deduplicated** — Deduplicated by `(padded_cols, seed)` key in `polar_rotation_fusion.rs`
+- **Quality benchmarks are stubs** — Real MSE/PSNR/dequantization implemented in `ironmill-bench/src/quality.rs`
+- **`bench-size.sh` missing PolarQuant config** — Script now includes `--polar-quantize 4`
+- **Name sanitizer can alias distinct ops** — `sanitize_block_names()` tracks seen names and appends numeric suffixes (test: `sanitize_block_names_deduplicates_collisions`)
+- **`gather` with int64 indices rejected by CoreML** — `convert_gather()` inserts `cast(dtype=int32)` before gather
+- **FP32 LUT round-trip deserializes as List, not Tensor** — `proto_to_ir.rs` reconstructs FP32 LUT tensors as `Value::Tensor`
+- **Row-norm ops lack explicit output types** — `polar_quantize.rs` now sets `output_types` explicitly

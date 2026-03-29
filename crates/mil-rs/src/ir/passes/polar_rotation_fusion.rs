@@ -112,9 +112,19 @@ impl Pass for PolarRotationFusionPass {
             }
 
             // Pairing: for each linear L1 with a polar weight, check if L1's
-            // output feeds through a safe activation into exactly one other
-            // linear L2 that also has a polar weight.
+            // output feeds through a chain of element-wise ops into another
+            // linear L2 that also has a polar weight. Common patterns:
+            //   linear → activation → linear
+            //   linear → activation → mul (residual/norm) → linear
+            //   linear → mul (norm) → activation → linear
             let mut paired: HashSet<usize> = HashSet::new(); // polar op indices that are paired
+
+            // Element-wise ops safe to trace through for rotation fusion.
+            let elementwise_ops: Vec<String> = {
+                let mut ops = self.safe_activations.clone();
+                ops.extend(["add", "mul", "sub"].iter().map(|s| s.to_string()));
+                ops
+            };
 
             for &l1_idx in &linear_indices {
                 if !linear_to_polar.contains_key(&l1_idx) {
@@ -125,42 +135,18 @@ impl Pass for PolarRotationFusionPass {
                     None => continue,
                 };
 
-                // Check consumers of L1's output.
-                let l1_consumers = match consumer_map.get(&l1_output) {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                // Look for: L1 -> activation -> L2
-                for &(consumer_idx, _) in l1_consumers {
-                    let consumer_op = &block.operations[consumer_idx];
-                    let is_safe_activation = self.safe_activations.contains(&consumer_op.op_type);
-
-                    let next_idx = if is_safe_activation {
-                        // Activation found; check its single output consumers.
-                        let act_output = match consumer_op.outputs.first() {
-                            Some(o) => o.clone(),
-                            None => continue,
-                        };
-                        let act_consumers = match consumer_map.get(&act_output) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-                        if act_consumers.len() != 1 {
-                            continue;
-                        }
-                        act_consumers[0].0
-                    } else if LINEAR_FAMILY.contains(&consumer_op.op_type.as_str()) {
-                        // Direct L1 -> L2 (no activation between).
-                        consumer_idx
-                    } else {
-                        continue;
-                    };
-
-                    // Check if next_idx is a linear op with a polar weight.
-                    if let Some(&p2) = linear_to_polar.get(&next_idx) {
+                // Trace through element-wise ops to find a downstream linear.
+                const MAX_PAIRING_DEPTH: usize = 4;
+                if let Some(l2_idx) = trace_to_linear(
+                    block.operations.as_slice(),
+                    &consumer_map,
+                    &l1_output,
+                    &elementwise_ops,
+                    &linear_indices,
+                    MAX_PAIRING_DEPTH,
+                ) {
+                    if let Some(&p2) = linear_to_polar.get(&l2_idx) {
                         let p1 = linear_to_polar[&l1_idx];
-                        // Both polar ops are paired — rotations cancel.
                         paired.insert(p1);
                         paired.insert(p2);
                     }
@@ -396,6 +382,71 @@ fn collect_references(value: &Value, cb: &mut impl FnMut(&str)) {
         }
         _ => {}
     }
+}
+
+/// Trace forward from `output_name` through a chain of element-wise ops to
+/// find the next linear-family op that consumes the result. Returns the
+/// linear op's index if found within `max_depth` hops.
+fn trace_to_linear(
+    ops: &[Operation],
+    consumer_map: &HashMap<String, Vec<(usize, String)>>,
+    output_name: &str,
+    elementwise_ops: &[String],
+    linear_indices: &[usize],
+    max_depth: usize,
+) -> Option<usize> {
+    trace_to_linear_recursive(
+        ops,
+        consumer_map,
+        output_name,
+        elementwise_ops,
+        linear_indices,
+        0,
+        max_depth,
+    )
+}
+
+fn trace_to_linear_recursive(
+    ops: &[Operation],
+    consumer_map: &HashMap<String, Vec<(usize, String)>>,
+    output_name: &str,
+    elementwise_ops: &[String],
+    linear_indices: &[usize],
+    depth: usize,
+    max_depth: usize,
+) -> Option<usize> {
+    if depth >= max_depth {
+        return None;
+    }
+
+    let consumers = consumer_map.get(output_name)?;
+
+    for &(consumer_idx, _) in consumers {
+        let consumer_op = &ops[consumer_idx];
+
+        // Found a linear op — return it.
+        if linear_indices.contains(&consumer_idx) {
+            return Some(consumer_idx);
+        }
+
+        // If element-wise, trace through it.
+        if elementwise_ops.contains(&consumer_op.op_type) {
+            let next_output = consumer_op.outputs.first()?;
+            if let Some(found) = trace_to_linear_recursive(
+                ops,
+                consumer_map,
+                next_output,
+                elementwise_ops,
+                linear_indices,
+                depth + 1,
+                max_depth,
+            ) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
 }
 
 /// Trace a reference back to see if it originates from a polar op.

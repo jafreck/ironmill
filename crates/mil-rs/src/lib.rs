@@ -65,12 +65,8 @@ pub mod writer;
 
 // Re-export key types at crate root for convenience.
 
-/// The compilation backend to use.
-pub use compiler::Backend;
 /// Compile a `.mlpackage` or `.mlmodel` to `.mlmodelc` using `xcrun coremlcompiler`.
 pub use compiler::compile_model;
-/// Compile a model using the specified backend.
-pub use compiler::compile_model_with_backend;
 /// Check whether `xcrun coremlcompiler` is available on this system.
 pub use compiler::is_compiler_available;
 

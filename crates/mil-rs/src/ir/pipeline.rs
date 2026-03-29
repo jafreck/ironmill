@@ -145,6 +145,11 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
         }
         "polar-quantization" => {
             let n_bits = params.get("bits").and_then(|v| v.as_integer()).unwrap_or(4) as u8;
+            if n_bits != 2 && n_bits != 4 {
+                return Err(MilError::Validation(format!(
+                    "polar-quantize bits must be 2 or 4, got {n_bits}"
+                )));
+            }
             let seed = params
                 .get("seed")
                 .and_then(|v| v.as_integer())
@@ -505,7 +510,7 @@ impl PassPipeline {
     /// Add PolarQuant weight quantization.
     ///
     /// Applies random Hadamard rotation + Beta-optimal scalar quantization
-    /// at the specified bit-width (2, 3, or 4). Automatically schedules
+    /// at the specified bit-width (2 or 4). Automatically schedules
     /// the rotation fusion pass after quantization.
     pub fn with_polar_quant(mut self, n_bits: u8) -> Result<Self> {
         if self.has_fp16 || self.has_int8 || self.has_palettize {
@@ -513,9 +518,9 @@ impl PassPipeline {
                 "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
             ));
         }
-        if !(2..=4).contains(&n_bits) {
+        if n_bits != 2 && n_bits != 4 {
             return Err(MilError::Validation(format!(
-                "polar-quantize n_bits must be 2, 3, or 4, got {n_bits}"
+                "polar-quantize n_bits must be 2 or 4, got {n_bits}"
             )));
         }
         self.has_polar_quant = true;

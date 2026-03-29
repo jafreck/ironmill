@@ -1859,15 +1859,21 @@ fn polar_quant_rejects_invalid_bits() {
     assert!(result.is_err(), "n_bits=5 should be rejected");
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
-        err_msg.contains("n_bits must be 2, 3, or 4"),
+        err_msg.contains("n_bits must be 2 or 4"),
         "error should mention valid bit values, got: {err_msg}"
     );
 
     let result = PassPipeline::new().with_polar_quant(1);
     assert!(result.is_err(), "n_bits=1 should be rejected");
 
+    let result = PassPipeline::new().with_polar_quant(3);
+    assert!(
+        result.is_err(),
+        "n_bits=3 should be rejected (unsupported CoreML LUT size)"
+    );
+
     // Valid values should succeed.
-    for bits in [2, 3, 4] {
+    for bits in [2, 4] {
         assert!(
             PassPipeline::new().with_polar_quant(bits).is_ok(),
             "n_bits={bits} should be accepted"

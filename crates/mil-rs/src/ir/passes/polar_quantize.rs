@@ -153,20 +153,19 @@ impl Pass for PolarQuantPass {
                     .map(|&v| quantize_to_index(v, &boundaries) as usize)
                     .collect();
 
-                // Truncate back to original cols (discard padded columns).
-                let truncated_indices = if padded_cols > cols {
-                    let mut trunc = Vec::with_capacity(rows * cols);
-                    for r in 0..rows {
-                        let start = r * padded_cols;
-                        trunc.extend_from_slice(&all_indices[start..start + cols]);
-                    }
-                    trunc
-                } else {
-                    all_indices
-                };
+                // Keep full padded indices — the downstream rotation fusion
+                // pass inserts a slice_by_index to trim back to original
+                // dimensions after un-rotation.
 
                 // Pack indices at n_bits per element.
-                let packed = pack_indices(&truncated_indices, self.n_bits);
+                let packed = pack_indices(&all_indices, self.n_bits);
+
+                // Padded output shape: same as original but with last dim = padded_cols.
+                let padded_shape = {
+                    let mut s = shape.clone();
+                    *s.last_mut().unwrap() = padded_cols;
+                    s
+                };
 
                 // LUT: Beta-optimal levels stored in the original weight dtype.
                 let lut_data: Vec<u8> = match original_dtype {
@@ -210,11 +209,12 @@ impl Pass for PolarQuantPass {
                 op.attributes
                     .insert("polar_quant_seed".to_string(), Value::Int(self.seed as i64));
 
-                // Update output type to match the LUT dtype.
+                // Update output type to use the padded shape.
                 // CoreML requires constexpr_lut_to_dense output dtype == LUT dtype.
                 use crate::ir::tensor::TensorType;
                 if !op.output_types.is_empty() {
-                    op.output_types[0] = Some(TensorType::new(original_dtype, shape.clone()));
+                    op.output_types[0] =
+                        Some(TensorType::new(original_dtype, padded_shape.clone()));
                 }
 
                 // ── Phase 4: build row-norms const + mul ops ──────────────
@@ -230,7 +230,7 @@ impl Pass for PolarQuantPass {
                 };
 
                 let norms_shape = {
-                    let mut s = shape.clone();
+                    let mut s = padded_shape.clone();
                     *s.last_mut().unwrap() = 1;
                     s
                 };
@@ -251,7 +251,7 @@ impl Pass for PolarQuantPass {
                     .with_input("x", Value::Reference(original_output.clone()))
                     .with_input("y", Value::Reference(norms_output))
                     .with_output(&mul_output);
-                mul_op.output_types[0] = Some(TensorType::new(original_dtype, shape.clone()));
+                mul_op.output_types[0] = Some(TensorType::new(original_dtype, padded_shape));
 
                 insertions.push((i, vec![norms_op, mul_op]));
                 replacements.push((original_output, mul_output));

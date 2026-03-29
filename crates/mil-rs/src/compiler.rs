@@ -1,12 +1,8 @@
-//! Compile CoreML models using `xcrun coremlcompiler` or direct ANE FFI.
+//! Compile CoreML models using `xcrun coremlcompiler`.
 //!
 //! This module shells out to Apple's `coremlcompiler` tool to compile
 //! `.mlpackage` or `.mlmodel` files into `.mlmodelc` bundles that can be
 //! loaded at runtime on Apple platforms.
-//!
-//! When the `ane-direct` feature is enabled, an alternative backend is
-//! available that calls the private `_ANECompiler` Objective-C class
-//! directly, bypassing `xcrun`.  See [`Backend`] for details.
 //!
 //! # Requirements
 //!
@@ -17,28 +13,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{MilError, Result};
-
-/// Which compilation backend to use.
-///
-/// The default is [`Xcrun`](Backend::Xcrun), which shells out to
-/// `xcrun coremlcompiler`.  When the `ane-direct` feature is enabled,
-/// [`AneDirect`](Backend::AneDirect) calls Apple's private `_ANECompiler`
-/// class via Objective-C FFI for potentially faster compilation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Backend {
-    /// Shell out to `xcrun coremlcompiler` (the default, stable path).
-    #[default]
-    Xcrun,
-
-    /// Call the private `_ANECompiler` class directly via Objective-C FFI.
-    ///
-    /// # ⚠️ Experimental
-    ///
-    /// This backend uses **undocumented Apple private APIs** that can break
-    /// across macOS updates.  It is not suitable for App Store distribution.
-    /// Requires the `ane-direct` feature flag.
-    AneDirect,
-}
 
 /// Check if `xcrun coremlcompiler` is available on this system.
 pub fn is_compiler_available() -> bool {
@@ -113,49 +87,6 @@ pub fn compile_model(input: impl AsRef<Path>, output_dir: impl AsRef<Path>) -> R
             "compiled model not found in output directory".into(),
         ))
     }
-}
-
-/// Compile a model using the specified [`Backend`].
-///
-/// When `backend` is [`Backend::Xcrun`], this delegates to [`compile_model`].
-/// When `backend` is [`Backend::AneDirect`] and the `ane-direct` feature is
-/// enabled, it uses the direct FFI path.  If `ane-direct` is not enabled
-/// but `AneDirect` is requested, this returns an error.
-///
-/// # Errors
-///
-/// Same errors as [`compile_model`], plus feature-gate errors for the
-/// `AneDirect` backend.
-pub fn compile_model_with_backend(
-    input: impl AsRef<Path>,
-    output_dir: impl AsRef<Path>,
-    backend: Backend,
-) -> Result<PathBuf> {
-    match backend {
-        Backend::Xcrun => compile_model(input, output_dir),
-        Backend::AneDirect => compile_model_ane_direct(input, output_dir),
-    }
-}
-
-#[cfg(feature = "ane-direct")]
-fn compile_model_ane_direct(
-    input: impl AsRef<Path>,
-    output_dir: impl AsRef<Path>,
-) -> Result<PathBuf> {
-    use crate::ffi::ane::AneCompiler;
-    AneCompiler::compile(input.as_ref(), output_dir.as_ref()).map_err(Into::into)
-}
-
-#[cfg(not(feature = "ane-direct"))]
-fn compile_model_ane_direct(
-    _input: impl AsRef<Path>,
-    _output_dir: impl AsRef<Path>,
-) -> Result<PathBuf> {
-    Err(MilError::Validation(
-        "The 'ane-direct' backend requires the `ane-direct` feature flag. \
-         Rebuild with `--features ane-direct`."
-            .into(),
-    ))
 }
 
 #[cfg(test)]

@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
-use mil_rs::compiler::Backend;
+use clap::{Parser, Subcommand};
 use mil_rs::ir::ModelSplitPass;
 use mil_rs::ir::PassPipeline;
 use mil_rs::ir::PipelineReport;
@@ -13,10 +12,10 @@ use mil_rs::validate::{print_validation_report, validation_report_to_json};
 #[allow(unused_imports)]
 use mil_rs::{
     ConversionConfig, LossFunction, TemplateOptions, UpdatableModelConfig, UpdateOptimizer,
-    compile_model, compile_model_with_backend, convert_pipeline, is_compiler_available,
-    onnx_to_program_with_config, parse_pipeline_manifest, program_to_model,
-    program_to_multi_function_model, program_to_updatable_model, read_mlmodel, read_mlpackage,
-    read_onnx, validate_ane_compatibility, weights_to_program, weights_to_program_with_options,
+    compile_model, convert_pipeline, is_compiler_available, onnx_to_program_with_config,
+    parse_pipeline_manifest, program_to_model, program_to_multi_function_model,
+    program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx,
+    validate_ane_compatibility, weights_to_program, weights_to_program_with_options,
     write_mlpackage,
 };
 
@@ -29,24 +28,6 @@ use mil_rs::{
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-}
-
-/// Compilation backend selection for the CLI.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum BackendArg {
-    /// Use `xcrun coremlcompiler` (default, stable).
-    Xcrun,
-    /// Use direct ANE FFI (experimental, requires `ane-direct` feature).
-    AneDirect,
-}
-
-impl From<BackendArg> for Backend {
-    fn from(arg: BackendArg) -> Self {
-        match arg {
-            BackendArg::Xcrun => Backend::Xcrun,
-            BackendArg::AneDirect => Backend::AneDirect,
-        }
-    }
 }
 
 /// Runtime backend for inference.
@@ -92,7 +73,7 @@ enum Commands {
         #[arg(long, value_name = "BITS")]
         palettize: Option<u8>,
 
-        /// PolarQuant weight quantization bit-width (2, 3, or 4).
+        /// PolarQuant weight quantization bit-width (2 or 4).
         #[arg(long = "polar-quantize", value_name = "BITS")]
         polar_quantize: Option<u8>,
 
@@ -104,14 +85,6 @@ enum Commands {
         /// Format: "name:d0,d1,d2,...". May be repeated.
         #[arg(long = "input-shape", value_name = "NAME:SHAPE")]
         input_shapes: Vec<String>,
-
-        /// Compilation backend: "xcrun" (default) or "ane-direct" (experimental).
-        ///
-        /// The "ane-direct" backend calls Apple's private _ANECompiler class
-        /// directly via FFI, bypassing xcrun. Requires the `ane-direct`
-        /// feature flag at build time.
-        #[arg(long, value_enum, default_value_t = BackendArg::Xcrun)]
-        backend: BackendArg,
 
         /// Merge LoRA adapter weights into the base model during conversion (default).
         /// LoRA A/B weight pairs found in the ONNX initializers are automatically
@@ -300,7 +273,6 @@ fn run() -> Result<()> {
             polar_quantize,
             no_fusion,
             input_shapes,
-            backend,
             merge_lora,
             no_merge_lora,
             emit_adapter,
@@ -331,7 +303,6 @@ fn run() -> Result<()> {
                 polar_quantize,
                 no_fusion,
                 input_shapes,
-                backend: backend.into(),
                 merge_lora: merge_lora && !no_merge_lora,
                 emit_adapter,
                 adapters,
@@ -390,7 +361,6 @@ struct CompileOpts {
     polar_quantize: Option<u8>,
     no_fusion: bool,
     input_shapes: Vec<String>,
-    backend: Backend,
     merge_lora: bool,
     emit_adapter: bool,
     adapters: Vec<PathBuf>,
@@ -433,7 +403,7 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
                     "Note: --moe-split/--moe-bundle/--moe-fuse-topk is only supported for ONNX input. Ignoring."
                 );
             }
-            compile_coreml(input_path, &ext, opts.backend)
+            compile_coreml(input_path, &ext)
         }
         InputFormat::Unknown(ext) => {
             bail!(
@@ -693,7 +663,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                 .with_context(|| format!("Failed to write {manifest_path}"))?;
             println!("  Wrote manifest: {manifest_path}");
 
-            compile_output(&bundle_path, opts.backend);
+            compile_output(&bundle_path);
 
             println!();
             println!("MoE bundle complete.");
@@ -762,7 +732,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
             write_mlpackage(&model, &output_path)
                 .with_context(|| format!("Failed to write {output_path}"))?;
 
-            compile_output(&output_path, opts.backend);
+            compile_output(&output_path);
 
             println!();
             println!("MoE top-{k} fusion complete.");
@@ -830,8 +800,8 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
             .with_context(|| format!("Failed to write verifier mlpackage: {verifier_path}"))?;
 
         // Compile both
-        compile_output(&draft_path, opts.backend);
-        compile_output(&verifier_path, opts.backend);
+        compile_output(&draft_path);
+        compile_output(&verifier_path);
     } else {
         // Normal single-model output.
         match opts.runtime {
@@ -893,7 +863,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                 write_mlpackage(&model, &output_path)
                     .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
-                compile_output(&output_path, opts.backend);
+                compile_output(&output_path);
             }
             RuntimeArg::AneDirect => {
                 #[cfg(feature = "ane-direct")]
@@ -987,7 +957,6 @@ fn compile_from_weights(input_path: &Path, _opts: &CompileOpts) -> Result<()> {
     //
     //   // Derive ANE template options from CLI flags.
     //   let ane_mode = _opts.ane
-    //       || matches!(_opts.backend, Backend::AneDirect)
     //       || matches!(_opts.runtime, RuntimeArg::AneDirect);
     //   let template_opts = TemplateOptions { ane: ane_mode };
     //
@@ -1001,58 +970,34 @@ fn compile_from_weights(input_path: &Path, _opts: &CompileOpts) -> Result<()> {
     //   // ... write output ...
 }
 
-/// Compile a .mlpackage using the selected backend.
-fn compile_output(output_path: &str, backend: Backend) {
-    match backend {
-        Backend::AneDirect => {
-            println!("Compiling with ANE direct backend...");
-            let output_dir = Path::new(output_path).parent().unwrap_or(Path::new("."));
-            match compile_model_with_backend(output_path, output_dir, Backend::AneDirect) {
-                Ok(compiled) => println!("Done: {}", compiled.display()),
-                Err(e) => println!("Warning: ANE direct compilation failed: {e}"),
-            }
+/// Compile a .mlpackage using xcrun coremlcompiler.
+fn compile_output(output_path: &str) {
+    if is_compiler_available() {
+        println!("Compiling with xcrun coremlcompiler...");
+        let output_dir = Path::new(output_path).parent().unwrap_or(Path::new("."));
+        match compile_model(output_path, output_dir) {
+            Ok(compiled) => println!("Done: {}", compiled.display()),
+            Err(e) => println!("Warning: compilation failed: {e}"),
         }
-        Backend::Xcrun => {
-            if is_compiler_available() {
-                println!("Compiling with xcrun coremlcompiler...");
-                let output_dir = Path::new(output_path).parent().unwrap_or(Path::new("."));
-                match compile_model(output_path, output_dir) {
-                    Ok(compiled) => println!("Done: {}", compiled.display()),
-                    Err(e) => println!("Warning: compilation failed: {e}"),
-                }
-            } else {
-                println!("Note: xcrun coremlcompiler not found — skipping compilation step.");
-                println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
-            }
-        }
+    } else {
+        println!("Note: xcrun coremlcompiler not found — skipping compilation step.");
+        println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
     }
 }
 
-fn compile_coreml(input_path: &Path, ext: &str, backend: Backend) -> Result<()> {
+fn compile_coreml(input_path: &Path, ext: &str) -> Result<()> {
     let input_display = input_path.display();
     println!("Input is already CoreML format (.{ext}): {input_display}");
 
-    let output_dir = input_path.parent().unwrap_or(Path::new("."));
-
-    match backend {
-        Backend::AneDirect => {
-            println!("Compiling with ANE direct backend...");
-            let compiled = compile_model_with_backend(input_path, output_dir, Backend::AneDirect)
-                .with_context(|| format!("Failed to compile {input_display}"))?;
-            println!("Done: {}", compiled.display());
-        }
-        Backend::Xcrun => {
-            if !is_compiler_available() {
-                bail!(
-                    "xcrun coremlcompiler is not available. Install Xcode to compile CoreML models."
-                );
-            }
-            println!("Compiling with xcrun coremlcompiler...");
-            let compiled = compile_model(input_path, output_dir)
-                .with_context(|| format!("Failed to compile {input_display}"))?;
-            println!("Done: {}", compiled.display());
-        }
+    if !is_compiler_available() {
+        bail!("xcrun coremlcompiler is not available. Install Xcode to compile CoreML models.");
     }
+
+    let output_dir = input_path.parent().unwrap_or(Path::new("."));
+    println!("Compiling with xcrun coremlcompiler...");
+    let compiled = compile_model(input_path, output_dir)
+        .with_context(|| format!("Failed to compile {input_display}"))?;
+    println!("Done: {}", compiled.display());
 
     Ok(())
 }

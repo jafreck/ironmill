@@ -7,9 +7,9 @@ use std::collections::HashMap;
 
 use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
 use mil_rs::{
-    Backend, ExpertFrequencyProfile, Function, Operation, Pass, PassPipeline, PipelineReport,
-    Program, ScalarType, TensorType, Value, compile_model, compile_model_with_backend, detect_moe,
-    fuse_top_k_experts, program_to_multi_function_model, split_moe,
+    ExpertFrequencyProfile, Function, Operation, Pass, PassPipeline, PipelineReport, Program,
+    ScalarType, TensorType, Value, compile_model, detect_moe, fuse_top_k_experts,
+    program_to_multi_function_model, split_moe,
 };
 
 use mil_rs::ir::passes::{
@@ -767,51 +767,29 @@ ffn = "int8"
 // =========================================================================
 
 #[test]
-fn ane_compiler_not_available_returns_error() {
-    // Without the ane-direct feature, requesting AneDirect should return
-    // a validation error, not a panic.
-    let result = compile_model_with_backend("nonexistent.mlpackage", "out_dir", Backend::AneDirect);
+fn compile_model_nonexistent_returns_error() {
+    // compile_model on a nonexistent path should return an error.
+    let result = compile_model("nonexistent.mlpackage", "out_dir");
     assert!(
         result.is_err(),
-        "AneDirect on nonexistent path should error"
+        "compile_model on nonexistent path should error"
     );
     let err_msg = result.unwrap_err().to_string();
-    // Without the feature, we get a feature-gate error.
-    // With the feature, we'd get an IO error.
     assert!(
-        err_msg.contains("ane-direct")
-            || err_msg.contains("not found")
-            || err_msg.contains("exist"),
-        "error should mention ane-direct feature or path issue, got: {err_msg}"
+        err_msg.contains("not found") || err_msg.contains("exist"),
+        "error should mention path issue, got: {err_msg}"
     );
 }
 
 #[test]
-fn backend_enum_defaults_to_xcrun() {
-    // Backend implements Default; verify it's Xcrun.
-    let default_backend = Backend::default();
-    assert_eq!(
-        default_backend,
-        Backend::Xcrun,
-        "Backend::default() should be Xcrun"
-    );
-
-    // Verify that compile_model and compile_model_with_backend(_, _, Xcrun)
-    // behave the same on a nonexistent path.
-    let result_plain = compile_model("nonexistent.mlpackage", "out_dir");
-    let result_xcrun =
-        compile_model_with_backend("nonexistent.mlpackage", "out_dir", Backend::Xcrun);
-
-    // Both should fail.
-    assert!(result_plain.is_err());
-    assert!(result_xcrun.is_err());
-
-    // Both should produce the same error kind.
-    let plain_err = result_plain.unwrap_err().to_string();
-    let xcrun_err = result_xcrun.unwrap_err().to_string();
-    assert_eq!(
-        plain_err, xcrun_err,
-        "compile_model and compile_model_with_backend(Xcrun) should produce same error"
+fn compile_model_gives_consistent_error() {
+    // Verify that compile_model produces the expected error on a nonexistent path.
+    let result = compile_model("nonexistent.mlpackage", "out_dir");
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not found") || err_msg.contains("exist"),
+        "compile_model should mention path, got: {err_msg}"
     );
 }
 
