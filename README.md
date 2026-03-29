@@ -80,6 +80,68 @@ graph TD
     E -->|xcrun coremlcompiler| H["Compiled (.mlmodelc)"]
 ```
 
+## Ecosystem Integration
+
+### Use from Rust build scripts
+
+Compile models at build time with [`CompileBuilder`](crates/mil-rs/src/build_api.rs) —
+your app ships with an optimized CoreML model, no manual conversion step:
+
+```rust
+// In build.rs:
+mil_rs::CompileBuilder::new("model.onnx")
+    .quantize(mil_rs::Quantization::Fp16)
+    .input_shape("input", vec![1, 3, 224, 224])
+    .compile()
+    .build()
+    .expect("model compilation failed");
+```
+
+### Deploy candle models to the Neural Engine
+
+[`candle-coreml`](crates/candle-coreml/) converts ONNX models (widely used in
+the HuggingFace ecosystem) to CoreML and runs them via the ANE — faster and more
+power-efficient than Metal for supported architectures:
+
+```rust
+use candle_coreml::convert::{convert_onnx, ConvertOptions};
+
+convert_onnx("model.onnx", "model.mlpackage", ConvertOptions {
+    quantization: mil_rs::Quantization::Fp16,
+    compile: true,
+    ..Default::default()
+})?;
+```
+
+### Train in Burn, deploy on Apple silicon
+
+[`burn-coreml`](crates/burn-coreml/) closes the train → deploy loop: train your
+model with Burn's GPU backends, export to ONNX, then convert to CoreML for
+production inference on iPhones, iPads, and Macs:
+
+```rust
+use burn_coreml::export::{export_to_coreml, ExportOptions};
+
+let result = export_to_coreml("model.onnx", "model.mlpackage", ExportOptions {
+    quantization: mil_rs::Quantization::Fp16,
+    compile: true,
+    ..Default::default()
+})?;
+```
+
+### Call from C, Swift, C++, or Go
+
+The [C API](docs/C_API.md) (behind `--features c-api`) exposes the full
+conversion pipeline via stable C ABI — use it from Swift apps, C++ engines, Go
+services, or any language with FFI:
+
+```c
+MilModel *onnx = mil_read_onnx("model.onnx");
+MilProgram *prog = mil_onnx_to_program(onnx);
+MilModel *coreml = mil_program_to_model(prog, 7);
+mil_write_mlpackage(coreml, "model.mlpackage");
+```
+
 ## Using `mil-rs` as a library
 
 See the [`mil-rs` README](crates/mil-rs/README.md) for detailed API docs and
