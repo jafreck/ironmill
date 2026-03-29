@@ -22,6 +22,9 @@ anyhow = { workspace = true }
 statrs = { workspace = true }
 half = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default = []
 ane-direct = ["mil-rs/ane-direct", "dep:ironmill-ane"]
