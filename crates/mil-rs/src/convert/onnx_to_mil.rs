@@ -74,6 +74,27 @@ pub fn convert_node(node: &NodeProto) -> Result<Vec<Operation>> {
         // Dropout is an identity in inference mode.
         "Dropout" => convert_identity(node),
 
+        // P3 — Transformer / LLM ops
+        "Sin" => convert_unary(node, "sin"),
+        "Cos" => convert_unary(node, "cos"),
+        "Neg" => convert_unary(node, "neg"),
+        "Reciprocal" => convert_unary(node, "reciprocal"),
+        "Gelu" => convert_unary(node, "gelu"),
+        "Silu" => convert_unary(node, "silu"),
+        "Log" => convert_unary(node, "log"),
+        "Exp" => convert_unary(node, "exp"),
+        "Abs" => convert_unary(node, "abs"),
+        "Ceil" => convert_unary(node, "ceil"),
+        "Floor" => convert_unary(node, "floor"),
+        "Identity" => convert_identity(node),
+        "Equal" => convert_binary(node, "equal"),
+        "Less" => convert_binary(node, "less"),
+        "Greater" => convert_binary(node, "greater"),
+        "Not" => convert_unary(node, "logical_not"),
+        "CumSum" => convert_cumsum(node),
+        "Tile" => convert_tile(node),
+        "Expand" => convert_expand(node),
+
         other => Err(MilError::UnsupportedOp(other.to_string())),
     }
 }
@@ -688,7 +709,7 @@ fn convert_constant(node: &NodeProto) -> Result<Vec<Operation>> {
     if let Some(tensor) = get_tensor_attr(node, "value") {
         let dtype = super::onnx_graph::onnx_dtype_to_scalar(tensor.data_type)?;
         let shape: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-        let raw_bytes = super::onnx_graph::extract_tensor_raw_data(tensor, dtype);
+        let raw_bytes = super::onnx_graph::extract_tensor_raw_data(tensor, dtype, None);
         op = op.with_attr(
             "val",
             Value::Tensor {
@@ -810,6 +831,43 @@ fn convert_resize(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("align_corners", Value::Bool(align));
     }
 
+    Ok(vec![with_outputs(op, node)])
+}
+
+fn convert_cumsum(node: &NodeProto) -> Result<Vec<Operation>> {
+    let name = op_name(node);
+    let mut op = Operation::new("cumsum", name);
+    if !node.input.is_empty() {
+        op = op.with_input("x", Value::Reference(node.input[0].clone()));
+    }
+    if node.input.len() > 1 {
+        op = op.with_input("axis", Value::Reference(node.input[1].clone()));
+    }
+    Ok(vec![with_outputs(op, node)])
+}
+
+fn convert_tile(node: &NodeProto) -> Result<Vec<Operation>> {
+    let name = op_name(node);
+    let mut op = Operation::new("tile", name);
+    if !node.input.is_empty() {
+        op = op.with_input("x", Value::Reference(node.input[0].clone()));
+    }
+    if node.input.len() > 1 {
+        op = op.with_input("reps", Value::Reference(node.input[1].clone()));
+    }
+    Ok(vec![with_outputs(op, node)])
+}
+
+fn convert_expand(node: &NodeProto) -> Result<Vec<Operation>> {
+    // ONNX Expand broadcasts input to a target shape.
+    let name = op_name(node);
+    let mut op = Operation::new("expand_dims", name);
+    if !node.input.is_empty() {
+        op = op.with_input("x", Value::Reference(node.input[0].clone()));
+    }
+    if node.input.len() > 1 {
+        op = op.with_input("shape", Value::Reference(node.input[1].clone()));
+    }
     Ok(vec![with_outputs(op, node)])
 }
 

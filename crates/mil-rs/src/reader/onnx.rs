@@ -1,6 +1,6 @@
 //! Reader for ONNX `.onnx` model files (protobuf binary).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use prost::Message;
 
@@ -29,6 +29,18 @@ pub fn read_onnx(path: impl AsRef<Path>) -> Result<ModelProto> {
     let bytes = std::fs::read(path.as_ref())?;
     let model = ModelProto::decode(&bytes[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
     Ok(model)
+}
+
+/// Read an ONNX `.onnx` file, returning the model and its parent directory.
+///
+/// The directory is needed to resolve external data files referenced by
+/// `TensorProto.data_location == EXTERNAL`.
+pub fn read_onnx_with_dir(path: impl AsRef<Path>) -> Result<(ModelProto, PathBuf)> {
+    let path = path.as_ref();
+    let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let bytes = std::fs::read(path)?;
+    let model = ModelProto::decode(&bytes[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
+    Ok((model, dir))
 }
 
 /// Print a human-readable summary of an ONNX model to stdout.

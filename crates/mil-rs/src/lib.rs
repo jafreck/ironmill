@@ -128,6 +128,8 @@ pub use reader::read_mlmodel;
 pub use reader::read_mlpackage;
 /// Read an ONNX `.onnx` file into an ONNX [`proto::onnx::ModelProto`].
 pub use reader::read_onnx;
+/// Read an ONNX `.onnx` file, returning the model and its parent directory.
+pub use reader::read_onnx_with_dir;
 
 /// Write a protobuf [`Model`] to a `.mlmodel` file.
 pub use writer::write_mlmodel;

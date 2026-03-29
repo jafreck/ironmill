@@ -428,6 +428,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     println!("Converting to CoreML MIL IR...");
     let config = ConversionConfig {
         merge_lora: opts.merge_lora,
+        model_dir: input_path.parent().map(|p| p.to_path_buf()),
     };
     let result = onnx_to_program_with_config(&onnx_model, &config)
         .context("Failed to convert ONNX model to MIL IR")?;

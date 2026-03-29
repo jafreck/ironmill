@@ -12,6 +12,7 @@
 //! entire conversion, so callers can inspect partial results.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use crate::convert::lora::{detect_lora_adapters, lora_initializer_names, merge_lora};
 use crate::convert::onnx_to_mil::convert_node;
@@ -42,11 +43,17 @@ pub struct ConversionConfig {
     /// Whether to detect and merge LoRA adapter weights into the base model.
     /// Defaults to `true`.
     pub merge_lora: bool,
+    /// Directory the ONNX model was loaded from.
+    /// Used to resolve external data files referenced by `TensorProto.data_location == EXTERNAL`.
+    pub model_dir: Option<PathBuf>,
 }
 
 impl Default for ConversionConfig {
     fn default() -> Self {
-        Self { merge_lora: true }
+        Self {
+            merge_lora: true,
+            model_dir: None,
+        }
     }
 }
 
@@ -81,7 +88,13 @@ pub fn onnx_to_program_with_config(
 
     let opset = extract_opset_version(model);
     let mut warnings = Vec::new();
-    let function = convert_graph(graph, opset, &mut warnings, config.merge_lora)?;
+    let function = convert_graph(
+        graph,
+        opset,
+        &mut warnings,
+        config.merge_lora,
+        config.model_dir.as_deref(),
+    )?;
 
     let mut program = Program::new("1.0.0");
     program.add_function(function);
@@ -104,6 +117,7 @@ fn convert_graph(
     _opset: i64,
     warnings: &mut Vec<String>,
     merge_lora_weights: bool,
+    model_dir: Option<&Path>,
 ) -> Result<Function> {
     // 1. Collect initializer names for fast lookup.
     let initializer_names: HashSet<&str> =
@@ -166,7 +180,7 @@ fn convert_graph(
     for tensor in &graph.initializer {
         if let Ok(dtype) = onnx_dtype_to_scalar(tensor.data_type) {
             let shape: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-            let data = extract_tensor_raw_data(tensor, dtype);
+            let data = extract_tensor_raw_data(tensor, dtype, model_dir);
             init_data.insert(tensor.name.clone(), (data, shape, dtype));
         }
     }
@@ -226,7 +240,7 @@ fn convert_graph(
 
         if let Some(fmt) = prequant.get(tensor.name.as_str()) {
             // Pre-quantized weights get special handling.
-            match prequantized_to_op(tensor, *fmt, &graph.initializer) {
+            match prequantized_to_op(tensor, *fmt, &graph.initializer, model_dir) {
                 Ok(mut op) => {
                     stamp_output_types(&mut op, &onnx_type_map);
                     block.add_op(op);
@@ -263,7 +277,7 @@ fn convert_graph(
             stamp_output_types(&mut op, &onnx_type_map);
             block.add_op(op);
         } else {
-            match initializer_to_const(tensor) {
+            match initializer_to_const(tensor, model_dir) {
                 Ok(mut op) => {
                     stamp_output_types(&mut op, &onnx_type_map);
                     block.add_op(op);
@@ -848,11 +862,11 @@ fn get_int_list(op: &Operation, name: &str) -> Option<Vec<i64>> {
 ///
 /// CoreML MIL does not support int64 tensors in most operations, so int64
 /// initializers are automatically narrowed to int32.
-fn initializer_to_const(tensor: &TensorProto) -> Result<Operation> {
+fn initializer_to_const(tensor: &TensorProto, model_dir: Option<&Path>) -> Result<Operation> {
     let mut dtype = onnx_dtype_to_scalar(tensor.data_type)?;
     let shape: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
 
-    let mut raw_bytes = extract_tensor_raw_data(tensor, dtype);
+    let mut raw_bytes = extract_tensor_raw_data(tensor, dtype, model_dir);
 
     // Narrow int64 → int32 for CoreML compatibility.
     if dtype == ScalarType::Int64 {
@@ -884,7 +898,25 @@ fn initializer_to_const(tensor: &TensorProto) -> Result<Operation> {
 /// ONNX tensors store data either in `raw_data` or in typed fields
 /// (`float_data`, `int32_data`, etc.). This function normalises both
 /// representations into a single `Vec<u8>`.
-pub(crate) fn extract_tensor_raw_data(tensor: &TensorProto, dtype: ScalarType) -> Vec<u8> {
+pub(crate) fn extract_tensor_raw_data(
+    tensor: &TensorProto,
+    dtype: ScalarType,
+    model_dir: Option<&Path>,
+) -> Vec<u8> {
+    // Handle external data (e.g., model.onnx_data sidecar files).
+    // data_location == 1 means EXTERNAL in the ONNX spec.
+    if tensor.data_location == 1 {
+        if let Some(dir) = model_dir {
+            return load_external_tensor_data(&tensor.external_data, dir);
+        } else {
+            eprintln!(
+                "warning: tensor '{}' uses external data but no model directory provided",
+                tensor.name
+            );
+            return Vec::new();
+        }
+    }
+
     if !tensor.raw_data.is_empty() {
         return tensor.raw_data.clone();
     }
@@ -941,6 +973,67 @@ pub(crate) fn extract_tensor_raw_data(tensor: &TensorProto, dtype: ScalarType) -
             .iter()
             .flat_map(|v| (*v as u32).to_le_bytes())
             .collect(),
+    }
+}
+
+/// Load tensor data from an external file referenced by ONNX `external_data` entries.
+fn load_external_tensor_data(
+    external_data: &[crate::proto::onnx::StringStringEntryProto],
+    model_dir: &Path,
+) -> Vec<u8> {
+    let mut location = None;
+    let mut offset: u64 = 0;
+    let mut length: Option<u64> = None;
+
+    for entry in external_data {
+        match entry.key.as_str() {
+            "location" => location = Some(entry.value.clone()),
+            "offset" => offset = entry.value.parse().unwrap_or(0),
+            "length" => length = entry.value.parse().ok(),
+            _ => {}
+        }
+    }
+
+    let Some(file_name) = location else {
+        eprintln!("warning: external_data has no 'location' key");
+        return Vec::new();
+    };
+
+    let file_path = model_dir.join(&file_name);
+    let file = match std::fs::File::open(&file_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to open external data file '{}': {e}",
+                file_path.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = std::io::BufReader::new(file);
+    if offset > 0 {
+        if let Err(e) = reader.seek(SeekFrom::Start(offset)) {
+            eprintln!("warning: failed to seek in external data file: {e}");
+            return Vec::new();
+        }
+    }
+
+    if let Some(len) = length {
+        let mut buf = vec![0u8; len as usize];
+        if let Err(e) = reader.read_exact(&mut buf) {
+            eprintln!("warning: failed to read external data: {e}");
+            return Vec::new();
+        }
+        buf
+    } else {
+        let mut buf = Vec::new();
+        if let Err(e) = reader.read_to_end(&mut buf) {
+            eprintln!("warning: failed to read external data: {e}");
+            return Vec::new();
+        }
+        buf
     }
 }
 
@@ -1050,8 +1143,9 @@ fn prequantized_to_op(
     tensor: &TensorProto,
     fmt: PreQuantFormat,
     all_initializers: &[TensorProto],
+    model_dir: Option<&Path>,
 ) -> Result<Operation> {
-    let mut op = initializer_to_const(tensor)?;
+    let mut op = initializer_to_const(tensor, model_dir)?;
 
     let fmt_str = match fmt {
         PreQuantFormat::QLoRA => "qlora",
@@ -1079,7 +1173,7 @@ fn prequantized_to_op(
         if let Some(aux_tensor) = all_initializers.iter().find(|t| t.name == aux_name) {
             if let Ok(aux_dtype) = onnx_dtype_to_scalar(aux_tensor.data_type) {
                 let shape: Vec<usize> = aux_tensor.dims.iter().map(|&d| d as usize).collect();
-                let raw = extract_tensor_raw_data(aux_tensor, aux_dtype);
+                let raw = extract_tensor_raw_data(aux_tensor, aux_dtype, None);
                 let attr_key = suffix.trim_start_matches('.').replace('.', "_");
                 op.attributes.insert(
                     attr_key,
