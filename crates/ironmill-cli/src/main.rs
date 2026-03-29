@@ -10,12 +10,13 @@ use mil_rs::ir::PassPipeline;
 use mil_rs::ir::PipelineReport;
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::validate::{print_validation_report, validation_report_to_json};
+#[allow(unused_imports)]
 use mil_rs::{
     ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer, compile_model,
     compile_model_with_backend, convert_pipeline, is_compiler_available,
     onnx_to_program_with_config, parse_pipeline_manifest, program_to_model,
     program_to_multi_function_model, program_to_updatable_model, read_mlmodel, read_mlpackage,
-    read_onnx, validate_ane_compatibility, write_mlpackage,
+    read_onnx, validate_ane_compatibility, weights_to_program, write_mlpackage,
 };
 
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
@@ -246,6 +247,38 @@ fn count_ops(program: &mil_rs::ir::Program) -> usize {
         .sum()
 }
 
+/// Detected input format for the compile command.
+enum InputFormat {
+    Onnx,
+    SafeTensors,
+    Gguf,
+    CoreMl(String),
+    Unknown(String),
+}
+
+/// Detect the input format from a file path.
+fn detect_input_format(path: &Path) -> InputFormat {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        match ext {
+            "onnx" => return InputFormat::Onnx,
+            "gguf" => return InputFormat::Gguf,
+            "mlmodel" | "mlpackage" => return InputFormat::CoreMl(ext.to_string()),
+            "safetensors" => return InputFormat::SafeTensors,
+            _ => {}
+        }
+    }
+    // A directory with config.json is a HuggingFace model directory.
+    if path.is_dir() && path.join("config.json").exists() {
+        return InputFormat::SafeTensors;
+    }
+    let ext_display = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("<none>")
+        .to_string();
+    InputFormat::Unknown(ext_display)
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -374,12 +407,6 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
         bail!("Input file not found: {input}");
     }
 
-    let ext = input_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
     if opts.target != "all" && opts.target != "cpu-and-ne" {
         println!(
             "Note: --target '{}' will be fully supported in Phase 3. Proceeding with default target.",
@@ -387,9 +414,10 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
         );
     }
 
-    match ext.as_str() {
-        "onnx" => compile_from_onnx(input_path, &opts),
-        "mlmodel" | "mlpackage" => {
+    match detect_input_format(input_path) {
+        InputFormat::Onnx => compile_from_onnx(input_path, &opts),
+        InputFormat::SafeTensors | InputFormat::Gguf => compile_from_weights(input_path, &opts),
+        InputFormat::CoreMl(ext) => {
             if opts.moe_split || opts.moe_bundle || opts.moe_fuse_topk.is_some() {
                 println!(
                     "Note: --moe-split/--moe-bundle/--moe-fuse-topk is only supported for ONNX input. Ignoring."
@@ -397,7 +425,13 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
             }
             compile_coreml(input_path, &ext, opts.backend)
         }
-        _ => bail!("Unsupported input format '.{ext}'. Expected .onnx, .mlmodel, or .mlpackage"),
+        InputFormat::Unknown(ext) => {
+            bail!(
+                "Unrecognized input format (extension: '{ext}'). \
+                 Supported formats: .onnx, .safetensors, .gguf, .mlmodel, .mlpackage, \
+                 or a HuggingFace model directory containing config.json."
+            );
+        }
     }
 }
 
@@ -908,6 +942,46 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     println!();
     println!("Conversion complete.");
     Ok(())
+}
+
+/// Compile a model from SafeTensors or GGUF weight files.
+fn compile_from_weights(input_path: &Path, _opts: &CompileOpts) -> Result<()> {
+    let input_display = input_path.display();
+
+    let is_gguf = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e == "gguf");
+
+    if is_gguf {
+        bail!("GGUF format support is not yet implemented. Please use SafeTensors format.");
+    }
+
+    // 1. Load weights
+    println!("Loading weights from: {input_display}");
+    println!("  Note: SafeTensors provider is a stub — using template for graph construction.");
+    println!();
+
+    // TODO(milestone-2): Replace this stub with real SafeTensorsProvider.
+    // For now, we construct the program using the template which will
+    // emit warnings for any missing weight tensors.
+    bail!(
+        "SafeTensors weight loading is not yet implemented (Milestone 2). \
+         The architecture template and CLI routing are ready — \
+         provide a SafeTensorsProvider implementation to enable end-to-end conversion."
+    );
+
+    // When SafeTensorsProvider is implemented, the flow will be:
+    //
+    //   let provider = SafeTensorsProvider::load(input_path)?;
+    //   let result = weights_to_program(&provider)?;
+    //   let mut program = result.program;
+    //   let warnings = result.warnings;
+    //
+    //   // Build and run the same pass pipeline as ONNX:
+    //   let pipeline = build_pass_pipeline(opts)?;
+    //   let report = pipeline.run(&mut program)?;
+    //   // ... write output ...
 }
 
 /// Compile a .mlpackage using the selected backend.

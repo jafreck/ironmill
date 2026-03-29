@@ -93,6 +93,11 @@ pub use convert::program_to_updatable_model;
 /// Configuration for producing an updatable CoreML model.
 pub use convert::{LossFunction, UpdatableModelConfig, UpdateOptimizer};
 
+/// Build a MIL IR [`Program`] from weight tensors using architecture templates.
+pub use convert::weights_to_program;
+/// Weight provider abstraction for SafeTensors/GGUF formats.
+pub use convert::{Architecture, ModelConfig, WeightProvider, WeightTensor};
+
 /// Detect Mixture-of-Experts architecture in a MIL [`Program`].
 pub use convert::moe::detect_moe;
 /// Fuse top-K most frequently activated experts into a single dense program.
