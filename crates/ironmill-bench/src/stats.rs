@@ -14,6 +14,23 @@ pub struct BenchResult {
     pub min: f64,
     pub max: f64,
     pub cv: f64,
+
+    // Throughput fields
+    /// Inferences per second (1000.0 / median_ms).
+    #[serde(default)]
+    pub inferences_per_sec: f64,
+    /// Achieved TFLOPS (model_flops / median_sec / 1e12).
+    #[serde(default)]
+    pub tflops: Option<f64>,
+    /// Tokens per second for autoregressive models.
+    #[serde(default)]
+    pub tokens_per_sec: Option<f64>,
+    /// Time to first token in ms (prefill latency).
+    #[serde(default)]
+    pub ttft_ms: Option<f64>,
+    /// Per-token decode throughput (tok/s).
+    #[serde(default)]
+    pub decode_tok_per_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +55,15 @@ pub struct AggregatedResult {
 
 /// Compute statistics from a vector of latencies (in milliseconds).
 pub fn compute_stats(label: &str, latencies: &[f64]) -> BenchResult {
+    compute_stats_with_flops(label, latencies, None)
+}
+
+/// Compute statistics with optional FLOPs count for TFLOPS calculation.
+pub fn compute_stats_with_flops(
+    label: &str,
+    latencies: &[f64],
+    model_flops: Option<u64>,
+) -> BenchResult {
     if latencies.is_empty() {
         return BenchResult {
             config_label: label.to_string(),
@@ -50,6 +76,11 @@ pub fn compute_stats(label: &str, latencies: &[f64]) -> BenchResult {
             min: 0.0,
             max: 0.0,
             cv: 0.0,
+            inferences_per_sec: 0.0,
+            tflops: None,
+            tokens_per_sec: None,
+            ttft_ms: None,
+            decode_tok_per_sec: None,
         };
     }
 
@@ -73,6 +104,16 @@ pub fn compute_stats(label: &str, latencies: &[f64]) -> BenchResult {
     let max = sorted[sorted.len() - 1];
     let cv = if mean != 0.0 { stddev / mean } else { 0.0 };
 
+    let inferences_per_sec = if median > 0.0 { 1000.0 / median } else { 0.0 };
+    let tflops = model_flops.map(|flops| {
+        let median_sec = median / 1000.0;
+        if median_sec > 0.0 {
+            flops as f64 / median_sec / 1e12
+        } else {
+            0.0
+        }
+    });
+
     BenchResult {
         config_label: label.to_string(),
         latencies_ms: latencies.to_vec(),
@@ -84,6 +125,11 @@ pub fn compute_stats(label: &str, latencies: &[f64]) -> BenchResult {
         min,
         max,
         cv,
+        inferences_per_sec,
+        tflops,
+        tokens_per_sec: None,
+        ttft_ms: None,
+        decode_tok_per_sec: None,
     }
 }
 

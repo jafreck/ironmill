@@ -1,6 +1,9 @@
+mod baseline;
 mod compiler;
 mod config;
+mod hardware;
 mod inference;
+mod power;
 mod quality;
 mod report;
 mod stats;
@@ -11,8 +14,9 @@ use anyhow::Result;
 use clap::Parser;
 
 use config::{ModelConfig, Settings};
-use report::{BenchReport, OutputFormat, ReportRow};
-use stats::{aggregate_runs, compute_stats, welch_t_test};
+use report::{BenchReport, MemorySummary, OutputFormat, ReportRow, UtilizationSummary};
+#[allow(unused_imports)]
+use stats::{aggregate_runs, compute_stats, compute_stats_with_flops, welch_t_test};
 
 #[derive(Parser)]
 #[command(name = "ironmill-bench", about = "Inference benchmark harness")]
@@ -64,6 +68,18 @@ struct Cli {
     /// Remove all cached compilation artifacts
     #[arg(long)]
     clean_cache: bool,
+
+    /// Enable energy sampling (requires sudo for powermetrics)
+    #[arg(long)]
+    power: bool,
+
+    /// Save results as a named baseline for regression tracking
+    #[arg(long)]
+    save_baseline: Option<String>,
+
+    /// Compare against a saved baseline
+    #[arg(long)]
+    compare_baseline: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -104,8 +120,6 @@ fn main() -> Result<()> {
         warmup: cli.warmup,
         runs: cli.runs,
         backends: if cli.backend.is_empty() {
-            // Default: benchmark on each compute unit individually to show the
-            // performance matrix across hardware targets.
             vec!["cpu".to_string(), "gpu".to_string(), "ane".to_string()]
         } else {
             cli.backend.clone()
@@ -120,9 +134,33 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("invalid backend: {e}"))?;
 
+    // Power sampling setup
+    let power_enabled = cli.power && power::is_power_available();
+    if cli.power && !power_enabled {
+        eprintln!("Energy metrics unavailable (requires sudo)");
+    }
+
+    // Sample idle power if power measurement is enabled
+    let idle_power = if power_enabled {
+        eprintln!("Sampling idle power (2s)...");
+        power::sample_idle_power(std::time::Duration::from_secs(2))
+    } else {
+        None
+    };
+
     let mut report_rows = Vec::new();
 
     for model_cfg in &matrix.models {
+        // Compute model FLOPs if we can parse the model
+        let model_flops = compute_model_flops(model_cfg);
+        if let Some(flops) = model_flops {
+            eprintln!(
+                "  Model FLOPs: {:.2}G ({:.2}M MACs)",
+                flops as f64 / 1e9,
+                flops as f64 / 2e6
+            );
+        }
+
         for opt_cfg in &matrix.optimizations {
             eprintln!("Compiling {} with {}...", model_cfg.name, opt_cfg.name);
             let mlmodelc = compiler::compile_model(model_cfg, opt_cfg, &cache_dir, cli.no_cache)?;
@@ -130,7 +168,21 @@ fn main() -> Result<()> {
             for &cu in &compute_units {
                 eprintln!("  Running inference ({cu})...");
 
+                // Start power sampling if enabled
+                let power_sampler = if power_enabled {
+                    let expected_duration_sec =
+                        matrix.settings.iterations as f64 * 0.001 * matrix.settings.runs as f64;
+                    let samples = (expected_duration_sec * 10.0).max(20.0) as usize;
+                    power::PowerSampler::start(100, samples)
+                } else {
+                    None
+                };
+
                 let mut run_results = Vec::new();
+                let mut last_utilization = None;
+                let mut last_memory = None;
+                let mut last_load_time = None;
+
                 for run_idx in 0..matrix.settings.runs {
                     let result = inference::run_inference(
                         &mlmodelc,
@@ -138,6 +190,10 @@ fn main() -> Result<()> {
                         matrix.settings.iterations,
                         matrix.settings.warmup,
                     )?;
+
+                    last_load_time = Some(result.load_time.as_secs_f64() * 1000.0);
+                    last_utilization = result.utilization;
+                    last_memory = result.memory;
 
                     let latencies_ms: Vec<f64> = result
                         .latencies
@@ -147,11 +203,29 @@ fn main() -> Result<()> {
 
                     let label =
                         format!("{}/{}/{}/run{}", model_cfg.name, opt_cfg.name, cu, run_idx);
-                    run_results.push(compute_stats(&label, &latencies_ms));
+                    run_results.push(compute_stats_with_flops(&label, &latencies_ms, model_flops));
                 }
 
                 let label = format!("{}/{}/{}", model_cfg.name, opt_cfg.name, cu);
                 let aggregated = aggregate_runs(&label, &run_results);
+
+                // Collect power metrics
+                let energy = power_sampler.and_then(|sampler| {
+                    let power_metrics = sampler.finish()?;
+                    Some(power::compute_energy_metrics(
+                        power_metrics,
+                        idle_power.clone(),
+                        aggregated.pooled.inferences_per_sec,
+                        aggregated.pooled.median / 1000.0,
+                        aggregated.pooled.tflops,
+                        aggregated.pooled.tokens_per_sec,
+                    ))
+                });
+
+                let utilization_summary = last_utilization
+                    .as_ref()
+                    .map(UtilizationSummary::from_metrics);
+                let memory_summary = last_memory.as_ref().map(MemorySummary::from_metrics);
 
                 report_rows.push(ReportRow {
                     model: model_cfg.name.clone(),
@@ -159,6 +233,10 @@ fn main() -> Result<()> {
                     backend: cu.to_string(),
                     result: aggregated,
                     significance: None,
+                    energy,
+                    utilization: utilization_summary,
+                    memory: memory_summary,
+                    load_time_ms: last_load_time,
                 });
             }
         }
@@ -227,6 +305,10 @@ fn main() -> Result<()> {
                             backend: "ane-direct".to_string(),
                             result: aggregated,
                             significance: None,
+                            energy: None,
+                            utilization: None,
+                            memory: None,
+                            load_time_ms: None,
                         });
                     }
                 }
@@ -249,11 +331,11 @@ fn main() -> Result<()> {
             if row.optimization == *baseline_name {
                 continue;
             }
-            if let Some(baseline) = baseline_rows
+            if let Some(bl) = baseline_rows
                 .iter()
                 .find(|b| b.model == row.model && b.backend == row.backend)
             {
-                let sig = welch_t_test(&baseline.result.pooled, &row.result.pooled, cli.alpha);
+                let sig = welch_t_test(&bl.result.pooled, &row.result.pooled, cli.alpha);
                 row.significance = Some(sig);
             }
         }
@@ -266,5 +348,70 @@ fn main() -> Result<()> {
 
     print!("{}", report::format_report(&bench_report, cli.output));
 
+    // Save baseline if requested
+    if let Some(baseline_name) = &cli.save_baseline {
+        let entries: Vec<baseline::BaselineEntry> = bench_report
+            .rows
+            .iter()
+            .map(|row| baseline::BaselineEntry {
+                model: row.model.clone(),
+                optimization: row.optimization.clone(),
+                backend: row.backend.clone(),
+                median_ms: row.result.pooled.median,
+                mean_ms: row.result.pooled.mean,
+                p95_ms: row.result.pooled.p95,
+                inferences_per_sec: row.result.pooled.inferences_per_sec,
+                tflops: row.result.pooled.tflops,
+            })
+            .collect();
+
+        let path = baseline::save_baseline(baseline_name, &entries)?;
+        eprintln!("Baseline saved: {}", path.display());
+    }
+
+    // Compare against baseline if requested
+    if let Some(baseline_name) = &cli.compare_baseline {
+        let baseline_data = baseline::load_baseline(baseline_name)?;
+        let current_entries: Vec<baseline::BaselineEntry> = bench_report
+            .rows
+            .iter()
+            .map(|row| baseline::BaselineEntry {
+                model: row.model.clone(),
+                optimization: row.optimization.clone(),
+                backend: row.backend.clone(),
+                median_ms: row.result.pooled.median,
+                mean_ms: row.result.pooled.mean,
+                p95_ms: row.result.pooled.p95,
+                inferences_per_sec: row.result.pooled.inferences_per_sec,
+                tflops: row.result.pooled.tflops,
+            })
+            .collect();
+
+        let regression_report =
+            baseline::compare_against_baseline(&baseline_data, &current_entries);
+        eprintln!(
+            "\n{}",
+            baseline::format_regression_report(&regression_report)
+        );
+    }
+
     Ok(())
+}
+
+/// Try to compute model FLOPs by parsing the ONNX model into MIL IR.
+fn compute_model_flops(model_cfg: &ModelConfig) -> Option<u64> {
+    if !model_cfg.path.exists() {
+        return None;
+    }
+
+    let ext = model_cfg.path.extension()?.to_str()?;
+    match ext {
+        "onnx" => {
+            let onnx = mil_rs::read_onnx(model_cfg.path.to_str()?).ok()?;
+            let result = mil_rs::onnx_to_program(&onnx).ok()?;
+            let flops = result.program.total_flops();
+            if flops > 0 { Some(flops) } else { None }
+        }
+        _ => None,
+    }
 }

@@ -56,6 +56,14 @@ impl Program {
     pub fn is_autoregressive(&self) -> bool {
         self.has_attribute("autoregressive", "true")
     }
+
+    /// Estimate the total floating-point operations (FLOPs) for a forward pass.
+    ///
+    /// Walks all functions and sums per-op FLOPs using shape-aware formulas
+    /// for conv, matmul, linear, attention, and other compute ops.
+    pub fn total_flops(&self) -> u64 {
+        crate::analysis::flops::estimate_program_flops(self)
+    }
 }
 
 /// A function in the MIL program — a graph with a typed signature.

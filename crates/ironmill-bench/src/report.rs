@@ -3,6 +3,9 @@ use std::fmt::Write;
 use serde::Serialize;
 
 use crate::config::Settings;
+use crate::hardware::HardwareInfo;
+use crate::inference::{MemoryMetrics, UtilizationMetrics};
+use crate::power::EnergyMetrics;
 use crate::stats::{AggregatedResult, SignificanceResult};
 
 /// Output format selection.
@@ -22,6 +25,56 @@ pub struct ReportRow {
     pub backend: String,
     pub result: AggregatedResult,
     pub significance: Option<SignificanceResult>,
+    /// Energy efficiency metrics (when --power is used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub energy: Option<EnergyMetrics>,
+    /// ANE utilization breakdown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<UtilizationSummary>,
+    /// Memory footprint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySummary>,
+    /// Model load time in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_time_ms: Option<f64>,
+}
+
+/// Summary of utilization metrics for serialization.
+#[derive(Debug, Clone, Serialize)]
+pub struct UtilizationSummary {
+    pub predict_pct: f64,
+    pub dispatch_overhead_ms: f64,
+}
+
+/// Summary of memory metrics for serialization.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemorySummary {
+    pub rss_after_load_mb: f64,
+    pub peak_rss_mb: f64,
+    pub rss_growth_mb: f64,
+    pub model_file_size_mb: f64,
+    pub efficiency_ratio: f64,
+}
+
+impl UtilizationSummary {
+    pub fn from_metrics(m: &UtilizationMetrics) -> Self {
+        Self {
+            predict_pct: m.utilization_pct(),
+            dispatch_overhead_ms: m.dispatch_overhead_ms(),
+        }
+    }
+}
+
+impl MemorySummary {
+    pub fn from_metrics(m: &MemoryMetrics) -> Self {
+        Self {
+            rss_after_load_mb: m.rss_after_load as f64 / (1024.0 * 1024.0),
+            peak_rss_mb: m.peak_rss as f64 / (1024.0 * 1024.0),
+            rss_growth_mb: m.rss_growth_mb(),
+            model_file_size_mb: m.model_file_size as f64 / (1024.0 * 1024.0),
+            efficiency_ratio: m.efficiency_ratio(),
+        }
+    }
 }
 
 /// Full benchmark report.
@@ -31,11 +84,117 @@ pub struct BenchReport {
     pub settings: Settings,
 }
 
+/// Structured JSON output with versioned schema.
+#[derive(Debug, Clone, Serialize)]
+pub struct StructuredReport {
+    pub version: &'static str,
+    pub timestamp: String,
+    pub hardware: HardwareInfo,
+    pub ironmill_version: String,
+    pub results: Vec<StructuredResult>,
+}
+
+/// A single result in the structured JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct StructuredResult {
+    pub model: String,
+    pub optimization: String,
+    pub backend: String,
+    pub iterations: usize,
+    pub warmup: usize,
+    pub runs: usize,
+    pub latency: LatencyStats,
+    pub throughput: ThroughputStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub energy: Option<EnergyMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<UtilizationSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LatencyStats {
+    pub mean_ms: f64,
+    pub median_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub stddev_ms: f64,
+    pub cv: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThroughputStats {
+    pub inferences_per_sec: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tflops: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_tok_per_sec: Option<f64>,
+}
+
+/// Build a structured JSON report from a BenchReport.
+pub fn build_structured_report(report: &BenchReport) -> StructuredReport {
+    let hardware = HardwareInfo::detect();
+    let timestamp = {
+        use std::time::SystemTime;
+        let dur = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}", dur.as_secs())
+    };
+
+    let results = report
+        .rows
+        .iter()
+        .map(|row| {
+            let r = &row.result.pooled;
+            StructuredResult {
+                model: row.model.clone(),
+                optimization: row.optimization.clone(),
+                backend: row.backend.clone(),
+                iterations: report.settings.iterations,
+                warmup: report.settings.warmup,
+                runs: report.settings.runs,
+                latency: LatencyStats {
+                    mean_ms: r.mean,
+                    median_ms: r.median,
+                    p95_ms: r.p95,
+                    p99_ms: r.p99,
+                    stddev_ms: r.stddev,
+                    cv: r.cv,
+                },
+                throughput: ThroughputStats {
+                    inferences_per_sec: r.inferences_per_sec,
+                    tflops: r.tflops,
+                    tokens_per_sec: r.tokens_per_sec,
+                    ttft_ms: r.ttft_ms,
+                    decode_tok_per_sec: r.decode_tok_per_sec,
+                },
+                energy: row.energy.clone(),
+                utilization: row.utilization.clone(),
+                memory: row.memory.clone(),
+            }
+        })
+        .collect();
+
+    StructuredReport {
+        version: "1",
+        timestamp,
+        hardware,
+        ironmill_version: env!("CARGO_PKG_VERSION").to_string(),
+        results,
+    }
+}
+
 /// Format the report in the specified output format.
 pub fn format_report(report: &BenchReport, format: OutputFormat) -> String {
     match format {
         OutputFormat::Table => format_table(report),
-        OutputFormat::Json => format_json(report),
+        OutputFormat::Json => format_structured_json(report),
         OutputFormat::Csv => format_csv(report),
         OutputFormat::Markdown => format_markdown(report),
     }
@@ -108,7 +267,7 @@ fn format_cross_table(report: &BenchReport, backends: &[String]) -> String {
 
         writeln!(
             out,
-            "{} — {} runs × {} iterations (median latency)",
+            "{} — {} runs × {} iterations (median latency, inf/sec)",
             model, report.settings.runs, report.settings.iterations
         )
         .unwrap();
@@ -206,14 +365,20 @@ fn format_flat_table(report: &BenchReport) -> String {
             .unwrap();
             writeln!(
                 out,
-                "{:<18} {:>10}  {:>7}  {:>7}  {:>7}",
-                "Configuration", "mean±sd", "median", "p95", "p99"
+                "{:<18} {:>10}  {:>7}  {:>7}  {:>7}  {:>8}  {:>8}",
+                "Configuration", "mean±sd", "median", "p95", "p99", "inf/sec", "TFLOPS"
             )
             .unwrap();
             writeln!(
                 out,
-                "{:<18} {:>10}  {:>7}  {:>7}  {:>7}",
-                "─────────────────", "─────────", "───────", "───────", "───────"
+                "{:<18} {:>10}  {:>7}  {:>7}  {:>7}  {:>8}  {:>8}",
+                "─────────────────",
+                "─────────",
+                "───────",
+                "───────",
+                "───────",
+                "────────",
+                "────────"
             )
             .unwrap();
         }
@@ -226,10 +391,20 @@ fn format_flat_table(report: &BenchReport) -> String {
             format!("{}/{}", row.optimization, row.backend)
         };
 
+        let tflops_str = r.tflops.map_or("—".to_string(), |t| format!("{:.2}", t));
+
         writeln!(
             out,
-            "{:<18} {:>5.1}±{:.1}ms  {:>5.1}ms  {:>5.1}ms  {:>5.1}ms{}",
-            label, r.mean, r.stddev, r.median, r.p95, r.p99, stars
+            "{:<18} {:>5.1}±{:.1}ms  {:>5.1}ms  {:>5.1}ms  {:>5.1}ms  {:>8.0}  {:>8}{}",
+            label,
+            r.mean,
+            r.stddev,
+            r.median,
+            r.p95,
+            r.p99,
+            r.inferences_per_sec,
+            tflops_str,
+            stars
         )
         .unwrap();
     }
@@ -237,9 +412,10 @@ fn format_flat_table(report: &BenchReport) -> String {
     out
 }
 
-/// Format as JSON.
-fn format_json(report: &BenchReport) -> String {
-    serde_json::to_string_pretty(report).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+/// Format as structured JSON with versioned schema and hardware info.
+fn format_structured_json(report: &BenchReport) -> String {
+    let structured = build_structured_report(report);
+    serde_json::to_string_pretty(&structured).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
 }
 
 /// Format as CSV.
@@ -247,7 +423,7 @@ fn format_csv(report: &BenchReport) -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "model,optimization,backend,mean,stddev,median,p95,p99,min,max,cv,p_value"
+        "model,optimization,backend,mean,stddev,median,p95,p99,min,max,cv,inf_per_sec,tflops,p_value"
     )
     .unwrap();
 
@@ -258,10 +434,11 @@ fn format_csv(report: &BenchReport) -> String {
             .as_ref()
             .map(|s| format!("{:.6}", s.p_value))
             .unwrap_or_default();
+        let tflops = r.tflops.map(|t| format!("{:.4}", t)).unwrap_or_default();
 
         writeln!(
             out,
-            "{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.6},{}",
+            "{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.6},{:.2},{},{}",
             row.model,
             row.optimization,
             row.backend,
@@ -273,6 +450,8 @@ fn format_csv(report: &BenchReport) -> String {
             r.min,
             r.max,
             r.cv,
+            r.inferences_per_sec,
+            tflops,
             p_value
         )
         .unwrap();
@@ -351,6 +530,10 @@ mod tests {
                     backend: "all".to_string(),
                     result: agg1,
                     significance: None,
+                    energy: None,
+                    utilization: None,
+                    memory: None,
+                    load_time_ms: None,
                 },
                 ReportRow {
                     model: "MobileNetV2".to_string(),
@@ -365,6 +548,10 @@ mod tests {
                         ci_upper: 2.5,
                         method: "welch_t_test".to_string(),
                     }),
+                    energy: None,
+                    utilization: None,
+                    memory: None,
+                    load_time_ms: None,
                 },
             ],
             settings: Settings {
@@ -393,8 +580,10 @@ mod tests {
         let json = format_report(&report, OutputFormat::Json);
         assert!(json.starts_with('{'));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed["rows"].is_array());
-        assert_eq!(parsed["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["version"], "1");
+        assert!(parsed["hardware"].is_object());
+        assert!(parsed["results"].is_array());
+        assert_eq!(parsed["results"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -404,7 +593,7 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(
             lines[0],
-            "model,optimization,backend,mean,stddev,median,p95,p99,min,max,cv,p_value"
+            "model,optimization,backend,mean,stddev,median,p95,p99,min,max,cv,inf_per_sec,tflops,p_value"
         );
         assert_eq!(lines.len(), 3); // header + 2 data rows
         assert!(lines[1].starts_with("MobileNetV2,baseline,"));

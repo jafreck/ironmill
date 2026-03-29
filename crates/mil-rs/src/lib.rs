@@ -58,6 +58,8 @@
 //! [examples/build_rs_example.rs](../examples/build_rs_example.rs) for usage
 //! patterns.
 
+/// Analysis passes for MIL IR programs (FLOPs counting, etc.).
+pub mod analysis;
 /// High-level builder API for compiling ML models at build time.
 ///
 /// Provides [`CompileBuilder`] for use in `build.rs` scripts.
@@ -138,6 +140,9 @@ pub use ir::{
     OpSplittingPass, Operation, Pass, PassPipeline, PassResult, PipelineReport, Program,
     ScalarType, SplitResult, TensorType, Value,
 };
+
+/// Estimate total FLOPs for a MIL program's forward pass.
+pub use analysis::flops::estimate_program_flops;
 
 /// Result of ANE compatibility analysis.
 pub use validate::ValidationReport;
