@@ -13,7 +13,7 @@ Apple's CoreML format without Python. Think of it as the Rust equivalent of Appl
 2. `docs/research/value-proposition.md` — why this exists (honest assessment)
 3. `docs/research/ane-research.md` — the macOS AI landscape
 4. `docs/research/competitive-analysis.md` — every competitor examined
-5. `docs/IMPLEMENTATION_PLAN.md` — the full phased task breakdown
+5. `docs/INFERENCE_IMPROVEMENTS_PLAN.md` — the forward-looking inference roadmap
 
 ## Project Structure
 
@@ -55,8 +55,10 @@ ironmill/
 │       └── src/
 │           └── main.rs           # clap-based CLI (exists, scaffold)
 ├── docs/
-│   ├── IMPLEMENTATION_PLAN.md    # Detailed task breakdown
-│   └── research/                 # Background research
+│   ├── INFERENCE_IMPROVEMENTS_PLAN.md  # Inference roadmap
+│   ├── QUALITY_BENCHMARK_PLAN.md      # Quality benchmark roadmap
+│   ├── TEST_SPEC.md                   # Integration test design spec
+│   └── research/                      # Background research
 │       ├── ane-research.md
 │       ├── competitive-analysis.md
 │       ├── integration-strategy.md
@@ -164,7 +166,7 @@ A task is done when:
 2. All new public APIs have doc comments
 3. Unit tests exist for the happy path and at least one error case
 4. Existing tests still pass (`cargo test`)
-5. The implementation matches what the IMPLEMENTATION_PLAN.md describes
+5. The implementation matches what the relevant plan/spec documents describe
 
 ## Test Fixtures
 
@@ -209,7 +211,7 @@ p1-vendor-protos
 When dispatching a task to a sub-agent, provide:
 1. The task ID and full description from the task database
 2. A pointer to `docs/AGENT_GUIDE.md` for conventions and structure
-3. A pointer to `docs/IMPLEMENTATION_PLAN.md` for the specific task section
+3. A pointer to the relevant plan doc (e.g., `docs/INFERENCE_IMPROVEMENTS_PLAN.md`)
 4. Which files the previous task created (so the agent knows what exists)
 
 ### Commit convention
