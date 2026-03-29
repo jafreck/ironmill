@@ -37,6 +37,10 @@ harness = false
 name = "passes"
 harness = false
 
+[[bench]]
+name = "weight_formats"
+harness = false
+
 [features]
 ane-direct = []
 
