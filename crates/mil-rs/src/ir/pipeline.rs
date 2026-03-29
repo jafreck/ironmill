@@ -720,6 +720,7 @@ fn estimate_memory(program: &Program) -> u64 {
 }
 
 /// Report from running a [`PassPipeline`].
+#[derive(Debug)]
 pub struct PipelineReport {
     pub pass_results: Vec<PassResult>,
 }
@@ -838,6 +839,7 @@ impl PipelineReport {
 }
 
 /// Result of a single pass execution.
+#[derive(Debug)]
 pub struct PassResult {
     pub name: String,
     pub ops_before: usize,

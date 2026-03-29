@@ -43,6 +43,10 @@
 //! Legacy `NeuralNetwork` models can be read and written at the protobuf level
 //! but cannot be converted to the MIL IR.
 
+/// High-level builder API for compiling ML models at build time.
+///
+/// Provides [`CompileBuilder`] for use in `build.rs` scripts.
+pub mod build_api;
 /// C-compatible FFI API for use from C, Swift, C++, Go, etc.
 #[cfg(feature = "c-api")]
 pub mod c_api;
@@ -150,3 +154,6 @@ pub use convert::SafeTensorsProvider;
 pub use writer::write_mlmodel;
 /// Write a protobuf [`Model`] to a `.mlpackage` directory.
 pub use writer::write_mlpackage;
+
+/// Builder for compiling ML models at build time.
+pub use build_api::{BuildOutput, CompileBuilder, Quantization, TargetComputeUnit};
