@@ -1582,3 +1582,409 @@ fn polar_quant_lut_shape_preserved_in_proto() {
         "original shape tensor should be preserved through serialization"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// PolarQuant unit + quality tests
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: build a program with a single const op of the given shape (FP32)
+/// and a matmul consumer.
+fn make_program_with_const(shape: Vec<usize>) -> Program {
+    let numel: usize = shape.iter().product();
+    let tensor_data: Vec<f32> = (0..numel).map(|i| (i as f32) * 0.001).collect();
+    let tensor_bytes: Vec<u8> = tensor_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let input_ty = TensorType::new(ScalarType::Float32, vec![1, shape[shape.len() - 1]]);
+    let mut func = Function::new("main");
+    func = func.with_input("input", input_ty);
+
+    let mut program = Program::new("1");
+    program.add_function(func);
+
+    let block = &mut program.functions.get_mut("main").unwrap().body;
+    block.add_op(
+        Operation::new("const", "weight_0")
+            .with_input(
+                "val",
+                Value::Tensor {
+                    data: tensor_bytes,
+                    shape,
+                    dtype: ScalarType::Float32,
+                },
+            )
+            .with_output("weight_0_out"),
+    );
+    block.add_op(
+        Operation::new("matmul", "matmul_0")
+            .with_input("x", Value::Reference("input".into()))
+            .with_input("y", Value::Reference("weight_0_out".into()))
+            .with_output("output"),
+    );
+    block.outputs.push("output".into());
+
+    program
+}
+
+#[test]
+fn polar_quant_converts_const_to_lut() {
+    let mut program = make_program_with_const(vec![8, 128]); // 1024 elements
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let ops = &program.functions["main"].body.operations;
+    assert_eq!(
+        ops[0].op_type, "constexpr_lut_to_dense",
+        "const op should be converted to constexpr_lut_to_dense"
+    );
+    assert!(ops[0].attributes.contains_key("lut"));
+    assert!(ops[0].attributes.contains_key("indices"));
+    assert!(ops[0].attributes.contains_key("shape"));
+}
+
+#[test]
+fn polar_quant_preserves_output_shape() {
+    let original_shape = vec![16, 64]; // 1024 elements
+    let mut program = make_program_with_const(original_shape.clone());
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let ops = &program.functions["main"].body.operations;
+    let shape_attr = match ops[0].attributes.get("shape") {
+        Some(Value::Tensor { data, shape, dtype }) => {
+            assert_eq!(*dtype, ScalarType::UInt32);
+            // shape tensor records rank as its own shape
+            assert_eq!(*shape, vec![original_shape.len()]);
+            // decode the stored dimensions
+            let dims: Vec<u32> = data
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            dims.into_iter().map(|d| d as usize).collect::<Vec<_>>()
+        }
+        other => panic!("expected shape tensor, got {other:?}"),
+    };
+    assert_eq!(
+        shape_attr, original_shape,
+        "shape attribute should match original weight shape"
+    );
+}
+
+#[test]
+fn polar_quant_skips_small_tensors() {
+    // 512 elements < 1024 min_elements threshold
+    let mut program = make_program_with_const(vec![8, 64]);
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let ops = &program.functions["main"].body.operations;
+    assert_eq!(
+        ops[0].op_type, "const",
+        "small tensors should not be quantized"
+    );
+}
+
+#[test]
+fn polar_quant_skips_non_float32() {
+    // Build a program with an Int32 const tensor (>= 1024 elements).
+    let shape = vec![8, 128];
+    let numel: usize = shape.iter().product();
+    let tensor_bytes: Vec<u8> = (0..numel as i32).flat_map(|v| v.to_le_bytes()).collect();
+
+    let input_ty = TensorType::new(ScalarType::Float32, vec![1, 128]);
+    let mut func = Function::new("main");
+    func = func.with_input("input", input_ty);
+    let mut program = Program::new("1");
+    program.add_function(func);
+
+    let block = &mut program.functions.get_mut("main").unwrap().body;
+    block.add_op(
+        Operation::new("const", "weight_0")
+            .with_input(
+                "val",
+                Value::Tensor {
+                    data: tensor_bytes,
+                    shape,
+                    dtype: ScalarType::Int32,
+                },
+            )
+            .with_output("weight_0_out"),
+    );
+    block.outputs.push("weight_0_out".into());
+
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let ops = &program.functions["main"].body.operations;
+    assert_eq!(
+        ops[0].op_type, "const",
+        "non-FP32 tensors should not be quantized"
+    );
+}
+
+#[test]
+fn polar_quant_deterministic_with_seed() {
+    let run_with_seed = |seed: u64| -> Vec<u8> {
+        let mut program = make_program_with_const(vec![8, 128]);
+        let pass = PolarQuantPass {
+            n_bits: 4,
+            seed,
+            min_elements: 1024,
+        };
+        pass.run(&mut program).unwrap();
+        let ops = &program.functions["main"].body.operations;
+        match ops[0].attributes.get("indices") {
+            Some(Value::Tensor { data, .. }) => data.clone(),
+            other => panic!("expected indices tensor, got {other:?}"),
+        }
+    };
+
+    let indices_a = run_with_seed(42);
+    let indices_b = run_with_seed(42);
+    assert_eq!(
+        indices_a, indices_b,
+        "same seed should produce identical indices"
+    );
+}
+
+#[test]
+fn polar_quant_different_seeds_differ() {
+    let run_with_seed = |seed: u64| -> Vec<u8> {
+        // Use structured data so rotation produces meaningfully different results.
+        let rows = 8;
+        let cols = 128;
+        let numel = rows * cols;
+        let tensor_data: Vec<f32> = (0..numel)
+            .map(|i| {
+                let r = (i / cols) as f32;
+                let c = (i % cols) as f32;
+                (r * 0.7 + c * 0.03).sin() * (r * 0.1).cos()
+            })
+            .collect();
+        let tensor_bytes: Vec<u8> = tensor_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let input_ty = TensorType::new(ScalarType::Float32, vec![1, cols]);
+        let mut func = Function::new("main");
+        func = func.with_input("input", input_ty);
+        let mut program = Program::new("1");
+        program.add_function(func);
+        let block = &mut program.functions.get_mut("main").unwrap().body;
+        block.add_op(
+            Operation::new("const", "weight_0")
+                .with_input(
+                    "val",
+                    Value::Tensor {
+                        data: tensor_bytes,
+                        shape: vec![rows, cols],
+                        dtype: ScalarType::Float32,
+                    },
+                )
+                .with_output("weight_0_out"),
+        );
+        block.outputs.push("weight_0_out".into());
+
+        let pass = PolarQuantPass {
+            n_bits: 4,
+            seed,
+            min_elements: 1024,
+        };
+        pass.run(&mut program).unwrap();
+        let ops = &program.functions["main"].body.operations;
+        match ops[0].attributes.get("indices") {
+            Some(Value::Tensor { data, .. }) => data.clone(),
+            other => panic!("expected indices tensor, got {other:?}"),
+        }
+    };
+
+    let indices_a = run_with_seed(1);
+    let indices_b = run_with_seed(9999);
+    assert_ne!(
+        indices_a, indices_b,
+        "different seeds should produce different quantized indices"
+    );
+}
+
+#[test]
+fn polar_quant_handles_non_power_of_two() {
+    // Inner dim 100 is not a power of two; should still work via padding.
+    let mut program = make_program_with_const(vec![12, 100]); // 1200 elements
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let ops = &program.functions["main"].body.operations;
+    assert_eq!(
+        ops[0].op_type, "constexpr_lut_to_dense",
+        "non-power-of-two inner dim should still be quantized"
+    );
+    // Verify the shape attribute still records the original shape.
+    match ops[0].attributes.get("shape") {
+        Some(Value::Tensor { data, .. }) => {
+            let dims: Vec<u32> = data
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(dims, vec![12, 100]);
+        }
+        other => panic!("expected shape tensor, got {other:?}"),
+    }
+}
+
+#[test]
+fn polar_quant_handles_rank1() {
+    let mut program = make_program_with_const(vec![1024]);
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let ops = &program.functions["main"].body.operations;
+    assert_eq!(
+        ops[0].op_type, "constexpr_lut_to_dense",
+        "rank-1 tensor should be quantized"
+    );
+    // Shape attribute should record [1024].
+    match ops[0].attributes.get("shape") {
+        Some(Value::Tensor { data, .. }) => {
+            let dims: Vec<u32> = data
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(dims, vec![1024]);
+        }
+        other => panic!("expected shape tensor, got {other:?}"),
+    }
+}
+
+#[test]
+fn polar_quant_rejects_invalid_bits() {
+    let result = PassPipeline::new().with_polar_quant(5);
+    assert!(result.is_err(), "n_bits=5 should be rejected");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("n_bits must be 2, 3, or 4"),
+        "error should mention valid bit values, got: {err_msg}"
+    );
+
+    let result = PassPipeline::new().with_polar_quant(1);
+    assert!(result.is_err(), "n_bits=1 should be rejected");
+
+    // Valid values should succeed.
+    for bits in [2, 3, 4] {
+        assert!(
+            PassPipeline::new().with_polar_quant(bits).is_ok(),
+            "n_bits={bits} should be accepted"
+        );
+    }
+}
+
+#[test]
+fn polar_4bit_round_trip_quality() {
+    // Create deterministic FP32 weights using sin/cos patterns.
+    let rows = 8;
+    let cols = 128;
+    let numel = rows * cols; // 1024
+    let original_data: Vec<f32> = (0..numel)
+        .map(|i| {
+            let x = i as f32 * 0.01;
+            x.sin() * 0.5 + x.cos() * 0.3
+        })
+        .collect();
+    let tensor_bytes: Vec<u8> = original_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let input_ty = TensorType::new(ScalarType::Float32, vec![1, cols]);
+    let mut func = Function::new("main");
+    func = func.with_input("input", input_ty);
+    let mut program = Program::new("1");
+    program.add_function(func);
+
+    let block = &mut program.functions.get_mut("main").unwrap().body;
+    block.add_op(
+        Operation::new("const", "weight_0")
+            .with_input(
+                "val",
+                Value::Tensor {
+                    data: tensor_bytes,
+                    shape: vec![rows, cols],
+                    dtype: ScalarType::Float32,
+                },
+            )
+            .with_output("weight_0_out"),
+    );
+    block.outputs.push("weight_0_out".into());
+
+    let pass = PolarQuantPass::new(4);
+    pass.run(&mut program).unwrap();
+
+    let ops = &program.functions["main"].body.operations;
+    assert_eq!(ops[0].op_type, "constexpr_lut_to_dense");
+
+    // Extract the LUT (Float16) and decode to f32.
+    let lut_f32: Vec<f32> = match ops[0].attributes.get("lut") {
+        Some(Value::Tensor { data, .. }) => data
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        other => panic!("expected lut tensor, got {other:?}"),
+    };
+
+    // Extract the packed indices.
+    let (indices_data, _indices_shape) = match ops[0].attributes.get("indices") {
+        Some(Value::Tensor { data, shape, .. }) => (data.clone(), shape.clone()),
+        other => panic!("expected indices tensor, got {other:?}"),
+    };
+
+    // Unpack 4-bit indices (MSB-first packing).
+    let n_bits: usize = 4;
+    let mut unpacked_indices = Vec::with_capacity(numel);
+    for i in 0..numel {
+        let bit_offset = i * n_bits;
+        let byte_pos = bit_offset / 8;
+        let bit_in_byte = bit_offset % 8;
+        let mask = (1u16 << n_bits) - 1;
+
+        let mut word = (indices_data[byte_pos] as u16) << 8;
+        if byte_pos + 1 < indices_data.len() {
+            word |= indices_data[byte_pos + 1] as u16;
+        }
+        let shift = 16 - n_bits - bit_in_byte;
+        let idx = ((word >> shift) & mask) as usize;
+        unpacked_indices.push(idx);
+    }
+
+    // Extract norms (Float16) from the norms const op.
+    let norms_f32: Vec<f32> = match ops[1]
+        .inputs
+        .get("val")
+        .or_else(|| ops[1].attributes.get("val"))
+    {
+        Some(Value::Tensor { data, .. }) => data
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        other => panic!("expected norms tensor, got {other:?}"),
+    };
+
+    // Reconstruct the quantized weights: lut[index] * norm.
+    // The norms have shape [rows, 1], one per row.
+    let mut reconstructed = Vec::with_capacity(numel);
+    for r in 0..rows {
+        let norm = norms_f32[r];
+        for c in 0..cols {
+            let idx = unpacked_indices[r * cols + c];
+            reconstructed.push(lut_f32[idx] * norm);
+        }
+    }
+
+    // Compute MSE between original and reconstructed.
+    let mse: f64 = original_data
+        .iter()
+        .zip(reconstructed.iter())
+        .map(|(o, r)| {
+            let diff = *o as f64 - *r as f64;
+            diff * diff
+        })
+        .sum::<f64>()
+        / numel as f64;
+
+    assert!(
+        mse < 0.5,
+        "4-bit PolarQuant MSE should be < 0.5, got {mse:.6}"
+    );
+}

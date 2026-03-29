@@ -656,3 +656,79 @@ fn parallel_moe_expert_compilation() {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// PolarQuant pipeline composition tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn polar_quant_mutually_exclusive_with_int8() {
+    let result = PassPipeline::new()
+        .with_polar_quant(4)
+        .and_then(|p| p.with_int8(None));
+    assert!(
+        result.is_err(),
+        "polar_quant + int8 should be mutually exclusive"
+    );
+}
+
+#[test]
+fn polar_quant_mutually_exclusive_with_fp16() {
+    let result = PassPipeline::new()
+        .with_polar_quant(4)
+        .and_then(|p| p.with_fp16());
+    assert!(
+        result.is_err(),
+        "polar_quant + fp16 should be mutually exclusive"
+    );
+}
+
+#[test]
+fn polar_quant_mutually_exclusive_with_palettize() {
+    let result = PassPipeline::new()
+        .with_polar_quant(4)
+        .and_then(|p| p.with_palettize(4));
+    assert!(
+        result.is_err(),
+        "polar_quant + palettize should be mutually exclusive"
+    );
+}
+
+#[test]
+fn polar_quant_pipeline_runs_successfully() {
+    let mut program = build_const_program(&[8, 128], ScalarType::Float32);
+    let pipeline = PassPipeline::new()
+        .with_polar_quant(4)
+        .expect("with_polar_quant(4) should succeed");
+    pipeline
+        .run(&mut program)
+        .expect("polar_quant pipeline should run without error");
+
+    // Verify the const was converted.
+    let ops = &program.functions["main"].body.operations;
+    let has_lut = ops.iter().any(|op| op.op_type == "constexpr_lut_to_dense");
+    assert!(
+        has_lut,
+        "pipeline should have created constexpr_lut_to_dense ops"
+    );
+}
+
+#[test]
+fn polar_quant_toml_config() {
+    let toml = r#"
+[[passes]]
+name = "polar-quantization"
+enabled = true
+
+[passes.params]
+bits = 4
+seed = 42
+min_elements = 1024
+"#;
+    let pipeline = PassPipeline::from_config_str(toml).unwrap();
+    let names = pipeline.pass_names();
+    assert!(
+        names.contains(&"polar-quantization"),
+        "pipeline should contain polar-quantization pass, got: {names:?}"
+    );
+}
