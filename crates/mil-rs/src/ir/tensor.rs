@@ -15,6 +15,18 @@ pub enum ScalarType {
     Bool,
 }
 
+impl ScalarType {
+    /// Returns the number of bytes required to store a single element of this type.
+    pub fn byte_size(&self) -> usize {
+        match self {
+            ScalarType::Bool | ScalarType::Int8 | ScalarType::UInt8 => 1,
+            ScalarType::Float16 | ScalarType::Int16 | ScalarType::UInt16 => 2,
+            ScalarType::Float32 | ScalarType::Int32 | ScalarType::UInt32 => 4,
+            ScalarType::Float64 | ScalarType::Int64 | ScalarType::UInt64 => 8,
+        }
+    }
+}
+
 /// A tensor type descriptor — shape + element type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorType {

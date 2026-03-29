@@ -18,6 +18,7 @@ pub mod onnx_graph;
 pub mod onnx_to_mil;
 pub mod pipeline;
 pub mod proto_to_ir;
+pub mod weights;
 
 pub use ir_to_proto::{
     LossFunction, UpdatableModelConfig, UpdateOptimizer, program_to_model,
@@ -30,3 +31,4 @@ pub use onnx_graph::{
 pub use onnx_to_mil::convert_node;
 pub use pipeline::{PipelineManifest, convert_pipeline, parse_pipeline_manifest};
 pub use proto_to_ir::model_to_program;
+pub use weights::{Architecture, ModelConfig, WeightProvider, WeightTensor};
