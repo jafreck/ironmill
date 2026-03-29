@@ -83,7 +83,7 @@ tensors are eligible for quantization.
 |---|---|
 | Weight tensors quantized | 256 / 312 (82%) |
 | Target bit-width | 4-bit |
-| Rotation fusion ops added | 512 (256 R_inv + 256 matmul) |
+| Rotation fusion ops added | Deduplicated (shared R_inv by seed+dims) |
 | Pipeline time | ~28s |
 
 PolarQuant quantizes 82% of Qwen3's weight tensors at 4-bit precision.
@@ -104,7 +104,7 @@ compilation of transformer-specific ops (`rotary_embedding`,
 |---|---|---|
 | 4-bit | 16 | ✅ Supported |
 | 2-bit | 4 | ✅ Supported |
-| 3-bit | 8 | ❌ CoreML requires LUT sizes in {2, 4, 16, 64, 256} |
+| 3-bit | 8 | ❌ Rejected at pipeline level (CoreML requires LUT sizes in {2, 4, 16, 64, 256}) |
 
 3-bit PolarQuant is mathematically functional but cannot be deployed through
 CoreML's `constexpr_lut_to_dense` due to the LUT size restriction. A future
@@ -127,6 +127,8 @@ Output `.mlpackage` size compared to original ONNX file.
 | + INT8 | 16K | 59% |
 | + Palettize 4-bit | 12K | 72% |
 | + Palettize 6-bit | 16K | 62% |
+| + FP16 + Palettize 4-bit | 12K | 73% |
+| + PolarQuant 4-bit | 32K | -4% |
 
 ### SqueezeNet 1.1 (original: 4.7M)
 
@@ -138,10 +140,13 @@ Output `.mlpackage` size compared to original ONNX file.
 | + INT8 | 1.2M | 73% |
 | + Palettize 4-bit | 636K | 87% |
 | + Palettize 6-bit | 948K | 80% |
+| + FP16 + Palettize 4-bit | 632K | 87% |
+| + PolarQuant 4-bit | 4.7M | 0% |
 
 PolarQuant is a no-op on these CNN models (conv kernel inner dims are 1–3,
-below the ≥ 64 threshold). PolarQuant's size benefits apply to transformer
-models where linear weight tensors dominate the model size.
+below the ≥ 64 threshold). The `+ PolarQuant 4-bit` rows confirm no size
+change. PolarQuant's size benefits apply to transformer models where
+linear weight tensors dominate the model size.
 
 ---
 
