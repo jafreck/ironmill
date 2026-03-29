@@ -47,6 +47,9 @@ pub fn compile_model(
     if let Some(bits) = opt.palettize {
         pipeline = pipeline.with_palettize(bits)?;
     }
+    if let Some(bits) = opt.polar_quantize {
+        pipeline = pipeline.with_polar_quant(bits)?;
+    }
 
     pipeline.run(&mut program)?;
 
@@ -88,6 +91,9 @@ pub fn build_optimized_program(
     }
     if let Some(bits) = opt.palettize {
         pipeline = pipeline.with_palettize(bits)?;
+    }
+    if let Some(bits) = opt.polar_quantize {
+        pipeline = pipeline.with_polar_quant(bits)?;
     }
 
     pipeline.run(&mut program)?;

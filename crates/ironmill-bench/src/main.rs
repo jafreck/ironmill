@@ -1,6 +1,7 @@
 mod compiler;
 mod config;
 mod inference;
+mod quality;
 mod report;
 mod stats;
 

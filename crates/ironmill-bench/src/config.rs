@@ -31,6 +31,8 @@ pub struct OptConfig {
     #[serde(default)]
     pub palettize: Option<u8>,
     #[serde(default)]
+    pub polar_quantize: Option<u8>,
+    #[serde(default)]
     pub no_fusion: bool,
     #[serde(default)]
     pub disabled_passes: Vec<String>,
@@ -119,6 +121,7 @@ pub fn default_matrix() -> BenchMatrix {
             name: "baseline".to_string(),
             quantize: None,
             palettize: None,
+            polar_quantize: None,
             no_fusion: true,
             disabled_passes: vec![],
         },
@@ -126,6 +129,7 @@ pub fn default_matrix() -> BenchMatrix {
             name: "default".to_string(),
             quantize: None,
             palettize: None,
+            polar_quantize: None,
             no_fusion: false,
             disabled_passes: vec![],
         },
@@ -133,6 +137,7 @@ pub fn default_matrix() -> BenchMatrix {
             name: "fp16".to_string(),
             quantize: Some("fp16".to_string()),
             palettize: None,
+            polar_quantize: None,
             no_fusion: false,
             disabled_passes: vec![],
         },
@@ -140,6 +145,7 @@ pub fn default_matrix() -> BenchMatrix {
             name: "int8".to_string(),
             quantize: Some("int8".to_string()),
             palettize: None,
+            polar_quantize: None,
             no_fusion: false,
             disabled_passes: vec![],
         },
@@ -147,6 +153,23 @@ pub fn default_matrix() -> BenchMatrix {
             name: "palettize-4".to_string(),
             quantize: None,
             palettize: Some(4),
+            polar_quantize: None,
+            no_fusion: false,
+            disabled_passes: vec![],
+        },
+        OptConfig {
+            name: "polar-4".to_string(),
+            quantize: None,
+            palettize: None,
+            polar_quantize: Some(4),
+            no_fusion: false,
+            disabled_passes: vec![],
+        },
+        OptConfig {
+            name: "polar-3".to_string(),
+            quantize: None,
+            palettize: None,
+            polar_quantize: Some(3),
             no_fusion: false,
             disabled_passes: vec![],
         },
@@ -202,7 +225,7 @@ mod tests {
     fn test_default_matrix() {
         let m = default_matrix();
         assert_eq!(m.models.len(), 2);
-        assert_eq!(m.optimizations.len(), 5);
+        assert_eq!(m.optimizations.len(), 7);
         assert_eq!(m.backends, vec!["all"]);
         assert_eq!(m.settings.iterations, 200);
         assert_eq!(m.settings.warmup, 20);
@@ -222,7 +245,15 @@ mod tests {
         let names: Vec<&str> = m.optimizations.iter().map(|o| o.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["baseline", "default", "fp16", "int8", "palettize-4"]
+            vec![
+                "baseline",
+                "default",
+                "fp16",
+                "int8",
+                "palettize-4",
+                "polar-4",
+                "polar-3"
+            ]
         );
     }
 
@@ -270,6 +301,7 @@ backends = ["cpu", "gpu"]
             name: "baseline".to_string(),
             quantize: None,
             palettize: None,
+            polar_quantize: None,
             no_fusion: true,
             disabled_passes: vec![],
         };
@@ -290,6 +322,7 @@ backends = ["cpu", "gpu"]
             name: "baseline".to_string(),
             quantize: None,
             palettize: None,
+            polar_quantize: None,
             no_fusion: true,
             disabled_passes: vec![],
         };
@@ -297,6 +330,7 @@ backends = ["cpu", "gpu"]
             name: "fp16".to_string(),
             quantize: Some("fp16".to_string()),
             palettize: None,
+            polar_quantize: None,
             no_fusion: false,
             disabled_passes: vec![],
         };
