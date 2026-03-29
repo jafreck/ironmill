@@ -80,6 +80,10 @@ struct Cli {
     /// Compare against a saved baseline
     #[arg(long)]
     compare_baseline: Option<String>,
+
+    /// Run weight fidelity quality benchmarks for quantized optimizations
+    #[arg(long)]
+    quality: bool,
 }
 
 fn main() -> Result<()> {
@@ -347,6 +351,48 @@ fn main() -> Result<()> {
     };
 
     print!("{}", report::format_report(&bench_report, cli.output));
+
+    // Quality benchmarks — measure weight fidelity impact of quantization
+    if cli.quality {
+        eprintln!("\nRunning weight fidelity quality benchmarks...");
+        let mut summaries = Vec::new();
+
+        for model_cfg in &matrix.models {
+            for opt_cfg in &matrix.optimizations {
+                // Only run quality for quantized optimizations
+                let (method, bits) = match (&opt_cfg.polar_quantize, &opt_cfg.palettize) {
+                    (Some(b), _) => ("polar", *b),
+                    (_, Some(b)) => ("palettize", *b),
+                    _ => continue,
+                };
+
+                eprintln!(
+                    "  Quality: {} with {} ({}-bit)...",
+                    model_cfg.name, opt_cfg.name, bits
+                );
+
+                match compiler::build_optimized_program(model_cfg, opt_cfg) {
+                    Ok(program) => {
+                        let results = quality::measure_program_quality(&program, method, bits);
+                        if let Some(summary) = quality::summarize_quality(&model_cfg.name, &results)
+                        {
+                            summaries.push(summary);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("    ✗ failed: {e}");
+                    }
+                }
+            }
+        }
+
+        if !summaries.is_empty() {
+            eprintln!();
+            eprint!("{}", quality::format_quality_summary(&summaries));
+        } else {
+            eprintln!("  No quantized optimizations to measure.");
+        }
+    }
 
     // Save baseline if requested
     if let Some(baseline_name) = &cli.save_baseline {

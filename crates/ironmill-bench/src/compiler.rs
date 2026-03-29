@@ -65,9 +65,8 @@ pub fn compile_model(
 
 /// Build the optimized MIL IR program for a model without compiling to CoreML.
 ///
-/// This is used by the ANE direct runtime path which takes the IR program
-/// directly rather than going through .mlpackage compilation.
-#[cfg(feature = "ane-direct")]
+/// Returns the program after the optimization pipeline has been applied.
+/// Used for quality measurement and the ANE direct runtime path.
 pub fn build_optimized_program(
     model: &ModelConfig,
     opt: &OptConfig,
@@ -99,6 +98,18 @@ pub fn build_optimized_program(
     pipeline.run(&mut program)?;
 
     Ok(program)
+}
+
+/// Build the optimized MIL IR program for a model without compiling to CoreML.
+///
+/// This variant is gated behind `ane-direct` and is kept for backward
+/// compatibility — the ungated [`build_optimized_program`] is now preferred.
+#[cfg(feature = "ane-direct")]
+pub fn build_optimized_program_ane(
+    model: &ModelConfig,
+    opt: &OptConfig,
+) -> Result<mil_rs::ir::Program> {
+    build_optimized_program(model, opt)
 }
 
 /// Remove all cached compilation artifacts.

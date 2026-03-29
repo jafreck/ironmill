@@ -1,8 +1,7 @@
-#![allow(dead_code)]
 //! Quality benchmarks for quantization fidelity.
 //!
 //! Measures per-tensor MSE and PSNR for different quantization methods,
-//! enabling automated tracking of PolarQuant quality claims.
+//! enabling automated tracking of weight fidelity impact from optimizations.
 
 use half::f16;
 use mil_rs::ir::passes::PolarQuantPass;
@@ -12,6 +11,7 @@ use mil_rs::{Pass, Program, ScalarType, Value};
 /// Result of a quality benchmark for one (model, method) pair.
 #[derive(Debug, Clone)]
 pub struct QualityResult {
+    #[allow(dead_code)]
     pub model_name: String,
     pub method: String,
     pub bits: u8,
@@ -241,6 +241,7 @@ pub fn measure_program_quality(program: &Program, method: &str, bits: u8) -> Vec
 }
 
 /// Format quality results as a summary table string.
+#[allow(dead_code)]
 pub fn format_quality_table(results: &[QualityResult]) -> String {
     let mut out = String::new();
     out.push_str("| Tensor | Method | Bits | MSE | PSNR (dB) | Compression |\n");
@@ -250,6 +251,93 @@ pub fn format_quality_table(results: &[QualityResult]) -> String {
             "| {} | {} | {} | {:.6} | {:.1} | {:.1}× |\n",
             r.model_name, r.method, r.bits, r.mse, r.psnr_db, r.compression_ratio
         ));
+    }
+    out
+}
+
+/// Aggregate quality results into a per-model summary.
+#[derive(Debug, Clone)]
+pub struct QualitySummary {
+    pub model_name: String,
+    pub method: String,
+    pub bits: u8,
+    #[allow(dead_code)]
+    pub tensor_count: usize,
+    pub avg_mse: f64,
+    pub avg_psnr_db: f64,
+    pub avg_compression_ratio: f64,
+    pub worst_psnr_db: f64,
+}
+
+/// Compute a summary from per-tensor quality results.
+pub fn summarize_quality(model_name: &str, results: &[QualityResult]) -> Option<QualitySummary> {
+    if results.is_empty() {
+        return None;
+    }
+    let n = results.len() as f64;
+    let method = results[0].method.clone();
+    let bits = results[0].bits;
+    Some(QualitySummary {
+        model_name: model_name.to_string(),
+        method,
+        bits,
+        tensor_count: results.len(),
+        avg_mse: results.iter().map(|r| r.mse).sum::<f64>() / n,
+        avg_psnr_db: results.iter().map(|r| r.psnr_db).sum::<f64>() / n,
+        avg_compression_ratio: results.iter().map(|r| r.compression_ratio).sum::<f64>() / n,
+        worst_psnr_db: results
+            .iter()
+            .map(|r| r.psnr_db)
+            .fold(f64::INFINITY, f64::min),
+    })
+}
+
+/// Format a quality summary table across models and optimizations.
+pub fn format_quality_summary(summaries: &[QualitySummary]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    writeln!(out, "Weight Fidelity Impact").unwrap();
+    writeln!(out, "{}", "─".repeat(80)).unwrap();
+    writeln!(
+        out,
+        "{:<18} {:<12} {:>6} {:>10} {:>12} {:>10} {:>10}",
+        "Model", "Method", "Bits", "Avg MSE", "Avg PSNR", "Worst PSNR", "Compress"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "{:<18} {:<12} {:>6} {:>10} {:>12} {:>10} {:>10}",
+        "─────────────────",
+        "───────────",
+        "──────",
+        "──────────",
+        "────────────",
+        "──────────",
+        "──────────"
+    )
+    .unwrap();
+
+    for s in summaries {
+        let status = if s.worst_psnr_db > 30.0 {
+            "✓ SAFE"
+        } else if s.worst_psnr_db > 20.0 {
+            "⚠ WARN"
+        } else {
+            "✗ RISK"
+        };
+        writeln!(
+            out,
+            "{:<18} {:<12} {:>6} {:>10.6} {:>10.1} dB {:>10.1} dB {:>8.1}×  {}",
+            s.model_name,
+            s.method,
+            s.bits,
+            s.avg_mse,
+            s.avg_psnr_db,
+            s.worst_psnr_db,
+            s.avg_compression_ratio,
+            status
+        )
+        .unwrap();
     }
     out
 }
