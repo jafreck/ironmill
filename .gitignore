@@ -3,6 +3,7 @@
 
 # Large test fixtures — download with ./scripts/download-fixtures.sh
 tests/fixtures/*.onnx
+tests/fixtures/*.onnx_data
 tests/fixtures/*.mlmodel
 # Keep the mlpackage directory structure (it's small)
 # Keep the README
