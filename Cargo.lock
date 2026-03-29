@@ -572,6 +572,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+ "statrs",
  "tempfile",
  "thiserror",
  "toml",
