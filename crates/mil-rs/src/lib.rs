@@ -27,21 +27,36 @@
 //!
 //! ## Modules
 //!
-//! | Module       | Description |
-//! |--------------|-------------|
-//! | [`compiler`] | Compile models to `.mlmodelc` via `xcrun coremlcompiler` |
-//! | [`convert`]  | Bidirectional conversion between protobuf [`Model`] and IR [`Program`] |
-//! | [`error`]    | [`MilError`] enum and [`Result`](error::Result) type alias |
-//! | [`ir`]       | MIL intermediate representation — [`Program`], [`Function`], [`Block`], [`Operation`], [`Graph`], tensor types |
-//! | [`proto`]    | Auto-generated protobuf types from Apple's CoreML `.proto` specification |
-//! | [`reader`]   | Read `.mlmodel` and `.mlpackage` files into a protobuf [`Model`] |
-//! | [`writer`]   | Write a protobuf [`Model`] to `.mlmodel` or `.mlpackage` |
+//! | Module        | Description |
+//! |---------------|-------------|
+//! | [`build_api`] | High-level [`CompileBuilder`] for converting models in `build.rs` scripts |
+//! | `c_api`       | C-compatible FFI (enable with `--features c-api`) |
+//! | [`compiler`]  | Compile models to `.mlmodelc` via `xcrun coremlcompiler` |
+//! | [`convert`]   | Bidirectional conversion between protobuf [`Model`] and IR [`Program`] |
+//! | [`error`]     | [`MilError`] enum and [`Result`](error::Result) type alias |
+//! | [`ir`]        | MIL intermediate representation — [`Program`], [`Function`], [`Block`], [`Operation`], [`Graph`], tensor types |
+//! | [`proto`]     | Auto-generated protobuf types from Apple's CoreML `.proto` specification |
+//! | [`reader`]    | Read `.mlmodel` and `.mlpackage` files into a protobuf [`Model`] |
+//! | [`writer`]    | Write a protobuf [`Model`] to `.mlmodel` or `.mlpackage` |
 //!
 //! ## Supported model types
 //!
 //! The proto ↔ IR conversion supports **ML Program** models (CoreML spec v7+).
 //! Legacy `NeuralNetwork` models can be read and written at the protobuf level
 //! but cannot be converted to the MIL IR.
+//!
+//! ## C API
+//!
+//! A C-compatible FFI is available behind the `c-api` feature flag. Build with
+//! `cargo build --features c-api` and generate the header with `cbindgen`.
+//! See the `c_api` module for details and the [C API guide](../docs/C_API.md).
+//!
+//! ## Build-time compilation
+//!
+//! Use [`CompileBuilder`] in your `build.rs` to convert ONNX models to CoreML
+//! at build time. See [`build_api`] for the full API and
+//! [examples/build_rs_example.rs](../examples/build_rs_example.rs) for usage
+//! patterns.
 
 /// High-level builder API for compiling ML models at build time.
 ///

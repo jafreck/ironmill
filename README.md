@@ -47,16 +47,23 @@ ironmill validate model.onnx
 | ANE compatibility validator | ✅ |
 | `xcrun coremlcompiler` integration | ✅ |
 | CLI (`compile`, `inspect`, `validate`) | ✅ |
-| `candle` / `burn` integration | planned |
+| C API (`--features c-api`) | ✅ |
+| Build.rs compile API (`CompileBuilder`) | ✅ |
+| `candle-coreml` bridge crate | ✅ |
+| `burn-coreml` export/inference crate | ✅ |
 
 ## Architecture
 
-The project is a Cargo workspace with two crates:
+The project is a Cargo workspace:
 
 | Crate | Description |
 |-------|-------------|
 | [`mil-rs`](crates/mil-rs/) | Core library — read/write CoreML models, MIL IR, ONNX conversion, optimization passes, ANE validation |
 | [`ironmill-cli`](crates/ironmill-cli/) | CLI tool wrapping `mil-rs` — `compile`, `inspect`, and `validate` commands |
+| [`candle-coreml`](crates/candle-coreml/) | Bridge crate — ONNX→CoreML conversion + inference for candle users |
+| [`burn-coreml`](crates/burn-coreml/) | Export + inference — ONNX→CoreML + CoreML runtime for Burn users |
+| [`ironmill-coreml`](crates/ironmill-coreml/) | macOS CoreML runtime wrapper (objc2-based `MLModel` bridge) |
+| [`ironmill-runtime`](crates/ironmill-runtime/) | Backend-agnostic runtime traits |
 
 ### How conversion works
 
@@ -147,7 +154,9 @@ Requires Rust 1.85+ (edition 2024).
 ## Documentation
 
 - [API docs](https://docs.rs/mil-rs) — generated from rustdoc
-- [Inference improvements roadmap](docs/INFERENCE_IMPROVEMENTS_ROADMAP.md)
+- [C API usage guide](docs/C_API.md) — building, linking, and calling from C/Swift
+- [Build.rs example](examples/build_rs_example.rs) — using `CompileBuilder` at build time
+- [Inference improvements plan](docs/INFERENCE_IMPROVEMENTS_PLAN.md)
 - [`docs/research/`](docs/research/) — background research:
   - [ANE Gap Analysis](docs/research/ane-research.md)
   - [Competitive Analysis](docs/research/competitive-analysis.md)

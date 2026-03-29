@@ -1,27 +1,31 @@
-# Inference Improvements Roadmap
+# Inference Improvements Implementation Plan
 
 ## Goal
 
 Improve Ironmill's inference story by adopting the highest-value ideas from
-`maderix/ANE`, `Orion`, and adjacent direct-ANE projects without changing
-Ironmill's identity.
+`maderix/ANE`, `Orion`, and adjacent direct-ANE projects.
 
-This roadmap is intentionally **not** a training plan. Ironmill should remain a
-Rust-native model conversion, optimization, validation, and deployment
-toolchain with:
+This plan is intentionally **not** a training plan. Ironmill is a Rust-native
+compiler and runtime for Apple Silicon ML deployment:
 
-- **CoreML as the stable default path**
-- **`ane-direct` as an experimental backend**
-- **compiler and packaging improvements prioritized over bespoke runtime work**
+- **Compiler**: ONNX/SafeTensors/GGUF → MIL IR → CoreML conversion,
+  optimization passes, and `.mlmodelc` compilation
+- **CoreML runtime**: stable production path via public CoreML APIs
+  (`crates/ironmill-coreml/`)
+- **ANE direct runtime**: experimental backend via private ANE APIs
+  (`crates/ironmill-ane/`)
 
 ## Current Position
 
-Ironmill already has a strong compiler-side foundation:
+Ironmill already has a strong compiler and runtime foundation:
 
-- ONNX -> MIL -> CoreML conversion and packaging
+- ONNX → MIL → CoreML conversion and packaging
+- SafeTensors and GGUF weight loading with direct pipeline integration
 - ANE-specific optimization and validation passes
-- safe CoreML runtime bindings in `crates/ironmill-coreml/`
-- an experimental direct ANE runtime in `crates/ironmill-ane/`
+- CoreML runtime backend in `crates/ironmill-coreml/`
+- experimental direct ANE runtime backend in `crates/ironmill-ane/`
+- unified `RuntimeBackend`/`RuntimeModel` trait abstraction in
+  `crates/ironmill-runtime/`
 - a benchmark harness in `crates/ironmill-bench/`
 
 The main remaining gap is that Ironmill's inference path is still mostly
@@ -36,7 +40,7 @@ gains from controlling:
 
 ## Existing Scaffolding
 
-The repo already contains useful starting points for this work:
+The repo already contains useful starting points for this plan:
 
 - `crates/mil-rs/src/ir/passes/kv_cache.rs`
 - `crates/mil-rs/src/ir/passes/shape_materialize.rs`
@@ -53,38 +57,39 @@ The repo already contains useful starting points for this work:
 - `crates/ironmill-runtime/src/lib.rs` (unified `RuntimeBackend`/`RuntimeModel` traits)
 
 These pieces suggest the right direction already exists in the codebase, but it
-needs to be turned into a coherent inference roadmap.
+needs to be turned into a coherent inference implementation plan.
 
 ## Principles
 
-### 1. Toolchain First, Runtime Second
+### 1. Compiler Improvements Lift All Runtimes
 
-Ironmill should prefer emitting better artifacts, metadata, manifests, and
-compiler guidance rather than absorbing large amounts of custom runtime logic.
+Better artifacts, metadata, manifests, and compiler passes benefit both the
+CoreML and ANE direct runtimes equally. Compiler-side work should be
+prioritized when it produces gains across both backends.
 
 ### 2. CoreML First by Default
 
-The public, stable path should remain CoreML-based. The direct ANE backend is
-valuable for research, profiling, and specialized workflows, but it should stay
-feature-gated and non-default.
+The public, stable runtime path should remain CoreML-based. The direct ANE
+backend is valuable for research, profiling, and specialized workflows, but it
+should stay feature-gated and non-default.
 
 ### 3. Treat LLM Inference as Stateful
 
 Decoder-style inference is not a single `predict()` call repeated forever. It
 depends on cache layout, sequence buckets, and different strategies for prompt
-prefill vs token decode.
+prefill vs token decode. Both runtimes need to support this.
 
-### 4. Prefer Packaging and Routing Metadata Over Runtime Tricks
+### 4. Prefer Structured Metadata Over Hardcoded Behavior
 
-Where possible, Ironmill should emit artifacts that make routing decisions
-obvious to downstream runtimes instead of becoming a monolithic custom
-inference engine.
+Where possible, Ironmill should emit artifacts with routing decisions,
+stage metadata, and shape constraints encoded declaratively — making both
+runtimes and any downstream consumers smarter by default.
 
 ### 5. Copy Constraints and Tactics, Not Project Identity
 
 Ironmill should learn from `maderix/ANE`, `Orion`, `Espresso`, and
-`ane-infer`, but it should not try to become another direct-ANE runtime
-framework.
+`ane-infer`, but it should remain focused on its own compiler + runtime
+architecture rather than replicating another project wholesale.
 
 ## Prerequisites
 
@@ -109,9 +114,7 @@ the trait-based `RuntimeBackend`/`RuntimeModel` abstraction. This cleanup
 simplifies the benchmark overhaul (#4) and avoids confusion about which
 backend abstraction to use.
 
-## Prioritized Improvements
-
-## Tier 1: High-Confidence, High-Fit Improvements
+## Tier 1: High-Confidence, High-Fit Tasks
 
 ### 1. Stateful Autoregressive Export and KV Cache Support
 
@@ -128,9 +131,9 @@ pipeline for decoder-style models:
 
 Why this matters:
 
-- unlocks real decoder-style LLM deployment
+- unlocks real decoder-style LLM deployment via both runtimes
 - aligns with how modern ANE/CoreML LLM pipelines are actually used
-- fits Ironmill's compiler identity better than inventing a new runtime
+- compiler-side improvements benefit both CoreML and ANE direct backends
 
 ### 2. Prefill / Decode Split With Shape Buckets
 
@@ -163,7 +166,7 @@ Why this matters:
 ### 3. Better ANE-Aware Routing and Diagnostics
 
 Ironmill already has ANE validation and compute-unit annotation. It should push
- that further so users can make deployment decisions with confidence.
+that further so users can make deployment decisions with confidence.
 
 Recommended direction:
 
@@ -201,12 +204,11 @@ Why this matters:
 - `Orion` demonstrates the value of measuring compile, reload, and dispatch
   overhead explicitly
 
-## Tier 2: High-Value, More Involved Improvements
+## Tier 2: High-Value, More Involved Tasks
 
 ### 5. Hybrid Execution Planning
 
-Ironmill should support hybrid execution planning without becoming a full custom
-hybrid runtime.
+Ironmill should support hybrid execution planning across its runtimes.
 
 Recommended direction:
 
@@ -225,8 +227,7 @@ Good candidates include:
 Why this matters:
 
 - larger models will increasingly need hybrid execution
-- packaging-level guidance is a better fit for Ironmill than a giant runtime
-  scheduler
+- packaging-level guidance benefits both CoreML and ANE direct runtimes
 
 ### 6. Per-Layer Mixed Precision for Inference
 
@@ -246,7 +247,69 @@ Why this matters:
 - it aligns with real-world model serving practice
 - it builds on Ironmill's existing quantization and pass infrastructure
 
-### 7. Direct ANE Cache Hardening
+### 7. LoRA Hot-Swap at Runtime
+
+Ironmill already supports static LoRA merging during compilation (ONNX and
+SafeTensors paths), and the CLI has reserved `--adapter` and `--emit-adapter`
+flags. This task extends that foundation into a runtime capability.
+
+Recommended direction:
+
+- implement `--emit-adapter` to package adapter weights separately from the
+  base model
+- implement `--adapter` to load external adapter weight sets at runtime
+- add adapter selection to `RuntimeBackend`/`RuntimeModel` traits so both
+  CoreML and ANE direct backends can apply adapters per session or request
+- support loading multiple adapter sets and switching between them without
+  recompilation
+
+Existing scaffolding:
+
+- `crates/mil-rs/src/convert/lora.rs` — format-agnostic LoRA detection and
+  merge kernel
+- `crates/mil-rs/src/convert/weights/safetensors.rs` — adapter discovery
+  from `adapter_config.json`
+- CLI reserved flags in `crates/ironmill-cli/src/main.rs`
+
+Why this matters:
+
+- adapter switching is a core deployment pattern for fine-tuned model serving
+- static merge forces recompilation per adapter, which is impractical at scale
+- the detection and merge foundations already exist; the gap is runtime plumbing
+
+### 8. Multi-Procedure Pipeline Orchestration
+
+Ironmill already emits multi-stage pipelines with `pipeline.json` manifests,
+MoE multi-function bundles, and draft/verifier splits. This task adds a runtime
+consumer for those artifacts.
+
+Recommended direction:
+
+- implement a pipeline orchestrator that reads `pipeline.json` and loads
+  multiple compiled artifacts
+- chain stage outputs to stage inputs automatically based on `depends_on`
+  topology
+- support state transfer conventions between stages (e.g., KV cache handoff)
+- integrate with both CoreML and ANE direct backends
+
+Existing scaffolding:
+
+- `crates/mil-rs/src/convert/pipeline.rs` — stage topology, dependency
+  ordering, I/O validation, and manifest emission
+- `crates/mil-rs/src/convert/ir_to_proto.rs` — multi-function model bundling
+  for MoE
+- `crates/mil-rs/src/ir/passes/model_split.rs` — draft/verifier splitting
+
+Why this matters:
+
+- multi-stage execution is required for prefill/decode splits, MoE routing,
+  and speculative decoding
+- the compile-time packaging is already solid; the missing piece is runtime
+  execution
+- this directly enables Tier 3 items (multi-artifact packaging, speculative
+  decoding)
+
+### 9. Direct ANE Cache Hardening
 
 Ironmill already has a `ProgramCache` for the experimental direct ANE backend.
 That is a good idea and should be strengthened.
@@ -264,9 +327,9 @@ Why this matters:
   constraints learned from `maderix/ANE` and `Orion`
 - this is a focused improvement with a good risk/reward profile
 
-## Tier 3: Valuable Later, But Not Core for Now
+## Tier 3: Valuable Later, Lower Priority
 
-### 8. Multi-Artifact Packaging for Runtime Selection
+### 10. Multi-Artifact Packaging for Runtime Selection
 
 Once bucketing and prefill/decode splitting exist, Ironmill should package
 related artifacts together with selection metadata.
@@ -289,7 +352,7 @@ Existing scaffolding:
 
 This is a natural follow-on once the core inference improvements above land.
 
-### 9. Limited Speculative Decoding Support at the Toolchain Layer
+### 11. Limited Speculative Decoding Support at the Toolchain Layer
 
 Ironmill may eventually want to support speculative-decoding-friendly packaging,
 but only at the compiler and artifact level.
@@ -298,7 +361,8 @@ Recommended scope:
 
 - emit draft/verifier-compatible artifacts
 - expose metadata needed by a downstream scheduler
-- avoid implementing a full speculative runtime loop inside Ironmill
+- avoid implementing a full speculative scheduling loop; keep focus on
+  artifact generation and metadata
 
 Existing scaffolding:
 
@@ -310,27 +374,24 @@ This should remain secondary to stateful export and bucketed decode support.
 
 ## Explicitly Deferred
 
-The following ideas are worth understanding, but they are poor fits for
-Ironmill right now:
+The following ideas are worth understanding, but they are out of scope for
+this plan:
 
 - training-specific features
 - delta compilation and weight hot-reload
-- LoRA hot-swap as a runtime feature
-- multi-procedure chaining tricks
 - custom mega-kernel runtimes
 - native INT4 direct-ANE execution as a mainline path
 - turning Ironmill into an `Orion` replacement
 
 Why these are deferred:
 
-- they are runtime-heavy rather than toolchain-heavy
-- they depend on fragile private APIs
-- they create significant maintenance risk
-- they blur Ironmill's identity as a Rust-native compiler and deployment tool
+- they are orthogonal to the inference improvements in this plan
+- several depend on fragile private APIs beyond what `ironmill-ane` already uses
+- they carry significant maintenance risk relative to their value
 
-## Suggested Execution Order
+## Implementation Order
 
-### Near Term
+### Phase 1
 
 Focus on:
 
@@ -340,30 +401,33 @@ Focus on:
 3. better ANE-aware routing and diagnostics
 4. inference benchmark overhaul
 
-### Mid Term
+### Phase 2
 
 Focus on:
 
 5. hybrid execution planning
 6. per-layer mixed precision for inference
-7. direct ANE cache hardening
+7. LoRA hot-swap at runtime
+8. multi-procedure pipeline orchestration
+9. direct ANE cache hardening
 
-### Later
+### Phase 3
 
 Focus on:
 
-8. multi-artifact packaging
-9. toolchain-level speculative decoding support
+10. multi-artifact packaging
+11. toolchain-level speculative decoding support
 
 ## Success Criteria
 
-This roadmap is succeeding when Ironmill can do all of the following:
+This plan is succeeding when Ironmill can do all of the following:
 
 - export a practical decoder-style model with explicit cache/state handling
 - package prefill and decode artifacts with fixed-shape buckets
+- load weights from ONNX, SafeTensors, and GGUF through a unified pipeline
 - explain why each major block wants ANE, CPU, or GPU
 - benchmark real inference loops rather than only generic prediction calls
-- support downstream runtimes without forcing Ironmill to become one
+- run stateful inference through both CoreML and ANE direct runtimes
 
 ## Related Documents
 
