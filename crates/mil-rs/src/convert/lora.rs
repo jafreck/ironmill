@@ -360,17 +360,12 @@ pub fn merge_lora_weights(
     Ok(())
 }
 
-/// Public wrapper around `scalar_from_bytes` for use by other modules.
-pub fn scalar_from_bytes_pub(data: &[u8], dtype: ScalarType) -> Option<f64> {
-    scalar_from_bytes(data, dtype)
-}
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 /// Read a single scalar from raw bytes.
-fn scalar_from_bytes(data: &[u8], dtype: ScalarType) -> Option<f64> {
+pub(crate) fn scalar_from_bytes(data: &[u8], dtype: ScalarType) -> Option<f64> {
     match dtype {
         ScalarType::Float32 if data.len() >= 4 => {
             Some(f32::from_le_bytes(data[..4].try_into().ok()?) as f64)

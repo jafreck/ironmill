@@ -22,10 +22,23 @@ use super::{Architecture, ModelConfig, WeightProvider, WeightTensor};
 type MergedTensor = (Vec<u8>, Vec<usize>, ScalarType);
 
 /// Location of a tensor within a set of sharded safetensors files.
+///
+/// Pre-parsed metadata is stored during `load()` so that `tensor()` can
+/// slice the mmap directly without re-deserializing the SafeTensors header.
 #[derive(Debug, Clone)]
 struct TensorLocation {
     /// Index into `SafeTensorsProvider::mmaps`.
     shard_index: usize,
+    /// Byte offset of the tensor data within the mmap.
+    data_start: usize,
+    /// Byte length of the tensor data.
+    data_len: usize,
+    /// Tensor shape.
+    shape: Vec<usize>,
+    /// MIL scalar type (BF16 is mapped to Float16).
+    dtype: ScalarType,
+    /// True when the underlying data is BF16 and must be converted to FP16.
+    needs_bf16_conversion: bool,
 }
 
 /// Weight provider backed by memory-mapped SafeTensors files.
@@ -90,7 +103,7 @@ impl SafeTensorsProvider {
             mmaps.push(mmap);
         }
 
-        // --- Build tensor index ---
+        // --- Build tensor index (pre-parse metadata to avoid re-deserializing) ---
         let mut tensor_index = HashMap::new();
         for (shard_idx, mmap) in mmaps.iter().enumerate() {
             let st = SafeTensors::deserialize(mmap).map_err(|e| {
@@ -99,11 +112,23 @@ impl SafeTensorsProvider {
                     shard_paths[shard_idx].display()
                 ))
             })?;
-            for name in st.names() {
+            let mmap_ptr = mmap.as_ptr() as usize;
+            for (name, view) in st.tensors() {
+                let data = view.data();
+                let data_start = data.as_ptr() as usize - mmap_ptr;
+                let data_len = data.len();
+                let st_dtype = view.dtype();
+                let needs_bf16 = st_dtype == safetensors::Dtype::BF16;
+                let dtype = safetensors_dtype_to_scalar(st_dtype)?;
                 tensor_index.insert(
-                    name.to_string(),
+                    name,
                     TensorLocation {
                         shard_index: shard_idx,
+                        data_start,
+                        data_len,
+                        shape: view.shape().to_vec(),
+                        dtype,
+                        needs_bf16_conversion: needs_bf16,
                     },
                 );
             }
@@ -134,19 +159,14 @@ impl WeightProvider for SafeTensorsProvider {
             .ok_or_else(|| MilError::Validation(format!("tensor not found: {name}")))?;
 
         let mmap = &self.mmaps[loc.shard_index];
-        let st = SafeTensors::deserialize(mmap).map_err(|e| {
-            MilError::Validation(format!("failed to deserialize safetensors shard: {e}"))
-        })?;
+        let data = &mmap[loc.data_start..loc.data_start + loc.data_len];
 
-        let view = st
-            .tensor(name)
-            .map_err(|e| MilError::Validation(format!("failed to read tensor '{name}': {e}")))?;
-
-        let dtype = safetensors_dtype_to_scalar(view.dtype())?;
-        let shape: Vec<usize> = view.shape().to_vec();
-        let data = view.data();
-
-        Ok(WeightTensor::borrowed(data, shape, dtype))
+        if loc.needs_bf16_conversion {
+            let converted = convert_bf16_to_f16(data);
+            Ok(WeightTensor::owned(converted, loc.shape.clone(), loc.dtype))
+        } else {
+            Ok(WeightTensor::borrowed(data, loc.shape.clone(), loc.dtype))
+        }
     }
 
     fn tensor_names(&self) -> Vec<&str> {
@@ -155,6 +175,10 @@ impl WeightProvider for SafeTensorsProvider {
 
     fn config(&self) -> &ModelConfig {
         &self.config
+    }
+
+    fn has_tensor(&self, name: &str) -> bool {
+        self.tensor_index.contains_key(name)
     }
 }
 
@@ -367,9 +391,9 @@ fn detect_and_merge_lora(
         let b_view = get_tensor_view(&mmaps[b_loc.shard_index], &b_name)?;
         let base_view = get_tensor_view(&mmaps[base_loc.shard_index], &base_name)?;
 
-        let a_dtype = safetensors_dtype_to_scalar(a_view.dtype)?;
-        let b_dtype = safetensors_dtype_to_scalar(b_view.dtype)?;
-        let base_dtype = safetensors_dtype_to_scalar(base_view.dtype)?;
+        let a_dtype = a_view.dtype;
+        let b_dtype = b_view.dtype;
+        let base_dtype = base_view.dtype;
 
         if a_dtype != b_dtype || a_dtype != base_dtype {
             continue;
@@ -384,8 +408,8 @@ fn detect_and_merge_lora(
             let alpha_view = get_tensor_view(&mmaps[alpha_loc.shard_index], &alpha_name)?;
             let numel: usize = alpha_view.shape.iter().product();
             if numel == 1 {
-                let alpha_dtype = safetensors_dtype_to_scalar(alpha_view.dtype)?;
-                lora::scalar_from_bytes_pub(alpha_view.data, alpha_dtype)
+                let alpha_dtype = alpha_view.dtype;
+                lora::scalar_from_bytes(&alpha_view.data, alpha_dtype)
             } else {
                 global_alpha
             }
@@ -425,23 +449,37 @@ fn detect_and_merge_lora(
 
 /// Lightweight tensor view extracted from a safetensors shard.
 struct RawTensorView<'a> {
-    data: &'a [u8],
+    data: std::borrow::Cow<'a, [u8]>,
     shape: Vec<usize>,
-    dtype: safetensors::Dtype,
+    dtype: ScalarType,
 }
 
 /// Get a tensor view from a memory-mapped safetensors shard.
+///
+/// BF16 data is automatically converted to FP16.
 fn get_tensor_view<'a>(mmap: &'a Mmap, name: &str) -> Result<RawTensorView<'a>> {
     let st = SafeTensors::deserialize(mmap)
         .map_err(|e| MilError::Validation(format!("failed to deserialize shard: {e}")))?;
     let view = st
         .tensor(name)
         .map_err(|e| MilError::Validation(format!("tensor '{name}' not found in shard: {e}")))?;
-    Ok(RawTensorView {
-        data: view.data(),
-        shape: view.shape().to_vec(),
-        dtype: view.dtype(),
-    })
+    let st_dtype = view.dtype();
+    let dtype = safetensors_dtype_to_scalar(st_dtype)?;
+    let shape = view.shape().to_vec();
+    if st_dtype == safetensors::Dtype::BF16 {
+        let converted = convert_bf16_to_f16(view.data());
+        Ok(RawTensorView {
+            data: std::borrow::Cow::Owned(converted),
+            shape,
+            dtype,
+        })
+    } else {
+        Ok(RawTensorView {
+            data: std::borrow::Cow::Borrowed(view.data()),
+            shape,
+            dtype,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +492,7 @@ fn safetensors_dtype_to_scalar(dtype: safetensors::Dtype) -> Result<ScalarType> 
     use safetensors::Dtype;
     match dtype {
         Dtype::F16 => Ok(ScalarType::Float16),
+        Dtype::BF16 => Ok(ScalarType::Float16), // data converted at read time
         Dtype::F32 => Ok(ScalarType::Float32),
         Dtype::F64 => Ok(ScalarType::Float64),
         Dtype::I8 => Ok(ScalarType::Int8),
@@ -469,6 +508,19 @@ fn safetensors_dtype_to_scalar(dtype: safetensors::Dtype) -> Result<ScalarType> 
             "unsupported safetensors dtype: {other:?}"
         ))),
     }
+}
+
+/// Convert BF16 raw bytes to FP16 raw bytes.
+///
+/// Each pair of bytes is read as a bf16 value, converted through f32 to f16.
+fn convert_bf16_to_f16(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks_exact(2) {
+        let bf = half::bf16::from_le_bytes([chunk[0], chunk[1]]);
+        let fp = half::f16::from_f32(bf.to_f32());
+        out.extend_from_slice(&fp.to_le_bytes());
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +553,10 @@ mod tests {
             ScalarType::Float16
         );
         assert_eq!(
+            safetensors_dtype_to_scalar(Dtype::BF16).unwrap(),
+            ScalarType::Float16
+        );
+        assert_eq!(
             safetensors_dtype_to_scalar(Dtype::F32).unwrap(),
             ScalarType::Float32
         );
@@ -516,6 +572,59 @@ mod tests {
             safetensors_dtype_to_scalar(Dtype::BOOL).unwrap(),
             ScalarType::Bool
         );
+    }
+
+    #[test]
+    fn test_convert_bf16_to_f16() {
+        // BF16 for 1.0: upper 16 bits of f32 1.0 = 0x3F80
+        let bf16_one = half::bf16::from_f32(1.0);
+        let bf16_neg = half::bf16::from_f32(-2.5);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&bf16_one.to_le_bytes());
+        raw.extend_from_slice(&bf16_neg.to_le_bytes());
+
+        let result = convert_bf16_to_f16(&raw);
+        assert_eq!(result.len(), 4); // 2 × 2 bytes
+
+        let h0 = half::f16::from_le_bytes([result[0], result[1]]);
+        let h1 = half::f16::from_le_bytes([result[2], result[3]]);
+        assert!((h0.to_f32() - 1.0).abs() < 0.01);
+        assert!((h1.to_f32() - (-2.5)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_load_bf16_tensor() {
+        use safetensors::tensor::serialize;
+        use std::collections::HashMap as StdHashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "llama", "hidden_size": 4, "num_attention_heads": 2}"#,
+        )
+        .unwrap();
+
+        // Create BF16 tensor data: two bf16 values [1.0, -0.5]
+        let bf_vals: Vec<half::bf16> = vec![half::bf16::from_f32(1.0), half::bf16::from_f32(-0.5)];
+        let data: Vec<u8> = bf_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let shape = vec![2];
+        let mut tensors = StdHashMap::new();
+        tensors.insert(
+            "test.weight",
+            safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, shape, &data).unwrap(),
+        );
+        let serialized = serialize(tensors, None).unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), &serialized).unwrap();
+
+        let provider = SafeTensorsProvider::load(dir.path()).unwrap();
+        let tensor = provider.tensor("test.weight").unwrap();
+        assert_eq!(tensor.dtype, ScalarType::Float16);
+        assert_eq!(tensor.shape, vec![2]);
+        // Data should be FP16 now
+        let h0 = half::f16::from_le_bytes([tensor.data[0], tensor.data[1]]);
+        let h1 = half::f16::from_le_bytes([tensor.data[2], tensor.data[3]]);
+        assert!((h0.to_f32() - 1.0).abs() < 0.01);
+        assert!((h1.to_f32() - (-0.5)).abs() < 0.01);
     }
 
     #[test]

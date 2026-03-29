@@ -174,11 +174,11 @@ impl MetadataValue {
             Self::UInt8(v) => Some(*v as u32),
             Self::UInt16(v) => Some(*v as u32),
             Self::UInt32(v) => Some(*v),
-            Self::UInt64(v) => Some(*v as u32),
-            Self::Int8(v) => Some(*v as u32),
-            Self::Int16(v) => Some(*v as u32),
-            Self::Int32(v) => Some(*v as u32),
-            Self::Int64(v) => Some(*v as u32),
+            Self::UInt64(v) => u32::try_from(*v).ok(),
+            Self::Int8(v) => u32::try_from(*v).ok(),
+            Self::Int16(v) => u32::try_from(*v).ok(),
+            Self::Int32(v) => u32::try_from(*v).ok(),
+            Self::Int64(v) => u32::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -337,6 +337,11 @@ impl<'a> BinReader<'a> {
                 // Array: element type (u32) + count (u64) + elements
                 let elem_type = self.read_u32()?;
                 let count = self.read_u64()? as usize;
+                if count > 1_000_000 {
+                    return Err(MilError::Validation(format!(
+                        "GGUF metadata array count {count} exceeds limit"
+                    )));
+                }
                 let mut elems = Vec::with_capacity(count.min(1 << 20));
                 for _ in 0..count {
                     elems.push(self.read_metadata_value(elem_type)?);
