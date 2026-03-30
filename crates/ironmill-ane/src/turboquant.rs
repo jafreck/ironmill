@@ -226,6 +226,17 @@ impl KvCacheManager {
         self.k_caches[layer].write_bytes_at(byte_offset, k_quantized)?;
         self.v_caches[layer].write_bytes_at(byte_offset, v_quantized)?;
 
+        // TODO(qjl): Compute QJL residual signs when enable_qjl is true.
+        // This requires the original fp16 K_proj (pre-quantization) to compute
+        // sign(K_original - K_dequantized). The dequantization involves:
+        //   1. Cast INT8 → f32
+        //   2. Multiply by dequant scale (inverse of inv_scale)
+        //   3. Apply inverse Hadamard rotation via unrotate_rows_hadamard
+        //   4. Compare with original: sign(K_original[i] - K_dequantized[i])
+        //   5. Store ±1 as fp16 in qjl_sign_caches[layer] at seq_pos
+        // Requires changing update_cache signature to accept &[f16] k_original,
+        // or computing signs in step_attention before calling update_cache.
+
         Ok(())
     }
 

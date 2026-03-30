@@ -302,12 +302,12 @@ pub fn emit_attention_mil(
     let sliced_shape = fmt_shape(&[1, kv_ch, 1, seq_len]);
     let rot_shape = fmt_shape(&[1, head_dim, 1, head_dim]);
 
-    // For attention computation (assuming num_heads == num_kv_heads for now)
-    let head_4d = fmt_shape(&[1, num_heads, head_dim, seq_len]);
+    let gqa_groups = num_heads / num_kv_heads; // >=1; validated by TurboQuantConfig
+    let kv_head_4d = fmt_shape(&[1, num_kv_heads, head_dim, seq_len]);
+    let attn_head_4d = fmt_shape(&[1, num_heads, head_dim, seq_len]);
     let q_head_4d = fmt_shape(&[1, num_heads, head_dim, 1]);
     // QK shape: [1, num_heads, 1, seq_len] after matmul with transpose
     let qk_shape = fmt_shape(&[1, num_heads, 1, seq_len]);
-    let _attn_out_head = fmt_shape(&[1, num_heads, head_dim, 1]);
 
     let deq_scale = compute_deq_scale(head_dim, config.n_bits);
     let scale_factor = 1.0 / (head_dim as f32).sqrt();
@@ -416,23 +416,63 @@ pub fn emit_attention_mil(
     )
     .unwrap();
 
-    // Reshape K_unrotated: [1, kv_ch, 1, seq_len] -> [1, num_heads, head_dim, seq_len]
+    // Reshape K_unrotated: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
     writeln!(
         body,
-        "        tensor<fp16, {head_4d}> k_attn = reshape(\
-         x=k_unrotated, shape=tensor<int32, [4]>([1,{num_heads},{head_dim},{seq_len}]))\
-         [name=string(\"k_attn\")];"
+        "        tensor<fp16, {kv_head_4d}> k_heads = reshape(\
+         x=k_unrotated, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
+         [name=string(\"k_heads\")];"
     )
     .unwrap();
+
+    // Reshape V_unrotated: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
+    writeln!(
+        body,
+        "        tensor<fp16, {kv_head_4d}> v_heads = reshape(\
+         x=v_unrotated, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
+         [name=string(\"v_heads\")];"
+    )
+    .unwrap();
+
+    // GQA head expansion: tile KV heads to match query heads when num_heads > num_kv_heads
+    let (k_attn_name, v_attn_name) = if gqa_groups > 1 {
+        writeln!(
+            body,
+            "        tensor<int32, [4]> gqa_reps = const()[name=string(\"gqa_reps\"), \
+             val=tensor<int32, [4]>([1,{gqa_groups},1,1])];"
+        )
+        .unwrap();
+
+        writeln!(
+            body,
+            "        tensor<fp16, {attn_head_4d}> k_attn = tile(\
+             x=k_heads, reps=gqa_reps)\
+             [name=string(\"k_attn\")];"
+        )
+        .unwrap();
+
+        writeln!(
+            body,
+            "        tensor<fp16, {attn_head_4d}> v_attn = tile(\
+             x=v_heads, reps=gqa_reps)\
+             [name=string(\"v_attn\")];"
+        )
+        .unwrap();
+
+        ("k_attn", "v_attn")
+    } else {
+        // MHA: num_heads == num_kv_heads, no expansion needed
+        ("k_heads", "v_heads")
+    };
 
     // QK = matmul(Q^T, K) -> [1, num_heads, 1, seq_len]
     // Q is [1, num_heads, head_dim, 1], K is [1, num_heads, head_dim, seq_len]
     // transpose_x=true -> Q^T is [1, num_heads, 1, head_dim]
-    // Q^T × K -> [1, num_heads, 1, seq_len]
+    // Q^T x K -> [1, num_heads, 1, seq_len]
     writeln!(
         body,
         "        tensor<fp16, {qk_shape}> qk = matmul(\
-         x=q_reshaped, y=k_attn, transpose_x=bT, transpose_y=bF)\
+         x=q_reshaped, y={k_attn_name}, transpose_x=bT, transpose_y=bF)\
          [name=string(\"qk\")];"
     )
     .unwrap();
@@ -455,26 +495,16 @@ pub fn emit_attention_mil(
     )
     .unwrap();
 
-    // Reshape V_unrotated: [1, kv_ch, 1, seq_len] -> [1, num_heads, head_dim, seq_len]
-    writeln!(
-        body,
-        "        tensor<fp16, {head_4d}> v_attn = reshape(\
-         x=v_unrotated, shape=tensor<int32, [4]>([1,{num_heads},{head_dim},{seq_len}]))\
-         [name=string(\"v_attn\")];"
-    )
-    .unwrap();
-
-    // attn_out = attn_weights × V^T -> [1, num_heads, 1, head_dim]
-    // Wait — we need [1, num_heads, head_dim, 1] as output.
+    // attn_out = attn_weights x V^T -> [1, num_heads, 1, head_dim]
     // attn_weights is [1, num_heads, 1, seq_len]
     // V is [1, num_heads, head_dim, seq_len]
     // V^T is [1, num_heads, seq_len, head_dim]
-    // attn_weights × V^T = [1, num_heads, 1, head_dim]
+    // attn_weights x V^T = [1, num_heads, 1, head_dim]
     let attn_pre_shape = fmt_shape(&[1, num_heads, 1, head_dim]);
     writeln!(
         body,
         "        tensor<fp16, {attn_pre_shape}> attn_pre = matmul(\
-         x=attn_weights, y=v_attn, transpose_x=bF, transpose_y=bT)\
+         x=attn_weights, y={v_attn_name}, transpose_x=bF, transpose_y=bT)\
          [name=string(\"attn_pre\")];"
     )
     .unwrap();
@@ -899,5 +929,39 @@ mod tests {
         assert!(mil.starts_with("program(1.3)"));
         assert!(mil.contains("func main<ios18>"));
         assert!(weights.is_empty());
+    }
+
+    #[test]
+    fn attention_mil_gqa_uses_tile() {
+        // GQA config: 32 query heads, 8 KV heads (4x expansion)
+        let gqa_config = TurboQuantConfig {
+            n_bits: 8,
+            max_seq_len: 128,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 64,
+            num_layers: 1,
+            rotation_seed: 42,
+            enable_qjl: false,
+        };
+        let (mil, _weights) = emit_attention_mil(&gqa_config, 32);
+
+        // Should contain tile op for GQA expansion
+        assert!(mil.contains("tile"), "GQA attention should use tile op");
+        assert!(mil.contains("gqa_reps"), "GQA should have reps constant");
+        // Reps should be [1, 4, 1, 1] for 32/8 = 4x expansion
+        assert!(mil.contains("[1,4,1,1]"), "GQA reps should be [1,4,1,1]");
+        // Should still have valid program structure
+        assert!(mil.contains("softmax"));
+        assert!(mil.contains("z_output0"));
+    }
+
+    #[test]
+    fn attention_mil_mha_no_tile() {
+        // MHA config: num_heads == num_kv_heads, no tile needed
+        let config = test_config();
+        let (mil, _weights) = emit_attention_mil(&config, 32);
+        assert!(!mil.contains("tile"), "MHA should not use tile op");
+        assert!(!mil.contains("gqa_reps"), "MHA should not have gqa_reps");
     }
 }

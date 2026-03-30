@@ -1,6 +1,16 @@
 # TurboQuant on ANE-Direct — Implementation Plan
 
-> **Status:** Draft
+> **Status:** Implemented (see notes below)
+>
+> **Implementation notes:**
+> - All components implemented in `turboquant.rs`, `turboquant_mil.rs`, CLI, and benchmarks.
+> - GQA head expansion via `tile` is implemented but `tile` is only compile-verified
+>   on ANE (`⚠️ compile`), not eval-verified. MHA (num_heads == num_kv_heads) is
+>   fully eval-verified.
+> - **QJL residual sign computation is not yet implemented.** The QJL MIL sub-program
+>   is generated and compiled, but `update_cache` does not populate the sign caches.
+>   This requires the original fp16 K_proj to compute `sign(K_original - K_dequantized)`.
+>   See TODO in `turboquant.rs::KvCacheManager::update_cache`.
 >
 > **Prerequisites:**
 > - [TurboQuant Research Analysis](../research/turboquant-analysis.md)
