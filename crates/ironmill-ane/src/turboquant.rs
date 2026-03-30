@@ -376,6 +376,13 @@ pub struct TurboQuantModel {
     cw_alloc_size: usize,
     /// Uniform allocation size for attention program inputs/outputs.
     attn_alloc_size: usize,
+    /// Staging buffers for external tensors that need alloc-size alignment.
+    /// ANE requires all input IOSurfaces in a single eval call to have
+    /// the same allocation size. Pre-attn outputs may have a different
+    /// alloc size, so we copy into these staging buffers before eval.
+    cw_k_staging: AneTensor,
+    cw_v_staging: AneTensor,
+    attn_q_staging: AneTensor,
     /// The ANE runtime handle.
     runtime: AneRuntime,
 }
@@ -471,6 +478,17 @@ impl TurboQuantModel {
         )?;
         unrotation_tensor.write_bytes_at(0, unrot_data)?;
 
+        // Pre-allocate staging buffers for external tensors (Q, K_proj, V_proj)
+        // that arrive from pre-attn sub-programs with a different alloc size.
+        let kv_channels = config.num_kv_heads * head_dim;
+        let q_channels = config.num_heads * head_dim;
+        let cw_k_staging =
+            AneTensor::new_with_min_alloc(kv_channels, 1, ScalarType::Float16, cw_alloc_size)?;
+        let cw_v_staging =
+            AneTensor::new_with_min_alloc(kv_channels, 1, ScalarType::Float16, cw_alloc_size)?;
+        let attn_q_staging =
+            AneTensor::new_with_min_alloc(q_channels, 1, ScalarType::Float16, attn_alloc_size)?;
+
         Ok(Self {
             config,
             cache,
@@ -481,6 +499,9 @@ impl TurboQuantModel {
             unrotation_tensor,
             cw_alloc_size,
             attn_alloc_size,
+            cw_k_staging,
+            cw_v_staging,
+            attn_q_staging,
             runtime,
         })
     }
@@ -530,6 +551,14 @@ impl TurboQuantModel {
     ) -> Result<AneTensor> {
         let channels = self.config.num_kv_heads * self.config.head_dim;
 
+        // Copy external tensors into staging buffers with matching alloc sizes.
+        // ANE requires all input IOSurfaces in a single eval to have the same
+        // allocation size. Pre-attn outputs may have a different alloc size.
+        let k_data = k_proj.read_f16()?;
+        self.cw_k_staging.write_f16(&k_data[..channels])?;
+        let v_data = v_proj.read_f16()?;
+        self.cw_v_staging.write_f16(&v_data[..channels])?;
+
         // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
         let mut k_quant =
             AneTensor::new_with_min_alloc(channels, 1, ScalarType::Float16, self.cw_alloc_size)?;
@@ -537,7 +566,11 @@ impl TurboQuantModel {
             AneTensor::new_with_min_alloc(channels, 1, ScalarType::Float16, self.cw_alloc_size)?;
         self.runtime.eval(
             &self.cache_write_program,
-            &[k_proj, v_proj, &self.rotation_tensor],
+            &[
+                &self.cw_k_staging,
+                &self.cw_v_staging,
+                &self.rotation_tensor,
+            ],
             &mut [&mut k_quant, &mut v_quant],
         )?;
 
@@ -559,8 +592,10 @@ impl TurboQuantModel {
             .update_cache(layer, &k_bytes, &v_bytes, k_original.as_deref())?;
 
         // 3. Attention: Q + cached K/V + unrotation_matrix → output
-        let (k_cache, v_cache) = self.cache.cache_tensors(layer);
+        let q_data = q.read_f16()?;
         let q_channels = self.config.num_heads * self.config.head_dim;
+        self.attn_q_staging.write_f16(&q_data[..q_channels])?;
+        let (k_cache, v_cache) = self.cache.cache_tensors(layer);
         let mut attn_out = AneTensor::new_with_min_alloc(
             q_channels,
             1,
@@ -569,7 +604,12 @@ impl TurboQuantModel {
         )?;
         self.runtime.eval(
             &self.attention_program,
-            &[q, k_cache, v_cache, &self.unrotation_tensor],
+            &[
+                &self.attn_q_staging,
+                k_cache,
+                v_cache,
+                &self.unrotation_tensor,
+            ],
             &mut [&mut attn_out],
         )?;
 
