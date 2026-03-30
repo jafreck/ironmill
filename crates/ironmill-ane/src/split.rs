@@ -533,17 +533,15 @@ fn try_structural_split(
         return None;
     }
 
-    // 4. Pre-attn: walk backward from each projection's non-const
-    //    inputs. These are the ops that feed INTO the projections
-    //    (norm, etc.), not the projections or their weights.
+    // 4. Pre-attn: the projections themselves + everything feeding into them.
+    //    TurboQuant (and FP16 attention) need Q/K/V projection outputs
+    //    from pre_attn, so the projections must be IN pre_attn, not stripped.
     let mut pre_attn_set: HashSet<usize> = HashSet::new();
     for &proj in &proj_matmuls {
-        for &pred in &graph.backward[proj] {
-            if !is_const_op(&ops[pred]) {
-                pre_attn_set.insert(pred);
-                pre_attn_set.extend(graph.walk_backward(pred));
-            }
-        }
+        // Include the projection matmul itself.
+        pre_attn_set.insert(proj);
+        // Include all ops feeding into it (norm, weight consts, etc.).
+        pre_attn_set.extend(graph.walk_backward(proj));
     }
 
     // 5. Find the O-projection: first matmul/linear with const weight
@@ -1580,10 +1578,11 @@ mod tests {
             !all_returned.contains("layer_0_av_matmul"),
             "AV matmul should be stripped (in attention cluster)"
         );
-        // Q/K/V projection matmuls are part of the attention cluster.
+        // Q/K/V projection matmuls should be in pre_attn (not stripped)
+        // so TurboQuant receives correct Q/K/V inputs.
         assert!(
-            !all_returned.contains("layer_0_q_proj"),
-            "Q projection matmul should be in the attention cluster"
+            pre_names.contains(&"layer_0_q_proj"),
+            "Q projection matmul should be in pre_attn, got: {pre_names:?}"
         );
     }
 
