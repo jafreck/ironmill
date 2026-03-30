@@ -376,9 +376,8 @@ impl AneRuntime {
     /// Unload a program, freeing ANE resources.
     ///
     /// Calls `[model unloadWithQoS:21 error:&e]` then releases the model.
-    pub fn unload_program(&self, program: LoadedProgram) {
+    pub fn unload_program(&self, mut program: LoadedProgram) {
         if !program.model.is_null() {
-            // [model unloadWithQoS:21 error:&e]
             let mut error: *mut c_void = std::ptr::null_mut();
             type UnloadFn =
                 unsafe extern "C" fn(*mut c_void, *mut c_void, i64, *mut *mut c_void) -> i8;
@@ -386,8 +385,9 @@ impl AneRuntime {
             let unload_fn: UnloadFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
             unsafe { unload_fn(program.model, sel, ANE_QOS, &mut error) };
 
-            // Release the model
             unsafe { cf::CFRelease(program.model) };
+            // Null the pointer so Drop doesn't double-release.
+            program.model = std::ptr::null_mut();
         }
     }
 

@@ -36,6 +36,24 @@ impl CompiledProgram {
 // is an opaque pointer that is not accessed until eval.
 unsafe impl Send for CompiledProgram {}
 
+// CompiledProgram holds a retained reference from compile_mil_text.
+// load_program retains again, so CompiledProgram can be safely dropped
+// independently of any LoadedProgram created from it.
+#[cfg(target_os = "macos")]
+impl Drop for CompiledProgram {
+    fn drop(&mut self) {
+        if !self.model.is_null() {
+            unsafe {
+                unsafe extern "C" {
+                    fn CFRelease(cf: *mut c_void);
+                }
+                CFRelease(self.model);
+            }
+            self.model = std::ptr::null_mut();
+        }
+    }
+}
+
 /// A program that has been loaded into the ANE runtime for execution.
 ///
 /// In the Orion-based API, this wraps the same `_ANEInMemoryModel`
@@ -49,3 +67,20 @@ pub struct LoadedProgram {
 // SAFETY: LoadedProgram is Send (can move between threads) but NOT Sync
 // (cannot be shared — ANE is not thread-safe).
 unsafe impl Send for LoadedProgram {}
+
+// LoadedProgram holds a retained reference from load_program.
+// Releasing it when dropped prevents model handle leaks.
+#[cfg(target_os = "macos")]
+impl Drop for LoadedProgram {
+    fn drop(&mut self) {
+        if !self.model.is_null() {
+            unsafe {
+                unsafe extern "C" {
+                    fn CFRelease(cf: *mut c_void);
+                }
+                CFRelease(self.model);
+            }
+            self.model = std::ptr::null_mut();
+        }
+    }
+}
