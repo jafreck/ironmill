@@ -61,8 +61,10 @@ pub struct AneInference {
     /// Current sequence position.
     seq_pos: usize,
     /// Number of KV heads (for FP16 cache management).
+    #[allow(dead_code)]
     num_kv_heads: usize,
     /// Head dimension.
+    #[allow(dead_code)]
     head_dim: usize,
     /// Maximum sequence length for FP16 caches.
     #[allow(dead_code)]
@@ -521,14 +523,12 @@ impl AneInference {
                 };
 
                 // Write K/V to persistent FP16 cache at current position.
-                let token_elements = self.num_kv_heads * self.head_dim;
-                let elem_offset = self.seq_pos * token_elements;
-                caches[layer_idx]
-                    .0
-                    .write_f16_at(elem_offset, &k_data[..token_elements])?;
-                caches[layer_idx]
-                    .1
-                    .write_f16_at(elem_offset, &v_data[..token_elements])?;
+                let k_elements = k_data.len();
+                let v_elements = v_data.len();
+                let elem_offset_k = self.seq_pos * k_elements;
+                let elem_offset_v = self.seq_pos * v_elements;
+                caches[layer_idx].0.write_f16_at(elem_offset_k, &k_data)?;
+                caches[layer_idx].1.write_f16_at(elem_offset_v, &v_data)?;
 
                 // If we have an FP16 attention sub-program, use it.
                 let layer = &mut self.layers[layer_idx];
