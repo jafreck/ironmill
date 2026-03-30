@@ -359,8 +359,24 @@ fn is_const_op(op: &Operation) -> bool {
 /// CPU fills before running the sub-program on ANE. Dead const ops that
 /// only fed gathers are cleaned up by subsequent DCE.
 fn strip_gather_ops(ops: &[Operation]) -> Vec<Operation> {
+    // Strip ops that ANE can't compile in the attention cluster:
+    // - gather (❌ ANE unsupported)
+    // - RoPE ops (contain split which is only compile-verified, unreliable in combination)
+    // - per-head norm ops (reduce_mean + pow pattern, move to CPU)
+    // Keep only: reshape, transpose, tile, matmul/conv, mul (scale), softmax, const, identity
+    let keep_types: &[&str] = &[
+        "reshape",
+        "transpose",
+        "tile",
+        "matmul",
+        "conv",
+        "mul",
+        "softmax",
+        "const",
+        "identity",
+    ];
     ops.iter()
-        .filter(|op| op.op_type != "gather")
+        .filter(|op| keep_types.contains(&op.op_type.as_str()))
         .cloned()
         .collect()
 }
@@ -2294,8 +2310,8 @@ mod tests {
     #[test]
     fn strip_gather_ops_preserves_non_gathers() {
         let ops = vec![
-            make_connected_op("norm", "layer_norm", "x", "norm_out"),
-            make_connected_op("matmul", "matmul", "norm_out", "matmul_out"),
+            make_connected_op("reshape", "reshape", "x", "reshaped"),
+            make_connected_op("matmul", "matmul", "reshaped", "matmul_out"),
         ];
         let stripped = strip_gather_ops(&ops);
         assert_eq!(stripped.len(), 2);

@@ -246,7 +246,8 @@ impl AneInference {
             // With lazy load/unload (loadWithQoS/unloadWithQoS), we can
             // emit attention programs without exceeding the ANE slot limit:
             // at most 3 programs are loaded simultaneously during decode.
-            emit_attention: turbo_config.is_none(),
+            emit_attention: false, // fp16_attn shapes corrupted by global S≥32 padding;
+            // attention sub-programs need original per-head dims, not padded S=32
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
