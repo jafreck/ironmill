@@ -469,6 +469,7 @@ fn find_fused_attention_ops(ops: &[Operation]) -> Vec<usize> {
             op.op_type == "scaled_dot_product_attention"
                 || op.op_type == "sdpa"
                 || op.op_type == "GroupQueryAttention"
+                || op.op_type == "grouped_query_attention"
                 || op.op_type == "MultiHeadAttention"
         })
         .map(|(i, _)| i)
@@ -1964,6 +1965,56 @@ mod tests {
         assert!(
             post_names.contains(&"layer_0_ffn_down"),
             "post-attn should contain FFN down, got: {post_names:?}"
+        );
+    }
+
+    #[test]
+    fn structural_split_fused_gqa_snake_case() {
+        // The GqaFusionPass emits "grouped_query_attention" (snake_case).
+        // Verify the structural split recognises this variant.
+        let p = "layer_0";
+        let ops = vec![
+            make_connected_op(
+                &format!("{p}_norm"),
+                "layer_norm",
+                "hidden_in",
+                &format!("{p}_norm_out"),
+            ),
+            make_const_op(&format!("{p}_q_weight"), &format!("{p}_q_weight_out")),
+            make_const_op(&format!("{p}_k_weight"), &format!("{p}_k_weight_out")),
+            make_const_op(&format!("{p}_v_weight"), &format!("{p}_v_weight_out")),
+            Operation::new("grouped_query_attention", &format!("{p}_gqa"))
+                .with_input("Q", Value::Reference(format!("{p}_norm_out")))
+                .with_input("K", Value::Reference(format!("{p}_q_weight_out")))
+                .with_input("V", Value::Reference(format!("{p}_k_weight_out")))
+                .with_output(&format!("{p}_gqa_out")),
+            make_const_op(&format!("{p}_o_weight"), &format!("{p}_o_weight_out")),
+            make_matmul_op(
+                &format!("{p}_o_proj"),
+                &format!("{p}_gqa_out"),
+                &format!("{p}_o_weight_out"),
+                &format!("{p}_o_proj_out"),
+            ),
+            make_const_op(&format!("{p}_down_weight"), &format!("{p}_down_weight_out")),
+            make_matmul_op(
+                &format!("{p}_ffn_down"),
+                &format!("{p}_o_proj_out"),
+                &format!("{p}_down_weight_out"),
+                &format!("{p}_ffn_down_out"),
+            ),
+        ];
+
+        let (pre, attn, post) = split_at_attention_boundary(&ops);
+        let attn_names: Vec<&str> = attn.iter().map(|op| op.name.as_str()).collect();
+        let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
+
+        assert!(
+            attn_names.contains(&"layer_0_gqa"),
+            "snake_case GQA op should be in attention cluster, got: {attn_names:?}"
+        );
+        assert!(
+            post_names.contains(&"layer_0_o_proj"),
+            "post-attn should contain O projection, got: {post_names:?}"
         );
     }
 
