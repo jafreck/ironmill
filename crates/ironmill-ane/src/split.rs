@@ -251,53 +251,314 @@ fn classify_ops(operations: &[Operation]) -> Vec<(String, Vec<Operation>)> {
 }
 
 // ---------------------------------------------------------------------------
+// Op dependency graph
+// ---------------------------------------------------------------------------
+
+/// Directed dependency graph over a flat `&[Operation]` list.
+///
+/// Each op index maps to the set of op indices it feeds into (forward)
+/// and the set of op indices it consumes from (backward). Edges are
+/// derived from `Value::Reference` entries in each op's inputs.
+struct OpGraph {
+    /// op index → set of op indices that consume this op's outputs.
+    forward: Vec<HashSet<usize>>,
+    /// op index → set of op indices whose outputs this op consumes.
+    backward: Vec<HashSet<usize>>,
+}
+
+impl OpGraph {
+    /// Build the dependency graph from a flat, topologically-ordered op list.
+    fn build(ops: &[Operation]) -> Self {
+        let n = ops.len();
+        let mut forward = vec![HashSet::new(); n];
+        let mut backward = vec![HashSet::new(); n];
+
+        // Map output name → producing op index.
+        let mut output_to_idx: HashMap<&str, usize> = HashMap::new();
+        for (i, op) in ops.iter().enumerate() {
+            for out in &op.outputs {
+                output_to_idx.insert(out.as_str(), i);
+            }
+        }
+
+        // Wire up edges from Value::Reference inputs.
+        for (consumer_idx, op) in ops.iter().enumerate() {
+            for val in op.inputs.values() {
+                if let Value::Reference(ref_name) = val {
+                    if let Some(&producer_idx) = output_to_idx.get(ref_name.as_str()) {
+                        forward[producer_idx].insert(consumer_idx);
+                        backward[consumer_idx].insert(producer_idx);
+                    }
+                }
+            }
+        }
+
+        Self { forward, backward }
+    }
+
+    /// Collect all ops reachable by walking backward (transitively) from
+    /// `start`, *excluding* `start` itself.
+    fn walk_backward(&self, start: usize) -> HashSet<usize> {
+        let mut visited = HashSet::new();
+        let mut stack: Vec<usize> = self.backward[start].iter().copied().collect();
+        while let Some(idx) = stack.pop() {
+            if visited.insert(idx) {
+                stack.extend(self.backward[idx].iter().copied());
+            }
+        }
+        visited
+    }
+
+    /// Collect all ops reachable by walking forward (transitively) from
+    /// `start`, *excluding* `start` itself.
+    fn walk_forward(&self, start: usize) -> HashSet<usize> {
+        let mut visited = HashSet::new();
+        let mut stack: Vec<usize> = self.forward[start].iter().copied().collect();
+        while let Some(idx) = stack.pop() {
+            if visited.insert(idx) {
+                stack.extend(self.forward[idx].iter().copied());
+            }
+        }
+        visited
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structural anchor detection
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the op is a const (weight/bias/scalar literal).
+fn is_const_op(op: &Operation) -> bool {
+    op.op_type == "const" || op.op_type.starts_with("constexpr_")
+}
+
+/// Find indices of Q/K/V projection matmuls.
+///
+/// Q/K/V projections are matmul/linear ops that:
+///   - have at least one const input (the weight), and
+///   - share the same non-const activation input (the norm output).
+///
+/// The group of 2–3 matmuls sharing a non-const input and appearing
+/// earliest in topological order are the projections.
+fn find_projection_matmuls(ops: &[Operation], graph: &OpGraph) -> Vec<usize> {
+    // Map output name → producing op index (for resolving references).
+    let mut output_to_idx: HashMap<&str, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        for out in &op.outputs {
+            output_to_idx.insert(out.as_str(), i);
+        }
+    }
+
+    // Find matmul/linear ops with at least one const input.
+    let matmuls_with_const: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(i, op)| {
+            (op.op_type == "matmul" || op.op_type == "linear")
+                && graph.backward[*i]
+                    .iter()
+                    .any(|&pred| is_const_op(&ops[pred]))
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    // Group by their non-const input reference name. Q/K/V projections
+    // share the same activation input (e.g., the norm output).
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for &idx in &matmuls_with_const {
+        for val in ops[idx].inputs.values() {
+            if let Value::Reference(ref_name) = val {
+                if let Some(&pred_idx) = output_to_idx.get(ref_name.as_str()) {
+                    if !is_const_op(&ops[pred_idx]) {
+                        groups.entry(ref_name.clone()).or_default().push(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pick the earliest group with 2+ members (Q/K/V projections).
+    let mut best: Option<Vec<usize>> = None;
+    for (_, mut indices) in groups {
+        if indices.len() >= 2 {
+            indices.sort();
+            if best.is_none() || indices[0] < best.as_ref().unwrap()[0] {
+                best = Some(indices);
+            }
+        }
+    }
+
+    best.unwrap_or_default()
+}
+
+/// Find the O-projection matmul by walking forward from softmax.
+///
+/// The O-projection is the first matmul/linear with a const weight
+/// reachable downstream from the softmax (via AV matmul → output
+/// reshape/transpose → O-proj). It excludes the original Q/K/V
+/// projection matmuls.
+fn find_o_projection(
+    ops: &[Operation],
+    graph: &OpGraph,
+    softmax_indices: &[usize],
+    proj_matmuls: &[usize],
+) -> Option<usize> {
+    let proj_set: HashSet<usize> = proj_matmuls.iter().copied().collect();
+
+    for &s in softmax_indices {
+        let forward = graph.walk_forward(s);
+        let mut candidates: Vec<usize> = forward
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                !proj_set.contains(&idx)
+                    && (ops[idx].op_type == "matmul" || ops[idx].op_type == "linear")
+                    && graph.backward[idx]
+                        .iter()
+                        .any(|&pred| is_const_op(&ops[pred]))
+            })
+            .collect();
+        candidates.sort();
+        if let Some(&first) = candidates.first() {
+            return Some(first);
+        }
+    }
+    None
+}
+
+/// Find softmax ops (the attention core marker).
+fn find_softmax_ops(ops: &[Operation]) -> Vec<usize> {
+    ops.iter()
+        .enumerate()
+        .filter(|(_, op)| op.op_type == "softmax")
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Attention-boundary splitting
 // ---------------------------------------------------------------------------
 
 /// Split a layer's ops into pre-attention and post-attention groups.
 ///
-/// The split point is the attention op cluster — the ops between Q/K/V
-/// projections and the output projection. For the GQA lowered pattern
-/// this includes reshapes, transposes, tiles, matmuls (QK^T, softmax,
-/// AV), and the output reshape/transpose.
+/// Uses **structural graph traversal** rather than name-based heuristics.
+/// The split identifies the attention cluster by finding softmax ops and
+/// Q/K/V projection matmuls, then classifies:
 ///
-/// **Pre-attention** (→ `layer_N_pre_attn`): norm → Q/K/V projections.
-/// **Post-attention** (→ `layer_N_post_attn`): O projection → residual → FFN → residual.
+/// - **Pre-attention**: ops that feed *into* the Q/K/V projection inputs
+///   (input norm, embedding lookups, weight consts for projections).
+/// - **Attention cluster** (stripped): the projections themselves, RoPE,
+///   per-head reshapes/norms, QK^T matmul, softmax, AV matmul, and the
+///   output reshape/transpose.
+/// - **Post-attention**: ops reachable forward from the O-projection
+///   output (O projection, residual add, FFN, their weight consts).
 ///
-/// The attention ops themselves are excluded — they are replaced at
-/// runtime by either an FP16 attention sub-program or TurboQuant.
+/// Falls back to the legacy name-based heuristic if structural detection
+/// fails.
 fn split_at_attention_boundary(ops: &[Operation]) -> (Vec<Operation>, Vec<Operation>) {
-    // Find the attention cluster by looking for the characteristic GQA
-    // lowered pattern: RoPE rotation, reshape/transpose ops for Q/K/V,
-    // matmul (QK^T), softmax, matmul (AV), reshape, transpose (output).
-    //
-    // RoPE (RotaryEmbedding) ops are included in the cluster because
-    // they contain concat ops that ANE doesn't support, and they are
-    // tightly coupled to the attention mechanism. RoPE is handled
-    // externally (on CPU or by TurboQuant's rotation pipeline).
-    //
-    // Heuristic: the first RoPE or Q reshape op starts the attention
-    // cluster, and the last attention-related op ends it.
+    if let Some(result) = try_structural_split(ops) {
+        return result;
+    }
 
+    // Fallback: legacy name-based heuristic.
+    eprintln!(
+        "warning: structural attention split failed, falling back to name heuristic ({} ops)",
+        ops.len()
+    );
+    split_at_attention_boundary_by_name(ops)
+}
+
+/// Attempt the graph-based structural split. Returns `None` if the
+/// structural anchors can't be identified (no softmax, no projections).
+fn try_structural_split(ops: &[Operation]) -> Option<(Vec<Operation>, Vec<Operation>)> {
+    let graph = OpGraph::build(ops);
+
+    // 1. Find softmax ops — the attention core marker.
+    let softmax_indices = find_softmax_ops(ops);
+    if softmax_indices.is_empty() {
+        return None;
+    }
+
+    // 2. Find Q/K/V projection matmuls (matmul with const weight that
+    //    share the same activation input). Expect 2–3.
+    let proj_matmuls = find_projection_matmuls(ops, &graph);
+    if proj_matmuls.len() < 2 {
+        return None;
+    }
+
+    // 3. Pre-attn: walk backward from each projection's non-const
+    //    inputs. These are the ops that feed INTO the projections
+    //    (norm, etc.), not the projections or their weights.
+    let mut pre_attn_set: HashSet<usize> = HashSet::new();
+    for &proj in &proj_matmuls {
+        for &pred in &graph.backward[proj] {
+            if !is_const_op(&ops[pred]) {
+                pre_attn_set.insert(pred);
+                pre_attn_set.extend(graph.walk_backward(pred));
+            }
+        }
+    }
+
+    // 4. Find the O-projection: first matmul/linear with const weight
+    //    reachable forward from softmax (excludes Q/K/V projections).
+    let o_proj_idx = find_o_projection(ops, &graph, &softmax_indices, &proj_matmuls);
+
+    // 5. Post-attn: O-projection + everything forward from it.
+    let mut post_attn_set: HashSet<usize> = HashSet::new();
+    if let Some(o_idx) = o_proj_idx {
+        post_attn_set.insert(o_idx);
+        post_attn_set.extend(graph.walk_forward(o_idx));
+    }
+
+    // Add const ops that exclusively feed post-attn ops.
+    for (i, op) in ops.iter().enumerate() {
+        if !is_const_op(op) || graph.forward[i].is_empty() {
+            continue;
+        }
+        if graph.forward[i].iter().all(|c| post_attn_set.contains(c)) {
+            post_attn_set.insert(i);
+        }
+    }
+
+    // 6. Collect pre-attn and post-attn ops in topological order.
+    //    Everything not in either set is the attention cluster (stripped).
+    let mut pre_attn = Vec::new();
+    let mut post_attn = Vec::new();
+
+    for (i, op) in ops.iter().enumerate() {
+        if pre_attn_set.contains(&i) {
+            pre_attn.push(op.clone());
+        } else if post_attn_set.contains(&i) {
+            post_attn.push(op.clone());
+        }
+        // else: attention cluster → stripped
+    }
+
+    // If both halves are empty, fall back.
+    if pre_attn.is_empty() && post_attn.is_empty() {
+        return None;
+    }
+
+    Some((pre_attn, post_attn))
+}
+
+/// Legacy name-based attention split (fallback).
+fn split_at_attention_boundary_by_name(ops: &[Operation]) -> (Vec<Operation>, Vec<Operation>) {
     let mut attn_start = None;
     let mut attn_end = None;
 
     for (i, op) in ops.iter().enumerate() {
         let name_lower = op.name.to_ascii_lowercase();
-        let is_attn_op = // RoPE / RotaryEmbedding ops (split, gather cos/sin, mul, sub, add, concat)
-            name_lower.contains("rotaryembedding")
+        let is_attn_op = name_lower.contains("rotaryembedding")
             || name_lower.contains("rotary_embedding")
             || name_lower.contains("_rotary_")
             || name_lower.contains("_rope_")
-            // cos/sin cache gather for RoPE
             || name_lower.contains("_cos_gather")
             || name_lower.contains("_sin_gather")
             || name_lower.contains("_cos_gathered")
             || name_lower.contains("_sin_gathered")
-            // Position ID reformatting for RoPE
             || name_lower.contains("pos_ids_reformat")
             || name_lower.contains("position_ids_reformat")
-            // GQA reshape/transpose
             || name_lower.contains("_q_reshape")
             || name_lower.contains("_k_reshape")
             || name_lower.contains("_v_reshape")
@@ -308,7 +569,6 @@ fn split_at_attention_boundary(ops: &[Operation]) -> (Vec<Operation>, Vec<Operat
             || name_lower.contains("_v_tile")
             || name_lower.contains("_k_tiled")
             || name_lower.contains("_v_tiled")
-            // Attention core
             || name_lower.contains("_qk_matmul")
             || name_lower.contains("_qk_scale")
             || name_lower.contains("_attn_softmax")
@@ -328,22 +588,15 @@ fn split_at_attention_boundary(ops: &[Operation]) -> (Vec<Operation>, Vec<Operat
         (Some(start), Some(end)) => {
             let pre_attn = ops[..start].to_vec();
             let post_attn = ops[end + 1..].to_vec();
-            // If pre_attn or post_attn is empty, fall back to keeping
-            // everything in pre_attn (the caller can still use it).
-            if pre_attn.is_empty() && post_attn.is_empty() {
-                (ops.to_vec(), vec![])
-            } else if pre_attn.is_empty() {
-                // All ops before attention are attention ops — unusual,
-                // put everything in pre_attn.
+            if pre_attn.is_empty() {
+                // All ops before attention are attention ops, or there
+                // are no ops at all — put everything in pre_attn.
                 (ops.to_vec(), vec![])
             } else {
                 (pre_attn, post_attn)
             }
         }
-        _ => {
-            // No attention pattern found — put everything in pre_attn.
-            (ops.to_vec(), vec![])
-        }
+        _ => (ops.to_vec(), vec![]),
     }
 }
 
@@ -752,7 +1005,8 @@ mod tests {
 
     #[test]
     fn split_attention_boundary() {
-        // Simulate a layer with pre-attn ops, attention ops, and post-attn ops.
+        // Simulate a layer with pre-attn ops, attention ops, and post-attn
+        // ops. Uses the name-based heuristic fallback (no data-flow links).
         let ops = vec![
             make_op("embed_tok", "gather"),
             // Layer 0: pre-attn
@@ -830,5 +1084,540 @@ mod tests {
 
         let names: Vec<&str> = split.programs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, &["layer_0"]);
+    }
+
+    // -------------------------------------------------------------------
+    // Structural split helpers
+    // -------------------------------------------------------------------
+
+    /// Build a const (weight) op that produces a named output.
+    fn make_const_op(name: &str, output_name: &str) -> Operation {
+        Operation::new("const", name)
+            .with_input(
+                "val",
+                Value::Tensor {
+                    data: vec![0u8; 16],
+                    shape: vec![4, 4],
+                    dtype: ScalarType::Float16,
+                },
+            )
+            .with_output(output_name)
+    }
+
+    /// Build a connected op with one `x` input reference and one output.
+    fn make_connected_op(
+        name: &str,
+        op_type: &str,
+        input_ref: &str,
+        output_name: &str,
+    ) -> Operation {
+        Operation::new(op_type, name)
+            .with_input("x", Value::Reference(input_ref.to_string()))
+            .with_output(output_name)
+    }
+
+    /// Build a matmul op with two named inputs (x, y) and one output.
+    fn make_matmul_op(name: &str, x_ref: &str, y_ref: &str, output_name: &str) -> Operation {
+        Operation::new("matmul", name)
+            .with_input("x", Value::Reference(x_ref.to_string()))
+            .with_input("y", Value::Reference(y_ref.to_string()))
+            .with_output(output_name)
+    }
+
+    /// Build a standard GQA layer op list with proper data-flow links.
+    ///
+    /// Graph:
+    /// ```text
+    /// [input] → norm → ─┬─ (+ q_weight const) → q_proj_matmul → q_reshape → q_transpose ──┐
+    ///                    ├─ (+ k_weight const) → k_proj_matmul → k_reshape → k_transpose ──┤
+    ///                    └─ (+ v_weight const) → v_proj_matmul → v_reshape → v_transpose ──┤
+    ///                                                                                       │
+    ///                    ┌───────────────── qk_matmul (Q × K^T) ◄──────────────────────────┘
+    ///                    │
+    ///                    └→ scale → softmax → av_matmul (attn × V) → out_reshape → out_transpose
+    ///                                                                                       │
+    ///                    (+ o_weight const) → o_proj_matmul ◄──────────────────────────────┘
+    ///                    │
+    ///                    └→ residual_add → (+ up_weight const) → ffn_up → ffn_act
+    ///                       → (+ down_weight const) → ffn_down → ffn_residual
+    /// ```
+    fn make_gqa_layer_ops(prefix: &str) -> Vec<Operation> {
+        let p = prefix;
+        vec![
+            // Input norm
+            make_connected_op(
+                &format!("{p}_norm"),
+                "layer_norm",
+                "hidden_in",
+                &format!("{p}_norm_out"),
+            ),
+            // Q/K/V weight consts
+            make_const_op(&format!("{p}_q_weight"), &format!("{p}_q_weight_out")),
+            make_const_op(&format!("{p}_k_weight"), &format!("{p}_k_weight_out")),
+            make_const_op(&format!("{p}_v_weight"), &format!("{p}_v_weight_out")),
+            // Q/K/V projection matmuls
+            make_matmul_op(
+                &format!("{p}_q_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_q_weight_out"),
+                &format!("{p}_q_proj_out"),
+            ),
+            make_matmul_op(
+                &format!("{p}_k_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_k_weight_out"),
+                &format!("{p}_k_proj_out"),
+            ),
+            make_matmul_op(
+                &format!("{p}_v_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_v_weight_out"),
+                &format!("{p}_v_proj_out"),
+            ),
+            // Attention reshapes/transposes
+            make_connected_op(
+                &format!("{p}_q_reshape"),
+                "reshape",
+                &format!("{p}_q_proj_out"),
+                &format!("{p}_q_reshaped"),
+            ),
+            make_connected_op(
+                &format!("{p}_q_transpose"),
+                "transpose",
+                &format!("{p}_q_reshaped"),
+                &format!("{p}_q_transposed"),
+            ),
+            make_connected_op(
+                &format!("{p}_k_reshape"),
+                "reshape",
+                &format!("{p}_k_proj_out"),
+                &format!("{p}_k_reshaped"),
+            ),
+            make_connected_op(
+                &format!("{p}_k_transpose"),
+                "transpose",
+                &format!("{p}_k_reshaped"),
+                &format!("{p}_k_transposed"),
+            ),
+            make_connected_op(
+                &format!("{p}_v_reshape"),
+                "reshape",
+                &format!("{p}_v_proj_out"),
+                &format!("{p}_v_reshaped"),
+            ),
+            make_connected_op(
+                &format!("{p}_v_transpose"),
+                "transpose",
+                &format!("{p}_v_reshaped"),
+                &format!("{p}_v_transposed"),
+            ),
+            // QK^T matmul
+            make_matmul_op(
+                &format!("{p}_qk_matmul"),
+                &format!("{p}_q_transposed"),
+                &format!("{p}_k_transposed"),
+                &format!("{p}_qk_scores"),
+            ),
+            // Scale
+            make_connected_op(
+                &format!("{p}_qk_scale"),
+                "mul",
+                &format!("{p}_qk_scores"),
+                &format!("{p}_qk_scaled"),
+            ),
+            // Softmax
+            make_connected_op(
+                &format!("{p}_softmax"),
+                "softmax",
+                &format!("{p}_qk_scaled"),
+                &format!("{p}_attn_weights"),
+            ),
+            // AV matmul
+            make_matmul_op(
+                &format!("{p}_av_matmul"),
+                &format!("{p}_attn_weights"),
+                &format!("{p}_v_transposed"),
+                &format!("{p}_av_out"),
+            ),
+            // Output reshape/transpose
+            make_connected_op(
+                &format!("{p}_out_reshape"),
+                "reshape",
+                &format!("{p}_av_out"),
+                &format!("{p}_out_reshaped"),
+            ),
+            make_connected_op(
+                &format!("{p}_out_transpose"),
+                "transpose",
+                &format!("{p}_out_reshaped"),
+                &format!("{p}_out_transposed"),
+            ),
+            // O projection
+            make_const_op(&format!("{p}_o_weight"), &format!("{p}_o_weight_out")),
+            make_matmul_op(
+                &format!("{p}_o_proj"),
+                &format!("{p}_out_transposed"),
+                &format!("{p}_o_weight_out"),
+                &format!("{p}_o_proj_out"),
+            ),
+            // Residual add
+            make_matmul_op(
+                &format!("{p}_residual_add"),
+                &format!("{p}_o_proj_out"),
+                "hidden_in",
+                &format!("{p}_residual_out"),
+            ),
+            // FFN
+            make_const_op(&format!("{p}_up_weight"), &format!("{p}_up_weight_out")),
+            make_matmul_op(
+                &format!("{p}_ffn_up"),
+                &format!("{p}_residual_out"),
+                &format!("{p}_up_weight_out"),
+                &format!("{p}_ffn_up_out"),
+            ),
+            make_connected_op(
+                &format!("{p}_ffn_act"),
+                "relu",
+                &format!("{p}_ffn_up_out"),
+                &format!("{p}_ffn_act_out"),
+            ),
+            make_const_op(&format!("{p}_down_weight"), &format!("{p}_down_weight_out")),
+            make_matmul_op(
+                &format!("{p}_ffn_down"),
+                &format!("{p}_ffn_act_out"),
+                &format!("{p}_down_weight_out"),
+                &format!("{p}_ffn_down_out"),
+            ),
+        ]
+    }
+
+    // -------------------------------------------------------------------
+    // Structural split tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn structural_split_standard_gqa() {
+        // Standard GQA layer with proper data-flow links.
+        // The structural split should identify the attention cluster by
+        // following data flow, not op names.
+        let layer_ops = make_gqa_layer_ops("layer_0");
+        let (pre, post) = split_at_attention_boundary(&layer_ops);
+
+        let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
+
+        // Pre-attn: norm + Q/K/V weight consts (norm feeds into projections).
+        assert!(
+            pre_names.contains(&"layer_0_norm"),
+            "pre-attn should contain the norm op, got: {pre_names:?}"
+        );
+
+        // Post-attn: O projection, residual, FFN ops and their weight consts.
+        assert!(
+            post_names.contains(&"layer_0_o_proj"),
+            "post-attn should contain O projection, got: {post_names:?}"
+        );
+        assert!(
+            post_names.contains(&"layer_0_ffn_down"),
+            "post-attn should contain FFN down, got: {post_names:?}"
+        );
+
+        // Attention cluster ops should be in neither pre nor post.
+        let all_returned: HashSet<&str> =
+            pre_names.iter().chain(post_names.iter()).copied().collect();
+        assert!(
+            !all_returned.contains("layer_0_softmax"),
+            "softmax should be stripped (in attention cluster)"
+        );
+        assert!(
+            !all_returned.contains("layer_0_qk_matmul"),
+            "QK matmul should be stripped (in attention cluster)"
+        );
+        assert!(
+            !all_returned.contains("layer_0_av_matmul"),
+            "AV matmul should be stripped (in attention cluster)"
+        );
+        // Q/K/V projection matmuls are part of the attention cluster.
+        assert!(
+            !all_returned.contains("layer_0_q_proj"),
+            "Q projection matmul should be in the attention cluster"
+        );
+    }
+
+    #[test]
+    fn structural_split_qwen3_per_head_norms() {
+        // Qwen3-like layer with per-head K/V norms between projection
+        // and attention. The K-norm reshapes should be classified as
+        // attention cluster ops, NOT pre-attn — this was the original bug.
+        let p = "layer_1";
+        let mut ops = vec![
+            // Input norm
+            make_connected_op(
+                &format!("{p}_norm"),
+                "layer_norm",
+                "hidden_in",
+                &format!("{p}_norm_out"),
+            ),
+            // Q/K/V weight consts
+            make_const_op(&format!("{p}_q_weight"), &format!("{p}_q_weight_out")),
+            make_const_op(&format!("{p}_k_weight"), &format!("{p}_k_weight_out")),
+            make_const_op(&format!("{p}_v_weight"), &format!("{p}_v_weight_out")),
+            // Q/K/V projection matmuls
+            make_matmul_op(
+                &format!("{p}_q_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_q_weight_out"),
+                &format!("{p}_q_proj_out"),
+            ),
+            make_matmul_op(
+                &format!("{p}_k_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_k_weight_out"),
+                &format!("{p}_k_proj_out"),
+            ),
+            make_matmul_op(
+                &format!("{p}_v_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_v_weight_out"),
+                &format!("{p}_v_proj_out"),
+            ),
+            // --- Per-head K norm (the Qwen3 pattern that caused the bug) ---
+            // K reshape for per-head norm (1024 → [batch, heads, head_dim])
+            make_connected_op(
+                &format!("{p}_attn_k_norm_Reshape_0"),
+                "reshape",
+                &format!("{p}_k_proj_out"),
+                &format!("{p}_k_for_norm"),
+            ),
+            // K per-head norm (SimplifiedLayerNormalization)
+            make_connected_op(
+                &format!("{p}_attn_k_norm"),
+                "layer_norm",
+                &format!("{p}_k_for_norm"),
+                &format!("{p}_k_normed"),
+            ),
+            // K reshape back after norm
+            make_connected_op(
+                &format!("{p}_attn_k_norm_Reshape_1"),
+                "reshape",
+                &format!("{p}_k_normed"),
+                &format!("{p}_k_normed_reshaped"),
+            ),
+            // --- Per-head Q norm ---
+            make_connected_op(
+                &format!("{p}_attn_q_norm_Reshape_0"),
+                "reshape",
+                &format!("{p}_q_proj_out"),
+                &format!("{p}_q_for_norm"),
+            ),
+            make_connected_op(
+                &format!("{p}_attn_q_norm"),
+                "layer_norm",
+                &format!("{p}_q_for_norm"),
+                &format!("{p}_q_normed"),
+            ),
+            make_connected_op(
+                &format!("{p}_attn_q_norm_Reshape_1"),
+                "reshape",
+                &format!("{p}_q_normed"),
+                &format!("{p}_q_normed_reshaped"),
+            ),
+            // V reshape (no norm for V in Qwen3)
+            make_connected_op(
+                &format!("{p}_v_reshape"),
+                "reshape",
+                &format!("{p}_v_proj_out"),
+                &format!("{p}_v_reshaped"),
+            ),
+        ];
+        // Standard attention core after the norms.
+        ops.extend(vec![
+            make_connected_op(
+                &format!("{p}_q_transpose"),
+                "transpose",
+                &format!("{p}_q_normed_reshaped"),
+                &format!("{p}_q_transposed"),
+            ),
+            make_connected_op(
+                &format!("{p}_k_transpose"),
+                "transpose",
+                &format!("{p}_k_normed_reshaped"),
+                &format!("{p}_k_transposed"),
+            ),
+            make_connected_op(
+                &format!("{p}_v_transpose"),
+                "transpose",
+                &format!("{p}_v_reshaped"),
+                &format!("{p}_v_transposed"),
+            ),
+            make_matmul_op(
+                &format!("{p}_qk_matmul"),
+                &format!("{p}_q_transposed"),
+                &format!("{p}_k_transposed"),
+                &format!("{p}_qk_scores"),
+            ),
+            make_connected_op(
+                &format!("{p}_qk_scale"),
+                "mul",
+                &format!("{p}_qk_scores"),
+                &format!("{p}_qk_scaled"),
+            ),
+            make_connected_op(
+                &format!("{p}_softmax"),
+                "softmax",
+                &format!("{p}_qk_scaled"),
+                &format!("{p}_attn_weights"),
+            ),
+            make_matmul_op(
+                &format!("{p}_av_matmul"),
+                &format!("{p}_attn_weights"),
+                &format!("{p}_v_transposed"),
+                &format!("{p}_av_out"),
+            ),
+            make_connected_op(
+                &format!("{p}_out_reshape"),
+                "reshape",
+                &format!("{p}_av_out"),
+                &format!("{p}_out_reshaped"),
+            ),
+            make_connected_op(
+                &format!("{p}_out_transpose"),
+                "transpose",
+                &format!("{p}_out_reshaped"),
+                &format!("{p}_out_transposed"),
+            ),
+            // O projection + post-attn
+            make_const_op(&format!("{p}_o_weight"), &format!("{p}_o_weight_out")),
+            make_matmul_op(
+                &format!("{p}_o_proj"),
+                &format!("{p}_out_transposed"),
+                &format!("{p}_o_weight_out"),
+                &format!("{p}_o_proj_out"),
+            ),
+            make_const_op(&format!("{p}_down_weight"), &format!("{p}_down_weight_out")),
+            make_matmul_op(
+                &format!("{p}_ffn_down"),
+                &format!("{p}_o_proj_out"),
+                &format!("{p}_down_weight_out"),
+                &format!("{p}_ffn_down_out"),
+            ),
+        ]);
+
+        let (pre, post) = split_at_attention_boundary(&ops);
+
+        let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
+        let all_returned: HashSet<&str> =
+            pre_names.iter().chain(post_names.iter()).copied().collect();
+
+        // The K-norm reshapes must NOT be in pre-attn (this was the original bug).
+        assert!(
+            !pre_names.contains(&"layer_1_attn_k_norm_Reshape_0"),
+            "K-norm reshape should NOT be in pre-attn (was the original bug), pre: {pre_names:?}"
+        );
+        assert!(
+            !pre_names.contains(&"layer_1_attn_k_norm_Reshape_1"),
+            "K-norm reshape-back should NOT be in pre-attn, pre: {pre_names:?}"
+        );
+
+        // K-norm ops should be in the attention cluster (stripped).
+        assert!(
+            !all_returned.contains("layer_1_attn_k_norm_Reshape_0"),
+            "K-norm reshape should be in attention cluster (stripped)"
+        );
+        assert!(
+            !all_returned.contains("layer_1_attn_k_norm"),
+            "K per-head norm should be in attention cluster (stripped)"
+        );
+
+        // Pre-attn should contain the input norm.
+        assert!(
+            pre_names.contains(&"layer_1_norm"),
+            "pre-attn should contain input norm, got: {pre_names:?}"
+        );
+
+        // Post-attn should contain O projection and FFN.
+        assert!(
+            post_names.contains(&"layer_1_o_proj"),
+            "post-attn should contain O projection, got: {post_names:?}"
+        );
+        assert!(
+            post_names.contains(&"layer_1_ffn_down"),
+            "post-attn should contain FFN down, got: {post_names:?}"
+        );
+    }
+
+    #[test]
+    fn structural_split_no_attention() {
+        // Layer with no softmax → fallback puts everything in pre-attn.
+        let ops = vec![
+            make_connected_op("layer_0_norm", "layer_norm", "x", "norm_out"),
+            make_const_op("layer_0_w", "w_out"),
+            make_matmul_op("layer_0_linear", "norm_out", "w_out", "linear_out"),
+        ];
+        let (pre, post) = split_at_attention_boundary(&ops);
+
+        assert_eq!(pre.len(), 3, "all ops should be in pre-attn");
+        assert!(post.is_empty(), "post-attn should be empty");
+    }
+
+    #[test]
+    fn structural_split_layer_0_edge_case() {
+        // Layer 0 edge case: the input norm might trace to a function
+        // input rather than a previous op. The structural split should
+        // still correctly identify pre-attn ops.
+        let layer_ops = make_gqa_layer_ops("layer_0");
+        let (pre, post) = split_at_attention_boundary(&layer_ops);
+
+        // Pre-attn should not be empty (layer 0 previously had empty pre-attn).
+        assert!(
+            !pre.is_empty(),
+            "layer 0 pre-attn should NOT be empty (was the bug)"
+        );
+
+        // Should at least contain the norm op.
+        let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        assert!(
+            pre_names.contains(&"layer_0_norm"),
+            "layer 0 pre-attn should contain norm, got: {pre_names:?}"
+        );
+
+        // Post-attn should contain O proj and FFN.
+        assert!(!post.is_empty(), "layer 0 post-attn should not be empty");
+        let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
+        assert!(
+            post_names.contains(&"layer_0_o_proj"),
+            "layer 0 post-attn should contain O proj, got: {post_names:?}"
+        );
+    }
+
+    #[test]
+    fn opgraph_build_and_walk() {
+        // Unit test for OpGraph itself.
+        let ops = vec![
+            make_const_op("w", "w_out"),
+            make_connected_op("norm", "layer_norm", "x_in", "norm_out"),
+            make_matmul_op("proj", "norm_out", "w_out", "proj_out"),
+            make_connected_op("act", "relu", "proj_out", "act_out"),
+        ];
+        let graph = OpGraph::build(&ops);
+
+        // w (0) → proj (2)
+        assert!(graph.forward[0].contains(&2));
+        // norm (1) → proj (2)
+        assert!(graph.forward[1].contains(&2));
+        // proj (2) → act (3)
+        assert!(graph.forward[2].contains(&3));
+
+        // Backward walk from act should reach w, norm, proj.
+        let ancestors = graph.walk_backward(3);
+        assert!(ancestors.contains(&0), "should reach const w");
+        assert!(ancestors.contains(&1), "should reach norm");
+        assert!(ancestors.contains(&2), "should reach proj");
+
+        // Forward walk from norm should reach proj, act.
+        let descendants = graph.walk_forward(1);
+        assert!(descendants.contains(&2), "should reach proj");
+        assert!(descendants.contains(&3), "should reach act");
     }
 }
