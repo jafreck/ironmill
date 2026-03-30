@@ -11,6 +11,7 @@ use crate::program::{CompiledProgram, LoadedProgram};
 use crate::runtime::AneRuntime;
 use crate::tensor::AneTensor;
 use crate::turboquant_mil;
+use crate::turboquant_mil::MIN_IO_SEQ;
 use crate::{AneError, Result};
 
 /// Configuration for TurboQuant INT8 KV cache compression.
@@ -442,19 +443,19 @@ impl TurboQuantModel {
         let kv_ch = config.num_kv_heads * head_dim;
         let q_ch = config.num_heads * head_dim;
 
-        // Cache-write inputs: K[kv_ch,1] fp16, V[kv_ch,1] fp16, R[hd,hd] fp16
-        // Cache-write outputs: K_q[kv_ch,1] fp16, V_q[kv_ch,1] fp16
+        // Cache-write inputs: K[kv_ch,S] fp16, V[kv_ch,S] fp16, R[hd,hd] fp16
+        // Cache-write outputs: K_q[kv_ch,S] fp16, V_q[kv_ch,S] fp16
         let cw_alloc_size = crate::tensor::uniform_alloc_size(&[
-            ([1, kv_ch, 1, 1], ScalarType::Float16),
-            ([1, kv_ch, 1, 1], ScalarType::Float16),
+            ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
+            ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
             ([1, 1, head_dim, head_dim], ScalarType::Float16),
         ]);
 
-        // Attention inputs: Q[q_ch,1] fp16, K_cache[kv_ch,max_seq] i8,
+        // Attention inputs: Q[q_ch,S] fp16, K_cache[kv_ch,max_seq] i8,
         //   V_cache[kv_ch,max_seq] i8, R_inv[hd,hd] fp16
-        // Attention output: out[q_ch,1] fp16
+        // Attention output: out[q_ch,S] fp16
         let attn_alloc_size = crate::tensor::uniform_alloc_size(&[
-            ([1, q_ch, 1, 1], ScalarType::Float16),
+            ([1, q_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
             ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),
             ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),
             ([1, 1, head_dim, head_dim], ScalarType::Float16),
@@ -482,12 +483,24 @@ impl TurboQuantModel {
         // that arrive from pre-attn sub-programs with a different alloc size.
         let kv_channels = config.num_kv_heads * head_dim;
         let q_channels = config.num_heads * head_dim;
-        let cw_k_staging =
-            AneTensor::new_with_min_alloc(kv_channels, 1, ScalarType::Float16, cw_alloc_size)?;
-        let cw_v_staging =
-            AneTensor::new_with_min_alloc(kv_channels, 1, ScalarType::Float16, cw_alloc_size)?;
-        let attn_q_staging =
-            AneTensor::new_with_min_alloc(q_channels, 1, ScalarType::Float16, attn_alloc_size)?;
+        let cw_k_staging = AneTensor::new_with_min_alloc(
+            kv_channels,
+            MIN_IO_SEQ,
+            ScalarType::Float16,
+            cw_alloc_size,
+        )?;
+        let cw_v_staging = AneTensor::new_with_min_alloc(
+            kv_channels,
+            MIN_IO_SEQ,
+            ScalarType::Float16,
+            cw_alloc_size,
+        )?;
+        let attn_q_staging = AneTensor::new_with_min_alloc(
+            q_channels,
+            MIN_IO_SEQ,
+            ScalarType::Float16,
+            attn_alloc_size,
+        )?;
 
         Ok(Self {
             config,
@@ -555,17 +568,28 @@ impl TurboQuantModel {
         // ANE requires all input IOSurfaces in a single eval to have the same
         // allocation size. Pre-attn outputs may have a different alloc size.
         // Pre-attn tensors are S=32 padded ([1,C,1,32] NCHW), so we must
-        // gather column 0 from each channel row, not take a flat slice.
+        // gather column 0 from each channel row, then scatter back into the
+        // S=32 staging buffer layout.
         let k_data = gather_column0(k_proj)?;
-        self.cw_k_staging.write_f16(&k_data[..channels])?;
+        let k_scattered = scatter_to_column0(&k_data[..channels], MIN_IO_SEQ);
+        self.cw_k_staging.write_f16(&k_scattered)?;
         let v_data = gather_column0(v_proj)?;
-        self.cw_v_staging.write_f16(&v_data[..channels])?;
+        let v_scattered = scatter_to_column0(&v_data[..channels], MIN_IO_SEQ);
+        self.cw_v_staging.write_f16(&v_scattered)?;
 
         // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
-        let mut k_quant =
-            AneTensor::new_with_min_alloc(channels, 1, ScalarType::Float16, self.cw_alloc_size)?;
-        let mut v_quant =
-            AneTensor::new_with_min_alloc(channels, 1, ScalarType::Float16, self.cw_alloc_size)?;
+        let mut k_quant = AneTensor::new_with_min_alloc(
+            channels,
+            MIN_IO_SEQ,
+            ScalarType::Float16,
+            self.cw_alloc_size,
+        )?;
+        let mut v_quant = AneTensor::new_with_min_alloc(
+            channels,
+            MIN_IO_SEQ,
+            ScalarType::Float16,
+            self.cw_alloc_size,
+        )?;
         self.runtime.eval(
             &self.cache_write_program,
             &[
@@ -577,10 +601,11 @@ impl TurboQuantModel {
         )?;
 
         // 2. CPU cache interception: read fp16 values (rounded to integer),
-        //    convert to INT8 bytes, write to persistent cache
-        let k_f16 = k_quant.read_f16()?;
+        //    convert to INT8 bytes, write to persistent cache.
+        //    Output is S=32 padded; gather column 0 to get actual values.
+        let k_f16 = gather_column0(&k_quant)?;
         let k_bytes: Vec<u8> = k_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
-        let v_f16 = v_quant.read_f16()?;
+        let v_f16 = gather_column0(&v_quant)?;
         let v_bytes: Vec<u8> = v_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
 
         // Read original K_proj for QJL residual sign computation
@@ -596,11 +621,12 @@ impl TurboQuantModel {
         // 3. Attention: Q + cached K/V + unrotation_matrix → output
         let q_data = gather_column0(q)?;
         let q_channels = self.config.num_heads * self.config.head_dim;
-        self.attn_q_staging.write_f16(&q_data[..q_channels])?;
+        let q_scattered = scatter_to_column0(&q_data[..q_channels], MIN_IO_SEQ);
+        self.attn_q_staging.write_f16(&q_scattered)?;
         let (k_cache, v_cache) = self.cache.cache_tensors(layer);
         let mut attn_out = AneTensor::new_with_min_alloc(
             q_channels,
-            1,
+            MIN_IO_SEQ,
             ScalarType::Float16,
             self.attn_alloc_size,
         )?;
@@ -669,4 +695,18 @@ fn gather_column0(tensor: &AneTensor) -> Result<Vec<f16>> {
         out.push(full[c * seq_len]);
     }
     Ok(out)
+}
+
+/// Scatter C elements into column 0 of a `[1, C, 1, seq_len]` buffer.
+///
+/// Returns a flat `Vec<f16>` of length `C * seq_len` with each input
+/// value placed at index `c * seq_len` (column 0 of channel c);
+/// all other positions are zero.
+fn scatter_to_column0(data: &[f16], seq_len: usize) -> Vec<f16> {
+    let channels = data.len();
+    let mut buf = vec![f16::ZERO; channels * seq_len];
+    for c in 0..channels {
+        buf[c * seq_len] = data[c];
+    }
+    buf
 }
