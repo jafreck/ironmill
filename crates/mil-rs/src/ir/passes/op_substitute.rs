@@ -41,6 +41,37 @@ fn substitute_in_block(block: &mut Block) {
     while i < block.operations.len() {
         let op = &block.operations[i];
 
+        // Pattern-based substitution: SiLU fusion.
+        // Detect mul(a, sigmoid(a)) or mul(sigmoid(a), a) → silu(a).
+        // Both sigmoid and silu are eval-verified on ANE; fusion reduces 2 ops → 1.
+        if op.op_type == "mul" {
+            if let Some((silu_op, sigmoid_idx)) = try_fuse_silu(block, i) {
+                let original_output = op.outputs.first().cloned().unwrap();
+                let silu_output = silu_op.outputs.first().cloned().unwrap();
+
+                // Remove the mul op first.
+                block.operations.remove(i);
+
+                // Remove the sigmoid (adjust index for the removed mul).
+                let adj_si = if sigmoid_idx > i {
+                    sigmoid_idx - 1
+                } else {
+                    sigmoid_idx
+                };
+                block.operations.remove(adj_si);
+
+                // Insert silu at the earlier of the two removed positions.
+                let insert_at = adj_si.min(i);
+                block.operations.insert(insert_at, silu_op);
+
+                if silu_output != original_output {
+                    replace_reference(block, &original_output, &silu_output);
+                }
+                i = insert_at + 1;
+                continue;
+            }
+        }
+
         // Pattern-based substitution: rsqrt pattern.
         // Detect real_div(1.0, sqrt(x)) → pow(x, -0.5).
         // real_div is only compile-verified on ANE; pow(-0.5) is eval-verified.
@@ -276,6 +307,85 @@ fn substitute_gelu(op: &Operation) -> Vec<Operation> {
 }
 
 // ---- Pattern-based substitutions -------------------------------------------
+
+/// Detect `mul(a, sigmoid(a))` or `mul(sigmoid(a), a)` and fuse to `silu(a)`.
+///
+/// Returns `(silu_op, sigmoid_index)` if the pattern matches and the sigmoid
+/// output is only consumed by this mul (safe to remove).
+fn try_fuse_silu(block: &Block, mul_idx: usize) -> Option<(Operation, usize)> {
+    let op = &block.operations[mul_idx];
+    if op.op_type != "mul" {
+        return None;
+    }
+
+    let x_ref = match op.inputs.get("x") {
+        Some(Value::Reference(name)) => name.clone(),
+        _ => return None,
+    };
+    let y_ref = match op.inputs.get("y") {
+        Some(Value::Reference(name)) => name.clone(),
+        _ => return None,
+    };
+
+    // Try both orderings: mul(a, sigmoid(a)) and mul(sigmoid(a), a).
+    let (sigmoid_output, raw_input) = if let Some(r) = match_sigmoid_input(block, &y_ref, &x_ref) {
+        r
+    } else if let Some(r) = match_sigmoid_input(block, &x_ref, &y_ref) {
+        r
+    } else {
+        return None;
+    };
+
+    // Find sigmoid op index.
+    let sigmoid_idx = block.operations.iter().position(|o| {
+        o.op_type == "sigmoid" && o.outputs.first().map(|s| s.as_str()) == Some(&sigmoid_output)
+    })?;
+
+    // Only fuse if sigmoid is single-consumed (only used by this mul).
+    let sigmoid_used_elsewhere = block.operations.iter().enumerate().any(|(idx, o)| {
+        if idx == mul_idx {
+            return false;
+        }
+        o.inputs
+            .values()
+            .any(|v| matches!(v, Value::Reference(name) if name == &sigmoid_output))
+    }) || block.outputs.contains(&sigmoid_output);
+
+    if sigmoid_used_elsewhere {
+        return None;
+    }
+
+    // Preserve the mul's output name so downstream references work.
+    let output_name = op
+        .outputs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("{}_silu", op.name));
+
+    let silu_op = Operation::new("silu", format!("{}_silu", op.name))
+        .with_input("x", Value::Reference(raw_input))
+        .with_output(&output_name);
+
+    Some((silu_op, sigmoid_idx))
+}
+
+/// Check if `candidate_sigmoid` is a sigmoid output whose input matches `candidate_raw`.
+fn match_sigmoid_input(
+    block: &Block,
+    candidate_sigmoid: &str,
+    candidate_raw: &str,
+) -> Option<(String, String)> {
+    let sigmoid_op = block.operations.iter().find(|o| {
+        o.op_type == "sigmoid" && o.outputs.first().map(|s| s.as_str()) == Some(candidate_sigmoid)
+    })?;
+
+    match sigmoid_op.inputs.get("x") {
+        Some(Value::Reference(name)) if name == candidate_raw => {
+            Some((candidate_sigmoid.to_string(), candidate_raw.to_string()))
+        }
+        _ => None,
+    }
+}
 
 /// Detect `real_div(scalar_1.0, sqrt_output)` and replace the sqrt + real_div
 /// pair with `pow(sqrt_input, -0.5)`.
@@ -530,5 +640,137 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- SiLU fusion --------------------------------------------------------
+
+    #[test]
+    fn silu_fusion_basic() {
+        // sigmoid(x) → mul(x, sigmoid_out) → silu(x)
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("sigmoid", "sig_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("sig_out"),
+        );
+        block.add_op(
+            Operation::new("mul", "mul_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_input("y", Value::Reference("sig_out".into()))
+                .with_output("mul_out"),
+        );
+        block.outputs.push("mul_out".into());
+
+        let mut program = program_with_block(block);
+        OpSubstitutionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 1, "expected 1 silu op, got {}", ops.len());
+        assert_eq!(ops[0].op_type, "silu");
+        assert_eq!(ops[0].outputs[0], "mul_out");
+        match ops[0].inputs.get("x") {
+            Some(Value::Reference(name)) => assert_eq!(name, "input"),
+            other => panic!("expected reference to input, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn silu_fusion_reversed_mul_inputs() {
+        // mul(sigmoid(x), x) — sigmoid output as first arg
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("sigmoid", "sig_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("sig_out"),
+        );
+        block.add_op(
+            Operation::new("mul", "mul_0")
+                .with_input("x", Value::Reference("sig_out".into()))
+                .with_input("y", Value::Reference("input".into()))
+                .with_output("mul_out"),
+        );
+        block.outputs.push("mul_out".into());
+
+        let mut program = program_with_block(block);
+        OpSubstitutionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_type, "silu");
+    }
+
+    #[test]
+    fn silu_fusion_preserves_downstream_refs() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("sigmoid", "sig_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("sig_out"),
+        );
+        block.add_op(
+            Operation::new("mul", "mul_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_input("y", Value::Reference("sig_out".into()))
+                .with_output("mul_out"),
+        );
+        block.add_op(
+            Operation::new("add", "add_0")
+                .with_input("x", Value::Reference("mul_out".into()))
+                .with_input("y", Value::Reference("input".into()))
+                .with_output("add_out"),
+        );
+        block.outputs.push("add_out".into());
+
+        let mut program = program_with_block(block);
+        OpSubstitutionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        assert_eq!(ops.len(), 2); // silu + add
+        assert_eq!(ops[0].op_type, "silu");
+
+        let add_op = &ops[1];
+        match add_op.inputs.get("x") {
+            Some(Value::Reference(name)) => assert_eq!(name, "mul_out"),
+            other => panic!("expected reference to mul_out, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn silu_fusion_skipped_when_sigmoid_has_multiple_consumers() {
+        let mut block = Block::new();
+        block.add_op(
+            Operation::new("sigmoid", "sig_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_output("sig_out"),
+        );
+        block.add_op(
+            Operation::new("mul", "mul_0")
+                .with_input("x", Value::Reference("input".into()))
+                .with_input("y", Value::Reference("sig_out".into()))
+                .with_output("mul_out"),
+        );
+        // Another consumer of sig_out
+        block.add_op(
+            Operation::new("add", "add_0")
+                .with_input("x", Value::Reference("sig_out".into()))
+                .with_input("y", Value::Reference("input".into()))
+                .with_output("add_out"),
+        );
+        block.outputs.push("mul_out".into());
+        block.outputs.push("add_out".into());
+
+        let mut program = program_with_block(block);
+        OpSubstitutionPass.run(&mut program).unwrap();
+
+        let ops = block_ops(&program);
+        // Should NOT fuse — sigmoid is used by both mul and add
+        assert!(
+            ops.iter().any(|o| o.op_type == "sigmoid"),
+            "sigmoid should remain when multi-consumed"
+        );
+        assert!(
+            ops.iter().any(|o| o.op_type == "mul"),
+            "mul should remain when fusion is skipped"
+        );
     }
 }

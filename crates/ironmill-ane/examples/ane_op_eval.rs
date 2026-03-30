@@ -1110,6 +1110,782 @@ fn test_generated_attention_gqa_mil() -> (bool, bool) {
     }
 }
 
+// ── Extended eval coverage: ops previously compile-only ──────────────────
+
+// -- Activations & unary math --
+
+fn test_sigmoid() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = sigmoid(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.01).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("sigmoid", &out[0], &expected, 0.015)),
+        None => (false, false),
+    }
+}
+
+fn test_tanh() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = tanh(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.01).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.tanh()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("tanh", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_exp2() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = exp2(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    // Keep exponents small to stay in fp16 range
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.01).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| (2.0_f32).powf(x)).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("exp2", &out[0], &expected, 0.5)),
+        None => (false, false),
+    }
+}
+
+fn test_log() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = log(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    // Positive inputs only
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 + 1.0) * 0.1).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.ln()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("log", &out[0], &expected, 0.1)),
+        None => (false, false),
+    }
+}
+
+fn test_rsqrt() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = rsqrt(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 + 1.0) * 0.1).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| 1.0 / x.sqrt()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("rsqrt", &out[0], &expected, 0.05)),
+        None => (false, false),
+    }
+}
+
+fn test_inverse() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = inverse(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    // Avoid values near zero
+    let a: Vec<f32> = (0..N)
+        .map(|i| {
+            let v = (i as f32 - 512.0) * 0.02;
+            if v.abs() < 0.5 {
+                0.5_f32.copysign(v + 0.001)
+            } else {
+                v
+            }
+        })
+        .collect();
+    let expected: Vec<f32> = a.iter().map(|&x| 1.0 / x).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("inverse", &out[0], &expected, 0.5)),
+        None => (false, false),
+    }
+}
+
+fn test_neg() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = neg(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.1).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| -x).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("neg", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_square() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = square(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    // Small values to keep squares in fp16 range
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.01).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x * x).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("square", &out[0], &expected, 0.1)),
+        None => (false, false),
+    }
+}
+
+fn test_ceil() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = ceil(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.03).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .map(|&x| f16::from_f32(x).to_f32().ceil())
+        .collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("ceil", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_floor() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = floor(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.03).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .map(|&x| f16::from_f32(x).to_f32().floor())
+        .collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("floor", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_round() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = round(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.03).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .map(|&x| f16::from_f32(x).to_f32().round())
+        .collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("round", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_sin() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = sin(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.006).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.sin()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("sin", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_cos() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = cos(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.006).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.cos()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("cos", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_tan() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = tan(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    // Keep values away from ±π/2 to avoid large outputs
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.001).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.tan()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("tan", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_asin() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = asin(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    // Domain: [-1, 1] — use [-0.9, 0.9] to avoid boundary issues
+    let a: Vec<f32> = (0..N)
+        .map(|i| (i as f32 / (N as f32 - 1.0)) * 1.8 - 0.9)
+        .collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.asin()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("asin", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_acos() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = acos(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N)
+        .map(|i| (i as f32 / (N as f32 - 1.0)) * 1.8 - 0.9)
+        .collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.acos()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("acos", &out[0], &expected, 0.02)),
+        None => (false, false),
+    }
+}
+
+fn test_atan() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = atan(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.01).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.atan()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("atan", &out[0], &expected, 0.05)),
+        None => (false, false),
+    }
+}
+
+fn test_sinh() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = sinh(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    // Keep values small to avoid fp16 overflow
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.005).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.sinh()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("sinh", &out[0], &expected, 0.05)),
+        None => (false, false),
+    }
+}
+
+fn test_cosh() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = cosh(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.005).collect();
+    let expected: Vec<f32> = a.iter().map(|&x| x.cosh()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("cosh", &out[0], &expected, 0.05)),
+        None => (false, false),
+    }
+}
+
+fn test_softsign() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = softsign(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.02).collect();
+    // softsign(x) = x / (1 + |x|)
+    let expected: Vec<f32> = a.iter().map(|&x| x / (1.0 + x.abs())).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("softsign", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_softplus() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = softplus(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.01).collect();
+    // softplus(x) = ln(1 + exp(x))
+    let expected: Vec<f32> = a.iter().map(|&x| (1.0 + x.exp()).ln()).collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("softplus", &out[0], &expected, 0.05)),
+        None => (false, false),
+    }
+}
+
+// -- Binary ops --
+
+fn test_real_div() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = real_div(x=a_input0, y=a_input1)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.1).collect();
+    // Divisors must be non-zero
+    let b: Vec<f32> = (0..N).map(|i| (i as f32 + 1.0) * 0.1 + 0.5).collect();
+    let expected: Vec<f32> = a.iter().zip(b.iter()).map(|(&x, &y)| x / y).collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("real_div", &out[0], &expected, 0.5)),
+        None => (false, false),
+    }
+}
+
+fn test_minimum() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = minimum(x=a_input0, y=a_input1)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 500.0) * 0.1).collect();
+    let b: Vec<f32> = (0..N).map(|i| (700.0 - i as f32) * 0.1).collect();
+    let expected: Vec<f32> = a.iter().zip(b.iter()).map(|(&x, &y)| x.min(y)).collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("minimum", &out[0], &expected, 0.05)),
+        None => (false, false),
+    }
+}
+
+fn test_floor_div() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = floor_div(x=a_input0, y=a_input1)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| i as f32 + 1.0).collect();
+    let b: Vec<f32> = (0..N).map(|_| 7.0).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x / y).floor())
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("floor_div", &out[0], &expected, 1.0)),
+        None => (false, false),
+    }
+}
+
+fn test_mod() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = mod(x=a_input0, y=a_input1)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| i as f32 + 1.0).collect();
+    let b: Vec<f32> = (0..N).map(|_| 7.0).collect();
+    // mod follows Python semantics: x - floor(x/y) * y
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x - (x / y).floor() * y)
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("mod", &out[0], &expected, 1.0)),
+        None => (false, false),
+    }
+}
+
+// -- Comparison ops --
+
+fn test_greater_equal() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> cmp = greater_equal(x=a_input0, y=a_input1)[name=string(\"cmp\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=cmp, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i % 7) as f32).collect();
+    let b: Vec<f32> = (0..N).map(|_| 3.0f32).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| if x >= y { 1.0 } else { 0.0 })
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("greater_equal", &out[0], &expected, 0.01),
+        ),
+        None => (false, false),
+    }
+}
+
+fn test_less() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> cmp = less(x=a_input0, y=a_input1)[name=string(\"cmp\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=cmp, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i % 7) as f32).collect();
+    let b: Vec<f32> = (0..N).map(|_| 3.0f32).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| if x < y { 1.0 } else { 0.0 })
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("less", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_less_equal() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> cmp = less_equal(x=a_input0, y=a_input1)[name=string(\"cmp\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=cmp, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i % 7) as f32).collect();
+    let b: Vec<f32> = (0..N).map(|_| 3.0f32).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| if x <= y { 1.0 } else { 0.0 })
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("less_equal", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_equal() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> cmp = equal(x=a_input0, y=a_input1)[name=string(\"cmp\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=cmp, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i % 5) as f32).collect();
+    let b: Vec<f32> = (0..N).map(|_| 2.0f32).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| if (x - y).abs() < 1e-6 { 1.0 } else { 0.0 })
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("equal", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_not_equal() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> cmp = not_equal(x=a_input0, y=a_input1)[name=string(\"cmp\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=cmp, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i % 5) as f32).collect();
+    let b: Vec<f32> = (0..N).map(|_| 2.0f32).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| if (x - y).abs() > 1e-6 { 1.0 } else { 0.0 })
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("not_equal", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+// -- Reductions (axis -1, spatial) --
+
+fn test_reduce_min() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([-1])];\n\
+                 bool kd = const()[name=string(\"kd\"), val=bool(true)];\n\
+                 tensor<fp16, [1,32,1,1]> rm = reduce_min(x=a_input0, axes=rax, keep_dims=kd)[name=string(\"rm\")];\n\
+                 tensor<int32, [4]> rep = const()[name=string(\"rep\"), val=tensor<int32, [4]>([1,1,1,32])];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = tile(x=rm, reps=rep)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| ((i % S) as f32 - 16.0) * 0.5).collect();
+    let mut expected = vec![0.0f32; N];
+    for c in 0..C {
+        let start = c * S;
+        let channel_min = a[start..start + S]
+            .iter()
+            .cloned()
+            .fold(f32::INFINITY, f32::min);
+        for s in 0..S {
+            expected[start + s] = channel_min;
+        }
+    }
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("reduce_min", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_reduce_l2_norm() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([-1])];\n\
+                 bool kd = const()[name=string(\"kd\"), val=bool(true)];\n\
+                 tensor<fp16, [1,32,1,1]> rl = reduce_l2_norm(x=a_input0, axes=rax, keep_dims=kd)[name=string(\"rl\")];\n\
+                 tensor<int32, [4]> rep = const()[name=string(\"rep\"), val=tensor<int32, [4]>([1,1,1,32])];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = tile(x=rl, reps=rep)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| ((i % S) as f32 - 16.0) * 0.1).collect();
+    let mut expected = vec![0.0f32; N];
+    for c in 0..C {
+        let start = c * S;
+        let l2: f32 = a[start..start + S]
+            .iter()
+            .map(|&x| x * x)
+            .sum::<f32>()
+            .sqrt();
+        for s in 0..S {
+            expected[start + s] = l2;
+        }
+    }
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("reduce_l2_norm", &out[0], &expected, 0.5),
+        ),
+        None => (false, false),
+    }
+}
+
+// -- Reductions (axis 1, channel) --
+
+fn test_reduce_sum_axis1() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n\
+                 bool kd = const()[name=string(\"kd\"), val=bool(true)];\n\
+                 tensor<fp16, [1,1,1,32]> rs = reduce_sum(x=a_input0, axes=rax, keep_dims=kd)[name=string(\"rs\")];\n\
+                 tensor<int32, [4]> rep = const()[name=string(\"rep\"), val=tensor<int32, [4]>([1,32,1,1])];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = tile(x=rs, reps=rep)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| ((i % S) as f32 + 1.0) * 0.1).collect();
+    let mut expected = vec![0.0f32; N];
+    for s_pos in 0..S {
+        let channel_sum: f32 = (0..C).map(|c| a[c * S + s_pos]).sum();
+        for c in 0..C {
+            expected[c * S + s_pos] = channel_sum;
+        }
+    }
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("reduce_sum axis=1", &out[0], &expected, 1.0),
+        ),
+        None => (false, false),
+    }
+}
+
+fn test_reduce_mean_axis1() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n\
+                 bool kd = const()[name=string(\"kd\"), val=bool(true)];\n\
+                 tensor<fp16, [1,1,1,32]> rm = reduce_mean(x=a_input0, axes=rax, keep_dims=kd)[name=string(\"rm\")];\n\
+                 tensor<int32, [4]> rep = const()[name=string(\"rep\"), val=tensor<int32, [4]>([1,32,1,1])];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = tile(x=rm, reps=rep)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| ((i % S) as f32 + 1.0) * 0.1).collect();
+    let mut expected = vec![0.0f32; N];
+    for s_pos in 0..S {
+        let channel_mean: f32 = (0..C).map(|c| a[c * S + s_pos]).sum::<f32>() / C as f32;
+        for c in 0..C {
+            expected[c * S + s_pos] = channel_mean;
+        }
+    }
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("reduce_mean axis=1", &out[0], &expected, 0.1),
+        ),
+        None => (false, false),
+    }
+}
+
+fn test_reduce_max_axis1() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n\
+                 bool kd = const()[name=string(\"kd\"), val=bool(true)];\n\
+                 tensor<fp16, [1,1,1,32]> rm = reduce_max(x=a_input0, axes=rax, keep_dims=kd)[name=string(\"rm\")];\n\
+                 tensor<int32, [4]> rep = const()[name=string(\"rep\"), val=tensor<int32, [4]>([1,32,1,1])];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = tile(x=rm, reps=rep)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N)
+        .map(|i| ((i % S) as f32 - 16.0) * 0.5 + (i / S) as f32)
+        .collect();
+    let mut expected = vec![0.0f32; N];
+    for s_pos in 0..S {
+        let channel_max = (0..C)
+            .map(|c| a[c * S + s_pos])
+            .fold(f32::NEG_INFINITY, f32::max);
+        for c in 0..C {
+            expected[c * S + s_pos] = channel_max;
+        }
+    }
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("reduce_max axis=1", &out[0], &expected, 0.01),
+        ),
+        None => (false, false),
+    }
+}
+
+fn test_reduce_min_axis1() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n\
+                 bool kd = const()[name=string(\"kd\"), val=bool(true)];\n\
+                 tensor<fp16, [1,1,1,32]> rm = reduce_min(x=a_input0, axes=rax, keep_dims=kd)[name=string(\"rm\")];\n\
+                 tensor<int32, [4]> rep = const()[name=string(\"rep\"), val=tensor<int32, [4]>([1,32,1,1])];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = tile(x=rm, reps=rep)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N)
+        .map(|i| ((i % S) as f32 - 16.0) * 0.5 + (i / S) as f32)
+        .collect();
+    let mut expected = vec![0.0f32; N];
+    for s_pos in 0..S {
+        let channel_min = (0..C)
+            .map(|c| a[c * S + s_pos])
+            .fold(f32::INFINITY, f32::min);
+        for c in 0..C {
+            expected[c * S + s_pos] = channel_min;
+        }
+    }
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("reduce_min axis=1", &out[0], &expected, 0.01),
+        ),
+        None => (false, false),
+    }
+}
+
+// -- Logical ops --
+
+fn test_logical_not() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> b = cast(x=a_input0, dtype=string(\"bool\"))[name=string(\"b\")];\n\
+                 tensor<bool, [1,32,1,32]> nb = logical_not(x=b)[name=string(\"nb\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=nb, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N)
+        .map(|i| if i % 3 == 0 { 0.0 } else { (i as f32) * 0.1 })
+        .collect();
+    // not(false) = true (1.0), not(true) = false (0.0)
+    let expected: Vec<f32> = a
+        .iter()
+        .map(|&x| if x == 0.0 { 1.0 } else { 0.0 })
+        .collect();
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("logical_not", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_logical_and() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> ba = cast(x=a_input0, dtype=string(\"bool\"))[name=string(\"ba\")];\n\
+                 tensor<bool, [1,32,1,32]> bb = cast(x=a_input1, dtype=string(\"bool\"))[name=string(\"bb\")];\n\
+                 tensor<bool, [1,32,1,32]> result = logical_and(x=ba, y=bb)[name=string(\"result\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=result, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+    let b: Vec<f32> = (0..N).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| if x != 0.0 && y != 0.0 { 1.0 } else { 0.0 })
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("logical_and", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_logical_or() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> ba = cast(x=a_input0, dtype=string(\"bool\"))[name=string(\"ba\")];\n\
+                 tensor<bool, [1,32,1,32]> bb = cast(x=a_input1, dtype=string(\"bool\"))[name=string(\"bb\")];\n\
+                 tensor<bool, [1,32,1,32]> result = logical_or(x=ba, y=bb)[name=string(\"result\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=result, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+    let b: Vec<f32> = (0..N).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| if x != 0.0 || y != 0.0 { 1.0 } else { 0.0 })
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("logical_or", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
+fn test_logical_xor() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> ba = cast(x=a_input0, dtype=string(\"bool\"))[name=string(\"ba\")];\n\
+                 tensor<bool, [1,32,1,32]> bb = cast(x=a_input1, dtype=string(\"bool\"))[name=string(\"bb\")];\n\
+                 tensor<bool, [1,32,1,32]> result = logical_xor(x=ba, y=bb)[name=string(\"result\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=result, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+    let b: Vec<f32> = (0..N).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| if (x != 0.0) ^ (y != 0.0) { 1.0 } else { 0.0 })
+        .collect();
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("logical_xor", &out[0], &expected, 0.01)),
+        None => (false, false),
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -1165,6 +1941,53 @@ fn main() {
         ("gen attention MIL", test_generated_attention_mil),
         ("gen QJL correction MIL", test_generated_qjl_mil),
         ("gen GQA attention MIL", test_generated_attention_gqa_mil),
+        // Extended coverage: previously compile-only ops
+        // Activations & unary math
+        ("sigmoid", test_sigmoid),
+        ("tanh", test_tanh),
+        ("exp2", test_exp2),
+        ("log", test_log),
+        ("rsqrt", test_rsqrt),
+        ("inverse", test_inverse),
+        ("neg", test_neg),
+        ("square", test_square),
+        ("ceil", test_ceil),
+        ("floor", test_floor),
+        ("round", test_round),
+        ("sin", test_sin),
+        ("cos", test_cos),
+        ("tan", test_tan),
+        ("asin", test_asin),
+        ("acos", test_acos),
+        ("atan", test_atan),
+        ("sinh", test_sinh),
+        ("cosh", test_cosh),
+        ("softsign", test_softsign),
+        ("softplus", test_softplus),
+        // Binary ops
+        ("real_div", test_real_div),
+        ("minimum", test_minimum),
+        ("floor_div", test_floor_div),
+        ("mod", test_mod),
+        // Comparison ops
+        ("greater_equal", test_greater_equal),
+        ("less", test_less),
+        ("less_equal", test_less_equal),
+        ("equal", test_equal),
+        ("not_equal", test_not_equal),
+        // Reductions (axis -1)
+        ("reduce_min", test_reduce_min),
+        ("reduce_l2_norm", test_reduce_l2_norm),
+        // Reductions (axis 1)
+        ("reduce_sum axis=1", test_reduce_sum_axis1),
+        ("reduce_mean axis=1", test_reduce_mean_axis1),
+        ("reduce_max axis=1", test_reduce_max_axis1),
+        ("reduce_min axis=1", test_reduce_min_axis1),
+        // Logical ops
+        ("logical_not", test_logical_not),
+        ("logical_and", test_logical_and),
+        ("logical_or", test_logical_or),
+        ("logical_xor", test_logical_xor),
     ];
 
     let mut compile_pass = 0;

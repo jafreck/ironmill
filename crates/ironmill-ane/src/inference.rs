@@ -18,9 +18,9 @@ use mil_rs::ffi::ane::AneCompiler;
 use mil_rs::ir::Pass;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::{
-    AneArgPromotionPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
-    AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, OpSubstitutionPass,
-    TypeRepropagationPass,
+    AneArgPromotionPass, AneLayoutPass, AneMatmulToConvPass, AneVariableNamingPass,
+    AttentionDecomposePass, AutoregressiveShapeMaterializePass, DeadCodeEliminationPass,
+    OpSubstitutionPass, TypeRepropagationPass,
 };
 
 use crate::program::{CompiledProgram, LoadedProgram};
@@ -165,7 +165,16 @@ impl AneInference {
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
 
-        // 2b. Run dead code elimination on each sub-program to remove
+        // 2b. Convert matmul → 1×1 conv on each sub-program.
+        // This must run AFTER splitting so the structural attention splitter
+        // can still find matmul ops for Q/K/V projection identification.
+        for sub in &mut model_split.programs {
+            AneMatmulToConvPass.run(&mut sub.program).map_err(|e| {
+                AneError::Other(anyhow::anyhow!("MatmulToConv failed for {}: {e}", sub.name))
+            })?;
+        }
+
+        // 2c. Run dead code elimination on each sub-program to remove
         // orphaned ops (e.g., position ID reformatting that only fed RoPE).
         for sub in &mut model_split.programs {
             DeadCodeEliminationPass.run(&mut sub.program).map_err(|e| {
@@ -173,7 +182,7 @@ impl AneInference {
             })?;
         }
 
-        // 2c. Validate that no concat ops remain in any sub-program.
+        // 2d. Validate that no concat ops remain in any sub-program.
         for sub in &model_split.programs {
             if let Some(func) = sub.program.main() {
                 let concats: Vec<&str> = func

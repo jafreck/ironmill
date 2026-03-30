@@ -40,6 +40,8 @@ pub mod ane_concat_elim;
 #[cfg(feature = "ane-direct")]
 pub mod ane_layout;
 #[cfg(feature = "ane-direct")]
+pub mod ane_matmul_to_conv;
+#[cfg(feature = "ane-direct")]
 pub mod ane_variable_naming;
 
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
@@ -79,6 +81,8 @@ pub use ane_attention_decompose::AttentionDecomposePass;
 pub use ane_concat_elim::AneConcatEliminationPass;
 #[cfg(feature = "ane-direct")]
 pub use ane_layout::AneLayoutPass;
+#[cfg(feature = "ane-direct")]
+pub use ane_matmul_to_conv::AneMatmulToConvPass;
 #[cfg(feature = "ane-direct")]
 pub use ane_variable_naming::AneVariableNamingPass;
 

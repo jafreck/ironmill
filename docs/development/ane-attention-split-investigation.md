@@ -129,25 +129,49 @@ verified, max_err=0.0004), and `reduce_mean` with const ref args.
 | Sub-program | Status | Notes |
 |---|---|---|
 | `pre_attn` (all 29 layers) | ✅ Compiles | Structural split + RMSNorm fixes |
-| `post_attn` (all layers) | ❌ Fails | `matmul` + `sigmoid` — see next steps |
+| `post_attn` (all 29 layers) | ✅ Compiles | matmul→conv + SiLU fusion |
+| E2E inference | ❌ Eval fails | Runtime tensor buffer error — see next steps |
 
-### Next Steps — post_attn ANE Compilation
+### Completed — post_attn ANE Compilation
 
-The `post_attn` sub-program fails ANE compilation due to two issues
-unrelated to the attention split:
+The `post_attn` sub-program now compiles successfully on ANE:
 
-1. **`matmul` → `conv` conversion**: Orion uses 1×1 `conv` for linear
-   layers in ANE layout `[1,C,1,S]`, not `matmul`. The existing
-   `e2e_compile_and_load_conv_linear` test confirms conv works. Need
-   an `AneMatmulToConvPass` that converts `matmul(x, weight_const)` to
-   `conv(x, weight)` with appropriate weight reshape (`[Cin, Cout]` →
-   `[Cout, Cin, 1, 1]`).
+1. **`matmul` → `conv` conversion** ✅: `AneMatmulToConvPass` converts
+   `matmul(x, weight_const)` to 1×1 `conv(x, weight)` with weight
+   transposition from `[Cin, Cout]` → `[Cout, Cin, 1, 1]`. Runs after
+   the attention split (so structural splitter still finds matmul ops).
+   **File:** `crates/mil-rs/src/ir/passes/ane_matmul_to_conv.rs`
 
-2. **`sigmoid` + `mul` → `silu` fusion**: The SiLU activation is
-   decomposed as `sigmoid(x)` + `mul(x, sigmoid_out)`. The `silu` op
-   is eval-verified on ANE (max_err=0.015) but `sigmoid` alone is only
-   compile-verified. Need an op fusion pass or extend `OpSubstitutionPass`
-   to detect and fuse the SiLU pattern.
+2. **`sigmoid` + `mul` → `silu` fusion** ✅: Added to `OpSubstitutionPass`.
+   Detects `mul(a, sigmoid(a))` in either input ordering and replaces
+   with `silu(a)`. Both `sigmoid` (max_err=0.003) and `silu`
+   (max_err=0.015) are eval-verified on ANE — fusion is an optimization,
+   not a correctness requirement.
+   **File:** `crates/mil-rs/src/ir/passes/op_substitute.rs`
+
+### Next Steps — Runtime Inference
+
+All 29 layers compile (5.99s), but `ANEProgramProcessRequestDirect()`
+fails at eval time with `status=0x1d : statusType=0x9: Program Inference
+error`. This is a runtime error, not a compilation error — the E5 binary
+loads but fails when processing the input request. Likely causes:
+
+1. **IOSurface tensor size mismatch**: The `AneTensor` alloc sizes for
+   conv-based sub-programs may not match what the compiled E5 binary
+   expects. Conv ops may require different buffer alignment or padding
+   than matmul. Check `uniform_alloc_size` calculation and compare
+   against the compiled program's input/output descriptors.
+
+2. **Input/output index wiring**: The `_ANERequest` maps IOSurface
+   tensors to input/output indices. After matmul→conv conversion, the
+   sub-program's function signature (input count, order) may differ.
+   Verify that `CompiledProgram` input/output metadata matches the
+   actual MIL function signature.
+
+3. **Conv weight BLOBFILE format**: The transposed weight data must be
+   written in Orion's 128-byte-header BLOBFILE format. Verify the
+   `ir_to_mil_text` emitter handles the new `[Cout, Cin, 1, 1]` weight
+   shape correctly and that the BLOBFILE offset/size match.
 
 ## Implementation Tasks
 

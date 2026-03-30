@@ -300,6 +300,7 @@ fn check_tensor_type(
 /// Returns `true` if the MIL operation type is known to run on the ANE.
 pub fn is_ane_supported(op_type: &str) -> bool {
     // Verified against Apple's private ANE compiler via ane_op_probe.
+    // 59 ops are also eval-verified (numerical correctness confirmed).
     // See docs/research/ane-op-support-matrix.md for full results.
     matches!(
         op_type,
