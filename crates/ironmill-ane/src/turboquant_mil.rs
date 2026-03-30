@@ -11,14 +11,6 @@ use std::fmt::Write;
 
 use crate::turboquant::TurboQuantConfig;
 
-/// Minimum spatial dimension for ANE I/O tensors with high channel counts.
-///
-/// ANE rejects `[1, C, 1, S]` tensors when C > ~768 and S < 32.
-/// Padding S to 32 ensures the shape is always accepted, regardless
-/// of the channel count. Only column 0 carries real data; the other
-/// 31 columns are zero-padded.
-pub(crate) const MIN_IO_SEQ: usize = 32;
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -118,7 +110,7 @@ fn compute_deq_scale(head_dim: usize, n_bits: u8) -> f32 {
 /// fp16 bytes to populate the input IOSurface tensor.
 pub fn emit_cache_write_mil(config: &TurboQuantConfig) -> (String, Vec<(String, Vec<u8>)>) {
     let ch = config.num_kv_heads * config.head_dim;
-    let in_shape = fmt_shape(&[1, ch, 1, MIN_IO_SEQ]);
+    let in_shape = fmt_shape(&[1, ch, 1, 1]);
     let rot_shape = fmt_shape(&[1, 1, config.head_dim, config.head_dim]);
 
     let inv_scale = compute_inv_scale(config.head_dim, config.n_bits);
@@ -195,15 +187,13 @@ fn emit_quantize_chain(
     let ch = config.num_kv_heads * config.head_dim;
     let _ = rot_shape; // rotation applied via matmul broadcast
 
-    let s = MIN_IO_SEQ;
-
-    // Reshape to [1, num_kv_heads, head_dim, S] for per-head rotation
-    let reshape_4d = fmt_shape(&[1, config.num_kv_heads, config.head_dim, s]);
+    // Reshape to [1, num_kv_heads, head_dim, 1] for per-head rotation
+    let reshape_4d = fmt_shape(&[1, config.num_kv_heads, config.head_dim, 1]);
     let reshaped = format!("{prefix}_reshaped");
     writeln!(
         body,
         "        tensor<fp16, {reshape_4d}> {reshaped} = reshape(\
-         x={input_name}, shape=tensor<int32, [4]>([1,{},{},{s}]))\
+         x={input_name}, shape=tensor<int32, [4]>([1,{},{},1]))\
          [name=string(\"{reshaped}\")];",
         config.num_kv_heads, config.head_dim
     )
@@ -220,13 +210,13 @@ fn emit_quantize_chain(
     )
     .unwrap();
 
-    // Reshape back to [1, ch, 1, S]
-    let flat_shape = fmt_shape(&[1, ch, 1, s]);
+    // Reshape back to [1, ch, 1, 1]
+    let flat_shape = fmt_shape(&[1, ch, 1, 1]);
     let flat = format!("{prefix}_flat");
     writeln!(
         body,
         "        tensor<fp16, {flat_shape}> {flat} = reshape(\
-         x={rotated}, shape=tensor<int32, [4]>([1,{ch},1,{s}]))\
+         x={rotated}, shape=tensor<int32, [4]>([1,{ch},1,1]))\
          [name=string(\"{flat}\")];"
     )
     .unwrap();
@@ -325,7 +315,7 @@ pub fn emit_attention_mil(
     let kv_ch = num_kv_heads * head_dim;
     let q_ch = num_heads * head_dim;
 
-    let q_shape = fmt_shape(&[1, q_ch, 1, MIN_IO_SEQ]);
+    let q_shape = fmt_shape(&[1, q_ch, 1, 1]);
     let cache_shape = fmt_shape(&[1, kv_ch, 1, config.max_seq_len]);
     let sliced_shape = fmt_shape(&[1, kv_ch, 1, seq_len]);
     let rot_shape = fmt_shape(&[1, 1, head_dim, head_dim]);
@@ -333,9 +323,9 @@ pub fn emit_attention_mil(
     let gqa_groups = num_heads / num_kv_heads; // >=1; validated by TurboQuantConfig
     let kv_head_4d = fmt_shape(&[1, num_kv_heads, head_dim, seq_len]);
     let attn_head_4d = fmt_shape(&[1, num_heads, head_dim, seq_len]);
-    let q_head_4d = fmt_shape(&[1, num_heads, head_dim, MIN_IO_SEQ]);
-    // QK shape: [1, num_heads, MIN_IO_SEQ, seq_len] after matmul with transpose
-    let qk_shape = fmt_shape(&[1, num_heads, MIN_IO_SEQ, seq_len]);
+    let q_head_4d = fmt_shape(&[1, num_heads, head_dim, 1]);
+    // QK shape: [1, num_heads, 1, seq_len] after matmul with transpose
+    let qk_shape = fmt_shape(&[1, num_heads, 1, seq_len]);
 
     let deq_scale = compute_deq_scale(head_dim, config.n_bits);
     let scale_factor = 1.0 / (head_dim as f32).sqrt();
@@ -427,12 +417,11 @@ pub fn emit_attention_mil(
 
     // --- Attention computation ---
 
-    // Reshape Q: [1, q_ch, 1, S] -> [1, num_heads, head_dim, S]
-    let s = MIN_IO_SEQ;
+    // Reshape Q: [1, q_ch, 1, 1] -> [1, num_heads, head_dim, 1]
     writeln!(
         body,
         "        tensor<fp16, {q_head_4d}> q_reshaped = reshape(\
-         x=a_input0, shape=tensor<int32, [4]>([1,{num_heads},{head_dim},{s}]))\
+         x=a_input0, shape=tensor<int32, [4]>([1,{num_heads},{head_dim},1]))\
          [name=string(\"q_reshaped\")];"
     )
     .unwrap();
@@ -486,10 +475,10 @@ pub fn emit_attention_mil(
         ("k_heads", "v_heads")
     };
 
-    // QK = matmul(Q^T, K) -> [1, num_heads, S, seq_len]
-    // Q is [1, num_heads, head_dim, S], K is [1, num_heads, head_dim, seq_len]
-    // transpose_x=true -> Q^T is [1, num_heads, S, head_dim]
-    // Q^T x K -> [1, num_heads, S, seq_len]
+    // QK = matmul(Q^T, K) -> [1, num_heads, 1, seq_len]
+    // Q is [1, num_heads, head_dim, 1], K is [1, num_heads, head_dim, seq_len]
+    // transpose_x=true -> Q^T is [1, num_heads, 1, head_dim]
+    // Q^T x K -> [1, num_heads, 1, seq_len]
     writeln!(
         body,
         "        tensor<fp16, {qk_shape}> qk = matmul(\
@@ -516,12 +505,12 @@ pub fn emit_attention_mil(
     )
     .unwrap();
 
-    // attn_out = attn_weights x V^T -> [1, num_heads, S, head_dim]
-    // attn_weights is [1, num_heads, S, seq_len]
+    // attn_out = attn_weights x V^T -> [1, num_heads, 1, head_dim]
+    // attn_weights is [1, num_heads, 1, seq_len]
     // V is [1, num_heads, head_dim, seq_len]
     // V^T is [1, num_heads, seq_len, head_dim]
-    // attn_weights x V^T = [1, num_heads, S, head_dim]
-    let attn_pre_shape = fmt_shape(&[1, num_heads, s, head_dim]);
+    // attn_weights x V^T = [1, num_heads, 1, head_dim]
+    let attn_pre_shape = fmt_shape(&[1, num_heads, 1, head_dim]);
     writeln!(
         body,
         "        tensor<fp16, {attn_pre_shape}> attn_pre = matmul(\
@@ -530,11 +519,11 @@ pub fn emit_attention_mil(
     )
     .unwrap();
 
-    // Reshape to output: [1, q_ch, 1, S]
+    // Reshape to output: [1, q_ch, 1, 1]
     writeln!(
         body,
         "        tensor<fp16, {q_shape}> z_output0 = reshape(\
-         x=attn_pre, shape=tensor<int32, [4]>([1,{q_ch},1,{s}]))\
+         x=attn_pre, shape=tensor<int32, [4]>([1,{q_ch},1,1]))\
          [name=string(\"z_output0\")];"
     )
     .unwrap();

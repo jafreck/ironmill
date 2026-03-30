@@ -11,6 +11,9 @@ use mil_rs::ir::ScalarType;
 
 use crate::{AneError, Result};
 
+/// Minimum IOSurface allocation size (~49KB, ANE constraint #4).
+pub const MIN_SURFACE_ALLOC: usize = 49152; // 48 * 1024
+
 // ── FFI bindings (macOS) ─────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -67,17 +70,6 @@ mod ffi {
     /// `kIOSurfaceLockReadOnly` = 1.
     pub const IOSURFACE_LOCK_READ_ONLY: u32 = 1;
 }
-
-/// Minimum IOSurface allocation size required by the ANE hardware.
-///
-/// The ANE rejects IOSurface tensors below this size with status 0x1d.
-/// Both Orion and maderix/ANE use larger tensor sizes in practice
-/// (d_model ≥ 768), so this constraint is rarely hit. The previous
-/// value of 48KB (49152) was overly conservative; the actual hardware
-/// minimum is smaller but undetermined. We use 16KB as a safe lower
-/// bound — still a significant reduction from 48KB for small tensors
-/// used in testing.
-pub(crate) const ANE_MIN_SURFACE_BYTES: usize = 16384; // 16 KB
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -168,7 +160,7 @@ unsafe impl Send for AneTensor {}
 impl AneTensor {
     /// Create a new tensor with shape `[1, channels, 1, seq_len]`.
     pub fn new(channels: usize, seq_len: usize, dtype: ScalarType) -> Result<Self> {
-        Self::new_with_min_alloc(channels, seq_len, dtype, ANE_MIN_SURFACE_BYTES)
+        Self::new_with_min_alloc(channels, seq_len, dtype, MIN_SURFACE_ALLOC)
     }
 
     /// Create with a specific minimum allocation size (for uniform sizing).
@@ -179,7 +171,7 @@ impl AneTensor {
         min_alloc: usize,
     ) -> Result<Self> {
         let data_size = channels * seq_len * scalar_byte_size(dtype);
-        let alloc_size = data_size.max(min_alloc).max(ANE_MIN_SURFACE_BYTES);
+        let alloc_size = data_size.max(min_alloc).max(MIN_SURFACE_ALLOC);
 
         #[cfg(target_os = "macos")]
         {
@@ -342,158 +334,6 @@ impl AneTensor {
         self.shape[1] * self.shape[3]
     }
 
-    /// Copy column 0 from `src` into column 0 of `self`.
-    ///
-    /// Both tensors must have the same channel count (`shape[1]`) and dtype.
-    /// Copies one element per channel from `src[c * src_S + 0]` to
-    /// `self[c * self_S + 0]`. The rest of each destination row is left
-    /// unchanged (staging buffers are pre-zeroed).
-    pub fn copy_column0_from(&mut self, src: &AneTensor) -> Result<()> {
-        let dst_c = self.shape[1];
-        let src_c = src.shape[1];
-        if dst_c != src_c {
-            return Err(AneError::SurfaceError(format!(
-                "copy_column0_from: channel mismatch: dst has {dst_c}, src has {src_c}"
-            )));
-        }
-        if self.dtype != src.dtype {
-            return Err(AneError::SurfaceError(
-                "copy_column0_from: dtype mismatch".into(),
-            ));
-        }
-
-        let channels = dst_c;
-        let bpe = scalar_byte_size(self.dtype);
-        let src_s = src.shape[3];
-        let dst_s = self.shape[3];
-        let src_stride = src_s * bpe;
-        let dst_stride = dst_s * bpe;
-
-        #[cfg(target_os = "macos")]
-        {
-            unsafe {
-                // Lock src read-only.
-                let rc = ffi::IOSurfaceLock(
-                    src.surface,
-                    ffi::IOSURFACE_LOCK_READ_ONLY,
-                    std::ptr::null_mut(),
-                );
-                if rc != 0 {
-                    return Err(AneError::SurfaceError(format!(
-                        "copy_column0_from: IOSurfaceLock(src) failed (status {rc})"
-                    )));
-                }
-                let src_base = ffi::IOSurfaceGetBaseAddress(src.surface);
-                if src_base.is_null() {
-                    ffi::IOSurfaceUnlock(
-                        src.surface,
-                        ffi::IOSURFACE_LOCK_READ_ONLY,
-                        std::ptr::null_mut(),
-                    );
-                    return Err(AneError::SurfaceError(
-                        "copy_column0_from: IOSurfaceGetBaseAddress(src) returned null".into(),
-                    ));
-                }
-
-                // Lock dst read-write.
-                let rc = ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
-                if rc != 0 {
-                    ffi::IOSurfaceUnlock(
-                        src.surface,
-                        ffi::IOSURFACE_LOCK_READ_ONLY,
-                        std::ptr::null_mut(),
-                    );
-                    return Err(AneError::SurfaceError(format!(
-                        "copy_column0_from: IOSurfaceLock(dst) failed (status {rc})"
-                    )));
-                }
-                let dst_base = ffi::IOSurfaceGetBaseAddress(self.surface);
-                if dst_base.is_null() {
-                    ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
-                    ffi::IOSurfaceUnlock(
-                        src.surface,
-                        ffi::IOSURFACE_LOCK_READ_ONLY,
-                        std::ptr::null_mut(),
-                    );
-                    return Err(AneError::SurfaceError(
-                        "copy_column0_from: IOSurfaceGetBaseAddress(dst) returned null".into(),
-                    ));
-                }
-
-                let src_ptr = src_base as *const u8;
-                let dst_ptr = dst_base as *mut u8;
-                for c in 0..channels {
-                    std::ptr::copy_nonoverlapping(
-                        src_ptr.add(c * src_stride),
-                        dst_ptr.add(c * dst_stride),
-                        bpe,
-                    );
-                }
-
-                ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
-                ffi::IOSurfaceUnlock(
-                    src.surface,
-                    ffi::IOSURFACE_LOCK_READ_ONLY,
-                    std::ptr::null_mut(),
-                );
-            }
-            Ok(())
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            for c in 0..channels {
-                let src_off = c * src_stride;
-                let dst_off = c * dst_stride;
-                self.buffer[dst_off..dst_off + bpe]
-                    .copy_from_slice(&src.buffer[src_off..src_off + bpe]);
-            }
-            Ok(())
-        }
-    }
-
-    /// Read column 0 values from an S-padded tensor as f16.
-    ///
-    /// Returns `C` elements (one per channel), reading only the necessary
-    /// bytes at strided positions `c * S * 2` rather than the entire surface.
-    /// When `S == 1`, equivalent to [`read_f16`].
-    pub fn read_column0_f16(&self) -> Result<Vec<f16>> {
-        let channels = self.shape[1];
-        let seq_len = self.shape[3];
-
-        if seq_len == 1 {
-            return self.read_f16();
-        }
-
-        let stride_bytes = seq_len * 2; // 2 bytes per f16
-        let mut out = vec![f16::ZERO; channels];
-
-        #[cfg(target_os = "macos")]
-        {
-            self.with_locked_base(ffi::IOSURFACE_LOCK_READ_ONLY, |base| unsafe {
-                let src = base as *const u8;
-                for c in 0..channels {
-                    std::ptr::copy_nonoverlapping(
-                        src.add(c * stride_bytes),
-                        (out.as_mut_ptr() as *mut u8).add(c * 2),
-                        2,
-                    );
-                }
-            })?;
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            for c in 0..channels {
-                let off = c * stride_bytes;
-                let bytes = [self.buffer[off], self.buffer[off + 1]];
-                out[c] = f16::from_le_bytes(bytes);
-            }
-        }
-
-        Ok(out)
-    }
-
     /// Raw IOSurface pointer for ANE API calls.
     #[cfg(target_os = "macos")]
     pub fn as_ptr(&self) -> *mut c_void {
@@ -598,10 +438,10 @@ pub fn uniform_alloc_size(shapes: &[([usize; 4], ScalarType)]) -> usize {
         .iter()
         .map(|(shape, dtype)| {
             let data_size = shape[1] * shape[3] * scalar_byte_size(*dtype);
-            data_size.max(ANE_MIN_SURFACE_BYTES)
+            data_size.max(MIN_SURFACE_ALLOC)
         })
         .max()
-        .unwrap_or(ANE_MIN_SURFACE_BYTES)
+        .unwrap_or(MIN_SURFACE_ALLOC)
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -617,18 +457,10 @@ mod tests {
     }
 
     #[test]
-    fn tensor_small_uses_ane_minimum() {
-        // 4 * 8 * 2 = 64 bytes data, but ANE requires at least 16KB.
+    fn tensor_min_49kb() {
+        // 4 * 8 * 2 = 64 bytes, well under the 49KB minimum.
         let t = AneTensor::new(4, 8, ScalarType::Float16).unwrap();
-        assert_eq!(t.alloc_size(), ANE_MIN_SURFACE_BYTES);
-    }
-
-    #[test]
-    fn tensor_min_alloc_size() {
-        // Small tensors get inflated to ANE minimum.
-        let t = AneTensor::new(2, 4, ScalarType::Float16).unwrap();
-        assert_eq!(t.alloc_size(), ANE_MIN_SURFACE_BYTES);
-        assert_eq!(t.alloc_size(), 16384);
+        assert_eq!(t.alloc_size(), MIN_SURFACE_ALLOC);
     }
 
     #[test]
@@ -653,18 +485,19 @@ mod tests {
     #[test]
     fn tensor_uniform_alloc() {
         let shapes = vec![
-            ([1, 32, 1, 128], ScalarType::Float16), // 32*128*2 = 8192 → 16384 (ANE min)
+            ([1, 32, 1, 128], ScalarType::Float16), // 32*128*2 = 8192 → 49152
             ([1, 64, 1, 512], ScalarType::Float16), // 64*512*2 = 65536
-            ([1, 16, 1, 64], ScalarType::Float16),  // 16*64*2  = 2048 → 16384 (ANE min)
+            ([1, 16, 1, 64], ScalarType::Float16),  // 16*64*2  = 2048 → 49152
         ];
         assert_eq!(uniform_alloc_size(&shapes), 65536);
     }
 
     #[test]
-    fn tensor_alloc_size_exact_fit() {
+    fn tensor_alloc_size_includes_padding() {
         let t = AneTensor::new(64, 512, ScalarType::Float16).unwrap();
-        let data_size = 64 * 512 * 2; // 65536
-        assert_eq!(t.alloc_size(), data_size);
+        let data_size = 64 * 512 * 2;
+        assert!(t.alloc_size() >= data_size);
+        assert!(t.alloc_size() >= MIN_SURFACE_ALLOC);
     }
 
     #[test]
@@ -723,100 +556,5 @@ mod tests {
         // Verify untouched region is still zero.
         let before = t.read_f16_at(0, 8).unwrap();
         assert!(before.iter().all(|&v| v == f16::ZERO));
-    }
-
-    #[test]
-    fn copy_column0_same_seq_len() {
-        // src and dst both [1, 4, 1, 8], copy column 0 across.
-        let mut src = AneTensor::new(4, 8, ScalarType::Float16).unwrap();
-        let mut src_data = vec![f16::ZERO; 4 * 8];
-        // Set column 0 of each channel: indices 0, 8, 16, 24.
-        src_data[0] = f16::from_f32(1.0);
-        src_data[8] = f16::from_f32(2.0);
-        src_data[16] = f16::from_f32(3.0);
-        src_data[24] = f16::from_f32(4.0);
-        src.write_f16(&src_data).unwrap();
-
-        let mut dst = AneTensor::new(4, 8, ScalarType::Float16).unwrap();
-        dst.copy_column0_from(&src).unwrap();
-
-        let out = dst.read_f16().unwrap();
-        assert_eq!(out[0], f16::from_f32(1.0));
-        assert_eq!(out[8], f16::from_f32(2.0));
-        assert_eq!(out[16], f16::from_f32(3.0));
-        assert_eq!(out[24], f16::from_f32(4.0));
-        // Non-column-0 positions should still be zero.
-        assert_eq!(out[1], f16::ZERO);
-        assert_eq!(out[9], f16::ZERO);
-    }
-
-    #[test]
-    fn copy_column0_different_seq_len() {
-        // src [1, 3, 1, 16], dst [1, 3, 1, 32].
-        let mut src = AneTensor::new(3, 16, ScalarType::Float16).unwrap();
-        let mut src_data = vec![f16::ZERO; 3 * 16];
-        src_data[0] = f16::from_f32(10.0);
-        src_data[16] = f16::from_f32(20.0);
-        src_data[32] = f16::from_f32(30.0);
-        src.write_f16(&src_data).unwrap();
-
-        let mut dst = AneTensor::new(3, 32, ScalarType::Float16).unwrap();
-        dst.copy_column0_from(&src).unwrap();
-
-        let out = dst.read_f16().unwrap();
-        assert_eq!(out[0], f16::from_f32(10.0));
-        assert_eq!(out[32], f16::from_f32(20.0));
-        assert_eq!(out[64], f16::from_f32(30.0));
-    }
-
-    #[test]
-    fn copy_column0_src_seq1() {
-        // src [1, 2, 1, 1] (flat), dst [1, 2, 1, 8].
-        let mut src = AneTensor::new(2, 1, ScalarType::Float16).unwrap();
-        src.write_f16(&[f16::from_f32(5.0), f16::from_f32(6.0)])
-            .unwrap();
-
-        let mut dst = AneTensor::new(2, 8, ScalarType::Float16).unwrap();
-        dst.copy_column0_from(&src).unwrap();
-
-        let out = dst.read_f16().unwrap();
-        assert_eq!(out[0], f16::from_f32(5.0));
-        assert_eq!(out[8], f16::from_f32(6.0));
-    }
-
-    #[test]
-    fn copy_column0_channel_mismatch_errors() {
-        let src = AneTensor::new(4, 8, ScalarType::Float16).unwrap();
-        let mut dst = AneTensor::new(8, 8, ScalarType::Float16).unwrap();
-        assert!(dst.copy_column0_from(&src).is_err());
-    }
-
-    #[test]
-    fn read_column0_f16_strided() {
-        let mut t = AneTensor::new(4, 8, ScalarType::Float16).unwrap();
-        let mut data = vec![f16::ZERO; 4 * 8];
-        data[0] = f16::from_f32(1.0);
-        data[1] = f16::from_f32(99.0); // not column 0
-        data[8] = f16::from_f32(2.0);
-        data[16] = f16::from_f32(3.0);
-        data[24] = f16::from_f32(4.0);
-        t.write_f16(&data).unwrap();
-
-        let col0 = t.read_column0_f16().unwrap();
-        assert_eq!(col0.len(), 4);
-        assert_eq!(col0[0], f16::from_f32(1.0));
-        assert_eq!(col0[1], f16::from_f32(2.0));
-        assert_eq!(col0[2], f16::from_f32(3.0));
-        assert_eq!(col0[3], f16::from_f32(4.0));
-    }
-
-    #[test]
-    fn read_column0_f16_seq1() {
-        let mut t = AneTensor::new(3, 1, ScalarType::Float16).unwrap();
-        let data = [f16::from_f32(7.0), f16::from_f32(8.0), f16::from_f32(9.0)];
-        t.write_f16(&data).unwrap();
-
-        let col0 = t.read_column0_f16().unwrap();
-        assert_eq!(col0, data.to_vec());
     }
 }

@@ -191,7 +191,6 @@ impl AneInference {
         // the sub-programs that will be compiled for ANE.
         let split_config = SplitConfig {
             split_attention: true,
-            emit_attention: turbo_config.is_none(),
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
