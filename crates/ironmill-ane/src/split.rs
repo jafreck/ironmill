@@ -39,12 +39,19 @@ pub struct SplitConfig {
     /// Maximum weight data size per sub-program (bytes).
     /// Sub-programs exceeding this are further chunked.
     pub max_weight_size: usize,
+    /// When `true`, split each `layer_N` sub-program at the attention
+    /// boundary into `layer_N_pre_attn` and `layer_N_post_attn`.
+    ///
+    /// Required for autoregressive inference where the attention + KV
+    /// cache is managed externally (both FP16 baseline and TurboQuant).
+    pub split_attention: bool,
 }
 
 impl Default for SplitConfig {
     fn default() -> Self {
         Self {
             max_weight_size: 64 * 1024 * 1024, // 64 MB
+            split_attention: false,
         }
     }
 }
@@ -100,8 +107,21 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
     // Build sub-programs from the classified groups.
     let mut sub_programs: Vec<SubProgram> = Vec::new();
     for (name, ops) in &groups {
-        let sp = build_sub_program(name, ops, &type_map);
-        sub_programs.push(sp);
+        if config.split_attention && name.starts_with("layer_") {
+            // Split this layer at the attention boundary into pre_attn and post_attn.
+            let (pre, post) = split_at_attention_boundary(ops);
+            let pre_name = format!("{name}_pre_attn");
+            let post_name = format!("{name}_post_attn");
+            if !pre.is_empty() {
+                sub_programs.push(build_sub_program(&pre_name, &pre, &type_map));
+            }
+            if !post.is_empty() {
+                sub_programs.push(build_sub_program(&post_name, &post, &type_map));
+            }
+        } else {
+            let sp = build_sub_program(name, ops, &type_map);
+            sub_programs.push(sp);
+        }
     }
 
     // Enforce weight-size limits: chunk oversized sub-programs.
@@ -118,25 +138,27 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
 
 /// Extract a layer number from an operation name.
 ///
-/// Only matches names with explicit layer prefixes to avoid false positives
-/// (e.g., `conv_0` is NOT a layer number — it's just a counter).
+/// Matches layer/block patterns anywhere in the name (not just at the start)
+/// to handle both direct names (`layer_0_attn_q`) and ONNX-converted names
+/// with prefixes (`_model_layers_0_attn_...`, `/model/layers.0/...`).
 ///
 /// Recognized patterns: `layer_0_attn_q`, `layers.3.ffn.up`, `block_12_norm`,
-/// `layer0_w`, `layer.0.weight`.
+/// `_model_layers_0_attn_q`, `layer0_w`, `layer.0.weight`.
 fn extract_layer_number(op_name: &str) -> Option<usize> {
-    // Look for "layer", "layers", or "block" prefix followed by a separator and number
     let lower = op_name.to_ascii_lowercase();
-    for prefix in ["layer_", "layer.", "layers_", "layers.", "block_", "block."] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            // Take the first numeric part after the prefix
+    // Search for layer/block patterns anywhere in the name.
+    for pattern in ["layers.", "layers_", "layer.", "layer_", "block.", "block_"] {
+        if let Some(idx) = lower.find(pattern) {
+            let rest = &lower[idx + pattern.len()..];
             let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if !num_str.is_empty() {
                 return num_str.parse().ok();
             }
         }
     }
-    // Also check for "layerN" without separator (e.g., "layer0_w")
-    if let Some(rest) = lower.strip_prefix("layer") {
+    // Also match "layerN" without separator.
+    if let Some(idx) = lower.find("layer") {
+        let rest = &lower[idx + "layer".len()..];
         let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if !num_str.is_empty() {
             return num_str.parse().ok();
@@ -226,6 +248,103 @@ fn classify_ops(operations: &[Operation]) -> Vec<(String, Vec<Operation>)> {
     }
 
     groups
+}
+
+// ---------------------------------------------------------------------------
+// Attention-boundary splitting
+// ---------------------------------------------------------------------------
+
+/// Split a layer's ops into pre-attention and post-attention groups.
+///
+/// The split point is the attention op cluster — the ops between Q/K/V
+/// projections and the output projection. For the GQA lowered pattern
+/// this includes reshapes, transposes, tiles, matmuls (QK^T, softmax,
+/// AV), and the output reshape/transpose.
+///
+/// **Pre-attention** (→ `layer_N_pre_attn`): norm → Q/K/V projections.
+/// **Post-attention** (→ `layer_N_post_attn`): O projection → residual → FFN → residual.
+///
+/// The attention ops themselves are excluded — they are replaced at
+/// runtime by either an FP16 attention sub-program or TurboQuant.
+fn split_at_attention_boundary(ops: &[Operation]) -> (Vec<Operation>, Vec<Operation>) {
+    // Find the attention cluster by looking for the characteristic GQA
+    // lowered pattern: RoPE rotation, reshape/transpose ops for Q/K/V,
+    // matmul (QK^T), softmax, matmul (AV), reshape, transpose (output).
+    //
+    // RoPE (RotaryEmbedding) ops are included in the cluster because
+    // they contain concat ops that ANE doesn't support, and they are
+    // tightly coupled to the attention mechanism. RoPE is handled
+    // externally (on CPU or by TurboQuant's rotation pipeline).
+    //
+    // Heuristic: the first RoPE or Q reshape op starts the attention
+    // cluster, and the last attention-related op ends it.
+
+    let mut attn_start = None;
+    let mut attn_end = None;
+
+    for (i, op) in ops.iter().enumerate() {
+        let name_lower = op.name.to_ascii_lowercase();
+        let is_attn_op = // RoPE / RotaryEmbedding ops (split, gather cos/sin, mul, sub, add, concat)
+            name_lower.contains("rotaryembedding")
+            || name_lower.contains("rotary_embedding")
+            || name_lower.contains("_rotary_")
+            || name_lower.contains("_rope_")
+            // cos/sin cache gather for RoPE
+            || name_lower.contains("_cos_gather")
+            || name_lower.contains("_sin_gather")
+            || name_lower.contains("_cos_gathered")
+            || name_lower.contains("_sin_gathered")
+            // Position ID reformatting for RoPE
+            || name_lower.contains("pos_ids_reformat")
+            || name_lower.contains("position_ids_reformat")
+            // GQA reshape/transpose
+            || name_lower.contains("_q_reshape")
+            || name_lower.contains("_k_reshape")
+            || name_lower.contains("_v_reshape")
+            || name_lower.contains("_q_transpose")
+            || name_lower.contains("_k_transpose")
+            || name_lower.contains("_v_transpose")
+            || name_lower.contains("_k_tile")
+            || name_lower.contains("_v_tile")
+            || name_lower.contains("_k_tiled")
+            || name_lower.contains("_v_tiled")
+            // Attention core
+            || name_lower.contains("_qk_matmul")
+            || name_lower.contains("_qk_scale")
+            || name_lower.contains("_attn_softmax")
+            || name_lower.contains("_av_matmul")
+            || name_lower.contains("_attn_out_reshape")
+            || name_lower.contains("_attn_out_transpose");
+
+        if is_attn_op {
+            if attn_start.is_none() {
+                attn_start = Some(i);
+            }
+            attn_end = Some(i);
+        }
+    }
+
+    match (attn_start, attn_end) {
+        (Some(start), Some(end)) => {
+            let pre_attn = ops[..start].to_vec();
+            let post_attn = ops[end + 1..].to_vec();
+            // If pre_attn or post_attn is empty, fall back to keeping
+            // everything in pre_attn (the caller can still use it).
+            if pre_attn.is_empty() && post_attn.is_empty() {
+                (ops.to_vec(), vec![])
+            } else if pre_attn.is_empty() {
+                // All ops before attention are attention ops — unusual,
+                // put everything in pre_attn.
+                (ops.to_vec(), vec![])
+            } else {
+                (pre_attn, post_attn)
+            }
+        }
+        _ => {
+            // No attention pattern found — put everything in pre_attn.
+            (ops.to_vec(), vec![])
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +648,9 @@ mod tests {
         assert_eq!(extract_layer_number("block_12_norm"), Some(12));
         assert_eq!(extract_layer_number("embedding_lookup"), None);
         assert_eq!(extract_layer_number("lm_head"), None);
+        // ONNX-converted names with prefixes
+        assert_eq!(extract_layer_number("_model_layers_0_attn_q"), Some(0));
+        assert_eq!(extract_layer_number("/model/layers.27/mlp/down"), Some(27));
     }
 
     #[test]
@@ -616,6 +738,7 @@ mod tests {
         let prog = make_program(vec![op0, op1], vec![]);
         let config = SplitConfig {
             max_weight_size: 50 * 1024 * 1024, // 50 MB limit
+            ..Default::default()
         };
         let split = split_for_ane(&prog, &config).unwrap();
 
@@ -625,5 +748,87 @@ mod tests {
             "expected chunking, got {} sub-programs",
             split.programs.len()
         );
+    }
+
+    #[test]
+    fn split_attention_boundary() {
+        // Simulate a layer with pre-attn ops, attention ops, and post-attn ops.
+        let ops = vec![
+            make_op("embed_tok", "gather"),
+            // Layer 0: pre-attn
+            make_op("layer_0_norm", "layer_norm"),
+            make_op("layer_0_q_linear", "linear"),
+            make_op("layer_0_k_linear", "linear"),
+            make_op("layer_0_v_linear", "linear"),
+            // Layer 0: attention cluster
+            make_op("layer_0_q_reshape_op", "reshape"),
+            make_op("layer_0_q_transpose_op", "transpose"),
+            make_op("layer_0_k_reshape_op", "reshape"),
+            make_op("layer_0_k_transpose_op", "transpose"),
+            make_op("layer_0_v_reshape_op", "reshape"),
+            make_op("layer_0_v_transpose_op", "transpose"),
+            make_op("layer_0_qk_matmul", "matmul"),
+            make_op("layer_0_qk_scale", "mul"),
+            make_op("layer_0_attn_softmax", "softmax"),
+            make_op("layer_0_av_matmul", "matmul"),
+            make_op("layer_0_attn_out_transpose", "transpose"),
+            make_op("layer_0_attn_out_reshape", "reshape"),
+            // Layer 0: post-attn
+            make_op("layer_0_o_proj", "linear"),
+            make_op("layer_0_ffn_up", "linear"),
+            make_op("layer_0_ffn_down", "linear"),
+            // Post
+            make_op("final_norm", "layer_norm"),
+            make_op("lm_head_proj", "linear"),
+        ];
+        let prog = make_program(ops, vec![]);
+        let config = SplitConfig {
+            split_attention: true,
+            ..Default::default()
+        };
+        let split = split_for_ane(&prog, &config).unwrap();
+
+        let names: Vec<&str> = split.programs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            &[
+                "embedding",
+                "layer_0_pre_attn",
+                "layer_0_post_attn",
+                "lm_head"
+            ]
+        );
+
+        // pre_attn should have: norm, q_linear, k_linear, v_linear (4 ops)
+        let pre_attn = &split.programs[1];
+        assert_eq!(
+            pre_attn.program.main().unwrap().body.operations.len(),
+            4,
+            "pre_attn should have 4 ops"
+        );
+
+        // post_attn should have: o_proj, ffn_up, ffn_down (3 ops)
+        let post_attn = &split.programs[2];
+        assert_eq!(
+            post_attn.program.main().unwrap().body.operations.len(),
+            3,
+            "post_attn should have 3 ops"
+        );
+    }
+
+    #[test]
+    fn split_attention_disabled_keeps_whole_layers() {
+        let ops = vec![
+            make_op("layer_0_norm", "layer_norm"),
+            make_op("layer_0_q_reshape_op", "reshape"),
+            make_op("layer_0_attn_softmax", "softmax"),
+            make_op("layer_0_ffn", "linear"),
+        ];
+        let prog = make_program(ops, vec![]);
+        let config = SplitConfig::default(); // split_attention = false
+        let split = split_for_ane(&prog, &config).unwrap();
+
+        let names: Vec<&str> = split.programs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, &["layer_0"]);
     }
 }

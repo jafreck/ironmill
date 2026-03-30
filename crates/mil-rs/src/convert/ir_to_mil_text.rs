@@ -238,7 +238,10 @@ impl<'a> MilTextEmitter<'a> {
             .unwrap_or_else(|| op.name.clone());
 
         // Check if this is a weight tensor or a scalar const.
-        if let Some(Value::Tensor { data, shape, dtype }) = op.inputs.get("val") {
+        // ONNX-converted models put the value in `attributes["val"]`,
+        // while hand-built programs use `inputs["val"]`.
+        let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+        if let Some(Value::Tensor { data, shape, dtype }) = val {
             // Register the type for downstream ops.
             if let Some(out_name) = op.outputs.first() {
                 self.type_map
@@ -266,7 +269,7 @@ impl<'a> MilTextEmitter<'a> {
                 "        {type_str} {output_name} = const()[name=string(\"{output_name}\"), val={type_str}(BLOBFILE(path=string(\"{weight_path}\"), offset=uint64(64)))];",
             )
             .unwrap();
-        } else if let Some(val) = op.inputs.get("val") {
+        } else if let Some(val) = op.inputs.get("val").or_else(|| op.attributes.get("val")) {
             // Scalar/list const → emit with typed value.
             let (type_str, val_str) = self.format_typed_const_value(val);
 

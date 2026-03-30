@@ -1,6 +1,12 @@
 # ANE BLOBFILE Weight Investigation
 
-> **Status:** Open
+> **Status:** Resolved
+>
+> **Root cause:** `emit_const_op` in `ir_to_mil_text.rs` only checked
+> `inputs["val"]` for weight tensors, but ONNX-converted const ops store
+> weights in `attributes["val"]`. Fixed to check both. See
+> [ANE MIL Emitter Compatibility](ane-mil-emitter-compat.md) for remaining
+> emitter format issues.
 >
 > **Discovered during:** TurboQuant implementation
 >

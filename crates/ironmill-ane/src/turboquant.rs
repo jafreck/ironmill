@@ -102,6 +102,20 @@ impl TurboQuantConfig {
         self.rotation_seed = seed;
         self
     }
+
+    /// Construct a `TurboQuantConfig` from detected model architecture.
+    ///
+    /// Uses 8-bit quantization by default.
+    pub fn from_arch(arch: &mil_rs::analysis::arch::ModelArch, max_seq_len: usize) -> Result<Self> {
+        Self::new(
+            8,
+            max_seq_len,
+            arch.num_heads,
+            arch.num_kv_heads,
+            arch.head_dim,
+            arch.num_layers,
+        )
+    }
 }
 
 /// Manages per-layer INT8 KV caches with TurboQuant quantization.
@@ -570,6 +584,16 @@ impl TurboQuantModel {
     /// Current sequence length.
     pub fn seq_len(&self) -> usize {
         self.cache.seq_len()
+    }
+
+    /// Advance the sequence position after all layers have been updated
+    /// for the current token via per-layer `step_attention` calls.
+    ///
+    /// This is not needed when using `step()` (which advances internally),
+    /// but is required when calling `step_attention()` per-layer from an
+    /// external inference loop like [`AneInference`].
+    pub fn advance_seq_pos(&mut self) {
+        self.cache.advance_seq_pos();
     }
 
     /// Get a reference to the config.
