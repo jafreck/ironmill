@@ -946,33 +946,86 @@ fn convert_reduce_sum(node: &NodeProto) -> Result<Vec<Operation>> {
 /// SimplifiedLayerNormalization (RMSNorm without bias):
 /// `Y = X / sqrt(mean(X^2, axis) + eps) * scale`
 ///
-/// Emits a single `layer_norm` op — eval-verified on ANE (max_err=0.001).
-/// The decomposed arithmetic pattern (mul→reduce_mean→pow→mul) has axis
-/// remapping issues under ANE's `[1,C,1,S]` layout, and `layer_norm`
-/// handles the reduction internally with correct axis semantics.
+/// Emits the decomposed arithmetic pattern following Orion's
+/// `orion_mil_rmsnorm` — eval-verified on ANE. Uses axis=1 (channel
+/// dim in ANE `[1,C,1,S]` layout) with `reduce_sum` + manual division
+/// instead of `reduce_mean` to avoid ANE axis semantics issues.
 fn convert_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
+    let name = op_name(node);
     let eps = get_float_attr(node, "epsilon").unwrap_or(1e-5);
-    let axes = get_int_attr(node, "axis").unwrap_or(-1);
 
     let x_ref = node.input.first().cloned().unwrap_or_default();
     let scale_ref = node.input.get(1).cloned().unwrap_or_default();
 
-    let output_name = &node.output[0];
-    let ln_op = Operation::new("layer_norm", output_name)
+    // x_sq = x * x
+    let x_sq_name = format!("{name}_sq");
+    let x_sq = Operation::new("mul", &x_sq_name)
+        .with_input("x", Value::Reference(x_ref.clone()))
+        .with_input("y", Value::Reference(x_ref.clone()))
+        .with_output(&x_sq_name);
+
+    // mean_sq = reduce_mean(x_sq, axes=[1], keep_dims=true)
+    // Uses axis=1 (channel dim in ANE [1,C,1,S] layout) following
+    // Orion's pattern. The arg promotion pass ensures axes are emitted
+    // as const references.
+    let mean_name = format!("{name}_mean");
+    let mean_op = Operation::new("reduce_mean", &mean_name)
+        .with_input("x", Value::Reference(x_sq_name.clone()))
+        .with_attr("axes", Value::List(vec![Value::Int(1)]))
+        .with_attr("keep_dims", Value::Bool(true))
+        .with_output(&mean_name);
+
+    // eps constant
+    let eps_const_name = format!("{name}_eps_const");
+    let mut eps_op = Operation::new("const", &eps_const_name);
+    eps_op
+        .attributes
+        .insert("val".into(), Value::Float(eps as f64));
+    eps_op = eps_op.with_output(&eps_const_name);
+
+    // mean_eps = mean_sq + eps
+    let add_eps_name = format!("{name}_add_eps");
+    let add_eps = Operation::new("add", &add_eps_name)
+        .with_input("x", Value::Reference(mean_name.clone()))
+        .with_input("y", Value::Reference(eps_const_name.clone()))
+        .with_output(&add_eps_name);
+
+    // rsqrt = pow(mean_eps, -0.5) — eval-verified on ANE (max_err=0.0004)
+    let nhalf_name = format!("{name}_nhalf");
+    let nhalf_op = Operation::new("const", &nhalf_name)
+        .with_input("val", Value::Float(-0.5))
+        .with_output(&nhalf_name);
+
+    let rsqrt_name = format!("{name}_rsqrt");
+    let rsqrt_op = Operation::new("pow", &rsqrt_name)
+        .with_input("x", Value::Reference(add_eps_name.clone()))
+        .with_input("y", Value::Reference(nhalf_name.clone()))
+        .with_output(&rsqrt_name);
+
+    // normalized = x * rsqrt
+    let norm_name = format!("{name}_norm");
+    let norm_op = Operation::new("mul", &norm_name)
         .with_input("x", Value::Reference(x_ref))
-        .with_input("gamma", Value::Reference(scale_ref))
-        .with_attr("axes", Value::List(vec![Value::Int(axes)]))
-        .with_attr("epsilon", Value::Float(eps as f64))
+        .with_input("y", Value::Reference(rsqrt_name.clone()))
+        .with_output(&norm_name);
+
+    // output = normalized * scale
+    let output_name = &node.output[0];
+    let scale_op = Operation::new("mul", output_name)
+        .with_input("x", Value::Reference(norm_name.clone()))
+        .with_input("y", Value::Reference(scale_ref))
         .with_output(output_name);
 
-    Ok(vec![ln_op])
+    Ok(vec![
+        x_sq, mean_op, eps_op, add_eps, nhalf_op, rsqrt_op, norm_op, scale_op,
+    ])
 }
 
 /// SkipSimplifiedLayerNormalization: residual add then RMSNorm.
 /// `skip_add = X + skip; Y = RMSNorm(skip_add) * scale`
 /// Outputs: (Y, ?, ?, skip_add)
 ///
-/// Emits `add` (skip connection) + `layer_norm` — eval-verified on ANE.
+/// Decomposed RMSNorm with axis=1 following Orion's pattern.
 fn convert_skip_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
     let name = op_name(node);
     let eps = get_float_attr(node, "epsilon").unwrap_or(1e-5);
@@ -988,16 +1041,61 @@ fn convert_skip_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>
         .with_input("y", Value::Reference(skip_ref))
         .with_output(&skip_add_name);
 
-    // Y = layer_norm(skip_add, gamma=scale, axes=[-1], epsilon=eps)
-    let y_name = node.output.first().cloned().unwrap_or_default();
-    let ln_op = Operation::new("layer_norm", &y_name)
+    // x_sq = skip_add * skip_add
+    let x_sq_name = format!("{name}_sq");
+    let x_sq = Operation::new("mul", &x_sq_name)
         .with_input("x", Value::Reference(skip_add_name.clone()))
-        .with_input("gamma", Value::Reference(scale_ref))
-        .with_attr("axes", Value::List(vec![Value::Int(-1)]))
-        .with_attr("epsilon", Value::Float(eps as f64))
+        .with_input("y", Value::Reference(skip_add_name.clone()))
+        .with_output(&x_sq_name);
+
+    // mean_sq = reduce_mean(x_sq, axes=[1], keep_dims=true)
+    let mean_name = format!("{name}_mean");
+    let mean_op = Operation::new("reduce_mean", &mean_name)
+        .with_input("x", Value::Reference(x_sq_name.clone()))
+        .with_attr("axes", Value::List(vec![Value::Int(1)]))
+        .with_attr("keep_dims", Value::Bool(true))
+        .with_output(&mean_name);
+
+    let eps_const_name = format!("{name}_eps_const");
+    let mut eps_op = Operation::new("const", &eps_const_name);
+    eps_op
+        .attributes
+        .insert("val".into(), Value::Float(eps as f64));
+    eps_op = eps_op.with_output(&eps_const_name);
+
+    let add_eps_name = format!("{name}_add_eps");
+    let add_eps = Operation::new("add", &add_eps_name)
+        .with_input("x", Value::Reference(mean_name.clone()))
+        .with_input("y", Value::Reference(eps_const_name.clone()))
+        .with_output(&add_eps_name);
+
+    let nhalf_name = format!("{name}_nhalf");
+    let nhalf_op = Operation::new("const", &nhalf_name)
+        .with_input("val", Value::Float(-0.5))
+        .with_output(&nhalf_name);
+
+    let rsqrt_name = format!("{name}_rsqrt");
+    let rsqrt_op = Operation::new("pow", &rsqrt_name)
+        .with_input("x", Value::Reference(add_eps_name.clone()))
+        .with_input("y", Value::Reference(nhalf_name.clone()))
+        .with_output(&rsqrt_name);
+
+    let norm_name = format!("{name}_norm");
+    let norm_op = Operation::new("mul", &norm_name)
+        .with_input("x", Value::Reference(skip_add_name.clone()))
+        .with_input("y", Value::Reference(rsqrt_name.clone()))
+        .with_output(&norm_name);
+
+    // Output 0: Y = normalized * scale
+    let y_name = node.output.first().cloned().unwrap_or_default();
+    let scale_op = Operation::new("mul", &y_name)
+        .with_input("x", Value::Reference(norm_name.clone()))
+        .with_input("y", Value::Reference(scale_ref))
         .with_output(&y_name);
 
-    let mut ops = vec![skip_add, ln_op];
+    let mut ops = vec![
+        skip_add, x_sq, mean_op, eps_op, add_eps, nhalf_op, rsqrt_op, norm_op, scale_op,
+    ];
 
     // Output 3: residual = skip_add (identity alias)
     if let Some(residual_out) = node.output.get(3) {

@@ -13,7 +13,7 @@
 //! are properly handled (the layout pass skips const ops, preventing
 //! corruption of parameter tensors like axis vectors).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::Result;
 use crate::ir::Operation;
@@ -151,9 +151,98 @@ fn promote_inline_args(operations: &mut Vec<Operation>) {
         if is_attr {
             // Move from attributes to inputs (ANE expects named input refs).
             op.attributes.remove(&param);
-            op.inputs.insert(param, ref_val);
+            op.inputs.insert(param.clone(), ref_val);
         } else {
-            op.inputs.insert(param, ref_val);
+            op.inputs.insert(param.clone(), ref_val);
+        }
+
+        // Fix output type for reduce ops: if axes=[1], collapse dim 1 to 1.
+        // Also fix downstream ops in the norm chain (add_eps, pow) that
+        // should have the same reduced shape until the broadcast mul.
+        if param == "axes" && REDUCE_OPS.contains(&op.op_type.as_str()) {
+            if let Some(Some(out_ty)) = op.output_types.first_mut() {
+                if out_ty.shape.len() >= 2 {
+                    let reduced_shape = out_ty.shape.clone();
+                    out_ty.shape[1] = Some(1);
+                    let new_reduced = out_ty.shape.clone();
+
+                    // Walk forward: fix ops that consume this reduced
+                    // output and whose types still have the old C dim.
+                    let reduce_out = op.outputs.first().cloned();
+                    if let Some(ref out_name) = reduce_out {
+                        fix_downstream_reduced_types(
+                            operations,
+                            actual_idx + 1,
+                            out_name,
+                            &reduced_shape,
+                            &new_reduced,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Walk forward from a reduce op and fix output types of downstream
+/// ops in the norm chain (add_eps, pow) that should have the reduced
+/// shape until we hit a mul op (which broadcasts back to full shape).
+fn fix_downstream_reduced_types(
+    operations: &mut [Operation],
+    start_idx: usize,
+    current_output: &str,
+    old_shape: &[Option<usize>],
+    new_shape: &[Option<usize>],
+) {
+    let mut tracked_outputs: HashSet<String> = HashSet::new();
+    tracked_outputs.insert(current_output.to_string());
+
+    for i in start_idx..operations.len() {
+        let op = &operations[i];
+
+        // Check if this op consumes a tracked reduced-shape output.
+        let consumes_reduced = op.inputs.values().any(|v| {
+            if let Value::Reference(name) = v {
+                tracked_outputs.contains(name)
+            } else {
+                false
+            }
+        });
+
+        if !consumes_reduced {
+            continue;
+        }
+
+        // If this op also has an input with the full (non-reduced) shape,
+        // it's a broadcast op (like mul(x, rrms)) — stop here.
+        // The mul will correctly broadcast [1,C,1,S] × [1,1,1,S] → [1,C,1,S].
+        let has_full_input = op.inputs.values().any(|v| {
+            if let Value::Reference(name) = v {
+                !tracked_outputs.contains(name)
+                    && !operations[..i].iter().any(|o| {
+                        o.op_type == "const"
+                            && o.outputs.first().map(|s| s.as_str()) == Some(name.as_str())
+                    })
+            } else {
+                false
+            }
+        });
+
+        if has_full_input && (op.op_type == "mul" || op.op_type == "real_div") {
+            break;
+        }
+
+        // Fix this op's output type if it matches the old shape.
+        let op = &mut operations[i];
+        if let Some(Some(out_ty)) = op.output_types.first_mut() {
+            if out_ty.shape == old_shape {
+                out_ty.shape = new_shape.to_vec();
+            }
+        }
+
+        // Track this op's output for further downstream propagation.
+        if let Some(out_name) = op.outputs.first() {
+            tracked_outputs.insert(out_name.clone());
         }
     }
 }

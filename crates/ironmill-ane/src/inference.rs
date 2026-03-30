@@ -20,6 +20,7 @@ use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::{
     AneArgPromotionPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
     AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, OpSubstitutionPass,
+    TypeRepropagationPass,
 };
 
 use crate::program::{CompiledProgram, LoadedProgram};
@@ -146,6 +147,7 @@ impl AneInference {
             ("OpSubstitution", &OpSubstitutionPass),
             ("AneLayout", &AneLayoutPass),
             ("AneArgPromotion", &AneArgPromotionPass),
+            ("TypeRepropagate", &TypeRepropagationPass),
             ("AttentionDecompose", &AttentionDecomposePass),
             ("AneVariableNaming", &AneVariableNamingPass),
         ];
