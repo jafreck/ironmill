@@ -591,6 +591,158 @@ fn emit_dequantize_chain(
     .unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// QJL correction sub-program
+// ---------------------------------------------------------------------------
+
+/// Generate MIL text for the QJL 1-bit bias correction sub-program.
+///
+/// Takes raw Q tensor and pre-stored residual signs, computes
+/// the JL-based correction to attention logits.
+///
+/// # Arguments
+///
+/// * `config` – TurboQuant configuration.
+/// * `seq_len` – Current sequence length for the residual sign buffer.
+///
+/// # Returns
+///
+/// `(mil_text, weights)` — no weight blobs needed (only scalar consts).
+pub fn emit_qjl_correction_mil(
+    config: &TurboQuantConfig,
+    seq_len: usize,
+) -> (String, Vec<(String, Vec<u8>)>) {
+    let head_dim = config.head_dim;
+    let num_heads = config.num_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let q_ch = num_heads * head_dim;
+    let kv_ch = num_kv_heads * head_dim;
+
+    let q_shape = fmt_shape(&[1, q_ch, 1, 1]);
+    let q_head_shape = fmt_shape(&[1, num_heads, head_dim, 1]);
+    let residual_shape = fmt_shape(&[1, kv_ch, 1, seq_len]);
+    let residual_head_shape = fmt_shape(&[1, num_kv_heads, head_dim, seq_len]);
+    let correction_shape = fmt_shape(&[1, num_heads, 1, seq_len]);
+
+    let qjl_scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut body = String::new();
+    let weights: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // --- Constants ---
+
+    writeln!(
+        body,
+        "        fp16 zero = const()[name=string(\"zero\"), val=fp16(0)];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        fp16 pos_one = const()[name=string(\"pos_one\"), val=fp16(1)];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        fp16 neg_one = const()[name=string(\"neg_one\"), val=fp16(-1)];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        fp16 qjl_scale = const()[name=string(\"qjl_scale\"), val=fp16({qjl_scale})];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
+    )
+    .unwrap();
+
+    // --- Reshape Q: [1, q_ch, 1, 1] -> [1, num_heads, head_dim, 1] ---
+
+    writeln!(
+        body,
+        "        tensor<fp16, {q_head_shape}> q_reshaped = reshape(\
+         x=a_input0, shape=tensor<int32, [4]>([1,{num_heads},{head_dim},1]))\
+         [name=string(\"q_reshaped\")];"
+    )
+    .unwrap();
+
+    // --- Sign extraction from reshaped Q ---
+
+    // greater(x=q_reshaped, y=zero) → q_pos (bool)
+    writeln!(
+        body,
+        "        tensor<bool, {q_head_shape}> q_pos = greater(\
+         x=q_reshaped, y=zero)\
+         [name=string(\"q_pos\")];"
+    )
+    .unwrap();
+
+    // select(cond=q_pos, a=pos_one, b=neg_one) → q_sign (fp16)
+    writeln!(
+        body,
+        "        tensor<fp16, {q_head_shape}> q_sign = select(\
+         cond=q_pos, a=pos_one, b=neg_one)\
+         [name=string(\"q_sign\")];"
+    )
+    .unwrap();
+
+    // --- Reshape residual: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len] ---
+
+    writeln!(
+        body,
+        "        tensor<fp16, {residual_head_shape}> residual_reshaped = reshape(\
+         x=a_input1, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
+         [name=string(\"residual_reshaped\")];"
+    )
+    .unwrap();
+
+    // --- Correction computation ---
+
+    // matmul(x=q_sign, y=residual_reshaped, transpose_x=true, transpose_y=false)
+    // q_sign:            [1, num_heads, head_dim, 1]
+    // transpose_x=true:  [1, num_heads, 1, head_dim]
+    // residual_reshaped: [1, num_kv_heads, head_dim, seq_len]
+    // result:            [1, num_heads, 1, seq_len]
+    writeln!(
+        body,
+        "        tensor<fp16, {correction_shape}> correction = matmul(\
+         x=q_sign, y=residual_reshaped, transpose_x=bT, transpose_y=bF)\
+         [name=string(\"correction\")];"
+    )
+    .unwrap();
+
+    // mul(x=correction, y=qjl_scale) → z_output0
+    writeln!(
+        body,
+        "        tensor<fp16, {correction_shape}> z_output0 = mul(\
+         x=correction, y=qjl_scale)\
+         [name=string(\"z_output0\")];"
+    )
+    .unwrap();
+
+    // Assemble function
+    let func = format!(
+        "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
+         tensor<fp16, {residual_shape}> a_input1) {{\n\
+         {body}\
+         \n    }} -> (tensor<fp16, {correction_shape}> z_output0);"
+    );
+
+    let mil_text = mil_program_wrapper(&func);
+    (mil_text, weights)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +824,80 @@ mod tests {
     fn inv_scale_is_positive() {
         let scale = compute_inv_scale(64, 8);
         assert!(scale > 0.0, "inv_scale should be positive, got {scale}");
+    }
+
+    #[test]
+    fn qjl_correction_mil_is_valid_program() {
+        let config = test_config();
+        let (mil, weights) = emit_qjl_correction_mil(&config, 32);
+
+        // Should start with program header
+        assert!(mil.starts_with("program(1.3)"));
+        // Should contain function declaration
+        assert!(mil.contains("func main<ios18>"));
+        // Should have two inputs
+        assert!(mil.contains("a_input0"));
+        assert!(mil.contains("a_input1"));
+        // Should have output
+        assert!(mil.contains("z_output0"));
+        // Should contain sign extraction ops
+        assert!(mil.contains("greater"));
+        assert!(mil.contains("select"));
+        // Should contain correction ops
+        assert!(mil.contains("matmul"));
+        assert!(mil.contains("qjl_scale"));
+        // No weight blobs needed
+        assert!(weights.is_empty());
+    }
+
+    #[test]
+    fn qjl_correction_mil_various_configs() {
+        // Small config
+        let small = TurboQuantConfig {
+            n_bits: 4,
+            max_seq_len: 64,
+            num_heads: 8,
+            num_kv_heads: 8,
+            head_dim: 32,
+            num_layers: 1,
+            rotation_seed: 42,
+            enable_qjl: true,
+        };
+        let (mil, weights) = emit_qjl_correction_mil(&small, 16);
+        assert!(mil.starts_with("program(1.3)"));
+        assert!(mil.contains("func main<ios18>"));
+        assert!(weights.is_empty());
+
+        // Large config
+        let large = TurboQuantConfig {
+            n_bits: 2,
+            max_seq_len: 4096,
+            num_heads: 64,
+            num_kv_heads: 64,
+            head_dim: 128,
+            num_layers: 32,
+            rotation_seed: 123,
+            enable_qjl: true,
+        };
+        let (mil, weights) = emit_qjl_correction_mil(&large, 2048);
+        assert!(mil.starts_with("program(1.3)"));
+        assert!(mil.contains("func main<ios18>"));
+        assert!(weights.is_empty());
+
+        // Single head
+        let single = TurboQuantConfig {
+            n_bits: 8,
+            max_seq_len: 32,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 64,
+            num_layers: 1,
+            rotation_seed: 42,
+            enable_qjl: true,
+        };
+        let (mil, weights) = emit_qjl_correction_mil(&single, 1);
+        assert!(mil.starts_with("program(1.3)"));
+        assert!(mil.contains("func main<ios18>"));
+        assert!(weights.is_empty());
     }
 }
