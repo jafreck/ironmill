@@ -387,53 +387,9 @@ impl AneCompiler {
         }
 
         // 7. Get hex identifier and pre-populate temp directory
-        //    [model hexStringIdentifier] → NSString
-        type HexIdFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-        let hex_sel = unsafe { sel_registerName(sel!("hexStringIdentifier")) };
-        let hex_fn: HexIdFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        let hex_id = unsafe { hex_fn(model, hex_sel) };
-
-        if !hex_id.is_null() {
-            // Get the hex string as a C string
-            type Utf8Fn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const u8;
-            let utf8_sel = unsafe { sel_registerName(sel!("UTF8String")) };
-            let utf8_fn: Utf8Fn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-            let cstr = unsafe { utf8_fn(hex_id, utf8_sel) };
-
-            if !cstr.is_null() {
-                let hex_str = unsafe { std::ffi::CStr::from_ptr(cstr as *const i8) }
-                    .to_str()
-                    .unwrap_or("unknown");
-
-                // Build temp dir path: NSTemporaryDirectory()/hexId/
-                let tmp_dir = std::env::temp_dir().join(hex_str);
-                let weights_dir = tmp_dir.join("weights");
-
-                #[cfg(debug_assertions)]
-                eprintln!("[ane] hexId={hex_str}, tmp_dir={}", tmp_dir.display());
-
-                // Pre-populate: write model.mil and weight files
-                if let Ok(()) = std::fs::create_dir_all(&weights_dir) {
-                    let _ = std::fs::write(tmp_dir.join("model.mil"), mil_text.as_bytes());
-                    for (path_key, data) in weights {
-                        // path_key is like "@model_path/weights/w.bin"
-                        let rel_path = path_key.strip_prefix("@model_path/").unwrap_or(path_key);
-                        let full_path = tmp_dir.join(rel_path);
-                        if let Some(parent) = full_path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        #[cfg(debug_assertions)]
-                        eprintln!(
-                            "[ane] writing weight {} ({} bytes) → {}",
-                            path_key,
-                            data.len(),
-                            full_path.display()
-                        );
-                        let blob = make_blobfile(data);
-                        let _ = std::fs::write(&full_path, &blob);
-                    }
-                }
-            }
+        let hex_str = get_model_hex_id(model);
+        if let Some(ref hex_str) = hex_str {
+            populate_tmp_dir(hex_str, mil_text, weights);
         }
 
         // 8. Compile: [model compileWithQoS:21 options:@{} error:&e]
@@ -532,6 +488,247 @@ impl AneCompiler {
     /// Remaining compile budget before hitting the ~119 limit.
     pub fn remaining_budget() -> usize {
         ANE_COMPILE_LIMIT.saturating_sub(COMPILE_COUNT.load(Ordering::Relaxed))
+    }
+
+    /// Create a new ANE program by reusing a donor's compiled artifacts.
+    ///
+    /// Follows Orion's `orion_program_patch_weights` pattern:
+    /// 1. Create a new `_ANEInMemoryModel` with the same MIL text but different weights
+    /// 2. Copy the donor's compiled `net.plist` to the new model's temp directory
+    /// 3. Call `loadWithQoS:` — **no `compileWithQoS:`** — skipping compilation entirely
+    ///
+    /// This does **not** consume a compile budget slot.
+    ///
+    /// # Arguments
+    ///
+    /// * `donor_model` — Raw pointer to the donor `_ANEInMemoryModel` (must have
+    ///   been compiled from the same MIL text structure).
+    /// * `mil_text` — MIL program text (must be identical to the donor's).
+    /// * `weights` — New weight entries for the patched program.
+    ///
+    /// # Returns
+    ///
+    /// An opaque pointer to the new `_ANEInMemoryModel` instance (retained).
+    pub fn patch_weights(
+        donor_model: *mut c_void,
+        mil_text: &str,
+        weights: &[(&str, &[u8])],
+    ) -> std::result::Result<*mut c_void, AneError> {
+        if donor_model.is_null() {
+            return Err(AneError::InvalidInput("donor_model pointer is null".into()));
+        }
+        if mil_text.is_empty() {
+            return Err(AneError::InvalidInput("MIL text is empty".into()));
+        }
+
+        // 1. Get donor's hex ID → find its temp dir with net.plist
+        let donor_hex = get_model_hex_id(donor_model).ok_or_else(|| {
+            AneError::CompilationFailed("failed to get donor model hexStringIdentifier".into())
+        })?;
+        let donor_tmp = std::env::temp_dir().join(&donor_hex);
+        let donor_net_plist = donor_tmp.join("net.plist");
+        if !donor_net_plist.exists() {
+            return Err(AneError::CompilationFailed(format!(
+                "donor net.plist not found at {}",
+                donor_net_plist.display()
+            )));
+        }
+
+        // 2. dlopen the framework + resolve classes
+        let handle = unsafe {
+            dlopen(
+                sel!(
+                    "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine"
+                ),
+                RTLD_NOW,
+            )
+        };
+        if handle.is_null() {
+            return Err(AneError::FrameworkNotFound(
+                "failed to dlopen AppleNeuralEngine.framework".into(),
+            ));
+        }
+        let desc_cls = unsafe { objc_getClass(sel!("_ANEInMemoryModelDescriptor")) };
+        if desc_cls.is_null() {
+            return Err(AneError::ClassNotFound(
+                "_ANEInMemoryModelDescriptor".into(),
+            ));
+        }
+        let imm_cls = unsafe { objc_getClass(sel!("_ANEInMemoryModel")) };
+        if imm_cls.is_null() {
+            return Err(AneError::ClassNotFound("_ANEInMemoryModel".into()));
+        }
+
+        // 3. Create descriptor + model with new weights
+        let mil_data = create_nsdata(mil_text.as_bytes())?;
+        let weight_dict = if weights.is_empty() {
+            ns_empty_dict()?
+        } else {
+            build_multi_weight_dict(weights)?
+        };
+
+        let desc_sel = unsafe { sel_registerName(sel!("modelWithMILText:weights:optionsPlist:")) };
+        type ModelWithMILTextFn = unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+        ) -> *mut c_void;
+        let desc_fn: ModelWithMILTextFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let descriptor = unsafe {
+            desc_fn(
+                desc_cls,
+                desc_sel,
+                mil_data,
+                weight_dict,
+                std::ptr::null_mut(),
+            )
+        };
+        if descriptor.is_null() {
+            unsafe {
+                CFRelease(mil_data);
+                CFRelease(weight_dict);
+            }
+            return Err(AneError::CompilationFailed(
+                "patch_weights: modelWithMILText:weights:optionsPlist: returned nil".into(),
+            ));
+        }
+
+        let imm_sel = unsafe { sel_registerName(sel!("inMemoryModelWithDescriptor:")) };
+        type InMemoryModelFn =
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+        let imm_fn: InMemoryModelFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let model = unsafe { imm_fn(imm_cls, imm_sel, descriptor) };
+        if model.is_null() {
+            unsafe {
+                CFRelease(mil_data);
+                CFRelease(weight_dict);
+            }
+            return Err(AneError::CompilationFailed(
+                "patch_weights: inMemoryModelWithDescriptor: returned nil".into(),
+            ));
+        }
+
+        // 4. Get new model's hex ID → set up its temp dir
+        let new_hex = get_model_hex_id(model).ok_or_else(|| {
+            AneError::CompilationFailed("failed to get new model hexStringIdentifier".into())
+        })?;
+        populate_tmp_dir(&new_hex, mil_text, weights);
+
+        // 5. Copy donor's net.plist → new model's temp dir (the key trick)
+        let new_tmp = std::env::temp_dir().join(&new_hex);
+        let new_net_plist = new_tmp.join("net.plist");
+        std::fs::copy(&donor_net_plist, &new_net_plist)?;
+
+        #[cfg(debug_assertions)]
+        eprintln!("[ane] patch_weights: copied net.plist from {donor_hex} → {new_hex}");
+
+        // 6. Load (NO compile!) — [model loadWithQoS:21 options:@{} error:&e]
+        let empty_dict = ns_empty_dict()?;
+        let mut error: *mut c_void = std::ptr::null_mut();
+        type LoadFn = unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+        ) -> i8;
+        let load_sel = unsafe { sel_registerName(sel!("loadWithQoS:options:error:")) };
+        let load_fn: LoadFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let ok = unsafe { load_fn(model, load_sel, ANE_QOS, empty_dict, &mut error) };
+        unsafe { CFRelease(empty_dict) };
+
+        if ok == 0 {
+            let err_msg = if !error.is_null() {
+                extract_nserror_description(error)
+            } else {
+                "patch_weights: loadWithQoS:options:error: returned NO".into()
+            };
+            unsafe {
+                CFRelease(mil_data);
+                CFRelease(weight_dict);
+            }
+            return Err(AneError::CompilationFailed(err_msg));
+        }
+
+        // 7. Retain — caller owns the reference
+        type RetainFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        let retain_sel = unsafe { sel_registerName(sel!("retain")) };
+        let retain_fn: RetainFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { retain_fn(model, retain_sel) };
+
+        unsafe {
+            CFRelease(mil_data);
+            CFRelease(weight_dict);
+        }
+
+        // NO COMPILE_COUNT increment — this bypasses the compiler entirely.
+
+        Ok(model)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model hex ID and temp dir helpers
+// ---------------------------------------------------------------------------
+
+/// Get the `hexStringIdentifier` from an `_ANEInMemoryModel` as a Rust string.
+///
+/// Returns `None` if the selector returns nil or the string is not valid UTF-8.
+fn get_model_hex_id(model: *mut c_void) -> Option<String> {
+    type HexIdFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    let hex_sel = unsafe { sel_registerName(sel!("hexStringIdentifier")) };
+    let hex_fn: HexIdFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    let hex_id = unsafe { hex_fn(model, hex_sel) };
+    if hex_id.is_null() {
+        return None;
+    }
+
+    type Utf8Fn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const u8;
+    let utf8_sel = unsafe { sel_registerName(sel!("UTF8String")) };
+    let utf8_fn: Utf8Fn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    let cstr = unsafe { utf8_fn(hex_id, utf8_sel) };
+    if cstr.is_null() {
+        return None;
+    }
+
+    unsafe { std::ffi::CStr::from_ptr(cstr as *const i8) }
+        .to_str()
+        .ok()
+        .map(|s| s.to_string())
+}
+
+/// Pre-populate the model's temp directory with MIL text and weight blobs.
+///
+/// Writes `model.mil` and BLOBFILE-wrapped weight files to
+/// `$TMPDIR/<hex_id>/`.
+fn populate_tmp_dir(hex_id: &str, mil_text: &str, weights: &[(&str, &[u8])]) {
+    let tmp_dir = std::env::temp_dir().join(hex_id);
+    let weights_dir = tmp_dir.join("weights");
+
+    #[cfg(debug_assertions)]
+    eprintln!("[ane] hexId={hex_id}, tmp_dir={}", tmp_dir.display());
+
+    if let Ok(()) = std::fs::create_dir_all(&weights_dir) {
+        let _ = std::fs::write(tmp_dir.join("model.mil"), mil_text.as_bytes());
+        for (path_key, data) in weights {
+            // path_key is like "@model_path/weights/w.bin"
+            let rel_path = path_key.strip_prefix("@model_path/").unwrap_or(path_key);
+            let full_path = tmp_dir.join(rel_path);
+            if let Some(parent) = full_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[ane] writing weight {} ({} bytes) → {}",
+                path_key,
+                data.len(),
+                full_path.display()
+            );
+            let blob = make_blobfile(data);
+            let _ = std::fs::write(&full_path, &blob);
+        }
     }
 }
 
@@ -941,5 +1138,32 @@ mod tests {
             msg.contains("budget"),
             "error message should mention budget: {msg}"
         );
+    }
+
+    #[test]
+    fn patch_weights_null_donor_returns_error() {
+        let result = AneCompiler::patch_weights(std::ptr::null_mut(), "program test {}", &[]);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AneError::InvalidInput(msg) => {
+                assert!(msg.contains("null"), "expected 'null' in message: {msg}");
+            }
+            other => panic!("expected InvalidInput, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn patch_weights_empty_text_returns_error() {
+        // Use a non-null dummy pointer — patch_weights validates MIL text before
+        // dereferencing the donor.
+        let dummy: *mut c_void = 0x1 as *mut c_void;
+        let result = AneCompiler::patch_weights(dummy, "", &[]);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AneError::InvalidInput(msg) => {
+                assert!(msg.contains("empty"), "expected 'empty' in message: {msg}");
+            }
+            other => panic!("expected InvalidInput, got: {other}"),
+        }
     }
 }

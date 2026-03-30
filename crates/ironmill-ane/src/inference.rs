@@ -195,6 +195,11 @@ impl AneLmHead {
     /// Splits `[vocab_size, hidden_size]` into chunks of ≤16384 output
     /// channels, compiles each as a conv1×1 ANE program with BLOBFILE
     /// weights, and pre-allocates I/O tensors.
+    ///
+    /// Uses donor/patch optimization: all full-size chunks share the same
+    /// MIL text (same `hidden_size` × `LM_HEAD_MAX_CHUNK_CH` conv1×1).
+    /// Only the first full-size chunk is compiled; the rest reuse its
+    /// compiled `net.plist` via `AneCompiler::patch_weights`.
     fn compile(weight: &CpuWeight) -> Result<Self> {
         let [vocab_size, hidden_size] = weight.shape;
         let runtime = AneRuntime::new()?;
@@ -204,6 +209,11 @@ impl AneLmHead {
 
         let bytes_per_elem = 2; // fp16
         let row_bytes = hidden_size * bytes_per_elem;
+
+        // Track the donor for full-size chunks (all have out_ch == LM_HEAD_MAX_CHUNK_CH).
+        // The last chunk may be smaller — it gets its own compilation.
+        // We store the raw model pointer (Copy) to avoid borrow issues with the chunks vec.
+        let mut full_chunk_donor_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
 
         for chunk_idx in 0..num_chunks {
             let start = chunk_idx * LM_HEAD_MAX_CHUNK_CH;
@@ -217,15 +227,39 @@ impl AneLmHead {
             let mil_text = emit_lm_head_chunk_mil(hidden_size, out_ch);
             let weight_path = "@model_path/weights/weight.bin";
 
-            let ptr = AneCompiler::compile_mil_text(&mil_text, &[(weight_path, &chunk_data)])
+            let is_full_size = out_ch == LM_HEAD_MAX_CHUNK_CH;
+
+            let compiled = if is_full_size && !full_chunk_donor_ptr.is_null() {
+                // Patch from the donor — skip compilation.
+                let ptr = AneCompiler::patch_weights(
+                    full_chunk_donor_ptr,
+                    &mil_text,
+                    &[(weight_path, &chunk_data)],
+                )
                 .map_err(|e| AneError::CompileFailed {
                     status: 0,
                     context: format!(
-                        "lm_head chunk {chunk_idx} ({out_ch} channels) compilation failed: {e}"
+                        "lm_head chunk {chunk_idx} ({out_ch} ch) donor patch failed: {e}"
                     ),
                 })?;
-            let compiled = unsafe { CompiledProgram::from_raw(ptr) };
+                unsafe { CompiledProgram::from_raw(ptr) }
+            } else {
+                // Full compile (first full-size chunk, or the smaller tail chunk).
+                let ptr = AneCompiler::compile_mil_text(&mil_text, &[(weight_path, &chunk_data)])
+                    .map_err(|e| AneError::CompileFailed {
+                    status: 0,
+                    context: format!(
+                        "lm_head chunk {chunk_idx} ({out_ch} ch) compilation failed: {e}"
+                    ),
+                })?;
+                unsafe { CompiledProgram::from_raw(ptr) }
+            };
             runtime.unload_compiled(&compiled);
+
+            // Set the donor pointer once the first full-size chunk is compiled.
+            if is_full_size && full_chunk_donor_ptr.is_null() {
+                full_chunk_donor_ptr = compiled.model;
+            }
 
             // ANE requires all I/O tensors in one eval to have the same alloc size.
             let alloc = uniform_alloc_size(&[
@@ -250,9 +284,20 @@ impl AneLmHead {
             });
         }
 
+        let patched_chunks = if num_chunks > 1 {
+            num_chunks
+                - 1
+                - if vocab_size % LM_HEAD_MAX_CHUNK_CH != 0 {
+                    1
+                } else {
+                    0
+                }
+        } else {
+            0
+        };
         eprintln!(
             "ANE lm_head: {vocab_size} vocab × {hidden_size} hidden → {num_chunks} chunks \
-             (max {LM_HEAD_MAX_CHUNK_CH} channels each)"
+             (max {LM_HEAD_MAX_CHUNK_CH} channels each, {patched_chunks} patched)"
         );
 
         Ok(Self {
@@ -583,21 +628,84 @@ impl AneInference {
         };
 
         // 6. Compile and load per-layer sub-programs for ANE.
-        let mut layers = Vec::with_capacity(num_layers);
-        for &layer_n in &layer_numbers {
+        //
+        // Donor/patch optimization: all layers share the same MIL text
+        // structure (same ops, shapes, BLOBFILE paths) — only weight data
+        // differs. Compile the first layer's sub-programs normally (the
+        // "donor"), then use AneCompiler::patch_weights for layers 1+.
+        // This copies the donor's compiled net.plist and loads with new
+        // weights, bypassing compileWithQoS: entirely. Saves ~56
+        // compilations for a 29-layer model (2 instead of 58).
+        let mut layers: Vec<LayerPrograms> = Vec::with_capacity(num_layers);
+        for (i, &layer_n) in layer_numbers.iter().enumerate() {
             let pre_sub = pre_attn_map.get(&layer_n).ok_or_else(|| {
                 AneError::Other(anyhow::anyhow!("missing pre_attn for layer {layer_n}"))
             })?;
             let pre_packing = packing_map.remove(&pre_sub.name);
-            let pre = compile_and_load_sub(pre_sub, &runtime, &mil_config, pre_packing)?;
-            let post = if let Some(post_sub) = post_attn_map.get(&layer_n) {
-                let post_packing = packing_map.remove(&post_sub.name);
-                Some(compile_and_load_sub(
-                    post_sub,
+            let pre = if i == 0 {
+                // First layer: compile normally — this becomes the donor.
+                compile_and_load_sub(pre_sub, &runtime, &mil_config, pre_packing)?
+            } else {
+                // Layers 1+: patch weights from the layer-0 donor.
+                match compile_and_load_sub_with_donor(
+                    pre_sub,
+                    &layers[0].pre_attn.compiled,
                     &runtime,
                     &mil_config,
-                    post_packing,
-                )?)
+                    pre_packing,
+                ) {
+                    Ok(loaded) => loaded,
+                    Err(e) => {
+                        eprintln!(
+                            "warning: layer {layer_n} pre_attn donor patch failed, \
+                             falling back to full compile: {e}"
+                        );
+                        let pre_packing_retry = packing_map.remove(&pre_sub.name);
+                        compile_and_load_sub(pre_sub, &runtime, &mil_config, pre_packing_retry)?
+                    }
+                }
+            };
+            let post = if let Some(post_sub) = post_attn_map.get(&layer_n) {
+                let post_packing = packing_map.remove(&post_sub.name);
+                if i == 0 {
+                    Some(compile_and_load_sub(
+                        post_sub,
+                        &runtime,
+                        &mil_config,
+                        post_packing,
+                    )?)
+                } else if let Some(ref donor_post) = layers[0].post_attn {
+                    match compile_and_load_sub_with_donor(
+                        post_sub,
+                        &donor_post.compiled,
+                        &runtime,
+                        &mil_config,
+                        post_packing,
+                    ) {
+                        Ok(loaded) => Some(loaded),
+                        Err(e) => {
+                            eprintln!(
+                                "warning: layer {layer_n} post_attn donor patch failed, \
+                                 falling back to full compile: {e}"
+                            );
+                            let post_packing_retry = packing_map.remove(&post_sub.name);
+                            Some(compile_and_load_sub(
+                                post_sub,
+                                &runtime,
+                                &mil_config,
+                                post_packing_retry,
+                            )?)
+                        }
+                    }
+                } else {
+                    // Layer 0 had no post_attn — no donor available.
+                    Some(compile_and_load_sub(
+                        post_sub,
+                        &runtime,
+                        &mil_config,
+                        post_packing,
+                    )?)
+                }
             } else {
                 None
             };
@@ -633,6 +741,16 @@ impl AneInference {
                 post_attn: post,
                 attn_input_map,
             });
+        }
+
+        // Report donor/patch savings.
+        if num_layers > 1 {
+            let patched = (num_layers - 1) * if layers[0].post_attn.is_some() { 2 } else { 1 };
+            eprintln!(
+                "donor/patch: compiled 1 donor layer, patched {patched} sub-programs \
+                 ({} compilations saved)",
+                patched
+            );
         }
 
         // 6b. Unload fp16_attn programs to free ANE slots.
@@ -1134,6 +1252,76 @@ fn compile_and_load_sub(
     // Note: we do NOT call runtime.load_program() — the program is
     // auto-loaded by compile_mil_text and will be unloaded in bulk
     // after all layers are compiled.
+    let input_shapes: Vec<_> = sub.inputs.iter().map(|td| (td.shape, td.dtype)).collect();
+    let output_shapes: Vec<_> = sub.outputs.iter().map(|td| (td.shape, td.dtype)).collect();
+    let input_alloc = uniform_alloc_size(&input_shapes);
+    let output_alloc = uniform_alloc_size(&output_shapes);
+
+    let input_tensors: Vec<AneTensor> = sub
+        .inputs
+        .iter()
+        .map(|td| AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc))
+        .collect::<Result<Vec<_>>>()?;
+    let output_tensors: Vec<AneTensor> = sub
+        .outputs
+        .iter()
+        .map(|td| AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(LoadedSubProgram {
+        compiled,
+        input_tensors,
+        output_tensors,
+        input_packing,
+    })
+}
+
+/// Compile a sub-program by patching weights from a donor program.
+///
+/// Uses `AneCompiler::patch_weights` to copy the donor's compiled
+/// `net.plist` and load with new weights — **no compilation**. This does
+/// not consume a compile budget slot.
+///
+/// The donor must have been compiled from the same MIL text structure
+/// (same ops and shapes, different weight data).
+fn compile_and_load_sub_with_donor(
+    sub: &crate::split::SubProgram,
+    donor: &CompiledProgram,
+    _runtime: &AneRuntime,
+    mil_config: &MilTextConfig,
+    input_packing: Option<crate::packing::InputPacking>,
+) -> Result<LoadedSubProgram> {
+    let mut program = sub.program.clone();
+    convert_f32_consts_to_f16(&mut program);
+
+    let (mil_text, weight_entries) = program_to_mil_text(&program, mil_config).map_err(|e| {
+        AneError::Other(anyhow::anyhow!(
+            "MIL text emission failed for {}: {e}",
+            sub.name
+        ))
+    })?;
+
+    let weight_refs: Vec<(String, Vec<u8>)> = weight_entries
+        .iter()
+        .map(|e| (e.path.clone(), e.data.clone()))
+        .collect();
+    let weight_slices: Vec<(&str, &[u8])> = weight_refs
+        .iter()
+        .map(|(path, data)| (path.as_str(), data.as_slice()))
+        .collect();
+
+    let ptr = AneCompiler::patch_weights(donor.model, &mil_text, &weight_slices).map_err(|e| {
+        AneError::CompileFailed {
+            status: 0,
+            context: format!(
+                "{} donor patch failed: {e} (weights: {} entries)",
+                sub.name,
+                weight_slices.len(),
+            ),
+        }
+    })?;
+    let compiled = unsafe { CompiledProgram::from_raw(ptr) };
+
     let input_shapes: Vec<_> = sub.inputs.iter().map(|td| (td.shape, td.dtype)).collect();
     let output_shapes: Vec<_> = sub.outputs.iter().map(|td| (td.shape, td.dtype)).collect();
     let input_alloc = uniform_alloc_size(&input_shapes);
