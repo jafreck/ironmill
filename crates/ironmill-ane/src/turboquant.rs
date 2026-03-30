@@ -1,9 +1,13 @@
 //! TurboQuant INT8 KV cache compression configuration and KV cache management.
 
+use mil_rs::ffi::ane::AneCompiler;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels};
 
+use crate::program::{CompiledProgram, LoadedProgram};
+use crate::runtime::AneRuntime;
 use crate::tensor::AneTensor;
+use crate::turboquant_mil;
 use crate::{AneError, Result};
 
 /// Configuration for TurboQuant INT8 KV cache compression.
@@ -12,6 +16,7 @@ use crate::{AneError, Result};
 /// scalar quantization. Storage format is always INT8 (1 byte/element);
 /// `n_bits` controls the number of distinct quantization levels within
 /// the INT8 range.
+#[derive(Clone)]
 pub struct TurboQuantConfig {
     /// Number of quantization bits (1, 2, 4, 6, or 8).
     /// Controls quality via 2^n_bits distinct Beta-optimal levels
@@ -231,5 +236,139 @@ impl KvCacheManager {
     /// it will be overwritten on subsequent `update_cache` calls.
     pub fn reset(&mut self) {
         self.seq_pos = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TurboQuantModel — inference loop orchestrator
+// ---------------------------------------------------------------------------
+
+/// Orchestrates TurboQuant INT8 KV cache inference on the ANE.
+///
+/// Holds compiled cache-write (rotate + quantize) and attention (dequant +
+/// attention) sub-programs together with a [`KvCacheManager`] and an
+/// [`AneRuntime`] handle.
+#[allow(dead_code)]
+pub struct TurboQuantModel {
+    config: TurboQuantConfig,
+    cache: KvCacheManager,
+    /// Compiled cache-write sub-program (rotate + quantize K/V to INT8).
+    cache_write_program: LoadedProgram,
+    /// Compiled attention sub-program (dequant + attention).
+    attention_program: LoadedProgram,
+    /// Optional QJL correction program.
+    qjl_program: Option<LoadedProgram>,
+    /// The ANE runtime handle.
+    runtime: AneRuntime,
+}
+
+impl TurboQuantModel {
+    /// Compile and load the TurboQuant sub-programs onto the ANE.
+    ///
+    /// 1. Creates an [`AneRuntime`].
+    /// 2. Emits + compiles the cache-write MIL program.
+    /// 3. Emits + compiles the attention MIL program.
+    /// 4. Allocates the [`KvCacheManager`].
+    pub fn compile(config: TurboQuantConfig) -> Result<Self> {
+        let runtime = AneRuntime::new()?;
+
+        // --- cache-write sub-program ---
+        let (cw_mil, cw_weights) = turboquant_mil::emit_cache_write_mil(&config);
+        let cw_weight_refs: Vec<(&str, &[u8])> = cw_weights
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        let cw_ptr = AneCompiler::compile_mil_text(&cw_mil, &cw_weight_refs).map_err(|e| {
+            AneError::CompileFailed {
+                status: 0,
+                context: format!("cache-write compilation failed: {e}"),
+            }
+        })?;
+        let cw_compiled = unsafe { CompiledProgram::from_raw(cw_ptr) };
+        let cache_write_program = runtime.load_program(&cw_compiled)?;
+
+        // --- attention sub-program ---
+        let (attn_mil, attn_weights) =
+            turboquant_mil::emit_attention_mil(&config, config.max_seq_len);
+        let attn_weight_refs: Vec<(&str, &[u8])> = attn_weights
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        let attn_ptr =
+            AneCompiler::compile_mil_text(&attn_mil, &attn_weight_refs).map_err(|e| {
+                AneError::CompileFailed {
+                    status: 0,
+                    context: format!("attention compilation failed: {e}"),
+                }
+            })?;
+        let attn_compiled = unsafe { CompiledProgram::from_raw(attn_ptr) };
+        let attention_program = runtime.load_program(&attn_compiled)?;
+
+        // --- KV cache ---
+        let cache = KvCacheManager::new(config.clone())?;
+
+        Ok(Self {
+            config,
+            cache,
+            cache_write_program,
+            attention_program,
+            qjl_program: None,
+            runtime,
+        })
+    }
+
+    /// Process one token through cache-write and attention for a single layer.
+    ///
+    /// Takes Q, K_proj, V_proj as fp16 [`AneTensor`]s (single token).
+    /// Returns attention output as fp16 [`AneTensor`].
+    pub fn step_attention(
+        &mut self,
+        layer: usize,
+        q: &AneTensor,
+        k_proj: &AneTensor,
+        v_proj: &AneTensor,
+    ) -> Result<AneTensor> {
+        let channels = self.config.num_kv_heads * self.config.head_dim;
+
+        // 1. Cache-write: K_proj, V_proj → K_quant, V_quant (INT8)
+        let mut k_quant = AneTensor::new(channels, 1, ScalarType::Int8)?;
+        let mut v_quant = AneTensor::new(channels, 1, ScalarType::Int8)?;
+        self.runtime.eval(
+            &self.cache_write_program,
+            &[k_proj, v_proj],
+            &mut [&mut k_quant, &mut v_quant],
+        )?;
+
+        // 2. CPU cache interception: copy INT8 bytes into persistent cache
+        let k_bytes = k_quant.read_bytes_at(0, channels)?;
+        let v_bytes = v_quant.read_bytes_at(0, channels)?;
+        self.cache.update_cache(layer, &k_bytes, &v_bytes)?;
+
+        // 3. Attention: Q + cached K/V → output
+        let (k_cache, v_cache) = self.cache.cache_tensors(layer);
+        let q_channels = self.config.num_heads * self.config.head_dim;
+        let mut attn_out = AneTensor::new(q_channels, 1, ScalarType::Float16)?;
+        self.runtime.eval(
+            &self.attention_program,
+            &[q, k_cache, v_cache],
+            &mut [&mut attn_out],
+        )?;
+
+        Ok(attn_out)
+    }
+
+    /// Reset cache for a new conversation.
+    pub fn reset(&mut self) {
+        self.cache.reset();
+    }
+
+    /// Current sequence length.
+    pub fn seq_len(&self) -> usize {
+        self.cache.seq_len()
+    }
+
+    /// Get a reference to the config.
+    pub fn config(&self) -> &TurboQuantConfig {
+        &self.config
     }
 }
