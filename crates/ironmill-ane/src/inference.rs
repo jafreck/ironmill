@@ -193,7 +193,8 @@ impl AneInference {
         // the sub-programs that will be compiled for ANE.
         let split_config = SplitConfig {
             split_attention: true,
-            emit_attention: false, // Disabled: fp16_attn sub-programs fail ANE compilation
+            emit_attention: false, // TODO: build_sub_program needs multi-output support
+            // for the attention cluster (QK/AV chain + present_key/value outputs)
             // due to name-heuristic fallback producing wrong op subsets
             ..Default::default()
         };
