@@ -240,3 +240,184 @@ To recover the memory advantage, a future Phase E could:
 - `emit_cache_write_mil` — current TQ cache-write MIL
 - `step_attention` in `turboquant.rs` — current CPU-heavy data path
 - FP16 decode path in `inference.rs` — the zero-copy target pattern
+
+---
+
+## Implementation Details (Phase A+B)
+
+### Files to change
+
+- `crates/ironmill-ane/src/turboquant.rs` — main changes
+- `crates/ironmill-ane/src/turboquant_mil.rs` — attention MIL update
+- `crates/ironmill-ane/src/inference.rs` — decode loop wiring
+
+### turboquant.rs: KvCacheManager
+
+**Current** (line 161): caches use `ScalarType::Int8`
+```rust
+k_caches.push(AneTensor::new_with_min_alloc(channels, config.max_seq_len, ScalarType::Int8, min_alloc)?);
+v_caches.push(AneTensor::new_with_min_alloc(channels, config.max_seq_len, ScalarType::Int8, min_alloc)?);
+```
+
+**Change to** `ScalarType::Float16`:
+```rust
+k_caches.push(AneTensor::new_with_min_alloc(channels, config.max_seq_len, ScalarType::Float16, min_alloc)?);
+v_caches.push(AneTensor::new_with_min_alloc(channels, config.max_seq_len, ScalarType::Float16, min_alloc)?);
+```
+
+### turboquant.rs: update_cache
+
+**Current** (line 226-266): takes `k_quantized: &[u8]`, `v_quantized: &[u8]`
+and calls `write_bytes_at`.
+
+**Change to** take `&[f16]` and call `write_f16_at`:
+```rust
+pub fn update_cache(
+    &mut self,
+    layer: usize,
+    k_quantized: &[f16],  // was &[u8]
+    v_quantized: &[f16],  // was &[u8]
+    k_original: Option<&[f16]>,
+) -> Result<()> {
+    // ...
+    let elem_offset = self.seq_pos * token_elements;
+    self.k_caches[layer].write_f16_at(elem_offset, k_quantized)?;  // was write_bytes_at
+    self.v_caches[layer].write_f16_at(elem_offset, v_quantized)?;
+    // ...
+}
+```
+
+### turboquant.rs: TurboQuantModel::compile
+
+**Current alloc sizes** (lines 452-465):
+```rust
+let cw_alloc_size = uniform_alloc_size(&[
+    ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),  // K input
+    ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),  // V input
+    ([1, 1, head_dim, head_dim], ScalarType::Float16),  // rotation matrix
+]);
+
+let attn_alloc_size = uniform_alloc_size(&[
+    ([1, q_ch, 1, MIN_IO_SEQ], ScalarType::Float16),               // Q
+    ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),          // K cache
+    ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),          // V cache
+    ([1, 1, head_dim, head_dim], ScalarType::Float16),              // unrotation
+]);
+```
+
+**Change** attn K/V cache to Float16:
+```rust
+let attn_alloc_size = uniform_alloc_size(&[
+    ([1, q_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
+    ([1, kv_ch, 1, config.max_seq_len], ScalarType::Float16),  // was Int8
+    ([1, kv_ch, 1, config.max_seq_len], ScalarType::Float16),  // was Int8
+    ([1, 1, head_dim, head_dim], ScalarType::Float16),
+]);
+```
+
+### turboquant.rs: step_attention
+
+**Current flow** (lines 579-643):
+1. `copy_column0_from(k_proj)` → staging          ← REMOVE
+2. `copy_column0_from(v_proj)` → staging          ← REMOVE
+3. ANE eval cache-write with staging inputs
+4. `read_column0_f16` → convert to INT8 → `write_bytes_at`  ← SIMPLIFY
+5. `copy_column0_from(q)` → staging               ← REMOVE
+6. ANE eval attention with staging Q
+7. Return attn_out
+
+**New flow:**
+1. ANE eval cache-write with pre_attn output IOSurfaces directly
+   (requires matching alloc sizes — see Phase B)
+2. `read_column0_f16` → `write_f16_at` (no INT8 conversion)
+3. ANE eval attention with pre_attn Q IOSurface directly
+4. Return attn_out
+
+If alloc sizes don't match for Phase A (deferred to Phase B),
+keep staging copies but remove INT8 conversion:
+```rust
+// Phase A: Keep staging, remove INT8 conversion
+self.cw_k_staging.copy_column0_from(k_proj)?;
+self.cw_v_staging.copy_column0_from(v_proj)?;
+
+self.runtime.eval(&self.cache_write_program, ...)?;
+
+// CHANGED: read FP16 directly, write FP16 to cache (no INT8 conversion)
+let k_f16 = self.cw_k_output.read_column0_f16()?;
+let v_f16 = self.cw_v_output.read_column0_f16()?;
+self.cache.update_cache(layer, &k_f16, &v_f16, k_original.as_deref())?;
+```
+
+### turboquant_mil.rs: emit_attention_mil
+
+**Current** (line 308-543): INT8 cache inputs with dequant chain:
+```
+a_input1: tensor<int8, [1, kv_ch, 1, max_seq_len]>  // K cache
+a_input2: tensor<int8, [1, kv_ch, 1, max_seq_len]>  // V cache
+```
+Then: `slice_by_index → cast(int8→fp16) → mul(deq_scale) → sub(offset)`
+
+**Change to** FP16 cache inputs with simpler dequant:
+```
+a_input1: tensor<fp16, [1, kv_ch, 1, max_seq_len]>  // K cache (FP16-quantized)
+a_input2: tensor<fp16, [1, kv_ch, 1, max_seq_len]>  // V cache
+```
+Then: `slice_by_index → mul(deq_scale)` (no cast needed, no sub needed
+since offset is 0 for symmetric quantization)
+
+Specifically in `emit_dequantize_chain` (line 547-635):
+- Remove the `cast(int8→fp16)` op (line 574-580)
+- Remove the `sub(deq_offset)` op (lines 594-601) — offset is always 0
+- Change input type from `int8` to `fp16`
+- Change `sliced_shape` type from `int8` to `fp16`
+
+### inference.rs: decode TurboQuant path
+
+**Current** (lines 921-940): passes pre_attn output tensors to
+`step_attention`:
+```rust
+let q = &layer.pre_attn.output_tensors[0];
+let k_proj = if num_pre_outputs > 1 { &layer.pre_attn.output_tensors[1] } else { ... };
+let v_proj = if num_pre_outputs > 2 { &layer.pre_attn.output_tensors[2] } else { ... };
+let attn_tensor = tq.step_attention(layer_idx, q, k_proj, v_proj)?;
+```
+
+This wiring stays the same — `step_attention` receives the same
+IOSurface references. The changes are internal to `step_attention`.
+
+### QJL Impact
+
+QJL (`enable_qjl`) computes `sign(K_original - K_dequantized)` in
+`compute_qjl_signs` (line 318-350). This function:
+1. Casts INT8 quantized K to f32: `(k_quantized[i] as i8) as f32`
+2. Scales by `deq_scale`
+3. Un-rotates
+4. Compares against original K
+
+**With FP16 cache:** Step 1 changes — instead of `(byte as i8) as f32`,
+read the FP16 value directly: `k_quantized_f16[i].to_f32()`. The rest
+stays the same. `update_cache` already receives `k_original` as
+`Option<&[f16]>`.
+
+Change `compute_qjl_signs` signature:
+```rust
+fn compute_qjl_signs(
+    k_quantized: &[f16],  // was &[u8]
+    k_original: &[f16],
+    ...
+```
+
+### Tests to update
+
+- `turboquant.rs` tests that create `KvCacheManager` and call
+  `update_cache` with `&[u8]` → change to `&[f16]`
+- `turboquant_mil.rs` tests that assert `int8` in attention MIL
+  input shapes → change to `fp16`
+- Any test asserting `ScalarType::Int8` for cache tensors → `Float16`
+
+### Existing tests to verify unchanged
+
+- `cache_write_mil_is_valid_program` — unchanged, cache-write still
+  outputs FP16 (it always did)
+- `attention_mil_gqa_uses_tile` — needs shape type update
+- `turboquant_bench` example — should work with updated types
