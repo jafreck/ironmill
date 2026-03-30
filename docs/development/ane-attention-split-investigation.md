@@ -1,6 +1,6 @@
 # ANE Attention-Boundary Split — Structural Split Implementation Plan
 
-> **Status:** In Progress
+> **Status:** Resolved (split) · In Progress (ANE compilation)
 >
 > **Blocks:** [TurboQuant E2E Inference](turboquant-e2e-inference.md) — layer sub-program compilation
 >
@@ -53,138 +53,170 @@ attention cluster. This is fundamentally fragile:
 - Layers 1–28 have pre_attn sub-programs with only the K projection
   path; Q and V projections were incorrectly stripped.
 
-## Approach — Structural Split
+## Resolution — Structural Split
 
-Replace the name-based heuristic with a **data-flow graph traversal**.
-Instead of scanning op names, trace the computation graph to identify
-structural boundaries:
+Replaced the name-based heuristic with a **data-flow graph traversal**
+(`a016ae6`). The implementation:
 
-- **Pre-attn:** all ops reachable backward from the Q/K/V projection
-  matmul *inputs* — input norm, embedding lookups, and their weight
-  const ops. These are ops that feed *into* the projections.
-- **Post-attn:** all ops reachable forward from the attention output
-  concat/reshape — O projection, residual add, FFN, and their weight
-  const ops.
-- **Attention cluster:** everything in between — the projections
-  themselves, RoPE, per-head reshapes/norms, QK^T matmul, softmax,
-  AV matmul, and the output reshape/transpose.
+- **`OpGraph`**: directed dependency graph built from `Value::Reference`
+  edges in the flat op list. Provides `walk_forward()` / `walk_backward()`
+  transitive traversal.
+- **Q/K/V projection detection**: groups matmul/linear ops by shared
+  non-const activation input. The group of 2–3 matmuls sharing the same
+  norm output are the projections. This avoids false positives from FFN
+  matmuls (which have different activation inputs).
+- **O-projection detection**: first matmul/linear with a const weight
+  reachable forward from softmax (excluding Q/K/V projections).
+- **Split classification**:
+  - Pre-attn = backward walk from projections' non-const data inputs
+  - Post-attn = O-projection + forward walk + exclusively-feeding consts
+  - Attention cluster = everything else (stripped)
+- **Fallback**: legacy name heuristic if structural detection fails
+  (e.g., layers without softmax).
 
-The key insight: the Q/K/V projection matmuls are the *first* ops in
-the attention cluster (not pre-attn), and the O projection matmul is
-the *first* op in post-attn. This draws a clean structural boundary
-without relying on naming conventions.
+Verified on Qwen3-0.6B: all 29 layers produce correct pre_attn and
+post_attn sub-programs. Layer 0 (previously dropped) is now included.
+Per-head K/V norm reshapes correctly stay in the attention cluster.
+
+## Additional Fixes Discovered During E2E Verification
+
+E2E testing with `turboquant_e2e_bench` on Qwen3-0.6B revealed that
+the structural split was necessary but not sufficient — the sub-programs
+also failed ANE compilation due to MIL emission issues. These were fixed
+in `7accb97` and `f1f7b6b`:
+
+### 1. AneArgPromotionPass (new pass)
+
+The ANE compiler requires `reduce_mean`/`softmax`/`layer_norm` args
+(`axes`, `keep_dims`, `epsilon`) to be named const references, not
+inline literal values. The ONNX converter stores these as inline
+`Value::Tensor`/`Value::Bool` in attributes. The new pass:
+
+- Promotes inline args to standalone `const` ops with `Value::Reference`
+- Remaps reduce axes from `-1` (original hidden dim) to `1` (ANE
+  channel dim in `[1,C,1,S]` layout)
+- Fixes downstream output types in the norm chain (reduce→add→pow
+  all get `[1,1,1,S]` instead of `[1,C,1,S]`)
+
+### 2. AneLayoutPass fixes
+
+- Removed attribute reshaping — `axes`, `keep_dims` etc. are metadata
+  parameters, not activation tensors. Reshaping them corrupts semantics.
+- Skip reshaping integer tensor inputs (`Value::Tensor` with int dtype)
+  — these are parameter metadata (axes vectors, shape arrays).
+
+### 3. ONNX SimplifiedLayerNormalization → decomposed RMSNorm
+
+Changed from `sqrt` → `reciprocal` (ANE-unsupported) to the
+[Orion](https://github.com/mechramc/Orion)-verified pattern:
+
+```
+mul(x, x) → reduce_mean(axes=[1]) → add(eps) → pow(-0.5) → mul(x, rrms) → mul(weight)
+```
+
+Key: uses `axis=1` (channel dim in ANE layout), `pow(x, -0.5)` (eval-
+verified, max_err=0.0004), and `reduce_mean` with const ref args.
+
+### 4. MIL text emitter fixes
+
+- Integer const tensors (axes, shapes) emitted **inline** instead of
+  BLOBFILE — ANE expects inline for small parameter tensors.
+- Reduce op output type inference: collapses the reduced axis dimension
+  to 1 (was incorrectly copying the input shape).
+
+## Current Status
+
+| Sub-program | Status | Notes |
+|---|---|---|
+| `pre_attn` (all 29 layers) | ✅ Compiles | Structural split + RMSNorm fixes |
+| `post_attn` (all layers) | ❌ Fails | `matmul` + `sigmoid` — see next steps |
+
+### Next Steps — post_attn ANE Compilation
+
+The `post_attn` sub-program fails ANE compilation due to two issues
+unrelated to the attention split:
+
+1. **`matmul` → `conv` conversion**: Orion uses 1×1 `conv` for linear
+   layers in ANE layout `[1,C,1,S]`, not `matmul`. The existing
+   `e2e_compile_and_load_conv_linear` test confirms conv works. Need
+   an `AneMatmulToConvPass` that converts `matmul(x, weight_const)` to
+   `conv(x, weight)` with appropriate weight reshape (`[Cin, Cout]` →
+   `[Cout, Cin, 1, 1]`).
+
+2. **`sigmoid` + `mul` → `silu` fusion**: The SiLU activation is
+   decomposed as `sigmoid(x)` + `mul(x, sigmoid_out)`. The `silu` op
+   is eval-verified on ANE (max_err=0.015) but `sigmoid` alone is only
+   compile-verified. Need an op fusion pass or extend `OpSubstitutionPass`
+   to detect and fuse the SiLU pattern.
 
 ## Implementation Tasks
 
-### Task 1 — Build op dependency graph
+### Task 1 — Build op dependency graph ✅
 
-Add a helper to `split.rs` that builds a directed graph from the
-flat `&[Operation]` list. Each op's output names map to edges
-connecting to ops that reference those outputs.
-
-```rust
-struct OpGraph {
-    /// op index → set of op indices that consume this op's outputs
-    forward: Vec<HashSet<usize>>,
-    /// op index → set of op indices whose outputs this op consumes
-    backward: Vec<HashSet<usize>>,
-}
-```
+`OpGraph` struct with `forward`/`backward` adjacency lists built from
+`Value::Reference` edges. Provides `walk_forward()` and `walk_backward()`
+for transitive graph traversal.
 
 **File:** `crates/ironmill-ane/src/split.rs`
 
-### Task 2 — Identify anchor ops structurally
+### Task 2 — Identify anchor ops structurally ✅
 
-Find the Q/K/V projection matmuls and the O projection matmul by
-structure rather than name:
-
-- **Q/K/V projections:** matmul ops whose one input is a weight
-  const and the other traces back (transitively) to a layer norm op.
-  There should be exactly 3 such matmuls at the start of attention
-  (3 for GQA/MHA with separate Q, K, V projections; 2 for MQA with
-  shared KV). For GQA models, the Q projection has a larger output
-  dim than K/V projections.
-- **O projection:** the matmul op whose input traces back to an
-  attention-pattern op (softmax consumer's output → reshape →
-  transpose → matmul) and whose output feeds into a residual add.
-- **Attention core:** ops containing softmax, or matmuls between
-  non-const tensors (QK^T and AV), which distinguish attention
-  matmuls from projection matmuls (which always have a const weight).
-
-Fall back to the existing name heuristic if structural detection
-fails, logging a warning.
+- **Q/K/V projections**: grouped by shared non-const activation input
+  (earliest group of 2+ matmul/linear ops sharing the same norm output).
+- **O projection**: first matmul/linear with const weight reachable
+  forward from softmax.
+- **Softmax** as the attention core marker.
 
 **File:** `crates/ironmill-ane/src/split.rs`
 
-### Task 3 — Implement graph-based split
+### Task 3 — Implement graph-based split ✅
 
-Replace the body of `split_at_attention_boundary()` with graph
-traversal:
-
-1. Build `OpGraph` from the op list.
-2. Find anchor ops (Task 2).
-3. Walk backward from Q/K/V projection inputs to collect pre-attn ops.
-4. Walk forward from O projection output to collect post-attn ops.
-5. Everything else is the attention cluster (stripped).
-
-The existing function signature `(Vec<Operation>, Vec<Operation>)`
-stays unchanged — callers (`split_for_ane`) are unaffected.
+Pre-attn = backward from projections' non-const inputs. Post-attn =
+O-proj + forward + associated consts. Everything else = attention
+cluster (stripped). Falls back to legacy name heuristic on failure.
 
 **File:** `crates/ironmill-ane/src/split.rs`
 
-### Task 4 — Tests for the structural split
+### Task 4 — Tests for the structural split ✅
 
-Add tests to `split.rs` covering:
-
-- **Qwen3-like layer** (per-head K/V norms between projection and
-  attention) — verifies that norm reshapes are correctly classified
-  as attention cluster ops, not pre-attn.
-- **Standard GQA layer** (no per-head norms) — regression test for
-  the common case.
-- **Layer with no attention pattern** — falls back to putting
-  everything in pre-attn (existing behavior preserved).
-- **Layer 0 edge case** — previously produced an empty pre-attn;
-  the structural split should correctly identify pre-attn ops.
+Five tests: standard GQA, Qwen3-like per-head norms, no-attention
+fallback, layer-0 edge case, OpGraph unit test. All pass.
 
 **File:** `crates/ironmill-ane/src/split.rs` (test module)
 
-### Task 5 — BLOBFILE verification for large weights
+### Task 5 — ANE compilation fixes ✅
 
-Once the split produces valid sub-programs, verify BLOBFILE
-compilation with transformer-sized weights (`[1, 1024, 1, 1024]` =
-2 MB at fp16). The original BLOBFILE investigation concluded that references
-fail, but that was before the `emit_const_op` attribute lookup bug
-was fixed (`2c9c10a`). The `AneModel` E2E tests already use BLOBFILE
-successfully with small 4D weights.
+`AneArgPromotionPass`, `AneLayoutPass` metadata fixes, RMSNorm →
+Orion-style decomposition, MIL emitter int tensor inline emission.
+pre_attn compiles for all 29 Qwen3-0.6B layers.
 
-If BLOBFILE fails for large weights, fall back to emitting weights
-as function inputs (IOSurface parameters), matching TurboQuant's
-approach.
+**Files:** `crates/mil-rs/src/ir/passes/ane_arg_promotion.rs` (new),
+`crates/mil-rs/src/ir/passes/ane_layout.rs`,
+`crates/mil-rs/src/convert/onnx_to_mil.rs`,
+`crates/mil-rs/src/convert/ir_to_mil_text.rs`
 
-**File:** `crates/ironmill-ane/tests/` (new integration test)
+### Task 6 — E2E validation with AneInference::compile() 🔶
 
-### Task 6 — E2E validation with AneInference::compile()
+pre_attn compiles for all layers. post_attn blocked on matmul→conv
+and SiLU fusion (see next steps above).
 
-Run the full `AneInference::compile()` pipeline on a Qwen3 model
-(or equivalent with per-head norms) and verify:
-
-- All layers produce both `pre_attn` and `post_attn` sub-programs
-  (including layer 0).
-- No `ANECCompile() FAILED` errors from invalid reshapes.
-- Sub-program inputs/outputs have correct tensor types at boundaries.
-
-**File:** `crates/ironmill-ane/src/inference.rs` (call chain: `compile()` → `split_for_ane()` → `split_at_attention_boundary()`)
+**File:** `crates/ironmill-ane/src/inference.rs`
 
 ## Files
 
 | File | Role |
 |---|---|
-| `crates/ironmill-ane/src/split.rs` | `split_at_attention_boundary()` — primary change target. Called by `split_for_ane()`, which is the public entry point used by `AneInference::compile()`. |
-| `crates/ironmill-ane/src/inference.rs` | `AneInference::compile()` → calls `split_for_ane()` with `split_attention: true` |
-| `crates/mil-rs/src/ir/passes/ane_layout.rs` | `AneLayoutPass` — reshapes tensors to `[1, C, 1, S]`. Runs *before* the split. Interacts with reshape validity. |
+| `crates/ironmill-ane/src/split.rs` | `split_at_attention_boundary()` — structural split with `OpGraph`. Called by `split_for_ane()`. |
+| `crates/ironmill-ane/src/inference.rs` | `AneInference::compile()` → pass pipeline + `split_for_ane()` with `split_attention: true` |
+| `crates/mil-rs/src/ir/passes/ane_arg_promotion.rs` | `AneArgPromotionPass` — promotes inline reduce/norm args to const refs, remaps axes |
+| `crates/mil-rs/src/ir/passes/ane_layout.rs` | `AneLayoutPass` — reshapes tensors to `[1, C, 1, S]`. Fixed to skip metadata values. |
+| `crates/mil-rs/src/convert/onnx_to_mil.rs` | ONNX → MIL converter. `SimplifiedLayerNormalization` → decomposed RMSNorm with axis=1. |
+| `crates/mil-rs/src/convert/ir_to_mil_text.rs` | MIL text emitter. Int tensors inline, reduce output type inference. |
+| `crates/mil-rs/src/ir/passes/op_substitute.rs` | `OpSubstitutionPass` — gelu substitution + rsqrt pattern detection. |
 
 ## References
 
 - [ANE MIL Emitter Compatibility](ane-mil-emitter-compat.md) — predecessor investigation (resolved; `emit_const_op` fix in `2c9c10a`)
 - [TurboQuant E2E Inference](turboquant-e2e-inference.md)
-- [Orion project](https://github.com/mechramc/Orion) — reference ANE implementation; uses reshape for attention layout transforms only
+- [Orion project](https://github.com/mechramc/Orion) — reference ANE implementation; `orion_mil_rmsnorm` pattern used for RMSNorm decomposition
+- [ANE Op Support Matrix](../research/ane-op-support-matrix.md) — empirically verified op support table
