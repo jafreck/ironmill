@@ -34,6 +34,7 @@ pub mod runtime;
 pub mod split;
 pub mod tensor;
 pub mod turboquant;
+pub mod turboquant_mil;
 
 use std::path::PathBuf;
 
