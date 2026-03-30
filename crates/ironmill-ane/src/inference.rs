@@ -254,6 +254,8 @@ impl AneLmHead {
                 })?;
                 unsafe { CompiledProgram::from_raw(ptr) }
             };
+            // Unload to free ANE slots — lm_head uses eval_compiled (called
+            // 10 times per token, load/unload overhead is ~1ms total).
             runtime.unload_compiled(&compiled);
 
             // Set the donor pointer once the first full-size chunk is compiled.
@@ -316,7 +318,7 @@ impl AneLmHead {
             // Write hidden state to input tensor (column 0, zero-padded).
             write_f16_padded(&mut chunk.input_tensor, hidden)?;
 
-            // Eval conv1×1 on ANE (load → eval → unload per chunk).
+            // Eval conv1×1 on ANE (load → eval → unload to stay within budget).
             self.runtime.eval_compiled(
                 &chunk.compiled,
                 &[&chunk.input_tensor],
@@ -811,7 +813,8 @@ impl AneInference {
                     ),
                 })?;
             let attn_compiled = unsafe { CompiledProgram::from_raw(attn_ptr) };
-            runtime.unload_compiled(&attn_compiled);
+            // Keep loaded — it's only 1 program, well within budget.
+            // Using eval_raw avoids the ~5ms loadWithQoS cost per layer.
 
             // Uniform alloc: all tensors in one eval must share the same alloc.
             let attn_alloc = uniform_alloc_size(&[
@@ -888,15 +891,37 @@ impl AneInference {
 
     /// Process one token, return logits as f32.
     pub fn decode(&mut self, token_id: u32) -> Result<Vec<f32>> {
+        let profiling = self.seq_pos == 0 && std::env::var("IRONMILL_PROFILE").is_ok();
+        let t_total = if profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         // 1. Embedding: CPU gather from weight table.
+        let t0 = if profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let embed_out = cpu_embedding_lookup(&self.embed_weight, token_id)?;
+        let d_embed = t0.map(|t| t.elapsed());
 
         // 2. Per-layer: pre_attn → attention → post_attn
         let num_layers = self.layers.len();
         let mut hidden = embed_out;
+        let mut d_pre_attn = std::time::Duration::ZERO;
+        let mut d_read_qkv = std::time::Duration::ZERO;
+        let mut d_attn = std::time::Duration::ZERO;
+        let mut d_post_attn = std::time::Duration::ZERO;
 
         for layer_idx in 0..num_layers {
             // Pre-attention: norm → Q/K/V projection
+            let t0 = if profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let layer = &mut self.layers[layer_idx];
             write_f16_padded(&mut layer.pre_attn.input_tensors[0], &hidden)?;
             {
@@ -911,6 +936,9 @@ impl AneInference {
                         ))
                     })?;
             }
+            if let Some(t) = t0 {
+                d_pre_attn += t.elapsed();
+            }
 
             // Read Q, K_proj, V_proj from pre_attn outputs.
             // Convention: outputs are [Q, K_proj, V_proj, residual_hidden]
@@ -919,6 +947,11 @@ impl AneInference {
 
             // Attention (divergent path)
             let attn_out_data = if let Some(tq) = &mut self.turboquant {
+                let t0 = if profiling {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let q = &layer.pre_attn.output_tensors[0];
                 let k_proj = if num_pre_outputs > 1 {
                     &layer.pre_attn.output_tensors[1]
@@ -937,8 +970,17 @@ impl AneInference {
                             "layer {layer_idx} turboquant step_attention failed: {e}"
                         ))
                     })?;
-                read_f16_channels(&attn_tensor)?
+                let result = read_f16_channels(&attn_tensor)?;
+                if let Some(t) = t0 {
+                    d_attn += t.elapsed();
+                }
+                result
             } else if let Some(ref mut caches) = self.fp16_kv_caches {
+                let t0 = if profiling {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let q_data = read_f16_channels(&layer.pre_attn.output_tensors[0])?;
                 let k_data = if num_pre_outputs > 1 {
                     read_f16_channels(&layer.pre_attn.output_tensors[1])?
@@ -950,7 +992,15 @@ impl AneInference {
                 } else {
                     q_data.clone()
                 };
+                if let Some(t) = t0 {
+                    d_read_qkv += t.elapsed();
+                }
 
+                let t0 = if profiling {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 // Write K/V to persistent FP16 cache at current position.
                 let k_elements = k_data.len();
                 let v_elements = v_data.len();
@@ -960,13 +1010,17 @@ impl AneInference {
                 caches[layer_idx].1.write_f16_at(elem_offset_v, &v_data)?;
 
                 // Hand-written FP16 attention: Q + K_cache + V_cache → attn_output
-                if let Some(ref compiled) = self.fp16_attn_compiled {
+                let result = if let Some(ref compiled) = self.fp16_attn_compiled {
                     let q_staging = self.fp16_attn_q_staging.as_mut().unwrap();
                     let out_staging = self.fp16_attn_out_staging.as_mut().unwrap();
                     write_f16_padded(q_staging, &q_data)?;
                     let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
                     self.runtime
-                        .eval_compiled(compiled, &[q_staging, k_cache, v_cache], &mut [out_staging])
+                        .eval_raw(
+                            compiled.model,
+                            &[q_staging, k_cache, v_cache],
+                            &mut [out_staging],
+                        )
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} fp16_attn eval failed: {e}"
@@ -976,7 +1030,11 @@ impl AneInference {
                 } else {
                     // No compiled attention — return Q as pass-through.
                     q_data
+                };
+                if let Some(t) = t0 {
+                    d_attn += t.elapsed();
                 }
+                result
             } else {
                 return Err(AneError::Other(anyhow::anyhow!(
                     "no attention backend configured"
@@ -984,6 +1042,11 @@ impl AneInference {
             };
 
             // Post-attention: O proj → residual → FFN → residual
+            let t0 = if profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let layer = &mut self.layers[layer_idx];
             if let Some(ref mut post_attn) = layer.post_attn {
                 if let Some(ref packing) = post_attn.input_packing {
@@ -1034,6 +1097,9 @@ impl AneInference {
                 // No post_attn sub-program — use attention output directly.
                 hidden = attn_out_data;
             }
+            if let Some(t) = t0 {
+                d_post_attn += t.elapsed();
+            }
         }
 
         // Advance TurboQuant sequence position after all layers.
@@ -1044,10 +1110,32 @@ impl AneInference {
         self.seq_pos += 1;
 
         // 3. LM head: ANE conv1×1 (chunked) or CPU fallback.
-        match &mut self.lm_head {
+        let t0 = if profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let logits = match &mut self.lm_head {
             LmHead::Ane(ane_lm_head) => ane_lm_head.forward(&hidden),
             LmHead::Cpu(weight) => cpu_lm_head_matmul(weight, &hidden),
+        };
+        let d_lm_head = t0.map(|t| t.elapsed());
+
+        if profiling {
+            let total = t_total.unwrap().elapsed();
+            eprintln!(
+                "[profile] decode token 0: embed={:.2}ms pre_attn={:.1}ms read_qkv={:.1}ms attn={:.1}ms post_attn={:.1}ms lm_head={:.1}ms total={:.1}ms",
+                d_embed.unwrap().as_secs_f64() * 1000.0,
+                d_pre_attn.as_secs_f64() * 1000.0,
+                d_read_qkv.as_secs_f64() * 1000.0,
+                d_attn.as_secs_f64() * 1000.0,
+                d_post_attn.as_secs_f64() * 1000.0,
+                d_lm_head.unwrap().as_secs_f64() * 1000.0,
+                total.as_secs_f64() * 1000.0,
+            );
         }
+
+        logits
     }
 
     // -----------------------------------------------------------------------
