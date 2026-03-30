@@ -45,6 +45,10 @@ pub struct SplitConfig {
     /// Required for autoregressive inference where the attention + KV
     /// cache is managed externally (both FP16 baseline and TurboQuant).
     pub split_attention: bool,
+    /// When `true` (and `split_attention` is also `true`), emit the
+    /// attention cluster ops as `layer_N_fp16_attn` sub-programs instead
+    /// of discarding them. Used for FP16 baseline inference.
+    pub emit_attention: bool,
 }
 
 impl Default for SplitConfig {
@@ -52,6 +56,7 @@ impl Default for SplitConfig {
         Self {
             max_weight_size: 64 * 1024 * 1024, // 64 MB
             split_attention: false,
+            emit_attention: false,
         }
     }
 }
@@ -108,12 +113,16 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
     let mut sub_programs: Vec<SubProgram> = Vec::new();
     for (name, ops) in &groups {
         if config.split_attention && name.starts_with("layer_") {
-            // Split this layer at the attention boundary into pre_attn and post_attn.
-            let (pre, post) = split_at_attention_boundary(ops);
+            // Split this layer at the attention boundary.
+            let (pre, attn, post) = split_at_attention_boundary(ops);
             let pre_name = format!("{name}_pre_attn");
             let post_name = format!("{name}_post_attn");
             if !pre.is_empty() {
                 sub_programs.push(build_sub_program(&pre_name, &pre, &type_map));
+            }
+            if config.emit_attention && !attn.is_empty() {
+                let attn_name = format!("{name}_fp16_attn");
+                sub_programs.push(build_sub_program(&attn_name, &attn, &type_map));
             }
             if !post.is_empty() {
                 sub_programs.push(build_sub_program(&post_name, &post, &type_map));
@@ -486,7 +495,9 @@ fn find_fused_attention_ops(ops: &[Operation]) -> Vec<usize> {
 ///
 /// Falls back to the legacy name-based heuristic if structural detection
 /// fails.
-fn split_at_attention_boundary(ops: &[Operation]) -> (Vec<Operation>, Vec<Operation>) {
+fn split_at_attention_boundary(
+    ops: &[Operation],
+) -> (Vec<Operation>, Vec<Operation>, Vec<Operation>) {
     if std::env::var("IRONMILL_SPLIT_DEBUG").is_ok() {
         eprintln!("split_at_attention_boundary: {} ops", ops.len());
         for (i, op) in ops.iter().enumerate() {
@@ -508,7 +519,9 @@ fn split_at_attention_boundary(ops: &[Operation]) -> (Vec<Operation>, Vec<Operat
 
 /// Attempt the graph-based structural split. Returns `None` if the
 /// structural anchors can't be identified (no softmax, no projections).
-fn try_structural_split(ops: &[Operation]) -> Option<(Vec<Operation>, Vec<Operation>)> {
+fn try_structural_split(
+    ops: &[Operation],
+) -> Option<(Vec<Operation>, Vec<Operation>, Vec<Operation>)> {
     let graph = OpGraph::build(ops);
 
     // 1. Find softmax ops — the attention core marker.
@@ -565,9 +578,10 @@ fn try_structural_split(ops: &[Operation]) -> Option<(Vec<Operation>, Vec<Operat
         }
     }
 
-    // 7. Collect pre-attn and post-attn ops in topological order.
-    //    Everything not in either set is the attention cluster (stripped).
+    // 7. Collect pre-attn, attention cluster, and post-attn ops in
+    //    topological order.
     let mut pre_attn = Vec::new();
+    let mut attn_cluster = Vec::new();
     let mut post_attn = Vec::new();
 
     for (i, op) in ops.iter().enumerate() {
@@ -575,8 +589,9 @@ fn try_structural_split(ops: &[Operation]) -> Option<(Vec<Operation>, Vec<Operat
             pre_attn.push(op.clone());
         } else if post_attn_set.contains(&i) {
             post_attn.push(op.clone());
+        } else {
+            attn_cluster.push(op.clone());
         }
-        // else: attention cluster → stripped
     }
 
     // If both halves are empty, fall back.
@@ -584,7 +599,7 @@ fn try_structural_split(ops: &[Operation]) -> Option<(Vec<Operation>, Vec<Operat
         return None;
     }
 
-    Some((pre_attn, post_attn))
+    Some((pre_attn, attn_cluster, post_attn))
 }
 
 /// Structural split when the attention block is a single fused op
@@ -597,7 +612,7 @@ fn try_fused_attention_split(
     ops: &[Operation],
     graph: &OpGraph,
     fused_indices: &[usize],
-) -> Option<(Vec<Operation>, Vec<Operation>)> {
+) -> Option<(Vec<Operation>, Vec<Operation>, Vec<Operation>)> {
     // Use the first fused attention op as the split point.
     let fused_idx = fused_indices[0];
 
@@ -650,6 +665,7 @@ fn try_fused_attention_split(
 
     // Collect in topological order.
     let mut pre_attn = Vec::new();
+    let mut attn_ops = Vec::new();
     let mut post_attn = Vec::new();
 
     for (i, op) in ops.iter().enumerate() {
@@ -657,19 +673,22 @@ fn try_fused_attention_split(
             pre_attn.push(op.clone());
         } else if post_attn_set.contains(&i) {
             post_attn.push(op.clone());
+        } else {
+            attn_ops.push(op.clone());
         }
-        // else: fused attention cluster → stripped
     }
 
     if pre_attn.is_empty() && post_attn.is_empty() {
         return None;
     }
 
-    Some((pre_attn, post_attn))
+    Some((pre_attn, attn_ops, post_attn))
 }
 
 /// Legacy name-based attention split (fallback).
-fn split_at_attention_boundary_by_name(ops: &[Operation]) -> (Vec<Operation>, Vec<Operation>) {
+fn split_at_attention_boundary_by_name(
+    ops: &[Operation],
+) -> (Vec<Operation>, Vec<Operation>, Vec<Operation>) {
     let mut attn_start = None;
     let mut attn_end = None;
 
@@ -713,16 +732,17 @@ fn split_at_attention_boundary_by_name(ops: &[Operation]) -> (Vec<Operation>, Ve
     match (attn_start, attn_end) {
         (Some(start), Some(end)) => {
             let pre_attn = ops[..start].to_vec();
+            let attn_cluster = ops[start..=end].to_vec();
             let post_attn = ops[end + 1..].to_vec();
             if pre_attn.is_empty() {
                 // All ops before attention are attention ops, or there
                 // are no ops at all — put everything in pre_attn.
-                (ops.to_vec(), vec![])
+                (ops.to_vec(), vec![], vec![])
             } else {
-                (pre_attn, post_attn)
+                (pre_attn, attn_cluster, post_attn)
             }
         }
-        _ => (ops.to_vec(), vec![]),
+        _ => (ops.to_vec(), vec![], vec![]),
     }
 }
 
@@ -1212,6 +1232,108 @@ mod tests {
         assert_eq!(names, &["layer_0"]);
     }
 
+    #[test]
+    fn split_emit_attention_produces_fp16_attn_sub() {
+        // With emit_attention = true, the attention cluster ops should
+        // appear as a layer_N_fp16_attn sub-program.
+        let ops = vec![
+            make_op("embed_tok", "gather"),
+            // Layer 0: pre-attn
+            make_op("layer_0_norm", "layer_norm"),
+            make_op("layer_0_q_linear", "linear"),
+            make_op("layer_0_k_linear", "linear"),
+            make_op("layer_0_v_linear", "linear"),
+            // Layer 0: attention cluster
+            make_op("layer_0_q_reshape_op", "reshape"),
+            make_op("layer_0_q_transpose_op", "transpose"),
+            make_op("layer_0_k_reshape_op", "reshape"),
+            make_op("layer_0_k_transpose_op", "transpose"),
+            make_op("layer_0_v_reshape_op", "reshape"),
+            make_op("layer_0_v_transpose_op", "transpose"),
+            make_op("layer_0_qk_matmul", "matmul"),
+            make_op("layer_0_qk_scale", "mul"),
+            make_op("layer_0_attn_softmax", "softmax"),
+            make_op("layer_0_av_matmul", "matmul"),
+            make_op("layer_0_attn_out_transpose", "transpose"),
+            make_op("layer_0_attn_out_reshape", "reshape"),
+            // Layer 0: post-attn
+            make_op("layer_0_o_proj", "linear"),
+            make_op("layer_0_ffn_up", "linear"),
+            make_op("layer_0_ffn_down", "linear"),
+            // Post
+            make_op("final_norm", "layer_norm"),
+            make_op("lm_head_proj", "linear"),
+        ];
+        let prog = make_program(ops, vec![]);
+        let config = SplitConfig {
+            split_attention: true,
+            emit_attention: true,
+            ..Default::default()
+        };
+        let split = split_for_ane(&prog, &config).unwrap();
+
+        let names: Vec<&str> = split.programs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            &[
+                "embedding",
+                "layer_0_pre_attn",
+                "layer_0_fp16_attn",
+                "layer_0_post_attn",
+                "lm_head"
+            ]
+        );
+
+        // fp16_attn should contain the attention cluster ops.
+        let fp16_attn = &split.programs[2];
+        let fp16_ops: Vec<&str> = fp16_attn
+            .program
+            .main()
+            .unwrap()
+            .body
+            .operations
+            .iter()
+            .map(|op| op.name.as_str())
+            .collect();
+        assert!(
+            fp16_ops.contains(&"layer_0_attn_softmax"),
+            "fp16_attn should contain softmax, got: {fp16_ops:?}"
+        );
+        assert!(
+            fp16_ops.contains(&"layer_0_qk_matmul"),
+            "fp16_attn should contain QK matmul, got: {fp16_ops:?}"
+        );
+    }
+
+    #[test]
+    fn split_emit_attention_false_strips_cluster() {
+        // With emit_attention = false (default), attention cluster is discarded.
+        let ops = vec![
+            make_op("embed_tok", "gather"),
+            make_op("layer_0_norm", "layer_norm"),
+            make_op("layer_0_q_reshape_op", "reshape"),
+            make_op("layer_0_attn_softmax", "softmax"),
+            make_op("layer_0_attn_out_reshape", "reshape"),
+            make_op("layer_0_o_proj", "linear"),
+            make_op("final_norm", "layer_norm"),
+            make_op("lm_head_proj", "linear"),
+        ];
+        let prog = make_program(ops, vec![]);
+        let config = SplitConfig {
+            split_attention: true,
+            emit_attention: false,
+            ..Default::default()
+        };
+        let split = split_for_ane(&prog, &config).unwrap();
+
+        let names: Vec<&str> = split.programs.iter().map(|s| s.name.as_str()).collect();
+        // No fp16_attn sub-program should exist.
+        assert!(
+            !names.iter().any(|n| n.contains("fp16_attn")),
+            "emit_attention=false should not produce fp16_attn sub-programs, got: {names:?}"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Structural split helpers
     // -------------------------------------------------------------------
@@ -1427,9 +1549,10 @@ mod tests {
         // The structural split should identify the attention cluster by
         // following data flow, not op names.
         let layer_ops = make_gqa_layer_ops("layer_0");
-        let (pre, post) = split_at_attention_boundary(&layer_ops);
+        let (pre, attn, post) = split_at_attention_boundary(&layer_ops);
 
         let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let attn_names: Vec<&str> = attn.iter().map(|op| op.name.as_str()).collect();
         let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
 
         // Pre-attn: norm + Q/K/V weight consts (norm feeds into projections).
@@ -1448,7 +1571,12 @@ mod tests {
             "post-attn should contain FFN down, got: {post_names:?}"
         );
 
-        // Attention cluster ops should be in neither pre nor post.
+        // Attention cluster ops should be in the attn group, not pre or post.
+        assert!(!attn.is_empty(), "attention cluster should not be empty");
+        assert!(
+            attn_names.contains(&"layer_0_softmax"),
+            "attention cluster should contain softmax, got: {attn_names:?}"
+        );
         let all_returned: HashSet<&str> =
             pre_names.iter().chain(post_names.iter()).copied().collect();
         assert!(
@@ -1629,9 +1757,10 @@ mod tests {
             ),
         ]);
 
-        let (pre, post) = split_at_attention_boundary(&ops);
+        let (pre, attn, post) = split_at_attention_boundary(&ops);
 
         let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let attn_names: Vec<&str> = attn.iter().map(|op| op.name.as_str()).collect();
         let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
         let all_returned: HashSet<&str> =
             pre_names.iter().chain(post_names.iter()).copied().collect();
@@ -1646,14 +1775,22 @@ mod tests {
             "K-norm reshape-back should NOT be in pre-attn, pre: {pre_names:?}"
         );
 
-        // K-norm ops should be in the attention cluster (stripped).
+        // K-norm ops should be in the attention cluster.
+        assert!(
+            attn_names.contains(&"layer_1_attn_k_norm_Reshape_0"),
+            "K-norm reshape should be in attention cluster, got: {attn_names:?}"
+        );
+        assert!(
+            attn_names.contains(&"layer_1_attn_k_norm"),
+            "K per-head norm should be in attention cluster, got: {attn_names:?}"
+        );
         assert!(
             !all_returned.contains("layer_1_attn_k_norm_Reshape_0"),
-            "K-norm reshape should be in attention cluster (stripped)"
+            "K-norm reshape should not be in pre or post"
         );
         assert!(
             !all_returned.contains("layer_1_attn_k_norm"),
-            "K per-head norm should be in attention cluster (stripped)"
+            "K per-head norm should not be in pre or post"
         );
 
         // Pre-attn should contain the input norm.
@@ -1681,9 +1818,10 @@ mod tests {
             make_const_op("layer_0_w", "w_out"),
             make_matmul_op("layer_0_linear", "norm_out", "w_out", "linear_out"),
         ];
-        let (pre, post) = split_at_attention_boundary(&ops);
+        let (pre, attn, post) = split_at_attention_boundary(&ops);
 
         assert_eq!(pre.len(), 3, "all ops should be in pre-attn");
+        assert!(attn.is_empty(), "attn cluster should be empty");
         assert!(post.is_empty(), "post-attn should be empty");
     }
 
@@ -1693,7 +1831,7 @@ mod tests {
         // input rather than a previous op. The structural split should
         // still correctly identify pre-attn ops.
         let layer_ops = make_gqa_layer_ops("layer_0");
-        let (pre, post) = split_at_attention_boundary(&layer_ops);
+        let (pre, _attn, post) = split_at_attention_boundary(&layer_ops);
 
         // Pre-attn should not be empty (layer 0 previously had empty pre-attn).
         assert!(
@@ -1794,9 +1932,10 @@ mod tests {
             ),
         ];
 
-        let (pre, post) = split_at_attention_boundary(&ops);
+        let (pre, attn, post) = split_at_attention_boundary(&ops);
 
         let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let attn_names: Vec<&str> = attn.iter().map(|op| op.name.as_str()).collect();
         let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
         let all_returned: HashSet<&str> =
             pre_names.iter().chain(post_names.iter()).copied().collect();
@@ -1807,10 +1946,14 @@ mod tests {
             "pre-attn should contain norm, got: {pre_names:?}"
         );
 
-        // The fused GQA op should be stripped (in the attention cluster).
+        // The fused GQA op should be in the attention cluster.
+        assert!(
+            attn_names.contains(&"layer_0_gqa"),
+            "fused GQA op should be in attention cluster, got: {attn_names:?}"
+        );
         assert!(
             !all_returned.contains("layer_0_gqa"),
-            "fused GQA op should be stripped (attention cluster), but found in: {all_returned:?}"
+            "fused GQA op should not be in pre or post, but found in: {all_returned:?}"
         );
 
         // Post-attn should contain O projection and FFN.
@@ -1867,9 +2010,10 @@ mod tests {
             ),
         ];
 
-        let (pre, post) = split_at_attention_boundary(&ops);
+        let (pre, attn, post) = split_at_attention_boundary(&ops);
 
         let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let attn_names: Vec<&str> = attn.iter().map(|op| op.name.as_str()).collect();
         let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
         let all_returned: HashSet<&str> =
             pre_names.iter().chain(post_names.iter()).copied().collect();
@@ -1880,10 +2024,14 @@ mod tests {
             "pre-attn should contain norm, got: {pre_names:?}"
         );
 
-        // The fused SDPA op should be stripped (in the attention cluster).
+        // The fused SDPA op should be in the attention cluster.
+        assert!(
+            attn_names.contains(&"layer_0_sdpa"),
+            "fused SDPA op should be in attention cluster, got: {attn_names:?}"
+        );
         assert!(
             !all_returned.contains("layer_0_sdpa"),
-            "fused SDPA op should be stripped (attention cluster), but found in: {all_returned:?}"
+            "fused SDPA op should not be in pre or post, but found in: {all_returned:?}"
         );
 
         // SDPA must NOT appear in find_softmax_ops.
@@ -1996,12 +2144,11 @@ mod tests {
             &format!("{p}_ffn_down_out"),
         ));
 
-        let (pre, post) = split_at_attention_boundary(&ops);
+        let (pre, attn, post) = split_at_attention_boundary(&ops);
 
         let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let attn_names: Vec<&str> = attn.iter().map(|op| op.name.as_str()).collect();
         let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
-        let all_returned: HashSet<&str> =
-            pre_names.iter().chain(post_names.iter()).copied().collect();
 
         // Pre-attn should contain the norm.
         assert!(
@@ -2009,10 +2156,10 @@ mod tests {
             "pre-attn should contain norm, got: {pre_names:?}"
         );
 
-        // The reduce_softmax variant should be detected and stripped.
+        // The reduce_softmax variant should be in the attention cluster.
         assert!(
-            !all_returned.contains("layer_0_softmax"),
-            "softmax variant should be stripped (attention cluster)"
+            attn_names.contains(&"layer_0_softmax"),
+            "softmax variant should be in attention cluster, got: {attn_names:?}"
         );
 
         // Post-attn should contain O projection and FFN.

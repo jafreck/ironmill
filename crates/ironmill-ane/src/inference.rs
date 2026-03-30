@@ -189,6 +189,7 @@ impl AneInference {
         // the sub-programs that will be compiled for ANE.
         let split_config = SplitConfig {
             split_attention: true,
+            emit_attention: turbo_config.is_none(),
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -244,6 +245,8 @@ impl AneInference {
             std::collections::BTreeMap::new();
         let mut post_attn_map: std::collections::BTreeMap<usize, &crate::split::SubProgram> =
             std::collections::BTreeMap::new();
+        let mut fp16_attn_map: std::collections::BTreeMap<usize, &crate::split::SubProgram> =
+            std::collections::BTreeMap::new();
 
         for sub in &model_split.programs {
             if sub.name == "embedding" {
@@ -259,6 +262,15 @@ impl AneInference {
                     .and_then(|s| s.parse::<usize>().ok())
                 {
                     pre_attn_map.insert(n, sub);
+                }
+            } else if sub.name.ends_with("_fp16_attn") {
+                if let Some(n) = sub
+                    .name
+                    .strip_suffix("_fp16_attn")
+                    .and_then(|s| s.strip_prefix("layer_"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    fp16_attn_map.insert(n, sub);
                 }
             } else if sub.name.ends_with("_post_attn") {
                 if let Some(n) = sub
@@ -313,9 +325,14 @@ impl AneInference {
             } else {
                 None
             };
+            let fp16_attn = if let Some(attn_sub) = fp16_attn_map.get(&layer_n) {
+                Some(compile_and_load_sub(attn_sub, &runtime, &mil_config)?)
+            } else {
+                None
+            };
             layers.push(LayerPrograms {
                 pre_attn: pre,
-                fp16_attn: None,
+                fp16_attn,
                 post_attn: post,
             });
         }
@@ -442,8 +459,14 @@ impl AneInference {
 
                 // If we have an FP16 attention sub-program, use it.
                 if let Some(ref mut fp16_attn) = self.layers[layer_idx].fp16_attn {
-                    fp16_attn.input_tensors[0].write_f16(&q_data)?;
-                    // Wire cache tensors as additional inputs if expected.
+                    write_f16_padded(&mut fp16_attn.input_tensors[0], &q_data)?;
+                    // Wire K_proj and V_proj as additional inputs if expected.
+                    if fp16_attn.input_tensors.len() > 1 {
+                        write_f16_padded(&mut fp16_attn.input_tensors[1], &k_data)?;
+                    }
+                    if fp16_attn.input_tensors.len() > 2 {
+                        write_f16_padded(&mut fp16_attn.input_tensors[2], &v_data)?;
+                    }
                     let in_refs: Vec<&AneTensor> = fp16_attn.input_tensors.iter().collect();
                     let mut out_refs: Vec<&mut AneTensor> =
                         fp16_attn.output_tensors.iter_mut().collect();
