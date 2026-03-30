@@ -119,17 +119,17 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
             let pre_name = format!("{name}_pre_attn");
             let post_name = format!("{name}_post_attn");
             if !pre.is_empty() {
-                sub_programs.push(build_sub_program(&pre_name, &pre, &type_map));
+                sub_programs.push(build_sub_program(&pre_name, &pre, &type_map, Some(ops)));
             }
             if config.emit_attention && !attn.is_empty() {
                 let attn_name = format!("{name}_fp16_attn");
-                sub_programs.push(build_sub_program(&attn_name, &attn, &type_map));
+                sub_programs.push(build_sub_program(&attn_name, &attn, &type_map, Some(ops)));
             }
             if !post.is_empty() {
-                sub_programs.push(build_sub_program(&post_name, &post, &type_map));
+                sub_programs.push(build_sub_program(&post_name, &post, &type_map, Some(ops)));
             }
         } else {
-            let sp = build_sub_program(name, ops, &type_map);
+            let sp = build_sub_program(name, ops, &type_map, None);
             sub_programs.push(sp);
         }
     }
@@ -738,10 +738,15 @@ fn split_at_attention_boundary_by_name(
 // ---------------------------------------------------------------------------
 
 /// Build a standalone [`SubProgram`] from a group of operations.
+///
+/// `all_ops` is the full set of operations in the parent function,
+/// used to identify cross-boundary outputs (values produced by this
+/// group that are consumed by ops outside this group).
 fn build_sub_program(
     name: &str,
     ops: &[Operation],
     type_map: &HashMap<String, TensorType>,
+    all_ops: Option<&[Operation]>,
 ) -> SubProgram {
     // Values produced within this group.
     let produced: HashSet<String> = ops
@@ -767,8 +772,31 @@ fn build_sub_program(
     // Deterministic ordering.
     input_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Outputs = last operation's outputs (simplified heuristic).
-    let output_names: Vec<String> = ops.last().map(|op| op.outputs.clone()).unwrap_or_default();
+    // Outputs: find values produced by this group that are consumed by
+    // ops outside this group (cross-boundary outputs).
+    let output_names: Vec<String> = if let Some(all) = all_ops {
+        // Collect all references from ops NOT in this group.
+        let external_refs: HashSet<String> = all
+            .iter()
+            .filter(|op| !produced.contains(op.outputs.first().unwrap_or(&String::new())))
+            .flat_map(|op| op.inputs.values())
+            .filter_map(|v| match v {
+                Value::Reference(r) if produced.contains(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut outs: Vec<String> = external_refs.into_iter().collect();
+        outs.sort(); // deterministic
+        if outs.is_empty() {
+            // Terminal sub-program (e.g., lm_head) — use last op's outputs.
+            ops.last().map(|op| op.outputs.clone()).unwrap_or_default()
+        } else {
+            outs
+        }
+    } else {
+        // No context — fall back to last op's outputs.
+        ops.last().map(|op| op.outputs.clone()).unwrap_or_default()
+    };
 
     // Build Function.
     let mut func = Function::new("main");
@@ -855,7 +883,12 @@ fn enforce_weight_limit(sub_programs: Vec<SubProgram>, config: &SplitConfig) -> 
             // unless the current chunk is empty (single oversized op).
             if !current_ops.is_empty() && current_size + op_size > config.max_weight_size {
                 let chunk_name = format!("{}_{}", sp.name, chunk_idx);
-                result.push(build_sub_program(&chunk_name, &current_ops, &type_map));
+                result.push(build_sub_program(
+                    &chunk_name,
+                    &current_ops,
+                    &type_map,
+                    None,
+                ));
                 chunk_idx += 1;
                 current_ops.clear();
                 current_size = 0;
@@ -870,7 +903,12 @@ fn enforce_weight_limit(sub_programs: Vec<SubProgram>, config: &SplitConfig) -> 
             } else {
                 format!("{}_{}", sp.name, chunk_idx)
             };
-            result.push(build_sub_program(&chunk_name, &current_ops, &type_map));
+            result.push(build_sub_program(
+                &chunk_name,
+                &current_ops,
+                &type_map,
+                None,
+            ));
         }
     }
 
