@@ -130,20 +130,27 @@ impl KvCacheManager {
     /// Create a new `KvCacheManager`, allocating per-layer INT8 KV cache
     /// tensors and precomputing quantization tables.
     pub fn new(config: TurboQuantConfig) -> Result<Self> {
+        Self::new_with_alloc(config, 0)
+    }
+
+    /// Create with a minimum allocation size for uniform ANE eval compatibility.
+    pub fn new_with_alloc(config: TurboQuantConfig, min_alloc: usize) -> Result<Self> {
         let channels = config.num_kv_heads * config.head_dim;
 
         let mut k_caches = Vec::with_capacity(config.num_layers);
         let mut v_caches = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
-            k_caches.push(AneTensor::new(
+            k_caches.push(AneTensor::new_with_min_alloc(
                 channels,
                 config.max_seq_len,
                 ScalarType::Int8,
+                min_alloc,
             )?);
-            v_caches.push(AneTensor::new(
+            v_caches.push(AneTensor::new_with_min_alloc(
                 channels,
                 config.max_seq_len,
                 ScalarType::Int8,
+                min_alloc,
             )?);
         }
 
@@ -169,10 +176,11 @@ impl KvCacheManager {
         let qjl_sign_caches = if config.enable_qjl {
             let mut caches = Vec::with_capacity(config.num_layers);
             for _ in 0..config.num_layers {
-                caches.push(AneTensor::new(
+                caches.push(AneTensor::new_with_min_alloc(
                     channels,
                     config.max_seq_len,
                     ScalarType::Float16,
+                    min_alloc,
                 )?);
             }
             Some(caches)
@@ -350,6 +358,10 @@ pub struct TurboQuantModel {
     rotation_tensor: AneTensor,
     /// Inverse rotation matrix as IOSurface tensor (input to attention program).
     unrotation_tensor: AneTensor,
+    /// Uniform allocation size for cache-write program inputs/outputs.
+    cw_alloc_size: usize,
+    /// Uniform allocation size for attention program inputs/outputs.
+    attn_alloc_size: usize,
     /// The ANE runtime handle.
     runtime: AneRuntime,
 }
@@ -364,6 +376,7 @@ impl TurboQuantModel {
     /// 5. Allocates the [`KvCacheManager`].
     pub fn compile(config: TurboQuantConfig) -> Result<Self> {
         let runtime = AneRuntime::new()?;
+        let head_dim = config.head_dim;
 
         // --- cache-write sub-program ---
         let (cw_mil, cw_weights) = turboquant_mil::emit_cache_write_mil(&config);
@@ -403,18 +416,45 @@ impl TurboQuantModel {
             None
         };
 
-        // --- KV cache ---
-        let cache = KvCacheManager::new(config.clone())?;
+        // --- Compute uniform alloc sizes (ANE requires all tensors in one eval
+        //     to have the same allocation) ---
+        let kv_ch = config.num_kv_heads * head_dim;
+        let q_ch = config.num_heads * head_dim;
+
+        // Cache-write inputs: K[kv_ch,1] fp16, V[kv_ch,1] fp16, R[hd,hd] fp16
+        // Cache-write outputs: K_q[kv_ch,1] fp16, V_q[kv_ch,1] fp16
+        let cw_alloc_size = crate::tensor::uniform_alloc_size(&[
+            ([1, kv_ch, 1, 1], ScalarType::Float16),
+            ([1, kv_ch, 1, 1], ScalarType::Float16),
+            ([1, 1, head_dim, head_dim], ScalarType::Float16),
+        ]);
+
+        // Attention inputs: Q[q_ch,1] fp16, K_cache[kv_ch,max_seq] i8,
+        //   V_cache[kv_ch,max_seq] i8, R_inv[hd,hd] fp16
+        // Attention output: out[q_ch,1] fp16
+        let attn_alloc_size = crate::tensor::uniform_alloc_size(&[
+            ([1, q_ch, 1, 1], ScalarType::Float16),
+            ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),
+            ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),
+            ([1, 1, head_dim, head_dim], ScalarType::Float16),
+        ]);
+
+        // --- KV cache with uniform attention alloc ---
+        let cache = KvCacheManager::new_with_alloc(config.clone(), attn_alloc_size)?;
 
         // --- Rotation matrix IOSurface tensors ---
-        // Weights are delivered as function inputs, not BLOBFILE constants.
-        let head_dim = config.head_dim;
-        let rot_data = &cw_weights[0].1; // rotation_matrix fp16 bytes
-        let mut rotation_tensor = AneTensor::new(head_dim, head_dim, ScalarType::Float16)?;
+        let rot_data = &cw_weights[0].1;
+        let mut rotation_tensor =
+            AneTensor::new_with_min_alloc(head_dim, head_dim, ScalarType::Float16, cw_alloc_size)?;
         rotation_tensor.write_bytes_at(0, rot_data)?;
 
-        let unrot_data = &attn_weights[0].1; // unrotation_matrix fp16 bytes
-        let mut unrotation_tensor = AneTensor::new(head_dim, head_dim, ScalarType::Float16)?;
+        let unrot_data = &attn_weights[0].1;
+        let mut unrotation_tensor = AneTensor::new_with_min_alloc(
+            head_dim,
+            head_dim,
+            ScalarType::Float16,
+            attn_alloc_size,
+        )?;
         unrotation_tensor.write_bytes_at(0, unrot_data)?;
 
         Ok(Self {
@@ -425,6 +465,8 @@ impl TurboQuantModel {
             qjl_program,
             rotation_tensor,
             unrotation_tensor,
+            cw_alloc_size,
+            attn_alloc_size,
             runtime,
         })
     }
@@ -475,8 +517,10 @@ impl TurboQuantModel {
         let channels = self.config.num_kv_heads * self.config.head_dim;
 
         // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
-        let mut k_quant = AneTensor::new(channels, 1, ScalarType::Float16)?;
-        let mut v_quant = AneTensor::new(channels, 1, ScalarType::Float16)?;
+        let mut k_quant =
+            AneTensor::new_with_min_alloc(channels, 1, ScalarType::Float16, self.cw_alloc_size)?;
+        let mut v_quant =
+            AneTensor::new_with_min_alloc(channels, 1, ScalarType::Float16, self.cw_alloc_size)?;
         self.runtime.eval(
             &self.cache_write_program,
             &[k_proj, v_proj, &self.rotation_tensor],
@@ -503,7 +547,12 @@ impl TurboQuantModel {
         // 3. Attention: Q + cached K/V + unrotation_matrix → output
         let (k_cache, v_cache) = self.cache.cache_tensors(layer);
         let q_channels = self.config.num_heads * self.config.head_dim;
-        let mut attn_out = AneTensor::new(q_channels, 1, ScalarType::Float16)?;
+        let mut attn_out = AneTensor::new_with_min_alloc(
+            q_channels,
+            1,
+            ScalarType::Float16,
+            self.attn_alloc_size,
+        )?;
         self.runtime.eval(
             &self.attention_program,
             &[q, k_cache, v_cache, &self.unrotation_tensor],
@@ -526,5 +575,15 @@ impl TurboQuantModel {
     /// Get a reference to the config.
     pub fn config(&self) -> &TurboQuantConfig {
         &self.config
+    }
+
+    /// Required uniform allocation sizes for external tensors.
+    ///
+    /// Returns `(cache_write_alloc, attention_alloc)`. All user-provided
+    /// tensors in a `step_attention` call must use these sizes:
+    /// - K_proj, V_proj: use `cache_write_alloc`
+    /// - Q: use `attention_alloc`
+    pub fn alloc_sizes(&self) -> (usize, usize) {
+        (self.cw_alloc_size, self.attn_alloc_size)
     }
 }
