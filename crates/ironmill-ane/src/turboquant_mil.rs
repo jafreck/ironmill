@@ -553,6 +553,216 @@ pub fn emit_attention_mil(
     (mil_text, weights)
 }
 
+/// Generate MIL text for an FP16 attention sub-program.
+///
+/// Like TurboQuant's `emit_attention_mil` but operates on FP16 K/V
+/// cache tensors directly — no dequantization or unrotation needed.
+/// RoPE is applied on CPU before calling this program.
+///
+/// # Inputs
+/// - `a_input0`: Q (rotated), `[1, q_ch, 1, MIN_IO_SEQ]` fp16
+/// - `a_input1`: K cache, `[1, kv_ch, 1, max_seq_len]` fp16
+/// - `a_input2`: V cache, `[1, kv_ch, 1, max_seq_len]` fp16
+///
+/// # Output
+/// - `z_output0`: attention output, `[1, q_ch, 1, MIN_IO_SEQ]` fp16
+pub fn emit_fp16_attention_mil(
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    seq_len: usize,
+) -> String {
+    let kv_ch = num_kv_heads * head_dim;
+    let q_ch = num_heads * head_dim;
+
+    let q_shape = fmt_shape(&[1, q_ch, 1, MIN_IO_SEQ]);
+    let cache_shape = fmt_shape(&[1, kv_ch, 1, max_seq_len]);
+    let sliced_shape = fmt_shape(&[1, kv_ch, 1, seq_len]);
+
+    let gqa_groups = num_heads / num_kv_heads;
+    let kv_head_4d = fmt_shape(&[1, num_kv_heads, head_dim, seq_len]);
+    let attn_head_4d = fmt_shape(&[1, num_heads, head_dim, seq_len]);
+    let q_head_4d = fmt_shape(&[1, num_heads, head_dim, MIN_IO_SEQ]);
+    let qk_shape = fmt_shape(&[1, num_heads, MIN_IO_SEQ, seq_len]);
+
+    let scale_factor = 1.0 / (head_dim as f32).sqrt();
+
+    let mut body = String::new();
+
+    // --- Constants ---
+    writeln!(
+        body,
+        "        fp16 scale_factor = const()[name=string(\"scale_factor\"), val=fp16({scale_factor})];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        int32 softmax_axis = const()[name=string(\"softmax_axis\"), val=int32(-1)];"
+    )
+    .unwrap();
+
+    // slice_by_index constants
+    writeln!(
+        body,
+        "        tensor<int32, [4]> slice_begin = const()[name=string(\"slice_begin\"), \
+         val=tensor<int32, [4]>([0,0,0,0])];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        tensor<int32, [4]> slice_end_k = const()[name=string(\"slice_end_k\"), \
+         val=tensor<int32, [4]>([1,{kv_ch},1,{seq_len}])];"
+    )
+    .unwrap();
+
+    // --- Slice K and V caches to [1, kv_ch, 1, seq_len] ---
+    writeln!(
+        body,
+        "        tensor<fp16, {sliced_shape}> k_sliced = slice_by_index(\
+         x=a_input1, begin=slice_begin, end=slice_end_k)\
+         [name=string(\"k_sliced\")];"
+    )
+    .unwrap();
+
+    writeln!(
+        body,
+        "        tensor<fp16, {sliced_shape}> v_sliced = slice_by_index(\
+         x=a_input2, begin=slice_begin, end=slice_end_k)\
+         [name=string(\"v_sliced\")];"
+    )
+    .unwrap();
+
+    // --- Reshape Q: [1, q_ch, 1, S] -> [1, num_heads, head_dim, S] ---
+    let s = MIN_IO_SEQ;
+    writeln!(
+        body,
+        "        tensor<fp16, {q_head_4d}> q_reshaped = reshape(\
+         x=a_input0, shape=tensor<int32, [4]>([1,{num_heads},{head_dim},{s}]))\
+         [name=string(\"q_reshaped\")];"
+    )
+    .unwrap();
+
+    // Reshape K: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
+    writeln!(
+        body,
+        "        tensor<fp16, {kv_head_4d}> k_heads = reshape(\
+         x=k_sliced, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
+         [name=string(\"k_heads\")];"
+    )
+    .unwrap();
+
+    // Reshape V: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
+    writeln!(
+        body,
+        "        tensor<fp16, {kv_head_4d}> v_heads = reshape(\
+         x=v_sliced, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
+         [name=string(\"v_heads\")];"
+    )
+    .unwrap();
+
+    // GQA head expansion: tile KV heads to match query heads
+    let (k_attn_name, v_attn_name) = if gqa_groups > 1 {
+        writeln!(
+            body,
+            "        tensor<int32, [4]> gqa_reps = const()[name=string(\"gqa_reps\"), \
+             val=tensor<int32, [4]>([1,{gqa_groups},1,1])];"
+        )
+        .unwrap();
+
+        writeln!(
+            body,
+            "        tensor<fp16, {attn_head_4d}> k_attn = tile(\
+             x=k_heads, reps=gqa_reps)\
+             [name=string(\"k_attn\")];"
+        )
+        .unwrap();
+
+        writeln!(
+            body,
+            "        tensor<fp16, {attn_head_4d}> v_attn = tile(\
+             x=v_heads, reps=gqa_reps)\
+             [name=string(\"v_attn\")];"
+        )
+        .unwrap();
+
+        ("k_attn", "v_attn")
+    } else {
+        ("k_heads", "v_heads")
+    };
+
+    // QK = matmul(Q^T, K) -> [1, num_heads, S, seq_len]
+    writeln!(
+        body,
+        "        tensor<fp16, {qk_shape}> qk = matmul(\
+         x=q_reshaped, y={k_attn_name}, transpose_x=bT, transpose_y=bF)\
+         [name=string(\"qk\")];"
+    )
+    .unwrap();
+
+    // Scale QK
+    writeln!(
+        body,
+        "        tensor<fp16, {qk_shape}> qk_scaled = mul(\
+         x=qk, y=scale_factor)\
+         [name=string(\"qk_scaled\")];"
+    )
+    .unwrap();
+
+    // Softmax
+    writeln!(
+        body,
+        "        tensor<fp16, {qk_shape}> attn_weights = softmax(\
+         x=qk_scaled, axis=softmax_axis)\
+         [name=string(\"attn_weights\")];"
+    )
+    .unwrap();
+
+    // attn_out = attn_weights x V^T -> [1, num_heads, S, head_dim]
+    let attn_pre_shape = fmt_shape(&[1, num_heads, s, head_dim]);
+    writeln!(
+        body,
+        "        tensor<fp16, {attn_pre_shape}> attn_pre = matmul(\
+         x=attn_weights, y={v_attn_name}, transpose_x=bF, transpose_y=bT)\
+         [name=string(\"attn_pre\")];"
+    )
+    .unwrap();
+
+    // Reshape to output: [1, q_ch, 1, S]
+    writeln!(
+        body,
+        "        tensor<fp16, {q_shape}> z_output0 = reshape(\
+         x=attn_pre, shape=tensor<int32, [4]>([1,{q_ch},1,{s}]))\
+         [name=string(\"z_output0\")];"
+    )
+    .unwrap();
+
+    // Assemble function — 3 inputs: Q, K_cache, V_cache (all fp16)
+    let func = format!(
+        "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
+         tensor<fp16, {cache_shape}> a_input1, \
+         tensor<fp16, {cache_shape}> a_input2) {{\n\
+         {body}\
+         \n    }} -> (z_output0);"
+    );
+
+    mil_program_wrapper(&func)
+}
+
 /// Emit the dequantization op chain for a single K or V cache tensor.
 #[allow(clippy::too_many_arguments)]
 fn emit_dequantize_chain(
@@ -987,5 +1197,63 @@ mod tests {
         let (mil, _weights) = emit_attention_mil(&config, 32);
         assert!(!mil.contains("tile"), "MHA should not use tile op");
         assert!(!mil.contains("gqa_reps"), "MHA should not have gqa_reps");
+    }
+
+    #[test]
+    fn fp16_attention_mil_is_valid_program() {
+        let mil = emit_fp16_attention_mil(32, 32, 64, 128, 128);
+        assert!(mil.starts_with("program(1.3)"));
+        assert!(mil.contains("func main<ios18>"));
+        // Three fp16 inputs: Q, K_cache, V_cache
+        assert!(mil.contains("a_input0"));
+        assert!(mil.contains("a_input1"));
+        assert!(mil.contains("a_input2"));
+        // All inputs are fp16 (no int8)
+        assert!(!mil.contains("int8"), "FP16 attention should not use int8");
+        // No dequantization ops
+        assert!(
+            !mil.contains("deq_scale"),
+            "FP16 attention should not dequantize"
+        );
+        assert!(
+            !mil.contains("deq_offset"),
+            "FP16 attention should not dequantize"
+        );
+        // No unrotation
+        assert!(
+            !mil.contains("unrotated"),
+            "FP16 attention should not unrotate"
+        );
+        assert!(
+            !mil.contains("a_input3"),
+            "FP16 attention should have 3 inputs, not 4"
+        );
+        // Should contain attention ops
+        assert!(mil.contains("slice_by_index"));
+        assert!(mil.contains("softmax"));
+        assert!(mil.contains("matmul"));
+        assert!(mil.contains("scale_factor"));
+        assert!(mil.contains("z_output0"));
+    }
+
+    #[test]
+    fn fp16_attention_mil_gqa_uses_tile() {
+        // GQA: 32 query heads, 8 KV heads
+        let mil = emit_fp16_attention_mil(32, 8, 64, 128, 128);
+        assert!(
+            mil.contains("tile"),
+            "FP16 GQA attention should use tile op"
+        );
+        assert!(mil.contains("gqa_reps"));
+        assert!(mil.contains("[1,4,1,1]"));
+        assert!(mil.contains("softmax"));
+    }
+
+    #[test]
+    fn fp16_attention_mil_mha_no_tile() {
+        // MHA: num_heads == num_kv_heads
+        let mil = emit_fp16_attention_mil(32, 32, 64, 128, 128);
+        assert!(!mil.contains("tile"), "FP16 MHA should not use tile op");
+        assert!(!mil.contains("gqa_reps"));
     }
 }

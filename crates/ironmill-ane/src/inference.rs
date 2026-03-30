@@ -28,6 +28,8 @@ use crate::runtime::AneRuntime;
 use crate::split::{SplitConfig, split_for_ane};
 use crate::tensor::{AneTensor, uniform_alloc_size};
 use crate::turboquant::{TurboQuantConfig, TurboQuantModel};
+use crate::turboquant_mil;
+use crate::turboquant_mil::MIN_IO_SEQ;
 use crate::{AneError, Result};
 
 // ---------------------------------------------------------------------------
@@ -56,6 +58,13 @@ pub struct AneInference {
     /// FP16 KV caches (used when TurboQuant is disabled).
     /// Per-layer (K, V) tensors. `None` when TurboQuant manages the cache.
     fp16_kv_caches: Option<Vec<(AneTensor, AneTensor)>>,
+    /// Compiled FP16 attention program (shared across all layers).
+    /// Only present when TurboQuant is NOT configured.
+    fp16_attn_compiled: Option<CompiledProgram>,
+    /// Staging tensor for Q input to FP16 attention.
+    fp16_attn_q_staging: Option<AneTensor>,
+    /// Staging tensor for FP16 attention output.
+    fp16_attn_out_staging: Option<AneTensor>,
     /// Runtime handle.
     runtime: AneRuntime,
     /// Current sequence position.
@@ -72,9 +81,12 @@ pub struct AneInference {
     /// Pre-extracted RoPE cos/sin cache tables (from model consts).
     /// Flat f16 arrays: `[num_positions * values_per_position]`.
     /// Indexed as `cache[pos * rope_cache_dim .. (pos+1) * rope_cache_dim]`.
+    #[allow(dead_code)]
     rope_cos_cache: Vec<f16>,
+    #[allow(dead_code)]
     rope_sin_cache: Vec<f16>,
     /// Number of f16 values per position in the RoPE cache.
+    #[allow(dead_code)]
     rope_cache_dim: usize,
 }
 
@@ -90,12 +102,16 @@ struct CpuWeight {
 struct LayerPrograms {
     pre_attn: LoadedSubProgram,
     /// FP16 attention sub-program. Only compiled in baseline mode;
-    /// in TurboQuant mode this is `None`.
+    /// in TurboQuant mode this is `None`. Retained for future use
+    /// (model-extracted attention path).
+    #[allow(dead_code)]
     fp16_attn: Option<LoadedSubProgram>,
     /// Post-attention sub-program. `None` for layers where all ops
     /// fall within the attention cluster (e.g., position-only layers).
     post_attn: Option<LoadedSubProgram>,
     /// Input mapping for fp16_attn (which tensor indices are Q/K/V/cos/sin).
+    /// Retained for future use (model-extracted attention path).
+    #[allow(dead_code)]
     attn_input_map: Option<AttnInputMap>,
 }
 
@@ -105,6 +121,9 @@ struct LayerPrograms {
 /// sub-program's inputs are determined by `build_sub_program` in alphabetical
 /// order. This map records which index is which so `decode()` writes
 /// the correct data to the correct input tensor.
+///
+/// Retained for future use (model-extracted attention path).
+#[allow(dead_code)]
 struct AttnInputMap {
     q_idx: usize,
     k_idx: usize,
@@ -626,33 +645,104 @@ impl AneInference {
         }
 
         // 7. Set up TurboQuant or FP16 caches.
-        let (turboquant, fp16_kv_caches, num_kv_heads, head_dim, max_seq_len) =
-            if let Some(tq_config) = turbo_config {
-                let nkv = tq_config.num_kv_heads;
-                let hd = tq_config.head_dim;
-                let msl = tq_config.max_seq_len;
-                let tq = TurboQuantModel::compile(tq_config)?;
-                (Some(tq), None, nkv, hd, msl)
+        let (
+            turboquant,
+            fp16_kv_caches,
+            fp16_attn_compiled,
+            fp16_attn_q_staging,
+            fp16_attn_out_staging,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+        ) = if let Some(tq_config) = turbo_config {
+            let nkv = tq_config.num_kv_heads;
+            let hd = tq_config.head_dim;
+            let msl = tq_config.max_seq_len;
+            let tq = TurboQuantModel::compile(tq_config)?;
+            (Some(tq), None, None, None, None, nkv, hd, msl)
+        } else {
+            // FP16 baseline: detect architecture from program.
+            let arch = mil_rs::analysis::arch::detect_model_arch(&program);
+            let (nh, nkv, hd, msl) = if let Some(ref a) = arch {
+                (a.num_heads, a.num_kv_heads, a.head_dim, 2048)
             } else {
-                // FP16 baseline: we need arch info to allocate caches.
-                // Infer from the pre_attn output shapes.
+                // Fallback: infer from pre_attn output shapes.
                 let pre_sps: Vec<&crate::split::SubProgram> =
                     pre_attn_map.values().copied().collect();
-                // infer_kv_heads_from_sub returns the K channel count
-                // (= num_kv_heads * head_dim), not the head count itself.
                 let kv_channels = infer_kv_heads_from_sub(&pre_sps);
                 let hd = infer_head_dim_from_sub(&pre_sps);
-                let msl = 2048; // Default, can be made configurable.
                 let nkv = kv_channels / hd.max(1);
-
-                let mut caches = Vec::with_capacity(num_layers);
-                for _ in 0..num_layers {
-                    let k = AneTensor::new(kv_channels, msl, ScalarType::Float16)?;
-                    let v = AneTensor::new(kv_channels, msl, ScalarType::Float16)?;
-                    caches.push((k, v));
-                }
-                (None, Some(caches), nkv, hd, msl)
+                let q_channels = pre_sps
+                    .first()
+                    .map(|sp| sp.outputs[0].shape[1])
+                    .unwrap_or(kv_channels);
+                (q_channels / hd.max(1), nkv, hd, 2048)
             };
+            let kv_channels = nkv * hd;
+            let q_channels = nh * hd;
+
+            // Compile hand-written FP16 attention MIL (shared across layers).
+            let mil = turboquant_mil::emit_fp16_attention_mil(nh, nkv, hd, msl, msl);
+            let dump_path = "/tmp/ironmill_debug_fp16_attn_handwritten.mil";
+            let _ = std::fs::write(dump_path, &mil);
+            let attn_ptr =
+                AneCompiler::compile_mil_text(&mil, &[]).map_err(|e| AneError::CompileFailed {
+                    status: 0,
+                    context: format!(
+                        "FP16 attention compilation failed: {e} (MIL dumped to {dump_path})"
+                    ),
+                })?;
+            let attn_compiled = unsafe { CompiledProgram::from_raw(attn_ptr) };
+            runtime.unload_compiled(&attn_compiled);
+
+            // Uniform alloc: all tensors in one eval must share the same alloc.
+            let attn_alloc = uniform_alloc_size(&[
+                ([1, q_channels, 1, MIN_IO_SEQ], ScalarType::Float16),
+                ([1, kv_channels, 1, msl], ScalarType::Float16),
+                ([1, kv_channels, 1, msl], ScalarType::Float16),
+            ]);
+
+            let mut caches = Vec::with_capacity(num_layers);
+            for _ in 0..num_layers {
+                let k = AneTensor::new_with_min_alloc(
+                    kv_channels,
+                    msl,
+                    ScalarType::Float16,
+                    attn_alloc,
+                )?;
+                let v = AneTensor::new_with_min_alloc(
+                    kv_channels,
+                    msl,
+                    ScalarType::Float16,
+                    attn_alloc,
+                )?;
+                caches.push((k, v));
+            }
+
+            let q_staging = AneTensor::new_with_min_alloc(
+                q_channels,
+                MIN_IO_SEQ,
+                ScalarType::Float16,
+                attn_alloc,
+            )?;
+            let out_staging = AneTensor::new_with_min_alloc(
+                q_channels,
+                MIN_IO_SEQ,
+                ScalarType::Float16,
+                attn_alloc,
+            )?;
+
+            (
+                None,
+                Some(caches),
+                Some(attn_compiled),
+                Some(q_staging),
+                Some(out_staging),
+                nkv,
+                hd,
+                msl,
+            )
+        };
 
         Ok(Self {
             embed_weight,
@@ -660,6 +750,9 @@ impl AneInference {
             lm_head,
             turboquant,
             fp16_kv_caches,
+            fp16_attn_compiled,
+            fp16_attn_q_staging,
+            fp16_attn_out_staging,
             runtime,
             seq_pos: 0,
             num_kv_heads,
@@ -748,71 +841,22 @@ impl AneInference {
                 caches[layer_idx].0.write_f16_at(elem_offset_k, &k_data)?;
                 caches[layer_idx].1.write_f16_at(elem_offset_v, &v_data)?;
 
-                // If we have an FP16 attention sub-program, use it.
-                let layer = &mut self.layers[layer_idx];
-                if let Some(ref mut fp16_attn) = layer.fp16_attn {
-                    let attn_map = layer.attn_input_map.as_ref();
-
-                    if let Some(ref packing) = fp16_attn.input_packing {
-                        // Packed: write all logical inputs into the single tensor.
-                        let mut logical_inputs: Vec<&[f16]> = vec![&q_data];
-                        if packing.offsets.len() > 1 {
-                            logical_inputs.push(&k_data);
-                        }
-                        if packing.offsets.len() > 2 {
-                            logical_inputs.push(&v_data);
-                        }
-                        crate::packing::write_packed_inputs(
-                            &mut fp16_attn.input_tensors[0],
-                            &logical_inputs,
-                            packing,
-                        )?;
-                    } else if let Some(map) = attn_map {
-                        // Input-mapped mode: write Q/K/V to their mapped indices.
-                        write_f16_padded(&mut fp16_attn.input_tensors[map.q_idx], &q_data)?;
-                        write_f16_padded(&mut fp16_attn.input_tensors[map.k_idx], &k_data)?;
-                        write_f16_padded(&mut fp16_attn.input_tensors[map.v_idx], &v_data)?;
-
-                        // Write CPU-gathered RoPE cos/sin values for this position.
-                        if self.rope_cache_dim > 0
-                            && self.seq_pos < self.rope_cos_cache.len() / self.rope_cache_dim.max(1)
-                        {
-                            let offset = self.seq_pos * self.rope_cache_dim;
-                            let cos_slice =
-                                &self.rope_cos_cache[offset..offset + self.rope_cache_dim];
-                            let sin_slice =
-                                &self.rope_sin_cache[offset..offset + self.rope_cache_dim];
-                            for &idx in &map.rope_cos_indices {
-                                write_f16_padded(&mut fp16_attn.input_tensors[idx], cos_slice)?;
-                            }
-                            for &idx in &map.rope_sin_indices {
-                                write_f16_padded(&mut fp16_attn.input_tensors[idx], sin_slice)?;
-                            }
-                        }
-                    } else {
-                        // Legacy positional mode (no input map).
-                        write_f16_padded(&mut fp16_attn.input_tensors[0], &q_data)?;
-                        if fp16_attn.input_tensors.len() > 1 {
-                            write_f16_padded(&mut fp16_attn.input_tensors[1], &k_data)?;
-                        }
-                        if fp16_attn.input_tensors.len() > 2 {
-                            write_f16_padded(&mut fp16_attn.input_tensors[2], &v_data)?;
-                        }
-                    }
-                    let in_refs: Vec<&AneTensor> = fp16_attn.input_tensors.iter().collect();
-                    let mut out_refs: Vec<&mut AneTensor> =
-                        fp16_attn.output_tensors.iter_mut().collect();
+                // Hand-written FP16 attention: Q + K_cache + V_cache → attn_output
+                if let Some(ref compiled) = self.fp16_attn_compiled {
+                    let q_staging = self.fp16_attn_q_staging.as_mut().unwrap();
+                    let out_staging = self.fp16_attn_out_staging.as_mut().unwrap();
+                    write_f16_padded(q_staging, &q_data)?;
+                    let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
                     self.runtime
-                        .eval_compiled(&fp16_attn.compiled, &in_refs, &mut out_refs)
+                        .eval_compiled(compiled, &[q_staging, k_cache, v_cache], &mut [out_staging])
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} fp16_attn eval failed: {e}"
                             ))
                         })?;
-                    read_f16_channels(&fp16_attn.output_tensors[0])?
+                    read_f16_channels(out_staging)?
                 } else {
-                    // No compiled attention — return Q as pass-through
-                    // (real deployment would have attention sub-programs).
+                    // No compiled attention — return Q as pass-through.
                     q_data
                 }
             } else {
@@ -1092,15 +1136,20 @@ fn compile_and_load_sub(
 
 /// Infer the number of KV heads from pre_attn sub-program output shapes.
 fn infer_kv_heads_from_sub(pre_attn_sps: &[&crate::split::SubProgram]) -> usize {
-    // Look at the second output (K_proj) of the first pre_attn sub-program.
+    // The KV projection outputs have fewer channels than Q in GQA models.
+    // Find the minimum channel count among outputs (excluding very small ones
+    // like scalars/position IDs). This gives kv_channels = num_kv_heads * head_dim.
     if let Some(sp) = pre_attn_sps.first() {
-        if sp.outputs.len() > 1 {
-            // Shape is [1, C, 1, S] where C = num_kv_heads * head_dim.
-            // We can't distinguish without head_dim, so return the channel count.
-            return sp.outputs[1].shape[1];
+        let min_channels = sp
+            .outputs
+            .iter()
+            .map(|td| td.shape[1])
+            .filter(|&c| c > 1) // skip scalars
+            .min();
+        if let Some(c) = min_channels {
+            return c;
         }
     }
-    // Fallback: can't detect.
     1
 }
 
