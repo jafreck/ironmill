@@ -93,6 +93,8 @@ struct LoadedSubProgram {
     loaded: LoadedProgram,
     input_tensors: Vec<AneTensor>,
     output_tensors: Vec<AneTensor>,
+    /// If inputs were spatially packed, stores the packing metadata.
+    input_packing: Option<crate::packing::InputPacking>,
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +195,17 @@ impl AneInference {
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
+
+        // 2a. Pack inputs spatially where possible.
+        // Must run BEFORE matmul→conv since packing adds slice_by_size ops,
+        // not matmuls. Stores packing metadata per sub-program name.
+        let mut packing_map: std::collections::HashMap<String, crate::packing::InputPacking> =
+            std::collections::HashMap::new();
+        for sub in &mut model_split.programs {
+            if let Some(packing) = crate::packing::pack_inputs(sub) {
+                packing_map.insert(sub.name.clone(), packing);
+            }
+        }
 
         // 2b. Convert matmul → 1×1 conv on each sub-program.
         // This must run AFTER splitting so the structural attention splitter
@@ -319,14 +332,27 @@ impl AneInference {
             let pre_sub = pre_attn_map.get(&layer_n).ok_or_else(|| {
                 AneError::Other(anyhow::anyhow!("missing pre_attn for layer {layer_n}"))
             })?;
-            let pre = compile_and_load_sub(pre_sub, &runtime, &mil_config)?;
+            let pre_packing = packing_map.remove(&pre_sub.name);
+            let pre = compile_and_load_sub(pre_sub, &runtime, &mil_config, pre_packing)?;
             let post = if let Some(post_sub) = post_attn_map.get(&layer_n) {
-                Some(compile_and_load_sub(post_sub, &runtime, &mil_config)?)
+                let post_packing = packing_map.remove(&post_sub.name);
+                Some(compile_and_load_sub(
+                    post_sub,
+                    &runtime,
+                    &mil_config,
+                    post_packing,
+                )?)
             } else {
                 None
             };
             let fp16_attn = if let Some(attn_sub) = fp16_attn_map.get(&layer_n) {
-                Some(compile_and_load_sub(attn_sub, &runtime, &mil_config)?)
+                let attn_packing = packing_map.remove(&attn_sub.name);
+                Some(compile_and_load_sub(
+                    attn_sub,
+                    &runtime,
+                    &mil_config,
+                    attn_packing,
+                )?)
             } else {
                 None
             };
@@ -459,13 +485,28 @@ impl AneInference {
 
                 // If we have an FP16 attention sub-program, use it.
                 if let Some(ref mut fp16_attn) = self.layers[layer_idx].fp16_attn {
-                    write_f16_padded(&mut fp16_attn.input_tensors[0], &q_data)?;
-                    // Wire K_proj and V_proj as additional inputs if expected.
-                    if fp16_attn.input_tensors.len() > 1 {
-                        write_f16_padded(&mut fp16_attn.input_tensors[1], &k_data)?;
-                    }
-                    if fp16_attn.input_tensors.len() > 2 {
-                        write_f16_padded(&mut fp16_attn.input_tensors[2], &v_data)?;
+                    if let Some(ref packing) = fp16_attn.input_packing {
+                        // Packed: write all logical inputs into the single tensor.
+                        let mut logical_inputs: Vec<&[f16]> = vec![&q_data];
+                        if packing.offsets.len() > 1 {
+                            logical_inputs.push(&k_data);
+                        }
+                        if packing.offsets.len() > 2 {
+                            logical_inputs.push(&v_data);
+                        }
+                        crate::packing::write_packed_inputs(
+                            &mut fp16_attn.input_tensors[0],
+                            &logical_inputs,
+                            packing,
+                        )?;
+                    } else {
+                        write_f16_padded(&mut fp16_attn.input_tensors[0], &q_data)?;
+                        if fp16_attn.input_tensors.len() > 1 {
+                            write_f16_padded(&mut fp16_attn.input_tensors[1], &k_data)?;
+                        }
+                        if fp16_attn.input_tensors.len() > 2 {
+                            write_f16_padded(&mut fp16_attn.input_tensors[2], &v_data)?;
+                        }
                     }
                     let in_refs: Vec<&AneTensor> = fp16_attn.input_tensors.iter().collect();
                     let mut out_refs: Vec<&mut AneTensor> =
@@ -492,11 +533,36 @@ impl AneInference {
             // Post-attention: O proj → residual → FFN → residual
             let layer = &mut self.layers[layer_idx];
             if let Some(ref mut post_attn) = layer.post_attn {
-                write_f16_padded(&mut post_attn.input_tensors[0], &attn_out_data)?;
-                // If post_attn expects a residual_hidden input, wire it.
-                if post_attn.input_tensors.len() > 1 && num_pre_outputs > 3 {
-                    let residual = read_f16_channels(&layer.pre_attn.output_tensors[3])?;
-                    write_f16_padded(&mut post_attn.input_tensors[1], &residual)?;
+                if let Some(ref packing) = post_attn.input_packing {
+                    // Packed: write all logical inputs into the single tensor.
+                    if packing.offsets.len() > 1 && num_pre_outputs > 3 {
+                        let residual = read_f16_channels(&layer.pre_attn.output_tensors[3])?;
+                        // Build the packed buffer directly (can't use write_packed_inputs
+                        // because residual is a temporary we need to own).
+                        let [_, channels, _, total_s] = post_attn.input_tensors[0].shape();
+                        let mut packed = vec![f16::ZERO; channels * total_s];
+                        let c0 = attn_out_data.len().min(channels);
+                        for ch in 0..c0 {
+                            packed[ch * total_s + packing.offsets[0]] = attn_out_data[ch];
+                        }
+                        let c1 = residual.len().min(channels);
+                        for ch in 0..c1 {
+                            packed[ch * total_s + packing.offsets[1]] = residual[ch];
+                        }
+                        post_attn.input_tensors[0].write_f16(&packed)?;
+                    } else {
+                        crate::packing::write_packed_inputs(
+                            &mut post_attn.input_tensors[0],
+                            &[&attn_out_data],
+                            packing,
+                        )?;
+                    }
+                } else {
+                    write_f16_padded(&mut post_attn.input_tensors[0], &attn_out_data)?;
+                    if post_attn.input_tensors.len() > 1 && num_pre_outputs > 3 {
+                        let residual = read_f16_channels(&layer.pre_attn.output_tensors[3])?;
+                        write_f16_padded(&mut post_attn.input_tensors[1], &residual)?;
+                    }
                 }
                 {
                     let in_refs: Vec<&AneTensor> = post_attn.input_tensors.iter().collect();
@@ -649,6 +715,7 @@ fn compile_and_load_sub(
     sub: &crate::split::SubProgram,
     runtime: &AneRuntime,
     mil_config: &MilTextConfig,
+    input_packing: Option<crate::packing::InputPacking>,
 ) -> Result<LoadedSubProgram> {
     // ANE requires Float16. Convert any Float32 const ops to Float16.
     let mut program = sub.program.clone();
@@ -715,6 +782,7 @@ fn compile_and_load_sub(
         loaded,
         input_tensors,
         output_tensors,
+        input_packing,
     })
 }
 

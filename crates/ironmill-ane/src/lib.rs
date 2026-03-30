@@ -30,6 +30,7 @@ compile_error!("ironmill-ane only supports macOS");
 pub mod blobfile;
 pub mod cache;
 pub mod inference;
+pub mod packing;
 pub mod program;
 pub mod runtime;
 pub mod split;
