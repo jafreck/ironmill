@@ -6,6 +6,26 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+/// KV cache quantization strategy for TurboQuant benchmarks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvQuantMode {
+    #[default]
+    None,
+    TurboInt8,
+    TurboInt8Qjl,
+}
+
+impl std::fmt::Display for KvQuantMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KvQuantMode::None => write!(f, "none"),
+            KvQuantMode::TurboInt8 => write!(f, "turbo-int8"),
+            KvQuantMode::TurboInt8Qjl => write!(f, "turbo-int8-qjl"),
+        }
+    }
+}
+
 /// A benchmark run is the cartesian product of models × optimizations × backends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchMatrix {
@@ -36,6 +56,12 @@ pub struct OptConfig {
     pub no_fusion: bool,
     #[serde(default)]
     pub disabled_passes: Vec<String>,
+    /// KV cache quantization strategy
+    #[serde(default)]
+    pub kv_quant: KvQuantMode,
+    /// Maximum sequence length for KV cache
+    #[serde(default = "default_max_seq_len")]
+    pub max_seq_len: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +84,9 @@ fn default_warmup() -> usize {
 }
 fn default_runs() -> usize {
     3
+}
+fn default_max_seq_len() -> usize {
+    2048
 }
 
 impl Default for Settings {
@@ -144,6 +173,8 @@ pub fn default_matrix() -> BenchMatrix {
             polar_quantize: None,
             no_fusion: true,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
         },
         OptConfig {
             name: "default".to_string(),
@@ -152,6 +183,8 @@ pub fn default_matrix() -> BenchMatrix {
             polar_quantize: None,
             no_fusion: false,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
         },
         OptConfig {
             name: "fp16".to_string(),
@@ -160,6 +193,8 @@ pub fn default_matrix() -> BenchMatrix {
             polar_quantize: None,
             no_fusion: false,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
         },
         OptConfig {
             name: "int8".to_string(),
@@ -168,6 +203,8 @@ pub fn default_matrix() -> BenchMatrix {
             polar_quantize: None,
             no_fusion: false,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
         },
         OptConfig {
             name: "palettize-4".to_string(),
@@ -176,6 +213,8 @@ pub fn default_matrix() -> BenchMatrix {
             polar_quantize: None,
             no_fusion: false,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
         },
         OptConfig {
             name: "polar-4".to_string(),
@@ -184,6 +223,8 @@ pub fn default_matrix() -> BenchMatrix {
             polar_quantize: Some(4),
             no_fusion: false,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
         },
         OptConfig {
             name: "polar-3".to_string(),
@@ -192,6 +233,30 @@ pub fn default_matrix() -> BenchMatrix {
             polar_quantize: Some(3),
             no_fusion: false,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
+        },
+        // TurboQuant INT8
+        OptConfig {
+            name: "turbo-int8".to_string(),
+            quantize: None,
+            palettize: None,
+            polar_quantize: None,
+            no_fusion: false,
+            disabled_passes: vec![],
+            kv_quant: KvQuantMode::TurboInt8,
+            max_seq_len: 4096,
+        },
+        // TurboQuant INT8 + QJL
+        OptConfig {
+            name: "turbo-int8-qjl".to_string(),
+            quantize: None,
+            palettize: None,
+            polar_quantize: None,
+            no_fusion: false,
+            disabled_passes: vec![],
+            kv_quant: KvQuantMode::TurboInt8Qjl,
+            max_seq_len: 4096,
         },
     ];
 
@@ -234,7 +299,17 @@ pub fn cache_key(model: &ModelConfig, opt: &OptConfig) -> String {
         opt_json.hash(&mut hasher);
     }
 
-    format!("{:016x}", hasher.finish())
+    let mut key = format!("{:016x}", hasher.finish());
+
+    // Include KV quant mode explicitly for readable cache directory names
+    if matches!(
+        opt.kv_quant,
+        KvQuantMode::TurboInt8 | KvQuantMode::TurboInt8Qjl
+    ) {
+        key.push_str(&format!("_kv-{}_seq-{}", opt.kv_quant, opt.max_seq_len));
+    }
+
+    key
 }
 
 #[cfg(test)]
@@ -245,7 +320,7 @@ mod tests {
     fn test_default_matrix() {
         let m = default_matrix();
         assert_eq!(m.models.len(), 6);
-        assert_eq!(m.optimizations.len(), 7);
+        assert_eq!(m.optimizations.len(), 9);
         assert_eq!(m.backends, vec!["all"]);
         assert_eq!(m.settings.iterations, 200);
         assert_eq!(m.settings.warmup, 20);
@@ -276,7 +351,9 @@ mod tests {
                 "int8",
                 "palettize-4",
                 "polar-4",
-                "polar-3"
+                "polar-3",
+                "turbo-int8",
+                "turbo-int8-qjl",
             ]
         );
     }
@@ -328,6 +405,8 @@ backends = ["cpu", "gpu"]
             polar_quantize: None,
             no_fusion: true,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
         };
         let key1 = cache_key(&model, &opt);
         let key2 = cache_key(&model, &opt);
@@ -349,6 +428,8 @@ backends = ["cpu", "gpu"]
             polar_quantize: None,
             no_fusion: true,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
         };
         let opt2 = OptConfig {
             name: "fp16".to_string(),
@@ -357,8 +438,54 @@ backends = ["cpu", "gpu"]
             polar_quantize: None,
             no_fusion: false,
             disabled_passes: vec![],
+            kv_quant: KvQuantMode::None,
+            max_seq_len: default_max_seq_len(),
         };
         assert_ne!(cache_key(&model, &opt1), cache_key(&model, &opt2));
+    }
+
+    #[test]
+    fn test_cache_key_turbo_quant_suffix() {
+        let model = ModelConfig {
+            name: "test".to_string(),
+            path: PathBuf::from("nonexistent.onnx"),
+            input_shapes: vec![],
+        };
+        let opt = OptConfig {
+            name: "turbo-int8".to_string(),
+            quantize: None,
+            palettize: None,
+            polar_quantize: None,
+            no_fusion: false,
+            disabled_passes: vec![],
+            kv_quant: KvQuantMode::TurboInt8,
+            max_seq_len: 4096,
+        };
+        let key = cache_key(&model, &opt);
+        assert!(key.contains("_kv-turbo-int8_seq-4096"));
+    }
+
+    #[test]
+    fn test_kv_quant_mode_display() {
+        assert_eq!(KvQuantMode::None.to_string(), "none");
+        assert_eq!(KvQuantMode::TurboInt8.to_string(), "turbo-int8");
+        assert_eq!(KvQuantMode::TurboInt8Qjl.to_string(), "turbo-int8-qjl");
+    }
+
+    #[test]
+    fn test_kv_quant_mode_default_deserialize() {
+        let toml_content = r#"
+[[model]]
+name = "TestModel"
+path = "test.onnx"
+
+[[optimization]]
+name = "baseline"
+no_fusion = true
+"#;
+        let file: ConfigFile = toml::from_str(toml_content).unwrap();
+        assert_eq!(file.optimization[0].kv_quant, KvQuantMode::None);
+        assert_eq!(file.optimization[0].max_seq_len, 2048);
     }
 
     #[test]

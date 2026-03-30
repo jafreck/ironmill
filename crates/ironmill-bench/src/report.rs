@@ -23,6 +23,8 @@ pub struct ReportRow {
     pub model: String,
     pub optimization: String,
     pub backend: String,
+    /// KV cache quantization mode (TurboQuant).
+    pub kv_quant: String,
     pub result: AggregatedResult,
     pub significance: Option<SignificanceResult>,
     /// Energy efficiency metrics (when --power is used).
@@ -100,6 +102,8 @@ pub struct StructuredResult {
     pub model: String,
     pub optimization: String,
     pub backend: String,
+    /// KV cache quantization mode (TurboQuant).
+    pub kv_quant: String,
     pub iterations: usize,
     pub warmup: usize,
     pub runs: usize,
@@ -156,6 +160,7 @@ pub fn build_structured_report(report: &BenchReport) -> StructuredReport {
                 model: row.model.clone(),
                 optimization: row.optimization.clone(),
                 backend: row.backend.clone(),
+                kv_quant: row.kv_quant.clone(),
                 iterations: report.settings.iterations,
                 warmup: report.settings.warmup,
                 runs: report.settings.runs,
@@ -390,6 +395,11 @@ fn format_flat_table(report: &BenchReport) -> String {
         } else {
             format!("{}/{}", row.optimization, row.backend)
         };
+        let label = if row.kv_quant != "none" && !row.kv_quant.is_empty() {
+            format!("{} [{}]", label, row.kv_quant)
+        } else {
+            label
+        };
 
         let tflops_str = r.tflops.map_or("—".to_string(), |t| format!("{:.2}", t));
 
@@ -423,7 +433,7 @@ fn format_csv(report: &BenchReport) -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "model,optimization,backend,mean,stddev,median,p95,p99,min,max,cv,inf_per_sec,tflops,p_value"
+        "model,optimization,backend,kv_quant,mean,stddev,median,p95,p99,min,max,cv,inf_per_sec,tflops,p_value"
     )
     .unwrap();
 
@@ -438,10 +448,11 @@ fn format_csv(report: &BenchReport) -> String {
 
         writeln!(
             out,
-            "{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.6},{:.2},{},{}",
+            "{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.6},{:.2},{},{}",
             row.model,
             row.optimization,
             row.backend,
+            row.kv_quant,
             r.mean,
             r.stddev,
             r.median,
@@ -495,6 +506,11 @@ fn format_markdown(report: &BenchReport) -> String {
         } else {
             format!("{}/{}", row.optimization, row.backend)
         };
+        let label = if row.kv_quant != "none" && !row.kv_quant.is_empty() {
+            format!("{} [{}]", label, row.kv_quant)
+        } else {
+            label
+        };
 
         writeln!(
             out,
@@ -528,6 +544,7 @@ mod tests {
                     model: "MobileNetV2".to_string(),
                     optimization: "baseline".to_string(),
                     backend: "all".to_string(),
+                    kv_quant: "none".to_string(),
                     result: agg1,
                     significance: None,
                     energy: None,
@@ -539,6 +556,7 @@ mod tests {
                     model: "MobileNetV2".to_string(),
                     optimization: "fp16".to_string(),
                     backend: "all".to_string(),
+                    kv_quant: "none".to_string(),
                     result: agg2,
                     significance: Some(SignificanceResult {
                         significant: true,
@@ -593,7 +611,7 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(
             lines[0],
-            "model,optimization,backend,mean,stddev,median,p95,p99,min,max,cv,inf_per_sec,tflops,p_value"
+            "model,optimization,backend,kv_quant,mean,stddev,median,p95,p99,min,max,cv,inf_per_sec,tflops,p_value"
         );
         assert_eq!(lines.len(), 3); // header + 2 data rows
         assert!(lines[1].starts_with("MobileNetV2,baseline,"));
