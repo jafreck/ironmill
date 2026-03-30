@@ -1,5 +1,9 @@
-//! TurboQuant INT8 KV cache compression configuration.
+//! TurboQuant INT8 KV cache compression configuration and KV cache management.
 
+use mil_rs::ir::ScalarType;
+use mil_rs::ir::passes::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels};
+
+use crate::tensor::AneTensor;
 use crate::{AneError, Result};
 
 /// Configuration for TurboQuant INT8 KV cache compression.
@@ -89,5 +93,143 @@ impl TurboQuantConfig {
     pub fn with_rotation_seed(mut self, seed: u64) -> Self {
         self.rotation_seed = seed;
         self
+    }
+}
+
+/// Manages per-layer INT8 KV caches with TurboQuant quantization.
+#[allow(dead_code)]
+pub struct KvCacheManager {
+    config: TurboQuantConfig,
+    /// Per-layer K caches: [num_kv_heads, max_seq_len, head_dim] as INT8.
+    k_caches: Vec<AneTensor>,
+    /// Per-layer V caches (same format).
+    v_caches: Vec<AneTensor>,
+    /// Current sequence position (next write index).
+    seq_pos: usize,
+    /// Precomputed Beta-optimal quantization levels [2^n_bits].
+    quant_levels: Vec<f32>,
+    /// Precomputed quantization boundaries [2^n_bits - 1].
+    quant_boundaries: Vec<f32>,
+    /// Precomputed Hadamard rotation signs for the seed.
+    rotation_signs: Vec<f32>,
+    /// Optional: per-layer QJL residual sign caches (fp16 ±1).
+    qjl_sign_caches: Option<Vec<AneTensor>>,
+}
+
+impl KvCacheManager {
+    /// Create a new `KvCacheManager`, allocating per-layer INT8 KV cache
+    /// tensors and precomputing quantization tables.
+    pub fn new(config: TurboQuantConfig) -> Result<Self> {
+        let channels = config.num_kv_heads * config.head_dim;
+
+        let mut k_caches = Vec::with_capacity(config.num_layers);
+        let mut v_caches = Vec::with_capacity(config.num_layers);
+        for _ in 0..config.num_layers {
+            k_caches.push(AneTensor::new(
+                channels,
+                config.max_seq_len,
+                ScalarType::Int8,
+            )?);
+            v_caches.push(AneTensor::new(
+                channels,
+                config.max_seq_len,
+                ScalarType::Int8,
+            )?);
+        }
+
+        let quant_levels = beta_optimal_levels(config.head_dim, config.n_bits);
+        let quant_boundaries = beta_optimal_boundaries(config.head_dim, config.n_bits);
+
+        // TODO: extract rotation signs from Hadamard transform once the
+        // `generate_signs` helper in `mil_rs::ir::passes::rotation` is made public.
+        let rotation_signs = Vec::new();
+
+        let qjl_sign_caches = if config.enable_qjl {
+            let mut caches = Vec::with_capacity(config.num_layers);
+            for _ in 0..config.num_layers {
+                caches.push(AneTensor::new(
+                    channels,
+                    config.max_seq_len,
+                    ScalarType::Float16,
+                )?);
+            }
+            Some(caches)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            config,
+            k_caches,
+            v_caches,
+            seq_pos: 0,
+            quant_levels,
+            quant_boundaries,
+            rotation_signs,
+            qjl_sign_caches,
+        })
+    }
+
+    /// Write one token's worth of quantized K and V data into `layer`'s
+    /// caches at the current sequence position, then advance the position.
+    pub fn update_cache(
+        &mut self,
+        layer: usize,
+        k_quantized: &[u8],
+        v_quantized: &[u8],
+    ) -> Result<()> {
+        if layer >= self.config.num_layers {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "layer index {layer} out of range (num_layers = {})",
+                self.config.num_layers
+            )));
+        }
+
+        let token_elements = self.config.num_kv_heads * self.config.head_dim;
+        if k_quantized.len() != token_elements {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "k_quantized length {} != expected {} (num_kv_heads * head_dim)",
+                k_quantized.len(),
+                token_elements
+            )));
+        }
+        if v_quantized.len() != token_elements {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "v_quantized length {} != expected {} (num_kv_heads * head_dim)",
+                v_quantized.len(),
+                token_elements
+            )));
+        }
+
+        if self.seq_pos >= self.config.max_seq_len {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "KV cache full: seq_pos {} >= max_seq_len {}",
+                self.seq_pos,
+                self.config.max_seq_len
+            )));
+        }
+
+        let byte_offset = self.seq_pos * token_elements;
+        self.k_caches[layer].write_bytes_at(byte_offset, k_quantized)?;
+        self.v_caches[layer].write_bytes_at(byte_offset, v_quantized)?;
+        self.seq_pos += 1;
+
+        Ok(())
+    }
+
+    /// Return references to the K and V cache tensors for a given layer.
+    pub fn cache_tensors(&self, layer: usize) -> (&AneTensor, &AneTensor) {
+        (&self.k_caches[layer], &self.v_caches[layer])
+    }
+
+    /// Current number of tokens stored (next write index).
+    pub fn seq_len(&self) -> usize {
+        self.seq_pos
+    }
+
+    /// Reset the sequence position to zero. Tensor data is not cleared —
+    /// it will be overwritten on subsequent `update_cache` calls.
+    pub fn reset(&mut self) {
+        self.seq_pos = 0;
     }
 }
