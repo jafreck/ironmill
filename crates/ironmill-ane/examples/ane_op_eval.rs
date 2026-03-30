@@ -1012,6 +1012,104 @@ fn test_turboquant_int8_cache_pipeline() -> (bool, bool) {
 // pipeline test above (test_turboquant_int8_cache_pipeline), which passes
 // all 30/30 eval checks.
 
+// ── Generated MIL compilation tests ──────────────────────────────────────
+
+// These test that the actual MIL text produced by the turboquant_mil emitters
+// compiles successfully on ANE (not just the hand-crafted pipeline above).
+
+fn test_generated_cache_write_mil() -> (bool, bool) {
+    use ironmill_ane::turboquant::TurboQuantConfig;
+    use ironmill_ane::turboquant_mil::emit_cache_write_mil;
+
+    let config = TurboQuantConfig::new(8, 128, 32, 32, 64, 1).unwrap();
+    let (mil_text, weights) = emit_cache_write_mil(&config);
+    let weight_refs: Vec<(&str, &[u8])> = weights
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+
+    match AneCompiler::compile_mil_text(&mil_text, &[]) {
+        Ok(_ptr) => {
+            println!("    ✅ generated cache-write MIL: compiles on ANE");
+            (true, true)
+        }
+        Err(e) => {
+            println!("    ❌ generated cache-write MIL: compile failed: {e}");
+            (true, false) // MIL was generated (true) but compile failed
+        }
+    }
+}
+
+fn test_generated_attention_mil() -> (bool, bool) {
+    use ironmill_ane::turboquant::TurboQuantConfig;
+    use ironmill_ane::turboquant_mil::emit_attention_mil;
+
+    let config = TurboQuantConfig::new(8, 128, 32, 32, 64, 1).unwrap();
+    let (mil_text, weights) = emit_attention_mil(&config, 32);
+    let weight_refs: Vec<(&str, &[u8])> = weights
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+
+    match AneCompiler::compile_mil_text(&mil_text, &[]) {
+        Ok(_ptr) => {
+            println!("    ✅ generated attention MIL: compiles on ANE");
+            (true, true)
+        }
+        Err(e) => {
+            println!("    ❌ generated attention MIL: compile failed: {e}");
+            (true, false)
+        }
+    }
+}
+
+fn test_generated_qjl_mil() -> (bool, bool) {
+    use ironmill_ane::turboquant::TurboQuantConfig;
+    use ironmill_ane::turboquant_mil::emit_qjl_correction_mil;
+
+    let config = TurboQuantConfig::new(8, 128, 32, 32, 64, 1).unwrap();
+    let (mil_text, weights) = emit_qjl_correction_mil(&config, 32);
+    let weight_refs: Vec<(&str, &[u8])> = weights
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+
+    match AneCompiler::compile_mil_text(&mil_text, &[]) {
+        Ok(_ptr) => {
+            println!("    ✅ generated QJL correction MIL: compiles on ANE");
+            (true, true)
+        }
+        Err(e) => {
+            println!("    ❌ generated QJL correction MIL: compile failed: {e}");
+            (true, false)
+        }
+    }
+}
+
+fn test_generated_attention_gqa_mil() -> (bool, bool) {
+    use ironmill_ane::turboquant::TurboQuantConfig;
+    use ironmill_ane::turboquant_mil::emit_attention_mil;
+
+    // GQA config: 32 query heads, 8 KV heads (4× expansion via tile)
+    let config = TurboQuantConfig::new(8, 128, 32, 8, 64, 1).unwrap();
+    let (mil_text, weights) = emit_attention_mil(&config, 32);
+    let weight_refs: Vec<(&str, &[u8])> = weights
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+
+    match AneCompiler::compile_mil_text(&mil_text, &[]) {
+        Ok(_ptr) => {
+            println!("    ✅ generated GQA attention MIL: compiles on ANE");
+            (true, true)
+        }
+        Err(e) => {
+            println!("    ❌ generated GQA attention MIL: compile failed: {e}");
+            (true, false)
+        }
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -1062,6 +1160,11 @@ fn main() {
             "TQ INT8 cache pipeline",
             test_turboquant_int8_cache_pipeline,
         ),
+        // Generated MIL compilation (tests actual emitter output on ANE)
+        ("gen cache-write MIL", test_generated_cache_write_mil),
+        ("gen attention MIL", test_generated_attention_mil),
+        ("gen QJL correction MIL", test_generated_qjl_mil),
+        ("gen GQA attention MIL", test_generated_attention_gqa_mil),
     ];
 
     let mut compile_pass = 0;

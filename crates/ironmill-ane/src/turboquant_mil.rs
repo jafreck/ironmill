@@ -17,12 +17,19 @@ use crate::turboquant::TurboQuantConfig;
 
 /// Standard MIL program wrapper used by the ANE compiler.
 fn mil_program_wrapper(func_body: &str) -> String {
+    // The buildInfo dict uses {{ }} as delimiters in MIL text.
+    // In Rust format!, {{ → { and }} → }, so we need quadruple braces
+    // for the outer dict delimiters.
     format!(
-        r#"program(1.3)
-[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}}, {{"coremlc-version", "3505.4.1"}}, {{"coremltools-component-milinternal", ""}}, {{"coremltools-version", "9.0"}})]
-{{
-{func_body}
-}}"#
+        "program(1.3)\n\
+         [buildInfo = dict<string, string>(\
+         {{{{\"coremlc-component-MIL\", \"3510.2.1\"}}, \
+         {{\"coremlc-version\", \"3505.4.1\"}}, \
+         {{\"coremltools-component-milinternal\", \"\"}}, \
+         {{\"coremltools-version\", \"9.0\"}}}})]\n\
+         {{\n\
+         {func_body}\n\
+         }}"
     )
 }
 
@@ -86,39 +93,38 @@ fn compute_deq_scale(head_dim: usize, n_bits: u8) -> f32 {
 
 /// Generate MIL text for the cache-write sub-program.
 ///
-/// Takes fp16 K/V projections, applies Hadamard rotation + Beta-optimal
-/// quantization, and outputs INT8 quantized values.
+/// Takes fp16 K/V projections and a rotation matrix, applies Hadamard
+/// rotation + Beta-optimal quantization, outputs fp16 values clamped
+/// to INT8 range (cast to INT8 → back to fp16 since ANE rejects INT8
+/// function outputs).
+///
+/// # Inputs
+///
+/// - `a_input0`: K projection `[1, kv_ch, 1, 1]` fp16
+/// - `a_input1`: V projection `[1, kv_ch, 1, 1]` fp16
+/// - `a_input2`: Rotation matrix `[1, 1, head_dim, head_dim]` fp16
 ///
 /// # Returns
 ///
-/// `(mil_text, weights)` where `weights` is a `Vec` of `(name, data)` pairs
-/// for the rotation matrix and quantization constants.
+/// `(mil_text, weights)` where `weights` contains the rotation matrix
+/// fp16 bytes to populate the input IOSurface tensor.
 pub fn emit_cache_write_mil(config: &TurboQuantConfig) -> (String, Vec<(String, Vec<u8>)>) {
     let ch = config.num_kv_heads * config.head_dim;
     let in_shape = fmt_shape(&[1, ch, 1, 1]);
-    let rot_shape = fmt_shape(&[1, config.head_dim, 1, config.head_dim]);
+    let rot_shape = fmt_shape(&[1, 1, config.head_dim, config.head_dim]);
 
     let inv_scale = compute_inv_scale(config.head_dim, config.n_bits);
 
     let mut body = String::new();
     let mut weights: Vec<(String, Vec<u8>)> = Vec::new();
 
-    // --- Rotation matrix constant (weight blob) ---
+    // Rotation matrix passed as function input (a_input2), not BLOBFILE.
+    // BLOBFILE weight references fail with compile_mil_text — see
+    // docs/development/ane-blobfile-investigation.md for details.
     let rot_data = generate_rotation_weights(config.head_dim, config.rotation_seed);
     weights.push(("rotation_matrix".to_string(), rot_data));
 
     // --- Build function body ---
-
-    // Constants
-    writeln!(
-        body,
-        "        tensor<fp16, {rot_shape}> rotation_matrix = const()\
-         [name=string(\"rotation_matrix\"), \
-         val=tensor<fp16, {rot_shape}>(BLOBFILE(\
-         path=string(\"@model_path/weights/rotation_matrix.bin\"), \
-         offset=uint64(64)))];"
-    )
-    .unwrap();
 
     writeln!(
         body,
@@ -150,18 +156,19 @@ pub fn emit_cache_write_mil(config: &TurboQuantConfig) -> (String, Vec<(String, 
     )
     .unwrap();
 
-    // --- K pipeline ---
+    // --- K pipeline (rotation_matrix = a_input2) ---
     emit_quantize_chain(&mut body, "k", "a_input0", &in_shape, &rot_shape, config);
 
     // --- V pipeline ---
     emit_quantize_chain(&mut body, "v", "a_input1", &in_shape, &rot_shape, config);
 
-    // Assemble function
+    // Assemble function — rotation matrix is a_input2
     let func = format!(
         "    func main<ios18>(tensor<fp16, {in_shape}> a_input0, \
-         tensor<fp16, {in_shape}> a_input1) {{\n\
+         tensor<fp16, {in_shape}> a_input1, \
+         tensor<fp16, {rot_shape}> a_input2) {{\n\
          {body}\
-         \n    }} -> (tensor<int8, {in_shape}> z_output0, tensor<int8, {in_shape}> z_output1);"
+         \n    }} -> (z_output0, z_output1);"
     );
 
     let mil_text = mil_program_wrapper(&func);
@@ -192,13 +199,13 @@ fn emit_quantize_chain(
     )
     .unwrap();
 
-    // matmul: [1, num_kv_heads, head_dim, 1] × [1, head_dim, 1, head_dim]
+    // matmul: [1, 1, head_dim, head_dim] × [1, num_kv_heads, head_dim, 1]
     // -> [1, num_kv_heads, head_dim, 1]  (rotation applied per head via broadcast)
     let rotated = format!("{prefix}_rotated");
     writeln!(
         body,
         "        tensor<fp16, {reshape_4d}> {rotated} = matmul(\
-         x={reshaped}, y=rotation_matrix, transpose_x=bF, transpose_y=bF)\
+         x=a_input2, y={reshaped}, transpose_x=bF, transpose_y=bF)\
          [name=string(\"{rotated}\")];"
     )
     .unwrap();
@@ -254,7 +261,18 @@ fn emit_quantize_chain(
     )
     .unwrap();
 
-    // cast to int8
+    // cast to int8 then back to fp16 for function output
+    // (ANE rejects INT8 function outputs; the fp16 values are already
+    // rounded/clamped to [-128, 127] so the cast is lossless)
+    let int8_name = format!("{prefix}_int8");
+    writeln!(
+        body,
+        "        tensor<int8, {flat_shape}> {int8_name} = cast(\
+         x={clamped}, dtype=string(\"int8\"))\
+         [name=string(\"{int8_name}\")];"
+    )
+    .unwrap();
+
     let output = if prefix == "k" {
         "z_output0"
     } else {
@@ -262,8 +280,8 @@ fn emit_quantize_chain(
     };
     writeln!(
         body,
-        "        tensor<int8, {flat_shape}> {output} = cast(\
-         x={clamped}, dtype=string(\"int8\"))\
+        "        tensor<fp16, {flat_shape}> {output} = cast(\
+         x={int8_name}, dtype=string(\"fp16\"))\
          [name=string(\"{output}\")];"
     )
     .unwrap();
@@ -300,7 +318,7 @@ pub fn emit_attention_mil(
     let q_shape = fmt_shape(&[1, q_ch, 1, 1]);
     let cache_shape = fmt_shape(&[1, kv_ch, 1, config.max_seq_len]);
     let sliced_shape = fmt_shape(&[1, kv_ch, 1, seq_len]);
-    let rot_shape = fmt_shape(&[1, head_dim, 1, head_dim]);
+    let rot_shape = fmt_shape(&[1, 1, head_dim, head_dim]);
 
     let gqa_groups = num_heads / num_kv_heads; // >=1; validated by TurboQuantConfig
     let kv_head_4d = fmt_shape(&[1, num_kv_heads, head_dim, seq_len]);
@@ -315,21 +333,13 @@ pub fn emit_attention_mil(
     let mut body = String::new();
     let mut weights: Vec<(String, Vec<u8>)> = Vec::new();
 
-    // --- Un-rotation matrix weight ---
+    // --- Un-rotation matrix delivered as function input (a_input3) ---
+    // BLOBFILE weight references fail with compile_mil_text — see
+    // docs/development/ane-blobfile-investigation.md
     let unrot_data = generate_unrotation_weights(head_dim, config.rotation_seed);
     weights.push(("unrotation_matrix".to_string(), unrot_data));
 
     // --- Constants ---
-    writeln!(
-        body,
-        "        tensor<fp16, {rot_shape}> unrotation_matrix = const()\
-         [name=string(\"unrotation_matrix\"), \
-         val=tensor<fp16, {rot_shape}>(BLOBFILE(\
-         path=string(\"@model_path/weights/unrotation_matrix.bin\"), \
-         offset=uint64(64)))];"
-    )
-    .unwrap();
-
     writeln!(
         body,
         "        fp16 deq_scale = const()[name=string(\"deq_scale\"), val=fp16({deq_scale})];"
@@ -518,13 +528,14 @@ pub fn emit_attention_mil(
     )
     .unwrap();
 
-    // Assemble function
+    // Assemble function — un-rotation matrix is a_input3
     let func = format!(
         "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
          tensor<int8, {cache_shape}> a_input1, \
-         tensor<int8, {cache_shape}> a_input2) {{\n\
+         tensor<int8, {cache_shape}> a_input2, \
+         tensor<fp16, {rot_shape}> a_input3) {{\n\
          {body}\
-         \n    }} -> (tensor<fp16, {q_shape}> z_output0);"
+         \n    }} -> (z_output0);"
     );
 
     let mil_text = mil_program_wrapper(&func);
@@ -601,11 +612,13 @@ fn emit_dequantize_chain(
     .unwrap();
 
     // matmul: un-rotate per head via broadcast
+    // [1, 1, head_dim, head_dim] × [1, num_kv_heads, head_dim, seq_len]
+    // -> [1, num_kv_heads, head_dim, seq_len]
     let unrotated_head = format!("{prefix}_unrot_head");
     writeln!(
         body,
         "        tensor<fp16, {head_shape}> {unrotated_head} = matmul(\
-         x={reshaped}, y=unrotation_matrix, transpose_x=bF, transpose_y=bF)\
+         x=a_input3, y={reshaped}, transpose_x=bF, transpose_y=bF)\
          [name=string(\"{unrotated_head}\")];"
     )
     .unwrap();
@@ -766,7 +779,7 @@ pub fn emit_qjl_correction_mil(
         "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
          tensor<fp16, {residual_shape}> a_input1) {{\n\
          {body}\
-         \n    }} -> (tensor<fp16, {correction_shape}> z_output0);"
+         \n    }} -> (z_output0);"
     );
 
     let mil_text = mil_program_wrapper(&func);

@@ -346,6 +346,10 @@ pub struct TurboQuantModel {
     attention_program: LoadedProgram,
     /// Optional QJL correction program.
     qjl_program: Option<LoadedProgram>,
+    /// Rotation matrix as IOSurface tensor (input to cache-write program).
+    rotation_tensor: AneTensor,
+    /// Inverse rotation matrix as IOSurface tensor (input to attention program).
+    unrotation_tensor: AneTensor,
     /// The ANE runtime handle.
     runtime: AneRuntime,
 }
@@ -363,51 +367,36 @@ impl TurboQuantModel {
 
         // --- cache-write sub-program ---
         let (cw_mil, cw_weights) = turboquant_mil::emit_cache_write_mil(&config);
-        let cw_weight_refs: Vec<(&str, &[u8])> = cw_weights
-            .iter()
-            .map(|(name, data)| (name.as_str(), data.as_slice()))
-            .collect();
-        let cw_ptr = AneCompiler::compile_mil_text(&cw_mil, &cw_weight_refs).map_err(|e| {
-            AneError::CompileFailed {
+        // Weights are delivered as function inputs, not BLOBFILE — pass empty weights
+        let cw_ptr =
+            AneCompiler::compile_mil_text(&cw_mil, &[]).map_err(|e| AneError::CompileFailed {
                 status: 0,
                 context: format!("cache-write compilation failed: {e}"),
-            }
-        })?;
+            })?;
         let cw_compiled = unsafe { CompiledProgram::from_raw(cw_ptr) };
         let cache_write_program = runtime.load_program(&cw_compiled)?;
 
         // --- attention sub-program ---
         let (attn_mil, attn_weights) =
             turboquant_mil::emit_attention_mil(&config, config.max_seq_len);
-        let attn_weight_refs: Vec<(&str, &[u8])> = attn_weights
-            .iter()
-            .map(|(name, data)| (name.as_str(), data.as_slice()))
-            .collect();
         let attn_ptr =
-            AneCompiler::compile_mil_text(&attn_mil, &attn_weight_refs).map_err(|e| {
-                AneError::CompileFailed {
-                    status: 0,
-                    context: format!("attention compilation failed: {e}"),
-                }
+            AneCompiler::compile_mil_text(&attn_mil, &[]).map_err(|e| AneError::CompileFailed {
+                status: 0,
+                context: format!("attention compilation failed: {e}"),
             })?;
         let attn_compiled = unsafe { CompiledProgram::from_raw(attn_ptr) };
         let attention_program = runtime.load_program(&attn_compiled)?;
 
         // --- QJL correction sub-program (optional) ---
         let qjl_program = if config.enable_qjl {
-            let (qjl_mil, qjl_weights) =
+            let (qjl_mil, _qjl_weights) =
                 turboquant_mil::emit_qjl_correction_mil(&config, config.max_seq_len);
-            let qjl_weight_refs: Vec<(&str, &[u8])> = qjl_weights
-                .iter()
-                .map(|(name, data)| (name.as_str(), data.as_slice()))
-                .collect();
-            let qjl_ptr =
-                AneCompiler::compile_mil_text(&qjl_mil, &qjl_weight_refs).map_err(|e| {
-                    AneError::CompileFailed {
-                        status: 0,
-                        context: format!("QJL correction compilation failed: {e}"),
-                    }
-                })?;
+            let qjl_ptr = AneCompiler::compile_mil_text(&qjl_mil, &[]).map_err(|e| {
+                AneError::CompileFailed {
+                    status: 0,
+                    context: format!("QJL correction compilation failed: {e}"),
+                }
+            })?;
             let qjl_compiled = unsafe { CompiledProgram::from_raw(qjl_ptr) };
             Some(runtime.load_program(&qjl_compiled)?)
         } else {
@@ -417,12 +406,25 @@ impl TurboQuantModel {
         // --- KV cache ---
         let cache = KvCacheManager::new(config.clone())?;
 
+        // --- Rotation matrix IOSurface tensors ---
+        // Weights are delivered as function inputs, not BLOBFILE constants.
+        let head_dim = config.head_dim;
+        let rot_data = &cw_weights[0].1; // rotation_matrix fp16 bytes
+        let mut rotation_tensor = AneTensor::new(head_dim, head_dim, ScalarType::Float16)?;
+        rotation_tensor.write_bytes_at(0, rot_data)?;
+
+        let unrot_data = &attn_weights[0].1; // unrotation_matrix fp16 bytes
+        let mut unrotation_tensor = AneTensor::new(head_dim, head_dim, ScalarType::Float16)?;
+        unrotation_tensor.write_bytes_at(0, unrot_data)?;
+
         Ok(Self {
             config,
             cache,
             cache_write_program,
             attention_program,
             qjl_program,
+            rotation_tensor,
+            unrotation_tensor,
             runtime,
         })
     }
@@ -472,18 +474,21 @@ impl TurboQuantModel {
     ) -> Result<AneTensor> {
         let channels = self.config.num_kv_heads * self.config.head_dim;
 
-        // 1. Cache-write: K_proj, V_proj → K_quant, V_quant (INT8)
-        let mut k_quant = AneTensor::new(channels, 1, ScalarType::Int8)?;
-        let mut v_quant = AneTensor::new(channels, 1, ScalarType::Int8)?;
+        // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
+        let mut k_quant = AneTensor::new(channels, 1, ScalarType::Float16)?;
+        let mut v_quant = AneTensor::new(channels, 1, ScalarType::Float16)?;
         self.runtime.eval(
             &self.cache_write_program,
-            &[k_proj, v_proj],
+            &[k_proj, v_proj, &self.rotation_tensor],
             &mut [&mut k_quant, &mut v_quant],
         )?;
 
-        // 2. CPU cache interception: copy INT8 bytes into persistent cache
-        let k_bytes = k_quant.read_bytes_at(0, channels)?;
-        let v_bytes = v_quant.read_bytes_at(0, channels)?;
+        // 2. CPU cache interception: read fp16 values (rounded to integer),
+        //    convert to INT8 bytes, write to persistent cache
+        let k_f16 = k_quant.read_f16()?;
+        let k_bytes: Vec<u8> = k_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
+        let v_f16 = v_quant.read_f16()?;
+        let v_bytes: Vec<u8> = v_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
 
         // Read original K_proj for QJL residual sign computation
         let k_original = if self.config.enable_qjl {
@@ -495,13 +500,13 @@ impl TurboQuantModel {
         self.cache
             .update_cache(layer, &k_bytes, &v_bytes, k_original.as_deref())?;
 
-        // 3. Attention: Q + cached K/V → output
+        // 3. Attention: Q + cached K/V + unrotation_matrix → output
         let (k_cache, v_cache) = self.cache.cache_tensors(layer);
         let q_channels = self.config.num_heads * self.config.head_dim;
         let mut attn_out = AneTensor::new(q_channels, 1, ScalarType::Float16)?;
         self.runtime.eval(
             &self.attention_program,
-            &[q, k_cache, v_cache],
+            &[q, k_cache, v_cache, &self.unrotation_tensor],
             &mut [&mut attn_out],
         )?;
 
