@@ -29,12 +29,15 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("ironmill-ane only supports macOS");
 
-pub mod inference;
 pub mod program;
-pub mod runtime;
 pub mod tensor;
-pub mod turboquant;
-pub mod turboquant_mil;
+
+// Re-export inference modules from ironmill-inference for backward compatibility.
+pub use ironmill_inference::ane::decode as inference;
+pub use ironmill_inference::ane::decode::AneInference;
+pub use ironmill_inference::ane::runtime;
+pub use ironmill_inference::ane::turboquant;
+pub use ironmill_inference::ane::turboquant::mil_emitter as turboquant_mil;
 
 use std::path::PathBuf;
 
@@ -47,59 +50,12 @@ use ironmill_compile::ane::split::{SplitConfig, split_for_ane};
 pub use ironmill_compile::ane::TensorDescriptor;
 
 use crate::program::LoadedProgram;
-use crate::runtime::AneRuntime;
-use crate::tensor::{AneTensor, IOSurfaceError, uniform_alloc_size};
+use crate::tensor::{AneTensor, uniform_alloc_size};
+use ironmill_inference::ane::runtime::AneRuntime;
 
-// ── Error type ────────────────────────────────────────────────────
+// ── Error type (re-exported from ironmill-inference) ──────────────
 
-/// Errors from the ANE runtime backend.
-#[derive(Debug, thiserror::Error)]
-pub enum AneError {
-    /// ANE compilation failed with a status code.
-    #[error("ANE compilation failed (status {status:#x}): {context}")]
-    CompileFailed { status: u32, context: String },
-
-    /// ANE eval failed with a status code.
-    #[error("ANE eval failed (status {status:#x}): {context}")]
-    EvalFailed { status: u32, context: String },
-
-    /// IOSurface creation or I/O failed.
-    #[error("IOSurface error: {0}")]
-    SurfaceError(String),
-
-    /// The compile budget (~119 per process) has been exhausted.
-    #[error("ANE compile budget exhausted ({used}/{limit} compilations used)")]
-    BudgetExhausted { used: usize, limit: usize },
-
-    /// A generic error from an underlying operation.
-    #[error("{0}")]
-    Other(#[from] anyhow::Error),
-}
-
-impl From<IOSurfaceError> for AneError {
-    fn from(e: IOSurfaceError) -> Self {
-        AneError::SurfaceError(e.to_string())
-    }
-}
-
-impl From<ironmill_compile::ane::AneCompileError> for AneError {
-    fn from(e: ironmill_compile::ane::AneCompileError) -> Self {
-        use ironmill_compile::ane::AneCompileError;
-        match e {
-            AneCompileError::CompileFailed { status, context } => {
-                AneError::CompileFailed { status, context }
-            }
-            AneCompileError::EvalFailed { status, context } => {
-                AneError::EvalFailed { status, context }
-            }
-            AneCompileError::SurfaceError(msg) => AneError::SurfaceError(msg),
-            AneCompileError::BudgetExhausted { used, limit } => {
-                AneError::BudgetExhausted { used, limit }
-            }
-            AneCompileError::Other(e) => AneError::Other(e),
-        }
-    }
-}
+pub use ironmill_inference::AneError;
 
 /// Result type alias for ANE operations.
 pub type Result<T> = std::result::Result<T, AneError>;

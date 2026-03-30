@@ -7,12 +7,12 @@ use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard}
 
 use half::f16;
 
-use crate::program::LoadedProgram;
-use crate::runtime::AneRuntime;
-use crate::tensor::AneTensor;
-use crate::turboquant_mil;
-use crate::turboquant_mil::MIN_IO_SEQ;
-use crate::{AneError, Result};
+use super::mil_emitter;
+use super::mil_emitter::MIN_IO_SEQ;
+use crate::ane::runtime::AneRuntime;
+use crate::ane::{AneError, Result};
+use ironmill_ane_sys::LoadedProgram;
+use ironmill_iosurface::AneTensor;
 
 /// Configuration for TurboQuant INT8 KV cache compression.
 ///
@@ -405,7 +405,7 @@ impl TurboQuantModel {
         let head_dim = config.head_dim;
 
         // --- cache-write sub-program ---
-        let (cw_mil, cw_weights) = turboquant_mil::emit_cache_write_mil(&config);
+        let (cw_mil, cw_weights) = mil_emitter::emit_cache_write_mil(&config);
         // Weights are delivered as function inputs, not BLOBFILE — pass empty weights
         let cw_compiled =
             AneCompiler::compile_mil_text(&cw_mil, &[]).map_err(|e| AneError::CompileFailed {
@@ -415,8 +415,7 @@ impl TurboQuantModel {
         let cache_write_program = runtime.load_program(&cw_compiled)?;
 
         // --- attention sub-program ---
-        let (attn_mil, attn_weights) =
-            turboquant_mil::emit_attention_mil(&config, config.max_seq_len);
+        let (attn_mil, attn_weights) = mil_emitter::emit_attention_mil(&config, config.max_seq_len);
         let attn_compiled =
             AneCompiler::compile_mil_text(&attn_mil, &[]).map_err(|e| AneError::CompileFailed {
                 status: 0,
@@ -427,7 +426,7 @@ impl TurboQuantModel {
         // --- QJL correction sub-program (optional) ---
         let qjl_program = if config.enable_qjl {
             let (qjl_mil, _qjl_weights) =
-                turboquant_mil::emit_qjl_correction_mil(&config, config.max_seq_len);
+                mil_emitter::emit_qjl_correction_mil(&config, config.max_seq_len);
             let qjl_compiled = AneCompiler::compile_mil_text(&qjl_mil, &[]).map_err(|e| {
                 AneError::CompileFailed {
                     status: 0,
@@ -446,7 +445,7 @@ impl TurboQuantModel {
 
         // Cache-write inputs: K[kv_ch,S] fp16, V[kv_ch,S] fp16, R[hd,hd] fp16
         // Cache-write outputs: K_q[kv_ch,S] fp16, V_q[kv_ch,S] fp16
-        let cw_alloc_size = crate::tensor::uniform_alloc_size(&[
+        let cw_alloc_size = ironmill_iosurface::uniform_alloc_size(&[
             ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
             ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
             ([1, 1, head_dim, head_dim], ScalarType::Float16),
@@ -455,7 +454,7 @@ impl TurboQuantModel {
         // Attention inputs: Q[q_ch,S] fp16, K_cache[kv_ch,max_seq] i8,
         //   V_cache[kv_ch,max_seq] i8, R_inv[hd,hd] fp16
         // Attention output: out[q_ch,S] fp16
-        let attn_alloc_size = crate::tensor::uniform_alloc_size(&[
+        let attn_alloc_size = ironmill_iosurface::uniform_alloc_size(&[
             ([1, q_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
             ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),
             ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),

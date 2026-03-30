@@ -458,6 +458,7 @@ dependencies = [
  "half",
  "ironmill-ane-sys",
  "ironmill-compile",
+ "ironmill-inference",
  "ironmill-iosurface",
  "ironmill-runtime",
  "mil-rs",
@@ -531,7 +532,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ironmill-coreml-sys",
- "ironmill-runtime",
+ "ironmill-inference",
 ]
 
 [[package]]
@@ -544,6 +545,23 @@ dependencies = [
  "objc2-core-ml",
  "objc2-foundation",
  "serde",
+]
+
+[[package]]
+name = "ironmill-inference"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "ironmill-ane-sys",
+ "ironmill-compile",
+ "ironmill-coreml-sys",
+ "ironmill-iosurface",
+ "mil-rs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -561,6 +579,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "ironmill-inference",
 ]
 
 [[package]]

@@ -9,7 +9,7 @@ use mil_rs::ir::passes::beta_quantizer::beta_optimal_levels;
 use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard};
 use std::fmt::Write;
 
-use crate::turboquant::TurboQuantConfig;
+use super::model::TurboQuantConfig;
 
 /// Minimum spatial dimension for ANE I/O tensors with high channel counts.
 ///

@@ -8,9 +8,9 @@
 
 use std::ffi::c_void;
 
-use crate::program::{CompiledProgram, LoadedProgram};
-use crate::tensor::AneTensor;
-use crate::{AneError, Result};
+use crate::ane::{AneError, Result};
+use ironmill_ane_sys::{CompiledProgram, LoadedProgram};
+use ironmill_iosurface::AneTensor;
 
 // ── AneRuntime ───────────────────────────────────────────────────
 

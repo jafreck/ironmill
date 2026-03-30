@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Common runtime traits for ironmill backends"
+description = "Common runtime traits for ironmill backends (re-exports from ironmill-inference)"
 
 [dependencies]
+ironmill-inference = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }

@@ -1,26 +1,23 @@
 [package]
-name = "ironmill-ane"
-description = "ANE (Apple Neural Engine) direct runtime backend for ironmill"
+name = "ironmill-inference"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Inference engine for ironmill (ANE + CoreML backends)"
 
 [dependencies]
 mil-rs = { workspace = true }
 ironmill-compile = { workspace = true }
-ironmill-iosurface = { workspace = true }
 ironmill-ane-sys = { workspace = true }
-ironmill-runtime = { workspace = true }
-ironmill-inference = { workspace = true }
+ironmill-iosurface = { workspace = true }
+ironmill-coreml-sys = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
-
-[dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
