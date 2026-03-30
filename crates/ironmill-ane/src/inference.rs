@@ -23,7 +23,7 @@ use mil_rs::ir::passes::{
     TypeRepropagationPass,
 };
 
-use crate::program::{CompiledProgram, LoadedProgram};
+use crate::program::CompiledProgram;
 use crate::runtime::AneRuntime;
 use crate::split::{SplitConfig, split_for_ane};
 use crate::tensor::{AneTensor, uniform_alloc_size};
@@ -183,7 +183,7 @@ struct AneLmHead {
 
 /// One chunk of the ANE lm_head — a conv1×1 with ≤16384 output channels.
 struct LmHeadChunk {
-    loaded: LoadedProgram,
+    compiled: CompiledProgram,
     input_tensor: AneTensor,
     output_tensor: AneTensor,
     out_channels: usize,
@@ -225,7 +225,7 @@ impl AneLmHead {
                     ),
                 })?;
             let compiled = unsafe { CompiledProgram::from_raw(ptr) };
-            let loaded = runtime.load_program(&compiled)?;
+            runtime.unload_compiled(&compiled);
 
             // ANE requires all I/O tensors in one eval to have the same alloc size.
             let alloc = uniform_alloc_size(&[
@@ -243,7 +243,7 @@ impl AneLmHead {
                 AneTensor::new_with_min_alloc(out_ch, LM_HEAD_MIN_SEQ, ScalarType::Float16, alloc)?;
 
             chunks.push(LmHeadChunk {
-                loaded,
+                compiled,
                 input_tensor,
                 output_tensor,
                 out_channels: out_ch,
@@ -271,9 +271,9 @@ impl AneLmHead {
             // Write hidden state to input tensor (column 0, zero-padded).
             write_f16_padded(&mut chunk.input_tensor, hidden)?;
 
-            // Eval conv1×1 on ANE.
-            self.runtime.eval(
-                &chunk.loaded,
+            // Eval conv1×1 on ANE (load → eval → unload per chunk).
+            self.runtime.eval_compiled(
+                &chunk.compiled,
                 &[&chunk.input_tensor],
                 &mut [&mut chunk.output_tensor],
             )?;
@@ -1008,6 +1008,30 @@ impl AneInference {
     /// Whether the lm_head runs on ANE (true) or CPU (false).
     pub fn is_ane_lm_head(&self) -> bool {
         matches!(self.lm_head, LmHead::Ane(_))
+    }
+}
+
+impl Drop for AneInference {
+    fn drop(&mut self) {
+        // Unload all compiled programs from the ANE to free execution slots
+        // and compile budget for subsequent model compilations in the same process.
+        for layer in &self.layers {
+            self.runtime.unload_compiled(&layer.pre_attn.compiled);
+            if let Some(ref attn) = layer.fp16_attn {
+                self.runtime.unload_compiled(&attn.compiled);
+            }
+            if let Some(ref post) = layer.post_attn {
+                self.runtime.unload_compiled(&post.compiled);
+            }
+        }
+        if let Some(ref compiled) = self.fp16_attn_compiled {
+            self.runtime.unload_compiled(compiled);
+        }
+        if let LmHead::Ane(ref ane_lm) = self.lm_head {
+            for chunk in &ane_lm.chunks {
+                self.runtime.unload_compiled(&chunk.compiled);
+            }
+        }
     }
 }
 
