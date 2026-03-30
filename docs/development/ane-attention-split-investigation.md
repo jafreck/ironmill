@@ -154,72 +154,76 @@ The `post_attn` sub-program now compiles successfully on ANE:
 All 29 layers compile (5.99s), but `ANEProgramProcessRequestDirect()`
 fails at eval time with `status=0x1d : statusType=0x9: Program Inference
 error`. This is a **pre-existing** runtime error — identical with and
-without the matmul→conv/SiLU changes (verified by reverting). The E5
-binary loads but fails when processing the input request.
+without the matmul→conv/SiLU changes (verified by reverting).
 
 **Reproduce:** `cargo run -p ironmill-ane --example turboquant_e2e_bench --release`
 
-**Where the error occurs:** `inference.rs` `decode()` method (line ~362
-or ~446). The error propagates from `AneRuntime::eval()` in
-`runtime.rs` (~line 340). The error message comes from Apple's
-`_ANEInMemoryModel evaluateWithQoS:options:request:error:`.
+#### Root cause: ANE minimum I/O tensor size constraint
 
-**Control flow in decode():**
-1. `layer.pre_attn.input_tensors[0].write_f16(&hidden)` — write input
-2. `runtime.eval(&layer.pre_attn.loaded, ...)` — run pre_attn on ANE
-3. Read Q/K/V from pre_attn outputs
-4. Attention — in FP16 baseline, `fp16_attn` is `None` so Q is
-   passed through as a **no-op** (line ~424: `q_data` returned directly)
-5. `post_attn.input_tensors[0].write_f16(&attn_out_data)` — write
-   attention output (which is actually just Q)
-6. `runtime.eval(&post_attn.loaded, ...)` — run post_attn on ANE ← likely fails here
+**Confirmed via isolation testing.** Even a trivial `mul(x,x)` program
+fails at eval time when the function I/O tensor shape is `[1, C, 1, S]`
+with C > ~768 and S < 32. The ANE compiler accepts these shapes, but
+the hardware rejects them at eval. Empirical boundary:
 
-**The error does NOT tell us which eval call failed.** First debugging
-step is to add error context identifying which layer/sub-program
-fails (wrap each `runtime.eval()` in `decode()` with `.map_err()`
-that adds the layer index and sub-program name).
+- `C=768, S=1`: ✅ works
+- `C=800, S=1`: ❌ fails (0x1d)
+- `C=1024, S=1`: ❌ fails
+- `C=1024, S=32`: ✅ works
+- `C=768, S=33`: ❌ fails
 
-**Key files:**
-- `crates/ironmill-ane/src/inference.rs` — `decode()` (~line 345),
-  `compile_and_load_sub()` (~line 540), I/O tensor preallocation
-- `crates/ironmill-ane/src/runtime.rs` — `AneRuntime::eval()` (~line 240)
-- `crates/ironmill-ane/src/tensor.rs` — `AneTensor`, `uniform_alloc_size`
-- `crates/ironmill-ane/src/split.rs` — `SubProgram` I/O shape metadata
+This is NOT about IOSurface allocation size (tested with exact-fit and
+padded — both same result). It's an ANE hardware constraint on how
+function I/O buffers map to the ANE's on-chip memory.
 
-**Likely root causes (ordered by probability):**
+**Evidence from external projects:**
 
-1. **FP16 attention path is a no-op**: When `fp16_attn` is `None`,
-   `decode()` returns raw Q data as the "attention output" (line ~424).
-   Q shape is `[1, 2048, 1, 1]` (n_heads * head_dim = 32 * 64), but
-   post_attn's first input (`a_input1` in the MIL) expects the
-   concatenated attention output which should also be `[1, 2048, 1, 1]`.
-   However, the pre_attn output tensor for Q may be allocated with
-   different `alloc_size` than post_attn's input tensor, causing
-   the IOSurface size check in the ANE framework to fail.
+- **Orion** (mechramc/Orion): Uses GPT-2 124M with `d_model=768` — below
+  the threshold. Tests use shapes like `[1, 32, 1, 32]`.
+- **maderix/ANE**: Documents "multi-input ANE requests cause 0x1d error"
+  and packs ALL data (activations + weights) into a **single spatial
+  input** tensor. For Qwen3-0.6B (DIM=1024, SEQ=256), the input is
+  `[1, 1024, 1, 4352]` — always large spatial. They also use only
+  1 input and 1 output per kernel.
 
-2. **Uniform alloc size mismatch**: `compile_and_load_sub()` computes
-   `uniform_alloc_size()` separately for each sub-program. The ANE
-   may require all IOSurfaces in a single eval call to match the
-   exact buffer sizes the compiled model expects. Inspect the pre_attn
-   output shapes vs post_attn input shapes — if they differ, their
-   `uniform_alloc_size()` will differ, and the data copied from
-   pre_attn output to post_attn input will be in a differently-sized
-   IOSurface.
+**Fix (in progress):** After all passes (including AneLayoutPass which
+converts to `[1,C,1,S]` format), pad dim 3 (S) to at least 32 for
+all sub-program function I/O tensors. The MIL compiles with S=32
+shapes; at decode time, write one token's data into column 0 and read
+from column 0. The padding columns contain zeros which don't affect
+correctness for elementwise or channel-reduction ops.
 
-3. **Input count mismatch**: post_attn MIL has 2 inputs (`a_input0`
-   = residual, `a_input1` = attention output), but `decode()` only
-   fills `input_tensors[1]` conditionally (when `num_pre_outputs > 3`
-   at line ~437). If this condition is false, post_attn gets only 1
-   written input but the compiled model expects 2.
+**Additional constraint — single input per eval call:** maderix/ANE
+reports that multi-input ANE requests cause 0x1d error. Ironmill's
+`post_attn` sub-programs have 2 inputs (attention output + residual).
+After fixing the shape constraint, this may be the next blocker. The
+workaround is to pack multiple inputs into the spatial dimension of
+a single input tensor (matching how maderix and Orion handle this).
 
-**Debugging approach:**
-1. Add layer/sub-program identification to eval errors
-2. Log the shape and alloc_size of every input/output tensor at eval
-   time vs what the compiled MIL function signature declares
-3. Try running a single-layer model (fewer layers = fewer compiles,
-   faster iteration)
-4. Compare against the working `e2e_compile_and_load_conv_linear` test
-   in `lib.rs` which successfully compiles AND evaluates a conv program
+#### Debugging progress
+
+1. ✅ Added `.map_err()` context → **layer 0 pre_attn** is the first
+   eval that fails
+2. ✅ Isolated to the MIL program itself — fails even when compiled and
+   evaluated in complete isolation (no other programs loaded)
+3. ✅ Narrowed to shape constraint: `[1, 1024, 1, 1]` fails, not op-
+   specific (even `mul(x,x)` fails at this shape)
+4. ✅ Padded S from 1 to 32 after AneLayoutPass in `inference.rs` —
+   sub-programs compile and eval with `[1, 1024, 1, 32]` shapes
+5. ✅ Updated `decode()` with scatter-write / gather-read helpers
+   (`write_f16_padded`, `read_f16_channels`) for NCHW column-0 I/O
+6. ✅ **FP16 baseline inference works end-to-end** — 128 tokens
+   generated at 5.9 tok/s on Qwen3-0.6B (29 layers, ANE-only decode)
+
+#### Remaining: TurboQuant uniform alloc size
+
+TurboQuant's `step_attention` fails with "all input tensors must have
+the same allocation size". TurboQuant compiles its own MIL sub-programs
+(cache-write, attention) independently of `AneInference`. These programs
+have inputs with different shapes (Q tensor vs cache tensor), producing
+different-sized IOSurfaces that fail `validate_uniform_alloc` in
+`runtime.eval()`. Fix: apply the same S-padding and uniform alloc logic
+to TurboQuant's MIL programs in `turboquant.rs` / `turboquant_mil.rs`.
+Note: the multi-input constraint from maderix/ANE may also apply here.
 
 ## Implementation Tasks
 

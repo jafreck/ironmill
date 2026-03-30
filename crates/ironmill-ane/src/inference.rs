@@ -156,6 +156,34 @@ impl AneInference {
                 .map_err(|e| AneError::Other(anyhow::anyhow!("{name} pass failed: {e}")))?;
         }
 
+        // ANE rejects IOSurface-backed tensors when C > ~768 and S < 32.
+        // After AneLayoutPass, tensors are in [1, C, 1, S] format.
+        // Pad dim 3 (S) to at least 32. The decode loop writes one token
+        // to column 0 and reads from column 0.
+        const ANE_MIN_SEQ: usize = 32;
+        for func in program.functions.values_mut() {
+            for (_, ty) in &mut func.inputs {
+                if ty.shape.len() == 4 {
+                    if let Some(s) = ty.shape[3] {
+                        if s < ANE_MIN_SEQ {
+                            ty.shape[3] = Some(ANE_MIN_SEQ);
+                        }
+                    }
+                }
+            }
+            for op in &mut func.body.operations {
+                for t in op.output_types.iter_mut().flatten() {
+                    if t.shape.len() == 4 {
+                        if let Some(s) = t.shape[3] {
+                            if s < ANE_MIN_SEQ {
+                                t.shape[3] = Some(ANE_MIN_SEQ);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 2. Split with attention boundary.
         // This strips attention + RoPE ops (which contain concat) from
         // the sub-programs that will be compiled for ANE.
@@ -274,10 +302,6 @@ impl AneInference {
         });
 
         // 6. Compile and load per-layer sub-programs for ANE.
-        eprintln!(
-            "  [debug] Compiling {} layers: {:?}",
-            num_layers, layer_numbers
-        );
         let mut layers = Vec::with_capacity(num_layers);
         for &layer_n in &layer_numbers {
             let pre_sub = pre_attn_map.get(&layer_n).ok_or_else(|| {
@@ -353,13 +377,18 @@ impl AneInference {
         for layer_idx in 0..num_layers {
             // Pre-attention: norm → Q/K/V projection
             let layer = &mut self.layers[layer_idx];
-            layer.pre_attn.input_tensors[0].write_f16(&hidden)?;
+            write_f16_padded(&mut layer.pre_attn.input_tensors[0], &hidden)?;
             {
                 let in_refs: Vec<&AneTensor> = layer.pre_attn.input_tensors.iter().collect();
                 let mut out_refs: Vec<&mut AneTensor> =
                     layer.pre_attn.output_tensors.iter_mut().collect();
                 self.runtime
-                    .eval(&layer.pre_attn.loaded, &in_refs, &mut out_refs)?;
+                    .eval(&layer.pre_attn.loaded, &in_refs, &mut out_refs)
+                    .map_err(|e| {
+                        AneError::Other(anyhow::anyhow!(
+                            "layer {layer_idx} pre_attn eval failed: {e}"
+                        ))
+                    })?;
             }
 
             // Read Q, K_proj, V_proj from pre_attn outputs.
@@ -369,8 +398,6 @@ impl AneInference {
 
             // Attention (divergent path)
             let attn_out_data = if let Some(tq) = &mut self.turboquant {
-                // TurboQuant: rotate+quantize K/V to INT8, write to cache,
-                // dequant+attend from INT8 cache
                 let q = &layer.pre_attn.output_tensors[0];
                 let k_proj = if num_pre_outputs > 1 {
                     &layer.pre_attn.output_tensors[1]
@@ -382,18 +409,23 @@ impl AneInference {
                 } else {
                     &layer.pre_attn.output_tensors[0]
                 };
-                let attn_tensor = tq.step_attention(layer_idx, q, k_proj, v_proj)?;
-                attn_tensor.read_f16()?
+                let attn_tensor = tq
+                    .step_attention(layer_idx, q, k_proj, v_proj)
+                    .map_err(|e| {
+                        AneError::Other(anyhow::anyhow!(
+                            "layer {layer_idx} turboquant step_attention failed: {e}"
+                        ))
+                    })?;
+                read_f16_channels(&attn_tensor)?
             } else if let Some(ref mut caches) = self.fp16_kv_caches {
-                // FP16 baseline: manually manage KV cache.
-                let q_data = layer.pre_attn.output_tensors[0].read_f16()?;
+                let q_data = read_f16_channels(&layer.pre_attn.output_tensors[0])?;
                 let k_data = if num_pre_outputs > 1 {
-                    layer.pre_attn.output_tensors[1].read_f16()?
+                    read_f16_channels(&layer.pre_attn.output_tensors[1])?
                 } else {
                     q_data.clone()
                 };
                 let v_data = if num_pre_outputs > 2 {
-                    layer.pre_attn.output_tensors[2].read_f16()?
+                    read_f16_channels(&layer.pre_attn.output_tensors[2])?
                 } else {
                     q_data.clone()
                 };
@@ -416,8 +448,13 @@ impl AneInference {
                     let mut out_refs: Vec<&mut AneTensor> =
                         fp16_attn.output_tensors.iter_mut().collect();
                     self.runtime
-                        .eval(&fp16_attn.loaded, &in_refs, &mut out_refs)?;
-                    fp16_attn.output_tensors[0].read_f16()?
+                        .eval(&fp16_attn.loaded, &in_refs, &mut out_refs)
+                        .map_err(|e| {
+                            AneError::Other(anyhow::anyhow!(
+                                "layer {layer_idx} fp16_attn eval failed: {e}"
+                            ))
+                        })?;
+                    read_f16_channels(&fp16_attn.output_tensors[0])?
                 } else {
                     // No compiled attention — return Q as pass-through
                     // (real deployment would have attention sub-programs).
@@ -432,20 +469,25 @@ impl AneInference {
             // Post-attention: O proj → residual → FFN → residual
             let layer = &mut self.layers[layer_idx];
             if let Some(ref mut post_attn) = layer.post_attn {
-                post_attn.input_tensors[0].write_f16(&attn_out_data)?;
+                write_f16_padded(&mut post_attn.input_tensors[0], &attn_out_data)?;
                 // If post_attn expects a residual_hidden input, wire it.
                 if post_attn.input_tensors.len() > 1 && num_pre_outputs > 3 {
-                    let residual = layer.pre_attn.output_tensors[3].read_f16()?;
-                    post_attn.input_tensors[1].write_f16(&residual)?;
+                    let residual = read_f16_channels(&layer.pre_attn.output_tensors[3])?;
+                    write_f16_padded(&mut post_attn.input_tensors[1], &residual)?;
                 }
                 {
                     let in_refs: Vec<&AneTensor> = post_attn.input_tensors.iter().collect();
                     let mut out_refs: Vec<&mut AneTensor> =
                         post_attn.output_tensors.iter_mut().collect();
                     self.runtime
-                        .eval(&post_attn.loaded, &in_refs, &mut out_refs)?;
+                        .eval(&post_attn.loaded, &in_refs, &mut out_refs)
+                        .map_err(|e| {
+                            AneError::Other(anyhow::anyhow!(
+                                "layer {layer_idx} post_attn eval failed: {e}"
+                            ))
+                        })?;
                 }
-                hidden = post_attn.output_tensors[0].read_f16()?;
+                hidden = read_f16_channels(&post_attn.output_tensors[0])?;
             } else {
                 // No post_attn sub-program — use attention output directly.
                 hidden = attn_out_data;
@@ -535,6 +577,44 @@ impl AneInference {
     pub fn is_turboquant(&self) -> bool {
         self.turboquant.is_some()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Padded I/O helpers for ANE minimum-S constraint
+// ---------------------------------------------------------------------------
+
+/// Write `data` (C elements for one token) into an ANE tensor with shape
+/// `[1, C, 1, S]` at sequence position 0. ANE uses NCHW layout, so element
+/// `(c, s)` is at flat index `c * S + s`. The remaining S-1 columns are
+/// zero-padded.
+fn write_f16_padded(tensor: &mut AneTensor, data: &[f16]) -> Result<()> {
+    let [_, channels, _, seq_len] = tensor.shape();
+    if seq_len == 1 {
+        // No padding needed — direct write.
+        return tensor.write_f16(data);
+    }
+    let total = channels * seq_len;
+    let mut padded = vec![f16::ZERO; total];
+    let c = data.len().min(channels);
+    for i in 0..c {
+        padded[i * seq_len] = data[i]; // column 0 of each channel row
+    }
+    tensor.write_f16(&padded)
+}
+
+/// Read C elements (one token at column 0) from an ANE tensor with shape
+/// `[1, C, 1, S]`. Inverse of `write_f16_padded`.
+fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
+    let [_, channels, _, seq_len] = tensor.shape();
+    if seq_len == 1 {
+        return tensor.read_f16();
+    }
+    let full = tensor.read_f16()?;
+    let mut out = Vec::with_capacity(channels);
+    for c in 0..channels {
+        out.push(full[c * seq_len]); // column 0 of each channel row
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
