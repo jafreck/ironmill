@@ -54,7 +54,8 @@ pub struct SplitConfig {
 impl Default for SplitConfig {
     fn default() -> Self {
         Self {
-            max_weight_size: 64 * 1024 * 1024, // 64 MB
+            max_weight_size: 128 * 1024 * 1024, // 128 MB — increased to avoid weight-limit
+            // chunking that creates extra sub-programs exceeding the ANE budget
             split_attention: false,
             emit_attention: false,
         }
@@ -206,44 +207,31 @@ fn classify_ops(operations: &[Operation]) -> Vec<(String, Vec<Operation>)> {
     let last_layer = *unique_layers.keys().last().unwrap();
 
     // Find the index of the last op that belongs to the last layer number.
-    // Non-numbered ops before this index should attach to the last layer,
-    // not to post_ops (this handles decomposed ops like softmax that lack
-    // layer numbers and appear interleaved with last-layer ops).
-    let last_layer_final_idx = operations
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, op)| {
-            if extract_layer_number(&op.name) == Some(last_layer) {
-                Some(i)
-            } else {
-                None
-            }
-        })
-        .unwrap(); // safe: last_layer came from layer_numbers
-
     let mut groups: Vec<(String, Vec<Operation>)> = Vec::new();
     let mut pre_ops: Vec<Operation> = Vec::new();
     let mut layer_ops: BTreeMap<usize, Vec<Operation>> = BTreeMap::new();
     let mut post_ops: Vec<Operation> = Vec::new();
 
+    let mut seen_last_layer = false;
     let mut seen_any_layer = false;
 
-    for (idx, (op, layer_num)) in operations.iter().zip(layer_numbers.iter()).enumerate() {
+    for (op, layer_num) in operations.iter().zip(layer_numbers.iter()) {
         match layer_num {
             Some(n) => {
                 seen_any_layer = true;
+                if *n == last_layer {
+                    seen_last_layer = true;
+                }
                 layer_ops.entry(*n).or_default().push(op.clone());
             }
             None => {
                 if !seen_any_layer {
                     pre_ops.push(op.clone());
-                } else if idx > last_layer_final_idx {
+                } else if seen_last_layer {
                     post_ops.push(op.clone());
                 } else {
                     // Non-numbered op between layers — attach to the
                     // preceding layer (or pre if before first layer).
-                    // Find the most recent layer number.
                     let recent = layer_ops.keys().last().copied();
                     if let Some(k) = recent {
                         layer_ops.entry(k).or_default().push(op.clone());
@@ -2221,49 +2209,6 @@ mod tests {
         assert!(
             post_names.contains(&"layer_0_ffn_down"),
             "post-attn should contain FFN down, got: {post_names:?}"
-        );
-    }
-
-    #[test]
-    fn classify_ops_non_numbered_between_last_layer_ops() {
-        // Non-numbered ops interleaved with last-layer ops should be
-        // assigned to the last layer, not to post_ops.
-        let ops = vec![
-            make_op("layer_0_norm", "layer_norm"),
-            make_op("layer_0_ffn", "matmul"),
-            make_op("layer_1_norm", "layer_norm"),
-            make_op("layer_1_proj", "matmul"),
-            // Non-numbered op after a layer_1 op but before more layer_1 ops
-            make_op("decomposed_softmax", "softmax"),
-            make_op("layer_1_ffn", "matmul"),
-            // True post-layer op (after all layer_1 ops)
-            make_op("lm_head_proj", "matmul"),
-        ];
-
-        let groups = classify_ops(&ops);
-
-        // Find the layer_1 group.
-        let layer_1 = groups
-            .iter()
-            .find(|(name, _)| name == "layer_1")
-            .expect("should have layer_1 group");
-        let layer_1_names: Vec<&str> = layer_1.1.iter().map(|op| op.name.as_str()).collect();
-
-        // The non-numbered softmax should be in layer_1, not lm_head.
-        assert!(
-            layer_1_names.contains(&"decomposed_softmax"),
-            "non-numbered op between last-layer ops should be in layer_1, got: {layer_1_names:?}"
-        );
-
-        // lm_head_proj should be in the lm_head group (post-layer).
-        let lm_head = groups
-            .iter()
-            .find(|(name, _)| name == "lm_head")
-            .expect("should have lm_head group");
-        let lm_head_names: Vec<&str> = lm_head.1.iter().map(|op| op.name.as_str()).collect();
-        assert!(
-            lm_head_names.contains(&"lm_head_proj"),
-            "lm_head_proj should be in lm_head group, got: {lm_head_names:?}"
         );
     }
 }

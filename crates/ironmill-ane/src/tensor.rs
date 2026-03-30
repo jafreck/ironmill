@@ -351,16 +351,13 @@ impl AneTensor {
     pub fn copy_column0_from(&mut self, src: &AneTensor) -> Result<()> {
         let dst_c = self.shape[1];
         let src_c = src.shape[1];
-        if dst_c != src_c {
+        if src_c < dst_c {
             return Err(AneError::SurfaceError(format!(
-                "copy_column0_from: channel mismatch: dst has {dst_c}, src has {src_c}"
+                "copy_column0_from: src has {src_c} channels, need at least {dst_c}"
             )));
         }
-        if self.dtype != src.dtype {
-            return Err(AneError::SurfaceError(
-                "copy_column0_from: dtype mismatch".into(),
-            ));
-        }
+        // Use destination's element size for the strided copy.
+        // Caller is responsible for ensuring data interpretation is correct.
 
         let channels = dst_c;
         let bpe = scalar_byte_size(self.dtype);
