@@ -196,29 +196,40 @@ fn classify_ops(operations: &[Operation]) -> Vec<(String, Vec<Operation>)> {
 
     let last_layer = *unique_layers.keys().last().unwrap();
 
+    // Find the index of the last op that belongs to the last layer number.
+    // Non-numbered ops before this index should attach to the last layer,
+    // not to post_ops (this handles decomposed ops like softmax that lack
+    // layer numbers and appear interleaved with last-layer ops).
+    let last_layer_final_idx = operations
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, op)| {
+            if extract_layer_number(&op.name) == Some(last_layer) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .unwrap(); // safe: last_layer came from layer_numbers
+
     let mut groups: Vec<(String, Vec<Operation>)> = Vec::new();
     let mut pre_ops: Vec<Operation> = Vec::new();
     let mut layer_ops: BTreeMap<usize, Vec<Operation>> = BTreeMap::new();
     let mut post_ops: Vec<Operation> = Vec::new();
 
-    // Track whether we've seen the last layer yet, so trailing non-layer ops
-    // go into "post".
-    let mut seen_last_layer = false;
     let mut seen_any_layer = false;
 
-    for (op, layer_num) in operations.iter().zip(layer_numbers.iter()) {
+    for (idx, (op, layer_num)) in operations.iter().zip(layer_numbers.iter()).enumerate() {
         match layer_num {
             Some(n) => {
                 seen_any_layer = true;
-                if *n == last_layer {
-                    seen_last_layer = true;
-                }
                 layer_ops.entry(*n).or_default().push(op.clone());
             }
             None => {
                 if !seen_any_layer {
                     pre_ops.push(op.clone());
-                } else if seen_last_layer {
+                } else if idx > last_layer_final_idx {
                     post_ops.push(op.clone());
                 } else {
                     // Non-numbered op between layers — attach to the
@@ -427,10 +438,30 @@ fn find_o_projection(
 }
 
 /// Find softmax ops (the attention core marker).
+///
+/// Matches standard `softmax` as well as variants produced by different
+/// ONNX→MIL decomposition paths (`reduce_softmax`, `_softmax` suffixes,
+/// and fused `scaled_dot_product_attention` / `sdpa` ops).
 fn find_softmax_ops(ops: &[Operation]) -> Vec<usize> {
     ops.iter()
         .enumerate()
-        .filter(|(_, op)| op.op_type == "softmax")
+        .filter(|(_, op)| op.op_type == "softmax" || op.op_type.ends_with("_softmax"))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Find fused attention ops (GQA/MHA that were not decomposed into
+/// individual matmul/softmax ops). These serve as both the attention
+/// core marker AND the attention cluster.
+fn find_fused_attention_ops(ops: &[Operation]) -> Vec<usize> {
+    ops.iter()
+        .enumerate()
+        .filter(|(_, op)| {
+            op.op_type == "scaled_dot_product_attention"
+                || op.op_type == "sdpa"
+                || op.op_type == "GroupQueryAttention"
+                || op.op_type == "MultiHeadAttention"
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -456,6 +487,13 @@ fn find_softmax_ops(ops: &[Operation]) -> Vec<usize> {
 /// Falls back to the legacy name-based heuristic if structural detection
 /// fails.
 fn split_at_attention_boundary(ops: &[Operation]) -> (Vec<Operation>, Vec<Operation>) {
+    if std::env::var("IRONMILL_SPLIT_DEBUG").is_ok() {
+        eprintln!("split_at_attention_boundary: {} ops", ops.len());
+        for (i, op) in ops.iter().enumerate() {
+            eprintln!("  [{i}] {} (type: {})", op.name, op.op_type);
+        }
+    }
+
     if let Some(result) = try_structural_split(ops) {
         return result;
     }
@@ -475,18 +513,25 @@ fn try_structural_split(ops: &[Operation]) -> Option<(Vec<Operation>, Vec<Operat
 
     // 1. Find softmax ops — the attention core marker.
     let softmax_indices = find_softmax_ops(ops);
+
+    // 2. If no softmax found, check for fused attention ops (GQA/MHA
+    //    that weren't decomposed into individual ops).
     if softmax_indices.is_empty() {
+        let fused_attn_indices = find_fused_attention_ops(ops);
+        if !fused_attn_indices.is_empty() {
+            return try_fused_attention_split(ops, &graph, &fused_attn_indices);
+        }
         return None;
     }
 
-    // 2. Find Q/K/V projection matmuls (matmul with const weight that
+    // 3. Find Q/K/V projection matmuls (matmul with const weight that
     //    share the same activation input). Expect 2–3.
     let proj_matmuls = find_projection_matmuls(ops, &graph);
     if proj_matmuls.len() < 2 {
         return None;
     }
 
-    // 3. Pre-attn: walk backward from each projection's non-const
+    // 4. Pre-attn: walk backward from each projection's non-const
     //    inputs. These are the ops that feed INTO the projections
     //    (norm, etc.), not the projections or their weights.
     let mut pre_attn_set: HashSet<usize> = HashSet::new();
@@ -499,11 +544,11 @@ fn try_structural_split(ops: &[Operation]) -> Option<(Vec<Operation>, Vec<Operat
         }
     }
 
-    // 4. Find the O-projection: first matmul/linear with const weight
+    // 5. Find the O-projection: first matmul/linear with const weight
     //    reachable forward from softmax (excludes Q/K/V projections).
     let o_proj_idx = find_o_projection(ops, &graph, &softmax_indices, &proj_matmuls);
 
-    // 5. Post-attn: O-projection + everything forward from it.
+    // 6. Post-attn: O-projection + everything forward from it.
     let mut post_attn_set: HashSet<usize> = HashSet::new();
     if let Some(o_idx) = o_proj_idx {
         post_attn_set.insert(o_idx);
@@ -520,7 +565,7 @@ fn try_structural_split(ops: &[Operation]) -> Option<(Vec<Operation>, Vec<Operat
         }
     }
 
-    // 6. Collect pre-attn and post-attn ops in topological order.
+    // 7. Collect pre-attn and post-attn ops in topological order.
     //    Everything not in either set is the attention cluster (stripped).
     let mut pre_attn = Vec::new();
     let mut post_attn = Vec::new();
@@ -535,6 +580,87 @@ fn try_structural_split(ops: &[Operation]) -> Option<(Vec<Operation>, Vec<Operat
     }
 
     // If both halves are empty, fall back.
+    if pre_attn.is_empty() && post_attn.is_empty() {
+        return None;
+    }
+
+    Some((pre_attn, post_attn))
+}
+
+/// Structural split when the attention block is a single fused op
+/// (e.g., `GroupQueryAttention` or `MultiHeadAttention`).
+///
+/// The fused op itself IS the attention cluster. Pre-attn = everything
+/// that feeds into it (walk backward). Post-attn = everything it feeds
+/// into (walk forward).
+fn try_fused_attention_split(
+    ops: &[Operation],
+    graph: &OpGraph,
+    fused_indices: &[usize],
+) -> Option<(Vec<Operation>, Vec<Operation>)> {
+    // Use the first fused attention op as the split point.
+    let fused_idx = fused_indices[0];
+
+    // Walk backward from the fused op to find all ops that feed into it.
+    let mut attn_cluster: HashSet<usize> = HashSet::new();
+    attn_cluster.insert(fused_idx);
+    // Include any other fused attention ops.
+    for &idx in fused_indices {
+        attn_cluster.insert(idx);
+    }
+
+    // Pre-attn: ops that are ancestors of the fused op's non-const inputs.
+    let mut pre_attn_set: HashSet<usize> = HashSet::new();
+    for &pred in &graph.backward[fused_idx] {
+        if !is_const_op(&ops[pred]) {
+            pre_attn_set.insert(pred);
+            pre_attn_set.extend(graph.walk_backward(pred));
+        }
+    }
+
+    // Also include const ops that exclusively feed pre-attn ops.
+    for (i, op) in ops.iter().enumerate() {
+        if !is_const_op(op) || graph.forward[i].is_empty() {
+            continue;
+        }
+        if graph.forward[i].iter().all(|c| pre_attn_set.contains(c)) {
+            pre_attn_set.insert(i);
+        }
+    }
+
+    // Post-attn: everything forward from the fused op.
+    let mut post_attn_set: HashSet<usize> = HashSet::new();
+    for &succ in &graph.forward[fused_idx] {
+        post_attn_set.insert(succ);
+        post_attn_set.extend(graph.walk_forward(succ));
+    }
+
+    // Add const ops that exclusively feed post-attn ops.
+    for (i, op) in ops.iter().enumerate() {
+        if !is_const_op(op) || graph.forward[i].is_empty() {
+            continue;
+        }
+        if !pre_attn_set.contains(&i)
+            && !attn_cluster.contains(&i)
+            && graph.forward[i].iter().all(|c| post_attn_set.contains(c))
+        {
+            post_attn_set.insert(i);
+        }
+    }
+
+    // Collect in topological order.
+    let mut pre_attn = Vec::new();
+    let mut post_attn = Vec::new();
+
+    for (i, op) in ops.iter().enumerate() {
+        if pre_attn_set.contains(&i) {
+            pre_attn.push(op.clone());
+        } else if post_attn_set.contains(&i) {
+            post_attn.push(op.clone());
+        }
+        // else: fused attention cluster → stripped
+    }
+
     if pre_attn.is_empty() && post_attn.is_empty() {
         return None;
     }
@@ -1619,5 +1745,327 @@ mod tests {
         let descendants = graph.walk_forward(1);
         assert!(descendants.contains(&2), "should reach proj");
         assert!(descendants.contains(&3), "should reach act");
+    }
+
+    // -------------------------------------------------------------------
+    // Fused attention and softmax variant tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn structural_split_fused_gqa_op() {
+        // A layer where attention is a single fused GroupQueryAttention op
+        // (not decomposed into matmul/softmax). The structural split should
+        // use the fused op as the attention cluster.
+        let p = "layer_0";
+        let ops = vec![
+            // Input norm
+            make_connected_op(
+                &format!("{p}_norm"),
+                "layer_norm",
+                "hidden_in",
+                &format!("{p}_norm_out"),
+            ),
+            // Q/K/V weight consts (fed directly to the fused op)
+            make_const_op(&format!("{p}_q_weight"), &format!("{p}_q_weight_out")),
+            make_const_op(&format!("{p}_k_weight"), &format!("{p}_k_weight_out")),
+            make_const_op(&format!("{p}_v_weight"), &format!("{p}_v_weight_out")),
+            // Fused GroupQueryAttention op
+            Operation::new("GroupQueryAttention", &format!("{p}_gqa"))
+                .with_input("x", Value::Reference(format!("{p}_norm_out")))
+                .with_input("q_weight", Value::Reference(format!("{p}_q_weight_out")))
+                .with_input("k_weight", Value::Reference(format!("{p}_k_weight_out")))
+                .with_input("v_weight", Value::Reference(format!("{p}_v_weight_out")))
+                .with_output(&format!("{p}_gqa_out")),
+            // O projection
+            make_const_op(&format!("{p}_o_weight"), &format!("{p}_o_weight_out")),
+            make_matmul_op(
+                &format!("{p}_o_proj"),
+                &format!("{p}_gqa_out"),
+                &format!("{p}_o_weight_out"),
+                &format!("{p}_o_proj_out"),
+            ),
+            // FFN
+            make_const_op(&format!("{p}_down_weight"), &format!("{p}_down_weight_out")),
+            make_matmul_op(
+                &format!("{p}_ffn_down"),
+                &format!("{p}_o_proj_out"),
+                &format!("{p}_down_weight_out"),
+                &format!("{p}_ffn_down_out"),
+            ),
+        ];
+
+        let (pre, post) = split_at_attention_boundary(&ops);
+
+        let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
+        let all_returned: HashSet<&str> =
+            pre_names.iter().chain(post_names.iter()).copied().collect();
+
+        // Pre-attn should contain the norm.
+        assert!(
+            pre_names.contains(&"layer_0_norm"),
+            "pre-attn should contain norm, got: {pre_names:?}"
+        );
+
+        // The fused GQA op should be stripped (in the attention cluster).
+        assert!(
+            !all_returned.contains("layer_0_gqa"),
+            "fused GQA op should be stripped (attention cluster), but found in: {all_returned:?}"
+        );
+
+        // Post-attn should contain O projection and FFN.
+        assert!(
+            post_names.contains(&"layer_0_o_proj"),
+            "post-attn should contain O projection, got: {post_names:?}"
+        );
+        assert!(
+            post_names.contains(&"layer_0_ffn_down"),
+            "post-attn should contain FFN down, got: {post_names:?}"
+        );
+    }
+
+    #[test]
+    fn structural_split_sdpa_fused_op() {
+        // A layer where attention is a single fused scaled_dot_product_attention
+        // op. It should be routed through the fused attention path (not the
+        // softmax path).
+        let p = "layer_0";
+        let ops = vec![
+            // Input norm
+            make_connected_op(
+                &format!("{p}_norm"),
+                "layer_norm",
+                "hidden_in",
+                &format!("{p}_norm_out"),
+            ),
+            // Q/K/V weight consts (fed directly to the fused op)
+            make_const_op(&format!("{p}_q_weight"), &format!("{p}_q_weight_out")),
+            make_const_op(&format!("{p}_k_weight"), &format!("{p}_k_weight_out")),
+            make_const_op(&format!("{p}_v_weight"), &format!("{p}_v_weight_out")),
+            // Fused scaled_dot_product_attention op
+            Operation::new("scaled_dot_product_attention", &format!("{p}_sdpa"))
+                .with_input("x", Value::Reference(format!("{p}_norm_out")))
+                .with_input("q_weight", Value::Reference(format!("{p}_q_weight_out")))
+                .with_input("k_weight", Value::Reference(format!("{p}_k_weight_out")))
+                .with_input("v_weight", Value::Reference(format!("{p}_v_weight_out")))
+                .with_output(&format!("{p}_sdpa_out")),
+            // O projection
+            make_const_op(&format!("{p}_o_weight"), &format!("{p}_o_weight_out")),
+            make_matmul_op(
+                &format!("{p}_o_proj"),
+                &format!("{p}_sdpa_out"),
+                &format!("{p}_o_weight_out"),
+                &format!("{p}_o_proj_out"),
+            ),
+            // FFN
+            make_const_op(&format!("{p}_down_weight"), &format!("{p}_down_weight_out")),
+            make_matmul_op(
+                &format!("{p}_ffn_down"),
+                &format!("{p}_o_proj_out"),
+                &format!("{p}_down_weight_out"),
+                &format!("{p}_ffn_down_out"),
+            ),
+        ];
+
+        let (pre, post) = split_at_attention_boundary(&ops);
+
+        let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
+        let all_returned: HashSet<&str> =
+            pre_names.iter().chain(post_names.iter()).copied().collect();
+
+        // Pre-attn should contain the norm.
+        assert!(
+            pre_names.contains(&"layer_0_norm"),
+            "pre-attn should contain norm, got: {pre_names:?}"
+        );
+
+        // The fused SDPA op should be stripped (in the attention cluster).
+        assert!(
+            !all_returned.contains("layer_0_sdpa"),
+            "fused SDPA op should be stripped (attention cluster), but found in: {all_returned:?}"
+        );
+
+        // SDPA must NOT appear in find_softmax_ops.
+        assert!(
+            find_softmax_ops(&ops).is_empty(),
+            "scaled_dot_product_attention should not be detected by find_softmax_ops"
+        );
+
+        // SDPA must appear in find_fused_attention_ops.
+        assert!(
+            !find_fused_attention_ops(&ops).is_empty(),
+            "scaled_dot_product_attention should be detected by find_fused_attention_ops"
+        );
+
+        // Post-attn should contain O projection and FFN.
+        assert!(
+            post_names.contains(&"layer_0_o_proj"),
+            "post-attn should contain O projection, got: {post_names:?}"
+        );
+        assert!(
+            post_names.contains(&"layer_0_ffn_down"),
+            "post-attn should contain FFN down, got: {post_names:?}"
+        );
+    }
+
+    #[test]
+    fn structural_split_softmax_variant_op_type() {
+        // A layer where softmax has a variant op_type (e.g. `reduce_softmax`).
+        let p = "layer_0";
+        let mut ops = vec![
+            // Input norm
+            make_connected_op(
+                &format!("{p}_norm"),
+                "layer_norm",
+                "hidden_in",
+                &format!("{p}_norm_out"),
+            ),
+            // Q/K/V weight consts
+            make_const_op(&format!("{p}_q_weight"), &format!("{p}_q_weight_out")),
+            make_const_op(&format!("{p}_k_weight"), &format!("{p}_k_weight_out")),
+            make_const_op(&format!("{p}_v_weight"), &format!("{p}_v_weight_out")),
+            // Q/K/V projection matmuls
+            make_matmul_op(
+                &format!("{p}_q_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_q_weight_out"),
+                &format!("{p}_q_proj_out"),
+            ),
+            make_matmul_op(
+                &format!("{p}_k_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_k_weight_out"),
+                &format!("{p}_k_proj_out"),
+            ),
+            make_matmul_op(
+                &format!("{p}_v_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_v_weight_out"),
+                &format!("{p}_v_proj_out"),
+            ),
+        ];
+        // QK matmul
+        ops.push(make_matmul_op(
+            &format!("{p}_qk_matmul"),
+            &format!("{p}_q_proj_out"),
+            &format!("{p}_k_proj_out"),
+            &format!("{p}_qk_scores"),
+        ));
+        // Use variant softmax op_type: "reduce_softmax"
+        ops.push(make_connected_op(
+            &format!("{p}_softmax"),
+            "reduce_softmax",
+            &format!("{p}_qk_scores"),
+            &format!("{p}_attn_weights"),
+        ));
+        // AV matmul
+        ops.push(make_matmul_op(
+            &format!("{p}_av_matmul"),
+            &format!("{p}_attn_weights"),
+            &format!("{p}_v_proj_out"),
+            &format!("{p}_av_out"),
+        ));
+        // Output reshape
+        ops.push(make_connected_op(
+            &format!("{p}_out_reshape"),
+            "reshape",
+            &format!("{p}_av_out"),
+            &format!("{p}_out_reshaped"),
+        ));
+        // O projection
+        ops.push(make_const_op(
+            &format!("{p}_o_weight"),
+            &format!("{p}_o_weight_out"),
+        ));
+        ops.push(make_matmul_op(
+            &format!("{p}_o_proj"),
+            &format!("{p}_out_reshaped"),
+            &format!("{p}_o_weight_out"),
+            &format!("{p}_o_proj_out"),
+        ));
+        // FFN
+        ops.push(make_const_op(
+            &format!("{p}_down_weight"),
+            &format!("{p}_down_weight_out"),
+        ));
+        ops.push(make_matmul_op(
+            &format!("{p}_ffn_down"),
+            &format!("{p}_o_proj_out"),
+            &format!("{p}_down_weight_out"),
+            &format!("{p}_ffn_down_out"),
+        ));
+
+        let (pre, post) = split_at_attention_boundary(&ops);
+
+        let pre_names: Vec<&str> = pre.iter().map(|op| op.name.as_str()).collect();
+        let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
+        let all_returned: HashSet<&str> =
+            pre_names.iter().chain(post_names.iter()).copied().collect();
+
+        // Pre-attn should contain the norm.
+        assert!(
+            pre_names.contains(&"layer_0_norm"),
+            "pre-attn should contain norm, got: {pre_names:?}"
+        );
+
+        // The reduce_softmax variant should be detected and stripped.
+        assert!(
+            !all_returned.contains("layer_0_softmax"),
+            "softmax variant should be stripped (attention cluster)"
+        );
+
+        // Post-attn should contain O projection and FFN.
+        assert!(
+            post_names.contains(&"layer_0_o_proj"),
+            "post-attn should contain O projection, got: {post_names:?}"
+        );
+        assert!(
+            post_names.contains(&"layer_0_ffn_down"),
+            "post-attn should contain FFN down, got: {post_names:?}"
+        );
+    }
+
+    #[test]
+    fn classify_ops_non_numbered_between_last_layer_ops() {
+        // Non-numbered ops interleaved with last-layer ops should be
+        // assigned to the last layer, not to post_ops.
+        let ops = vec![
+            make_op("layer_0_norm", "layer_norm"),
+            make_op("layer_0_ffn", "matmul"),
+            make_op("layer_1_norm", "layer_norm"),
+            make_op("layer_1_proj", "matmul"),
+            // Non-numbered op after a layer_1 op but before more layer_1 ops
+            make_op("decomposed_softmax", "softmax"),
+            make_op("layer_1_ffn", "matmul"),
+            // True post-layer op (after all layer_1 ops)
+            make_op("lm_head_proj", "matmul"),
+        ];
+
+        let groups = classify_ops(&ops);
+
+        // Find the layer_1 group.
+        let layer_1 = groups
+            .iter()
+            .find(|(name, _)| name == "layer_1")
+            .expect("should have layer_1 group");
+        let layer_1_names: Vec<&str> = layer_1.1.iter().map(|op| op.name.as_str()).collect();
+
+        // The non-numbered softmax should be in layer_1, not lm_head.
+        assert!(
+            layer_1_names.contains(&"decomposed_softmax"),
+            "non-numbered op between last-layer ops should be in layer_1, got: {layer_1_names:?}"
+        );
+
+        // lm_head_proj should be in the lm_head group (post-layer).
+        let lm_head = groups
+            .iter()
+            .find(|(name, _)| name == "lm_head")
+            .expect("should have lm_head group");
+        let lm_head_names: Vec<&str> = lm_head.1.iter().map(|op| op.name.as_str()).collect();
+        assert!(
+            lm_head_names.contains(&"lm_head_proj"),
+            "lm_head_proj should be in lm_head group, got: {lm_head_names:?}"
+        );
     }
 }
