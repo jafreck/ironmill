@@ -74,6 +74,16 @@ post_attn (ANE)
 **Per-layer overhead: 4 CPU ops (2 reads + 2 writes for cache update), 0 staging buffers**
 **Per-token (29 layers): 116 CPU ops (vs 203 before)**
 
+## Status
+
+| Item | Status | Impact |
+|------|--------|--------|
+| Staging buffer elimination | ✅ Done | −3 CPU copies/layer (87/token) |
+| Unified attention MIL emitter | ✅ Done | Code dedup, no perf change |
+| INT8 cache with ANE-inline cast | ✅ Done | 50% cache memory, +1 ANE cast op |
+| Dequant chain simplification | ✅ Done | Removed `sub(offset)` + `cast` ops |
+| Direct cache write (IOSurface aliasing) | ❌ Future | Would remove last 4 CPU ops/layer |
+
 ## Changes Made
 
 ### Phase B+C: Unified Alloc + Staging Elimination + Unified MIL (Implemented)
