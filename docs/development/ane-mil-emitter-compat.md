@@ -9,86 +9,110 @@
 ## Problem
 
 `ir_to_mil_text.rs` emits MIL text that the private ANE compiler
-(`_ANECompiler`) rejects for real transformer sub-programs, even when
-all ops are individually ANE-supported.
+(`_ANECompiler`) rejects for real transformer sub-programs. The format
+differences are specific and identified:
 
-The E2E inference pipeline (ONNX → MIL IR → passes → split → MIL text
-→ ANE compile) successfully:
-- loads the model and detects architecture
-- splits layers at attention boundaries
-- extracts weights as BLOBFILE entries
-- materializes static shapes
-- decomposes unsupported ops (`reciprocal` → `real_div`)
+1. **`reshape` shape argument** — The emitter prints `reshape(shape=<tensor>, ...)`
+   as a debug placeholder instead of emitting the actual shape value
+   like `reshape(x=..., shape=tensor<int32, [4]>([1,1,1,128]))`.
+   This is a bug in `format_value()` for `Value::Tensor` used as an
+   op input (not a const val).
 
-But `ANECCompile()` returns a generic failure with no error detail.
+2. **BLOBFILE weight references** — `compile_mil_text()` fails on MIL
+   text containing `BLOBFILE(path=..., offset=...)` const values. The
+   working TurboQuant and ane_op_eval generators avoid BLOBFILE entirely
+   by passing weights as function inputs (`a_inputN`). The general
+   emitter needs the same approach: emit weights as function parameters
+   instead of BLOBFILE-backed const ops.
 
 ## Root Cause
 
-The MIL text format produced by `emit_op()` in `ir_to_mil_text.rs`
-doesn't match what the ANE compiler expects for certain argument
-patterns. The emitter was built against simple test programs (add,
-conv, linear) and hasn't been validated against the full op/argument
-space that real ONNX-converted transformer layers produce.
+Two concrete format issues, identified by comparing working MIL text
+(TurboQuant emitter, ane_op_eval examples) against failing MIL text
+(ir_to_mil_text output for ONNX-converted layers):
 
-Known format gaps:
-1. **`reshape(shape=<tensor>)`** — The `shape` argument is emitted as
-   a reference to a const tensor, but ANE may expect an inline int
-   list like `shape=[1, 1, 1, 128]`.
-2. **`reduce_mean(axes=tensor<int32,[1]>([-1]))`** — The axes format
-   may need to be a plain int list, not a typed tensor literal.
-3. **Argument ordering** — ANE's MIL parser may be sensitive to the
-   order of named arguments (e.g., `x=` before `y=`), which `HashMap`
-   iteration doesn't guarantee.
-4. **Op name quoting** — Some op names from ONNX conversion contain
-   dots and slashes that may need escaping or sanitization.
+### Issue 1: `reshape` shape argument (bug)
+
+Working format (TurboQuant emitter):
+```mil
+tensor<fp16, [1,2,64,1]> reshaped = reshape(x=a_input0, shape=tensor<int32, [4]>([1,2,64,1]))[name=string("reshaped")];
+```
+
+Failing format (ir_to_mil_text):
+```mil
+tensor<fp16, [1,1,1,128]> out = reshape(shape=<tensor>, x=input)[name=string("out")];
+```
+
+`<tensor>` is the `Debug` format of a `Value::Tensor` variant, not
+a valid MIL literal. `format_value()` needs to emit the tensor inline
+(e.g., `tensor<int32, [4]>([1,1,1,128])`) when a tensor is used as
+an op argument rather than a const val.
+
+### Issue 2: BLOBFILE incompatibility (design)
+
+Working format (TurboQuant / ane_op_eval):
+```mil
+func main<ios18>(tensor<fp16, [1,64,1,64]> a_input0, tensor<fp16, [1,64,1,64]> a_input2) {
+    // weights are function inputs, populated via IOSurface before eval
+```
+
+Failing format (ir_to_mil_text):
+```mil
+tensor<fp16, [1024,1024]> weight = const()[name=string("weight"),
+    val=tensor<fp16, [1024,1024]>(BLOBFILE(path=string("@model_path/weights/weight.bin"),
+    offset=uint64(64)))];
+```
+
+The ANE compiler's `compile_mil_text()` API does not resolve BLOBFILE
+references correctly, even when the weight dictionary is provided.
+This was confirmed during the BLOBFILE investigation. The fix is to
+emit weight tensors as function inputs and populate them via IOSurface
+before eval, matching the TurboQuant approach.
 
 ## Approach
 
-Systematically test each op format against `ANECCompile()` by building
-minimal MIL text programs with one op each, using the exact argument
-formats from `ir_to_mil_text.rs`. This identifies which ops compile
-and which need format fixes.
+Two targeted fixes, not a broad survey:
 
-### Phase 1 — Minimal op compilation probes
+### Fix 1 — `format_value()` for tensor op arguments
 
-For each op used in transformer layers, generate a minimal MIL program
-and attempt ANE compilation. Record pass/fail and the exact MIL text.
+In `ir_to_mil_text.rs`, when a `Value::Tensor` appears as an op input
+(not a const val), emit it as an inline typed tensor literal:
 
-**Ops to probe** (used in Qwen3-0.6B pre_attn/post_attn):
+```rust
+// Before (bug): prints Debug format
+Value::Tensor { .. } => "<tensor>".to_string(),
 
-| Op | In support matrix | Used as | Priority |
-|---|---|---|---|
-| `add` | ✅ eval | RMSNorm, residual | High |
-| `mul` | ✅ eval | RMSNorm, gating | High |
-| `sub` | ✅ eval | RoPE (if kept) | Medium |
-| `matmul` | ✅ eval | Q/K/V/O projection | High |
-| `reduce_mean` | ✅ eval | RMSNorm | High |
-| `sqrt` | ✅ eval | RMSNorm | High |
-| `real_div` | ⚠️ compile | rsqrt decomposition | High |
-| `reshape` | ✅ eval† | Head reshape | High |
-| `softmax` | ✅ eval | Attention | Medium |
-| `transpose` | ⚠️ compile | Head layout | Medium |
-| `split` | ⚠️ compile | RoPE | Medium |
-| `tile` | ✅ eval† | GQA head tiling | Medium |
-| `silu` | ✅ eval | FFN activation | Medium |
-| `cast` | ⚠️ compile | Type conversion | Low |
+// After: emit as MIL tensor literal
+Value::Tensor { data, shape, dtype } => {
+    // e.g., tensor<int32, [4]>([1, 1, 1, 128])
+    format_inline_tensor(data, shape, dtype)
+}
+```
 
-†Cannot compile standalone; only verified as intermediate ops.
+This only affects ops that take tensor-valued arguments inline (like
+`reshape`'s `shape` parameter). Most ops use scalar or reference args.
 
-### Phase 2 — Argument format normalization
+### Fix 2 — Emit weights as function inputs instead of BLOBFILE
 
-For ops that fail, compare the emitted format against:
-- The TurboQuant MIL emitter (`turboquant_mil.rs`) — which works
-- The `ane_op_eval.rs` example — which also works
-- coremltools' MIL text output for the same ops
+Change `emit_const_op` to emit large weight tensors as additional
+function inputs (`a_inputN`) instead of BLOBFILE-backed const ops.
+The caller pre-populates the IOSurface with weight data before eval.
 
-Fix `emit_op()` argument formatting to match what ANE accepts.
+This matches the working TurboQuant pattern. The weight data is the
+same; only the delivery mechanism changes (IOSurface parameter vs
+embedded const with BLOBFILE reference).
 
-### Phase 3 — Full layer compilation
+```
+Before:
+  func main(tensor<fp16, [1,1,1,1024]> a_input0) {
+      tensor<fp16, [1024,1024]> w = const()[val=BLOBFILE(...)];
+      y = matmul(x=a_input0, y=w);
 
-Once individual ops pass, attempt full layer sub-program compilation.
-If it still fails, bisect by removing ops until the minimal failing
-combination is found.
+After:
+  func main(tensor<fp16, [1,1,1,1024]> a_input0,
+            tensor<fp16, [1024,1024]> a_input1) {  // weight as input
+      y = matmul(x=a_input0, y=a_input1);
+```
 
 ## Files
 
@@ -102,15 +126,11 @@ combination is found.
 
 ## Key Insight
 
-The TurboQuant MIL emitter (`turboquant_mil.rs`) works because it
-generates MIL text by hand-crafting each op's format string — it knows
-exactly what ANE accepts. The general-purpose `ir_to_mil_text.rs`
-emitter uses generic formatting that doesn't account for ANE's
-idiosyncratic MIL parser.
-
-The fix path is to make `ir_to_mil_text.rs` emit ANE-compatible
-format for each op, using `turboquant_mil.rs` and `ane_op_eval.rs`
-as reference implementations for the correct syntax.
+The working MIL text and failing MIL text use the **same dialect and
+syntax** — same function signatures, same named argument format, same
+const op format, same attribute syntax. The two concrete differences
+are the `reshape` bug and BLOBFILE usage. This is not a broad format
+incompatibility requiring systematic testing; it's two specific fixes.
 
 ## Fixes Already Applied (during investigation)
 
