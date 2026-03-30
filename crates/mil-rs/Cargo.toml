@@ -23,6 +23,7 @@ rand = { workspace = true }
 statrs = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }
+ironmill-ane-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -42,7 +43,7 @@ name = "weight_formats"
 harness = false
 
 [features]
-ane-direct = []
+ane-direct = ["dep:ironmill-ane-sys"]
 c-api = []
 
 [build-dependencies]

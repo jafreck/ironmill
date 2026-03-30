@@ -205,15 +205,14 @@ impl AneLmHead {
         let runtime = AneRuntime::new()?;
 
         let num_chunks = vocab_size.div_ceil(LM_HEAD_MAX_CHUNK_CH);
-        let mut chunks = Vec::with_capacity(num_chunks);
+        let mut chunks: Vec<LmHeadChunk> = Vec::with_capacity(num_chunks);
 
         let bytes_per_elem = 2; // fp16
         let row_bytes = hidden_size * bytes_per_elem;
 
         // Track the donor for full-size chunks (all have out_ch == LM_HEAD_MAX_CHUNK_CH).
         // The last chunk may be smaller — it gets its own compilation.
-        // We store the raw model pointer (Copy) to avoid borrow issues with the chunks vec.
-        let mut full_chunk_donor_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut full_chunk_donor_idx: Option<usize> = None;
 
         for chunk_idx in 0..num_chunks {
             let start = chunk_idx * LM_HEAD_MAX_CHUNK_CH;
@@ -229,38 +228,34 @@ impl AneLmHead {
 
             let is_full_size = out_ch == LM_HEAD_MAX_CHUNK_CH;
 
-            let compiled = if is_full_size && !full_chunk_donor_ptr.is_null() {
+            let compiled = if let Some(donor_idx) = full_chunk_donor_idx.filter(|_| is_full_size) {
                 // Patch from the donor — skip compilation.
-                let ptr = AneCompiler::patch_weights(
-                    full_chunk_donor_ptr,
-                    &mil_text,
-                    &[(weight_path, &chunk_data)],
-                )
-                .map_err(|e| AneError::CompileFailed {
-                    status: 0,
-                    context: format!(
-                        "lm_head chunk {chunk_idx} ({out_ch} ch) donor patch failed: {e}"
-                    ),
-                })?;
-                unsafe { CompiledProgram::from_raw(ptr) }
+                let donor = &chunks[donor_idx].compiled;
+                AneCompiler::patch_weights(donor, &mil_text, &[(weight_path, &chunk_data)])
+                    .map_err(|e| AneError::CompileFailed {
+                        status: 0,
+                        context: format!(
+                            "lm_head chunk {chunk_idx} ({out_ch} ch) donor patch failed: {e}"
+                        ),
+                    })?
             } else {
                 // Full compile (first full-size chunk, or the smaller tail chunk).
-                let ptr = AneCompiler::compile_mil_text(&mil_text, &[(weight_path, &chunk_data)])
-                    .map_err(|e| AneError::CompileFailed {
-                    status: 0,
-                    context: format!(
-                        "lm_head chunk {chunk_idx} ({out_ch} ch) compilation failed: {e}"
-                    ),
-                })?;
-                unsafe { CompiledProgram::from_raw(ptr) }
+                AneCompiler::compile_mil_text(&mil_text, &[(weight_path, &chunk_data)]).map_err(
+                    |e| AneError::CompileFailed {
+                        status: 0,
+                        context: format!(
+                            "lm_head chunk {chunk_idx} ({out_ch} ch) compilation failed: {e}"
+                        ),
+                    },
+                )?
             };
             // Unload to free ANE slots — lm_head uses eval_compiled (called
             // 10 times per token, load/unload overhead is ~1ms total).
             runtime.unload_compiled(&compiled);
 
-            // Set the donor pointer once the first full-size chunk is compiled.
-            if is_full_size && full_chunk_donor_ptr.is_null() {
-                full_chunk_donor_ptr = compiled.model;
+            // Set the donor index once the first full-size chunk is compiled.
+            if is_full_size && full_chunk_donor_idx.is_none() {
+                full_chunk_donor_idx = Some(chunks.len());
             }
 
             // ANE requires all I/O tensors in one eval to have the same alloc size.
@@ -805,14 +800,13 @@ impl AneInference {
             let mil = turboquant_mil::emit_fp16_attention_mil(nh, nkv, hd, msl, msl);
             let dump_path = "/tmp/ironmill_debug_fp16_attn_handwritten.mil";
             let _ = std::fs::write(dump_path, &mil);
-            let attn_ptr =
+            let attn_compiled =
                 AneCompiler::compile_mil_text(&mil, &[]).map_err(|e| AneError::CompileFailed {
                     status: 0,
                     context: format!(
                         "FP16 attention compilation failed: {e} (MIL dumped to {dump_path})"
                     ),
                 })?;
-            let attn_compiled = unsafe { CompiledProgram::from_raw(attn_ptr) };
             // Keep loaded — it's only 1 program, well within budget.
             // Using eval_raw avoids the ~5ms loadWithQoS cost per layer.
 
@@ -929,7 +923,11 @@ impl AneInference {
                 let mut out_refs: Vec<&mut AneTensor> =
                     layer.pre_attn.output_tensors.iter_mut().collect();
                 self.runtime
-                    .eval_raw(layer.pre_attn.compiled.model, &in_refs, &mut out_refs)
+                    .eval_raw(
+                        layer.pre_attn.compiled.as_raw_ptr(),
+                        &in_refs,
+                        &mut out_refs,
+                    )
                     .map_err(|e| {
                         AneError::Other(anyhow::anyhow!(
                             "layer {layer_idx} pre_attn eval failed: {e}"
@@ -1017,7 +1015,7 @@ impl AneInference {
                     let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
                     self.runtime
                         .eval_raw(
-                            compiled.model,
+                            compiled.as_raw_ptr(),
                             &[q_staging, k_cache, v_cache],
                             &mut [out_staging],
                         )
@@ -1085,7 +1083,7 @@ impl AneInference {
                     let mut out_refs: Vec<&mut AneTensor> =
                         post_attn.output_tensors.iter_mut().collect();
                     self.runtime
-                        .eval_raw(post_attn.compiled.model, &in_refs, &mut out_refs)
+                        .eval_raw(post_attn.compiled.as_raw_ptr(), &in_refs, &mut out_refs)
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} post_attn eval failed: {e}"
@@ -1314,7 +1312,7 @@ fn compile_and_load_sub(
         .map(|(path, data)| (path.as_str(), data.as_slice()))
         .collect();
 
-    let ptr = AneCompiler::compile_mil_text(&mil_text, &weight_slices).map_err(|e| {
+    let compiled = AneCompiler::compile_mil_text(&mil_text, &weight_slices).map_err(|e| {
         // Collect op types for diagnosis.
         let op_types: Vec<&str> = program
             .main()
@@ -1334,7 +1332,6 @@ fn compile_and_load_sub(
             ),
         }
     })?;
-    let compiled = unsafe { CompiledProgram::from_raw(ptr) };
 
     // Pre-allocate I/O tensors with uniform sizing.
     // Note: we do NOT call runtime.load_program() — the program is
@@ -1404,7 +1401,7 @@ fn compile_and_load_sub_with_donor(
         .map(|(path, data)| (path.as_str(), data.as_slice()))
         .collect();
 
-    let ptr = AneCompiler::patch_weights(donor.model, &mil_text, &weight_slices).map_err(|e| {
+    let compiled = AneCompiler::patch_weights(donor, &mil_text, &weight_slices).map_err(|e| {
         AneError::CompileFailed {
             status: 0,
             context: format!(
@@ -1414,7 +1411,6 @@ fn compile_and_load_sub_with_donor(
             ),
         }
     })?;
-    let compiled = unsafe { CompiledProgram::from_raw(ptr) };
 
     let input_shapes: Vec<_> = sub.inputs.iter().map(|td| (td.shape, td.dtype)).collect();
     let output_shapes: Vec<_> = sub.outputs.iter().map(|td| (td.shape, td.dtype)).collect();

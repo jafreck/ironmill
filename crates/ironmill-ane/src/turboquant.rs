@@ -7,7 +7,7 @@ use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard}
 
 use half::f16;
 
-use crate::program::{CompiledProgram, LoadedProgram};
+use crate::program::LoadedProgram;
 use crate::runtime::AneRuntime;
 use crate::tensor::AneTensor;
 use crate::turboquant_mil;
@@ -407,36 +407,33 @@ impl TurboQuantModel {
         // --- cache-write sub-program ---
         let (cw_mil, cw_weights) = turboquant_mil::emit_cache_write_mil(&config);
         // Weights are delivered as function inputs, not BLOBFILE — pass empty weights
-        let cw_ptr =
+        let cw_compiled =
             AneCompiler::compile_mil_text(&cw_mil, &[]).map_err(|e| AneError::CompileFailed {
                 status: 0,
                 context: format!("cache-write compilation failed: {e}"),
             })?;
-        let cw_compiled = unsafe { CompiledProgram::from_raw(cw_ptr) };
         let cache_write_program = runtime.load_program(&cw_compiled)?;
 
         // --- attention sub-program ---
         let (attn_mil, attn_weights) =
             turboquant_mil::emit_attention_mil(&config, config.max_seq_len);
-        let attn_ptr =
+        let attn_compiled =
             AneCompiler::compile_mil_text(&attn_mil, &[]).map_err(|e| AneError::CompileFailed {
                 status: 0,
                 context: format!("attention compilation failed: {e}"),
             })?;
-        let attn_compiled = unsafe { CompiledProgram::from_raw(attn_ptr) };
         let attention_program = runtime.load_program(&attn_compiled)?;
 
         // --- QJL correction sub-program (optional) ---
         let qjl_program = if config.enable_qjl {
             let (qjl_mil, _qjl_weights) =
                 turboquant_mil::emit_qjl_correction_mil(&config, config.max_seq_len);
-            let qjl_ptr = AneCompiler::compile_mil_text(&qjl_mil, &[]).map_err(|e| {
+            let qjl_compiled = AneCompiler::compile_mil_text(&qjl_mil, &[]).map_err(|e| {
                 AneError::CompileFailed {
                     status: 0,
                     context: format!("QJL correction compilation failed: {e}"),
                 }
             })?;
-            let qjl_compiled = unsafe { CompiledProgram::from_raw(qjl_ptr) };
             Some(runtime.load_program(&qjl_compiled)?)
         } else {
             None

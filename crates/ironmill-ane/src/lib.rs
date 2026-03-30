@@ -44,7 +44,7 @@ use mil_rs::ir::ScalarType;
 
 use crate::blobfile::BlobFileWriter;
 use crate::cache::ProgramCache;
-use crate::program::{CompiledProgram, LoadedProgram};
+use crate::program::LoadedProgram;
 use crate::runtime::AneRuntime;
 use crate::split::{SplitConfig, split_for_ane};
 use crate::tensor::{AneTensor, IOSurfaceError, uniform_alloc_size};
@@ -237,31 +237,28 @@ impl AneModel {
                 .map(|(path, data)| (path.as_str(), data.as_slice()))
                 .collect();
 
-            let compiled = if cache.contains(&cache_key) {
-                let ptr =
-                    AneCompiler::compile_mil_text(&mil_text, &weight_slices).map_err(|e| {
-                        AneError::CompileFailed {
+            let compiled =
+                if cache.contains(&cache_key) {
+                    let compiled = AneCompiler::compile_mil_text(&mil_text, &weight_slices)
+                        .map_err(|e| AneError::CompileFailed {
                             status: 0,
                             context: format!("{e}"),
-                        }
-                    })?;
-                cache.record_compilation();
-                CompiledProgram { model: ptr }
-            } else {
-                let ptr =
-                    AneCompiler::compile_mil_text(&mil_text, &weight_slices).map_err(|e| {
-                        AneError::CompileFailed {
+                        })?;
+                    cache.record_compilation();
+                    compiled
+                } else {
+                    let compiled = AneCompiler::compile_mil_text(&mil_text, &weight_slices)
+                        .map_err(|e| AneError::CompileFailed {
                             status: 0,
                             context: format!("{e}"),
-                        }
-                    })?;
-                cache.record_compilation();
-                if let Some(disk_path) = cache.disk_path_for(&cache_key) {
-                    std::fs::create_dir_all(&disk_path).ok();
-                    cache.insert(cache_key, disk_path);
-                }
-                CompiledProgram { model: ptr }
-            };
+                        })?;
+                    cache.record_compilation();
+                    if let Some(disk_path) = cache.disk_path_for(&cache_key) {
+                        std::fs::create_dir_all(&disk_path).ok();
+                        cache.insert(cache_key, disk_path);
+                    }
+                    compiled
+                };
 
             // 4e. Load into runtime
             let loaded = runtime.load_program(&compiled)?;

@@ -454,11 +454,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "ironmill-ane-sys",
  "ironmill-iosurface",
  "ironmill-runtime",
  "mil-rs",
  "serde_json",
  "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "ironmill-ane-sys"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 
@@ -645,6 +653,7 @@ dependencies = [
  "glob-match",
  "half",
  "indexmap",
+ "ironmill-ane-sys",
  "memmap2",
  "prost",
  "prost-build",

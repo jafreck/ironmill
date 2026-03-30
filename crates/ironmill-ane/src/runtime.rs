@@ -1,8 +1,7 @@
 //! ANE runtime — `_ANEInMemoryModel` lifecycle and program execution.
 //!
-//! Wraps the private ANE classes for loading compiled programs and
-//! executing inference on the Apple Neural Engine, following Orion's
-//! actual API (`_ANEInMemoryModel`, `_ANERequest`, `_ANEIOSurfaceObject`).
+//! Wraps [`ironmill_ane_sys::AneRuntime`] with tensor-level validation
+//! and conversion from [`AneTensor`] to raw IOSurface pointers.
 //!
 //! `AneRuntime` is `Send` but **not** `Sync` — the underlying ANE objects
 //! are assumed thread-unsafe. Use one runtime per thread or wrap in a `Mutex`.
@@ -13,113 +12,17 @@ use crate::program::{CompiledProgram, LoadedProgram};
 use crate::tensor::AneTensor;
 use crate::{AneError, Result};
 
-// ── Objective-C FFI (macOS only) ─────────────────────────────────
-
-#[cfg(target_os = "macos")]
-#[link(name = "objc", kind = "dylib")]
-unsafe extern "C" {
-    fn objc_getClass(name: *const u8) -> *mut c_void;
-    fn sel_registerName(name: *const u8) -> *mut c_void;
-    fn objc_msgSend(receiver: *mut c_void, sel: *mut c_void) -> *mut c_void;
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlopen(path: *const u8, mode: i32) -> *mut c_void;
-}
-
-#[cfg(target_os = "macos")]
-const RTLD_NOW: i32 = 0x2;
-
-/// QoS value used for compile/load/eval (matches Orion's constant of 21).
-#[cfg(target_os = "macos")]
-const ANE_QOS: i64 = 21;
-
-/// Create a null-terminated byte pointer from a string literal.
-macro_rules! sel {
-    ($s:expr) => {
-        concat!($s, "\0").as_ptr()
-    };
-}
-
-// ── CoreFoundation / ObjC helpers (macOS only) ───────────────────
-
-#[cfg(target_os = "macos")]
-mod cf {
-    use std::ffi::c_void;
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        pub fn CFRelease(cf: *mut c_void);
-    }
-
-    #[link(name = "objc", kind = "dylib")]
-    unsafe extern "C" {
-        fn objc_getClass(name: *const u8) -> *mut c_void;
-        fn sel_registerName(name: *const u8) -> *mut c_void;
-        fn objc_msgSend(receiver: *mut c_void, sel: *mut c_void) -> *mut c_void;
-    }
-
-    /// Create an empty `NSMutableArray`.
-    pub unsafe fn ns_mutable_array() -> *mut c_void {
-        unsafe {
-            let cls = objc_getClass(sel!("NSMutableArray"));
-            type NewFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-            let new_sel = sel_registerName(sel!("new"));
-            let f: NewFn = std::mem::transmute(objc_msgSend as *const ());
-            f(cls, new_sel)
-        }
-    }
-
-    /// Append an object to an `NSMutableArray`.
-    pub unsafe fn ns_array_add(array: *mut c_void, object: *mut c_void) {
-        unsafe {
-            type AddFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
-            let sel = sel_registerName(sel!("addObject:"));
-            let f: AddFn = std::mem::transmute(objc_msgSend as *const ());
-            f(array, sel, object);
-        }
-    }
-
-    /// Create an empty `NSDictionary`.
-    pub unsafe fn ns_empty_dict() -> *mut c_void {
-        unsafe {
-            let cls = objc_getClass(sel!("NSDictionary"));
-            type NewFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-            let new_sel = sel_registerName(sel!("new"));
-            let f: NewFn = std::mem::transmute(objc_msgSend as *const ());
-            f(cls, new_sel)
-        }
-    }
-
-    /// Create an `NSNumber` from an integer.
-    pub unsafe fn ns_number(value: i64) -> *mut c_void {
-        unsafe {
-            let cls = objc_getClass(sel!("NSNumber"));
-            type NumFn = unsafe extern "C" fn(*mut c_void, *mut c_void, i64) -> *mut c_void;
-            let sel = sel_registerName(sel!("numberWithLongLong:"));
-            let f: NumFn = std::mem::transmute(objc_msgSend as *const ());
-            f(cls, sel, value)
-        }
-    }
-}
-
 // ── AneRuntime ───────────────────────────────────────────────────
 
 /// ANE runtime wrapping the private ANE framework classes.
 ///
-/// Resolves `_ANEIOSurfaceObject` and `_ANERequest` classes on init.
-/// The `_ANEInMemoryModel` (compiled + loaded) is the program handle.
+/// Delegates to [`ironmill_ane_sys::AneRuntime`] for the low-level
+/// Objective-C interop, adding tensor validation and IOSurface extraction.
 pub struct AneRuntime {
-    /// `_ANEIOSurfaceObject` class pointer.
-    aio_cls: *mut c_void,
-    /// `_ANERequest` class pointer.
-    req_cls: *mut c_void,
+    inner: ironmill_ane_sys::AneRuntime,
 }
 
-// SAFETY: The class pointers are only accessed through &self methods.
-// Not Sync because the underlying ANE framework is not thread-safe.
+// SAFETY: The inner runtime is Send; we add no shared mutable state.
 unsafe impl Send for AneRuntime {}
 
 // ── Validation helpers (platform-independent) ────────────────────
@@ -160,104 +63,41 @@ fn validate_nonempty(inputs: &[&AneTensor], outputs: &[&mut AneTensor]) -> Resul
 #[cfg(target_os = "macos")]
 impl AneRuntime {
     /// Initialize the ANE runtime.
-    ///
-    /// `dlopen`s the AppleNeuralEngine framework and resolves the
-    /// `_ANEIOSurfaceObject` and `_ANERequest` classes.
     pub fn new() -> Result<Self> {
-        // dlopen the framework
-        let handle = unsafe {
-            dlopen(
-                sel!(
-                    "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine"
-                ),
-                RTLD_NOW,
-            )
-        };
-        if handle.is_null() {
-            return Err(AneError::Other(anyhow::anyhow!(
-                "failed to dlopen AppleNeuralEngine.framework"
-            )));
-        }
-
-        let aio_cls = unsafe { objc_getClass(sel!("_ANEIOSurfaceObject")) };
-        if aio_cls.is_null() {
-            return Err(AneError::Other(anyhow::anyhow!(
-                "_ANEIOSurfaceObject class not found"
-            )));
-        }
-
-        let req_cls = unsafe { objc_getClass(sel!("_ANERequest")) };
-        if req_cls.is_null() {
-            return Err(AneError::Other(anyhow::anyhow!(
-                "_ANERequest class not found"
-            )));
-        }
-
-        Ok(Self { aio_cls, req_cls })
+        let inner = ironmill_ane_sys::AneRuntime::new()
+            .map_err(|e| AneError::Other(anyhow::anyhow!("{e}")))?;
+        Ok(Self { inner })
     }
 
     /// Check if the ANE runtime is available on this system.
     pub fn is_available() -> bool {
-        let handle = unsafe {
-            dlopen(
-                sel!(
-                    "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine"
-                ),
-                RTLD_NOW,
-            )
-        };
-        if handle.is_null() {
-            return false;
-        }
-        let cls = unsafe { objc_getClass(sel!("_ANEInMemoryModel")) };
-        !cls.is_null()
+        ironmill_ane_sys::AneRuntime::is_available()
     }
 
     /// Load a compiled program for execution.
-    ///
-    /// In the Orion-based API, the model is already compiled + loaded after
-    /// `compile_mil_text`. This transfers the model handle from
-    /// `CompiledProgram` to `LoadedProgram`.
     pub fn load_program(&self, program: &CompiledProgram) -> Result<LoadedProgram> {
-        if program.model.is_null() {
-            return Err(AneError::EvalFailed {
+        self.inner
+            .load_program(program)
+            .map_err(|e| AneError::EvalFailed {
                 status: 0,
-                context: "CompiledProgram has null model handle".into(),
-            });
-        }
-
-        // Retain the model for the LoadedProgram handle
-        type RetainFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-        let retain_sel = unsafe { sel_registerName(sel!("retain")) };
-        let retain_fn: RetainFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        unsafe { retain_fn(program.model, retain_sel) };
-
-        Ok(LoadedProgram {
-            model: program.model,
-        })
+                context: format!("{e}"),
+            })
     }
 
     /// Execute a loaded program with input/output tensors.
-    ///
-    /// Follows Orion's eval flow:
-    /// 1. Wrap IOSurfaces in `_ANEIOSurfaceObject`
-    /// 2. Build index arrays
-    /// 3. Build `_ANERequest`
-    /// 4. Call `evaluateWithQoS:options:request:error:` on the model
     pub fn eval(
         &self,
         program: &LoadedProgram,
         inputs: &[&AneTensor],
         outputs: &mut [&mut AneTensor],
     ) -> Result<()> {
-        self.eval_raw(program.model, inputs, outputs)
+        self.eval_raw(program.as_raw_ptr(), inputs, outputs)
     }
 
     /// Core eval implementation that takes a raw model pointer.
     ///
     /// Both `eval` (for `LoadedProgram`) and `eval_compiled` (for
-    /// `CompiledProgram`) delegate here — the `evaluateWithQoS:` call
-    /// only needs the `_ANEInMemoryModel` pointer.
+    /// `CompiledProgram`) delegate here.
     pub(crate) fn eval_raw(
         &self,
         model: *mut c_void,
@@ -270,175 +110,33 @@ impl AneRuntime {
         let output_refs: Vec<&AneTensor> = outputs.iter().map(|t| &**t).collect();
         validate_uniform_alloc(&output_refs, "output")?;
 
-        // Wrap inputs in _ANEIOSurfaceObject and build index arrays
-        let in_arr = unsafe { cf::ns_mutable_array() };
-        let in_idx = unsafe { cf::ns_mutable_array() };
-        for (i, tensor) in inputs.iter().enumerate() {
-            let wrapped = self.wrap_iosurface(tensor.as_ptr())?;
-            unsafe {
-                cf::ns_array_add(in_arr, wrapped);
-                cf::ns_array_add(in_idx, cf::ns_number(i as i64));
-            }
-        }
+        let input_surfaces: Vec<*mut c_void> = inputs.iter().map(|t| t.as_ptr()).collect();
+        let output_surfaces: Vec<*mut c_void> = outputs.iter().map(|t| t.as_ptr()).collect();
 
-        // Wrap outputs
-        let out_arr = unsafe { cf::ns_mutable_array() };
-        let out_idx = unsafe { cf::ns_mutable_array() };
-        for (i, tensor) in outputs.iter().enumerate() {
-            let wrapped = self.wrap_iosurface(tensor.as_ptr())?;
-            unsafe {
-                cf::ns_array_add(out_arr, wrapped);
-                cf::ns_array_add(out_idx, cf::ns_number(i as i64));
-            }
-        }
-
-        // Build _ANERequest
-        let zero = unsafe { cf::ns_number(0) };
-        type RequestFn = unsafe extern "C" fn(
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-        ) -> *mut c_void;
-        let req_sel = unsafe {
-            sel_registerName(sel!(
-                "requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:"
-            ))
-        };
-        let req_fn: RequestFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        let request = unsafe {
-            req_fn(
-                self.req_cls,
-                req_sel,
-                in_arr,
-                in_idx,
-                out_arr,
-                out_idx,
-                std::ptr::null_mut(), // weightsBuffer: nil
-                std::ptr::null_mut(), // perfStats: nil
-                zero,                 // procedureIndex: @0
-            )
-        };
-
-        if request.is_null() {
-            unsafe {
-                cf::CFRelease(in_arr);
-                cf::CFRelease(in_idx);
-                cf::CFRelease(out_arr);
-                cf::CFRelease(out_idx);
-            }
-            return Err(AneError::EvalFailed {
-                status: 0,
-                context: "failed to create _ANERequest".into(),
-            });
-        }
-
-        // Evaluate: [model evaluateWithQoS:21 options:@{} request:req error:&e]
-        let empty_dict = unsafe { cf::ns_empty_dict() };
-        let mut error: *mut c_void = std::ptr::null_mut();
-
-        type EvalFn = unsafe extern "C" fn(
-            *mut c_void,
-            *mut c_void,
-            i64,
-            *mut c_void,
-            *mut c_void,
-            *mut *mut c_void,
-        ) -> i8;
-        let eval_sel = unsafe { sel_registerName(sel!("evaluateWithQoS:options:request:error:")) };
-        let eval_fn: EvalFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        let ok = unsafe { eval_fn(model, eval_sel, ANE_QOS, empty_dict, request, &mut error) };
-
-        // Release temporary ObjC collections
+        // SAFETY: model is a valid ANE model pointer, surfaces come from AneTensor.
         unsafe {
-            cf::CFRelease(in_arr);
-            cf::CFRelease(in_idx);
-            cf::CFRelease(out_arr);
-            cf::CFRelease(out_idx);
-            cf::CFRelease(empty_dict);
+            self.inner
+                .eval_raw(model, &input_surfaces, &output_surfaces)
         }
-
-        if ok == 0 {
-            let err_msg = if !error.is_null() {
-                extract_nserror_description(error)
-            } else {
-                "evaluateWithQoS:options:request:error: returned NO".into()
-            };
-            return Err(AneError::EvalFailed {
-                status: 1,
-                context: err_msg,
-            });
-        }
-
-        Ok(())
+        .map_err(|e| AneError::EvalFailed {
+            status: 1,
+            context: format!("{e}"),
+        })
     }
 
     /// Load a previously compiled (and unloaded) program into the ANE.
-    ///
-    /// Calls `[model loadWithQoS:21 options:@{} error:&e]`.
-    /// The model must have been compiled by `compile_mil_text`. Can be
-    /// called after `unload_compiled` to reload the program without
-    /// recompiling.
     pub fn load_compiled(&self, program: &CompiledProgram) -> Result<()> {
-        if program.model.is_null() {
-            return Err(AneError::Other(anyhow::anyhow!(
-                "load_compiled: null model pointer"
-            )));
-        }
-
-        let mut error: *mut c_void = std::ptr::null_mut();
-        let sel = unsafe { sel_registerName(sel!("loadWithQoS:options:error:")) };
-        type LoadFn = unsafe extern "C" fn(
-            *mut c_void,
-            *mut c_void,
-            i64,
-            *mut c_void,
-            *mut *mut c_void,
-        ) -> i8;
-        let load_fn: LoadFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        let empty_dict = unsafe { cf::ns_empty_dict() };
-        let ok = unsafe { load_fn(program.model, sel, ANE_QOS, empty_dict, &mut error) };
-        unsafe { cf::CFRelease(empty_dict) };
-
-        if ok == 0 {
-            let desc = if !error.is_null() {
-                extract_nserror_description(error)
-            } else {
-                "unknown load error".into()
-            };
-            return Err(AneError::Other(anyhow::anyhow!(
-                "loadWithQoS failed: {desc}"
-            )));
-        }
-        Ok(())
+        self.inner
+            .load_compiled(program)
+            .map_err(|e| AneError::Other(anyhow::anyhow!("loadWithQoS failed: {e}")))
     }
 
     /// Unload a compiled program from the ANE, freeing the execution slot.
-    ///
-    /// The program can be reloaded later with `load_compiled`.
-    /// Unlike `unload_program`, this does **not** release the model
-    /// object — `CompiledProgram::Drop` handles that.
     pub fn unload_compiled(&self, program: &CompiledProgram) {
-        if !program.model.is_null() {
-            let mut error: *mut c_void = std::ptr::null_mut();
-            type UnloadFn =
-                unsafe extern "C" fn(*mut c_void, *mut c_void, i64, *mut *mut c_void) -> i8;
-            let sel = unsafe { sel_registerName(sel!("unloadWithQoS:error:")) };
-            let unload_fn: UnloadFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-            unsafe { unload_fn(program.model, sel, ANE_QOS, &mut error) };
-        }
+        self.inner.unload_compiled(program);
     }
 
     /// Load, evaluate, and unload a compiled program in one call.
-    ///
-    /// This is the primary entry point for lazy program management:
-    /// `loadWithQoS:` → `evaluateWithQoS:` → `unloadWithQoS:`. At most
-    /// one additional program is loaded during the call.
     pub fn eval_compiled(
         &self,
         program: &CompiledProgram,
@@ -446,74 +144,21 @@ impl AneRuntime {
         outputs: &mut [&mut AneTensor],
     ) -> Result<()> {
         self.load_compiled(program)?;
-        let result = self.eval_raw(program.model, inputs, outputs);
+        let result = self.eval_raw(program.as_raw_ptr(), inputs, outputs);
         self.unload_compiled(program);
         result
     }
 
     /// Unload a program, freeing ANE resources.
-    ///
-    /// Calls `[model unloadWithQoS:21 error:&e]` then releases the model.
-    pub fn unload_program(&self, mut program: LoadedProgram) {
-        if !program.model.is_null() {
-            let mut error: *mut c_void = std::ptr::null_mut();
-            type UnloadFn =
-                unsafe extern "C" fn(*mut c_void, *mut c_void, i64, *mut *mut c_void) -> i8;
-            let sel = unsafe { sel_registerName(sel!("unloadWithQoS:error:")) };
-            let unload_fn: UnloadFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-            unsafe { unload_fn(program.model, sel, ANE_QOS, &mut error) };
-
-            unsafe { cf::CFRelease(program.model) };
-            // Null the pointer so Drop doesn't double-release.
-            program.model = std::ptr::null_mut();
-        }
+    pub fn unload_program(&self, program: LoadedProgram) {
+        self.inner.unload_program(program);
     }
-
-    /// Wrap an IOSurface pointer in `_ANEIOSurfaceObject`.
-    fn wrap_iosurface(&self, surface: *mut c_void) -> Result<*mut c_void> {
-        type WrapFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
-        let sel = unsafe { sel_registerName(sel!("objectWithIOSurface:")) };
-        let f: WrapFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        let wrapped = unsafe { f(self.aio_cls, sel, surface) };
-        if wrapped.is_null() {
-            return Err(AneError::EvalFailed {
-                status: 0,
-                context: "objectWithIOSurface: returned nil".into(),
-            });
-        }
-        Ok(wrapped)
-    }
-}
-
-/// Extract the `localizedDescription` string from an `NSError`.
-#[cfg(target_os = "macos")]
-fn extract_nserror_description(error: *mut c_void) -> String {
-    type DescFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-    let sel = unsafe { sel_registerName(sel!("localizedDescription")) };
-    let f: DescFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-    let desc = unsafe { f(error, sel) };
-    if desc.is_null() {
-        return "unknown error (nil description)".into();
-    }
-
-    type Utf8Fn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const u8;
-    let utf8_sel = unsafe { sel_registerName(sel!("UTF8String")) };
-    let utf8_fn: Utf8Fn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-    let cstr = unsafe { utf8_fn(desc, utf8_sel) };
-    if cstr.is_null() {
-        return "unknown error (nil UTF8String)".into();
-    }
-
-    unsafe { std::ffi::CStr::from_ptr(cstr as *const i8) }
-        .to_str()
-        .unwrap_or("unknown error (invalid UTF-8)")
-        .to_string()
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for AneRuntime {
     fn drop(&mut self) {
-        // Class pointers are not owned — no cleanup needed.
+        // Inner runtime handles cleanup.
     }
 }
 

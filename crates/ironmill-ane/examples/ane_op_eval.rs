@@ -28,8 +28,8 @@ fn mil_program(body: &str, inputs: &str, output: &str) -> String {
 
 /// Compile MIL text, load it, and return (runtime, loaded_program).
 fn compile_and_load(mil_text: &str) -> Option<(AneRuntime, ironmill_ane::program::LoadedProgram)> {
-    let ptr = match AneCompiler::compile_mil_text(mil_text, &[]) {
-        Ok(ptr) => ptr,
+    let compiled = match AneCompiler::compile_mil_text(mil_text, &[]) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("    compile failed: {e}");
             return None;
@@ -44,7 +44,6 @@ fn compile_and_load(mil_text: &str) -> Option<(AneRuntime, ironmill_ane::program
         }
     };
 
-    let compiled = unsafe { CompiledProgram::from_raw(ptr) };
     let loaded = match runtime.load_program(&compiled) {
         Ok(l) => l,
         Err(e) => {
