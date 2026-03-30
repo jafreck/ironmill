@@ -155,24 +155,71 @@ All 29 layers compile (5.99s), but `ANEProgramProcessRequestDirect()`
 fails at eval time with `status=0x1d : statusType=0x9: Program Inference
 error`. This is a **pre-existing** runtime error — identical with and
 without the matmul→conv/SiLU changes (verified by reverting). The E5
-binary loads but fails when processing the input request. Likely causes:
+binary loads but fails when processing the input request.
 
-1. **IOSurface tensor size mismatch**: The `AneTensor` alloc sizes may
-   not match what the compiled E5 binary expects. `compile_and_load_sub`
-   preallocates I/O tensors from the sub-program's declared shapes, but
-   the runtime does not validate that these match the compiled model.
-   Check `uniform_alloc_size` calculation vs actual compiled I/O.
+**Reproduce:** `cargo run -p ironmill-ane --example turboquant_e2e_bench --release`
 
-2. **Input/output count or ordering**: The `_ANERequest` maps IOSurface
-   tensors to indices. After splitting, the sub-program's function
-   signature (input count, order) may not match how `decode()` wires
-   the tensors. The post_attn sub-program expects 2 inputs (attention
-   output + residual) but `decode()` conditionally fills the second.
+**Where the error occurs:** `inference.rs` `decode()` method (line ~362
+or ~446). The error propagates from `AneRuntime::eval()` in
+`runtime.rs` (~line 340). The error message comes from Apple's
+`_ANEInMemoryModel evaluateWithQoS:options:request:error:`.
 
-3. **FP16 attention path incomplete**: The baseline FP16 path has no
-   compiled attention sub-program (`fp16_attn` is `None`), so `decode()`
-   passes Q through as a no-op. The attention output shape may not match
-   what post_attn expects.
+**Control flow in decode():**
+1. `layer.pre_attn.input_tensors[0].write_f16(&hidden)` — write input
+2. `runtime.eval(&layer.pre_attn.loaded, ...)` — run pre_attn on ANE
+3. Read Q/K/V from pre_attn outputs
+4. Attention — in FP16 baseline, `fp16_attn` is `None` so Q is
+   passed through as a **no-op** (line ~424: `q_data` returned directly)
+5. `post_attn.input_tensors[0].write_f16(&attn_out_data)` — write
+   attention output (which is actually just Q)
+6. `runtime.eval(&post_attn.loaded, ...)` — run post_attn on ANE ← likely fails here
+
+**The error does NOT tell us which eval call failed.** First debugging
+step is to add error context identifying which layer/sub-program
+fails (wrap each `runtime.eval()` in `decode()` with `.map_err()`
+that adds the layer index and sub-program name).
+
+**Key files:**
+- `crates/ironmill-ane/src/inference.rs` — `decode()` (~line 345),
+  `compile_and_load_sub()` (~line 540), I/O tensor preallocation
+- `crates/ironmill-ane/src/runtime.rs` — `AneRuntime::eval()` (~line 240)
+- `crates/ironmill-ane/src/tensor.rs` — `AneTensor`, `uniform_alloc_size`
+- `crates/ironmill-ane/src/split.rs` — `SubProgram` I/O shape metadata
+
+**Likely root causes (ordered by probability):**
+
+1. **FP16 attention path is a no-op**: When `fp16_attn` is `None`,
+   `decode()` returns raw Q data as the "attention output" (line ~424).
+   Q shape is `[1, 2048, 1, 1]` (n_heads * head_dim = 32 * 64), but
+   post_attn's first input (`a_input1` in the MIL) expects the
+   concatenated attention output which should also be `[1, 2048, 1, 1]`.
+   However, the pre_attn output tensor for Q may be allocated with
+   different `alloc_size` than post_attn's input tensor, causing
+   the IOSurface size check in the ANE framework to fail.
+
+2. **Uniform alloc size mismatch**: `compile_and_load_sub()` computes
+   `uniform_alloc_size()` separately for each sub-program. The ANE
+   may require all IOSurfaces in a single eval call to match the
+   exact buffer sizes the compiled model expects. Inspect the pre_attn
+   output shapes vs post_attn input shapes — if they differ, their
+   `uniform_alloc_size()` will differ, and the data copied from
+   pre_attn output to post_attn input will be in a differently-sized
+   IOSurface.
+
+3. **Input count mismatch**: post_attn MIL has 2 inputs (`a_input0`
+   = residual, `a_input1` = attention output), but `decode()` only
+   fills `input_tensors[1]` conditionally (when `num_pre_outputs > 3`
+   at line ~437). If this condition is false, post_attn gets only 1
+   written input but the compiled model expects 2.
+
+**Debugging approach:**
+1. Add layer/sub-program identification to eval errors
+2. Log the shape and alloc_size of every input/output tensor at eval
+   time vs what the compiled MIL function signature declares
+3. Try running a single-layer model (fewer layers = fewer compiles,
+   faster iteration)
+4. Compare against the working `e2e_compile_and_load_conv_linear` test
+   in `lib.rs` which successfully compiles AND evaluates a conv program
 
 ## Implementation Tasks
 
