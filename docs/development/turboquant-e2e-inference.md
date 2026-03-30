@@ -1,15 +1,28 @@
 # TurboQuant End-to-End Inference Integration
 
-> **Status:** In Progress
+> **Status:** Implemented — benchmarks running
 >
-> **Prerequisites:**
-> - [TurboQuant Implementation](turboquant-implementation.md) — completed
-> - [ANE BLOBFILE Investigation](ane-blobfile-investigation.md) — resolved (root cause: `emit_const_op` attribute lookup)
-> - [ANE MIL Emitter Compatibility](ane-mil-emitter-compat.md) — resolved (reshape format, layout alignment)
-> - [ANE Attention Split Investigation](ane-attention-split-investigation.md) — open (blocks layer compilation)
+> **Results (Qwen3-0.6B, 128 tokens, M2 Max ANE-only decode):**
 >
-> **Goal:** Run Qwen3-0.6B on ANE-direct with and without TurboQuant INT8
-> KV cache compression. Measure tokens/sec, memory, and perplexity delta.
+> | Path | Throughput | KV Cache | Token Agreement |
+> |------|-----------|----------|-----------------|
+> | FP16 baseline | 6.1 tok/s | 29.0 MB | — |
+> | TurboQuant INT8 | 5.5 tok/s | 14.5 MB | 0% vs baseline |
+>
+> Both paths run end-to-end but **neither computes real attention** —
+> the FP16 baseline passes Q through as attention output (no softmax/
+> QK^T/AV), and 0% token agreement confirms output is not meaningful.
+> See [ANE Inference Optimizations](ane-inference-optimizations.md) for
+> the plan to implement FP16 attention and fix the structural split.
+>
+> **Prerequisites (all completed):**
+> - [TurboQuant Implementation](turboquant-implementation.md) ✅
+> - [ANE BLOBFILE Investigation](ane-blobfile-investigation.md) ✅ resolved
+> - [ANE MIL Emitter Compatibility](ane-mil-emitter-compat.md) ✅ resolved
+> - [ANE Attention Split Investigation](ane-attention-split-investigation.md) ✅ resolved (split works, runtime eval fixed)
+>
+> **Remaining for correctness:** FP16 attention sub-programs, structural
+> split fix — tracked in [ANE Inference Optimizations](ane-inference-optimizations.md)
 
 ## Design
 

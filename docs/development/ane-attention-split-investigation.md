@@ -1,10 +1,19 @@
 # ANE Attention-Boundary Split — Structural Split Implementation Plan
 
-> **Status:** Resolved (split) · In Progress (ANE compilation)
+> **Status:** Resolved — split works, runtime eval fixed, e2e inference running
 >
-> **Blocks:** [TurboQuant E2E Inference](turboquant-e2e-inference.md) — layer sub-program compilation
+> **Was blocking:** [TurboQuant E2E Inference](turboquant-e2e-inference.md) ✅ now running
 >
 > **Discovered during:** MIL emitter investigation → E2E inference bringup
+>
+> **Key fix:** ANE rejects IOSurface I/O tensors `[1, C, 1, S]` when
+> C > ~768 and S < 32. Padding dim 3 to S=32 after AneLayoutPass
+> resolved the 0x1d eval error. See "Next Steps — Runtime Inference"
+> below for full root cause analysis.
+>
+> **Remaining:** Structural split falls back to name heuristic (softmax
+> not found). FP16 attention sub-programs not yet compiled. Tracked in
+> [ANE Inference Optimizations](ane-inference-optimizations.md).
 
 ## Problem
 
