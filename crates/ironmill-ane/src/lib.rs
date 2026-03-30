@@ -33,6 +33,7 @@ pub mod program;
 pub mod runtime;
 pub mod split;
 pub mod tensor;
+pub mod turboquant;
 
 use std::path::PathBuf;
 
