@@ -235,7 +235,8 @@ impl AneInference {
             // Gather ops (RoPE cos/sin lookup) are stripped from the
             // attention cluster by strip_gather_ops() in the splitter;
             // the gathered values are filled by the CPU at decode time.
-            emit_attention: turbo_config.is_none(),
+            emit_attention: false, // fp16_attn compiles for layers 0-3 but 87 total programs
+            // exceed ANE budget (~55). Needs lazy compile/free per eval.
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
