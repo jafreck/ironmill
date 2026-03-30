@@ -3,7 +3,9 @@
 use mil_rs::ffi::ane::AneCompiler;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels};
-use mil_rs::ir::passes::rotation::rotate_rows_hadamard;
+use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard};
+
+use half::f16;
 
 use crate::program::{CompiledProgram, LoadedProgram};
 use crate::runtime::AneRuntime;
@@ -116,8 +118,10 @@ pub struct KvCacheManager {
     quant_levels: Vec<f32>,
     /// Precomputed quantization boundaries [2^n_bits - 1].
     quant_boundaries: Vec<f32>,
-    /// Precomputed Hadamard rotation signs for the seed.
-    rotation_signs: Vec<f32>,
+    /// Precomputed Hadamard rotation matrix [head_dim × head_dim].
+    rotation_matrix: Vec<f32>,
+    /// Dequantization scale: 1.0 / inv_scale.
+    deq_scale: f32,
     /// Optional: per-layer QJL residual sign caches (fp16 ±1).
     qjl_sign_caches: Option<Vec<AneTensor>>,
 }
@@ -146,13 +150,21 @@ impl KvCacheManager {
         let quant_levels = beta_optimal_levels(config.head_dim, config.n_bits);
         let quant_boundaries = beta_optimal_boundaries(config.head_dim, config.n_bits);
 
-        // Precompute Hadamard rotation signs by rotating an identity matrix.
+        // Precompute Hadamard rotation matrix by rotating an identity matrix.
         let dim = config.head_dim;
-        let mut rotation_signs = vec![0.0f32; dim * dim];
+        let mut rotation_matrix = vec![0.0f32; dim * dim];
         for i in 0..dim {
-            rotation_signs[i * dim + i] = 1.0;
+            rotation_matrix[i * dim + i] = 1.0;
         }
-        rotate_rows_hadamard(&mut rotation_signs, dim, dim, config.rotation_seed);
+        rotate_rows_hadamard(&mut rotation_matrix, dim, dim, config.rotation_seed);
+
+        // Precompute dequantization scale.
+        let max_level = quant_levels.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let deq_scale = if max_level == 0.0 {
+            1.0
+        } else {
+            max_level / 127.0
+        };
 
         let qjl_sign_caches = if config.enable_qjl {
             let mut caches = Vec::with_capacity(config.num_layers);
@@ -175,13 +187,17 @@ impl KvCacheManager {
             seq_pos: 0,
             quant_levels,
             quant_boundaries,
-            rotation_signs,
+            rotation_matrix,
+            deq_scale,
             qjl_sign_caches,
         })
     }
 
     /// Write one token's worth of quantized K and V data into `layer`'s
     /// caches at the current sequence position.
+    ///
+    /// When QJL is enabled, also computes and stores residual signs:
+    /// `sign(K_original - K_dequantized)` as ±1 fp16.
     ///
     /// **Does not advance `seq_pos`.** Call [`advance_seq_pos`] once after
     /// all layers have been updated for a given token.
@@ -190,6 +206,7 @@ impl KvCacheManager {
         layer: usize,
         k_quantized: &[u8],
         v_quantized: &[u8],
+        k_original: Option<&[f16]>,
     ) -> Result<()> {
         if layer >= self.config.num_layers {
             return Err(AneError::Other(anyhow::anyhow!(
@@ -226,18 +243,27 @@ impl KvCacheManager {
         self.k_caches[layer].write_bytes_at(byte_offset, k_quantized)?;
         self.v_caches[layer].write_bytes_at(byte_offset, v_quantized)?;
 
-        // TODO(qjl): Compute QJL residual signs when enable_qjl is true.
-        // This requires the original fp16 K_proj (pre-quantization) to compute
-        // sign(K_original - K_dequantized). The dequantization involves:
-        //   1. Cast INT8 → f32
-        //   2. Multiply by dequant scale (inverse of inv_scale)
-        //   3. Apply inverse Hadamard rotation via unrotate_rows_hadamard
-        //   4. Compare with original: sign(K_original[i] - K_dequantized[i])
-        //   5. Store ±1 as fp16 in qjl_sign_caches[layer] at seq_pos
-        // Requires changing update_cache signature to accept &[f16] k_original,
-        // or computing signs in step_attention before calling update_cache.
+        // QJL residual sign computation
+        if let (Some(sign_caches), Some(k_orig)) = (&mut self.qjl_sign_caches, k_original) {
+            let signs = compute_qjl_signs(
+                k_quantized,
+                k_orig,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.deq_scale,
+                self.config.rotation_seed,
+            );
+            let elem_offset = self.seq_pos * token_elements;
+            sign_caches[layer].write_f16_at(elem_offset, &signs)?;
+        }
 
         Ok(())
+    }
+
+    /// Return references to the QJL sign caches for a given layer.
+    /// Returns `None` if QJL is not enabled.
+    pub fn qjl_sign_tensors(&self, layer: usize) -> Option<&AneTensor> {
+        self.qjl_sign_caches.as_ref().map(|c| &c[layer])
     }
 
     /// Advance the sequence position after all layers have been updated
@@ -261,6 +287,44 @@ impl KvCacheManager {
     pub fn reset(&mut self) {
         self.seq_pos = 0;
     }
+}
+
+/// Compute QJL residual signs: `sign(K_original - K_dequantized)`.
+///
+/// Dequantization pipeline: int8 → f32 → scale → un-rotate.
+/// Returns ±1 as fp16 for each element.
+fn compute_qjl_signs(
+    k_quantized: &[u8],
+    k_original: &[f16],
+    num_kv_heads: usize,
+    head_dim: usize,
+    deq_scale: f32,
+    rotation_seed: u64,
+) -> Vec<f16> {
+    let total = num_kv_heads * head_dim;
+
+    // 1. Cast INT8 to f32 and scale (undo quantization, still rotated)
+    let mut k_deq_rotated = vec![0.0f32; total];
+    for i in 0..total {
+        k_deq_rotated[i] = (k_quantized[i] as i8) as f32 * deq_scale;
+    }
+
+    // 2. Un-rotate per head
+    unrotate_rows_hadamard(&mut k_deq_rotated, num_kv_heads, head_dim, rotation_seed);
+
+    // 3. Compute sign(original - dequantized)
+    let mut signs = vec![f16::ZERO; total];
+    for i in 0..total {
+        let orig = k_original[i].to_f32();
+        let diff = orig - k_deq_rotated[i];
+        signs[i] = if diff >= 0.0 {
+            f16::from_f32(1.0)
+        } else {
+            f16::from_f32(-1.0)
+        };
+    }
+
+    signs
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +484,16 @@ impl TurboQuantModel {
         // 2. CPU cache interception: copy INT8 bytes into persistent cache
         let k_bytes = k_quant.read_bytes_at(0, channels)?;
         let v_bytes = v_quant.read_bytes_at(0, channels)?;
-        self.cache.update_cache(layer, &k_bytes, &v_bytes)?;
+
+        // Read original K_proj for QJL residual sign computation
+        let k_original = if self.config.enable_qjl {
+            Some(k_proj.read_f16()?)
+        } else {
+            None
+        };
+
+        self.cache
+            .update_cache(layer, &k_bytes, &v_bytes, k_original.as_deref())?;
 
         // 3. Attention: Q + cached K/V → output
         let (k_cache, v_cache) = self.cache.cache_tensors(layer);
