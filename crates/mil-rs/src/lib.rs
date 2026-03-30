@@ -58,6 +58,8 @@
 //! [examples/build_rs_example.rs](../examples/build_rs_example.rs) for usage
 //! patterns.
 
+#![deny(unsafe_code)]
+
 /// Analysis passes for MIL IR programs (FLOPs counting, etc.).
 pub mod analysis;
 /// High-level builder API for compiling ML models at build time.
@@ -66,6 +68,7 @@ pub mod analysis;
 pub mod build_api;
 /// C-compatible FFI API for use from C, Swift, C++, Go, etc.
 #[cfg(feature = "c-api")]
+#[allow(unsafe_code)]
 pub mod c_api;
 /// Compile CoreML models to `.mlmodelc` via `xcrun coremlcompiler`.
 pub mod compiler;

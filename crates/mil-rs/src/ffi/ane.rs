@@ -129,6 +129,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn patch_weights_null_donor_returns_error() {
         // SAFETY: from_raw with a null pointer — patch_weights validates it.
         let donor = unsafe { CompiledProgram::from_raw(std::ptr::null_mut()) };
@@ -144,6 +145,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn patch_weights_empty_text_returns_error() {
         // Use a non-null dummy pointer — patch_weights validates MIL text before
         // dereferencing the donor.

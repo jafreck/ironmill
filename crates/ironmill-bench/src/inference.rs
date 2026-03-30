@@ -101,10 +101,13 @@ impl MemoryMetrics {
 }
 
 /// Get current process RSS in bytes using mach_task_basic_info.
+#[allow(unsafe_code)]
 fn current_rss() -> u64 {
     #[cfg(target_os = "macos")]
     {
         use std::mem;
+        // SAFETY: These are standard Mach kernel ABI functions available on all
+        // macOS versions. The signatures match the system headers.
         unsafe extern "C" {
             fn mach_task_self() -> u32;
             fn task_info(
@@ -129,6 +132,10 @@ fn current_rss() -> u64 {
             suspend_count: i32,
         }
 
+        // SAFETY: `mach_task_self()` returns the current task port (always valid).
+        // `task_info` writes into `info` which is a properly aligned, zeroed
+        // struct with `count` set to its size in u32 words. On success (kr == 0)
+        // the struct is fully initialized by the kernel.
         unsafe {
             let mut info: MachTaskBasicInfo = mem::zeroed();
             let mut count = (mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<u32>()) as u32;

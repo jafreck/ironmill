@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 #[cfg(not(target_os = "macos"))]
 compile_error!("ironmill-coreml-sys only supports macOS");
 

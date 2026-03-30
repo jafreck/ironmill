@@ -18,6 +18,8 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+#![forbid(unsafe_code)]
+
 pub mod convert;
 
 #[cfg(target_os = "macos")]

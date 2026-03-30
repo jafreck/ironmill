@@ -23,6 +23,7 @@ pub struct AneRuntime {
 }
 
 // SAFETY: The inner runtime is Send; we add no shared mutable state.
+#[allow(unsafe_code)]
 unsafe impl Send for AneRuntime {}
 
 // ── Validation helpers (platform-independent) ────────────────────
@@ -98,6 +99,7 @@ impl AneRuntime {
     ///
     /// Both `eval` (for `LoadedProgram`) and `eval_compiled` (for
     /// `CompiledProgram`) delegate here.
+    #[allow(unsafe_code)]
     pub(crate) fn eval_raw(
         &self,
         model: *mut c_void,

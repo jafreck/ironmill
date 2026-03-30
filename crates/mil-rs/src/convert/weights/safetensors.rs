@@ -71,6 +71,7 @@ impl SafeTensorsProvider {
     /// - `config.json`
     /// - `model.safetensors` (or sharded `model-00001-of-NNNNN.safetensors`, etc.)
     /// - optionally `adapter_config.json` for LoRA adapters
+    #[allow(unsafe_code)]
     pub fn load(model_dir: &Path) -> Result<Self> {
         // --- Parse config.json ---
         let config_path = model_dir.join("config.json");

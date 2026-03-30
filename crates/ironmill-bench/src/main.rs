@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 mod baseline;
 mod compiler;
 mod config;

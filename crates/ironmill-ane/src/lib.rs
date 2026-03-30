@@ -24,6 +24,8 @@
 //! | `split`     | Model → ANE-sized sub-program splitter      |
 //! | `program`   | Compiled program handle types               |
 
+#![deny(unsafe_code)]
+
 #[cfg(not(target_os = "macos"))]
 compile_error!("ironmill-ane only supports macOS");
 

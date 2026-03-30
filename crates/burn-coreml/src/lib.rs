@@ -28,6 +28,8 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+#![forbid(unsafe_code)]
+
 pub mod export;
 
 #[cfg(target_os = "macos")]

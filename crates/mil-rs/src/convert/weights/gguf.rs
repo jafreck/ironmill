@@ -401,6 +401,7 @@ impl GgufProvider {
     ///
     /// For split-shard models (e.g. `model-00001-of-00003.gguf`), pass any
     /// shard path and siblings will be auto-discovered.
+    #[allow(unsafe_code)]
     pub fn load(path: &Path) -> Result<Self, MilError> {
         let shard_paths = discover_shards(path)?;
         let mut all_metadata: HashMap<String, MetadataValue> = HashMap::new();

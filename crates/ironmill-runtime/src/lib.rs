@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Common runtime traits for ironmill backends.
 //!
 //! Provides a unified interface for compiling and running inference across
