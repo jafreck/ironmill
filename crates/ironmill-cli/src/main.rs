@@ -41,6 +41,16 @@ enum RuntimeArg {
     AneDirect,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+enum KvQuantArg {
+    /// No KV cache quantization (default)
+    #[value(name = "none")]
+    None,
+    /// TurboQuant INT8 KV cache compression
+    #[value(name = "turbo-int8")]
+    TurboInt8,
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
@@ -174,6 +184,18 @@ enum Commands {
         /// bypassing MLModel for potentially lower latency. Requires --features ane-direct.
         #[arg(long, value_enum, default_value_t = RuntimeArg::CoreMl)]
         runtime: RuntimeArg,
+
+        /// KV cache quantization strategy. Options: "none" (default), "turbo-int8".
+        #[arg(long, value_enum, default_value = "none")]
+        kv_quant: KvQuantArg,
+
+        /// Enable QJL 1-bit bias correction for TurboQuant (requires --kv-quant turbo-int8).
+        #[arg(long, default_value_t = false)]
+        kv_quant_qjl: bool,
+
+        /// Maximum sequence length for KV cache allocation (default: 2048).
+        #[arg(long, default_value_t = 2048)]
+        max_seq_len: usize,
     },
 
     /// Inspect a model and show its structure.
@@ -291,6 +313,9 @@ fn run() -> Result<()> {
             ane_memory_budget,
             ane,
             runtime,
+            kv_quant,
+            kv_quant_qjl,
+            max_seq_len,
         } => cmd_compile(
             &input,
             CompileOpts {
@@ -320,6 +345,9 @@ fn run() -> Result<()> {
                 ane_memory_budget,
                 ane,
                 runtime,
+                kv_quant,
+                kv_quant_qjl,
+                max_seq_len,
             },
         ),
         Commands::Inspect { input } => cmd_inspect(&input),
@@ -379,6 +407,9 @@ struct CompileOpts {
     #[allow(dead_code)] // Used in compile_from_weights once SafeTensorsProvider lands.
     ane: bool,
     runtime: RuntimeArg,
+    kv_quant: KvQuantArg,
+    kv_quant_qjl: bool,
+    max_seq_len: usize,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -387,10 +418,33 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
         bail!("Input file not found: {input}");
     }
 
+    if opts.max_seq_len == 0 {
+        bail!("--max-seq-len must be at least 1");
+    }
+
     if opts.target != "all" && opts.target != "cpu-and-ne" {
         println!(
             "Note: --target '{}' will be fully supported in Phase 3. Proceeding with default target.",
             opts.target
+        );
+    }
+
+    // TurboQuant validation
+    if opts.kv_quant == KvQuantArg::TurboInt8 && !matches!(opts.runtime, RuntimeArg::AneDirect) {
+        bail!("--kv-quant turbo-int8 requires --runtime ane-direct");
+    }
+    if opts.kv_quant_qjl && opts.kv_quant != KvQuantArg::TurboInt8 {
+        bail!("--kv-quant-qjl requires --kv-quant turbo-int8");
+    }
+    if opts.kv_quant == KvQuantArg::TurboInt8 {
+        println!(
+            "TurboQuant: INT8 KV cache (max_seq_len={}{})",
+            opts.max_seq_len,
+            if opts.kv_quant_qjl {
+                ", QJL enabled"
+            } else {
+                ""
+            }
         );
     }
 
