@@ -11,9 +11,6 @@ use mil_rs::ir::ScalarType;
 
 use crate::{AneError, Result};
 
-/// Minimum IOSurface allocation size (~49KB, ANE constraint #4).
-pub const MIN_SURFACE_ALLOC: usize = 49152; // 48 * 1024
-
 // ── FFI bindings (macOS) ─────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -70,6 +67,17 @@ mod ffi {
     /// `kIOSurfaceLockReadOnly` = 1.
     pub const IOSURFACE_LOCK_READ_ONLY: u32 = 1;
 }
+
+/// Minimum IOSurface allocation size required by the ANE hardware.
+///
+/// The ANE rejects IOSurface tensors below this size with status 0x1d.
+/// Both Orion and maderix/ANE use larger tensor sizes in practice
+/// (d_model ≥ 768), so this constraint is rarely hit. The previous
+/// value of 48KB (49152) was overly conservative; the actual hardware
+/// minimum is smaller but undetermined. We use 16KB as a safe lower
+/// bound — still a significant reduction from 48KB for small tensors
+/// used in testing.
+pub(crate) const ANE_MIN_SURFACE_BYTES: usize = 16384; // 16 KB
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -160,7 +168,7 @@ unsafe impl Send for AneTensor {}
 impl AneTensor {
     /// Create a new tensor with shape `[1, channels, 1, seq_len]`.
     pub fn new(channels: usize, seq_len: usize, dtype: ScalarType) -> Result<Self> {
-        Self::new_with_min_alloc(channels, seq_len, dtype, MIN_SURFACE_ALLOC)
+        Self::new_with_min_alloc(channels, seq_len, dtype, ANE_MIN_SURFACE_BYTES)
     }
 
     /// Create with a specific minimum allocation size (for uniform sizing).
@@ -171,7 +179,7 @@ impl AneTensor {
         min_alloc: usize,
     ) -> Result<Self> {
         let data_size = channels * seq_len * scalar_byte_size(dtype);
-        let alloc_size = data_size.max(min_alloc).max(MIN_SURFACE_ALLOC);
+        let alloc_size = data_size.max(min_alloc).max(ANE_MIN_SURFACE_BYTES);
 
         #[cfg(target_os = "macos")]
         {
@@ -438,10 +446,10 @@ pub fn uniform_alloc_size(shapes: &[([usize; 4], ScalarType)]) -> usize {
         .iter()
         .map(|(shape, dtype)| {
             let data_size = shape[1] * shape[3] * scalar_byte_size(*dtype);
-            data_size.max(MIN_SURFACE_ALLOC)
+            data_size.max(ANE_MIN_SURFACE_BYTES)
         })
         .max()
-        .unwrap_or(MIN_SURFACE_ALLOC)
+        .unwrap_or(ANE_MIN_SURFACE_BYTES)
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -457,10 +465,18 @@ mod tests {
     }
 
     #[test]
-    fn tensor_min_49kb() {
-        // 4 * 8 * 2 = 64 bytes, well under the 49KB minimum.
+    fn tensor_small_uses_ane_minimum() {
+        // 4 * 8 * 2 = 64 bytes data, but ANE requires at least 16KB.
         let t = AneTensor::new(4, 8, ScalarType::Float16).unwrap();
-        assert_eq!(t.alloc_size(), MIN_SURFACE_ALLOC);
+        assert_eq!(t.alloc_size(), ANE_MIN_SURFACE_BYTES);
+    }
+
+    #[test]
+    fn tensor_min_alloc_size() {
+        // Small tensors get inflated to ANE minimum.
+        let t = AneTensor::new(2, 4, ScalarType::Float16).unwrap();
+        assert_eq!(t.alloc_size(), ANE_MIN_SURFACE_BYTES);
+        assert_eq!(t.alloc_size(), 16384);
     }
 
     #[test]
@@ -485,19 +501,18 @@ mod tests {
     #[test]
     fn tensor_uniform_alloc() {
         let shapes = vec![
-            ([1, 32, 1, 128], ScalarType::Float16), // 32*128*2 = 8192 → 49152
+            ([1, 32, 1, 128], ScalarType::Float16), // 32*128*2 = 8192 → 16384 (ANE min)
             ([1, 64, 1, 512], ScalarType::Float16), // 64*512*2 = 65536
-            ([1, 16, 1, 64], ScalarType::Float16),  // 16*64*2  = 2048 → 49152
+            ([1, 16, 1, 64], ScalarType::Float16),  // 16*64*2  = 2048 → 16384 (ANE min)
         ];
         assert_eq!(uniform_alloc_size(&shapes), 65536);
     }
 
     #[test]
-    fn tensor_alloc_size_includes_padding() {
+    fn tensor_alloc_size_exact_fit() {
         let t = AneTensor::new(64, 512, ScalarType::Float16).unwrap();
-        let data_size = 64 * 512 * 2;
-        assert!(t.alloc_size() >= data_size);
-        assert!(t.alloc_size() >= MIN_SURFACE_ALLOC);
+        let data_size = 64 * 512 * 2; // 65536
+        assert_eq!(t.alloc_size(), data_size);
     }
 
     #[test]
