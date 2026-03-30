@@ -258,7 +258,7 @@ impl AneRuntime {
     /// Both `eval` (for `LoadedProgram`) and `eval_compiled` (for
     /// `CompiledProgram`) delegate here — the `evaluateWithQoS:` call
     /// only needs the `_ANEInMemoryModel` pointer.
-    fn eval_raw(
+    pub(crate) fn eval_raw(
         &self,
         model: *mut c_void,
         inputs: &[&AneTensor],

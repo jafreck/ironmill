@@ -207,31 +207,9 @@ impl AneInference {
 
         // ANE rejects IOSurface-backed tensors when C > ~768 and S < 32.
         // After AneLayoutPass, tensors are in [1, C, 1, S] format.
-        // Pad dim 3 (S) to at least 32. The decode loop writes one token
-        // to column 0 and reads from column 0.
-        const ANE_MIN_SEQ: usize = 32;
-        for func in program.functions.values_mut() {
-            for (_, ty) in &mut func.inputs {
-                if ty.shape.len() == 4 {
-                    if let Some(s) = ty.shape[3] {
-                        if s < ANE_MIN_SEQ {
-                            ty.shape[3] = Some(ANE_MIN_SEQ);
-                        }
-                    }
-                }
-            }
-            for op in &mut func.body.operations {
-                for t in op.output_types.iter_mut().flatten() {
-                    if t.shape.len() == 4 {
-                        if let Some(s) = t.shape[3] {
-                            if s < ANE_MIN_SEQ {
-                                t.shape[3] = Some(ANE_MIN_SEQ);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Padding is applied PER SUB-PROGRAM after splitting (below),
+        // NOT on the full program — fp16_attn sub-programs need original
+        // shapes for correct attention dimension semantics.
 
         // 2. Split with attention boundary.
         // This strips attention + RoPE ops (which contain concat) from
@@ -246,13 +224,56 @@ impl AneInference {
             // With lazy load/unload (loadWithQoS/unloadWithQoS), we can
             // emit attention programs without exceeding the ANE slot limit:
             // at most 3 programs are loaded simultaneously during decode.
-            emit_attention: false, // fp16_attn shapes corrupted by global S≥32 padding;
-            // attention sub-programs need original per-head dims, not padded S=32
+            emit_attention: false, // FP16 attention needs KV cache inputs (full seq_len)
+            // not single-token K/V (S=1 with C>768 violates ANE constraint)
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
 
-        // 2a. Pack inputs spatially where possible.
+        // 2a. Pad S≥32 on non-attention sub-programs only.
+        // fp16_attn sub-programs need original shapes for correct
+        // per-head attention dimensions (reshape [1,C,1,1] → [1,H,D,1]).
+        const ANE_MIN_SEQ: usize = 32;
+        for sub in &mut model_split.programs {
+            if sub.name.ends_with("_fp16_attn") {
+                continue;
+            }
+            if let Some(func) = sub.program.functions.values_mut().next() {
+                for (_, ty) in &mut func.inputs {
+                    if ty.shape.len() == 4 {
+                        if let Some(s) = ty.shape[3] {
+                            if s < ANE_MIN_SEQ {
+                                ty.shape[3] = Some(ANE_MIN_SEQ);
+                            }
+                        }
+                    }
+                }
+                for op in &mut func.body.operations {
+                    for t in op.output_types.iter_mut().flatten() {
+                        if t.shape.len() == 4 {
+                            if let Some(s) = t.shape[3] {
+                                if s < ANE_MIN_SEQ {
+                                    t.shape[3] = Some(ANE_MIN_SEQ);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Also update the sub-program's TensorDescriptors.
+            for td in &mut sub.inputs {
+                if td.shape[3] < ANE_MIN_SEQ {
+                    td.shape[3] = ANE_MIN_SEQ;
+                }
+            }
+            for td in &mut sub.outputs {
+                if td.shape[3] < ANE_MIN_SEQ {
+                    td.shape[3] = ANE_MIN_SEQ;
+                }
+            }
+        }
+
+        // 2b. Pack inputs spatially where possible.
         // Must run BEFORE matmul→conv since packing adds slice_by_size ops,
         // not matmuls. Stores packing metadata per sub-program name.
         let mut packing_map: std::collections::HashMap<String, crate::packing::InputPacking> =
@@ -416,16 +437,12 @@ impl AneInference {
             });
         }
 
-        // 6b. Immediately unload all compiled programs to free ANE slots.
-        // compile_mil_text auto-loads each program; unloading here means
-        // only ~3 programs will be loaded at a time during decode().
+        // 6b. Unload fp16_attn programs to free ANE slots.
+        // pre_attn and post_attn stay loaded (they fit within the ~55 budget).
+        // fp16_attn programs are loaded on demand via eval_compiled().
         for layer in &layers {
-            runtime.unload_compiled(&layer.pre_attn.compiled);
             if let Some(ref attn) = layer.fp16_attn {
                 runtime.unload_compiled(&attn.compiled);
-            }
-            if let Some(ref post) = layer.post_attn {
-                runtime.unload_compiled(&post.compiled);
             }
         }
 
@@ -497,7 +514,7 @@ impl AneInference {
                 let mut out_refs: Vec<&mut AneTensor> =
                     layer.pre_attn.output_tensors.iter_mut().collect();
                 self.runtime
-                    .eval_compiled(&layer.pre_attn.compiled, &in_refs, &mut out_refs)
+                    .eval_raw(layer.pre_attn.compiled.model, &in_refs, &mut out_refs)
                     .map_err(|e| {
                         AneError::Other(anyhow::anyhow!(
                             "layer {layer_idx} pre_attn eval failed: {e}"
@@ -664,7 +681,7 @@ impl AneInference {
                     let mut out_refs: Vec<&mut AneTensor> =
                         post_attn.output_tensors.iter_mut().collect();
                     self.runtime
-                        .eval_compiled(&post_attn.compiled, &in_refs, &mut out_refs)
+                        .eval_raw(post_attn.compiled.model, &in_refs, &mut out_refs)
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} post_attn eval failed: {e}"
