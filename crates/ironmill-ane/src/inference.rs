@@ -1253,7 +1253,7 @@ fn write_f16_padded(tensor: &mut AneTensor, data: &[f16]) -> Result<()> {
     let [_, channels, _, seq_len] = tensor.shape();
     if seq_len == 1 {
         // No padding needed — direct write.
-        return tensor.write_f16(data);
+        return Ok(tensor.write_f16(data)?);
     }
     let total = channels * seq_len;
     let mut padded = vec![f16::ZERO; total];
@@ -1261,7 +1261,7 @@ fn write_f16_padded(tensor: &mut AneTensor, data: &[f16]) -> Result<()> {
     for i in 0..c {
         padded[i * seq_len] = data[i]; // column 0 of each channel row
     }
-    tensor.write_f16(&padded)
+    Ok(tensor.write_f16(&padded)?)
 }
 
 /// Read C elements (one token at column 0) from an ANE tensor with shape
@@ -1269,7 +1269,7 @@ fn write_f16_padded(tensor: &mut AneTensor, data: &[f16]) -> Result<()> {
 fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
     let [_, channels, _, seq_len] = tensor.shape();
     if seq_len == 1 {
-        return tensor.read_f16();
+        return Ok(tensor.read_f16()?);
     }
     let full = tensor.read_f16()?;
     let mut out = Vec::with_capacity(channels);
@@ -1348,12 +1348,18 @@ fn compile_and_load_sub(
     let input_tensors: Vec<AneTensor> = sub
         .inputs
         .iter()
-        .map(|td| AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc))
+        .map(|td| {
+            AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc)
+                .map_err(Into::into)
+        })
         .collect::<Result<Vec<_>>>()?;
     let output_tensors: Vec<AneTensor> = sub
         .outputs
         .iter()
-        .map(|td| AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc))
+        .map(|td| {
+            AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc)
+                .map_err(Into::into)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LoadedSubProgram {
@@ -1418,12 +1424,18 @@ fn compile_and_load_sub_with_donor(
     let input_tensors: Vec<AneTensor> = sub
         .inputs
         .iter()
-        .map(|td| AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc))
+        .map(|td| {
+            AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc)
+                .map_err(Into::into)
+        })
         .collect::<Result<Vec<_>>>()?;
     let output_tensors: Vec<AneTensor> = sub
         .outputs
         .iter()
-        .map(|td| AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc))
+        .map(|td| {
+            AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc)
+                .map_err(Into::into)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LoadedSubProgram {

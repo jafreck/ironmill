@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mil-rs", "crates/ironmill-cli", "crates/ironmill-coreml", "crates/ironmill-coreml-sys", "crates/ironmill-ane", "crates/ironmill-bench", "crates/ironmill-runtime", "crates/burn-coreml", "crates/candle-coreml"]
+members = ["crates/mil-rs", "crates/ironmill-cli", "crates/ironmill-coreml", "crates/ironmill-coreml-sys", "crates/ironmill-ane", "crates/ironmill-iosurface", "crates/ironmill-bench", "crates/ironmill-runtime", "crates/burn-coreml", "crates/candle-coreml"]
 resolver = "2"
 
 [workspace.package]
@@ -12,6 +12,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 mil-rs = { path = "crates/mil-rs", version = "0.1.0" }
 ironmill-ane = { path = "crates/ironmill-ane", version = "0.1.0" }
+ironmill-iosurface = { path = "crates/ironmill-iosurface", version = "0.1.0" }
 ironmill-coreml = { path = "crates/ironmill-coreml", version = "0.1.0" }
 ironmill-coreml-sys = { path = "crates/ironmill-coreml-sys", version = "0.1.0" }
 ironmill-runtime = { path = "crates/ironmill-runtime", version = "0.1.0" }

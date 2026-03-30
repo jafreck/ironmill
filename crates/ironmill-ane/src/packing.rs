@@ -231,7 +231,7 @@ pub fn write_packed_inputs(
             packed[ch * total_s + offset] = data[ch];
         }
     }
-    tensor.write_f16(&packed)
+    Ok(tensor.write_f16(&packed)?)
 }
 
 // ---------------------------------------------------------------------------

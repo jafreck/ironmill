@@ -47,7 +47,7 @@ use crate::cache::ProgramCache;
 use crate::program::{CompiledProgram, LoadedProgram};
 use crate::runtime::AneRuntime;
 use crate::split::{SplitConfig, split_for_ane};
-use crate::tensor::{AneTensor, uniform_alloc_size};
+use crate::tensor::{AneTensor, IOSurfaceError, uniform_alloc_size};
 
 // ── Error type ────────────────────────────────────────────────────
 
@@ -73,6 +73,12 @@ pub enum AneError {
     /// A generic error from an underlying operation.
     #[error("{0}")]
     Other(#[from] anyhow::Error),
+}
+
+impl From<IOSurfaceError> for AneError {
+    fn from(e: IOSurfaceError) -> Self {
+        AneError::SurfaceError(e.to_string())
+    }
 }
 
 /// Result type alias for ANE operations.
@@ -271,6 +277,7 @@ impl AneModel {
                 .iter()
                 .map(|td| {
                     AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc)
+                        .map_err(Into::into)
                 })
                 .collect::<Result<Vec<_>>>()?;
             let output_tensors: Vec<AneTensor> = sub
@@ -278,6 +285,7 @@ impl AneModel {
                 .iter()
                 .map(|td| {
                     AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc)
+                        .map_err(Into::into)
                 })
                 .collect::<Result<Vec<_>>>()?;
 

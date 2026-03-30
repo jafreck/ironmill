@@ -454,6 +454,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "ironmill-iosurface",
  "ironmill-runtime",
  "mil-rs",
  "serde_json",
@@ -510,6 +511,15 @@ dependencies = [
  "objc2-core-ml",
  "objc2-foundation",
  "serde",
+]
+
+[[package]]
+name = "ironmill-iosurface"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "mil-rs",
+ "thiserror",
 ]
 
 [[package]]

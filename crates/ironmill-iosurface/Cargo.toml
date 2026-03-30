@@ -1,0 +1,13 @@
+[package]
+name = "ironmill-iosurface"
+description = "Safe IOSurface tensor management for Apple Neural Engine I/O"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+half = { workspace = true }
+mil-rs = { workspace = true }
