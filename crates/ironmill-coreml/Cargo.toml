@@ -7,10 +7,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-objc2 = "0.6"
-objc2-core-ml = { version = "0.3", features = ["MLModel", "MLModelConfiguration", "MLModelDescription", "MLFeatureDescription", "MLFeatureValue", "MLFeatureType", "MLMultiArray", "MLMultiArrayConstraint", "MLDictionaryFeatureProvider", "MLModelError", "MLFeatureProvider", "block2"] }
-objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSArray", "NSDictionary", "NSError", "NSObject", "NSValue", "NSObjCRuntime", "NSSet", "NSEnumerator"] }
-block2 = "0.6"
-anyhow = { workspace = true }
-serde = { workspace = true }
+ironmill-coreml-sys = { workspace = true }
 ironmill-runtime = { workspace = true }
+anyhow = { workspace = true }

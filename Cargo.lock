@@ -496,8 +496,16 @@ name = "ironmill-coreml"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "block2",
+ "ironmill-coreml-sys",
  "ironmill-runtime",
+]
+
+[[package]]
+name = "ironmill-coreml-sys"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "block2",
  "objc2",
  "objc2-core-ml",
  "objc2-foundation",
