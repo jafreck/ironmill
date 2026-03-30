@@ -214,16 +214,26 @@ These work on the current hardware/macOS version but may be fragile.
 - `crates/ironmill-ane/src/inference.rs`
 - `crates/ironmill-ane/src/turboquant_mil.rs`
 
-## Recommended order
+## Dependencies
 
-1. **Phase 0** — TurboQuant S=32 padding (fragility fix, enables Phase 4)
-2. **Phase 2** — Fix structural split (prerequisite for Phase 1)
-3. **Phase 1** — FP16 attention (correctness, enables quality benchmarks)
-4. **Phase 3** — Pre-allocate TQ output tensors (easy perf win)
-5. **Phase 4** — Remove MIN_SURFACE_ALLOC (cleanup, depends on Phase 0)
-6. **Phase 5** — Reduce TQ memcpy overhead (perf)
-7. **Phase 6** — Spatial packing (biggest perf win, most complex)
-8. **Phase 7** — Single-input robustness (subsumed by Phase 6)
+```
+Phase 0 (TQ S=32 padding) ──→ Phase 4 (remove MIN_SURFACE_ALLOC)
+Phase 2 (fix structural split) ──→ Phase 1 (FP16 attention)
+Phase 6 (spatial packing) ──→ Phase 7 (single-input, subsumed)
+
+Independent: Phase 3 (pre-alloc TQ tensors)
+Independent: Phase 5 (reduce TQ memcpy)
+```
+
+Three parallel tracks:
+
+| Track | Phases | Goal |
+|-------|--------|------|
+| **Correctness** | 2 → 1 | Real attention output |
+| **TQ robustness** | 0 → 4 | Remove fragile MIN_SURFACE_ALLOC dependency |
+| **Performance** | 3, 5, 6 | Reduce overhead (all independent of each other) |
+
+Phases 0, 2, 3 can all start immediately in parallel.
 
 ## References
 
