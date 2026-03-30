@@ -18,9 +18,9 @@ use mil_rs::ffi::ane::AneCompiler;
 use mil_rs::ir::Pass;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::{
-    AneArgPromotionPass, AneConcatEliminationPass, AneLayoutPass, AneMatmulToConvPass,
-    AneVariableNamingPass, AutoregressiveShapeMaterializePass, DeadCodeEliminationPass,
-    OpSubstitutionPass, TypeRepropagationPass,
+    AneArgPromotionPass, AneLayoutPass, AneMatmulToConvPass, AneVariableNamingPass,
+    AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, OpSubstitutionPass,
+    TypeRepropagationPass,
 };
 
 use crate::program::{CompiledProgram, LoadedProgram};
@@ -193,8 +193,9 @@ impl AneInference {
         // the sub-programs that will be compiled for ANE.
         let split_config = SplitConfig {
             split_attention: true,
-            emit_attention: false, // FP16 attention blocked by RoPE concat ops (ANE constraint #1);
-            // needs a RotaryEmbedding-specific concat decomposition pass
+            emit_attention: false, // fp16_attn sub-programs fail ANE compilation;
+            // needs debugging of which ops in the attention cluster (RoPE gather/split,
+            // per-head norm pow/reduce_mean) cause _ANECCompile() to reject the program
             // due to name-heuristic fallback producing wrong op subsets
             ..Default::default()
         };
@@ -211,16 +212,7 @@ impl AneInference {
             }
         }
 
-        // 2b. Eliminate concat ops in fp16_attn sub-programs (ANE constraint #1).
-        // RoPE contains concat; if elimination fails, the fp16_attn program
-        // will fail ANE compilation and fall back to Q pass-through.
-        for sub in &mut model_split.programs {
-            if sub.name.ends_with("_fp16_attn") {
-                let _ = AneConcatEliminationPass.run(&mut sub.program);
-            }
-        }
-
-        // 2c. Convert matmul → 1×1 conv on each sub-program.
+        // 2b. Convert matmul → 1×1 conv on each sub-program.
         // This must run AFTER splitting so the structural attention splitter
         // can still find matmul ops for Q/K/V projection identification.
         for sub in &mut model_split.programs {
@@ -237,31 +229,8 @@ impl AneInference {
             })?;
         }
 
-        // 2d. Validate that no concat ops remain in compiled sub-programs.
-        // Skip fp16_attn (will fail gracefully at ANE compile time if concat remains).
-        for sub in &model_split.programs {
-            if sub.name.ends_with("_fp16_attn") {
-                continue;
-            }
-            if let Some(func) = sub.program.main() {
-                let concats: Vec<&str> = func
-                    .body
-                    .operations
-                    .iter()
-                    .filter(|op| op.op_type == "concat")
-                    .map(|op| op.name.as_str())
-                    .collect();
-                if !concats.is_empty() {
-                    return Err(AneError::Other(anyhow::anyhow!(
-                        "sub-program '{}' still contains {} concat op(s) after splitting: {}. \
-                         ANE does not support concat (constraint #1).",
-                        sub.name,
-                        concats.len(),
-                        concats.join(", ")
-                    )));
-                }
-            }
-        }
+        // Note: concat IS supported by ANE (eval-verified, see ane-op-support-matrix.md).
+        // The previous concat validation was based on a false assumption.
 
         // 3. Initialize runtime.
         let runtime = AneRuntime::new()?;
