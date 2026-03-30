@@ -35,11 +35,11 @@ impl Pass for AneLayoutPass {
                 }
 
                 // Only reshape non-const op input tensors.
+                // Attributes (axes, keep_dims, epsilon, etc.) are metadata
+                // parameters, not activation tensors — reshaping them
+                // corrupts their semantics (e.g., axes=[−1] becomes [1,1,1,1]).
                 if op.op_type != "const" {
                     for value in op.inputs.values_mut() {
-                        reshape_value_tensor(value);
-                    }
-                    for value in op.attributes.values_mut() {
                         reshape_value_tensor(value);
                     }
                 }
@@ -77,10 +77,27 @@ impl Pass for AneLayoutPass {
 }
 
 /// Reshape a `Value::Tensor`'s shape (or recurse into lists).
+///
+/// Skips integer tensors — those are parameter metadata (axes, shapes,
+/// strides) that must retain their original 1-D shape.
 fn reshape_value_tensor(value: &mut Value) {
     match value {
-        Value::Tensor { shape, .. } => {
-            *shape = to_ane_shape_static(shape);
+        Value::Tensor { shape, dtype, .. } => {
+            // Skip integer tensors — they're metadata parameters
+            // (reduce axes, reshape shapes, etc.), not activation data.
+            if !matches!(
+                dtype,
+                crate::ir::ScalarType::Int8
+                    | crate::ir::ScalarType::Int16
+                    | crate::ir::ScalarType::Int32
+                    | crate::ir::ScalarType::Int64
+                    | crate::ir::ScalarType::UInt8
+                    | crate::ir::ScalarType::UInt16
+                    | crate::ir::ScalarType::UInt32
+                    | crate::ir::ScalarType::UInt64
+            ) {
+                *shape = to_ane_shape_static(shape);
+            }
         }
         Value::List(items) => {
             for item in items {

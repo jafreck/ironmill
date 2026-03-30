@@ -269,10 +269,26 @@ impl<'a> MilTextEmitter<'a> {
                 shape: shape.clone(),
             });
 
-            // ANE requires 4D tensor types. Reshape the weight type
-            // declaration to 4D [1, C, 1, S] for the MIL text.
-            let ane_shape = to_ane_weight_shape(shape);
-            let type_str = self.format_tensor_type_from(&ane_shape, *dtype);
+            // ANE requires 4D tensor types for activation/weight data.
+            // Integer tensors (axes, shapes, strides) are metadata
+            // parameters and must keep their original 1-D shape.
+            let is_int_param = matches!(
+                dtype,
+                ScalarType::Int8
+                    | ScalarType::Int16
+                    | ScalarType::Int32
+                    | ScalarType::Int64
+                    | ScalarType::UInt8
+                    | ScalarType::UInt16
+                    | ScalarType::UInt32
+                    | ScalarType::UInt64
+            );
+            let emit_shape = if is_int_param {
+                shape.clone()
+            } else {
+                to_ane_weight_shape(shape)
+            };
+            let type_str = self.format_tensor_type_from(&emit_shape, *dtype);
 
             // TYPE %name = const()[name=string("name"), val=TYPE(BLOBFILE(...))];
             writeln!(

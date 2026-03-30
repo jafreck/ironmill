@@ -18,7 +18,7 @@ use mil_rs::ffi::ane::AneCompiler;
 use mil_rs::ir::Pass;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::{
-    AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
+    AneArgPromotionPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
     AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, OpSubstitutionPass,
 };
 
@@ -145,6 +145,7 @@ impl AneInference {
             ("ArShapeMaterialize", &ar_shape_pass),
             ("OpSubstitution", &OpSubstitutionPass),
             ("AneLayout", &AneLayoutPass),
+            ("AneArgPromotion", &AneArgPromotionPass),
             ("AttentionDecompose", &AttentionDecomposePass),
             ("AneVariableNaming", &AneVariableNamingPass),
         ];

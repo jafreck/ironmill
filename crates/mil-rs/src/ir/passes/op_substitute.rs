@@ -41,6 +41,57 @@ fn substitute_in_block(block: &mut Block) {
     while i < block.operations.len() {
         let op = &block.operations[i];
 
+        // Pattern-based substitution: rsqrt pattern.
+        // Detect real_div(1.0, sqrt(x)) → pow(x, -0.5).
+        // real_div is only compile-verified on ANE; pow(-0.5) is eval-verified.
+        if op.op_type == "real_div" {
+            if let Some(new_ops) = try_substitute_rsqrt(block, i) {
+                let original_output = op.outputs.first().cloned().unwrap();
+                let last_output = new_ops.last().unwrap().outputs.first().cloned().unwrap();
+                // Find and remove the sqrt op that feeds this real_div.
+                let sqrt_idx = find_sqrt_feeding_real_div(block, i);
+                // Remove the real_div first (it's at index i).
+                block.operations.remove(i);
+                // If sqrt was before real_div, its index is still valid.
+                if let Some(si) = sqrt_idx {
+                    if si < i {
+                        block.operations.remove(si);
+                        // Adjust i since we removed an op before it.
+                        let insert_at = si;
+                        let count = new_ops.len();
+                        for (j, new_op) in new_ops.into_iter().enumerate() {
+                            block.operations.insert(insert_at + j, new_op);
+                        }
+                        if last_output != original_output {
+                            replace_reference(block, &original_output, &last_output);
+                        }
+                        i = insert_at + count;
+                    } else {
+                        // sqrt was after real_div (unusual).
+                        let count = new_ops.len();
+                        for (j, new_op) in new_ops.into_iter().enumerate() {
+                            block.operations.insert(i + j, new_op);
+                        }
+                        if last_output != original_output {
+                            replace_reference(block, &original_output, &last_output);
+                        }
+                        i += count;
+                    }
+                } else {
+                    // No sqrt found — just replace real_div with pow.
+                    let count = new_ops.len();
+                    for (j, new_op) in new_ops.into_iter().enumerate() {
+                        block.operations.insert(i + j, new_op);
+                    }
+                    if last_output != original_output {
+                        replace_reference(block, &original_output, &last_output);
+                    }
+                    i += count;
+                }
+                continue;
+            }
+        }
+
         // Only substitute ops the ANE can't run natively.
         if is_ane_supported(&op.op_type) {
             i += 1;
@@ -222,6 +273,87 @@ fn substitute_gelu(op: &Operation) -> Vec<Operation> {
         half_const,
         mul_half,
     ]
+}
+
+// ---- Pattern-based substitutions -------------------------------------------
+
+/// Detect `real_div(scalar_1.0, sqrt_output)` and replace the sqrt + real_div
+/// pair with `pow(sqrt_input, -0.5)`.
+///
+/// The ANE op support matrix shows:
+/// - `real_div` → ⚠️ compile-only (not eval-verified)
+/// - `pow(x, -0.5)` → ✅ eval-verified (max_err=0.0004)
+fn try_substitute_rsqrt(block: &Block, real_div_idx: usize) -> Option<Vec<Operation>> {
+    let op = &block.operations[real_div_idx];
+    if op.op_type != "real_div" {
+        return None;
+    }
+
+    // Check that x is a scalar 1.0.
+    let x_is_one = match op.inputs.get("x") {
+        Some(Value::Float(f)) => (*f - 1.0).abs() < 1e-6,
+        Some(Value::Reference(name)) => {
+            // Check if it references a const with value 1.0.
+            block.operations.iter().any(|o| {
+                o.op_type == "const"
+                    && o.outputs.first().map(|s| s.as_str()) == Some(name.as_str())
+                    && matches!(o.inputs.get("val").or(o.attributes.get("val")),
+                        Some(Value::Float(f)) if (*f - 1.0).abs() < 1e-6)
+            })
+        }
+        _ => false,
+    };
+    if !x_is_one {
+        return None;
+    }
+
+    // Check that y references a sqrt op's output.
+    let y_ref = match op.inputs.get("y") {
+        Some(Value::Reference(name)) => name.clone(),
+        _ => return None,
+    };
+
+    let sqrt_op = block
+        .operations
+        .iter()
+        .find(|o| o.op_type == "sqrt" && o.outputs.first().map(|s| s.as_str()) == Some(&y_ref))?;
+
+    // Get the sqrt's input (the value we want to compute pow(x, -0.5) on).
+    let sqrt_input = sqrt_op.inputs.get("x")?.clone();
+
+    let base = &op.name;
+    let output_name = op
+        .outputs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("{base}_pow_out"));
+
+    // const -0.5
+    let nhalf_name = format!("{base}_nhalf");
+    let nhalf_const = Operation::new("const", &nhalf_name)
+        .with_input("val", Value::Float(-0.5))
+        .with_output(&nhalf_name);
+
+    // pow(sqrt_input, -0.5)
+    let pow_op = Operation::new("pow", format!("{base}_pow"))
+        .with_input("x", sqrt_input)
+        .with_input("y", Value::Reference(nhalf_name.clone()))
+        .with_output(&output_name);
+
+    Some(vec![nhalf_const, pow_op])
+}
+
+/// Find the sqrt op that feeds the real_div at `real_div_idx`.
+fn find_sqrt_feeding_real_div(block: &Block, real_div_idx: usize) -> Option<usize> {
+    let op = &block.operations[real_div_idx];
+    let y_ref = match op.inputs.get("y") {
+        Some(Value::Reference(name)) => name.clone(),
+        _ => return None,
+    };
+    block
+        .operations
+        .iter()
+        .position(|o| o.op_type == "sqrt" && o.outputs.first().map(|s| s.as_str()) == Some(&y_ref))
 }
 
 #[cfg(test)]

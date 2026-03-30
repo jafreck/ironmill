@@ -32,6 +32,8 @@ pub mod type_repropagate;
 
 // ANE-specific passes (feature-gated)
 #[cfg(feature = "ane-direct")]
+pub mod ane_arg_promotion;
+#[cfg(feature = "ane-direct")]
 pub mod ane_attention_decompose;
 #[cfg(feature = "ane-direct")]
 pub mod ane_concat_elim;
@@ -69,6 +71,8 @@ pub use polar_rotation_fusion::PolarRotationFusionPass;
 pub use shape_materialize::{AutoregressiveShapeMaterializePass, ShapeMaterializePass};
 pub use type_repropagate::TypeRepropagationPass;
 
+#[cfg(feature = "ane-direct")]
+pub use ane_arg_promotion::AneArgPromotionPass;
 #[cfg(feature = "ane-direct")]
 pub use ane_attention_decompose::AttentionDecomposePass;
 #[cfg(feature = "ane-direct")]
