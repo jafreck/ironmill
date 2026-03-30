@@ -3,6 +3,7 @@
 use mil_rs::ffi::ane::AneCompiler;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels};
+use mil_rs::ir::passes::rotation::rotate_rows_hadamard;
 
 use crate::program::{CompiledProgram, LoadedProgram};
 use crate::runtime::AneRuntime;
@@ -145,9 +146,13 @@ impl KvCacheManager {
         let quant_levels = beta_optimal_levels(config.head_dim, config.n_bits);
         let quant_boundaries = beta_optimal_boundaries(config.head_dim, config.n_bits);
 
-        // TODO: extract rotation signs from Hadamard transform once the
-        // `generate_signs` helper in `mil_rs::ir::passes::rotation` is made public.
-        let rotation_signs = Vec::new();
+        // Precompute Hadamard rotation signs by rotating an identity matrix.
+        let dim = config.head_dim;
+        let mut rotation_signs = vec![0.0f32; dim * dim];
+        for i in 0..dim {
+            rotation_signs[i * dim + i] = 1.0;
+        }
+        rotate_rows_hadamard(&mut rotation_signs, dim, dim, config.rotation_seed);
 
         let qjl_sign_caches = if config.enable_qjl {
             let mut caches = Vec::with_capacity(config.num_layers);
@@ -176,7 +181,10 @@ impl KvCacheManager {
     }
 
     /// Write one token's worth of quantized K and V data into `layer`'s
-    /// caches at the current sequence position, then advance the position.
+    /// caches at the current sequence position.
+    ///
+    /// **Does not advance `seq_pos`.** Call [`advance_seq_pos`] once after
+    /// all layers have been updated for a given token.
     pub fn update_cache(
         &mut self,
         layer: usize,
@@ -217,9 +225,14 @@ impl KvCacheManager {
         let byte_offset = self.seq_pos * token_elements;
         self.k_caches[layer].write_bytes_at(byte_offset, k_quantized)?;
         self.v_caches[layer].write_bytes_at(byte_offset, v_quantized)?;
-        self.seq_pos += 1;
 
         Ok(())
+    }
+
+    /// Advance the sequence position after all layers have been updated
+    /// for the current token. Must be called exactly once per token.
+    pub fn advance_seq_pos(&mut self) {
+        self.seq_pos += 1;
     }
 
     /// Return references to the K and V cache tensors for a given layer.
@@ -268,7 +281,8 @@ impl TurboQuantModel {
     /// 1. Creates an [`AneRuntime`].
     /// 2. Emits + compiles the cache-write MIL program.
     /// 3. Emits + compiles the attention MIL program.
-    /// 4. Allocates the [`KvCacheManager`].
+    /// 4. Optionally compiles the QJL correction program.
+    /// 5. Allocates the [`KvCacheManager`].
     pub fn compile(config: TurboQuantConfig) -> Result<Self> {
         let runtime = AneRuntime::new()?;
 
@@ -304,6 +318,27 @@ impl TurboQuantModel {
         let attn_compiled = unsafe { CompiledProgram::from_raw(attn_ptr) };
         let attention_program = runtime.load_program(&attn_compiled)?;
 
+        // --- QJL correction sub-program (optional) ---
+        let qjl_program = if config.enable_qjl {
+            let (qjl_mil, qjl_weights) =
+                turboquant_mil::emit_qjl_correction_mil(&config, config.max_seq_len);
+            let qjl_weight_refs: Vec<(&str, &[u8])> = qjl_weights
+                .iter()
+                .map(|(name, data)| (name.as_str(), data.as_slice()))
+                .collect();
+            let qjl_ptr =
+                AneCompiler::compile_mil_text(&qjl_mil, &qjl_weight_refs).map_err(|e| {
+                    AneError::CompileFailed {
+                        status: 0,
+                        context: format!("QJL correction compilation failed: {e}"),
+                    }
+                })?;
+            let qjl_compiled = unsafe { CompiledProgram::from_raw(qjl_ptr) };
+            Some(runtime.load_program(&qjl_compiled)?)
+        } else {
+            None
+        };
+
         // --- KV cache ---
         let cache = KvCacheManager::new(config.clone())?;
 
@@ -312,15 +347,47 @@ impl TurboQuantModel {
             cache,
             cache_write_program,
             attention_program,
-            qjl_program: None,
+            qjl_program,
             runtime,
         })
+    }
+
+    /// Run one token through all layers of the model.
+    ///
+    /// For each layer: quantize K/V → write to cache → run attention.
+    /// The `projections` slice must contain one `(Q, K_proj, V_proj)` tuple
+    /// per layer.
+    pub fn step(
+        &mut self,
+        projections: &[(AneTensor, AneTensor, AneTensor)],
+    ) -> Result<Vec<AneTensor>> {
+        if projections.len() != self.config.num_layers {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "expected {} layer projections, got {}",
+                self.config.num_layers,
+                projections.len()
+            )));
+        }
+
+        let mut outputs = Vec::with_capacity(self.config.num_layers);
+        for (layer, (q, k_proj, v_proj)) in projections.iter().enumerate() {
+            let attn_out = self.step_attention(layer, q, k_proj, v_proj)?;
+            outputs.push(attn_out);
+        }
+
+        // Advance sequence position once after all layers processed this token.
+        self.cache.advance_seq_pos();
+
+        Ok(outputs)
     }
 
     /// Process one token through cache-write and attention for a single layer.
     ///
     /// Takes Q, K_proj, V_proj as fp16 [`AneTensor`]s (single token).
     /// Returns attention output as fp16 [`AneTensor`].
+    ///
+    /// **Note:** Does not advance `seq_pos`. Use [`step`] for full-model
+    /// inference, which advances after all layers.
     pub fn step_attention(
         &mut self,
         layer: usize,

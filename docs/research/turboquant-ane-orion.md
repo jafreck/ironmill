@@ -28,14 +28,27 @@ need to make that work.
 
 ### ANE's native op set
 
-ironmill's ANE validator (`validate.rs`) recognizes these ops as ANE-compatible:
+ironmill's ANE validator (`validate.rs`) recognizes these ops as ANE-compatible.
+This list has been **empirically verified** by compiling minimal MIL programs
+against Apple's private ANE compiler and running eval-time correctness checks.
+See [ANE Op Support Matrix](ane-op-support-matrix.md) for complete results.
 
 ```
-conv, matmul, linear, relu, sigmoid, tanh, softmax, batch_norm,
-add, mul, sub, real_div, concat, reshape, transpose, max_pool,
-avg_pool, reduce_mean, layer_norm, squeeze, expand_dims, pad,
-cast, const, clip, gather, split, slice_by_index, pow, sqrt,
-select, scaled_dot_product_attention
+Verified supported (69 ops):
+conv, matmul, linear, relu, relu6, sigmoid, tanh, softmax, silu, softsign,
+softplus, add, mul, sub, real_div, maximum, minimum, floor_div, abs, sign,
+sqrt, square, exp, exp2, erf, ceil, floor, round, atan, pow, clip,
+greater, greater_equal, less, less_equal, equal, not_equal,
+reduce_sum, reduce_mean, reduce_max, reduce_min, reduce_l2_norm,
+reduce_l1_norm, reduce_log_sum, reduce_log_sum_exp, reduce_sum_square,
+layer_norm, reshape, transpose, concat, slice_by_index, slice_by_size,
+split, expand_dims, squeeze, tile, reverse, identity,
+select, logical_not, cast, dequantize, const,
+scaled_dot_product_attention
+
+Confirmed unsupported (name fuzzing found no aliases):
+gather, scatter, scatter_nd, neg, log, rsqrt, inverse, mod,
+sin, cos, tan, batch_norm, avg_pool, max_pool, quantize, where
 ```
 
 ANE-supported data types per ironmill's validator: `Float16`, `Float32`, `Int8`.
@@ -44,20 +57,35 @@ capabilities. See the data type section below for the full picture.
 
 ### TurboQuant op decomposition
 
-Every TurboQuant operation can be expressed using ANE-native ops:
+Most TurboQuant operations map to ANE-native ops. Two gaps require workarounds:
 
-| TurboQuant step | ANE decomposition | Ops used |
-|----------------|-------------------|----------|
-| **Hadamard rotation** | Matrix multiply with precomputed R | `matmul` or `conv` (1×1) |
-| **Row norm extraction** | Normalize rows before quantization | `mul`, `sqrt`, `reduce_mean`, `real_div` |
-| **Scalar quantize** (float → int) | Scale + offset + clamp + cast | `mul` → `add` → `clip` → `cast` |
-| **Scalar dequantize** (int → float) | Cast + scale + offset | `cast` → `mul` → `add` |
-| **QJL sign extraction** | Threshold at zero → ±1 | `select` (x > 0 → +1, else -1) |
-| **QJL inner product correction** | Dot product of sign vectors | `mul` → `reduce_mean` → `mul` |
-| **LUT dequantize** | Index into 2^b reconstruction levels | `gather` (from 16-entry const table) |
-| **KV cache slice** | Read a range from the cache tensor | `slice_by_index` |
+| TurboQuant step | ANE decomposition | Ops used | Status |
+|----------------|-------------------|----------|--------|
+| **Hadamard rotation** | Matrix multiply with precomputed R | `matmul` or `conv` (1×1) | ✅ Verified |
+| **Row norm extraction** | Normalize rows before quantization | `mul`, `sqrt`, `reduce_mean`, `real_div` | ✅ Verified |
+| **Scalar quantize** (float → int) | Scale + offset + clamp + cast | `mul` → `add` → `clip` → `cast` | ✅ Verified |
+| **Scalar dequantize** (int → float) | Cast + scale + offset | `cast` → `mul` → `add` | ✅ Verified |
+| **QJL sign extraction** | Threshold at zero → ±1 | `greater` → `select` | ✅ Verified (eval) |
+| **QJL inner product correction** | Dot product of sign vectors | `mul` → `reduce_sum` → `mul` | ✅ Verified |
+| **LUT dequantize (static)** | Compile-time expansion | `constexpr_lut_to_dense` | ✅ Not blocked (compile-time) |
+| **LUT dequantize (runtime)** | Index into reconstruction levels | `gather` | ❌ Unsupported — see below |
+| **KV cache read** | Read a range from the cache tensor | `slice_by_index` | ✅ Verified |
+| **KV cache write** | Write new K/V into cache | `scatter` | ❌ Unsupported — see below |
 
-**Result: no op-level blockers.** Every step maps to native ANE operations.
+**Op-level assessment:**
+- ✅ **Arithmetic path is fully verified** — all quantize/dequantize, rotation,
+  normalization, and QJL sign extraction ops compile and produce correct results.
+- ⚠️ **Runtime `gather` is unsupported** — this affects dynamic LUT dequantization
+  of cached activations. Workarounds: use affine dequant (`mul` + `add`) instead of
+  LUT-based, or decompose into `select` chains for small codebooks (≤4 entries).
+- ⚠️ **`scatter` is unsupported** — cache writes require decomposition. Options:
+  append via `concat`, masked overwrite via `select`, or CPU interception at
+  sub-program boundaries (recommended for production).
+
+> **Note on `constexpr_lut_to_dense`:** This is a compile-time op — the ANE
+> compiler expands LUTs into dense weight blobs during program compilation.
+> `gather` failing at runtime does **not** block static weight palettization
+> or PolarQuant. Only runtime/dynamic LUT lookups on activations are affected.
 
 ### The data type situation: CoreML limitation, not hardware
 
@@ -168,14 +196,25 @@ Inputs:  Q         [batch, heads, 1, head_dim]     (Float16)
          LUT       [16]                               (Float16, const levels)
          R         [head_dim, head_dim]               (Float16, const rotation)
 
-Ops:     gather(LUT, K_cache)                   → K_dequant  (Float16)
+Ops:     # Dequantize — use affine path since runtime gather is unsupported.
+         # For 4-bit: mul(cast(K_cache, fp16), scale) + add(offset)
+         # Alternative: constexpr_lut_to_dense bakes LUT at compile time,
+         # but that only works for static weights, not dynamic cache values.
+         affine_dequant(K_cache)                → K_dequant  (Float16)
          matmul(K_dequant, R)                   → K_approx   (Float16)
-         gather(LUT, V_cache)                   → V_dequant  (Float16)
+         affine_dequant(V_cache)                → V_dequant  (Float16)
          matmul(V_dequant, R)                   → V_approx   (Float16)
          scaled_dot_product_attention(Q, K, V)  → attn_out   (Float16)
 
 Outputs: attn_out (Float16)
 ```
+
+> **Design note:** The original design used `gather(LUT, cache)` for dequantization,
+> but ANE probing confirmed `gather` is unsupported at runtime. Two alternatives:
+> 1. **Affine dequant** (`cast` → `mul` → `add`): simpler, works for uniform quantization.
+>    Loses the LUT flexibility but the Beta-optimal levels are near-uniform anyway.
+> 2. **Select chains** for small codebooks: `select(equal(x, 0), level_0, select(equal(x, 1), level_1, ...))`
+>    Feasible for 2-bit (4 levels) but impractical for 4-bit (16 levels).
 
 ### Program 3 — QJL correction (optional, runs once per new token)
 
@@ -192,6 +231,11 @@ Outputs: scaled  (Float16, added to attention logits)
 
 Programs 1 and 2 are the core path. Program 3 (QJL) adds 1 bit of overhead
 for unbiased attention scores and can be omitted if slight bias is acceptable.
+
+> **Op gap summary:** The arithmetic pipeline is fully verified on ANE.
+> Runtime `gather` (for LUT dequant) and `scatter` (for cache write) are the
+> two gaps — both have decomposition paths. See
+> [ANE Op Support Matrix](ane-op-support-matrix.md) for the full verified op set.
 
 ### Program compilation budget
 

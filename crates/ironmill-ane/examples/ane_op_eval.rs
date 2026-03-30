@@ -682,13 +682,335 @@ fn test_affine_quantize_pattern() -> (bool, bool) {
     }
 }
 
+// ── Gap-closing tests: ops claimed as feasible but not yet eval-verified ─
+
+fn test_matmul() -> (bool, bool) {
+    // Hadamard rotation is matmul with a precomputed matrix
+    let mil = mil_program(
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];\n\
+                 tensor<fp16, [1,32,32]> z_output0 = matmul(x=a_input0, y=a_input1, transpose_x=bF, transpose_y=bF)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,32]> a_input0, tensor<fp16, [1,32,32]> a_input1",
+        "z_output0",
+    );
+    // A = identity-ish, B = simple values → result should be A @ B
+    let mut a = vec![0.0f32; 32 * 32];
+    let mut b = vec![0.0f32; 32 * 32];
+    for i in 0..32 {
+        a[i * 32 + i] = 1.0; // identity matrix
+        for j in 0..32 {
+            b[i * 32 + j] = (i * 32 + j) as f32 * 0.01;
+        }
+    }
+    // I @ B = B
+    let expected = b.clone();
+
+    match run_ane(
+        &mil,
+        &[f16v(&a), f16v(&b)],
+        &[(32, 32), (32, 32)], // 3D [1,32,32] → C=32, S=32
+        &[(32, 32)],
+    ) {
+        Some(out) => (true, check_results("matmul", &out[0], &expected, 0.05)),
+        None => (false, false),
+    }
+}
+
+fn test_cast_fp16_bool() -> (bool, bool) {
+    // cast fp16→bool→fp16 round-trip: nonzero→1.0, zero→0.0
+    let mil = mil_program(
+        "        tensor<bool, [1,32,1,32]> b = cast(x=a_input0, dtype=string(\"bool\"))[name=string(\"b\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=b, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N)
+        .map(|i| {
+            if i % 3 == 0 {
+                0.0
+            } else {
+                (i as f32 - 500.0) * 0.1
+            }
+        })
+        .collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .map(|&x| if x != 0.0 { 1.0 } else { 0.0 })
+        .collect();
+
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("cast fp16↔bool", &out[0], &expected, 0.01),
+        ),
+        None => (false, false),
+    }
+}
+
+fn test_layer_norm() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<int32, [1]> nax = const()[name=string(\"nax\"), val=tensor<int32, [1]>([3])];\n\
+                 fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = layer_norm(x=a_input0, axes=nax, epsilon=eps)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| ((i % S) as f32 - 16.0) * 0.3).collect();
+    // layer_norm along axis 3 (spatial): per-channel normalize S values
+    let mut expected = vec![0.0f32; N];
+    for c in 0..C {
+        let start = c * S;
+        let mean: f32 = a[start..start + S].iter().sum::<f32>() / S as f32;
+        let var: f32 = a[start..start + S]
+            .iter()
+            .map(|&x| (x - mean) * (x - mean))
+            .sum::<f32>()
+            / S as f32;
+        let inv_std = 1.0 / (var + 1e-5f32).sqrt();
+        for s in 0..S {
+            expected[start + s] = (a[start + s] - mean) * inv_std;
+        }
+    }
+
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("layer_norm", &out[0], &expected, 0.1)),
+        None => (false, false),
+    }
+}
+
+fn test_concat() -> (bool, bool) {
+    // concat along channel axis — the cache-append decomposition path
+    let mil = mil_program(
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n\
+                 bool cid = const()[name=string(\"cid\"), val=bool(false)];\n\
+                 tensor<fp16, [1,64,1,32]> z_output0 = concat(axis=cax, interleave=cid, values=(a_input0, a_input1))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| i as f32 * 0.1).collect();
+    let b: Vec<f32> = (0..N).map(|i| -(i as f32) * 0.1).collect();
+    let mut expected = Vec::with_capacity(N * 2);
+    expected.extend_from_slice(&a);
+    expected.extend_from_slice(&b);
+
+    match run_ane(&mil, &[f16v(&a), f16v(&b)], &[(C, S), (C, S)], &[(64, S)]) {
+        Some(out) => (true, check_results("concat", &out[0], &expected, 0.05)),
+        None => (false, false),
+    }
+}
+
+fn test_silu() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = silu(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.01).collect();
+    // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    let expected: Vec<f32> = a.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("silu", &out[0], &expected, 0.02)),
+        None => (false, false),
+    }
+}
+
+fn test_reduce_log_sum_exp() -> (bool, bool) {
+    // reduce_log_sum_exp — numerically stable log-softmax building block
+    let mil = mil_program(
+        "        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([-1])];\n\
+                 bool kd = const()[name=string(\"kd\"), val=bool(true)];\n\
+                 tensor<fp16, [1,32,1,1]> rlse = reduce_log_sum_exp(x=a_input0, axes=rax, keep_dims=kd)[name=string(\"rlse\")];\n\
+                 tensor<int32, [4]> rep = const()[name=string(\"rep\"), val=tensor<int32, [4]>([1,1,1,32])];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = tile(x=rlse, reps=rep)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| ((i % S) as f32 - 16.0) * 0.2).collect();
+    let mut expected = vec![0.0f32; N];
+    for c in 0..C {
+        let start = c * S;
+        let max_val = a[start..start + S]
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let lse: f32 = max_val
+            + a[start..start + S]
+                .iter()
+                .map(|&x| (x - max_val).exp())
+                .sum::<f32>()
+                .ln();
+        for s in 0..S {
+            expected[start + s] = lse;
+        }
+    }
+
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("reduce_log_sum_exp", &out[0], &expected, 0.2),
+        ),
+        None => (false, false),
+    }
+}
+
+// ── INT8 KV cache pipeline tests ─────────────────────────────────────────
+
+fn test_int8_round_trip() -> (bool, bool) {
+    // fp16 → cast int8 → cast fp16: verifies INT8 storage path
+    let mil = mil_program(
+        "        tensor<int8, [1,32,1,32]> q = cast(x=a_input0, dtype=string(\"int8\"))[name=string(\"q\")];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = cast(x=q, dtype=string(\"fp16\"))[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    // Values in INT8 range [-128, 127], cast truncates fractional parts
+    let a: Vec<f32> = (0..N).map(|i| (i % 256) as f32 - 128.0).collect();
+    let expected: Vec<f32> = a
+        .iter()
+        .map(|&x| {
+            // fp16 → int8 truncates, then int8 → fp16 is exact
+            (x.clamp(-128.0, 127.0) as i8) as f32
+        })
+        .collect();
+
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("INT8 round-trip", &out[0], &expected, 1.0),
+        ),
+        None => (false, false),
+    }
+}
+
+fn test_int8_quantize_dequantize() -> (bool, bool) {
+    // Full affine quantize → dequantize chain through INT8:
+    //   quant:   int8_val = cast(round(clip(x * inv_scale + zero_point, -128, 127)), int8)
+    //   dequant: fp16_val = (cast(int8_val, fp16) - zero_point) * scale
+    let mil = mil_program(
+        "        fp16 inv_scale = const()[name=string(\"inv_scale\"), val=fp16(10.0)];\n\
+                 fp16 zp = const()[name=string(\"zp\"), val=fp16(0.0)];\n\
+                 tensor<fp16, [1,32,1,32]> scaled = mul(x=a_input0, y=inv_scale)[name=string(\"scaled\")];\n\
+                 tensor<fp16, [1,32,1,32]> shifted = add(x=scaled, y=zp)[name=string(\"shifted\")];\n\
+                 tensor<fp16, [1,32,1,32]> rounded = round(x=shifted)[name=string(\"rounded\")];\n\
+                 fp16 lo = const()[name=string(\"lo\"), val=fp16(-128.0)];\n\
+                 fp16 hi = const()[name=string(\"hi\"), val=fp16(127.0)];\n\
+                 tensor<fp16, [1,32,1,32]> clamped = clip(x=rounded, alpha=lo, beta=hi)[name=string(\"clamped\")];\n\
+                 tensor<int8, [1,32,1,32]> quantized = cast(x=clamped, dtype=string(\"int8\"))[name=string(\"quantized\")];\n\
+                 tensor<fp16, [1,32,1,32]> back = cast(x=quantized, dtype=string(\"fp16\"))[name=string(\"back\")];\n\
+                 tensor<fp16, [1,32,1,32]> unshifted = sub(x=back, y=zp)[name=string(\"unshifted\")];\n\
+                 fp16 scale = const()[name=string(\"scale\"), val=fp16(0.1)];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = mul(x=unshifted, y=scale)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    // Input values in [-12.7, 12.7] range so quantized values fit INT8
+    let a: Vec<f32> = (0..N).map(|i| (i as f32 - 512.0) * 0.02).collect();
+    // Expected: round-trip through INT8 at scale=0.1
+    let expected: Vec<f32> = a
+        .iter()
+        .map(|&x| {
+            let q = (x * 10.0).round().clamp(-128.0, 127.0) as i8;
+            (q as f32) * 0.1
+        })
+        .collect();
+
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (
+            true,
+            check_results("INT8 quant→dequant", &out[0], &expected, 0.15),
+        ),
+        None => (false, false),
+    }
+}
+
+fn test_turboquant_int8_cache_pipeline() -> (bool, bool) {
+    // Full TurboQuant-style INT8 KV cache pipeline on ANE:
+    //   1. RMSNorm input
+    //   2. Quantize to INT8 (mul → round → clip → cast)
+    //   3. Dequantize back (cast → mul)
+    //   4. Compute dot product (simulating attention score)
+    //
+    // This verifies the complete cache-write → cache-read → attention path
+    // can execute on ANE as a single sub-program.
+    let mil = mil_program(
+        // Step 1: RMSNorm-style normalization
+        "        tensor<fp16, [1,32,1,32]> sq = mul(x=a_input0, y=a_input0)[name=string(\"sq\")];\n\
+                 tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([-1])];\n\
+                 bool kd = const()[name=string(\"kd\"), val=bool(true)];\n\
+                 tensor<fp16, [1,32,1,1]> ms = reduce_mean(x=sq, axes=rax, keep_dims=kd)[name=string(\"ms\")];\n\
+                 fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n\
+                 tensor<fp16, [1,32,1,1]> mse = add(x=ms, y=eps)[name=string(\"mse\")];\n\
+                 fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n\
+                 tensor<fp16, [1,32,1,1]> rrms = pow(x=mse, y=nhalf)[name=string(\"rrms\")];\n\
+                 tensor<fp16, [1,32,1,32]> normed = mul(x=a_input0, y=rrms)[name=string(\"normed\")];\n\
+                 \n\
+                 // Step 2: Quantize to INT8\n\
+                 fp16 inv_scale = const()[name=string(\"inv_scale\"), val=fp16(50.0)];\n\
+                 tensor<fp16, [1,32,1,32]> qscaled = mul(x=normed, y=inv_scale)[name=string(\"qscaled\")];\n\
+                 tensor<fp16, [1,32,1,32]> qrounded = round(x=qscaled)[name=string(\"qrounded\")];\n\
+                 fp16 lo = const()[name=string(\"lo\"), val=fp16(-128.0)];\n\
+                 fp16 hi = const()[name=string(\"hi\"), val=fp16(127.0)];\n\
+                 tensor<fp16, [1,32,1,32]> qclamped = clip(x=qrounded, alpha=lo, beta=hi)[name=string(\"qclamped\")];\n\
+                 tensor<int8, [1,32,1,32]> quantized = cast(x=qclamped, dtype=string(\"int8\"))[name=string(\"quantized\")];\n\
+                 \n\
+                 // Step 3: Dequantize back to fp16\n\
+                 tensor<fp16, [1,32,1,32]> dequantized = cast(x=quantized, dtype=string(\"fp16\"))[name=string(\"dequantized\")];\n\
+                 fp16 scale = const()[name=string(\"scale\"), val=fp16(0.02)];\n\
+                 tensor<fp16, [1,32,1,32]> restored = mul(x=dequantized, y=scale)[name=string(\"restored\")];\n\
+                 \n\
+                 // Step 4: Dot product with query (attention score simulation)\n\
+                 tensor<fp16, [1,32,1,32]> product = mul(x=a_input1, y=restored)[name=string(\"product\")];\n\
+                 tensor<fp16, [1,32,1,1]> dot = reduce_sum(x=product, axes=rax, keep_dims=kd)[name=string(\"dot\")];\n\
+                 tensor<int32, [4]> rep = const()[name=string(\"rep\"), val=tensor<int32, [4]>([1,1,1,32])];\n\
+                 tensor<fp16, [1,32,1,32]> z_output0 = tile(x=dot, reps=rep)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0, tensor<fp16, [1,32,1,32]> a_input1",
+        "z_output0",
+    );
+    let k_proj: Vec<f32> = (0..N).map(|i| ((i % S) as f32 - 16.0) * 0.2).collect();
+    let query: Vec<f32> = (0..N).map(|i| ((i % S) as f32 - 16.0) * 0.1).collect();
+
+    // CPU reference: rmsnorm → quantize(int8) → dequantize → dot product with query
+    let mut expected = vec![0.0f32; N];
+    for c in 0..C {
+        let start = c * S;
+        // RMSNorm
+        let mean_sq: f32 = k_proj[start..start + S].iter().map(|&x| x * x).sum::<f32>() / S as f32;
+        let rrms = 1.0 / (mean_sq + 1e-5f32).sqrt();
+        // Quantize → dequantize
+        let mut restored = vec![0.0f32; S];
+        for s in 0..S {
+            let normed = k_proj[start + s] * rrms;
+            let q = (normed * 50.0).round().clamp(-128.0, 127.0) as i8;
+            restored[s] = (q as f32) * 0.02;
+        }
+        // Dot product with query
+        let dot: f32 = (0..S).map(|s| query[start + s] * restored[s]).sum();
+        for s in 0..S {
+            expected[start + s] = dot;
+        }
+    }
+
+    match run_ane(
+        &mil,
+        &[f16v(&k_proj), f16v(&query)],
+        &[(C, S), (C, S)],
+        &[(C, S)],
+    ) {
+        Some(out) => (
+            true,
+            check_results("TurboQuant INT8 cache pipeline", &out[0], &expected, 1.5),
+        ),
+        None => (false, false),
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║             ANE Op Eval Verification                            ║");
+    println!("║             ANE Op Eval Verification                             ║");
     println!("╠══════════════════════════════════════════════════════════════════╣");
-    println!("║  Tests compile + eval + numerical correctness on real ANE       ║");
+    println!("║  Tests compile + eval + numerical correctness on real ANE        ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -718,6 +1040,20 @@ fn main() {
         ("QJL sign extract", test_qjl_sign_extraction),
         ("RMSNorm", test_rmsnorm_pattern),
         ("affine quantize", test_affine_quantize_pattern),
+        // Gap-closing: ops claimed feasible but previously only compile-probed
+        ("matmul", test_matmul),
+        ("cast fp16↔bool", test_cast_fp16_bool),
+        ("layer_norm", test_layer_norm),
+        ("concat", test_concat),
+        ("silu", test_silu),
+        ("reduce_log_sum_exp", test_reduce_log_sum_exp),
+        // INT8 KV cache pipeline
+        ("INT8 round-trip", test_int8_round_trip),
+        ("INT8 quant→dequant", test_int8_quantize_dequantize),
+        (
+            "TQ INT8 cache pipeline",
+            test_turboquant_int8_cache_pipeline,
+        ),
     ];
 
     let mut compile_pass = 0;

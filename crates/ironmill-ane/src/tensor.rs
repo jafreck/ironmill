@@ -499,4 +499,62 @@ mod tests {
         assert!(t.alloc_size() >= data_size);
         assert!(t.alloc_size() >= MIN_SURFACE_ALLOC);
     }
+
+    #[test]
+    fn partial_write_only_changes_target_region() {
+        // Allocate an INT8 tensor and write known data everywhere.
+        let channels = 8;
+        let seq_len = 16;
+        let total = channels * seq_len; // 128 bytes
+        let mut t = AneTensor::new(channels, seq_len, ScalarType::Int8).unwrap();
+
+        // Fill entire tensor with 0xAA.
+        let fill = vec![0xAAu8; total];
+        t.write_bytes_at(0, &fill).unwrap();
+
+        // Partial write: overwrite bytes [16..24] with 0x55.
+        let patch = vec![0x55u8; 8];
+        t.write_bytes_at(16, &patch).unwrap();
+
+        // Read back full tensor and verify.
+        let readback = t.read_bytes_at(0, total).unwrap();
+        for (i, &b) in readback.iter().enumerate() {
+            if (16..24).contains(&i) {
+                assert_eq!(b, 0x55, "byte {i} should be 0x55 (patched region)");
+            } else {
+                assert_eq!(b, 0xAA, "byte {i} should be 0xAA (untouched region)");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_f16_write_read_roundtrip() {
+        let channels = 4;
+        let seq_len = 8;
+        let total_elements = channels * seq_len; // 32 f16 elements
+        let mut t = AneTensor::new(channels, seq_len, ScalarType::Float16).unwrap();
+
+        // Fill with zeros.
+        let zeros = vec![f16::ZERO; total_elements];
+        t.write_f16(&zeros).unwrap();
+
+        // Partial write at element offset 8, length 4.
+        let patch = [
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(3.0),
+            f16::from_f32(4.0),
+        ];
+        t.write_f16_at(8, &patch).unwrap();
+
+        // Read back just the patched region.
+        let readback = t.read_f16_at(8, 4).unwrap();
+        assert_eq!(readback.len(), 4);
+        assert_eq!(readback[0], f16::from_f32(1.0));
+        assert_eq!(readback[3], f16::from_f32(4.0));
+
+        // Verify untouched region is still zero.
+        let before = t.read_f16_at(0, 8).unwrap();
+        assert!(before.iter().all(|&v| v == f16::ZERO));
+    }
 }

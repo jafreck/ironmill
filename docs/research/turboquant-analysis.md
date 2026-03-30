@@ -103,6 +103,11 @@ bias using just 1 extra bit, making the combined estimator **unbiased**.
 | Models tested | Gemma, Mistral (open-source LLMs) |
 | Hardware tested | H100 GPUs |
 
+> **CoreML/ANE constraint:** ironmill's `constexpr_lut_to_dense` path only supports
+> LUT sizes `{2, 4, 16, 64, 256}`, mapping to `n_bits ∈ {1, 2, 4, 6, 8}`. The paper's
+> 3-bit and 3.5-bit results cannot be directly replicated on the CoreML path — 2-bit
+> and 4-bit are the closest available. See `KNOWN_ISSUES.md` for details.
+
 ---
 
 ## Relevance to ironmill
@@ -139,6 +144,12 @@ bits with k-means).
 - Beta distribution optimal quantizer levels
 - 1-bit quantization support
 - Runtime quantization hooks
+
+> **Update (March 2026):** PolarQuant static weight quantization has been
+> implemented (see `polar_quantize.rs`, `beta_quantizer.rs`, `rotation.rs`).
+> The ANE-direct backend has been probed for op support — see
+> [ANE Op Support Matrix](ane-op-support-matrix.md) for empirically verified
+> op availability including eval-time correctness checks.
 
 ---
 
