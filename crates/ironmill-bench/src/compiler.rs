@@ -27,8 +27,12 @@ pub fn compile_model(
 
     std::fs::create_dir_all(&entry_dir)?;
 
-    let onnx = mil_rs::read_onnx(&model.path)?;
-    let conversion_result = mil_rs::onnx_to_program(&onnx)?;
+    let (onnx, model_dir) = mil_rs::read_onnx_with_dir(&model.path)?;
+    let config = mil_rs::ConversionConfig {
+        model_dir: Some(model_dir),
+        ..Default::default()
+    };
+    let conversion_result = mil_rs::onnx_to_program_with_config(&onnx, &config)?;
     let mut program = conversion_result.program;
 
     let mut pipeline = mil_rs::PassPipeline::default();
@@ -71,8 +75,12 @@ pub fn build_optimized_program(
     model: &ModelConfig,
     opt: &OptConfig,
 ) -> Result<mil_rs::ir::Program> {
-    let onnx = mil_rs::read_onnx(&model.path)?;
-    let conversion_result = mil_rs::onnx_to_program(&onnx)?;
+    let (onnx, model_dir) = mil_rs::read_onnx_with_dir(&model.path)?;
+    let config = mil_rs::ConversionConfig {
+        model_dir: Some(model_dir),
+        ..Default::default()
+    };
+    let conversion_result = mil_rs::onnx_to_program_with_config(&onnx, &config)?;
     let mut program = conversion_result.program;
 
     let mut pipeline = mil_rs::PassPipeline::default();

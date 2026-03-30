@@ -384,6 +384,10 @@ pub struct TurboQuantModel {
     cw_k_staging: AneTensor,
     cw_v_staging: AneTensor,
     attn_q_staging: AneTensor,
+    /// Pre-allocated cache-write output for K (reused across calls).
+    cw_k_output: AneTensor,
+    /// Pre-allocated cache-write output for V (reused across calls).
+    cw_v_output: AneTensor,
     /// The ANE runtime handle.
     runtime: AneRuntime,
 }
@@ -502,6 +506,21 @@ impl TurboQuantModel {
             attn_alloc_size,
         )?;
 
+        // Pre-allocate output tensors for step_attention() reuse.
+        // These are overwritten on every eval call, so sharing across layers is safe.
+        let cw_k_output = AneTensor::new_with_min_alloc(
+            kv_channels,
+            MIN_IO_SEQ,
+            ScalarType::Float16,
+            cw_alloc_size,
+        )?;
+        let cw_v_output = AneTensor::new_with_min_alloc(
+            kv_channels,
+            MIN_IO_SEQ,
+            ScalarType::Float16,
+            cw_alloc_size,
+        )?;
+
         Ok(Self {
             config,
             cache,
@@ -515,6 +534,8 @@ impl TurboQuantModel {
             cw_k_staging,
             cw_v_staging,
             attn_q_staging,
+            cw_k_output,
+            cw_v_output,
             runtime,
         })
     }
@@ -578,18 +599,6 @@ impl TurboQuantModel {
         self.cw_v_staging.write_f16(&v_scattered)?;
 
         // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
-        let mut k_quant = AneTensor::new_with_min_alloc(
-            channels,
-            MIN_IO_SEQ,
-            ScalarType::Float16,
-            self.cw_alloc_size,
-        )?;
-        let mut v_quant = AneTensor::new_with_min_alloc(
-            channels,
-            MIN_IO_SEQ,
-            ScalarType::Float16,
-            self.cw_alloc_size,
-        )?;
         self.runtime.eval(
             &self.cache_write_program,
             &[
@@ -597,15 +606,15 @@ impl TurboQuantModel {
                 &self.cw_v_staging,
                 &self.rotation_tensor,
             ],
-            &mut [&mut k_quant, &mut v_quant],
+            &mut [&mut self.cw_k_output, &mut self.cw_v_output],
         )?;
 
         // 2. CPU cache interception: read fp16 values (rounded to integer),
         //    convert to INT8 bytes, write to persistent cache.
         //    Output is S=32 padded; gather column 0 to get actual values.
-        let k_f16 = gather_column0(&k_quant)?;
+        let k_f16 = gather_column0(&self.cw_k_output)?;
         let k_bytes: Vec<u8> = k_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
-        let v_f16 = gather_column0(&v_quant)?;
+        let v_f16 = gather_column0(&self.cw_v_output)?;
         let v_bytes: Vec<u8> = v_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
 
         // Read original K_proj for QJL residual sign computation

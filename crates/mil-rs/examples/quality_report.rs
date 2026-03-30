@@ -13,7 +13,10 @@ use std::collections::HashMap;
 
 use half::f16;
 use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
-use mil_rs::{PassPipeline, Program, ScalarType, Value, onnx_to_program, read_onnx};
+use mil_rs::{
+    ConversionConfig, PassPipeline, Program, ScalarType, Value, onnx_to_program_with_config,
+    read_onnx_with_dir,
+};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -27,7 +30,11 @@ fn main() -> anyhow::Result<()> {
         .to_string_lossy();
     println!("Model: {model_name}\n");
 
-    let onnx_model = read_onnx(input)?;
+    let (onnx_model, model_dir) = read_onnx_with_dir(input)?;
+    let conversion_config = ConversionConfig {
+        model_dir: Some(model_dir),
+        ..Default::default()
+    };
 
     // Each combo: (label, baseline pipeline builder, optimized pipeline builder).
     // The baseline uses the default always-on passes so that graph structure
@@ -66,13 +73,13 @@ fn main() -> anyhow::Result<()> {
 
     for (label, make_base_pipeline, make_opt_pipeline) in &combos {
         // Baseline: default passes only (same graph structure, no quantization).
-        let result_base = onnx_to_program(&onnx_model)?;
+        let result_base = onnx_to_program_with_config(&onnx_model, &conversion_config)?;
         let mut baseline = result_base.program;
         let base_pipeline = make_base_pipeline()?;
         base_pipeline.run(&mut baseline)?;
 
         // Optimized: default passes + the specific quantization/palettization.
-        let result_opt = onnx_to_program(&onnx_model)?;
+        let result_opt = onnx_to_program_with_config(&onnx_model, &conversion_config)?;
         let mut optimized = result_opt.program;
         let opt_pipeline = make_opt_pipeline()?;
         let report = opt_pipeline.run(&mut optimized)?;

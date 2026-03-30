@@ -455,8 +455,12 @@ fn compute_model_flops(model_cfg: &ModelConfig) -> Option<u64> {
     let ext = model_cfg.path.extension()?.to_str()?;
     match ext {
         "onnx" => {
-            let onnx = mil_rs::read_onnx(model_cfg.path.to_str()?).ok()?;
-            let result = mil_rs::onnx_to_program(&onnx).ok()?;
+            let (onnx, model_dir) = mil_rs::read_onnx_with_dir(model_cfg.path.to_str()?).ok()?;
+            let config = mil_rs::ConversionConfig {
+                model_dir: Some(model_dir),
+                ..Default::default()
+            };
+            let result = mil_rs::onnx_to_program_with_config(&onnx, &config).ok()?;
             let flops = result.program.total_flops();
             if flops > 0 { Some(flops) } else { None }
         }
