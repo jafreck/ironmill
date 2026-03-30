@@ -221,6 +221,93 @@ impl AneTensor {
         Ok(out)
     }
 
+    /// Write raw bytes at a byte offset within the surface.
+    pub fn write_bytes_at(&mut self, byte_offset: usize, data: &[u8]) -> Result<()> {
+        let end = byte_offset.checked_add(data.len()).ok_or_else(|| {
+            AneError::SurfaceError("write_bytes_at: offset + length overflows".into())
+        })?;
+        if end > self.alloc_size {
+            return Err(AneError::SurfaceError(format!(
+                "write_bytes_at: offset {} + len {} = {} exceeds allocation ({} bytes)",
+                byte_offset,
+                data.len(),
+                end,
+                self.alloc_size
+            )));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.with_locked_base(0, |base| unsafe {
+                let dst = (base as *mut u8).add(byte_offset);
+                std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.buffer[byte_offset..end].copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// Read raw bytes from a specific byte offset within the surface.
+    pub fn read_bytes_at(&self, byte_offset: usize, len: usize) -> Result<Vec<u8>> {
+        let end = byte_offset.checked_add(len).ok_or_else(|| {
+            AneError::SurfaceError("read_bytes_at: offset + length overflows".into())
+        })?;
+        if end > self.alloc_size {
+            return Err(AneError::SurfaceError(format!(
+                "read_bytes_at: offset {} + len {} = {} exceeds allocation ({} bytes)",
+                byte_offset, len, end, self.alloc_size
+            )));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut out = vec![0u8; len];
+            self.with_locked_base(ffi::IOSURFACE_LOCK_READ_ONLY, |base| unsafe {
+                let src = (base as *const u8).add(byte_offset);
+                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
+            })?;
+            Ok(out)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(self.buffer[byte_offset..end].to_vec())
+        }
+    }
+
+    /// Write f16 values at an element offset within the surface.
+    pub fn write_f16_at(&mut self, offset_elements: usize, data: &[f16]) -> Result<()> {
+        let byte_offset = offset_elements.checked_mul(2).ok_or_else(|| {
+            AneError::SurfaceError("write_f16_at: offset_elements too large".into())
+        })?;
+        let byte_len = data
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| AneError::SurfaceError("write_f16_at: data length too large".into()))?;
+        let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+        self.write_bytes_at(byte_offset, src)
+    }
+
+    /// Read f16 values from an element offset within the surface.
+    pub fn read_f16_at(&self, offset_elements: usize, len: usize) -> Result<Vec<f16>> {
+        let byte_offset = offset_elements.checked_mul(2).ok_or_else(|| {
+            AneError::SurfaceError("read_f16_at: offset_elements too large".into())
+        })?;
+        let byte_len = len
+            .checked_mul(2)
+            .ok_or_else(|| AneError::SurfaceError("read_f16_at: length too large".into()))?;
+        let bytes = self.read_bytes_at(byte_offset, byte_len)?;
+        let mut out = vec![f16::ZERO; len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, byte_len);
+        }
+        Ok(out)
+    }
+
     /// Write packed f32 data (converted to f16 internally).
     pub fn write_f32(&mut self, data: &[f32]) -> Result<()> {
         let f16_data: Vec<f16> = data.iter().map(|&v| f16::from_f32(v)).collect();
