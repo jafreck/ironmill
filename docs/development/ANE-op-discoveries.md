@@ -108,3 +108,21 @@ Discovered from [Orion](https://github.com/mechramc/Orion) (`core/ane_runtime.m`
 3. **Per-head norms on CPU**: Untested on ANE in combination with attention; safest to do on CPU (also cheap)
 
 The TurboQuant path avoids all three by using hand-written MIL programs with correct shapes and CPU-side rotation.
+
+## S≥32 Padding — Must Be Per-Sub-Program (Updated)
+
+The S≥32 padding was moved from global (pre-split) to per-sub-program
+(post-split). fp16_attn sub-programs are skipped because:
+
+1. Attention reshapes convert `[1, hidden, 1, S]` → `[1, heads, head_dim, S]`
+2. With S=32 padding, the reshape produces `[1, 16, 128, 32]` — wrong
+3. Without padding, `[1, 2048, 1, 1]` → `[1, 16, 128, 1]` — correct dimensions
+4. BUT: `[1, 16*128, 1, 1]` = `C=2048 > 768, S=1 < 32` → ANE constraint violation
+
+**Root cause**: Single-token decode creates matmul shapes with S=1
+and C>768, which ANE rejects regardless of padding. The KV cache
+needs full seq_len dimension in the matmul (like TurboQuant uses).
+
+**Conclusion**: FP16 attention on ANE requires the same architectural
+pattern as TurboQuant — KV cache IOSurfaces as matmul inputs with
+S=seq_len ≥ 32, not single-token S=1 projections.
