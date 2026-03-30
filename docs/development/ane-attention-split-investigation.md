@@ -153,25 +153,26 @@ The `post_attn` sub-program now compiles successfully on ANE:
 
 All 29 layers compile (5.99s), but `ANEProgramProcessRequestDirect()`
 fails at eval time with `status=0x1d : statusType=0x9: Program Inference
-error`. This is a runtime error, not a compilation error — the E5 binary
-loads but fails when processing the input request. Likely causes:
+error`. This is a **pre-existing** runtime error — identical with and
+without the matmul→conv/SiLU changes (verified by reverting). The E5
+binary loads but fails when processing the input request. Likely causes:
 
-1. **IOSurface tensor size mismatch**: The `AneTensor` alloc sizes for
-   conv-based sub-programs may not match what the compiled E5 binary
-   expects. Conv ops may require different buffer alignment or padding
-   than matmul. Check `uniform_alloc_size` calculation and compare
-   against the compiled program's input/output descriptors.
+1. **IOSurface tensor size mismatch**: The `AneTensor` alloc sizes may
+   not match what the compiled E5 binary expects. `compile_and_load_sub`
+   preallocates I/O tensors from the sub-program's declared shapes, but
+   the runtime does not validate that these match the compiled model.
+   Check `uniform_alloc_size` calculation vs actual compiled I/O.
 
-2. **Input/output index wiring**: The `_ANERequest` maps IOSurface
-   tensors to input/output indices. After matmul→conv conversion, the
-   sub-program's function signature (input count, order) may differ.
-   Verify that `CompiledProgram` input/output metadata matches the
-   actual MIL function signature.
+2. **Input/output count or ordering**: The `_ANERequest` maps IOSurface
+   tensors to indices. After splitting, the sub-program's function
+   signature (input count, order) may not match how `decode()` wires
+   the tensors. The post_attn sub-program expects 2 inputs (attention
+   output + residual) but `decode()` conditionally fills the second.
 
-3. **Conv weight BLOBFILE format**: The transposed weight data must be
-   written in Orion's 128-byte-header BLOBFILE format. Verify the
-   `ir_to_mil_text` emitter handles the new `[Cout, Cin, 1, 1]` weight
-   shape correctly and that the BLOBFILE offset/size match.
+3. **FP16 attention path incomplete**: The baseline FP16 path has no
+   compiled attention sub-program (`fp16_attn` is `None`), so `decode()`
+   passes Q through as a no-op. The attention output shape may not match
+   what post_attn expects.
 
 ## Implementation Tasks
 
@@ -221,8 +222,10 @@ pre_attn compiles for all 29 Qwen3-0.6B layers.
 
 ### Task 6 — E2E validation with AneInference::compile() 🔶
 
-pre_attn compiles for all layers. post_attn blocked on matmul→conv
-and SiLU fusion (see next steps above).
+Both pre_attn and post_attn compile for all 29 layers. matmul→conv
+(`AneMatmulToConvPass`) and SiLU fusion (`OpSubstitutionPass`) are
+complete. Runtime inference fails with `ANEProgramProcessRequestDirect()
+status=0x1d` — see "Next Steps — Runtime Inference" above.
 
 **File:** `crates/ironmill-ane/src/inference.rs`
 
