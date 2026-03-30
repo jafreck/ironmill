@@ -121,6 +121,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "ironmill-compile",
  "ironmill-coreml",
  "mil-rs",
 ]
@@ -143,6 +144,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "ironmill-compile",
  "ironmill-coreml",
  "mil-rs",
 ]
@@ -455,6 +457,7 @@ dependencies = [
  "anyhow",
  "half",
  "ironmill-ane-sys",
+ "ironmill-compile",
  "ironmill-iosurface",
  "ironmill-runtime",
  "mil-rs",
@@ -478,6 +481,7 @@ dependencies = [
  "clap",
  "half",
  "ironmill-ane",
+ "ironmill-compile",
  "ironmill-coreml",
  "mil-rs",
  "serde",
@@ -494,9 +498,30 @@ dependencies = [
  "anyhow",
  "clap",
  "ironmill-ane",
+ "ironmill-compile",
  "mil-rs",
  "serde_json",
  "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "ironmill-compile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glob-match",
+ "half",
+ "indexmap",
+ "ironmill-ane-sys",
+ "ironmill-iosurface",
+ "memmap2",
+ "mil-rs",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "toml",
 ]
 
@@ -653,8 +678,7 @@ dependencies = [
  "glob-match",
  "half",
  "indexmap",
- "ironmill-ane-sys",
- "memmap2",
+ "ironmill-compile",
  "prost",
  "prost-build",
  "rand",

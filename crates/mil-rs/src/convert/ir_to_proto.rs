@@ -963,7 +963,7 @@ fn convert_operation(
     }
 
     // Emit compute unit preference as a proto attribute when set.
-    if let Some(cu) = &op.compute_unit {
+    if let Some(cu) = op.compute_unit() {
         use crate::ir::ComputeUnit;
         let cu_str = match cu {
             ComputeUnit::Ane => "ane",

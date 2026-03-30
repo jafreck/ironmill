@@ -7,7 +7,7 @@
 //! name might succeed under an alias. This fuzzer tries hundreds of
 //! plausible MIL op names against the compiler to discover what it accepts.
 
-use mil_rs::ffi::ane::AneCompiler;
+use ironmill_ane_sys::AneCompiler;
 use std::collections::HashSet;
 
 const BUILD_INFO: &str = r#"[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]"#;

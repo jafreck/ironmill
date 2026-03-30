@@ -1,13 +1,13 @@
 //! ONNX → CoreML conversion helpers.
 //!
-//! Wraps [`mil_rs::CompileBuilder`] in a candle-friendly API. Works on all
+//! Wraps [`ironmill_compile::coreml::build_api::CompileBuilder`] in a candle-friendly API. Works on all
 //! platforms — no macOS or Xcode required for conversion itself.
 //!
 //! # Example
 //!
 //! ```no_run
 //! use candle_coreml::convert::{convert_onnx, ConvertOptions};
-//! use mil_rs::Quantization;
+//! use ironmill_compile::coreml::build_api::Quantization;
 //!
 //! let opts = ConvertOptions {
 //!     quantization: Quantization::Fp16,
@@ -19,8 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mil_rs::build_api::TargetComputeUnit;
-use mil_rs::{CompileBuilder, Quantization};
+use ironmill_compile::coreml::build_api::{CompileBuilder, Quantization, TargetComputeUnit};
 
 /// Options for ONNX → CoreML conversion.
 #[derive(Debug, Clone, Default)]

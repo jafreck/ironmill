@@ -13,19 +13,21 @@
 //! attention + cache management diverges (~20 lines in the per-layer loop).
 
 use half::f16;
-use mil_rs::convert::ir_to_mil_text::{MilTextConfig, program_to_mil_text};
-use mil_rs::ffi::ane::AneCompiler;
+use ironmill_ane_sys::AneCompiler;
+use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+use ironmill_compile::ane::passes::{
+    AneArgPromotionPass, AneLayoutPass, AneMatmulToConvPass, AneVariableNamingPass,
+    OpSubstitutionPass,
+};
+use ironmill_compile::ane::split::{SplitConfig, split_for_ane};
 use mil_rs::ir::Pass;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::{
-    AneArgPromotionPass, AneLayoutPass, AneMatmulToConvPass, AneVariableNamingPass,
-    AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, OpSubstitutionPass,
-    TypeRepropagationPass,
+    AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, TypeRepropagationPass,
 };
 
 use crate::program::CompiledProgram;
 use crate::runtime::AneRuntime;
-use crate::split::{SplitConfig, split_for_ane};
 use crate::tensor::{AneTensor, uniform_alloc_size};
 use crate::turboquant::{TurboQuantConfig, TurboQuantModel};
 use crate::turboquant_mil;
@@ -145,7 +147,7 @@ struct LoadedSubProgram {
     input_tensors: Vec<AneTensor>,
     output_tensors: Vec<AneTensor>,
     /// If inputs were spatially packed, stores the packing metadata.
-    input_packing: Option<crate::packing::InputPacking>,
+    input_packing: Option<ironmill_compile::ane::packing::InputPacking>,
 }
 
 /// LM head projection — ANE-accelerated or CPU fallback.
@@ -507,10 +509,12 @@ impl AneInference {
         // 2b. Pack inputs spatially where possible.
         // Must run BEFORE matmul→conv since packing adds slice_by_size ops,
         // not matmuls. Stores packing metadata per sub-program name.
-        let mut packing_map: std::collections::HashMap<String, crate::packing::InputPacking> =
-            std::collections::HashMap::new();
+        let mut packing_map: std::collections::HashMap<
+            String,
+            ironmill_compile::ane::packing::InputPacking,
+        > = std::collections::HashMap::new();
         for sub in &mut model_split.programs {
-            if let Some(packing) = crate::packing::pack_inputs(sub) {
+            if let Some(packing) = ironmill_compile::ane::packing::pack_inputs(sub) {
                 packing_map.insert(sub.name.clone(), packing);
             }
         }
@@ -543,12 +547,18 @@ impl AneInference {
         let mut embedding_sp = None;
         let mut lm_head_sp = None;
         // Collect layer sub-programs indexed by layer number.
-        let mut pre_attn_map: std::collections::BTreeMap<usize, &crate::split::SubProgram> =
-            std::collections::BTreeMap::new();
-        let mut post_attn_map: std::collections::BTreeMap<usize, &crate::split::SubProgram> =
-            std::collections::BTreeMap::new();
-        let mut fp16_attn_map: std::collections::BTreeMap<usize, &crate::split::SubProgram> =
-            std::collections::BTreeMap::new();
+        let mut pre_attn_map: std::collections::BTreeMap<
+            usize,
+            &ironmill_compile::ane::split::SubProgram,
+        > = std::collections::BTreeMap::new();
+        let mut post_attn_map: std::collections::BTreeMap<
+            usize,
+            &ironmill_compile::ane::split::SubProgram,
+        > = std::collections::BTreeMap::new();
+        let mut fp16_attn_map: std::collections::BTreeMap<
+            usize,
+            &ironmill_compile::ane::split::SubProgram,
+        > = std::collections::BTreeMap::new();
 
         for sub in &model_split.programs {
             if sub.name == "embedding" {
@@ -782,7 +792,7 @@ impl AneInference {
                 (a.num_heads, a.num_kv_heads, a.head_dim, 2048)
             } else {
                 // Fallback: infer from pre_attn output shapes.
-                let pre_sps: Vec<&crate::split::SubProgram> =
+                let pre_sps: Vec<&ironmill_compile::ane::split::SubProgram> =
                     pre_attn_map.values().copied().collect();
                 let kv_channels = infer_kv_heads_from_sub(&pre_sps);
                 let hd = infer_head_dim_from_sub(&pre_sps);
@@ -1065,7 +1075,7 @@ impl AneInference {
                         }
                         post_attn.input_tensors[0].write_f16(&packed)?;
                     } else {
-                        crate::packing::write_packed_inputs(
+                        ironmill_compile::ane::packing::write_packed_inputs(
                             &mut post_attn.input_tensors[0],
                             &[&attn_out_data],
                             packing,
@@ -1286,10 +1296,10 @@ fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
 /// The program is auto-loaded by `compile_mil_text`; the caller is
 /// responsible for calling `runtime.unload_compiled()` afterwards.
 fn compile_and_load_sub(
-    sub: &crate::split::SubProgram,
+    sub: &ironmill_compile::ane::split::SubProgram,
     _runtime: &AneRuntime,
     mil_config: &MilTextConfig,
-    input_packing: Option<crate::packing::InputPacking>,
+    input_packing: Option<ironmill_compile::ane::packing::InputPacking>,
 ) -> Result<LoadedSubProgram> {
     // ANE requires Float16. Convert any Float32 const ops to Float16.
     let mut program = sub.program.clone();
@@ -1376,11 +1386,11 @@ fn compile_and_load_sub(
 /// The donor must have been compiled from the same MIL text structure
 /// (same ops and shapes, different weight data).
 fn compile_and_load_sub_with_donor(
-    sub: &crate::split::SubProgram,
+    sub: &ironmill_compile::ane::split::SubProgram,
     donor: &CompiledProgram,
     _runtime: &AneRuntime,
     mil_config: &MilTextConfig,
-    input_packing: Option<crate::packing::InputPacking>,
+    input_packing: Option<ironmill_compile::ane::packing::InputPacking>,
 ) -> Result<LoadedSubProgram> {
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
@@ -1443,7 +1453,7 @@ fn compile_and_load_sub_with_donor(
 }
 
 /// Infer the number of KV heads from pre_attn sub-program output shapes.
-fn infer_kv_heads_from_sub(pre_attn_sps: &[&crate::split::SubProgram]) -> usize {
+fn infer_kv_heads_from_sub(pre_attn_sps: &[&ironmill_compile::ane::split::SubProgram]) -> usize {
     // The KV projection outputs have fewer channels than Q in GQA models.
     // Find the minimum channel count among outputs (excluding very small ones
     // like scalars/position IDs). This gives kv_channels = num_kv_heads * head_dim.
@@ -1462,7 +1472,7 @@ fn infer_kv_heads_from_sub(pre_attn_sps: &[&crate::split::SubProgram]) -> usize 
 }
 
 /// Infer head_dim from pre_attn sub-program output shapes.
-fn infer_head_dim_from_sub(_pre_attn_sps: &[&crate::split::SubProgram]) -> usize {
+fn infer_head_dim_from_sub(_pre_attn_sps: &[&ironmill_compile::ane::split::SubProgram]) -> usize {
     // Without explicit arch info, assume head_dim = 64 (common default).
     64
 }
@@ -1476,7 +1486,10 @@ fn infer_head_dim_from_sub(_pre_attn_sps: &[&crate::split::SubProgram]) -> usize
 /// Walks the sub-program's ops looking for `const` ops with tensor values.
 /// Returns the largest one (embedding table or lm_head weight), converted
 /// to fp16 if needed.
-fn extract_cpu_weight(sub: &crate::split::SubProgram, _label: &str) -> Option<CpuWeight> {
+fn extract_cpu_weight(
+    sub: &ironmill_compile::ane::split::SubProgram,
+    _label: &str,
+) -> Option<CpuWeight> {
     use mil_rs::ir::Value;
 
     let func = sub.program.main()?;

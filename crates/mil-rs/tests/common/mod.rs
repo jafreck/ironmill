@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use mil_rs::ir::passes::tensor_utils::f32_slice_to_bytes;
 use mil_rs::{
-    Block, Function, Operation, Pass, PassPipeline, PipelineReport, Program, ScalarType,
-    TensorType, Value, model_to_program, program_to_model,
+    Block, Function, Operation, PassPipeline, PipelineReport, Program, ScalarType, TensorType,
+    Value, model_to_program, program_to_model,
 };
 
 /// CoreML spec version used for test conversions.

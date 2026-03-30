@@ -8,11 +8,11 @@
 
 use std::path::{Path, PathBuf};
 
+use ironmill_compile::coreml::compiler::{compile_model, is_compiler_available};
 use mil_rs::convert::onnx_graph::ConversionResult;
 use mil_rs::ir::passes::{ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass};
 use mil_rs::{
-    Pass, Program, compile_model, is_compiler_available, onnx_to_program, program_to_model,
-    read_mlpackage, read_onnx, write_mlpackage,
+    Pass, Program, onnx_to_program, program_to_model, read_mlpackage, read_onnx, write_mlpackage,
 };
 
 /// CoreML spec version used for ONNX conversions (matches CLI).

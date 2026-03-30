@@ -1,6 +1,6 @@
 //! TurboQuant INT8 KV cache compression configuration and KV cache management.
 
-use mil_rs::ffi::ane::AneCompiler;
+use ironmill_ane_sys::AneCompiler;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels};
 use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard};

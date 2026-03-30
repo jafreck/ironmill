@@ -2,26 +2,22 @@
 //!
 //! Each pass implements the [`Pass`](super::Pass) trait and transforms a
 //! [`Program`](super::Program) in place.
+//!
+//! ANE-specific passes (codebook, compute-unit, kv-cache, layer-schedule,
+//! mixed-precision, model-split, op-split, op-substitute, and all `ane_*`
+//! passes) have moved to the `ironmill-compile` crate.
 
 pub mod attention_fusion;
 pub mod beta_quantizer;
 pub mod bn_weight_fold;
-pub mod codebook;
-pub mod compute_unit;
 pub mod constant_fold;
 pub mod dead_code;
 pub mod fp16_quantize;
 pub mod identity_elim;
 pub mod int8_quantize;
 pub mod kmeans;
-pub mod kv_cache;
-pub mod layer_schedule;
 pub mod layout_optimize;
-pub mod mixed_precision;
-pub mod model_split;
 pub mod op_fusion;
-pub mod op_split;
-pub mod op_substitute;
 pub mod palettize;
 pub mod polar_quantize;
 pub mod polar_rotation_fusion;
@@ -30,61 +26,23 @@ pub mod shape_materialize;
 pub mod tensor_utils;
 pub mod type_repropagate;
 
-// ANE-specific passes (feature-gated)
-#[cfg(feature = "ane-direct")]
-pub mod ane_arg_promotion;
-#[cfg(feature = "ane-direct")]
-pub mod ane_attention_decompose;
-#[cfg(feature = "ane-direct")]
-pub mod ane_concat_elim;
-#[cfg(feature = "ane-direct")]
-pub mod ane_layout;
-#[cfg(feature = "ane-direct")]
-pub mod ane_matmul_to_conv;
-#[cfg(feature = "ane-direct")]
-pub mod ane_variable_naming;
-
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
-pub use codebook::CodebookOptimizationPass;
-pub use compute_unit::ComputeUnitAnnotationPass;
 pub use constant_fold::ConstantFoldPass;
 pub use dead_code::DeadCodeEliminationPass;
 pub use fp16_quantize::Fp16QuantizePass;
 pub use identity_elim::IdentityEliminationPass;
 pub use int8_quantize::{Granularity, Int8QuantizePass};
-pub use kv_cache::KvCachePass;
-pub use layer_schedule::{LayerScheduleConfig, LayerSchedulePass, LayerType};
 pub use layout_optimize::LayoutOptimizationPass;
-pub use mixed_precision::{
-    ExpertQuantConfig, ExpertQuantStrategy, MixedPrecisionConfig, MixedPrecisionPass, OpPrecision,
-    PerExpertQuantPass,
-};
-pub use model_split::{ModelSplitPass, SplitResult};
 pub use op_fusion::{
     ConvBatchNormFusionPass, ConvReluFusionPass, GeluLinearFusionPass, LayerNormLinearFusionPass,
     LinearReluFusionPass, ResidualAddFusionPass,
 };
-pub use op_split::{OpSplittingPass, parse_memory_size};
-pub use op_substitute::OpSubstitutionPass;
 pub use palettize::{GroupedPalettizePass, PalettizePass};
 pub use polar_quantize::PolarQuantPass;
 pub use polar_rotation_fusion::PolarRotationFusionPass;
 pub use shape_materialize::{AutoregressiveShapeMaterializePass, ShapeMaterializePass};
 pub use type_repropagate::TypeRepropagationPass;
-
-#[cfg(feature = "ane-direct")]
-pub use ane_arg_promotion::AneArgPromotionPass;
-#[cfg(feature = "ane-direct")]
-pub use ane_attention_decompose::AttentionDecomposePass;
-#[cfg(feature = "ane-direct")]
-pub use ane_concat_elim::AneConcatEliminationPass;
-#[cfg(feature = "ane-direct")]
-pub use ane_layout::AneLayoutPass;
-#[cfg(feature = "ane-direct")]
-pub use ane_matmul_to_conv::AneMatmulToConvPass;
-#[cfg(feature = "ane-direct")]
-pub use ane_variable_naming::AneVariableNamingPass;
 
 use super::program::Block;
 use super::types::Value;

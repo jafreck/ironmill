@@ -14,7 +14,7 @@ CoreML via [mil-rs](https://github.com/jafreck/ironmill).
 
 ```rust,no_run
 use candle_coreml::convert::{convert_onnx, ConvertOptions};
-use mil_rs::Quantization;
+use ironmill_compile::coreml::build_api::Quantization;
 
 let opts = ConvertOptions {
     quantization: Quantization::Fp16,

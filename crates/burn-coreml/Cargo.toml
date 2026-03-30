@@ -11,6 +11,7 @@ keywords = ["burn", "coreml", "apple", "machine-learning", "neural-engine"]
 
 [dependencies]
 mil-rs = { workspace = true }
+ironmill-compile = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }
 

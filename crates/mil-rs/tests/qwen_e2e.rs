@@ -9,9 +9,9 @@ use std::fs;
 use safetensors::Dtype;
 use safetensors::tensor::TensorView;
 
-use mil_rs::convert::templates::weights_to_program;
-use mil_rs::convert::weights::safetensors::SafeTensorsProvider;
-use mil_rs::convert::weights::{Architecture, WeightProvider};
+use ironmill_compile::templates::weights_to_program;
+use ironmill_compile::weights::safetensors::SafeTensorsProvider;
+use ironmill_compile::weights::{Architecture, WeightProvider};
 
 // ---------------------------------------------------------------------------
 // Config

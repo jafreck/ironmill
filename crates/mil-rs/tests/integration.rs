@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mil_rs::ir::{Block, Function, Pass, PassPipeline};
+use mil_rs::ir::{Block, Function, PassPipeline};
 use mil_rs::reader::print_model_summary;
 use mil_rs::{
     Operation, Program, ScalarType, TensorType, Value, model_to_program, program_to_model,

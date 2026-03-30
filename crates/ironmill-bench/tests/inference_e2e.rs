@@ -4,8 +4,9 @@
 
 use std::path::PathBuf;
 
+use ironmill_compile::coreml::compiler::compile_model;
 use mil_rs::ir::passes::{ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass};
-use mil_rs::{Pass, compile_model, onnx_to_program, program_to_model, read_onnx, write_mlpackage};
+use mil_rs::{Pass, onnx_to_program, program_to_model, read_onnx, write_mlpackage};
 
 use ironmill_coreml::{ComputeUnits, Model, build_dummy_input};
 

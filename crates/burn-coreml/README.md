@@ -41,7 +41,7 @@ crate for CoreML conversion and inference.
 
 ```rust,no_run
 use burn_coreml::export::{export_to_coreml, ExportOptions};
-use mil_rs::build_api::{Quantization, TargetComputeUnit};
+use ironmill_compile::coreml::build_api::{Quantization, TargetComputeUnit};
 
 // Convert a Burn-exported ONNX model to CoreML
 let result = export_to_coreml(

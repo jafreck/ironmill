@@ -11,7 +11,7 @@ use half::f16;
 use ironmill_ane::program::CompiledProgram;
 use ironmill_ane::runtime::AneRuntime;
 use ironmill_ane::tensor::AneTensor;
-use mil_rs::ffi::ane::AneCompiler;
+use ironmill_ane_sys::AneCompiler;
 use mil_rs::ir::ScalarType;
 
 // ── MIL text helpers ────────────────────────────────────────────────────

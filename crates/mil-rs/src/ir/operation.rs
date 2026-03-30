@@ -57,10 +57,6 @@ pub struct Operation {
 
     /// Operation-specific attributes (e.g., kernel size, stride, padding).
     pub attributes: HashMap<String, Value>,
-
-    /// Preferred compute unit for this operation.
-    /// Set by [`ComputeUnitAnnotationPass`] based on ANE shape-aware validation.
-    pub compute_unit: Option<ComputeUnit>,
 }
 
 impl Operation {
@@ -73,7 +69,6 @@ impl Operation {
             outputs: Vec::new(),
             output_types: Vec::new(),
             attributes: HashMap::new(),
-            compute_unit: None,
         }
     }
 
@@ -94,5 +89,25 @@ impl Operation {
     pub fn with_attr(mut self, name: impl Into<String>, value: Value) -> Self {
         self.attributes.insert(name.into(), value);
         self
+    }
+
+    /// Get the compute unit preference for this operation, if set.
+    pub fn compute_unit(&self) -> Option<ComputeUnit> {
+        match self.attributes.get("compute_unit") {
+            Some(Value::String(s)) => match s.as_str() {
+                "ane" => Some(ComputeUnit::Ane),
+                "gpu" => Some(ComputeUnit::Gpu),
+                "cpu" => Some(ComputeUnit::Cpu),
+                "any" => Some(ComputeUnit::Any),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Set the compute unit preference for this operation.
+    pub fn set_compute_unit(&mut self, cu: ComputeUnit) {
+        self.attributes
+            .insert("compute_unit".to_string(), Value::String(cu.to_string()));
     }
 }

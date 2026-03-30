@@ -6,9 +6,9 @@
 
 use std::fs;
 
-use mil_rs::convert::templates::weights_to_program;
-use mil_rs::convert::weights::gguf::GgufProvider;
-use mil_rs::convert::weights::{Architecture, WeightProvider};
+use ironmill_compile::templates::weights_to_program;
+use ironmill_compile::weights::gguf::GgufProvider;
+use ironmill_compile::weights::{Architecture, WeightProvider};
 
 // ---------------------------------------------------------------------------
 // Config constants (must match GGUF metadata)

@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
+use crate::analysis::build_type_map;
 use crate::ir::{Function, Operation, Program, TensorType, Value};
-use crate::validate::build_type_map;
 
 // ---------------------------------------------------------------------------
 // Public API

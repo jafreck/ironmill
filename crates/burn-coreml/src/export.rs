@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mil_rs::build_api::{CompileBuilder, Quantization, TargetComputeUnit};
+use ironmill_compile::coreml::build_api::{CompileBuilder, Quantization, TargetComputeUnit};
 
 /// Options for exporting to CoreML.
 #[derive(Debug, Clone, Default)]

@@ -2,14 +2,17 @@
 
 mod common;
 
-use mil_rs::ir::{
-    CodebookOptimizationPass, ComputeUnitAnnotationPass, ExpertQuantConfig, Fp16QuantizePass,
-    Int8QuantizePass, KvCachePass, LayerScheduleConfig, LayerSchedulePass, ModelSplitPass,
-    PalettizePass, PerExpertQuantPass,
-};
+use mil_rs::convert::moe::{detect_moe, split_moe};
+use mil_rs::ir::passes::{Fp16QuantizePass, Int8QuantizePass, PalettizePass};
 use mil_rs::{
-    ComputeUnit, MixedPrecisionConfig, OpSplittingPass, Pass, PassPipeline, ScalarType, Value,
-    detect_moe, program_to_model, program_to_multi_function_model, split_moe,
+    ComputeUnit, Pass, PassPipeline, ScalarType, Value, program_to_model,
+    program_to_multi_function_model,
+};
+
+use ironmill_compile::ane::passes::{
+    CodebookOptimizationPass, ComputeUnitAnnotationPass, ExpertQuantConfig, KvCachePass,
+    LayerScheduleConfig, LayerSchedulePass, MixedPrecisionConfig, ModelSplitPass, OpSplittingPass,
+    PerExpertQuantPass,
 };
 
 use common::{
@@ -28,9 +31,10 @@ fn layout_plus_mixed_precision_pipeline() {
 
     // Layout optimization is included in the default pipeline (cancel-only).
     let config = MixedPrecisionConfig::preset_fp16_int8();
-    let pipeline = PassPipeline::new()
-        .with_mixed_precision_config(config)
-        .expect("mixed precision config should be valid");
+    let mut pipeline = PassPipeline::new();
+    pipeline.add_pass(Box::new(
+        ironmill_compile::ane::passes::MixedPrecisionPass::new(config),
+    ));
 
     pipeline.run(&mut program).expect("pipeline should succeed");
 
@@ -98,7 +102,7 @@ fn kv_cache_plus_compute_unit_annotations() {
     // Every op should now have a compute_unit annotation.
     for op in ops {
         assert!(
-            op.compute_unit.is_some(),
+            op.compute_unit().is_some(),
             "op '{}' ({}) should have a compute_unit annotation",
             op.name,
             op.op_type
@@ -122,13 +126,13 @@ fn kv_cache_plus_compute_unit_annotations() {
     let non_cache_annotated = ops
         .iter()
         .filter(|op| !op.op_type.contains("kv_cache") && !op.name.contains("cache"))
-        .all(|op| op.compute_unit.is_some());
+        .all(|op| op.compute_unit().is_some());
     assert!(non_cache_annotated, "all non-cache ops should be annotated");
 
     // Const ops should be annotated as Any.
     for op in ops.iter().filter(|op| op.op_type == "const") {
         assert_eq!(
-            op.compute_unit,
+            op.compute_unit(),
             Some(ComputeUnit::Any),
             "const op '{}' should be ComputeUnit::Any",
             op.name
@@ -338,7 +342,7 @@ other = "none"
     LayerSchedulePass::new(ls_config)
         .run(&mut program)
         .expect("LayerSchedulePass should succeed");
-    mil_rs::MixedPrecisionPass::new(mp_config)
+    ironmill_compile::ane::passes::MixedPrecisionPass::new(mp_config)
         .run(&mut program)
         .expect("MixedPrecisionPass should succeed");
 
@@ -473,35 +477,16 @@ fn model_split_plus_different_pipelines() {
 
 #[test]
 fn configurable_pipeline_with_all_new_passes() {
-    let toml_config = r#"
-[[passes]]
-name = "kv-cache"
-enabled = true
-[passes.params]
-max_seq_length = 2048
+    use ironmill_compile::ane::passes::{
+        CodebookOptimizationPass, ComputeUnitAnnotationPass, KvCachePass, LayerSchedulePass,
+        OpSplittingPass,
+    };
 
-[[passes]]
-name = "op-splitting"
-enabled = true
-[passes.params]
-memory_budget_bytes = 67108864
-
-[[passes]]
-name = "compute-unit-annotation"
-enabled = true
-
-[[passes]]
-name = "codebook-optimization"
-enabled = true
-
-[[passes]]
-name = "layer-schedule"
-enabled = true
-[passes.params]
-layer_strategies = { attention = "fp16", ffn = "int8", conv = "fp16", norm = "fp16", other = "none" }
-"#;
-
-    let pipeline = PassPipeline::from_config_str(toml_config).expect("TOML config should parse");
+    let mut pipeline = PassPipeline::new();
+    pipeline.add_pass(Box::new(KvCachePass::new(2048)));
+    pipeline.add_pass(Box::new(OpSplittingPass::new(67108864)));
+    pipeline.add_pass(Box::new(ComputeUnitAnnotationPass));
+    pipeline.add_pass(Box::new(CodebookOptimizationPass));
 
     let mut program = build_transformer_program(2);
     pipeline
@@ -643,7 +628,7 @@ fn parallel_moe_expert_compilation() {
 
     let results: Vec<_> = handles
         .into_iter()
-        .map(|h| h.join().expect("expert thread should not panic"))
+        .map(|h: std::thread::JoinHandle<_>| h.join().expect("expert thread should not panic"))
         .collect();
 
     // Verify each expert serializes correctly.

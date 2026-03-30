@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 mil-rs = { workspace = true }
+ironmill-compile = { workspace = true }
 ironmill-coreml = { path = "../ironmill-coreml" }
 ironmill-ane = { path = "../ironmill-ane", optional = true }
 clap = { workspace = true }
@@ -27,4 +28,4 @@ tempfile = { workspace = true }
 
 [features]
 default = []
-ane-direct = ["mil-rs/ane-direct", "dep:ironmill-ane"]
+ane-direct = ["dep:ironmill-ane"]

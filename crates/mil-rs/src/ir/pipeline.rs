@@ -9,14 +9,12 @@ use serde::Deserialize;
 
 use super::pass::Pass;
 use super::passes::{
-    AttentionFusionPass, CodebookOptimizationPass, ComputeUnitAnnotationPass, ConstantFoldPass,
-    ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
-    DeadCodeEliminationPass, ExpertQuantConfig, Fp16QuantizePass, GeluLinearFusionPass,
-    GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass, KvCachePass,
-    LayerNormLinearFusionPass, LayerSchedulePass, LayoutOptimizationPass, LinearReluFusionPass,
-    MixedPrecisionConfig, MixedPrecisionPass, OpSplittingPass, OpSubstitutionPass, PalettizePass,
-    PerExpertQuantPass, PolarQuantPass, PolarRotationFusionPass, ResidualAddFusionPass,
-    ShapeMaterializePass, TypeRepropagationPass,
+    AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass,
+    ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass, GeluLinearFusionPass,
+    GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass,
+    LayerNormLinearFusionPass, LayoutOptimizationPass, LinearReluFusionPass, PalettizePass,
+    PolarQuantPass, PolarRotationFusionPass, ResidualAddFusionPass, ShapeMaterializePass,
+    TypeRepropagationPass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -31,7 +29,6 @@ pub struct PassPipeline {
     has_int8: bool,
     has_palettize: bool,
     has_polar_quant: bool,
-    has_mixed_precision: bool,
 }
 
 // ── TOML configuration types ──────────────────────────────────────────
@@ -74,21 +71,13 @@ const KNOWN_PASSES: &[&str] = &[
     "residual-add-fusion",
     "attention-fusion",
     "gqa-fusion",
-    "kv-cache",
-    "codebook-optimization",
-    "op-substitution",
     "layout-optimization",
     "type-repropagation",
     "fp16-quantization",
     "int8-quantization",
-    "mixed-precision",
-    "layer-schedule",
     "palettization",
     "polar-quantization",
-    "per-expert-quantization",
     "shape-materialization",
-    "compute-unit-annotation",
-    "op-splitting",
 ];
 
 /// Create a boxed pass from its name and optional parameters.
@@ -106,16 +95,6 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
         "residual-add-fusion" => Ok(Box::new(ResidualAddFusionPass)),
         "attention-fusion" => Ok(Box::new(AttentionFusionPass)),
         "gqa-fusion" => Ok(Box::new(GqaFusionPass)),
-        "kv-cache" => {
-            let max_seq = params
-                .get("max_seq_length")
-                .and_then(|v| v.as_integer())
-                .map(|i| i as usize)
-                .unwrap_or(2048);
-            Ok(Box::new(KvCachePass::new(max_seq)))
-        }
-        "codebook-optimization" => Ok(Box::new(CodebookOptimizationPass)),
-        "op-substitution" => Ok(Box::new(OpSubstitutionPass)),
         "layout-optimization" => Ok(Box::new(LayoutOptimizationPass)),
         "type-repropagation" => Ok(Box::new(TypeRepropagationPass)),
         "fp16-quantization" => Ok(Box::new(Fp16QuantizePass)),
@@ -164,32 +143,16 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
                 min_elements,
             }))
         }
-        "mixed-precision" => {
-            let config_path = params
-                .get("config_path")
-                .and_then(|v| v.as_str())
-                .map(PathBuf::from);
-            if let Some(path) = config_path {
-                let pass = MixedPrecisionPass::from_config_file(&path)?;
-                Ok(Box::new(pass))
-            } else {
-                let config = MixedPrecisionConfig::preset_fp16_int8();
-                Ok(Box::new(MixedPrecisionPass::new(config)))
-            }
-        }
-        "layer-schedule" => {
-            let config_path = params
-                .get("config_path")
-                .and_then(|v| v.as_str())
-                .map(PathBuf::from);
-            if let Some(path) = config_path {
-                let pass = LayerSchedulePass::from_config_file(&path)?;
-                Ok(Box::new(pass))
-            } else {
-                let pass = LayerSchedulePass::from_params(params)?;
-                Ok(Box::new(pass))
-            }
-        }
+        "mixed-precision"
+        | "layer-schedule"
+        | "compute-unit-annotation"
+        | "op-splitting"
+        | "per-expert-quantization"
+        | "kv-cache"
+        | "codebook-optimization"
+        | "op-substitution" => Err(MilError::Validation(format!(
+            "pass '{name}' has been moved to ironmill-compile"
+        ))),
         "shape-materialization" => {
             let mut pass = ShapeMaterializePass::new();
             if let Some(shapes) = params.get("shapes") {
@@ -210,52 +173,6 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
             }
             Ok(Box::new(pass))
         }
-        "compute-unit-annotation" => Ok(Box::new(ComputeUnitAnnotationPass)),
-        "op-splitting" => {
-            let budget = params
-                .get("memory_budget")
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    super::passes::op_split::parse_memory_size(s)
-                        .map_err(|e| MilError::Validation(format!("invalid memory budget: {e}")))
-                })
-                .transpose()?
-                .or_else(|| {
-                    params
-                        .get("memory_budget_bytes")
-                        .and_then(|v| v.as_integer())
-                        .map(|i| i as usize)
-                })
-                .unwrap_or(super::passes::op_split::DEFAULT_MEMORY_BUDGET);
-            Ok(Box::new(OpSplittingPass::new(budget)))
-        }
-        "per-expert-quantization" => {
-            let config_path = params
-                .get("config_path")
-                .and_then(|v| v.as_str())
-                .map(PathBuf::from);
-            if let Some(path) = config_path {
-                let pass = PerExpertQuantPass::from_config_file(&path)?;
-                Ok(Box::new(pass))
-            } else {
-                // Default: hot experts 0,1 in FP16, everything else 4-bit palettize.
-                let total = params
-                    .get("total_experts")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(8) as usize;
-                let hot: Vec<usize> = params
-                    .get("hot_experts")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_integer().map(|i| i as usize))
-                            .collect()
-                    })
-                    .unwrap_or_else(|| vec![0, 1]);
-                let config = ExpertQuantConfig::preset_hot_cold(&hot, total);
-                Ok(Box::new(PerExpertQuantPass::new(config)))
-            }
-        }
         _ => Err(MilError::Validation(format!("unknown pass: '{name}'"))),
     }
 }
@@ -274,7 +191,6 @@ impl std::fmt::Debug for PassPipeline {
             .field("has_int8", &self.has_int8)
             .field("has_palettize", &self.has_palettize)
             .field("has_polar_quant", &self.has_polar_quant)
-            .field("has_mixed_precision", &self.has_mixed_precision)
             .finish()
     }
 }
@@ -285,7 +201,7 @@ impl PassPipeline {
     /// Includes cleanup (DCE, identity elimination, constant folding),
     /// fusion (conv-bn weight fold, conv-bn fusion, conv-relu, linear-relu,
     /// layernorm-linear, gelu-linear, residual-add), and optimization
-    /// (attention fusion, GQA fusion, op substitution).
+    /// (attention fusion, GQA fusion, layout optimization, type repropagation).
     pub fn new() -> Self {
         Self {
             passes: vec![
@@ -304,9 +220,6 @@ impl PassPipeline {
                 // Optimization passes
                 Box::new(AttentionFusionPass),
                 Box::new(GqaFusionPass),
-                Box::new(KvCachePass::default()),
-                Box::new(CodebookOptimizationPass),
-                Box::new(OpSubstitutionPass),
                 Box::new(LayoutOptimizationPass),
                 // Re-propagate output types after all transformations so that
                 // newly-created ops (transposes, tiles, etc.) get concrete types.
@@ -316,7 +229,6 @@ impl PassPipeline {
             has_int8: false,
             has_palettize: false,
             has_polar_quant: false,
-            has_mixed_precision: false,
         }
     }
 
@@ -354,7 +266,6 @@ impl PassPipeline {
         let mut has_int8 = false;
         let mut has_palettize = false;
         let mut has_polar_quant = false;
-        let mut has_mixed_precision = false;
 
         for entry in &config.passes {
             if !entry.enabled {
@@ -370,7 +281,7 @@ impl PassPipeline {
             // Enforce mutual exclusivity
             match entry.name.as_str() {
                 "fp16-quantization" => {
-                    if has_int8 && !has_mixed_precision {
+                    if has_int8 {
                         return Err(MilError::Validation(
                             "FP16 and INT8 quantization are mutually exclusive".into(),
                         ));
@@ -384,7 +295,7 @@ impl PassPipeline {
                     has_fp16 = true;
                 }
                 "int8-quantization" => {
-                    if has_fp16 && !has_mixed_precision {
+                    if has_fp16 {
                         return Err(MilError::Validation(
                             "FP16 and INT8 quantization are mutually exclusive".into(),
                         ));
@@ -424,9 +335,6 @@ impl PassPipeline {
                     }
                     has_polar_quant = true;
                 }
-                "mixed-precision" => {
-                    has_mixed_precision = true;
-                }
                 _ => {}
             }
 
@@ -439,13 +347,12 @@ impl PassPipeline {
             has_int8,
             has_palettize,
             has_polar_quant,
-            has_mixed_precision,
         })
     }
 
-    /// Add FP16 quantization. Errors if INT8 is already added (unless mixed-precision is enabled).
+    /// Add FP16 quantization. Errors if INT8 is already added.
     pub fn with_fp16(mut self) -> Result<Self> {
-        if self.has_int8 && !self.has_mixed_precision {
+        if self.has_int8 {
             return Err(MilError::Validation(
                 "FP16 and INT8 quantization are mutually exclusive".into(),
             ));
@@ -460,9 +367,9 @@ impl PassPipeline {
         Ok(self)
     }
 
-    /// Add INT8 quantization. Errors if FP16 is already added (unless mixed-precision is enabled).
+    /// Add INT8 quantization. Errors if FP16 is already added.
     pub fn with_int8(mut self, cal_dir: Option<PathBuf>) -> Result<Self> {
-        if self.has_fp16 && !self.has_mixed_precision {
+        if self.has_fp16 {
             return Err(MilError::Validation(
                 "FP16 and INT8 quantization are mutually exclusive".into(),
             ));
@@ -531,34 +438,6 @@ impl PassPipeline {
         Ok(self)
     }
 
-    /// Add mixed-precision quantization from a TOML config file.
-    ///
-    /// When mixed-precision is configured, the normal FP16/INT8 mutual exclusivity
-    /// constraints are relaxed since the mixed-precision pass handles per-op routing.
-    pub fn with_mixed_precision(mut self, config_path: &Path) -> Result<Self> {
-        let pass = MixedPrecisionPass::from_config_file(config_path)?;
-        self.has_mixed_precision = true;
-        self.passes.push(Box::new(pass));
-        Ok(self)
-    }
-
-    /// Add mixed-precision quantization from a [`MixedPrecisionConfig`].
-    pub fn with_mixed_precision_config(mut self, config: MixedPrecisionConfig) -> Result<Self> {
-        self.has_mixed_precision = true;
-        self.passes.push(Box::new(MixedPrecisionPass::new(config)));
-        Ok(self)
-    }
-
-    /// Add per-expert quantization from an [`ExpertQuantConfig`].
-    ///
-    /// This pass applies different compression strategies to different experts
-    /// in a Mixture-of-Experts model, based on activation frequency profiles.
-    pub fn with_per_expert_quant(mut self, config: ExpertQuantConfig) -> Result<Self> {
-        self.has_mixed_precision = true;
-        self.passes.push(Box::new(PerExpertQuantPass::new(config)));
-        Ok(self)
-    }
-
     /// Add shape materialization with user-provided shapes.
     ///
     /// The shape pass is inserted before any quantization/palettization passes.
@@ -577,21 +456,9 @@ impl PassPipeline {
                     || name == "int8-quantization"
                     || name == "palettization"
                     || name == "polar-quantization"
-                    || name == "mixed-precision-quantization"
-                    || name == "per-expert-quantization"
             })
             .unwrap_or(self.passes.len());
         self.passes.insert(insert_pos, Box::new(shape_pass));
-        self
-    }
-
-    /// Add operator splitting with the given ANE memory budget (in bytes).
-    ///
-    /// Ops whose estimated memory exceeds the budget are decomposed into
-    /// smaller tiles that each fit within the ANE's on-chip memory.
-    pub fn with_op_splitting(mut self, memory_budget_bytes: usize) -> Self {
-        self.passes
-            .push(Box::new(OpSplittingPass::new(memory_budget_bytes)));
         self
     }
 
@@ -607,24 +474,33 @@ impl PassPipeline {
             "residual-add-fusion",
             "attention-fusion",
             "gqa-fusion",
-            "kv-cache",
-            "codebook-optimization",
-            "op-substitution",
             "layout-optimization",
         ];
         self.passes.retain(|p| !FUSION_NAMES.contains(&p.name()));
         self
     }
 
-    /// Append the compute-unit annotation pass to the pipeline.
+    /// Append a pass to the end of the pipeline.
     ///
-    /// This pass annotates each operation with its preferred compute unit
-    /// (ANE, GPU, CPU, or Any) based on shape-aware ANE constraint checks.
-    /// Should be added after all optimization/fusion passes so annotations
-    /// reflect the final graph.
-    pub fn with_compute_unit_annotations(mut self) -> Self {
-        self.passes.push(Box::new(ComputeUnitAnnotationPass));
-        self
+    /// This allows downstream crates (e.g. ironmill-compile) to register
+    /// backend-specific passes that are not part of the core mil-rs pipeline.
+    pub fn add_pass(&mut self, pass: Box<dyn Pass>) {
+        self.passes.push(pass);
+    }
+
+    /// Insert a pass immediately after the named pass.
+    ///
+    /// Returns `true` if the named pass was found (and the new pass was
+    /// inserted after it). Returns `false` if the named pass was not found,
+    /// in which case the new pass is appended to the end.
+    pub fn add_pass_after(&mut self, after_name: &str, pass: Box<dyn Pass>) -> bool {
+        if let Some(pos) = self.passes.iter().position(|p| p.name() == after_name) {
+            self.passes.insert(pos + 1, pass);
+            true
+        } else {
+            self.passes.push(pass);
+            false
+        }
     }
 
     /// Return the names of passes in the pipeline, in order.
@@ -895,9 +771,6 @@ mod tests {
                 "residual-add-fusion",
                 "attention-fusion",
                 "gqa-fusion",
-                "kv-cache",
-                "codebook-optimization",
-                "op-substitution",
                 "layout-optimization",
                 "type-repropagation",
             ]
@@ -999,7 +872,7 @@ mod tests {
     #[test]
     fn default_trait_works() {
         let pipeline = PassPipeline::default();
-        assert_eq!(pipeline.pass_names().len(), 17);
+        assert_eq!(pipeline.pass_names().len(), 14);
     }
 
     #[test]
@@ -1153,15 +1026,6 @@ name = "attention-fusion"
 
 [[passes]]
 name = "gqa-fusion"
-
-[[passes]]
-name = "kv-cache"
-
-[[passes]]
-name = "codebook-optimization"
-
-[[passes]]
-name = "op-substitution"
 
 [[passes]]
 name = "layout-optimization"

@@ -7,15 +7,17 @@ mod common;
 
 use mil_rs::ir::passes::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
 use mil_rs::ir::passes::{
-    ComputeUnitAnnotationPass, Fp16QuantizePass, Granularity, Int8QuantizePass,
-    LayoutOptimizationPass, MixedPrecisionConfig, MixedPrecisionPass, OpSplittingPass,
-    PolarQuantPass,
+    Fp16QuantizePass, Granularity, Int8QuantizePass, LayoutOptimizationPass, PolarQuantPass,
 };
 use mil_rs::{
     Block, ComputeUnit, Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorType,
-    Value, model_to_program, program_to_model, validate_ane_compatibility,
-    validation_report_to_json,
+    Value, model_to_program, program_to_model,
 };
+
+use ironmill_compile::ane::passes::{
+    ComputeUnitAnnotationPass, MixedPrecisionConfig, MixedPrecisionPass, OpSplittingPass,
+};
+use ironmill_compile::ane::validate::{validate_ane_compatibility, validation_report_to_json};
 
 // ═══════════════════════════════════════════════════════════════════════
 // 5.1: NHWC Layout
@@ -524,10 +526,10 @@ default = "fp16"
     );
     block.outputs.push("final_out".into());
 
-    // Use PassPipeline::with_mixed_precision (file-based pipeline method).
-    let pipeline = PassPipeline::new()
-        .with_mixed_precision(&config_path)
-        .expect("with_mixed_precision");
+    // Use MixedPrecisionPass directly (file-based config).
+    let config = MixedPrecisionConfig::from_toml_file(&config_path).expect("load config");
+    let mut pipeline = PassPipeline::new();
+    pipeline.add_pass(Box::new(MixedPrecisionPass::new(config)));
     pipeline.run(&mut program).expect("pipeline");
 
     let ops = &program.functions["main"].body.operations;
@@ -942,12 +944,12 @@ fn compute_unit_annotation_roundtrip() {
         .iter()
         .find(|o| o.op_type == "relu")
         .unwrap()
-        .compute_unit;
+        .compute_unit();
     let custom_cu = ops
         .iter()
         .find(|o| o.op_type == "custom_unknown_op")
         .unwrap()
-        .compute_unit;
+        .compute_unit();
     assert_eq!(relu_cu, Some(ComputeUnit::Ane));
     assert_eq!(custom_cu, Some(ComputeUnit::Cpu));
 
@@ -1002,7 +1004,7 @@ fn compute_unit_annotation_roundtrip() {
         .expect("relu after roundtrip");
     assert!(
         rt_relu.attributes.contains_key("compute_unit")
-            || rt_relu.compute_unit == Some(ComputeUnit::Ane),
+            || rt_relu.compute_unit() == Some(ComputeUnit::Ane),
         "relu compute_unit should survive roundtrip (as attribute or field)"
     );
 
@@ -1012,7 +1014,7 @@ fn compute_unit_annotation_roundtrip() {
         .expect("custom op after roundtrip");
     assert!(
         rt_custom.attributes.contains_key("compute_unit")
-            || rt_custom.compute_unit == Some(ComputeUnit::Cpu),
+            || rt_custom.compute_unit() == Some(ComputeUnit::Cpu),
         "custom op compute_unit should survive roundtrip (as attribute or field)"
     );
 }
@@ -1062,12 +1064,16 @@ fn annotations_match_validation() {
             .map(|r| r.ane_eligible)
             .unwrap_or(false);
 
-        let annotation_ane = op.compute_unit == Some(ComputeUnit::Ane);
+        let annotation_ane = op.compute_unit() == Some(ComputeUnit::Ane);
 
         assert_eq!(
-            annotation_ane, validation_eligible,
+            annotation_ane,
+            validation_eligible,
             "op '{}' ({}) annotation={:?} but validation ane_eligible={}",
-            op.name, op.op_type, op.compute_unit, validation_eligible
+            op.name,
+            op.op_type,
+            op.compute_unit(),
+            validation_eligible
         );
     }
 }

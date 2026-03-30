@@ -21,14 +21,13 @@ toml = { workspace = true }
 glob-match = { workspace = true }
 rand = { workspace = true }
 statrs = { workspace = true }
-safetensors = { workspace = true }
-memmap2 = { workspace = true }
-ironmill-ane-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 tempfile = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
+ironmill-compile = { workspace = true }
+safetensors = { workspace = true }
 
 [[bench]]
 name = "pipeline"
@@ -43,8 +42,6 @@ name = "weight_formats"
 harness = false
 
 [features]
-ane-direct = ["dep:ironmill-ane-sys"]
-c-api = []
 
 [build-dependencies]
 prost-build = { workspace = true }

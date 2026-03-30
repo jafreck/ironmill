@@ -5,17 +5,18 @@ mod common;
 
 use std::collections::HashMap;
 
+use mil_rs::convert::moe::{ExpertFrequencyProfile, detect_moe, fuse_top_k_experts, split_moe};
 use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
+use mil_rs::ir::passes::{GroupedPalettizePass, PalettizePass};
 use mil_rs::{
-    ExpertFrequencyProfile, Function, Operation, Pass, PassPipeline, PipelineReport, Program,
-    ScalarType, TensorType, Value, compile_model, detect_moe, fuse_top_k_experts,
-    program_to_multi_function_model, split_moe,
+    Function, Operation, Pass, PassPipeline, PipelineReport, Program, ScalarType, TensorType,
+    Value, program_to_multi_function_model,
 };
 
-use mil_rs::ir::passes::{
-    ExpertQuantConfig, GroupedPalettizePass, LayerScheduleConfig, LayerSchedulePass,
-    ModelSplitPass, PalettizePass, PerExpertQuantPass,
+use ironmill_compile::ane::passes::{
+    ExpertQuantConfig, LayerScheduleConfig, LayerSchedulePass, ModelSplitPass, PerExpertQuantPass,
 };
+use ironmill_compile::coreml::compiler::compile_model;
 
 use common::{
     build_const_program, build_conv_program, build_moe_program, build_transformer_program,
@@ -510,16 +511,7 @@ name = "attention-fusion"
 name = "gqa-fusion"
 
 [[passes]]
-name = "kv-cache"
-
-[[passes]]
-name = "codebook-optimization"
-
-[[passes]]
-name = "op-substitution"
-
-[[passes]]
-name = "type-repropagation"
+name = "layout-optimization"
 
 [[passes]]
 name = "type-repropagation"

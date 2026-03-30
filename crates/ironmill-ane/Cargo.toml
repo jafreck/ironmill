@@ -8,7 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-mil-rs = { workspace = true, features = ["ane-direct"] }
+mil-rs = { workspace = true }
+ironmill-compile = { workspace = true }
 ironmill-iosurface = { workspace = true }
 ironmill-ane-sys = { workspace = true }
 ironmill-runtime = { workspace = true }

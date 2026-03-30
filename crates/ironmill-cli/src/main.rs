@@ -6,19 +6,25 @@ use std::process;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mil_rs::ir::ModelSplitPass;
+use ironmill_compile::ane::passes::ModelSplitPass;
+use ironmill_compile::ane::validate::validate_ane_compatibility;
+use ironmill_compile::ane::validate::{print_validation_report, validation_report_to_json};
+#[allow(unused_imports)]
+use ironmill_compile::convert::pipeline::{convert_pipeline, parse_pipeline_manifest};
+#[allow(unused_imports)]
+use ironmill_compile::coreml::compiler::{compile_model, is_compiler_available};
+#[allow(unused_imports)]
+use ironmill_compile::templates::{
+    TemplateOptions, weights_to_program, weights_to_program_with_options,
+};
 use mil_rs::ir::PassPipeline;
 use mil_rs::ir::PipelineReport;
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
-use mil_rs::validate::{print_validation_report, validation_report_to_json};
 #[allow(unused_imports)]
 use mil_rs::{
-    ConversionConfig, LossFunction, TemplateOptions, UpdatableModelConfig, UpdateOptimizer,
-    compile_model, convert_pipeline, is_compiler_available, onnx_to_program_with_config,
-    parse_pipeline_manifest, program_to_model, program_to_multi_function_model,
-    program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx,
-    validate_ane_compatibility, weights_to_program, weights_to_program_with_options,
-    write_mlpackage,
+    ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer,
+    onnx_to_program_with_config, program_to_model, program_to_multi_function_model,
+    program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx, write_mlpackage,
 };
 
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
@@ -535,9 +541,10 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         // Add quantization. If a quantize-config file is provided it takes
         // precedence over the --quantize flag to avoid double quantization.
         if let Some(ref config_path) = opts.quantize_config {
-            pipeline = pipeline
-                .with_mixed_precision(config_path)
-                .context("Failed to configure mixed-precision from config file")?;
+            let pass =
+                ironmill_compile::ane::passes::MixedPrecisionPass::from_config_file(config_path)
+                    .context("Failed to configure mixed-precision from config file")?;
+            pipeline.add_pass(Box::new(pass));
         } else {
             match opts.quantize.as_str() {
                 "fp16" => {
@@ -551,10 +558,10 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                         .context("Failed to configure INT8 quantization")?;
                 }
                 "mixed-fp16-int8" => {
-                    let config = mil_rs::MixedPrecisionConfig::preset_fp16_int8();
-                    pipeline = pipeline
-                        .with_mixed_precision_config(config)
-                        .context("Failed to configure mixed-precision quantization")?;
+                    let config =
+                        ironmill_compile::ane::passes::MixedPrecisionConfig::preset_fp16_int8();
+                    let pass = ironmill_compile::ane::passes::MixedPrecisionPass::new(config);
+                    pipeline.add_pass(Box::new(pass));
                 }
                 "none" => {}
                 other => {
@@ -581,14 +588,18 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
         // Add compute unit annotations (should run last, after all transforms).
         if opts.annotate_compute_units {
-            pipeline = pipeline.with_compute_unit_annotations();
+            pipeline.add_pass(Box::new(
+                ironmill_compile::ane::passes::ComputeUnitAnnotationPass,
+            ));
         }
 
         // Add op splitting for ANE memory budget
         if let Some(ref budget_str) = opts.ane_memory_budget {
-            let budget = mil_rs::ir::passes::op_split::parse_memory_size(budget_str)
+            let budget = ironmill_compile::ane::passes::op_split::parse_memory_size(budget_str)
                 .map_err(|e| anyhow::anyhow!("invalid --ane-memory-budget: {e}"))?;
-            pipeline = pipeline.with_op_splitting(budget);
+            pipeline.add_pass(Box::new(
+                ironmill_compile::ane::passes::OpSplittingPass::new(budget),
+            ));
             println!("  ANE memory budget: {budget_str} ({budget} bytes)");
         }
 
@@ -625,7 +636,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 5. MoE split (if requested)
     if opts.moe_split {
-        use mil_rs::{detect_moe, split_moe};
+        use mil_rs::convert::moe::{detect_moe, split_moe};
 
         if let Some(topology) = detect_moe(&program) {
             println!(
@@ -677,7 +688,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 5b. MoE bundle (if requested) — single multi-function .mlpackage
     if opts.moe_bundle {
-        use mil_rs::{detect_moe, split_moe};
+        use mil_rs::convert::moe::{detect_moe, split_moe};
 
         if let Some(topology) = detect_moe(&program) {
             println!(
@@ -733,7 +744,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 5c. MoE top-K fusion (if requested)
     if let Some(k) = opts.moe_fuse_topk {
-        use mil_rs::{ExpertFrequencyProfile, fuse_top_k_experts};
+        use mil_rs::convert::moe::{ExpertFrequencyProfile, fuse_top_k_experts};
 
         // Load or build frequency profile
         let profile = if let Some(ref cal_dir) = opts.cal_data {
@@ -749,14 +760,14 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                     profile_path.display()
                 );
                 // Detect expert count to build uniform profile
-                let expert_count = mil_rs::detect_moe(&program)
+                let expert_count = mil_rs::convert::moe::detect_moe(&program)
                     .map(|t| t.expert_count)
                     .unwrap_or(k);
                 ExpertFrequencyProfile::uniform(expert_count)
             }
         } else {
             println!("  Note: --cal-data not provided, using uniform profile.");
-            let expert_count = mil_rs::detect_moe(&program)
+            let expert_count = mil_rs::convert::moe::detect_moe(&program)
                 .map(|t| t.expert_count)
                 .unwrap_or(k);
             ExpertFrequencyProfile::uniform(expert_count)

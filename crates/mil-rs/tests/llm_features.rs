@@ -3,10 +3,11 @@
 
 mod common;
 
+use ironmill_compile::ane::passes::KvCachePass;
 use mil_rs::convert::lora::{LoraAdapter, merge_lora};
 use mil_rs::convert::onnx_graph::detect_autoregressive_pattern;
+use mil_rs::ir::passes::AutoregressiveShapeMaterializePass;
 use mil_rs::ir::passes::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
-use mil_rs::ir::passes::{AutoregressiveShapeMaterializePass, KvCachePass};
 use mil_rs::{
     Block, Function, LossFunction, Operation, Pass, Program, ScalarType, TensorType,
     UpdatableModelConfig, UpdateOptimizer, Value, program_to_model, program_to_updatable_model,

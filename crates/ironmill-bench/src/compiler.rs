@@ -62,7 +62,8 @@ pub fn compile_model(
     let mlpackage_path = entry_dir.join("model.mlpackage");
     mil_rs::write_mlpackage(&model_proto, &mlpackage_path)?;
 
-    let compiled_path = mil_rs::compile_model(&mlpackage_path, &entry_dir)?;
+    let compiled_path =
+        ironmill_compile::coreml::compiler::compile_model(&mlpackage_path, &entry_dir)?;
 
     Ok(compiled_path)
 }

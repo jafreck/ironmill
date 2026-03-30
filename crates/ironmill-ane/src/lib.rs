@@ -29,13 +29,9 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("ironmill-ane only supports macOS");
 
-pub mod blobfile;
-pub mod cache;
 pub mod inference;
-pub mod packing;
 pub mod program;
 pub mod runtime;
-pub mod split;
 pub mod tensor;
 pub mod turboquant;
 pub mod turboquant_mil;
@@ -44,11 +40,14 @@ use std::path::PathBuf;
 
 use mil_rs::ir::ScalarType;
 
-use crate::blobfile::BlobFileWriter;
-use crate::cache::ProgramCache;
+use ironmill_compile::ane::blobfile::BlobFileWriter;
+use ironmill_compile::ane::cache::ProgramCache;
+use ironmill_compile::ane::split::{SplitConfig, split_for_ane};
+
+pub use ironmill_compile::ane::TensorDescriptor;
+
 use crate::program::LoadedProgram;
 use crate::runtime::AneRuntime;
-use crate::split::{SplitConfig, split_for_ane};
 use crate::tensor::{AneTensor, IOSurfaceError, uniform_alloc_size};
 
 // ── Error type ────────────────────────────────────────────────────
@@ -83,6 +82,25 @@ impl From<IOSurfaceError> for AneError {
     }
 }
 
+impl From<ironmill_compile::ane::AneCompileError> for AneError {
+    fn from(e: ironmill_compile::ane::AneCompileError) -> Self {
+        use ironmill_compile::ane::AneCompileError;
+        match e {
+            AneCompileError::CompileFailed { status, context } => {
+                AneError::CompileFailed { status, context }
+            }
+            AneCompileError::EvalFailed { status, context } => {
+                AneError::EvalFailed { status, context }
+            }
+            AneCompileError::SurfaceError(msg) => AneError::SurfaceError(msg),
+            AneCompileError::BudgetExhausted { used, limit } => {
+                AneError::BudgetExhausted { used, limit }
+            }
+            AneCompileError::Other(e) => AneError::Other(e),
+        }
+    }
+}
+
 /// Result type alias for ANE operations.
 pub type Result<T> = std::result::Result<T, AneError>;
 
@@ -109,19 +127,6 @@ impl Default for AneConfig {
             enable_int4: false,
         }
     }
-}
-
-// ── Tensor descriptor ─────────────────────────────────────────────
-
-/// Describes a tensor's shape and data type for I/O specification.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TensorDescriptor {
-    /// Variable name in the MIL program.
-    pub name: String,
-    /// Shape in ANE layout: `[1, C, 1, S]`.
-    pub shape: [usize; 4],
-    /// Element data type.
-    pub dtype: ScalarType,
 }
 
 // ── AneModel facade ───────────────────────────────────────────────
@@ -170,13 +175,13 @@ impl AneModel {
     ///    f. Pre-allocate IOSurface tensors for I/O
     /// 4. Return the assembled `AneModel`
     pub fn compile_and_load(program: &mil_rs::ir::Program, config: AneConfig) -> Result<Self> {
-        use mil_rs::convert::ir_to_mil_text::{MilTextConfig, program_to_mil_text};
-        use mil_rs::ffi::ane::AneCompiler;
-        use mil_rs::ir::Pass;
-        use mil_rs::ir::passes::{
+        use ironmill_ane_sys::AneCompiler;
+        use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+        use ironmill_compile::ane::passes::{
             AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
             OpSubstitutionPass,
         };
+        use mil_rs::ir::Pass;
 
         // 1. Clone and run ANE-specific passes
         let mut program = program.clone();
@@ -437,12 +442,12 @@ impl CompiledArtifacts {
     /// require the ANE runtime or private APIs. The artifacts can be
     /// inspected, persisted to disk, or fed to `_ANECompiler` separately.
     pub fn prepare(program: &mil_rs::ir::Program) -> Result<Self> {
-        use mil_rs::convert::ir_to_mil_text::{MilTextConfig, program_to_mil_text};
-        use mil_rs::ir::Pass;
-        use mil_rs::ir::passes::{
+        use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+        use ironmill_compile::ane::passes::{
             AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
             OpSubstitutionPass,
         };
+        use mil_rs::ir::Pass;
 
         // 1. Clone and run ANE-specific passes
         let mut program = program.clone();
@@ -725,15 +730,14 @@ mod tests {
 
     #[test]
     fn pass_pipeline_runs_without_error() {
-        use mil_rs::ir::Pass;
-        use mil_rs::ir::Program;
-        use mil_rs::ir::passes::{
+        use ironmill_compile::ane::passes::{
             AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
             OpSubstitutionPass,
         };
+        use mil_rs::ir::Pass;
 
         // Minimal empty program — passes should be no-ops.
-        let mut program = Program {
+        let mut program = mil_rs::ir::Program {
             version: "1.0".to_string(),
             functions: Default::default(),
             attributes: Default::default(),
@@ -1265,7 +1269,6 @@ mod tests {
 
         // First, dump the post-pass MIL text for debugging.
         {
-            use mil_rs::convert::ir_to_mil_text::{MilTextConfig, program_to_mil_text};
             let artifacts = CompiledArtifacts::prepare(&program).expect("prepare");
             for sub in &artifacts.sub_programs {
                 eprintln!("  [post-pass MIL for '{}']\n{}", sub.name, sub.mil_text);
@@ -1309,7 +1312,7 @@ mod tests {
     #[test]
     fn e2e_debug_mil_text_output() {
         // Dump the MIL text for debugging ANE compilation failures.
-        use mil_rs::convert::ir_to_mil_text::{MilTextConfig, program_to_mil_text};
+        use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
 
         for (label, program) in [
             ("add (no weights)", build_add_program()),

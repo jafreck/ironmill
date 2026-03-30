@@ -5,12 +5,11 @@
 
 mod common;
 
-use mil_rs::convert::pipeline::{
+use ironmill_compile::ane::passes::{CodebookOptimizationPass, ModelSplitPass, OpSplittingPass};
+use ironmill_compile::convert::pipeline::{
     PipelineManifest, PipelineMeta, StageConfig, parse_pipeline_manifest,
 };
-use mil_rs::ir::passes::{
-    CodebookOptimizationPass, Fp16QuantizePass, Int8QuantizePass, ModelSplitPass, OpSplittingPass,
-};
+use mil_rs::ir::passes::{Fp16QuantizePass, Int8QuantizePass};
 use mil_rs::{Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorType, Value};
 
 use common::{build_transformer_program, make_const_op};
@@ -114,7 +113,7 @@ depends_on = ["feature_extractor"]
         .flat_map(|s| {
             s.depends_on
                 .iter()
-                .map(move |dep| (s.name.as_str(), dep.as_str()))
+                .map(move |dep: &String| (s.name.as_str(), dep.as_str()))
         })
         .collect();
     assert_eq!(edges.len(), 1);
@@ -698,7 +697,7 @@ depends_on = ["A"]
         ],
     };
 
-    let err = mil_rs::convert_pipeline(
+    let err = ironmill_compile::convert::pipeline::convert_pipeline(
         &cyclic_manifest,
         std::path::Path::new("."),
         std::path::Path::new("/nonexistent"),
@@ -746,7 +745,7 @@ fn pipeline_manifest_missing_dependency() {
         ],
     };
 
-    let err = mil_rs::convert_pipeline(
+    let err = ironmill_compile::convert::pipeline::convert_pipeline(
         &manifest,
         std::path::Path::new("."),
         std::path::Path::new("/nonexistent"),
