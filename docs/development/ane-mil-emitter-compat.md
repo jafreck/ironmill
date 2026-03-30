@@ -1,138 +1,56 @@
 # ANE MIL Text Emitter Compatibility
 
-> **Status:** Open
+> **Status:** Resolved
 >
-> **Blocks:** [TurboQuant E2E Inference](turboquant-e2e-inference.md) — layer sub-program compilation
+> **Blocked:** [TurboQuant E2E Inference](turboquant-e2e-inference.md) — layer sub-program compilation
 >
 > **Discovered during:** BLOBFILE investigation → E2E inference bringup
 
 ## Problem
 
-`ir_to_mil_text.rs` emits MIL text that the private ANE compiler
-(`_ANECompiler`) rejects for real transformer sub-programs. The format
-differences are specific and identified:
+`ir_to_mil_text.rs` emitted MIL text that the private ANE compiler
+(`_ANECompiler`) rejected for real transformer sub-programs. Two
+format issues were identified and fixed.
 
-1. **`reshape` shape argument** — The emitter prints `reshape(shape=<tensor>, ...)`
-   as a debug placeholder instead of emitting the actual shape value
-   like `reshape(x=..., shape=tensor<int32, [4]>([1,1,1,128]))`.
-   This is a bug in `format_value()` for `Value::Tensor` used as an
-   op input (not a const val).
+## Issues Found and Fixed
 
-2. **BLOBFILE weight references** — `compile_mil_text()` fails on MIL
-   text containing `BLOBFILE(path=..., offset=...)` const values. The
-   working TurboQuant and ane_op_eval generators avoid BLOBFILE entirely
-   by passing weights as function inputs (`a_inputN`). The general
-   emitter needs the same approach: emit weights as function parameters
-   instead of BLOBFILE-backed const ops.
+### Issue 1: `reshape` shape argument (fixed)
 
-## Root Cause
+`format_value()` emitted `<tensor>` (Rust Debug format) instead of
+a valid MIL tensor literal for `Value::Tensor` op arguments.
 
-Two concrete format issues, identified by comparing working MIL text
-(TurboQuant emitter, ane_op_eval examples) against failing MIL text
-(ir_to_mil_text output for ONNX-converted layers):
-
-### Issue 1: `reshape` shape argument (bug)
-
-Working format (TurboQuant emitter):
 ```mil
-tensor<fp16, [1,2,64,1]> reshaped = reshape(x=a_input0, shape=tensor<int32, [4]>([1,2,64,1]))[name=string("reshaped")];
+// Before (bug):
+reshape(shape=<tensor>, x=input)
+
+// After (fix):
+reshape(x=input, shape=tensor<int32, [4]>([1,1024,1,1]))
 ```
 
-Failing format (ir_to_mil_text):
-```mil
-tensor<fp16, [1,1,1,128]> out = reshape(shape=<tensor>, x=input)[name=string("out")];
-```
+**Fix:** `format_value()` now emits inline typed tensor literals via
+`format_tensor_elements()`. Shapes are flattened to 1-D. Argument
+ordering puts `x=` first.
 
-`<tensor>` is the `Debug` format of a `Value::Tensor` variant, not
-a valid MIL literal. `format_value()` needs to emit the tensor inline
-(e.g., `tensor<int32, [4]>([1,1,1,128])`) when a tensor is used as
-an op argument rather than a const val.
+### Issue 2: BLOBFILE weight references (unverified)
 
-### Issue 2: BLOBFILE incompatibility (design)
+The original BLOBFILE investigation concluded that `compile_mil_text()`
+fails on BLOBFILE references. However, this conclusion was reached
+**before** the `emit_const_op` attribute lookup bug was fixed (the
+weights were silently empty). The existing `AneModel::compile_and_load()`
+E2E tests use BLOBFILE successfully with 4D weight shapes.
 
-Working format (TurboQuant / ane_op_eval):
-```mil
-func main<ios18>(tensor<fp16, [1,64,1,64]> a_input0, tensor<fp16, [1,64,1,64]> a_input2) {
-    // weights are function inputs, populated via IOSurface before eval
-```
+**Current status:** BLOBFILE with correct weight data and 4D type
+declarations **has not been independently verified** for real
+transformer-sized weights. The E2E compilation currently fails due
+to an invalid reshape in the sub-program graph (see
+[ANE Attention Split Investigation](ane-attention-split-investigation.md)),
+which prevents reaching the BLOBFILE compilation path for valid programs.
 
-Failing format (ir_to_mil_text):
-```mil
-tensor<fp16, [1024,1024]> weight = const()[name=string("weight"),
-    val=tensor<fp16, [1024,1024]>(BLOBFILE(path=string("@model_path/weights/weight.bin"),
-    offset=uint64(64)))];
-```
+**If BLOBFILE does fail** after the split issue is resolved, the fix
+is to emit weights as function inputs (IOSurface parameters) instead
+of BLOBFILE-backed const ops, matching the TurboQuant approach.
 
-The ANE compiler's `compile_mil_text()` API does not resolve BLOBFILE
-references correctly, even when the weight dictionary is provided.
-This was confirmed during the BLOBFILE investigation. The fix is to
-emit weight tensors as function inputs and populate them via IOSurface
-before eval, matching the TurboQuant approach.
-
-## Approach
-
-Two targeted fixes, not a broad survey:
-
-### Fix 1 — `format_value()` for tensor op arguments
-
-In `ir_to_mil_text.rs`, when a `Value::Tensor` appears as an op input
-(not a const val), emit it as an inline typed tensor literal:
-
-```rust
-// Before (bug): prints Debug format
-Value::Tensor { .. } => "<tensor>".to_string(),
-
-// After: emit as MIL tensor literal
-Value::Tensor { data, shape, dtype } => {
-    // e.g., tensor<int32, [4]>([1, 1, 1, 128])
-    format_inline_tensor(data, shape, dtype)
-}
-```
-
-This only affects ops that take tensor-valued arguments inline (like
-`reshape`'s `shape` parameter). Most ops use scalar or reference args.
-
-### Fix 2 — Emit weights as function inputs instead of BLOBFILE
-
-Change `emit_const_op` to emit large weight tensors as additional
-function inputs (`a_inputN`) instead of BLOBFILE-backed const ops.
-The caller pre-populates the IOSurface with weight data before eval.
-
-This matches the working TurboQuant pattern. The weight data is the
-same; only the delivery mechanism changes (IOSurface parameter vs
-embedded const with BLOBFILE reference).
-
-```
-Before:
-  func main(tensor<fp16, [1,1,1,1024]> a_input0) {
-      tensor<fp16, [1024,1024]> w = const()[val=BLOBFILE(...)];
-      y = matmul(x=a_input0, y=w);
-
-After:
-  func main(tensor<fp16, [1,1,1,1024]> a_input0,
-            tensor<fp16, [1024,1024]> a_input1) {  // weight as input
-      y = matmul(x=a_input0, y=a_input1);
-```
-
-## Files
-
-| File | Role |
-|---|---|
-| `crates/mil-rs/src/convert/ir_to_mil_text.rs` | MIL text emitter (fix target) |
-| `crates/ironmill-ane/src/turboquant_mil.rs` | Working MIL emitter (reference) |
-| `crates/ironmill-ane/examples/ane_op_eval.rs` | Op-level ANE eval probes |
-| `crates/ironmill-ane/examples/ane_op_probe.rs` | Op-level ANE compile probes |
-| `docs/research/ane-op-support-matrix.md` | Known op support status |
-
-## Key Insight
-
-The working MIL text and failing MIL text use the **same dialect and
-syntax** — same function signatures, same named argument format, same
-const op format, same attribute syntax. The two concrete differences
-are the `reshape` bug and BLOBFILE usage. This is not a broad format
-incompatibility requiring systematic testing; it's two specific fixes.
-
-## Fixes Already Applied (during investigation)
+## Additional Fixes Applied
 
 These were discovered and fixed while tracing the E2E compilation
 failure. They apply to all ANE compilation, not just E2E inference:
@@ -146,10 +64,30 @@ failure. They apply to all ANE compilation, not just E2E inference:
    Decomposed to `real_div(1, x)` in `AneInference` pre-compilation.
 
 3. **Dynamic shape materialization** — ONNX models have dynamic `?`
-   dimensions. Materialized to `1` for single-token decode shapes.
+   dimensions. Materialized to `1` before `AneLayoutPass` so the
+   layout mapping sees static shapes.
+
+4. **Weight const type declarations** — Reshaped to 4D in MIL text
+   (`[1024]` → `[1,1024,1,1]`) via `to_ane_weight_shape()`.
+
+5. **ANE layout dimension alignment** — Fixed 3D `[1,1,N]` → 4D
+   mapping to put hidden_size in C (`[1,N,1,1]`) instead of S
+   (`[1,1,1,N]`), aligning activations with weight shapes.
+
+6. **Reshape shape sync** — `AneLayoutPass` now updates reshape ops'
+   shape parameters to match the 4D output type.
+
+## Files Changed
+
+| File | Change |
+|---|---|
+| `crates/mil-rs/src/convert/ir_to_mil_text.rs` | `format_value` for tensors, arg ordering, weight 4D shapes |
+| `crates/mil-rs/src/ir/passes/ane_layout.rs` | Reshape shape sync, 3D decode mapping, dynamic shape fix |
+| `crates/ironmill-ane/src/inference.rs` | Pre-layout shape materialization, `reciprocal` decomposition |
 
 ## References
 
 - [ANE BLOBFILE Investigation](ane-blobfile-investigation.md) — predecessor (root cause resolved: #1 above)
-- [TurboQuant E2E Inference](turboquant-e2e-inference.md) — blocked by this
-- [ANE Op Support Matrix](../research/ane-op-support-matrix.md) — per-op status
+- [ANE Attention Split Investigation](ane-attention-split-investigation.md) — current blocker
+- [TurboQuant E2E Inference](turboquant-e2e-inference.md)
+- [ANE Op Support Matrix](../research/ane-op-support-matrix.md)

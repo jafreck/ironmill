@@ -5,7 +5,8 @@
 > **Prerequisites:**
 > - [TurboQuant Implementation](turboquant-implementation.md) — completed
 > - [ANE BLOBFILE Investigation](ane-blobfile-investigation.md) — resolved (root cause: `emit_const_op` attribute lookup)
-> - [ANE MIL Emitter Compatibility](ane-mil-emitter-compat.md) — open (blocks layer ANE compilation)
+> - [ANE MIL Emitter Compatibility](ane-mil-emitter-compat.md) — resolved (reshape format, layout alignment)
+> - [ANE Attention Split Investigation](ane-attention-split-investigation.md) — open (blocks layer compilation)
 >
 > **Goal:** Run Qwen3-0.6B on ANE-direct with and without TurboQuant INT8
 > KV cache compression. Measure tokens/sec, memory, and perplexity delta.
