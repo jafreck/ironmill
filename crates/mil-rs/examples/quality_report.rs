@@ -215,9 +215,10 @@ fn main() -> anyhow::Result<()> {
 
 /// Collect all const tensor values from a program, keyed by op name.
 ///
-/// Handles three storage formats:
+/// Handles four storage formats:
 /// - Plain `const` ops with FP32/FP16 tensor data in inputs["val"]
-/// - INT8 quantized `const` ops (UInt8 data + scale/zero_point attributes)
+/// - INT8 quantized `const` ops (UInt8 data + scalar scale/zero_point)
+/// - `constexpr_affine_dequantize` ops (per-tensor or per-channel INT8)
 /// - Palettized `constexpr_lut_to_dense` ops (LUT + packed indices)
 fn collect_const_tensors(program: &Program) -> HashMap<String, Vec<f32>> {
     let mut result = HashMap::new();
@@ -226,6 +227,13 @@ fn collect_const_tensors(program: &Program) -> HashMap<String, Vec<f32>> {
         for op in &function.body.operations {
             if op.op_type == "constexpr_lut_to_dense" {
                 if let Some(values) = reconstruct_palettized(op) {
+                    result.insert(op.name.clone(), values);
+                }
+                continue;
+            }
+
+            if op.op_type == "constexpr_affine_dequantize" {
+                if let Some(values) = reconstruct_affine_dequantize(op) {
                     result.insert(op.name.clone(), values);
                 }
                 continue;
@@ -281,6 +289,82 @@ fn collect_const_tensors(program: &Program) -> HashMap<String, Vec<f32>> {
     }
 
     result
+}
+
+/// Reconstruct float values from a `constexpr_affine_dequantize` op.
+///
+/// Handles both per-tensor (scalar scale/zero_point) and per-channel
+/// (tensor scale/zero_point) representations produced by the INT8 pass.
+fn reconstruct_affine_dequantize(op: &mil_rs::Operation) -> Option<Vec<f32>> {
+    let (qdata, shape) = match op.attributes.get("quantized_data") {
+        Some(Value::Tensor {
+            data,
+            shape,
+            dtype: ScalarType::UInt8,
+        }) => (data, shape),
+        _ => return None,
+    };
+
+    let axis = match op.attributes.get("axis") {
+        Some(Value::Int(a)) => *a as usize,
+        _ => 0,
+    };
+
+    // Per-tensor: scalar scale/zero_point
+    if let (Some(Value::Float(s)), Some(Value::Float(zp))) =
+        (op.attributes.get("scale"), op.attributes.get("zero_point"))
+    {
+        let scale = *s as f32;
+        let zero_point = *zp as f32;
+        return Some(
+            qdata
+                .iter()
+                .map(|&q| (q as f32 - zero_point) * scale)
+                .collect(),
+        );
+    }
+
+    // Per-channel: tensor scale/zero_point
+    let scales = match op.attributes.get("scale") {
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::Float32,
+            ..
+        }) => tensor_as_f32_slice(data),
+        _ => return None,
+    };
+    let zero_points = match op.attributes.get("zero_point") {
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::Float32,
+            ..
+        }) => tensor_as_f32_slice(data),
+        _ => return None,
+    };
+
+    let num_channels = scales.len();
+    if num_channels == 0 || shape.is_empty() {
+        return None;
+    }
+
+    let total_elements: usize = shape.iter().product();
+    let channel_size = if num_channels > 0 && axis < shape.len() {
+        total_elements / shape[axis]
+    } else {
+        total_elements / num_channels
+    };
+
+    let mut result = Vec::with_capacity(total_elements);
+    for (ch, &q_byte) in qdata.iter().enumerate() {
+        let ch_idx = ch / channel_size;
+        if ch_idx < num_channels {
+            result.push((q_byte as f32 - zero_points[ch_idx]) * scales[ch_idx]);
+        } else {
+            result.push(q_byte as f32);
+        }
+    }
+
+    Some(result)
 }
 
 /// Reconstruct float values from a palettized `constexpr_lut_to_dense` op.

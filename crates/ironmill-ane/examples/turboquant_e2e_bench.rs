@@ -78,36 +78,39 @@ fn main() {
     println!("  │  Compiling...");
 
     let baseline_compile_start = Instant::now();
-    let mut baseline = match AneInference::compile(&program, None) {
-        Ok(m) => m,
+    let baseline_result = AneInference::compile(&program, None);
+    let baseline_compile_time = baseline_compile_start.elapsed();
+
+    let (baseline_output, baseline_tps) = match baseline_result {
+        Ok(mut baseline) => {
+            println!("  │  Compile time: {:.2?}", baseline_compile_time);
+            println!("  │  Generating {GEN_TOKENS} tokens...");
+            let baseline_gen_start = Instant::now();
+            match baseline.generate(PROMPT, GEN_TOKENS, 0.0) {
+                Ok(tokens) => {
+                    let gen_time = baseline_gen_start.elapsed();
+                    let tps = tokens.len() as f64 / gen_time.as_secs_f64();
+                    let fp16_kv_bytes =
+                        arch.num_layers * 2 * arch.num_kv_heads * arch.head_dim * MAX_SEQ_LEN * 2;
+                    println!("  │  Tokens generated: {}", tokens.len());
+                    println!("  │  Throughput: {tps:.1} tok/s");
+                    println!(
+                        "  │  KV cache size: {:.1} MB",
+                        fp16_kv_bytes as f64 / 1_048_576.0
+                    );
+                    (Some(tokens), Some(tps))
+                }
+                Err(e) => {
+                    eprintln!("  │  ✗ Baseline generation failed: {e}");
+                    (None, None)
+                }
+            }
+        }
         Err(e) => {
             eprintln!("  │  ✗ Baseline compilation failed: {e}");
-            return;
+            (None, None)
         }
     };
-    let baseline_compile_time = baseline_compile_start.elapsed();
-    println!("  │  Compile time: {:.2?}", baseline_compile_time);
-
-    println!("  │  Generating {GEN_TOKENS} tokens...");
-    let baseline_gen_start = Instant::now();
-    let baseline_output = match baseline.generate(PROMPT, GEN_TOKENS, 0.0) {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            eprintln!("  │  ✗ Baseline generation failed: {e}");
-            return;
-        }
-    };
-    let baseline_gen_time = baseline_gen_start.elapsed();
-    let baseline_tps = baseline_output.len() as f64 / baseline_gen_time.as_secs_f64();
-
-    let fp16_kv_bytes = arch.num_layers * 2 * arch.num_kv_heads * arch.head_dim * MAX_SEQ_LEN * 2; // 2 bytes/elem for FP16
-
-    println!("  │  Tokens generated: {}", baseline_output.len());
-    println!("  │  Throughput: {baseline_tps:.1} tok/s");
-    println!(
-        "  │  KV cache size: {:.1} MB",
-        fp16_kv_bytes as f64 / 1_048_576.0
-    );
     println!("  └────────────────────────────────────────────────────────");
     println!();
 
@@ -160,27 +163,33 @@ fn main() {
     // ── Comparison ───────────────────────────────────────────────────
     println!("  ┌─ Comparison ─────────────────────────────────────────────");
 
-    let speedup = turbo_tps / baseline_tps;
+    let fp16_kv_bytes = arch.num_layers * 2 * arch.num_kv_heads * arch.head_dim * MAX_SEQ_LEN * 2;
     let memory_ratio = int8_kv_bytes as f64 / fp16_kv_bytes as f64;
-    let min_len = baseline_output.len().min(turbo_output.len());
-    let agreement = if min_len > 0 {
-        let matching = baseline_output[..min_len]
-            .iter()
-            .zip(turbo_output[..min_len].iter())
-            .filter(|(a, b)| a == b)
-            .count();
-        matching as f64 / min_len as f64
-    } else {
-        0.0
-    };
-
-    println!("  │  Throughput ratio:  {speedup:.2}x (TQ vs baseline)");
     println!("  │  Memory ratio:      {memory_ratio:.2}x (TQ vs baseline)");
-    println!(
-        "  │  Token agreement:   {:.1}% ({}/{})",
-        agreement * 100.0,
-        (agreement * min_len as f64) as usize,
-        min_len,
-    );
+
+    if let (Some(bl_out), Some(bl_tps)) = (&baseline_output, baseline_tps) {
+        let speedup = turbo_tps / bl_tps;
+        let min_len = bl_out.len().min(turbo_output.len());
+        let agreement = if min_len > 0 {
+            let matching = bl_out[..min_len]
+                .iter()
+                .zip(turbo_output[..min_len].iter())
+                .filter(|(a, b)| a == b)
+                .count();
+            matching as f64 / min_len as f64
+        } else {
+            0.0
+        };
+        println!("  │  Throughput ratio:  {speedup:.2}x (TQ vs baseline)");
+        println!(
+            "  │  Token agreement:   {:.1}% ({}/{})",
+            agreement * 100.0,
+            (agreement * min_len as f64) as usize,
+            min_len,
+        );
+    } else {
+        println!("  │  Throughput ratio:  N/A (baseline unavailable)");
+        println!("  │  Token agreement:   N/A (baseline unavailable)");
+    }
     println!("  └────────────────────────────────────────────────────────");
 }

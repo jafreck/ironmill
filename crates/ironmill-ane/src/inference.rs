@@ -347,12 +347,16 @@ impl AneInference {
             };
             let fp16_attn = if let Some(attn_sub) = fp16_attn_map.get(&layer_n) {
                 let attn_packing = packing_map.remove(&attn_sub.name);
-                Some(compile_and_load_sub(
-                    attn_sub,
-                    &runtime,
-                    &mil_config,
-                    attn_packing,
-                )?)
+                match compile_and_load_sub(attn_sub, &runtime, &mil_config, attn_packing) {
+                    Ok(loaded) => Some(loaded),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: layer {layer_n} fp16_attn compilation failed, \
+                             falling back to Q pass-through: {e}"
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             };
