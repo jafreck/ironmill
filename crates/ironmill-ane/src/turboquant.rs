@@ -554,9 +554,11 @@ impl TurboQuantModel {
         // Copy external tensors into staging buffers with matching alloc sizes.
         // ANE requires all input IOSurfaces in a single eval to have the same
         // allocation size. Pre-attn outputs may have a different alloc size.
-        let k_data = k_proj.read_f16()?;
+        // Pre-attn tensors are S=32 padded ([1,C,1,32] NCHW), so we must
+        // gather column 0 from each channel row, not take a flat slice.
+        let k_data = gather_column0(k_proj)?;
         self.cw_k_staging.write_f16(&k_data[..channels])?;
-        let v_data = v_proj.read_f16()?;
+        let v_data = gather_column0(v_proj)?;
         self.cw_v_staging.write_f16(&v_data[..channels])?;
 
         // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
@@ -592,7 +594,7 @@ impl TurboQuantModel {
             .update_cache(layer, &k_bytes, &v_bytes, k_original.as_deref())?;
 
         // 3. Attention: Q + cached K/V + unrotation_matrix → output
-        let q_data = q.read_f16()?;
+        let q_data = gather_column0(q)?;
         let q_channels = self.config.num_heads * self.config.head_dim;
         self.attn_q_staging.write_f16(&q_data[..q_channels])?;
         let (k_cache, v_cache) = self.cache.cache_tensors(layer);
@@ -650,4 +652,21 @@ impl TurboQuantModel {
     pub fn alloc_sizes(&self) -> (usize, usize) {
         (self.cw_alloc_size, self.attn_alloc_size)
     }
+}
+
+/// Read C elements (one token at column 0) from an ANE tensor with shape
+/// `[1, C, 1, S]`. In NCHW layout, element `(c, s)` is at flat index
+/// `c * S + s`, so column 0 values are at indices `0, S, 2S, ...`.
+/// When S=1, returns the flat data directly.
+fn gather_column0(tensor: &AneTensor) -> Result<Vec<f16>> {
+    let [_, channels, _, seq_len] = tensor.shape();
+    if seq_len == 1 {
+        return tensor.read_f16();
+    }
+    let full = tensor.read_f16()?;
+    let mut out = Vec::with_capacity(channels);
+    for c in 0..channels {
+        out.push(full[c * seq_len]);
+    }
+    Ok(out)
 }
