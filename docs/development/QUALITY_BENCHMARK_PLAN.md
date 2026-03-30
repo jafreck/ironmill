@@ -1,306 +1,478 @@
-# Quality Benchmark Implementation Plan
+# Perplexity Benchmark Implementation
 
-## Problem
+> **Status**: Not started — blocked on real attention in ANE inference path
+>
+> **Prerequisite**: `AneInference::decode()` must produce correct logits
+> (i.e., the FP16 attention path computes real SDPA, not Q pass-through)
+>
+> **Goal**: Measure perplexity on WikiText-2 for each quantization config
+> and cross-reference with weight-level SNR to validate that ironmill's
+> optimizations preserve model quality
 
-Ironmill's optimization pipeline applies transformations that trade precision
-for speed and size — FP16 conversion, INT8 quantization, 4-bit palettization,
-and PolarQuant rotation-based compression. Each of these changes model weights,
-and the impact on model **output quality** is currently unmeasured.
+## Background
 
-### What Exists Today
+Weight-level metrics (SNR, cosine similarity) tell us how close quantized
+weights are to the originals, but not whether the model still works. A model
+can have 44.7 dB SNR and still produce gibberish if errors accumulate across
+28 transformer layers. Perplexity is the standard metric for evaluating LLM
+quantization quality.
 
-**Weight-level fidelity** (`crates/ironmill-bench/src/quality.rs`):
-
-- Compares original FP32 weights against quantized+reconstructed weights
-- Metrics: MSE, PSNR (dB), compression ratio
-- Per-tensor granularity — measures every const tensor ≥ 1024 elements
-- Currently supports PolarQuant pass only
-- Now wired into CLI via `ironmill-bench --quality`
-
-This answers: "How close are the quantized weights to the originals?"
-
-### What's Missing
-
-**Task-level accuracy** — whether the model still produces correct outputs:
-
-| Question | Metric | Why weight fidelity doesn't answer it |
-|----------|--------|---------------------------------------|
-| Does the LLM still generate coherent text? | Perplexity | Low MSE on individual weight tensors doesn't guarantee low accumulated error across 32+ transformer layers |
-| Does the classifier still get the right answer? | Top-k accuracy | Error distribution matters — uniform small errors may be fine, but a few large errors in attention weights can flip predictions |
-| Does the ASR model still transcribe correctly? | Word Error Rate | Quantization can shift the output distribution enough to change beam search decisions without large per-weight MSE |
-
-The gap is real: a model can have 38 dB PSNR (weight SNR) and still show 3%
-perplexity degradation, or conversely, 25 dB PSNR with negligible task impact
-if the errors are in less-sensitive layers.
+**Perplexity** = `exp(mean(cross_entropy_losses))` over a corpus. Lower is
+better. For Qwen3-0.6B, FP32 baseline perplexity on WikiText-2 is typically
+~12–13. A good INT8 quantization adds <1% to perplexity.
 
 ## Design
 
-### Architecture
+### Data flow
 
 ```
-ironmill-bench --quality --model model.onnx
-                   │
-                   ▼
-         ┌─────────────────┐
-         │ Weight Fidelity  │ ← existing quality.rs
-         │ (MSE, PSNR, CR)  │
-         └────────┬─────────┘
-                  │
-                  ▼
-         ┌─────────────────┐
-         │ Task Accuracy    │ ← new: requires datasets + model-specific eval
-         │ (PPL, Top-k, WER)│
-         └────────┬─────────┘
-                  │
-                  ▼
-         ┌─────────────────┐
-         │ Cross-tabulated  │
-         │ Quality Report   │
-         └─────────────────┘
+Pre-tokenized WikiText-2 fixture (JSON)
+         │
+         ▼
+  ┌──────────────┐
+  │ Load token    │  tests/fixtures/quality/wikitext2-qwen3.json
+  │ sequences     │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ For each      │  AneInference::decode(token) → logits: Vec<f32>
+  │ token in seq  │  No sampling — we need the full logit distribution
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ Cross-entropy │  CE = -log(softmax(logits)[ground_truth_next_token])
+  │ per position  │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ Aggregate     │  PPL = exp(mean(all CE values))
+  │ perplexity    │
+  └──────────────┘
 ```
 
-Weight fidelity runs on the MIL IR (fast, no datasets needed). Task accuracy
-runs the compiled CoreML model on reference data (slower, needs fixtures).
+### What already exists
 
-### Task-Level Metrics
+| Component | Location | Status |
+|-----------|----------|--------|
+| ANE inference loop | `ironmill-ane/src/inference.rs` | `decode()` returns `Vec<f32>` logits |
+| Token sampling | `inference.rs::sample_token()` | Greedy argmax or temperature sampling |
+| Weight fidelity bench | `ironmill-bench/src/quality.rs` | MSE/PSNR per tensor, wired to `--quality` |
+| Quality plan | `docs/development/QUALITY_BENCHMARK_PLAN.md` | Phases 1–6 outlined |
+| E2E bench | `ironmill-ane/examples/turboquant_e2e_bench.rs` | Token agreement only (no logit comparison) |
 
-#### 1. Perplexity (Decoder / LLM models)
+### What needs to be built
 
-**Models**: Qwen3-0.6B, Llama-3.2-1B (future)
+1. **Pre-tokenized dataset fixture** + preparation script
+2. **Perplexity evaluation module** in `ironmill-bench`
+3. **Cross-entropy math** (log-softmax + gather)
+4. **Evaluation loop** that calls `decode()` without sampling
+5. **CLI integration** via `ironmill-bench --perplexity`
 
-**Method**:
-- Load a fixed dataset: 500 sequences from WikiText-2 (or similar)
-- For each sequence, run the optimized model through CoreML
-- Compute cross-entropy loss from the output logits vs. ground truth tokens
-- Aggregate into perplexity: `exp(mean(cross_entropy_losses))`
-- Compare against FP32 baseline perplexity
+## Implementation
 
-**Challenges**:
-- CoreML logit extraction: `Model::extract_outputs()` already returns
-  `Vec<OutputTensorData>` as f32, but the benchmark harness (`inference.rs`)
-  currently discards prediction results — need to wire extraction into a new
-  evaluation pipeline
-- Tokenization: need a tokenizer to convert text → token IDs for input.
-  Options: (a) pre-tokenized dataset bundled as fixture, (b) minimal BPE
-  tokenizer in Rust, (c) shell out to Python tokenizer
-- Autoregressive loop: each token prediction depends on prior context, so
-  this must be sequential — can't batch like classification
+### Step 1: Dataset preparation script
 
-**Recommended approach**: Pre-tokenize the dataset offline and bundle as a
-fixture (JSON array of token ID sequences). This avoids runtime tokenizer
-dependency and keeps the benchmark deterministic.
+Create `scripts/prepare-quality-dataset.py`:
 
-**Dataset fixture**: `tests/fixtures/quality/wikitext2-500.json`
-```json
-{
-  "name": "WikiText-2 (500 samples)",
-  "sequences": [
-    [1234, 5678, ...],
-    ...
-  ]
+```python
+"""Pre-tokenize WikiText-2 for perplexity evaluation.
+
+Usage:
+    pip install datasets transformers
+    python scripts/prepare-quality-dataset.py
+"""
+import json
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+
+# Concatenate all text, split into fixed-length sequences
+full_text = "\n\n".join([t for t in dataset["text"] if t.strip()])
+tokens = tokenizer.encode(full_text)
+
+SEQ_LEN = 512
+sequences = []
+for i in range(0, len(tokens) - SEQ_LEN, SEQ_LEN):
+    sequences.append(tokens[i : i + SEQ_LEN])
+
+# Cap at 500 sequences for tractable eval time
+sequences = sequences[:500]
+
+output = {
+    "name": "WikiText-2 (Qwen3-0.6B tokenizer)",
+    "model": "Qwen3-0.6B",
+    "tokenizer": "Qwen/Qwen3-0.6B",
+    "vocab_size": tokenizer.vocab_size,
+    "seq_len": SEQ_LEN,
+    "num_sequences": len(sequences),
+    "eos_token_id": tokenizer.eos_token_id,
+    "sequences": sequences,
+}
+
+out_path = "tests/fixtures/quality/wikitext2-qwen3.json"
+with open(out_path, "w") as f:
+    json.dump(output, f)
+
+print(f"Wrote {len(sequences)} sequences ({SEQ_LEN} tokens each) to {out_path}")
+```
+
+Add to `scripts/download-fixtures.sh`:
+
+```bash
+if [ ! -f "$FIXTURE_DIR/quality/wikitext2-qwen3.json" ]; then
+    echo "==> Pre-tokenizing WikiText-2 for Qwen3..."
+    python3 scripts/prepare-quality-dataset.py
+fi
+```
+
+### Step 2: Perplexity module
+
+Create `crates/ironmill-bench/src/perplexity.rs`:
+
+```rust
+//! Perplexity evaluation for LLM quantization quality.
+
+use anyhow::Result;
+use std::path::Path;
+
+/// A pre-tokenized evaluation dataset.
+#[derive(serde::Deserialize)]
+pub struct PerplexityDataset {
+    pub name: String,
+    pub model: String,
+    pub vocab_size: usize,
+    pub seq_len: usize,
+    pub num_sequences: usize,
+    pub eos_token_id: Option<u32>,
+    pub sequences: Vec<Vec<u32>>,
+}
+
+impl PerplexityDataset {
+    pub fn load(path: &Path) -> Result<Self> {
+        let data = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&data)?)
+    }
+}
+
+/// Result of perplexity evaluation for one optimization config.
+pub struct PerplexityResult {
+    pub config_name: String,
+    pub perplexity: f64,
+    pub avg_cross_entropy: f64,
+    pub num_tokens_evaluated: usize,
+    pub num_sequences: usize,
+}
+
+/// Compute cross-entropy for a single position.
+///
+/// Given the model's raw logits and the ground-truth next token,
+/// computes -log(softmax(logits)[target]).
+///
+/// Uses log-sum-exp for numerical stability.
+pub fn cross_entropy(logits: &[f32], target: u32) -> f64 {
+    let target = target as usize;
+    if target >= logits.len() {
+        return 0.0;
+    }
+
+    // log-softmax = logit[target] - log(sum(exp(logits)))
+    // Use max subtraction for numerical stability.
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let log_sum_exp: f64 = logits
+        .iter()
+        .map(|&x| ((x - max_logit) as f64).exp())
+        .sum::<f64>()
+        .ln()
+        + max_logit as f64;
+
+    let log_prob = logits[target] as f64 - log_sum_exp;
+    -log_prob
+}
+
+/// Compute perplexity from a vector of per-token cross-entropy losses.
+pub fn perplexity_from_losses(losses: &[f64]) -> f64 {
+    if losses.is_empty() {
+        return f64::INFINITY;
+    }
+    let avg_ce = losses.iter().sum::<f64>() / losses.len() as f64;
+    avg_ce.exp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cross_entropy_perfect_prediction() {
+        // Logits strongly favoring token 2
+        let logits = vec![-10.0, -10.0, 100.0, -10.0];
+        let ce = cross_entropy(&logits, 2);
+        assert!(ce < 1e-6, "CE should be ~0 for perfect prediction, got {ce}");
+    }
+
+    #[test]
+    fn cross_entropy_uniform() {
+        // Uniform logits over 4 tokens → CE = ln(4) ≈ 1.386
+        let logits = vec![0.0; 4];
+        let ce = cross_entropy(&logits, 0);
+        assert!((ce - (4.0_f64).ln()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn perplexity_from_uniform() {
+        // Uniform over V=32000 tokens → PPL = 32000
+        let ce = (32000.0_f64).ln();
+        let losses = vec![ce; 100];
+        let ppl = perplexity_from_losses(&losses);
+        assert!((ppl - 32000.0).abs() < 1.0);
+    }
 }
 ```
 
-**Download**: Add to `scripts/download-fixtures.sh`:
-```bash
-# Download and pre-tokenize WikiText-2 subset
-python3 scripts/prepare-quality-dataset.py \
-  --dataset wikitext-2 \
-  --samples 500 \
-  --tokenizer Qwen/Qwen3-0.6B \
-  --output tests/fixtures/quality/wikitext2-500.json
+### Step 3: Evaluation loop
+
+Add to `perplexity.rs` (requires `ironmill-ane` as dependency):
+
+```rust
+/// Evaluate perplexity of a compiled model on a dataset.
+///
+/// For each sequence, runs the model autoregressively and computes
+/// cross-entropy at every position. The model's `decode()` must
+/// return valid logits (requires real attention, not pass-through).
+pub fn evaluate_perplexity(
+    inference: &mut ironmill_ane::AneInference,
+    dataset: &PerplexityDataset,
+    max_sequences: Option<usize>,
+) -> Result<PerplexityResult> {
+    let num_sequences = max_sequences
+        .map(|m| m.min(dataset.num_sequences))
+        .unwrap_or(dataset.num_sequences);
+
+    let mut all_losses = Vec::new();
+
+    for (seq_idx, sequence) in dataset.sequences.iter().take(num_sequences).enumerate() {
+        // Reset KV cache for each sequence.
+        inference.reset();
+
+        // Feed tokens one at a time, collecting CE at each position.
+        // Token i predicts token i+1, so we evaluate positions 0..len-1.
+        for pos in 0..sequence.len() - 1 {
+            let token = sequence[pos];
+            let target = sequence[pos + 1];
+
+            let logits = inference.decode(token)?;
+            let ce = cross_entropy(&logits, target);
+            all_losses.push(ce);
+        }
+
+        if (seq_idx + 1) % 50 == 0 {
+            let running_ppl = perplexity_from_losses(&all_losses);
+            eprintln!(
+                "  [{}/{}] running PPL: {:.2} ({} tokens)",
+                seq_idx + 1,
+                num_sequences,
+                running_ppl,
+                all_losses.len()
+            );
+        }
+    }
+
+    let perplexity = perplexity_from_losses(&all_losses);
+    let avg_cross_entropy = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
+
+    Ok(PerplexityResult {
+        config_name: String::new(),
+        perplexity,
+        avg_cross_entropy,
+        num_tokens_evaluated: all_losses.len(),
+        num_sequences,
+    })
+}
 ```
 
-#### 2. Top-k Accuracy (Encoder / Classification models)
+### Step 4: CLI integration
 
-**Models**: DistilBERT (SST-2), MobileNetV2 (ImageNet)
+Add `--perplexity` flag to `ironmill-bench`:
+
+```
+ironmill-bench --perplexity \
+    -m tests/fixtures/qwen3-0.6b.onnx \
+    --dataset tests/fixtures/quality/wikitext2-qwen3.json
+```
+
+The flag triggers the perplexity pipeline instead of/in addition to the
+latency benchmark. For each optimization config (baseline, FP16, INT8,
+palettize-4, polar-4), it:
+
+1. Compiles the model with that config
+2. Creates an `AneInference` instance
+3. Runs `evaluate_perplexity()`
+4. Records the result
+
+### Step 5: Cross-tabulated output
+
+Combine with existing weight fidelity in a unified report:
+
+```
+Qwen3-0.6B — Quality Report (WikiText-2, 500 sequences)
+═══════════════════════════════════════════════════════════════════
+Optimization       SNR (dB)   Perplexity   Δ PPL     Size     Status
+─────────────────  ─────────  ──────────   ───────   ──────   ──────
+FP32 baseline      ∞          12.41        —         2.2 GB   —
+FP16               78.3       12.41        +0.0%     1.1 GB   ✓ SAFE
+INT8               44.7       12.56        +1.2%     578 MB   ✓ SAFE
+Palettize 4-bit    25.1       14.12        +13.8%    ~300 MB  ⚠ WARN
+PolarQuant 4-bit   —          12.91        +4.0%     ~350 MB  ✓ SAFE
+═══════════════════════════════════════════════════════════════════
+Thresholds: SAFE <5%, WARN 5–15%, FAIL >15%
+```
+
+## Performance considerations
+
+### Evaluation time estimate
+
+- 500 sequences × 512 tokens = **256,000 decode steps**
+- At ~5 tok/s (current ANE throughput): **~14 hours per config**
+- With 5 configs (baseline + 4 optimizations): **~70 hours total**
+
+This is impractical for CI. Mitigations:
+
+| Strategy | Sequences | Tokens | Time/config | Accuracy |
+|----------|-----------|--------|-------------|----------|
+| Full eval | 500 | 256K | ~14h | Gold standard |
+| Reduced | 50 | 25.6K | ~1.4h | Good (±0.3 PPL) |
+| Smoke test | 10 | 5.1K | ~17min | Rough (±1.0 PPL) |
+| CI gate | 5 | 2.5K | ~8min | Directional only |
+
+**Recommendation**: Default to 50 sequences. Use `--perplexity-sequences N`
+to override. CI uses 5 sequences as a regression smoke test.
+
+### Optimization: sliding window
+
+Instead of resetting KV cache per sequence, use a **sliding window**
+approach with stride < seq_len. This amortizes prefill cost and is the
+standard approach in `lm-eval-harness`. A stride of 256 with seq_len 512
+means each token has at least 256 tokens of context.
+
+### Optimization: prefill batching
+
+If `AneInference` supports batched prefill (feeding multiple prompt tokens
+simultaneously rather than one-at-a-time decode), use it for the context
+window. Only the final prediction at each position needs CE computed. This
+could reduce evaluation time by 10–50× depending on prefill throughput.
+
+## Validation
+
+### Sanity checks before trusting results
+
+1. **Baseline PPL in expected range**: Qwen3-0.6B FP32 on WikiText-2 should
+   be ~12–13. If it's >20 or <8, something is wrong (bad tokenizer, broken
+   attention, wrong dataset).
+
+2. **FP16 ≈ FP32**: FP16 perplexity should be within 0.1% of FP32. If it's
+   not, the FP16 pass has a bug.
+
+3. **Monotonic degradation**: Generally, PPL should increase as quantization
+   gets more aggressive: FP32 < FP16 ≤ INT8 < 4-bit. If INT8 is worse than
+   4-bit, something is wrong with one of the passes.
+
+4. **Determinism**: Same config + same dataset = same PPL. Run twice to
+   confirm (no temperature sampling — greedy logit extraction only).
+
+### Cross-validation with external tools
+
+To validate ironmill's perplexity numbers:
+
+1. Quantize Qwen3-0.6B with ironmill (e.g., INT8)
+2. Export the quantized weights
+3. Load into `llama.cpp` or HuggingFace
+4. Run `lm-eval-harness` perplexity on the same WikiText-2 subset
+5. Compare: results should be within ±0.5 PPL
+
+## Related documents
+
+- [TurboQuant E2E Inference](turboquant-e2e-inference.md) — current ANE
+  inference status (attention not yet real)
+- [ANE Inference Optimizations](ane-inference-optimizations.md) — throughput
+  improvement roadmap
+- [Benchmark Results](../BENCHMARK_RESULTS.md) — current weight-level SNR
+  numbers
+
+## Future: Classification Accuracy
+
+**Models**: MobileNetV2 (ImageNet top-1/top-5), DistilBERT (SST-2 sentiment)
 
 **Method**:
-- Load a labeled dataset: 200 SST-2 samples (DistilBERT), 500 ImageNet-val
-  samples (MobileNetV2)
-- Run inference on each sample
+- Load pre-processed labeled inputs as binary tensor fixtures
+- Run inference on each sample through the compiled CoreML model
 - Compare predicted label against ground truth
 - Report top-1 accuracy (and top-5 for ImageNet)
 
-**Challenges**:
-- DistilBERT needs tokenized text input — same approach as perplexity
-  (pre-tokenized fixture)
-- MobileNetV2 needs preprocessed images — bundle as raw float tensors or
-  load from JPEG + normalize in Rust
-- Label mapping: need class index → label for ImageNet
-
-**Recommended approach**: Bundle pre-processed inputs as binary tensor files.
-Each fixture is a directory:
+**Fixture format**:
 ```
-tests/fixtures/quality/sst2-200/
-  inputs.bin     # 200 × [1, 128] int32 tensors (tokenized)
-  labels.json    # [0, 1, 1, 0, ...] ground truth labels
-  metadata.json  # { "model": "DistilBERT", "task": "sentiment", "classes": 2 }
-
 tests/fixtures/quality/imagenet-500/
   inputs.bin     # 500 × [1, 3, 224, 224] float32 tensors (preprocessed)
   labels.json    # [281, 153, ...] ground truth class indices
   metadata.json  # { "model": "MobileNetV2", "task": "classification", "classes": 1000 }
+
+tests/fixtures/quality/sst2-200/
+  inputs.bin     # 200 × [1, 128] int32 tensors (tokenized)
+  labels.json    # [0, 1, 1, 0, ...] ground truth labels
+  metadata.json  # { "model": "DistilBERT", "task": "sentiment", "classes": 2 }
 ```
 
-#### 3. Word Error Rate (ASR models)
-
-**Models**: Whisper-tiny, Whisper-small (future)
-
-**Method**:
-- Load 50 audio samples from LibriSpeech test-clean
-- Run encoder through CoreML to get audio features
-- Decode output tokens to text (greedy or beam search)
-- Compute WER against reference transcriptions
+**Expected report**:
+```
+MobileNetV2 — Quality Impact
+═══════════════════════════════════════════════════════════════════
+Optimization       SNR (dB)   Top-1 Acc    Δ Acc     Size     Status
+─────────────────  ─────────  ──────────   ───────   ──────   ──────
+FP32 baseline      ∞          71.8%        —         16 MB    —
+FP16               73.6       71.8%        +0.0%     8 MB     ✓ SAFE
+INT8               42.7       71.2%        -0.8%     4 MB     ✓ SAFE
+Palettize 4-bit    18.8       68.3%        -4.9%     ~2 MB    ⚠ WARN
+═══════════════════════════════════════════════════════════════════
+Thresholds: SAFE <2% drop, WARN 2–5%, FAIL >5%
+```
 
 **Challenges**:
-- Audio preprocessing: Whisper requires log-mel spectrogram (80 bins,
-  30s windows). This is complex to implement in Rust.
-- Decoder: Whisper uses an encoder-decoder architecture. The encoder
-  output goes through autoregressive decoding.
-- WER computation: standard Levenshtein distance on word sequences
+- ImageNet fixtures cannot be redistributed (registration required) — download
+  on demand via `scripts/download-fixtures.sh`, gitignored
+- MobileNetV2 requires specific image preprocessing (resize, center crop,
+  normalize with ImageNet mean/std)
+- DistilBERT needs the same pre-tokenization approach as perplexity
 
-**Recommended approach**: This is the most complex metric. Implement in
-two phases:
-1. **Phase 1**: Encoder-only timing (already benchmarked). Skip WER.
-2. **Phase 2**: Full pipeline with pre-computed mel spectrograms as
-   fixtures and a minimal greedy decoder.
+**Priority**: After perplexity is validated. Classification accuracy is faster
+to compute (~minutes, not hours) and easier to validate against published
+baselines.
 
-### Quality Report Format
+## Future: Word Error Rate (ASR)
 
-The output cross-references weight fidelity with task accuracy:
+**Models**: Whisper-tiny, Whisper-small (stretch)
 
-```
-Qwen3-0.6B — Quality Impact
-─────────────────────────────────────────────────────────────
-Optimization       Weight PSNR  Perplexity   Δ PPL    Status
-─────────────────  ──────────   ──────────   ──────   ──────
-FP32 baseline      ∞            12.4         —        —
-FP16               73.6 dB      12.4         +0.0%    ✓ SAFE
-INT8               38.5 dB      12.8         +3.2%    ✓ SAFE
-Palettize 4-bit    19.9 dB      14.1         +13.7%   ⚠ WARN
-PolarQuant 4-bit   22.4 dB      12.9         +4.0%    ✓ SAFE
+**Method**:
+- Load 50 pre-computed log-mel spectrograms from LibriSpeech test-clean
+- Run encoder through CoreML to get audio features
+- Greedy-decode output tokens to text
+- Compute WER via Levenshtein distance on word sequences
 
-MobileNetV2 — Quality Impact
-─────────────────────────────────────────────────────────────
-Optimization       Weight PSNR  Top-1 Acc    Δ Acc    Status
-─────────────────  ──────────   ──────────   ──────   ──────
-FP32 baseline      ∞            71.8%        —        —
-FP16               73.6 dB      71.8%        +0.0%    ✓ SAFE
-INT8               38.5 dB      71.2%        -0.8%    ✓ SAFE
-Palettize 4-bit    19.9 dB      68.3%        -4.9%    ⚠ WARN
-```
+**Challenges**:
+- Whisper uses an encoder-decoder architecture — the encoder output feeds into
+  autoregressive decoding, which is a separate inference path from LLM decode
+- Audio preprocessing (80-bin log-mel spectrogram, 30s windows) is complex to
+  implement in Rust — pre-computed spectrograms as fixtures avoids this
+- WER computation: use the `strsim` crate for edit distance
 
-**Thresholds** (configurable):
-- Perplexity: >5% relative increase → WARN, >15% → FAIL
-- Top-1 accuracy: >2% absolute drop → WARN, >5% → FAIL
-- WER: >5% absolute increase → WARN, >15% → FAIL
+**Recommended approach**: Implement in two phases:
+1. Encoder-only quality (compare encoder output tensors before/after
+   quantization — fast, no decoder needed)
+2. Full pipeline WER with pre-computed mel spectrograms and a minimal greedy
+   decoder
 
-## Implementation Order
-
-### Phase 1 — Weight Fidelity Improvements (current PR)
-
-- [x] Wire `quality.rs` into CLI via `--quality` flag
-- [x] Add model-level quality summary (`QualitySummary`)
-- [x] Add SAFE/WARN/RISK status based on worst-case PSNR
-- [ ] Extend `measure_program_quality` with a pass selector to support FP16
-      and INT8 (not just PolarQuant) — the comparison logic (MSE/PSNR) is
-      identical; only the quantization pass and reconstruction path differ
-
-### Phase 2 — Dataset Infrastructure & Inference Output Extraction
-
-- [ ] Build a "real input → CoreML prediction → extract output" evaluation
-      pipeline using the existing `Model::extract_outputs()` method — the
-      current benchmark path (`inference.rs`) only times `predict()` and
-      discards results; the new pipeline reuses `extract_outputs()` to obtain
-      typed f32 tensors (logits, class probabilities) for metric computation
-- [ ] Create `scripts/prepare-quality-dataset.py` for pre-tokenizing
-      reference datasets
-- [ ] Define fixture format for quality datasets
-- [ ] Add dataset download to `scripts/download-fixtures.sh`
-- [ ] Create `tests/fixtures/quality/` directory structure (`.gitignore`
-      ImageNet fixtures — they are downloaded on demand, not committed)
-- [ ] Smoke-test `extract_outputs()` → logit pipeline on Qwen3-0.6B with a
-      single hand-crafted input to catch CoreML output-shape surprises early
-
-### Phase 3 — Perplexity Measurement
-
-- [ ] Add `perplexity.rs` module to `ironmill-bench`
-- [ ] Implement cross-entropy computation from CoreML logit output
-- [ ] Pre-tokenized dataset loading
-- [ ] Autoregressive evaluation loop
-- [ ] Baseline caching (FP32 perplexity computed once, reused)
-- [ ] Unit tests for cross-entropy and perplexity aggregation
-
-### Phase 4 — Classification Accuracy
-
-- [ ] Add `accuracy.rs` module to `ironmill-bench`
-- [ ] Top-1 and top-5 accuracy computation
-- [ ] Support for DistilBERT (text classification) and MobileNetV2
-      (image classification) fixture formats
-- [ ] Pre-processed input loading from binary tensor files
-- [ ] Unit tests for top-k accuracy computation
-
-### Phase 5 — ASR Quality (stretch goal)
-
-- [ ] Pre-computed mel spectrogram fixtures
-- [ ] Minimal greedy decoder for Whisper output tokens
-- [ ] WER computation using the `strsim` crate for Levenshtein distance on
-      word sequences
-- [ ] Integration with encoder benchmark results
-
-### Phase 6 — Cross-Tabulated Report
-
-- [ ] Combine weight fidelity and task accuracy in unified report
-- [ ] JSON schema extension for quality metrics
-- [ ] Regression tracking for quality metrics via new `QualityBaselineEntry`
-      in a separate `~/.ironmill/quality-baselines/` directory — quality
-      baselines are stored separately from performance baselines since they
-      have different fields, comparison semantics (relative % for perplexity,
-      absolute % for accuracy), and change drivers (optimization config vs.
-      hardware)
-- [ ] `--quality-threshold` CLI flag for configurable WARN/FAIL levels
-
-## Dependencies
-
-- **Pre-tokenized datasets**: Requires a one-time Python script run (HuggingFace
-  `datasets` + `transformers` libraries) to prepare fixtures
-- **CoreML inference**: Task accuracy runs through the compiled model, so it
-  depends on the existing inference pipeline. `Model::extract_outputs()` already
-  supports extracting f32 multi-array outputs; the benchmark harness needs a new
-  evaluation pipeline that uses it instead of discarding prediction results
-  (addressed in Phase 2).
-- **No new Rust crate dependencies** for Phase 1–4 (dataset loading is just
-  JSON + binary file I/O)
-- **Phase 5** adds `strsim` for Levenshtein distance (WER computation) and may
-  need an audio processing crate for mel spectrogram verification, but the
-  recommended approach avoids the latter by pre-computing spectrograms
-
-## Decisions
-
-1. **Quality benchmarks do not block CI.** Report-only by default. Use
-   `--quality-fail-on-regression` to opt in to CI gating.
-
-2. **Dataset licensing determines fixture strategy.** Open-licensed datasets
-   (WikiText-2 CC-BY-SA, SST-2, LibriSpeech CC-BY-4.0) are committed to the
-   repo as pre-processed fixtures. ImageNet requires registration and cannot
-   be redistributed — ImageNet fixtures are downloaded on demand via
-   `scripts/download-fixtures.sh`, stored under `tests/fixtures/quality/imagenet-500/`,
-   and excluded from version control via `.gitignore`.
-
-3. **FP16/INT8 weight fidelity extends `measure_program_quality`.** The
-   comparison logic (MSE/PSNR) is identical across quantization passes; only
-   the pass applied and reconstruction path differ. A pass selector parameter
-   avoids duplicating the measurement pipeline.
-
-4. **Quality baselines are separate from performance baselines.** Stored under
-   `~/.ironmill/quality-baselines/` with a `QualityBaselineEntry` schema
-   distinct from `BaselineEntry`. Performance baselines change with hardware;
-   quality baselines change with optimization config. Different lifecycle,
-   different fields, different comparison semantics (relative % for perplexity,
-   absolute % for accuracy).
-
-## Open Questions
-
-~~1. **Baseline management**: Should quality baselines be separate from
-   performance baselines, or combined?~~ **Resolved** — separate. See Decision 4.
+**Priority**: Lowest. Whisper encoder benchmarks already exist for latency;
+WER adds correctness validation but requires the most new infrastructure.

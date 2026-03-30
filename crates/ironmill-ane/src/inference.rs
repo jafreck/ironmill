@@ -19,8 +19,8 @@ use mil_rs::ir::Pass;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::{
     AneArgPromotionPass, AneLayoutPass, AneMatmulToConvPass, AneVariableNamingPass,
-    AttentionDecomposePass, AutoregressiveShapeMaterializePass, DeadCodeEliminationPass,
-    OpSubstitutionPass, TypeRepropagationPass,
+    AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, OpSubstitutionPass,
+    TypeRepropagationPass,
 };
 
 use crate::program::{CompiledProgram, LoadedProgram};
@@ -150,7 +150,9 @@ impl AneInference {
             ("AneLayout", &AneLayoutPass),
             ("AneArgPromotion", &AneArgPromotionPass),
             ("TypeRepropagate", &TypeRepropagationPass),
-            ("AttentionDecompose", &AttentionDecomposePass),
+            // AttentionDecompose skipped: decomposing grouped_query_attention
+            // expands layers from ~12 to ~106 ops, exceeding the ANE program
+            // budget. The structural split handles fused GQA ops directly.
             ("AneVariableNaming", &AneVariableNamingPass),
         ];
         for (name, pass) in passes {
