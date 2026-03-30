@@ -122,8 +122,20 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
                 sub_programs.push(build_sub_program(&pre_name, &pre, &type_map, Some(ops)));
             }
             if config.emit_attention && !attn.is_empty() {
+                // Strip gather ops (RoPE cos/sin cache lookup) from the
+                // attention cluster. Gather is unsupported on ANE; the
+                // gathered values become cross-boundary inputs filled by
+                // the CPU at decode time. The remaining RoPE arithmetic
+                // (split, mul, sub, add, concat) stays in the sub-program
+                // and is ANE-compatible.
+                let attn_stripped = strip_gather_ops(&attn);
                 let attn_name = format!("{name}_fp16_attn");
-                sub_programs.push(build_sub_program(&attn_name, &attn, &type_map, Some(ops)));
+                sub_programs.push(build_sub_program(
+                    &attn_name,
+                    &attn_stripped,
+                    &type_map,
+                    Some(ops),
+                ));
             }
             if !post.is_empty() {
                 sub_programs.push(build_sub_program(&post_name, &post, &type_map, Some(ops)));
@@ -338,6 +350,19 @@ impl OpGraph {
 /// Returns `true` if the op is a const (weight/bias/scalar literal).
 fn is_const_op(op: &Operation) -> bool {
     op.op_type == "const" || op.op_type.starts_with("constexpr_")
+}
+
+/// Strip `gather` ops from attention cluster ops.
+///
+/// Gather ops (used for RoPE cos/sin cache lookup) are unsupported on ANE.
+/// Removing them turns their outputs into cross-boundary inputs that the
+/// CPU fills before running the sub-program on ANE. Dead const ops that
+/// only fed gathers are cleaned up by subsequent DCE.
+fn strip_gather_ops(ops: &[Operation]) -> Vec<Operation> {
+    ops.iter()
+        .filter(|op| op.op_type != "gather")
+        .cloned()
+        .collect()
 }
 
 /// Find indices of Q/K/V projection matmuls.
@@ -2246,6 +2271,212 @@ mod tests {
         assert!(
             post_names.contains(&"layer_0_ffn_down"),
             "post-attn should contain FFN down, got: {post_names:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Gather stripping tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn strip_gather_ops_removes_gathers() {
+        let ops = vec![
+            make_connected_op("cos_gather", "gather", "cos_cache", "cos_gathered"),
+            make_connected_op("sin_gather", "gather", "sin_cache", "sin_gathered"),
+            make_connected_op("reshape", "reshape", "cos_gathered", "reshaped"),
+            make_connected_op("softmax", "softmax", "reshaped", "softmax_out"),
+        ];
+        let stripped = strip_gather_ops(&ops);
+        let names: Vec<&str> = stripped.iter().map(|op| op.name.as_str()).collect();
+        assert_eq!(names, &["reshape", "softmax"]);
+    }
+
+    #[test]
+    fn strip_gather_ops_preserves_non_gathers() {
+        let ops = vec![
+            make_connected_op("norm", "layer_norm", "x", "norm_out"),
+            make_connected_op("matmul", "matmul", "norm_out", "matmul_out"),
+        ];
+        let stripped = strip_gather_ops(&ops);
+        assert_eq!(stripped.len(), 2);
+    }
+
+    #[test]
+    fn emit_attention_strips_gathers_from_cluster() {
+        // A layer with RoPE gathers in the attention cluster.
+        // With emit_attention = true, gathers should be stripped from
+        // the fp16_attn sub-program.
+        let p = "layer_0";
+        let ty = f32_type(&[1, 128]);
+        let mut ops = vec![
+            make_connected_op(
+                &format!("{p}_norm"),
+                "layer_norm",
+                "hidden_in",
+                &format!("{p}_norm_out"),
+            ),
+            make_const_op(&format!("{p}_q_weight"), &format!("{p}_q_weight_out")),
+            make_const_op(&format!("{p}_k_weight"), &format!("{p}_k_weight_out")),
+            make_const_op(&format!("{p}_v_weight"), &format!("{p}_v_weight_out")),
+            make_matmul_op(
+                &format!("{p}_q_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_q_weight_out"),
+                &format!("{p}_q_proj_out"),
+            ),
+            make_matmul_op(
+                &format!("{p}_k_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_k_weight_out"),
+                &format!("{p}_k_proj_out"),
+            ),
+            make_matmul_op(
+                &format!("{p}_v_proj"),
+                &format!("{p}_norm_out"),
+                &format!("{p}_v_weight_out"),
+                &format!("{p}_v_proj_out"),
+            ),
+            // RoPE gathers (these should be stripped)
+            make_connected_op(
+                &format!("{p}_cos_gather"),
+                "gather",
+                "cos_cache",
+                &format!("{p}_cos_gathered"),
+            ),
+            make_connected_op(
+                &format!("{p}_sin_gather"),
+                "gather",
+                "sin_cache",
+                &format!("{p}_sin_gathered"),
+            ),
+        ];
+        // Attention reshapes (consume projection outputs)
+        ops.extend(vec![
+            make_connected_op(
+                &format!("{p}_q_reshape"),
+                "reshape",
+                &format!("{p}_q_proj_out"),
+                &format!("{p}_q_reshaped"),
+            ),
+            make_connected_op(
+                &format!("{p}_q_transpose"),
+                "transpose",
+                &format!("{p}_q_reshaped"),
+                &format!("{p}_q_transposed"),
+            ),
+            make_connected_op(
+                &format!("{p}_k_reshape"),
+                "reshape",
+                &format!("{p}_k_proj_out"),
+                &format!("{p}_k_reshaped"),
+            ),
+            make_connected_op(
+                &format!("{p}_k_transpose"),
+                "transpose",
+                &format!("{p}_k_reshaped"),
+                &format!("{p}_k_transposed"),
+            ),
+            make_connected_op(
+                &format!("{p}_v_reshape"),
+                "reshape",
+                &format!("{p}_v_proj_out"),
+                &format!("{p}_v_reshaped"),
+            ),
+            make_connected_op(
+                &format!("{p}_v_transpose"),
+                "transpose",
+                &format!("{p}_v_reshaped"),
+                &format!("{p}_v_transposed"),
+            ),
+            make_matmul_op(
+                &format!("{p}_qk_matmul"),
+                &format!("{p}_q_transposed"),
+                &format!("{p}_k_transposed"),
+                &format!("{p}_qk_scores"),
+            ),
+            make_connected_op(
+                &format!("{p}_qk_scale"),
+                "mul",
+                &format!("{p}_qk_scores"),
+                &format!("{p}_qk_scaled"),
+            ),
+            make_connected_op(
+                &format!("{p}_softmax"),
+                "softmax",
+                &format!("{p}_qk_scaled"),
+                &format!("{p}_attn_weights"),
+            ),
+            make_matmul_op(
+                &format!("{p}_av_matmul"),
+                &format!("{p}_attn_weights"),
+                &format!("{p}_v_transposed"),
+                &format!("{p}_av_out"),
+            ),
+            make_connected_op(
+                &format!("{p}_out_reshape"),
+                "reshape",
+                &format!("{p}_av_out"),
+                &format!("{p}_out_reshaped"),
+            ),
+            make_connected_op(
+                &format!("{p}_out_transpose"),
+                "transpose",
+                &format!("{p}_out_reshaped"),
+                &format!("{p}_out_transposed"),
+            ),
+            make_const_op(&format!("{p}_o_weight"), &format!("{p}_o_weight_out")),
+            make_matmul_op(
+                &format!("{p}_o_proj"),
+                &format!("{p}_out_transposed"),
+                &format!("{p}_o_weight_out"),
+                &format!("{p}_o_proj_out"),
+            ),
+            make_const_op(&format!("{p}_down_weight"), &format!("{p}_down_weight_out")),
+            make_matmul_op(
+                &format!("{p}_ffn_down"),
+                &format!("{p}_o_proj_out"),
+                &format!("{p}_down_weight_out"),
+                &format!("{p}_ffn_down_out"),
+            ),
+        ]);
+
+        let func_inputs = vec![
+            ("hidden_in".to_string(), ty.clone()),
+            ("cos_cache".to_string(), ty.clone()),
+            ("sin_cache".to_string(), ty.clone()),
+        ];
+        let prog = make_program(ops, func_inputs);
+        let config = SplitConfig {
+            split_attention: true,
+            emit_attention: true,
+            ..Default::default()
+        };
+        let split = split_for_ane(&prog, &config).unwrap();
+
+        // Find the fp16_attn sub-program
+        let fp16_attn = split.programs.iter().find(|s| s.name.contains("fp16_attn"));
+        assert!(fp16_attn.is_some(), "should have fp16_attn sub-program");
+        let fp16_attn = fp16_attn.unwrap();
+        let fp16_op_types: Vec<&str> = fp16_attn
+            .program
+            .main()
+            .unwrap()
+            .body
+            .operations
+            .iter()
+            .map(|op| op.op_type.as_str())
+            .collect();
+
+        // No gather ops should remain in fp16_attn
+        assert!(
+            !fp16_op_types.contains(&"gather"),
+            "fp16_attn should not contain gather ops after stripping, got: {fp16_op_types:?}"
+        );
+
+        // Softmax and matmul should still be present
+        assert!(
+            fp16_op_types.contains(&"softmax"),
+            "fp16_attn should still contain softmax, got: {fp16_op_types:?}"
         );
     }
 }

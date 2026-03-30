@@ -67,6 +67,13 @@ pub struct AneInference {
     /// Maximum sequence length for FP16 caches.
     #[allow(dead_code)]
     max_seq_len: usize,
+    /// Pre-extracted RoPE cos/sin cache tables (from model consts).
+    /// Flat f16 arrays: `[num_positions * values_per_position]`.
+    /// Indexed as `cache[pos * rope_cache_dim .. (pos+1) * rope_cache_dim]`.
+    rope_cos_cache: Vec<f16>,
+    rope_sin_cache: Vec<f16>,
+    /// Number of f16 values per position in the RoPE cache.
+    rope_cache_dim: usize,
 }
 
 /// CPU-side weight tensor for embedding/lm_head.
@@ -86,6 +93,24 @@ struct LayerPrograms {
     /// Post-attention sub-program. `None` for layers where all ops
     /// fall within the attention cluster (e.g., position-only layers).
     post_attn: Option<LoadedSubProgram>,
+    /// Input mapping for fp16_attn (which tensor indices are Q/K/V/cos/sin).
+    attn_input_map: Option<AttnInputMap>,
+}
+
+/// Mapping from logical Q/K/V/cos/sin roles to fp16_attn input tensor indices.
+///
+/// After stripping gather ops from the attention cluster, the fp16_attn
+/// sub-program's inputs are determined by `build_sub_program` in alphabetical
+/// order. This map records which index is which so `decode()` writes
+/// the correct data to the correct input tensor.
+struct AttnInputMap {
+    q_idx: usize,
+    k_idx: usize,
+    v_idx: usize,
+    /// Indices of cos cache inputs (RoPE gathered values).
+    rope_cos_indices: Vec<usize>,
+    /// Indices of sin cache inputs (RoPE gathered values).
+    rope_sin_indices: Vec<usize>,
 }
 
 /// A loaded sub-program with pre-allocated I/O tensors.
@@ -111,6 +136,19 @@ impl AneInference {
         program: &mil_rs::ir::Program,
         turbo_config: Option<TurboQuantConfig>,
     ) -> Result<Self> {
+        // 0. Extract RoPE cos/sin cache from the original program before
+        //    passes modify shapes. These tables are used by CPU-side RoPE
+        //    when gather ops are stripped from fp16_attn sub-programs.
+        let (rope_cos_cache, rope_sin_cache, rope_cache_dim) = extract_rope_caches(program)
+            .unwrap_or_else(|| {
+                // No extractable RoPE cache (model may not use RoPE, or
+                // caches are runtime inputs). Precompute a default.
+                let head_dim = 64; // will be refined later
+                let max_pos = 2048;
+                let theta = 500_000.0f32;
+                precompute_rope_cache(head_dim, max_pos, theta)
+            });
+
         // 1. Run ANE-specific passes.
         // Note: AneConcatEliminationPass is NOT run here on the full program.
         // RoPE (RotaryEmbedding) ops contain concat and are stripped by the
@@ -193,10 +231,11 @@ impl AneInference {
         // the sub-programs that will be compiled for ANE.
         let split_config = SplitConfig {
             split_attention: true,
-            emit_attention: false, // fp16_attn sub-programs fail ANE compilation;
-            // needs debugging of which ops in the attention cluster (RoPE gather/split,
-            // per-head norm pow/reduce_mean) cause _ANECCompile() to reject the program
-            // due to name-heuristic fallback producing wrong op subsets
+            // Emit fp16_attn sub-programs in FP16 baseline mode.
+            // Gather ops (RoPE cos/sin lookup) are stripped from the
+            // attention cluster by strip_gather_ops() in the splitter;
+            // the gathered values are filled by the CPU at decode time.
+            emit_attention: turbo_config.is_none(),
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -346,10 +385,22 @@ impl AneInference {
             } else {
                 None
             };
+            // Compute input mapping for fp16_attn (which tensor indices
+            // correspond to Q/K/V vs RoPE cos/sin gathered values).
+            let attn_input_map = if let Some(attn_sub) = fp16_attn_map.get(&layer_n) {
+                if fp16_attn.is_some() {
+                    Some(compute_attn_input_map(&attn_sub.inputs))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             layers.push(LayerPrograms {
                 pre_attn: pre,
                 fp16_attn,
                 post_attn: post,
+                attn_input_map,
             });
         }
 
@@ -366,15 +417,17 @@ impl AneInference {
                 // Infer from the pre_attn output shapes.
                 let pre_sps: Vec<&crate::split::SubProgram> =
                     pre_attn_map.values().copied().collect();
-                let nkv = infer_kv_heads_from_sub(&pre_sps);
+                // infer_kv_heads_from_sub returns the K channel count
+                // (= num_kv_heads * head_dim), not the head count itself.
+                let kv_channels = infer_kv_heads_from_sub(&pre_sps);
                 let hd = infer_head_dim_from_sub(&pre_sps);
                 let msl = 2048; // Default, can be made configurable.
-                let channels = nkv * hd;
+                let nkv = kv_channels / hd.max(1);
 
                 let mut caches = Vec::with_capacity(num_layers);
                 for _ in 0..num_layers {
-                    let k = AneTensor::new(channels, msl, ScalarType::Float16)?;
-                    let v = AneTensor::new(channels, msl, ScalarType::Float16)?;
+                    let k = AneTensor::new(kv_channels, msl, ScalarType::Float16)?;
+                    let v = AneTensor::new(kv_channels, msl, ScalarType::Float16)?;
                     caches.push((k, v));
                 }
                 (None, Some(caches), nkv, hd, msl)
@@ -391,6 +444,9 @@ impl AneInference {
             num_kv_heads,
             head_dim,
             max_seq_len,
+            rope_cos_cache,
+            rope_sin_cache,
+            rope_cache_dim,
         })
     }
 
@@ -474,7 +530,10 @@ impl AneInference {
                     .write_f16_at(elem_offset, &v_data[..token_elements])?;
 
                 // If we have an FP16 attention sub-program, use it.
-                if let Some(ref mut fp16_attn) = self.layers[layer_idx].fp16_attn {
+                let layer = &mut self.layers[layer_idx];
+                if let Some(ref mut fp16_attn) = layer.fp16_attn {
+                    let attn_map = layer.attn_input_map.as_ref();
+
                     if let Some(ref packing) = fp16_attn.input_packing {
                         // Packed: write all logical inputs into the single tensor.
                         let mut logical_inputs: Vec<&[f16]> = vec![&q_data];
@@ -489,7 +548,30 @@ impl AneInference {
                             &logical_inputs,
                             packing,
                         )?;
+                    } else if let Some(map) = attn_map {
+                        // Input-mapped mode: write Q/K/V to their mapped indices.
+                        write_f16_padded(&mut fp16_attn.input_tensors[map.q_idx], &q_data)?;
+                        write_f16_padded(&mut fp16_attn.input_tensors[map.k_idx], &k_data)?;
+                        write_f16_padded(&mut fp16_attn.input_tensors[map.v_idx], &v_data)?;
+
+                        // Write CPU-gathered RoPE cos/sin values for this position.
+                        if self.rope_cache_dim > 0
+                            && self.seq_pos < self.rope_cos_cache.len() / self.rope_cache_dim.max(1)
+                        {
+                            let offset = self.seq_pos * self.rope_cache_dim;
+                            let cos_slice =
+                                &self.rope_cos_cache[offset..offset + self.rope_cache_dim];
+                            let sin_slice =
+                                &self.rope_sin_cache[offset..offset + self.rope_cache_dim];
+                            for &idx in &map.rope_cos_indices {
+                                write_f16_padded(&mut fp16_attn.input_tensors[idx], cos_slice)?;
+                            }
+                            for &idx in &map.rope_sin_indices {
+                                write_f16_padded(&mut fp16_attn.input_tensors[idx], sin_slice)?;
+                            }
+                        }
                     } else {
+                        // Legacy positional mode (no input map).
                         write_f16_padded(&mut fp16_attn.input_tensors[0], &q_data)?;
                         if fp16_attn.input_tensors.len() > 1 {
                             write_f16_padded(&mut fp16_attn.input_tensors[1], &k_data)?;
@@ -1045,6 +1127,165 @@ fn simple_random_f32() -> f32 {
 /// - 128001: LLaMA-3
 fn is_eos_token(token_id: u32) -> bool {
     matches!(token_id, 2 | 151643 | 128001)
+}
+
+// ---------------------------------------------------------------------------
+// RoPE cache extraction and precomputation
+// ---------------------------------------------------------------------------
+
+/// Extracted RoPE cos/sin cache data.
+type RopeCacheData = (Vec<f16>, Vec<f16>, usize);
+
+/// Extract RoPE cos/sin cache data from model const ops.
+///
+/// Walks the program looking for `gather` ops whose names contain "cos"
+/// or "sin" (produced by RotaryEmbedding decomposition). Traces back to
+/// the const table input and extracts it.
+///
+/// Returns `(cos_values, sin_values, values_per_position)` where each
+/// value array is flat `[num_positions * values_per_position]` in fp16.
+fn extract_rope_caches(program: &mil_rs::ir::Program) -> Option<RopeCacheData> {
+    use mil_rs::ir::Value;
+    let func = program.main()?;
+
+    // Map output_name → (data, shape, dtype) for const ops.
+    let mut const_map: std::collections::HashMap<&str, (&[u8], &[usize], ScalarType)> =
+        std::collections::HashMap::new();
+    for op in &func.body.operations {
+        if op.op_type == "const" {
+            let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+            if let Some(Value::Tensor { data, shape, dtype }) = tensor {
+                for out in &op.outputs {
+                    const_map.insert(out.as_str(), (data.as_slice(), shape.as_slice(), *dtype));
+                }
+            }
+        }
+    }
+
+    let mut cos_result: Option<(Vec<f16>, usize, usize)> = None;
+    let mut sin_result: Option<(Vec<f16>, usize, usize)> = None;
+
+    for op in &func.body.operations {
+        if op.op_type != "gather" {
+            continue;
+        }
+        let name = op.name.to_ascii_lowercase();
+        let is_cos = name.contains("cos");
+        let is_sin = name.contains("sin");
+        if !is_cos && !is_sin {
+            continue;
+        }
+
+        // Trace the gather's "x" input back to a const table.
+        if let Some(Value::Reference(cache_ref)) = op.inputs.get("x") {
+            if let Some(&(data, shape, dtype)) = const_map.get(cache_ref.as_str()) {
+                if shape.len() < 2 {
+                    continue;
+                }
+                let f16_values: Vec<f16> = match dtype {
+                    ScalarType::Float32 => data
+                        .chunks_exact(4)
+                        .map(|b| f16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                        .collect(),
+                    ScalarType::Float16 => data
+                        .chunks_exact(2)
+                        .map(|b| f16::from_le_bytes([b[0], b[1]]))
+                        .collect(),
+                    _ => continue,
+                };
+                let num_pos = shape[0];
+                let dim = shape[1];
+
+                if is_cos && cos_result.is_none() {
+                    cos_result = Some((f16_values.clone(), num_pos, dim));
+                }
+                if is_sin && sin_result.is_none() {
+                    sin_result = Some((f16_values, num_pos, dim));
+                }
+            }
+        }
+    }
+
+    match (cos_result, sin_result) {
+        (Some((cos, _num_pos, dim)), Some((sin, _, _))) => Some((cos, sin, dim)),
+        _ => None,
+    }
+}
+
+/// Precompute RoPE cos/sin cache tables from scratch.
+///
+/// Used as a fallback when the model's const tables can't be extracted.
+fn precompute_rope_cache(head_dim: usize, max_pos: usize, theta: f32) -> RopeCacheData {
+    let half_dim = head_dim / 2;
+    let mut cos_cache = Vec::with_capacity(max_pos * half_dim);
+    let mut sin_cache = Vec::with_capacity(max_pos * half_dim);
+
+    for pos in 0..max_pos {
+        for i in 0..half_dim {
+            let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+            let angle = pos as f32 * freq;
+            cos_cache.push(f16::from_f32(angle.cos()));
+            sin_cache.push(f16::from_f32(angle.sin()));
+        }
+    }
+    (cos_cache, sin_cache, half_dim)
+}
+
+// ---------------------------------------------------------------------------
+// Attention input mapping
+// ---------------------------------------------------------------------------
+
+/// Compute the [`AttnInputMap`] for an fp16_attn sub-program.
+///
+/// After stripping gather ops, the fp16_attn sub-program has inputs for
+/// Q, K, V projections AND gathered cos/sin values. The inputs are sorted
+/// alphabetically by name. This function identifies which index is which
+/// by examining input names and channel counts.
+fn compute_attn_input_map(inputs: &[crate::TensorDescriptor]) -> AttnInputMap {
+    let mut cos_indices = Vec::new();
+    let mut sin_indices = Vec::new();
+    let mut qkv_candidates: Vec<(usize, &crate::TensorDescriptor)> = Vec::new();
+
+    for (i, td) in inputs.iter().enumerate() {
+        let name = td.name.to_ascii_lowercase();
+        if name.contains("cos") {
+            cos_indices.push(i);
+        } else if name.contains("sin") {
+            sin_indices.push(i);
+        } else {
+            qkv_candidates.push((i, td));
+        }
+    }
+
+    // Sort QKV candidates: largest channels first (Q has more channels
+    // than K/V in GQA models). For equal channels (MHA), distinguish
+    // by name: "q" before "k" before "v".
+    qkv_candidates.sort_by(|a, b| {
+        let ch_cmp = b.1.shape[1].cmp(&a.1.shape[1]);
+        if ch_cmp != std::cmp::Ordering::Equal {
+            return ch_cmp;
+        }
+        let a_name = a.1.name.to_ascii_lowercase();
+        let b_name = b.1.name.to_ascii_lowercase();
+        let rank = |n: &str| -> u8 {
+            if n.contains("q_proj") || n.contains("_q_") {
+                0
+            } else if n.contains("k_proj") || n.contains("_k_") {
+                1
+            } else {
+                2
+            }
+        };
+        rank(&a_name).cmp(&rank(&b_name))
+    });
+
+    AttnInputMap {
+        q_idx: qkv_candidates.first().map_or(0, |&(i, _)| i),
+        k_idx: qkv_candidates.get(1).map_or(1, |&(i, _)| i),
+        v_idx: qkv_candidates.get(2).map_or(2, |&(i, _)| i),
+        rope_cos_indices: cos_indices,
+        rope_sin_indices: sin_indices,
+    }
 }
 
 #[cfg(test)]
