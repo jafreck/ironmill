@@ -39,18 +39,58 @@ Token ID → Embedding sub-program (ANE)
 ### Comparison benchmark
 
 ```
-┌──────────────────────┬──────────────────────┐
-│ Baseline (FP16)      │ TurboQuant (INT8)    │
-├──────────────────────┼──────────────────────┤
-│ AneModel::predict()  │ TQInference::decode()│
-│ FP16 KV cache        │ INT8 KV cache        │
-│ 2 bytes/elem         │ 1 byte/elem          │
-│ No rotation overhead │ Rotation + quant     │
-│                      │ overhead per token   │
-└──────────────────────┴──────────────────────┘
+┌──────────────────────────┬──────────────────────────┐
+│ Baseline (FP16)          │ TurboQuant (INT8)        │
+├──────────────────────────┼──────────────────────────┤
+│ AneInference::decode()   │ AneInference::decode()   │  ← same code path
+│ FP16 attention sub-prog  │ TurboQuant attention     │  ← only divergence
+│ FP16 KV cache (2 B/elem) │ INT8 KV cache (1 B/elem) │
+└──────────────────────────┴──────────────────────────┘
 
 Metrics: tokens/sec, KV cache MB, perplexity (WikiText-2 / LongBench)
 ```
+
+### Shared vs divergent code
+
+`AneInference` is a **single struct** that serves both the FP16 baseline
+and TurboQuant paths. The `turboquant: Option<TurboQuantModel>` field is
+the only branching point.
+
+**Shared (identical for both paths):**
+- ONNX → MIL IR conversion
+- Model architecture extraction
+- Attention-boundary layer splitting (both paths need pre_attn/post_attn)
+- ANE compilation of embedding, pre_attn, post_attn, lm_head sub-programs
+- `decode()` control flow (per-layer loop, tensor threading)
+- `generate()` loop, sampling, EOS detection
+- Tensor I/O (token ID → embedding, logits → f32)
+- Benchmarking harness and quality measurement
+- CLI integration
+
+**Divergent (~20 lines in the per-layer loop):**
+```rust
+// Inside decode(), for each layer:
+let (q, k_proj, v_proj) = self.run_pre_attn(layer)?;
+
+let attn_out = if let Some(tq) = &mut self.turboquant {
+    // TurboQuant: rotate+quantize K/V to INT8, write to cache,
+    // dequant+attend from INT8 cache
+    tq.step_attention(layer, &q, &k_proj, &v_proj)?
+} else {
+    // Baseline: run FP16 attention sub-program, copy FP16 KV
+    // to persistent cache via write_f16_at
+    self.run_fp16_attention(layer, &q, &k_proj, &v_proj)?
+};
+
+self.run_post_attn(layer, &attn_out)?;
+```
+
+**Why both paths need the layer split:** Even the FP16 baseline requires
+stateful KV cache management — the ONNX model's `past_key_values` /
+`present` must be threaded across decode steps. This means both paths
+intercept at the attention boundary to manage cache state. The split
+is not TurboQuant-specific infrastructure; it's a prerequisite for any
+autoregressive ANE inference.
 
 ---
 
