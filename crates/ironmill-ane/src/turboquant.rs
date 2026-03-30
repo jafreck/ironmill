@@ -583,20 +583,12 @@ impl TurboQuantModel {
         k_proj: &AneTensor,
         v_proj: &AneTensor,
     ) -> Result<AneTensor> {
-        let channels = self.config.num_kv_heads * self.config.head_dim;
-
-        // Copy external tensors into staging buffers with matching alloc sizes.
+        // Copy column 0 directly from external tensors into staging buffers.
         // ANE requires all input IOSurfaces in a single eval to have the same
         // allocation size. Pre-attn outputs may have a different alloc size.
-        // Pre-attn tensors are S=32 padded ([1,C,1,32] NCHW), so we must
-        // gather column 0 from each channel row, then scatter back into the
-        // S=32 staging buffer layout.
-        let k_data = gather_column0(k_proj)?;
-        let k_scattered = scatter_to_column0(&k_data[..channels], MIN_IO_SEQ);
-        self.cw_k_staging.write_f16(&k_scattered)?;
-        let v_data = gather_column0(v_proj)?;
-        let v_scattered = scatter_to_column0(&v_data[..channels], MIN_IO_SEQ);
-        self.cw_v_staging.write_f16(&v_scattered)?;
+        // Direct IOSurface-to-IOSurface strided copy avoids CPU Vec intermediaries.
+        self.cw_k_staging.copy_column0_from(k_proj)?;
+        self.cw_v_staging.copy_column0_from(v_proj)?;
 
         // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
         self.runtime.eval(
@@ -611,10 +603,10 @@ impl TurboQuantModel {
 
         // 2. CPU cache interception: read fp16 values (rounded to integer),
         //    convert to INT8 bytes, write to persistent cache.
-        //    Output is S=32 padded; gather column 0 to get actual values.
-        let k_f16 = gather_column0(&self.cw_k_output)?;
+        //    Output is S=32 padded; read only column 0 to get actual values.
+        let k_f16 = self.cw_k_output.read_column0_f16()?;
         let k_bytes: Vec<u8> = k_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
-        let v_f16 = gather_column0(&self.cw_v_output)?;
+        let v_f16 = self.cw_v_output.read_column0_f16()?;
         let v_bytes: Vec<u8> = v_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
 
         // Read original K_proj for QJL residual sign computation
@@ -628,10 +620,8 @@ impl TurboQuantModel {
             .update_cache(layer, &k_bytes, &v_bytes, k_original.as_deref())?;
 
         // 3. Attention: Q + cached K/V + unrotation_matrix → output
-        let q_data = gather_column0(q)?;
+        self.attn_q_staging.copy_column0_from(q)?;
         let q_channels = self.config.num_heads * self.config.head_dim;
-        let q_scattered = scatter_to_column0(&q_data[..q_channels], MIN_IO_SEQ);
-        self.attn_q_staging.write_f16(&q_scattered)?;
         let (k_cache, v_cache) = self.cache.cache_tensors(layer);
         let mut attn_out = AneTensor::new_with_min_alloc(
             q_channels,
@@ -687,35 +677,4 @@ impl TurboQuantModel {
     pub fn alloc_sizes(&self) -> (usize, usize) {
         (self.cw_alloc_size, self.attn_alloc_size)
     }
-}
-
-/// Read C elements (one token at column 0) from an ANE tensor with shape
-/// `[1, C, 1, S]`. In NCHW layout, element `(c, s)` is at flat index
-/// `c * S + s`, so column 0 values are at indices `0, S, 2S, ...`.
-/// When S=1, returns the flat data directly.
-fn gather_column0(tensor: &AneTensor) -> Result<Vec<f16>> {
-    let [_, channels, _, seq_len] = tensor.shape();
-    if seq_len == 1 {
-        return tensor.read_f16();
-    }
-    let full = tensor.read_f16()?;
-    let mut out = Vec::with_capacity(channels);
-    for c in 0..channels {
-        out.push(full[c * seq_len]);
-    }
-    Ok(out)
-}
-
-/// Scatter C elements into column 0 of a `[1, C, 1, seq_len]` buffer.
-///
-/// Returns a flat `Vec<f16>` of length `C * seq_len` with each input
-/// value placed at index `c * seq_len` (column 0 of channel c);
-/// all other positions are zero.
-fn scatter_to_column0(data: &[f16], seq_len: usize) -> Vec<f16> {
-    let channels = data.len();
-    let mut buf = vec![f16::ZERO; channels * seq_len];
-    for c in 0..channels {
-        buf[c * seq_len] = data[c];
-    }
-    buf
 }
