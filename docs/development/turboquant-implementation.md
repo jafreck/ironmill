@@ -4,9 +4,9 @@
 >
 > **Implementation notes:**
 > - All components implemented in `turboquant.rs`, `turboquant_mil.rs`, CLI, and benchmarks.
-> - GQA head expansion via `tile` is implemented but `tile` is only compile-verified
->   on ANE (`⚠️ compile`), not eval-verified. MHA (num_heads == num_kv_heads) is
->   fully eval-verified.
+> - GQA head expansion via `tile` is implemented. `tile`, `reshape`, and `slice_by_index`
+>   are eval-verified as intermediate ops within the TurboQuant INT8 cache pipeline
+>   (30/30 checks pass, max_err=0.014). They cannot compile as standalone ANE programs.
 >
 > **Prerequisites:**
 > - [TurboQuant Research Analysis](../research/turboquant-analysis.md)
