@@ -23,7 +23,7 @@ use mil_rs::ir::passes::{
     TypeRepropagationPass,
 };
 
-use crate::program::CompiledProgram;
+use crate::program::{CompiledProgram, LoadedProgram};
 use crate::runtime::AneRuntime;
 use crate::split::{SplitConfig, split_for_ane};
 use crate::tensor::{AneTensor, uniform_alloc_size};
@@ -49,8 +49,8 @@ pub struct AneInference {
     /// Per-layer: (pre_attn, post_attn) sub-programs.
     /// The fp16_attn sub-program is only present in baseline mode.
     layers: Vec<LayerPrograms>,
-    /// lm_head weight: [vocab_size, hidden_size] as fp16 bytes.
-    lm_head_weight: CpuWeight,
+    /// LM head projection. ANE-accelerated when possible, CPU fallback otherwise.
+    lm_head: LmHead,
     /// Optional TurboQuant model (replaces layer attention when enabled).
     turboquant: Option<TurboQuantModel>,
     /// FP16 KV caches (used when TurboQuant is disabled).
@@ -129,7 +129,177 @@ struct LoadedSubProgram {
     input_packing: Option<crate::packing::InputPacking>,
 }
 
+/// LM head projection — ANE-accelerated or CPU fallback.
+enum LmHead {
+    /// ANE-accelerated: chunked conv1×1 across multiple ANE programs.
+    Ane(AneLmHead),
+    /// CPU fallback: scalar matmul (used when ANE compilation fails).
+    Cpu(CpuWeight),
+}
+
 // ---------------------------------------------------------------------------
+// ANE-accelerated LM head
+// ---------------------------------------------------------------------------
+
+/// Maximum output channels per ANE lm_head chunk.
+/// ANE rejects tensor dimensions > 16384.
+const LM_HEAD_MAX_CHUNK_CH: usize = 16384;
+
+/// Minimum spatial dimension for ANE I/O tensors (same as TurboQuant).
+const LM_HEAD_MIN_SEQ: usize = 32;
+
+/// ANE-accelerated lm_head projection via chunked conv1×1.
+///
+/// Splits the `[vocab_size, hidden_size]` weight matrix into chunks of
+/// ≤16384 output channels. Each chunk is compiled as a separate conv1×1
+/// ANE program. At inference time, all chunks are evaluated and their
+/// outputs concatenated to produce the full logits vector.
+#[allow(dead_code)]
+struct AneLmHead {
+    chunks: Vec<LmHeadChunk>,
+    vocab_size: usize,
+    hidden_size: usize,
+    runtime: AneRuntime,
+}
+
+/// One chunk of the ANE lm_head — a conv1×1 with ≤16384 output channels.
+struct LmHeadChunk {
+    loaded: LoadedProgram,
+    input_tensor: AneTensor,
+    output_tensor: AneTensor,
+    out_channels: usize,
+}
+
+impl AneLmHead {
+    /// Compile the chunked ANE lm_head from a CPU weight tensor.
+    ///
+    /// Splits `[vocab_size, hidden_size]` into chunks of ≤16384 output
+    /// channels, compiles each as a conv1×1 ANE program with BLOBFILE
+    /// weights, and pre-allocates I/O tensors.
+    fn compile(weight: &CpuWeight) -> Result<Self> {
+        let [vocab_size, hidden_size] = weight.shape;
+        let runtime = AneRuntime::new()?;
+
+        let num_chunks = vocab_size.div_ceil(LM_HEAD_MAX_CHUNK_CH);
+        let mut chunks = Vec::with_capacity(num_chunks);
+
+        let bytes_per_elem = 2; // fp16
+        let row_bytes = hidden_size * bytes_per_elem;
+
+        for chunk_idx in 0..num_chunks {
+            let start = chunk_idx * LM_HEAD_MAX_CHUNK_CH;
+            let end = (start + LM_HEAD_MAX_CHUNK_CH).min(vocab_size);
+            let out_ch = end - start;
+
+            // Extract weight chunk: rows [start..end], each row = hidden_size fp16 values.
+            let chunk_data = weight.data[start * row_bytes..end * row_bytes].to_vec();
+
+            // Generate MIL text for conv1×1 with BLOBFILE weight.
+            let mil_text = emit_lm_head_chunk_mil(hidden_size, out_ch);
+            let weight_path = "@model_path/weights/weight.bin";
+
+            let ptr = AneCompiler::compile_mil_text(&mil_text, &[(weight_path, &chunk_data)])
+                .map_err(|e| AneError::CompileFailed {
+                    status: 0,
+                    context: format!(
+                        "lm_head chunk {chunk_idx} ({out_ch} channels) compilation failed: {e}"
+                    ),
+                })?;
+            let compiled = unsafe { CompiledProgram::from_raw(ptr) };
+            let loaded = runtime.load_program(&compiled)?;
+
+            // ANE requires all I/O tensors in one eval to have the same alloc size.
+            let alloc = uniform_alloc_size(&[
+                ([1, hidden_size, 1, LM_HEAD_MIN_SEQ], ScalarType::Float16),
+                ([1, out_ch, 1, LM_HEAD_MIN_SEQ], ScalarType::Float16),
+            ]);
+
+            let input_tensor = AneTensor::new_with_min_alloc(
+                hidden_size,
+                LM_HEAD_MIN_SEQ,
+                ScalarType::Float16,
+                alloc,
+            )?;
+            let output_tensor =
+                AneTensor::new_with_min_alloc(out_ch, LM_HEAD_MIN_SEQ, ScalarType::Float16, alloc)?;
+
+            chunks.push(LmHeadChunk {
+                loaded,
+                input_tensor,
+                output_tensor,
+                out_channels: out_ch,
+            });
+        }
+
+        eprintln!(
+            "ANE lm_head: {vocab_size} vocab × {hidden_size} hidden → {num_chunks} chunks \
+             (max {LM_HEAD_MAX_CHUNK_CH} channels each)"
+        );
+
+        Ok(Self {
+            chunks,
+            vocab_size,
+            hidden_size,
+            runtime,
+        })
+    }
+
+    /// Run the lm_head projection on ANE, returning logits as f32.
+    fn forward(&mut self, hidden: &[f16]) -> Result<Vec<f32>> {
+        let mut logits = Vec::with_capacity(self.vocab_size);
+
+        for chunk in &mut self.chunks {
+            // Write hidden state to input tensor (column 0, zero-padded).
+            write_f16_padded(&mut chunk.input_tensor, hidden)?;
+
+            // Eval conv1×1 on ANE.
+            self.runtime.eval(
+                &chunk.loaded,
+                &[&chunk.input_tensor],
+                &mut [&mut chunk.output_tensor],
+            )?;
+
+            // Read output logits from column 0 of each channel.
+            let output = read_f16_channels(&chunk.output_tensor)?;
+            logits.extend(output.iter().take(chunk.out_channels).map(|v| v.to_f32()));
+        }
+
+        Ok(logits)
+    }
+}
+
+/// Generate MIL text for a single lm_head chunk (conv1×1).
+///
+/// The weight is delivered via BLOBFILE at `@model_path/weights/weight.bin`.
+/// Input: `[1, hidden_size, 1, 32]` fp16.
+/// Output: `[1, out_channels, 1, 32]` fp16.
+fn emit_lm_head_chunk_mil(hidden_size: usize, out_channels: usize) -> String {
+    let s = LM_HEAD_MIN_SEQ;
+    // Reuse the same program wrapper format as turboquant_mil.
+    format!(
+        "program(1.3)\n\
+         [buildInfo = dict<string, string>(\
+         {{{{\"coremlc-component-MIL\", \"3510.2.1\"}}, \
+         {{\"coremlc-version\", \"3505.4.1\"}}, \
+         {{\"coremltools-component-milinternal\", \"\"}}, \
+         {{\"coremltools-version\", \"9.0\"}}}})]\n\
+         {{\n\
+             func main<ios18>(tensor<fp16, [1,{hidden_size},1,{s}]> a_input0) {{\n\
+                 string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n\
+                 tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n\
+                 tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n\
+                 tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n\
+                 int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n\
+                 tensor<fp16, [{out_channels},{hidden_size},1,1]> weight = const()\
+                     [name=string(\"weight\"), val=tensor<fp16, [{out_channels},{hidden_size},1,1]>\
+                     (BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(64)))];\n\
+                 tensor<fp16, [1,{out_channels},1,{s}]> z_output0 = conv(\
+                     x=a_input0, weight=weight, pad_type=pt, strides=st, pad=pd, \
+                     dilations=dl, groups=gr)[name=string(\"z_output0\")];\n\
+             }} -> (z_output0);\n\
+         }}"
+    )
+}
 // Construction
 // ---------------------------------------------------------------------------
 
@@ -369,20 +539,29 @@ impl AneInference {
             )));
         }
 
-        // 5. Extract CPU weights for embedding and lm_head (these run on CPU
-        // because they contain ops ANE doesn't support: gather, large matmul).
+        // 5. Extract CPU weights for embedding; build ANE or CPU lm_head.
         let embed_weight = extract_cpu_weight(embedding_sub, "embed").ok_or_else(|| {
             AneError::Other(anyhow::anyhow!(
                 "could not extract embedding weight from sub-program"
             ))
         })?;
-        let lm_head_weight = extract_cpu_weight(lm_head_sub, "lm_head").unwrap_or_else(|| {
+        let lm_head_cpu_weight = extract_cpu_weight(lm_head_sub, "lm_head").unwrap_or_else(|| {
             // Tied embeddings: lm_head reuses embedding weight.
             CpuWeight {
                 data: embed_weight.data.clone(),
                 shape: embed_weight.shape,
             }
         });
+
+        // Try to compile lm_head as chunked ANE conv1×1. Falls back to CPU
+        // if ANE compilation fails (e.g., unsupported shape or ANE unavailable).
+        let lm_head = match AneLmHead::compile(&lm_head_cpu_weight) {
+            Ok(ane_lm_head) => LmHead::Ane(ane_lm_head),
+            Err(e) => {
+                eprintln!("warning: ANE lm_head compilation failed, falling back to CPU: {e}");
+                LmHead::Cpu(lm_head_cpu_weight)
+            }
+        };
 
         // 6. Compile and load per-layer sub-programs for ANE.
         let mut layers = Vec::with_capacity(num_layers);
@@ -478,7 +657,7 @@ impl AneInference {
         Ok(Self {
             embed_weight,
             layers,
-            lm_head_weight,
+            lm_head,
             turboquant,
             fp16_kv_caches,
             runtime,
@@ -702,8 +881,11 @@ impl AneInference {
 
         self.seq_pos += 1;
 
-        // 3. LM head: CPU matmul hidden × lm_head_weight^T → logits
-        cpu_lm_head_matmul(&self.lm_head_weight, &hidden)
+        // 3. LM head: ANE conv1×1 (chunked) or CPU fallback.
+        match &mut self.lm_head {
+            LmHead::Ane(ane_lm_head) => ane_lm_head.forward(&hidden),
+            LmHead::Cpu(weight) => cpu_lm_head_matmul(weight, &hidden),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -777,6 +959,11 @@ impl AneInference {
     /// Whether TurboQuant mode is active.
     pub fn is_turboquant(&self) -> bool {
         self.turboquant.is_some()
+    }
+
+    /// Whether the lm_head runs on ANE (true) or CPU (false).
+    pub fn is_ane_lm_head(&self) -> bool {
+        matches!(self.lm_head, LmHead::Ane(_))
     }
 }
 
@@ -1361,5 +1548,38 @@ mod tests {
         let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let token = sample_token(&logits, 1.0);
         assert!(token < 5);
+    }
+
+    #[test]
+    fn lm_head_mil_is_valid_program() {
+        let mil = emit_lm_head_chunk_mil(1024, 8192);
+        assert!(mil.starts_with("program(1.3)"));
+        assert!(mil.contains("func main<ios18>"));
+        assert!(mil.contains("a_input0"));
+        assert!(mil.contains("z_output0"));
+        assert!(mil.contains("conv("));
+        assert!(mil.contains("[8192,1024,1,1]"));
+        assert!(
+            mil.contains("BLOBFILE"),
+            "weight should use BLOBFILE reference"
+        );
+    }
+
+    #[test]
+    fn lm_head_mil_small_chunk() {
+        let mil = emit_lm_head_chunk_mil(512, 256);
+        assert!(mil.contains("[256,512,1,1]"));
+        assert!(mil.contains("conv("));
+    }
+
+    #[test]
+    fn lm_head_chunk_count() {
+        // 151936 vocab / 16384 max = 10 chunks (9×16384 + 1×4480)
+        let vocab_size: usize = 151936;
+        let num_chunks = vocab_size.div_ceil(LM_HEAD_MAX_CHUNK_CH);
+        assert_eq!(num_chunks, 10);
+
+        let last_chunk_size = vocab_size - (num_chunks - 1) * LM_HEAD_MAX_CHUNK_CH;
+        assert_eq!(last_chunk_size, 4480);
     }
 }
