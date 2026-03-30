@@ -269,7 +269,10 @@ impl<'a> MilTextEmitter<'a> {
                 shape: shape.clone(),
             });
 
-            let type_str = self.format_tensor_type_from(shape, *dtype);
+            // ANE requires 4D tensor types. Reshape the weight type
+            // declaration to 4D [1, C, 1, S] for the MIL text.
+            let ane_shape = to_ane_weight_shape(shape);
+            let type_str = self.format_tensor_type_from(&ane_shape, *dtype);
 
             // TYPE %name = const()[name=string("name"), val=TYPE(BLOBFILE(...))];
             writeln!(
@@ -467,6 +470,28 @@ fn format_float(f: f64) -> String {
         format!("{f:.1}")
     } else {
         format!("{f}")
+    }
+}
+
+/// Convert a weight tensor shape to ANE-compatible 4D.
+///
+/// ANE requires all tensor type declarations in MIL text to be 4D.
+/// Weight shapes like `[1024]` or `[1024,1024]` need to be padded
+/// to `[1,1024,1,1]` or `[1,1024,1,1024]`.
+fn to_ane_weight_shape(shape: &[usize]) -> Vec<usize> {
+    match shape.len() {
+        0 => vec![1, 1, 1, 1],
+        1 => vec![1, shape[0], 1, 1],
+        2 => vec![1, shape[0], 1, shape[1]],
+        3 => vec![1, shape[0], shape[1], shape[2]],
+        4 => shape.to_vec(),
+        _ => {
+            // 5D+ — collapse trailing dims.
+            let mut s = vec![1usize; 4];
+            s[1] = shape[0];
+            s[3] = shape[1..].iter().product();
+            s
+        }
     }
 }
 

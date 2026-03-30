@@ -44,6 +44,33 @@ impl Pass for AneLayoutPass {
                     }
                 }
             }
+
+            // Fix reshape ops: update the shape parameter to match the
+            // ANE 4D output type. The layout pass converts output types
+            // to 4D but doesn't touch the shape const that reshape reads.
+            for op in &mut function.body.operations {
+                if op.op_type == "reshape" {
+                    if let Some(Some(out_ty)) = op.output_types.first() {
+                        let target_shape: Vec<usize> =
+                            out_ty.shape.iter().map(|d| d.unwrap_or(1)).collect();
+                        // Replace the shape input with an inline tensor
+                        // containing the 4D target shape.
+                        let n = target_shape.len();
+                        let data: Vec<u8> = target_shape
+                            .iter()
+                            .flat_map(|&d| (d as i32).to_le_bytes())
+                            .collect();
+                        op.inputs.insert(
+                            "shape".to_string(),
+                            Value::Tensor {
+                                data,
+                                shape: vec![n],
+                                dtype: crate::ir::ScalarType::Int32,
+                            },
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -72,7 +99,10 @@ fn to_ane_shape_static(shape: &[usize]) -> Vec<usize> {
         2 => vec![1, shape[0], 1, shape[1]],
         3 => {
             let (b, m, n) = (shape[0], shape[1], shape[2]);
-            if b == 1 {
+            if b == 1 && m == 1 {
+                // [1, 1, N] — single-token decode: N is hidden_size, put in C.
+                vec![1, n, 1, 1]
+            } else if b == 1 {
                 vec![1, m, 1, n]
             } else {
                 vec![1, b * m, 1, n]
@@ -117,8 +147,10 @@ fn to_ane_shape_dynamic(shape: &[Option<usize>]) -> Vec<Option<usize>> {
         1 => vec![Some(1), shape[0], Some(1), Some(1)],
         2 => vec![Some(1), shape[0], Some(1), shape[1]],
         3 => {
-            // If batch dim is known to be 1, straightforward.
-            if shape[0] == Some(1) {
+            if shape[0] == Some(1) && shape[1] == Some(1) {
+                // [1, 1, N] — single-token decode: N is hidden_size, put in C.
+                vec![Some(1), shape[2], Some(1), Some(1)]
+            } else if shape[0] == Some(1) {
                 vec![Some(1), shape[1], Some(1), shape[2]]
             } else {
                 // Cannot statically compute B*M — keep channel as dynamic.
@@ -287,6 +319,59 @@ mod tests {
                 assert_eq!(shape, &vec![4, 4]);
             }
             other => panic!("expected Tensor value, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reshape_op_shape_updated_to_4d() {
+        // A reshape from [1, 1024] to [1, 1, 128] should get its shape
+        // input updated to [1, 1, 1, 128] to match the ANE 4D output type.
+        let mut block = Block::new();
+
+        let shape_data: Vec<u8> = [1i32, 1, 128]
+            .iter()
+            .flat_map(|&v| v.to_le_bytes())
+            .collect();
+        let reshape_op = Operation::new("reshape", "reshape_0")
+            .with_input("x", Value::Reference("input".into()))
+            .with_input(
+                "shape",
+                Value::Tensor {
+                    data: shape_data,
+                    shape: vec![3],
+                    dtype: ScalarType::Int32,
+                },
+            )
+            .with_output("reshaped");
+        let mut reshape_op = reshape_op;
+        reshape_op.output_types = vec![Some(TensorType::new(ScalarType::Float16, vec![1, 1, 128]))];
+
+        block.add_op(reshape_op);
+        block.outputs.push("reshaped".into());
+
+        let input_ty = TensorType::new(ScalarType::Float16, vec![1, 1024]);
+        let func = Function::new("main").with_input("input", input_ty);
+        let mut func = func;
+        func.body = block;
+        let mut program = Program::new("1.0");
+        program.add_function(func);
+
+        AneLayoutPass.run(&mut program).unwrap();
+
+        // The reshape shape input should now be 4D matching the output type.
+        // [1, 1, 128] with b=1, m=1 maps to [1, 128, 1, 1] (hidden in C).
+        let op = &program.functions["main"].body.operations[0];
+        match op.inputs.get("shape") {
+            Some(Value::Tensor { data, shape, dtype }) => {
+                assert_eq!(*dtype, ScalarType::Int32);
+                assert_eq!(shape, &vec![4]); // 1-D tensor with 4 elements
+                let values: Vec<i32> = data
+                    .chunks_exact(4)
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                assert_eq!(values, vec![1, 128, 1, 1]);
+            }
+            other => panic!("expected Tensor shape input, got {:?}", other),
         }
     }
 }

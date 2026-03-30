@@ -114,6 +114,32 @@ impl AneInference {
         // attention-boundary split below. Concat validation runs per
         // sub-program after splitting.
         let mut program = program.clone();
+        // Ensure autoregressive tagging (required for ArShapeMaterialize).
+        if !program.is_autoregressive() {
+            program.set_attribute("autoregressive", "true");
+        }
+
+        // Materialize all dynamic dims to 1 for single-token decode
+        // BEFORE AneLayoutPass so the layout gets static shapes.
+        for func in program.functions.values_mut() {
+            for (_, ty) in &mut func.inputs {
+                for dim in &mut ty.shape {
+                    if dim.is_none() {
+                        *dim = Some(1);
+                    }
+                }
+            }
+            for op in &mut func.body.operations {
+                for t in op.output_types.iter_mut().flatten() {
+                    for dim in &mut t.shape {
+                        if dim.is_none() {
+                            *dim = Some(1);
+                        }
+                    }
+                }
+            }
+        }
+
         let ar_shape_pass = AutoregressiveShapeMaterializePass::new(2048);
         let passes: &[(&str, &dyn Pass)] = &[
             ("ArShapeMaterialize", &ar_shape_pass),
@@ -236,6 +262,10 @@ impl AneInference {
         });
 
         // 6. Compile and load per-layer sub-programs for ANE.
+        eprintln!(
+            "  [debug] Compiling {} layers: {:?}",
+            num_layers, layer_numbers
+        );
         let mut layers = Vec::with_capacity(num_layers);
         for &layer_n in &layer_numbers {
             let pre_sub = pre_attn_map.get(&layer_n).ok_or_else(|| {
