@@ -198,9 +198,17 @@ impl<'a> MilTextEmitter<'a> {
         }
 
         let mut params = Vec::new();
-        // Sort input keys for deterministic output.
+        // Emit input keys with "x" first (ANE expects the primary data
+        // input before other parameters), then remaining keys sorted.
         let mut input_keys: Vec<&String> = op.inputs.keys().collect();
-        input_keys.sort();
+        input_keys.sort_by(|a, b| {
+            // "x" sorts first, then alphabetical.
+            match (a.as_str(), b.as_str()) {
+                ("x", _) => std::cmp::Ordering::Less,
+                (_, "x") => std::cmp::Ordering::Greater,
+                _ => a.cmp(b),
+            }
+        });
         for key in input_keys {
             let val = &op.inputs[key];
             params.push(format!("{}={}", key, self.format_value(val)));
@@ -317,7 +325,18 @@ impl<'a> MilTextEmitter<'a> {
                 format!("[{}]", parts.join(", "))
             }
             Value::Type(ty) => self.format_tensor_type(ty),
-            Value::Tensor { .. } => "<tensor>".to_string(),
+            Value::Tensor { data, shape, dtype } => {
+                // Emit as inline typed tensor literal with 1-D shape.
+                // Op arguments (e.g., reshape's `shape`, reduce's `axes`)
+                // are always 1-D vectors. Flatten multi-dim shapes to [N].
+                let dtype_str = format_scalar_type(*dtype, self.config.enable_int4);
+                let num_elements: usize = shape.iter().product();
+                let type_str = format!("tensor<{dtype_str}, [{num_elements}]>");
+
+                // Decode the raw bytes into element values.
+                let values = format_tensor_elements(data, *dtype);
+                format!("{type_str}([{values}])")
+            }
         }
     }
 
@@ -455,6 +474,52 @@ fn format_float(f: f64) -> String {
 #[allow(dead_code)]
 fn align_up(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+/// Format raw tensor bytes as a comma-separated list of element values.
+///
+/// Used for inline tensor literals in op arguments (e.g., reshape shape).
+fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> String {
+    match dtype {
+        ScalarType::Int32 => data
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        ScalarType::Int64 => data
+            .chunks_exact(8)
+            .map(|b| {
+                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]).to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        ScalarType::Float32 => data
+            .chunks_exact(4)
+            .map(|b| format_float(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64))
+            .collect::<Vec<_>>()
+            .join(","),
+        ScalarType::Float16 => data
+            .chunks_exact(2)
+            .map(|b| format_float(half::f16::from_le_bytes([b[0], b[1]]).to_f64()))
+            .collect::<Vec<_>>()
+            .join(","),
+        ScalarType::Int8 => data
+            .iter()
+            .map(|&b| (b as i8).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        ScalarType::UInt8 => data
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        ScalarType::Bool => data
+            .iter()
+            .map(|&b| if b != 0 { "true" } else { "false" })
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => "0".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -770,6 +835,16 @@ mod tests {
             "tensor<int32, [2]>([1,2])"
         );
         assert_eq!(emitter.format_value(&Value::Reference("foo".into())), "foo");
+
+        // Tensor values should produce inline tensor literals.
+        assert_eq!(
+            emitter.format_value(&Value::Tensor {
+                data: vec![1, 0, 0, 0, 1, 0, 0, 0, 128, 0, 0, 0], // [1, 1, 128] as int32
+                shape: vec![3],
+                dtype: ScalarType::Int32,
+            }),
+            "tensor<int32, [3]>([1,1,128])"
+        );
     }
 
     #[test]
