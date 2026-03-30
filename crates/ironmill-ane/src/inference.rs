@@ -191,6 +191,8 @@ impl AneInference {
         // the sub-programs that will be compiled for ANE.
         let split_config = SplitConfig {
             split_attention: true,
+            emit_attention: false, // Disabled: fp16_attn sub-programs fail ANE compilation
+            // due to name-heuristic fallback producing wrong op subsets
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
