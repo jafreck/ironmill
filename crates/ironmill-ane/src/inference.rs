@@ -23,7 +23,7 @@ use mil_rs::ir::passes::{
     TypeRepropagationPass,
 };
 
-use crate::program::{CompiledProgram, LoadedProgram};
+use crate::program::CompiledProgram;
 use crate::runtime::AneRuntime;
 use crate::split::{SplitConfig, split_for_ane};
 use crate::tensor::{AneTensor, uniform_alloc_size};
@@ -115,9 +115,14 @@ struct AttnInputMap {
     rope_sin_indices: Vec<usize>,
 }
 
-/// A loaded sub-program with pre-allocated I/O tensors.
+/// A compiled sub-program with pre-allocated I/O tensors.
+///
+/// Programs are compiled upfront but kept unloaded. During decode,
+/// each program is loaded → evaluated → unloaded on demand via
+/// `runtime.eval_compiled()`, keeping at most ~3 programs loaded
+/// simultaneously.
 struct LoadedSubProgram {
-    loaded: LoadedProgram,
+    compiled: CompiledProgram,
     input_tensors: Vec<AneTensor>,
     output_tensors: Vec<AneTensor>,
     /// If inputs were spatially packed, stores the packing metadata.
@@ -237,8 +242,11 @@ impl AneInference {
             // Gather ops (RoPE cos/sin lookup) are stripped from the
             // attention cluster by strip_gather_ops() in the splitter;
             // the gathered values are filled by the CPU at decode time.
-            emit_attention: false, // fp16_attn compiles for layers 0-3 but 87 total programs
-            // exceed ANE budget (~55). Needs lazy compile/free per eval.
+            //
+            // With lazy load/unload (loadWithQoS/unloadWithQoS), we can
+            // emit attention programs without exceeding the ANE slot limit:
+            // at most 3 programs are loaded simultaneously during decode.
+            emit_attention: turbo_config.is_none(),
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -407,6 +415,19 @@ impl AneInference {
             });
         }
 
+        // 6b. Immediately unload all compiled programs to free ANE slots.
+        // compile_mil_text auto-loads each program; unloading here means
+        // only ~3 programs will be loaded at a time during decode().
+        for layer in &layers {
+            runtime.unload_compiled(&layer.pre_attn.compiled);
+            if let Some(ref attn) = layer.fp16_attn {
+                runtime.unload_compiled(&attn.compiled);
+            }
+            if let Some(ref post) = layer.post_attn {
+                runtime.unload_compiled(&post.compiled);
+            }
+        }
+
         // 7. Set up TurboQuant or FP16 caches.
         let (turboquant, fp16_kv_caches, num_kv_heads, head_dim, max_seq_len) =
             if let Some(tq_config) = turbo_config {
@@ -475,7 +496,7 @@ impl AneInference {
                 let mut out_refs: Vec<&mut AneTensor> =
                     layer.pre_attn.output_tensors.iter_mut().collect();
                 self.runtime
-                    .eval(&layer.pre_attn.loaded, &in_refs, &mut out_refs)
+                    .eval_compiled(&layer.pre_attn.compiled, &in_refs, &mut out_refs)
                     .map_err(|e| {
                         AneError::Other(anyhow::anyhow!(
                             "layer {layer_idx} pre_attn eval failed: {e}"
@@ -585,7 +606,7 @@ impl AneInference {
                     let mut out_refs: Vec<&mut AneTensor> =
                         fp16_attn.output_tensors.iter_mut().collect();
                     self.runtime
-                        .eval(&fp16_attn.loaded, &in_refs, &mut out_refs)
+                        .eval_compiled(&fp16_attn.compiled, &in_refs, &mut out_refs)
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} fp16_attn eval failed: {e}"
@@ -642,7 +663,7 @@ impl AneInference {
                     let mut out_refs: Vec<&mut AneTensor> =
                         post_attn.output_tensors.iter_mut().collect();
                     self.runtime
-                        .eval(&post_attn.loaded, &in_refs, &mut out_refs)
+                        .eval_compiled(&post_attn.compiled, &in_refs, &mut out_refs)
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} post_attn eval failed: {e}"
@@ -783,10 +804,13 @@ fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
 // Compilation helpers
 // ---------------------------------------------------------------------------
 
-/// Compile and load a single sub-program, pre-allocating I/O tensors.
+/// Compile a single sub-program, pre-allocating I/O tensors.
+///
+/// The program is auto-loaded by `compile_mil_text`; the caller is
+/// responsible for calling `runtime.unload_compiled()` afterwards.
 fn compile_and_load_sub(
     sub: &crate::split::SubProgram,
-    runtime: &AneRuntime,
+    _runtime: &AneRuntime,
     mil_config: &MilTextConfig,
     input_packing: Option<crate::packing::InputPacking>,
 ) -> Result<LoadedSubProgram> {
@@ -832,9 +856,11 @@ fn compile_and_load_sub(
         }
     })?;
     let compiled = unsafe { CompiledProgram::from_raw(ptr) };
-    let loaded = runtime.load_program(&compiled)?;
 
     // Pre-allocate I/O tensors with uniform sizing.
+    // Note: we do NOT call runtime.load_program() — the program is
+    // auto-loaded by compile_mil_text and will be unloaded in bulk
+    // after all layers are compiled.
     let input_shapes: Vec<_> = sub.inputs.iter().map(|td| (td.shape, td.dtype)).collect();
     let output_shapes: Vec<_> = sub.outputs.iter().map(|td| (td.shape, td.dtype)).collect();
     let input_alloc = uniform_alloc_size(&input_shapes);
@@ -852,7 +878,7 @@ fn compile_and_load_sub(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LoadedSubProgram {
-        loaded,
+        compiled,
         input_tensors,
         output_tensors,
         input_packing,

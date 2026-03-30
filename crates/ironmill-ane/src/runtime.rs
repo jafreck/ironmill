@@ -250,6 +250,20 @@ impl AneRuntime {
         inputs: &[&AneTensor],
         outputs: &mut [&mut AneTensor],
     ) -> Result<()> {
+        self.eval_raw(program.model, inputs, outputs)
+    }
+
+    /// Core eval implementation that takes a raw model pointer.
+    ///
+    /// Both `eval` (for `LoadedProgram`) and `eval_compiled` (for
+    /// `CompiledProgram`) delegate here — the `evaluateWithQoS:` call
+    /// only needs the `_ANEInMemoryModel` pointer.
+    fn eval_raw(
+        &self,
+        model: *mut c_void,
+        inputs: &[&AneTensor],
+        outputs: &mut [&mut AneTensor],
+    ) -> Result<()> {
         validate_nonempty(inputs, outputs)?;
         validate_uniform_alloc(inputs, "input")?;
 
@@ -338,16 +352,7 @@ impl AneRuntime {
         ) -> i8;
         let eval_sel = unsafe { sel_registerName(sel!("evaluateWithQoS:options:request:error:")) };
         let eval_fn: EvalFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        let ok = unsafe {
-            eval_fn(
-                program.model,
-                eval_sel,
-                ANE_QOS,
-                empty_dict,
-                request,
-                &mut error,
-            )
-        };
+        let ok = unsafe { eval_fn(model, eval_sel, ANE_QOS, empty_dict, request, &mut error) };
 
         // Release temporary ObjC collections
         unsafe {
@@ -371,6 +376,79 @@ impl AneRuntime {
         }
 
         Ok(())
+    }
+
+    /// Load a previously compiled (and unloaded) program into the ANE.
+    ///
+    /// Calls `[model loadWithQoS:21 options:@{} error:&e]`.
+    /// The model must have been compiled by `compile_mil_text`. Can be
+    /// called after `unload_compiled` to reload the program without
+    /// recompiling.
+    pub fn load_compiled(&self, program: &CompiledProgram) -> Result<()> {
+        if program.model.is_null() {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "load_compiled: null model pointer"
+            )));
+        }
+
+        let mut error: *mut c_void = std::ptr::null_mut();
+        let sel = unsafe { sel_registerName(sel!("loadWithQoS:options:error:")) };
+        type LoadFn = unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            i64,
+            *mut c_void,
+            *mut *mut c_void,
+        ) -> i8;
+        let load_fn: LoadFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let empty_dict = unsafe { cf::ns_empty_dict() };
+        let ok = unsafe { load_fn(program.model, sel, ANE_QOS, empty_dict, &mut error) };
+        unsafe { cf::CFRelease(empty_dict) };
+
+        if ok == 0 {
+            let desc = if !error.is_null() {
+                extract_nserror_description(error)
+            } else {
+                "unknown load error".into()
+            };
+            return Err(AneError::Other(anyhow::anyhow!(
+                "loadWithQoS failed: {desc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Unload a compiled program from the ANE, freeing the execution slot.
+    ///
+    /// The program can be reloaded later with `load_compiled`.
+    /// Unlike `unload_program`, this does **not** release the model
+    /// object — `CompiledProgram::Drop` handles that.
+    pub fn unload_compiled(&self, program: &CompiledProgram) {
+        if !program.model.is_null() {
+            let mut error: *mut c_void = std::ptr::null_mut();
+            type UnloadFn =
+                unsafe extern "C" fn(*mut c_void, *mut c_void, i64, *mut *mut c_void) -> i8;
+            let sel = unsafe { sel_registerName(sel!("unloadWithQoS:error:")) };
+            let unload_fn: UnloadFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            unsafe { unload_fn(program.model, sel, ANE_QOS, &mut error) };
+        }
+    }
+
+    /// Load, evaluate, and unload a compiled program in one call.
+    ///
+    /// This is the primary entry point for lazy program management:
+    /// `loadWithQoS:` → `evaluateWithQoS:` → `unloadWithQoS:`. At most
+    /// one additional program is loaded during the call.
+    pub fn eval_compiled(
+        &self,
+        program: &CompiledProgram,
+        inputs: &[&AneTensor],
+        outputs: &mut [&mut AneTensor],
+    ) -> Result<()> {
+        self.load_compiled(program)?;
+        let result = self.eval_raw(program.model, inputs, outputs);
+        self.unload_compiled(program);
+        result
     }
 
     /// Unload a program, freeing ANE resources.
@@ -476,6 +554,28 @@ impl AneRuntime {
 
     /// Not available on non-macOS.
     pub fn unload_program(&self, _program: LoadedProgram) {}
+
+    /// Not available on non-macOS.
+    pub fn load_compiled(&self, _program: &CompiledProgram) -> Result<()> {
+        Err(AneError::Other(anyhow::anyhow!(
+            "ANE runtime requires macOS"
+        )))
+    }
+
+    /// Not available on non-macOS.
+    pub fn unload_compiled(&self, _program: &CompiledProgram) {}
+
+    /// Not available on non-macOS.
+    pub fn eval_compiled(
+        &self,
+        _program: &CompiledProgram,
+        _inputs: &[&AneTensor],
+        _outputs: &mut [&mut AneTensor],
+    ) -> Result<()> {
+        Err(AneError::Other(anyhow::anyhow!(
+            "ANE runtime requires macOS"
+        )))
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
