@@ -685,9 +685,156 @@ tensors after projection, not on weight buffers.
 - **Rotation fusion on GPU:** Should `PolarRotationFusionPass` run for
   the GPU path? It cancels Hadamard rotations between sequential linear
   layers. Worth testing for throughput impact but not blocking for Phase 1.
-- **Per-layer mixed precision:** Which layers benefit most from staying
-  FP16? First/last layers and attention projections are candidates for
-  higher precision. Needs empirical testing.
 - **MPS fallback:** Should the GPU path fall back to MPS FP16 matmul
   when custom kernels are slower (small matrices)? Profile to determine
   crossover point.
+
+---
+
+## Addendum: Additional Design Areas
+
+### A. Tiled GEMM strategy for `polarquant_matmul`
+
+The Phase 3 kernel (Task 8) shows a naive 1-thread-per-output-element
+implementation. Production needs threadgroup tiling with SIMD reductions.
+
+#### Tiling scheme
+
+```
+Threadgroup: [TILE_M × TILE_N] threads
+  Each threadgroup computes a TILE_M × TILE_N tile of the output C.
+  Each thread accumulates one element of C by iterating over K in
+  chunks of TILE_K.
+
+  TILE_M = 8    (output rows per threadgroup, one per SIMD lane)
+  TILE_N = 32   (output columns per threadgroup)
+  TILE_K = 32   (inner dimension chunk, fits in threadgroup memory)
+
+Per iteration:
+  1. Cooperatively load A tile [TILE_M × TILE_K] into threadgroup memory (FP16)
+  2. Cooperatively load B tile [TILE_N × TILE_K/pack_ratio] into threadgroup memory
+  3. Each thread: unpack B indices, LUT lookup, multiply by norm, accumulate
+  4. Advance to next TILE_K chunk
+
+Threadgroup memory budget (32 KB):
+  A tile:  8 × 32 × 2 bytes =    512 bytes
+  B tile: 32 × 32/2 bytes   =    512 bytes (INT4)
+  LUT:    16 × 2 bytes       =     32 bytes
+  Norms:  32 × 2 bytes       =     64 bytes
+  Total:                       ~1,120 bytes — well within budget
+```
+
+For single-token decode (M=1), use a specialized `polarquant_matvec_int4`
+kernel with one threadgroup per output element and K-reduction via SIMD.
+
+Task 8 should ship both `polarquant_matvec_int4` (decode) and
+`polarquant_matmul_int4` (prefill) plus INT8 variants.
+
+---
+
+### B. Per-group quantization
+
+The current spec assumes one global LUT per tensor. Per-group quantization
+(e.g., `group_size=128`) uses independent LUTs per contiguous group of
+elements along the reduction dimension.
+
+#### Format extension
+
+```rust
+LutToDense {
+    // ...existing fields...
+    group_size: Option<usize>,  // None = per-tensor, Some(128) = per-group
+}
+```
+
+When `group_size` is set:
+- `lut` shape: `[num_groups, 2^n_bits]` where `num_groups = ceil(K / group_size)`
+- Shader indexes LUT by group: `lut_base = group_idx * lut_size`
+
+`PolarQuantPass` gains `with_group_size(128)` which splits rows into groups
+and computes independent beta-optimal levels per group.
+
+Impact: typically 30–50% PPL improvement for INT4 at negligible storage cost.
+
+---
+
+### C. Mixed-precision weight quantization
+
+Per-layer bit-width selection for sensitivity-aware quantization.
+
+```rust
+pub struct GpuQuantConfig {
+    pub default_n_bits: u8,
+    pub layer_overrides: HashMap<usize, u8>,  // layer → bits (0 = FP16)
+    pub fp16_patterns: Vec<String>,           // tensor name patterns kept FP16
+    pub min_elements: usize,
+    pub group_size: Option<usize>,
+}
+```
+
+Defaults: embed_tokens, lm_head, layernorm stay FP16. All linear
+projections get `default_n_bits`.
+
+#### Sensitivity analysis tool
+
+```
+ironmill-bench --metal --sensitivity --model model.safetensors
+```
+
+Quantizes each layer independently, measures per-layer PPL impact,
+outputs a ranking to inform `layer_overrides`.
+
+---
+
+### D. VRAM budget planner
+
+Predict total GPU memory before compilation to validate it fits.
+
+```rust
+pub fn estimate_gpu_memory(
+    config: &ModelConfig,
+    quant: &GpuQuantConfig,
+    tq: &GpuConfig,
+) -> MemoryEstimate
+```
+
+Computes weight bytes (FP16 or packed + LUT + norms per layer), KV cache
+bytes (with TQ scaling), activation bytes (reused across layers), and
+total. Exposed via `--dry-run` CLI flag:
+
+```
+$ ironmill compile --target gpu --quantize polarquant-4 model.safetensors --dry-run
+  Weights:     389 MB (INT4) + 2 MB (LUT/norms)
+  KV cache:     60 MB (TurboQuant INT4, seq=2048)
+  Activations:  24 MB
+  Total:       475 MB (fits 8 GB device)
+```
+
+---
+
+### E. Benchmark comparison table
+
+The `--metal` bench path produces a structured comparison with measured
+metrics:
+
+| Metric | Source | Notes |
+|--------|--------|-------|
+| Perplexity | WikiText-2 eval | PPL and avg cross-entropy |
+| Throughput | Decode timing | tok/s (median of N runs) |
+| Latency | Decode timing | ms/tok (median, p95, p99) |
+| GPU memory | `MTLDevice.currentAllocatedSize` | Measured, not estimated |
+| Load time | `Instant` around load | Includes dequant or shader compile |
+| Quality Δ | vs FP16 baseline | `(ppl_q - ppl_fp16) / ppl_fp16 × 100` |
+| Memory Δ | vs FP16 baseline | `(1 - mem_q / mem_fp16) × 100` |
+
+Summary format:
+
+```
+Config          PPL     tok/s   ms/tok   GPU MB   ΔPPL   ΔMem
+FP16 baseline   40.8    10.1    99.2    1823     —      —
+TQ-INT8 cache   40.6    10.5    95.1    1714    -0.5%   -6%
+PQ-INT4 wt      ?.?     ?.?     ?.?     ~475    ?%     -74%
+PQ-INT4 + TQ    ?.?     ?.?     ?.?     ~420    ?%     -77%
+```
+
+JSON output via `--output json` for CI tracking.
