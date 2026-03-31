@@ -1,4 +1,6 @@
-//! TurboQuant INT8 KV cache compression for GPU inference.
+//! TurboQuant quantized KV cache compression for GPU inference.
+//!
+//! Supports INT8 (n_bits=8) and INT4 (n_bits=4) quantization.
 
 pub mod cache;
 

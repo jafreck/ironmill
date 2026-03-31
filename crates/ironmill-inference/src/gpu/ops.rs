@@ -241,6 +241,7 @@ pub fn encode_turboquant_cache_write(
     max_seq_len: u32,
     seq_pos: u32,
     inv_scale: f32,
+    n_bits: u32,
 ) {
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(kv_proj, 0, 0);
@@ -251,6 +252,7 @@ pub fn encode_turboquant_cache_write(
     encoder.set_bytes(&max_seq_len.to_le_bytes(), 5);
     encoder.set_bytes(&seq_pos.to_le_bytes(), 6);
     encoder.set_bytes(&inv_scale.to_le_bytes(), 7);
+    encoder.set_bytes(&n_bits.to_le_bytes(), 8);
     encoder.dispatch_threadgroups((num_kv_heads as usize, 1, 1), (head_dim as usize, 1, 1));
 }
 
@@ -270,6 +272,7 @@ pub fn encode_turboquant_attention(
     max_seq_len: u32,
     seq_len: u32,
     deq_scale: f32,
+    n_bits: u32,
 ) {
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(q, 0, 0);
@@ -283,6 +286,7 @@ pub fn encode_turboquant_attention(
     encoder.set_bytes(&max_seq_len.to_le_bytes(), 8);
     encoder.set_bytes(&seq_len.to_le_bytes(), 9);
     encoder.set_bytes(&deq_scale.to_le_bytes(), 10);
+    encoder.set_bytes(&n_bits.to_le_bytes(), 11);
     encoder.dispatch_threadgroups((num_heads as usize, 1, 1), (head_dim as usize, 1, 1));
 }
 

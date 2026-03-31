@@ -10,11 +10,11 @@ pub struct GpuConfig {
     pub attention_tile_size: Option<usize>,
     /// Prefill chunk size. None = process entire prompt at once.
     pub prefill_chunk_size: Option<usize>,
-    /// Enable TurboQuant INT8 KV cache compression.
+    /// Enable TurboQuant quantized KV cache compression.
     pub enable_turboquant: bool,
     /// TurboQuant rotation seed (must match between cache write and attention).
     pub rotation_seed: u64,
-    /// Number of quantization bits for TurboQuant (default: 8).
+    /// Number of quantization bits for TurboQuant KV cache (4 or 8).
     pub n_bits: u8,
 }
 
@@ -28,5 +28,15 @@ impl Default for GpuConfig {
             rotation_seed: 42,
             n_bits: 8,
         }
+    }
+}
+
+impl GpuConfig {
+    /// Validate configuration. Returns an error message if invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.n_bits != 4 && self.n_bits != 8 {
+            return Err(format!("n_bits must be 4 or 8, got {}", self.n_bits));
+        }
+        Ok(())
     }
 }

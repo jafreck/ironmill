@@ -1,14 +1,16 @@
-//! MTLBuffer-backed INT8 KV cache for GPU TurboQuant inference.
+//! MTLBuffer-backed quantized KV cache for GPU TurboQuant inference.
 
 use ironmill_metal_sys::{MetalBuffer, MetalDevice, StorageMode};
 
 use super::TurboQuantGpuConfig;
 use crate::gpu::error::GpuError;
 
-/// GPU-resident INT8 KV cache for TurboQuant inference.
+/// GPU-resident quantized KV cache for TurboQuant inference.
 ///
-/// Each layer has separate K and V cache buffers stored as INT8.
-/// Layout: `[num_kv_heads × max_seq_len × head_dim]` per buffer.
+/// Each layer has separate K and V cache buffers stored as INT8 or INT4.
+/// Layout per buffer:
+///   INT8: `[num_kv_heads × max_seq_len × head_dim]`     (1 byte/element)
+///   INT4: `[num_kv_heads × max_seq_len × head_dim / 2]` (2 elements/byte)
 #[allow(dead_code)]
 pub struct GpuKvCache {
     /// K cache per layer.
@@ -23,6 +25,8 @@ pub struct GpuKvCache {
     max_seq_len: usize,
     /// Dimension per head.
     head_dim: usize,
+    /// Quantization bits (4 or 8).
+    n_bits: u8,
 }
 
 impl GpuKvCache {
@@ -30,7 +34,12 @@ impl GpuKvCache {
     ///
     /// Uses shared storage mode for CPU-side inspection during development.
     pub fn new(device: &MetalDevice, config: &TurboQuantGpuConfig) -> Result<Self, GpuError> {
-        let cache_size = config.num_kv_heads * config.max_seq_len * config.head_dim;
+        let elements_per_pos = if config.n_bits == 4 {
+            config.head_dim / 2
+        } else {
+            config.head_dim
+        };
+        let cache_size = config.num_kv_heads * config.max_seq_len * elements_per_pos;
         let mut k_caches = Vec::with_capacity(config.num_layers);
         let mut v_caches = Vec::with_capacity(config.num_layers);
 
@@ -54,6 +63,7 @@ impl GpuKvCache {
             num_kv_heads: config.num_kv_heads,
             max_seq_len: config.max_seq_len,
             head_dim: config.head_dim,
+            n_bits: config.n_bits,
         })
     }
 
