@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-macOS_Apple_Silicon-lightgrey.svg)]()
 
-Rust-native compiler and inference runtime for Apple's Neural Engine.
+Rust-native model compiler and GPU inference runtime for Apple Silicon.
 
 > [!WARNING]
 > **ironmill is currently in alpha and under active development.** APIs, file
@@ -16,9 +16,10 @@ Rust-native compiler and inference runtime for Apple's Neural Engine.
 
 </div>
 
-ironmill converts models from ONNX, SafeTensors, and GGUF into optimized
-CoreML packages, and can run them directly on the ANE via either CoreML or
-experimental direct ANE APIs.
+ironmill compiles models from ONNX, SafeTensors, and GGUF into optimized
+representations and runs them on Apple Silicon GPUs via Metal/MPS. It also
+supports CoreML-based inference and includes an experimental direct-ANE backend
+using reverse-engineered private APIs.
 
 ## Quick Start
 
@@ -61,6 +62,15 @@ targeting Apple's Neural Engine:
 
 ironmill-inference provides three backends for running compiled models:
 
+**Metal GPU backend:** runs inference on Apple Silicon GPUs via Metal compute
+shaders and MPS. Primary backend for LLM inference, supporting full
+LLaMA-style autoregressive decode:
+
+- MPS-accelerated matrix multiplication for all linear layers
+- Custom Metal compute kernels for RMSNorm, RoPE, SiLU, attention, and residuals
+- TurboQuant INT8 KV cache with fused quantize/dequantize shaders
+- Prefill and single-step decode modes
+
 **CoreML backend:** standard CoreML runtime via `MLModel`. Works with any
 .mlmodelc compiled package. Apple manages ANE/GPU/CPU scheduling.
 
@@ -74,26 +84,33 @@ fine-grained control over:
   Hadamard rotation and on-ANE dequantization
 - Autoregressive decode loop with ANE-accelerated lm_head via chunked conv1×1
 
-**Metal GPU backend** *(experimental)*: runs inference directly on Apple GPU
-via Metal compute shaders and MPS. Supports full LLaMA-style autoregressive
-decode including:
-
-- MPS-accelerated matrix multiplication for all linear layers
-- Custom Metal compute kernels for RMSNorm, RoPE, SiLU, attention, and residuals
-- TurboQuant INT8 KV cache with fused quantize/dequantize shaders
-- Prefill and single-step decode modes
-
 ### Ecosystem Integration
 
 - **CLI:** `ironmill compile`, `inspect`, `validate`
 - **C API:** stable C ABI for Swift, C++, Go, or any FFI language ([docs](docs/C_API.md))
 - **Build.rs API:** compile models at build time with `CompileBuilder`
-- **[candle-coreml](crates/candle-coreml/):** ONNX→CoreML conversion + runtime for candle
-- **[burn-coreml](crates/burn-coreml/):** export + inference bridge for Burn
+- **[candle-coreml](crates/candle-coreml/):** ONNX→CoreML conversion + runtime for [candle](https://github.com/huggingface/candle)
+- **[burn-coreml](crates/burn-coreml/):** export + inference bridge for [Burn](https://github.com/tracel-ai/burn)
 
-## ANE Research Findings
+## Rust ML Ecosystem
 
-Building on [prior art](#related-projects) in ANE reverse-engineering, ironmill
+ironmill sits alongside a growing ecosystem of Rust-native ML frameworks.
+The candle and Burn bridge crates let you use ironmill's Metal GPU/CoreML
+backends from models built in those frameworks.
+
+| Project | Focus |
+|---------|-------|
+| [candle](https://github.com/huggingface/candle) | Lightweight ML framework with GPU support (candle-coreml bridge in this repo) |
+| [Burn](https://github.com/tracel-ai/burn) | Modular deep learning framework with multiple backends (burn-coreml bridge in this repo) |
+| [tract](https://github.com/sonos/tract) | ONNX/NNEF inference engine for edge deployment |
+| [ort](https://github.com/pykeio/ort) | Rust bindings for ONNX Runtime |
+| [tch-rs](https://github.com/LaurentMazare/tch-rs) | Rust bindings for the PyTorch C++ API (libtorch) |
+| [dfdx](https://github.com/coreylowman/dfdx) | Compile-time typed deep learning framework |
+| [luminal](https://github.com/jafioti/luminal) | Graph-based ML framework with Metal support |
+
+## ANE Research & Related Projects
+
+Building on [prior art](#ane-related-projects) in ANE reverse-engineering, ironmill
 contributes reproducible eval-verified tests for MIL ops on Apple's Neural
 Engine:
 
@@ -112,6 +129,15 @@ Engine:
 Every finding has a reproducible eval test in
 [`ane_op_eval.rs`](crates/ironmill-inference/examples/ane_op_eval.rs).
 See the full [ANE Op Support Matrix](docs/design/ane-op-support-matrix.md).
+
+### ANE Related Projects
+
+Open-source projects working with the ANE via private APIs:
+
+- [maderix/ANE](https://github.com/maderix/ANE): ANE reverse-engineering, hardware characterization, transformer training proof-of-concept
+- [mechramc/Orion](https://github.com/mechramc/Orion): ANE LLM training and inference runtime with graph IR compiler ([paper](https://arxiv.org/abs/2603.06728))
+- [vipuldivyanshu92/ANEgpt](https://github.com/vipuldivyanshu92/ANEgpt): GPT-style transformer training on ANE
+- [hollance/neural-engine](https://github.com/hollance/neural-engine): Community documentation of ANE capabilities
 
 ## Architecture
 
@@ -264,15 +290,6 @@ Requires Rust 1.85+ (edition 2024).
 - [ANE Constraints](docs/design/ane-constraints.md): hardware limits and diagnostics
 - [TurboQuant](docs/design/turboquant.md): INT8 KV cache compression design
 - [Compact Cache](docs/design/compact-cache.md): cache memory optimization
-
-## Related Projects
-
-Open-source projects working with the ANE via private APIs:
-
-- [maderix/ANE](https://github.com/maderix/ANE): ANE reverse-engineering, hardware characterization, transformer training proof-of-concept
-- [mechramc/Orion](https://github.com/mechramc/Orion): ANE LLM training and inference runtime with graph IR compiler ([paper](https://arxiv.org/abs/2603.06728))
-- [vipuldivyanshu92/ANEgpt](https://github.com/vipuldivyanshu92/ANEgpt): GPT-style transformer training on ANE
-- [hollance/neural-engine](https://github.com/hollance/neural-engine): Community documentation of ANE capabilities
 
 ## License
 
