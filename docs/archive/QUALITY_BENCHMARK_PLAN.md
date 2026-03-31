@@ -1,6 +1,11 @@
 # Perplexity Benchmark Implementation
 
-> **Status**: Not started
+> **Status**: ✅ Implemented (`5f6a944`)
+>
+> Perplexity module, CLI integration, dataset prep script, and 9 unit tests
+> are complete in `crates/ironmill-bench/src/perplexity.rs`. Initial run on
+> Qwen3-0.6B confirms the pipeline works end-to-end (7.8 tok/s) but reports
+> PPL=inf — attention executes but does not yet produce correct logits.
 >
 > **Prerequisite**: ~~`AneInference::decode()` must produce correct logits~~ ✅ FP16 attention implemented (`c632f05`)
 >
