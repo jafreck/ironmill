@@ -458,15 +458,16 @@ impl AneInference {
         //     decode time, preserving all downstream references.
         replace_gather_with_inputs(&mut program);
 
-        // 2. Split each layer into two deep sub-programs at the K/V boundary:
-        //    - pre_attn: norm → Q/K/V projections (+ Q/K norms, RoPE if present)
-        //    - post_attn: attention (using KV cache) → O-proj → residual → FFN
-        //    KV cache writes happen on CPU between pre_attn and post_attn.
-        //    The post_attn receives Q from pre_attn + K_cache/V_cache as inputs,
-        //    making it a deep graph (~40-50 ops) for maximum ANE utilization.
+        // 2. Split each layer into three sub-programs:
+        //    - pre_attn: norm → Q/K/V projections (~8 MB weights)
+        //    - fp16_attn: attention core (0 weights, ~15 ops)
+        //    - post_attn: O-proj → residual → norm → FFN (~16 MB weights)
+        //    CPU manages KV cache between pre_attn and fp16_attn.
+        //    This matches the TurboQuant architecture but uses
+        //    model-derived attention ops instead of hand-written MIL.
         let split_config = SplitConfig {
             split_attention: true,
-            emit_attention: false, // attention ops go into post_attn, not separate
+            emit_attention: true,
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
