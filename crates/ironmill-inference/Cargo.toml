@@ -9,7 +9,7 @@ description = "Inference engine for ironmill (ANE + CoreML backends)"
 
 [dependencies]
 mil-rs = { workspace = true }
-ironmill-compile = { workspace = true }
+ironmill-compile = { workspace = true, optional = true }
 ironmill-ane-sys = { workspace = true }
 ironmill-iosurface = { workspace = true }
 ironmill-coreml-sys = { workspace = true }
@@ -23,15 +23,24 @@ tempfile = { workspace = true }
 [features]
 default = []
 int4 = []
+compile = ["dep:ironmill-compile"]
 
 [[example]]
 name = "ane_op_eval"
 path = "examples/ane_op_eval.rs"
+required-features = ["compile"]
+
+[[example]]
+name = "cache_bandwidth_bench"
+path = "examples/cache_bandwidth_bench.rs"
+required-features = ["compile"]
 
 [[example]]
 name = "turboquant_bench"
 path = "examples/turboquant_bench.rs"
+required-features = ["compile"]
 
 [[example]]
 name = "turboquant_e2e_bench"
 path = "examples/turboquant_e2e_bench.rs"
+required-features = ["compile"]

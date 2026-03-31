@@ -9,22 +9,49 @@ use std::sync::Arc;
 
 use mil_rs::ir::ScalarType;
 
-use ironmill_compile::ane::TensorDescriptor;
+#[cfg(feature = "compile")]
 use ironmill_compile::ane::blobfile::BlobFileWriter;
+#[cfg(feature = "compile")]
 use ironmill_compile::ane::cache::ProgramCache;
+#[cfg(feature = "compile")]
 use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+#[cfg(feature = "compile")]
 use ironmill_compile::ane::passes::{
     AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
     OpSubstitutionPass,
 };
+#[cfg(feature = "compile")]
 use ironmill_compile::ane::split::{SplitConfig, split_for_ane};
 use ironmill_iosurface::{AneTensor, uniform_alloc_size};
+#[cfg(feature = "compile")]
 use mil_rs::ir::Pass;
 
 use super::device::{AneDevice, HardwareAneDevice};
 use crate::AneError;
 use crate::ane::bundle_manifest::{BundleManifest, BundleModelType, TensorDescriptorManifest};
 use crate::types::{ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor};
+
+/// Describes an ANE tensor's name, shape, and element type.
+///
+/// This is the inference-side equivalent of `ironmill_compile::ane::TensorDescriptor`.
+/// Having a local copy avoids requiring the compile crate at runtime.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorDescriptor {
+    pub name: String,
+    pub shape: [usize; 4],
+    pub dtype: ScalarType,
+}
+
+#[cfg(feature = "compile")]
+impl From<&ironmill_compile::ane::TensorDescriptor> for TensorDescriptor {
+    fn from(td: &ironmill_compile::ane::TensorDescriptor) -> Self {
+        Self {
+            name: td.name.clone(),
+            shape: td.shape,
+            dtype: td.dtype,
+        }
+    }
+}
 
 /// Result type alias for ANE operations.
 pub type Result<T> = std::result::Result<T, AneError>;
@@ -61,6 +88,7 @@ impl Default for AneConfig {
 pub struct AneModel<D: AneDevice> {
     device: Arc<D>,
     sub_programs: Vec<LoadedSubProgram<D>>,
+    #[cfg(feature = "compile")]
     cache: ProgramCache,
     #[allow(dead_code)]
     config: AneConfig,
@@ -82,6 +110,7 @@ struct SubProgramMeta {
     outputs: Vec<TensorDescriptor>,
 }
 
+#[cfg(feature = "compile")]
 impl<D: AneDevice> AneModel<D> {
     /// Compile a model from ironmill IR and load it for execution.
     ///
@@ -196,8 +225,8 @@ impl<D: AneDevice> AneModel<D> {
                 program: compiled,
                 meta: SubProgramMeta {
                     name: sub.name.clone(),
-                    inputs: sub.inputs.clone(),
-                    outputs: sub.outputs.clone(),
+                    inputs: sub.inputs.iter().map(TensorDescriptor::from).collect(),
+                    outputs: sub.outputs.iter().map(TensorDescriptor::from).collect(),
                 },
                 input_tensors,
                 output_tensors,
@@ -207,12 +236,15 @@ impl<D: AneDevice> AneModel<D> {
         Ok(Self {
             device,
             sub_programs: loaded_subs,
+            #[cfg(feature = "compile")]
             cache,
             config,
             _work_dir: work_dir,
         })
     }
+}
 
+impl<D: AneDevice> AneModel<D> {
     /// Load a pre-compiled `.ironml` bundle for execution.
     ///
     /// Reads the manifest and compiled artifacts from the bundle directory,
@@ -234,8 +266,7 @@ impl<D: AneDevice> AneModel<D> {
             )));
         }
 
-        // 3. Initialize cache and work directory
-        let cache = ProgramCache::new(config.cache_dir.clone(), config.max_programs);
+        // 3. Initialize work directory
         let work_dir = tempfile::tempdir()
             .map_err(|e| AneError::Other(anyhow::anyhow!("failed to create work dir: {e}")))?;
 
@@ -282,10 +313,24 @@ impl<D: AneDevice> AneModel<D> {
             let compiled = device.compile(&mil_text, &weight_slices)?;
 
             // 4e. Convert manifest descriptors to TensorDescriptor
-            let inputs: Vec<TensorDescriptor> =
-                sub_manifest.inputs.iter().map(|td| td.into()).collect();
-            let outputs: Vec<TensorDescriptor> =
-                sub_manifest.outputs.iter().map(|td| td.into()).collect();
+            let inputs: Vec<TensorDescriptor> = sub_manifest
+                .inputs
+                .iter()
+                .map(|td| TensorDescriptor {
+                    name: td.name.clone(),
+                    shape: td.shape,
+                    dtype: td.scalar_type(),
+                })
+                .collect();
+            let outputs: Vec<TensorDescriptor> = sub_manifest
+                .outputs
+                .iter()
+                .map(|td| TensorDescriptor {
+                    name: td.name.clone(),
+                    shape: td.shape,
+                    dtype: td.scalar_type(),
+                })
+                .collect();
 
             // 4f. Pre-allocate I/O tensors with uniform sizing
             let input_shapes: Vec<_> = inputs.iter().map(|td| (td.shape, td.dtype)).collect();
@@ -323,7 +368,8 @@ impl<D: AneDevice> AneModel<D> {
         Ok(Self {
             device,
             sub_programs: loaded_subs,
-            cache,
+            #[cfg(feature = "compile")]
+            cache: ProgramCache::new(config.cache_dir.clone(), config.max_programs),
             config,
             _work_dir: work_dir,
         })
@@ -414,6 +460,7 @@ impl<D: AneDevice> AneModel<D> {
     }
 
     /// Cache statistics: `(cached_count, session_compiles)`.
+    #[cfg(feature = "compile")]
     pub fn cache_stats(&self) -> (usize, usize) {
         (self.cache.len(), self.cache.session_compile_count())
     }
@@ -427,6 +474,7 @@ impl<D: AneDevice> AneModel<D> {
 /// BLOBFILE writing, without requiring the ANE runtime. Useful for
 /// persisting compiled artifacts to disk and validating the pipeline
 /// independently of the private ANE APIs.
+#[cfg(feature = "compile")]
 pub struct CompiledArtifacts {
     /// Per-sub-program artifacts, in execution order.
     pub sub_programs: Vec<SubProgramArtifact>,
@@ -446,6 +494,7 @@ pub struct SubProgramArtifact {
     pub outputs: Vec<TensorDescriptor>,
 }
 
+#[cfg(feature = "compile")]
 impl CompiledArtifacts {
     /// Run the full pre-compilation pipeline on an IR program.
     ///
@@ -493,8 +542,8 @@ impl CompiledArtifacts {
                 name: sub.name.clone(),
                 mil_text,
                 weight_blob: blob_writer.as_bytes().to_vec(),
-                inputs: sub.inputs.clone(),
-                outputs: sub.outputs.clone(),
+                inputs: sub.inputs.iter().map(TensorDescriptor::from).collect(),
+                outputs: sub.outputs.iter().map(TensorDescriptor::from).collect(),
             });
         }
 
@@ -711,7 +760,7 @@ fn extract_weight_byte_size(line: &str) -> Option<usize> {
     Some(num_elements * byte_size_per_elem)
 }
 
-/// Convert a `TensorDescriptorManifest` to compile-crate's `TensorDescriptor`.
+/// Convert a `TensorDescriptorManifest` to `TensorDescriptor`.
 impl From<&TensorDescriptorManifest> for TensorDescriptor {
     fn from(td: &TensorDescriptorManifest) -> Self {
         TensorDescriptor {
@@ -792,6 +841,7 @@ mod tests {
 
     /// Try to construct a minimal `AneModel` for testing descriptor methods.
     /// Returns `None` if the ANE runtime isn't available (e.g. CI).
+    #[cfg(feature = "compile")]
     fn test_model(
         sub_programs: Vec<LoadedSubProgram<HardwareAneDevice>>,
     ) -> Option<AneModel<HardwareAneDevice>> {
@@ -807,6 +857,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compile")]
     fn input_description_empty() {
         if let Some(model) = test_model(vec![]) {
             assert!(model.input_description().is_empty());
@@ -814,6 +865,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compile")]
     fn output_description_empty() {
         if let Some(model) = test_model(vec![]) {
             assert!(model.output_description().is_empty());
@@ -821,6 +873,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compile")]
     fn num_sub_programs_count() {
         if let Some(model) = test_model(vec![]) {
             assert_eq!(model.num_sub_programs(), 0);
@@ -828,6 +881,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compile")]
     fn pass_pipeline_runs_without_error() {
         let mut program = mil_rs::ir::Program {
             version: "1.0".to_string(),
@@ -850,8 +904,9 @@ mod tests {
             .expect("AneVariableNaming");
     }
 
-    // ── E2E pipeline tests ───────────────────────────────────────
+    // ── E2E pipeline tests (require compile feature) ────────────
 
+    #[cfg(feature = "compile")]
     fn build_add_program() -> mil_rs::ir::Program {
         use mil_rs::ir::{Block, Function, Operation, Program, TensorType, Value};
 
@@ -878,6 +933,7 @@ mod tests {
         program
     }
 
+    #[cfg(feature = "compile")]
     fn build_weighted_program() -> mil_rs::ir::Program {
         use mil_rs::ir::{Block, Function, Operation, Program, TensorType, Value};
 
@@ -968,6 +1024,7 @@ mod tests {
         program
     }
 
+    #[cfg(feature = "compile")]
     fn build_conv_linear_program() -> mil_rs::ir::Program {
         use mil_rs::ir::{Block, Function, Operation, Program, TensorType, Value};
 
@@ -1046,6 +1103,7 @@ mod tests {
         program
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_prepare_simple_add_program() {
         let program = build_add_program();
@@ -1072,6 +1130,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_prepare_weighted_program() {
         let program = build_weighted_program();
@@ -1102,6 +1161,7 @@ mod tests {
         artifacts.validate().expect("validation failed");
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_prepare_multi_layer_produces_sub_programs() {
         let program = build_multi_layer_program();
@@ -1126,6 +1186,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_save_and_validate_artifacts() {
         let program = build_weighted_program();
@@ -1164,6 +1225,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_validate_catches_bad_mil_text() {
         let mut blob = vec![0u8; 128];
@@ -1186,6 +1248,7 @@ mod tests {
         assert!(msg.contains("missing program()"), "{msg}");
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_validate_catches_bad_blobfile() {
         let mut blob = vec![0u8; 128];
@@ -1207,6 +1270,7 @@ mod tests {
         assert!(msg.contains("invalid header"), "{msg}");
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_full_pipeline_add_program() {
         let program = build_add_program();
@@ -1226,6 +1290,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_full_pipeline_weighted_program() {
         let program = build_weighted_program();
@@ -1242,6 +1307,7 @@ mod tests {
         assert_eq!(blob[0], 1, "BLOBFILE byte 0 should be 1");
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_compile_and_load_weighted_program() {
         let program = build_weighted_program();
@@ -1282,6 +1348,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_compile_and_load_add_program() {
         let program = build_add_program();
@@ -1320,6 +1387,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_compile_and_load_conv_linear() {
         let program = build_conv_linear_program();
@@ -1373,6 +1441,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compile")]
     #[test]
     fn e2e_debug_mil_text_output() {
         use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};

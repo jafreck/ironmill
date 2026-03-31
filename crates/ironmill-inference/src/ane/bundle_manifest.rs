@@ -122,6 +122,7 @@ impl From<InputPackingManifest> for InputPacking {
 }
 
 /// Convert compile-crate InputPacking to inference-side InputPacking.
+#[cfg(feature = "compile")]
 impl From<ironmill_compile::ane::packing::InputPacking> for InputPacking {
     fn from(ip: ironmill_compile::ane::packing::InputPacking) -> Self {
         Self {

@@ -14,22 +14,31 @@
 
 use half::f16;
 
+#[cfg(feature = "compile")]
 use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+#[cfg(feature = "compile")]
 use ironmill_compile::ane::passes::{
     AneArgPromotionPass, AneLayoutPass, AneMatmulToConvPass, AneVariableNamingPass,
     OpSubstitutionPass,
 };
+#[cfg(feature = "compile")]
 use ironmill_compile::ane::split::{SplitConfig, split_for_ane};
+#[cfg(feature = "compile")]
 use mil_rs::ir::Pass;
 use mil_rs::ir::ScalarType;
+#[cfg(feature = "compile")]
 use mil_rs::ir::passes::{
     AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, TypeRepropagationPass,
 };
 
 use super::device::AneDevice;
+#[cfg(feature = "compile")]
+use super::turboquant::TurboQuantConfig;
+use super::turboquant::TurboQuantModel;
+#[cfg(feature = "compile")]
 use super::turboquant::mil_emitter;
+#[cfg(feature = "compile")]
 use super::turboquant::mil_emitter::MIN_IO_SEQ;
-use super::turboquant::{TurboQuantConfig, TurboQuantModel};
 use crate::ane::{AneError, Result};
 use std::sync::Arc;
 
@@ -365,6 +374,7 @@ impl<D: AneDevice> AneInference<D> {
     /// saving ANE compile budget).
     ///
     /// The program must be a transformer with attention-splittable layers.
+    #[cfg(feature = "compile")]
     pub fn compile(
         device: Arc<D>,
         program: &mil_rs::ir::Program,
@@ -1124,6 +1134,7 @@ impl<D: AneDevice> AneInference<D> {
     /// saved via `AneDecodeBundle::save()`. This method reads the manifest,
     /// CPU weights, and per-layer MIL programs, then compiles them on the
     /// ANE device and sets up runtime state (KV caches, etc.).
+    #[cfg(feature = "compile")]
     pub fn from_bundle(
         device: Arc<D>,
         bundle_path: &std::path::Path,
@@ -2125,6 +2136,7 @@ fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
 /// This finds the `skip_add` variable and appends `add(skip_add, down_proj)`
 /// as the new output.
 #[allow(dead_code)]
+#[cfg(feature = "compile")]
 fn inject_ffn_residual(program: &mut mil_rs::ir::Program) {
     use mil_rs::ir::{Operation, Value};
 
@@ -2212,6 +2224,7 @@ fn inject_ffn_residual(program: &mut mil_rs::ir::Program) {
 /// When QJL is enabled, K_proj is preserved as an additional output.
 /// Returns `Ok(true)` if injection was applied, `Ok(false)` if the
 /// sub-program was skipped (e.g., <3 outputs), or `Err` on failure.
+#[cfg(feature = "compile")]
 fn inject_cache_write_ops(
     sub: &mut ironmill_compile::ane::split::SubProgram,
     config: &TurboQuantConfig,
@@ -2324,6 +2337,7 @@ fn inject_cache_write_ops(
 /// When `min_output_alloc` > 0, output tensors are allocated with at
 /// least that alloc size. This enables zero-copy passing of outputs
 /// to downstream programs that require a specific alloc size.
+#[cfg(feature = "compile")]
 fn compile_and_load_sub<D: AneDevice>(
     sub: &ironmill_compile::ane::split::SubProgram,
     device: &D,
@@ -2628,6 +2642,7 @@ fn compile_and_load_sub<D: AneDevice>(
 ///
 /// The donor must have been compiled from the same MIL text structure
 /// (same ops and shapes, different weight data).
+#[cfg(feature = "compile")]
 fn compile_and_load_sub_with_donor<D: AneDevice>(
     sub: &ironmill_compile::ane::split::SubProgram,
     donor: &D::Program,
@@ -2870,6 +2885,7 @@ fn allocate_io_from_manifest<D: AneDevice>(
 
 /// Infer the number of KV heads from pre_attn sub-program output shapes.
 #[allow(dead_code)]
+#[cfg(feature = "compile")]
 fn infer_kv_heads_from_sub(pre_attn_sps: &[&ironmill_compile::ane::split::SubProgram]) -> usize {
     // The KV projection outputs have fewer channels than Q in GQA models.
     // Find the minimum channel count among outputs (excluding very small ones
@@ -2890,6 +2906,7 @@ fn infer_kv_heads_from_sub(pre_attn_sps: &[&ironmill_compile::ane::split::SubPro
 
 /// Infer head_dim from pre_attn sub-program output shapes.
 #[allow(dead_code)]
+#[cfg(feature = "compile")]
 fn infer_head_dim_from_sub(_pre_attn_sps: &[&ironmill_compile::ane::split::SubProgram]) -> usize {
     // Without explicit arch info, assume head_dim = 64 (common default).
     64
@@ -2904,6 +2921,7 @@ fn infer_head_dim_from_sub(_pre_attn_sps: &[&ironmill_compile::ane::split::SubPr
 /// Walks the sub-program's ops looking for `const` ops with tensor values.
 /// Returns the largest one (embedding table or lm_head weight), converted
 /// to fp16 if needed.
+#[cfg(feature = "compile")]
 fn extract_cpu_weight(
     sub: &ironmill_compile::ane::split::SubProgram,
     _label: &str,
@@ -2945,6 +2963,7 @@ fn extract_cpu_weight(
 
 /// Extract a 1D weight (e.g., RMSNorm gamma) from a sub-program.
 /// Finds the smallest 1D const tensor whose name contains `hint`.
+#[cfg(feature = "compile")]
 fn extract_1d_weight(
     sub: &ironmill_compile::ane::split::SubProgram,
     hint: &str,
@@ -2989,6 +3008,7 @@ fn extract_1d_weight(
 /// Qwen3 models apply per-head RMSNorm to Q and K after projection.
 /// Returns `Some(Vec<(q_norm, k_norm)>)` indexed by layer, or `None`
 /// if the model doesn't use QK normalization.
+#[cfg(feature = "compile")]
 fn extract_qk_norm_weights(program: &mil_rs::ir::Program) -> Option<Vec<(Vec<f16>, Vec<f16>)>> {
     use mil_rs::ir::Value;
 
@@ -3053,6 +3073,7 @@ fn extract_qk_norm_weights(program: &mil_rs::ir::Program) -> Option<Vec<(Vec<f16
 }
 
 /// Extract a layer number from an operation name.
+#[cfg(feature = "compile")]
 fn extract_layer_number_from_name(name: &str) -> Option<usize> {
     for pattern in ["layers.", "layers_", "layer.", "layer_"] {
         if let Some(idx) = name.find(pattern) {
@@ -3155,6 +3176,7 @@ fn cpu_lm_head_matmul(weight: &CpuWeight, hidden: &[f16]) -> Result<Vec<f32>> {
 ///
 /// Both are replaced with function inputs that the CPU fills at decode time.
 /// Downstream ops referencing their outputs are rewired to the new inputs.
+#[cfg(feature = "compile")]
 fn replace_gather_with_inputs(program: &mut mil_rs::ir::Program) {
     use mil_rs::ir::TensorType;
 
@@ -3275,6 +3297,7 @@ fn replace_gather_with_inputs(program: &mut mil_rs::ir::Program) {
 }
 
 /// Remove function inputs that are not referenced by any op in the body.
+#[cfg(feature = "compile")]
 fn prune_unreferenced_inputs(program: &mut mil_rs::ir::Program) {
     for func in program.functions.values_mut() {
         let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3299,6 +3322,7 @@ fn prune_unreferenced_inputs(program: &mut mil_rs::ir::Program) {
 
 /// Pad the S dimension (dim 3) to at least `min_seq` across function
 /// inputs, op output types, and reshape shape constants.
+#[cfg(feature = "compile")]
 fn apply_min_seq_padding(program: &mut mil_rs::ir::Program, min_seq: usize) {
     for func in program.functions.values_mut() {
         for (_, ty) in &mut func.inputs {
@@ -3351,6 +3375,7 @@ fn apply_min_seq_padding(program: &mut mil_rs::ir::Program, min_seq: usize) {
 
 /// Convert Float32 const ops to Float16, materialize dynamic shapes,
 /// and decompose unsupported ops for ANE compatibility.
+#[cfg(feature = "compile")]
 fn convert_f32_consts_to_f16(program: &mut mil_rs::ir::Program) {
     use mil_rs::ir::{Operation, Value};
 
@@ -3435,6 +3460,7 @@ use crate::sampling::{is_eos_token, sample_token};
 // ---------------------------------------------------------------------------
 
 /// Extracted RoPE cos/sin cache data.
+#[cfg(feature = "compile")]
 type RopeCacheData = (Vec<f16>, Vec<f16>, usize);
 
 /// Extract RoPE cos/sin cache data from model const ops.
@@ -3445,6 +3471,7 @@ type RopeCacheData = (Vec<f16>, Vec<f16>, usize);
 ///
 /// Returns `(cos_values, sin_values, values_per_position)` where each
 /// value array is flat `[num_positions * values_per_position]` in fp16.
+#[cfg(feature = "compile")]
 fn extract_rope_caches(program: &mil_rs::ir::Program) -> Option<RopeCacheData> {
     use mil_rs::ir::Value;
     let func = program.main()?;
@@ -3516,6 +3543,7 @@ fn extract_rope_caches(program: &mil_rs::ir::Program) -> Option<RopeCacheData> {
 /// Precompute RoPE cos/sin cache tables from scratch.
 ///
 /// Used as a fallback when the model's const tables can't be extracted.
+#[cfg(feature = "compile")]
 fn precompute_rope_cache(head_dim: usize, max_pos: usize, theta: f32) -> RopeCacheData {
     let half_dim = head_dim / 2;
     let mut cos_cache = Vec::with_capacity(max_pos * half_dim);
@@ -3542,6 +3570,7 @@ fn precompute_rope_cache(head_dim: usize, max_pos: usize, theta: f32) -> RopeCac
 /// Q, K, V projections AND gathered cos/sin values. The inputs are sorted
 /// alphabetically by name. This function identifies which index is which
 /// by examining input names and channel counts.
+#[cfg(feature = "compile")]
 fn compute_attn_input_map(inputs: &[ironmill_compile::ane::TensorDescriptor]) -> AttnInputMap {
     let mut cos_indices = Vec::new();
     let mut sin_indices = Vec::new();

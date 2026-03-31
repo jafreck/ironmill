@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 ironmill-compile = { workspace = true }
-ironmill-inference = { workspace = true, optional = true }
+ironmill-inference = { workspace = true, optional = true, features = ["compile"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }

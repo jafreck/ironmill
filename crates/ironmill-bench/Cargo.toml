@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ironmill-compile = { workspace = true }
-ironmill-inference = { path = "../ironmill-inference" }
+ironmill-inference = { path = "../ironmill-inference", features = ["compile"] }
 ironmill-iosurface = { path = "../ironmill-iosurface", optional = true }
 clap = { workspace = true }
 serde = { workspace = true }
