@@ -170,138 +170,55 @@ fn main() -> Result<()> {
 
     let mut report_rows = Vec::new();
 
-    for model_cfg in &matrix.models {
-        // Compute model FLOPs if we can parse the model
-        let model_flops = compute_model_flops(model_cfg);
-        if let Some(flops) = model_flops {
-            eprintln!(
-                "  Model FLOPs: {:.2}G ({:.2}M MACs)",
-                flops as f64 / 1e9,
-                flops as f64 / 2e6
-            );
-        }
+    // Skip the main benchmark loop if only perplexity is requested
+    let run_latency_bench = !cli.perplexity || cli.ane_direct || cli.quality;
 
-        for opt_cfg in &matrix.optimizations {
-            eprintln!("Compiling {} with {}...", model_cfg.name, opt_cfg.name);
-            let mlmodelc = compiler::compile_model(model_cfg, opt_cfg, &cache_dir, cli.no_cache)?;
-
-            for &cu in &compute_units {
-                eprintln!("  Running inference ({cu})...");
-
-                // Start power sampling if enabled
-                let power_sampler = if power_enabled {
-                    let expected_duration_sec =
-                        matrix.settings.iterations as f64 * 0.001 * matrix.settings.runs as f64;
-                    let samples = (expected_duration_sec * 10.0).max(20.0) as usize;
-                    power::PowerSampler::start(100, samples)
-                } else {
-                    None
-                };
-
-                let mut run_results = Vec::new();
-                let mut last_utilization = None;
-                let mut last_memory = None;
-                let mut last_load_time = None;
-
-                for run_idx in 0..matrix.settings.runs {
-                    let result = inference::run_inference(
-                        &mlmodelc,
-                        cu,
-                        matrix.settings.iterations,
-                        matrix.settings.warmup,
-                    )?;
-
-                    last_load_time = Some(result.load_time.as_secs_f64() * 1000.0);
-                    last_utilization = result.utilization;
-                    last_memory = result.memory;
-
-                    let latencies_ms: Vec<f64> = result
-                        .latencies
-                        .iter()
-                        .map(|d| d.as_secs_f64() * 1000.0)
-                        .collect();
-
-                    let label =
-                        format!("{}/{}/{}/run{}", model_cfg.name, opt_cfg.name, cu, run_idx);
-                    run_results.push(compute_stats_with_flops(&label, &latencies_ms, model_flops));
-                }
-
-                let label = format!("{}/{}/{}", model_cfg.name, opt_cfg.name, cu);
-                let aggregated = aggregate_runs(&label, &run_results);
-
-                // Collect power metrics
-                let energy = power_sampler.and_then(|sampler| {
-                    let power_metrics = sampler.finish()?;
-                    Some(power::compute_energy_metrics(
-                        power_metrics,
-                        idle_power.clone(),
-                        aggregated.pooled.inferences_per_sec,
-                        aggregated.pooled.median / 1000.0,
-                        aggregated.pooled.tflops,
-                        aggregated.pooled.tokens_per_sec,
-                    ))
-                });
-
-                let utilization_summary = last_utilization
-                    .as_ref()
-                    .map(UtilizationSummary::from_metrics);
-                let memory_summary = last_memory.as_ref().map(MemorySummary::from_metrics);
-
-                report_rows.push(ReportRow {
-                    model: model_cfg.name.clone(),
-                    optimization: opt_cfg.name.clone(),
-                    backend: cu.to_string(),
-                    kv_quant: opt_cfg.kv_quant.to_string(),
-                    result: aggregated,
-                    significance: None,
-                    energy,
-                    utilization: utilization_summary,
-                    memory: memory_summary,
-                    load_time_ms: last_load_time,
-                });
+    if run_latency_bench {
+        for model_cfg in &matrix.models {
+            // Compute model FLOPs if we can parse the model
+            let model_flops = compute_model_flops(model_cfg);
+            if let Some(flops) = model_flops {
+                eprintln!(
+                    "  Model FLOPs: {:.2}G ({:.2}M MACs)",
+                    flops as f64 / 1e9,
+                    flops as f64 / 2e6
+                );
             }
-        }
-    }
 
-    if cli.ane_direct {
-        #[cfg(feature = "ane-direct")]
-        {
-            eprintln!("\n  ANE Direct Runtime Benchmark");
-            eprintln!("  {}", "─".repeat(40));
-            eprintln!("  ⚠ ANE direct benchmarking requires runtime verification");
-            eprintln!("    (private API selectors must be validated on this macOS version)");
+            for opt_cfg in &matrix.optimizations {
+                eprintln!("Compiling {} with {}...", model_cfg.name, opt_cfg.name);
+                let mlmodelc =
+                    compiler::compile_model(model_cfg, opt_cfg, &cache_dir, cli.no_cache)?;
 
-            for model_cfg in &matrix.models {
-                for opt_cfg in &matrix.optimizations {
-                    eprintln!(
-                        "  Compiling {} with {} (ANE direct)...",
-                        model_cfg.name, opt_cfg.name
-                    );
+                for &cu in &compute_units {
+                    eprintln!("  Running inference ({cu})...");
 
-                    let program = match compiler::build_optimized_program(model_cfg, opt_cfg) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("  ✗ failed to build program: {e}");
-                            continue;
-                        }
+                    // Start power sampling if enabled
+                    let power_sampler = if power_enabled {
+                        let expected_duration_sec =
+                            matrix.settings.iterations as f64 * 0.001 * matrix.settings.runs as f64;
+                        let samples = (expected_duration_sec * 10.0).max(20.0) as usize;
+                        power::PowerSampler::start(100, samples)
+                    } else {
+                        None
                     };
 
-                    let config = ironmill_inference::AneConfig::default();
-
                     let mut run_results = Vec::new();
+                    let mut last_utilization = None;
+                    let mut last_memory = None;
+                    let mut last_load_time = None;
+
                     for run_idx in 0..matrix.settings.runs {
-                        let result = match inference::run_ane_direct_inference(
-                            &program,
-                            config.clone(),
-                            matrix.settings.warmup,
+                        let result = inference::run_inference(
+                            &mlmodelc,
+                            cu,
                             matrix.settings.iterations,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("  ✗ ANE direct inference failed: {e}");
-                                continue;
-                            }
-                        };
+                            matrix.settings.warmup,
+                        )?;
+
+                        last_load_time = Some(result.load_time.as_secs_f64() * 1000.0);
+                        last_utilization = result.utilization;
+                        last_memory = result.memory;
 
                         let latencies_ms: Vec<f64> = result
                             .latencies
@@ -309,66 +226,161 @@ fn main() -> Result<()> {
                             .map(|d| d.as_secs_f64() * 1000.0)
                             .collect();
 
-                        let label = format!(
-                            "{}/{}/ane-direct/run{}",
-                            model_cfg.name, opt_cfg.name, run_idx
-                        );
-                        run_results.push(compute_stats(&label, &latencies_ms));
+                        let label =
+                            format!("{}/{}/{}/run{}", model_cfg.name, opt_cfg.name, cu, run_idx);
+                        run_results.push(compute_stats_with_flops(
+                            &label,
+                            &latencies_ms,
+                            model_flops,
+                        ));
                     }
 
-                    if !run_results.is_empty() {
-                        let label = format!("{}/{}/ane-direct", model_cfg.name, opt_cfg.name);
-                        let aggregated = aggregate_runs(&label, &run_results);
+                    let label = format!("{}/{}/{}", model_cfg.name, opt_cfg.name, cu);
+                    let aggregated = aggregate_runs(&label, &run_results);
 
-                        report_rows.push(ReportRow {
-                            model: model_cfg.name.clone(),
-                            optimization: opt_cfg.name.clone(),
-                            backend: "ane-direct".to_string(),
-                            kv_quant: opt_cfg.kv_quant.to_string(),
-                            result: aggregated,
-                            significance: None,
-                            energy: None,
-                            utilization: None,
-                            memory: None,
-                            load_time_ms: None,
-                        });
-                    }
+                    // Collect power metrics
+                    let energy = power_sampler.and_then(|sampler| {
+                        let power_metrics = sampler.finish()?;
+                        Some(power::compute_energy_metrics(
+                            power_metrics,
+                            idle_power.clone(),
+                            aggregated.pooled.inferences_per_sec,
+                            aggregated.pooled.median / 1000.0,
+                            aggregated.pooled.tflops,
+                            aggregated.pooled.tokens_per_sec,
+                        ))
+                    });
+
+                    let utilization_summary = last_utilization
+                        .as_ref()
+                        .map(UtilizationSummary::from_metrics);
+                    let memory_summary = last_memory.as_ref().map(MemorySummary::from_metrics);
+
+                    report_rows.push(ReportRow {
+                        model: model_cfg.name.clone(),
+                        optimization: opt_cfg.name.clone(),
+                        backend: cu.to_string(),
+                        kv_quant: opt_cfg.kv_quant.to_string(),
+                        result: aggregated,
+                        significance: None,
+                        energy,
+                        utilization: utilization_summary,
+                        memory: memory_summary,
+                        load_time_ms: last_load_time,
+                    });
                 }
             }
         }
-        #[cfg(not(feature = "ane-direct"))]
-        {
-            eprintln!("warning: --ane-direct requires --features ane-direct, skipping");
-        }
-    }
 
-    if let Some(baseline_name) = &cli.baseline {
-        let baseline_rows: Vec<_> = report_rows
-            .iter()
-            .filter(|r| r.optimization == *baseline_name)
-            .cloned()
-            .collect();
-
-        for row in &mut report_rows {
-            if row.optimization == *baseline_name {
-                continue;
-            }
-            if let Some(bl) = baseline_rows
-                .iter()
-                .find(|b| b.model == row.model && b.backend == row.backend)
+        if cli.ane_direct {
+            #[cfg(feature = "ane-direct")]
             {
-                let sig = welch_t_test(&bl.result.pooled, &row.result.pooled, cli.alpha);
-                row.significance = Some(sig);
+                eprintln!("\n  ANE Direct Runtime Benchmark");
+                eprintln!("  {}", "─".repeat(40));
+                eprintln!("  ⚠ ANE direct benchmarking requires runtime verification");
+                eprintln!("    (private API selectors must be validated on this macOS version)");
+
+                for model_cfg in &matrix.models {
+                    for opt_cfg in &matrix.optimizations {
+                        eprintln!(
+                            "  Compiling {} with {} (ANE direct)...",
+                            model_cfg.name, opt_cfg.name
+                        );
+
+                        let program = match compiler::build_optimized_program(model_cfg, opt_cfg) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("  ✗ failed to build program: {e}");
+                                continue;
+                            }
+                        };
+
+                        let config = ironmill_inference::AneConfig::default();
+
+                        let mut run_results = Vec::new();
+                        for run_idx in 0..matrix.settings.runs {
+                            let result = match inference::run_ane_direct_inference(
+                                &program,
+                                config.clone(),
+                                matrix.settings.warmup,
+                                matrix.settings.iterations,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    eprintln!("  ✗ ANE direct inference failed: {e}");
+                                    continue;
+                                }
+                            };
+
+                            let latencies_ms: Vec<f64> = result
+                                .latencies
+                                .iter()
+                                .map(|d| d.as_secs_f64() * 1000.0)
+                                .collect();
+
+                            let label = format!(
+                                "{}/{}/ane-direct/run{}",
+                                model_cfg.name, opt_cfg.name, run_idx
+                            );
+                            run_results.push(compute_stats(&label, &latencies_ms));
+                        }
+
+                        if !run_results.is_empty() {
+                            let label = format!("{}/{}/ane-direct", model_cfg.name, opt_cfg.name);
+                            let aggregated = aggregate_runs(&label, &run_results);
+
+                            report_rows.push(ReportRow {
+                                model: model_cfg.name.clone(),
+                                optimization: opt_cfg.name.clone(),
+                                backend: "ane-direct".to_string(),
+                                kv_quant: opt_cfg.kv_quant.to_string(),
+                                result: aggregated,
+                                significance: None,
+                                energy: None,
+                                utilization: None,
+                                memory: None,
+                                load_time_ms: None,
+                            });
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "ane-direct"))]
+            {
+                eprintln!("warning: --ane-direct requires --features ane-direct, skipping");
             }
         }
-    }
+
+        if let Some(baseline_name) = &cli.baseline {
+            let baseline_rows: Vec<_> = report_rows
+                .iter()
+                .filter(|r| r.optimization == *baseline_name)
+                .cloned()
+                .collect();
+
+            for row in &mut report_rows {
+                if row.optimization == *baseline_name {
+                    continue;
+                }
+                if let Some(bl) = baseline_rows
+                    .iter()
+                    .find(|b| b.model == row.model && b.backend == row.backend)
+                {
+                    let sig = welch_t_test(&bl.result.pooled, &row.result.pooled, cli.alpha);
+                    row.significance = Some(sig);
+                }
+            }
+        }
+    } // end run_latency_bench
 
     let bench_report = BenchReport {
         rows: report_rows,
-        settings: matrix.settings,
+        settings: matrix.settings.clone(),
     };
 
-    print!("{}", report::format_report(&bench_report, cli.output));
+    if run_latency_bench && !bench_report.rows.is_empty() {
+        print!("{}", report::format_report(&bench_report, cli.output));
+    }
 
     // Quality benchmarks — measure weight fidelity impact of quantization
     if cli.quality {
