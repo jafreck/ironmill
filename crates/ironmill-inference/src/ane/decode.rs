@@ -379,7 +379,12 @@ impl AneInference {
         program: &mil_rs::ir::Program,
         turbo_config: Option<TurboQuantConfig>,
     ) -> Result<Self> {
-        // 0. Extract RoPE cos/sin cache from the original program before
+        // 0. Detect model architecture from the ORIGINAL program (before
+        //    ANE passes modify shapes). This gives correct head counts for
+        //    the hand-written FP16 attention MIL program.
+        let original_arch = mil_rs::analysis::arch::detect_model_arch(program);
+
+        // 0a. Extract RoPE cos/sin cache from the original program before
         //    passes modify shapes. These tables are used by CPU-side RoPE
         //    when gather ops are stripped from fp16_attn sub-programs.
         let (rope_cos_cache, rope_sin_cache, rope_cache_dim) = extract_rope_caches(program)
@@ -452,16 +457,7 @@ impl AneInference {
         // the sub-programs that will be compiled for ANE.
         let split_config = SplitConfig {
             split_attention: true,
-            // Emit fp16_attn sub-programs in FP16 baseline mode.
-            // Gather ops (RoPE cos/sin lookup) are stripped from the
-            // attention cluster by strip_gather_ops() in the splitter;
-            // the gathered values are filled by the CPU at decode time.
-            //
-            // With lazy load/unload (loadWithQoS/unloadWithQoS), we can
-            // emit attention programs without exceeding the ANE slot limit:
-            // at most 3 programs are loaded simultaneously during decode.
-            emit_attention: false, // FP16 attention needs KV cache inputs (full seq_len)
-            // not single-token K/V (S=1 with C>768 violates ANE constraint)
+            emit_attention: true,
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -917,9 +913,8 @@ impl AneInference {
             let tq = TurboQuantModel::compile(tq_config)?;
             (Some(tq), None, None, None, None, nkv, hd, msl)
         } else {
-            // FP16 baseline: detect architecture from program.
-            let arch = mil_rs::analysis::arch::detect_model_arch(&program);
-            let (nh, nkv, hd, msl) = if let Some(ref a) = arch {
+            // FP16 baseline: use architecture detected from original program.
+            let (nh, nkv, hd, msl) = if let Some(ref a) = original_arch {
                 (a.num_heads, a.num_kv_heads, a.head_dim, 2048)
             } else {
                 // Fallback: infer from pre_attn output shapes.
@@ -928,10 +923,30 @@ impl AneInference {
                 let kv_channels = infer_kv_heads_from_sub(&pre_sps);
                 let hd = infer_head_dim_from_sub(&pre_sps);
                 let nkv = kv_channels / hd.max(1);
-                let q_channels = pre_sps
-                    .first()
-                    .map(|sp| sp.outputs[0].shape[1])
-                    .unwrap_or(kv_channels);
+                // Outputs are sorted lexicographically: [k_proj, q_proj, v_proj].
+                // Q is the LARGEST projection (index 1 for GQA models).
+                let q_channels = if pre_sps.first().map_or(0, |sp| sp.outputs.len()) >= 3 {
+                    // Find the largest output — that's Q.
+                    pre_sps
+                        .first()
+                        .map(|sp| {
+                            sp.outputs
+                                .iter()
+                                .map(|o| o.shape[1])
+                                .max()
+                                .unwrap_or(kv_channels)
+                        })
+                        .unwrap_or(kv_channels)
+                } else {
+                    pre_sps
+                        .first()
+                        .map(|sp| sp.outputs[0].shape[1])
+                        .unwrap_or(kv_channels)
+                };
+                eprintln!(
+                    "  Arch fallback: q_ch={}, kv_ch={}, hd={}, nkv={}",
+                    q_channels, kv_channels, hd, nkv
+                );
                 (q_channels / hd.max(1), nkv, hd, 2048)
             };
             let kv_channels = nkv * hd;
@@ -1142,6 +1157,66 @@ impl AneInference {
                     d_attn += t.elapsed();
                 }
                 result
+            } else if let Some(ref mut attn) = layer.fp16_attn {
+                // Per-layer fp16_attn from the splitter: execute directly.
+                // Inputs match pre_attn outputs (same ANE layout, same shapes).
+                let t0 = if profiling {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+
+                if let Some(ref map) = layer.attn_input_map {
+                    // Copy Q/K/V from pre_attn outputs to fp16_attn inputs.
+                    let q_src = layer.pre_attn.output_tensors[map.q_idx].read_f16()?;
+                    attn.input_tensors[map.q_idx].write_f16(&q_src)?;
+
+                    let k_src = layer.pre_attn.output_tensors[map.k_idx].read_f16()?;
+                    attn.input_tensors[map.k_idx].write_f16(&k_src)?;
+
+                    let v_src = layer.pre_attn.output_tensors[map.v_idx].read_f16()?;
+                    attn.input_tensors[map.v_idx].write_f16(&v_src)?;
+
+                    // Fill RoPE cos/sin from CPU cache.
+                    for &cos_idx in &map.rope_cos_indices {
+                        let cos_slice = &self.rope_cos_cache[self.seq_pos * self.rope_cache_dim
+                            ..(self.seq_pos + 1) * self.rope_cache_dim];
+                        write_f16_padded(&mut attn.input_tensors[cos_idx], cos_slice)?;
+                    }
+                    for &sin_idx in &map.rope_sin_indices {
+                        let sin_slice = &self.rope_sin_cache[self.seq_pos * self.rope_cache_dim
+                            ..(self.seq_pos + 1) * self.rope_cache_dim];
+                        write_f16_padded(&mut attn.input_tensors[sin_idx], sin_slice)?;
+                    }
+                } else {
+                    // No input map — copy pre_attn outputs to fp16_attn inputs.
+                    for (i, src) in layer.pre_attn.output_tensors.iter().enumerate() {
+                        if i < attn.input_tensors.len() {
+                            let data = src.read_f16()?;
+                            attn.input_tensors[i].write_f16(&data)?;
+                        }
+                    }
+                }
+
+                // Eval fp16_attn on ANE.
+                {
+                    let in_refs: Vec<&AneTensor> = attn.input_tensors.iter().collect();
+                    let mut out_refs: Vec<&mut AneTensor> =
+                        attn.output_tensors.iter_mut().collect();
+                    self.runtime
+                        .eval_compiled(&attn.compiled, &in_refs, &mut out_refs)
+                        .map_err(|e| {
+                            AneError::Other(anyhow::anyhow!(
+                                "layer {layer_idx} fp16_attn eval failed: {e}"
+                            ))
+                        })?;
+                }
+
+                let result = read_f16_channels(&attn.output_tensors[0])?;
+                if let Some(t) = t0 {
+                    d_attn += t.elapsed();
+                }
+                result
             } else if let Some(ref mut caches) = self.fp16_kv_caches {
                 let t0 = if profiling {
                     Some(std::time::Instant::now())
@@ -1150,17 +1225,43 @@ impl AneInference {
                 };
                 // Outputs are lexicographically sorted: [k_proj, q_proj, v_proj]
                 // Index 0 = K, index 1 = Q, index 2 = V
-                let q_data = if num_pre_outputs > 1 {
+                // ANE layout pass doubles channel dimensions. Truncate to the
+                // real model dimensions (num_heads * head_dim for Q,
+                // num_kv_heads * head_dim for K/V).
+                let _real_q_ch = (self.num_kv_heads * self.head_dim).max(self.head_dim); // at least head_dim
+                // Q has more heads than K/V in GQA — compute from num_kv_heads ratio
+                let gqa = if self.num_kv_heads > 0 {
+                    // num_heads / num_kv_heads, but we only have num_kv_heads stored
+                    // Infer: Q output channels / K output channels = GQA ratio
+                    let q_ane_ch = layer
+                        .pre_attn
+                        .output_tensors
+                        .get(1)
+                        .map(|t| t.shape()[1])
+                        .unwrap_or(0);
+                    let k_ane_ch = layer.pre_attn.output_tensors[0].shape()[1];
+                    if k_ane_ch > 0 { q_ane_ch / k_ane_ch } else { 1 }
+                } else {
+                    1
+                };
+                let real_kv_ch = self.num_kv_heads * self.head_dim;
+                let real_q_ch = real_kv_ch * gqa;
+
+                let mut q_data = if num_pre_outputs > 1 {
                     read_f16_channels(&layer.pre_attn.output_tensors[1])?
                 } else {
                     read_f16_channels(&layer.pre_attn.output_tensors[0])?
                 };
-                let k_data = read_f16_channels(&layer.pre_attn.output_tensors[0])?;
-                let v_data = if num_pre_outputs > 2 {
+                let mut k_data = read_f16_channels(&layer.pre_attn.output_tensors[0])?;
+                let mut v_data = if num_pre_outputs > 2 {
                     read_f16_channels(&layer.pre_attn.output_tensors[2])?
                 } else {
                     k_data.clone()
                 };
+                // Truncate to real model dimensions (undo ANE layout doubling).
+                q_data.truncate(real_q_ch);
+                k_data.truncate(real_kv_ch);
+                v_data.truncate(real_kv_ch);
                 if let Some(t) = t0 {
                     d_read_qkv += t.elapsed();
                 }
