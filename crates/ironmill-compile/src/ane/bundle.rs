@@ -4,24 +4,37 @@
 //! compiled ANE models. Bundles are directory trees containing MIL programs,
 //! weight blobs, and a JSON manifest that captures all metadata needed for
 //! runtime loading.
+//!
+//! The [`compile_decode_bundle`] function runs the full decode-path compilation
+//! pipeline, producing an [`AneDecodeBundle`] ready for serialization.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use mil_rs::ir::passes::{
+    AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, TypeRepropagationPass,
+};
 use mil_rs::ir::{Pass, Program};
 
 use crate::ane::TensorDescriptor;
 use crate::ane::blobfile::BlobFileWriter;
+use crate::ane::decode_compile::{
+    CacheWriteConfig, CpuWeight, apply_min_seq_padding, convert_f32_consts_to_f16,
+    extract_1d_weight, extract_cpu_weight, extract_qk_norm_weights, extract_rope_caches,
+    inject_cache_write_ops, inject_ffn_residual, precompute_rope_cache, prune_unreferenced_inputs,
+    replace_gather_with_inputs,
+};
 use crate::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use crate::ane::packing::InputPacking;
 use crate::ane::passes::{
-    AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
-    OpSubstitutionPass,
+    AneArgPromotionPass, AneConcatEliminationPass, AneLayoutPass, AneMatmulToConvPass,
+    AneVariableNamingPass, AttentionDecomposePass, OpSubstitutionPass,
 };
-use crate::ane::split::{SplitConfig, split_for_ane};
+use crate::ane::split::{SplitConfig, SubProgram, split_for_ane};
 
 // ---------------------------------------------------------------------------
 // Bundle types
@@ -121,8 +134,534 @@ pub enum LmHeadBundle {
 }
 
 // ---------------------------------------------------------------------------
-// Manifest types
+// Decode compilation config
 // ---------------------------------------------------------------------------
+
+/// Configuration for autoregressive decode model compilation.
+pub struct AneDecodeConfig {
+    /// Maximum sequence length for autoregressive shape materialization.
+    pub max_seq_len: usize,
+    /// Number of attention heads.
+    pub num_heads: usize,
+    /// Number of KV heads (for GQA).
+    pub num_kv_heads: usize,
+    /// Head dimension.
+    pub head_dim: usize,
+    /// RoPE theta parameter.
+    pub rope_theta: f64,
+    /// EOS token IDs.
+    pub eos_tokens: Vec<u32>,
+    /// Enable cache-write fusion into pre_attn sub-programs.
+    pub fuse_cache_write: bool,
+    /// Enable QJL correction in cache-write fusion.
+    pub enable_qjl: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Compile decode bundle
+// ---------------------------------------------------------------------------
+
+/// Compile a MIL program into an [`AneDecodeBundle`].
+///
+/// This runs the full decode-path compilation pipeline (ANE passes,
+/// splitting, weight extraction, MIL text emission) but does NOT call
+/// `device.compile()`. The resulting bundle contains MIL text + weight
+/// blobs ready for ANE device compilation at load time.
+pub fn compile_decode_bundle(
+    program: &mil_rs::ir::Program,
+    config: &AneDecodeConfig,
+) -> Result<AneDecodeBundle> {
+    // 0. Detect architecture from the ORIGINAL program (before passes).
+    let original_arch = mil_rs::analysis::arch::detect_model_arch(program);
+
+    // 0a. Extract RoPE cos/sin cache from original program.
+    let (rope_cos_cache, rope_sin_cache, _rope_cache_dim) = extract_rope_caches(program)
+        .unwrap_or_else(|| {
+            let head_dim = config.head_dim;
+            let max_pos = config.max_seq_len;
+            let theta = config.rope_theta as f32;
+            precompute_rope_cache(head_dim, max_pos, theta)
+        });
+
+    // 0b. Extract per-layer QK norm weights (Qwen3 feature).
+    let qk_norm_weights = extract_qk_norm_weights(program);
+    let has_qk_norm = qk_norm_weights.is_some();
+
+    // 1. Run ANE-specific passes on a clone.
+    let mut program = program.clone();
+    if !program.is_autoregressive() {
+        program.set_attribute("autoregressive", "true");
+    }
+
+    // Materialize all dynamic dims to 1 for single-token decode.
+    for func in program.functions.values_mut() {
+        for (_, ty) in &mut func.inputs {
+            for dim in &mut ty.shape {
+                if dim.is_none() {
+                    *dim = Some(1);
+                }
+            }
+        }
+        for op in &mut func.body.operations {
+            for t in op.output_types.iter_mut().flatten() {
+                for dim in &mut t.shape {
+                    if dim.is_none() {
+                        *dim = Some(1);
+                    }
+                }
+            }
+        }
+    }
+
+    let ar_shape_pass = AutoregressiveShapeMaterializePass::new(config.max_seq_len);
+    let passes: &[(&str, &dyn Pass)] = &[
+        ("ArShapeMaterialize", &ar_shape_pass),
+        ("OpSubstitution", &OpSubstitutionPass),
+        ("AneLayout", &AneLayoutPass),
+        ("AneArgPromotion", &AneArgPromotionPass),
+        ("TypeRepropagate", &TypeRepropagationPass),
+    ];
+    for (name, pass) in passes {
+        pass.run(&mut program)
+            .map_err(|e| anyhow::anyhow!("{name} pass failed: {e}"))?;
+    }
+
+    // 1b. Replace gather/split/concat/sub ops with function inputs.
+    replace_gather_with_inputs(&mut program);
+
+    // 2. Split into sub-programs.
+    let split_config = SplitConfig {
+        split_attention: true,
+        emit_attention: false,
+        ..Default::default()
+    };
+    let mut model_split = split_for_ane(&program, &split_config)?;
+
+    // 2a. Prune unreferenced inputs from each sub-program.
+    for sub in &mut model_split.programs {
+        prune_unreferenced_inputs(&mut sub.program);
+        if let Some(func) = sub.program.main() {
+            let func_input_names: HashSet<String> =
+                func.inputs.iter().map(|(n, _)| n.clone()).collect();
+            sub.inputs.retain(|td| func_input_names.contains(&td.name));
+        }
+    }
+
+    // 2b. Pad all shapes to S≥32 (ANE rejects C>768, S<32 on I/O tensors).
+    const ANE_MIN_SEQ: usize = 32;
+    for sub in &mut model_split.programs {
+        if let Some(func) = sub.program.functions.values_mut().next() {
+            for (_, ty) in &mut func.inputs {
+                if ty.shape.len() == 4 {
+                    if let Some(s) = ty.shape[3] {
+                        if s < ANE_MIN_SEQ {
+                            ty.shape[3] = Some(ANE_MIN_SEQ);
+                        }
+                    }
+                }
+            }
+            for op in &mut func.body.operations {
+                for t in op.output_types.iter_mut().flatten() {
+                    if t.shape.len() == 4 {
+                        if let Some(s) = t.shape[3] {
+                            if s < ANE_MIN_SEQ {
+                                t.shape[3] = Some(ANE_MIN_SEQ);
+                            }
+                        }
+                    }
+                }
+                // Update reshape shape constants to match padded dims.
+                if op.op_type == "reshape" {
+                    if let Some(mil_rs::ir::Value::Tensor { shape, data, dtype }) =
+                        op.inputs.get_mut("shape")
+                    {
+                        if shape.len() == 1 && *dtype == mil_rs::ir::ScalarType::Int32 {
+                            let ndims = shape[0];
+                            if ndims >= 4 && data.len() >= ndims * 4 {
+                                let last_offset = (ndims - 1) * 4;
+                                let last_val = i32::from_le_bytes([
+                                    data[last_offset],
+                                    data[last_offset + 1],
+                                    data[last_offset + 2],
+                                    data[last_offset + 3],
+                                ]);
+                                if last_val > 0 && (last_val as usize) < ANE_MIN_SEQ {
+                                    let new_val = ANE_MIN_SEQ as i32;
+                                    let b = new_val.to_le_bytes();
+                                    data[last_offset] = b[0];
+                                    data[last_offset + 1] = b[1];
+                                    data[last_offset + 2] = b[2];
+                                    data[last_offset + 3] = b[3];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Update sub-program TensorDescriptors to match.
+        for td in &mut sub.inputs {
+            if td.shape[3] < ANE_MIN_SEQ {
+                td.shape[3] = ANE_MIN_SEQ;
+            }
+        }
+        for td in &mut sub.outputs {
+            if td.shape[3] < ANE_MIN_SEQ {
+                td.shape[3] = ANE_MIN_SEQ;
+            }
+        }
+    }
+
+    // 2c. Convert matmul → 1×1 conv + DCE on each sub-program.
+    for sub in &mut model_split.programs {
+        AneMatmulToConvPass
+            .run(&mut sub.program)
+            .map_err(|e| anyhow::anyhow!("MatmulToConv failed for {}: {e}", sub.name))?;
+    }
+    for sub in &mut model_split.programs {
+        DeadCodeEliminationPass
+            .run(&mut sub.program)
+            .map_err(|e| anyhow::anyhow!("DCE failed for {}: {e}", sub.name))?;
+    }
+
+    // 2d. Inject second residual add into post_attn sub-programs.
+    for sub in &mut model_split.programs {
+        if sub.name.ends_with("_post_attn") {
+            inject_ffn_residual(&mut sub.program);
+        }
+    }
+
+    // 2e. Cache-write fusion (conditional).
+    let mut cache_write_fused = false;
+    if config.fuse_cache_write {
+        let cw_config = CacheWriteConfig {
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+        };
+
+        let kv_ch = config.num_kv_heads * config.head_dim;
+        let q_ch = config.num_heads * config.head_dim;
+
+        let all_injectable = model_split.programs.iter().all(|sub| {
+            if !sub.name.ends_with("_pre_attn") {
+                return true;
+            }
+            let func = match sub.program.main() {
+                Some(f) => f,
+                None => return false,
+            };
+            if func.body.outputs.len() < 3 {
+                return false;
+            }
+            let mut found_q = false;
+            let mut found_k = false;
+            let mut found_v = false;
+            for name in &func.body.outputs {
+                let lower = name.to_lowercase();
+                if lower.contains("k_proj") {
+                    found_k = true;
+                } else if lower.contains("v_proj") {
+                    found_v = true;
+                } else if lower.contains("q_proj") {
+                    found_q = true;
+                }
+            }
+            if !found_q || !found_k || !found_v {
+                found_q = false;
+                found_k = false;
+                found_v = false;
+                for td in &sub.outputs {
+                    if td.shape[1] == q_ch && !found_q {
+                        found_q = true;
+                    } else if td.shape[1] == kv_ch {
+                        if !found_k {
+                            found_k = true;
+                        } else if !found_v {
+                            found_v = true;
+                        }
+                    }
+                }
+            }
+            found_q && found_k && found_v
+        });
+
+        let has_pre_attn = model_split
+            .programs
+            .iter()
+            .any(|s| s.name.ends_with("_pre_attn"));
+
+        if all_injectable && has_pre_attn {
+            for sub in &mut model_split.programs {
+                if sub.name.ends_with("_pre_attn") {
+                    inject_cache_write_ops(sub, &cw_config)?;
+                }
+            }
+            cache_write_fused = true;
+        }
+    }
+
+    // 3-4. Classify sub-programs and extract CPU weights.
+    let mil_config = MilTextConfig::default();
+
+    let mut embedding_sp: Option<&SubProgram> = None;
+    let mut lm_head_sp: Option<&SubProgram> = None;
+    let mut pre_attn_map: BTreeMap<usize, &SubProgram> = BTreeMap::new();
+    let mut post_attn_map: BTreeMap<usize, &SubProgram> = BTreeMap::new();
+    let mut fp16_attn_map: BTreeMap<usize, &SubProgram> = BTreeMap::new();
+
+    for sub in &model_split.programs {
+        if sub.name == "embedding" {
+            embedding_sp = Some(sub);
+        } else if sub.name == "lm_head" {
+            lm_head_sp = Some(sub);
+        } else if sub.name.ends_with("_pre_attn") {
+            if let Some(n) = sub
+                .name
+                .strip_suffix("_pre_attn")
+                .and_then(|s| s.strip_prefix("layer_"))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                pre_attn_map.insert(n, sub);
+            }
+        } else if sub.name.ends_with("_fp16_attn") {
+            if let Some(n) = sub
+                .name
+                .strip_suffix("_fp16_attn")
+                .and_then(|s| s.strip_prefix("layer_"))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                fp16_attn_map.insert(n, sub);
+            }
+        } else if sub.name.ends_with("_post_attn") {
+            if let Some(n) = sub
+                .name
+                .strip_suffix("_post_attn")
+                .and_then(|s| s.strip_prefix("layer_"))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                post_attn_map.insert(n, sub);
+            }
+        } else if sub.name.starts_with("layer_") {
+            if let Some(n) = sub
+                .name
+                .strip_prefix("layer_")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                pre_attn_map.insert(n, sub);
+            }
+        }
+    }
+
+    let embedding_sub =
+        embedding_sp.ok_or_else(|| anyhow::anyhow!("no embedding sub-program found"))?;
+    let lm_head_sub = lm_head_sp.ok_or_else(|| anyhow::anyhow!("no lm_head sub-program found"))?;
+
+    let layer_numbers: Vec<usize> = pre_attn_map.keys().copied().collect();
+    let num_layers = layer_numbers.len();
+    if num_layers == 0 {
+        anyhow::bail!("no layer sub-programs found after attention splitting");
+    }
+
+    // Extract CPU weights.
+    let embed_weight = extract_cpu_weight(embedding_sub, "embed")
+        .ok_or_else(|| anyhow::anyhow!("could not extract embedding weight"))?;
+    let lm_head_cpu_weight = extract_cpu_weight(lm_head_sub, "lm_head").unwrap_or_else(|| {
+        // Tied embeddings: lm_head reuses embedding weight.
+        CpuWeight {
+            data: embed_weight.data.clone(),
+            shape: embed_weight.shape,
+        }
+    });
+
+    let lm_head_hidden_size = lm_head_cpu_weight.shape[1];
+
+    // Extract the final RMSNorm weight.
+    let final_norm_weight = extract_1d_weight(lm_head_sub, "norm");
+
+    // Determine architecture parameters.
+    let (num_heads, num_kv_heads, head_dim, vocab_size, hidden_size) =
+        if let Some(ref arch) = original_arch {
+            (
+                arch.num_heads,
+                arch.num_kv_heads,
+                arch.head_dim,
+                arch.vocab_size,
+                arch.hidden_size,
+            )
+        } else {
+            let hidden = lm_head_hidden_size;
+            let hd = config.head_dim;
+            let nh = config.num_heads;
+            let nkv = config.num_kv_heads;
+            let vocab = lm_head_cpu_weight.shape[0];
+            (nh, nkv, hd, vocab, hidden)
+        };
+
+    // 5. Emit MIL text + weight blobs for each layer sub-program.
+    let mut layer_bundles: Vec<LayerBundle> = Vec::with_capacity(num_layers);
+
+    for &layer_n in &layer_numbers {
+        let pre_sub = pre_attn_map
+            .get(&layer_n)
+            .ok_or_else(|| anyhow::anyhow!("missing pre_attn for layer {layer_n}"))?;
+        let pre_attn_bundle = emit_sub_program_bundle(pre_sub, &mil_config)?;
+
+        let post_attn_bundle = if let Some(post_sub) = post_attn_map.get(&layer_n) {
+            Some(emit_sub_program_bundle(post_sub, &mil_config)?)
+        } else {
+            None
+        };
+
+        let fp16_attn_bundle = if let Some(attn_sub) = fp16_attn_map.get(&layer_n) {
+            Some(emit_sub_program_bundle(attn_sub, &mil_config)?)
+        } else {
+            None
+        };
+
+        // Donor compatibility: all layers share the same MIL text structure.
+        // Layer 0 is the donor; layers 1+ are donor-compatible.
+        let donor_compatible = layer_n > *layer_numbers.first().unwrap_or(&0);
+
+        layer_bundles.push(LayerBundle {
+            index: layer_n,
+            pre_attn: pre_attn_bundle,
+            post_attn: post_attn_bundle,
+            fp16_attn: fp16_attn_bundle,
+            cache_write_fused,
+            donor_compatible,
+        });
+    }
+
+    // Convert RoPE caches to raw bytes.
+    let rope_cos_bytes: Vec<u8> = rope_cos_cache
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let rope_sin_bytes: Vec<u8> = rope_sin_cache
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+
+    // Convert final norm weight to raw bytes.
+    let final_norm_bytes =
+        final_norm_weight.map(|w| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+
+    // 6. Assemble the bundle.
+    Ok(AneDecodeBundle {
+        architecture: BundleArchitecture {
+            vocab_size,
+            eos_tokens: config.eos_tokens.clone(),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            hidden_size,
+            rope_theta: config.rope_theta,
+            max_seq_len: config.max_seq_len,
+            qk_norm: has_qk_norm,
+        },
+        rope_cos: rope_cos_bytes,
+        rope_sin: rope_sin_bytes,
+        embedding_weights: embed_weight.data,
+        lm_head: LmHeadBundle::Cpu {
+            weight_data: lm_head_cpu_weight.data,
+            vocab_size: lm_head_cpu_weight.shape[0],
+            hidden_size: lm_head_cpu_weight.shape[1],
+        },
+        final_norm_weight: final_norm_bytes,
+        layers: layer_bundles,
+    })
+}
+
+/// Emit MIL text + weight blob for a single sub-program, producing a
+/// [`SubProgramBundle`].
+///
+/// Runs per-sub-program passes (f32→f16 conversion, layout fixups,
+/// padding, variable naming) before emission.
+fn emit_sub_program_bundle(
+    sub: &SubProgram,
+    mil_config: &MilTextConfig,
+) -> Result<SubProgramBundle> {
+    let mut program = sub.program.clone();
+
+    convert_f32_consts_to_f16(&mut program);
+    prune_unreferenced_inputs(&mut program);
+
+    let _ = AneLayoutPass.run(&mut program);
+    apply_min_seq_padding(&mut program, 32);
+    let _ = TypeRepropagationPass.run(&mut program);
+
+    // Rename variables to ANE-friendly names.
+    let _ = AneVariableNamingPass.run(&mut program);
+
+    let (mil_text, weight_entries) = program_to_mil_text(&program, mil_config)
+        .map_err(|e| anyhow::anyhow!("MIL text emission failed for {}: {e}", sub.name))?;
+
+    // Build the weight blob.
+    let mut blob = BlobFileWriter::new();
+    for entry in &weight_entries {
+        blob.add_weight(&entry.name, &entry.data, entry.dtype);
+    }
+
+    // Derive I/O descriptors from the processed program.
+    let inputs: Vec<BundleTensorDescriptor> = program
+        .main()
+        .map(|f| {
+            f.inputs
+                .iter()
+                .map(|(name, ty)| {
+                    let mut shape = [1usize; 4];
+                    for (i, d) in ty.shape.iter().enumerate().take(4) {
+                        shape[i] = d.unwrap_or(1);
+                    }
+                    BundleTensorDescriptor {
+                        name: name.clone(),
+                        shape,
+                        dtype: format!("{:?}", ty.scalar_type),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let outputs: Vec<BundleTensorDescriptor> = program
+        .main()
+        .map(|f| {
+            f.body
+                .outputs
+                .iter()
+                .filter_map(|out_name| {
+                    f.body
+                        .operations
+                        .iter()
+                        .find(|op| op.outputs.iter().any(|o| o == out_name))
+                        .and_then(|op| {
+                            let idx = op.outputs.iter().position(|o| o == out_name)?;
+                            let ty = op.output_types.get(idx)?.as_ref()?;
+                            let mut shape = [1usize; 4];
+                            for (i, d) in ty.shape.iter().enumerate().take(4) {
+                                shape[i] = d.unwrap_or(1);
+                            }
+                            Some(BundleTensorDescriptor {
+                                name: out_name.clone(),
+                                shape,
+                                dtype: format!("{:?}", ty.scalar_type),
+                            })
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(SubProgramBundle {
+        name: sub.name.clone(),
+        mil_text,
+        weight_blob: blob.as_bytes(),
+        inputs,
+        outputs,
+        input_packing: None,
+    })
+}
 
 /// Top-level manifest for `.ironml` bundles.
 #[derive(Debug, Serialize, Deserialize)]

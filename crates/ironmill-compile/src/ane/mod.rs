@@ -5,6 +5,7 @@ use mil_rs::ir::ScalarType;
 pub mod blobfile;
 pub mod bundle;
 pub mod cache;
+pub mod decode_compile;
 pub mod mil_text;
 pub mod packing;
 pub mod passes;
