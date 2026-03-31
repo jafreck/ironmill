@@ -2,8 +2,9 @@
 
 > Design doc for static model weight compression using PolarQuant.
 >
-> **Status**: Partially implemented — `PolarQuantPass` exists, needs ANE
-> integration testing and pipeline wiring for the FP16 baseline path.
+> **Status**: Complete — `PolarQuantPass`, `PolarRotationFusionPass`, and
+> `beta_quantizer` are implemented. GPU runtime consumption is tracked in
+> [GPU Quantized Inference](../development/gpu-quantized-inference.md).
 
 ## Problem
 

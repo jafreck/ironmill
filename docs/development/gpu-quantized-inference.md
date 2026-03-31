@@ -7,7 +7,8 @@ acceptance criteria, and explicit dependencies.
 Derived from investigation of the compiler passes, GPU weight loading path,
 and TurboQuant INT4 implementation (which proves the custom-kernel pattern).
 
-> **Prerequisites**: [PolarQuant Weight Quantization](../design/polarquant-weight-quantization.md),
+> **Prerequisites**: [PolarQuant Weight Quantization](../archive/polarquant-weight-quantization.md)
+> (algorithm, compiler pass, ANE constraints),
 > [Metal GPU Backend](../design/gpu-backend.md)
 
 ---
@@ -102,9 +103,13 @@ Update `WeightTensor::borrowed()` and `WeightTensor::owned()` to default
 
 #### Name mapping
 
-MIL IR sanitizes names: `model.layers.0.self_attn.q_proj.weight` becomes
+MIL IR sanitizes names via `sanitize_mil_name()`: replaces non-alphanumeric
+chars (except `_`) with underscores, prefixes `_` if the result starts with a
+digit, and deduplicates collisions with `_1`, `_2` suffixes. So
+`model.layers.0.self_attn.q_proj.weight` becomes
 `model_layers_0_self_attn_q_proj_weight`. The sanitization is deterministic
-(`sanitize_mil_name()` in `mil-rs/src/convert/onnx_graph.rs`).
+(`sanitize_mil_name()` and `sanitize_block_names()` in
+`mil-rs/src/convert/onnx_graph.rs`).
 
 `MilWeightProvider` builds a reverse mapping at construction time:
 
@@ -126,9 +131,11 @@ struct ExtractedTensor {
 Construction walks the MIL Program's main function block:
 
 1. For each `constexpr_lut_to_dense` op:
-   - Extract `lut`, `indices`, `shape` from op attributes
-   - Find the associated `{name}_polar_norms` const op (row norms)
-   - Find the associated `{name}_polar_mul` mul op
+   - Extract `lut`, `indices`, `shape`, `polar_quant_seed` from op attributes
+   - Find the associated `{op_name}_polar_norms` const op (row norms,
+     output named `{original_output}_polar_norms`)
+   - Find the associated `{op_name}_polar_mul` mul op (output named
+     `{original_output}_polar_scaled` — note: output name differs from op name)
    - Reverse-sanitize the op name to recover the HF name
    - Store as `ExtractedTensor` with `QuantizationInfo::LutToDense`
 
@@ -145,15 +152,16 @@ Construction walks the MIL Program's main function block:
 
 ```rust
 fn reverse_sanitize(sanitized: &str) -> String {
-    // MIL sanitization replaces dots, slashes, etc. with underscores.
-    // HF names use dots as separators. The pattern is deterministic:
-    //   model.layers.0.self_attn.q_proj.weight
+    // sanitize_mil_name() replaces non-alphanumeric (except _) with _,
+    // prefixes _ for leading digits, and deduplicates with _1/_2 suffixes.
+    // HF names use dots: model.layers.0.self_attn.q_proj.weight
     //   → model_layers_0_self_attn_q_proj_weight
-    // Reverse by replacing underscores with dots, then fix known patterns
-    // where underscores are semantic (e.g., "q_proj", "self_attn").
+    // Reverse by replacing _ with . then restoring known underscore
+    // patterns: self_attn, q_proj, k_proj, v_proj, o_proj, gate_proj,
+    // up_proj, down_proj, embed_tokens, word_embeddings.
     //
-    // Alternatively: store the original name in the MIL op as metadata
-    // during ONNX import (cleaner long-term solution).
+    // Cleaner long-term: store original name as op attribute during
+    // ONNX import (see Phase 2+).
 }
 ```
 
@@ -242,8 +250,9 @@ pub fn dequant_affine(
 #### Index unpacking detail
 
 PolarQuantPass packs indices with `n_bits` per value into `u8` bytes,
-LSB-first. For 4-bit: 2 values per byte (low nibble, high nibble) — same
-packing as GPU TurboQuant INT4 in `turboquant.metal`.
+LSB-first. For 4-bit: 2 values per byte — `lo | (hi << 4)` where the low
+nibble holds the first value and the high nibble holds the second. This
+matches GPU TurboQuant INT4 packing in `turboquant.metal`.
 
 #### Acceptance criteria
 
@@ -312,6 +321,8 @@ fn load_weight_buffer(
   contains PolarQuant-compressed tensors.
 - All Metal buffers contain valid FP16 data.
 - Existing path (SafeTensors/GGUF with `QuantizationInfo::None`) unchanged.
+- Tied embeddings (`config.tie_word_embeddings`) still work — `lm_head`
+  loads from `model.embed_tokens.weight` when tied.
 
 **Dependencies:** Task 2, Task 3
 
@@ -343,9 +354,11 @@ impl GpuCompileBuilder {
 
     /// Run import + PolarQuant passes, return a provider for GpuWeights.
     pub fn build(self) -> Result<MilWeightProvider, CompileError> {
-        // 1. Import ONNX/SafeTensors/GGUF → Program
-        // 2. Run PolarQuantPass (+ PolarRotationFusionPass)
-        // 3. Wrap in MilWeightProvider
+        // 1. detect_format(input) → ONNX/SafeTensors/GGUF/MLPackage
+        // 2. Import to Program (reuse CompileBuilder's import logic)
+        // 3. Run PassPipeline::new().with_polar_quant(n_bits, min_elements)
+        //    (includes PolarQuantPass + PolarRotationFusionPass)
+        // 4. Wrap in MilWeightProvider
     }
 }
 ```
@@ -533,7 +546,9 @@ per byte with no nibble unpacking.
 
 - Kernel produces correct output vs. MPS FP16 matmul (within quantization tolerance).
 - Benchmarked: memory savings and throughput vs. dense MPS path.
-- Compiled via existing `GpuPipelines::compile()` infrastructure.
+- Shader added to `GpuPipelines::compile()` in `gpu/ops.rs` via
+  `include_str!` + `device.compile_shader_source()` (same pattern as
+  existing shaders: normalization, activation, rope, turboquant, etc.).
 
 **Dependencies:** Task 6
 
