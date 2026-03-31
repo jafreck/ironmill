@@ -5,12 +5,15 @@
 //! high-level [`AneModel`] facade.
 
 pub mod decode;
+#[allow(unsafe_code)]
+pub mod device;
 pub mod model;
 #[allow(unsafe_code)]
 pub mod runtime;
 pub mod turboquant;
 
 pub use decode::AneInference;
+pub use device::{AneDevice, HardwareAneDevice, HardwareProgram};
 pub use model::{
     AneConfig, AneDirectBackend, AneModel, AneRuntimeModel, CompiledArtifacts, SubProgramArtifact,
 };
