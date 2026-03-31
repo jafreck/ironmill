@@ -1,9 +1,8 @@
 # Perplexity Benchmark Implementation
 
-> **Status**: Not started — blocked on real attention in ANE inference path
+> **Status**: Not started
 >
-> **Prerequisite**: `AneInference::decode()` must produce correct logits
-> (i.e., the FP16 attention path computes real SDPA, not Q pass-through)
+> **Prerequisite**: ~~`AneInference::decode()` must produce correct logits~~ ✅ FP16 attention implemented (`c632f05`)
 >
 > **Goal**: Measure perplexity on WikiText-2 for each quantization config
 > and cross-reference with weight-level SNR to validate that ironmill's

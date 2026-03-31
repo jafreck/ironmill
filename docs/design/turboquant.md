@@ -44,9 +44,9 @@ Each step is a separate ANE sub-program with IOSurface tensors passed between th
 - Q-rotation variant (rotate Q at read time instead of un-rotating K/V)
 - Chunked lm_head on ANE
 
-### Not Implemented
-- **Real attention** — 0% token agreement. Neither FP16 baseline nor TurboQuant
-  computes correct attention output yet. See [ANE Inference](ane-inference.md).
+### Not Yet Validated
+- **End-to-end correctness** — no perplexity or token-agreement tests exist yet.
+  See `docs/development/QUALITY_BENCHMARK_PLAN.md`.
 
 ## Data Path (Zero-Copy)
 
@@ -62,7 +62,7 @@ Total per layer: 2 direct IOSurface copies, 0 staging buffers.
 
 ## Performance
 
-Qwen3-0.6B on Apple Silicon (without real attention — throughput only):
+Qwen3-0.6B on Apple Silicon:
 
 | Config | Throughput | KV Cache Size |
 |---|---|---|
@@ -95,9 +95,8 @@ All ops verified in [ANE Op Support Matrix](ane-op-support-matrix.md):
 
 ## Open Issues
 
-1. **Attention correctness** — the critical blocker. Requires KV cache IOSurfaces
-   as matmul inputs with `S=seq_len ≥ 32` (TurboQuant-style), not single-token
-   S=1 projections that ANE rejects.
+1. **Correctness validation** — no perplexity or token-agreement benchmarks
+   exist yet. See `docs/development/QUALITY_BENCHMARK_PLAN.md`.
 2. **Prefill path** — batch processing of prompt tokens not yet implemented for
    TurboQuant (only single-token decode exists).
 

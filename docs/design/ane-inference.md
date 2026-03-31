@@ -18,20 +18,15 @@
 - `Drop for CompiledProgram` prevents cross-model handle leaks
 
 ### What Doesn't Work
-- **Real attention is not implemented** — 0% token agreement between FP16
-  baseline and TurboQuant against reference
-- FP16 attention sub-programs fail due to shape constraints: single-token
-  decode creates matmul shapes with `S=1` and `C>768`, which ANE rejects
-- The inference pipeline runs end-to-end but produces wrong output
+- No end-to-end correctness tests (perplexity, token agreement) — see
+  `docs/development/QUALITY_BENCHMARK_PLAN.md`
 
-### Performance (without real attention)
+### Performance
 
 | Config | Throughput | KV Cache |
 |---|---|---|
 | Qwen3-0.6B FP16 baseline | ~6.1 tok/s | 29.0 MB |
 | Qwen3-0.6B TurboQuant INT8 | ~5.5 tok/s | 14.5 MB |
-
-These numbers reflect sub-program execution overhead only, not correct inference.
 
 ## Key Discoveries
 
@@ -70,7 +65,8 @@ that don't surface during single-op testing.
 
 ## Architecture Requirements for Real Attention
 
-The FP16 attention path needs the same architectural pattern as TurboQuant:
+FP16 attention on ANE is implemented via hand-written MIL programs
+(`c632f05`). The key architectural decisions:
 
 1. **KV cache as matmul inputs** — IOSurface-backed tensors with `S=seq_len ≥ 32`,
    not single-token `S=1` projections
