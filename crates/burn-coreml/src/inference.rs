@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use ironmill_coreml::{ComputeUnits, Model, MultiArrayDataType, PredictionInput};
+use ironmill_coreml_sys::{ComputeUnits, Model, MultiArrayDataType, PredictionInput};
 
 /// A CoreML inference session for running exported models.
 ///
@@ -13,7 +13,7 @@ use ironmill_coreml::{ComputeUnits, Model, MultiArrayDataType, PredictionInput};
 ///
 /// ```no_run
 /// use burn_coreml::inference::CoreMlInference;
-/// use ironmill_coreml::ComputeUnits;
+/// use ironmill_coreml_sys::ComputeUnits;
 ///
 /// let session = CoreMlInference::load("model.mlmodelc", ComputeUnits::All)?;
 /// let inputs = session.input_description()?;
@@ -104,7 +104,7 @@ impl CoreMlInference {
     pub fn predict_raw(
         &self,
         inputs: &[(&str, &[usize], &[f32])],
-    ) -> anyhow::Result<ironmill_coreml::PredictionOutput> {
+    ) -> anyhow::Result<ironmill_coreml_sys::PredictionOutput> {
         let mut pi = PredictionInput::new();
         for &(name, shape, data) in inputs {
             pi.add_multi_array(name, shape, MultiArrayDataType::Float32, data)?;

@@ -8,7 +8,7 @@ use ironmill_compile::coreml::compiler::compile_model;
 use mil_rs::ir::passes::{ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass};
 use mil_rs::{Pass, onnx_to_program, program_to_model, read_onnx, write_mlpackage};
 
-use ironmill_coreml::{ComputeUnits, Model, build_dummy_input};
+use ironmill_coreml_sys::{ComputeUnits, Model, build_dummy_input};
 
 const SPEC_VERSION: i32 = 7;
 

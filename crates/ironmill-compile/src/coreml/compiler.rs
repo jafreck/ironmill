@@ -12,7 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use mil_rs::error::{MilError, Result};
+use crate::error::CompileError;
+
+type Result<T> = std::result::Result<T, CompileError>;
 
 /// Check if `xcrun coremlcompiler` is available on this system.
 pub fn is_compiler_available() -> bool {
@@ -46,14 +48,14 @@ pub fn compile_model(input: impl AsRef<Path>, output_dir: impl AsRef<Path>) -> R
     let output_dir = output_dir.as_ref();
 
     if !input.exists() {
-        return Err(MilError::Io(std::io::Error::new(
+        return Err(CompileError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("input path does not exist: {}", input.display()),
         )));
     }
 
     if !is_compiler_available() {
-        return Err(MilError::Validation(
+        return Err(CompileError::CompilerNotAvailable(
             "xcrun coremlcompiler not found. Install Xcode or Command Line Tools.".into(),
         ));
     }
@@ -68,7 +70,7 @@ pub fn compile_model(input: impl AsRef<Path>, output_dir: impl AsRef<Path>) -> R
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MilError::Validation(format!(
+        return Err(CompileError::CompilerFailed(format!(
             "coremlcompiler failed: {stderr}"
         )));
     }
@@ -83,7 +85,7 @@ pub fn compile_model(input: impl AsRef<Path>, output_dir: impl AsRef<Path>) -> R
     if compiled.exists() {
         Ok(compiled)
     } else {
-        Err(MilError::Validation(
+        Err(CompileError::Other(
             "compiled model not found in output directory".into(),
         ))
     }

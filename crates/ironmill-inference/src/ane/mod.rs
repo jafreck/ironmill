@@ -1,14 +1,19 @@
 //! ANE (Apple Neural Engine) direct inference backend.
 //!
-//! Provides the `AneInference` autoregressive decode loop and the safe
-//! runtime wrapper around `ironmill_ane_sys::AneRuntime`.
+//! Provides the `AneInference` autoregressive decode loop, the safe
+//! runtime wrapper around `ironmill_ane_sys::AneRuntime`, and the
+//! high-level [`AneModel`] facade.
 
 pub mod decode;
+pub mod model;
 #[allow(unsafe_code)]
 pub mod runtime;
 pub mod turboquant;
 
 pub use decode::AneInference;
+pub use model::{
+    AneConfig, AneDirectBackend, AneModel, AneRuntimeModel, CompiledArtifacts, SubProgramArtifact,
+};
 pub use runtime::AneRuntime;
 
 // Re-export error/result from the parent module for local convenience.

@@ -1,6 +1,6 @@
 //! CoreML inference runtime (macOS only).
 //!
-//! Wraps [`ironmill_coreml::Model`] and returns raw f32 data + shapes that
+//! Wraps [`ironmill_coreml_sys::Model`] and returns raw f32 data + shapes that
 //! callers can convert into candle `Tensor` values:
 //!
 //! ```ignore
@@ -16,8 +16,8 @@
 
 use std::path::Path;
 
-pub use ironmill_coreml::ComputeUnits;
-use ironmill_coreml::{Model, MultiArrayDataType, PredictionInput};
+pub use ironmill_coreml_sys::ComputeUnits;
+use ironmill_coreml_sys::{Model, MultiArrayDataType, PredictionInput};
 
 /// Output tensor from CoreML inference.
 #[derive(Debug, Clone)]

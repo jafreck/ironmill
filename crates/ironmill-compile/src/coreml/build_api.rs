@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use mil_rs::build_api::{CompileBuilder, Quantization, TargetComputeUnit};
+//! use ironmill_compile::coreml::build_api::{CompileBuilder, Quantization, TargetComputeUnit};
 //!
 //! let output = CompileBuilder::new("model.onnx")
 //!     .quantize(Quantization::Fp16)
@@ -23,13 +23,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::coreml::compiler::{compile_model, is_compiler_available};
+use crate::error::CompileError;
 use mil_rs::convert::{
     ConversionConfig, model_to_program, onnx_to_program_with_config, program_to_model,
 };
-use mil_rs::error::{MilError, Result};
 use mil_rs::ir::{PassPipeline, PipelineReport};
 use mil_rs::reader::{read_mlmodel, read_mlpackage, read_onnx};
 use mil_rs::writer::write_mlpackage;
+
+type Result<T> = std::result::Result<T, CompileError>;
 
 /// Quantization mode for model conversion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -69,7 +71,7 @@ pub enum TargetComputeUnit {
 /// # Example
 ///
 /// ```no_run
-/// use mil_rs::build_api::{CompileBuilder, Quantization};
+/// use ironmill_compile::coreml::build_api::{CompileBuilder, Quantization};
 ///
 /// CompileBuilder::new("model.onnx")
 ///     .quantize(Quantization::Fp16)
@@ -185,7 +187,7 @@ impl CompileBuilder {
         let input = &self.input;
 
         if !input.exists() {
-            return Err(MilError::Io(std::io::Error::new(
+            return Err(CompileError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("input path does not exist: {}", input.display()),
             )));
@@ -221,7 +223,7 @@ impl CompileBuilder {
                 result.program
             }
             InputFormat::Unknown(ext) => {
-                return Err(MilError::Validation(format!(
+                return Err(CompileError::Other(format!(
                     "unsupported input format '{ext}'. \
                      Expected .onnx, .mlmodel, .mlpackage, .gguf, .safetensors, \
                      or a directory containing config.json."

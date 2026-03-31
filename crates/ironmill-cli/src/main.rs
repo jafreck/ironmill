@@ -935,7 +935,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
             RuntimeArg::AneDirect => {
                 #[cfg(feature = "ane-direct")]
                 {
-                    use ironmill_ane::CompiledArtifacts;
+                    use ironmill_inference::CompiledArtifacts;
 
                     let output_dir = opts.output.clone().unwrap_or_else(|| {
                         let stem = input_path

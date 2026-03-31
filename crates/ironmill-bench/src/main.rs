@@ -132,11 +132,11 @@ fn main() -> Result<()> {
         },
     };
 
-    let compute_units: Vec<ironmill_coreml::ComputeUnits> = matrix
+    let compute_units: Vec<ironmill_coreml_sys::ComputeUnits> = matrix
         .settings
         .backends
         .iter()
-        .map(|b| b.parse::<ironmill_coreml::ComputeUnits>())
+        .map(|b| b.parse::<ironmill_coreml_sys::ComputeUnits>())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("invalid backend: {e}"))?;
 
@@ -272,7 +272,7 @@ fn main() -> Result<()> {
                         }
                     };
 
-                    let config = ironmill_ane::AneConfig::default();
+                    let config = ironmill_inference::AneConfig::default();
 
                     let mut run_results = Vec::new();
                     for run_idx in 0..matrix.settings.runs {

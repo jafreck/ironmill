@@ -16,4 +16,4 @@ anyhow = { workspace = true }
 half = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-ironmill-coreml = { workspace = true }
+ironmill-coreml-sys = { workspace = true }

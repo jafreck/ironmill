@@ -122,7 +122,7 @@ dependencies = [
  "anyhow",
  "half",
  "ironmill-compile",
- "ironmill-coreml",
+ "ironmill-coreml-sys",
  "mil-rs",
 ]
 
@@ -145,7 +145,7 @@ dependencies = [
  "anyhow",
  "half",
  "ironmill-compile",
- "ironmill-coreml",
+ "ironmill-coreml-sys",
  "mil-rs",
 ]
 
@@ -451,23 +451,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironmill-ane"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "half",
- "ironmill-ane-sys",
- "ironmill-compile",
- "ironmill-inference",
- "ironmill-iosurface",
- "ironmill-runtime",
- "mil-rs",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
 name = "ironmill-ane-sys"
 version = "0.1.0"
 dependencies = [
@@ -481,9 +464,10 @@ dependencies = [
  "anyhow",
  "clap",
  "half",
- "ironmill-ane",
  "ironmill-compile",
- "ironmill-coreml",
+ "ironmill-coreml-sys",
+ "ironmill-inference",
+ "ironmill-iosurface",
  "mil-rs",
  "serde",
  "serde_json",
@@ -498,8 +482,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "ironmill-ane",
  "ironmill-compile",
+ "ironmill-inference",
  "mil-rs",
  "serde_json",
  "tempfile",
@@ -524,15 +508,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
-]
-
-[[package]]
-name = "ironmill-coreml"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ironmill-coreml-sys",
- "ironmill-inference",
 ]
 
 [[package]]
@@ -571,15 +546,6 @@ dependencies = [
  "half",
  "mil-rs",
  "thiserror",
-]
-
-[[package]]
-name = "ironmill-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "half",
- "ironmill-inference",
 ]
 
 [[package]]

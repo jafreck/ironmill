@@ -13,8 +13,9 @@ path = "src/main.rs"
 [dependencies]
 mil-rs = { workspace = true }
 ironmill-compile = { workspace = true }
-ironmill-coreml = { path = "../ironmill-coreml" }
-ironmill-ane = { path = "../ironmill-ane", optional = true }
+ironmill-coreml-sys = { workspace = true }
+ironmill-inference = { path = "../ironmill-inference", optional = true }
+ironmill-iosurface = { path = "../ironmill-iosurface", optional = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,4 +29,4 @@ tempfile = { workspace = true }
 
 [features]
 default = []
-ane-direct = ["dep:ironmill-ane"]
+ane-direct = ["dep:ironmill-inference", "dep:ironmill-iosurface"]

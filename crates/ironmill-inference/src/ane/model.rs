@@ -1,61 +1,29 @@
-//! ANE (Apple Neural Engine) direct runtime backend for ironmill.
+//! High-level ANE model API and compiled artifacts.
 //!
-//! This crate provides a Rust-native interface to Apple's private ANE APIs
-//! (`_ANEInMemoryModel`, `_ANERequest`, `_ANEIOSurfaceObject`) for compiling
-//! and executing models directly on the Neural Engine, bypassing CoreML's
-//! `MLModel` path. Follows the same approach as the Orion project.
-//!
-//! # ⚠️ Private API Warning
-//!
-//! This crate uses **undocumented Apple private APIs** that may change between
-//! macOS releases. It is feature-gated behind `ane-direct` and should not be
-//! used in Mac App Store submissions.
-//!
-//! # Architecture
-//!
-//! The crate mirrors `ironmill-coreml` but targets the ANE directly:
-//!
-//! | Module      | Purpose                                    |
-//! |-------------|--------------------------------------------|
-//! | `blobfile`  | BLOBFILE weight format writer               |
-//! | `tensor`    | IOSurface-backed tensor I/O                 |
-//! | `runtime`   | ANE lifecycle and program execution          |
-//! | `cache`     | Compiled program cache with disk persistence|
-//! | `split`     | Model → ANE-sized sub-program splitter      |
-//! | `program`   | Compiled program handle types               |
-
-#![deny(unsafe_code)]
-
-#[cfg(not(target_os = "macos"))]
-compile_error!("ironmill-ane only supports macOS");
-
-pub mod program;
-pub mod tensor;
-
-// Re-export inference modules from ironmill-inference for backward compatibility.
-pub use ironmill_inference::ane::decode as inference;
-pub use ironmill_inference::ane::decode::AneInference;
-pub use ironmill_inference::ane::runtime;
-pub use ironmill_inference::ane::turboquant;
-pub use ironmill_inference::ane::turboquant::mil_emitter as turboquant_mil;
+//! Contains the [`AneModel`] facade that orchestrates the full ANE pipeline
+//! (IR passes → split → emit MIL → compile → load → eval), plus
+//! [`CompiledArtifacts`] for offline compilation inspection.
 
 use std::path::PathBuf;
 
 use mil_rs::ir::ScalarType;
 
+use ironmill_ane_sys::AneCompiler;
+use ironmill_compile::ane::TensorDescriptor;
 use ironmill_compile::ane::blobfile::BlobFileWriter;
 use ironmill_compile::ane::cache::ProgramCache;
+use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+use ironmill_compile::ane::passes::{
+    AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
+    OpSubstitutionPass,
+};
 use ironmill_compile::ane::split::{SplitConfig, split_for_ane};
+use ironmill_iosurface::{AneTensor, uniform_alloc_size};
+use mil_rs::ir::Pass;
 
-pub use ironmill_compile::ane::TensorDescriptor;
-
-use crate::program::LoadedProgram;
-use crate::tensor::{AneTensor, uniform_alloc_size};
-use ironmill_inference::ane::runtime::AneRuntime;
-
-// ── Error type (re-exported from ironmill-inference) ──────────────
-
-pub use ironmill_inference::AneError;
+use super::runtime::AneRuntime;
+use crate::AneError;
+use crate::types::{ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor};
 
 /// Result type alias for ANE operations.
 pub type Result<T> = std::result::Result<T, AneError>;
@@ -89,8 +57,6 @@ impl Default for AneConfig {
 
 /// High-level model API that orchestrates the full ANE pipeline:
 /// IR passes → split → emit MIL → compile → load → eval.
-///
-/// Mirrors [`ironmill_coreml::Model`] for the direct-ANE path.
 pub struct AneModel {
     runtime: AneRuntime,
     sub_programs: Vec<LoadedSubProgram>,
@@ -102,7 +68,7 @@ pub struct AneModel {
 }
 
 struct LoadedSubProgram {
-    loaded: LoadedProgram,
+    loaded: ironmill_ane_sys::LoadedProgram,
     meta: SubProgramMeta,
     input_tensors: Vec<AneTensor>,
     output_tensors: Vec<AneTensor>,
@@ -131,14 +97,6 @@ impl AneModel {
     ///    f. Pre-allocate IOSurface tensors for I/O
     /// 4. Return the assembled `AneModel`
     pub fn compile_and_load(program: &mil_rs::ir::Program, config: AneConfig) -> Result<Self> {
-        use ironmill_ane_sys::AneCompiler;
-        use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
-        use ironmill_compile::ane::passes::{
-            AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
-            OpSubstitutionPass,
-        };
-        use mil_rs::ir::Pass;
-
         // 1. Clone and run ANE-specific passes
         let mut program = program.clone();
         let passes: &[(&str, &dyn Pass)] = &[
@@ -178,8 +136,6 @@ impl AneModel {
                 })?;
 
             // 4b. Collect raw weight data for the compiler's weight dict.
-            // The weight dict passes raw bytes to the ANE framework.
-            // BLOBFILEs are a disk format — the dict uses raw data directly.
             let weight_refs: Vec<(String, Vec<u8>)> = weight_entries
                 .iter()
                 .map(|e| (e.path.clone(), e.data.clone()))
@@ -298,9 +254,6 @@ impl AneModel {
         // Execute sub-programs sequentially, wiring outputs → next inputs.
         let n = self.sub_programs.len();
         for i in 0..n {
-            // Split-borrow: destructure the sub-program so the borrow checker
-            // can see that `loaded`, `input_tensors`, and `output_tensors` are
-            // disjoint from `self.runtime`.
             {
                 let sub = &mut self.sub_programs[i];
                 let input_refs: Vec<&AneTensor> = sub.input_tensors.iter().collect();
@@ -395,16 +348,8 @@ impl CompiledArtifacts {
     ///
     /// This exercises the same passes, splitting, MIL text emission, and
     /// BLOBFILE writing as [`AneModel::compile_and_load`], but does NOT
-    /// require the ANE runtime or private APIs. The artifacts can be
-    /// inspected, persisted to disk, or fed to `_ANECompiler` separately.
+    /// require the ANE runtime or private APIs.
     pub fn prepare(program: &mil_rs::ir::Program) -> Result<Self> {
-        use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
-        use ironmill_compile::ane::passes::{
-            AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
-            OpSubstitutionPass,
-        };
-        use mil_rs::ir::Pass;
-
         // 1. Clone and run ANE-specific passes
         let mut program = program.clone();
         let passes: &[(&str, &dyn Pass)] = &[
@@ -456,11 +401,6 @@ impl CompiledArtifacts {
     }
 
     /// Save all artifacts to a directory on disk.
-    ///
-    /// Creates one subdirectory per sub-program containing:
-    /// - `program.mil` — the MIL text
-    /// - `weights.blob` — the BLOBFILE
-    /// - `manifest.json` — I/O descriptors
     pub fn save(&self, dir: &std::path::Path) -> Result<()> {
         use std::io::Write;
 
@@ -472,7 +412,6 @@ impl CompiledArtifacts {
             std::fs::create_dir_all(&sub_dir)
                 .map_err(|e| AneError::Other(anyhow::anyhow!("failed to create sub-dir: {e}")))?;
 
-            // Write MIL text
             let mil_path = sub_dir.join("program.mil");
             let mut f = std::fs::File::create(&mil_path).map_err(|e| {
                 AneError::Other(anyhow::anyhow!(
@@ -483,12 +422,10 @@ impl CompiledArtifacts {
             f.write_all(sub.mil_text.as_bytes())
                 .map_err(|e| AneError::Other(anyhow::anyhow!("failed to write MIL text: {e}")))?;
 
-            // Write BLOBFILE
             let blob_path = sub_dir.join("weights.blob");
             std::fs::write(&blob_path, &sub.weight_blob)
                 .map_err(|e| AneError::Other(anyhow::anyhow!("failed to write BLOBFILE: {e}")))?;
 
-            // Write manifest
             let manifest = serde_json::json!({
                 "name": sub.name,
                 "inputs": sub.inputs.iter().map(|td| {
@@ -522,16 +459,10 @@ impl CompiledArtifacts {
     }
 
     /// Validate that all artifacts are well-formed.
-    ///
-    /// Checks:
-    /// - MIL text is non-empty and contains expected structure
-    /// - BLOBFILE has valid header
-    /// - All sub-programs have at least one output
     pub fn validate(&self) -> Result<Vec<String>> {
         let mut warnings = Vec::new();
 
         for sub in &self.sub_programs {
-            // MIL text must contain program declaration
             if !sub.mil_text.contains("program(") {
                 return Err(AneError::CompileFailed {
                     status: 0,
@@ -551,7 +482,6 @@ impl CompiledArtifacts {
                 });
             }
 
-            // BLOBFILE must have valid header (Orion format: byte 0=1, 0xDEADBEEF at byte 64)
             if sub.weight_blob.len() >= 68
                 && (sub.weight_blob[0] != 1 || sub.weight_blob[64..68] != [0xEF, 0xBE, 0xAD, 0xDE])
             {
@@ -564,7 +494,6 @@ impl CompiledArtifacts {
                 });
             }
 
-            // Sub-programs with no outputs are likely errors
             if sub.outputs.is_empty() {
                 warnings.push(format!("sub-program '{}': has no outputs", sub.name));
             }
@@ -575,10 +504,6 @@ impl CompiledArtifacts {
 }
 
 // ── RuntimeBackend / RuntimeModel ─────────────────────────────────
-
-use ironmill_runtime::{
-    ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor,
-};
 
 fn scalar_to_element(dt: ScalarType) -> ElementType {
     match dt {
@@ -608,9 +533,6 @@ impl RuntimeModel for AneRuntimeModel {
     }
 
     fn predict(&self, _inputs: &[RuntimeTensor]) -> anyhow::Result<Vec<RuntimeTensor>> {
-        // ANE predict requires &mut self for IOSurface buffer management.
-        // Full implementation would need interior mutability. For now,
-        // the trait enables backend-agnostic code paths in CLI/bench.
         Err(anyhow::anyhow!(
             "ANE predict through RuntimeModel requires compile_and_load with a Program"
         ))
@@ -641,6 +563,14 @@ impl RuntimeBackend for AneDirectBackend {
 mod tests {
     use super::*;
 
+    #[test]
+    fn config_default() {
+        let c = AneConfig::default();
+        assert_eq!(c.max_programs, 100);
+        assert!(c.cache_dir.is_none());
+        assert!(!c.enable_int4);
+    }
+
     /// Try to construct a minimal `AneModel` for testing descriptor methods.
     /// Returns `None` if the ANE runtime isn't available (e.g. CI).
     fn test_model(sub_programs: Vec<LoadedSubProgram>) -> Option<AneModel> {
@@ -653,14 +583,6 @@ mod tests {
             config: AneConfig::default(),
             _work_dir: work_dir,
         })
-    }
-
-    #[test]
-    fn config_default() {
-        let c = AneConfig::default();
-        assert_eq!(c.max_programs, 100);
-        assert!(c.cache_dir.is_none());
-        assert!(!c.enable_int4);
     }
 
     #[test]
@@ -686,13 +608,6 @@ mod tests {
 
     #[test]
     fn pass_pipeline_runs_without_error() {
-        use ironmill_compile::ane::passes::{
-            AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
-            OpSubstitutionPass,
-        };
-        use mil_rs::ir::Pass;
-
-        // Minimal empty program — passes should be no-ops.
         let mut program = mil_rs::ir::Program {
             version: "1.0".to_string(),
             functions: Default::default(),
@@ -716,7 +631,6 @@ mod tests {
 
     // ── E2E pipeline tests ───────────────────────────────────────
 
-    /// Build a simple `z = add(x, y)` program for e2e testing.
     fn build_add_program() -> mil_rs::ir::Program {
         use mil_rs::ir::{Block, Function, Operation, Program, TensorType, Value};
 
@@ -743,14 +657,11 @@ mod tests {
         program
     }
 
-    /// Build a program with const weights: `z = add(x, w)` where w is a
-    /// baked weight tensor.
     fn build_weighted_program() -> mil_rs::ir::Program {
         use mil_rs::ir::{Block, Function, Operation, Program, TensorType, Value};
 
         let input_ty = TensorType::new(ScalarType::Float16, vec![1, 4, 1, 8]);
 
-        // Weight: 4*8 = 32 fp16 elements = 64 bytes of zeros
         let weight_data = vec![0u8; 64];
         let weight_op = Operation::new("const", "w")
             .with_input(
@@ -783,16 +694,14 @@ mod tests {
         program
     }
 
-    /// Build a multi-layer program to test splitting.
     fn build_multi_layer_program() -> mil_rs::ir::Program {
         use mil_rs::ir::{Block, Function, Operation, Program, TensorType, Value};
 
         let ty = TensorType::new(ScalarType::Float16, vec![1, 4, 1, 8]);
-        let weight_data = vec![0u8; 64]; // 32 fp16 elements
+        let weight_data = vec![0u8; 64];
 
         let mut block = Block::new();
 
-        // Layer 0: w0 + add
         let w0 = Operation::new("const", "layer_0_w")
             .with_input(
                 "val",
@@ -810,7 +719,6 @@ mod tests {
         block.add_op(w0);
         block.add_op(add0);
 
-        // Layer 1: w1 + add
         let w1 = Operation::new("const", "layer_1_w")
             .with_input(
                 "val",
@@ -839,13 +747,6 @@ mod tests {
         program
     }
 
-    // ── CompiledArtifacts tests ──────────────────────────────────
-
-    /// Build a conv-based linear layer program matching Orion's
-    /// `orion_mil_linear` pattern — the known-working minimal ANE program.
-    ///
-    /// Implements: output = conv(weight, input) with 1×1 convolution.
-    /// Shape: input [1, in_dim, 1, seq] → output [1, out_dim, 1, seq].
     fn build_conv_linear_program() -> mil_rs::ir::Program {
         use mil_rs::ir::{Block, Function, Operation, Program, TensorType, Value};
 
@@ -857,12 +758,10 @@ mod tests {
         let output_ty = TensorType::new(ScalarType::Float16, vec![1, out_dim, 1, seq]);
         let weight_shape = vec![out_dim, in_dim, 1, 1];
 
-        // Weight: out_dim * in_dim fp16 elements = 64 bytes
         let weight_data = vec![0u8; out_dim * in_dim * 2];
 
         let mut block = Block::new();
 
-        // Conv constants (matching Orion's CONV_PARAMS exactly)
         let pt = Operation::new("const", "pt")
             .with_input("val", Value::String("valid".into()))
             .with_output("pt");
@@ -887,7 +786,6 @@ mod tests {
             .with_input("val", Value::Int(1))
             .with_output("gr");
 
-        // Weight tensor: [out_dim, in_dim, 1, 1]
         let w = Operation::new("const", "W")
             .with_input(
                 "val",
@@ -899,7 +797,6 @@ mod tests {
             )
             .with_output("W");
 
-        // Conv op
         let mut conv = Operation::new("conv", "conv_0")
             .with_input("x", Value::Reference("x".into()))
             .with_input("weight", Value::Reference("W".into()))
@@ -938,14 +835,11 @@ mod tests {
             "should produce at least one sub-program"
         );
 
-        // Validate the artifacts
         let warnings = artifacts.validate().expect("validation failed");
-        // Warnings about empty outputs are acceptable for simple programs
         for w in &warnings {
             eprintln!("  warning: {w}");
         }
 
-        // Check MIL text structure
         let first = &artifacts.sub_programs[0];
         assert!(
             first.mil_text.contains("program("),
@@ -966,7 +860,6 @@ mod tests {
 
         let first = &artifacts.sub_programs[0];
 
-        // Should have a BLOBFILE with weight data
         assert!(
             first.weight_blob.len() >= 128,
             "BLOBFILE should have at least header + chunk desc (got {} bytes)",
@@ -979,14 +872,12 @@ mod tests {
             "BLOBFILE should have 0xDEADBEEF chunk magic at byte 64"
         );
 
-        // MIL text should reference the weight blob
         assert!(
             first.mil_text.contains("BLOBFILE("),
             "MIL text should contain BLOBFILE reference for weight: {}",
             first.mil_text
         );
 
-        // Validate
         artifacts.validate().expect("validation failed");
     }
 
@@ -1000,7 +891,6 @@ mod tests {
             "multi-layer program should produce sub-programs"
         );
 
-        // Each sub-program should be independently valid
         for sub in &artifacts.sub_programs {
             assert!(
                 sub.mil_text.contains("program("),
@@ -1020,12 +910,10 @@ mod tests {
         let program = build_weighted_program();
         let artifacts = CompiledArtifacts::prepare(&program).expect("prepare failed");
 
-        // Save to a temp directory
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
         let save_dir = tmp.path().join("ane-compiled");
         artifacts.save(&save_dir).expect("save failed");
 
-        // Verify directory structure
         assert!(save_dir.exists(), "save directory should exist");
 
         for (i, sub) in artifacts.sub_programs.iter().enumerate() {
@@ -1057,7 +945,6 @@ mod tests {
 
     #[test]
     fn e2e_validate_catches_bad_mil_text() {
-        // Use a small valid-ish BLOBFILE header (byte 0=1, 0xDEADBEEF at 64)
         let mut blob = vec![0u8; 128];
         blob[0] = 1;
         blob[64..68].copy_from_slice(&[0xEF, 0xBE, 0xAD, 0xDE]);
@@ -1080,9 +967,8 @@ mod tests {
 
     #[test]
     fn e2e_validate_catches_bad_blobfile() {
-        // 68+ bytes but wrong magic
         let mut blob = vec![0u8; 128];
-        blob[0] = 99; // wrong
+        blob[0] = 99;
 
         let bad = CompiledArtifacts {
             sub_programs: vec![SubProgramArtifact {
@@ -1102,20 +988,13 @@ mod tests {
 
     #[test]
     fn e2e_full_pipeline_add_program() {
-        // Full pipeline: build IR → prepare → validate → save → reload from disk
         let program = build_add_program();
-
-        // Prepare (runs all passes, splitting, MIL emission, BLOBFILE writing)
         let artifacts = CompiledArtifacts::prepare(&program).expect("prepare failed");
-
-        // Validate
         let _warnings = artifacts.validate().expect("validation failed");
 
-        // Save
         let tmp = tempfile::tempdir().expect("temp dir");
         artifacts.save(tmp.path()).expect("save failed");
 
-        // Verify saved artifacts can be read back
         for (i, sub) in artifacts.sub_programs.iter().enumerate() {
             let sub_dir = tmp.path().join(format!("{:02}_{}", i, sub.name));
             let mil = std::fs::read_to_string(sub_dir.join("program.mil")).expect("read MIL");
@@ -1128,16 +1007,13 @@ mod tests {
 
     #[test]
     fn e2e_full_pipeline_weighted_program() {
-        // Full pipeline with weights: build IR → prepare → validate → save
         let program = build_weighted_program();
-
         let artifacts = CompiledArtifacts::prepare(&program).expect("prepare failed");
         let _warnings = artifacts.validate().expect("validation failed");
 
         let tmp = tempfile::tempdir().expect("temp dir");
         artifacts.save(tmp.path()).expect("save failed");
 
-        // Verify weight blob was persisted correctly
         let first = &artifacts.sub_programs[0];
         let sub_dir = tmp.path().join(format!("00_{}", first.name));
         let blob = std::fs::read(sub_dir.join("weights.blob")).expect("read BLOBFILE");
@@ -1147,9 +1023,6 @@ mod tests {
 
     #[test]
     fn e2e_compile_and_load_weighted_program() {
-        // This test exercises the full compile_and_load path with a weighted
-        // program, including passes, splitting, MIL emission, BLOBFILE
-        // writing, ANE compilation, and loading.
         let program = build_weighted_program();
         let config = AneConfig::default();
 
@@ -1170,8 +1043,6 @@ mod tests {
             Err(e) => {
                 let msg = format!("{e}");
                 eprintln!("  compile_and_load failed: {msg}");
-                // If compilation fails, it should be at the ANE stage,
-                // not at passes, splitting, or MIL emission.
                 assert!(
                     msg.contains("ANE")
                         || msg.contains("compilation")
@@ -1185,7 +1056,6 @@ mod tests {
 
     #[test]
     fn e2e_compile_and_load_add_program() {
-        // Same as above but with the simple add program (no weights).
         let program = build_add_program();
         let config = AneConfig::default();
 
@@ -1193,7 +1063,6 @@ mod tests {
 
         match result {
             Ok(mut model) => {
-                // On real ANE hardware: verify predict works.
                 let desc = model.input_description();
                 let inputs: Vec<AneTensor> = desc
                     .iter()
@@ -1218,12 +1087,9 @@ mod tests {
 
     #[test]
     fn e2e_compile_and_load_conv_linear() {
-        // Conv-based linear layer — matches Orion's orion_mil_linear,
-        // the known-working minimal ANE program pattern.
         let program = build_conv_linear_program();
         let config = AneConfig::default();
 
-        // First, dump the post-pass MIL text for debugging.
         {
             let artifacts = CompiledArtifacts::prepare(&program).expect("prepare");
             for sub in &artifacts.sub_programs {
@@ -1267,7 +1133,6 @@ mod tests {
 
     #[test]
     fn e2e_debug_mil_text_output() {
-        // Dump the MIL text for debugging ANE compilation failures.
         use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
 
         for (label, program) in [

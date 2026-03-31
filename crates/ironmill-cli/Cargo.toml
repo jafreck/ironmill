@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 mil-rs = { workspace = true }
 ironmill-compile = { workspace = true }
-ironmill-ane = { workspace = true, optional = true }
+ironmill-inference = { workspace = true, optional = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
@@ -24,4 +24,4 @@ toml = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-ane-direct = ["dep:ironmill-ane"]
+ane-direct = ["dep:ironmill-inference"]

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ironmill_coreml::{ComputeUnits, Model, build_dummy_input};
+use ironmill_coreml_sys::{ComputeUnits, Model, build_dummy_input};
 
 /// Results from a single inference benchmark run.
 pub struct InferenceResult {
@@ -256,20 +256,20 @@ pub fn run_inference(
 #[cfg(feature = "ane-direct")]
 pub fn run_ane_direct_inference(
     program: &mil_rs::ir::Program,
-    config: ironmill_ane::AneConfig,
+    config: ironmill_inference::AneConfig,
     warmup: usize,
     iterations: usize,
 ) -> Result<InferenceResult> {
     let compile_start = Instant::now();
-    let mut model = ironmill_ane::AneModel::compile_and_load(program, config)
+    let mut model = ironmill_inference::AneModel::compile_and_load(program, config)
         .map_err(|e| anyhow::anyhow!("ANE compile failed: {e}"))?;
     let load_time = compile_start.elapsed();
 
     let desc = model.input_description();
-    let dummy_inputs: Vec<ironmill_ane::tensor::AneTensor> = desc
+    let dummy_inputs: Vec<ironmill_iosurface::AneTensor> = desc
         .iter()
         .map(|td| {
-            ironmill_ane::tensor::AneTensor::new(td.shape[1], td.shape[3], td.dtype)
+            ironmill_iosurface::AneTensor::new(td.shape[1], td.shape[3], td.dtype)
                 .map_err(|e| anyhow::anyhow!("tensor creation failed: {e}"))
         })
         .collect::<Result<Vec<_>>>()?;

@@ -16,6 +16,9 @@ pub mod sampling;
 pub mod types;
 
 // Re-exports for convenience.
+pub use ane::model::{
+    AneConfig, AneDirectBackend, AneModel, AneRuntimeModel, CompiledArtifacts, SubProgramArtifact,
+};
 pub use engine::{InferenceEngine, InferenceError};
 pub use sampling::{is_eos_token, sample_token};
 pub use types::{

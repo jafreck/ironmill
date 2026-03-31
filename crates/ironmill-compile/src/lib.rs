@@ -6,6 +6,9 @@
 
 #![deny(unsafe_code)]
 
+/// Compilation error types.
+pub mod error;
+
 /// ANE (Apple Neural Engine) compilation: passes, splitting, packing, validation, and caching.
 pub mod ane;
 /// Model conversion utilities: LoRA merging, MoE splitting, and pipeline orchestration.
