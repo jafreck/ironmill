@@ -608,35 +608,54 @@ pub fn emit_attention_mil(config: &AttentionMilConfig) -> (String, Vec<(String, 
     )
     .unwrap();
 
+    // Apply causal mask: add -inf for future positions.
+    // mask_input is [1, 1, 1, seq_len] broadcasting to [1, num_heads, S, seq_len].
+    let mask_input_name = if config.unrotation_seed.is_some() {
+        "a_input4"
+    } else {
+        "a_input3"
+    };
+    let mask_shape = fmt_shape(&[1, 1, 1, seq_len]);
+    writeln!(
+        body,
+        "        tensor<fp16, {qk_shape}> qk_masked = add(\
+         x=qk_scaled, y={mask_input_name})\
+         [name=string(\"qk_masked\")];"
+    )
+    .unwrap();
+
     // Softmax
     writeln!(
         body,
         "        tensor<fp16, {qk_shape}> attn_weights = softmax(\
-         x=qk_scaled, axis=softmax_axis)\
+         x=qk_masked, axis=softmax_axis)\
          [name=string(\"attn_weights\")];"
     )
     .unwrap();
 
-    // attn_out = attn_weights x V^T -> [1, num_heads, S, head_dim]
-    let attn_pre_shape = fmt_shape(&[1, num_heads, s, head_dim]);
+    // attn_out = V x attn_weights^T -> [1, num_heads, head_dim, S]
+    // Swapped operands vs standard: produces [H, D, S] instead of [H, S, D],
+    // so the reshape to [1, q_ch, 1, S] preserves natural channel ordering
+    // where channel c maps to head c/head_dim, dim c%head_dim.
+    let attn_pre_shape = fmt_shape(&[1, num_heads, head_dim, s]);
     writeln!(
         body,
         "        tensor<fp16, {attn_pre_shape}> attn_pre = matmul(\
-         x=attn_weights, y={v_attn_name}, transpose_x=bF, transpose_y=bT)\
+         x={v_attn_name}, y=attn_weights, transpose_x=bF, transpose_y=bT)\
          [name=string(\"attn_pre\")];"
     )
     .unwrap();
 
     // --- Optional: output un-rotation (O(1) per token) ---
     // V is stored rotated in cache. The attention output is:
-    //   attn_pre = softmax(scores) · V_dequant^T
-    // where V_dequant ≈ R·V. So attn_pre columns are in the rotated space.
-    // Un-rotate: attn_out = attn_pre · R  (right-multiply by rotation matrix)
+    //   attn_pre = V_dequant · softmax(scores)^T
+    // where V_dequant ≈ R·V. So attn_pre rows are in the rotated space.
+    // Un-rotate: attn_out = R^T · attn_pre  (left-multiply by R^T)
     let final_attn = if config.unrotation_seed.is_some() {
         writeln!(
             body,
             "        tensor<fp16, {attn_pre_shape}> attn_unrot = matmul(\
-             x=attn_pre, y=a_input3, transpose_x=bF, transpose_y=bF)\
+             x=a_input3, y=attn_pre, transpose_x=bT, transpose_y=bF)\
              [name=string(\"attn_unrot\")];"
         )
         .unwrap();
@@ -654,13 +673,15 @@ pub fn emit_attention_mil(config: &AttentionMilConfig) -> (String, Vec<(String, 
     )
     .unwrap();
 
-    // Assemble function — input count depends on whether rotation is enabled
+    // Assemble function — input count depends on whether rotation is enabled.
+    // Mask input is always last: [1, 1, 1, seq_len] fp16 causal mask.
     let func = if config.unrotation_seed.is_some() {
         format!(
             "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
              tensor<{cache_dtype}, {cache_shape}> a_input1, \
              tensor<{cache_dtype}, {cache_shape}> a_input2, \
-             tensor<fp16, {rot_shape}> a_input3) {{\n\
+             tensor<fp16, {rot_shape}> a_input3, \
+             tensor<fp16, {mask_shape}> a_input4) {{\n\
              {body}\
              \n    }} -> (z_output0);"
         )
@@ -668,7 +689,8 @@ pub fn emit_attention_mil(config: &AttentionMilConfig) -> (String, Vec<(String, 
         format!(
             "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
              tensor<{cache_dtype}, {cache_shape}> a_input1, \
-             tensor<{cache_dtype}, {cache_shape}> a_input2) {{\n\
+             tensor<{cache_dtype}, {cache_shape}> a_input2, \
+             tensor<fp16, {mask_shape}> a_input3) {{\n\
              {body}\
              \n    }} -> (z_output0);"
         )

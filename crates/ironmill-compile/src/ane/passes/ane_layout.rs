@@ -138,6 +138,11 @@ impl Pass for AneLayoutPass {
                     let needs_layout =
                         ane_layout_names.contains(out_name) || func_output_set.contains(out_name);
                     if needs_layout {
+                        // First reshape the output type to ANE layout.
+                        for t in op.output_types.iter_mut().flatten() {
+                            reshape_tensor_type(t);
+                        }
+                        // Then update the shape const to match the new output type.
                         if let Some(Some(out_ty)) = op.output_types.first() {
                             let target_shape: Vec<usize> =
                                 out_ty.shape.iter().map(|d| d.unwrap_or(1)).collect();
@@ -154,10 +159,6 @@ impl Pass for AneLayoutPass {
                                     dtype: mil_rs::ir::ScalarType::Int32,
                                 },
                             );
-                        }
-                        // Also reshape the output type.
-                        for t in op.output_types.iter_mut().flatten() {
-                            reshape_tensor_type(t);
                         }
                         for out in &op.outputs {
                             ane_layout_names.insert(out.clone());
@@ -385,13 +386,23 @@ mod tests {
 
     #[test]
     fn ane_layout_op_output_types() {
+        // Relu following a function input should propagate ANE layout.
+        // The function input is transformed to [1, 64, 1, 512], then
+        // relu (a passthrough op) should inherit the same shape.
         let mut block = Block::new();
-        let mut op = Operation::new("relu", "relu_0").with_output("out");
+        let mut op = Operation::new("relu", "relu_0")
+            .with_input("x", Value::Reference("x".into()))
+            .with_output("out");
         op.output_types = vec![Some(TensorType::new(ScalarType::Float16, vec![64, 512]))];
         block.add_op(op);
         block.outputs.push("out".into());
 
-        let mut program = program_with_block(block);
+        let input_ty = TensorType::new(ScalarType::Float16, vec![64, 512]);
+        let mut func = Function::new("main").with_input("x", input_ty);
+        func.body = block;
+        let mut program = Program::new("1.0");
+        program.add_function(func);
+
         AneLayoutPass.run(&mut program).unwrap();
 
         let oty = program.functions["main"].body.operations[0].output_types[0]

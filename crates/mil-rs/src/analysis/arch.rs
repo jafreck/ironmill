@@ -196,7 +196,27 @@ fn detect_attention_params(ops: &[Operation]) -> Option<(usize, usize, usize)> {
 
             if let Some(shape) = weight_shape {
                 if shape.len() >= 2 {
-                    let out_features = shape[0];
+                    // For linear: weight is [out_features, in_features] → shape[0].
+                    // For matmul: y is [in_features, out_features] → shape[1].
+                    // Respect transpose_y: if true, y is [out_features, in_features].
+                    let out_features = if op.op_type == "matmul" {
+                        let transpose_y = op
+                            .attributes
+                            .get("transpose_y")
+                            .or_else(|| op.inputs.get("transpose_y"))
+                            .and_then(|v| match v {
+                                Value::Bool(b) => Some(*b),
+                                _ => None,
+                            })
+                            .unwrap_or(false);
+                        if transpose_y {
+                            shape[0]
+                        } else {
+                            shape[shape.len() - 1]
+                        }
+                    } else {
+                        shape[0]
+                    };
                     if let Some(nh) = num_heads {
                         if nh > 0 && out_features > 0 && out_features % nh == 0 {
                             head_dim = Some(out_features / nh);
@@ -437,12 +457,14 @@ mod tests {
     #[test]
     fn detect_onnx_gqa_with_const_weights() {
         // Simulates ONNX-converted model: weight in const op, matmul references it.
+        // ONNX matmul y input is [in_features, out_features] = [1024, 2048]
+        // for Q projection: hidden_size=1024, num_heads=16, head_dim=128.
         let weight_const = Operation::new("const", "q_weight_const")
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0u8; 896 * 896 * 4],
-                    shape: vec![896, 896],
+                    data: vec![0u8; 1024 * 2048 * 4],
+                    shape: vec![1024, 2048],
                     dtype: crate::ir::ScalarType::Float32,
                 },
             )
@@ -457,17 +479,17 @@ mod tests {
             weight_const,
             make_reshape_op(
                 "/model/layers.0/attn/GroupQueryAttention_q_reshape_op",
-                &[0, 0, 14, -1],
+                &[0, 0, 16, -1],
             ),
             make_reshape_op(
                 "/model/layers.0/attn/GroupQueryAttention_k_reshape_op",
-                &[0, 0, 2, -1],
+                &[0, 0, 8, -1],
             ),
             q_matmul,
         ];
         let (nh, nkv, hd) = detect_attention_params(&ops).unwrap();
-        assert_eq!(nh, 14);
-        assert_eq!(nkv, 2);
-        assert_eq!(hd, 64);
+        assert_eq!(nh, 16);
+        assert_eq!(nkv, 8);
+        assert_eq!(hd, 128); // 2048 / 16 = 128 (out_features is shape[1] for matmul)
     }
 }

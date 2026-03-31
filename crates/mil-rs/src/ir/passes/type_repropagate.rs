@@ -41,6 +41,23 @@ impl Pass for TypeRepropagationPass {
             }
 
             for op in &mut function.body.operations {
+                // Force re-inference for shape-dependent ops whose output types
+                // may be stale after passes like AneLayoutPass change input shapes.
+                if matches!(
+                    op.op_type.as_str(),
+                    "reduce_mean"
+                        | "reduce_sum"
+                        | "reduce_max"
+                        | "reduce_min"
+                        | "reduce_prod"
+                        | "reduce_l1"
+                        | "reduce_l2"
+                ) {
+                    for ot in &mut op.output_types {
+                        *ot = None;
+                    }
+                }
+
                 // Register any outputs that already have types.
                 for (i, out_name) in op.outputs.iter().enumerate() {
                     if let Some(Some(tt)) = op.output_types.get(i) {
@@ -91,6 +108,8 @@ fn infer_output_type(op: &Operation, type_map: &HashMap<String, TensorType>) -> 
         "max_pool" | "avg_pool" => infer_pool_output(op, type_map),
         "concat" => infer_concat_output(op, type_map),
         "tile" => infer_tile_output(op, type_map),
+        "reduce_mean" | "reduce_sum" | "reduce_max" | "reduce_min" | "reduce_prod"
+        | "reduce_l1" | "reduce_l2" => infer_reduce_output(op, type_map),
         _ => {
             // Element-wise / pass-through: output type matches primary input.
             resolve_primary_input(op, type_map)
@@ -347,6 +366,89 @@ fn infer_tile_output(op: &Operation, type_map: &HashMap<String, TensorType>) -> 
         // Can't resolve reps — return input type (incorrect but safe fallback).
         Some(input_type)
     }
+}
+
+/// Infer reduce op output: set reduced axes to 1 when keep_dims=true,
+/// or remove them when keep_dims=false.
+fn infer_reduce_output(
+    op: &Operation,
+    type_map: &HashMap<String, TensorType>,
+) -> Option<TensorType> {
+    let in_tt = op.inputs.get("x").and_then(|v| {
+        if let Value::Reference(n) = v {
+            type_map.get(n)
+        } else {
+            None
+        }
+    })?;
+
+    // Read axes from inline tensor or reference.
+    let axes_value = op.inputs.get("axes")?;
+    let axes = match axes_value {
+        Value::Tensor { .. } => read_int_list(axes_value)?,
+        Value::Reference(_name) => {
+            // Try to find the const op that defines this reference.
+            // We don't have access to the const map here, so check type_map
+            // for shape info. Fall back to input type if we can't resolve.
+            return resolve_primary_input(op, type_map);
+        }
+        Value::List(items) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::Int(i) => Some(*i),
+                _ => None,
+            })
+            .collect(),
+        _ => return resolve_primary_input(op, type_map),
+    };
+
+    let keep_dims = op
+        .inputs
+        .get("keep_dims")
+        .or_else(|| op.attributes.get("keep_dims"))
+        .and_then(|v| match v {
+            Value::Bool(b) => Some(*b),
+            Value::Reference(_) => Some(true), // default
+            _ => None,
+        })
+        .unwrap_or(true);
+
+    let ndim = in_tt.shape.len() as i64;
+    let mut out_shape = in_tt.shape.clone();
+
+    if keep_dims {
+        for &axis in &axes {
+            let a = if axis < 0 {
+                (ndim + axis) as usize
+            } else {
+                axis as usize
+            };
+            if a < out_shape.len() {
+                out_shape[a] = Some(1);
+            }
+        }
+    } else {
+        // Remove reduced axes (sort descending to avoid index shift).
+        let mut sorted_axes: Vec<usize> = axes
+            .iter()
+            .map(|&a| {
+                if a < 0 {
+                    (ndim + a) as usize
+                } else {
+                    a as usize
+                }
+            })
+            .collect();
+        sorted_axes.sort_unstable();
+        sorted_axes.dedup();
+        for &a in sorted_axes.iter().rev() {
+            if a < out_shape.len() {
+                out_shape.remove(a);
+            }
+        }
+    }
+
+    Some(TensorType::with_dynamic_shape(in_tt.scalar_type, out_shape))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

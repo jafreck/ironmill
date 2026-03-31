@@ -69,6 +69,9 @@ pub struct AneInference {
     fp16_attn_q_staging: Option<AneTensor>,
     /// Staging tensor for FP16 attention output.
     fp16_attn_out_staging: Option<AneTensor>,
+    /// Causal mask tensor for FP16 attention. Shape: [1, 1, 1, max_seq_len].
+    /// Updated each step: 0.0 for positions ≤ seq_pos, -inf for future.
+    fp16_attn_mask: Option<AneTensor>,
     /// Runtime handle.
     runtime: AneRuntime,
     /// Current sequence position.
@@ -393,7 +396,7 @@ impl AneInference {
                 // caches are runtime inputs). Precompute a default.
                 let head_dim = 64; // will be refined later
                 let max_pos = 2048;
-                let theta = 500_000.0f32;
+                let theta = 1_000_000.0f32;
                 precompute_rope_cache(head_dim, max_pos, theta)
             });
 
@@ -980,6 +983,7 @@ impl AneInference {
             fp16_attn_compiled,
             fp16_attn_q_staging,
             fp16_attn_out_staging,
+            fp16_attn_mask,
             num_kv_heads,
             head_dim,
             max_seq_len,
@@ -988,7 +992,7 @@ impl AneInference {
             let hd = tq_config.head_dim;
             let msl = tq_config.max_seq_len;
             let tq = TurboQuantModel::compile(tq_config)?;
-            (Some(tq), None, None, None, None, nkv, hd, msl)
+            (Some(tq), None, None, None, None, None, nkv, hd, msl)
         } else {
             // FP16 baseline: use architecture detected from original program.
             let (nh, nkv, hd, msl) = if let Some(ref a) = original_arch {
@@ -1006,13 +1010,14 @@ impl AneInference {
                     64
                 };
                 let nh = hidden_size / hd;
-                // Infer KV heads from pre_attn outputs (ANE layout doubles channels).
+                // Infer KV heads from pre_attn outputs.
+                // Sub-program output shapes are pre-AneLayoutPass (original dims).
                 let pre_sps: Vec<&ironmill_compile::ane::split::SubProgram> =
                     pre_attn_map.values().copied().collect();
                 let nkv = if let Some(sp) = pre_sps.first() {
                     if sp.outputs.len() >= 3 {
                         let min_ch = sp.outputs.iter().map(|o| o.shape[1]).min().unwrap_or(0);
-                        (min_ch / 2) / hd.max(1) // ANE layout doubles channels
+                        min_ch / hd.max(1)
                     } else {
                         nh
                     }
@@ -1030,23 +1035,21 @@ impl AneInference {
 
             // Compile hand-written FP16 attention MIL (shared across layers).
             let mil = mil_emitter::emit_fp16_attention_mil(nh, nkv, hd, msl, msl);
-            let dump_path = "/tmp/ironmill_debug_fp16_attn_handwritten.mil";
-            let _ = std::fs::write(dump_path, &mil);
             let attn_compiled =
                 AneCompiler::compile_mil_text(&mil, &[]).map_err(|e| AneError::CompileFailed {
                     status: 0,
-                    context: format!(
-                        "FP16 attention compilation failed: {e} (MIL dumped to {dump_path})"
-                    ),
+                    context: format!("FP16 attention compilation failed: {e}"),
                 })?;
             // Keep loaded — it's only 1 program, well within budget.
             // Using eval_raw avoids the ~5ms loadWithQoS cost per layer.
 
             // Uniform alloc: all tensors in one eval must share the same alloc.
+            // Include the mask tensor [1, 1, 1, msl] in the alloc calculation.
             let attn_alloc = uniform_alloc_size(&[
                 ([1, q_channels, 1, MIN_IO_SEQ], ScalarType::Float16),
                 ([1, kv_channels, 1, msl], ScalarType::Float16),
                 ([1, kv_channels, 1, msl], ScalarType::Float16),
+                ([1, 1, 1, msl], ScalarType::Float16),
             ]);
 
             let mut caches = Vec::with_capacity(num_layers);
@@ -1078,6 +1081,14 @@ impl AneInference {
                 ScalarType::Float16,
                 attn_alloc,
             )?;
+            // Causal mask: [1, 1, 1, max_seq_len]. Initialized to -inf everywhere;
+            // updated each step to unmask positions 0..=seq_pos.
+            let mut mask_tensor =
+                AneTensor::new_with_min_alloc(1, msl, ScalarType::Float16, attn_alloc)?;
+            // Initialize all positions to -inf (fp16 min ≈ -65504).
+            let neg_inf = f16::NEG_INFINITY;
+            let mask_data = vec![neg_inf; msl];
+            mask_tensor.write_f16(&mask_data)?;
 
             (
                 None,
@@ -1085,6 +1096,7 @@ impl AneInference {
                 Some(attn_compiled),
                 Some(q_staging),
                 Some(out_staging),
+                Some(mask_tensor),
                 nkv,
                 hd,
                 msl,
@@ -1101,6 +1113,7 @@ impl AneInference {
             fp16_attn_compiled,
             fp16_attn_q_staging,
             fp16_attn_out_staging,
+            fp16_attn_mask,
             runtime,
             seq_pos: 0,
             num_kv_heads,
@@ -1138,6 +1151,13 @@ impl AneInference {
         // 2. Per-layer: pre_attn → attention → post_attn
         let num_layers = self.layers.len();
         let mut hidden = embed_out;
+
+        // Update causal mask: unmask current position.
+        // mask[seq_pos] = 0.0 (allow attention), rest stays -inf.
+        if let Some(ref mut mask) = self.fp16_attn_mask {
+            mask.write_f16_at(self.seq_pos, &[f16::ZERO])?;
+        }
+
         let mut d_pre_attn = std::time::Duration::ZERO;
         let mut d_read_qkv = std::time::Duration::ZERO;
         let mut d_attn = std::time::Duration::ZERO;
@@ -1338,6 +1358,18 @@ impl AneInference {
                 q_data.truncate(real_q_ch);
                 k_data.truncate(real_kv_ch);
                 v_data.truncate(real_kv_ch);
+
+                // Apply RoPE rotation on CPU. Pre_attn outputs unrotated Q/K
+                // because RoPE gather ops were stripped during compilation.
+                if self.rope_cache_dim > 0 {
+                    let pos = self.seq_pos;
+                    let cos_start = pos * self.rope_cache_dim;
+                    let cos_end = cos_start + self.rope_cache_dim;
+                    let cos = &self.rope_cos_cache[cos_start..cos_end];
+                    let sin = &self.rope_sin_cache[cos_start..cos_end];
+                    apply_rope_rotation(&mut q_data, cos, sin, self.head_dim);
+                    apply_rope_rotation(&mut k_data, cos, sin, self.head_dim);
+                }
                 if let Some(t) = t0 {
                     d_read_qkv += t.elapsed();
                 }
@@ -1348,23 +1380,33 @@ impl AneInference {
                     None
                 };
                 // Write K/V to persistent FP16 cache at current position.
+                // Cache shape is [1, channels, 1, max_seq_len] in NCHW layout.
+                // Element (c, s) is at flat index c * max_seq_len + s.
+                // Each channel gets one value at the current sequence position.
                 let k_elements = k_data.len();
                 let v_elements = v_data.len();
-                let elem_offset_k = self.seq_pos * k_elements;
-                let elem_offset_v = self.seq_pos * v_elements;
-                caches[layer_idx].0.write_f16_at(elem_offset_k, &k_data)?;
-                caches[layer_idx].1.write_f16_at(elem_offset_v, &v_data)?;
+                for (c, &val) in k_data.iter().enumerate().take(k_elements) {
+                    caches[layer_idx]
+                        .0
+                        .write_f16_at(c * self.max_seq_len + self.seq_pos, &[val])?;
+                }
+                for (c, &val) in v_data.iter().enumerate().take(v_elements) {
+                    caches[layer_idx]
+                        .1
+                        .write_f16_at(c * self.max_seq_len + self.seq_pos, &[val])?;
+                }
 
-                // Hand-written FP16 attention: Q + K_cache + V_cache → attn_output
+                // Hand-written FP16 attention: Q + K_cache + V_cache + mask → attn_output
                 let result = if let Some(ref compiled) = self.fp16_attn_compiled {
                     let q_staging = self.fp16_attn_q_staging.as_mut().unwrap();
                     let out_staging = self.fp16_attn_out_staging.as_mut().unwrap();
+                    let mask = self.fp16_attn_mask.as_ref().unwrap();
                     write_f16_padded(q_staging, &q_data)?;
                     let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
                     self.runtime
                         .eval_raw(
                             compiled.as_raw_ptr(),
-                            &[q_staging, k_cache, v_cache],
+                            &[q_staging, k_cache, v_cache, mask],
                             &mut [out_staging],
                         )
                         .map_err(|e| {
@@ -1421,9 +1463,12 @@ impl AneInference {
                     }
                 } else {
                     write_f16_padded(&mut post_attn.input_tensors[0], &attn_out_data)?;
-                    if post_attn.input_tensors.len() > 1 && num_pre_outputs > 3 {
-                        let residual = read_f16_channels(&layer.pre_attn.output_tensors[3])?;
-                        write_f16_padded(&mut post_attn.input_tensors[1], &residual)?;
+                    // Write residual (pre-layer hidden state) to the second input.
+                    // The residual flows directly from the decode loop's hidden state,
+                    // not from a pre_attn output, since the 3-way split (pre_attn/
+                    // attention/post_attn) doesn't pass the residual through pre_attn.
+                    if post_attn.input_tensors.len() > 1 {
+                        write_f16_padded(&mut post_attn.input_tensors[1], &hidden)?;
                     }
                 }
                 {
@@ -1471,6 +1516,7 @@ impl AneInference {
             LmHead::Ane(ane_lm_head) => ane_lm_head.forward(&hidden),
             LmHead::Cpu(weight) => cpu_lm_head_matmul(weight, &hidden),
         };
+
         let d_lm_head = t0.map(|t| t.elapsed());
 
         if profiling {
@@ -1589,6 +1635,31 @@ impl Drop for AneInference {
             for chunk in &ane_lm.chunks {
                 self.runtime.unload_compiled(&chunk.compiled);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RoPE rotation helper
+// ---------------------------------------------------------------------------
+
+/// Apply rotary position encoding to a Q or K vector on CPU.
+///
+/// `data` is `[num_heads * head_dim]` values. `cos`/`sin` are
+/// `[head_dim / 2]` values for the current position. For each head,
+/// interleaved dimension pairs `(2i, 2i+1)` are rotated.
+fn apply_rope_rotation(data: &mut [f16], cos: &[f16], sin: &[f16], head_dim: usize) {
+    let half_dim = head_dim / 2;
+    let num_heads = data.len() / head_dim;
+    for h in 0..num_heads {
+        let base = h * head_dim;
+        for i in 0..half_dim.min(cos.len()) {
+            let x0 = data[base + 2 * i].to_f32();
+            let x1 = data[base + 2 * i + 1].to_f32();
+            let c = cos[i].to_f32();
+            let s = sin[i].to_f32();
+            data[base + 2 * i] = f16::from_f32(x0 * c - x1 * s);
+            data[base + 2 * i + 1] = f16::from_f32(x0 * s + x1 * c);
         }
     }
 }
@@ -1769,7 +1840,9 @@ fn compile_and_load_sub(
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
     prune_unreferenced_inputs(&mut program);
+
     let _ = AneLayoutPass.run(&mut program);
+
     apply_min_seq_padding(&mut program, 32);
     let _ = TypeRepropagationPass.run(&mut program);
 
@@ -1869,15 +1942,18 @@ fn compile_and_load_sub(
         // Collect op types for diagnosis.
         let op_types: Vec<&str> = program
             .main()
-            .map(|f| f.body.operations.iter().map(|op| op.op_type.as_str()).collect())
+            .map(|f| {
+                f.body
+                    .operations
+                    .iter()
+                    .map(|op| op.op_type.as_str())
+                    .collect()
+            })
             .unwrap_or_default();
-        // Dump MIL text for debugging.
-        let dump_path = format!("/tmp/ironmill_debug_{}.mil", sub.name);
-        let _ = std::fs::write(&dump_path, &mil_text);
         AneError::CompileFailed {
             status: 0,
             context: format!(
-                "{} compilation failed: {e} (ops: {:?}, mil_text: {} bytes → {dump_path}, weights: {} entries)",
+                "{} compilation failed: {e} (ops: {:?}, mil_text: {} bytes, weights: {} entries)",
                 sub.name,
                 op_types,
                 mil_text.len(),
@@ -1951,19 +2027,6 @@ fn compile_and_load_sub(
         .collect();
     let input_alloc = uniform_alloc_size(&input_shapes);
     let output_alloc = uniform_alloc_size(&output_shapes).max(min_output_alloc);
-
-    if sub.name.contains("layer_0") {
-        eprintln!(
-            "  [alloc] {} inputs: {:?}",
-            sub.name,
-            pruned_inputs.iter().map(|td| td.shape).collect::<Vec<_>>()
-        );
-        eprintln!(
-            "  [alloc] {} outputs: {:?}",
-            sub.name,
-            pruned_outputs.iter().map(|td| td.shape).collect::<Vec<_>>()
-        );
-    }
 
     let input_tensors: Vec<AneTensor> = pruned_inputs
         .iter()
