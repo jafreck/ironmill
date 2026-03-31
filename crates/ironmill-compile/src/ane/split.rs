@@ -164,10 +164,25 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
 /// to handle both direct names (`layer_0_attn_q`) and ONNX-converted names
 /// with prefixes (`_model_layers_0_attn_...`, `/model/layers.0/...`).
 ///
+/// Returns `None` for ops that belong to the final/output norm (not a
+/// transformer layer body), even though their ONNX names may contain a
+/// layer number (e.g., `model_layers_28_final_norm_...`). These ops
+/// should be classified into the `lm_head` group instead.
+///
 /// Recognized patterns: `layer_0_attn_q`, `layers.3.ffn.up`, `block_12_norm`,
 /// `_model_layers_0_attn_q`, `layer0_w`, `layer.0.weight`.
 fn extract_layer_number(op_name: &str) -> Option<usize> {
     let lower = op_name.to_ascii_lowercase();
+
+    // Reject final/output norm ops — these are not transformer layer body ops
+    // even though their ONNX names may contain a layer number.
+    // e.g., `model_layers_28_final_norm_layernorm_SkipLayerNorm_...`
+    // Be specific to avoid matching regular per-layer norm ops like
+    // `_input_layernorm_output_0`.
+    if lower.contains("final_norm") || lower.contains("final_layernorm") {
+        return None;
+    }
+
     // Search for layer/block patterns anywhere in the name.
     for pattern in ["layers.", "layers_", "layer.", "layer_", "block.", "block_"] {
         if let Some(idx) = lower.find(pattern) {

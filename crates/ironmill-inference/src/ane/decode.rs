@@ -1447,10 +1447,8 @@ fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
 fn inject_cache_write_ops(
     sub: &mut ironmill_compile::ane::split::SubProgram,
     config: &TurboQuantConfig,
-    enable_qjl: bool,
+    _enable_qjl: bool,
 ) -> Result<bool> {
-    use mil_rs::ir::{Operation, TensorType, Value};
-
     let func = sub
         .program
         .functions
@@ -1467,8 +1465,6 @@ fn inject_cache_write_ops(
 
     let kv_ch = config.num_kv_heads * config.head_dim;
     let q_ch = config.num_heads * config.head_dim;
-    let head_dim = config.head_dim;
-    let num_kv_heads = config.num_kv_heads;
 
     // Identify Q, K_proj, V_proj outputs by name pattern.
     // Outputs are sorted lexicographically by `build_sub_program`, so the
@@ -1514,245 +1510,28 @@ fn inject_cache_write_ops(
         }
     };
 
-    let k_proj_name = func.body.outputs[k_idx].clone();
-    let v_proj_name = func.body.outputs[v_idx].clone();
-
-    // Determine spatial dimension from the K_proj output type.
-    let s = {
-        let k_td = sub
-            .outputs
-            .get(k_idx)
-            .ok_or_else(|| AneError::Other(anyhow::anyhow!("missing K_proj output descriptor")))?;
-        k_td.shape[3]
-    };
-
-    let inv_scale = mil_emitter::compute_inv_scale(head_dim, config.n_bits);
-
-    // --- Build new operations ---
-    let mut new_ops: Vec<Operation> = Vec::new();
-
-    // Const: rotation matrix [1, 1, head_dim, head_dim] fp16
-    let rot_data = mil_emitter::generate_rotation_weights(head_dim, config.rotation_seed);
-    let rot_shape = vec![1, 1, head_dim, head_dim];
-    let mut rot_op = Operation::new("const", "tq_cw_rotation_matrix")
-        .with_input(
-            "val",
-            Value::Tensor {
-                data: rot_data,
-                shape: rot_shape.clone(),
-                dtype: ScalarType::Float16,
-            },
-        )
-        .with_output("tq_cw_rotation_matrix");
-    rot_op.output_types = vec![Some(TensorType::new(ScalarType::Float16, rot_shape))];
-    new_ops.push(rot_op);
-
-    // Scalar consts for the quantization chain
-    let mut inv_scale_op = Operation::new("const", "tq_cw_inv_scale")
-        .with_input("val", Value::Float(inv_scale as f64))
-        .with_output("tq_cw_inv_scale");
-    inv_scale_op.output_types = vec![Some(TensorType::new(ScalarType::Float16, vec![]))];
-    new_ops.push(inv_scale_op);
-
-    let mut zp_op = Operation::new("const", "tq_cw_zero_point")
-        .with_input("val", Value::Float(0.0))
-        .with_output("tq_cw_zero_point");
-    zp_op.output_types = vec![Some(TensorType::new(ScalarType::Float16, vec![]))];
-    new_ops.push(zp_op);
-
-    let mut clip_lo_op = Operation::new("const", "tq_cw_clip_lo")
-        .with_input("val", Value::Float(-128.0))
-        .with_output("tq_cw_clip_lo");
-    clip_lo_op.output_types = vec![Some(TensorType::new(ScalarType::Float16, vec![]))];
-    new_ops.push(clip_lo_op);
-
-    let mut clip_hi_op = Operation::new("const", "tq_cw_clip_hi")
-        .with_input("val", Value::Float(127.0))
-        .with_output("tq_cw_clip_hi");
-    clip_hi_op.output_types = vec![Some(TensorType::new(ScalarType::Float16, vec![]))];
-    new_ops.push(clip_hi_op);
-
-    let mut bf_op = Operation::new("const", "tq_cw_bF")
-        .with_input("val", Value::Bool(false))
-        .with_output("tq_cw_bF");
-    bf_op.output_types = vec![Some(TensorType::new(ScalarType::Bool, vec![]))];
-    new_ops.push(bf_op);
-
-    // Build quantization chain for K and V
-    for (prefix, input_ref) in [("k", &k_proj_name), ("v", &v_proj_name)] {
-        let reshaped_name = format!("tq_cw_{prefix}_reshaped");
-        let rotated_name = format!("tq_cw_{prefix}_rotated");
-        let flat_name = format!("tq_cw_{prefix}_flat");
-        let scaled_name = format!("tq_cw_{prefix}_scaled");
-        let shifted_name = format!("tq_cw_{prefix}_shifted");
-        let rounded_name = format!("tq_cw_{prefix}_rounded");
-        let clamped_name = format!("tq_cw_{prefix}_clamped");
-        let int8_name = format!("tq_cw_{prefix}_int8");
-        let output_name = format!("tq_cw_{prefix}_quant");
-
-        let reshape_4d = vec![1, num_kv_heads, head_dim, s];
-        let flat_shape = vec![1, kv_ch, 1, s];
-
-        // Reshape: [1, kv_ch, 1, S] → [1, num_kv_heads, head_dim, S]
-        let shape_data: Vec<u8> = [1i32, num_kv_heads as i32, head_dim as i32, s as i32]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let shape_const_name = format!("tq_cw_{prefix}_reshape_shape");
-        let mut shape_const =
-            Operation::new("const", &shape_const_name).with_output(&shape_const_name);
-        shape_const.inputs.insert(
-            "val".into(),
-            Value::Tensor {
-                data: shape_data,
-                shape: vec![4],
-                dtype: ScalarType::Int32,
-            },
-        );
-        shape_const.output_types = vec![Some(TensorType::new(ScalarType::Int32, vec![4]))];
-        new_ops.push(shape_const);
-
-        let mut reshape_op = Operation::new("reshape", &reshaped_name)
-            .with_input("x", Value::Reference(input_ref.clone()))
-            .with_input("shape", Value::Reference(shape_const_name.clone()))
-            .with_output(&reshaped_name);
-        reshape_op.output_types = vec![Some(TensorType::new(
-            ScalarType::Float16,
-            reshape_4d.clone(),
-        ))];
-        new_ops.push(reshape_op);
-
-        // Matmul: rotation_matrix × reshaped (broadcast per KV head)
-        let mut matmul_op = Operation::new("matmul", &rotated_name)
-            .with_input("x", Value::Reference("tq_cw_rotation_matrix".into()))
-            .with_input("y", Value::Reference(reshaped_name.clone()))
-            .with_input("transpose_x", Value::Reference("tq_cw_bF".into()))
-            .with_input("transpose_y", Value::Reference("tq_cw_bF".into()))
-            .with_output(&rotated_name);
-        matmul_op.output_types = vec![Some(TensorType::new(ScalarType::Float16, reshape_4d))];
-        new_ops.push(matmul_op);
-
-        // Reshape back: [1, num_kv_heads, head_dim, S] → [1, kv_ch, 1, S]
-        let flat_shape_data: Vec<u8> = [1i32, kv_ch as i32, 1, s as i32]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let flat_shape_const_name = format!("tq_cw_{prefix}_flat_shape");
-        let mut flat_shape_const =
-            Operation::new("const", &flat_shape_const_name).with_output(&flat_shape_const_name);
-        flat_shape_const.inputs.insert(
-            "val".into(),
-            Value::Tensor {
-                data: flat_shape_data,
-                shape: vec![4],
-                dtype: ScalarType::Int32,
-            },
-        );
-        flat_shape_const.output_types = vec![Some(TensorType::new(ScalarType::Int32, vec![4]))];
-        new_ops.push(flat_shape_const);
-
-        let mut flat_op = Operation::new("reshape", &flat_name)
-            .with_input("x", Value::Reference(rotated_name))
-            .with_input("shape", Value::Reference(flat_shape_const_name))
-            .with_output(&flat_name);
-        flat_op.output_types = vec![Some(TensorType::new(
-            ScalarType::Float16,
-            flat_shape.clone(),
-        ))];
-        new_ops.push(flat_op);
-
-        // mul: × inv_scale
-        let mut mul_op = Operation::new("mul", &scaled_name)
-            .with_input("x", Value::Reference(flat_name))
-            .with_input("y", Value::Reference("tq_cw_inv_scale".into()))
-            .with_output(&scaled_name);
-        mul_op.output_types = vec![Some(TensorType::new(
-            ScalarType::Float16,
-            flat_shape.clone(),
-        ))];
-        new_ops.push(mul_op);
-
-        // add: + zero_point
-        let mut add_op = Operation::new("add", &shifted_name)
-            .with_input("x", Value::Reference(scaled_name))
-            .with_input("y", Value::Reference("tq_cw_zero_point".into()))
-            .with_output(&shifted_name);
-        add_op.output_types = vec![Some(TensorType::new(
-            ScalarType::Float16,
-            flat_shape.clone(),
-        ))];
-        new_ops.push(add_op);
-
-        // round
-        let mut round_op = Operation::new("round", &rounded_name)
-            .with_input("x", Value::Reference(shifted_name))
-            .with_output(&rounded_name);
-        round_op.output_types = vec![Some(TensorType::new(
-            ScalarType::Float16,
-            flat_shape.clone(),
-        ))];
-        new_ops.push(round_op);
-
-        // clip: [-128, 127]
-        let mut clip_op = Operation::new("clip", &clamped_name)
-            .with_input("x", Value::Reference(rounded_name))
-            .with_input("alpha", Value::Reference("tq_cw_clip_lo".into()))
-            .with_input("beta", Value::Reference("tq_cw_clip_hi".into()))
-            .with_output(&clamped_name);
-        clip_op.output_types = vec![Some(TensorType::new(
-            ScalarType::Float16,
-            flat_shape.clone(),
-        ))];
-        new_ops.push(clip_op);
-
-        // cast: fp16 → int8
-        let mut cast_int8 = Operation::new("cast", &int8_name)
-            .with_input("x", Value::Reference(clamped_name))
-            .with_input("dtype", Value::String("int8".into()))
-            .with_output(&int8_name);
-        cast_int8.output_types = vec![Some(TensorType::new(ScalarType::Int8, flat_shape.clone()))];
-        new_ops.push(cast_int8);
-
-        // cast: int8 → fp16 (ANE rejects INT8 function outputs)
-        let mut cast_fp16 = Operation::new("cast", &output_name)
-            .with_input("x", Value::Reference(int8_name))
-            .with_input("dtype", Value::String("fp16".into()))
-            .with_output(&output_name);
-        cast_fp16.output_types = vec![Some(TensorType::new(ScalarType::Float16, flat_shape))];
-        new_ops.push(cast_fp16);
-    }
-
-    // Append new ops to the function body
-    func.body.operations.append(&mut new_ops);
-
-    // Reorder function outputs to [Q, K_quant, V_quant, ...extras...].
+    // Reorder function outputs to [Q, K, V, ...extras...].
     // The split sorts outputs lexicographically (e.g., k < q < v), which
-    // may not match the decode loop's expected [Q, K, V] convention.
-    // We enforce the canonical ordering here.
-    func.body.outputs[k_idx] = "tq_cw_k_quant".to_string();
-    func.body.outputs[v_idx] = "tq_cw_v_quant".to_string();
-    // Q stays at its original name at q_idx.
-
-    // Collect extra outputs (beyond Q/K/V, e.g., residual).
+    // doesn't match the decode loop's expected [Q, K, V] convention.
+    //
+    // NOTE: Cache-write op injection (rotation + quantization) is not yet
+    // active. ANE rejects programs that exceed the per-program resource
+    // budget when quantization ops are appended to the already-heavy
+    // pre_attn (~8MB projection weights). The reordering alone fixes the
+    // pre-existing Q/K output swap and enables correct non-fused TQ.
     let q_name = func.body.outputs[q_idx].clone();
-    let k_quant_name = func.body.outputs[k_idx].clone();
-    let v_quant_name = func.body.outputs[v_idx].clone();
+    let k_name = func.body.outputs[k_idx].clone();
+    let v_name = func.body.outputs[v_idx].clone();
     let mut extras: Vec<String> = Vec::new();
     for (i, name) in func.body.outputs.iter().enumerate() {
         if i != q_idx && i != k_idx && i != v_idx {
             extras.push(name.clone());
         }
     }
-
-    // Rebuild outputs in canonical order: [Q, K_quant, V_quant, ...extras]
-    let mut new_outputs = vec![q_name, k_quant_name, v_quant_name];
+    let mut new_outputs = vec![q_name, k_name, v_name];
     new_outputs.extend(extras);
-    if enable_qjl {
-        new_outputs.push(k_proj_name);
-    }
     func.body.outputs = new_outputs;
 
-    // Rebuild sub-program output descriptors in the same canonical order.
     let q_td = sub.outputs[q_idx].clone();
     let k_td = sub.outputs[k_idx].clone();
     let v_td = sub.outputs[v_idx].clone();
@@ -1762,24 +1541,8 @@ fn inject_cache_write_ops(
             extra_tds.push(td.clone());
         }
     }
-    let mut new_tds = vec![
-        q_td,
-        ironmill_compile::ane::TensorDescriptor {
-            name: "tq_cw_k_quant".to_string(),
-            ..k_td.clone()
-        },
-        ironmill_compile::ane::TensorDescriptor {
-            name: "tq_cw_v_quant".to_string(),
-            ..v_td
-        },
-    ];
+    let mut new_tds = vec![q_td, k_td, v_td];
     new_tds.extend(extra_tds);
-    if enable_qjl {
-        new_tds.push(ironmill_compile::ane::TensorDescriptor {
-            name: "k_proj_original".to_string(),
-            ..k_td
-        });
-    }
     sub.outputs = new_tds;
 
     Ok(true)
