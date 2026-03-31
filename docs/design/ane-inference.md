@@ -1,98 +1,100 @@
-# ANE Inference - Design & Status
+# ANE Inference — Design & Status
 
-> Consolidated from `ane-inference-optimizations.md` and `ANE-op-discoveries.md`.
-> Original investigation docs archived in `docs/archive/`.
+> Living design doc for the ANE direct inference pipeline.
+>
+> Last updated: 2026-03-31
+
+## Architecture
+
+Each transformer layer is split into two deep ANE sub-programs:
+
+```
+pre_attn (~15 ops, ~8 MB weights):
+  input_norm → Q/K/V projections
+
+  ↓ CPU: write K/V to cache, gather RoPE cos/sin
+
+post_attn (~50 ops, ~22 MB weights):
+  attention(Q, K_cache, V_cache) → O-proj → residual → post_norm → FFN
+```
+
+This 2-way split maximizes ANE graph depth (the ANE achieves 94% utilization
+at 32+ ops per program) while enabling KV cache management on CPU between
+the two dispatches.
+
+### Why this split
+
+- **ANE is optimized for deep graphs** — chaining 16-64 ops per program.
+  Single-op dispatches waste ~70% capacity due to 0.095ms overhead.
+  ([source](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-615))
+- **KV cache writes require a CPU boundary** — ANE programs are pure
+  computation with no side effects. The cache must be updated between
+  "produce K/V" and "consume KV cache."
+- **Weight budget** — a full layer has ~30 MB of projection weights.
+  Splitting at the attention boundary puts ~8 MB in pre_attn and ~22 MB
+  in post_attn, each under the ~32 MB SRAM limit.
 
 ## Current Status
 
 ### What Works
-- Decode loop with per-layer sub-program execution (pre_attn → attention → post_attn)
-- Pre_attn (QKV projections via 1×1 conv) compiles and runs on ANE
-- Post_attn (FFN via 1×1 conv + SiLU) compiles and runs on ANE
-- TurboQuant INT8 KV cache pipeline (quantize, cache write/read, dequantize)
-- CPU embedding lookup
-- CPU RoPE rotation (ANE `gather` is unsupported; CPU cost is trivial)
+- pre_attn sub-programs compile and run on ANE ✅
+- Decode loop with per-layer execution
+- CPU embedding lookup, CPU RoPE rotation
 - Token sampling with temperature, greedy, and EOS detection
-- Chunked lm_head on ANE (1×1 conv with donor/patch weight reuse)
-- Separate compile/load lifecycle (Orion-style `loadWithQoS`/`unloadWithQoS`)
-- `Drop for CompiledProgram` prevents cross-model handle leaks
+- Chunked lm_head on ANE
+- Final RMSNorm applied before lm_head (CPU)
+- Separate compile/load lifecycle (Orion-style loadWithQoS/unloadWithQoS)
+- Perplexity benchmark (--perplexity flag) runs end-to-end
 
 ### What Doesn't Work
-- **FP16 attention sub-programs fail to compile on ANE** due to bugs in
-  ironmill's MIL emission, not fundamental ANE limitations. The ANE handles
-  64+ op deep graphs (see [ANE Constraints](ane-constraints.md)). The
-  specific issues are in ironmill's split/emit pipeline:
-  - Duplicate `z_output*` variable names in emitted MIL (naming bug in
-    `build_sub_program` cross-boundary output assignment)
-  - `strip_gather_ops` uses an overly aggressive whitelist that breaks
-    computation graphs by removing ops without fixing references
-  - The `split` op in combination with `matmul + softmax + tile` is a
-    known ANE compiler bug
-- **Missing final RMSNorm** was found and fixed — `extract_1d_weight()`
-  and `cpu_rms_norm()` now apply the norm before lm_head projection
-- **Q/K/V output ordering** was found and fixed — split outputs are
-  sorted lexicographically (`k_proj < q_proj < v_proj`), not Q/K/V order
-- Perplexity benchmark (`--perplexity`) is implemented and runs end-to-end
-  at ~6-8 tok/s but reports PPL=inf due to the attention issue above
+- **post_attn sub-programs fail to compile on ANE.** The MIL is valid
+  (no duplicate names, no dangling references, correct shapes, 22 MB
+  weights) but ANECCompile() rejects it. This is an ironmill bug,
+  not a fundamental ANE limitation — see investigation notes below.
+- Without post_attn, layers fall back to Q pass-through → PPL=inf
 
-### Performance
+## Bugs Fixed During Investigation
 
-| Config | Throughput | KV Cache |
+| # | Bug | Fix |
 |---|---|---|
-| Qwen3-0.6B FP16 baseline | ~6.1 tok/s | 29.0 MB |
-| Qwen3-0.6B TurboQuant INT8 | ~5.5 tok/s | 14.5 MB |
+| 1 | Missing final RMSNorm before lm_head | Added cpu_rms_norm() + extract_1d_weight() |
+| 2 | Q/K/V output ordering assumed [Q,K,V] but split sorts lexicographically [K,Q,V] | Read index 1 as Q, 0 as K |
+| 3 | Architecture detection ran on post-pass program (doubled dims) | Detect from original program |
+| 4 | strip_gather_ops whitelist dropped verified ops (layer_norm, reduce_mean, etc.) | Narrowed to gather+split+concat+sub only |
+| 5 | AneVariableNamingPass ran pre-split, creating z_output* name collisions | Moved to per-subprogram in compile_and_load_sub |
+| 6 | Dangling function inputs after gather/split removal (20+ MB RoPE caches) | prune_unreferenced_inputs() + DCE |
+| 7 | TypeRepropagationPass didn't handle tile output shapes | Added infer_tile_output + manual fix for Reference-valued reps |
+| 8 | Output name deduplication missing in build_sub_program | Added collision detection + rename |
 
-## Key Discoveries
+## Investigation: post_attn Compilation Failure
 
-### Eval-Verified ≠ Compiler-Accepted
-Individual ops passing eval probes does not guarantee the ANE compiler
-(`_ANECCompile`) will accept a program containing them. The compiler applies
-additional constraints on op combinations, tensor shapes, and program structure
-that don't surface during single-op testing.
+### What we know
+- The emitted MIL is structurally valid (verified by script):
+  - No duplicate variable definitions
+  - No dangling references
+  - All shapes consistent with S=32 padding
+- 22 MB weights (5 conv projections: O + gate + up + down + norm)
+- 4 function inputs, all ≤128 KB
+- ~55 non-const ops including attention core + FFN
+- pre_attn (same architecture, same passes, ~8 MB weights) compiles fine
 
-### Program Budget
-- ~55 simultaneously-alive compiled models per process (model-size dependent)
-- 29-layer Qwen3-0.6B × 3 sub-programs = 87 → exceeds budget
-- Fix: separate compile/load lifecycle - compile all upfront, load ≤3 at a time
-- `Drop for CompiledProgram` calls `CFRelease` to prevent handle leaks
+### What we don't know
+- **Why** ANECCompile rejects this specific program
+- Whether it's the total weight size (22 MB is under 32 MB but close)
+- Whether a specific op pattern in the combined attention+FFN triggers
+  a compiler bug
+- Whether splitting post_attn into attention + FFN (3-way) would compile
 
-### IOSurface Constraints
-- Minimum allocation: **16KB** (not 48KB as previously assumed)
-- ANE rejects `[1, C, 1, S]` I/O tensors when `C > ~768` and `S < 32`
+### Recommended next steps
+1. **Bisect**: compile just the attention half of post_attn (no FFN) and
+   just the FFN half (no attention) to isolate which part fails
+2. **Reduce weights**: try with smaller intermediate_size to get under 16 MB
+3. **Compare with maderix**: check if maderix's 64-op deep graphs include
+   similar op patterns (matmul + softmax + conv + silu)
 
-### S≥32 Padding - Must Be Per-Sub-Program
-- S≥32 padding fixes pre_attn/post_attn (high-C tensors)
-- Padding **breaks** attention sub-programs where S represents per-head
-  dimensions, not sequence positions
-- With S=32: `[1, 2048, 1, 32]` → reshape `[1, 16, 128, 32]` - wrong
-- Without: `[1, 2048, 1, 1]` → reshape `[1, 16, 128, 1]` - correct dimensions
-- But `C=2048 > 768, S=1 < 32` → ANE constraint violation regardless
-
-### Op-Level Findings
-
-| Op | Finding | Workaround |
-|---|---|---|
-| `gather` | Runtime-rejected | CPU RoPE lookup (trivial: 256 bytes memcpy) |
-| `split` | Unreliable with matmul+softmax+tile | Strip RoPE from ANE sub-programs |
-| `concat` | ✅ Works (previous assumption it didn't was **wrong**) | N/A |
-| `matmul` dynamic×dynamic | May fail when S≥32 padding corrupts shapes | Use correct pre-padded shapes |
-
-## Architecture Requirements for Real Attention
-
-FP16 attention on ANE is implemented via hand-written MIL programs
-(`c632f05`). The key architectural decisions:
-
-1. **KV cache as matmul inputs** - IOSurface-backed tensors with `S=seq_len ≥ 32`,
-   not single-token `S=1` projections
-2. **Hand-written MIL programs** with correct shapes per sub-program type
-   (TurboQuant's MIL programs work because shapes are explicitly correct)
-3. **CPU RoPE rotation** - `gather` is unsupported but rotation is trivially
-   cheap on CPU (~nanoseconds for single-token decode)
-4. **Per-head norms on CPU** - untested in combination with attention on ANE;
-   safest to offload (also cheap)
+The failing MIL is dumped to /tmp/ironmill_debug_layer_0_post_attn.mil.
 
 ## References
-
-- [ANE Op Support Matrix](ane-op-support-matrix.md) - 74 verified ops
-- [ANE Constraints](ane-constraints.md) - hardware limits and diagnostics
-- [TurboQuant Design](turboquant.md) - INT8 KV cache compression
+- [ANE Op Support Matrix](ane-op-support-matrix.md) — 74 verified ops
+- [ANE Constraints](ane-constraints.md) — hardware limits and diagnostics
+- [TurboQuant Design](turboquant.md) — INT8 KV cache compression
