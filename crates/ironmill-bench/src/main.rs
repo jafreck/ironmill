@@ -364,7 +364,7 @@ fn main() -> Result<()> {
     if cli.metal {
         #[cfg(feature = "metal")]
         {
-            use ironmill_compile::weights::SafeTensorsProvider;
+            use ironmill_compile::weights::{SafeTensorsProvider, WeightProvider};
             use ironmill_inference::engine::InferenceEngine;
             use ironmill_inference::gpu::{GpuConfig, GpuInference};
 
@@ -525,6 +525,115 @@ fn main() -> Result<()> {
                             load_time_ms: Some(load_time_ms),
                         });
                     }
+                }
+            }
+
+            // ── Perplexity evaluation on Metal ──
+            if cli.perplexity {
+                eprintln!("\n  Metal Perplexity Evaluation");
+                eprintln!("  {}", "─".repeat(40));
+
+                let dataset = match perplexity::PerplexityDataset::load(&cli.perplexity_dataset) {
+                    Ok(ds) => {
+                        eprintln!(
+                            "  Dataset: {} ({} seqs × {} tokens)",
+                            ds.name, ds.num_sequences, ds.seq_len
+                        );
+                        ds
+                    }
+                    Err(e) => {
+                        eprintln!("  ✗ Failed to load dataset: {e}");
+                        eprintln!("  Run: python scripts/prepare-quality-dataset.py");
+                        return Ok(());
+                    }
+                };
+
+                let model_cfg = matrix.models.first().unwrap();
+                let model_dir = if model_cfg.path.is_dir() {
+                    model_cfg.path.clone()
+                } else {
+                    model_cfg.path.parent().unwrap().to_path_buf()
+                };
+
+                let provider = SafeTensorsProvider::load(&model_dir)
+                    .map_err(|e| anyhow::anyhow!("weight load: {e}"))?;
+
+                for (config_name, gpu_config) in &configs {
+                    eprintln!("  Evaluating {config_name}...");
+
+                    let mut engine = GpuInference::new(gpu_config.clone())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    engine
+                        .load_weights(&provider, gpu_config.clone())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                    // Memory footprint estimation
+                    let mc = provider.config();
+                    let weight_bytes = mc.vocab_size * mc.hidden_size * 2
+                        + mc.num_hidden_layers
+                            * (mc.hidden_size * 2 * 2
+                                + mc.num_attention_heads * mc.head_dim * mc.hidden_size * 2
+                                + mc.num_key_value_heads * mc.head_dim * mc.hidden_size * 2 * 2
+                                + mc.hidden_size * mc.num_attention_heads * mc.head_dim * 2
+                                + mc.intermediate_size * mc.hidden_size * 2 * 3)
+                        + mc.hidden_size * 2
+                        + if mc.tie_word_embeddings {
+                            0
+                        } else {
+                            mc.vocab_size * mc.hidden_size * 2
+                        };
+
+                    let kv_bytes_per_elem = if gpu_config.enable_turboquant { 1 } else { 2 };
+                    let kv_cache_bytes = mc.num_hidden_layers
+                        * 2
+                        * mc.num_key_value_heads
+                        * gpu_config.max_seq_len
+                        * mc.head_dim
+                        * kv_bytes_per_elem;
+
+                    let total_mb = (weight_bytes + kv_cache_bytes) as f64 / (1024.0 * 1024.0);
+                    let kv_mb = kv_cache_bytes as f64 / (1024.0 * 1024.0);
+                    eprintln!(
+                        "  Memory: {:.1} MB total ({:.1} MB weights, {:.1} MB KV cache)",
+                        total_mb,
+                        weight_bytes as f64 / (1024.0 * 1024.0),
+                        kv_mb
+                    );
+
+                    let num_seqs = cli.perplexity_sequences.min(dataset.num_sequences);
+                    let mut all_losses = Vec::new();
+                    let start = std::time::Instant::now();
+
+                    for (seq_idx, sequence) in dataset.sequences.iter().take(num_seqs).enumerate() {
+                        engine.reset();
+                        for pos in 0..sequence.len() - 1 {
+                            let token = sequence[pos];
+                            let target = sequence[pos + 1];
+                            let logits = engine
+                                .decode_step(token)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            let ce = perplexity::cross_entropy(&logits, target);
+                            all_losses.push(ce);
+                        }
+                        let running_ppl = perplexity::perplexity_from_losses(&all_losses);
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let tok_per_sec = all_losses.len() as f64 / elapsed;
+                        eprintln!(
+                            "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
+                            seq_idx + 1,
+                            num_seqs,
+                            running_ppl,
+                            all_losses.len(),
+                            tok_per_sec,
+                        );
+                    }
+
+                    let ppl = perplexity::perplexity_from_losses(&all_losses);
+                    let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
+                    eprintln!(
+                        "  ✓ {config_name}: PPL={:.2}, Avg CE={:.4}, KV={:.1} MB",
+                        ppl, avg_ce, kv_mb
+                    );
                 }
             }
         }

@@ -59,7 +59,7 @@ targeting Apple's Neural Engine:
 
 ### Inference Runtime
 
-ironmill-inference provides two backends for running compiled models:
+ironmill-inference provides three backends for running compiled models:
 
 **CoreML backend:** standard CoreML runtime via `MLModel`. Works with any
 .mlmodelc compiled package. Apple manages ANE/GPU/CPU scheduling.
@@ -73,6 +73,15 @@ fine-grained control over:
 - [TurboQuant](docs/design/turboquant.md): INT8 KV cache compression with
   Hadamard rotation and on-ANE dequantization
 - Autoregressive decode loop with ANE-accelerated lm_head via chunked conv1×1
+
+**Metal GPU backend** *(experimental)*: runs inference directly on Apple GPU
+via Metal compute shaders and MPS. Supports full LLaMA-style autoregressive
+decode including:
+
+- MPS-accelerated matrix multiplication for all linear layers
+- Custom Metal compute kernels for RMSNorm, RoPE, SiLU, attention, and residuals
+- TurboQuant INT8 KV cache with fused quantize/dequantize shaders
+- Prefill and single-step decode modes
 
 ### Ecosystem Integration
 
@@ -161,6 +170,7 @@ graph TD
         ane["ane-sys"]
         ios["iosurface"]
         coremlsys["coreml-sys"]
+        metalsys["metal-sys"]
     end
 
     subgraph Foundation
@@ -187,6 +197,7 @@ graph TD
     inference --> ane
     inference --> ios
     inference --> coremlsys
+    inference -.->|"metal" feature| metalsys
     inference -.->|"compile" feature| compile
 
     ios --> mil
@@ -196,10 +207,11 @@ graph TD
 |-------|-------------|
 | [`mil-rs`](crates/mil-rs/) | Core MIL IR library: read/write CoreML models, ONNX conversion, proto↔IR, pass pipeline |
 | [`ironmill-compile`](crates/ironmill-compile/) | Compilation pipeline: ANE lowering passes, CoreML build API, templates, weight providers |
-| [`ironmill-inference`](crates/ironmill-inference/) | Inference engine: ANE-direct and CoreML backends, decode loop, TurboQuant, sampling |
+| [`ironmill-inference`](crates/ironmill-inference/) | Inference engine: ANE-direct, CoreML, and Metal GPU backends, decode loop, TurboQuant, sampling |
 | [`ironmill-ane-sys`](crates/ironmill-ane-sys/) | Safe FFI bindings for Apple Neural Engine private APIs (macOS-only) |
 | [`ironmill-iosurface`](crates/ironmill-iosurface/) | IOSurface tensor management for ANE I/O (macOS-only) |
 | [`ironmill-coreml-sys`](crates/ironmill-coreml-sys/) | CoreML runtime bindings via objc2 (macOS-only) |
+| [`ironmill-metal-sys`](crates/ironmill-metal-sys/) | Safe FFI bindings for Apple Metal and MPS frameworks (macOS-only) |
 | [`ironmill-cli`](crates/ironmill-cli/) | CLI: `compile`, `inspect`, `validate` commands |
 | [`ironmill-bench`](crates/ironmill-bench/) | Inference benchmark harness: power, quality, perplexity metrics |
 | [`candle-coreml`](crates/candle-coreml/) | Bridge crate: ONNX→CoreML conversion + runtime for candle |
