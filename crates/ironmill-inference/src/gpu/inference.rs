@@ -205,6 +205,76 @@ impl GpuInference {
         })
     }
 
+    /// Load model weights directly from a [`WeightProvider`], bypassing
+    /// the type-erased [`InferenceEngine::load`] interface.
+    #[cfg(feature = "compile")]
+    pub fn load_weights(
+        &mut self,
+        provider: &dyn ironmill_compile::weights::WeightProvider,
+        config: GpuConfig,
+    ) -> Result<(), InferenceError> {
+        self.config = config;
+
+        let weights = GpuWeights::load(&self.device, provider)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+        let mc = &weights.config;
+        self.model_config = Some(mc.clone());
+
+        let max_prefill = self.config.prefill_chunk_size.unwrap_or(512).max(1);
+        let bufs = IntermediateBuffers::allocate(&self.device, max_prefill, mc)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        self.intermediate_buffers = Some(bufs);
+
+        let (cos, sin) = Self::build_rope_cache(
+            &self.device,
+            mc.head_dim,
+            self.config.max_seq_len,
+            mc.rope_theta,
+        )
+        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        self.rope_cos = Some(cos);
+        self.rope_sin = Some(sin);
+
+        let decode_cache = Self::build_matmul_cache(&self.device, mc, 1)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        self.decode_matmuls = Some(decode_cache);
+
+        if self.config.enable_turboquant {
+            let tq_config = TurboQuantGpuConfig {
+                n_bits: self.config.n_bits,
+                num_kv_heads: mc.num_key_value_heads,
+                head_dim: mc.head_dim,
+                max_seq_len: self.config.max_seq_len,
+                num_layers: mc.num_hidden_layers,
+                rotation_seed: self.config.rotation_seed,
+            };
+            let tq_model = GpuTurboQuantModel::new(&self.device, tq_config.clone())
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let kv_cache = GpuKvCache::new(&self.device, &tq_config)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            self.turboquant = Some(tq_model);
+            self.kv_cache = Some(kv_cache);
+            self.fp16_kv_cache = None;
+        } else {
+            let fp16_kv = Fp16KvCache::new(
+                &self.device,
+                mc.num_hidden_layers,
+                mc.num_key_value_heads,
+                self.config.max_seq_len,
+                mc.head_dim,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            self.fp16_kv_cache = Some(fp16_kv);
+            self.turboquant = None;
+            self.kv_cache = None;
+        }
+
+        self.weights = Some(weights);
+        self.seq_pos = 0;
+        Ok(())
+    }
+
     // ── RoPE cache ──────────────────────────────────────────────
 
     fn build_rope_cache(

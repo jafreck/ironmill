@@ -175,9 +175,12 @@ fn main() -> Result<()> {
     let mut report_rows = Vec::new();
 
     // Skip the main benchmark loop if only perplexity is requested
+    // or only metal/ane-direct are requested (they have their own paths)
     let run_latency_bench = !cli.perplexity || cli.ane_direct || cli.metal || cli.quality;
+    let run_coreml_bench = run_latency_bench
+        && (!cli.metal || cli.ane_direct || !cli.backend.is_empty() || cli.quality);
 
-    if run_latency_bench {
+    if run_coreml_bench {
         for model_cfg in &matrix.models {
             // Compute model FLOPs if we can parse the model
             let model_flops = compute_model_flops(model_cfg);
@@ -275,99 +278,147 @@ fn main() -> Result<()> {
                 }
             }
         }
+    } // end run_coreml_bench
 
-        if cli.ane_direct {
-            #[cfg(feature = "ane-direct")]
-            {
-                eprintln!("\n  ANE Direct Runtime Benchmark");
-                eprintln!("  {}", "─".repeat(40));
-                eprintln!("  ⚠ ANE direct benchmarking requires runtime verification");
-                eprintln!("    (private API selectors must be validated on this macOS version)");
+    // ── ANE-direct and Metal benchmarks (independent of CoreML) ──
 
-                for model_cfg in &matrix.models {
-                    for opt_cfg in &matrix.optimizations {
-                        eprintln!(
-                            "  Compiling {} with {} (ANE direct)...",
-                            model_cfg.name, opt_cfg.name
-                        );
+    if cli.ane_direct {
+        #[cfg(feature = "ane-direct")]
+        {
+            eprintln!("\n  ANE Direct Runtime Benchmark");
+            eprintln!("  {}", "─".repeat(40));
+            eprintln!("  ⚠ ANE direct benchmarking requires runtime verification");
+            eprintln!("    (private API selectors must be validated on this macOS version)");
 
-                        let program = match compiler::build_optimized_program(model_cfg, opt_cfg) {
-                            Ok(p) => p,
+            for model_cfg in &matrix.models {
+                for opt_cfg in &matrix.optimizations {
+                    eprintln!(
+                        "  Compiling {} with {} (ANE direct)...",
+                        model_cfg.name, opt_cfg.name
+                    );
+
+                    let program = match compiler::build_optimized_program(model_cfg, opt_cfg) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("  ✗ failed to build program: {e}");
+                            continue;
+                        }
+                    };
+
+                    let config = ironmill_inference::AneConfig::default();
+
+                    let mut run_results = Vec::new();
+                    for run_idx in 0..matrix.settings.runs {
+                        let result = match inference::run_ane_direct_inference(
+                            &program,
+                            config.clone(),
+                            matrix.settings.warmup,
+                            matrix.settings.iterations,
+                        ) {
+                            Ok(r) => r,
                             Err(e) => {
-                                eprintln!("  ✗ failed to build program: {e}");
+                                eprintln!("  ✗ ANE direct inference failed: {e}");
                                 continue;
                             }
                         };
 
-                        let config = ironmill_inference::AneConfig::default();
+                        let latencies_ms: Vec<f64> = result
+                            .latencies
+                            .iter()
+                            .map(|d| d.as_secs_f64() * 1000.0)
+                            .collect();
 
-                        let mut run_results = Vec::new();
-                        for run_idx in 0..matrix.settings.runs {
-                            let result = match inference::run_ane_direct_inference(
-                                &program,
-                                config.clone(),
-                                matrix.settings.warmup,
-                                matrix.settings.iterations,
-                            ) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    eprintln!("  ✗ ANE direct inference failed: {e}");
-                                    continue;
-                                }
-                            };
+                        let label = format!(
+                            "{}/{}/ane-direct/run{}",
+                            model_cfg.name, opt_cfg.name, run_idx
+                        );
+                        run_results.push(compute_stats(&label, &latencies_ms));
+                    }
 
-                            let latencies_ms: Vec<f64> = result
-                                .latencies
-                                .iter()
-                                .map(|d| d.as_secs_f64() * 1000.0)
-                                .collect();
+                    if !run_results.is_empty() {
+                        let label = format!("{}/{}/ane-direct", model_cfg.name, opt_cfg.name);
+                        let aggregated = aggregate_runs(&label, &run_results);
 
-                            let label = format!(
-                                "{}/{}/ane-direct/run{}",
-                                model_cfg.name, opt_cfg.name, run_idx
-                            );
-                            run_results.push(compute_stats(&label, &latencies_ms));
-                        }
-
-                        if !run_results.is_empty() {
-                            let label = format!("{}/{}/ane-direct", model_cfg.name, opt_cfg.name);
-                            let aggregated = aggregate_runs(&label, &run_results);
-
-                            report_rows.push(ReportRow {
-                                model: model_cfg.name.clone(),
-                                optimization: opt_cfg.name.clone(),
-                                backend: "ane-direct".to_string(),
-                                kv_quant: opt_cfg.kv_quant.to_string(),
-                                result: aggregated,
-                                significance: None,
-                                energy: None,
-                                utilization: None,
-                                memory: None,
-                                load_time_ms: None,
-                            });
-                        }
+                        report_rows.push(ReportRow {
+                            model: model_cfg.name.clone(),
+                            optimization: opt_cfg.name.clone(),
+                            backend: "ane-direct".to_string(),
+                            kv_quant: opt_cfg.kv_quant.to_string(),
+                            result: aggregated,
+                            significance: None,
+                            energy: None,
+                            utilization: None,
+                            memory: None,
+                            load_time_ms: None,
+                        });
                     }
                 }
             }
-            #[cfg(not(feature = "ane-direct"))]
-            {
-                eprintln!("warning: --ane-direct requires --features ane-direct, skipping");
-            }
         }
+        #[cfg(not(feature = "ane-direct"))]
+        {
+            eprintln!("warning: --ane-direct requires --features ane-direct, skipping");
+        }
+    }
 
-        if cli.metal {
-            #[cfg(feature = "metal")]
-            {
-                use ironmill_inference::gpu::{GpuConfig, GpuInference};
+    if cli.metal {
+        #[cfg(feature = "metal")]
+        {
+            use ironmill_compile::weights::SafeTensorsProvider;
+            use ironmill_inference::engine::InferenceEngine;
+            use ironmill_inference::gpu::{GpuConfig, GpuInference};
 
-                eprintln!("\n  Metal GPU Backend Benchmark");
-                eprintln!("  {}", "─".repeat(40));
+            eprintln!("\n  Metal GPU Backend Benchmark");
+            eprintln!("  {}", "─".repeat(40));
 
-                for model_cfg in &matrix.models {
-                    eprintln!("  Metal: {}...", model_cfg.name);
+            // Run two configurations: FP16 baseline and TurboQuant INT4
+            let configs: Vec<(&str, GpuConfig)> = vec![
+                (
+                    "fp16",
+                    GpuConfig {
+                        enable_turboquant: false,
+                        ..GpuConfig::default()
+                    },
+                ),
+                (
+                    "tq-int4",
+                    GpuConfig {
+                        enable_turboquant: true,
+                        n_bits: 4,
+                        ..GpuConfig::default()
+                    },
+                ),
+            ];
 
-                    let gpu_config = GpuConfig::default();
-                    let mut engine = match GpuInference::new(gpu_config) {
+            for model_cfg in &matrix.models {
+                // Load weights once, reuse across configs
+                let model_dir = if model_cfg.path.is_dir() {
+                    model_cfg.path.clone()
+                } else if let Some(parent) = model_cfg.path.parent() {
+                    parent.to_path_buf()
+                } else {
+                    eprintln!(
+                        "  ✗ cannot determine model directory for {}",
+                        model_cfg.name
+                    );
+                    continue;
+                };
+
+                let provider = match SafeTensorsProvider::load(&model_dir) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "  ✗ failed to load weights from {}: {e}",
+                            model_dir.display()
+                        );
+                        continue;
+                    }
+                };
+
+                for (config_name, gpu_config) in &configs {
+                    eprintln!("  Metal/{config_name}: {}...", model_cfg.name);
+
+                    let mut engine = match GpuInference::new(gpu_config.clone()) {
                         Ok(e) => e,
                         Err(e) => {
                             eprintln!("  ✗ Metal GPU init failed: {e}");
@@ -375,46 +426,134 @@ fn main() -> Result<()> {
                         }
                     };
 
-                    // Load weights from the model path if it's a SafeTensors
-                    // or GGUF file. For now, report that the engine initialized
-                    // and skip the decode loop since weight loading requires a
-                    // WeightProvider which needs format-specific setup.
-                    eprintln!(
-                        "  ✓ Metal GPU engine initialized (model loading requires weight provider)"
-                    );
-                    let _ = &mut engine; // suppress unused warning
+                    let load_start = std::time::Instant::now();
+                    if let Err(e) = engine.load_weights(&provider, gpu_config.clone()) {
+                        eprintln!("  ✗ Metal model load failed: {e}");
+                        continue;
+                    }
+                    let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("  ✓ loaded in {load_time_ms:.1}ms");
 
-                    // TODO: integrate weight loading from model_cfg.path once
-                    // the bench harness has a WeightProvider factory.
+                    // Prefill with a short prompt (token IDs for "Hello world")
+                    let prompt_tokens: Vec<u32> = vec![9707, 1879];
+
+                    let mut run_results = Vec::new();
+                    for run_idx in 0..matrix.settings.runs {
+                        engine.reset();
+
+                        // Prefill
+                        if let Err(e) = engine.prefill(&prompt_tokens) {
+                            eprintln!("  ✗ prefill failed: {e}");
+                            continue;
+                        }
+
+                        // Warmup decode steps
+                        let mut last_token = prompt_tokens.last().copied().unwrap_or(0);
+                        for _ in 0..matrix.settings.warmup {
+                            match engine.decode_step(last_token) {
+                                Ok(logits) => {
+                                    last_token = logits
+                                        .iter()
+                                        .enumerate()
+                                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                        .map(|(i, _)| i as u32)
+                                        .unwrap_or(0);
+                                }
+                                Err(e) => {
+                                    eprintln!("  ✗ warmup decode failed: {e}");
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Timed decode steps
+                        let mut latencies = Vec::with_capacity(matrix.settings.iterations);
+                        for _ in 0..matrix.settings.iterations {
+                            let t0 = std::time::Instant::now();
+                            match engine.decode_step(last_token) {
+                                Ok(logits) => {
+                                    let elapsed = t0.elapsed();
+                                    latencies.push(elapsed);
+                                    last_token = logits
+                                        .iter()
+                                        .enumerate()
+                                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                        .map(|(i, _)| i as u32)
+                                        .unwrap_or(0);
+                                }
+                                Err(e) => {
+                                    eprintln!("  ✗ decode failed at iteration: {e}");
+                                    break;
+                                }
+                            }
+                        }
+
+                        if latencies.is_empty() {
+                            continue;
+                        }
+
+                        let latencies_ms: Vec<f64> =
+                            latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+
+                        let label = format!(
+                            "{}/{}/metal-{config_name}/run{run_idx}",
+                            model_cfg.name, "default"
+                        );
+                        run_results.push(compute_stats(&label, &latencies_ms));
+                    }
+
+                    if !run_results.is_empty() {
+                        let label = format!("{}/metal-{config_name}", model_cfg.name);
+                        let aggregated = aggregate_runs(&label, &run_results);
+
+                        let tok_per_sec = 1000.0 / aggregated.pooled.mean;
+                        eprintln!(
+                            "  ✓ {config_name}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms",
+                            aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
+                        );
+
+                        report_rows.push(ReportRow {
+                            model: model_cfg.name.clone(),
+                            optimization: "default".to_string(),
+                            backend: format!("metal-{config_name}"),
+                            kv_quant: config_name.to_string(),
+                            result: aggregated,
+                            significance: None,
+                            energy: None,
+                            utilization: None,
+                            memory: None,
+                            load_time_ms: Some(load_time_ms),
+                        });
+                    }
                 }
             }
-            #[cfg(not(feature = "metal"))]
-            {
-                eprintln!("warning: --metal requires --features metal, skipping");
-            }
         }
+        #[cfg(not(feature = "metal"))]
+        {
+            eprintln!("warning: --metal requires --features metal, skipping");
+        }
+    }
 
-        if let Some(baseline_name) = &cli.baseline {
-            let baseline_rows: Vec<_> = report_rows
+    if let Some(baseline_name) = &cli.baseline {
+        let baseline_rows: Vec<_> = report_rows
+            .iter()
+            .filter(|r| r.optimization == *baseline_name)
+            .cloned()
+            .collect();
+
+        for row in &mut report_rows {
+            if row.optimization == *baseline_name {
+                continue;
+            }
+            if let Some(bl) = baseline_rows
                 .iter()
-                .filter(|r| r.optimization == *baseline_name)
-                .cloned()
-                .collect();
-
-            for row in &mut report_rows {
-                if row.optimization == *baseline_name {
-                    continue;
-                }
-                if let Some(bl) = baseline_rows
-                    .iter()
-                    .find(|b| b.model == row.model && b.backend == row.backend)
-                {
-                    let sig = welch_t_test(&bl.result.pooled, &row.result.pooled, cli.alpha);
-                    row.significance = Some(sig);
-                }
+                .find(|b| b.model == row.model && b.backend == row.backend)
+            {
+                let sig = welch_t_test(&bl.result.pooled, &row.result.pooled, cli.alpha);
+                row.significance = Some(sig);
             }
         }
-    } // end run_latency_bench
+    }
 
     let bench_report = BenchReport {
         rows: report_rows,
