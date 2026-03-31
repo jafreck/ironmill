@@ -449,15 +449,27 @@ impl AneInference {
         // ANE rejects IOSurface-backed tensors when C > ~768 and S < 32.
         // After AneLayoutPass, tensors are in [1, C, 1, S] format.
         // Padding is applied PER SUB-PROGRAM after splitting (below),
-        // NOT on the full program — fp16_attn sub-programs need original
-        // shapes for correct attention dimension semantics.
+        // NOT on the full program.
 
-        // 2. Split with attention boundary.
-        // This strips attention + RoPE ops (which contain concat) from
-        // the sub-programs that will be compiled for ANE.
+        // 1b. Replace `gather` ops with function inputs.
+        //     `gather` is unsupported on ANE at runtime. RoPE cos/sin
+        //     lookups use gather(cache, position_ids). We replace each
+        //     gather op with a function input that the CPU fills at
+        //     decode time, preserving all downstream references.
+        replace_gather_with_inputs(&mut program);
+
+        // 2. Split into per-layer programs (no attention boundary split).
+        //    Each layer is one deep program (~80-100 ops) for maximum ANE
+        //    utilization. The ANE is optimized for deep graphs (16-64+ ops)
+        //    and pays ~0.095ms dispatch overhead per eval. Splitting layers
+        //    into 3 sub-programs wastes dispatch budget.
+        //
+        //    `gather` ops (RoPE cos/sin lookup) are unsupported on ANE and
+        //    will cause compilation failures. They are handled by replacing
+        //    them with const tensors in the IR before compilation.
         let split_config = SplitConfig {
-            split_attention: true,
-            emit_attention: true,
+            split_attention: false,
+            emit_attention: false,
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -645,7 +657,6 @@ impl AneInference {
             } else if sub.name == "lm_head" {
                 lm_head_sp = Some(sub);
             } else if sub.name.ends_with("_pre_attn") {
-                // Extract layer number from "layer_N_pre_attn"
                 if let Some(n) = sub
                     .name
                     .strip_suffix("_pre_attn")
@@ -672,6 +683,17 @@ impl AneInference {
                 {
                     post_attn_map.insert(n, sub);
                 }
+            } else if sub.name.starts_with("layer_") {
+                // Unsplit layer: "layer_N" (no _pre_attn/_post_attn suffix).
+                if let Some(n) = sub
+                    .name
+                    .strip_prefix("layer_")
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    // Store as pre_attn — the decode loop treats it as the
+                    // full layer program (no separate attention or post_attn).
+                    pre_attn_map.insert(n, sub);
+                }
             }
         }
 
@@ -680,7 +702,8 @@ impl AneInference {
         let lm_head_sub = lm_head_sp
             .ok_or_else(|| AneError::Other(anyhow::anyhow!("no lm_head sub-program found")))?;
 
-        // Determine layers: a layer exists if it has at least a pre_attn.
+        // Determine layers: a layer exists if it has at least a pre_attn
+        // (or an unsplit layer_N stored in pre_attn_map).
         let layer_numbers: Vec<usize> = pre_attn_map.keys().copied().collect();
         let num_layers = layer_numbers.len();
         if num_layers == 0 {
@@ -2035,6 +2058,129 @@ fn cpu_lm_head_matmul(weight: &CpuWeight, hidden: &[f16]) -> Result<Vec<f32>> {
     }
 
     Ok(logits)
+}
+
+/// Replace `gather` and `split` ops with function inputs.
+///
+/// - `gather` is unsupported on ANE at runtime.
+/// - `split` triggers an ANE compiler bug when combined with
+///   `matmul + softmax + tile` in the same program.
+///
+/// Both are replaced with function inputs that the CPU fills at decode time.
+/// Downstream ops referencing their outputs are rewired to the new inputs.
+fn replace_gather_with_inputs(program: &mut mil_rs::ir::Program) {
+    use mil_rs::ir::TensorType;
+
+    let strip_ops = ["gather", "split", "concat", "sub"];
+
+    for func in program.functions.values_mut() {
+        let mut replaced_outputs: Vec<(String, TensorType)> = Vec::new();
+
+        // Find all gather/split ops and record their output names + types.
+        for op in &func.body.operations {
+            if !strip_ops.contains(&op.op_type.as_str()) {
+                continue;
+            }
+            for (idx, out_name) in op.outputs.iter().enumerate() {
+                let out_type = op
+                    .output_types
+                    .get(idx)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| TensorType {
+                        scalar_type: mil_rs::ir::ScalarType::Float16,
+                        shape: vec![Some(1), Some(1), Some(1), Some(1)],
+                    });
+                replaced_outputs.push((out_name.clone(), out_type));
+            }
+        }
+
+        if replaced_outputs.is_empty() {
+            continue;
+        }
+
+        // Add new function inputs for each replaced value.
+        for (name, ty) in &replaced_outputs {
+            let input_name = format!("cpu_{name}");
+            func.inputs.push((input_name, ty.clone()));
+        }
+
+        // Rewrite references: replace output names with new input names.
+        let rename_map: std::collections::HashMap<String, String> = replaced_outputs
+            .iter()
+            .map(|(name, _)| (name.clone(), format!("cpu_{name}")))
+            .collect();
+
+        for op in &mut func.body.operations {
+            for val in op.inputs.values_mut() {
+                if let mil_rs::ir::Value::Reference(r) = val {
+                    if let Some(new_name) = rename_map.get(r.as_str()) {
+                        *r = new_name.clone();
+                    }
+                }
+            }
+        }
+
+        // Remove the stripped ops.
+        func.body
+            .operations
+            .retain(|op| !strip_ops.contains(&op.op_type.as_str()));
+
+        // Dead code elimination: remove const ops whose outputs are
+        // no longer referenced by any remaining op or the function output.
+        let mut referenced_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // Collect all references from remaining ops.
+        for op in &func.body.operations {
+            for val in op.inputs.values() {
+                if let mil_rs::ir::Value::Reference(r) = val {
+                    referenced_names.insert(r.clone());
+                }
+            }
+            // Also check attributes for references.
+            for val in op.attributes.values() {
+                if let mil_rs::ir::Value::Reference(r) = val {
+                    referenced_names.insert(r.clone());
+                }
+            }
+        }
+        // Collect function output references.
+        for out_name in &func.body.outputs {
+            referenced_names.insert(out_name.clone());
+        }
+        // Remove unreferenced const ops (iterate until stable).
+        loop {
+            let before = func.body.operations.len();
+            func.body.operations.retain(|op| {
+                if op.op_type == "const" {
+                    // Keep if any output is referenced.
+                    op.outputs.iter().any(|o| referenced_names.contains(o))
+                } else {
+                    true
+                }
+            });
+            if func.body.operations.len() == before {
+                break;
+            }
+            // Recompute references after removing ops.
+            referenced_names.clear();
+            for op in &func.body.operations {
+                for val in op.inputs.values() {
+                    if let mil_rs::ir::Value::Reference(r) = val {
+                        referenced_names.insert(r.clone());
+                    }
+                }
+                for val in op.attributes.values() {
+                    if let mil_rs::ir::Value::Reference(r) = val {
+                        referenced_names.insert(r.clone());
+                    }
+                }
+            }
+            for out_name in &func.body.outputs {
+                referenced_names.insert(out_name.clone());
+            }
+        }
+    }
 }
 
 /// Convert Float32 const ops to Float16, materialize dynamic shapes,
