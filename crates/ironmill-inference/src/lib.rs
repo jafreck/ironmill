@@ -25,6 +25,17 @@ pub use types::{
     ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor, build_dummy_inputs,
 };
 
+/// CoreML runtime types re-exported for downstream consumers.
+///
+/// User-facing crates should depend on `ironmill-inference`, not
+/// `ironmill-coreml-sys` directly.
+pub mod coreml_runtime {
+    pub use ironmill_coreml_sys::{
+        ComputeUnits, ExtractedOutput, InputDescription, InputFeature, Model, MultiArrayDataType,
+        OutputTensorData, PredictionInput, PredictionOutput, build_dummy_input,
+    };
+}
+
 // ── ANE error type ───────────────────────────────────────────────
 // The AneError is shared across the ane submodules and needs to be
 // at the crate level since both ane::runtime and ane::decode use it.

@@ -162,23 +162,18 @@ graph TD
         mil["mil-rs"]
     end
 
-    cli --> mil
     cli --> compile
     cli -.-> inference
 
-    bench --> mil
     bench --> compile
-    bench --> coremlsys
-    bench -.-> inference
+    bench --> inference
     bench -.-> ios
 
-    burn --> mil
     burn --> compile
-    burn --> coremlsys
+    burn --> inference
 
-    candle --> mil
     candle --> compile
-    candle --> coremlsys
+    candle --> inference
 
     inference --> compile
     inference --> ane
@@ -186,7 +181,6 @@ graph TD
     inference --> coremlsys
 
     compile --> mil
-    compile --> ane
     compile --> ios
 
     ios --> mil

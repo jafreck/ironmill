@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ironmill_coreml_sys::{ComputeUnits, Model, build_dummy_input};
+use ironmill_inference::coreml_runtime::{ComputeUnits, Model, build_dummy_input};
 
 /// Results from a single inference benchmark run.
 pub struct InferenceResult {
@@ -255,7 +255,7 @@ pub fn run_inference(
 /// the ironmill-ane crate.
 #[cfg(feature = "ane-direct")]
 pub fn run_ane_direct_inference(
-    program: &mil_rs::ir::Program,
+    program: &ironmill_compile::mil::Program,
     config: ironmill_inference::AneConfig,
     warmup: usize,
     iterations: usize,

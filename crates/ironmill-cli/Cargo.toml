@@ -12,7 +12,6 @@ name = "ironmill"
 path = "src/main.rs"
 
 [dependencies]
-mil-rs = { workspace = true }
 ironmill-compile = { workspace = true }
 ironmill-inference = { workspace = true, optional = true }
 clap = { workspace = true }

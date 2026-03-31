@@ -20,6 +20,44 @@ pub mod templates;
 /// Weight providers for SafeTensors and GGUF formats.
 pub mod weights;
 
+/// Re-exports from [`mil_rs`] for downstream consumers.
+///
+/// User-facing crates should depend on `ironmill-compile`, not `mil-rs`
+/// directly. This module surfaces the subset of the MIL API needed for
+/// model I/O, conversion, pass pipelines, and IR inspection.
+pub mod mil {
+    // Core IR types
+    pub use mil_rs::ir::{
+        Block, ComputeUnit, Function, Graph, Operation, Pass, PassPipeline, PassResult,
+        PipelineReport, Program, ScalarType, TensorType, Value,
+    };
+
+    // Model I/O
+    pub use mil_rs::{
+        model_to_program, onnx_to_program, program_to_model, program_to_multi_function_model,
+        program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx, read_onnx_with_dir,
+        write_mlmodel, write_mlpackage,
+    };
+
+    // Conversion
+    pub use mil_rs::{
+        ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer,
+        onnx_to_program_with_config,
+    };
+
+    // Reader / inspection
+    pub use mil_rs::reader::{print_model_summary, print_onnx_summary};
+
+    // Passes
+    pub mod passes {
+        pub use mil_rs::ir::passes::ConstantFoldPass;
+        pub use mil_rs::ir::passes::DeadCodeEliminationPass;
+        pub use mil_rs::ir::passes::IdentityEliminationPass;
+        pub use mil_rs::ir::passes::PolarQuantPass;
+        pub use mil_rs::ir::passes::tensor_utils;
+    }
+}
+
 /// C-compatible FFI API (enable with `--features c-api`).
 #[cfg(feature = "c-api")]
 #[allow(unsafe_code)]

@@ -146,11 +146,11 @@ fn main() -> Result<()> {
         },
     };
 
-    let compute_units: Vec<ironmill_coreml_sys::ComputeUnits> = matrix
+    let compute_units: Vec<ironmill_inference::coreml_runtime::ComputeUnits> = matrix
         .settings
         .backends
         .iter()
-        .map(|b| b.parse::<ironmill_coreml_sys::ComputeUnits>())
+        .map(|b| b.parse::<ironmill_inference::coreml_runtime::ComputeUnits>())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("invalid backend: {e}"))?;
 
@@ -561,12 +561,13 @@ fn compute_model_flops(model_cfg: &ModelConfig) -> Option<u64> {
     let ext = model_cfg.path.extension()?.to_str()?;
     match ext {
         "onnx" => {
-            let (onnx, model_dir) = mil_rs::read_onnx_with_dir(model_cfg.path.to_str()?).ok()?;
-            let config = mil_rs::ConversionConfig {
+            let (onnx, model_dir) =
+                ironmill_compile::mil::read_onnx_with_dir(model_cfg.path.to_str()?).ok()?;
+            let config = ironmill_compile::mil::ConversionConfig {
                 model_dir: Some(model_dir),
                 ..Default::default()
             };
-            let result = mil_rs::onnx_to_program_with_config(&onnx, &config).ok()?;
+            let result = ironmill_compile::mil::onnx_to_program_with_config(&onnx, &config).ok()?;
             let flops = result.program.total_flops();
             if flops > 0 { Some(flops) } else { None }
         }

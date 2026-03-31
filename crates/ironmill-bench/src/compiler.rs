@@ -27,15 +27,15 @@ pub fn compile_model(
 
     std::fs::create_dir_all(&entry_dir)?;
 
-    let (onnx, model_dir) = mil_rs::read_onnx_with_dir(&model.path)?;
-    let config = mil_rs::ConversionConfig {
+    let (onnx, model_dir) = ironmill_compile::mil::read_onnx_with_dir(&model.path)?;
+    let config = ironmill_compile::mil::ConversionConfig {
         model_dir: Some(model_dir),
         ..Default::default()
     };
-    let conversion_result = mil_rs::onnx_to_program_with_config(&onnx, &config)?;
+    let conversion_result = ironmill_compile::mil::onnx_to_program_with_config(&onnx, &config)?;
     let mut program = conversion_result.program;
 
-    let mut pipeline = mil_rs::PassPipeline::default();
+    let mut pipeline = ironmill_compile::mil::PassPipeline::default();
     if opt.no_fusion {
         pipeline = pipeline.without_fusion();
     }
@@ -57,10 +57,10 @@ pub fn compile_model(
 
     pipeline.run(&mut program)?;
 
-    let model_proto = mil_rs::program_to_model(&program, 7)?;
+    let model_proto = ironmill_compile::mil::program_to_model(&program, 7)?;
 
     let mlpackage_path = entry_dir.join("model.mlpackage");
-    mil_rs::write_mlpackage(&model_proto, &mlpackage_path)?;
+    ironmill_compile::mil::write_mlpackage(&model_proto, &mlpackage_path)?;
 
     let compiled_path =
         ironmill_compile::coreml::compiler::compile_model(&mlpackage_path, &entry_dir)?;
@@ -75,16 +75,16 @@ pub fn compile_model(
 pub fn build_optimized_program(
     model: &ModelConfig,
     opt: &OptConfig,
-) -> Result<mil_rs::ir::Program> {
-    let (onnx, model_dir) = mil_rs::read_onnx_with_dir(&model.path)?;
-    let config = mil_rs::ConversionConfig {
+) -> Result<ironmill_compile::mil::Program> {
+    let (onnx, model_dir) = ironmill_compile::mil::read_onnx_with_dir(&model.path)?;
+    let config = ironmill_compile::mil::ConversionConfig {
         model_dir: Some(model_dir),
         ..Default::default()
     };
-    let conversion_result = mil_rs::onnx_to_program_with_config(&onnx, &config)?;
+    let conversion_result = ironmill_compile::mil::onnx_to_program_with_config(&onnx, &config)?;
     let mut program = conversion_result.program;
 
-    let mut pipeline = mil_rs::PassPipeline::default();
+    let mut pipeline = ironmill_compile::mil::PassPipeline::default();
     if opt.no_fusion {
         pipeline = pipeline.without_fusion();
     }
@@ -117,7 +117,7 @@ pub fn build_optimized_program(
 pub fn build_optimized_program_ane(
     model: &ModelConfig,
     opt: &OptConfig,
-) -> Result<mil_rs::ir::Program> {
+) -> Result<ironmill_compile::mil::Program> {
     build_optimized_program(model, opt)
 }
 

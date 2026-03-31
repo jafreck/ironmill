@@ -9,7 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 mil-rs = { workspace = true }
-ironmill-ane-sys = { workspace = true }
 ironmill-iosurface = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

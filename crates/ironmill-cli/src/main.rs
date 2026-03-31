@@ -13,18 +13,18 @@ use ironmill_compile::ane::validate::{print_validation_report, validation_report
 use ironmill_compile::convert::pipeline::{convert_pipeline, parse_pipeline_manifest};
 #[allow(unused_imports)]
 use ironmill_compile::coreml::compiler::{compile_model, is_compiler_available};
+use ironmill_compile::mil::PassPipeline;
+use ironmill_compile::mil::PipelineReport;
 #[allow(unused_imports)]
-use ironmill_compile::templates::{
-    TemplateOptions, weights_to_program, weights_to_program_with_options,
-};
-use mil_rs::ir::PassPipeline;
-use mil_rs::ir::PipelineReport;
-use mil_rs::reader::{print_model_summary, print_onnx_summary};
-#[allow(unused_imports)]
-use mil_rs::{
+use ironmill_compile::mil::{
     ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer,
     onnx_to_program_with_config, program_to_model, program_to_multi_function_model,
     program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx, write_mlpackage,
+};
+use ironmill_compile::mil::{print_model_summary, print_onnx_summary};
+#[allow(unused_imports)]
+use ironmill_compile::templates::{
+    TemplateOptions, weights_to_program, weights_to_program_with_options,
 };
 
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
@@ -248,7 +248,7 @@ enum Commands {
 }
 
 /// Count total operations across all functions in a program.
-fn count_ops(program: &mil_rs::ir::Program) -> usize {
+fn count_ops(program: &ironmill_compile::mil::Program) -> usize {
     program
         .functions
         .values()
@@ -636,7 +636,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 5. MoE split (if requested)
     if opts.moe_split {
-        use mil_rs::convert::moe::{detect_moe, split_moe};
+        use ironmill_compile::convert::moe::{detect_moe, split_moe};
 
         if let Some(topology) = detect_moe(&program) {
             println!(
@@ -688,7 +688,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 5b. MoE bundle (if requested) — single multi-function .mlpackage
     if opts.moe_bundle {
-        use mil_rs::convert::moe::{detect_moe, split_moe};
+        use ironmill_compile::convert::moe::{detect_moe, split_moe};
 
         if let Some(topology) = detect_moe(&program) {
             println!(
@@ -744,7 +744,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 5c. MoE top-K fusion (if requested)
     if let Some(k) = opts.moe_fuse_topk {
-        use mil_rs::convert::moe::{ExpertFrequencyProfile, fuse_top_k_experts};
+        use ironmill_compile::convert::moe::{ExpertFrequencyProfile, fuse_top_k_experts};
 
         // Load or build frequency profile
         let profile = if let Some(ref cal_dir) = opts.cal_data {
@@ -760,14 +760,14 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                     profile_path.display()
                 );
                 // Detect expert count to build uniform profile
-                let expert_count = mil_rs::convert::moe::detect_moe(&program)
+                let expert_count = ironmill_compile::convert::moe::detect_moe(&program)
                     .map(|t| t.expert_count)
                     .unwrap_or(k);
                 ExpertFrequencyProfile::uniform(expert_count)
             }
         } else {
             println!("  Note: --cal-data not provided, using uniform profile.");
-            let expert_count = mil_rs::convert::moe::detect_moe(&program)
+            let expert_count = ironmill_compile::convert::moe::detect_moe(&program)
                 .map(|t| t.expert_count)
                 .unwrap_or(k);
             ExpertFrequencyProfile::uniform(expert_count)
@@ -1162,7 +1162,7 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
                 println!("✓ CoreML model (.mlmodel) parsed successfully");
             }
 
-            match mil_rs::model_to_program(&model) {
+            match ironmill_compile::mil::model_to_program(&model) {
                 Ok(program) => {
                     if is_text {
                         println!();
@@ -1186,7 +1186,7 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
                 println!("✓ CoreML package (.mlpackage) parsed successfully");
             }
 
-            match mil_rs::model_to_program(&model) {
+            match ironmill_compile::mil::model_to_program(&model) {
                 Ok(program) => {
                     if is_text {
                         println!();

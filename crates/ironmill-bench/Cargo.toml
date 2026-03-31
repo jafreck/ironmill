@@ -11,10 +11,8 @@ name = "ironmill-bench"
 path = "src/main.rs"
 
 [dependencies]
-mil-rs = { workspace = true }
 ironmill-compile = { workspace = true }
-ironmill-coreml-sys = { workspace = true }
-ironmill-inference = { path = "../ironmill-inference", optional = true }
+ironmill-inference = { path = "../ironmill-inference" }
 ironmill-iosurface = { path = "../ironmill-iosurface", optional = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -29,4 +27,4 @@ tempfile = { workspace = true }
 
 [features]
 default = []
-ane-direct = ["dep:ironmill-inference", "dep:ironmill-iosurface"]
+ane-direct = ["dep:ironmill-iosurface"]
