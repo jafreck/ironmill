@@ -1195,26 +1195,7 @@ impl AneInference {
                                 "layer {layer_idx} fp16_attn eval failed: {e}"
                             ))
                         })?;
-                    let attn_out = read_f16_channels(out_staging)?;
-                    if layer_idx == 0 && self.seq_pos < 2 {
-                        let q_sample: Vec<f32> =
-                            q_data.iter().take(4).map(|v| v.to_f32()).collect();
-                        let k_sample: Vec<f32> =
-                            k_data.iter().take(4).map(|v| v.to_f32()).collect();
-                        let out_sample: Vec<f32> =
-                            attn_out.iter().take(4).map(|v| v.to_f32()).collect();
-                        eprintln!(
-                            "[debug] L0 pos={} Q[..4]={:?} K[..4]={:?} attn_out[..4]={:?} q_len={} k_len={} out_len={}",
-                            self.seq_pos,
-                            q_sample,
-                            k_sample,
-                            out_sample,
-                            q_data.len(),
-                            k_data.len(),
-                            attn_out.len(),
-                        );
-                    }
-                    attn_out
+                    read_f16_channels(out_staging)?
                 } else {
                     // No compiled attention — return Q as pass-through.
                     q_data
