@@ -412,7 +412,7 @@ impl GpuInference {
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
         // Create command buffer.
-        let cmd_buf = self
+        let mut cmd_buf = self
             .queue
             .command_buffer()
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -528,6 +528,34 @@ impl GpuInference {
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             lm.v.encode(&cmd_buf, &norm_mat, &v_weight_mat, &v_result_mat);
 
+            // QK normalization (Qwen3): per-head RMSNorm on Q and K before RoPE.
+            if let (Some(q_norm_w), Some(k_norm_w)) = (&lw.q_norm, &lw.k_norm) {
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_rms_norm(
+                    &enc,
+                    &self.pipelines.rms_norm,
+                    &bufs.q_proj,
+                    q_norm_w,
+                    &bufs.q_proj,
+                    hd,
+                    token_count as u32 * nh,
+                    eps,
+                );
+                ops::encode_rms_norm(
+                    &enc,
+                    &self.pipelines.rms_norm,
+                    &bufs.k_proj,
+                    k_norm_w,
+                    &bufs.k_proj,
+                    hd,
+                    token_count as u32 * nkv,
+                    eps,
+                );
+                enc.end_encoding();
+            }
+
             // Step 6: RoPE on Q and K
             {
                 let enc = cmd_buf
@@ -625,6 +653,15 @@ impl GpuInference {
                 let fp16_kv = self.fp16_kv_cache.as_ref().unwrap();
                 let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
                 let max_seq = self.config.max_seq_len as u32;
+
+                // Must commit current command buffer so MPS matmul results
+                // are available for CPU-side KV cache scatter.
+                cmd_buf.commit();
+                cmd_buf.wait_until_completed();
+                cmd_buf = self
+                    .queue
+                    .command_buffer()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
                 // Write K/V into FP16 cache at seq_pos via buffer copy.
                 // Each K/V projection is [token_count × num_kv_heads × head_dim] FP16.

@@ -37,8 +37,7 @@ pub struct TurboQuantGpuConfig {
 impl GpuTurboQuantModel {
     /// Initialize TurboQuant with rotation matrix and quantization scales.
     pub fn new(device: &MetalDevice, config: TurboQuantGpuConfig) -> Result<Self, GpuError> {
-        // Reuse the ANE TurboQuant rotation matrix generation, which is
-        // pub(crate) and produces [head_dim × head_dim] FP16 LE bytes.
+        // Hadamard rotation matrix from the ANE TurboQuant path.
         let rotation_bytes = crate::ane::turboquant::mil_emitter::generate_rotation_weights(
             config.head_dim,
             config.rotation_seed,
@@ -48,10 +47,19 @@ impl GpuTurboQuantModel {
             .create_buffer_with_data(&rotation_bytes, ironmill_metal_sys::StorageMode::Shared)
             .map_err(GpuError::Metal)?;
 
-        // Reuse the ANE TurboQuant scale computation.
-        let inv_scale =
-            crate::ane::turboquant::mil_emitter::compute_inv_scale(config.head_dim, config.n_bits);
-        let deq_scale = crate::ane::turboquant::compute_deq_scale(config.head_dim, config.n_bits);
+        // Uniform scale for Hadamard-rotated values.
+        //
+        // After Hadamard rotation (norm-preserving), per-element values are
+        // concentrated but the vector norm is preserved. For a Qwen3-0.6B
+        // K/V projection with hidden_size=1024, head_dim=128, typical
+        // per-element values are ~O(1). After rotation, they spread to
+        // ~O(||x||/√dim) with occasional outliers.
+        //
+        // max_abs must be large enough to avoid clipping outliers across
+        // all layers and positions. Empirically calibrated.
+        let max_abs = 32.0_f32;
+        let inv_scale = 127.0 / max_abs;
+        let deq_scale = max_abs / 127.0;
 
         Ok(Self {
             rotation_matrix,

@@ -39,6 +39,10 @@ pub struct LayerWeights {
     pub up_proj: MetalBuffer,
     /// Down projection [hidden_size, intermediate_size] FP16.
     pub down_proj: MetalBuffer,
+    /// Optional Q normalization weight [head_dim] FP16 (Qwen3 QK norm).
+    pub q_norm: Option<MetalBuffer>,
+    /// Optional K normalization weight [head_dim] FP16 (Qwen3 QK norm).
+    pub k_norm: Option<MetalBuffer>,
 }
 
 impl GpuWeights {
@@ -100,6 +104,24 @@ impl GpuWeights {
                     provider,
                     &format!("{prefix}.mlp.down_proj.weight"),
                 )?,
+                q_norm: if provider.has_tensor(&format!("{prefix}.self_attn.q_norm.weight")) {
+                    Some(load_weight_buffer(
+                        device,
+                        provider,
+                        &format!("{prefix}.self_attn.q_norm.weight"),
+                    )?)
+                } else {
+                    None
+                },
+                k_norm: if provider.has_tensor(&format!("{prefix}.self_attn.k_norm.weight")) {
+                    Some(load_weight_buffer(
+                        device,
+                        provider,
+                        &format!("{prefix}.self_attn.k_norm.weight"),
+                    )?)
+                } else {
+                    None
+                },
             });
         }
 

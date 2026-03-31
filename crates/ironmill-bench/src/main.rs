@@ -381,6 +381,14 @@ fn main() -> Result<()> {
                     },
                 ),
                 (
+                    "tq-int8",
+                    GpuConfig {
+                        enable_turboquant: true,
+                        n_bits: 8,
+                        ..GpuConfig::default()
+                    },
+                ),
+                (
                     "tq-int4",
                     GpuConfig {
                         enable_turboquant: true,
