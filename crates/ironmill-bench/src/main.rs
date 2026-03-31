@@ -5,6 +5,8 @@ mod compiler;
 mod config;
 mod hardware;
 mod inference;
+#[cfg_attr(not(feature = "ane-direct"), allow(dead_code))]
+mod perplexity;
 mod power;
 mod quality;
 mod report;
@@ -86,6 +88,18 @@ struct Cli {
     /// Run weight fidelity quality benchmarks for quantized optimizations
     #[arg(long)]
     quality: bool,
+
+    /// Run perplexity evaluation (requires ane-direct feature + model weights + dataset)
+    #[arg(long)]
+    perplexity: bool,
+
+    /// Number of sequences for perplexity evaluation (default: 50)
+    #[arg(long, default_value = "50")]
+    perplexity_sequences: usize,
+
+    /// Path to pre-tokenized dataset for perplexity evaluation
+    #[arg(long, default_value = "tests/fixtures/quality/wikitext2-qwen3.json")]
+    perplexity_dataset: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -396,6 +410,84 @@ fn main() -> Result<()> {
         } else {
             eprintln!("  No quantized optimizations to measure.");
         }
+    }
+
+    // Perplexity evaluation — measure model quality via cross-entropy on text corpus
+    #[cfg(feature = "ane-direct")]
+    if cli.perplexity {
+        use ironmill_inference::ane::AneInference;
+
+        eprintln!("\nRunning perplexity evaluation...");
+
+        let dataset = match perplexity::PerplexityDataset::load(&cli.perplexity_dataset) {
+            Ok(ds) => {
+                eprintln!(
+                    "  Dataset: {} ({} sequences, {} tokens each)",
+                    ds.name, ds.num_sequences, ds.seq_len
+                );
+                ds
+            }
+            Err(e) => {
+                eprintln!(
+                    "  ✗ Failed to load dataset '{}': {e}",
+                    cli.perplexity_dataset.display()
+                );
+                eprintln!("  Run: python scripts/prepare-quality-dataset.py");
+                return Ok(());
+            }
+        };
+
+        // Build an optimized program from the first model config
+        let model_cfg = match matrix.models.first() {
+            Some(m) => m,
+            None => {
+                eprintln!("  ✗ No model configured. Use --model <path.onnx>");
+                return Ok(());
+            }
+        };
+        let opt_cfg = &matrix.optimizations[0]; // baseline
+
+        eprintln!("  Model: {} ({})", model_cfg.name, model_cfg.path.display());
+        eprintln!(
+            "  Evaluating {} sequences...",
+            cli.perplexity_sequences.min(dataset.num_sequences)
+        );
+
+        let program = match compiler::build_optimized_program(model_cfg, opt_cfg) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("  ✗ Failed to build program: {e}");
+                return Ok(());
+            }
+        };
+
+        match AneInference::compile(&program, None) {
+            Ok(mut inference) => {
+                match perplexity::evaluate_perplexity(
+                    &mut inference,
+                    &dataset,
+                    Some(cli.perplexity_sequences),
+                ) {
+                    Ok(mut result) => {
+                        result.config_name = format!("{} ({})", model_cfg.name, opt_cfg.name);
+                        eprintln!();
+                        eprint!("{}", perplexity::format_perplexity_table(&[result]));
+                    }
+                    Err(e) => {
+                        eprintln!("  ✗ Perplexity evaluation failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  ✗ Failed to compile ANE inference: {e}");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "ane-direct"))]
+    if cli.perplexity {
+        eprintln!("Perplexity evaluation requires --features ane-direct");
+        eprintln!("Run: cargo run -p ironmill-bench --features ane-direct -- --perplexity ...");
     }
 
     // Save baseline if requested
