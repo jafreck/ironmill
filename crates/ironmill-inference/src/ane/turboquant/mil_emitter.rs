@@ -295,6 +295,11 @@ pub struct AttentionMilConfig {
     /// When true, cache inputs are INT8 tensors and a `cast(int8→fp16)`
     /// is emitted before any dequantization. This halves KV cache memory.
     pub cache_int8: bool,
+    /// When true, the attention program accepts an additional QJL correction
+    /// input `[1, num_heads, 1, seq_len]` and adds it to the scaled QK scores
+    /// before the causal mask and softmax. This corrects inner product bias
+    /// from TurboQuant quantization (TurboQuant Stage 2).
+    pub enable_qjl: bool,
 }
 
 /// Build the MIL IR program for an attention sub-program.
@@ -305,6 +310,10 @@ pub struct AttentionMilConfig {
 /// - **TurboQuant (INT8 cache, Q-rotation)**: `cache_int8: true, dequant_scale: Some(..), unrotation_seed: Some(..)`
 ///   → 5 inputs: Q(fp16), K_cache(int8), V_cache(int8), rotation_matrix(fp16), mask(fp16)
 ///   → pipeline: slice → cast(int8→fp16) → mul(deq_scale) → rotate Q → attention → un-rotate output
+///
+/// - **TurboQuant + QJL**: as above, plus `enable_qjl: true`
+///   → 6 inputs: Q, K_cache, V_cache, rotation_matrix, mask, qjl_correction(fp16)
+///   → QJL correction is added to scaled QK scores before mask and softmax
 ///
 /// - **FP16 baseline**: `cache_int8: false, dequant_scale: None, unrotation_seed: None`
 ///   → 4 inputs: Q(fp16), K_cache(fp16), V_cache(fp16), mask(fp16)
@@ -356,6 +365,15 @@ pub fn build_attention_program(config: &AttentionMilConfig) -> (Program, Vec<(St
     }
 
     func = func.with_input("mask", TensorType::new(ScalarType::Float16, mask_shape));
+
+    // Optional QJL correction input
+    let qjl_correction_shape = vec![1, num_heads, 1, seq_len];
+    if config.enable_qjl {
+        func = func.with_input(
+            "qjl_correction",
+            TensorType::new(ScalarType::Float16, qjl_correction_shape),
+        );
+    }
 
     // --- Constants ---
     if let Some(deq) = config.dequant_scale {
@@ -541,9 +559,22 @@ pub fn build_attention_program(config: &AttentionMilConfig) -> (Program, Vec<(St
     op.output_types[0] = Some(TensorType::new(ScalarType::Float16, qk_shape.clone()));
     func.body.add_op(op);
 
+    // Optional QJL bias correction (added before mask and softmax)
+    let qk_pre_mask = if config.enable_qjl {
+        let mut op = Operation::new("add", "qk_corrected")
+            .with_input("x", Value::Reference("qk_scaled".into()))
+            .with_input("y", Value::Reference("qjl_correction".into()))
+            .with_output("qk_corrected");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, qk_shape.clone()));
+        func.body.add_op(op);
+        "qk_corrected"
+    } else {
+        "qk_scaled"
+    };
+
     // Apply causal mask
     let mut op = Operation::new("add", "qk_masked")
-        .with_input("x", Value::Reference("qk_scaled".into()))
+        .with_input("x", Value::Reference(qk_pre_mask.into()))
         .with_input("y", Value::Reference("mask".into()))
         .with_output("qk_masked");
     op.output_types[0] = Some(TensorType::new(ScalarType::Float16, qk_shape.clone()));
@@ -628,6 +659,7 @@ pub fn build_fp16_attention_program(
         dequant_scale: None,
         unrotation_seed: None,
         cache_int8: false,
+        enable_qjl: false,
     };
     let (program, _weights) = build_attention_program(&config);
     program
@@ -660,7 +692,8 @@ pub fn build_qjl_program(
     let q_ch = num_heads * head_dim;
     let kv_ch = num_kv_heads * head_dim;
 
-    let q_shape = vec![1, q_ch, 1, 1];
+    let q_shape = vec![1, q_ch, 1, MIN_IO_SEQ];
+    let q_col0_shape = vec![1, q_ch, 1, 1];
     let q_head_shape = vec![1, num_heads, head_dim, 1];
     let residual_shape = vec![1, kv_ch, 1, seq_len];
     let residual_head_shape = vec![1, num_kv_heads, head_dim, seq_len];
@@ -683,9 +716,20 @@ pub fn build_qjl_program(
     add_const_op(&mut func.body, "bF", Value::Bool(false));
     add_const_op(&mut func.body, "bT", Value::Bool(true));
 
+    // Slice Q to column 0: [1, q_ch, 1, MIN_IO_SEQ] → [1, q_ch, 1, 1]
+    add_const_tensor_op(&mut func.body, "q_slice_begin", &[0, 0, 0, 0]);
+    add_const_tensor_op(&mut func.body, "q_slice_end", &[1, q_ch as i32, 1, 1]);
+    let mut op = Operation::new("slice_by_index", "q_col0")
+        .with_input("x", Value::Reference("q".into()))
+        .with_input("begin", Value::Reference("q_slice_begin".into()))
+        .with_input("end", Value::Reference("q_slice_end".into()))
+        .with_output("q_col0");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, q_col0_shape));
+    func.body.add_op(op);
+
     // Reshape Q: [1, q_ch, 1, 1] → [1, num_heads, head_dim, 1]
     let mut op = Operation::new("reshape", "q_reshaped")
-        .with_input("x", Value::Reference("q".into()))
+        .with_input("x", Value::Reference("q_col0".into()))
         .with_input(
             "shape",
             int32_tensor(&[1, num_heads as i32, head_dim as i32, 1]),
@@ -788,6 +832,7 @@ mod tests {
             dequant_scale: Some(deq_scale),
             unrotation_seed: Some(tq.rotation_seed),
             cache_int8: true,
+            enable_qjl: false,
         }
     }
 
@@ -959,6 +1004,7 @@ mod tests {
             dequant_scale: Some(deq_scale),
             unrotation_seed: Some(42),
             cache_int8: true,
+            enable_qjl: false,
         };
         let (program, _weights) = build_attention_program(&config);
         let mil = to_mil(&program);

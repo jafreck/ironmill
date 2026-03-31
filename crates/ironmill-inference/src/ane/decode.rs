@@ -1150,6 +1150,10 @@ impl<D: AneDevice> AneInference<D> {
         if let Some(ref mut mask) = self.fp16_attn_mask {
             mask.write_f16_at(self.seq_pos, &[f16::ZERO])?;
         }
+        // Update TurboQuant causal mask (for QJL correction path).
+        if let Some(ref mut tq) = self.turboquant {
+            tq.update_mask()?;
+        }
 
         let mut d_pre_attn = std::time::Duration::ZERO;
         let mut d_read_qkv = std::time::Duration::ZERO;
@@ -2010,6 +2014,103 @@ fn compile_and_load_sub<D: AneDevice>(
                         // Update local_types for downstream ops.
                         if let Some(out_name) = op.outputs.first() {
                             local_types.insert(out_name.clone(), out_shape);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fix reduce_mean output types and propagate through the norm chain.
+        // After AneLayoutPass, reduce_mean(axis=1) on [1,C,1,S] should produce
+        // [1,1,1,S], but the type annotation is stale [1,C,1,S]. Fix the
+        // reduce_mean and its immediate consumers (add_eps, pow) to [1,1,1,S].
+        // The subsequent mul(input, rsqrt) naturally broadcasts [1,1,1,S]→[1,C,1,S].
+        let reduce_outputs: Vec<String> = func
+            .body
+            .operations
+            .iter()
+            .filter(|op| op.op_type.starts_with("reduce_"))
+            .filter_map(|op| op.outputs.first().cloned())
+            .collect();
+
+        if !reduce_outputs.is_empty() {
+            // Build a set of variables that should have reduced shape.
+            // Starting from reduce outputs, follow the chain through
+            // elementwise ops (add, pow, sqrt, rsqrt) until we hit a
+            // mul with a full-rank input (the broadcast point).
+            let mut reduced_vars: std::collections::HashSet<String> =
+                reduce_outputs.iter().cloned().collect();
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for op in &func.body.operations {
+                    if matches!(op.op_type.as_str(), "add" | "pow" | "sqrt" | "rsqrt") {
+                        // If any input is a reduced var, output is also reduced.
+                        let has_reduced_input = op.inputs.values().any(|v| {
+                            matches!(v, mil_rs::ir::Value::Reference(r) if reduced_vars.contains(r))
+                        });
+                        if has_reduced_input {
+                            if let Some(out) = op.outputs.first() {
+                                if reduced_vars.insert(out.clone()) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Now fix the output types for all reduced vars.
+            for op in &mut func.body.operations {
+                if let Some(out_name) = op.outputs.first() {
+                    if reduced_vars.contains(out_name) {
+                        // Fix axes from const data.
+                        let axes: Vec<usize> = if op.op_type.starts_with("reduce_") {
+                            match op.inputs.get("axes") {
+                                Some(mil_rs::ir::Value::Reference(r)) => const_data
+                                    .get(r)
+                                    .map(|d| {
+                                        d.chunks_exact(4)
+                                            .map(|c| {
+                                                i32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                                                    as usize
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                Some(mil_rs::ir::Value::Tensor { data, .. }) => data
+                                    .chunks_exact(4)
+                                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+                                    .collect(),
+                                _ => vec![],
+                            }
+                        } else {
+                            vec![]
+                        };
+
+                        if let Some(Some(ty)) = op.output_types.first_mut() {
+                            if op.op_type.starts_with("reduce_") {
+                                // Set reduced axes to 1.
+                                for &a in &axes {
+                                    if a < ty.shape.len() {
+                                        ty.shape[a] = Some(1);
+                                    }
+                                }
+                            } else {
+                                // Downstream elementwise: match the reduced shape.
+                                // Find a reduced-var input and copy its shape.
+                                let reduced_shape = op.inputs.values().find_map(|v| match v {
+                                    mil_rs::ir::Value::Reference(r) if reduced_vars.contains(r) => {
+                                        local_types.get(r).cloned()
+                                    }
+                                    _ => None,
+                                });
+                                if let Some(shape) = reduced_shape {
+                                    ty.shape = shape;
+                                }
+                            }
+                            // Update local_types.
+                            local_types.insert(out_name.clone(), ty.shape.clone());
                         }
                     }
                 }

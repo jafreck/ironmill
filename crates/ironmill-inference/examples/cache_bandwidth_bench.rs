@@ -152,6 +152,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
         dequant_scale: Some(deq_scale),
         unrotation_seed: Some(42),
         cache_int8: true,
+        enable_qjl: false,
     };
     let (int8_program, _) = mil_emitter::build_attention_program(&attn_config_int8);
     let mil_config = MilTextConfig::default();
@@ -176,6 +177,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
         dequant_scale: None,   // no dequant mul
         unrotation_seed: None, // no rotation
         cache_int8: true,      // still INT8 input → cast to fp16
+        enable_qjl: false,
     };
     let (int8_raw_program, _) = mil_emitter::build_attention_program(&attn_config_int8_raw);
     let (int8_raw_mil, _) = program_to_mil_text(&int8_raw_program, &mil_config)

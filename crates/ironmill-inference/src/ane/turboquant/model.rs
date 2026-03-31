@@ -455,6 +455,15 @@ pub struct TurboQuantModel<D: AneDevice> {
     cw_k_output: AneTensor,
     /// Pre-allocated cache-write output for V (reused across calls).
     cw_v_output: AneTensor,
+    /// Pre-allocated QJL correction output (reused across calls).
+    /// Shape: [num_heads, max_seq_len] FP16.
+    qjl_correction: Option<AneTensor>,
+    /// Causal mask tensor for attention when QJL is enabled.
+    /// Shape: [1, 1, 1, max_seq_len] FP16. Updated each step: 0.0 for
+    /// positions ≤ seq_pos, -inf for future positions.
+    /// Required because QJL adds a 6th input to the attention program,
+    /// so the mask (5th input) must be explicitly provided.
+    mask_tensor: Option<AneTensor>,
     /// The ANE device handle.
     device: Arc<D>,
 }
@@ -488,6 +497,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
             dequant_scale: Some(deq_scale),
             unrotation_seed: Some(config.rotation_seed),
             cache_int8: true,
+            enable_qjl: config.enable_qjl,
         };
         let (attn_program, _attn_weights) = mil_emitter::build_attention_program(&attn_config);
         let (attn_mil, _) = program_to_mil_text(&attn_program, &mil_config)
@@ -514,7 +524,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
         let kv_ch = config.num_kv_heads * head_dim;
         let q_ch = config.num_heads * head_dim;
 
-        let tq_alloc_size = ironmill_iosurface::uniform_alloc_size(&[
+        let mut alloc_shapes: Vec<([usize; 4], ScalarType)> = vec![
             // Cache-write inputs
             ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16), // K_proj
             ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16), // V_proj
@@ -523,7 +533,19 @@ impl<D: AneDevice> TurboQuantModel<D> {
             ([1, q_ch, 1, MIN_IO_SEQ], ScalarType::Float16), // Q
             ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8), // K cache (INT8)
             ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8), // V cache (INT8)
-        ]);
+        ];
+
+        if config.enable_qjl {
+            // QJL program I/O: residual signs (FP16, same shape as KV cache but fp16)
+            alloc_shapes.push(([1, kv_ch, 1, config.max_seq_len], ScalarType::Float16));
+            // QJL correction output / attention extra input
+            alloc_shapes.push((
+                [1, config.num_heads, 1, config.max_seq_len],
+                ScalarType::Float16,
+            ));
+        }
+
+        let tq_alloc_size = ironmill_iosurface::uniform_alloc_size(&alloc_shapes);
 
         // Cache-write outputs only need to be uniform with each other.
         let cw_output_alloc_size = ironmill_iosurface::uniform_alloc_size(&[
@@ -559,6 +581,34 @@ impl<D: AneDevice> TurboQuantModel<D> {
             cw_output_alloc_size,
         )?;
 
+        // Pre-allocate QJL correction output tensor (reused across layers).
+        let qjl_correction = if config.enable_qjl {
+            Some(AneTensor::new_with_min_alloc(
+                config.num_heads,
+                config.max_seq_len,
+                ScalarType::Float16,
+                tq_alloc_size,
+            )?)
+        } else {
+            None
+        };
+
+        // Causal mask (only needed when QJL is enabled — see step_attention).
+        let mask_tensor = if config.enable_qjl {
+            let mut mask = AneTensor::new_with_min_alloc(
+                1,
+                config.max_seq_len,
+                ScalarType::Float16,
+                tq_alloc_size,
+            )?;
+            let neg_inf = f16::NEG_INFINITY;
+            let mask_data = vec![neg_inf; config.max_seq_len];
+            mask.write_f16(&mask_data)?;
+            Some(mask)
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             cache,
@@ -570,6 +620,8 @@ impl<D: AneDevice> TurboQuantModel<D> {
             cw_output_alloc_size,
             cw_k_output,
             cw_v_output,
+            qjl_correction,
+            mask_tensor,
             device,
         })
     }
@@ -589,6 +641,11 @@ impl<D: AneDevice> TurboQuantModel<D> {
                 self.config.num_layers,
                 projections.len()
             )));
+        }
+
+        // Update causal mask: unmask current position before attention.
+        if let Some(ref mut mask) = self.mask_tensor {
+            mask.write_f16_at(self.cache.seq_len(), &[f16::ZERO])?;
         }
 
         let mut outputs = Vec::with_capacity(self.config.num_layers);
@@ -655,11 +712,33 @@ impl<D: AneDevice> TurboQuantModel<D> {
             ScalarType::Float16,
             self.tq_alloc_size,
         )?;
-        self.device.eval(
-            &self.attention_program,
-            &[q, k_cache, v_cache, &self.rotation_tensor],
-            &mut [&mut attn_out],
-        )?;
+
+        // 3a. QJL correction: compute bias correction from residual signs
+        //     and pass to attention program as additional input.
+        if let (Some(qjl_prog), Some(qjl_corr), Some(mask)) = (
+            &self.qjl_program,
+            &mut self.qjl_correction,
+            &self.mask_tensor,
+        ) {
+            let sign_tensor = self.cache.qjl_sign_tensors(layer).ok_or_else(|| {
+                AneError::Other(anyhow::anyhow!(
+                    "QJL enabled but sign cache missing for layer {layer}"
+                ))
+            })?;
+            self.device
+                .eval(qjl_prog, &[q, sign_tensor], &mut [qjl_corr])?;
+            self.device.eval(
+                &self.attention_program,
+                &[q, k_cache, v_cache, &self.rotation_tensor, mask, qjl_corr],
+                &mut [&mut attn_out],
+            )?;
+        } else {
+            self.device.eval(
+                &self.attention_program,
+                &[q, k_cache, v_cache, &self.rotation_tensor],
+                &mut [&mut attn_out],
+            )?;
+        }
 
         Ok(attn_out)
     }
@@ -707,11 +786,32 @@ impl<D: AneDevice> TurboQuantModel<D> {
             ScalarType::Float16,
             self.tq_alloc_size,
         )?;
-        self.device.eval(
-            &self.attention_program,
-            &[q, k_cache, v_cache, &self.rotation_tensor],
-            &mut [&mut attn_out],
-        )?;
+
+        // 2a. QJL correction (same as step_attention).
+        if let (Some(qjl_prog), Some(qjl_corr), Some(mask)) = (
+            &self.qjl_program,
+            &mut self.qjl_correction,
+            &self.mask_tensor,
+        ) {
+            let sign_tensor = self.cache.qjl_sign_tensors(layer).ok_or_else(|| {
+                AneError::Other(anyhow::anyhow!(
+                    "QJL enabled but sign cache missing for layer {layer}"
+                ))
+            })?;
+            self.device
+                .eval(qjl_prog, &[q, sign_tensor], &mut [qjl_corr])?;
+            self.device.eval(
+                &self.attention_program,
+                &[q, k_cache, v_cache, &self.rotation_tensor, mask, qjl_corr],
+                &mut [&mut attn_out],
+            )?;
+        } else {
+            self.device.eval(
+                &self.attention_program,
+                &[q, k_cache, v_cache, &self.rotation_tensor],
+                &mut [&mut attn_out],
+            )?;
+        }
 
         Ok(attn_out)
     }
@@ -719,6 +819,12 @@ impl<D: AneDevice> TurboQuantModel<D> {
     /// Reset cache for a new conversation.
     pub fn reset(&mut self) {
         self.cache.reset();
+        // Re-initialize causal mask to all -inf.
+        if let Some(ref mut mask) = self.mask_tensor {
+            let neg_inf = f16::NEG_INFINITY;
+            let mask_data = vec![neg_inf; self.config.max_seq_len];
+            let _ = mask.write_f16(&mask_data);
+        }
     }
 
     /// Current sequence length.
@@ -734,6 +840,18 @@ impl<D: AneDevice> TurboQuantModel<D> {
     /// external inference loop like [`AneInference`].
     pub fn advance_seq_pos(&mut self) {
         self.cache.advance_seq_pos();
+    }
+
+    /// Update the causal mask for the current token position.
+    ///
+    /// Must be called once per token BEFORE calling `step_attention()` or
+    /// `step_attention_fused()` for any layer. This is not needed when using
+    /// `step()` (which updates the mask internally).
+    pub fn update_mask(&mut self) -> Result<()> {
+        if let Some(ref mut mask) = self.mask_tensor {
+            mask.write_f16_at(self.cache.seq_len(), &[f16::ZERO])?;
+        }
+        Ok(())
     }
 
     /// Get a reference to the config.

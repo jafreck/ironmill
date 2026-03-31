@@ -1077,6 +1077,7 @@ fn test_generated_attention_mil() -> (bool, bool) {
         dequant_scale: Some(deq_scale),
         unrotation_seed: Some(42),
         cache_int8: true,
+        enable_qjl: false,
     };
     let (program, _weights) = build_attention_program(&config);
     let mil_config = MilTextConfig::default();
@@ -1151,6 +1152,7 @@ fn test_generated_attention_gqa_mil() -> (bool, bool) {
         dequant_scale: Some(deq_scale),
         unrotation_seed: Some(42),
         cache_int8: true,
+        enable_qjl: false,
     };
     let (program, _weights) = build_attention_program(&config);
     let mil_config = MilTextConfig::default();

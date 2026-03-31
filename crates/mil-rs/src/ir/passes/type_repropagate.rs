@@ -41,23 +41,6 @@ impl Pass for TypeRepropagationPass {
             }
 
             for op in &mut function.body.operations {
-                // Force re-inference for shape-dependent ops whose output types
-                // may be stale after passes like AneLayoutPass change input shapes.
-                if matches!(
-                    op.op_type.as_str(),
-                    "reduce_mean"
-                        | "reduce_sum"
-                        | "reduce_max"
-                        | "reduce_min"
-                        | "reduce_prod"
-                        | "reduce_l1"
-                        | "reduce_l2"
-                ) {
-                    for ot in &mut op.output_types {
-                        *ot = None;
-                    }
-                }
-
                 // Register any outputs that already have types.
                 for (i, out_name) in op.outputs.iter().enumerate() {
                     if let Some(Some(tt)) = op.output_types.get(i) {
