@@ -18,8 +18,23 @@
 - `Drop for CompiledProgram` prevents cross-model handle leaks
 
 ### What Doesn't Work
-- No end-to-end correctness tests (perplexity, token agreement) - see
-  `docs/development/QUALITY_BENCHMARK_PLAN.md`
+- **FP16 attention sub-programs fail to compile on ANE.** The splitter
+  emits `fp16_attn` sub-programs from the model graph (with `emit_attention: true`),
+  but `ANECCompile()` rejects them. All layers fall back to Q pass-through,
+  producing incorrect logits (PPL=inf).
+- **Root causes under investigation:**
+  - Duplicate `z_output*` variable names in emitted MIL (naming bug in
+    `build_sub_program` cross-boundary output assignment)
+  - `strip_gather_ops` uses an overly aggressive whitelist that breaks
+    computation graphs by removing ops without fixing references
+  - The `split` op in combination with `matmul + softmax + tile` is a
+    known ANE compiler bug
+- **Missing final RMSNorm** was found and fixed — `extract_1d_weight()`
+  and `cpu_rms_norm()` now apply the norm before lm_head projection
+- **Q/K/V output ordering** was found and fixed — split outputs are
+  sorted lexicographically (`k_proj < q_proj < v_proj`), not Q/K/V order
+- Perplexity benchmark (`--perplexity`) is implemented and runs end-to-end
+  at ~6-8 tok/s but reports PPL=inf due to the attention issue above
 
 ### Performance
 

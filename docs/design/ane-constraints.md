@@ -2,6 +2,36 @@
 
 > Consolidated from `ane-performance-diagnosis.md` and `ane-program-compilation-limit.md`.
 > Original docs archived in `docs/archive/`.
+>
+> Key external reference: [Inside the M4 Apple Neural Engine](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-615)
+> (maderix, 2026) — benchmarks using direct `_ANEClient` API.
+
+## Performance Architecture
+
+The ANE is fundamentally a **convolution engine** optimized for deep operation
+graphs. Key findings from maderix benchmarks on M4:
+
+| Principle | Detail |
+|---|---|
+| **Deep graphs, not wide** | Chain 16–64 ops in one MIL program. Single ops waste ~70% of capacity due to dispatch overhead (~0.095ms per eval). |
+| **Conv over matmul** | 1×1 convolutions use the fast datapath. Matmul is ~3× slower for the same FLOPs. |
+| **Stay under 32 MB working set** | ANE has ~32 MB on-chip SRAM. Exceeding it causes DRAM spills and ~30% throughput drop. |
+| **INT8 saves bandwidth, not compute** | ANE dequantizes INT8 to FP16 before compute. No 2× speedup — only smaller memory transfers. |
+| **True peak: 19 TFLOPS FP16** | Apple's "38 TOPS" counts INT8 ops as 2× FP16. Real throughput is 19 TFLOPS regardless of quantization. |
+| **94% utilization at depth 32+** | Deep conv graphs reach near-theoretical peak. |
+| **6.6 TFLOPS/W efficiency** | ~80× more efficient per FLOP than A100. Hard power gating at idle (0 mW). |
+
+### Implications for ironmill
+
+- **Minimize sub-program count per layer.** Each ANE eval has ~0.095ms dispatch
+  overhead. A 3-way split (pre_attn + attention + post_attn) pays 3× overhead
+  vs a single deep program. The ideal is one program per layer.
+- **Use conv 1×1 instead of matmul** for all weight projections (already done
+  via `AneMatmulToConvPass`).
+- **Don't assume op count causes compilation failures.** The ANE compiler
+  (`_ANECCompile`) accepts 64+ op programs. Failures are more likely caused by
+  specific op combinations, invalid MIL (duplicate variable names, unsupported
+  ops like `gather`), or shape constraints — not by program size.
 
 ## Hardware Limits
 
@@ -87,20 +117,25 @@ cargo run -p ironmill-inference --example cache_bandwidth_bench --release
 | Simultaneously loaded models | ~55 | Model-size dependent; observed on M-series |
 | Sub-program weight budget | ~8 MB fp16 | Per-program, not per-model |
 
-### Per-Program Resource Limit
+### Per-Program Compilation Failures
 
-The most consequential constraint discovered during Qwen3-0.6B bringup:
+The ANE compiler (`_ANECCompile`) rejects programs without providing a
+reason code. Known causes of compilation failure include:
 
-- Pre_attn sub-program with `Q[2048,1024]` + `K[1024,1024]` + `V[1024,1024]`
-  projections = ~8 MB fp16 weights, 3 conv outputs, ~37 non-const ops
-- Adding **any** compute op (even a single scalar `mul`) causes `ANECCompile() FAILED`
-- Reordering outputs can sometimes succeed where adding ops fails
-- The constraint is NOT weight size alone - it is a combination of program
-  structure, op count, intermediate buffer count, and output-op restrictions
+- **Unsupported ops** — `gather` is genuinely unsupported at runtime
+- **Invalid MIL** — duplicate variable names, dangling references
+- **Op combination bugs** — `split` combined with `matmul + softmax + tile`
+  fails even though each op compiles individually
+- **Shape constraints** — `C > ~768` with `S < 32` on I/O tensors
 
-**Practical impact:** Cache-write fusion into pre_attn is infeasible for
-models at Qwen3-0.6B scale. The cache-write step must remain a separate
-sub-program.
+Op count alone is **not** a reliable predictor of failure. The maderix
+benchmarks demonstrate 64-op deep graphs compiling successfully. The
+Qwen3-0.6B pre_attn sub-program compiles with ~37 non-const ops and
+~8 MB of weights.
+
+When `ANECCompile()` fails, the dumped MIL text (written to `/tmp/`)
+should be inspected for the actual cause rather than assumed to be a
+size or op-count issue.
 
 ## Diagnostic Workflow
 
@@ -130,18 +165,21 @@ cargo run -p ironmill-ane --example ane_op_fuzz     # name fuzzing (400+ variant
 cargo run -p ironmill-ane --example ane_dtype_probe  # data type probe
 ```
 
-### 4. Debug sub-program splitting
+### 4. Debug compilation failures
 
-If a model compiles but produces wrong output, check sub-program boundaries:
-- Verify I/O tensor shapes meet ANE constraints (`C ≤ 768` or `S ≥ 32`)
-- Check that S≥32 padding is applied only to appropriate sub-programs
-- Confirm weight budget per sub-program is under ~8 MB
+When `ANECCompile()` fails, the MIL text is dumped to `/tmp/ironmill_debug_*.mil`.
+Inspect it for:
+- Duplicate variable names (e.g., `z_output1` defined twice)
+- Unsupported ops (`gather`, `scatter`)
+- Problematic op combinations (`split` + `matmul` + `softmax`)
+- Dangling references (ops referencing stripped/removed values)
+- Shape constraints on I/O tensors
 
 ## Common Failure Modes
 
-| Symptom | Cause | Fix |
+| Symptom | Likely cause | Investigation |
 |---|---|---|
-| `ANECCompile() FAILED` | Program exceeds resource limit | Split into smaller sub-programs |
+| `ANECCompile() FAILED` | Invalid MIL, unsupported op, or op combination bug | Inspect dumped MIL in `/tmp/`. NOT necessarily op count — 64+ op programs compile fine. |
 | `status=0x1d` at eval | IOSurface too small (< 16KB) | Increase `MIN_SURFACE_ALLOC` |
 | `status=0x1d` at eval | Multi-input request pattern | Reduce number of inputs per sub-program |
 | Wrong output shapes | S≥32 padding applied to attention sub-programs | Use per-sub-program padding |
@@ -152,6 +190,7 @@ If a model compiles but produces wrong output, check sub-program boundaries:
 
 ## References
 
-- [ANE Op Support Matrix](ane-op-support-matrix.md) - 74 verified ops with error bounds
-- [ANE Inference Design](ane-inference.md) - inference pipeline status
-- [TurboQuant Design](turboquant.md) - INT8 KV cache compression
+- [ANE Op Support Matrix](ane-op-support-matrix.md) — 74 verified ops with error bounds
+- [ANE Inference Design](ane-inference.md) — inference pipeline status
+- [TurboQuant Design](turboquant.md) — INT8 KV cache compression
+- [Inside the M4 Apple Neural Engine](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-615) — maderix benchmarks (external)
