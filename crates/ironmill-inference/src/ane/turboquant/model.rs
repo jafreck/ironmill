@@ -4,7 +4,8 @@
 //! Beta-optimal scalar quantization. The ANE attention program casts INT8→FP16
 //! inline, eliminating CPU format conversions while retaining 2× memory savings.
 
-use ironmill_ane_sys::AneCompiler;
+use std::sync::Arc;
+
 use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels};
@@ -14,9 +15,8 @@ use half::f16;
 
 use super::mil_emitter;
 use super::mil_emitter::MIN_IO_SEQ;
-use crate::ane::runtime::AneRuntime;
+use crate::ane::device::AneDevice;
 use crate::ane::{AneError, Result};
-use ironmill_ane_sys::LoadedProgram;
 use ironmill_iosurface::AneTensor;
 
 /// Configuration for TurboQuant KV cache compression.
@@ -426,22 +426,22 @@ fn compute_qjl_signs(
 ///
 /// Holds compiled cache-write (rotate + quantize) and attention (dequant +
 /// attention) sub-programs together with a [`KvCacheManager`] and an
-/// [`AneRuntime`] handle. The KV cache stores INT8 values (1 byte/element);
+/// [`AneDevice`] handle. The KV cache stores INT8 values (1 byte/element);
 /// the ANE attention program casts INT8→FP16 inline before dequantization.
 ///
 /// All TQ-facing tensors share a single uniform allocation size
 /// (`tq_alloc_size`), enabling zero-copy IOSurface passing from pre_attn
 /// outputs directly into cache-write and attention eval calls.
 #[allow(dead_code)]
-pub struct TurboQuantModel {
+pub struct TurboQuantModel<D: AneDevice> {
     config: TurboQuantConfig,
     cache: KvCacheManager,
     /// Compiled cache-write sub-program (rotate + quantize K/V).
-    cache_write_program: LoadedProgram,
+    cache_write_program: D::Program,
     /// Compiled attention sub-program (dequant + Q-rotate + attention + output un-rotate).
-    attention_program: LoadedProgram,
+    attention_program: D::Program,
     /// Optional QJL correction program.
-    qjl_program: Option<LoadedProgram>,
+    qjl_program: Option<D::Program>,
     /// Rotation matrix as IOSurface tensor (shared by cache-write and attention).
     /// Cache-write uses it to rotate K/V before quantization.
     /// Attention uses it to rotate Q and un-rotate the output.
@@ -455,20 +455,18 @@ pub struct TurboQuantModel {
     cw_k_output: AneTensor,
     /// Pre-allocated cache-write output for V (reused across calls).
     cw_v_output: AneTensor,
-    /// The ANE runtime handle.
-    runtime: AneRuntime,
+    /// The ANE device handle.
+    device: Arc<D>,
 }
 
-impl TurboQuantModel {
+impl<D: AneDevice> TurboQuantModel<D> {
     /// Compile and load the TurboQuant sub-programs onto the ANE.
     ///
-    /// 1. Creates an [`AneRuntime`].
-    /// 2. Emits + compiles the cache-write MIL program.
-    /// 3. Emits + compiles the attention MIL program.
-    /// 4. Optionally compiles the QJL correction program.
-    /// 5. Allocates the [`KvCacheManager`].
-    pub fn compile(config: TurboQuantConfig) -> Result<Self> {
-        let runtime = AneRuntime::new()?;
+    /// 1. Emits + compiles the cache-write MIL program.
+    /// 2. Emits + compiles the attention MIL program.
+    /// 3. Optionally compiles the QJL correction program.
+    /// 4. Allocates the [`KvCacheManager`].
+    pub fn compile(device: Arc<D>, config: TurboQuantConfig) -> Result<Self> {
         let head_dim = config.head_dim;
 
         // --- cache-write sub-program ---
@@ -477,12 +475,7 @@ impl TurboQuantModel {
         let (cw_mil, _) = program_to_mil_text(&cw_program, &mil_config)
             .map_err(|e| AneError::Other(anyhow::anyhow!("cache-write MIL text failed: {e}")))?;
         // Weights are delivered as function inputs, not BLOBFILE — pass empty weights
-        let cw_compiled =
-            AneCompiler::compile_mil_text(&cw_mil, &[]).map_err(|e| AneError::CompileFailed {
-                status: 0,
-                context: format!("cache-write compilation failed: {e}"),
-            })?;
-        let cache_write_program = runtime.load_program(&cw_compiled)?;
+        let cache_write_program = device.compile(&cw_mil, &[])?;
 
         // --- attention sub-program ---
         let deq_scale = mil_emitter::compute_deq_scale(head_dim, config.n_bits);
@@ -499,12 +492,7 @@ impl TurboQuantModel {
         let (attn_program, _attn_weights) = mil_emitter::build_attention_program(&attn_config);
         let (attn_mil, _) = program_to_mil_text(&attn_program, &mil_config)
             .map_err(|e| AneError::Other(anyhow::anyhow!("attention MIL text failed: {e}")))?;
-        let attn_compiled =
-            AneCompiler::compile_mil_text(&attn_mil, &[]).map_err(|e| AneError::CompileFailed {
-                status: 0,
-                context: format!("attention compilation failed: {e}"),
-            })?;
-        let attention_program = runtime.load_program(&attn_compiled)?;
+        let attention_program = device.compile(&attn_mil, &[])?;
 
         // --- QJL correction sub-program (optional) ---
         let qjl_program = if config.enable_qjl {
@@ -512,13 +500,7 @@ impl TurboQuantModel {
                 mil_emitter::build_qjl_program(&config, config.max_seq_len);
             let (qjl_mil, _) = program_to_mil_text(&qjl_program, &mil_config)
                 .map_err(|e| AneError::Other(anyhow::anyhow!("QJL MIL text failed: {e}")))?;
-            let qjl_compiled = AneCompiler::compile_mil_text(&qjl_mil, &[]).map_err(|e| {
-                AneError::CompileFailed {
-                    status: 0,
-                    context: format!("QJL correction compilation failed: {e}"),
-                }
-            })?;
-            Some(runtime.load_program(&qjl_compiled)?)
+            Some(device.compile(&qjl_mil, &[])?)
         } else {
             None
         };
@@ -588,7 +570,7 @@ impl TurboQuantModel {
             cw_output_alloc_size,
             cw_k_output,
             cw_v_output,
-            runtime,
+            device,
         })
     }
 
@@ -640,7 +622,7 @@ impl TurboQuantModel {
     ) -> Result<AneTensor> {
         // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
         //    Pre-attn outputs share tq_alloc_size, so no staging copy needed.
-        self.runtime.eval(
+        self.device.eval(
             &self.cache_write_program,
             &[k_proj, v_proj, &self.rotation_tensor],
             &mut [&mut self.cw_k_output, &mut self.cw_v_output],
@@ -673,7 +655,7 @@ impl TurboQuantModel {
             ScalarType::Float16,
             self.tq_alloc_size,
         )?;
-        self.runtime.eval(
+        self.device.eval(
             &self.attention_program,
             &[q, k_cache, v_cache, &self.rotation_tensor],
             &mut [&mut attn_out],
@@ -725,7 +707,7 @@ impl TurboQuantModel {
             ScalarType::Float16,
             self.tq_alloc_size,
         )?;
-        self.runtime.eval(
+        self.device.eval(
             &self.attention_program,
             &[q, k_cache, v_cache, &self.rotation_tensor],
             &mut [&mut attn_out],

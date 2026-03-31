@@ -5,10 +5,10 @@
 //! [`CompiledArtifacts`] for offline compilation inspection.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mil_rs::ir::ScalarType;
 
-use ironmill_ane_sys::AneCompiler;
 use ironmill_compile::ane::TensorDescriptor;
 use ironmill_compile::ane::blobfile::BlobFileWriter;
 use ironmill_compile::ane::cache::ProgramCache;
@@ -21,7 +21,7 @@ use ironmill_compile::ane::split::{SplitConfig, split_for_ane};
 use ironmill_iosurface::{AneTensor, uniform_alloc_size};
 use mil_rs::ir::Pass;
 
-use super::runtime::AneRuntime;
+use super::device::{AneDevice, HardwareAneDevice};
 use crate::AneError;
 use crate::types::{ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor};
 
@@ -57,9 +57,9 @@ impl Default for AneConfig {
 
 /// High-level model API that orchestrates the full ANE pipeline:
 /// IR passes → split → emit MIL → compile → load → eval.
-pub struct AneModel {
-    runtime: AneRuntime,
-    sub_programs: Vec<LoadedSubProgram>,
+pub struct AneModel<D: AneDevice> {
+    device: Arc<D>,
+    sub_programs: Vec<LoadedSubProgram<D>>,
     cache: ProgramCache,
     #[allow(dead_code)]
     config: AneConfig,
@@ -67,8 +67,8 @@ pub struct AneModel {
     _work_dir: tempfile::TempDir,
 }
 
-struct LoadedSubProgram {
-    loaded: ironmill_ane_sys::LoadedProgram,
+struct LoadedSubProgram<D: AneDevice> {
+    program: D::Program,
     meta: SubProgramMeta,
     input_tensors: Vec<AneTensor>,
     output_tensors: Vec<AneTensor>,
@@ -81,7 +81,7 @@ struct SubProgramMeta {
     outputs: Vec<TensorDescriptor>,
 }
 
-impl AneModel {
+impl<D: AneDevice> AneModel<D> {
     /// Compile a model from ironmill IR and load it for execution.
     ///
     /// Pipeline:
@@ -96,7 +96,11 @@ impl AneModel {
     ///    e. Load compiled program into runtime
     ///    f. Pre-allocate IOSurface tensors for I/O
     /// 4. Return the assembled `AneModel`
-    pub fn compile_and_load(program: &mil_rs::ir::Program, config: AneConfig) -> Result<Self> {
+    pub fn compile_and_load(
+        device: Arc<D>,
+        program: &mil_rs::ir::Program,
+        config: AneConfig,
+    ) -> Result<Self> {
         // 1. Clone and run ANE-specific passes
         let mut program = program.clone();
         let passes: &[(&str, &dyn Pass)] = &[
@@ -115,8 +119,7 @@ impl AneModel {
         let split_config = SplitConfig::default();
         let model_split = split_for_ane(&program, &split_config)?;
 
-        // 3. Initialize runtime and cache
-        let runtime = AneRuntime::new()?;
+        // 3. Initialize cache
         let mut cache = ProgramCache::new(config.cache_dir.clone(), config.max_programs);
 
         // 4. Process each sub-program
@@ -156,31 +159,14 @@ impl AneModel {
                 .map(|(path, data)| (path.as_str(), data.as_slice()))
                 .collect();
 
-            let compiled =
-                if cache.contains(&cache_key) {
-                    let compiled = AneCompiler::compile_mil_text(&mil_text, &weight_slices)
-                        .map_err(|e| AneError::CompileFailed {
-                            status: 0,
-                            context: format!("{e}"),
-                        })?;
-                    cache.record_compilation();
-                    compiled
-                } else {
-                    let compiled = AneCompiler::compile_mil_text(&mil_text, &weight_slices)
-                        .map_err(|e| AneError::CompileFailed {
-                            status: 0,
-                            context: format!("{e}"),
-                        })?;
-                    cache.record_compilation();
-                    if let Some(disk_path) = cache.disk_path_for(&cache_key) {
-                        std::fs::create_dir_all(&disk_path).ok();
-                        cache.insert(cache_key, disk_path);
-                    }
-                    compiled
-                };
-
-            // 4e. Load into runtime
-            let loaded = runtime.load_program(&compiled)?;
+            let compiled = device.compile(&mil_text, &weight_slices)?;
+            cache.record_compilation();
+            if !cache.contains(&cache_key) {
+                if let Some(disk_path) = cache.disk_path_for(&cache_key) {
+                    std::fs::create_dir_all(&disk_path).ok();
+                    cache.insert(cache_key, disk_path);
+                }
+            }
 
             // 4f. Pre-allocate I/O tensors with uniform sizing
             let input_shapes: Vec<_> = sub.inputs.iter().map(|td| (td.shape, td.dtype)).collect();
@@ -206,7 +192,7 @@ impl AneModel {
                 .collect::<Result<Vec<_>>>()?;
 
             loaded_subs.push(LoadedSubProgram {
-                loaded,
+                program: compiled,
                 meta: SubProgramMeta {
                     name: sub.name.clone(),
                     inputs: sub.inputs.clone(),
@@ -218,7 +204,7 @@ impl AneModel {
         }
 
         Ok(Self {
-            runtime,
+            device,
             sub_programs: loaded_subs,
             cache,
             config,
@@ -258,8 +244,8 @@ impl AneModel {
                 let sub = &mut self.sub_programs[i];
                 let input_refs: Vec<&AneTensor> = sub.input_tensors.iter().collect();
                 let mut output_refs: Vec<&mut AneTensor> = sub.output_tensors.iter_mut().collect();
-                self.runtime
-                    .eval(&sub.loaded, &input_refs, &mut output_refs)?;
+                self.device
+                    .eval(&sub.program, &input_refs, &mut output_refs)?;
             }
 
             // Wire outputs of sub-program i to inputs of sub-program i+1.
@@ -516,7 +502,7 @@ fn scalar_to_element(dt: ScalarType) -> ElementType {
 
 /// Wraps a loaded [`AneModel`] to implement [`RuntimeModel`].
 pub struct AneRuntimeModel {
-    model: AneModel,
+    model: AneModel<HardwareAneDevice>,
 }
 
 impl RuntimeModel for AneRuntimeModel {
@@ -573,11 +559,13 @@ mod tests {
 
     /// Try to construct a minimal `AneModel` for testing descriptor methods.
     /// Returns `None` if the ANE runtime isn't available (e.g. CI).
-    fn test_model(sub_programs: Vec<LoadedSubProgram>) -> Option<AneModel> {
-        let runtime = AneRuntime::new().ok()?;
+    fn test_model(
+        sub_programs: Vec<LoadedSubProgram<HardwareAneDevice>>,
+    ) -> Option<AneModel<HardwareAneDevice>> {
+        let device = Arc::new(HardwareAneDevice::new().ok()?);
         let work_dir = tempfile::tempdir().ok()?;
         Some(AneModel {
-            runtime,
+            device,
             sub_programs,
             cache: ProgramCache::default(),
             config: AneConfig::default(),
@@ -1026,7 +1014,14 @@ mod tests {
         let program = build_weighted_program();
         let config = AneConfig::default();
 
-        let result = AneModel::compile_and_load(&program, config);
+        let device = match HardwareAneDevice::new() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                eprintln!("  ANE not available: {e}");
+                return;
+            }
+        };
+        let result = AneModel::compile_and_load(device, &program, config);
 
         match result {
             Ok(mut model) => {
@@ -1059,7 +1054,14 @@ mod tests {
         let program = build_add_program();
         let config = AneConfig::default();
 
-        let result = AneModel::compile_and_load(&program, config);
+        let device = match HardwareAneDevice::new() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                eprintln!("  ANE not available: {e}");
+                return;
+            }
+        };
+        let result = AneModel::compile_and_load(device, &program, config);
 
         match result {
             Ok(mut model) => {
@@ -1097,7 +1099,14 @@ mod tests {
             }
         }
 
-        let result = AneModel::compile_and_load(&program, config);
+        let device = match HardwareAneDevice::new() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                eprintln!("  ANE not available: {e}");
+                return;
+            }
+        };
+        let result = AneModel::compile_and_load(device, &program, config);
 
         match result {
             Ok(mut model) => {

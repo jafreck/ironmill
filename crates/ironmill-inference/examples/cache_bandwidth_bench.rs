@@ -9,13 +9,13 @@
 //! and evaluates only the attention sub-program with configurable
 //! dimensions, directly measuring cache read bandwidth impact.
 
+use std::sync::Arc;
 use std::time::Instant;
 
-use ironmill_ane_sys::AneCompiler;
 use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
-use ironmill_inference::ane::AneRuntime;
 use ironmill_inference::ane::turboquant::mil_emitter;
 use ironmill_inference::ane::turboquant::{AttentionMilConfig, compute_deq_scale};
+use ironmill_inference::ane::{AneDevice, HardwareAneDevice};
 use ironmill_iosurface::{AneTensor, uniform_alloc_size};
 use mil_rs::ir::ScalarType;
 
@@ -157,7 +157,12 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
     let mil_config = MilTextConfig::default();
     let (int8_mil, _) = program_to_mil_text(&int8_program, &mil_config)
         .map_err(|e| format!("INT8+TQ attention MIL text failed: {e}"))?;
-    let int8_compiled = AneCompiler::compile_mil_text(&int8_mil, &[])
+
+    let device =
+        Arc::new(HardwareAneDevice::new().map_err(|e| format!("Device init failed: {e}"))?);
+
+    let int8_program_loaded = device
+        .compile(&int8_mil, &[])
         .map_err(|e| format!("INT8+TQ attention compile failed: {e}"))?;
 
     // --- INT8 raw attention (cast only, no dequant, no rotation) ---
@@ -175,7 +180,8 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
     let (int8_raw_program, _) = mil_emitter::build_attention_program(&attn_config_int8_raw);
     let (int8_raw_mil, _) = program_to_mil_text(&int8_raw_program, &mil_config)
         .map_err(|e| format!("INT8 raw attention MIL text failed: {e}"))?;
-    let int8_raw_compiled = AneCompiler::compile_mil_text(&int8_raw_mil, &[])
+    let int8_raw_loaded = device
+        .compile(&int8_raw_mil, &[])
         .map_err(|e| format!("INT8 raw attention compile failed: {e}"))?;
 
     // --- FP16 attention (baseline) ---
@@ -188,7 +194,8 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
     );
     let (fp16_mil, _) = program_to_mil_text(&fp16_program, &mil_config)
         .map_err(|e| format!("FP16 attention MIL text failed: {e}"))?;
-    let fp16_compiled = AneCompiler::compile_mil_text(&fp16_mil, &[])
+    let fp16_loaded = device
+        .compile(&fp16_mil, &[])
         .map_err(|e| format!("FP16 attention compile failed: {e}"))?;
 
     // --- Allocate tensors ---
@@ -203,17 +210,6 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
         ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Float16),
         ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Float16),
     ]);
-
-    let runtime = AneRuntime::new().map_err(|e| format!("Runtime init failed: {e}"))?;
-    let int8_loaded = runtime
-        .load_program(&int8_compiled)
-        .map_err(|e| format!("INT8+TQ load failed: {e}"))?;
-    let int8_raw_loaded = runtime
-        .load_program(&int8_raw_compiled)
-        .map_err(|e| format!("INT8 raw load failed: {e}"))?;
-    let fp16_loaded = runtime
-        .load_program(&fp16_compiled)
-        .map_err(|e| format!("FP16 load failed: {e}"))?;
 
     // INT8+TQ inputs: Q, K_cache(int8), V_cache(int8), rotation_matrix
     let q_int8 = AneTensor::new_with_min_alloc(q_ch, 32, ScalarType::Float16, int8_alloc)
@@ -262,8 +258,8 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
 
     // --- Benchmark INT8 ---
     for _ in 0..WARMUP {
-        let _ = runtime.eval(
-            &int8_loaded,
+        let _ = device.eval(
+            &int8_program_loaded,
             &[&q_int8, &k_cache_int8, &v_cache_int8, &rot],
             &mut [&mut out_int8],
         );
@@ -271,9 +267,9 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
     let mut int8_latencies = Vec::with_capacity(ITERATIONS);
     for _ in 0..ITERATIONS {
         let t = Instant::now();
-        runtime
+        device
             .eval(
-                &int8_loaded,
+                &int8_program_loaded,
                 &[&q_int8, &k_cache_int8, &v_cache_int8, &rot],
                 &mut [&mut out_int8],
             )
@@ -285,7 +281,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
 
     // --- Benchmark INT8 raw (cast-only, no dequant/rotation) ---
     for _ in 0..WARMUP {
-        let _ = runtime.eval(
+        let _ = device.eval(
             &int8_raw_loaded,
             &[&q_int8_raw, &k_cache_int8_raw, &v_cache_int8_raw],
             &mut [&mut out_int8_raw],
@@ -294,7 +290,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
     let mut int8_raw_latencies = Vec::with_capacity(ITERATIONS);
     for _ in 0..ITERATIONS {
         let t = Instant::now();
-        runtime
+        device
             .eval(
                 &int8_raw_loaded,
                 &[&q_int8_raw, &k_cache_int8_raw, &v_cache_int8_raw],
@@ -308,7 +304,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
 
     // --- Benchmark FP16 ---
     for _ in 0..WARMUP {
-        let _ = runtime.eval(
+        let _ = device.eval(
             &fp16_loaded,
             &[&q_fp16, &k_cache_fp16, &v_cache_fp16],
             &mut [&mut out_fp16],
@@ -317,7 +313,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
     let mut fp16_latencies = Vec::with_capacity(ITERATIONS);
     for _ in 0..ITERATIONS {
         let t = Instant::now();
-        runtime
+        device
             .eval(
                 &fp16_loaded,
                 &[&q_fp16, &k_cache_fp16, &v_cache_fp16],

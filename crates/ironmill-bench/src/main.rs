@@ -427,7 +427,8 @@ fn main() -> Result<()> {
     // Perplexity evaluation — measure model quality via cross-entropy on text corpus
     #[cfg(feature = "ane-direct")]
     if cli.perplexity {
-        use ironmill_inference::ane::AneInference;
+        use ironmill_inference::ane::{AneInference, HardwareAneDevice};
+        use std::sync::Arc;
 
         eprintln!("\nRunning perplexity evaluation...");
 
@@ -473,7 +474,8 @@ fn main() -> Result<()> {
             }
         };
 
-        match AneInference::compile(&program, None) {
+        let device = Arc::new(HardwareAneDevice::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+        match AneInference::compile(device, &program, None) {
             Ok(mut inference) => {
                 match perplexity::evaluate_perplexity(
                     &mut inference,

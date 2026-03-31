@@ -261,7 +261,11 @@ pub fn run_ane_direct_inference(
     iterations: usize,
 ) -> Result<InferenceResult> {
     let compile_start = Instant::now();
-    let mut model = ironmill_inference::AneModel::compile_and_load(program, config)
+    let device = std::sync::Arc::new(
+        ironmill_inference::ane::HardwareAneDevice::new()
+            .map_err(|e| anyhow::anyhow!("ANE device init failed: {e}"))?,
+    );
+    let mut model = ironmill_inference::AneModel::compile_and_load(device, program, config)
         .map_err(|e| anyhow::anyhow!("ANE compile failed: {e}"))?;
     let load_time = compile_start.elapsed();
 

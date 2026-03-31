@@ -75,7 +75,9 @@ pub fn perplexity_from_losses(losses: &[f64]) -> f64 {
 /// at each position against the ground-truth next token.
 #[cfg(feature = "ane-direct")]
 pub fn evaluate_perplexity(
-    inference: &mut ironmill_inference::ane::AneInference,
+    inference: &mut ironmill_inference::ane::AneInference<
+        ironmill_inference::ane::HardwareAneDevice,
+    >,
     dataset: &PerplexityDataset,
     max_sequences: Option<usize>,
 ) -> Result<PerplexityResult> {

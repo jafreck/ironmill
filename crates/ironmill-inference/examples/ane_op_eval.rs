@@ -7,9 +7,10 @@
 //!
 //! Re-run after macOS updates to detect behavioural changes in the ANE compiler.
 
+use std::sync::Arc;
+
 use half::f16;
-use ironmill_ane_sys::AneCompiler;
-use ironmill_inference::ane::runtime::AneRuntime;
+use ironmill_inference::ane::{AneDevice, HardwareAneDevice};
 use ironmill_iosurface::AneTensor;
 use mil_rs::ir::ScalarType;
 
@@ -25,33 +26,30 @@ fn mil_program(body: &str, inputs: &str, output: &str) -> String {
 
 // ── Test infrastructure ─────────────────────────────────────────────────
 
-/// Compile MIL text, load it, and return (runtime, loaded_program).
-fn compile_and_load(mil_text: &str) -> Option<(AneRuntime, ironmill_ane_sys::LoadedProgram)> {
-    let compiled = match AneCompiler::compile_mil_text(mil_text, &[]) {
-        Ok(prog) => prog,
+/// Compile MIL text, load it, and return the device and program.
+fn compile_and_load(
+    mil_text: &str,
+) -> Option<(
+    Arc<HardwareAneDevice>,
+    <HardwareAneDevice as AneDevice>::Program,
+)> {
+    let device = match HardwareAneDevice::new() {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            eprintln!("    device init failed: {e}");
+            return None;
+        }
+    };
+
+    let program = match device.compile(mil_text, &[]) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("    compile failed: {e}");
             return None;
         }
     };
 
-    let runtime = match AneRuntime::new() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("    runtime init failed: {e}");
-            return None;
-        }
-    };
-
-    let loaded = match runtime.load_program(&compiled) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("    load failed: {e}");
-            return None;
-        }
-    };
-
-    Some((runtime, loaded))
+    Some((device, program))
 }
 
 /// Run an ANE program with the given f16 input vectors.
@@ -62,7 +60,7 @@ fn run_ane(
     in_shapes: &[(usize, usize)],
     out_shapes: &[(usize, usize)],
 ) -> Option<Vec<Vec<f16>>> {
-    let (runtime, loaded) = compile_and_load(mil_text)?;
+    let (device, program) = compile_and_load(mil_text)?;
 
     // Compute uniform alloc sizes
     let max_in_alloc = in_shapes
@@ -98,7 +96,7 @@ fn run_ane(
     let in_refs: Vec<&AneTensor> = in_tensors.iter().collect();
     let mut out_refs: Vec<&mut AneTensor> = out_tensors.iter_mut().collect();
 
-    match runtime.eval(&loaded, &in_refs, &mut out_refs) {
+    match device.eval(&program, &in_refs, &mut out_refs) {
         Ok(()) => {}
         Err(e) => {
             eprintln!("    eval failed: {e}");
@@ -1044,8 +1042,15 @@ fn test_generated_cache_write_mil() -> (bool, bool) {
         .map(|(n, d)| (n.as_str(), d.as_slice()))
         .collect();
 
-    match AneCompiler::compile_mil_text(&mil_text, &[]) {
-        Ok(_ptr) => {
+    let device = match HardwareAneDevice::new() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("    ANE not available: {e}");
+            return (true, false);
+        }
+    };
+    match device.compile(&mil_text, &[]) {
+        Ok(_) => {
             println!("    ✅ generated cache-write MIL: compiles on ANE");
             (true, true)
         }
@@ -1077,8 +1082,15 @@ fn test_generated_attention_mil() -> (bool, bool) {
     let mil_config = MilTextConfig::default();
     let (mil_text, _) = program_to_mil_text(&program, &mil_config).unwrap();
 
-    match AneCompiler::compile_mil_text(&mil_text, &[]) {
-        Ok(_ptr) => {
+    let device = match HardwareAneDevice::new() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("    ANE not available: {e}");
+            return (true, false);
+        }
+    };
+    match device.compile(&mil_text, &[]) {
+        Ok(_) => {
             println!("    ✅ generated attention MIL: compiles on ANE");
             (true, true)
         }
@@ -1103,8 +1115,15 @@ fn test_generated_qjl_mil() -> (bool, bool) {
         .map(|(n, d): &(String, Vec<u8>)| (n.as_str(), d.as_slice()))
         .collect();
 
-    match AneCompiler::compile_mil_text(&mil_text, &[]) {
-        Ok(_ptr) => {
+    let device = match HardwareAneDevice::new() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("    ANE not available: {e}");
+            return (true, false);
+        }
+    };
+    match device.compile(&mil_text, &[]) {
+        Ok(_) => {
             println!("    ✅ generated QJL correction MIL: compiles on ANE");
             (true, true)
         }
@@ -1137,8 +1156,15 @@ fn test_generated_attention_gqa_mil() -> (bool, bool) {
     let mil_config = MilTextConfig::default();
     let (mil_text, _) = program_to_mil_text(&program, &mil_config).unwrap();
 
-    match AneCompiler::compile_mil_text(&mil_text, &[]) {
-        Ok(_ptr) => {
+    let device = match HardwareAneDevice::new() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("    ANE not available: {e}");
+            return (true, false);
+        }
+    };
+    match device.compile(&mil_text, &[]) {
+        Ok(_) => {
             println!("    ✅ generated GQA attention MIL: compiles on ANE");
             (true, true)
         }

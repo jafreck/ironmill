@@ -4,9 +4,11 @@
 //!
 //! Tests TurboQuantModel with real model dimensions (Qwen3-0.6B architecture).
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use half::f16;
+use ironmill_inference::ane::HardwareAneDevice;
 use ironmill_inference::ane::turboquant::{TurboQuantConfig, TurboQuantModel};
 use ironmill_iosurface::AneTensor;
 use mil_rs::ir::ScalarType;
@@ -44,7 +46,8 @@ fn main() {
     )
     .expect("invalid config");
 
-    let mut model = match TurboQuantModel::compile(config) {
+    let device = Arc::new(HardwareAneDevice::new().expect("Failed to init ANE device"));
+    let mut model = match TurboQuantModel::compile(device, config) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("  ✗ Compilation failed: {e}");

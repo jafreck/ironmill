@@ -8,8 +8,10 @@
 //!   tq         Run TurboQuant INT8 only
 //!   both       Run both and compare (default)
 
+use std::sync::Arc;
 use std::time::Instant;
 
+use ironmill_inference::ane::HardwareAneDevice;
 use ironmill_inference::ane::decode::AneInference;
 use ironmill_inference::ane::turboquant::TurboQuantConfig;
 
@@ -29,7 +31,8 @@ fn run_model(
     println!("  │  Compiling...");
 
     let compile_start = Instant::now();
-    let mut model = match AneInference::compile(program, turbo_config) {
+    let device = Arc::new(HardwareAneDevice::new().expect("Failed to init ANE device"));
+    let mut model = match AneInference::compile(device, program, turbo_config) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("  │  ✗ Compilation failed: {e}");

@@ -13,7 +13,7 @@
 //! attention + cache management diverges (~20 lines in the per-layer loop).
 
 use half::f16;
-use ironmill_ane_sys::AneCompiler;
+
 use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use ironmill_compile::ane::passes::{
     AneArgPromotionPass, AneLayoutPass, AneMatmulToConvPass, AneVariableNamingPass,
@@ -26,12 +26,13 @@ use mil_rs::ir::passes::{
     AutoregressiveShapeMaterializePass, DeadCodeEliminationPass, TypeRepropagationPass,
 };
 
-use super::runtime::AneRuntime;
+use super::device::AneDevice;
 use super::turboquant::mil_emitter;
 use super::turboquant::mil_emitter::MIN_IO_SEQ;
 use super::turboquant::{TurboQuantConfig, TurboQuantModel};
 use crate::ane::{AneError, Result};
-use ironmill_ane_sys::CompiledProgram;
+use std::sync::Arc;
+
 use ironmill_iosurface::{AneTensor, uniform_alloc_size};
 
 // ---------------------------------------------------------------------------
@@ -47,24 +48,24 @@ use ironmill_iosurface::{AneTensor, uniform_alloc_size};
 /// is a single-vector matmul — both too small to benefit from ANE and
 /// contain ops ANE doesn't support). Per-layer pre_attn/post_attn
 /// sub-programs run on ANE.
-pub struct AneInference {
+pub struct AneInference<D: AneDevice> {
     /// Embedding weight table: [vocab_size, hidden_size] as fp16 bytes.
     embed_weight: CpuWeight,
     /// Per-layer: (pre_attn, post_attn) sub-programs.
     /// The fp16_attn sub-program is only present in baseline mode.
-    layers: Vec<LayerPrograms>,
+    layers: Vec<LayerPrograms<D>>,
     /// LM head projection. ANE-accelerated when possible, CPU fallback otherwise.
-    lm_head: LmHead,
+    lm_head: LmHead<D>,
     /// Final RMSNorm weight applied before lm_head. Shape: [hidden_size].
     final_norm_weight: Option<Vec<f16>>,
     /// Optional TurboQuant model (replaces layer attention when enabled).
-    turboquant: Option<TurboQuantModel>,
+    turboquant: Option<TurboQuantModel<D>>,
     /// FP16 KV caches (used when TurboQuant is disabled).
     /// Per-layer (K, V) tensors. `None` when TurboQuant manages the cache.
     fp16_kv_caches: Option<Vec<(AneTensor, AneTensor)>>,
     /// Compiled FP16 attention program (shared across all layers).
     /// Only present when TurboQuant is NOT configured.
-    fp16_attn_compiled: Option<CompiledProgram>,
+    fp16_attn_program: Option<D::Program>,
     /// Staging tensor for Q input to FP16 attention.
     fp16_attn_q_staging: Option<AneTensor>,
     /// Staging tensor for FP16 attention output.
@@ -72,8 +73,8 @@ pub struct AneInference {
     /// Causal mask tensor for FP16 attention. Shape: [1, 1, 1, max_seq_len].
     /// Updated each step: 0.0 for positions ≤ seq_pos, -inf for future.
     fp16_attn_mask: Option<AneTensor>,
-    /// Runtime handle.
-    runtime: AneRuntime,
+    /// Device handle.
+    device: Arc<D>,
     /// Current sequence position.
     seq_pos: usize,
     /// Number of KV heads (for FP16 cache management).
@@ -111,16 +112,16 @@ struct CpuWeight {
 }
 
 /// Per-layer compiled sub-programs.
-struct LayerPrograms {
-    pre_attn: LoadedSubProgram,
+struct LayerPrograms<D: AneDevice> {
+    pre_attn: LoadedSubProgram<D>,
     /// FP16 attention sub-program. Only compiled in baseline mode;
     /// in TurboQuant mode this is `None`. Retained for future use
     /// (model-extracted attention path).
     #[allow(dead_code)]
-    fp16_attn: Option<LoadedSubProgram>,
+    fp16_attn: Option<LoadedSubProgram<D>>,
     /// Post-attention sub-program. `None` for layers where all ops
     /// fall within the attention cluster (e.g., position-only layers).
-    post_attn: Option<LoadedSubProgram>,
+    post_attn: Option<LoadedSubProgram<D>>,
     /// Input mapping for fp16_attn (which tensor indices are Q/K/V/cos/sin).
     /// Retained for future use (model-extracted attention path).
     #[allow(dead_code)]
@@ -152,8 +153,8 @@ struct AttnInputMap {
 /// each program is loaded → evaluated → unloaded on demand via
 /// `runtime.eval_compiled()`, keeping at most ~3 programs loaded
 /// simultaneously.
-struct LoadedSubProgram {
-    compiled: CompiledProgram,
+struct LoadedSubProgram<D: AneDevice> {
+    program: D::Program,
     input_tensors: Vec<AneTensor>,
     output_tensors: Vec<AneTensor>,
     /// If inputs were spatially packed, stores the packing metadata.
@@ -161,9 +162,9 @@ struct LoadedSubProgram {
 }
 
 /// LM head projection — ANE-accelerated or CPU fallback.
-enum LmHead {
+enum LmHead<D: AneDevice> {
     /// ANE-accelerated: chunked conv1×1 across multiple ANE programs.
-    Ane(AneLmHead),
+    Ane(AneLmHead<D>),
     /// CPU fallback: scalar matmul (used when ANE compilation fails).
     Cpu(CpuWeight),
 }
@@ -186,22 +187,22 @@ const LM_HEAD_MIN_SEQ: usize = 32;
 /// ANE program. At inference time, all chunks are evaluated and their
 /// outputs concatenated to produce the full logits vector.
 #[allow(dead_code)]
-struct AneLmHead {
-    chunks: Vec<LmHeadChunk>,
+struct AneLmHead<D: AneDevice> {
+    chunks: Vec<LmHeadChunk<D>>,
     vocab_size: usize,
     hidden_size: usize,
-    runtime: AneRuntime,
+    device: Arc<D>,
 }
 
 /// One chunk of the ANE lm_head — a conv1×1 with ≤16384 output channels.
-struct LmHeadChunk {
-    compiled: CompiledProgram,
+struct LmHeadChunk<D: AneDevice> {
+    program: D::Program,
     input_tensor: AneTensor,
     output_tensor: AneTensor,
     out_channels: usize,
 }
 
-impl AneLmHead {
+impl<D: AneDevice> AneLmHead<D> {
     /// Compile the chunked ANE lm_head from a CPU weight tensor.
     ///
     /// Splits `[vocab_size, hidden_size]` into chunks of ≤16384 output
@@ -212,12 +213,11 @@ impl AneLmHead {
     /// MIL text (same `hidden_size` × `LM_HEAD_MAX_CHUNK_CH` conv1×1).
     /// Only the first full-size chunk is compiled; the rest reuse its
     /// compiled `net.plist` via `AneCompiler::patch_weights`.
-    fn compile(weight: &CpuWeight) -> Result<Self> {
+    fn compile(device: Arc<D>, weight: &CpuWeight) -> Result<Self> {
         let [vocab_size, hidden_size] = weight.shape;
-        let runtime = AneRuntime::new()?;
 
         let num_chunks = vocab_size.div_ceil(LM_HEAD_MAX_CHUNK_CH);
-        let mut chunks: Vec<LmHeadChunk> = Vec::with_capacity(num_chunks);
+        let mut chunks: Vec<LmHeadChunk<D>> = Vec::with_capacity(num_chunks);
 
         let bytes_per_elem = 2; // fp16
         let row_bytes = hidden_size * bytes_per_elem;
@@ -241,25 +241,10 @@ impl AneLmHead {
             let is_full_size = out_ch == LM_HEAD_MAX_CHUNK_CH;
 
             let compiled = if let Some(donor_idx) = full_chunk_donor_idx.filter(|_| is_full_size) {
-                // Patch from the donor — skip compilation.
-                let donor = &chunks[donor_idx].compiled;
-                AneCompiler::patch_weights(donor, &mil_text, &[(weight_path, &chunk_data)])
-                    .map_err(|e| AneError::CompileFailed {
-                        status: 0,
-                        context: format!(
-                            "lm_head chunk {chunk_idx} ({out_ch} ch) donor patch failed: {e}"
-                        ),
-                    })?
+                let donor = &chunks[donor_idx].program;
+                device.compile_patched(donor, &mil_text, &[(weight_path, &chunk_data)])?
             } else {
-                // Full compile (first full-size chunk, or the smaller tail chunk).
-                AneCompiler::compile_mil_text(&mil_text, &[(weight_path, &chunk_data)]).map_err(
-                    |e| AneError::CompileFailed {
-                        status: 0,
-                        context: format!(
-                            "lm_head chunk {chunk_idx} ({out_ch} ch) compilation failed: {e}"
-                        ),
-                    },
-                )?
+                device.compile(&mil_text, &[(weight_path, &chunk_data)])?
             };
             // DON'T unload here — patches need the donor's net.plist to exist.
             // Programs will be unloaded in AneInference::Drop.
@@ -285,7 +270,7 @@ impl AneLmHead {
                 AneTensor::new_with_min_alloc(out_ch, LM_HEAD_MIN_SEQ, ScalarType::Float16, alloc)?;
 
             chunks.push(LmHeadChunk {
-                compiled,
+                program: compiled,
                 input_tensor,
                 output_tensor,
                 out_channels: out_ch,
@@ -312,7 +297,7 @@ impl AneLmHead {
             chunks,
             vocab_size,
             hidden_size,
-            runtime,
+            device,
         })
     }
 
@@ -325,8 +310,8 @@ impl AneLmHead {
             write_f16_padded(&mut chunk.input_tensor, hidden)?;
 
             // Eval conv1×1 on ANE (program stays loaded).
-            self.runtime.eval_raw(
-                chunk.compiled.as_raw_ptr(),
+            self.device.eval(
+                &chunk.program,
                 &[&chunk.input_tensor],
                 &mut [&mut chunk.output_tensor],
             )?;
@@ -375,13 +360,14 @@ fn emit_lm_head_chunk_mil(hidden_size: usize, out_channels: usize) -> String {
 // Construction
 // ---------------------------------------------------------------------------
 
-impl AneInference {
+impl<D: AneDevice> AneInference<D> {
     /// Build from a Program. When `turbo_config` is Some, TurboQuant
     /// replaces the FP16 attention sub-programs (they are not compiled,
     /// saving ANE compile budget).
     ///
     /// The program must be a transformer with attention-splittable layers.
     pub fn compile(
+        device: Arc<D>,
         program: &mil_rs::ir::Program,
         turbo_config: Option<TurboQuantConfig>,
     ) -> Result<Self> {
@@ -690,8 +676,7 @@ impl AneInference {
         // Note: concat IS supported by ANE (eval-verified, see ane-op-support-matrix.md).
         // The previous concat validation was based on a false assumption.
 
-        // 3. Initialize runtime.
-        let runtime = AneRuntime::new()?;
+        // 3. Initialize device config.
         let mil_config = MilTextConfig::default();
 
         // 4. Classify sub-programs by name.
@@ -802,7 +787,7 @@ impl AneInference {
 
         // Try to compile lm_head as chunked ANE conv1×1. Falls back to CPU
         // if ANE compilation fails (e.g., unsupported shape or ANE unavailable).
-        let lm_head = match AneLmHead::compile(&lm_head_cpu_weight) {
+        let lm_head = match AneLmHead::compile(Arc::clone(&device), &lm_head_cpu_weight) {
             Ok(ane_lm_head) => LmHead::Ane(ane_lm_head),
             Err(e) => {
                 eprintln!("warning: ANE lm_head compilation failed, falling back to CPU: {e}");
@@ -839,7 +824,7 @@ impl AneInference {
             0
         };
 
-        let mut layers: Vec<LayerPrograms> = Vec::with_capacity(num_layers);
+        let mut layers: Vec<LayerPrograms<D>> = Vec::with_capacity(num_layers);
         for (i, &layer_n) in layer_numbers.iter().enumerate() {
             let pre_sub = pre_attn_map.get(&layer_n).ok_or_else(|| {
                 AneError::Other(anyhow::anyhow!("missing pre_attn for layer {layer_n}"))
@@ -849,7 +834,7 @@ impl AneInference {
                 // First layer: compile normally — this becomes the donor.
                 compile_and_load_sub(
                     pre_sub,
-                    &runtime,
+                    &*device,
                     &mil_config,
                     pre_packing,
                     pre_attn_min_output_alloc,
@@ -858,8 +843,8 @@ impl AneInference {
                 // Layers 1+: patch weights from the layer-0 donor.
                 match compile_and_load_sub_with_donor(
                     pre_sub,
-                    &layers[0].pre_attn.compiled,
-                    &runtime,
+                    &layers[0].pre_attn.program,
+                    &*device,
                     &mil_config,
                     pre_packing,
                     pre_attn_min_output_alloc,
@@ -873,7 +858,7 @@ impl AneInference {
                         let pre_packing_retry = packing_map.remove(&pre_sub.name);
                         compile_and_load_sub(
                             pre_sub,
-                            &runtime,
+                            &*device,
                             &mil_config,
                             pre_packing_retry,
                             pre_attn_min_output_alloc,
@@ -886,7 +871,7 @@ impl AneInference {
                 if i == 0 {
                     Some(compile_and_load_sub(
                         post_sub,
-                        &runtime,
+                        &*device,
                         &mil_config,
                         post_packing,
                         0,
@@ -894,8 +879,8 @@ impl AneInference {
                 } else if let Some(ref donor_post) = layers[0].post_attn {
                     match compile_and_load_sub_with_donor(
                         post_sub,
-                        &donor_post.compiled,
-                        &runtime,
+                        &donor_post.program,
+                        &*device,
                         &mil_config,
                         post_packing,
                         0,
@@ -909,7 +894,7 @@ impl AneInference {
                             let post_packing_retry = packing_map.remove(&post_sub.name);
                             Some(compile_and_load_sub(
                                 post_sub,
-                                &runtime,
+                                &*device,
                                 &mil_config,
                                 post_packing_retry,
                                 0,
@@ -920,7 +905,7 @@ impl AneInference {
                     // Layer 0 had no post_attn — no donor available.
                     Some(compile_and_load_sub(
                         post_sub,
-                        &runtime,
+                        &*device,
                         &mil_config,
                         post_packing,
                         0,
@@ -931,7 +916,7 @@ impl AneInference {
             };
             let fp16_attn = if let Some(attn_sub) = fp16_attn_map.get(&layer_n) {
                 let attn_packing = packing_map.remove(&attn_sub.name);
-                match compile_and_load_sub(attn_sub, &runtime, &mil_config, attn_packing, 0) {
+                match compile_and_load_sub(attn_sub, &*device, &mil_config, attn_packing, 0) {
                     Ok(loaded) => Some(loaded),
                     Err(e) => {
                         eprintln!(
@@ -973,20 +958,11 @@ impl AneInference {
             );
         }
 
-        // 6b. Unload fp16_attn programs to free ANE slots.
-        // pre_attn and post_attn stay loaded (they fit within the ~55 budget).
-        // fp16_attn programs are loaded on demand via eval_compiled().
-        for layer in &layers {
-            if let Some(ref attn) = layer.fp16_attn {
-                runtime.unload_compiled(&attn.compiled);
-            }
-        }
-
         // 7. Set up TurboQuant or FP16 caches.
         let (
             turboquant,
             fp16_kv_caches,
-            fp16_attn_compiled,
+            fp16_attn_program,
             fp16_attn_q_staging,
             fp16_attn_out_staging,
             fp16_attn_mask,
@@ -997,7 +973,7 @@ impl AneInference {
             let nkv = tq_config.num_kv_heads;
             let hd = tq_config.head_dim;
             let msl = tq_config.max_seq_len;
-            let tq = TurboQuantModel::compile(tq_config)?;
+            let tq = TurboQuantModel::compile(Arc::clone(&device), tq_config)?;
             (Some(tq), None, None, None, None, None, nkv, hd, msl)
         } else {
             // FP16 baseline: use architecture detected from original program.
@@ -1045,11 +1021,7 @@ impl AneInference {
             let (mil, _) = program_to_mil_text(&attn_program, &mil_config).map_err(|e| {
                 AneError::Other(anyhow::anyhow!("FP16 attention MIL text failed: {e}"))
             })?;
-            let attn_compiled =
-                AneCompiler::compile_mil_text(&mil, &[]).map_err(|e| AneError::CompileFailed {
-                    status: 0,
-                    context: format!("FP16 attention compilation failed: {e}"),
-                })?;
+            let attn_compiled = device.compile(&mil, &[])?;
             // Keep loaded — it's only 1 program, well within budget.
             // Using eval_raw avoids the ~5ms loadWithQoS cost per layer.
 
@@ -1120,11 +1092,11 @@ impl AneInference {
             final_norm_weight,
             turboquant,
             fp16_kv_caches,
-            fp16_attn_compiled,
+            fp16_attn_program,
             fp16_attn_q_staging,
             fp16_attn_out_staging,
             fp16_attn_mask,
-            runtime,
+            device,
             seq_pos: 0,
             num_kv_heads,
             head_dim,
@@ -1187,12 +1159,8 @@ impl AneInference {
                 let in_refs: Vec<&AneTensor> = layer.pre_attn.input_tensors.iter().collect();
                 let mut out_refs: Vec<&mut AneTensor> =
                     layer.pre_attn.output_tensors.iter_mut().collect();
-                self.runtime
-                    .eval_raw(
-                        layer.pre_attn.compiled.as_raw_ptr(),
-                        &in_refs,
-                        &mut out_refs,
-                    )
+                self.device
+                    .eval(&layer.pre_attn.program, &in_refs, &mut out_refs)
                     .map_err(|e| {
                         AneError::Other(anyhow::anyhow!(
                             "layer {layer_idx} pre_attn eval failed: {e}"
@@ -1310,8 +1278,8 @@ impl AneInference {
                     let in_refs: Vec<&AneTensor> = attn.input_tensors.iter().collect();
                     let mut out_refs: Vec<&mut AneTensor> =
                         attn.output_tensors.iter_mut().collect();
-                    self.runtime
-                        .eval_compiled(&attn.compiled, &in_refs, &mut out_refs)
+                    self.device
+                        .eval(&attn.program, &in_refs, &mut out_refs)
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} fp16_attn eval failed: {e}"
@@ -1416,15 +1384,15 @@ impl AneInference {
                 }
 
                 // Hand-written FP16 attention: Q + K_cache + V_cache + mask → attn_output
-                let result = if let Some(ref compiled) = self.fp16_attn_compiled {
+                let result = if let Some(ref fp16_program) = self.fp16_attn_program {
                     let q_staging = self.fp16_attn_q_staging.as_mut().unwrap();
                     let out_staging = self.fp16_attn_out_staging.as_mut().unwrap();
                     let mask = self.fp16_attn_mask.as_ref().unwrap();
                     write_f16_padded(q_staging, &q_data)?;
                     let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
-                    self.runtime
-                        .eval_raw(
-                            compiled.as_raw_ptr(),
+                    self.device
+                        .eval(
+                            fp16_program,
                             &[q_staging, k_cache, v_cache, mask],
                             &mut [out_staging],
                         )
@@ -1494,8 +1462,8 @@ impl AneInference {
                     let in_refs: Vec<&AneTensor> = post_attn.input_tensors.iter().collect();
                     let mut out_refs: Vec<&mut AneTensor> =
                         post_attn.output_tensors.iter_mut().collect();
-                    self.runtime
-                        .eval_raw(post_attn.compiled.as_raw_ptr(), &in_refs, &mut out_refs)
+                    self.device
+                        .eval(&post_attn.program, &in_refs, &mut out_refs)
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} post_attn eval failed: {e}"
@@ -1644,30 +1612,6 @@ impl AneInference {
     /// Whether the lm_head runs on ANE (true) or CPU (false).
     pub fn is_ane_lm_head(&self) -> bool {
         matches!(self.lm_head, LmHead::Ane(_))
-    }
-}
-
-impl Drop for AneInference {
-    fn drop(&mut self) {
-        // Unload all compiled programs from the ANE to free execution slots
-        // and compile budget for subsequent model compilations in the same process.
-        for layer in &self.layers {
-            self.runtime.unload_compiled(&layer.pre_attn.compiled);
-            if let Some(ref attn) = layer.fp16_attn {
-                self.runtime.unload_compiled(&attn.compiled);
-            }
-            if let Some(ref post) = layer.post_attn {
-                self.runtime.unload_compiled(&post.compiled);
-            }
-        }
-        if let Some(ref compiled) = self.fp16_attn_compiled {
-            self.runtime.unload_compiled(compiled);
-        }
-        if let LmHead::Ane(ref ane_lm) = self.lm_head {
-            for chunk in &ane_lm.chunks {
-                self.runtime.unload_compiled(&chunk.compiled);
-            }
-        }
     }
 }
 
@@ -1891,13 +1835,13 @@ fn inject_cache_write_ops(
 /// When `min_output_alloc` > 0, output tensors are allocated with at
 /// least that alloc size. This enables zero-copy passing of outputs
 /// to downstream programs that require a specific alloc size.
-fn compile_and_load_sub(
+fn compile_and_load_sub<D: AneDevice>(
     sub: &ironmill_compile::ane::split::SubProgram,
-    _runtime: &AneRuntime,
+    device: &D,
     mil_config: &MilTextConfig,
     input_packing: Option<ironmill_compile::ane::packing::InputPacking>,
     min_output_alloc: usize,
-) -> Result<LoadedSubProgram> {
+) -> Result<LoadedSubProgram<D>> {
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
     prune_unreferenced_inputs(&mut program);
@@ -1999,29 +1943,7 @@ fn compile_and_load_sub(
         .map(|(path, data)| (path.as_str(), data.as_slice()))
         .collect();
 
-    let compiled = AneCompiler::compile_mil_text(&mil_text, &weight_slices).map_err(|e| {
-        // Collect op types for diagnosis.
-        let op_types: Vec<&str> = program
-            .main()
-            .map(|f| {
-                f.body
-                    .operations
-                    .iter()
-                    .map(|op| op.op_type.as_str())
-                    .collect()
-            })
-            .unwrap_or_default();
-        AneError::CompileFailed {
-            status: 0,
-            context: format!(
-                "{} compilation failed: {e} (ops: {:?}, mil_text: {} bytes, weights: {} entries)",
-                sub.name,
-                op_types,
-                mil_text.len(),
-                weight_slices.len(),
-            ),
-        }
-    })?;
+    let compiled = device.compile(&mil_text, &weight_slices)?;
 
     // Pre-allocate I/O tensors with uniform sizing.
     // Use the pruned program's function inputs (not sub.inputs, which may
@@ -2105,7 +2027,7 @@ fn compile_and_load_sub(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LoadedSubProgram {
-        compiled,
+        program: compiled,
         input_tensors,
         output_tensors,
         input_packing,
@@ -2120,14 +2042,14 @@ fn compile_and_load_sub(
 ///
 /// The donor must have been compiled from the same MIL text structure
 /// (same ops and shapes, different weight data).
-fn compile_and_load_sub_with_donor(
+fn compile_and_load_sub_with_donor<D: AneDevice>(
     sub: &ironmill_compile::ane::split::SubProgram,
-    donor: &CompiledProgram,
-    _runtime: &AneRuntime,
+    donor: &D::Program,
+    device: &D,
     mil_config: &MilTextConfig,
     input_packing: Option<ironmill_compile::ane::packing::InputPacking>,
     min_output_alloc: usize,
-) -> Result<LoadedSubProgram> {
+) -> Result<LoadedSubProgram<D>> {
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
     prune_unreferenced_inputs(&mut program);
@@ -2152,16 +2074,7 @@ fn compile_and_load_sub_with_donor(
         .map(|(path, data)| (path.as_str(), data.as_slice()))
         .collect();
 
-    let compiled = AneCompiler::patch_weights(donor, &mil_text, &weight_slices).map_err(|e| {
-        AneError::CompileFailed {
-            status: 0,
-            context: format!(
-                "{} donor patch failed: {e} (weights: {} entries)",
-                sub.name,
-                weight_slices.len(),
-            ),
-        }
-    })?;
+    let compiled = device.compile_patched(donor, &mil_text, &weight_slices)?;
 
     // Derive I/O shapes from the processed program (post layout + padding).
     let pruned_inputs: Vec<ironmill_compile::ane::TensorDescriptor> = program
@@ -2239,7 +2152,7 @@ fn compile_and_load_sub_with_donor(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LoadedSubProgram {
-        compiled,
+        program: compiled,
         input_tensors,
         output_tensors,
         input_packing,

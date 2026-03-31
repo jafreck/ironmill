@@ -38,7 +38,7 @@ pub mod coreml_runtime {
 
 // ── ANE error type ───────────────────────────────────────────────
 // The AneError is shared across the ane submodules and needs to be
-// at the crate level since both ane::runtime and ane::decode use it.
+// at the crate level since both ane::device and ane::decode use it.
 
 use ironmill_iosurface::IOSurfaceError;
 
