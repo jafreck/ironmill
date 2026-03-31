@@ -103,15 +103,11 @@ Update `WeightTensor::borrowed()` and `WeightTensor::owned()` to default
 
 #### Name mapping
 
-MIL IR sanitizes names via `sanitize_mil_name()`: replaces non-alphanumeric
-chars (except `_`) with underscores, prefixes `_` if the result starts with a
-digit, and deduplicates collisions with `_1`, `_2` suffixes. So
-`model.layers.0.self_attn.q_proj.weight` becomes
-`model_layers_0_self_attn_q_proj_weight`. The sanitization is deterministic
-(`sanitize_mil_name()` and `sanitize_block_names()` in
-`mil-rs/src/convert/onnx_graph.rs`).
+Every `const` op carries an `onnx_name` attribute with the original ONNX
+tensor name (set during import in `initializer_to_const()`). This attribute
+survives both MIL name sanitization and PolarQuantPass mutation.
 
-`MilWeightProvider` builds a reverse mapping at construction time:
+`MilWeightProvider` reads `onnx_name` directly — no reverse-sanitization:
 
 ```rust
 pub struct MilWeightProvider {
@@ -132,42 +128,19 @@ Construction walks the MIL Program's main function block:
 
 1. For each `constexpr_lut_to_dense` op:
    - Extract `lut`, `indices`, `shape`, `polar_quant_seed` from op attributes
+   - Read `onnx_name` attribute to get the HF tensor name
    - Find the associated `{op_name}_polar_norms` const op (row norms,
      output named `{original_output}_polar_norms`)
-   - Find the associated `{op_name}_polar_mul` mul op (output named
-     `{original_output}_polar_scaled` — note: output name differs from op name)
-   - Reverse-sanitize the op name to recover the HF name
    - Store as `ExtractedTensor` with `QuantizationInfo::LutToDense`
 
 2. For each `constexpr_affine_dequantize` op:
    - Extract `quantized_data`, `scale`, `zero_point`, `axis`
-   - Reverse-sanitize the op name
+   - Read `onnx_name` attribute for HF tensor name
    - Store with `QuantizationInfo::AffineDequantize`
 
 3. For each plain `const` op (not norms, not quantized):
    - Extract raw tensor data
    - Store with `QuantizationInfo::None`
-
-#### Reverse-sanitize
-
-```rust
-fn reverse_sanitize(sanitized: &str) -> String {
-    // sanitize_mil_name() replaces non-alphanumeric (except _) with _,
-    // prefixes _ for leading digits, and deduplicates with _1/_2 suffixes.
-    // HF names use dots: model.layers.0.self_attn.q_proj.weight
-    //   → model_layers_0_self_attn_q_proj_weight
-    // Reverse by replacing _ with . then restoring known underscore
-    // patterns: self_attn, q_proj, k_proj, v_proj, o_proj, gate_proj,
-    // up_proj, down_proj, embed_tokens, word_embeddings.
-    //
-    // Cleaner long-term: store original name as op attribute during
-    // ONNX import (see Phase 2+).
-}
-```
-
-The reverse-sanitization is fragile. A cleaner approach for Phase 2+: store
-the original HF name as an op attribute during ONNX import. For Phase 1,
-the reverse mapping works because the HF naming convention is regular.
 
 #### `WeightProvider` impl
 
@@ -677,11 +650,13 @@ the TurboQuant pattern already proven in the codebase.
 writing custom kernels. Catches bugs in LUT reconstruction, index packing,
 row norm application, and the name mapping between MIL ops and HF tensors.
 
-**Reverse-sanitize names (Phase 1), store originals (Phase 2+).** The MIL
-name sanitization is deterministic but the reverse mapping is fragile. A
-proper fix stores the original HF name as an op attribute during ONNX
-import, but that's a larger change. Phase 1 uses the reverse mapping since
-HF naming is highly regular.
+**Original ONNX names preserved.** `initializer_to_const()` stores the
+original ONNX tensor name as an `onnx_name` attribute on every `const` op.
+This attribute survives MIL name sanitization (which only renames outputs
+and references, not string attribute values) and PolarQuantPass (which
+only removes the `val` attribute). `MilWeightProvider` reads `onnx_name`
+to map quantized ops back to HF tensor names — no fragile reverse-
+sanitization needed.
 
 **Separate `GpuCompileBuilder`.** The existing `CompileBuilder` is CoreML-
 specific (writes `.mlpackage`, optionally compiles `.mlmodelc`). A separate

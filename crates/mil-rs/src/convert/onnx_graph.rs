@@ -897,6 +897,8 @@ fn initializer_to_const(tensor: &TensorProto, model_dir: Option<&Path>) -> Resul
 
     let mut op = Operation::new("const", &tensor.name);
     op = op.with_output(&tensor.name);
+    op.attributes
+        .insert("onnx_name".into(), Value::String(tensor.name.clone()));
     op.attributes.insert(
         "val".into(),
         Value::Tensor {
