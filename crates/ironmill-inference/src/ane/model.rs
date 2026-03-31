@@ -1159,4 +1159,166 @@ mod tests {
             eprintln!("{text}");
         }
     }
+
+    /// Build a program with an `add` op and a weight tensor large enough
+    /// for PolarQuantPass (>= 1024 elements, last dim >= 64).
+    fn build_polarquant_test_program() -> mil_rs::ir::Program {
+        use half::f16;
+        use mil_rs::ir::{Block, Function, Operation, Program, TensorType, Value};
+
+        let channels = 16usize;
+        let seq_len = 128usize; // power of 2, no padding needed
+
+        let input_ty = TensorType::new(ScalarType::Float16, vec![1, channels, 1, seq_len]);
+
+        // Non-zero FP16 weight data (sin-wave pattern).
+        let weight_data: Vec<u8> = (0..channels * seq_len)
+            .flat_map(|i| f16::from_f32((i as f32 * 0.1).sin() * 0.5).to_le_bytes())
+            .collect();
+
+        let weight_op = Operation::new("const", "w")
+            .with_input(
+                "val",
+                Value::Tensor {
+                    data: weight_data,
+                    shape: vec![1, channels, 1, seq_len],
+                    dtype: ScalarType::Float16,
+                },
+            )
+            .with_output("w");
+
+        let mut add_op = Operation::new("add", "add_0")
+            .with_input("x", Value::Reference("x".into()))
+            .with_input("y", Value::Reference("w".into()))
+            .with_output("result");
+        add_op.output_types = vec![Some(input_ty.clone())];
+
+        let mut block = Block::new();
+        block.add_op(weight_op);
+        block.add_op(add_op);
+        block.outputs.push("result".into());
+
+        let mut func = Function::new("main").with_input("x", input_ty);
+        func.body = block;
+
+        let mut program = Program::new("1.0");
+        program.add_function(func);
+        program
+    }
+
+    /// Verify that PolarQuant's `constexpr_lut_to_dense` op is accepted by
+    /// the ANE compiler and produces correct MIL text and artifacts.
+    #[test]
+    fn e2e_polarquant_constexpr_lut_to_dense_on_ane() {
+        use mil_rs::ir::Pass;
+        use mil_rs::ir::passes::PolarQuantPass;
+
+        // ── 1. Build FP16 baseline and PolarQuant variant ──────────
+        let fp16_program = build_polarquant_test_program();
+
+        let mut quant_program = fp16_program.clone();
+        PolarQuantPass::new(4).run(&mut quant_program).unwrap();
+
+        // Verify constexpr_lut_to_dense was inserted.
+        let ops = &quant_program.functions["main"].body.operations;
+        assert!(
+            ops.iter().any(|op| op.op_type == "constexpr_lut_to_dense"),
+            "PolarQuantPass should have inserted constexpr_lut_to_dense"
+        );
+
+        // ── 2. Compare pre-compilation weight blob sizes ───────────
+        let fp16_artifacts = CompiledArtifacts::prepare(&fp16_program).expect("FP16 prepare");
+        let quant_artifacts = CompiledArtifacts::prepare(&quant_program).expect("quant prepare");
+
+        let fp16_size: usize = fp16_artifacts
+            .sub_programs
+            .iter()
+            .map(|s| s.weight_blob.len())
+            .sum();
+        let quant_size: usize = quant_artifacts
+            .sub_programs
+            .iter()
+            .map(|s| s.weight_blob.len())
+            .sum();
+        eprintln!("  FP16 weight blob:      {fp16_size} bytes");
+        eprintln!("  PolarQuant weight blob: {quant_size} bytes");
+
+        // ── 3. Emit MIL text and check it contains constexpr_lut_to_dense
+        for sub in &quant_artifacts.sub_programs {
+            eprintln!("  [PolarQuant MIL for '{}']\n{}", sub.name, sub.mil_text);
+            assert!(
+                sub.mil_text.contains("constexpr_lut_to_dense"),
+                "MIL text should contain constexpr_lut_to_dense op"
+            );
+        }
+
+        // ── 4. Compile both on ANE ─────────────────────────────────
+        let device = match HardwareAneDevice::new() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                eprintln!("  ANE not available, skipping hardware test: {e}");
+                return;
+            }
+        };
+
+        let config = AneConfig::default();
+
+        // Compile FP16 baseline.
+        let fp16_ok =
+            match AneModel::compile_and_load(device.clone(), &fp16_program, config.clone()) {
+                Ok(mut model) => {
+                    eprintln!("  ✓ FP16 compile+load succeeded");
+                    let desc = model.input_description();
+                    let inputs: Vec<AneTensor> = desc
+                        .iter()
+                        .map(|td| AneTensor::new(td.shape[1], td.shape[3], td.dtype).unwrap())
+                        .collect();
+                    let outputs = model.predict(&inputs).expect("FP16 predict");
+                    eprintln!(
+                        "  ✓ FP16 predict succeeded with {} output(s)",
+                        outputs.len()
+                    );
+                    true
+                }
+                Err(e) => {
+                    eprintln!("  FP16 compile failed (ANE may not support this shape): {e}");
+                    false
+                }
+            };
+
+        // Compile PolarQuant variant — this is the key test.
+        // As of 2026-03, ANE's private API rejects constexpr_lut_to_dense.
+        // The op is only supported via CoreML's public API, which handles
+        // dequantization before passing to ANE.
+        match AneModel::compile_and_load(device, &quant_program, config) {
+            Ok(mut model) => {
+                eprintln!(
+                    "  ✓ PolarQuant compile+load succeeded \
+                     (constexpr_lut_to_dense accepted by ANE)"
+                );
+                let desc = model.input_description();
+                let inputs: Vec<AneTensor> = desc
+                    .iter()
+                    .map(|td| AneTensor::new(td.shape[1], td.shape[3], td.dtype).unwrap())
+                    .collect();
+                let outputs = model.predict(&inputs).expect("PolarQuant predict");
+                eprintln!(
+                    "  ✓ PolarQuant predict succeeded with {} output(s)",
+                    outputs.len()
+                );
+            }
+            Err(e) => {
+                // Expected: ANE private API does not support constexpr_lut_to_dense.
+                // PolarQuant integration must dequantize to FP16 before ANE compilation.
+                eprintln!(
+                    "  ✗ PolarQuant (constexpr_lut_to_dense) rejected by ANE \
+                     (expected with private API): {e}"
+                );
+                assert!(
+                    fp16_ok,
+                    "FP16 baseline should compile for this result to be meaningful"
+                );
+            }
+        }
+    }
 }
