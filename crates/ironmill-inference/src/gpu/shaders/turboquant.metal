@@ -44,8 +44,9 @@ inline float read_quantized(device const char* cache, uint base,
 //   buffer(4) head_dim:         uint
 //   buffer(5) max_seq_len:      uint
 //   buffer(6) seq_pos:          uint  (current write position)
-//   buffer(7) inv_scale:        float (1/scale for quantization)
+//   buffer(7) inv_scale:        float (UNUSED — kept for API compat)
 //   buffer(8) n_bits:           uint  (4 or 8)
+//   buffer(9) scale_buf:        [num_kv_heads × max_seq_len] float (per-head absmax deq scale)
 //
 // Cache layout:
 //   INT8: [num_kv_heads × max_seq_len × head_dim]       1 byte per element
@@ -61,14 +62,17 @@ kernel void turboquant_cache_write(
     constant uint& head_dim             [[buffer(4)]],
     constant uint& max_seq_len          [[buffer(5)]],
     constant uint& seq_pos              [[buffer(6)]],
-    constant float& inv_scale           [[buffer(7)]],
+    constant float& inv_scale           [[buffer(7)]],  // UNUSED — kept for API compat
     constant uint& n_bits               [[buffer(8)]],
+    device float* scale_buf             [[buffer(9)]],  // [num_kv_heads × max_seq_len] per-head deq scale
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
     threadgroup half shared_input[4096];
-    threadgroup char shared_quant[4096];
+    threadgroup float shared_rotated[4096];  // rotated values for 2nd pass
+    threadgroup float shared_reduce[256];    // absmax reduction
+    threadgroup char shared_quant[4096];     // INT4 packing scratch
 
     uint head_idx = tgid;
     if (head_idx >= num_kv_heads) return;
@@ -80,18 +84,48 @@ kernel void turboquant_cache_write(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 2: Rotate and quantize
-    float clamp_lo = (n_bits == 4) ? -8.0f : -128.0f;
-    float clamp_hi = (n_bits == 4) ?  7.0f :  127.0f;
-
+    // Step 2: Rotate + store rotated values + find per-thread absmax
+    float local_max = 0.0f;
     for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
         float acc = 0.0f;
         uint row_base = out_dim * head_dim;
         for (uint k = 0; k < head_dim; k++) {
             acc += float(rotation_matrix[row_base + k]) * float(shared_input[k]);
         }
+        shared_rotated[out_dim] = acc;
+        local_max = max(local_max, fabs(acc));
+    }
 
-        float scaled = clamp(acc * inv_scale, clamp_lo, clamp_hi);
+    // Step 3: Parallel max reduction across threads to find head absmax
+    shared_reduce[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint reduce_size = 1;
+    while (reduce_size < tg_size) reduce_size <<= 1;
+    for (uint stride = reduce_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && (tid + stride) < tg_size) {
+            shared_reduce[tid] = max(shared_reduce[tid], shared_reduce[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float max_val = max(shared_reduce[0], 1e-10f);  // avoid div-by-zero
+    float quant_max = (n_bits == 4) ? 7.0f : 127.0f;
+    float dyn_inv_scale = quant_max / max_val;
+    float dyn_deq_scale = max_val / quant_max;
+
+    // Write per-head per-position dequantization scale
+    if (tid == 0) {
+        scale_buf[head_idx * max_seq_len + seq_pos] = dyn_deq_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: Quantize using dynamic per-head absmax scale
+    float clamp_lo = (n_bits == 4) ? -8.0f : -128.0f;
+    float clamp_hi = (n_bits == 4) ?  7.0f :  127.0f;
+
+    for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
+        float scaled = clamp(shared_rotated[out_dim] * dyn_inv_scale, clamp_lo, clamp_hi);
         char quantized = char(rint(scaled));
 
         if (n_bits == 4) {
@@ -103,7 +137,7 @@ kernel void turboquant_cache_write(
         }
     }
 
-    // Step 3 (INT4 only): Pack pairs of 4-bit values into bytes
+    // Step 5 (INT4 only): Pack pairs of 4-bit values into bytes
     if (n_bits == 4) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -136,8 +170,10 @@ kernel void turboquant_cache_write(
 //   buffer(7)  head_dim:        uint
 //   buffer(8)  max_seq_len:     uint
 //   buffer(9)  seq_len:         uint  (number of valid positions)
-//   buffer(10) deq_scale:       float
+//   buffer(10) deq_scale:       float (UNUSED — kept for API compat)
 //   buffer(11) n_bits:          uint  (4 or 8)
+//   buffer(12) k_scale_buf:     [num_kv_heads × max_seq_len] float (per-head K deq scale)
+//   buffer(13) v_scale_buf:     [num_kv_heads × max_seq_len] float (per-head V deq scale)
 //
 // Dispatch: num_heads threadgroups, head_dim threads per group.
 
@@ -152,8 +188,10 @@ kernel void turboquant_attention(
     constant uint& head_dim             [[buffer(7)]],
     constant uint& max_seq_len          [[buffer(8)]],
     constant uint& seq_len              [[buffer(9)]],
-    constant float& deq_scale           [[buffer(10)]],
+    constant float& deq_scale           [[buffer(10)]],  // UNUSED — kept for API compat
     constant uint& n_bits               [[buffer(11)]],
+    device const float* k_scale_buf     [[buffer(12)]],  // per-head K deq scales
+    device const float* v_scale_buf     [[buffer(13)]],  // per-head V deq scales
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
@@ -194,10 +232,13 @@ kernel void turboquant_attention(
 
     // ---- Step 2: Online softmax attention over sequence positions ----
     for (uint p = 0; p < seq_len; p++) {
+        // Per-position dequantization scale for K
+        float k_deq = k_scale_buf[kv_head * max_seq_len + p];
+
         // Compute dot(Q_rot, dequant(K[p])) — parallel reduction
         float partial_dot = 0.0f;
         for (uint d = tid; d < head_dim; d += tg_size) {
-            float k_val = read_quantized(k_cache, kv_base, p, d, head_dim, n_bits, deq_scale);
+            float k_val = read_quantized(k_cache, kv_base, p, d, head_dim, n_bits, k_deq);
             partial_dot += shared_q_rot[d] * k_val;
         }
         shared_reduce[tid] = partial_dot;
@@ -229,8 +270,9 @@ kernel void turboquant_attention(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Rescale accumulator and add weighted dequantized V
+        float v_deq = v_scale_buf[kv_head * max_seq_len + p];
         for (uint d = tid; d < head_dim; d += tg_size) {
-            float v_val = read_quantized(v_cache, kv_base, p, d, head_dim, n_bits, deq_scale);
+            float v_val = read_quantized(v_cache, kv_base, p, d, head_dim, n_bits, v_deq);
             shared_output[d] = shared_output[d] * rescale + weight * v_val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -592,6 +592,7 @@ impl GpuInference {
                 let tq = self.turboquant.as_ref().unwrap();
                 let kv = self.kv_cache.as_ref().unwrap();
                 let (k_cache, v_cache) = kv.layer_caches(layer_idx);
+                let (k_scale, v_scale) = kv.layer_scales(layer_idx);
                 let max_seq = self.config.max_seq_len as u32;
                 let n_bits = self.config.n_bits as u32;
 
@@ -615,6 +616,7 @@ impl GpuInference {
                     enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
                     enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                     enc.set_bytes(&n_bits.to_le_bytes(), 8);
+                    enc.set_buffer(k_scale, 0, 9);
                     enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
                     // Cache write V
                     enc.set_pipeline(&self.pipelines.turboquant_cache_write);
@@ -627,6 +629,7 @@ impl GpuInference {
                     enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
                     enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                     enc.set_bytes(&n_bits.to_le_bytes(), 8);
+                    enc.set_buffer(v_scale, 0, 9);
                     enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
                 }
 
@@ -650,6 +653,8 @@ impl GpuInference {
                     enc.set_bytes(&current_seq_len.to_le_bytes(), 9);
                     enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
                     enc.set_bytes(&n_bits.to_le_bytes(), 11);
+                    enc.set_buffer(k_scale, 0, 12);
+                    enc.set_buffer(v_scale, 0, 13);
                     enc.dispatch_threadgroups((nh as usize, 1, 1), (hd as usize, 1, 1));
                 }
                 enc.end_encoding();
