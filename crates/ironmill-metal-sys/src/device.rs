@@ -101,6 +101,15 @@ impl MetalDevice {
         unsafe { f(self.raw, sel) }
     }
 
+    /// Returns the current total allocation size (bytes) across all Metal
+    /// resources created by this device.
+    pub fn current_allocated_size(&self) -> usize {
+        type LenFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
+        let sel = unsafe { objc::sel_registerName(sel!("currentAllocatedSize")) };
+        let f: LenFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        unsafe { f(self.raw, sel) }
+    }
+
     /// Returns the maximum threads per threadgroup as (width, height, depth).
     pub fn max_threads_per_threadgroup(&self) -> (usize, usize, usize) {
         // MTLSize is a struct { NSUInteger width, height, depth }.

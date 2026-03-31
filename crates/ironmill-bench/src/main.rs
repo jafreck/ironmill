@@ -364,7 +364,7 @@ fn main() -> Result<()> {
     if cli.metal {
         #[cfg(feature = "metal")]
         {
-            use ironmill_compile::weights::{SafeTensorsProvider, WeightProvider};
+            use ironmill_compile::weights::SafeTensorsProvider;
             use ironmill_inference::engine::InferenceEngine;
             use ironmill_inference::gpu::{GpuConfig, GpuInference};
 
@@ -435,12 +435,18 @@ fn main() -> Result<()> {
                     };
 
                     let load_start = std::time::Instant::now();
+                    let gpu_before = engine.gpu_allocated_bytes();
                     if let Err(e) = engine.load_weights(&provider, gpu_config.clone()) {
                         eprintln!("  ✗ Metal model load failed: {e}");
                         continue;
                     }
                     let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("  ✓ loaded in {load_time_ms:.1}ms");
+                    let gpu_after = engine.gpu_allocated_bytes();
+                    let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
+                    let gpu_growth_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
+                    eprintln!(
+                        "  ✓ loaded in {load_time_ms:.1}ms (GPU: {gpu_mb:.1} MB, model: {gpu_growth_mb:.1} MB)"
+                    );
 
                     // Prefill with a short prompt (token IDs for "Hello world")
                     let prompt_tokens: Vec<u32> = vec![9707, 1879];
@@ -512,13 +518,25 @@ fn main() -> Result<()> {
 
                     if !run_results.is_empty() {
                         let label = format!("{}/metal-{config_name}", model_cfg.name);
-                        let aggregated = aggregate_runs(&label, &run_results);
+                        let mut aggregated = aggregate_runs(&label, &run_results);
 
-                        let tok_per_sec = 1000.0 / aggregated.pooled.mean;
+                        // Set tok/s metrics on the pooled result.
+                        let tok_per_sec = 1000.0 / aggregated.pooled.median;
+                        aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
+                        aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
+
                         eprintln!(
-                            "  ✓ {config_name}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms",
+                            "  ✓ {config_name}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms | GPU: {gpu_mb:.1} MB",
                             aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
                         );
+
+                        let measured_memory = MemorySummary {
+                            rss_after_load_mb: gpu_mb,
+                            peak_rss_mb: gpu_mb,
+                            rss_growth_mb: gpu_growth_mb,
+                            model_file_size_mb: 0.0,
+                            efficiency_ratio: 0.0,
+                        };
 
                         report_rows.push(ReportRow {
                             model: model_cfg.name.clone(),
@@ -529,7 +547,7 @@ fn main() -> Result<()> {
                             significance: None,
                             energy: None,
                             utilization: None,
-                            memory: None,
+                            memory: Some(measured_memory),
                             load_time_ms: Some(load_time_ms),
                         });
                     }
@@ -571,58 +589,14 @@ fn main() -> Result<()> {
 
                     let mut engine = GpuInference::new(gpu_config.clone())
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let gpu_before = engine.gpu_allocated_bytes();
                     engine
                         .load_weights(&provider, gpu_config.clone())
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                    // Memory footprint estimation
-                    let mc = provider.config();
-                    let weight_bytes = mc.vocab_size * mc.hidden_size * 2
-                        + mc.num_hidden_layers
-                            * (mc.hidden_size * 2 * 2
-                                + mc.num_attention_heads * mc.head_dim * mc.hidden_size * 2
-                                + mc.num_key_value_heads * mc.head_dim * mc.hidden_size * 2 * 2
-                                + mc.hidden_size * mc.num_attention_heads * mc.head_dim * 2
-                                + mc.intermediate_size * mc.hidden_size * 2 * 3)
-                        + mc.hidden_size * 2
-                        + if mc.tie_word_embeddings {
-                            0
-                        } else {
-                            mc.vocab_size * mc.hidden_size * 2
-                        };
-
-                    let kv_bytes_per_elem: f64 = if !gpu_config.enable_turboquant {
-                        2.0 // FP16
-                    } else if gpu_config.n_bits == 4 {
-                        0.5 // INT4 packed
-                    } else {
-                        1.0 // INT8
-                    };
-                    let scale_bytes = if gpu_config.enable_turboquant {
-                        mc.num_hidden_layers
-                            * 2
-                            * mc.num_key_value_heads
-                            * gpu_config.max_seq_len
-                            * 4
-                    } else {
-                        0
-                    };
-                    let kv_cache_bytes = (mc.num_hidden_layers as f64
-                        * 2.0
-                        * mc.num_key_value_heads as f64
-                        * gpu_config.max_seq_len as f64
-                        * mc.head_dim as f64
-                        * kv_bytes_per_elem) as usize
-                        + scale_bytes;
-
-                    let total_mb = (weight_bytes + kv_cache_bytes) as f64 / (1024.0 * 1024.0);
-                    let kv_mb = kv_cache_bytes as f64 / (1024.0 * 1024.0);
-                    eprintln!(
-                        "  Memory: {:.1} MB total ({:.1} MB weights, {:.1} MB KV cache)",
-                        total_mb,
-                        weight_bytes as f64 / (1024.0 * 1024.0),
-                        kv_mb
-                    );
+                    let gpu_after = engine.gpu_allocated_bytes();
+                    let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
+                    let model_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
+                    eprintln!("  GPU memory: {gpu_mb:.1} MB (model: {model_mb:.1} MB)");
 
                     let num_seqs = cli.perplexity_sequences.min(dataset.num_sequences);
                     let mut all_losses = Vec::new();
@@ -655,8 +629,8 @@ fn main() -> Result<()> {
                     let ppl = perplexity::perplexity_from_losses(&all_losses);
                     let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
                     eprintln!(
-                        "  ✓ {config_name}: PPL={:.2}, Avg CE={:.4}, KV={:.1} MB",
-                        ppl, avg_ce, kv_mb
+                        "  ✓ {config_name}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
+                        ppl, avg_ce
                     );
                 }
             }
