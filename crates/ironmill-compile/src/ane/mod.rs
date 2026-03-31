@@ -3,6 +3,7 @@
 use mil_rs::ir::ScalarType;
 
 pub mod blobfile;
+pub mod bundle;
 pub mod cache;
 pub mod mil_text;
 pub mod packing;
