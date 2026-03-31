@@ -130,24 +130,9 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
                     &type_map,
                     Some(ops),
                 ));
-                // Post-attn is separate from attention.
-                if !post.is_empty() {
-                    sub_programs.push(build_sub_program(&post_name, &post, &type_map, Some(ops)));
-                }
-            } else {
-                // Merge attention ops into post_attn for a deeper graph.
-                // The attention ops consume Q/K/V from pre_attn outputs;
-                // KV cache inputs are added by the decode loop.
-                let mut merged_post = attn;
-                merged_post.extend(post);
-                if !merged_post.is_empty() {
-                    sub_programs.push(build_sub_program(
-                        &post_name,
-                        &merged_post,
-                        &type_map,
-                        Some(ops),
-                    ));
-                }
+            }
+            if !post.is_empty() {
+                sub_programs.push(build_sub_program(&post_name, &post, &type_map, Some(ops)));
             }
         } else {
             let sp = build_sub_program(name, ops, &type_map, None);

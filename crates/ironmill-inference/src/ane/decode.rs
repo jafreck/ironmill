@@ -458,16 +458,14 @@ impl AneInference {
         //     decode time, preserving all downstream references.
         replace_gather_with_inputs(&mut program);
 
-        // 2. Split each layer into three sub-programs:
-        //    - pre_attn: norm → Q/K/V projections (~8 MB weights)
-        //    - fp16_attn: attention core (0 weights, ~15 ops)
-        //    - post_attn: O-proj → residual → norm → FFN (~16 MB weights)
-        //    CPU manages KV cache between pre_attn and fp16_attn.
-        //    This matches the TurboQuant architecture but uses
-        //    model-derived attention ops instead of hand-written MIL.
+        // 2. Split each layer into pre_attn and post_attn.
+        //    Attention is handled by a separate hand-written MIL program
+        //    that uses correct 4D per-head shapes [1,H,D,S] — the splitter's
+        //    attention ops go through AneLayoutPass which flattens them to
+        //    [1,H*D,1,S], producing flat matmuls that ANE rejects.
         let split_config = SplitConfig {
             split_attention: true,
-            emit_attention: true,
+            emit_attention: false,
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -773,6 +771,9 @@ impl AneInference {
             }
         });
 
+        // Save lm_head shape before it's moved into LmHead.
+        let lm_head_hidden_size = lm_head_cpu_weight.shape[1];
+
         // Extract the final RMSNorm weight from the lm_head sub-program.
         // The splitter groups final_norm into the lm_head sub-program, but
         // AneLmHead only does the linear projection. We must apply final
@@ -985,39 +986,38 @@ impl AneInference {
         } else {
             // FP16 baseline: use architecture detected from original program.
             let (nh, nkv, hd, msl) = if let Some(ref a) = original_arch {
+                eprintln!(
+                    "  Arch detected: heads={}, kv_heads={}, head_dim={}",
+                    a.num_heads, a.num_kv_heads, a.head_dim,
+                );
                 (a.num_heads, a.num_kv_heads, a.head_dim, 2048)
             } else {
-                // Fallback: infer from pre_attn output shapes.
+                // Fallback: infer from lm_head weight shape (not ANE-doubled).
+                let hidden_size = lm_head_hidden_size;
+                let hd = if hidden_size % 128 == 0 && hidden_size / 128 >= 4 {
+                    128
+                } else {
+                    64
+                };
+                let nh = hidden_size / hd;
+                // Infer KV heads from pre_attn outputs (ANE layout doubles channels).
                 let pre_sps: Vec<&ironmill_compile::ane::split::SubProgram> =
                     pre_attn_map.values().copied().collect();
-                let kv_channels = infer_kv_heads_from_sub(&pre_sps);
-                let hd = infer_head_dim_from_sub(&pre_sps);
-                let nkv = kv_channels / hd.max(1);
-                // Outputs are sorted lexicographically: [k_proj, q_proj, v_proj].
-                // Q is the LARGEST projection (index 1 for GQA models).
-                let q_channels = if pre_sps.first().map_or(0, |sp| sp.outputs.len()) >= 3 {
-                    // Find the largest output — that's Q.
-                    pre_sps
-                        .first()
-                        .map(|sp| {
-                            sp.outputs
-                                .iter()
-                                .map(|o| o.shape[1])
-                                .max()
-                                .unwrap_or(kv_channels)
-                        })
-                        .unwrap_or(kv_channels)
+                let nkv = if let Some(sp) = pre_sps.first() {
+                    if sp.outputs.len() >= 3 {
+                        let min_ch = sp.outputs.iter().map(|o| o.shape[1]).min().unwrap_or(0);
+                        (min_ch / 2) / hd.max(1) // ANE layout doubles channels
+                    } else {
+                        nh
+                    }
                 } else {
-                    pre_sps
-                        .first()
-                        .map(|sp| sp.outputs[0].shape[1])
-                        .unwrap_or(kv_channels)
+                    nh
                 };
                 eprintln!(
-                    "  Arch fallback: q_ch={}, kv_ch={}, hd={}, nkv={}",
-                    q_channels, kv_channels, hd, nkv
+                    "  Arch fallback: hidden={}, heads={}, kv_heads={}, head_dim={}",
+                    hidden_size, nh, nkv, hd,
                 );
-                (q_channels / hd.max(1), nkv, hd, 2048)
+                (nh, nkv, hd, 2048)
             };
             let kv_channels = nkv * hd;
             let q_channels = nh * hd;
@@ -2016,6 +2016,7 @@ fn compile_and_load_sub_with_donor(
 }
 
 /// Infer the number of KV heads from pre_attn sub-program output shapes.
+#[allow(dead_code)]
 fn infer_kv_heads_from_sub(pre_attn_sps: &[&ironmill_compile::ane::split::SubProgram]) -> usize {
     // The KV projection outputs have fewer channels than Q in GQA models.
     // Find the minimum channel count among outputs (excluding very small ones
@@ -2035,6 +2036,7 @@ fn infer_kv_heads_from_sub(pre_attn_sps: &[&ironmill_compile::ane::split::SubPro
 }
 
 /// Infer head_dim from pre_attn sub-program output shapes.
+#[allow(dead_code)]
 fn infer_head_dim_from_sub(_pre_attn_sps: &[&ironmill_compile::ane::split::SubProgram]) -> usize {
     // Without explicit arch info, assume head_dim = 64 (common default).
     64
