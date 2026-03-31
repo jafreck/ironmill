@@ -466,7 +466,7 @@ impl AneInference {
         //    ops keep their natural [1, H, D, S] multi-head shapes.
         let split_config = SplitConfig {
             split_attention: true,
-            emit_attention: true,
+            emit_attention: false, // use hand-written attention MIL instead
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -1770,6 +1770,7 @@ fn compile_and_load_sub(
     convert_f32_consts_to_f16(&mut program);
     prune_unreferenced_inputs(&mut program);
     let _ = AneLayoutPass.run(&mut program);
+    apply_min_seq_padding(&mut program, 32);
     let _ = TypeRepropagationPass.run(&mut program);
 
     // Fix tile output types by resolving reps from const ops.
@@ -1912,9 +1913,57 @@ fn compile_and_load_sub(
         .iter()
         .map(|td| (td.shape, td.dtype))
         .collect();
-    let output_shapes: Vec<_> = sub.outputs.iter().map(|td| (td.shape, td.dtype)).collect();
+
+    // Derive output shapes from the processed program too (post-layout).
+    let pruned_outputs: Vec<ironmill_compile::ane::TensorDescriptor> = program
+        .main()
+        .map(|f| {
+            f.body
+                .outputs
+                .iter()
+                .filter_map(|out_name| {
+                    // Find the op that produces this output.
+                    f.body
+                        .operations
+                        .iter()
+                        .find(|op| op.outputs.iter().any(|o| o == out_name))
+                        .and_then(|op| {
+                            let idx = op.outputs.iter().position(|o| o == out_name)?;
+                            let ty = op.output_types.get(idx)?.as_ref()?;
+                            let mut shape = [1usize; 4];
+                            for (i, d) in ty.shape.iter().enumerate().take(4) {
+                                shape[i] = d.unwrap_or(1);
+                            }
+                            Some(ironmill_compile::ane::TensorDescriptor {
+                                name: out_name.clone(),
+                                shape,
+                                dtype: ty.scalar_type,
+                            })
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let output_shapes: Vec<_> = pruned_outputs
+        .iter()
+        .map(|td| (td.shape, td.dtype))
+        .collect();
     let input_alloc = uniform_alloc_size(&input_shapes);
     let output_alloc = uniform_alloc_size(&output_shapes).max(min_output_alloc);
+
+    if sub.name.contains("layer_0") {
+        eprintln!(
+            "  [alloc] {} inputs: {:?}",
+            sub.name,
+            pruned_inputs.iter().map(|td| td.shape).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "  [alloc] {} outputs: {:?}",
+            sub.name,
+            pruned_outputs.iter().map(|td| td.shape).collect::<Vec<_>>()
+        );
+    }
 
     let input_tensors: Vec<AneTensor> = pruned_inputs
         .iter()
@@ -1923,8 +1972,7 @@ fn compile_and_load_sub(
                 .map_err(Into::into)
         })
         .collect::<Result<Vec<_>>>()?;
-    let output_tensors: Vec<AneTensor> = sub
-        .outputs
+    let output_tensors: Vec<AneTensor> = pruned_outputs
         .iter()
         .map(|td| {
             AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc)
@@ -1959,10 +2007,8 @@ fn compile_and_load_sub_with_donor(
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
     prune_unreferenced_inputs(&mut program);
-    // Run AneLayoutPass per sub-program to ensure function I/O and
-    // conv/linear ops have [1,C,1,S] layout. The pre-split pass may
-    // not have reshaped cross-boundary values that become sub-program inputs.
     let _ = AneLayoutPass.run(&mut program);
+    apply_min_seq_padding(&mut program, 32);
     let _ = TypeRepropagationPass.run(&mut program);
     let _ = AneVariableNamingPass.run(&mut program);
 
@@ -1993,21 +2039,74 @@ fn compile_and_load_sub_with_donor(
         }
     })?;
 
-    let input_shapes: Vec<_> = sub.inputs.iter().map(|td| (td.shape, td.dtype)).collect();
-    let output_shapes: Vec<_> = sub.outputs.iter().map(|td| (td.shape, td.dtype)).collect();
+    // Derive I/O shapes from the processed program (post layout + padding).
+    let pruned_inputs: Vec<ironmill_compile::ane::TensorDescriptor> = program
+        .main()
+        .map(|f| {
+            f.inputs
+                .iter()
+                .map(|(name, ty)| {
+                    let mut shape = [1usize; 4];
+                    for (i, d) in ty.shape.iter().enumerate().take(4) {
+                        shape[i] = d.unwrap_or(1);
+                    }
+                    ironmill_compile::ane::TensorDescriptor {
+                        name: name.clone(),
+                        shape,
+                        dtype: ty.scalar_type,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let pruned_outputs: Vec<ironmill_compile::ane::TensorDescriptor> = program
+        .main()
+        .map(|f| {
+            f.body
+                .outputs
+                .iter()
+                .filter_map(|out_name| {
+                    f.body
+                        .operations
+                        .iter()
+                        .find(|op| op.outputs.iter().any(|o| o == out_name))
+                        .and_then(|op| {
+                            let idx = op.outputs.iter().position(|o| o == out_name)?;
+                            let ty = op.output_types.get(idx)?.as_ref()?;
+                            let mut shape = [1usize; 4];
+                            for (i, d) in ty.shape.iter().enumerate().take(4) {
+                                shape[i] = d.unwrap_or(1);
+                            }
+                            Some(ironmill_compile::ane::TensorDescriptor {
+                                name: out_name.clone(),
+                                shape,
+                                dtype: ty.scalar_type,
+                            })
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let input_shapes: Vec<_> = pruned_inputs
+        .iter()
+        .map(|td| (td.shape, td.dtype))
+        .collect();
+    let output_shapes: Vec<_> = pruned_outputs
+        .iter()
+        .map(|td| (td.shape, td.dtype))
+        .collect();
     let input_alloc = uniform_alloc_size(&input_shapes);
     let output_alloc = uniform_alloc_size(&output_shapes).max(min_output_alloc);
 
-    let input_tensors: Vec<AneTensor> = sub
-        .inputs
+    let input_tensors: Vec<AneTensor> = pruned_inputs
         .iter()
         .map(|td| {
             AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc)
                 .map_err(Into::into)
         })
         .collect::<Result<Vec<_>>>()?;
-    let output_tensors: Vec<AneTensor> = sub
-        .outputs
+    let output_tensors: Vec<AneTensor> = pruned_outputs
         .iter()
         .map(|td| {
             AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc)
@@ -2367,6 +2466,58 @@ fn prune_unreferenced_inputs(program: &mut mil_rs::ir::Program) {
             referenced.insert(out_name.clone());
         }
         func.inputs.retain(|(name, _)| referenced.contains(name));
+    }
+}
+
+/// Pad the S dimension (dim 3) to at least `min_seq` across function
+/// inputs, op output types, and reshape shape constants.
+fn apply_min_seq_padding(program: &mut mil_rs::ir::Program, min_seq: usize) {
+    for func in program.functions.values_mut() {
+        for (_, ty) in &mut func.inputs {
+            if ty.shape.len() >= 4 {
+                if let Some(s) = ty.shape[3] {
+                    if s < min_seq {
+                        ty.shape[3] = Some(min_seq);
+                    }
+                }
+            }
+        }
+        for op in &mut func.body.operations {
+            for t in op.output_types.iter_mut().flatten() {
+                if t.shape.len() >= 4 {
+                    if let Some(s) = t.shape[3] {
+                        if s < min_seq {
+                            t.shape[3] = Some(min_seq);
+                        }
+                    }
+                }
+            }
+            if op.op_type == "reshape" {
+                if let Some(mil_rs::ir::Value::Tensor { shape, data, dtype }) =
+                    op.inputs.get_mut("shape")
+                {
+                    if shape.len() == 1 && *dtype == mil_rs::ir::ScalarType::Int32 {
+                        let ndims = shape[0];
+                        if ndims >= 4 && data.len() >= ndims * 4 {
+                            let off = (ndims - 1) * 4;
+                            let last = i32::from_le_bytes([
+                                data[off],
+                                data[off + 1],
+                                data[off + 2],
+                                data[off + 3],
+                            ]);
+                            if last > 0 && (last as usize) < min_seq {
+                                let b = (min_seq as i32).to_le_bytes();
+                                data[off] = b[0];
+                                data[off + 1] = b[1];
+                                data[off + 2] = b[2];
+                                data[off + 3] = b[3];
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
