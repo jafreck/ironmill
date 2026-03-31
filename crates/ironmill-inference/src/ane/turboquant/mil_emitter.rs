@@ -131,7 +131,7 @@ pub fn emit_cache_write_mil(config: &TurboQuantConfig) -> (String, Vec<(String, 
 
     // Rotation matrix passed as function input (a_input2), not BLOBFILE.
     // BLOBFILE weight references fail with compile_mil_text — see
-    // docs/development/ane-blobfile-investigation.md for details.
+    // docs/archive/ane-blobfile-investigation.md for details.
     let rot_data = generate_rotation_weights(config.head_dim, config.rotation_seed);
     weights.push(("rotation_matrix".to_string(), rot_data));
 

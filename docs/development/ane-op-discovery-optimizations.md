@@ -5,7 +5,7 @@ These capabilities are unique to ironmill — no other open-source project
 (maderix/ANE, Orion, Espresso, ANEgpt, hollance/neural-engine) has verified
 the ops that enable them.
 
-See `docs/research/ane-op-support-matrix.md` for the full cross-reference.
+See `docs/design/ane-op-support-matrix.md` for the full cross-reference.
 
 ---
 

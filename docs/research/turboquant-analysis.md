@@ -148,7 +148,7 @@ bits with k-means).
 > **Update (March 2026):** PolarQuant static weight quantization has been
 > implemented (see `polar_quantize.rs`, `beta_quantizer.rs`, `rotation.rs`).
 > The ANE-direct backend has been probed for op support — see
-> [ANE Op Support Matrix](ane-op-support-matrix.md) for empirically verified
+> [ANE Op Support Matrix](../design/ane-op-support-matrix.md) for empirically verified
 > op availability including eval-time correctness checks.
 
 ---

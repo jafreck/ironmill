@@ -41,7 +41,7 @@ ironmill validate model.onnx
 | Memory layout optimization (NCHW → NHWC) | ✅ |
 | FP16 quantization | ✅ |
 | INT8 post-training quantization (weight-only) | ✅ |
-| Weight palettization (2/4/6/8-bit k-means) | ✅ |
+| Weight palettization (2/4/6/8-bit k-means) | ✅ | 3-bit rejected by CoreML; 2/4-bit benchmarked. See `docs/BENCHMARK_RESULTS.md` |
 | Pass pipeline manager with mutual exclusivity checks | ✅ |
 | Shape materialization for ANE | ✅ |
 | ANE compatibility validator | ✅ |
@@ -218,7 +218,11 @@ Requires Rust 1.85+ (edition 2024).
 - [API docs](https://docs.rs/mil-rs) — generated from rustdoc
 - [C API usage guide](docs/C_API.md) — building, linking, and calling from C/Swift
 - [Build.rs example](examples/build_rs_example.rs) — using `CompileBuilder` at build time
-- [Inference improvements plan](docs/development/INFERENCE_IMPROVEMENTS_PLAN.md)
+- [`docs/design/`](docs/design/) — living design docs:
+  - [ANE Op Support Matrix](docs/design/ane-op-support-matrix.md) — 74 empirically verified ops
+  - [ANE Inference](docs/design/ane-inference.md) — inference pipeline status & architecture
+  - [ANE Constraints](docs/design/ane-constraints.md) — hardware limits & diagnostics
+  - [TurboQuant](docs/design/turboquant.md) — INT8 KV cache compression
 - [`docs/research/`](docs/research/) — background research:
   - [ANE Gap Analysis](docs/research/ane-research.md)
   - [Competitive Analysis](docs/research/competitive-analysis.md)

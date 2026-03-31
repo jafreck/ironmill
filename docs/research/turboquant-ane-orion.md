@@ -1,5 +1,12 @@
 # TurboQuant on ANE via Orion — Feasibility Analysis
 
+> **⚠️ This document describes capabilities of Orion's private ANE APIs
+> (`_ANEClient`, `_ANECompiler`), NOT ironmill's current CoreML/MIL-text
+> compilation path. Claims about INT4 support, native weight patching, and
+> direct ANE programming are specific to Orion and are not available in
+> ironmill today. See `docs/design/ane-op-support-matrix.md` for what
+> ironmill has empirically verified.**
+>
 > **Prerequisite reading:** [TurboQuant Research Analysis](turboquant-analysis.md)
 >
 > **Prerequisite implementation:** [ANE Direct Runtime Backend](../ane-direct-runtime-plan.md)
@@ -31,10 +38,10 @@ need to make that work.
 ironmill's ANE validator (`validate.rs`) recognizes these ops as ANE-compatible.
 This list has been **empirically verified** by compiling minimal MIL programs
 against Apple's private ANE compiler and running eval-time correctness checks.
-See [ANE Op Support Matrix](ane-op-support-matrix.md) for complete results.
+See [ANE Op Support Matrix](../design/ane-op-support-matrix.md) for complete results.
 
 ```
-Verified supported (69 ops):
+Verified supported (74 ops — see `docs/design/ane-op-support-matrix.md`):
 conv, matmul, linear, relu, relu6, sigmoid, tanh, softmax, silu, softsign,
 softplus, add, mul, sub, real_div, maximum, minimum, floor_div, abs, sign,
 sqrt, square, exp, exp2, erf, ceil, floor, round, atan, pow, clip,
