@@ -11,7 +11,16 @@ use mil_rs::ir::Program;
 use mil_rs::ir::TensorType;
 use mil_rs::ir::Value;
 
-/// Reshape all tensors in the program to ANE's required `[1, C, 1, S]` layout.
+/// Reshape tensors to ANE's `[1, C, 1, S]` layout selectively.
+///
+/// Only transforms:
+/// - Function inputs/outputs (ANE requires `[1, C, 1, S]` for IOSurface I/O)
+/// - `conv` and `linear` op inputs/outputs (ANE conv engine requires this layout)
+/// - `const` weight tensors feeding conv/linear ops
+///
+/// Does NOT transform intermediate ops (reshape, transpose, matmul, softmax,
+/// tile, etc.) — these need their natural multi-dimensional shapes for
+/// correct multi-head attention semantics.
 pub struct AneLayoutPass;
 
 impl Pass for AneLayoutPass {
@@ -20,54 +29,139 @@ impl Pass for AneLayoutPass {
     }
 
     fn run(&self, program: &mut Program) -> Result<()> {
+        // Ops whose output types need ANE [1,C,1,S] layout.
+        let layout_ops: &[&str] = &["conv", "linear"];
+
         for function in program.functions.values_mut() {
-            // Reshape function input types (activations).
+            // 1. Reshape function input types (IOSurface-backed activations).
             for (_name, ty) in &mut function.inputs {
                 reshape_tensor_type(ty);
             }
 
-            // Reshape operation output types (activations).
-            // Skip reshaping const op tensor values — weights use their own
-            // layout convention (e.g., [Cout, Cin, kH, kW] for conv).
+            // 2. Reshape output types of conv/linear ops only.
+            //    Also reshape their input tensor values (not attributes).
             for op in &mut function.body.operations {
-                for t in op.output_types.iter_mut().flatten() {
-                    reshape_tensor_type(t);
-                }
-
-                // Only reshape non-const op input tensors.
-                // Attributes (axes, keep_dims, epsilon, etc.) are metadata
-                // parameters, not activation tensors — reshaping them
-                // corrupts their semantics (e.g., axes=[−1] becomes [1,1,1,1]).
-                if op.op_type != "const" {
+                if layout_ops.contains(&op.op_type.as_str()) {
+                    for t in op.output_types.iter_mut().flatten() {
+                        reshape_tensor_type(t);
+                    }
                     for value in op.inputs.values_mut() {
                         reshape_value_tensor(value);
                     }
                 }
             }
 
-            // Fix reshape ops: update the shape parameter to match the
-            // ANE 4D output type. The layout pass converts output types
-            // to 4D but doesn't touch the shape const that reshape reads.
+            // 3. Propagate: ops that consume a conv/linear output or a
+            //    function input also need their output types reshaped,
+            //    IF they are simple pass-through ops (elementwise, etc.).
+            //    Build a set of tensor names that are in ANE layout.
+            let mut ane_layout_names: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for (name, _) in &function.inputs {
+                ane_layout_names.insert(name.clone());
+            }
+            for op in &function.body.operations {
+                if layout_ops.contains(&op.op_type.as_str()) {
+                    for out in &op.outputs {
+                        ane_layout_names.insert(out.clone());
+                    }
+                }
+            }
+
+            // Elementwise/reduction ops that just pass through shapes:
+            // their output type should match their input's layout.
+            let passthrough_ops: &[&str] = &[
+                "add",
+                "sub",
+                "mul",
+                "real_div",
+                "relu",
+                "sigmoid",
+                "tanh",
+                "silu",
+                "softplus",
+                "softsign",
+                "gelu",
+                "erf",
+                "exp",
+                "exp2",
+                "sqrt",
+                "square",
+                "abs",
+                "sign",
+                "pow",
+                "clip",
+                "maximum",
+                "minimum",
+                "floor_div",
+                "ceil",
+                "floor",
+                "round",
+                "atan",
+                "reduce_mean",
+                "reduce_sum",
+                "reduce_max",
+                "reduce_min",
+                "layer_norm",
+                "cast",
+                "identity",
+            ];
+            for op in &mut function.body.operations {
+                if passthrough_ops.contains(&op.op_type.as_str()) {
+                    // Check if any input references an ANE-layout tensor.
+                    let has_ane_input = op.inputs.values().any(|v| {
+                        if let Value::Reference(r) = v {
+                            ane_layout_names.contains(r.as_str())
+                        } else {
+                            false
+                        }
+                    });
+                    if has_ane_input {
+                        for t in op.output_types.iter_mut().flatten() {
+                            reshape_tensor_type(t);
+                        }
+                        for out in &op.outputs {
+                            ane_layout_names.insert(out.clone());
+                        }
+                    }
+                }
+            }
+
+            // 4. Fix reshape ops whose output is consumed by a conv/linear
+            //    or is a function output: update the shape parameter.
+            let func_output_set: std::collections::HashSet<&str> =
+                function.body.outputs.iter().map(|s| s.as_str()).collect();
             for op in &mut function.body.operations {
                 if op.op_type == "reshape" {
-                    if let Some(Some(out_ty)) = op.output_types.first() {
-                        let target_shape: Vec<usize> =
-                            out_ty.shape.iter().map(|d| d.unwrap_or(1)).collect();
-                        // Replace the shape input with an inline tensor
-                        // containing the 4D target shape.
-                        let n = target_shape.len();
-                        let data: Vec<u8> = target_shape
-                            .iter()
-                            .flat_map(|&d| (d as i32).to_le_bytes())
-                            .collect();
-                        op.inputs.insert(
-                            "shape".to_string(),
-                            Value::Tensor {
-                                data,
-                                shape: vec![n],
-                                dtype: mil_rs::ir::ScalarType::Int32,
-                            },
-                        );
+                    // Only update reshape if its output feeds into an ANE-layout consumer.
+                    let out_name = op.outputs.first().map(|s| s.as_str()).unwrap_or("");
+                    let needs_layout =
+                        ane_layout_names.contains(out_name) || func_output_set.contains(out_name);
+                    if needs_layout {
+                        if let Some(Some(out_ty)) = op.output_types.first() {
+                            let target_shape: Vec<usize> =
+                                out_ty.shape.iter().map(|d| d.unwrap_or(1)).collect();
+                            let n = target_shape.len();
+                            let data: Vec<u8> = target_shape
+                                .iter()
+                                .flat_map(|&d| (d as i32).to_le_bytes())
+                                .collect();
+                            op.inputs.insert(
+                                "shape".to_string(),
+                                Value::Tensor {
+                                    data,
+                                    shape: vec![n],
+                                    dtype: mil_rs::ir::ScalarType::Int32,
+                                },
+                            );
+                        }
+                        // Also reshape the output type.
+                        for t in op.output_types.iter_mut().flatten() {
+                            reshape_tensor_type(t);
+                        }
+                        for out in &op.outputs {
+                            ane_layout_names.insert(out.clone());
+                        }
                     }
                 }
             }

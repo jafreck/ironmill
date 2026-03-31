@@ -14,24 +14,28 @@ Two code paths create the coupling:
 
 **Simple path** (`AneModel::compile_and_load` in `ane/model.rs`):
 Program → 5 passes → `split_for_ane` → `program_to_mil_text` → ANE compile →
-load. Already has a `CompiledArtifacts::prepare()` API that the CLI uses.
+load. `CompiledArtifacts::prepare()` (also in `ane/model.rs`) runs the pass
+pipeline without ANE runtime, and the CLI uses it for the `--runtime ane-direct`
+compile path.
 
 **Decode path** (`AneInference::compile` in `ane/decode.rs`):
 Program → architecture detection → autoregressive passes → gather replacement →
 attention-aware split → per-sub-program packing/matmul→conv/DCE → cache-write
-fusion → donor/patch compilation → full decode engine setup. ~2000 lines,
-deeply intertwined with compile-crate types.
+fusion → donor/patch compilation → full decode engine setup. ~730 lines
+(lines 378–1106), deeply intertwined with compile-crate types.
 
 ### What inference imports from compile
 
 | Category | Items |
 |----------|-------|
 | Passes | `OpSubstitutionPass`, `AneLayoutPass`, `AttentionDecomposePass`, `AneConcatEliminationPass`, `AneVariableNamingPass`, `AneArgPromotionPass`, `AneMatmulToConvPass` |
-| Split | `SplitConfig`, `split_for_ane`, `SubProgram`, `ModelSplit` |
-| Emission | `MilTextConfig`, `program_to_mil_text`, `BlobFileWriter`, `WeightBlobEntry` |
-| Packing | `InputPacking`, `pack_inputs`, `write_packed_inputs` |
-| Cache | `ProgramCache`, `ProgramKey` |
+| Split | `SplitConfig`, `split_for_ane`, `SubProgram`¹ |
+| Emission | `MilTextConfig`, `program_to_mil_text`, `BlobFileWriter` |
+| Packing | `InputPacking`¹, `pack_inputs`¹, `write_packed_inputs`¹ |
+| Cache | `ProgramCache`, `ProgramKey`¹ |
 | Types | `TensorDescriptor`, `AneCompileError` |
+
+¹ Used via fully-qualified paths rather than direct `use` imports.
 
 ### Key observation
 
@@ -45,22 +49,50 @@ a parameter.
 ## Approach
 
 Create a clean artifact boundary: `ironmill-compile` produces self-contained
-bundles that `ironmill-inference` can load and run without touching IR passes,
-splitting, or MIL emission. Shared types go in `mil-rs` (the common
-foundation).
+`.ironml` bundles that `ironmill-inference` can load and run without touching
+IR passes, splitting, or MIL emission. The `.ironml` directory format is the
+contract between the two crates — no shared Rust types are required.
 
-## Phase 1: Move shared types to mil-rs
+## Phase 1: Define `.ironml` format and bundle types
 
-`TensorDescriptor` is `{ name: String, shape: [usize; 4], dtype: ScalarType }`
-— generic enough for the foundation crate. `InputPacking` is
-`{ offsets: Vec<usize>, sizes: Vec<usize> }` — also simple.
+### Artifact format
 
-- Move `TensorDescriptor` from `ironmill-compile::ane` → `mil_rs::ir`
-- Move `InputPacking` from `ironmill-compile::ane::packing` → `mil_rs::ir`
-- Re-export from `ironmill-compile::ane` for backward compat
-- Update all import sites
+A `.ironml` bundle is a directory containing compiled ANE artifacts ready for
+runtime loading. The format follows the same directory-bundle pattern as
+CoreML's `.mlpackage` — a JSON manifest with separate binary files for weights
+and programs, enabling mmap-based loading and metadata updates without
+re-serializing large binaries.
 
-## Phase 2: Define artifact bundle types in ironmill-compile
+```
+model.ironml/
+├── manifest.json              # metadata, architecture, sub-program descriptors
+├── programs/
+│   ├── layer_0_pre_attn.mil   # compiled MIL text per sub-program
+│   ├── layer_0_post_attn.mil
+│   └── ...
+├── weights/
+│   ├── layer_0_pre_attn.bin   # weight blob per sub-program
+│   ├── layer_0_post_attn.bin
+│   └── ...
+└── cpu_weights/               # decode-path only: CPU-side weights
+    ├── embedding.bin
+    ├── lm_head.bin
+    ├── rope_cos.bin
+    ├── rope_sin.bin
+    └── final_norm.bin         # optional
+```
+
+The manifest contains:
+- Format version (for forward compatibility)
+- Model type (`simple` or `decode`)
+- Architecture identifier (for decode bundles)
+- Per-sub-program metadata: name, input/output tensor descriptors (name,
+  shape as `[usize; 4]`, dtype), input packing offsets/sizes
+- Per-layer metadata (for decode): layer index, cache-write-fused flag,
+  donor compatibility annotations
+- LM head configuration
+
+### Bundle types in ironmill-compile
 
 Create `ironmill_compile::ane::bundle` module:
 
@@ -97,13 +129,19 @@ pub struct LayerBundle {
     pub post_attn: SubProgramBundle,
     pub fp16_attn: Option<SubProgramBundle>,
     pub cache_write_fused: bool,
+    pub donor_compatible: bool,
 }
 ```
 
-Add serialization (save/load to disk) so artifacts can be cached or
-distributed.
+`TensorDescriptor` (`{ name, shape: [usize; 4], dtype }`) and `InputPacking`
+(`{ offsets, sizes }`) stay in ironmill-compile — they are ANE-specific types
+(the `[usize; 4]` shape encodes NCHW layout), not generic IR. Inference
+defines its own equivalent types for deserialization from the manifest.
 
-## Phase 3: Create high-level compilation APIs in ironmill-compile
+Add `AneModelBundle::save()` and `AneDecodeBundle::save()` to write the
+`.ironml` directory format.
+
+## Phase 2: Create high-level compilation APIs in ironmill-compile
 
 Move all compilation orchestration into compile:
 
@@ -125,7 +163,7 @@ pub fn compile_decode_bundle(
     config: &AneDecodeConfig,
 ) -> Result<AneDecodeBundle>
 ```
-Absorbs the decode setup from `inference::ane::decode::compile`:
+Absorbs the decode setup from `inference::ane::decode::compile` (~730 lines):
 - Autoregressive shape materialization
 - Gather replacement
 - Attention-aware splitting
@@ -138,38 +176,51 @@ The passes (`AutoregressiveShapeMaterializePass`, etc.) are MIL IR
 transformations — they belong in compile even though they're
 inference-mode-specific.
 
-## Phase 4: Refactor ironmill-inference to consume bundles
+## Phase 3: Refactor ironmill-inference to consume bundles
 
 Replace JIT compilation with bundle consumption:
 
 **Simple path:**
 ```rust
 impl AneModel {
-    pub fn from_bundle(bundle: AneModelBundle, config: AneConfig) -> Result<Self>
+    pub fn from_bundle(bundle_path: &Path, config: AneConfig) -> Result<Self>
 }
 ```
-Takes pre-compiled bundle → ANE `compile_mil_text` → load → allocate tensors.
+Reads `.ironml` directory → ANE `compile_mil_text` → load → allocate tensors.
 
 **Decode path:**
 ```rust
 impl AneInference {
-    pub fn from_bundle(bundle: AneDecodeBundle, turbo: Option<TurboQuantConfig>) -> Result<Self>
+    pub fn from_bundle(bundle_path: &Path, turbo: Option<TurboQuantConfig>) -> Result<Self>
 }
 ```
-Takes pre-compiled bundle → load sub-programs (with donor/patch optimization)
+Reads `.ironml` directory → load sub-programs (with donor/patch optimization)
 → set up caches → ready for decode loop.
 
-Remove `ironmill-compile` from inference's `Cargo.toml`. The convenience
-wrappers (`compile_and_load`, `AneInference::compile`) move to CLI/bench
-as orchestration code, or are removed.
+Remove `ironmill-compile` from inference's `Cargo.toml`.
 
-## Phase 5: Update dependent crates and README
+**Convenience wrappers** (`AneModel::compile_and_load`, `AneInference::compile`)
+stay on inference behind an optional `compile` feature flag that re-adds the
+`ironmill-compile` dependency. When enabled, these methods call
+`compile_model_bundle()` / `compile_decode_bundle()` then `from_bundle()`
+internally. Callers like `ironmill-bench` enable this feature for ergonomic
+one-call usage. The core inference crate has no compile dependency.
 
-**ironmill-cli:** Switch from `CompiledArtifacts::prepare()` to
-`compile_model_bundle()`. For decode, use `compile_decode_bundle()`.
+## Phase 4: Update dependent crates and README
 
-**ironmill-bench:** ANE-direct benchmark calls compile API to get bundle,
-then inference API to load/run. Bench orchestrates both crates.
+**ironmill-cli:** The CLI is a compiler — it has no inference/run command.
+Switch the `--runtime ane-direct` path from `CompiledArtifacts::prepare()` to
+`compile_model_bundle()` / `compile_decode_bundle()`, emitting `.ironml`
+bundles. CLI compile remains always-available (not feature-gated), supporting
+both `--runtime coreml` (`.mlpackage`) and `--runtime ane-direct` (`.ironml`).
+
+**ironmill-bench:** ANE-direct benchmarks and perplexity evaluation use the
+inference convenience wrappers (`AneInference::compile`, etc.) with the
+`compile` feature enabled. Bench orchestrates both compile and inference
+through the Rust API.
+
+**burn-coreml / candle-coreml:** These crates use the CoreML path
+(`CompileBuilder` + `Model::load`), not ANE-direct. No changes needed.
 
 **README Mermaid diagram:** Remove `inference --> compile` edge. Add
 `inference --> mil` edge (already a real dependency, currently missing
@@ -183,7 +234,7 @@ cli -.-> inference
 
 bench --> compile
 bench --> inference
-bench -.-> ios
+bench -.-> ironmill-iosurface
 
 burn --> compile
 burn --> inference
@@ -192,35 +243,42 @@ candle --> compile
 candle --> inference
 
 compile --> mil
-compile --> ios
+compile --> ironmill-iosurface
 
 inference --> mil
 inference --> ane-sys
-inference --> ios
+inference --> ironmill-iosurface
 inference --> coreml-sys
+inference -.-> compile           (optional, behind "compile" feature)
 
-ios --> mil
+ironmill-iosurface --> mil
 ```
 
 ## Risks
 
-1. **Decode bundle complexity**: The decode setup is ~2000 lines. The bundle
+1. **Decode bundle complexity**: The decode setup is ~730 lines. The bundle
    must capture everything the decode loop needs (architecture, RoPE, CPU
    weights, packing metadata, donor compatibility annotations).
 
 2. **Donor/patch optimization**: The decode loop compiles the first layer
-   normally then patches weights for subsequent layers. The bundle should
-   annotate which layers share structure to enable this at load time.
+   normally then patches weights for subsequent layers. The bundle annotates
+   which layers share structure (`donor_compatible`) to enable this at load
+   time.
 
 3. **`write_packed_inputs` at runtime**: This function writes packed data
-   into ANE tensors during decode. It uses `InputPacking` metadata (moving
-   to mil-rs) but operates on `AneTensor` (from inference). The function
-   itself should move to inference since it operates on runtime tensors.
+   into ANE tensors during decode. It uses `InputPacking` metadata but
+   operates on `AneTensor` (from inference). The function should move to
+   inference since it operates on runtime tensors. Inference defines its
+   own `InputPacking` equivalent for deserialization from the manifest.
 
-4. **`ProgramCache`**: Currently in compile, used by inference for ANE
-   compile budget tracking. Should move to inference or be reimplemented
-   there (~200 lines) since it's a runtime concern.
+4. **`ProgramCache`**: Currently in compile (~230 lines), used by inference
+   for ANE compile budget tracking. Should move to inference or be
+   reimplemented there since it's a runtime concern.
 
 5. **Testing**: Decode-path tests that build MIL programs and compile them
    would need to call both compile and inference APIs, so they'd move to
    integration tests or the bench crate.
+
+6. **Format versioning**: The `.ironml` manifest needs a version field from
+   day one. Bundle format changes must be backward-compatible or versioned
+   to avoid breaking cached artifacts.

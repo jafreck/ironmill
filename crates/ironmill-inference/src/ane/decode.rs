@@ -458,14 +458,15 @@ impl AneInference {
         //     decode time, preserving all downstream references.
         replace_gather_with_inputs(&mut program);
 
-        // 2. Split each layer into pre_attn and post_attn.
-        //    Attention is handled by a separate hand-written MIL program
-        //    that uses correct 4D per-head shapes [1,H,D,S] — the splitter's
-        //    attention ops go through AneLayoutPass which flattens them to
-        //    [1,H*D,1,S], producing flat matmuls that ANE rejects.
+        // 2. Split each layer into three sub-programs:
+        //    - pre_attn: norm → Q/K/V projections (conv-heavy, ANE layout)
+        //    - fp16_attn: attention core (matmul-heavy, natural 4D shapes)
+        //    - post_attn: O-proj → residual → FFN (conv-heavy, ANE layout)
+        //    AneLayoutPass now only transforms conv/linear ops, so attention
+        //    ops keep their natural [1, H, D, S] multi-head shapes.
         let split_config = SplitConfig {
             split_attention: true,
-            emit_attention: false,
+            emit_attention: true,
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -569,9 +570,14 @@ impl AneInference {
             String,
             ironmill_compile::ane::packing::InputPacking,
         > = std::collections::HashMap::new();
-        for sub in &mut model_split.programs {
-            if let Some(packing) = ironmill_compile::ane::packing::pack_inputs(sub) {
-                packing_map.insert(sub.name.clone(), packing);
+        // TODO: re-enable input packing after verifying base compilation.
+        // Packing is disabled temporarily to isolate compilation issues.
+        let _packing_disabled = true;
+        if false {
+            for sub in &mut model_split.programs {
+                if let Some(packing) = ironmill_compile::ane::packing::pack_inputs(sub) {
+                    packing_map.insert(sub.name.clone(), packing);
+                }
             }
         }
 
@@ -1760,12 +1766,10 @@ fn compile_and_load_sub(
     input_packing: Option<ironmill_compile::ane::packing::InputPacking>,
     min_output_alloc: usize,
 ) -> Result<LoadedSubProgram> {
-    // ANE requires Float16. Convert any Float32 const ops to Float16.
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
-    // Prune unreferenced inputs (may be left after gather/split removal + DCE).
     prune_unreferenced_inputs(&mut program);
-    // Repropagate types after S≥32 padding may have changed shapes.
+    let _ = AneLayoutPass.run(&mut program);
     let _ = TypeRepropagationPass.run(&mut program);
 
     // Fix tile output types by resolving reps from const ops.
@@ -1955,6 +1959,10 @@ fn compile_and_load_sub_with_donor(
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
     prune_unreferenced_inputs(&mut program);
+    // Run AneLayoutPass per sub-program to ensure function I/O and
+    // conv/linear ops have [1,C,1,S] layout. The pre-split pass may
+    // not have reshaped cross-boundary values that become sub-program inputs.
+    let _ = AneLayoutPass.run(&mut program);
     let _ = TypeRepropagationPass.run(&mut program);
     let _ = AneVariableNamingPass.run(&mut program);
 
