@@ -5,7 +5,9 @@
 //! Format-specific providers ([`GgufProvider`], [`SafeTensorsProvider`])
 //! are defined in this crate.
 
-pub use mil_rs::weights::{Architecture, ModelConfig, WeightProvider, WeightTensor};
+pub use mil_rs::weights::{
+    Architecture, ModelConfig, QuantizationInfo, WeightProvider, WeightTensor,
+};
 
 pub mod gguf;
 pub mod safetensors;

@@ -71,6 +71,33 @@ impl ModelConfig {
     }
 }
 
+/// Describes how a weight tensor is stored in compressed form.
+#[derive(Debug, Clone)]
+pub enum QuantizationInfo {
+    /// Dense storage, no quantization. Existing behavior.
+    None,
+    /// PolarQuant / palettization: LUT + packed indices + row norms.
+    /// Produced by `constexpr_lut_to_dense` in MIL IR.
+    LutToDense {
+        lut: Vec<u8>,
+        lut_dtype: ScalarType,
+        indices: Vec<u8>,
+        original_shape: Vec<usize>,
+        n_bits: u8,
+        row_norms: Vec<u8>,
+        norms_dtype: ScalarType,
+    },
+    /// INT8 affine quantization: (quantized - zero_point) * scale.
+    /// Produced by `constexpr_affine_dequantize` in MIL IR.
+    AffineDequantize {
+        scale: Vec<u8>,
+        zero_point: Vec<u8>,
+        scale_dtype: ScalarType,
+        zero_point_dtype: ScalarType,
+        axis: Option<usize>,
+    },
+}
+
 /// Borrowed view of a weight tensor. Uses `Cow` to allow zero-copy
 /// mmap access from SafeTensors while still supporting owned data
 /// from GGUF dequantization.
@@ -79,6 +106,7 @@ pub struct WeightTensor<'a> {
     pub data: Cow<'a, [u8]>,
     pub shape: Vec<usize>,
     pub dtype: ScalarType,
+    pub quant_info: QuantizationInfo,
 }
 
 impl<'a> WeightTensor<'a> {
@@ -88,6 +116,7 @@ impl<'a> WeightTensor<'a> {
             data: Cow::Borrowed(data),
             shape,
             dtype,
+            quant_info: QuantizationInfo::None,
         }
     }
 
@@ -97,6 +126,7 @@ impl<'a> WeightTensor<'a> {
             data: Cow::Owned(data),
             shape,
             dtype,
+            quant_info: QuantizationInfo::None,
         }
     }
 
