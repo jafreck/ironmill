@@ -90,6 +90,8 @@ pub struct AneInference {
     /// Number of f16 values per position in the RoPE cache.
     #[allow(dead_code)]
     rope_cache_dim: usize,
+    /// Whether cache-write ops were fused into pre_attn sub-programs.
+    cache_write_fused: bool,
 }
 
 /// CPU-side weight tensor for embedding/lm_head.
@@ -538,11 +540,80 @@ impl AneInference {
         // 2d. Fuse cache-write ops into pre_attn sub-programs (TurboQuant only).
         // This appends rotation + quantization ops so pre_attn directly outputs
         // quantized K/V, eliminating the separate cache-write ANE eval per layer.
+        // Skipped when pre_attn has <3 outputs (heuristic split fallback).
+        let mut cache_write_fused = false;
         if let Some(ref tc) = turbo_config {
-            for sub in &mut model_split.programs {
-                if sub.name.ends_with("_pre_attn") {
-                    inject_cache_write_ops(sub, tc, tc.enable_qjl)?;
+            // Pre-check: verify all pre_attn sub-programs can be injected
+            // before modifying any. This prevents partial injection where some
+            // layers have modified outputs but others don't.
+            let pre_attn_names: Vec<String> = model_split
+                .programs
+                .iter()
+                .filter(|s| s.name.ends_with("_pre_attn"))
+                .map(|s| s.name.clone())
+                .collect();
+
+            let all_injectable = model_split.programs.iter().all(|sub| {
+                if !sub.name.ends_with("_pre_attn") {
+                    return true;
                 }
+                let func = match sub.program.main() {
+                    Some(f) => f,
+                    None => return false,
+                };
+                if func.body.outputs.len() < 3 {
+                    return false;
+                }
+                // Check Q/K/V can be identified by name or shape
+                let mut found_q = false;
+                let mut found_k = false;
+                let mut found_v = false;
+                for name in &func.body.outputs {
+                    let lower = name.to_lowercase();
+                    if lower.contains("k_proj") {
+                        found_k = true;
+                    } else if lower.contains("v_proj") {
+                        found_v = true;
+                    } else if lower.contains("q_proj") {
+                        found_q = true;
+                    }
+                }
+                if !found_q || !found_k || !found_v {
+                    // Fallback: check by channel count
+                    let q_ch = tc.num_heads * tc.head_dim;
+                    let kv_ch = tc.num_kv_heads * tc.head_dim;
+                    found_q = false;
+                    found_k = false;
+                    found_v = false;
+                    for td in &sub.outputs {
+                        if td.shape[1] == q_ch && !found_q {
+                            found_q = true;
+                        } else if td.shape[1] == kv_ch {
+                            if !found_k {
+                                found_k = true;
+                            } else if !found_v {
+                                found_v = true;
+                            }
+                        }
+                    }
+                }
+                found_q && found_k && found_v
+            });
+
+            if all_injectable && !pre_attn_names.is_empty() {
+                let mut inject_count = 0usize;
+                for sub in &mut model_split.programs {
+                    if sub.name.ends_with("_pre_attn") {
+                        inject_cache_write_ops(sub, tc, tc.enable_qjl)?;
+                        inject_count += 1;
+                    }
+                }
+                cache_write_fused = true;
+                eprintln!("cache-write fusion: enabled ({inject_count} layers, −1 ANE eval/layer)");
+            } else {
+                eprintln!(
+                    "cache-write fusion: disabled (not all pre_attn sub-programs have identifiable Q/K/V outputs)"
+                );
             }
         }
 
@@ -933,6 +1004,7 @@ impl AneInference {
             rope_cos_cache,
             rope_sin_cache,
             rope_cache_dim,
+            cache_write_fused,
         })
     }
 
@@ -1009,29 +1081,44 @@ impl AneInference {
                     None
                 };
                 let q = &layer.pre_attn.output_tensors[0];
-                let k_quant = if num_pre_outputs > 1 {
-                    &layer.pre_attn.output_tensors[1]
+                let attn_tensor = if self.cache_write_fused {
+                    // Fused path: pre_attn already produced K_quant/V_quant
+                    let k_quant = if num_pre_outputs > 1 {
+                        &layer.pre_attn.output_tensors[1]
+                    } else {
+                        &layer.pre_attn.output_tensors[0]
+                    };
+                    let v_quant = if num_pre_outputs > 2 {
+                        &layer.pre_attn.output_tensors[2]
+                    } else {
+                        &layer.pre_attn.output_tensors[0]
+                    };
+                    // When QJL is enabled, output[3] is the original K_proj
+                    let k_original = if tq.config().enable_qjl && num_pre_outputs > 3 {
+                        Some(&layer.pre_attn.output_tensors[3])
+                    } else {
+                        None
+                    };
+                    tq.step_attention_fused(layer_idx, q, k_quant, v_quant, k_original)
                 } else {
-                    &layer.pre_attn.output_tensors[0]
+                    // Non-fused path: pre_attn outputs raw K_proj/V_proj
+                    let k_proj = if num_pre_outputs > 1 {
+                        &layer.pre_attn.output_tensors[1]
+                    } else {
+                        &layer.pre_attn.output_tensors[0]
+                    };
+                    let v_proj = if num_pre_outputs > 2 {
+                        &layer.pre_attn.output_tensors[2]
+                    } else {
+                        &layer.pre_attn.output_tensors[0]
+                    };
+                    tq.step_attention(layer_idx, q, k_proj, v_proj)
                 };
-                let v_quant = if num_pre_outputs > 2 {
-                    &layer.pre_attn.output_tensors[2]
-                } else {
-                    &layer.pre_attn.output_tensors[0]
-                };
-                // When QJL is enabled, output[3] is the original K_proj
-                let k_original = if tq.config().enable_qjl && num_pre_outputs > 3 {
-                    Some(&layer.pre_attn.output_tensors[3])
-                } else {
-                    None
-                };
-                let attn_tensor = tq
-                    .step_attention_fused(layer_idx, q, k_quant, v_quant, k_original)
-                    .map_err(|e| {
-                        AneError::Other(anyhow::anyhow!(
-                            "layer {layer_idx} turboquant step_attention_fused failed: {e}"
-                        ))
-                    })?;
+                let attn_tensor = attn_tensor.map_err(|e| {
+                    AneError::Other(anyhow::anyhow!(
+                        "layer {layer_idx} turboquant attention failed: {e}"
+                    ))
+                })?;
                 let result = read_f16_channels(&attn_tensor)?;
                 if let Some(t) = t0 {
                     d_attn += t.elapsed();
@@ -1351,15 +1438,17 @@ fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
 /// so pre_attn directly produces quantized K/V values. This eliminates the
 /// separate cache-write ANE eval call per layer.
 ///
-/// Before injection: `[Q, K_proj, V_proj, ...]`
-/// After injection:  `[Q, K_quant, V_quant, ...]`
+/// Before injection: `[..., Q, K_proj, V_proj, ...]` (in whatever order)
+/// After injection:  `[Q, K_quant, V_quant, ...extras]` (canonical order)
 ///
 /// When QJL is enabled, K_proj is preserved as an additional output.
+/// Returns `Ok(true)` if injection was applied, `Ok(false)` if the
+/// sub-program was skipped (e.g., <3 outputs), or `Err` on failure.
 fn inject_cache_write_ops(
     sub: &mut ironmill_compile::ane::split::SubProgram,
     config: &TurboQuantConfig,
     enable_qjl: bool,
-) -> Result<()> {
+) -> Result<bool> {
     use mil_rs::ir::{Operation, TensorType, Value};
 
     let func = sub
@@ -1371,24 +1460,68 @@ fn inject_cache_write_ops(
 
     let num_outputs = func.body.outputs.len();
     if num_outputs < 3 {
-        return Err(AneError::Other(anyhow::anyhow!(
-            "pre_attn has {} outputs, need at least 3 (Q, K_proj, V_proj)",
-            num_outputs
-        )));
+        // Pre_attn doesn't have separate Q/K/V outputs (heuristic split
+        // fallback). Skip injection — use the non-fused step_attention path.
+        return Ok(false);
     }
 
-    let k_proj_name = func.body.outputs[1].clone();
-    let v_proj_name = func.body.outputs[2].clone();
-
     let kv_ch = config.num_kv_heads * config.head_dim;
+    let q_ch = config.num_heads * config.head_dim;
     let head_dim = config.head_dim;
     let num_kv_heads = config.num_kv_heads;
+
+    // Identify Q, K_proj, V_proj outputs by name pattern.
+    // Outputs are sorted lexicographically by `build_sub_program`, so the
+    // indices depend on the model's naming convention (e.g., k < q < v).
+    let mut q_idx = None;
+    let mut k_idx = None;
+    let mut v_idx = None;
+    for (i, name) in func.body.outputs.iter().enumerate() {
+        let lower = name.to_lowercase();
+        if lower.contains("k_proj") {
+            k_idx = Some(i);
+        } else if lower.contains("v_proj") {
+            v_idx = Some(i);
+        } else if lower.contains("q_proj") {
+            q_idx = Some(i);
+        }
+    }
+
+    // Fallback: identify by channel count (Q has num_heads*head_dim channels,
+    // K/V have num_kv_heads*head_dim). Works for GQA where they differ.
+    if q_idx.is_none() || k_idx.is_none() || v_idx.is_none() {
+        for (i, td) in sub.outputs.iter().enumerate() {
+            if td.shape[1] == q_ch && q_idx.is_none() {
+                q_idx = Some(i);
+            } else if td.shape[1] == kv_ch {
+                if k_idx.is_none() {
+                    k_idx = Some(i);
+                } else if v_idx.is_none() {
+                    v_idx = Some(i);
+                }
+            }
+        }
+    }
+
+    let (q_idx, k_idx, v_idx) = match (q_idx, k_idx, v_idx) {
+        (Some(q), Some(k), Some(v)) => (q, k, v),
+        _ => {
+            eprintln!(
+                "warning: could not identify Q/K/V outputs in pre_attn (outputs: {:?})",
+                func.body.outputs
+            );
+            return Ok(false);
+        }
+    };
+
+    let k_proj_name = func.body.outputs[k_idx].clone();
+    let v_proj_name = func.body.outputs[v_idx].clone();
 
     // Determine spatial dimension from the K_proj output type.
     let s = {
         let k_td = sub
             .outputs
-            .get(1)
+            .get(k_idx)
             .ok_or_else(|| AneError::Other(anyhow::anyhow!("missing K_proj output descriptor")))?;
         k_td.shape[3]
     };
@@ -1592,29 +1725,64 @@ fn inject_cache_write_ops(
     // Append new ops to the function body
     func.body.operations.append(&mut new_ops);
 
-    // Update function outputs: replace K_proj → K_quant, V_proj → V_quant
-    func.body.outputs[1] = "tq_cw_k_quant".to_string();
-    func.body.outputs[2] = "tq_cw_v_quant".to_string();
+    // Reorder function outputs to [Q, K_quant, V_quant, ...extras...].
+    // The split sorts outputs lexicographically (e.g., k < q < v), which
+    // may not match the decode loop's expected [Q, K, V] convention.
+    // We enforce the canonical ordering here.
+    func.body.outputs[k_idx] = "tq_cw_k_quant".to_string();
+    func.body.outputs[v_idx] = "tq_cw_v_quant".to_string();
+    // Q stays at its original name at q_idx.
 
-    // When QJL is enabled, keep original K_proj as an extra output
-    if enable_qjl {
-        func.body.outputs.push(k_proj_name);
+    // Collect extra outputs (beyond Q/K/V, e.g., residual).
+    let q_name = func.body.outputs[q_idx].clone();
+    let k_quant_name = func.body.outputs[k_idx].clone();
+    let v_quant_name = func.body.outputs[v_idx].clone();
+    let mut extras: Vec<String> = Vec::new();
+    for (i, name) in func.body.outputs.iter().enumerate() {
+        if i != q_idx && i != k_idx && i != v_idx {
+            extras.push(name.clone());
+        }
     }
 
-    // Update sub-program output descriptors to match
-    if sub.outputs.len() >= 3 {
-        sub.outputs[1].name = "tq_cw_k_quant".to_string();
-        sub.outputs[2].name = "tq_cw_v_quant".to_string();
-    }
+    // Rebuild outputs in canonical order: [Q, K_quant, V_quant, ...extras]
+    let mut new_outputs = vec![q_name, k_quant_name, v_quant_name];
+    new_outputs.extend(extras);
     if enable_qjl {
-        let k_td = sub.outputs[1].clone();
-        sub.outputs.push(ironmill_compile::ane::TensorDescriptor {
+        new_outputs.push(k_proj_name);
+    }
+    func.body.outputs = new_outputs;
+
+    // Rebuild sub-program output descriptors in the same canonical order.
+    let q_td = sub.outputs[q_idx].clone();
+    let k_td = sub.outputs[k_idx].clone();
+    let v_td = sub.outputs[v_idx].clone();
+    let mut extra_tds: Vec<ironmill_compile::ane::TensorDescriptor> = Vec::new();
+    for (i, td) in sub.outputs.iter().enumerate() {
+        if i != q_idx && i != k_idx && i != v_idx {
+            extra_tds.push(td.clone());
+        }
+    }
+    let mut new_tds = vec![
+        q_td,
+        ironmill_compile::ane::TensorDescriptor {
+            name: "tq_cw_k_quant".to_string(),
+            ..k_td.clone()
+        },
+        ironmill_compile::ane::TensorDescriptor {
+            name: "tq_cw_v_quant".to_string(),
+            ..v_td
+        },
+    ];
+    new_tds.extend(extra_tds);
+    if enable_qjl {
+        new_tds.push(ironmill_compile::ane::TensorDescriptor {
             name: "k_proj_original".to_string(),
             ..k_td
         });
     }
+    sub.outputs = new_tds;
 
-    Ok(())
+    Ok(true)
 }
 
 /// Compile a single sub-program, pre-allocating I/O tensors.
