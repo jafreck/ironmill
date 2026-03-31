@@ -474,9 +474,21 @@ impl AneInference {
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
 
-        // 2a. Pad S≥32 on non-attention sub-programs only.
-        // fp16_attn sub-programs need original shapes for correct
-        // per-head attention dimensions (reshape [1,C,1,1] → [1,H,D,1]).
+        // 2a. Prune unreferenced inputs from each sub-program.
+        //     After gather/split/concat/sub removal + DCE, some function
+        //     inputs (e.g., RoPE cos/sin cache tables) are no longer
+        //     referenced. Remove them to avoid oversized IOSurface allocs.
+        for sub in &mut model_split.programs {
+            prune_unreferenced_inputs(&mut sub.program);
+            // Also prune the sub-program's input descriptors to match.
+            if let Some(func) = sub.program.main() {
+                let func_input_names: std::collections::HashSet<String> =
+                    func.inputs.iter().map(|(n, _)| n.clone()).collect();
+                sub.inputs.retain(|td| func_input_names.contains(&td.name));
+            }
+        }
+
+        // 2b. Pad S≥32 on sub-programs.
         const ANE_MIN_SEQ: usize = 32;
         for sub in &mut model_split.programs {
             if sub.name.ends_with("_fp16_attn") {
@@ -1716,6 +1728,8 @@ fn compile_and_load_sub(
     // ANE requires Float16. Convert any Float32 const ops to Float16.
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
+    // Prune unreferenced inputs (may be left after gather/split removal + DCE).
+    prune_unreferenced_inputs(&mut program);
 
     let (mil_text, weight_entries) = program_to_mil_text(&program, mil_config).map_err(|e| {
         AneError::Other(anyhow::anyhow!(
@@ -1756,16 +1770,37 @@ fn compile_and_load_sub(
     })?;
 
     // Pre-allocate I/O tensors with uniform sizing.
-    // Note: we do NOT call runtime.load_program() — the program is
-    // auto-loaded by compile_mil_text and will be unloaded in bulk
-    // after all layers are compiled.
-    let input_shapes: Vec<_> = sub.inputs.iter().map(|td| (td.shape, td.dtype)).collect();
+    // Use the pruned program's function inputs (not sub.inputs, which may
+    // still contain dangling inputs removed by prune_unreferenced_inputs).
+    let pruned_inputs: Vec<ironmill_compile::ane::TensorDescriptor> = program
+        .main()
+        .map(|f| {
+            f.inputs
+                .iter()
+                .map(|(name, ty)| {
+                    let mut shape = [1usize; 4];
+                    for (i, d) in ty.shape.iter().enumerate().take(4) {
+                        shape[i] = d.unwrap_or(1);
+                    }
+                    ironmill_compile::ane::TensorDescriptor {
+                        name: name.clone(),
+                        shape,
+                        dtype: ty.scalar_type,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let input_shapes: Vec<_> = pruned_inputs
+        .iter()
+        .map(|td| (td.shape, td.dtype))
+        .collect();
     let output_shapes: Vec<_> = sub.outputs.iter().map(|td| (td.shape, td.dtype)).collect();
     let input_alloc = uniform_alloc_size(&input_shapes);
     let output_alloc = uniform_alloc_size(&output_shapes).max(min_output_alloc);
 
-    let input_tensors: Vec<AneTensor> = sub
-        .inputs
+    let input_tensors: Vec<AneTensor> = pruned_inputs
         .iter()
         .map(|td| {
             AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc)
@@ -2180,6 +2215,33 @@ fn replace_gather_with_inputs(program: &mut mil_rs::ir::Program) {
                 referenced_names.insert(out_name.clone());
             }
         }
+
+        // Remove unreferenced function inputs (dangling after op stripping).
+        func.inputs
+            .retain(|(name, _)| referenced_names.contains(name));
+    }
+}
+
+/// Remove function inputs that are not referenced by any op in the body.
+fn prune_unreferenced_inputs(program: &mut mil_rs::ir::Program) {
+    for func in program.functions.values_mut() {
+        let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for op in &func.body.operations {
+            for val in op.inputs.values() {
+                if let mil_rs::ir::Value::Reference(r) = val {
+                    referenced.insert(r.clone());
+                }
+            }
+            for val in op.attributes.values() {
+                if let mil_rs::ir::Value::Reference(r) = val {
+                    referenced.insert(r.clone());
+                }
+            }
+        }
+        for out_name in &func.body.outputs {
+            referenced.insert(out_name.clone());
+        }
+        func.inputs.retain(|(name, _)| referenced.contains(name));
     }
 }
 
