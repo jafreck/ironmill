@@ -157,7 +157,7 @@ struct LoadedSubProgram<D: AneDevice> {
     input_tensors: Vec<AneTensor>,
     output_tensors: Vec<AneTensor>,
     /// If inputs were spatially packed, stores the packing metadata.
-    input_packing: Option<ironmill_compile::ane::packing::InputPacking>,
+    input_packing: Option<super::bundle_manifest::InputPacking>,
 }
 
 /// LM head projection — ANE-accelerated or CPU fallback.
@@ -562,7 +562,7 @@ impl<D: AneDevice> AneInference<D> {
         // not matmuls. Stores packing metadata per sub-program name.
         let mut packing_map: std::collections::HashMap<
             String,
-            ironmill_compile::ane::packing::InputPacking,
+            super::bundle_manifest::InputPacking,
         > = std::collections::HashMap::new();
         // TODO: re-enable input packing after verifying base compilation.
         // Packing is disabled temporarily to isolate compilation issues.
@@ -570,7 +570,7 @@ impl<D: AneDevice> AneInference<D> {
         if false {
             for sub in &mut model_split.programs {
                 if let Some(packing) = ironmill_compile::ane::packing::pack_inputs(sub) {
-                    packing_map.insert(sub.name.clone(), packing);
+                    packing_map.insert(sub.name.clone(), packing.into());
                 }
             }
         }
@@ -1117,6 +1117,350 @@ impl<D: AneDevice> AneInference<D> {
         })
     }
 
+    /// Load a pre-compiled `.ironml` decode bundle, bypassing the compile
+    /// pipeline.
+    ///
+    /// The bundle must have been created by `compile_decode_bundle()` and
+    /// saved via `AneDecodeBundle::save()`. This method reads the manifest,
+    /// CPU weights, and per-layer MIL programs, then compiles them on the
+    /// ANE device and sets up runtime state (KV caches, etc.).
+    pub fn from_bundle(
+        device: Arc<D>,
+        bundle_path: &std::path::Path,
+        turbo_config: Option<TurboQuantConfig>,
+    ) -> Result<Self> {
+        use super::bundle_manifest::BundleManifest;
+
+        // 1. Read manifest.
+        let manifest_json = std::fs::read_to_string(bundle_path.join("manifest.json"))
+            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to read manifest: {e}")))?;
+        let manifest: BundleManifest = serde_json::from_str(&manifest_json)
+            .map_err(|e| AneError::Other(anyhow::anyhow!("invalid manifest: {e}")))?;
+        let decode = manifest
+            .decode
+            .ok_or_else(|| AneError::Other(anyhow::anyhow!("not a decode bundle")))?;
+        let arch = &decode.architecture;
+
+        let programs_dir = bundle_path.join("programs");
+        let weights_dir = bundle_path.join("weights");
+
+        // 2. Load CPU weights.
+        let cpu_weights_dir = bundle_path.join("cpu_weights");
+        let embed_data = std::fs::read(cpu_weights_dir.join("embedding.bin")).map_err(|e| {
+            AneError::Other(anyhow::anyhow!("failed to read embedding weights: {e}"))
+        })?;
+        let embed_weight = CpuWeight {
+            data: embed_data,
+            shape: [arch.vocab_size, arch.hidden_size],
+        };
+
+        // Tied embeddings fallback: if lm_head.bin doesn't exist, reuse embed.
+        let lm_head_data = std::fs::read(cpu_weights_dir.join("lm_head.bin"))
+            .unwrap_or_else(|_| embed_weight.data.clone());
+        let lm_head_cpu_weight = CpuWeight {
+            data: lm_head_data,
+            shape: [arch.vocab_size, arch.hidden_size],
+        };
+
+        let final_norm_weight = std::fs::read(cpu_weights_dir.join("final_norm.bin"))
+            .ok()
+            .map(|data| {
+                data.chunks_exact(2)
+                    .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                    .collect::<Vec<f16>>()
+            });
+
+        // Load RoPE caches.
+        let rope_cos_data = std::fs::read(cpu_weights_dir.join("rope_cos.bin"))
+            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to read rope_cos: {e}")))?;
+        let rope_sin_data = std::fs::read(cpu_weights_dir.join("rope_sin.bin"))
+            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to read rope_sin: {e}")))?;
+        let rope_cos_cache: Vec<f16> = rope_cos_data
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let rope_sin_cache: Vec<f16> = rope_sin_data
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let rope_cache_dim = if rope_cos_cache.is_empty() {
+            0
+        } else {
+            arch.head_dim / 2
+        };
+
+        // 3. Compile LM head (try ANE, fall back to CPU).
+        let lm_head = match AneLmHead::compile(Arc::clone(&device), &lm_head_cpu_weight) {
+            Ok(ane_lm_head) => LmHead::Ane(ane_lm_head),
+            Err(e) => {
+                eprintln!("warning: ANE lm_head compilation failed: {e}");
+                LmHead::Cpu(lm_head_cpu_weight)
+            }
+        };
+
+        // 4. Compile per-layer sub-programs from bundle.
+        let num_layers = decode.layers.len();
+
+        // Pre_attn min output alloc for TurboQuant compatibility.
+        let pre_attn_min_output_alloc = if let Some(ref tc) = turbo_config {
+            let kv_ch = tc.num_kv_heads * tc.head_dim;
+            let q_ch = tc.num_heads * tc.head_dim;
+            uniform_alloc_size(&[
+                ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
+                ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
+                ([1, 1, tc.head_dim, tc.head_dim], ScalarType::Float16),
+                ([1, q_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
+                ([1, kv_ch, 1, tc.max_seq_len], ScalarType::Int8),
+                ([1, kv_ch, 1, tc.max_seq_len], ScalarType::Int8),
+                ([1, 1, tc.head_dim, tc.head_dim], ScalarType::Float16),
+            ])
+        } else {
+            0
+        };
+
+        let cache_write_fused = decode.layers.first().is_some_and(|l| l.cache_write_fused);
+
+        let mut layers: Vec<LayerPrograms<D>> = Vec::with_capacity(num_layers);
+        for (i, layer_manifest) in decode.layers.iter().enumerate() {
+            let pre = if i == 0 || !layer_manifest.donor_compatible {
+                // First layer or non-donor-compatible: full compile.
+                compile_sub_from_bundle(
+                    &layer_manifest.pre_attn,
+                    &programs_dir,
+                    &weights_dir,
+                    &*device,
+                    pre_attn_min_output_alloc,
+                )?
+            } else {
+                // Layers 1+: patch weights from layer-0 donor.
+                match compile_sub_from_bundle_with_donor(
+                    &layer_manifest.pre_attn,
+                    &layers[0].pre_attn.program,
+                    &programs_dir,
+                    &weights_dir,
+                    &*device,
+                    pre_attn_min_output_alloc,
+                ) {
+                    Ok(loaded) => loaded,
+                    Err(e) => {
+                        eprintln!(
+                            "warning: layer {} pre_attn donor patch failed, \
+                             falling back to full compile: {e}",
+                            layer_manifest.index
+                        );
+                        compile_sub_from_bundle(
+                            &layer_manifest.pre_attn,
+                            &programs_dir,
+                            &weights_dir,
+                            &*device,
+                            pre_attn_min_output_alloc,
+                        )?
+                    }
+                }
+            };
+
+            let post = if let Some(ref post_manifest) = layer_manifest.post_attn {
+                if i == 0 || !layer_manifest.donor_compatible {
+                    Some(compile_sub_from_bundle(
+                        post_manifest,
+                        &programs_dir,
+                        &weights_dir,
+                        &*device,
+                        0,
+                    )?)
+                } else if let Some(ref donor_post) = layers[0].post_attn {
+                    match compile_sub_from_bundle_with_donor(
+                        post_manifest,
+                        &donor_post.program,
+                        &programs_dir,
+                        &weights_dir,
+                        &*device,
+                        0,
+                    ) {
+                        Ok(loaded) => Some(loaded),
+                        Err(e) => {
+                            eprintln!(
+                                "warning: layer {} post_attn donor patch failed, \
+                                 falling back to full compile: {e}",
+                                layer_manifest.index
+                            );
+                            Some(compile_sub_from_bundle(
+                                post_manifest,
+                                &programs_dir,
+                                &weights_dir,
+                                &*device,
+                                0,
+                            )?)
+                        }
+                    }
+                } else {
+                    Some(compile_sub_from_bundle(
+                        post_manifest,
+                        &programs_dir,
+                        &weights_dir,
+                        &*device,
+                        0,
+                    )?)
+                }
+            } else {
+                None
+            };
+
+            let fp16_attn = if let Some(ref attn_manifest) = layer_manifest.fp16_attn {
+                match compile_sub_from_bundle(
+                    attn_manifest,
+                    &programs_dir,
+                    &weights_dir,
+                    &*device,
+                    0,
+                ) {
+                    Ok(loaded) => Some(loaded),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: layer {} fp16_attn compilation failed: {e}",
+                            layer_manifest.index
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            layers.push(LayerPrograms {
+                pre_attn: pre,
+                fp16_attn,
+                post_attn: post,
+                attn_input_map: None,
+            });
+        }
+
+        if num_layers > 1 {
+            let patched = (num_layers - 1) * if layers[0].post_attn.is_some() { 2 } else { 1 };
+            eprintln!(
+                "donor/patch: compiled 1 donor layer, patched {patched} sub-programs \
+                 ({} compilations saved)",
+                patched
+            );
+        }
+
+        // 5. Set up TurboQuant or FP16 caches (same as compile()).
+        let (
+            turboquant,
+            fp16_kv_caches,
+            fp16_attn_program,
+            fp16_attn_q_staging,
+            fp16_attn_out_staging,
+            fp16_attn_mask,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+        ) = if let Some(tq_config) = turbo_config {
+            let nkv = tq_config.num_kv_heads;
+            let hd = tq_config.head_dim;
+            let msl = tq_config.max_seq_len;
+            let tq = TurboQuantModel::compile(Arc::clone(&device), tq_config)?;
+            (Some(tq), None, None, None, None, None, nkv, hd, msl)
+        } else {
+            let nh = arch.num_heads;
+            let nkv = arch.num_kv_heads;
+            let hd = arch.head_dim;
+            let msl = arch.max_seq_len;
+            let kv_channels = nkv * hd;
+            let q_channels = nh * hd;
+
+            // Compile hand-written FP16 attention MIL (shared across layers).
+            let attn_program = mil_emitter::build_fp16_attention_program(nh, nkv, hd, msl, msl);
+            let mil_config = MilTextConfig::default();
+            let (mil, _) = program_to_mil_text(&attn_program, &mil_config).map_err(|e| {
+                AneError::Other(anyhow::anyhow!("FP16 attention MIL text failed: {e}"))
+            })?;
+            let attn_compiled = device.compile(&mil, &[])?;
+
+            let attn_alloc = uniform_alloc_size(&[
+                ([1, q_channels, 1, MIN_IO_SEQ], ScalarType::Float16),
+                ([1, kv_channels, 1, msl], ScalarType::Float16),
+                ([1, kv_channels, 1, msl], ScalarType::Float16),
+                ([1, 1, 1, msl], ScalarType::Float16),
+            ]);
+
+            let mut caches = Vec::with_capacity(num_layers);
+            for _ in 0..num_layers {
+                let k = AneTensor::new_with_min_alloc(
+                    kv_channels,
+                    msl,
+                    ScalarType::Float16,
+                    attn_alloc,
+                )?;
+                let v = AneTensor::new_with_min_alloc(
+                    kv_channels,
+                    msl,
+                    ScalarType::Float16,
+                    attn_alloc,
+                )?;
+                caches.push((k, v));
+            }
+
+            let q_staging = AneTensor::new_with_min_alloc(
+                q_channels,
+                MIN_IO_SEQ,
+                ScalarType::Float16,
+                attn_alloc,
+            )?;
+            let out_staging = AneTensor::new_with_min_alloc(
+                q_channels,
+                MIN_IO_SEQ,
+                ScalarType::Float16,
+                attn_alloc,
+            )?;
+            let mut mask_tensor =
+                AneTensor::new_with_min_alloc(1, msl, ScalarType::Float16, attn_alloc)?;
+            let neg_inf = f16::NEG_INFINITY;
+            let mask_data = vec![neg_inf; msl];
+            mask_tensor.write_f16(&mask_data)?;
+
+            (
+                None,
+                Some(caches),
+                Some(attn_compiled),
+                Some(q_staging),
+                Some(out_staging),
+                Some(mask_tensor),
+                nkv,
+                hd,
+                msl,
+            )
+        };
+
+        // TODO: Load per-layer QK norm weights from bundle.
+        // QK norm weights need to be serialized into the bundle by
+        // compile_decode_bundle. For now, set to None.
+        let qk_norm_weights: Option<Vec<(Vec<f16>, Vec<f16>)>> = None;
+
+        Ok(Self {
+            embed_weight,
+            layers,
+            lm_head,
+            final_norm_weight,
+            turboquant,
+            fp16_kv_caches,
+            fp16_attn_program,
+            fp16_attn_q_staging,
+            fp16_attn_out_staging,
+            fp16_attn_mask,
+            device,
+            seq_pos: 0,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+            rope_cos_cache,
+            rope_sin_cache,
+            rope_cache_dim,
+            cache_write_fused,
+            qk_norm_weights,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Decode
     // -----------------------------------------------------------------------
@@ -1460,7 +1804,7 @@ impl<D: AneDevice> AneInference<D> {
                         }
                         post_attn.input_tensors[0].write_f16(&packed)?;
                     } else {
-                        ironmill_compile::ane::packing::write_packed_inputs(
+                        super::bundle_manifest::write_packed_inputs(
                             &mut post_attn.input_tensors[0],
                             &[&attn_out_data],
                             packing,
@@ -1984,7 +2328,7 @@ fn compile_and_load_sub<D: AneDevice>(
     sub: &ironmill_compile::ane::split::SubProgram,
     device: &D,
     mil_config: &MilTextConfig,
-    input_packing: Option<ironmill_compile::ane::packing::InputPacking>,
+    input_packing: Option<super::bundle_manifest::InputPacking>,
     min_output_alloc: usize,
 ) -> Result<LoadedSubProgram<D>> {
     let mut program = sub.program.clone();
@@ -2289,7 +2633,7 @@ fn compile_and_load_sub_with_donor<D: AneDevice>(
     donor: &D::Program,
     device: &D,
     mil_config: &MilTextConfig,
-    input_packing: Option<ironmill_compile::ane::packing::InputPacking>,
+    input_packing: Option<super::bundle_manifest::InputPacking>,
     min_output_alloc: usize,
 ) -> Result<LoadedSubProgram<D>> {
     let mut program = sub.program.clone();
@@ -2395,6 +2739,129 @@ fn compile_and_load_sub_with_donor<D: AneDevice>(
 
     Ok(LoadedSubProgram {
         program: compiled,
+        input_tensors,
+        output_tensors,
+        input_packing,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Bundle loading helpers
+// ---------------------------------------------------------------------------
+
+/// Compile a sub-program from bundle artifacts (MIL text + weight blob).
+///
+/// Reads the MIL text from `programs/<name>.mil` and the combined weight
+/// BLOBFILE from `weights/<name>.bin`, extracts individual weight entries,
+/// and compiles via `device.compile()`.
+fn compile_sub_from_bundle<D: AneDevice>(
+    manifest: &super::bundle_manifest::SubProgramManifest,
+    programs_dir: &std::path::Path,
+    weights_dir: &std::path::Path,
+    device: &D,
+    min_output_alloc: usize,
+) -> Result<LoadedSubProgram<D>> {
+    let mil_text = std::fs::read_to_string(programs_dir.join(format!("{}.mil", manifest.name)))
+        .map_err(|e| {
+            AneError::Other(anyhow::anyhow!(
+                "failed to read MIL text for {}: {e}",
+                manifest.name
+            ))
+        })?;
+
+    let weight_blob =
+        std::fs::read(weights_dir.join(format!("{}.bin", manifest.name))).unwrap_or_default();
+
+    let weight_entries =
+        super::bundle_manifest::extract_weight_entries_from_bundle(&mil_text, &weight_blob);
+    let weight_slices: Vec<(&str, &[u8])> = weight_entries
+        .iter()
+        .map(|(path, data)| (path.as_str(), data.as_slice()))
+        .collect();
+
+    let compiled = device.compile(&mil_text, &weight_slices)?;
+
+    allocate_io_from_manifest(manifest, compiled, min_output_alloc)
+}
+
+/// Compile a sub-program from bundle artifacts using donor/patch optimization.
+fn compile_sub_from_bundle_with_donor<D: AneDevice>(
+    manifest: &super::bundle_manifest::SubProgramManifest,
+    donor: &D::Program,
+    programs_dir: &std::path::Path,
+    weights_dir: &std::path::Path,
+    device: &D,
+    min_output_alloc: usize,
+) -> Result<LoadedSubProgram<D>> {
+    let mil_text = std::fs::read_to_string(programs_dir.join(format!("{}.mil", manifest.name)))
+        .map_err(|e| {
+            AneError::Other(anyhow::anyhow!(
+                "failed to read MIL text for {}: {e}",
+                manifest.name
+            ))
+        })?;
+
+    let weight_blob =
+        std::fs::read(weights_dir.join(format!("{}.bin", manifest.name))).unwrap_or_default();
+
+    let weight_entries =
+        super::bundle_manifest::extract_weight_entries_from_bundle(&mil_text, &weight_blob);
+    let weight_slices: Vec<(&str, &[u8])> = weight_entries
+        .iter()
+        .map(|(path, data)| (path.as_str(), data.as_slice()))
+        .collect();
+
+    let compiled = device.compile_patched(donor, &mil_text, &weight_slices)?;
+
+    allocate_io_from_manifest(manifest, compiled, min_output_alloc)
+}
+
+/// Allocate I/O tensors based on manifest descriptors and build a
+/// `LoadedSubProgram`.
+fn allocate_io_from_manifest<D: AneDevice>(
+    manifest: &super::bundle_manifest::SubProgramManifest,
+    program: D::Program,
+    min_output_alloc: usize,
+) -> Result<LoadedSubProgram<D>> {
+    let input_shapes: Vec<_> = manifest
+        .inputs
+        .iter()
+        .map(|td| (td.shape, td.scalar_type()))
+        .collect();
+    let output_shapes: Vec<_> = manifest
+        .outputs
+        .iter()
+        .map(|td| (td.shape, td.scalar_type()))
+        .collect();
+
+    let input_alloc = uniform_alloc_size(&input_shapes);
+    let output_alloc = uniform_alloc_size(&output_shapes).max(min_output_alloc);
+
+    let input_tensors: Vec<AneTensor> = manifest
+        .inputs
+        .iter()
+        .map(|td| {
+            AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.scalar_type(), input_alloc)
+                .map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let output_tensors: Vec<AneTensor> = manifest
+        .outputs
+        .iter()
+        .map(|td| {
+            AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.scalar_type(), output_alloc)
+                .map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let input_packing = manifest
+        .input_packing
+        .clone()
+        .map(super::bundle_manifest::InputPacking::from);
+
+    Ok(LoadedSubProgram {
+        program,
         input_tensors,
         output_tensors,
         input_packing,

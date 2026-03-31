@@ -3,6 +3,7 @@
 //! Provides the `AneInference` autoregressive decode loop, the `AneDevice`
 //! trait for hardware abstraction, and the high-level [`AneModel`] facade.
 
+pub mod bundle_manifest;
 pub mod decode;
 #[allow(unsafe_code)]
 pub mod device;
