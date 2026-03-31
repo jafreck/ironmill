@@ -69,6 +69,10 @@ struct Cli {
     #[arg(long)]
     ane_direct: bool,
 
+    /// Benchmark the Metal GPU backend (experimental, requires --features metal).
+    #[arg(long)]
+    metal: bool,
+
     /// Remove all cached compilation artifacts
     #[arg(long)]
     clean_cache: bool,
@@ -171,7 +175,7 @@ fn main() -> Result<()> {
     let mut report_rows = Vec::new();
 
     // Skip the main benchmark loop if only perplexity is requested
-    let run_latency_bench = !cli.perplexity || cli.ane_direct || cli.quality;
+    let run_latency_bench = !cli.perplexity || cli.ane_direct || cli.metal || cli.quality;
 
     if run_latency_bench {
         for model_cfg in &matrix.models {
@@ -348,6 +352,45 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "ane-direct"))]
             {
                 eprintln!("warning: --ane-direct requires --features ane-direct, skipping");
+            }
+        }
+
+        if cli.metal {
+            #[cfg(feature = "metal")]
+            {
+                use ironmill_inference::gpu::{GpuConfig, GpuInference};
+
+                eprintln!("\n  Metal GPU Backend Benchmark");
+                eprintln!("  {}", "─".repeat(40));
+
+                for model_cfg in &matrix.models {
+                    eprintln!("  Metal: {}...", model_cfg.name);
+
+                    let gpu_config = GpuConfig::default();
+                    let mut engine = match GpuInference::new(gpu_config) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!("  ✗ Metal GPU init failed: {e}");
+                            continue;
+                        }
+                    };
+
+                    // Load weights from the model path if it's a SafeTensors
+                    // or GGUF file. For now, report that the engine initialized
+                    // and skip the decode loop since weight loading requires a
+                    // WeightProvider which needs format-specific setup.
+                    eprintln!(
+                        "  ✓ Metal GPU engine initialized (model loading requires weight provider)"
+                    );
+                    let _ = &mut engine; // suppress unused warning
+
+                    // TODO: integrate weight loading from model_cfg.path once
+                    // the bench harness has a WeightProvider factory.
+                }
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                eprintln!("warning: --metal requires --features metal, skipping");
             }
         }
 

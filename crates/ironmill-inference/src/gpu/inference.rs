@@ -1,14 +1,928 @@
-//! GPU inference engine implementing the InferenceEngine trait.
+//! GPU inference engine implementing the [`InferenceEngine`] trait.
 //!
-//! Full implementation is in the next task — this is the module
-//! skeleton to allow the build to pass.
+//! Runs the full LLaMA-family transformer decode pipeline on Metal:
+//!   - MPS `MPSMatrixMultiplication` for linear projections
+//!   - Custom Metal compute shaders for RMSNorm, RoPE, SiLU, residual add,
+//!     embedding lookup, and attention
+//!   - Optional TurboQuant INT8 KV cache compression
+
+use std::any::Any;
+
+use half::f16;
+use ironmill_compile::weights::{ModelConfig, WeightProvider};
+use ironmill_metal_sys::{
+    CommandBufferStatus, MetalBuffer, MetalDevice, MpsMatrix, MpsMatrixMultiply, StorageMode,
+};
 
 use super::config::GpuConfig;
+use super::error::GpuError;
+use super::ops;
+use super::turboquant::{GpuKvCache, GpuTurboQuantModel, TurboQuantGpuConfig};
+use super::weights::GpuWeights;
+use crate::engine::{InferenceEngine, InferenceError};
+use crate::types::Logits;
+
+// ── Public artifacts type for load() ────────────────────────────
+
+/// Artifacts passed to [`GpuInference::load`] via the type-erased
+/// [`InferenceEngine`] interface.
+pub struct GpuArtifacts<'a> {
+    pub weights: &'a dyn WeightProvider,
+    pub config: GpuConfig,
+}
+
+// ── Helper structs ──────────────────────────────────────────────
+
+/// FP16 KV cache (when TurboQuant is disabled).
+struct Fp16KvCache {
+    /// K caches per layer: `[num_kv_heads × max_seq × head_dim]` FP16.
+    k_caches: Vec<MetalBuffer>,
+    /// V caches per layer.
+    v_caches: Vec<MetalBuffer>,
+    seq_pos: usize,
+}
+
+impl Fp16KvCache {
+    fn new(
+        device: &MetalDevice,
+        num_layers: usize,
+        num_kv_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+    ) -> Result<Self, GpuError> {
+        let size_bytes = num_kv_heads * max_seq_len * head_dim * 2; // FP16
+        let mut k_caches = Vec::with_capacity(num_layers);
+        let mut v_caches = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            k_caches.push(
+                device
+                    .create_buffer(size_bytes, StorageMode::Shared)
+                    .map_err(GpuError::Metal)?,
+            );
+            v_caches.push(
+                device
+                    .create_buffer(size_bytes, StorageMode::Shared)
+                    .map_err(GpuError::Metal)?,
+            );
+        }
+        Ok(Self {
+            k_caches,
+            v_caches,
+            seq_pos: 0,
+        })
+    }
+
+    fn layer_caches(&self, layer: usize) -> (&MetalBuffer, &MetalBuffer) {
+        (&self.k_caches[layer], &self.v_caches[layer])
+    }
+
+    fn reset(&mut self) {
+        self.seq_pos = 0;
+    }
+}
+
+/// Reusable intermediate activation buffers.
+struct IntermediateBuffers {
+    hidden_state: MetalBuffer,
+    attn_out: MetalBuffer,
+    q_proj: MetalBuffer,
+    k_proj: MetalBuffer,
+    v_proj: MetalBuffer,
+    ffn_gate: MetalBuffer,
+    ffn_up: MetalBuffer,
+    ffn_down: MetalBuffer,
+    residual: MetalBuffer,
+    norm_out: MetalBuffer,
+    logits: MetalBuffer,
+    token_ids_buf: MetalBuffer,
+}
+
+impl IntermediateBuffers {
+    fn allocate(
+        device: &MetalDevice,
+        max_tokens: usize,
+        mc: &ModelConfig,
+    ) -> Result<Self, GpuError> {
+        let h = mc.hidden_size;
+        let nh = mc.num_attention_heads;
+        let nkv = mc.num_key_value_heads;
+        let hd = mc.head_dim;
+        let inter = mc.intermediate_size;
+        let vocab = mc.vocab_size;
+
+        let alloc = |size_elems: usize| -> Result<MetalBuffer, GpuError> {
+            // FP16 = 2 bytes per element; minimum 16 bytes for Metal
+            let bytes = (size_elems * 2).max(16);
+            device
+                .create_buffer(bytes, StorageMode::Shared)
+                .map_err(GpuError::Metal)
+        };
+
+        Ok(Self {
+            hidden_state: alloc(max_tokens * h)?,
+            attn_out: alloc(max_tokens * nh * hd)?,
+            q_proj: alloc(max_tokens * nh * hd)?,
+            k_proj: alloc(max_tokens * nkv * hd)?,
+            v_proj: alloc(max_tokens * nkv * hd)?,
+            ffn_gate: alloc(max_tokens * inter)?,
+            ffn_up: alloc(max_tokens * inter)?,
+            ffn_down: alloc(max_tokens * h)?,
+            residual: alloc(max_tokens * h)?,
+            norm_out: alloc(max_tokens * h)?,
+            logits: alloc(max_tokens * vocab)?,
+            token_ids_buf: device
+                .create_buffer((max_tokens * 4).max(16), StorageMode::Shared)
+                .map_err(GpuError::Metal)?,
+        })
+    }
+}
+
+/// Cached MPS matmul instances for a given token count.
+struct MpsMatmulCache {
+    /// Token count these were built for.
+    token_count: usize,
+    /// Per-layer matmul instances: (q, k, v, o, gate, up, down).
+    layer_matmuls: Vec<LayerMatmuls>,
+    /// LM head matmul.
+    lm_head: MpsMatrixMultiply,
+}
+
+struct LayerMatmuls {
+    q: MpsMatrixMultiply,
+    k: MpsMatrixMultiply,
+    v: MpsMatrixMultiply,
+    o: MpsMatrixMultiply,
+    gate: MpsMatrixMultiply,
+    up: MpsMatrixMultiply,
+    down: MpsMatrixMultiply,
+}
+
+// ── GpuInference ────────────────────────────────────────────────
 
 /// Metal GPU inference engine.
 ///
 /// Implements the full transformer decode pipeline using Metal compute
 /// shaders for element-wise ops and MPS for matrix multiplication.
 pub struct GpuInference {
-    _config: GpuConfig,
+    device: MetalDevice,
+    queue: ironmill_metal_sys::CommandQueue,
+    pipelines: super::ops::GpuPipelines,
+    weights: Option<GpuWeights>,
+    turboquant: Option<GpuTurboQuantModel>,
+    kv_cache: Option<GpuKvCache>,
+    fp16_kv_cache: Option<Fp16KvCache>,
+    intermediate_buffers: Option<IntermediateBuffers>,
+    rope_cos: Option<MetalBuffer>,
+    rope_sin: Option<MetalBuffer>,
+    /// MPS matmul cache for decode (token_count=1).
+    decode_matmuls: Option<MpsMatmulCache>,
+    config: GpuConfig,
+    model_config: Option<ModelConfig>,
+    seq_pos: usize,
+}
+
+impl GpuInference {
+    /// Create a new GPU inference engine (device + queue + shader pipelines).
+    pub fn new(config: GpuConfig) -> Result<Self, GpuError> {
+        let device = MetalDevice::system_default().map_err(GpuError::Metal)?;
+        let queue = device.create_command_queue().map_err(GpuError::Metal)?;
+        let pipelines = super::ops::GpuPipelines::compile(&device)?;
+        Ok(Self {
+            device,
+            queue,
+            pipelines,
+            weights: None,
+            turboquant: None,
+            kv_cache: None,
+            fp16_kv_cache: None,
+            intermediate_buffers: None,
+            rope_cos: None,
+            rope_sin: None,
+            decode_matmuls: None,
+            config,
+            model_config: None,
+            seq_pos: 0,
+        })
+    }
+
+    // ── RoPE cache ──────────────────────────────────────────────
+
+    fn build_rope_cache(
+        device: &MetalDevice,
+        head_dim: usize,
+        max_seq_len: usize,
+        theta: f64,
+    ) -> Result<(MetalBuffer, MetalBuffer), GpuError> {
+        let half_dim = head_dim / 2;
+        let mut cos_data = vec![0u8; max_seq_len * half_dim * 2];
+        let mut sin_data = vec![0u8; max_seq_len * half_dim * 2];
+
+        for pos in 0..max_seq_len {
+            for i in 0..half_dim {
+                let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+                let angle = pos as f64 * freq;
+                let c = f16::from_f64(angle.cos());
+                let s = f16::from_f64(angle.sin());
+                let offset = (pos * half_dim + i) * 2;
+                cos_data[offset..offset + 2].copy_from_slice(&c.to_le_bytes());
+                sin_data[offset..offset + 2].copy_from_slice(&s.to_le_bytes());
+            }
+        }
+
+        let cos_buf = device
+            .create_buffer_with_data(&cos_data, StorageMode::Shared)
+            .map_err(GpuError::Metal)?;
+        let sin_buf = device
+            .create_buffer_with_data(&sin_data, StorageMode::Shared)
+            .map_err(GpuError::Metal)?;
+        Ok((cos_buf, sin_buf))
+    }
+
+    // ── MPS matmul cache ────────────────────────────────────────
+
+    fn build_matmul_cache(
+        device: &MetalDevice,
+        mc: &ModelConfig,
+        token_count: usize,
+    ) -> Result<MpsMatmulCache, GpuError> {
+        let h = mc.hidden_size;
+        let nh = mc.num_attention_heads;
+        let nkv = mc.num_key_value_heads;
+        let hd = mc.head_dim;
+        let inter = mc.intermediate_size;
+        let vocab = mc.vocab_size;
+
+        // Weight layout: [out_features, in_features] stored row-major FP16.
+        // We compute: output = input × weight^T
+        // MPS: result = left × right
+        //   left  = input  [token_count × in_features]
+        //   right = weight [out_features × in_features], transpose_right=true
+        //   result = [token_count × out_features]
+        let make_matmul =
+            |rows: usize, cols: usize, inner: usize| -> Result<MpsMatrixMultiply, GpuError> {
+                MpsMatrixMultiply::new(
+                    device, false, // transpose_left
+                    true,  // transpose_right (weights are [out, in])
+                    rows,  // result_rows = token_count
+                    cols,  // result_columns = out_features
+                    inner, // interior_columns = in_features
+                    1.0,   // alpha
+                    0.0,   // beta
+                )
+                .map_err(GpuError::Metal)
+            };
+
+        let mut layer_matmuls = Vec::with_capacity(mc.num_hidden_layers);
+        for _ in 0..mc.num_hidden_layers {
+            layer_matmuls.push(LayerMatmuls {
+                q: make_matmul(token_count, nh * hd, h)?,
+                k: make_matmul(token_count, nkv * hd, h)?,
+                v: make_matmul(token_count, nkv * hd, h)?,
+                o: make_matmul(token_count, h, nh * hd)?,
+                gate: make_matmul(token_count, inter, h)?,
+                up: make_matmul(token_count, inter, h)?,
+                down: make_matmul(token_count, h, inter)?,
+            });
+        }
+
+        let lm_head = make_matmul(token_count, vocab, h)?;
+
+        Ok(MpsMatmulCache {
+            token_count,
+            layer_matmuls,
+            lm_head,
+        })
+    }
+
+    // ── Core decode pipeline ────────────────────────────────────
+
+    /// Run the transformer decode pipeline for `token_count` tokens.
+    /// Returns logits for the last token position.
+    fn run_pipeline(&mut self, token_ids: &[u32]) -> Result<Logits, InferenceError> {
+        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
+        let bufs = self
+            .intermediate_buffers
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?;
+        let rope_cos = self.rope_cos.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let rope_sin = self.rope_sin.as_ref().ok_or(InferenceError::NotLoaded)?;
+
+        let token_count = token_ids.len();
+        let seq_pos = self.seq_pos;
+        let h = mc.hidden_size;
+        let nh = mc.num_attention_heads as u32;
+        let nkv = mc.num_kv_heads() as u32;
+        let hd = mc.head_dim as u32;
+        let inter = mc.intermediate_size;
+        let vocab = mc.vocab_size;
+        let eps = mc.rms_norm_eps as f32;
+        let enable_tq = self.config.enable_turboquant && self.turboquant.is_some();
+
+        // Build or reuse MPS matmul cache for this token count.
+        let need_rebuild = self
+            .decode_matmuls
+            .as_ref()
+            .is_none_or(|c| c.token_count != token_count);
+        if need_rebuild {
+            let cache = Self::build_matmul_cache(&self.device, &mc, token_count)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            self.decode_matmuls = Some(cache);
+        }
+        let matmuls = self.decode_matmuls.as_ref().unwrap();
+
+        // Write token IDs to GPU buffer.
+        let token_bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
+        bufs.token_ids_buf
+            .write_bytes(&token_bytes, 0)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+        // Create command buffer.
+        let cmd_buf = self
+            .queue
+            .command_buffer()
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+        // Step 0: Embedding lookup via compute encoder.
+        {
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+            ops::encode_embedding_lookup(
+                &enc,
+                &self.pipelines.embedding_lookup,
+                &bufs.token_ids_buf,
+                &weights.embedding,
+                &bufs.hidden_state,
+                h as u32,
+                token_count as u32,
+                vocab as u32,
+            );
+            enc.end_encoding();
+        }
+
+        // Per-layer processing.
+        for layer_idx in 0..mc.num_hidden_layers {
+            let lw = &weights.layers[layer_idx];
+            let lm = &matmuls.layer_matmuls[layer_idx];
+
+            // Copy hidden_state → residual before layernorm.
+            // We use residual_add with a zero source to copy, but actually
+            // we just need to swap buffer roles. Since we can't swap,
+            // we encode a copy via residual_add(hidden, zero) — but that's
+            // wasteful. Instead, use the pattern: norm(hidden→norm_out),
+            // then at residual add time, add hidden (original) + proj_out.
+            // So `residual` holds the pre-norm hidden state.
+            //
+            // Actually: we copy hidden → residual via a residual_add with
+            // the input as source and a zero-add. Simpler: just track that
+            // the residual IS the hidden_state buffer at this point.
+            //
+            // The approach: after norm, we still have the pre-norm hidden_state.
+            // We only overwrite hidden_state at the residual add step.
+            // So the residual connection reads from hidden_state (pre-norm value).
+
+            // Step 2: RMSNorm (input layernorm)
+            {
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_rms_norm(
+                    &enc,
+                    &self.pipelines.rms_norm,
+                    &bufs.hidden_state,
+                    &lw.input_norm,
+                    &bufs.norm_out,
+                    h as u32,
+                    token_count as u32,
+                    eps,
+                );
+                enc.end_encoding();
+            }
+
+            // Steps 3-5: Q/K/V projections via MPS matmul.
+            // MPS matmul encodes directly onto the command buffer.
+            let row_bytes_h = h * 2; // FP16
+            let row_bytes_qo = (mc.num_attention_heads * mc.head_dim) * 2;
+            let row_bytes_kv = (mc.num_kv_heads() * mc.head_dim) * 2;
+            let row_bytes_inter = inter * 2;
+
+            let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+            // Q projection
+            let q_weight_mat = MpsMatrix::from_buffer(
+                &lw.q_proj,
+                mc.num_attention_heads * mc.head_dim,
+                h,
+                row_bytes_h,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let q_result_mat = MpsMatrix::from_buffer(
+                &bufs.q_proj,
+                token_count,
+                mc.num_attention_heads * mc.head_dim,
+                row_bytes_qo,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            lm.q.encode(&cmd_buf, &norm_mat, &q_weight_mat, &q_result_mat);
+
+            // K projection
+            let k_weight_mat =
+                MpsMatrix::from_buffer(&lw.k_proj, mc.num_kv_heads() * mc.head_dim, h, row_bytes_h)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let k_result_mat = MpsMatrix::from_buffer(
+                &bufs.k_proj,
+                token_count,
+                mc.num_kv_heads() * mc.head_dim,
+                row_bytes_kv,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            lm.k.encode(&cmd_buf, &norm_mat, &k_weight_mat, &k_result_mat);
+
+            // V projection
+            let v_weight_mat =
+                MpsMatrix::from_buffer(&lw.v_proj, mc.num_kv_heads() * mc.head_dim, h, row_bytes_h)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let v_result_mat = MpsMatrix::from_buffer(
+                &bufs.v_proj,
+                token_count,
+                mc.num_kv_heads() * mc.head_dim,
+                row_bytes_kv,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            lm.v.encode(&cmd_buf, &norm_mat, &v_weight_mat, &v_result_mat);
+
+            // Step 6: RoPE on Q and K
+            {
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_rope(
+                    &enc,
+                    &self.pipelines.rope,
+                    &bufs.q_proj,
+                    rope_cos,
+                    rope_sin,
+                    nh,
+                    hd,
+                    seq_pos as u32,
+                    token_count as u32,
+                );
+                ops::encode_rope(
+                    &enc,
+                    &self.pipelines.rope,
+                    &bufs.k_proj,
+                    rope_cos,
+                    rope_sin,
+                    nkv,
+                    hd,
+                    seq_pos as u32,
+                    token_count as u32,
+                );
+                enc.end_encoding();
+            }
+
+            // Steps 7-8: Cache write + attention
+            if enable_tq {
+                let tq = self.turboquant.as_ref().unwrap();
+                let kv = self.kv_cache.as_ref().unwrap();
+                let (k_cache, v_cache) = kv.layer_caches(layer_idx);
+                let max_seq = self.config.max_seq_len as u32;
+
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+                // TurboQuant cache write — loop over tokens so each
+                // token is written at the correct seq_pos offset.
+                let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
+                for t in 0..token_count {
+                    let token_offset = t * kv_head_stride_bytes;
+                    // Cache write K
+                    enc.set_pipeline(&self.pipelines.turboquant_cache_write);
+                    enc.set_buffer(&bufs.k_proj, token_offset, 0);
+                    enc.set_buffer(&tq.rotation_matrix, 0, 1);
+                    enc.set_buffer(k_cache, 0, 2);
+                    enc.set_bytes(&nkv.to_le_bytes(), 3);
+                    enc.set_bytes(&hd.to_le_bytes(), 4);
+                    enc.set_bytes(&max_seq.to_le_bytes(), 5);
+                    enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
+                    enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+                    enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
+                    // Cache write V
+                    enc.set_pipeline(&self.pipelines.turboquant_cache_write);
+                    enc.set_buffer(&bufs.v_proj, token_offset, 0);
+                    enc.set_buffer(&tq.rotation_matrix, 0, 1);
+                    enc.set_buffer(v_cache, 0, 2);
+                    enc.set_bytes(&nkv.to_le_bytes(), 3);
+                    enc.set_bytes(&hd.to_le_bytes(), 4);
+                    enc.set_bytes(&max_seq.to_le_bytes(), 5);
+                    enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
+                    enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+                    enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
+                }
+
+                // TurboQuant attention — loop over tokens with causal
+                // masking: each token attends to positions 0..seq_pos+t+1.
+                let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
+                for t in 0..token_count {
+                    let q_offset = t * q_head_stride_bytes;
+                    let attn_out_offset = t * q_head_stride_bytes;
+                    let current_seq_len = (seq_pos + t + 1) as u32;
+                    enc.set_pipeline(&self.pipelines.turboquant_attention);
+                    enc.set_buffer(&bufs.q_proj, q_offset, 0);
+                    enc.set_buffer(k_cache, 0, 1);
+                    enc.set_buffer(v_cache, 0, 2);
+                    enc.set_buffer(&tq.rotation_matrix, 0, 3);
+                    enc.set_buffer(&bufs.attn_out, attn_out_offset, 4);
+                    enc.set_bytes(&nh.to_le_bytes(), 5);
+                    enc.set_bytes(&nkv.to_le_bytes(), 6);
+                    enc.set_bytes(&hd.to_le_bytes(), 7);
+                    enc.set_bytes(&max_seq.to_le_bytes(), 8);
+                    enc.set_bytes(&current_seq_len.to_le_bytes(), 9);
+                    enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
+                    enc.dispatch_threadgroups((nh as usize, 1, 1), (hd as usize, 1, 1));
+                }
+                enc.end_encoding();
+            } else {
+                // FP16 KV cache path
+                let fp16_kv = self.fp16_kv_cache.as_ref().unwrap();
+                let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
+                let max_seq = self.config.max_seq_len as u32;
+
+                // Write K/V into FP16 cache at seq_pos via buffer copy.
+                // Each K/V projection is [token_count × num_kv_heads × head_dim] FP16.
+                // Cache layout: [num_kv_heads × max_seq × head_dim] FP16.
+                // For simplicity, write via CPU side since buffers are Shared.
+                let kv_size = mc.num_kv_heads() * mc.head_dim * token_count * 2;
+                let mut k_data = vec![0u8; kv_size];
+                let mut v_data = vec![0u8; kv_size];
+                bufs.k_proj
+                    .read_bytes(&mut k_data, 0)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                bufs.v_proj
+                    .read_bytes(&mut v_data, 0)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+                // Write token-by-token into the cache (interleaving heads).
+                // Projection layout: [token × nkv × hd] row-major.
+                // Cache layout: [nkv × max_seq × hd] row-major.
+                for t in 0..token_count {
+                    for head in 0..mc.num_kv_heads() {
+                        let src_off =
+                            (t * mc.num_kv_heads() * mc.head_dim + head * mc.head_dim) * 2;
+                        let dst_off = (head * self.config.max_seq_len * mc.head_dim
+                            + (seq_pos + t) * mc.head_dim)
+                            * 2;
+                        let len = mc.head_dim * 2;
+                        k_cache
+                            .write_bytes(&k_data[src_off..src_off + len], dst_off)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        v_cache
+                            .write_bytes(&v_data[src_off..src_off + len], dst_off)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    }
+                }
+
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                // Standard attention — loop over tokens with causal
+                // masking so each token attends only to 0..seq_pos+t+1.
+                let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
+                for t in 0..token_count {
+                    let q_offset = t * q_head_stride_bytes;
+                    let attn_out_offset = t * q_head_stride_bytes;
+                    let current_seq_len = (seq_pos + t + 1) as u32;
+                    enc.set_pipeline(&self.pipelines.standard_attention);
+                    enc.set_buffer(&bufs.q_proj, q_offset, 0);
+                    enc.set_buffer(k_cache, 0, 1);
+                    enc.set_buffer(v_cache, 0, 2);
+                    enc.set_buffer(&bufs.attn_out, attn_out_offset, 3);
+                    enc.set_bytes(&nh.to_le_bytes(), 4);
+                    enc.set_bytes(&nkv.to_le_bytes(), 5);
+                    enc.set_bytes(&hd.to_le_bytes(), 6);
+                    enc.set_bytes(&max_seq.to_le_bytes(), 7);
+                    enc.set_bytes(&current_seq_len.to_le_bytes(), 8);
+                    enc.dispatch_threadgroups((nh as usize, 1, 1), (hd as usize, 1, 1));
+                }
+                enc.end_encoding();
+            }
+
+            // Step 9: Output projection
+            let attn_mat = MpsMatrix::from_buffer(
+                &bufs.attn_out,
+                token_count,
+                mc.num_attention_heads * mc.head_dim,
+                row_bytes_qo,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let o_weight_mat = MpsMatrix::from_buffer(
+                &lw.o_proj,
+                h,
+                mc.num_attention_heads * mc.head_dim,
+                row_bytes_qo,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let ffn_down_mat_for_o =
+                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            lm.o.encode(&cmd_buf, &attn_mat, &o_weight_mat, &ffn_down_mat_for_o);
+
+            // Step 10: Residual add — hidden = hidden_state + o_proj_out
+            // hidden_state still contains the pre-norm value (our residual).
+            {
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_residual_add(
+                    &enc,
+                    &self.pipelines.residual_add,
+                    &bufs.hidden_state,
+                    &bufs.ffn_down, // o_proj output was written here
+                    &bufs.residual,
+                    (token_count * h) as u32,
+                );
+                enc.end_encoding();
+            }
+
+            // Step 11: RMSNorm (post-attention norm)
+            {
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_rms_norm(
+                    &enc,
+                    &self.pipelines.rms_norm,
+                    &bufs.residual,
+                    &lw.post_attn_norm,
+                    &bufs.norm_out,
+                    h as u32,
+                    token_count as u32,
+                    eps,
+                );
+                enc.end_encoding();
+            }
+
+            // Steps 12-13: Gate and Up projections
+            let norm_mat2 = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+            let gate_weight_mat = MpsMatrix::from_buffer(&lw.gate_proj, inter, h, row_bytes_h)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let gate_result_mat =
+                MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            lm.gate
+                .encode(&cmd_buf, &norm_mat2, &gate_weight_mat, &gate_result_mat);
+
+            let up_weight_mat = MpsMatrix::from_buffer(&lw.up_proj, inter, h, row_bytes_h)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let up_result_mat =
+                MpsMatrix::from_buffer(&bufs.ffn_up, token_count, inter, row_bytes_inter)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            lm.up
+                .encode(&cmd_buf, &norm_mat2, &up_weight_mat, &up_result_mat);
+
+            // Step 14: SiLU gate
+            {
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_silu_gate(
+                    &enc,
+                    &self.pipelines.silu_gate,
+                    &bufs.ffn_gate,
+                    &bufs.ffn_up,
+                    &bufs.ffn_gate, // in-place output into gate buffer
+                    (token_count * inter) as u32,
+                );
+                enc.end_encoding();
+            }
+
+            // Step 15: Down projection
+            let gate_out_mat =
+                MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let down_weight_mat = MpsMatrix::from_buffer(&lw.down_proj, h, inter, row_bytes_inter)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let down_result_mat =
+                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            lm.down
+                .encode(&cmd_buf, &gate_out_mat, &down_weight_mat, &down_result_mat);
+
+            // Step 16: Residual add — hidden = residual + ffn_down
+            {
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_residual_add(
+                    &enc,
+                    &self.pipelines.residual_add,
+                    &bufs.residual,
+                    &bufs.ffn_down,
+                    &bufs.hidden_state, // write back to hidden_state for next layer
+                    (token_count * h) as u32,
+                );
+                enc.end_encoding();
+            }
+        }
+
+        // Step 17: Final RMSNorm
+        {
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            ops::encode_rms_norm(
+                &enc,
+                &self.pipelines.rms_norm,
+                &bufs.hidden_state,
+                &weights.final_norm,
+                &bufs.norm_out,
+                h as u32,
+                token_count as u32,
+                eps,
+            );
+            enc.end_encoding();
+        }
+
+        // Step 18: LM head matmul
+        let row_bytes_h = h * 2;
+        let row_bytes_vocab = vocab * 2;
+        let final_norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        let lm_head_weight_mat = MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        let logits_mat = MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        matmuls
+            .lm_head
+            .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
+
+        // Step 19: Commit and wait.
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        if cmd_buf.status() == CommandBufferStatus::Error {
+            return Err(InferenceError::Decode(
+                "Metal command buffer execution failed".into(),
+            ));
+        }
+
+        // Step 20: Read logits for the last token position → Vec<f32>.
+        let last_token_offset = (token_count - 1) * vocab * 2; // FP16 offset in bytes
+        let logits_byte_count = vocab * 2;
+        let mut logits_fp16 = vec![0u8; logits_byte_count];
+        bufs.logits
+            .read_bytes(&mut logits_fp16, last_token_offset)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+        let logits: Vec<f32> = logits_fp16
+            .chunks_exact(2)
+            .map(|chunk| {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                f16::from_bits(bits).to_f32()
+            })
+            .collect();
+
+        // Advance sequence position.
+        self.seq_pos += token_count;
+        if enable_tq {
+            if let Some(kv) = self.kv_cache.as_mut() {
+                kv.advance_by(token_count);
+            }
+        } else if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
+            fp16_kv.seq_pos += token_count;
+        }
+
+        Ok(logits)
+    }
+}
+
+// ── Helpers on ModelConfig ──────────────────────────────────────
+
+trait ModelConfigExt {
+    fn num_kv_heads(&self) -> usize;
+}
+
+impl ModelConfigExt for ModelConfig {
+    fn num_kv_heads(&self) -> usize {
+        self.num_key_value_heads
+    }
+}
+
+// ── InferenceEngine implementation ──────────────────────────────
+
+impl InferenceEngine for GpuInference {
+    fn load(&mut self, artifacts: &dyn Any) -> Result<(), InferenceError> {
+        let gpu_artifacts = artifacts
+            .downcast_ref::<GpuArtifacts<'_>>()
+            .ok_or_else(|| {
+                InferenceError::Runtime("GpuInference::load expects GpuArtifacts".into())
+            })?;
+
+        self.config = gpu_artifacts.config.clone();
+
+        // Load weights into Metal buffers.
+        let weights = GpuWeights::load(&self.device, gpu_artifacts.weights)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+        let mc = &weights.config;
+        self.model_config = Some(mc.clone());
+
+        // Allocate intermediate buffers (sized for single-token decode;
+        // prefill will rebuild the matmul cache for larger token counts).
+        let max_prefill = self.config.prefill_chunk_size.unwrap_or(512).max(1);
+        let bufs = IntermediateBuffers::allocate(&self.device, max_prefill, mc)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        self.intermediate_buffers = Some(bufs);
+
+        // Build RoPE cos/sin caches.
+        let (cos, sin) = Self::build_rope_cache(
+            &self.device,
+            mc.head_dim,
+            self.config.max_seq_len,
+            mc.rope_theta,
+        )
+        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        self.rope_cos = Some(cos);
+        self.rope_sin = Some(sin);
+
+        // Build MPS matmul cache for single-token decode.
+        let decode_cache = Self::build_matmul_cache(&self.device, mc, 1)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        self.decode_matmuls = Some(decode_cache);
+
+        // Initialize KV cache.
+        if self.config.enable_turboquant {
+            let tq_config = TurboQuantGpuConfig {
+                n_bits: self.config.n_bits,
+                num_kv_heads: mc.num_key_value_heads,
+                head_dim: mc.head_dim,
+                max_seq_len: self.config.max_seq_len,
+                num_layers: mc.num_hidden_layers,
+                rotation_seed: self.config.rotation_seed,
+            };
+            let tq_model = GpuTurboQuantModel::new(&self.device, tq_config.clone())
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let kv_cache = GpuKvCache::new(&self.device, &tq_config)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            self.turboquant = Some(tq_model);
+            self.kv_cache = Some(kv_cache);
+            self.fp16_kv_cache = None;
+        } else {
+            let fp16_kv = Fp16KvCache::new(
+                &self.device,
+                mc.num_hidden_layers,
+                mc.num_key_value_heads,
+                self.config.max_seq_len,
+                mc.head_dim,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            self.fp16_kv_cache = Some(fp16_kv);
+            self.turboquant = None;
+            self.kv_cache = None;
+        }
+
+        self.weights = Some(weights);
+        self.seq_pos = 0;
+        Ok(())
+    }
+
+    fn decode_step(&mut self, token: u32) -> Result<Logits, InferenceError> {
+        self.run_pipeline(&[token])
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError> {
+        if tokens.is_empty() {
+            return Err(InferenceError::Decode("empty prefill tokens".into()));
+        }
+
+        let chunk_size = self.config.prefill_chunk_size.unwrap_or(tokens.len());
+        let chunk_size = chunk_size.max(1);
+
+        let mut last_logits = None;
+        for chunk in tokens.chunks(chunk_size) {
+            last_logits = Some(self.run_pipeline(chunk)?);
+        }
+
+        last_logits.ok_or_else(|| InferenceError::Decode("no chunks processed".into()))
+    }
+
+    fn reset(&mut self) {
+        self.seq_pos = 0;
+        if let Some(kv) = self.kv_cache.as_mut() {
+            kv.reset();
+        }
+        if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
+            fp16_kv.reset();
+        }
+    }
 }

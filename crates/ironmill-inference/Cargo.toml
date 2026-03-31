@@ -13,7 +13,7 @@ ironmill-compile = { workspace = true, optional = true }
 ironmill-ane-sys = { workspace = true }
 ironmill-iosurface = { workspace = true }
 ironmill-coreml-sys = { workspace = true }
-ironmill-metal-sys = { workspace = true }
+ironmill-metal-sys = { workspace = true, optional = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }
@@ -25,6 +25,7 @@ tempfile = { workspace = true }
 default = []
 int4 = []
 compile = ["dep:ironmill-compile"]
+metal = ["dep:ironmill-metal-sys", "compile"]
 
 [[example]]
 name = "ane_op_eval"

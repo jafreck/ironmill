@@ -12,4 +12,4 @@ pub mod weights;
 
 pub use config::GpuConfig;
 pub use error::GpuError;
-pub use inference::GpuInference;
+pub use inference::{GpuArtifacts, GpuInference};

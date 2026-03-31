@@ -28,3 +28,4 @@ tempfile = { workspace = true }
 [features]
 default = []
 ane-direct = ["dep:ironmill-iosurface"]
+metal = ["ironmill-inference/metal"]
