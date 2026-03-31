@@ -591,13 +591,29 @@ fn main() -> Result<()> {
                             mc.vocab_size * mc.hidden_size * 2
                         };
 
-                    let kv_bytes_per_elem = if gpu_config.enable_turboquant { 1 } else { 2 };
-                    let kv_cache_bytes = mc.num_hidden_layers
-                        * 2
-                        * mc.num_key_value_heads
-                        * gpu_config.max_seq_len
-                        * mc.head_dim
-                        * kv_bytes_per_elem;
+                    let kv_bytes_per_elem: f64 = if !gpu_config.enable_turboquant {
+                        2.0 // FP16
+                    } else if gpu_config.n_bits == 4 {
+                        0.5 // INT4 packed
+                    } else {
+                        1.0 // INT8
+                    };
+                    let scale_bytes = if gpu_config.enable_turboquant {
+                        mc.num_hidden_layers
+                            * 2
+                            * mc.num_key_value_heads
+                            * gpu_config.max_seq_len
+                            * 4
+                    } else {
+                        0
+                    };
+                    let kv_cache_bytes = (mc.num_hidden_layers as f64
+                        * 2.0
+                        * mc.num_key_value_heads as f64
+                        * gpu_config.max_seq_len as f64
+                        * mc.head_dim as f64
+                        * kv_bytes_per_elem) as usize
+                        + scale_bytes;
 
                     let total_mb = (weight_bytes + kv_cache_bytes) as f64 / (1024.0 * 1024.0);
                     let kv_mb = kv_cache_bytes as f64 / (1024.0 * 1024.0);
