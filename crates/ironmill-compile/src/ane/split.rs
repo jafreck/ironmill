@@ -585,14 +585,13 @@ fn try_structural_split(
         return None;
     }
 
-    // 4. Pre-attn: the projections themselves + everything feeding into them.
-    //    TurboQuant (and FP16 attention) need Q/K/V projection outputs
-    //    from pre_attn, so the projections must be IN pre_attn, not stripped.
+    // 4. Attention block (pre_attn_set): projections + everything feeding
+    //    them + all attention ops + O-projection + the first residual add.
+    //    This keeps attention as part of a deep graph for maximum ANE
+    //    utilization, rather than isolating it in a shallow sub-program.
     let mut pre_attn_set: HashSet<usize> = HashSet::new();
     for &proj in &proj_matmuls {
-        // Include the projection matmul itself.
         pre_attn_set.insert(proj);
-        // Include all ops feeding into it (norm, weight consts, etc.).
         pre_attn_set.extend(graph.walk_backward(proj));
     }
 
@@ -600,27 +599,57 @@ fn try_structural_split(
     //    reachable forward from softmax (excludes Q/K/V projections).
     let o_proj_idx = find_o_projection(ops, &graph, &softmax_indices, &proj_matmuls);
 
-    // 6. Post-attn: O-projection + everything forward from it.
-    let mut post_attn_set: HashSet<usize> = HashSet::new();
+    // 5b. Include attention ops + O-projection in the attention block.
+    //     Everything between Q/K/V projections and O-projection is attention.
     if let Some(o_idx) = o_proj_idx {
-        post_attn_set.insert(o_idx);
-        post_attn_set.extend(graph.walk_forward(o_idx));
+        // Walk backward from O-proj to include all attention ops.
+        let o_ancestors = graph.walk_backward(o_idx);
+        for &anc in &o_ancestors {
+            pre_attn_set.insert(anc);
+        }
+        pre_attn_set.insert(o_idx);
+        // Include the residual add immediately after O-proj (if present).
+        for &succ in &graph.forward[o_idx] {
+            if ops[succ].op_type == "add" {
+                pre_attn_set.insert(succ);
+                break;
+            }
+        }
+    } else {
+        // No O-proj found — include everything between projections and
+        // the softmax chain as attention.
+        for &s in &softmax_indices {
+            pre_attn_set.insert(s);
+            pre_attn_set.extend(graph.walk_backward(s));
+            pre_attn_set.extend(graph.walk_forward(s));
+        }
     }
 
-    // Add const ops that exclusively feed post-attn ops.
-    for (i, op) in ops.iter().enumerate() {
-        if !is_const_op(op) || graph.forward[i].is_empty() {
-            continue;
-        }
-        if graph.forward[i].iter().all(|c| post_attn_set.contains(c)) {
+    // 6. FFN block (post_attn_set): everything NOT in the attention block.
+    let mut post_attn_set: HashSet<usize> = HashSet::new();
+    for (i, _) in ops.iter().enumerate() {
+        if !pre_attn_set.contains(&i) {
             post_attn_set.insert(i);
         }
     }
 
-    // 7. Collect pre-attn, attention cluster, and post-attn ops in
-    //    topological order.
+    // Move const ops that exclusively feed one block into that block.
+    for (i, op) in ops.iter().enumerate() {
+        if !is_const_op(op) || graph.forward[i].is_empty() {
+            continue;
+        }
+        let feeds_pre = graph.forward[i].iter().any(|c| pre_attn_set.contains(c));
+        let feeds_post = graph.forward[i].iter().any(|c| post_attn_set.contains(c));
+        if feeds_pre && !feeds_post {
+            post_attn_set.remove(&i);
+            pre_attn_set.insert(i);
+        }
+    }
+
+    // 7. Collect attention block and FFN block in topological order.
+    //    The attention cluster is empty — attention ops are in pre_attn.
     let mut pre_attn = Vec::new();
-    let mut attn_cluster = Vec::new();
+    let mut attn_cluster = Vec::new(); // should remain empty with weight-aware split
     let mut post_attn = Vec::new();
 
     for (i, op) in ops.iter().enumerate() {
@@ -855,6 +884,56 @@ fn build_sub_program(
     func.inputs = input_pairs.clone();
     func.body.operations = ops.to_vec();
     func.body.outputs = output_names.clone();
+
+    // Deduplicate op output names. The AneVariableNamingPass may have
+    // assigned the same z_output* name to different ops in the original
+    // program. When they end up in the same sub-program, the names collide.
+    let mut seen_outputs: HashSet<String> = HashSet::new();
+    // Function inputs are pre-defined names.
+    for (name, _) in &func.inputs {
+        seen_outputs.insert(name.clone());
+    }
+    let mut renames: HashMap<String, String> = HashMap::new();
+    for op in &mut func.body.operations {
+        for out in &mut op.outputs {
+            if seen_outputs.contains(out.as_str()) {
+                // Collision — generate a unique name.
+                eprintln!("  [dedup] collision on '{}' in sub-program", out);
+                let mut suffix = 1;
+                let base = out.clone();
+                loop {
+                    let candidate = format!("{base}_dup{suffix}");
+                    if !seen_outputs.contains(&candidate) {
+                        renames.insert(out.clone(), candidate.clone());
+                        *out = candidate.clone();
+                        seen_outputs.insert(candidate);
+                        break;
+                    }
+                    suffix += 1;
+                }
+            } else {
+                seen_outputs.insert(out.clone());
+            }
+        }
+    }
+    // Update references to renamed outputs.
+    if !renames.is_empty() {
+        for op in &mut func.body.operations {
+            for val in op.inputs.values_mut() {
+                if let Value::Reference(r) = val {
+                    if let Some(new_name) = renames.get(r.as_str()) {
+                        *r = new_name.clone();
+                    }
+                }
+            }
+        }
+        // Update function outputs too.
+        for out in &mut func.body.outputs {
+            if let Some(new_name) = renames.get(out.as_str()) {
+                *out = new_name.clone();
+            }
+        }
+    }
 
     // Build Program.
     let mut prog = Program::new("1.0");

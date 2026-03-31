@@ -25,7 +25,9 @@ proven quantization scheme.
 ## Architecture
 
 ```
-Decode step pipeline (per layer):
+Full decode pipeline (single token):
+  0. embedding lookup    [CPU]
+  ─── per layer (×num_layers) ───
   1. rms_norm           [Metal kernel]
   2. Q/K/V projection   [MPS matmul]
   3. RoPE               [Metal kernel]
@@ -38,6 +40,9 @@ Decode step pipeline (per layer):
  10. silu + gate mul     [Metal kernel]
  11. down projection     [MPS matmul]
  12. residual add        [Metal kernel]
+  ─── end per layer ───
+ 13. final rms_norm      [Metal kernel]
+ 14. lm_head projection  [MPS matmul]
 ```
 
 All ops are encoded into a single `MTLCommandBuffer` per token, committed once.
@@ -59,8 +64,9 @@ crates/ironmill-metal-sys/              NEW — unsafe Metal FFI quarantine
 
 crates/ironmill-inference/src/gpu/      NEW — GPU inference (safe code)
 ├── mod.rs
-├── inference.rs                        GpuInference struct, decode/prefill/generate
+├── inference.rs                        GpuInference: InferenceEngine impl
 ├── config.rs                           GpuConfig
+├── error.rs                            GpuError (wraps MetalSysError)
 ├── ops.rs                              kernel dispatch helpers
 ├── weights.rs                          SafeTensors/GGUF → MetalBuffer loading
 ├── shaders/                            Metal shader sources (include_str!)
@@ -82,11 +88,35 @@ crates/ironmill-inference/src/gpu/      NEW — GPU inference (safe code)
 |---|---|---|
 | Metal FFI | `ironmill-metal-sys/src/` | Safe wrappers for device, buffers, command submission |
 | MPS matmul | `ironmill-metal-sys/src/mps.rs` | Apple-optimized FP16 matrix multiply |
-| GPU decode loop | `ironmill-inference/src/gpu/inference.rs` | `GpuInference` — compile, decode, prefill, generate, reset |
+| GPU decode loop | `ironmill-inference/src/gpu/inference.rs` | `GpuInference` implements `InferenceEngine` — load, prefill, decode_step, reset |
 | TQ cache write | `ironmill-inference/src/gpu/shaders/turboquant.metal` | Fused Hadamard rotation + beta-optimal quantize + INT8 write |
 | TQ attention | `ironmill-inference/src/gpu/shaders/turboquant.metal` | Fused INT8 dequant + unrotation + attention |
 | Standard ops | `ironmill-inference/src/gpu/shaders/*.metal` | RMSNorm, SiLU, RoPE, softmax, embedding, residual add |
 | Weight loader | `ironmill-inference/src/gpu/weights.rs` | Reuses SafeTensorsProvider / GgufProvider from ironmill-compile |
+
+### Integration
+
+`GpuInference` implements the `InferenceEngine` trait from `ironmill-inference`:
+
+| Trait Method | GPU Implementation |
+|---|---|
+| `load` | Parse model config from weight file metadata, load weights into MTLBuffers, compile Metal shader source into pipeline states, allocate KV cache buffers |
+| `prefill` | Batched forward pass over prompt tokens (see [Prefill Strategy](#prefill-strategy)) |
+| `decode_step` | Single-token forward pass through full pipeline |
+| `reset` | Clear KV cache positions, reset sequence counter |
+
+Backend selection is via the `--backend` flag on `ironmill-bench`:
+
+```
+ironmill-bench --backend gpu ...
+ironmill-bench --backend ane ...    # default
+```
+
+`ironmill-cli` remains a compiler tool (`compile`, `inspect`, `validate`). The
+GPU backend is an `InferenceEngine` implementation selected at runtime by
+`ironmill-bench` and any downstream library consumers of `ironmill-inference`.
+Auto-detection (e.g. falling back to GPU when ANE is unavailable) is future
+work.
 
 ## TurboQuant on GPU
 
@@ -147,16 +177,55 @@ Sequence dimension is tiled for cache-friendly access.
 | Prefill batching | Not feasible (sequential) | Possible (parallel tokens) |
 | Kernel fusion | Limited by program boundaries | Cache-write fused, attention fused |
 
+## Prefill Strategy
+
+During prefill, the GPU processes all prompt tokens in parallel. The same
+pipeline stages and kernels apply, but with a `token_count` dimension
+parameter: `token_count=1` for decode, `token_count=prompt_len` (or chunk
+size) for prefill.
+
+```
+Prefill pipeline (token_count prompt tokens):
+  0. embedding lookup    [CPU or Metal]  batch lookup for all tokens
+  ─── per layer (×num_layers) ───
+  1. rms_norm           [Metal kernel]  input: [token_count × hidden_size]
+  2. Q/K/V projection   [MPS matmul]   [token_count × hidden] → [token_count × proj_dim]
+  3. RoPE               [Metal kernel]  per-position rotation with offset indices
+  4. cache-write         [Metal kernel]  write all token_count positions at once
+  5. attention           [Metal kernel]  causal mask: position p attends to [0..p]
+  6–12. (same as decode, all inputs [token_count × dim])
+  ─── end per layer ───
+ 13. final rms_norm      [Metal kernel]
+ 14. lm_head projection  [MPS matmul]   only last position needed for next-token prediction
+```
+
+Key differences from decode:
+
+- MPS matmuls operate on `[token_count × dim]` inputs instead of `[1 × dim]`
+- Element-wise ops (RMSNorm, SiLU, RoPE, residual add) are trivially batched —
+  they process all positions in parallel with no code changes
+- Attention applies a causal mask so each position only attends to prior
+  positions and itself
+- Cache-write writes all `token_count` positions into the KV cache in a single
+  dispatch
+- lm_head logits are only needed for the final position; intermediate positions
+  can be skipped as an optimization
+
+For long prompts, prefill is chunked into fixed-size segments to bound peak
+memory. Each chunk writes its positions to the KV cache before the next chunk
+proceeds.
+
 ## Memory Model
 
-Weights are loaded into `MTLBuffer` with shared storage mode (CPU-writable,
-GPU-readable). Intermediate activations use private storage (GPU-only, faster).
-KV cache buffers use shared storage for potential CPU inspection during
-debugging but could be switched to private for production.
+Weights are loaded into `MTLBuffer` with shared storage mode for initial CPU→GPU
+transfer, then blitted to private storage for higher GPU read bandwidth.
+Intermediate activations use private storage (GPU-only, faster). KV cache
+buffers use shared storage during development for CPU-side inspection; production
+builds should use private storage.
 
 ```
 Weight loading:
-  SafeTensors/GGUF → CPU Vec<f16> → MTLBuffer::newWithBytes (shared)
+  SafeTensors/GGUF → CPU Vec<f16> → MTLBuffer::newWithBytes (shared) → blit to private
 
 Per-token intermediates (reused across layers):
   hidden_state    [hidden_size]              FP16  private
@@ -170,10 +239,10 @@ KV cache (persistent across tokens):
 
 ## Key Differences from ANE Path
 
-- **No MIL compilation.** The GPU backend does not compile MIL text into
-  programs. It constructs a fixed decode loop from model weights and pre-compiled
-  Metal kernels. The MIL IR is used only for weight extraction and architecture
-  detection during model loading.
+- **No MIL compilation.** The GPU backend does not compile MIL programs. During
+  `load`, it parses the model architecture directly from SafeTensors/GGUF
+  metadata, compiles Metal shader source into pipeline states, and loads weights
+  into MTLBuffers. The MIL IR is not involved.
 
 - **No model splitting.** ANE's per-program weight budget forces splitting into
   `pre_attn` / `post_attn` / `lm_head` sub-programs with IOSurface boundaries.
@@ -203,6 +272,15 @@ KV cache (persistent across tokens):
 - **Weight formats** — initial support for SafeTensors (FP16) and GGUF. Future
   work: quantized weight formats (Q4_0, Q8_0) with dequantization in matmul
   kernels.
+
+- **Warm-up cost** — Metal shader compilation and pipeline state creation happen
+  eagerly during `load`. The Metal driver compiles shader source to GPU machine
+  code on first load; subsequent runs benefit from Metal's on-disk shader cache.
+
+- **Error handling** — `ironmill-metal-sys` defines `MetalSysError` for FFI
+  failures. The safe inference layer defines `GpuError` in
+  `ironmill-inference/src/gpu/error.rs`, wrapping `MetalSysError` and
+  higher-level failures (weight loading, config parsing, shader compilation).
 
 ## Open Questions
 

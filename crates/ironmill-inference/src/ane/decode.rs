@@ -436,10 +436,10 @@ impl AneInference {
             ("AneLayout", &AneLayoutPass),
             ("AneArgPromotion", &AneArgPromotionPass),
             ("TypeRepropagate", &TypeRepropagationPass),
-            // AttentionDecompose skipped: decomposing grouped_query_attention
-            // expands layers from ~12 to ~106 ops, exceeding the ANE program
-            // budget. The structural split handles fused GQA ops directly.
-            ("AneVariableNaming", &AneVariableNamingPass),
+            // AneVariableNaming is run PER SUB-PROGRAM after splitting,
+            // not on the full program. Running it pre-split creates
+            // z_output* name collisions when ops from different sub-program
+            // boundaries end up in the same sub-program.
         ];
         for (name, pass) in passes {
             pass.run(&mut program)
@@ -458,18 +458,14 @@ impl AneInference {
         //     decode time, preserving all downstream references.
         replace_gather_with_inputs(&mut program);
 
-        // 2. Split into per-layer programs (no attention boundary split).
-        //    Each layer is one deep program (~80-100 ops) for maximum ANE
-        //    utilization. The ANE is optimized for deep graphs (16-64+ ops)
-        //    and pays ~0.095ms dispatch overhead per eval. Splitting layers
-        //    into 3 sub-programs wastes dispatch budget.
-        //
-        //    `gather` ops (RoPE cos/sin lookup) are unsupported on ANE and
-        //    will cause compilation failures. They are handled by replacing
-        //    them with const tensors in the IR before compilation.
+        // 2. Split each layer at the weight boundary into two deep programs:
+        //    - attn_block (pre_attn): norm → Q/K/V proj → attention → O-proj → residual
+        //    - ffn_block (post_attn): norm → gate/up proj → activation → down proj → residual
+        //    This keeps attention as part of a deep graph (~40-50 ops) for
+        //    maximum ANE utilization, while staying under the ~32 MB SRAM budget.
         let split_config = SplitConfig {
-            split_attention: false,
-            emit_attention: false,
+            split_attention: true,
+            emit_attention: false, // attention is included in pre_attn (attn_block)
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -488,11 +484,14 @@ impl AneInference {
             }
         }
 
-        // 2b. Pad S≥32 on sub-programs.
+        // 2b. Pad S≥32 on FFN sub-programs only.
+        //     pre_attn now contains attention ops where S represents
+        //     per-head dimensions, not sequence length. Padding S to 32
+        //     corrupts the reshape/matmul shapes in attention.
         const ANE_MIN_SEQ: usize = 32;
         for sub in &mut model_split.programs {
-            if sub.name.ends_with("_fp16_attn") {
-                continue;
+            if sub.name.ends_with("_pre_attn") || sub.name.ends_with("_fp16_attn") {
+                continue; // attention shapes must not be padded
             }
             if let Some(func) = sub.program.functions.values_mut().next() {
                 for (_, ty) in &mut func.inputs {
@@ -1730,6 +1729,8 @@ fn compile_and_load_sub(
     convert_f32_consts_to_f16(&mut program);
     // Prune unreferenced inputs (may be left after gather/split removal + DCE).
     prune_unreferenced_inputs(&mut program);
+    // Rename variables to ANE-friendly names per sub-program (not pre-split).
+    let _ = AneVariableNamingPass.run(&mut program);
 
     let (mil_text, weight_entries) = program_to_mil_text(&program, mil_config).map_err(|e| {
         AneError::Other(anyhow::anyhow!(
@@ -1842,6 +1843,8 @@ fn compile_and_load_sub_with_donor(
 ) -> Result<LoadedSubProgram> {
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
+    prune_unreferenced_inputs(&mut program);
+    let _ = AneVariableNamingPass.run(&mut program);
 
     let (mil_text, weight_entries) = program_to_mil_text(&program, mil_config).map_err(|e| {
         AneError::Other(anyhow::anyhow!(
