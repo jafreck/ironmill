@@ -595,14 +595,12 @@ impl<D: AneDevice> AneInference<D> {
         // 2c2. Inject second residual add into post_attn sub-programs.
         // ONNX SkipLayerNorm fuses the second residual (skip_add + FFN_output)
         // into the next layer's input norm. After splitting, post_attn outputs
-        // just FFN_output. Injecting the residual produces correct layer 0
-        // values but magnitudes explode through 28 layers, degrading PPL.
-        // Disabled until the underlying per-layer error is resolved.
-        // for sub in &mut model_split.programs {
-        //     if sub.name.ends_with("_post_attn") {
-        //         inject_ffn_residual(&mut sub.program);
-        //     }
-        // }
+        // just FFN_output. We inject add(skip_add, FFN_output) to restore it.
+        for sub in &mut model_split.programs {
+            if sub.name.ends_with("_post_attn") {
+                inject_ffn_residual(&mut sub.program);
+            }
+        }
 
         // 2d. Fuse cache-write ops into pre_attn sub-programs (TurboQuant only).
         // This appends rotation + quantization ops so pre_attn directly outputs
@@ -1160,7 +1158,13 @@ impl<D: AneDevice> AneInference<D> {
         let mut d_attn = std::time::Duration::ZERO;
         let mut d_post_attn = std::time::Duration::ZERO;
 
-        for layer_idx in 0..num_layers {
+        let effective_layers = std::env::var("IRONMILL_MAX_LAYERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(num_layers)
+            .min(num_layers);
+
+        for layer_idx in 0..effective_layers {
             // Pre-attention: norm → Q/K/V projection
             let t0 = if profiling {
                 Some(std::time::Instant::now())
