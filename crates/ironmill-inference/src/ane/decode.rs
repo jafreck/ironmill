@@ -484,16 +484,21 @@ impl AneInference {
             }
         }
 
-        // 2b. Pad S≥32 on FFN sub-programs only.
-        //     pre_attn now contains attention ops where S represents
-        //     per-head dimensions, not sequence length. Padding S to 32
-        //     corrupts the reshape/matmul shapes in attention.
+        // 2b. Pad function I/O to S≥32 (ANE rejects C>768, S<32 on I/O tensors).
+        //     Only pad the function inputs/outputs and their corresponding
+        //     TensorDescriptors — NOT internal op shapes. Internal ops
+        //     (especially attention reshapes) must keep their natural shapes
+        //     so dimension semantics are preserved.
         const ANE_MIN_SEQ: usize = 32;
         for sub in &mut model_split.programs {
-            if sub.name.ends_with("_pre_attn") || sub.name.ends_with("_fp16_attn") {
-                continue; // attention shapes must not be padded
-            }
             if let Some(func) = sub.program.functions.values_mut().next() {
+                // Pad ALL shapes to S≥32 consistently.
+                // The ANE rejects I/O tensors with C>768, S<32.
+                // Internal ops must also be padded so shapes are consistent
+                // (input S=32 → conv output S=32 → reshape must expect S=32).
+                // Attention matmul with S=32 computes over 32 positions
+                // (positions 1-31 are zero-padded, producing correct results
+                // at position 0 via the softmax).
                 for (_, ty) in &mut func.inputs {
                     if ty.shape.len() == 4 {
                         if let Some(s) = ty.shape[3] {
@@ -504,6 +509,7 @@ impl AneInference {
                     }
                 }
                 for op in &mut func.body.operations {
+                    // Pad output types S dimension.
                     for t in op.output_types.iter_mut().flatten() {
                         if t.shape.len() == 4 {
                             if let Some(s) = t.shape[3] {
@@ -513,9 +519,38 @@ impl AneInference {
                             }
                         }
                     }
+                    // Update reshape shape constants to match padded dims.
+                    if op.op_type == "reshape" {
+                        if let Some(mil_rs::ir::Value::Tensor { shape, data, dtype }) =
+                            op.inputs.get_mut("shape")
+                        {
+                            if shape.len() == 1 && *dtype == mil_rs::ir::ScalarType::Int32 {
+                                let ndims = shape[0];
+                                if ndims >= 4 && data.len() >= ndims * 4 {
+                                    let last_offset = (ndims - 1) * 4;
+                                    let last_val = i32::from_le_bytes([
+                                        data[last_offset],
+                                        data[last_offset + 1],
+                                        data[last_offset + 2],
+                                        data[last_offset + 3],
+                                    ]);
+                                    if last_val > 0 && (last_val as usize) < ANE_MIN_SEQ {
+                                        let new_val = ANE_MIN_SEQ as i32;
+                                        let b = new_val.to_le_bytes();
+                                        data[last_offset] = b[0];
+                                        data[last_offset + 1] = b[1];
+                                        data[last_offset + 2] = b[2];
+                                        data[last_offset + 3] = b[3];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Note: tile/transpose/matmul output types will be fixed
+                    // by TypeRepropagationPass in compile_and_load_sub.
                 }
             }
-            // Also update the sub-program's TensorDescriptors.
+            // Update sub-program TensorDescriptors to match.
             for td in &mut sub.inputs {
                 if td.shape[3] < ANE_MIN_SEQ {
                     td.shape[3] = ANE_MIN_SEQ;
@@ -1729,6 +1764,8 @@ fn compile_and_load_sub(
     convert_f32_consts_to_f16(&mut program);
     // Prune unreferenced inputs (may be left after gather/split removal + DCE).
     prune_unreferenced_inputs(&mut program);
+    // Repropagate types after S≥32 padding may have changed shapes.
+    let _ = TypeRepropagationPass.run(&mut program);
     // Rename variables to ANE-friendly names per sub-program (not pre-split).
     let _ = AneVariableNamingPass.run(&mut program);
 
@@ -1844,6 +1881,7 @@ fn compile_and_load_sub_with_donor(
     let mut program = sub.program.clone();
     convert_f32_consts_to_f16(&mut program);
     prune_unreferenced_inputs(&mut program);
+    let _ = TypeRepropagationPass.run(&mut program);
     let _ = AneVariableNamingPass.run(&mut program);
 
     let (mil_text, weight_entries) = program_to_mil_text(&program, mil_config).map_err(|e| {

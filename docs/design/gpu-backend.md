@@ -8,20 +8,6 @@ and custom Metal compute shaders for TurboQuant quantization, attention, and
 element-wise ops (RMSNorm, SiLU, RoPE). Supports INT8 KV cache compression via
 the same TurboQuant algorithm used in the ANE path.
 
-## Motivation
-
-The ANE backend has hard constraints that limit optimization headroom:
-
-- **~8 MB per-program weight budget** — forces model splitting, prevents
-  cache-write fusion into pre_attn at Qwen3-0.6B scale.
-- **Sequential token decode only** — ANE programs process one token at a time,
-  no batch prefill.
-- **IOSurface overhead** — each ANE sub-program requires IOSurface-backed I/O,
-  adding allocation and copy cost between program boundaries.
-
-A Metal GPU backend eliminates these constraints while reusing TurboQuant's
-proven quantization scheme.
-
 ## Architecture
 
 ```
@@ -32,7 +18,7 @@ Full decode pipeline (single token):
   2. Q/K/V projection   [MPS matmul]
   3. RoPE               [Metal kernel]
   4. cache-write         [Metal kernel]  fused: rotate → quantize → INT8 cache write
-  5. attention           [Metal kernel]  fused: dequant → unrotate → QK → softmax → ×V
+  5. attention           [Metal kernel]  fused: rotate Q → dequant K/V → QK → softmax → ×V → un-rotate
   6. output projection   [MPS matmul]
   7. residual add        [Metal kernel]
   8. rms_norm            [Metal kernel]
@@ -92,11 +78,16 @@ crates/ironmill-inference/src/gpu/      NEW — GPU inference (safe code)
 | TQ cache write | `ironmill-inference/src/gpu/shaders/turboquant.metal` | Fused Hadamard rotation + beta-optimal quantize + INT8 write |
 | TQ attention | `ironmill-inference/src/gpu/shaders/turboquant.metal` | Fused INT8 dequant + unrotation + attention |
 | Standard ops | `ironmill-inference/src/gpu/shaders/*.metal` | RMSNorm, SiLU, RoPE, softmax, embedding, residual add |
-| Weight loader | `ironmill-inference/src/gpu/weights.rs` | Reuses SafeTensorsProvider / GgufProvider from ironmill-compile |
+| Weight loader | `ironmill-inference/src/gpu/weights.rs` | Builds on SafeTensorsProvider / GgufProvider from ironmill-compile (extracts raw weight bytes via `WeightProvider::tensor()`, loads into MTLBuffers) |
 
 ### Integration
 
-`GpuInference` implements the `InferenceEngine` trait from `ironmill-inference`:
+`GpuInference` implements the `InferenceEngine` trait from `ironmill-inference`.
+The existing ANE path uses the separate `RuntimeBackend` / `RuntimeModel`
+abstraction; `InferenceEngine` currently has no implementations. Integrating
+`GpuInference` into `ironmill-bench` requires adding a `metal` arm to the
+backend dispatch that constructs a `GpuInference` directly, bypassing the
+`ComputeUnits` → `RuntimeBackend` path used by CoreML backends.
 
 | Trait Method | GPU Implementation |
 |---|---|
@@ -108,9 +99,14 @@ crates/ironmill-inference/src/gpu/      NEW — GPU inference (safe code)
 Backend selection is via the `--backend` flag on `ironmill-bench`:
 
 ```
-ironmill-bench --backend gpu ...
-ironmill-bench --backend ane ...    # default
+ironmill-bench --backend metal ...
+ironmill-bench --backend ane ...    # CoreML ANE (default)
+ironmill-bench --backend gpu ...    # CoreML CPU+GPU
 ```
+
+The `metal` backend selects the direct Metal inference engine (`GpuInference`).
+The existing `gpu` and `ane` values select CoreML compute units and are
+unchanged.
 
 `ironmill-cli` remains a compiler tool (`compile`, `inspect`, `validate`). The
 GPU backend is an `InferenceEngine` implementation selected at runtime by
@@ -130,14 +126,15 @@ Input:  K_proj, V_proj  [num_kv_heads × head_dim]  FP16
         rotation_matrix [head_dim × head_dim]       FP16
 Output: K_cache[layer][seq_pos], V_cache[layer][seq_pos]  INT8 (in-place)
 
-Per KV-head, single dispatch:
-  1. K_rotated = rotation_matrix @ K_head
-  2. quantized = round(clip(K_rotated × inv_scale, -128, 127))
+Per KV-head, single dispatch (same pipeline for both K and V):
+  1. rotated   = rotation_matrix @ head_vec
+  2. quantized = round(clip(rotated × inv_scale, -128, 127))
   3. write INT8 to cache at seq_pos offset
 ```
 
-No separate program, no IOSurface copy. The quantized result is written
-directly into the persistent cache buffer.
+Both K and V are rotated before quantization — the Hadamard rotation
+spreads energy across dimensions to improve scalar quantization quality.
+The quantized result is written directly into the persistent cache buffer.
 
 ### Fused Attention (single kernel)
 
@@ -151,29 +148,32 @@ Input:  Q          [num_heads × head_dim]                    FP16
 Output: attn_out   [num_heads × head_dim]                    FP16
 
 Per attention head (GQA-aware):
+  Q_rot = rotation @ Q_head                          ← O(1) per token
   for p in 0..seq_len:
     K_fp16    = cast(K_cache[kv_head][p]) × deq_scale
-    K_unrot   = rotation^T @ K_fp16
-    score[p]  = dot(Q_head, K_unrot) / √head_dim
+    score[p]  = dot(Q_rot, K_fp16) / √head_dim       ← K stays in rotated space
   scores = softmax(scores[0..seq_len])
   for p in 0..seq_len:
     V_fp16    = cast(V_cache[kv_head][p]) × deq_scale
-    output   += score[p] × V_fp16
+    output   += score[p] × V_fp16                     ← output in rotated V-space
+  attn_out = output @ rotation                        ← O(1) un-rotation
 ```
 
-Uses threadgroup shared memory for attention scores and partial output sums.
-Sequence dimension is tiled for cache-friendly access.
+Q is rotated to match K's rotated space (O(1) per token) rather than
+un-rotating every cached K position (O(seq_len)). Since both K and V are
+stored rotated, the weighted V sum is in rotated space and requires a
+final un-rotation. This matches the ANE TurboQuant approach.
 
 ### Comparison to ANE TurboQuant
 
 | Aspect | ANE (current) | GPU (proposed) |
 |---|---|---|
-| Cache write | Separate ANE program + IOSurface copy | Single fused Metal kernel |
+| Cache write | Separate ANE program + IOSurface copy | Single fused Metal kernel (K and V) |
 | Attention | Separate ANE program | Single fused Metal kernel |
 | Memory | IOSurface-backed tensors | MTLBuffer (shared or private) |
 | Cache update | `copy_column0_fp16_as_int8_to()` | Direct write in kernel |
 | Matmul | ANE 1×1 conv | MPS matrix multiply |
-| Per-program limit | ~8 MB weights | No limit |
+| Per-program limit | Observed at ~8 MB weight scale (root cause undiagnosed) | None |
 | Prefill batching | Not feasible (sequential) | Possible (parallel tokens) |
 | Kernel fusion | Limited by program boundaries | Cache-write fused, attention fused |
 
@@ -244,9 +244,10 @@ KV cache (persistent across tokens):
   metadata, compiles Metal shader source into pipeline states, and loads weights
   into MTLBuffers. The MIL IR is not involved.
 
-- **No model splitting.** ANE's per-program weight budget forces splitting into
-  `pre_attn` / `post_attn` / `lm_head` sub-programs with IOSurface boundaries.
-  The GPU path keeps all weights resident and dispatches kernels directly.
+- **No model splitting.** ANE's per-program compilation limits force splitting
+  into `pre_attn` / `post_attn` / `lm_head` sub-programs with IOSurface
+  boundaries. The GPU path keeps all weights resident and dispatches kernels
+  directly.
 
 - **Single command buffer per token.** All layers' ops are encoded into one
   `MTLCommandBuffer`, avoiding per-op commit overhead and enabling the Metal
@@ -282,17 +283,25 @@ KV cache (persistent across tokens):
   `ironmill-inference/src/gpu/error.rs`, wrapping `MetalSysError` and
   higher-level failures (weight loading, config parsing, shader compilation).
 
-## Open Questions
+## Design Decisions
 
-1. **Threadgroup sizing** — optimal thread configuration for attention kernels
-   depends on sequence length, head count, and Apple Silicon generation. Needs
-   empirical tuning.
-2. **Prefill strategy** — batch all prompt tokens in one matmul or chunk to
-   limit memory? Depends on model size vs GPU memory.
-3. **Weight quantization** — should the GPU path support INT4/INT8 weight
-   compression (separate from KV cache TurboQuant)?
-4. **Shared memory budget** — threadgroup memory for fused attention is limited
-   to 32 KB on most Apple GPUs. Large sequence lengths may need tiling.
+1. **Threadgroup sizing** — one threadgroup per attention head with `head_dim`
+   threads (clamped to 64–256). Sequence dimension tiled in chunks of
+   `min(seq_len, 32768 / (2 × head_dim))` to fit 32 KB threadgroup memory.
+   Expose tile size as a `GpuConfig` parameter for per-chip-generation tuning.
+
+2. **Prefill strategy** — full-prompt prefill (no chunking) for prompts up to
+   `max_seq_len`. For longer sequences, chunk at `max_seq_len` boundaries.
+   Chunk size configurable via `GpuConfig`. MPS matmul benefits from larger
+   batch dimensions, so prefer large chunks when memory allows.
+
+3. **Weight quantization** — FP16 weights only for initial implementation. Q8_0
+   support (INT8 weights with per-tensor scale, dequant before matmul) is a
+   follow-up. Q4_0 deferred — requires fused dequant-matmul kernels.
+
+4. **Shared memory budget** — 32 KB per threadgroup on M1–M4. Tile K in chunks
+   of 64 sequence positions (~16 KB for head_dim=128) to leave room for score
+   accumulators and partial output sums.
 
 ## References
 
