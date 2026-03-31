@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-**Is this truly novel?** Yes — with caveats. The *concept* of a model compiler targeting a
+**Is this truly novel?** Yes - with caveats. The *concept* of a model compiler targeting a
 hardware accelerator is well-established (Qualcomm, Intel, Google all have them). What's novel
 is that **no one has built one for CoreML/ANE outside of Python, in any language.** Not in C++,
 not in Swift (meaningfully), not in Go, not in Rust. Apple created a Python-only bottleneck
@@ -12,7 +12,7 @@ that the entire non-Python world must route through.
 
 ## Tier 1: Direct Competitors (CoreML Model Generation)
 
-### 1. Apple `coremltools` (Python) — THE incumbent
+### 1. Apple `coremltools` (Python) - THE incumbent
 - **What it does**: Full pipeline: PyTorch/TF/ONNX → MIL IR → CoreML protobuf → .mlmodel/.mlpackage
 - **Language**: Python only
 - **Stars**: ~4.5k GitHub
@@ -21,7 +21,7 @@ that the entire non-Python world must route through.
 - **Verdict**: This is what we'd be reimplementing the output side of. It's the gold standard
   but its Python-only nature is the entire reason the gap exists.
 
-### 2. SwiftCoreMLTools (Swift) — the only non-Python attempt
+### 2. SwiftCoreMLTools (Swift) - the only non-Python attempt
 - **What it does**: Programmatically create CoreML neural network models in Swift
 - **Language**: Swift
 - **Stars**: ~162 GitHub
@@ -39,7 +39,7 @@ that the entire non-Python world must route through.
 - **What it does**: GUI/Swift API for training simple models (classifiers, regressors)
 - **Strengths**: Fully native, Apple-supported
 - **Weaknesses**: Cannot convert external models, limited model types, requires Xcode
-- **Verdict**: Not a model compiler — it's a training tool. Doesn't compete.
+- **Verdict**: Not a model compiler - it's a training tool. Doesn't compete.
 
 ---
 
@@ -59,7 +59,7 @@ that the entire non-Python world must route through.
 - **Language**: C++/Python
 - **Strengths**: Cross-format, extensive optimization passes, INT8 quantization
 - **Weaknesses**: Intel-only, no Apple hardware support
-- **Verdict**: Another validated model — hardware vendor provides native compiler.
+- **Verdict**: Another validated model - hardware vendor provides native compiler.
   Apple is the outlier that only provides Python tools.
 
 ### 6. Apache TVM
@@ -77,7 +77,7 @@ that the entire non-Python world must route through.
 - **Apple support**: Metal backend (GPU); MPS dialect RFC exists; **no ANE target**
 - **Strengths**: Modular, production-quality, strong community
 - **Weaknesses**: No CoreML output, no ANE path, Rust not first-class
-- **Verdict**: Like TVM — works at a lower level but doesn't bridge to CoreML.
+- **Verdict**: Like TVM - works at a lower level but doesn't bridge to CoreML.
   An MPS dialect is in RFC stage but still targets GPU, not ANE.
 
 ---
@@ -88,7 +88,7 @@ that the entire non-Python world must route through.
 - **What it does**: Safe Rust bindings to CoreML runtime (load .mlmodelc, run inference)
 - **Stars**: <50
 - **Strengths**: Pure Rust, async, zero-copy tensors
-- **Weaknesses**: Runtime only — cannot create, convert, or optimize models
+- **Weaknesses**: Runtime only - cannot create, convert, or optimize models
 - **Verdict**: Complementary, not competitive. Our project would use this (or something like it)
   as its runtime layer.
 
@@ -124,7 +124,7 @@ that the entire non-Python world must route through.
 ### 13. Orion (C/C++)
 - **What it does**: Direct ANE programming via reverse-engineered private APIs
 - **Strengths**: True hardware access, training support, ~19 TFLOPS
-- **Weaknesses**: Private APIs — may break on any OS update, not App Store safe
+- **Weaknesses**: Private APIs - may break on any OS update, not App Store safe
 - **Verdict**: Impressive research, terrible production strategy. Our project uses public
   APIs and is update-safe. Different risk/reward profile entirely.
 
@@ -174,7 +174,7 @@ Apple publishes the CoreML protobuf schemas under BSD-3 license in
 - The format is documented and stable
 - No reverse engineering needed for the serialization layer
 
-The hard part isn't the format — it's the **MIL IR semantics, optimization passes, and
+The hard part isn't the format - it's the **MIL IR semantics, optimization passes, and
 op-mapping logic** that `coremltools` has built up over years.
 
 ---
@@ -183,10 +183,10 @@ op-mapping logic** that `coremltools` has built up over years.
 
 | Aspect | Novel? | Hard? | Notes |
 |---|---|---|---|
-| Non-Python CoreML model generation | ✅ Yes — no one has done this meaningfully | Medium | Protobuf schema is open; SwiftCoreMLTools proved partial feasibility |
-| Rust specifically | ✅ Yes — zero Rust tools exist | Medium | Rust protobuf tooling is mature (prost) |
-| ONNX → CoreML conversion | ❌ No — coremltools does this | Hard | 200+ op mappings, edge cases, numerical correctness |
-| MIL IR implementation | ❌ No — coremltools has this | Hard | Graph IR with type system, passes infrastructure |
+| Non-Python CoreML model generation | ✅ Yes - no one has done this meaningfully | Medium | Protobuf schema is open; SwiftCoreMLTools proved partial feasibility |
+| Rust specifically | ✅ Yes - zero Rust tools exist | Medium | Rust protobuf tooling is mature (prost) |
+| ONNX → CoreML conversion | ❌ No - coremltools does this | Hard | 200+ op mappings, edge cases, numerical correctness |
+| MIL IR implementation | ❌ No - coremltools has this | Hard | Graph IR with type system, passes infrastructure |
 | ANE-targeted optimizations | Partially novel | Very hard | Apple's internal heuristics are undocumented; community knowledge is scattered |
 | Full pipeline (convert + optimize + run) | ✅ Novel outside Python | Hard | Integration testing across model zoo is huge |
 
@@ -218,7 +218,7 @@ performance gaps.
 
 ### Why this could succeed:
 1. **Clear gap**: Every search confirms "no non-Python converter exists."
-2. **Precedent**: Qualcomm and Intel both offer native CLI tools — Apple is the outlier.
+2. **Precedent**: Qualcomm and Intel both offer native CLI tools - Apple is the outlier.
 3. **Growing demand**: Rust desktop apps (Tauri), CLI tools, and on-device AI are booming.
 4. **80/20 rule**: Supporting the top 30 ONNX ops covers most practical models.
 5. **Protobuf is open**: The hardest part (format) is documented and stable.
@@ -230,19 +230,19 @@ performance gaps.
 Given this analysis, the project scope should be **narrower and more opinionated** than
 originally proposed. Instead of a general-purpose "coremltools in Rust," consider:
 
-### Option A: `ironmill` — Focused Model Compiler
+### Option A: `ironmill` - Focused Model Compiler
 **Target**: ONNX → CoreML with ANE optimization, CLI + library
 **Scope**: Top 50 ONNX ops, FP16 quantization, basic op fusion
 **Differentiator**: `cargo install ironmill && ironmill compile model.onnx`
 **Audience**: Rust developers shipping on-device inference
 
-### Option B: `mil-rs` — CoreML IR Library (Lower-level, wider impact)
+### Option B: `mil-rs` - CoreML IR Library (Lower-level, wider impact)
 **Target**: MIL IR data structures + CoreML protobuf reader/writer in Rust
 **Scope**: Foundation crate that others build on (converters, optimizers, runtimes)
-**Differentiator**: The "serde of CoreML" — doesn't do conversion itself but enables it
+**Differentiator**: The "serde of CoreML" - doesn't do conversion itself but enables it
 **Audience**: Anyone building CoreML tooling in Rust (or via FFI from C/C++/Swift)
 
-### Option C: Hybrid — Start with B, build A on top
+### Option C: Hybrid - Start with B, build A on top
 **Phase 1**: `mil-rs` crate (IR + protobuf, small, useful immediately)
 **Phase 2**: `ironmill` CLI using `mil-rs` + ONNX reader + basic passes
 **Phase 3**: ANE optimizations, quantization, ecosystem integrations

@@ -1,4 +1,4 @@
-# TurboQuant on ANE via Orion — Feasibility Analysis
+# TurboQuant on ANE via Orion - Feasibility Analysis
 
 > **⚠️ This document describes capabilities of Orion's private ANE APIs
 > (`_ANEClient`, `_ANECompiler`), NOT ironmill's current CoreML/MIL-text
@@ -10,12 +10,12 @@
 > **Prerequisite reading:** [TurboQuant Research Analysis](turboquant-analysis.md)
 >
 > **Prerequisite implementation:** [ANE Direct Runtime Backend](../ane-direct-runtime-plan.md)
-> — the ANE runtime must be built before this plan can be executed.
+> - the ANE runtime must be built before this plan can be executed.
 
 ## Motivation
 
 TurboQuant's runtime KV cache compression is blocked in ironmill today because
-CoreML's `MLModel` API is a black box — ironmill cannot intercept the inference
+CoreML's `MLModel` API is a black box - ironmill cannot intercept the inference
 loop, manage KV cache memory, or insert quantize/dequantize steps between
 attention stages.
 
@@ -41,7 +41,7 @@ against Apple's private ANE compiler and running eval-time correctness checks.
 See [ANE Op Support Matrix](../design/ane-op-support-matrix.md) for complete results.
 
 ```
-Verified supported (74 ops — see `docs/design/ane-op-support-matrix.md`):
+Verified supported (74 ops - see `docs/design/ane-op-support-matrix.md`):
 conv, matmul, linear, relu, relu6, sigmoid, tanh, softmax, silu, softsign,
 softplus, add, mul, sub, real_div, maximum, minimum, floor_div, abs, sign,
 sqrt, square, exp, exp2, erf, ceil, floor, round, atan, pow, clip,
@@ -75,21 +75,21 @@ Most TurboQuant operations map to ANE-native ops. Two gaps require workarounds:
 | **QJL sign extraction** | Threshold at zero → ±1 | `greater` → `select` | ✅ Verified (eval) |
 | **QJL inner product correction** | Dot product of sign vectors | `mul` → `reduce_sum` → `mul` | ✅ Verified |
 | **LUT dequantize (static)** | Compile-time expansion | `constexpr_lut_to_dense` | ✅ Not blocked (compile-time) |
-| **LUT dequantize (runtime)** | Index into reconstruction levels | `gather` | ❌ Unsupported — see below |
+| **LUT dequantize (runtime)** | Index into reconstruction levels | `gather` | ❌ Unsupported - see below |
 | **KV cache read** | Read a range from the cache tensor | `slice_by_index` | ✅ Verified |
-| **KV cache write** | Write new K/V into cache | `scatter` | ❌ Unsupported — see below |
+| **KV cache write** | Write new K/V into cache | `scatter` | ❌ Unsupported - see below |
 
 **Op-level assessment:**
-- ✅ **Arithmetic path is fully verified** — all quantize/dequantize, rotation,
+- ✅ **Arithmetic path is fully verified** - all quantize/dequantize, rotation,
   normalization, and QJL sign extraction ops compile and produce correct results.
-- ⚠️ **Runtime `gather` is unsupported** — this affects dynamic LUT dequantization
+- ⚠️ **Runtime `gather` is unsupported** - this affects dynamic LUT dequantization
   of cached activations. Workarounds: use affine dequant (`mul` + `add`) instead of
   LUT-based, or decompose into `select` chains for small codebooks (≤4 entries).
-- ⚠️ **`scatter` is unsupported** — cache writes require decomposition. Options:
+- ⚠️ **`scatter` is unsupported** - cache writes require decomposition. Options:
   append via `concat`, masked overwrite via `select`, or CPU interception at
   sub-program boundaries (recommended for production).
 
-> **Note on `constexpr_lut_to_dense`:** This is a compile-time op — the ANE
+> **Note on `constexpr_lut_to_dense`:** This is a compile-time op - the ANE
 > compiler expands LUTs into dense weight blobs during program compilation.
 > `gather` failing at runtime does **not** block static weight palettization
 > or PolarQuant. Only runtime/dynamic LUT lookups on activations are affected.
@@ -108,7 +108,7 @@ mdaiter/ane) has confirmed that **ANE hardware natively supports INT4/UINT4**:
 - ANE executes 4-bit convolutions and matmuls directly, achieving **nearly 2×
   throughput compared to INT8**.
 - ANE upconverts INT4 to FP16 internally for arithmetic, but storage and
-  memory transfer use true 4-bit — this is where the bandwidth win comes from.
+  memory transfer use true 4-bit - this is where the bandwidth win comes from.
 - The main constraint is **memory alignment**: 4-bit tensors require specific
   alignment for ANE's DMA engines.
 
@@ -125,7 +125,7 @@ without any pack/unpack overhead.
 ## Storage strategy: native 4-bit on ANE via Orion
 
 With Orion exposing ANE's native INT4 support, the storage strategy simplifies
-dramatically. No pack/unpack step is needed — ANE handles 4-bit tensors
+dramatically. No pack/unpack step is needed - ANE handles 4-bit tensors
 directly.
 
 ```
@@ -152,7 +152,7 @@ directly.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-ANE handles the INT4↔FP16 conversion internally — it stores in 4-bit and
+ANE handles the INT4↔FP16 conversion internally - it stores in 4-bit and
 upconverts to FP16 for arithmetic automatically. This means:
 
 - **No pack/unpack programs** needed (eliminates Risk R3 entirely)
@@ -169,7 +169,7 @@ upconverts to FP16 for arithmetic automatically. This means:
 | 3-bit packed | 0.375 | ~0.4 GB | ~5× |
 
 With native INT4 on ANE, both the memory savings and the compute throughput
-improvement are real — ANE's internal datapath processes 4-bit values with
+improvement are real - ANE's internal datapath processes 4-bit values with
 nearly 2× the throughput of INT8.
 
 ---
@@ -179,7 +179,7 @@ nearly 2× the throughput of INT8.
 With Orion, each phase of inference is compiled as a separate ANE program.
 TurboQuant splits attention into three programs:
 
-### Program 1 — Cache write (runs once per new token)
+### Program 1 - Cache write (runs once per new token)
 
 ```
 Inputs:  K_proj [batch, heads, 1, head_dim]  (Float16, from projection)
@@ -194,7 +194,7 @@ Ops:     matmul(K_proj, R^T)                  → K_rotated   (Float16)
 Outputs: K_quant, V_quant  (INT4)
 ```
 
-### Program 2 — Cache read + attention (runs once per new token)
+### Program 2 - Cache read + attention (runs once per new token)
 
 ```
 Inputs:  Q         [batch, heads, 1, head_dim]     (Float16)
@@ -203,7 +203,7 @@ Inputs:  Q         [batch, heads, 1, head_dim]     (Float16)
          LUT       [16]                               (Float16, const levels)
          R         [head_dim, head_dim]               (Float16, const rotation)
 
-Ops:     # Dequantize — use affine path since runtime gather is unsupported.
+Ops:     # Dequantize - use affine path since runtime gather is unsupported.
          # For 4-bit: mul(cast(K_cache, fp16), scale) + add(offset)
          # Alternative: constexpr_lut_to_dense bakes LUT at compile time,
          # but that only works for static weights, not dynamic cache values.
@@ -223,7 +223,7 @@ Outputs: attn_out (Float16)
 > 2. **Select chains** for small codebooks: `select(equal(x, 0), level_0, select(equal(x, 1), level_1, ...))`
 >    Feasible for 2-bit (4 levels) but impractical for 4-bit (16 levels).
 
-### Program 3 — QJL correction (optional, runs once per new token)
+### Program 3 - QJL correction (optional, runs once per new token)
 
 ```
 Inputs:  residual_signs  [batch, heads, seq_len, head_dim]  (Int8, ±1)
@@ -241,7 +241,7 @@ for unbiased attention scores and can be omitted if slight bias is acceptable.
 
 > **Op gap summary:** The arithmetic pipeline is fully verified on ANE.
 > Runtime `gather` (for LUT dequant) and `scatter` (for cache write) are the
-> two gaps — both have decomposition paths. See
+> two gaps - both have decomposition paths. See
 > [ANE Op Support Matrix](ane-op-support-matrix.md) for the full verified op set.
 
 ### Program compilation budget
@@ -250,7 +250,7 @@ Orion discovered ANE caps at ~119 program compilations per process. A typical
 transformer layer needs ~3–5 programs (FFN, attention variants, cache ops).
 With TurboQuant adding 2–3 programs per layer:
 
-- 32-layer model × 5 programs = 160 — **over budget**
+- 32-layer model × 5 programs = 160 - **over budget**
 - Mitigation: share programs across layers (same architecture = same compiled
   program, different weight pointers). This reduces to ~5–8 unique programs
   total, well within budget.
@@ -293,7 +293,7 @@ At 32 heads × 2 (K+V) × 2 (rotate + un-rotate) = 128 matmuls per token:
 128 × 16,384 = ~2M FLOPs per token
 ```
 
-ANE delivers ~11 TFLOPS FP16 (M4). Time: **~0.2 μs per token** — negligible
+ANE delivers ~11 TFLOPS FP16 (M4). Time: **~0.2 μs per token** - negligible
 compared to the millisecond-scale attention read time.
 
 ### Net effect
@@ -306,7 +306,7 @@ long context lengths where KV cache size dominates.
 
 ## What ironmill needs to build
 
-### Phase 1 — Orion backend integration
+### Phase 1 - Orion backend integration
 
 | Component | Description |
 |-----------|-------------|
@@ -315,7 +315,7 @@ long context lengths where KV cache size dominates.
 | `KvCacheManager` | Manages the packed 4-bit KV cache in IOSurface memory. Handles pack/unpack, cache growth, and eviction. |
 | Program splitter | Given a full model graph, split into sub-programs for ANE execution (FFN, attention-write, attention-read, etc.). |
 
-### Phase 2 — TurboQuant runtime pass
+### Phase 2 - TurboQuant runtime pass
 
 | Component | Description |
 |-----------|-------------|
@@ -324,7 +324,7 @@ long context lengths where KV cache size dominates.
 | Beta-optimal LUT | Reuse from static pass (`beta_quantizer.rs`). Precomputed 16-entry LUT for 4-bit, 8-entry for 3-bit. |
 | Cache format codec | Pack/unpack between Int8 (ANE) and 4-bit packed (memory). Runs as a small ANE program or via NEON on host. |
 
-### Phase 3 — End-to-end pipeline
+### Phase 3 - End-to-end pipeline
 
 | Component | Description |
 |-----------|-------------|
@@ -336,7 +336,7 @@ long context lengths where KV cache size dominates.
 
 ## Risks
 
-### R1 — Orion stability and API surface
+### R1 - Orion stability and API surface
 
 Orion is a research project using private Apple APIs. These APIs can change
 between macOS versions without notice. ironmill would take a dependency on an
@@ -345,7 +345,7 @@ unstable, reverse-engineered interface.
 **Mitigation:** Isolate behind a feature flag (`--features orion-runtime`).
 Keep CoreML as the default backend. Pin to specific macOS versions in CI.
 
-### R2 — ANE program compilation limit (~119 per process)
+### R2 - ANE program compilation limit (~119 per process)
 
 Exceeding the limit crashes the ANE runtime.
 
@@ -353,7 +353,7 @@ Exceeding the limit crashes the ANE runtime.
 same binary, different weight pointers via IOSurface rebinding). A 32-layer
 model should need ~5–8 unique programs, not 32×5.
 
-### R3 — INT4 memory alignment requirements
+### R3 - INT4 memory alignment requirements
 
 ANE's DMA engines require specific memory alignment for 4-bit tensors. Tensor
 shapes and strides must be configured to match ANE's internal tiling. Orion's
@@ -364,7 +364,7 @@ combinations have been tested.
 Add alignment validation to ironmill's ANE program emitter. Fall back to Int8
 containers if a specific tensor shape doesn't meet alignment requirements.
 
-### R4 — Correctness of attention with quantized K/V
+### R4 - Correctness of attention with quantized K/V
 
 Quantization introduces approximation error in attention scores. While
 TurboQuant's theory guarantees near-optimal distortion, practical impact on
@@ -374,9 +374,9 @@ generation quality depends on the model.
 shipping. Offer 4-bit (safe) and 3-bit (aggressive) presets. Always allow
 fallback to FP16.
 
-### R5 — Scope of effort
+### R5 - Scope of effort
 
-This is not a pass — it's a new runtime backend. The Orion integration alone
+This is not a pass - it's a new runtime backend. The Orion integration alone
 is a substantial project before TurboQuant enters the picture.
 
 **Mitigation:** Phase the work. Phase 1 (Orion backend) is independently

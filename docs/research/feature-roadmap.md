@@ -6,7 +6,7 @@ maturity and effort.
 
 ---
 
-## Horizon 1 — Strengthen the Core
+## Horizon 1 - Strengthen the Core
 
 Deepen what ironmill already does well. These features build directly on
 existing infrastructure with moderate effort.
@@ -59,8 +59,8 @@ $ ironmill explore model.onnx \
   palettize-4    380 MB   3.3 ms   5.41         +0.12
 
   Per-layer sensitivity:
-  Layer 14 (self_attn.q_proj): high sensitivity — keep ≥ INT8
-  Layer 27 (mlp.gate_proj):    low sensitivity  — safe at 2-bit
+  Layer 14 (self_attn.q_proj): high sensitivity - keep ≥ INT8
+  Layer 27 (mlp.gate_proj):    low sensitivity  - safe at 2-bit
 ```
 
 Deliverables:
@@ -119,7 +119,7 @@ Deliverables:
 
 ---
 
-## Horizon 2 — Expand the Platform
+## Horizon 2 - Expand the Platform
 
 New capabilities that extend ironmill beyond a converter into a full model
 engineering toolkit.
@@ -142,13 +142,13 @@ $ ironmill extract model.onnx \
 ```
 
 Deliverables:
-- **`split`** — partition a model into draft/verifier pairs for speculative
+- **`split`** - partition a model into draft/verifier pairs for speculative
   decoding, or pre-attention/post-attention halves for ANE execution
-- **`merge`** — combine multiple models into a single CoreML pipeline with
+- **`merge`** - combine multiple models into a single CoreML pipeline with
   defined I/O connections
-- **`extract`** — pull a subgraph (by layer name or index range) into a
+- **`extract`** - pull a subgraph (by layer name or index range) into a
   standalone model
-- **`swap`** — replace a subgraph (e.g., swap a classification head)
+- **`swap`** - replace a subgraph (e.g., swap a classification head)
 - Build on existing `ModelSplitPass` and `compile-pipeline` infrastructure
 
 **Why this matters:** Model composition is manual and error-prone today.
@@ -235,7 +235,7 @@ option for pure-Apple toolchain workflows.
 
 ---
 
-## Horizon 3 — Define the Category
+## Horizon 3 - Define the Category
 
 Ambitious capabilities that establish ironmill as a new kind of tool in the
 ML ecosystem.
@@ -250,16 +250,16 @@ $ ironmill compile model.onnx --runtime metal-direct
 ```
 
 Deliverables:
-- `crates/ironmill-metal/` — new crate implementing `RuntimeBackend` trait
+- `crates/ironmill-metal/` - new crate implementing `RuntimeBackend` trait
 - MIL IR → MPSGraph lowering for standard ops
 - Custom Metal compute shaders for fused attention and quantized matmul
 - Leverage Apple Silicon unified memory for near zero-copy
 - Performance parity with or better than llama.cpp's Metal backend (ironmill
-  has the compiler advantage — optimized graph + direct GPU)
+  has the compiler advantage - optimized graph + direct GPU)
 
 **Why this matters:** CoreML is a black box that decides how to schedule ops.
 Metal direct gives full control. Combined with ironmill's 34 optimization
-passes, this is optimized-graph + direct-GPU — a combination nobody else has.
+passes, this is optimized-graph + direct-GPU - a combination nobody else has.
 
 ---
 
@@ -294,8 +294,8 @@ Runtime profiling that maps performance data back to the model graph.
 $ ironmill profile model.mlpackage --iterations 100
 
   Hotspot analysis:
-  Layer 14 self_attn     1.8 ms  (43% of total)  — running on GPU (ANE fallback)
-  Layer 22 mlp.down_proj 0.6 ms  (14% of total)  — running on ANE
+  Layer 14 self_attn     1.8 ms  (43% of total)  - running on GPU (ANE fallback)
+  Layer 22 mlp.down_proj 0.6 ms  (14% of total)  - running on ANE
   ...
 
   Recommendations:

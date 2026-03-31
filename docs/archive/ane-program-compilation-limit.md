@@ -4,7 +4,7 @@
 
 Appending **any** compute ops to the Qwen3-0.6B pre_attn sub-program
 causes `ANECCompile() FAILED`. The specific ANE resource that's exhausted
-is unknown — the ANE compiler provides no diagnostic beyond the generic
+is unknown - the ANE compiler provides no diagnostic beyond the generic
 failure code.
 
 ## What Was Tested
@@ -17,7 +17,7 @@ after the structural attention split. The base program contains:
 - **K projection:** conv with weight [1024, 1024, 1, 1]
 - **V projection:** conv with weight [1024, 1024, 1, 1]
 - **Total weights:** ~8 MB (fp16), 4 entries (3 conv + 1 norm)
-- **Function outputs:** 3 (Q, K_proj, V_proj — all conv outputs)
+- **Function outputs:** 3 (Q, K_proj, V_proj - all conv outputs)
 
 ### Test Results
 
@@ -40,7 +40,7 @@ weight size barely changes (~8.000 MB → ~8.000 MB). Yet ANE rejects it.
 This means **the constraint is NOT a weight size limit**. The failure
 occurs when the function outputs are changed from direct conv outputs
 to the outputs of downstream compute ops. Something about the program
-structure — not the weight data size — triggers the limit.
+structure - not the weight data size - triggers the limit.
 
 ## Hypotheses (Unconfirmed)
 
@@ -88,7 +88,7 @@ cargo run -p ironmill-ane --example turboquant_e2e_bench --release -- tq
 cargo run -p ironmill-ane --example turboquant_e2e_bench --release -- both
 ```
 
-### Expected output (current code — reorder only, no fusion)
+### Expected output (current code - reorder only, no fusion)
 
 ```
 cache-write fusion: enabled (28 layers, −1 ANE eval/layer)
@@ -159,7 +159,7 @@ weights already saturate ANE's per-program budget.
 3. **CPU-side fusion:** Move the cache-write ops to CPU instead of ANE.
    The rotation matmul + quantization would run on CPU between pre_attn
    and attention evals. This trades ANE eval overhead for CPU compute
-   overhead — may not be net positive for small models.
+   overhead - may not be net positive for small models.
 
 4. **Smaller models:** Models with smaller projection weights (e.g.,
    fewer heads or smaller head_dim) may have enough ANE headroom for
@@ -170,4 +170,4 @@ weights already saturate ANE's per-program budget.
 - `inject_cache_write_ops()` in `crates/ironmill-ane/src/inference.rs`
 - `turboquant_e2e_bench` example in `crates/ironmill-ane/examples/`
 - `step_attention_fused()` in `crates/ironmill-ane/src/turboquant.rs`
-- `docs/development/turboquant-zero-copy.md` — performance context
+- `docs/development/turboquant-zero-copy.md` - performance context

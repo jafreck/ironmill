@@ -1,6 +1,6 @@
-# ANE Attention-Boundary Split — Structural Split Implementation Plan
+# ANE Attention-Boundary Split - Structural Split Implementation Plan
 
-> **Status:** Resolved — split works, runtime eval fixed, e2e inference running
+> **Status:** Resolved - split works, runtime eval fixed, e2e inference running
 >
 > **Was blocking:** [TurboQuant E2E Inference](turboquant-e2e-inference.md) ✅ now running
 >
@@ -8,7 +8,7 @@
 >
 > **Key fix:** ANE rejects IOSurface I/O tensors `[1, C, 1, S]` when
 > C > ~768 and S < 32. Padding dim 3 to S=32 after AneLayoutPass
-> resolved the 0x1d eval error. See "Next Steps — Runtime Inference"
+> resolved the 0x1d eval error. See "Next Steps - Runtime Inference"
 > below for full root cause analysis.
 >
 > **Remaining:** Structural split falls back to name heuristic (softmax
@@ -18,7 +18,7 @@
 ## Problem
 
 The attention-boundary split in `split_at_attention_boundary()` produces
-sub-programs with **invalid reshape operations** — the reshape target
+sub-programs with **invalid reshape operations** - the reshape target
 shape doesn't match the input element count. This affects any model with
 ops between projections and attention (per-head norms, non-standard
 reshape naming), not just Qwen3.
@@ -28,7 +28,7 @@ Example from `layer_1_pre_attn`:
 // matmul output: 1024 elements
 tensor<fp16, [1,1024,1,1]> k_proj = matmul(x=norm_out, y=k_weight)[...];
 
-// reshape to 128 elements — INVALID (1024 ≠ 128)
+// reshape to 128 elements - INVALID (1024 ≠ 128)
 tensor<fp16, [1,128,1,1]> k_reshaped = reshape(x=k_proj, shape=...)[...];
 ```
 
@@ -40,7 +40,7 @@ The pre_attn sub-program only contains the **K projection** and
 **K-norm**, not the full Q/K/V projection set. The reshape from 1024
 to 128 dims is valid in the original model because it follows a K
 projection that outputs `num_kv_heads × head_dim = 8 × 128 = 1024`
-— then reshapes to `[batch, seq, num_kv_heads, head_dim]` before
+- then reshapes to `[batch, seq, num_kv_heads, head_dim]` before
 per-head normalization. But in the split sub-program, the reshape
 target was converted to a flat `[1, 128, 1, 1]` by the ANE layout
 pass, which collapses the multi-head structure into a single-head
@@ -57,12 +57,12 @@ attention cluster. This is fundamentally fragile:
   `SimplifiedLayerNormalization`) have reshape → norm → reshape
   sequences between projections and attention. The boundary between
   "projection ops" and "attention ops" is not separable by name alone.
-- Layer 0 has no pre_attn sub-program at all — every op was
+- Layer 0 has no pre_attn sub-program at all - every op was
   classified as an attention cluster op and stripped entirely.
 - Layers 1–28 have pre_attn sub-programs with only the K projection
   path; Q and V projections were incorrectly stripped.
 
-## Resolution — Structural Split
+## Resolution - Structural Split
 
 Replaced the name-based heuristic with a **data-flow graph traversal**
 (`a016ae6`). The implementation:
@@ -90,7 +90,7 @@ Per-head K/V norm reshapes correctly stay in the attention cluster.
 ## Additional Fixes Discovered During E2E Verification
 
 E2E testing with `turboquant_e2e_bench` on Qwen3-0.6B revealed that
-the structural split was necessary but not sufficient — the sub-programs
+the structural split was necessary but not sufficient - the sub-programs
 also failed ANE compilation due to MIL emission issues. These were fixed
 in `7accb97` and `f1f7b6b`:
 
@@ -109,10 +109,10 @@ inline literal values. The ONNX converter stores these as inline
 
 ### 2. AneLayoutPass fixes
 
-- Removed attribute reshaping — `axes`, `keep_dims` etc. are metadata
+- Removed attribute reshaping - `axes`, `keep_dims` etc. are metadata
   parameters, not activation tensors. Reshaping them corrupts semantics.
 - Skip reshaping integer tensor inputs (`Value::Tensor` with int dtype)
-  — these are parameter metadata (axes vectors, shape arrays).
+  - these are parameter metadata (axes vectors, shape arrays).
 
 ### 3. ONNX SimplifiedLayerNormalization → decomposed RMSNorm
 
@@ -129,7 +129,7 @@ verified, max_err=0.0004), and `reduce_mean` with const ref args.
 ### 4. MIL text emitter fixes
 
 - Integer const tensors (axes, shapes) emitted **inline** instead of
-  BLOBFILE — ANE expects inline for small parameter tensors.
+  BLOBFILE - ANE expects inline for small parameter tensors.
 - Reduce op output type inference: collapses the reduced axis dimension
   to 1 (was incorrectly copying the input shape).
 
@@ -139,9 +139,9 @@ verified, max_err=0.0004), and `reduce_mean` with const ref args.
 |---|---|---|
 | `pre_attn` (all 29 layers) | ✅ Compiles | Structural split + RMSNorm fixes |
 | `post_attn` (all 29 layers) | ✅ Compiles | matmul→conv + SiLU fusion |
-| E2E inference | ❌ Eval fails | Runtime tensor buffer error — see next steps |
+| E2E inference | ❌ Eval fails | Runtime tensor buffer error - see next steps |
 
-### Completed — post_attn ANE Compilation
+### Completed - post_attn ANE Compilation
 
 The `post_attn` sub-program now compiles successfully on ANE:
 
@@ -154,15 +154,15 @@ The `post_attn` sub-program now compiles successfully on ANE:
 2. **`sigmoid` + `mul` → `silu` fusion** ✅: Added to `OpSubstitutionPass`.
    Detects `mul(a, sigmoid(a))` in either input ordering and replaces
    with `silu(a)`. Both `sigmoid` (max_err=0.003) and `silu`
-   (max_err=0.015) are eval-verified on ANE — fusion is an optimization,
+   (max_err=0.015) are eval-verified on ANE - fusion is an optimization,
    not a correctness requirement.
    **File:** `crates/mil-rs/src/ir/passes/op_substitute.rs`
 
-### Next Steps — Runtime Inference
+### Next Steps - Runtime Inference
 
 All 29 layers compile (5.99s), but `ANEProgramProcessRequestDirect()`
 fails at eval time with `status=0x1d : statusType=0x9: Program Inference
-error`. This is a **pre-existing** runtime error — identical with and
+error`. This is a **pre-existing** runtime error - identical with and
 without the matmul→conv/SiLU changes (verified by reverting).
 
 **Reproduce:** `cargo run -p ironmill-ane --example turboquant_e2e_bench --release`
@@ -181,17 +181,17 @@ the hardware rejects them at eval. Empirical boundary:
 - `C=768, S=33`: ❌ fails
 
 This is NOT about IOSurface allocation size (tested with exact-fit and
-padded — both same result). It's an ANE hardware constraint on how
+padded - both same result). It's an ANE hardware constraint on how
 function I/O buffers map to the ANE's on-chip memory.
 
 **Evidence from external projects:**
 
-- **Orion** (mechramc/Orion): Uses GPT-2 124M with `d_model=768` — below
+- **Orion** (mechramc/Orion): Uses GPT-2 124M with `d_model=768` - below
   the threshold. Tests use shapes like `[1, 32, 1, 32]`.
 - **maderix/ANE**: Documents "multi-input ANE requests cause 0x1d error"
   and packs ALL data (activations + weights) into a **single spatial
   input** tensor. For Qwen3-0.6B (DIM=1024, SEQ=256), the input is
-  `[1, 1024, 1, 4352]` — always large spatial. They also use only
+  `[1, 1024, 1, 4352]` - always large spatial. They also use only
   1 input and 1 output per kernel.
 
 **Fix (in progress):** After all passes (including AneLayoutPass which
@@ -201,7 +201,7 @@ shapes; at decode time, write one token's data into column 0 and read
 from column 0. The padding columns contain zeros which don't affect
 correctness for elementwise or channel-reduction ops.
 
-**Additional constraint — single input per eval call:** maderix/ANE
+**Additional constraint - single input per eval call:** maderix/ANE
 reports that multi-input ANE requests cause 0x1d error. Ironmill's
 `post_attn` sub-programs have 2 inputs (attention output + residual).
 After fixing the shape constraint, this may be the next blocker. The
@@ -212,15 +212,15 @@ a single input tensor (matching how maderix and Orion handle this).
 
 1. ✅ Added `.map_err()` context → **layer 0 pre_attn** is the first
    eval that fails
-2. ✅ Isolated to the MIL program itself — fails even when compiled and
+2. ✅ Isolated to the MIL program itself - fails even when compiled and
    evaluated in complete isolation (no other programs loaded)
 3. ✅ Narrowed to shape constraint: `[1, 1024, 1, 1]` fails, not op-
    specific (even `mul(x,x)` fails at this shape)
-4. ✅ Padded S from 1 to 32 after AneLayoutPass in `inference.rs` —
+4. ✅ Padded S from 1 to 32 after AneLayoutPass in `inference.rs` -
    sub-programs compile and eval with `[1, 1024, 1, 32]` shapes
 5. ✅ Updated `decode()` with scatter-write / gather-read helpers
    (`write_f16_padded`, `read_f16_channels`) for NCHW column-0 I/O
-6. ✅ **FP16 baseline inference works end-to-end** — 128 tokens
+6. ✅ **FP16 baseline inference works end-to-end** - 128 tokens
    generated at 5.9 tok/s on Qwen3-0.6B (29 layers, ANE-only decode)
 
 #### Remaining: TurboQuant uniform alloc size
@@ -236,7 +236,7 @@ Note: the multi-input constraint from maderix/ANE may also apply here.
 
 ## Implementation Tasks
 
-### Task 1 — Build op dependency graph ✅
+### Task 1 - Build op dependency graph ✅
 
 `OpGraph` struct with `forward`/`backward` adjacency lists built from
 `Value::Reference` edges. Provides `walk_forward()` and `walk_backward()`
@@ -244,7 +244,7 @@ for transitive graph traversal.
 
 **File:** `crates/ironmill-ane/src/split.rs`
 
-### Task 2 — Identify anchor ops structurally ✅
+### Task 2 - Identify anchor ops structurally ✅
 
 - **Q/K/V projections**: grouped by shared non-const activation input
   (earliest group of 2+ matmul/linear ops sharing the same norm output).
@@ -254,7 +254,7 @@ for transitive graph traversal.
 
 **File:** `crates/ironmill-ane/src/split.rs`
 
-### Task 3 — Implement graph-based split ✅
+### Task 3 - Implement graph-based split ✅
 
 Pre-attn = backward from projections' non-const inputs. Post-attn =
 O-proj + forward + associated consts. Everything else = attention
@@ -262,14 +262,14 @@ cluster (stripped). Falls back to legacy name heuristic on failure.
 
 **File:** `crates/ironmill-ane/src/split.rs`
 
-### Task 4 — Tests for the structural split ✅
+### Task 4 - Tests for the structural split ✅
 
 Five tests: standard GQA, Qwen3-like per-head norms, no-attention
 fallback, layer-0 edge case, OpGraph unit test. All pass.
 
 **File:** `crates/ironmill-ane/src/split.rs` (test module)
 
-### Task 5 — ANE compilation fixes ✅
+### Task 5 - ANE compilation fixes ✅
 
 `AneArgPromotionPass`, `AneLayoutPass` metadata fixes, RMSNorm →
 Orion-style decomposition, MIL emitter int tensor inline emission.
@@ -280,12 +280,12 @@ pre_attn compiles for all 29 Qwen3-0.6B layers.
 `crates/mil-rs/src/convert/onnx_to_mil.rs`,
 `crates/mil-rs/src/convert/ir_to_mil_text.rs`
 
-### Task 6 — E2E validation with AneInference::compile() 🔶
+### Task 6 - E2E validation with AneInference::compile() 🔶
 
 Both pre_attn and post_attn compile for all 29 layers. matmul→conv
 (`AneMatmulToConvPass`) and SiLU fusion (`OpSubstitutionPass`) are
 complete. Runtime inference fails with `ANEProgramProcessRequestDirect()
-status=0x1d` — see "Next Steps — Runtime Inference" above.
+status=0x1d` - see "Next Steps - Runtime Inference" above.
 
 **File:** `crates/ironmill-ane/src/inference.rs`
 
@@ -293,17 +293,17 @@ status=0x1d` — see "Next Steps — Runtime Inference" above.
 
 | File | Role |
 |---|---|
-| `crates/ironmill-ane/src/split.rs` | `split_at_attention_boundary()` — structural split with `OpGraph`. Called by `split_for_ane()`. |
+| `crates/ironmill-ane/src/split.rs` | `split_at_attention_boundary()` - structural split with `OpGraph`. Called by `split_for_ane()`. |
 | `crates/ironmill-ane/src/inference.rs` | `AneInference::compile()` → pass pipeline + `split_for_ane()` with `split_attention: true` |
-| `crates/mil-rs/src/ir/passes/ane_arg_promotion.rs` | `AneArgPromotionPass` — promotes inline reduce/norm args to const refs, remaps axes |
-| `crates/mil-rs/src/ir/passes/ane_layout.rs` | `AneLayoutPass` — reshapes tensors to `[1, C, 1, S]`. Fixed to skip metadata values. |
+| `crates/mil-rs/src/ir/passes/ane_arg_promotion.rs` | `AneArgPromotionPass` - promotes inline reduce/norm args to const refs, remaps axes |
+| `crates/mil-rs/src/ir/passes/ane_layout.rs` | `AneLayoutPass` - reshapes tensors to `[1, C, 1, S]`. Fixed to skip metadata values. |
 | `crates/mil-rs/src/convert/onnx_to_mil.rs` | ONNX → MIL converter. `SimplifiedLayerNormalization` → decomposed RMSNorm with axis=1. |
 | `crates/mil-rs/src/convert/ir_to_mil_text.rs` | MIL text emitter. Int tensors inline, reduce output type inference. |
-| `crates/mil-rs/src/ir/passes/op_substitute.rs` | `OpSubstitutionPass` — gelu substitution + rsqrt pattern detection. |
+| `crates/mil-rs/src/ir/passes/op_substitute.rs` | `OpSubstitutionPass` - gelu substitution + rsqrt pattern detection. |
 
 ## References
 
-- [ANE MIL Emitter Compatibility](ane-mil-emitter-compat.md) — predecessor investigation (resolved; `emit_const_op` fix in `2c9c10a`)
+- [ANE MIL Emitter Compatibility](ane-mil-emitter-compat.md) - predecessor investigation (resolved; `emit_const_op` fix in `2c9c10a`)
 - [TurboQuant E2E Inference](turboquant-e2e-inference.md)
-- [Orion project](https://github.com/mechramc/Orion) — reference ANE implementation; `orion_mil_rmsnorm` pattern used for RMSNorm decomposition
-- [ANE Op Support Matrix](../research/ane-op-support-matrix.md) — empirically verified op support table
+- [Orion project](https://github.com/mechramc/Orion) - reference ANE implementation; `orion_mil_rmsnorm` pattern used for RMSNorm decomposition
+- [ANE Op Support Matrix](../research/ane-op-support-matrix.md) - empirically verified op support table

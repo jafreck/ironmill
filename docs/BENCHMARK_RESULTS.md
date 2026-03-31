@@ -9,13 +9,13 @@
 
 Four benchmark suites measure different aspects of ironmill's optimization pipeline:
 
-1. **Compile-time performance** (Criterion) — measures how fast ironmill transforms model graphs in-memory. Each benchmark loads an ONNX model, converts to MIL IR, and runs the optimization pipeline. Timings are median of 100 samples after warmup.
+1. **Compile-time performance** (Criterion) - measures how fast ironmill transforms model graphs in-memory. Each benchmark loads an ONNX model, converts to MIL IR, and runs the optimization pipeline. Timings are median of 100 samples after warmup.
 
-2. **Model size** — compares `.mlpackage` output size across optimization configurations against the original ONNX file size.
+2. **Model size** - compares `.mlpackage` output size across optimization configurations against the original ONNX file size.
 
-3. **Numerical quality** — compares weight tensor values between baseline (unoptimized) and optimized models. FP16 values are converted back to FP32; INT8 values are dequantized via stored scale/zero-point; palettized values are reconstructed from LUT + indices. All comparisons are element-wise against the original FP32 weights.
+3. **Numerical quality** - compares weight tensor values between baseline (unoptimized) and optimized models. FP16 values are converted back to FP32; INT8 values are dequantized via stored scale/zero-point; palettized values are reconstructed from LUT + indices. All comparisons are element-wise against the original FP32 weights.
 
-4. **Inference latency** — end-to-end inference on Apple Silicon using the Rust `ironmill-bench` harness. Models are compiled to `.mlmodelc` via `xcrun coremlcompiler` and loaded with `MLModel`. Latencies are measured over 200 iterations after 20 warmup runs, across 3 independent runs. Significance tested with Welch's t-test against the FP32 baseline (`*** p<0.001, ** p<0.01, * p<0.05`).
+4. **Inference latency** - end-to-end inference on Apple Silicon using the Rust `ironmill-bench` harness. Models are compiled to `.mlmodelc` via `xcrun coremlcompiler` and loaded with `MLModel`. Latencies are measured over 200 iterations after 20 warmup runs, across 3 independent runs. Significance tested with Welch's t-test against the FP32 baseline (`*** p<0.001, ** p<0.01, * p<0.05`).
 
 ---
 
@@ -55,7 +55,7 @@ Significance is Welch's t-test against the baseline (`*** p<0.001`).
 
 ### Key Findings
 
-- **FP16 + ANE is the fastest configuration** — 7–11× faster than unoptimized
+- **FP16 + ANE is the fastest configuration** - 7–11× faster than unoptimized
   CPU inference. The Neural Engine's FP16 data path is specifically optimized
   for half-precision arithmetic, which is why ironmill's FP16 quantization pass
   unlocks performance that other optimizations cannot.
@@ -65,7 +65,7 @@ Significance is Welch's t-test against the baseline (`*** p<0.001`).
   minimal. PolarQuant's primary value is on transformer architectures where
   most weight tensors qualify (see Qwen3 results below).
 - **INT8 and palettization reduce model size but don't improve inference** on
-  any backend — their value is in deployment size and load time, not throughput.
+  any backend - their value is in deployment size and load time, not throughput.
 - **GPU (Metal) provides consistent ~1.5ms latency** across all optimizations,
   making it the most predictable backend for latency-sensitive applications.
 
@@ -216,7 +216,7 @@ Compares reconstructed weight values against original FP32 weights to quantify p
 - **SNR 20–30 dB**: Acceptable for most tasks but should be validated on a representative dataset.
 - **SNR < 20 dB**: Significant precision loss. Requires task-specific accuracy testing before deployment.
 
-FP16 is nearly lossless (73+ dB SNR). INT8 provides strong compression with good fidelity (~40 dB). 4-bit palettization shows meaningful error that warrants task-level validation — recommended for size-constrained deployments where slight accuracy loss is acceptable.
+FP16 is nearly lossless (73+ dB SNR). INT8 provides strong compression with good fidelity (~40 dB). 4-bit palettization shows meaningful error that warrants task-level validation - recommended for size-constrained deployments where slight accuracy loss is acceptable.
 
 ---
 

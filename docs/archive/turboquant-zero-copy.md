@@ -13,7 +13,7 @@ pre_attn (ANE)
   ├─ CPU: copy_column0_from(V → cw_v_staging)     ← memcpy #2
   │
   ▼
-cache-write MIL (ANE) — handcrafted
+cache-write MIL (ANE) - handcrafted
   │ inputs:  cw_k_staging, cw_v_staging, rotation_matrix
   │ ops:     reshape → matmul(rotate) → mul(scale) → round → clip → cast(int8) → cast(fp16)
   │ outputs: K_quant [1,kv_ch,1,32], V_quant [1,kv_ch,1,32]
@@ -26,7 +26,7 @@ cache-write MIL (ANE) — handcrafted
   ├─ CPU: copy_column0_from(Q → attn_q_staging)    ← memcpy #6
   │
   ▼
-attention MIL (ANE) — handcrafted (separate from FP16 emitter)
+attention MIL (ANE) - handcrafted (separate from FP16 emitter)
   │ inputs:  attn_q_staging, k_cache(INT8), v_cache(INT8), unrotation_matrix
   │ ops:     slice → cast(int8→fp16) → mul(deq) → sub(offset) → reshape → matmul(unrotate K)
   │          → matmul(unrotate V) → reshape → [GQA tile] → matmul(QK) → scale → softmax
@@ -45,12 +45,12 @@ post_attn (ANE)
 
 ```
 pre_attn (ANE)
-  │ outputs: Q, K_proj, V_proj — allocated with tq_alloc_size
+  │ outputs: Q, K_proj, V_proj - allocated with tq_alloc_size
   │
-  │ (no CPU copy — IOSurfaces passed directly via unified alloc size)
+  │ (no CPU copy - IOSurfaces passed directly via unified alloc size)
   │
   ▼
-cache-write MIL (ANE) — handcrafted
+cache-write MIL (ANE) - handcrafted
   │ inputs:  K_proj IOSurface, V_proj IOSurface, rotation_matrix
   │ ops:     reshape → matmul(rotate) → mul(scale) → round → clip → cast(int8) → cast(fp16)
   │ outputs: K_quant [1,kv_ch,1,32], V_quant [1,kv_ch,1,32] as FP16
@@ -60,7 +60,7 @@ cache-write MIL (ANE) — handcrafted
   │   (single locked pass per tensor, zero heap allocations)
   │
   ▼
-attention MIL (ANE) — unified emitter (AttentionMilConfig), Q-rotation
+attention MIL (ANE) - unified emitter (AttentionMilConfig), Q-rotation
   │ inputs:  Q IOSurface, k_cache(INT8), v_cache(INT8), rotation_matrix
   │ ops:     matmul(rotate Q) ← O(head_dim²), constant per token
   │          → slice → cast(int8→fp16) → mul(deq_scale) → reshape
@@ -69,7 +69,7 @@ attention MIL (ANE) — unified emitter (AttentionMilConfig), Q-rotation
   │          → reshape
   │ outputs: attn_out IOSurface
   │
-  │ (no CPU copy — attn_out IOSurface passed directly to post_attn)
+  │ (no CPU copy - attn_out IOSurface passed directly to post_attn)
   │
   ▼
 post_attn (ANE)
@@ -136,7 +136,7 @@ attention output after the AV matmul.
 - Since R is orthogonal: `⟨R·Q, K_dequant⟩ = ⟨Q, R⁻¹·K_dequant⟩` (identical scores)
 - For V: output is `softmax(scores) · (R·V)^T`, un-rotate via `attn_pre · R`
 
-This is consistent with the TurboQuant paper's formulation — the paper
+This is consistent with the TurboQuant paper's formulation - the paper
 defines quantize/dequantize as abstract primitives that preserve inner
 products. Where the inverse rotation is applied is an implementation
 choice; the distortion bounds and quantization quality are identical.
@@ -154,12 +154,12 @@ doubles cache memory, negating TurboQuant's core benefit.
 Instead, the cache remains INT8 (1 byte/element) and the attention MIL
 program accepts INT8 function inputs directly. The `cast(int8→fp16)` op
 runs on the ANE inline before dequantization. This was verified
-empirically — ANE compiles and evaluates INT8 function inputs without
+empirically - ANE compiles and evaluates INT8 function inputs without
 error, contrary to the earlier assumption in `ane-op-support-matrix.md`
 that function inputs were limited to fp16/fp32/bool.
 
 **Key correction:** `ane-op-support-matrix.md` stated that ANE rejects
-INT8 function inputs. This is incorrect — INT8 function inputs compile
+INT8 function inputs. This is incorrect - INT8 function inputs compile
 and eval successfully. The restriction applies only to INT8 function
 *outputs* (ANE rejects those, which is why cache-write casts INT8→FP16
 before outputting).
@@ -218,9 +218,9 @@ TurboQuant adds these costs compared to FP16 baseline, per layer per token:
 | Cache-write ANE eval | Extra eval() call | **Fixed ~50μs** |
 | `cast(int8→fp16)` on cache | On-chip ANE op | O(seq_len) |
 | `mul(deq_scale)` on cache | On-chip ANE op | O(seq_len) |
-| Q rotation matmul | On-chip ANE op | O(head_dim²) — **constant** |
-| Output un-rotation matmul | On-chip ANE op | O(head_dim²) — **constant** |
-| IOSurface copy K+V | CPU, zero-alloc | O(kv_channels) — **constant** |
+| Q rotation matmul | On-chip ANE op | O(head_dim²) - **constant** |
+| Output un-rotation matmul | On-chip ANE op | O(head_dim²) - **constant** |
+| IOSurface copy K+V | CPU, zero-alloc | O(kv_channels) - **constant** |
 
 The bandwidth savings from INT8 (reading half the cache bytes) must
 exceed these combined costs for TQ to outperform FP16. For Qwen3-0.6B
@@ -270,7 +270,7 @@ ideal but requires deep ANE compiler integration.
 Investigation of [Orion](https://github.com/mechramc/Orion) (direct ANE
 runtime, no TurboQuant) confirmed:
 
-- Orion also uses CPU-side copies for KV cache updates — no project has
+- Orion also uses CPU-side copies for KV cache updates - no project has
   achieved true zero-copy ANE→cache writes
 - Orion does **CPU-side attention during decode** (not ANE attention),
   so its KV cache layout is unconstrained
@@ -281,12 +281,12 @@ runtime, no TurboQuant) confirmed:
 
 ## References
 
-- `copy_column0_fp16_as_int8_to` — zero-alloc IOSurface-to-IOSurface copy
-- `update_cache_direct` — direct cache update from ANE output tensors
-- `emit_attention_mil` — unified attention MIL emitter (TQ + FP16)
-- `AttentionMilConfig` — configuration struct for the unified emitter
-- `emit_cache_write_mil` — cache-write MIL (rotate + quantize)
-- `step_attention` in `turboquant.rs` — current data path
-- `compile_and_load_sub` in `inference.rs` — `min_output_alloc` param
-- FP16 decode path in `inference.rs` — zero-copy comparison target
+- `copy_column0_fp16_as_int8_to` - zero-alloc IOSurface-to-IOSurface copy
+- `update_cache_direct` - direct cache update from ANE output tensors
+- `emit_attention_mil` - unified attention MIL emitter (TQ + FP16)
+- `AttentionMilConfig` - configuration struct for the unified emitter
+- `emit_cache_write_mil` - cache-write MIL (rotate + quantize)
+- `step_attention` in `turboquant.rs` - current data path
+- `compile_and_load_sub` in `inference.rs` - `min_output_alloc` param
+- FP16 decode path in `inference.rs` - zero-copy comparison target
 - TurboQuant paper: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)

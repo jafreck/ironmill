@@ -2,7 +2,7 @@
 
 Current state: Qwen3-0.6B end-to-end on ANE with FP16 baseline (6.1
 tok/s) and TurboQuant INT8 (5.5 tok/s, 14.5 MB KV cache). Both paths
-run but neither computes real attention — 0% token agreement between
+run but neither computes real attention - 0% token agreement between
 them confirms output is not meaningful yet.
 
 Key constraints discovered (see `ane-attention-split-investigation.md`):
@@ -15,7 +15,7 @@ Key constraints discovered (see `ane-attention-split-investigation.md`):
 
 ---
 
-## Phase 0 — Pad TurboQuant MIL shapes to S ≥ 32
+## Phase 0 - Pad TurboQuant MIL shapes to S ≥ 32
 
 **Problem:** TurboQuant's MIL programs declare S=1 shapes for their
 function inputs: cache-write uses `[1, kv_ch, 1, 1]` (kv_ch=1024) and
@@ -31,14 +31,14 @@ Update the staging buffer writes to use scatter (column-0) layout, and
 reads to use gather.
 
 **Files:**
-- `crates/ironmill-ane/src/turboquant_mil.rs` — MIL shape declarations
-- `crates/ironmill-ane/src/turboquant.rs` — staging I/O
+- `crates/ironmill-ane/src/turboquant_mil.rs` - MIL shape declarations
+- `crates/ironmill-ane/src/turboquant.rs` - staging I/O
 
-## Phase 1 — Implement FP16 attention sub-programs (correctness)
+## Phase 1 - Implement FP16 attention sub-programs (correctness)
 
 **Problem:** The FP16 baseline path has no real attention computation.
 When `fp16_attn` is `None` (always, currently), `decode()` passes raw Q
-through as the attention output. Without attention, output is garbage —
+through as the attention output. Without attention, output is garbage -
 0% token agreement between baseline and TurboQuant confirms this.
 
 **Fix:** The attention split identifies attention cluster ops (softmax,
@@ -61,10 +61,10 @@ All required ops are ✅ eval-verified on ANE: `softmax`, `matmul`,
 benchmarks. Not a throughput optimization.
 
 **Files:**
-- `crates/ironmill-ane/src/split.rs` — attention cluster emission
-- `crates/ironmill-ane/src/inference.rs` — sub-program classification
+- `crates/ironmill-ane/src/split.rs` - attention cluster emission
+- `crates/ironmill-ane/src/inference.rs` - sub-program classification
 
-## Phase 2 — Fix structural attention split
+## Phase 2 - Fix structural attention split
 
 **Problem:** The structural attention split falls back to the name
 heuristic on every run ("structural attention split failed, falling back
@@ -73,10 +73,10 @@ to name heuristic (12 ops)"). This produces suboptimal sub-programs:
 - post_attn contains projections + O projection + FFN
 
 **Root cause (empirically confirmed):** `find_softmax_ops()` returns
-empty — no softmax ops found in the 12 ops per layer. The ONNX model
+empty - no softmax ops found in the 12 ops per layer. The ONNX model
 uses `GroupQueryAttention` which the converter decomposes into ops
 including `softmax`, so softmax should exist. The 12 ops per layer is
-suspiciously few — the issue is likely in how model_split partitions
+suspiciously few - the issue is likely in how model_split partitions
 layers before the attention split runs, or in how the decomposed GQA
 ops are structured after passes. Needs further investigation.
 
@@ -89,9 +89,9 @@ present but not found (detection issue).
 requires correct attention cluster identification).
 
 **Files:**
-- `crates/ironmill-ane/src/split.rs` — structural split logic
+- `crates/ironmill-ane/src/split.rs` - structural split logic
 
-## Phase 3 — Pre-allocate TurboQuant output tensors
+## Phase 3 - Pre-allocate TurboQuant output tensors
 
 **Problem:** `step_attention()` allocates `k_quant`, `v_quant`, and
 `attn_out` as new IOSurface-backed tensors on every call. That's 3
@@ -105,10 +105,10 @@ calls.
 **Impact:** Reduced allocation overhead. Simple change.
 
 **Files:**
-- `crates/ironmill-ane/src/turboquant.rs` — `TurboQuantModel` struct,
+- `crates/ironmill-ane/src/turboquant.rs` - `TurboQuantModel` struct,
   `compile()`, `step_attention()`
 
-## Phase 4 — Remove MIN_SURFACE_ALLOC
+## Phase 4 - Remove MIN_SURFACE_ALLOC
 
 **Depends on:** Phase 0 (TurboQuant shape padding).
 
@@ -131,10 +131,10 @@ currently only work because the 48KB floor inflates the IOSurface).
 **Risk:** Low if Phase 0 is done first.
 
 **Files:**
-- `crates/ironmill-ane/src/tensor.rs` — `MIN_SURFACE_ALLOC`,
+- `crates/ironmill-ane/src/tensor.rs` - `MIN_SURFACE_ALLOC`,
   `uniform_alloc_size`, `new_with_min_alloc`
 
-## Phase 5 — Reduce TurboQuant CPU round-trips
+## Phase 5 - Reduce TurboQuant CPU round-trips
 
 **Problem:** `step_attention` does 8 CPU↔IOSurface memcpy operations
 per layer (3 `gather_column0` reads + 3 staging `write_f16` + 2
@@ -142,7 +142,7 @@ per layer (3 `gather_column0` reads + 3 staging `write_f16` + 2
 operations per token.
 
 The CPU interception (reading quantized K/V from ANE, converting to
-INT8 bytes, writing to persistent cache) is architecturally necessary —
+INT8 bytes, writing to persistent cache) is architecturally necessary -
 ANE outputs whole tensors with no mechanism for partial/offset writes,
 so the ANE can't write directly to a specific position in the persistent
 KV cache IOSurface.
@@ -159,9 +159,9 @@ KV cache IOSurface.
 **Impact:** ~10-20% latency reduction for TurboQuant path.
 
 **Files:**
-- `crates/ironmill-ane/src/turboquant.rs` — `step_attention()`
+- `crates/ironmill-ane/src/turboquant.rs` - `step_attention()`
 
-## Phase 6 — Spatial input packing
+## Phase 6 - Spatial input packing
 
 **Problem:** All sub-program I/O tensors have dim 3 (S) padded from 1
 to 32 to satisfy the ANE minimum-S constraint. This means:
@@ -185,16 +185,16 @@ For ironmill:
 
 This also addresses the multi-input robustness concern (Phase 7).
 
-**Impact:** Unverified — directionally reduces wasted compute and
+**Impact:** Unverified - directionally reduces wasted compute and
 eliminates scatter/gather overhead, but the magnitude depends on whether
 ANE latency is compute-bound or dispatch-bound for these small tensors.
 
 **Files:**
-- `crates/ironmill-ane/src/inference.rs` — `compile()`, `decode()`,
+- `crates/ironmill-ane/src/inference.rs` - `compile()`, `decode()`,
   `compile_and_load_sub()`
 - New pass or post-split transform to pack/unpack I/O
 
-## Phase 7 — Single-input robustness
+## Phase 7 - Single-input robustness
 
 **Problem:** maderix/ANE documents that multi-input ANE requests cause
 0x1d errors. Ironmill currently uses multiple inputs successfully:
@@ -237,10 +237,10 @@ Phases 0, 2, 3 can all start immediately in parallel.
 
 ## References
 
-- maderix/ANE: https://github.com/maderix/ANE — training on ANE,
+- maderix/ANE: https://github.com/maderix/ANE - training on ANE,
   documents single-input constraint and spatial packing pattern
-- Orion: https://github.com/mechramc/Orion — ANE inference runtime,
+- Orion: https://github.com/mechramc/Orion - ANE inference runtime,
   exact-fit IOSurface allocation, GPT-2 124M (d_model=768)
-- `docs/development/ane-attention-split-investigation.md` — root cause
+- `docs/development/ane-attention-split-investigation.md` - root cause
   analysis of the 0x1d eval error and ANE shape constraints
-- `docs/research/ane-op-support-matrix.md` — op support verification
+- `docs/research/ane-op-support-matrix.md` - op support verification

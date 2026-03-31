@@ -1,4 +1,4 @@
-# MIL Op Parity Plan — coremltools Coverage
+# MIL Op Parity Plan - coremltools Coverage
 
 ironmill currently supports ~55 unique MIL op types via ~62 ONNX→MIL conversion
 handlers. Apple's `coremltools` defines ~170 unique MIL ops across the
@@ -7,11 +7,11 @@ implementation plan to reach full parity.
 
 For each op the work is:
 
-1. **IR support** — `ir_to_proto` serializes it; `proto_to_ir` deserializes it
-2. **ONNX converter** — add a handler in `onnx_to_mil.rs` (when an ONNX
+1. **IR support** - `ir_to_proto` serializes it; `proto_to_ir` deserializes it
+2. **ONNX converter** - add a handler in `onnx_to_mil.rs` (when an ONNX
    equivalent exists)
-3. **Validation** — type / shape inference rules in the validator
-4. **Tests** — round-trip serialization + ONNX conversion correctness
+3. **Validation** - type / shape inference rules in the validator
+4. **Tests** - round-trip serialization + ONNX conversion correctness
 
 ---
 
@@ -32,7 +32,7 @@ kv_cache_read, kv_cache_update, repeat_interleave, dequantize
 
 ---
 
-## Phase 1 — Elementwise Arithmetic & Comparison Gaps (23 ops) · Critical
+## Phase 1 - Elementwise Arithmetic & Comparison Gaps (23 ops) · Critical
 
 These are building blocks used in nearly every model. Many are thin wrappers
 with straightforward semantics.
@@ -60,19 +60,19 @@ with straightforward semantics.
 | `asin` | iOS15 | `Asin` | trig |
 | `atanh` | iOS15 | `Atanh` | hyperbolic |
 | `cosh` | iOS15 | `Cosh` | hyperbolic |
-| `exp2` | iOS15 | — | decompose: `exp(x * ln2)` |
+| `exp2` | iOS15 | - | decompose: `exp(x * ln2)` |
 | `inverse` | iOS15 | `Reciprocal` | 1/x (alias of reciprocal) |
 | `round` | iOS15 | `Round` | round to nearest |
-| `rsqrt` | iOS15 | — | decompose: `pow(x, -0.5)` |
+| `rsqrt` | iOS15 | - | decompose: `pow(x, -0.5)` |
 | `sign` | iOS15 | `Sign` | signum |
 | `sinh` | iOS15 | `Sinh` | hyperbolic |
-| `square` | iOS15 | — | decompose: `mul(x, x)` |
+| `square` | iOS15 | - | decompose: `mul(x, x)` |
 | `tan` | iOS15 | `Tan` | trig |
-| `threshold` | iOS15 | — | `x if x > α else α` |
+| `threshold` | iOS15 | - | `x if x > α else α` |
 
 ---
 
-## Phase 2 — Activation Functions (12 ops) · Critical
+## Phase 2 - Activation Functions (12 ops) · Critical
 
 Many legacy and specialized CNN / GAN architectures depend on these.
 
@@ -81,19 +81,19 @@ Many legacy and specialized CNN / GAN architectures depend on these.
 | `clamped_relu` | iOS15 | `Clip` + `Relu` | relu capped at α, β |
 | `elu` | iOS15 | `Elu` | exponential linear unit |
 | `leaky_relu` | iOS15 | `LeakyRelu` | standard |
-| `linear_activation` | iOS15 | — | `α * x + β` |
+| `linear_activation` | iOS15 | - | `α * x + β` |
 | `prelu` | iOS15 | `PRelu` | parametric relu |
-| `relu6` | iOS15 | — | decompose: `clip(relu(x), 0, 6)` |
-| `scaled_tanh` | iOS15 | — | `α * tanh(β * x)` |
+| `relu6` | iOS15 | - | decompose: `clip(relu(x), 0, 6)` |
+| `scaled_tanh` | iOS15 | - | `α * tanh(β * x)` |
 | `sigmoid_hard` | iOS15 | `HardSigmoid` | piecewise linear approx |
 | `softplus` | iOS15 | `Softplus` | `log(1 + exp(x))` |
-| `softplus_parametric` | iOS15 | — | `α * log(1 + exp(β * x))` |
+| `softplus_parametric` | iOS15 | - | `α * log(1 + exp(β * x))` |
 | `softsign` | iOS15 | `Softsign` | `x / (1 + |x|)` |
 | `thresholded_relu` | iOS15 | `ThresholdedRelu` | `x if x > α else 0` |
 
 ---
 
-## Phase 3 — Reduction Ops (10 ops) · Critical
+## Phase 3 - Reduction Ops (10 ops) · Critical
 
 Used in loss functions, normalization, and attention layers.
 
@@ -104,15 +104,15 @@ Used in loss functions, normalization, and attention layers.
 | `reduce_max` | iOS15 | `ReduceMax` | max reduction |
 | `reduce_min` | iOS15 | `ReduceMin` | min reduction |
 | `reduce_prod` | iOS15 | `ReduceProd` | product reduction |
-| `reduce_l1_norm` | iOS15 | — | L1 norm reduction |
-| `reduce_l2_norm` | iOS15 | — | L2 norm reduction |
+| `reduce_l1_norm` | iOS15 | - | L1 norm reduction |
+| `reduce_l2_norm` | iOS15 | - | L2 norm reduction |
 | `reduce_log_sum` | iOS15 | `ReduceLogSum` | log of sum |
 | `reduce_log_sum_exp` | iOS15 | `ReduceLogSumExp` | log-sum-exp |
 | `reduce_sum_square` | iOS15 | `ReduceSumSquare` | sum of squares |
 
 ---
 
-## Phase 4 — Scatter / Gather Variants (4 ops) · High
+## Phase 4 - Scatter / Gather Variants (4 ops) · High
 
 Critical for embedding lookups and advanced indexing patterns.
 
@@ -125,27 +125,27 @@ Critical for embedding lookups and advanced indexing patterns.
 
 ---
 
-## Phase 5 — Tensor Manipulation (11 ops) · High
+## Phase 5 - Tensor Manipulation (11 ops) · High
 
 Used in model reshaping, data preparation, and dynamic shape handling.
 
 | Op | Opset | ONNX | Notes |
 |----|-------|------|-------|
-| `slice_by_size` | iOS15 | — | slice with size (not end index) |
-| `stack` | iOS15 | — | stack tensors along new axis |
-| `argsort` | iOS15 | — | sort indices |
+| `slice_by_size` | iOS15 | - | slice with size (not end index) |
+| `stack` | iOS15 | - | stack tensors along new axis |
+| `argsort` | iOS15 | - | sort indices |
 | `topk` | iOS15 | `TopK` | top-k values + indices |
 | `fill` | iOS15 | `ConstantOfShape` | fill tensor with scalar |
-| `fill_like` | iOS16 | — | fill with matching shape |
+| `fill_like` | iOS16 | - | fill with matching shape |
 | `flatten2d` | iOS15 | `Flatten` | flatten to 2D |
 | `non_zero` | iOS15 | `NonZero` | indices of non-zero elems |
 | `one_hot` | iOS15 | `OneHot` | one-hot encoding |
 | `range_1d` | iOS15 | `Range` | arange-style sequence |
-| `band_part` | iOS15 | — | triangular mask |
+| `band_part` | iOS15 | - | triangular mask |
 
 ---
 
-## Phase 6 — Tensor Transformation (9 ops) · Medium-High
+## Phase 6 - Tensor Transformation (9 ops) · Medium-High
 
 Spatial rearrangement ops for vision and diffusion models.
 
@@ -153,34 +153,34 @@ Spatial rearrangement ops for vision and diffusion models.
 |----|-------|------|-------|
 | `depth_to_space` | iOS15 | `DepthToSpace` | depth → spatial |
 | `space_to_depth` | iOS15 | `SpaceToDepth` | spatial → depth |
-| `pixel_shuffle` | iOS15 | — | sub-pixel convolution |
-| `pixel_unshuffle` | iOS16 | — | inverse pixel shuffle |
-| `reshape_like` | iOS16 | — | reshape to match another tensor |
+| `pixel_shuffle` | iOS15 | - | sub-pixel convolution |
+| `pixel_unshuffle` | iOS16 | - | inverse pixel shuffle |
+| `reshape_like` | iOS16 | - | reshape to match another tensor |
 | `reverse_sequence` | iOS15 | `ReverseSequence` | reverse along seq axis |
-| `sliding_windows` | iOS15 | — | extract sliding windows |
-| `space_to_batch` | iOS15 | — | spatial → batch |
-| `slice_update` | iOS18 | — | in-place slice update |
+| `sliding_windows` | iOS15 | - | extract sliding windows |
+| `space_to_batch` | iOS15 | - | spatial → batch |
+| `slice_update` | iOS18 | - | in-place slice update |
 
 ---
 
-## Phase 7 — Image Resizing (8 ops) · Medium
+## Phase 7 - Image Resizing (8 ops) · Medium
 
 Required for vision and image-generation models.
 
 | Op | Opset | ONNX | Notes |
 |----|-------|------|-------|
-| `affine` | iOS15 | — | affine spatial transform |
-| `crop` | iOS15 | — | spatial cropping |
-| `crop_resize` | iOS15 | — | crop + resize (RoIAlign-like) |
-| `resample` | iOS15 | — | grid-based resampling |
+| `affine` | iOS15 | - | affine spatial transform |
+| `crop` | iOS15 | - | spatial cropping |
+| `crop_resize` | iOS15 | - | crop + resize (RoIAlign-like) |
+| `resample` | iOS15 | - | grid-based resampling |
 | `resize` | iOS17 | `Resize` | unified resize (replaces bilinear / nearest) |
-| `resize_bilinear` | iOS15 | — | bilinear interpolation |
-| `resize_nearest_neighbor` | iOS15 | — | nearest-neighbor interpolation |
-| `upsample_nearest_neighbor` | iOS15 | — | nearest-neighbor upsample |
+| `resize_bilinear` | iOS15 | - | bilinear interpolation |
+| `resize_nearest_neighbor` | iOS15 | - | nearest-neighbor interpolation |
+| `upsample_nearest_neighbor` | iOS15 | - | nearest-neighbor upsample |
 
 ---
 
-## Phase 8 — Normalization, Pooling & Linear Algebra (5 ops) · Medium
+## Phase 8 - Normalization, Pooling & Linear Algebra (5 ops) · Medium
 
 Completes the normalization and pooling families.
 
@@ -194,7 +194,7 @@ Completes the normalization and pooling families.
 
 ---
 
-## Phase 9 — Recurrent & Random (7 ops) · Medium
+## Phase 9 - Recurrent & Random (7 ops) · Medium
 
 RNNs are less common in modern transformer models but still needed for
 sequence-to-sequence and speech workloads.
@@ -211,7 +211,7 @@ sequence-to-sequence and speech workloads.
 
 ---
 
-## Phase 10 — Control Flow (8 ops) · Medium-Low
+## Phase 10 - Control Flow (8 ops) · Medium-Low
 
 Needed for dynamic models with loops and conditionals (e.g. beam search,
 autoregressive decoding with early stopping).
@@ -220,16 +220,16 @@ autoregressive decoding with early stopping).
 |----|-------|------|-------|
 | `cond` | iOS15 | `If` | conditional execution |
 | `while_loop` | iOS15 | `Loop` | loop construct |
-| `make_list` | iOS15 | — | create dynamic list |
-| `list_read` | iOS15 | — | read from list |
-| `list_write` | iOS15 | — | write to list |
-| `list_gather` | iOS15 | — | gather from list |
-| `list_scatter` | iOS15 | — | scatter into list |
-| `list_length` | iOS15 | — | list length |
+| `make_list` | iOS15 | - | create dynamic list |
+| `list_read` | iOS15 | - | read from list |
+| `list_write` | iOS15 | - | write to list |
+| `list_gather` | iOS15 | - | gather from list |
+| `list_scatter` | iOS15 | - | scatter into list |
+| `list_length` | iOS15 | - | list length |
 
 ---
 
-## Phase 11 — Constexpr & Quantization (6 ops) · Medium
+## Phase 11 - Constexpr & Quantization (6 ops) · Medium
 
 Weight compression ops for iOS 16–18. ironmill already supports
 `constexpr_affine_dequantize`, `constexpr_lut_to_dense`, and `dequantize`.
@@ -237,24 +237,24 @@ Weight compression ops for iOS 16–18. ironmill already supports
 | Op | Opset | ONNX | Notes |
 |----|-------|------|-------|
 | `quantize` | iOS17 | `QuantizeLinear` | activation quantization |
-| `constexpr_cast` | iOS16 | — | compile-time type cast |
-| `constexpr_sparse_to_dense` | iOS16 | — | sparse weight decompression |
-| `constexpr_blockwise_shift_scale` | iOS18 | — | blockwise quantization |
-| `constexpr_lut_to_sparse` | iOS18 | — | LUT + sparsity |
-| `constexpr_sparse_blockwise_shift_scale` | iOS18 | — | sparse blockwise quant |
+| `constexpr_cast` | iOS16 | - | compile-time type cast |
+| `constexpr_sparse_to_dense` | iOS16 | - | sparse weight decompression |
+| `constexpr_blockwise_shift_scale` | iOS18 | - | blockwise quantization |
+| `constexpr_lut_to_sparse` | iOS18 | - | LUT + sparsity |
+| `constexpr_sparse_blockwise_shift_scale` | iOS18 | - | sparse blockwise quant |
 
 ---
 
-## Phase 12 — Domain-Specific & Misc (4 ops) · Low
+## Phase 12 - Domain-Specific & Misc (4 ops) · Low
 
 Specialized ops for classification, object detection, and stateful models.
 
 | Op | Opset | ONNX | Notes |
 |----|-------|------|-------|
-| `classify` | iOS15 | — | classification label assignment |
+| `classify` | iOS15 | - | classification label assignment |
 | `non_maximum_suppression` | iOS15 | `NonMaxSuppression` | object detection NMS |
-| `conv_quantized` | iOS15 | — | quantized convolution variant |
-| `read_state` | iOS18 | — | stateful model support |
+| `conv_quantized` | iOS15 | - | quantized convolution variant |
+| `read_state` | iOS18 | - | stateful model support |
 
 ---
 
@@ -293,7 +293,7 @@ Specialized ops for classification, object detection, and stateful models.
 ## Decomposition Strategy
 
 Some ops can be decomposed into existing primitives rather than adding native
-support. Whether to decompose or implement natively is a case-by-case decision —
+support. Whether to decompose or implement natively is a case-by-case decision -
 native ops may receive better ANE scheduling.
 
 | Op | Decomposition |

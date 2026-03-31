@@ -1,4 +1,4 @@
-# TurboQuant — Research Analysis
+# TurboQuant - Research Analysis
 
 > **Paper:** [TurboQuant: Redefining AI Efficiency with Extreme Compression](https://arxiv.org/abs/2504.19874)
 > **Venue:** ICLR 2026
@@ -9,7 +9,7 @@
 
 TurboQuant is a **data-oblivious vector quantization** method that achieves
 near-optimal distortion at extreme bit-widths (2.5–3.5 bits per channel). It
-requires no training, no codebook learning, and no calibration data — the
+requires no training, no codebook learning, and no calibration data - the
 quantizer is derived purely from mathematical properties of random rotations in
 high-dimensional space.
 
@@ -35,16 +35,16 @@ It combines two sub-techniques in a two-stage pipeline:
 
 ### Primary use cases
 
-1. **KV cache compression** — reduce memory footprint of key-value caches in
+1. **KV cache compression** - reduce memory footprint of key-value caches in
    autoregressive LLM inference. This is a runtime/online application.
-2. **Vector search** — compress high-dimensional embedding vectors for
+2. **Vector search** - compress high-dimensional embedding vectors for
    nearest-neighbor lookup. Dramatically speeds up index building.
 
 ---
 
 ## How TurboQuant works
 
-### Stage 1 — PolarQuant
+### Stage 1 - PolarQuant
 
 1. **Random rotation:** Apply a random orthogonal rotation R (e.g., randomized
    Hadamard transform) to the input vector.
@@ -63,9 +63,9 @@ It combines two sub-techniques in a two-stage pipeline:
 4. **No normalization overhead:** Traditional quantization stores per-block
    scale and zero-point in full precision, adding 1–2 extra bits per number.
    PolarQuant eliminates this because the distribution boundaries are fixed
-   and known — no per-block metadata needed.
+   and known - no per-block metadata needed.
 
-### Stage 2 — QJL (Quantized Johnson-Lindenstrauss)
+### Stage 2 - QJL (Quantized Johnson-Lindenstrauss)
 
 1. **Compute residual:** After PolarQuant, compute the quantization error
    (residual = original - quantized).
@@ -84,7 +84,7 @@ It combines two sub-techniques in a two-stage pipeline:
 ### Why two stages?
 
 MSE-optimal scalar quantizers (PolarQuant) minimize reconstruction error but
-introduce **bias** in inner product estimation — the expected value of the
+introduce **bias** in inner product estimation - the expected value of the
 quantized inner product doesn't equal the true inner product. QJL corrects this
 bias using just 1 extra bit, making the combined estimator **unbiased**.
 
@@ -94,8 +94,8 @@ bias using just 1 extra bit, making the combined estimator **unbiased**.
 
 | Property | Value |
 |----------|-------|
-| Data-oblivious | Yes — no training, no codebook learning |
-| Online-capable | Yes — can quantize vectors as they arrive |
+| Data-oblivious | Yes - no training, no codebook learning |
+| Online-capable | Yes - can quantize vectors as they arrive |
 | Preprocessing | Random rotation (O(d log d) with Hadamard) |
 | Storage overhead | Zero normalization overhead; only quantized values + shared rotation seed |
 | Distortion bound | Within ≈2.7× of information-theoretic lower bound |
@@ -105,7 +105,7 @@ bias using just 1 extra bit, making the combined estimator **unbiased**.
 
 > **CoreML/ANE constraint:** ironmill's `constexpr_lut_to_dense` path only supports
 > LUT sizes `{2, 4, 16, 64, 256}`, mapping to `n_bits ∈ {1, 2, 4, 6, 8}`. The paper's
-> 3-bit and 3.5-bit results cannot be directly replicated on the CoreML path — 2-bit
+> 3-bit and 3.5-bit results cannot be directly replicated on the CoreML path - 2-bit
 > and 4-bit are the closest available. See `KNOWN_ISSUES.md` for details.
 
 ---
@@ -125,7 +125,7 @@ bias using just 1 extra bit, making the combined estimator **unbiased**.
 
 ### Fundamental tension
 
-TurboQuant's flagship use case — **runtime KV cache compression** — is an
+TurboQuant's flagship use case - **runtime KV cache compression** - is an
 **inference-time** concern. ironmill operates at **compile/conversion time** and
 does not control the inference loop. CoreML's runtime manages KV caches.
 
@@ -147,7 +147,7 @@ bits with k-means).
 
 > **Update (March 2026):** PolarQuant static weight quantization has been
 > implemented (see `polar_quantize.rs`, `beta_quantizer.rs`, `rotation.rs`).
-> The ANE-direct backend has been probed for op support — see
+> The ANE-direct backend has been probed for op support - see
 > [ANE Op Support Matrix](../design/ane-op-support-matrix.md) for empirically verified
 > op availability including eval-time correctness checks.
 
@@ -170,23 +170,23 @@ for the detailed implementation plan.
 
 ### What ironmill cannot do
 
-- **Online KV cache quantization** — ironmill doesn't run inference
-- **Attention score correction via QJL** — runtime computation
-- **Dynamic per-token quantization** — ironmill produces static graphs
-- **GPU kernel integration** — TurboQuant's 8× H100 speedup requires custom
+- **Online KV cache quantization** - ironmill doesn't run inference
+- **Attention score correction via QJL** - runtime computation
+- **Dynamic per-token quantization** - ironmill produces static graphs
+- **GPU kernel integration** - TurboQuant's 8× H100 speedup requires custom
   CUDA kernels; CoreML/ANE is a different execution target
 
 These require changes to the inference runtime (Apple's CoreML `MLModel` API,
 which ironmill invokes via `objc2-core-ml` for benchmarking but does not
 control), not to ironmill itself. CoreML internally dispatches to ANE, GPU, or
-CPU based on the model's compute-unit annotations — ironmill has no direct
+CPU based on the model's compute-unit annotations - ironmill has no direct
 access to the inference loop.
 
 ---
 
 ## References
 
-1. TurboQuant: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — Daliri et al., ICLR 2026
-2. PolarQuant: [arXiv:2502.02617](https://arxiv.org/abs/2502.02617) — Han et al., AISTATS 2026
-3. QJL: [doi:10.1609/aaai.v39i24.34773](https://dl.acm.org/doi/10.1609/aaai.v39i24.34773) — AAAI
+1. TurboQuant: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) - Daliri et al., ICLR 2026
+2. PolarQuant: [arXiv:2502.02617](https://arxiv.org/abs/2502.02617) - Han et al., AISTATS 2026
+3. QJL: [doi:10.1609/aaai.v39i24.34773](https://dl.acm.org/doi/10.1609/aaai.v39i24.34773) - AAAI
 4. Google Research Blog: [TurboQuant: Redefining AI Efficiency](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)

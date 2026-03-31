@@ -1,4 +1,4 @@
-# ANE Inference — Design & Status
+# ANE Inference - Design & Status
 
 > Consolidated from `ane-inference-optimizations.md` and `ANE-op-discoveries.md`.
 > Original investigation docs archived in `docs/archive/`.
@@ -18,7 +18,7 @@
 - `Drop for CompiledProgram` prevents cross-model handle leaks
 
 ### What Doesn't Work
-- No end-to-end correctness tests (perplexity, token agreement) — see
+- No end-to-end correctness tests (perplexity, token agreement) - see
   `docs/development/QUALITY_BENCHMARK_PLAN.md`
 
 ### Performance
@@ -39,19 +39,19 @@ that don't surface during single-op testing.
 ### Program Budget
 - ~55 simultaneously-alive compiled models per process (model-size dependent)
 - 29-layer Qwen3-0.6B × 3 sub-programs = 87 → exceeds budget
-- Fix: separate compile/load lifecycle — compile all upfront, load ≤3 at a time
+- Fix: separate compile/load lifecycle - compile all upfront, load ≤3 at a time
 - `Drop for CompiledProgram` calls `CFRelease` to prevent handle leaks
 
 ### IOSurface Constraints
 - Minimum allocation: **16KB** (not 48KB as previously assumed)
 - ANE rejects `[1, C, 1, S]` I/O tensors when `C > ~768` and `S < 32`
 
-### S≥32 Padding — Must Be Per-Sub-Program
+### S≥32 Padding - Must Be Per-Sub-Program
 - S≥32 padding fixes pre_attn/post_attn (high-C tensors)
 - Padding **breaks** attention sub-programs where S represents per-head
   dimensions, not sequence positions
-- With S=32: `[1, 2048, 1, 32]` → reshape `[1, 16, 128, 32]` — wrong
-- Without: `[1, 2048, 1, 1]` → reshape `[1, 16, 128, 1]` — correct dimensions
+- With S=32: `[1, 2048, 1, 32]` → reshape `[1, 16, 128, 32]` - wrong
+- Without: `[1, 2048, 1, 1]` → reshape `[1, 16, 128, 1]` - correct dimensions
 - But `C=2048 > 768, S=1 < 32` → ANE constraint violation regardless
 
 ### Op-Level Findings
@@ -68,17 +68,17 @@ that don't surface during single-op testing.
 FP16 attention on ANE is implemented via hand-written MIL programs
 (`c632f05`). The key architectural decisions:
 
-1. **KV cache as matmul inputs** — IOSurface-backed tensors with `S=seq_len ≥ 32`,
+1. **KV cache as matmul inputs** - IOSurface-backed tensors with `S=seq_len ≥ 32`,
    not single-token `S=1` projections
 2. **Hand-written MIL programs** with correct shapes per sub-program type
    (TurboQuant's MIL programs work because shapes are explicitly correct)
-3. **CPU RoPE rotation** — `gather` is unsupported but rotation is trivially
+3. **CPU RoPE rotation** - `gather` is unsupported but rotation is trivially
    cheap on CPU (~nanoseconds for single-token decode)
-4. **Per-head norms on CPU** — untested in combination with attention on ANE;
+4. **Per-head norms on CPU** - untested in combination with attention on ANE;
    safest to offload (also cheap)
 
 ## References
 
-- [ANE Op Support Matrix](ane-op-support-matrix.md) — 74 verified ops
-- [ANE Constraints](ane-constraints.md) — hardware limits and diagnostics
-- [TurboQuant Design](turboquant.md) — INT8 KV cache compression
+- [ANE Op Support Matrix](ane-op-support-matrix.md) - 74 verified ops
+- [ANE Constraints](ane-constraints.md) - hardware limits and diagnostics
+- [TurboQuant Design](turboquant.md) - INT8 KV cache compression

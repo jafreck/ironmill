@@ -10,7 +10,7 @@
 
 ### What Actually Works Today
 
-**Models CAN access the ANE.** This is not theoretical — CoreML routes supported operations
+**Models CAN access the ANE.** This is not theoretical - CoreML routes supported operations
 to the ANE through its public API. From Rust, the `coreml-native` crate can load compiled
 CoreML models (`.mlmodelc`) and run inference with `ComputeUnits::CpuAndNeuralEngine`.
 This works today.
@@ -93,11 +93,11 @@ Every Rust project wanting CoreML deployment must:
 This Python dependency breaks Rust's self-contained toolchain promise. It's the same
 problem for C++, Swift (without Xcode), and Go developers.
 
-## Project: `ironmill` — Rust-native CoreML Model Conversion
+## Project: `ironmill` - Rust-native CoreML Model Conversion
 
 ### Vision
 Eliminate the Python dependency in the CoreML model conversion pipeline. Not a
-reimplementation of all of `coremltools` — a focused tool that converts common model
+reimplementation of all of `coremltools` - a focused tool that converts common model
 formats to CoreML and applies basic optimizations.
 
 ### Architecture
@@ -144,9 +144,9 @@ formats to CoreML and applies basic optimizations.
 
 ### Core Components
 
-1. **MIL IR in Rust** — A typed, graph-based intermediate representation matching Apple's MIL spec. This is the linchpin: every model format converts *to* MIL, and MIL converts *to* CoreML protobuf.
+1. **MIL IR in Rust** - A typed, graph-based intermediate representation matching Apple's MIL spec. This is the linchpin: every model format converts *to* MIL, and MIL converts *to* CoreML protobuf.
 
-2. **Model Format Readers** — Parse ONNX, SafeTensors, and GGUF into the MIL IR. Start with ONNX (broadest compatibility).
+2. **Model Format Readers** - Parse ONNX, SafeTensors, and GGUF into the MIL IR. Start with ONNX (broadest compatibility).
 
 3. **ANE-Targeted Optimization Passes**:
    - **Op fusion**: Merge conv+bn+relu into fused ops the ANE handles natively
@@ -155,11 +155,11 @@ formats to CoreML and applies basic optimizations.
    - **Memory layout**: Reorder tensors for ANE's expected NHWC layout
    - **Op substitution**: Replace unsupported ops with ANE-friendly equivalents
 
-4. **CoreML Protobuf Emitter** — Generate `.mlmodel` / `.mlpackage` files. The CoreML format is protobuf-based and Apple's `.proto` schemas are published in `coremltools`.
+4. **CoreML Protobuf Emitter** - Generate `.mlmodel` / `.mlpackage` files. The CoreML format is protobuf-based and Apple's `.proto` schemas are published in `coremltools`.
 
-5. **Compilation Bridge** — Shell out to `xcrun coremlcompiler` to produce `.mlmodelc` (this is unavoidable — Apple's compiler is closed-source, but the CLI tool is free on every Mac).
+5. **Compilation Bridge** - Shell out to `xcrun coremlcompiler` to produce `.mlmodelc` (this is unavoidable - Apple's compiler is closed-source, but the CLI tool is free on every Mac).
 
-6. **Runtime Inference API** — Safe, async Rust API wrapping CoreML with explicit `ComputeUnit` selection (`.cpuAndNeuralEngine`, `.all`, `.cpuOnly`).
+6. **Runtime Inference API** - Safe, async Rust API wrapping CoreML with explicit `ComputeUnit` selection (`.cpuAndNeuralEngine`, `.all`, `.cpuOnly`).
 
 ### Why This Has Wide Appeal
 
@@ -178,29 +178,29 @@ formats to CoreML and applies basic optimizations.
 |---|---|
 | vs. `coremltools` (Python) | No Python dependency, embeddable in Rust apps |
 | vs. `coreml-native` / `coreml-rs` | Full pipeline (convert + optimize + run), not just bindings |
-| vs. Orion (direct ANE) | Uses public APIs — won't break on OS updates |
+| vs. Orion (direct ANE) | Uses public APIs - won't break on OS updates |
 | vs. ONNX Runtime CoreML EP | Native Rust, deeper optimization, ANE-specific passes |
 
 ### Phased Roadmap
 
-**Phase 1 — Foundation**
+**Phase 1 - Foundation**
 - MIL IR data structures in Rust
 - CoreML protobuf reader/writer (using `prost`)
 - Load and run pre-compiled `.mlmodelc` files from Rust
 - Explicit compute unit selection
 
-**Phase 2 — Conversion**
+**Phase 2 - Conversion**
 - ONNX → MIL converter (core ops: conv, matmul, relu, softmax, etc.)
 - Basic optimization passes (constant folding, dead code elimination)
 - Integration with `xcrun coremlcompiler`
 
-**Phase 3 — ANE Optimization**
+**Phase 3 - ANE Optimization**
 - Op fusion passes targeting ANE primitives
 - FP16/INT8 quantization pipeline
 - Shape materialization for dynamic models
 - ANE compatibility validator ("will this model actually run on ANE?")
 
-**Phase 4 — Ecosystem Integration**
+**Phase 4 - Ecosystem Integration**
 - `candle-coreml-compiler` bridge crate
 - `burn` backend
 - CLI tool: `coreml-compile model.onnx --target ane --quantize fp16`
@@ -208,7 +208,7 @@ formats to CoreML and applies basic optimizations.
 
 ## Key Sources
 
-- [Orion paper — Direct ANE programming](https://arxiv.org/html/2603.06728v1)
+- [Orion paper - Direct ANE programming](https://arxiv.org/html/2603.06728v1)
 - [Disaggregated inference on Apple Silicon](https://blog.squeezebits.com/disaggregated-inference-on-apple-silicon-npu-prefill-and-gpu-decode-67176)
 - [ANEMLL project](https://github.com/Anemll/Anemll)
 - [CoreML Tools (Apple)](https://apple.github.io/coremltools/docs-guides/)

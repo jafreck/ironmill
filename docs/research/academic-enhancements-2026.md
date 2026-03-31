@@ -13,7 +13,7 @@ architecture.
 
 ## 1. Quantization Passes (Compile-Time)
 
-### 1a. SliderQuant — Layer-Sensitive Adaptive Bit-Width
+### 1a. SliderQuant - Layer-Sensitive Adaptive Bit-Width
 
 **Paper:** SliderQuant: Accurate Post-Training Quantization for LLMs (ICLR 2026)
 **Link:** <https://openreview.net/forum?id=YNqZqw4fLT>
@@ -33,12 +33,12 @@ would automate optimal bit-width assignment:
 - Assign bit-widths that minimize total model quality loss under a memory budget
 - Emit the result as a `MixedPrecisionPass` config or apply directly
 
-**Effort:** Medium — requires calibration infrastructure but can reuse existing
+**Effort:** Medium - requires calibration infrastructure but can reuse existing
 per-layer quantization machinery in `pipeline.rs`.
 
 ---
 
-### 1b. DuQuant — Dual Rotation + Permutation
+### 1b. DuQuant - Dual Rotation + Permutation
 
 **Paper:** DuQuant: Distributing Outliers via Dual Transformation
 **Link:** <https://duquant.github.io/>
@@ -57,15 +57,15 @@ before rotation, achieving new SOTA for W4A4 quantization.
 - The permutation can be precomputed from calibration data (column-wise
   activation magnitude sorting)
 - `PolarRotationFusionPass` already handles rotation cancellation between
-  layers — extend it to cancel permutation+rotation pairs
+  layers - extend it to cancel permutation+rotation pairs
 
-**Effort:** Low — the rotation infrastructure in `rotation.rs` and
+**Effort:** Low - the rotation infrastructure in `rotation.rs` and
 `beta_quantizer.rs` already exists. The permutation is a column reorder applied
 before rotation.
 
 ---
 
-### 1c. CodeQuant — Unified Clustering + Rotation for MoE
+### 1c. CodeQuant - Unified Clustering + Rotation for MoE
 
 **Paper:** CodeQuant: Unified Clustering and Quantization for Enhanced Outlier
 Smoothing in Low-Precision Mixture-of-Experts
@@ -86,12 +86,12 @@ QuaRot or SmoothQuant under extreme quantization.
 - Emit `constexpr_lut_to_dense` with expert-specific LUTs
 - The `CodebookOptimizationPass` can be extended to handle per-expert codebooks
 
-**Effort:** Medium — requires per-expert weight grouping logic but reuses
+**Effort:** Medium - requires per-expert weight grouping logic but reuses
 existing codebook and rotation infrastructure.
 
 ---
 
-### 1d. LATMiX — Learnable Affine Transforms for Microscaling
+### 1d. LATMiX - Learnable Affine Transforms for Microscaling
 
 **Paper:** LATMiX: Learnable Affine Transformations for Microscaling
 Quantization
@@ -106,18 +106,18 @@ accuracy improvements for sub-4-bit quantization.
 PolarQuant, where the transform matrix is learned rather than fixed:
 
 - Requires a calibration/optimization step (gradient descent on the transform
-  matrix) — heavier than PolarQuant's zero-shot approach
+  matrix) - heavier than PolarQuant's zero-shot approach
 - The learned transform replaces the Hadamard in `polar_quantize.rs`
 - `PolarRotationFusionPass` would need to handle arbitrary learned matrices
-  instead of just Hadamard (no longer self-inverse — need explicit inverse)
+  instead of just Hadamard (no longer self-inverse - need explicit inverse)
 
-**Effort:** High — requires gradient-based optimization during compilation.
+**Effort:** High - requires gradient-based optimization during compilation.
 Best suited as an offline tool that produces a transform matrix, which ironmill
 then applies as a fixed pass.
 
 ---
 
-### 1e. SpinOut — Outlier-Injected Rotation Training
+### 1e. SpinOut - Outlier-Injected Rotation Training
 
 **Paper:** SpinOut: Enhanced Rotation-Based Quantization for LLM by Outlier
 Injection (2026)
@@ -135,13 +135,13 @@ strategy:
 - Produce per-layer rotation seeds or learned rotation matrices
 - Apply as a preprocessing step before `PolarQuantPass`
 
-**Effort:** Medium — primarily an offline calibration enhancement.
+**Effort:** Medium - primarily an offline calibration enhancement.
 
 ---
 
 ## 2. KV Cache & Decoding (Runtime / Compile-Time)
 
-### 2a. QuantSpec — Apple's Self-Speculative Decoding
+### 2a. QuantSpec - Apple's Self-Speculative Decoding
 
 **Paper:** QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV
 Cache (Apple Research, ICML 2025)
@@ -155,7 +155,7 @@ draft acceptance rate, 2.5× speedup, ~1.3× memory savings over competitors.
 **How it maps to ironmill:** This is the highest-ROI enhancement because it
 comes from Apple Research and targets the exact same deployment stack:
 
-- **Compile-time:** `KvCachePass` emits two KV cache variants per layer — a
+- **Compile-time:** `KvCachePass` emits two KV cache variants per layer - a
   4-bit draft cache and a full-precision verifier cache. The model's CoreML
   stateful API exposes both.
 - **Compile-time:** `ModelSplitPass` could emit draft/verifier `.mlpackage`
@@ -163,15 +163,15 @@ comes from Apple Research and targets the exact same deployment stack:
 - **Runtime:** The inference loop alternates between draft (fast, quantized KV)
   and verify (accurate, full KV) phases, accepting or rejecting draft tokens.
 
-**Effort:** Medium-High — requires changes to both `KvCachePass` and the
+**Effort:** Medium-High - requires changes to both `KvCachePass` and the
 runtime inference loop. But Apple designed this for CoreML, so the API fit is
 natural.
 
-**Priority:** 🔥🔥🔥 Highest — Apple-native, designed for CoreML deployment.
+**Priority:** 🔥🔥🔥 Highest - Apple-native, designed for CoreML deployment.
 
 ---
 
-### 2b. DapQ — Position-Aware KV Cache Eviction
+### 2b. DapQ - Position-Aware KV Cache Eviction
 
 **Paper:** Where Matters More Than What: Decoding-Aligned KV Cache Compression
 via Position-aware Pseudo Queries (March 2026)
@@ -187,17 +187,17 @@ near-lossless performance at 3% cache retention.
 
 - At compile time, annotate KV cache ops with eviction metadata (window size,
   importance scoring function)
-- The scoring function uses positional pseudo-queries — a small auxiliary
+- The scoring function uses positional pseudo-queries - a small auxiliary
   computation graph emitted alongside the main attention
 - At runtime, the eviction logic uses these scores to decide which KV entries
   to keep
 
-**Effort:** Medium — the pseudo-query generation is a graph transformation,
+**Effort:** Medium - the pseudo-query generation is a graph transformation,
 but the eviction logic is runtime.
 
 ---
 
-### 2c. FAFO — Draftless Speculative Decoding with Compressed KV
+### 2c. FAFO - Draftless Speculative Decoding with Compressed KV
 
 **Paper:** FAFO: Lossy KV Cache Compression for Lossless Inference
 Acceleration via Draftless Fumble Decoding (ICLR 2026)
@@ -214,16 +214,16 @@ draft model needed. 1.2–2.7× speedup with nearly perfect output fidelity.
   quantization)
 - FAFO adds a verify-then-accept loop: generate N tokens with compressed KV,
   verify all N in parallel with full-precision attention
-- The compile-time component is minimal — emit the verification attention
+- The compile-time component is minimal - emit the verification attention
   subgraph alongside the main model
 - The runtime component manages the speculative loop
 
-**Effort:** High — primarily a runtime architecture change. The compile-time
+**Effort:** High - primarily a runtime architecture change. The compile-time
 pass changes are small (emit verification subgraph).
 
 ---
 
-### 2d. RotateKV — 2-Bit KV Cache Quantization
+### 2d. RotateKV - 2-Bit KV Cache Quantization
 
 **Paper:** RotateKV: Accurate and Robust 2-Bit KV Cache Quantization for LLMs
 via Outlier-Aware Adaptive Rotations
@@ -241,14 +241,14 @@ different outlier patterns, so RotateKV learns head-specific rotation matrices.
 - The MIL generation in `turboquant_mil.rs` would emit 2-bit
   quantize/dequantize ops
 
-**Effort:** Low-Medium — TurboQuant's rotation + quantization pipeline already
+**Effort:** Low-Medium - TurboQuant's rotation + quantization pipeline already
 exists. Main work is supporting 2-bit precision and per-head rotation matrices.
 
 ---
 
 ## 3. Pruning & Sparsity (Compile-Time)
 
-### 3a. REAP — Router-Weighted Expert Pruning for MoE
+### 3a. REAP - Router-Weighted Expert Pruning for MoE
 
 **Paper:** REAP the Experts: Why Pruning Prevails for One-Shot MoE Compression
 (March 2026)
@@ -266,21 +266,21 @@ models like Qwen3-Coder-480B.
   importance scores
 - Prune lowest-scoring experts by removing their subgraphs and adjusting router
   normalization
-- Works naturally with `PerExpertQuantPass` — prune first, then quantize
+- Works naturally with `PerExpertQuantPass` - prune first, then quantize
   remaining experts
 
-**Effort:** Medium — requires MoE subgraph detection (partially exists for
+**Effort:** Medium - requires MoE subgraph detection (partially exists for
 `PerExpertQuantPass`) and expert ranking logic.
 
 ---
 
-### 3b. Sparse-BitNet — 1.58-Bit + N:M Structured Sparsity
+### 3b. Sparse-BitNet - 1.58-Bit + N:M Structured Sparsity
 
 **Paper:** Sparse-BitNet: 1.58-bit LLMs with N:M Sparsity (2026)
 **Link:** <https://arxiv.org/abs/2603.05168>
 
 **What it does:** Combines ultra-low-bit quantization (ternary / 1.58-bit
-weights) with structured N:M sparsity (e.g., 2:4 — every group of 4 weights
+weights) with structured N:M sparsity (e.g., 2:4 - every group of 4 weights
 has exactly 2 zeros). The structured pattern enables hardware acceleration.
 
 **How it maps to ironmill:** CoreML does not currently expose N:M sparse
@@ -289,23 +289,23 @@ kernels, making this **speculative** for now:
 - If Apple adds N:M sparsity support to CoreML/ANE, a `StructuredSparsityPass`
   could enforce N:M patterns on weight tensors
 - Even without hardware support, the ternary quantization aspect could be
-  implemented as a `TernaryQuantPass` — weights stored as {-1, 0, +1} with a
+  implemented as a `TernaryQuantPass` - weights stored as {-1, 0, +1} with a
   per-channel scale factor, packed into 2-bit `constexpr_lut_to_dense`
 
 **Effort:** Low (ternary quant only) to High (full N:M with hardware support).
-**Status:** Speculative — blocked on CoreML N:M support.
+**Status:** Speculative - blocked on CoreML N:M support.
 
 ---
 
 ## 4. Compiler Architecture
 
-### 4a. TransFusion — Global Graph Fusion + Pipelined Scheduling
+### 4a. TransFusion - Global Graph Fusion + Pipelined Scheduling
 
 **Paper:** TransFusion: End-to-End Transformer Acceleration via Graph Fusion
 and Pipelined Scheduling (MICRO 2025)
 **Link:** <https://jnamaral.github.io/CDOL/papers/ZhangMICRO25.pdf>
 
-**What it does:** Current fusion passes (including ironmill's) are *local* —
+**What it does:** Current fusion passes (including ironmill's) are *local* -
 they pattern-match within a single layer (e.g., conv+bn+relu). TransFusion
 introduces *global* fusion across layer boundaries with pipelined execution
 scheduling. A DAG-based scheduler (DPipe) and Monte Carlo Tree Search-based
@@ -322,7 +322,7 @@ tile search (TileSeek) jointly optimize inter-layer and intra-layer fusions.
 - The `LayerSchedulePass` and `ComputeUnitAnnotationPass` are steps in this
   direction but don't do cross-layer fusion
 
-**Effort:** High — requires new scheduling infrastructure. Best approached
+**Effort:** High - requires new scheduling infrastructure. Best approached
 incrementally: start with cross-layer buffer reuse analysis, then add pipelined
 scheduling.
 
@@ -383,15 +383,15 @@ PassPipeline architecture      → TransFusion (global fusion + scheduling)
 
 ## 7. Key References
 
-1. SliderQuant — <https://openreview.net/forum?id=YNqZqw4fLT> (ICLR 2026)
-2. DuQuant — <https://duquant.github.io/> (NeurIPS 2025)
-3. CodeQuant — <https://openreview.net/forum?id=ATpchFiBQi> (2026)
-4. LATMiX — <https://arxiv.org/abs/2602.17681> (Feb 2026)
-5. SpinOut — <http://esoc.hanyang.ac.kr/publications/2026/SpinOut_Enhanced_Rotation-Based_Quantization_for_LLM_by_Outlier_Injection.pdf> (2026)
-6. QuantSpec — <https://machinelearning.apple.com/research/quantspec> (Apple, ICML 2025)
-7. DapQ — <https://arxiv.org/abs/2603.11564> (March 2026)
-8. FAFO — <https://openreview.net/forum?id=oSk9tP5Mgs> (ICLR 2026)
-9. RotateKV — <https://huggingface.co/papers/2501.16383> (2025)
-10. REAP — <https://arxiv.org/abs/2510.13999> (March 2026)
-11. Sparse-BitNet — <https://arxiv.org/abs/2603.05168> (2026)
-12. TransFusion — <https://jnamaral.github.io/CDOL/papers/ZhangMICRO25.pdf> (MICRO 2025)
+1. SliderQuant - <https://openreview.net/forum?id=YNqZqw4fLT> (ICLR 2026)
+2. DuQuant - <https://duquant.github.io/> (NeurIPS 2025)
+3. CodeQuant - <https://openreview.net/forum?id=ATpchFiBQi> (2026)
+4. LATMiX - <https://arxiv.org/abs/2602.17681> (Feb 2026)
+5. SpinOut - <http://esoc.hanyang.ac.kr/publications/2026/SpinOut_Enhanced_Rotation-Based_Quantization_for_LLM_by_Outlier_Injection.pdf> (2026)
+6. QuantSpec - <https://machinelearning.apple.com/research/quantspec> (Apple, ICML 2025)
+7. DapQ - <https://arxiv.org/abs/2603.11564> (March 2026)
+8. FAFO - <https://openreview.net/forum?id=oSk9tP5Mgs> (ICLR 2026)
+9. RotateKV - <https://huggingface.co/papers/2501.16383> (2025)
+10. REAP - <https://arxiv.org/abs/2510.13999> (March 2026)
+11. Sparse-BitNet - <https://arxiv.org/abs/2603.05168> (2026)
+12. TransFusion - <https://jnamaral.github.io/CDOL/papers/ZhangMICRO25.pdf> (MICRO 2025)

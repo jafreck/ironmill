@@ -43,7 +43,7 @@ optimizations matter most.
 
 The sweet spot for ANE-optimized CoreML models today is **1–3B parameters with
 aggressive quantization** (2-bit to 4-bit). Ironmill's conversion pipeline is
-perfectly positioned to serve this niche — the optimizations below should
+perfectly positioned to serve this niche - the optimizations below should
 prioritize making sub-4B models run as fast as possible on ANE, while also
 enabling hybrid execution hints for larger models.
 
@@ -68,7 +68,7 @@ doesn't reason about cache layout. A new pass could:
 - Materialize static cache shapes to keep operations ANE-eligible
 - Annotate cache tensors for NHWC layout where ANE benefits
 - Support grouped-query attention (GQA) where fewer KV heads are shared across
-  Q heads — critical for modern architectures like Llama 3
+  Q heads - critical for modern architectures like Llama 3
 
 ### 1b. Speculative Decoding–Friendly Model Splitting
 
@@ -135,14 +135,14 @@ optimization dramatically improves fusion discovery.
 
 **Ironmill opportunity:** Expand fusion passes beyond the current set:
 
-- **LayerNorm + Linear fusion** — very common in transformers, not currently
+- **LayerNorm + Linear fusion** - very common in transformers, not currently
   fused
-- **GELU + Linear fusion** — complement to current GELU expansion in
+- **GELU + Linear fusion** - complement to current GELU expansion in
   `op_substitute.rs`
-- **Residual add fusion** — skip connection + main branch into single op
+- **Residual add fusion** - skip connection + main branch into single op
 - **Multi-head attention → single fused op** with explicit head count attribute
   for ANE
-- **Grouped-query attention fusion** — fewer KV heads shared across Q heads
+- **Grouped-query attention fusion** - fewer KV heads shared across Q heads
 
 ### 2c. Configurable Pipeline Search Space
 
@@ -166,7 +166,7 @@ configurable:
 
 ### 3a. LoRA Adapter Export Support
 
-**Research context:** LoRA is the dominant PEFT method — 99%+ parameter
+**Research context:** LoRA is the dominant PEFT method - 99%+ parameter
 reduction, 95–98% accuracy retention. Adapter modules enable multi-task serving
 from a single base model. Apple's Foundation Models framework now exposes LoRA
 adapter APIs natively.
@@ -220,7 +220,7 @@ personalization:
 ### 4a. Orion-Informed ANE Constraint Database
 
 **Research context:** The Orion paper ([arxiv 2603.06728](https://arxiv.org/abs/2603.06728))
-reverse-engineers ANE internals — documenting IR program restrictions, numerical
+reverse-engineers ANE internals - documenting IR program restrictions, numerical
 quirks, memory boundaries, and operator support that Apple hasn't publicly
 documented. This is the first comprehensive characterization of ANE hardware
 constraints.
@@ -268,7 +268,7 @@ properly utilizing both compute units.
 - A new pass could analyze each op's shape/type and annotate whether ANE, GPU,
   or CPU is optimal based on the Orion constraint database
 - Particularly useful for models in the 3–8B range where some ops inevitably
-  fall back — explicit annotations are better than CoreML's heuristic placement
+  fall back - explicit annotations are better than CoreML's heuristic placement
 
 ### 4d. NHWC Layout Fix (Unblock Existing Work)
 
@@ -276,12 +276,12 @@ properly utilizing both compute units.
 implemented but **disabled** because transpose serialization causes CoreML
 segfaults (`pipeline.rs:65-68`).
 
-**Ironmill opportunity — highest ROI item:**
+**Ironmill opportunity - highest ROI item:**
 
 - ANE natively operates in NHWC; the current NCHW default causes implicit
   transposes at runtime
 - Fix transpose serialization in the writer to unblock the layout pass
-- This is pure engineering — no research uncertainty, just a serialization bug
+- This is pure engineering - no research uncertainty, just a serialization bug
 - Once fixed, NHWC layout should become the default for ANE-targeted models
 
 ### 4e. Op Splitting for Large Models
@@ -310,7 +310,7 @@ attractive because they deliver large-model quality at a fraction of the compute
 cost. However, ANE's execution model creates fundamental challenges:
 
 - **ANE requires a fully compiled static graph.** There is no mechanism for
-  dynamic per-token expert routing — the router's conditional dispatch has no
+  dynamic per-token expert routing - the router's conditional dispatch has no
   ANE equivalent and falls back to CPU.
 - **CoreML does not support true conditional execution.** The `if/else`
   branching that MoE gating needs is not ANE-accelerated.
@@ -355,7 +355,7 @@ frequently-active experts into a single dense model:
 - Accept a calibration dataset or activation frequency profile
 - Identify the top-K most frequently activated experts
 - Merge those K experts into a single dense `.mlpackage`, discarding the rest
-- This trades model flexibility for ANE compatibility — the resulting model is
+- This trades model flexibility for ANE compatibility - the resulting model is
   a dense submodel of the original MoE that fits within ANE memory
 - Particularly useful for domain-specific deployments where the same experts
   are always hot
@@ -388,7 +388,7 @@ bundle experts as separate functions within a single `.mlpackage`:
 
 ## 6. Multi-Stage Model Pipeline Conversion
 
-Some models are not monolithic — they consist of multiple interdependent stages
+Some models are not monolithic - they consist of multiple interdependent stages
 that must be converted and deployed together. Qwen3-TTS is the motivating
 example, but this applies broadly to encoder-decoder models, cascaded
 pipelines, and any model with separately-exported ONNX components.
@@ -419,14 +419,14 @@ special handling for KV cache state and dynamic sequence lengths.
 - Insert KV cache management ops with statically-sized ring buffers
 - Materialize sequence length dimensions to fixed max values for ANE
   compatibility (ties into existing shape materialization pass)
-- Support CoreML stateful model export — persist KV cache state across
+- Support CoreML stateful model export - persist KV cache state across
   inference calls without re-passing as explicit I/O
 - This is prerequisite for any LLM or TTS decoder running on ANE
 
 ### 6c. Causal Convolution Support
 
 **Research context:** Streaming TTS models (Qwen3-TTS 12Hz, Mimi codec) use
-causal convolutions for real-time inference — future audio samples must not
+causal convolutions for real-time inference - future audio samples must not
 depend on future input.
 
 **Ironmill opportunity:** Ensure causal conv patterns are preserved and
@@ -493,12 +493,12 @@ ONNX as gather/embedding ops with specific patterns.
 **Why this model:**
 - Fits fully within ANE's memory budget (~1.5GB ONNX, smaller after quantization)
 - Standard transformer encoder with fixed-length input (30s audio → 80-bin mel
-  spectrogram → 1500 frames) — no autoregressive decoding complexity
+  spectrogram → 1500 frames) - no autoregressive decoding complexity
 - Exercises all of ironmill's core optimization passes: attention fusion,
   conv+relu fusion, FP16/INT8 quantization, palettization
 - Established baselines exist via WhisperKit and whisper.cpp CoreML for
   direct A/B comparison of ironmill's output quality
-- Real-world production use case — speech recognition is one of the most
+- Real-world production use case - speech recognition is one of the most
   common ANE workloads
 
 **Benchmark plan:**
@@ -531,7 +531,7 @@ the ~1.5GB download)
 - 0.6B total params (~2.5GB) is within ANE's memory budget with quantization
 - ONNX exports already available on HuggingFace (`sivasub987/Qwen3-TTS-0.6B-ONNX-INT8`,
   `xkos/Qwen3-TTS-12Hz-1.7B-ONNX`)
-- No existing CoreML conversion — ironmill would be **first to market** for
+- No existing CoreML conversion - ironmill would be **first to market** for
   on-device TTS via ANE
 - Real-world use case with high demand: private, low-latency text-to-speech on
   Apple devices
@@ -569,9 +569,9 @@ the ~1.5GB download)
 
 ---
 
-- [Orion: Characterizing and Programming Apple's Neural Engine for LLM Inference and Training](https://arxiv.org/abs/2603.06728) — March 2026
-- [NeuralForge: On-device LLM fine-tuning via ANE private APIs](https://agent-wars.com/news/2026-03-13-neuralforge-on-device-llm-fine-tuning-on-mac-using-apple-neural-engine) — March 2026
-- [Apple Intelligence Foundation Language Models Tech Report](https://arxiv.org/abs/2507.13575) — 2025
+- [Orion: Characterizing and Programming Apple's Neural Engine for LLM Inference and Training](https://arxiv.org/abs/2603.06728) - March 2026
+- [NeuralForge: On-device LLM fine-tuning via ANE private APIs](https://agent-wars.com/news/2026-03-13-neuralforge-on-device-llm-fine-tuning-on-mac-using-apple-neural-engine) - March 2026
+- [Apple Intelligence Foundation Language Models Tech Report](https://arxiv.org/abs/2507.13575) - 2025
 - [ANEMLL: Artificial Neural Engine ML Library](https://www.anemll.com/) & [Benchmarks](https://github.com/Anemll/anemll-bench)
 - [Disaggregated LLM Inference on Apple Silicon](https://atomgradient.github.io/hybrid-ane-mlx-bench/paper.pdf)
 - [Reasoning Compiler: LLM-Guided Optimizations (NeurIPS 2025)](https://arxiv.org/abs/2506.01374)
@@ -580,10 +580,10 @@ the ~1.5GB download)
 - [Batch Speculative Decoding (ICLR 2026)](https://openreview.net/forum?id=eM51kSFkoG)
 - [Layer-wise NPU Compiler Optimization (ICCTA 2024)](https://dl.acm.org/doi/fullHtml/10.1145/3674558.3674562)
 - [LLM Inference Optimization 2026 (Zylos Research)](https://zylos.ai/research/2026-01-15-llm-inference-optimization)
-- [Apple Roster of Experts (RoE): Hyper-Parallel MoE Inference](https://machinelearning.apple.com/research/roe) — 2026
+- [Apple Roster of Experts (RoE): Hyper-Parallel MoE Inference](https://machinelearning.apple.com/research/roe) - 2026
 - [M1MoE: MoE inference on Apple Silicon via Metal](https://github.com/koaWood/M1MoE)
 - [Comprehensive Survey of Mixture-of-Experts (2025)](https://arxiv.org/abs/2503.07137)
-- [Qwen3-TTS Technical Report](https://arxiv.org/abs/2601.15621) — January 2026
+- [Qwen3-TTS Technical Report](https://arxiv.org/abs/2601.15621) - January 2026
 - [Qwen3-TTS GitHub](https://github.com/QwenLM/Qwen3-TTS)
 - [Qwen3-TTS 0.6B ONNX INT8 (HuggingFace)](https://huggingface.co/sivasub987/Qwen3-TTS-0.6B-ONNX-INT8)
 - [Qwen3-TTS 1.7B ONNX (HuggingFace)](https://huggingface.co/xkos/Qwen3-TTS-12Hz-1.7B-ONNX)

@@ -20,7 +20,7 @@
 
 | Constraint | Limit | Notes |
 |---|---|---|
-| Minimum allocation | 16,384 bytes (16KB) | Previously assumed 48KB — empirically corrected |
+| Minimum allocation | 16,384 bytes (16KB) | Previously assumed 48KB - empirically corrected |
 | Shape rejection | `C > ~768` AND `S < 32` | ANE rejects `[1,C,1,S]` I/O tensors matching this |
 | Below-minimum rejection | status `0x1d` | IOSurfaces below 16KB are rejected |
 
@@ -28,7 +28,7 @@
 
 | Constraint | Details | Notes |
 |---|---|---|
-| Compute precision | FP16 only | ANE dequantizes INT8 to FP16 before compute — no native INT8 arithmetic |
+| Compute precision | FP16 only | ANE dequantizes INT8 to FP16 before compute - no native INT8 arithmetic |
 | INT8 support | Storage/transport only | `cast(int8→fp16)` ✅, `cast(fp16→int8)` ✅, but INT8 arithmetic (`add`/`mul` on int8) ❌ |
 | INT4/UINT4 support | Comprehensively rejected | All paths rejected: inputs, outputs, casts, consts, `constexpr_lut_to_dense`, `constexpr_blockwise_shift_scale` |
 | INT8 function outputs | ❌ Rejected | INT8 function *inputs* work, but INT8 *outputs* are rejected by the ANE compiler |
@@ -46,7 +46,7 @@ beyond SRAM (~32 MB), FP16 outperforms INT8.
 **Benchmark methodology:** Identical attention MIL programs compiled and
 evaluated on ANE, differing only in cache input dtype (INT8 vs FP16).
 The "INT8 raw" column uses `cache_int8=true` with no dequant scale and
-no rotation — structurally identical to FP16 except for the `cast(int8→fp16)`.
+no rotation - structurally identical to FP16 except for the `cast(int8→fp16)`.
 
 ```
 Config                        INT8+TQ  INT8raw     FP16 raw/fp16    Cache
@@ -64,8 +64,8 @@ Qwen3-0.6B @ 2048                 787      761      739    0.97x     4.0
 ```
 
 Key observations:
-- INT8+TQ vs INT8raw are nearly identical — dequant/rotation overhead is negligible
-- INT8raw vs FP16 shows **pure cast cost** — 3–30% slower depending on cache size
+- INT8+TQ vs INT8raw are nearly identical - dequant/rotation overhead is negligible
+- INT8raw vs FP16 shows **pure cast cost** - 3–30% slower depending on cache size
 - The gap *widens* at larger KV dimensions (32 KV heads: 30% slower at 128 MB cache)
 - Aligns with maderix's finding: "INT8 and FP16 deliver nearly identical throughput.
   The ANE dequantizes INT8 weights to FP16 before compute."
@@ -95,7 +95,7 @@ The most consequential constraint discovered during Qwen3-0.6B bringup:
   projections = ~8 MB fp16 weights, 3 conv outputs, ~37 non-const ops
 - Adding **any** compute op (even a single scalar `mul`) causes `ANECCompile() FAILED`
 - Reordering outputs can sometimes succeed where adding ops fails
-- The constraint is NOT weight size alone — it is a combination of program
+- The constraint is NOT weight size alone - it is a combination of program
   structure, op count, intermediate buffer count, and output-op restrictions
 
 **Practical impact:** Cache-write fusion into pre_attn is infeasible for
@@ -152,6 +152,6 @@ If a model compiles but produces wrong output, check sub-program boundaries:
 
 ## References
 
-- [ANE Op Support Matrix](ane-op-support-matrix.md) — 74 verified ops with error bounds
-- [ANE Inference Design](ane-inference.md) — inference pipeline status
-- [TurboQuant Design](turboquant.md) — INT8 KV cache compression
+- [ANE Op Support Matrix](ane-op-support-matrix.md) - 74 verified ops with error bounds
+- [ANE Inference Design](ane-inference.md) - inference pipeline status
+- [TurboQuant Design](turboquant.md) - INT8 KV cache compression

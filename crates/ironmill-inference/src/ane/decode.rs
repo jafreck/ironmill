@@ -1085,6 +1085,10 @@ impl AneInference {
             // With cache-write fusion, outputs are [Q, K_quant, V_quant, ...]
             // K_quant/V_quant are already rotated + quantized (fp16 with INT8-range values).
             // When QJL is enabled, an extra output carries the original K_proj.
+            // Read Q/K/V from pre_attn outputs.
+            // Outputs are sorted lexicographically by name (k_proj < q_proj < v_proj),
+            // NOT in Q/K/V order. Identify Q by channel count: Q has num_heads * head_dim
+            // channels while K/V have num_kv_heads * head_dim (smaller for GQA models).
             let num_pre_outputs = layer.pre_attn.output_tensors.len();
 
             // Attention (divergent path)
@@ -1144,16 +1148,18 @@ impl AneInference {
                 } else {
                     None
                 };
-                let q_data = read_f16_channels(&layer.pre_attn.output_tensors[0])?;
-                let k_data = if num_pre_outputs > 1 {
+                // Outputs are lexicographically sorted: [k_proj, q_proj, v_proj]
+                // Index 0 = K, index 1 = Q, index 2 = V
+                let q_data = if num_pre_outputs > 1 {
                     read_f16_channels(&layer.pre_attn.output_tensors[1])?
                 } else {
-                    q_data.clone()
+                    read_f16_channels(&layer.pre_attn.output_tensors[0])?
                 };
+                let k_data = read_f16_channels(&layer.pre_attn.output_tensors[0])?;
                 let v_data = if num_pre_outputs > 2 {
                     read_f16_channels(&layer.pre_attn.output_tensors[2])?
                 } else {
-                    q_data.clone()
+                    k_data.clone()
                 };
                 if let Some(t) = t0 {
                     d_read_qkv += t.elapsed();
@@ -1189,7 +1195,26 @@ impl AneInference {
                                 "layer {layer_idx} fp16_attn eval failed: {e}"
                             ))
                         })?;
-                    read_f16_channels(out_staging)?
+                    let attn_out = read_f16_channels(out_staging)?;
+                    if layer_idx == 0 && self.seq_pos < 2 {
+                        let q_sample: Vec<f32> =
+                            q_data.iter().take(4).map(|v| v.to_f32()).collect();
+                        let k_sample: Vec<f32> =
+                            k_data.iter().take(4).map(|v| v.to_f32()).collect();
+                        let out_sample: Vec<f32> =
+                            attn_out.iter().take(4).map(|v| v.to_f32()).collect();
+                        eprintln!(
+                            "[debug] L0 pos={} Q[..4]={:?} K[..4]={:?} attn_out[..4]={:?} q_len={} k_len={} out_len={}",
+                            self.seq_pos,
+                            q_sample,
+                            k_sample,
+                            out_sample,
+                            q_data.len(),
+                            k_data.len(),
+                            attn_out.len(),
+                        );
+                    }
+                    attn_out
                 } else {
                     // No compiled attention — return Q as pass-through.
                     q_data

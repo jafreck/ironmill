@@ -49,20 +49,20 @@ as `a_input2` / `a_input3` function parameters.
 
 ## Root Cause Candidates
 
-1. **Path format** — `@model_path/weights/name.bin` may not be resolved
+1. **Path format** - `@model_path/weights/name.bin` may not be resolved
    correctly by the in-memory compilation path. The `mlpackage` path
    compilation may handle it differently.
 
-2. **Offset** — `offset=uint64(64)` may be wrong for the in-memory
+2. **Offset** - `offset=uint64(64)` may be wrong for the in-memory
    weight dictionary. The `compile_mil_text` implementation in
    `crates/mil-rs/src/ffi/ane.rs` builds an `NSDictionary` of weight
    blobs; the offset may need to be 0 for in-memory data.
 
-3. **Weight dictionary encoding** — The NSData objects in the weight
+3. **Weight dictionary encoding** - The NSData objects in the weight
    dictionary may need different formatting (e.g., including a 64-byte
    header before the payload to match the offset=64 convention).
 
-4. **Weight name mapping** — The dictionary key format may not match
+4. **Weight name mapping** - The dictionary key format may not match
    what the MIL parser expects from the `path=string(...)` reference.
 
 ## Investigation Steps
@@ -78,6 +78,6 @@ as `a_input2` / `a_input3` function parameters.
 
 ## Files
 
-- `crates/mil-rs/src/ffi/ane.rs` — `AneCompiler::compile_mil_text`
-- `crates/mil-rs/src/convert/ir_to_mil_text.rs` — BLOBFILE emission for standard path
-- `crates/ironmill-ane/src/turboquant_mil.rs` — workaround implementation
+- `crates/mil-rs/src/ffi/ane.rs` - `AneCompiler::compile_mil_text`
+- `crates/mil-rs/src/convert/ir_to_mil_text.rs` - BLOBFILE emission for standard path
+- `crates/ironmill-ane/src/turboquant_mil.rs` - workaround implementation

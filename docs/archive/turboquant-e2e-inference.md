@@ -1,15 +1,15 @@
 # TurboQuant End-to-End Inference Integration
 
-> **Status:** Implemented — benchmarks running
+> **Status:** Implemented - benchmarks running
 >
 > **Results (Qwen3-0.6B, 128 tokens, M2 Max ANE-only decode):**
 >
 > | Path | Throughput | KV Cache | Token Agreement |
 > |------|-----------|----------|-----------------|
-> | FP16 baseline | 6.1 tok/s | 29.0 MB | — |
+> | FP16 baseline | 6.1 tok/s | 29.0 MB | - |
 > | TurboQuant INT8 | 5.5 tok/s | 14.5 MB | 0% vs baseline |
 >
-> Both paths run end-to-end but **neither computes real attention** —
+> Both paths run end-to-end but **neither computes real attention** -
 > the FP16 baseline passes Q through as attention output (no softmax/
 > QK^T/AV), and 0% token agreement confirms output is not meaningful.
 > See [ANE Inference Optimizations](ane-inference-optimizations.md) for
@@ -22,7 +22,7 @@
 > - [ANE Attention Split Investigation](ane-attention-split-investigation.md) ✅ resolved (split works, runtime eval fixed)
 >
 > **Remaining for correctness:** FP16 attention sub-programs, structural
-> split fix — tracked in [ANE Inference Optimizations](ane-inference-optimizations.md)
+> split fix - tracked in [ANE Inference Optimizations](ane-inference-optimizations.md)
 
 ## Design
 
@@ -35,7 +35,7 @@ on ANE sub-programs.
 Each `layer_N` sub-program is split at the attention boundary during
 compilation, producing two sub-programs per layer: `pre_attn` and
 `post_attn`. The attention ops between them are excluded from the split
-and handled at runtime. This split is required for both paths — FP16
+and handled at runtime. This split is required for both paths - FP16
 baseline also needs it for stateful KV cache management. In TurboQuant
 mode, TurboQuant's cache-write + attention programs replace the
 attention step; in FP16 mode, an FP16 attention sub-program or
@@ -109,7 +109,7 @@ self.run_post_attn(layer, &attn_out)?;
 ```
 
 **Why both paths need the layer split:** Even the FP16 baseline requires
-stateful KV cache management — the ONNX model's `past_key_values` /
+stateful KV cache management - the ONNX model's `past_key_values` /
 `present` must be threaded across decode steps. This means both paths
 intercept at the attention boundary to manage cache state. The split
 is not TurboQuant-specific infrastructure; it's a prerequisite for any
@@ -119,11 +119,11 @@ autoregressive ANE inference.
 
 ## Implementation Plan
 
-### Phase 1 — Model architecture extraction
+### Phase 1 - Model architecture extraction
 
 Extract `num_heads`, `num_kv_heads`, `head_dim`, `num_layers` from a
 loaded ONNX/MIL Program. The ONNX converter already reads these from
-`GroupQueryAttention` attributes — surface them as a `ModelArch` struct.
+`GroupQueryAttention` attributes - surface them as a `ModelArch` struct.
 
 **File:** `crates/mil-rs/src/analysis/arch.rs` (new)
 
@@ -155,7 +155,7 @@ impl TurboQuantConfig {
 }
 ```
 
-### Phase 2 — Attention-boundary layer splitting
+### Phase 2 - Attention-boundary layer splitting
 
 Extend `split_for_ane` to split each `layer_N` into two sub-programs
 at the attention boundary (the attention ops are excluded and handled
@@ -185,7 +185,7 @@ pub struct SplitConfig {
 
 When `split_attention` is false, behavior is unchanged.
 
-### Phase 3 — Autoregressive `AneInference` engine
+### Phase 3 - Autoregressive `AneInference` engine
 
 New struct that manages stateful autoregressive inference. Replaces the
 stateless `AneModel::predict()` for decode workloads.
@@ -252,7 +252,7 @@ cache-write + attention → post_attn, with INT8 KV cache.
 
 Same code path, same model, only the attention + cache differs.
 
-### Phase 4 — Generation loop
+### Phase 4 - Generation loop
 
 **File:** `crates/ironmill-ane/src/inference.rs`
 
@@ -262,7 +262,7 @@ impl AneInference {
     /// KV cache. Returns logits for the last prompt token.
     ///
     /// Batch prefill (processing multiple tokens in one ANE eval) is not
-    /// supported initially — the attention sub-programs are compiled for
+    /// supported initially - the attention sub-programs are compiled for
     /// single-token decode shapes. Sequential prefill calls decode()
     /// for each prompt token.
     pub fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>>;
@@ -281,7 +281,7 @@ impl AneInference {
 Sampling strategies: greedy (temperature=0), temperature scaling,
 top-k/top-p. EOS token detection stops generation.
 
-> **Future optimization — Metal batch prefill:** Sequential prefill is
+> **Future optimization - Metal batch prefill:** Sequential prefill is
 > the biggest performance bottleneck. A 2K-token prompt takes ~22 s at
 > 11 ms/token. Batched Metal prefill could reduce this to ~200 ms by
 > dispatching one large GPU matmul per layer. The architecture supports
@@ -290,7 +290,7 @@ top-k/top-p. EOS token detection stops generation.
 > separate Metal compute pipeline and is independent of the ANE decode
 > path being built here.
 
-### Phase 5 — Benchmark + quality comparison
+### Phase 5 - Benchmark + quality comparison
 
 **File:** `crates/ironmill-ane/examples/turboquant_e2e_bench.rs`
 

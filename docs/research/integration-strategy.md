@@ -2,7 +2,7 @@
 
 ## Core Principle: Foundation Crate, Not a Framework Feature
 
-`mil-rs` is a **standalone foundation crate** — not a feature of candle, burn, or any
+`mil-rs` is a **standalone foundation crate** - not a feature of candle, burn, or any
 specific ML framework. It follows the established Rust pattern where a focused library
 provides building blocks that multiple higher-level projects compose on top of.
 
@@ -22,12 +22,12 @@ coupling to each other.
 ## Why NOT Upstream in Candle
 
 1. **`candle-coreml` is already external.** It lives at `mazhewitt/candle-cormel`, not
-   in the huggingface/candle workspace. The precedent is set — CoreML is not an in-tree
+   in the huggingface/candle workspace. The precedent is set - CoreML is not an in-tree
    candle concern.
 
 2. **Different abstraction layer.** Candle's in-tree backends (Metal, CUDA) implement
    `BackendStorage` and `BackendDevice` traits for general tensor computation. CoreML is
-   not a general compute backend — it runs precompiled models. `mil-rs` is even further
+   not a general compute backend - it runs precompiled models. `mil-rs` is even further
    removed: it's a model *format* library, not a compute library.
 
 3. **Multiple consumers.** Burn, tract, standalone CLI tools, and C/C++ projects via FFI
@@ -52,7 +52,7 @@ External crates (separate repos, depend on candle-core):
 ```
 
 Metal is in-tree because it implements the `BackendStorage` trait for general tensor
-math. CoreML is external because it's an inference-only runtime bridge — you hand it a
+math. CoreML is external because it's an inference-only runtime bridge - you hand it a
 precompiled model, it runs it.
 
 ## How Burn's Architecture Works (for context)
@@ -117,7 +117,7 @@ Future (separate repo):
 ### Phase 2: `ironmill` CLI
 - Uses `mil-rs` for conversion
 - Calls `xcrun coremlcompiler` for final compilation
-- `cargo install ironmill` — a standalone tool
+- `cargo install ironmill` - a standalone tool
 
 ### Phase 3: Ecosystem bridges (PRs to existing projects)
 - **PR to `candle-coreml`**: Add optional `mil-rs` dependency, enabling
@@ -147,8 +147,8 @@ Future (separate repo):
 
 > `mil-rs` is to the Rust ML ecosystem what `prost` is to the Rust networking ecosystem.
 >
-> `prost` doesn't implement gRPC — `tonic` does that. But `tonic` couldn't exist without
+> `prost` doesn't implement gRPC - `tonic` does that. But `tonic` couldn't exist without
 > `prost` providing the protobuf foundation.
 >
-> Similarly, `mil-rs` doesn't implement ML inference — `candle-coreml` and `burn-coreml`
+> Similarly, `mil-rs` doesn't implement ML inference - `candle-coreml` and `burn-coreml`
 > do that. But they can't create CoreML models without a Rust-native CoreML format library.

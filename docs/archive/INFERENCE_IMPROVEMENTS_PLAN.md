@@ -81,7 +81,7 @@ prefill vs token decode. Both runtimes need to support this.
 ### 4. Prefer Structured Metadata Over Hardcoded Behavior
 
 Where possible, Ironmill should emit artifacts with routing decisions,
-stage metadata, and shape constraints encoded declaratively — making both
+stage metadata, and shape constraints encoded declaratively - making both
 runtimes and any downstream consumers smarter by default.
 
 ### 5. Copy Constraints and Tactics, Not Project Identity
@@ -103,7 +103,7 @@ custom MIL ops that CoreML cannot compile. Until these are decomposed into
 standard MIL ops, stateful autoregressive export (#1) and prefill/decode
 splitting (#2) cannot be validated end-to-end on real transformer models.
 
-See: `KNOWN_ISSUES.md` — "Transformer ops are opaque pass-throughs"
+See: `KNOWN_ISSUES.md` - "Transformer ops are opaque pass-throughs"
 
 ### Remove Legacy Compiler Dispatch
 
@@ -264,9 +264,9 @@ Recommended direction:
 
 Existing scaffolding:
 
-- `crates/mil-rs/src/convert/lora.rs` — format-agnostic LoRA detection and
+- `crates/mil-rs/src/convert/lora.rs` - format-agnostic LoRA detection and
   merge kernel
-- `crates/mil-rs/src/convert/weights/safetensors.rs` — adapter discovery
+- `crates/mil-rs/src/convert/weights/safetensors.rs` - adapter discovery
   from `adapter_config.json`
 - CLI reserved flags in `crates/ironmill-cli/src/main.rs`
 
@@ -293,11 +293,11 @@ Recommended direction:
 
 Existing scaffolding:
 
-- `crates/mil-rs/src/convert/pipeline.rs` — stage topology, dependency
+- `crates/mil-rs/src/convert/pipeline.rs` - stage topology, dependency
   ordering, I/O validation, and manifest emission
-- `crates/mil-rs/src/convert/ir_to_proto.rs` — multi-function model bundling
+- `crates/mil-rs/src/convert/ir_to_proto.rs` - multi-function model bundling
   for MoE
-- `crates/mil-rs/src/ir/passes/model_split.rs` — draft/verifier splitting
+- `crates/mil-rs/src/ir/passes/model_split.rs` - draft/verifier splitting
 
 Why this matters:
 
@@ -394,7 +394,7 @@ Why these are deferred:
 
 Focus on:
 
-0. transformer op decomposition (prerequisite — unblocks #1 and #2 validation)
+0. transformer op decomposition (prerequisite - unblocks #1 and #2 validation)
 1. stateful autoregressive export and KV cache support
 2. prefill/decode split with shape buckets
 3. better ANE-aware routing and diagnostics

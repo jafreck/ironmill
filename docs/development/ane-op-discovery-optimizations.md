@@ -1,7 +1,7 @@
 # ANE Op Discovery–Driven Optimizations
 
 Concrete optimizations unlocked by ironmill's 52 novel ANE op discoveries.
-These capabilities are unique to ironmill — no other open-source project
+These capabilities are unique to ironmill - no other open-source project
 (maderix/ANE, Orion, Espresso, ANEgpt, hollance/neural-engine) has verified
 the ops that enable them.
 
@@ -26,7 +26,7 @@ ANE: QKV + attention + FFN
 ...
 ```
 
-Espresso works around this with "fused 3-layer kernels" — cramming 3 layers
+Espresso works around this with "fused 3-layer kernels" - cramming 3 layers
 into 1 ANE dispatch to reduce the number of CPU roundtrips. maderix and Orion
 run normalization entirely on CPU via vDSP.
 
@@ -56,7 +56,7 @@ ANE: embed → [LayerNorm → QKV → attention → LayerNorm → FFN] × N → 
 Eliminating CPU normalization removes the primary latency bottleneck in
 every competing ANE project. The CPU roundtrip involves IOSurface reads,
 fp16→fp32 conversion, vDSP computation, fp32→fp16 conversion, and IOSurface
-writes — typically 0.5-1.0ms per layer on M4.
+writes - typically 0.5-1.0ms per layer on M4.
 
 ---
 
@@ -83,7 +83,7 @@ With `erf`, GELU is exact in 5 ops:
 gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
 ```
 
-Ops: `mul`, `erf`, `add`, `mul`, `mul` — and the ANE's `erf` has 10× better
+Ops: `mul`, `erf`, `add`, `mul`, `mul` - and the ANE's `erf` has 10× better
 precision than the tanh approximation (0.001 vs 0.01 max error).
 
 ### Implementation
@@ -170,7 +170,7 @@ ANE: Q @ K^T → greater(positions, positions_T) → select(mask, scores, -inf)
 Note: the `status=0x1d` error documented in
 `ane-attention-split-investigation.md` was caused by the ANE minimum I/O
 tensor size constraint (C > ~768, S < 32), not by masking. Causal masking
-is a separate concern — it enables keeping the full attention block on
+is a separate concern - it enables keeping the full attention block on
 ANE rather than decomposing attention to do masking on CPU.
 
 ### Expected impact
@@ -189,12 +189,12 @@ If the full attention block stays on ANE, the CPU roundtrip for masking
 
 No project in the open-source ANE ecosystem knew logarithm was possible on
 ANE. Espresso doesn't list it. Orion doesn't have it. maderix never tested
-it. The key was the mandatory `epsilon` parameter — without it, the ANE
+it. The key was the mandatory `epsilon` parameter - without it, the ANE
 compiler rejects `log`; with it, `log` compiles and produces correct results.
 
 ### What this unlocks
 
-- **Log-softmax:** `log(softmax(x))` entirely on ANE — used in loss
+- **Log-softmax:** `log(softmax(x))` entirely on ANE - used in loss
   computation during training and in some sampling strategies
 - **Cross-entropy loss:** `sum(-target * log(pred))` on ANE
 - **Entropy / KL divergence:** information-theoretic computations on-device
@@ -234,7 +234,7 @@ compiler rejects `log`; with it, `log` compiles and produces correct results.
 
 ### What this enables
 
-- Asymmetric pre-padding for causal convolutions (left-pad only) — critical
+- Asymmetric pre-padding for causal convolutions (left-pad only) - critical
   for WaveNet-style architectures and causal conv in speech models
 - Shape alignment before conv/matmul to satisfy ANE's channel alignment
   requirements (multiples of 32) without reshape workarounds
@@ -248,7 +248,7 @@ compiler rejects `log`; with it, `log` compiles and produces correct results.
 
 ### What this simplifies
 
-Replace `real_div(1, x)` with `inverse(x, epsilon)` — single op, slightly
+Replace `real_div(1, x)` with `inverse(x, epsilon)` - single op, slightly
 better numerical stability due to epsilon guarding against division by zero.
 Useful in attention scaling (`1/sqrt(d_k)`), normalization denominators, and
 any reciprocal computation.

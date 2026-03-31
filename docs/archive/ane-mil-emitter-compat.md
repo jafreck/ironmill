@@ -2,7 +2,7 @@
 
 > **Status:** Resolved
 >
-> **Blocked:** [TurboQuant E2E Inference](turboquant-e2e-inference.md) — layer sub-program compilation
+> **Blocked:** [TurboQuant E2E Inference](turboquant-e2e-inference.md) - layer sub-program compilation
 >
 > **Discovered during:** BLOBFILE investigation → E2E inference bringup
 
@@ -55,26 +55,26 @@ of BLOBFILE-backed const ops, matching the TurboQuant approach.
 These were discovered and fixed while tracing the E2E compilation
 failure. They apply to all ANE compilation, not just E2E inference:
 
-1. **`emit_const_op` attribute lookup** — ONNX-converted const ops
+1. **`emit_const_op` attribute lookup** - ONNX-converted const ops
    store weight tensors in `attributes["val"]`, not `inputs["val"]`.
    Fixed in `ir_to_mil_text.rs` to check both.
    *(This was the actual root cause of the BLOBFILE investigation.)*
 
-2. **`reciprocal` decomposition** — ANE doesn't support `reciprocal`.
+2. **`reciprocal` decomposition** - ANE doesn't support `reciprocal`.
    Decomposed to `real_div(1, x)` in `AneInference` pre-compilation.
 
-3. **Dynamic shape materialization** — ONNX models have dynamic `?`
+3. **Dynamic shape materialization** - ONNX models have dynamic `?`
    dimensions. Materialized to `1` before `AneLayoutPass` so the
    layout mapping sees static shapes.
 
-4. **Weight const type declarations** — Reshaped to 4D in MIL text
+4. **Weight const type declarations** - Reshaped to 4D in MIL text
    (`[1024]` → `[1,1024,1,1]`) via `to_ane_weight_shape()`.
 
-5. **ANE layout dimension alignment** — Fixed 3D `[1,1,N]` → 4D
+5. **ANE layout dimension alignment** - Fixed 3D `[1,1,N]` → 4D
    mapping to put hidden_size in C (`[1,N,1,1]`) instead of S
    (`[1,1,1,N]`), aligning activations with weight shapes.
 
-6. **Reshape shape sync** — `AneLayoutPass` now updates reshape ops'
+6. **Reshape shape sync** - `AneLayoutPass` now updates reshape ops'
    shape parameters to match the 4D output type.
 
 ## Files Changed
@@ -87,7 +87,7 @@ failure. They apply to all ANE compilation, not just E2E inference:
 
 ## References
 
-- [ANE BLOBFILE Investigation](ane-blobfile-investigation.md) — predecessor (root cause resolved: #1 above)
-- [ANE Attention Split Investigation](ane-attention-split-investigation.md) — current blocker
+- [ANE BLOBFILE Investigation](ane-blobfile-investigation.md) - predecessor (root cause resolved: #1 above)
+- [ANE Attention Split Investigation](ane-attention-split-investigation.md) - current blocker
 - [TurboQuant E2E Inference](turboquant-e2e-inference.md)
 - [ANE Op Support Matrix](../research/ane-op-support-matrix.md)

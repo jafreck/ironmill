@@ -1,4 +1,4 @@
-# TurboQuant — ANE KV Cache Compression
+# TurboQuant - ANE KV Cache Compression
 
 > Consolidated from `turboquant-implementation.md` and `turboquant-zero-copy.md`.
 > Original investigation docs archived in `docs/archive/`.
@@ -8,7 +8,7 @@
 TurboQuant compresses KV cache entries from FP16 to INT8 at runtime during
 autoregressive decoding, halving cache memory and bandwidth. It uses Hadamard
 rotation for incoherence, beta-optimal scalar quantization, and optional QJL
-sign correction — all running on the ANE via hand-written MIL programs.
+sign correction - all running on the ANE via hand-written MIL programs.
 
 ## Architecture
 
@@ -45,7 +45,7 @@ Each step is a separate ANE sub-program with IOSurface tensors passed between th
 - Chunked lm_head on ANE
 
 ### Not Yet Validated
-- **End-to-end correctness** — no perplexity or token-agreement tests exist yet.
+- **End-to-end correctness** - no perplexity or token-agreement tests exist yet.
   See `docs/development/QUALITY_BENCHMARK_PLAN.md`.
 
 ## Data Path (Zero-Copy)
@@ -84,26 +84,26 @@ All ops verified in [ANE Op Support Matrix](ane-op-support-matrix.md):
 
 ## Key Constraints
 
-- **INT4 is NOT feasible** via the MIL text path — comprehensively rejected
+- **INT4 is NOT feasible** via the MIL text path - comprehensively rejected
   by ANE compiler. See [op matrix](ane-op-support-matrix.md#int4-comprehensively-rejected).
-- **INT8 is a storage format, not compute** — all arithmetic must be in fp16.
+- **INT8 is a storage format, not compute** - all arithmetic must be in fp16.
   Cast to int8 for bandwidth, cast back for math.
-- **Per-program weight budget** — ~8 MB fp16 per sub-program. Adding compute
+- **Per-program weight budget** - ~8 MB fp16 per sub-program. Adding compute
   ops to programs at this limit causes compiler failure. See [ANE Constraints](ane-constraints.md).
 - **Cache-write fusion into pre_attn is infeasible** at Qwen3-0.6B scale due
   to the per-program resource limit.
 
 ## Open Issues
 
-1. **Correctness validation** — no perplexity or token-agreement benchmarks
+1. **Correctness validation** - no perplexity or token-agreement benchmarks
    exist yet. See `docs/development/QUALITY_BENCHMARK_PLAN.md`.
-2. **Prefill path** — batch processing of prompt tokens not yet implemented for
+2. **Prefill path** - batch processing of prompt tokens not yet implemented for
    TurboQuant (only single-token decode exists).
 
 ## References
 
-- [ANE Op Support Matrix](ane-op-support-matrix.md) — verified op set
-- [ANE Inference](ane-inference.md) — inference pipeline status
-- [ANE Constraints](ane-constraints.md) — hardware limits
-- [TurboQuant Research Analysis](../research/turboquant-analysis.md) — paper background
-- [TurboQuant via Orion](../research/turboquant-ane-orion.md) — private API feasibility (not current path)
+- [ANE Op Support Matrix](ane-op-support-matrix.md) - verified op set
+- [ANE Inference](ane-inference.md) - inference pipeline status
+- [ANE Constraints](ane-constraints.md) - hardware limits
+- [TurboQuant Research Analysis](../research/turboquant-analysis.md) - paper background
+- [TurboQuant via Orion](../research/turboquant-ane-orion.md) - private API feasibility (not current path)

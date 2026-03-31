@@ -14,14 +14,14 @@ single-op eval testing.
 
 ## Specific Discoveries
 
-### `gather` — Runtime Gather Rejected
+### `gather` - Runtime Gather Rejected
 
 - **Status**: ❌ compiler-rejected (confirmed by `ane-op-support-matrix.md`)
 - **Context**: RoPE cos/sin cache lookup uses `gather(cos_cache, position_ids, axis=0)`
 - **Workaround**: CPU-side gather (trivially cheap for single-token decode: 256 bytes memcpy, ~nanoseconds)
 - **Note**: Static `constexpr_lut_to_dense` gather works (compile-time expansion). Only runtime/dynamic gather fails.
 
-### `split` — Unreliable in Attention Sub-Programs
+### `split` - Unreliable in Attention Sub-Programs
 
 - **Support matrix status**: ⚠️ compile-only
 - **Finding**: Programs containing `split` (from RoPE half-rotation) fail `_ANECCompile` when combined with matmul + softmax + tile in the same program
@@ -29,14 +29,14 @@ single-op eval testing.
 - **In combination**: `split` + `concat` + `matmul` + `softmax` → compiler rejects the full program
 - **Workaround**: Strip RoPE ops from ANE sub-programs; apply rotation on CPU
 
-### `concat` — Works on ANE (Previous Validation Was Wrong)
+### `concat` - Works on ANE (Previous Validation Was Wrong)
 
 - **Support matrix status**: ✅ eval-verified (`max_err=0.025`)
-- **Previous ironmill assumption**: "ANE does not support concat (constraint #1)" — **FALSE**
+- **Previous ironmill assumption**: "ANE does not support concat (constraint #1)" - **FALSE**
 - **Finding**: `concat` with const `axis` and `interleave` is eval-verified and works
 - **Action taken**: Removed the false concat validation from `inference.rs`
 
-### `matmul` — Dynamic×Dynamic May Require Shape Constraints
+### `matmul` - Dynamic×Dynamic May Require Shape Constraints
 
 - **Support matrix status**: ✅ eval-verified
 - **Finding**: `matmul(Q, K, transpose_y=true)` where both Q and K are dynamic (not const weights) fails compilation when shapes are `[1, 2048, 1, 32]` (S=32 padded)
@@ -44,11 +44,11 @@ single-op eval testing.
 - **TurboQuant comparison**: TurboQuant's matmul works because its MIL programs are hand-written with correct shapes (`[1, num_heads, head_dim, 1]` for Q, `[1, num_kv_heads, head_dim, seq_len]` for K cache)
 - **Workaround**: Skip S≥32 padding for fp16_attn sub-programs, or emit MIL with pre-padded-correct shapes
 
-### `reduce_mean` + `pow` — Work Individually, Untested in Combination
+### `reduce_mean` + `pow` - Work Individually, Untested in Combination
 
 - **Support matrix status**: ✅ eval-verified (both)
 - **Context**: Per-head Q/K norms use `mul → reduce_mean → add → pow(-0.5) → mul → mul`
-- **Finding**: These ops were present in fp16_attn sub-programs that failed compilation, but the failure was caused by other ops (split, shape issues). These ops are NOT confirmed as problematic — they may work in isolation within an attention sub-program.
+- **Finding**: These ops were present in fp16_attn sub-programs that failed compilation, but the failure was caused by other ops (split, shape issues). These ops are NOT confirmed as problematic - they may work in isolation within an attention sub-program.
 
 ## Program Budget Constraint
 
@@ -71,14 +71,14 @@ Discovered from [Orion](https://github.com/mechramc/Orion) (`core/ane_runtime.m`
 
 // After unload, reload IS possible:
 [model unloadWithQoS:21 error:&e];                 // free ANE slot
-[model loadWithQoS:21 options:@{} error:&e];       // reload — WORKS!
+[model loadWithQoS:21 options:@{} error:&e];       // reload - WORKS!
 ```
 
 - `unloadWithQoS:` frees the ANE execution slot but the ObjC model object stays alive
 - `loadWithQoS:` can reload using the compiled artifact (net.plist on disk)
 - This enables lazy load/unload: compile all programs upfront, unload all, then load ≤3 at a time during decode
 
-### `CompiledProgram` Drop — Prevents Cross-Model Leaks
+### `CompiledProgram` Drop - Prevents Cross-Model Leaks
 
 - Neither `CompiledProgram` nor `LoadedProgram` had `Drop` impls
 - Model handles leaked when `AneInference` went out of scope
@@ -89,17 +89,17 @@ Discovered from [Orion](https://github.com/mechramc/Orion) (`core/ane_runtime.m`
 
 ### Minimum Allocation Size
 
-- Previous assumption: 48KB (`MIN_SURFACE_ALLOC = 49152`) — overly conservative
+- Previous assumption: 48KB (`MIN_SURFACE_ALLOC = 49152`) - overly conservative
 - Empirical finding: 16KB (`ANE_MIN_SURFACE_BYTES = 16384`) is sufficient
 - Exact-fit allocations (as used by Orion/maderix) fail for very small tensors
 - ANE rejects IOSurfaces below 16KB with status `0x1d`
 
-### S≥32 Padding — Necessary but Causes Shape Issues
+### S≥32 Padding - Necessary but Causes Shape Issues
 
 - ANE rejects I/O tensors `[1, C, 1, S]` when `C > ~768` and `S < 32`
 - The global S≥32 padding in `inference.rs` fixes this for pre_attn/post_attn
 - **Problem**: The same padding corrupts attention sub-program shapes where S represents per-head dimensions, not sequence positions
-- **Fix needed**: Selective padding — apply S≥32 only to sub-programs with high-C tensors, not to attention sub-programs where shapes have specific meaning
+- **Fix needed**: Selective padding - apply S≥32 only to sub-programs with high-C tensors, not to attention sub-programs where shapes have specific meaning
 
 ## Remaining Blockers for FP16 Attention on ANE
 
@@ -109,14 +109,14 @@ Discovered from [Orion](https://github.com/mechramc/Orion) (`core/ane_runtime.m`
 
 The TurboQuant path avoids all three by using hand-written MIL programs with correct shapes and CPU-side rotation.
 
-## S≥32 Padding — Must Be Per-Sub-Program (Updated)
+## S≥32 Padding - Must Be Per-Sub-Program (Updated)
 
 The S≥32 padding was moved from global (pre-split) to per-sub-program
 (post-split). fp16_attn sub-programs are skipped because:
 
 1. Attention reshapes convert `[1, hidden, 1, S]` → `[1, heads, head_dim, S]`
-2. With S=32 padding, the reshape produces `[1, 16, 128, 32]` — wrong
-3. Without padding, `[1, 2048, 1, 1]` → `[1, 16, 128, 1]` — correct dimensions
+2. With S=32 padding, the reshape produces `[1, 16, 128, 32]` - wrong
+3. Without padding, `[1, 2048, 1, 1]` → `[1, 16, 128, 1]` - correct dimensions
 4. BUT: `[1, 16*128, 1, 1]` = `C=2048 > 768, S=1 < 32` → ANE constraint violation
 
 **Root cause**: Single-token decode creates matmul shapes with S=1
@@ -124,5 +124,5 @@ and C>768, which ANE rejects regardless of padding. The KV cache
 needs full seq_len dimension in the matmul (like TurboQuant uses).
 
 **Conclusion**: FP16 attention on ANE requires the same architectural
-pattern as TurboQuant — KV cache IOSurfaces as matmul inputs with
+pattern as TurboQuant - KV cache IOSurfaces as matmul inputs with
 S=seq_len ≥ 32, not single-token S=1 projections.

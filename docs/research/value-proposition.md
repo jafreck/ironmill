@@ -5,7 +5,7 @@
 
 ## 1. Training or Inference?
 
-**Inference deployment — specifically, model conversion for deployment.**
+**Inference deployment - specifically, model conversion for deployment.**
 
 ### What's actually missing
 The ANE is accessible today. `coreml-native` (Rust) can load compiled CoreML models and
@@ -34,14 +34,14 @@ optimized.save_mlpackage("model.mlpackage")?;
 CoreML's public API now supports on-device fine-tuning and personalization (as of
 WWDC 2024+). Our role would be to prepare models that are *structured for* on-device
 adaptation (marking layers as updatable in the CoreML protobuf). We don't reimplement
-backprop — training from scratch stays in Python/PyTorch where it belongs.
+backprop - training from scratch stays in Python/PyTorch where it belongs.
 
 ---
 
 ## 2. Where It Fits in the Wider AI Tooling Ecosystem
 
 ### The real problem in context
-Every NPU vendor provides native model conversion tools — except Apple, which requires Python:
+Every NPU vendor provides native model conversion tools - except Apple, which requires Python:
 
 | Vendor | Accelerator | Native conversion tool | Language |
 |--------|------------|----------------------|----------|
@@ -56,7 +56,7 @@ We provide what every other vendor already has: a native conversion tool.
 ### Honest scope
 This is **not** "unlocking stranded hardware that nobody can use." CoreML + ANE works
 today via Python conversion → xcrun compile → native runtime. The value is removing
-Python from that pipeline — which matters most for:
+Python from that pipeline - which matters most for:
 
 - **CI/CD pipelines** that don't want a Python environment
 - **Rust/C++ apps** that want self-contained build systems
@@ -143,18 +143,18 @@ fn main() {
 ## 4. Who Specifically Would Use This?
 
 ### Strongest use cases
-1. **Tauri/desktop AI apps** — No Python in CI, self-contained builds
-2. **iOS/macOS Rust developers** — `build.rs` model conversion
-3. **CI/CD pipelines** — Reproducible model compilation without Python env
-4. **CLI tool authors** — `cargo install`-able tools that include model conversion
+1. **Tauri/desktop AI apps** - No Python in CI, self-contained builds
+2. **iOS/macOS Rust developers** - `build.rs` model conversion
+3. **CI/CD pipelines** - Reproducible model compilation without Python env
+4. **CLI tool authors** - `cargo install`-able tools that include model conversion
 
 ### Moderate use cases
-5. **candle/burn users** — ANE path for power-sensitive deployments (mobile, laptop)
-6. **Embedded Rust on Apple** — IoT, kiosk, always-on inference
+5. **candle/burn users** - ANE path for power-sensitive deployments (mobile, laptop)
+6. **Embedded Rust on Apple** - IoT, kiosk, always-on inference
 
 ### Weaker use cases (Metal GPU is fine)
-7. **Server-side Rust on Mac** — Plugged in, GPU available, power doesn't matter
-8. **Dev/prototyping** — Metal GPU via candle is fast enough
+7. **Server-side Rust on Mac** - Plugged in, GPU available, power doesn't matter
+8. **Dev/prototyping** - Metal GPU via candle is fast enough
 
 ---
 
@@ -178,5 +178,5 @@ fn main() {
 | Training or inference? | **Model conversion for inference deployment.** Training stays in Python. |
 | What's truly missing? | Native (non-Python) model conversion to CoreML format. |
 | Is ANE access broken? | **No.** Runtime access works. Conversion pipeline requires Python. |
-| Is this worth building? | Yes — for the toolchain story and the shipped-app power/GPU-freedom benefits. Not for dramatic speed gains. |
+| Is this worth building? | Yes - for the toolchain story and the shipped-app power/GPU-freedom benefits. Not for dramatic speed gains. |
 | Addressable audience? | Rust app developers shipping on Apple platforms, CI/CD pipelines, anyone wanting Python-free CoreML conversion. |

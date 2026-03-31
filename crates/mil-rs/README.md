@@ -1,6 +1,6 @@
 # mil-rs
 
-Read, write, and manipulate Apple CoreML models in Rust — no Python required.
+Read, write, and manipulate Apple CoreML models in Rust - no Python required.
 
 `mil-rs` provides a strongly-typed MIL (Model Intermediate Language)
 intermediate representation, ONNX-to-CoreML conversion, optimization passes
@@ -18,11 +18,11 @@ mil-rs = "0.1"
 
 ### Model I/O
 
-- **`.mlmodel` reader/writer** — serialize and deserialize single-file CoreML
+- **`.mlmodel` reader/writer** - serialize and deserialize single-file CoreML
   models (protobuf binary)
-- **`.mlpackage` reader/writer** — directory-based package format with
+- **`.mlpackage` reader/writer** - directory-based package format with
   `Manifest.json` handling
-- **ONNX reader** — parse `.onnx` files into ONNX protobuf types
+- **ONNX reader** - parse `.onnx` files into ONNX protobuf types
 
 ### MIL IR
 
@@ -147,11 +147,4 @@ but cannot be converted to the MIL IR.
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](../../LICENSE-APACHE) or
-  <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](../../LICENSE-MIT) or
-  <http://opensource.org/licenses/MIT>)
-
-at your option.
+Licensed under the Apache License, Version 2.0 ([LICENSE](../../LICENSE) or <http://www.apache.org/licenses/LICENSE-2.0>).

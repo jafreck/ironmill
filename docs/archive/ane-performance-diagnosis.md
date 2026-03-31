@@ -30,21 +30,21 @@ From `crates/mil-rs/src/validate.rs`:
 
 ## Diagnosis Workflow
 
-### Step 1: Validate — identify limit violations
+### Step 1: Validate - identify limit violations
 
 ```bash
 cargo run --release -p ironmill-cli -- validate <model> --format text
 ```
 
 The validation report shows:
-- **ANE compatibility %** — what fraction of ops can run on ANE
-- **ANE compute %** — what fraction of FLOPs run on ANE
-- **Per-op fallback reasons** — exactly which limit each op violates
-- **Performance annotations** — supported-but-slow patterns (large gather, channel-moving transpose, large reshape)
+- **ANE compatibility %** - what fraction of ops can run on ANE
+- **ANE compute %** - what fraction of FLOPs run on ANE
+- **Per-op fallback reasons** - exactly which limit each op violates
+- **Performance annotations** - supported-but-slow patterns (large gather, channel-moving transpose, large reshape)
 
 Use `--format json` for structured output.
 
-### Step 2: Benchmark — measure actual impact
+### Step 2: Benchmark - measure actual impact
 
 ```bash
 # Compare all backends
@@ -64,11 +64,11 @@ cargo run --release -p ironmill-bench -- --model <model> --compare-baseline befo
 
 Key metrics to compare:
 - **Latency** (mean, p50, p95, p99)
-- **Utilization %** — time spent in compute vs dispatch overhead
-- **Memory** — RSS growth, model load cost, efficiency ratio
-- **Power** — inferences/watt, joules/inference
+- **Utilization %** - time spent in compute vs dispatch overhead
+- **Memory** - RSS growth, model load cost, efficiency ratio
+- **Power** - inferences/watt, joules/inference
 
-### Step 3: Probe — test op acceptance
+### Step 3: Probe - test op acceptance
 
 ```bash
 # Which ops does ANE accept?
@@ -96,14 +96,14 @@ This shows how the model is partitioned into sub-programs (embedding, layer_N, l
 
 ### "Is this an ANE limit or a splitting issue?"
 
-1. Run `validate` — if compatibility % is high but performance is poor, the issue is likely splitting/dispatch overhead, not op rejection.
-2. Run `ironmill-bench --backend all` — if GPU outperforms ANE significantly, check utilization %. Low utilization suggests dispatch overhead from too many sub-programs.
-3. Check split debug output — if layers are being chunked beyond the natural boundaries, the `max_weight_size` budget may need tuning.
+1. Run `validate` - if compatibility % is high but performance is poor, the issue is likely splitting/dispatch overhead, not op rejection.
+2. Run `ironmill-bench --backend all` - if GPU outperforms ANE significantly, check utilization %. Low utilization suggests dispatch overhead from too many sub-programs.
+3. Check split debug output - if layers are being chunked beyond the natural boundaries, the `max_weight_size` budget may need tuning.
 
 ### "Is this an op-support gap?"
 
-1. Run `validate` — look for fallback ops with reasons like "unsupported op type".
-2. Run `ane_op_probe` — test whether alternative formulations of the same operation are accepted.
+1. Run `validate` - look for fallback ops with reasons like "unsupported op type".
+2. Run `ane_op_probe` - test whether alternative formulations of the same operation are accepted.
 3. Check `docs/research/ane-op-support-matrix.md` for known support status.
 
 ### Common patterns

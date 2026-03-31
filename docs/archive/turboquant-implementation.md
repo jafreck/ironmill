@@ -1,4 +1,4 @@
-# TurboQuant on ANE-Direct — Implementation Plan
+# TurboQuant on ANE-Direct - Implementation Plan
 
 > **Status:** Implemented (see notes below)
 >
@@ -11,7 +11,7 @@
 > **Prerequisites:**
 > - [TurboQuant Research Analysis](../research/turboquant-analysis.md)
 > - [TurboQuant ANE/Orion Feasibility](../research/turboquant-ane-orion.md)
-> - [ANE Op Support Matrix](../research/ane-op-support-matrix.md) — empirically verified op set
+> - [ANE Op Support Matrix](../research/ane-op-support-matrix.md) - empirically verified op set
 >
 > **Scope:** Full TurboQuant (PolarQuant + QJL + runtime KV cache compression)
 > on the ANE-direct backend.
@@ -64,7 +64,7 @@ compression empirically verified to work end-to-end on ANE.
 
 ---
 
-## Phase 1 — Runtime Infrastructure
+## Phase 1 - Runtime Infrastructure
 
 ### 1.1 Partial tensor writes
 
@@ -127,7 +127,7 @@ confirms only the target region changed.
 pub struct TurboQuantConfig {
     /// Number of distinct quantization bits. Supported values: 1, 2, 4, 6, 8
     /// (corresponding to 2, 4, 16, 64, 256 LUT entries).
-    /// Controls quality, not storage format — storage is always INT8.
+    /// Controls quality, not storage format - storage is always INT8.
     /// Beta-optimal levels are computed for 2^n_bits distinct values
     /// within the [-128, 127] INT8 range.
     /// Validated at construction time; unsupported values are rejected.
@@ -205,13 +205,13 @@ impl KvCacheManager {
 ```
 
 **Cache update strategy:** CPU interception at sub-program boundary. The CPU
-work is minimal — just `write_bytes_at` to splice INT8 bytes into the IOSurface
+work is minimal - just `write_bytes_at` to splice INT8 bytes into the IOSurface
 at O(1) cost. All dequantization and un-rotation happens on ANE during the
 subsequent cache-read sub-program.
 
 ---
 
-## Phase 2 — ANE Sub-Programs
+## Phase 2 - ANE Sub-Programs
 
 TurboQuant splits each attention layer into sub-programs connected by the Rust
 inference loop. All ops below have been verified against the ANE compiler
@@ -255,13 +255,13 @@ After the cache-write sub-program returns, Rust code:
 3. Optionally computes QJL residual signs on CPU: `sign(K_original - K_dequantized)`
 4. Advances `seq_pos`
 
-This is O(head_dim × num_kv_heads) bytes copied per token — microseconds.
+This is O(head_dim × num_kv_heads) bytes copied per token - microseconds.
 No dequantization or un-rotation on CPU; those happen on ANE at read time.
 
 ### 2.3 Cache-read + attention sub-program
 
 Runs once per new token per layer. Dequantizes cached INT8 K/V to fp16 and
-computes attention. **This is where the 2× bandwidth win happens** — the ANE
+computes attention. **This is where the 2× bandwidth win happens** - the ANE
 reads 1 byte/element from the cache IOSurface instead of 2.
 
 ```
@@ -289,7 +289,7 @@ Outputs: attn_out  [1, num_heads, 1, head_dim]  (fp16)
 **INT8 function inputs are supported** when the first op converts to fp16.
 The dtype probe showed `tensor<int8, ...>` as a function input to `identity`
 fails (because identity preserves dtype), but `cast(x=tensor<int8>, dtype=fp16)`
-succeeds — the MIL parser accepts INT8 function parameters when they flow into
+succeeds - the MIL parser accepts INT8 function parameters when they flow into
 a cast/dequantize op. This means the cache IOSurface can be bound directly as
 an INT8-typed input to the attention sub-program.
 
@@ -347,7 +347,7 @@ Total: ~4–6 programs, well within budget.
 
 ---
 
-## Phase 3 — QJL Correction + Polish
+## Phase 3 - QJL Correction + Polish
 
 ### 3.1 QJL correction sub-program (optional)
 
@@ -427,35 +427,35 @@ Extend `ironmill-bench` to compare:
 
 ## Risks and mitigations
 
-### R1 — Private API stability
+### R1 - Private API stability
 ANE-direct uses undocumented Apple APIs that may change between macOS versions.
 
 **Mitigation:** Feature-gated behind `ane-direct`. The `ane_op_probe` / `ane_op_eval`
-/ `ane_op_fuzz` / `ane_dtype_probe` examples serve as a regression suite — re-run
+/ `ane_op_fuzz` / `ane_dtype_probe` examples serve as a regression suite - re-run
 after macOS updates to detect changes. All 30 eval tests must pass before shipping.
 
-### R2 — ANE program compilation limit (~119)
+### R2 - ANE program compilation limit (~119)
 Exceeding the limit crashes the process.
 
 **Mitigation:** TurboQuant needs ~4–6 unique programs total (shared across layers).
 Well within budget. Monitor via `AneCompiler::compile_count()` (in `mil-rs::ffi::ane`).
 
-### R3 — INT4 not available; limited to 2× bandwidth reduction
+### R3 - INT4 not available; limited to 2× bandwidth reduction
 The ANE compiler comprehensively rejects INT4/UINT4 via the MIL text path.
 INT8 gives 2× bandwidth reduction, not the 4× that TurboQuant achieves on
 GPU with custom kernels.
 
-**Mitigation:** 2× is still significant — on M4 Pro it cuts KV read time from
+**Mitigation:** 2× is still significant - on M4 Pro it cuts KV read time from
 ~7ms to ~3.5ms at seq=4096 for a 7B model. TurboQuant's rotation trick at
 INT8 also gives better quality than naive INT8 affine quantization. If a
 sub-MIL INT4 path (like maderix's weight descriptor approach) becomes viable,
-the architecture supports it — only the cache manager and IOSurface dtype
+the architecture supports it - only the cache manager and IOSurface dtype
 would change.
 
-### R4 — CPU interception latency
+### R4 - CPU interception latency
 Cache update runs on CPU between ANE sub-programs.
 
-**Mitigation:** With INT8 cache, CPU interception per token per layer is minimal — just a byte copy:
+**Mitigation:** With INT8 cache, CPU interception per token per layer is minimal - just a byte copy:
 - 128 × 8 = 1024 bytes for GQA models (head_dim × num_kv_heads, e.g. Llama-3 7B with 8 KV heads); 4096 bytes for MHA (32 KV heads)
 - `write_bytes_at`: ~1 μs per IOSurface write
 - No dequantization or un-rotation on CPU (that's ANE's job at read time)
@@ -464,7 +464,7 @@ Cache update runs on CPU between ANE sub-programs.
 
 Negligible compared to attention latency.
 
-### R5 — Quantization correctness
+### R5 - Quantization correctness
 TurboQuant's theory guarantees near-optimal distortion, but practical impact
 depends on the model.
 
@@ -478,10 +478,10 @@ validation is part of Phase 3.
 
 ## References
 
-1. [ANE Op Support Matrix](../research/ane-op-support-matrix.md) — 69 verified ops with eval status
-2. [TurboQuant Research Analysis](../research/turboquant-analysis.md) — paper summary and ironmill relevance
-3. [TurboQuant ANE/Orion Feasibility](../research/turboquant-ane-orion.md) — op decomposition and program structure
-4. Static PolarQuant pass — implemented in `crates/mil-rs/src/ir/passes/polar_quantize.rs`
+1. [ANE Op Support Matrix](../research/ane-op-support-matrix.md) - 69 verified ops with eval status
+2. [TurboQuant Research Analysis](../research/turboquant-analysis.md) - paper summary and ironmill relevance
+3. [TurboQuant ANE/Orion Feasibility](../research/turboquant-ane-orion.md) - op decomposition and program structure
+4. Static PolarQuant pass - implemented in `crates/mil-rs/src/ir/passes/polar_quantize.rs`
 5. TurboQuant paper: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
 6. PolarQuant paper: [arXiv:2502.02617](https://arxiv.org/abs/2502.02617)
-7. maderix/ANE: [github.com/maderix/ANE](https://github.com/maderix/ANE) — independent ANE reverse engineering
+7. maderix/ANE: [github.com/maderix/ANE](https://github.com/maderix/ANE) - independent ANE reverse engineering

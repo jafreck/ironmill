@@ -7,8 +7,8 @@ CoreML model export and inference for [Burn](https://burn.dev) via
 
 `burn-coreml` bridges the gap between Burn models and Apple's CoreML runtime:
 
-- **Export** — Convert Burn models (via ONNX) to CoreML `.mlpackage` format
-- **Inference** (macOS only) — Load and run CoreML models with f32 tensors
+- **Export** - Convert Burn models (via ONNX) to CoreML `.mlpackage` format
+- **Inference** (macOS only) - Load and run CoreML models with f32 tensors
 
 ## Workflow
 

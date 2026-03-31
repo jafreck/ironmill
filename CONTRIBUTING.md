@@ -13,9 +13,9 @@ workflow for both `mil-rs` (library) and `ironmill-cli` (CLI tool).
    cargo build --workspace
    cargo test --workspace
    ```
-3. **(Optional) Install `protoc`** — only needed if you modify `.proto` files.
+3. **(Optional) Install `protoc`** - only needed if you modify `.proto` files.
    The generated code is committed, so most contributors don't need this.
-4. **(Optional) Xcode** — required on macOS for `xcrun coremlcompiler`
+4. **(Optional) Xcode** - required on macOS for `xcrun coremlcompiler`
    integration tests (these are `#[ignore]`d by default).
 
 ## Project structure
@@ -83,7 +83,7 @@ Passes live in `crates/mil-rs/src/ir/passes/`.
    }
    ```
 3. Register the module in `passes/mod.rs` and re-export the struct.
-4. Add tests — at minimum, verify the pass is idempotent (running twice
+4. Add tests - at minimum, verify the pass is idempotent (running twice
    produces the same result).
 
 ## Test conventions
@@ -100,7 +100,7 @@ Passes live in `crates/mil-rs/src/ir/passes/`.
 - Use `cargo fmt` before committing.
 - Run `cargo clippy --workspace` and fix warnings.
 - Public items should have doc comments (`///`).
-- Keep modules focused — prefer many small files over large ones.
+- Keep modules focused - prefer many small files over large ones.
 
 ## PR process
 

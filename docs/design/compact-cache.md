@@ -4,7 +4,7 @@
 
 TurboQuant's INT8 KV cache provides 50% memory savings but 3–30% throughput
 **regression** on ANE (see `ane-constraints.md`). The regression is caused by
-ANE's `cast(int8→fp16)` op inside the attention program — ANE dequantizes to
+ANE's `cast(int8→fp16)` op inside the attention program - ANE dequantizes to
 FP16 before compute, and the cast itself is pure overhead with no compensating
 bandwidth savings.
 
@@ -46,7 +46,7 @@ post_attn (ANE) ── same as FP16 baseline
 | Quantize location | N/A | ANE (separate eval) | CPU (inline) |
 | Dequantize location | N/A | ANE (inside attention) | CPU (before attention eval) |
 | Extra ANE ops | None | cast, mul, rotation matmuls | None |
-| Throughput vs FP16 | — | −3% to −30% | ~0% (hypothesis) |
+| Throughput vs FP16 | - | −3% to −30% | ~0% (hypothesis) |
 
 ## Quantization Strategy
 
@@ -78,7 +78,7 @@ unrotated = R⁻¹ · dequantized             # R is self-inverse for Hadamard
 
 - Better quality at the cost of a CPU matmul per head per layer
 - head_dim=128: 128×128 matmul = 16K MACs per head per token
-- 8 KV heads × 16K = 128K MACs per layer — trivial on ARM
+- 8 KV heads × 16K = 128K MACs per layer - trivial on ARM
 
 ## Module Structure
 
@@ -201,7 +201,7 @@ TurboQuant adds per layer:
 - Cache-write eval: ~50 μs dispatch overhead
 - `cast(int8→fp16)` + `mul(deq_scale)` on full cache: measured 7-30% of attention time
 
-For 8B MHA @ 4096, the TQ INT8 attention measured 3811 μs vs FP16's 2681 μs —
+For 8B MHA @ 4096, the TQ INT8 attention measured 3811 μs vs FP16's 2681 μs -
 a penalty of 1130 μs/layer. Compact Cache's estimated CPU cost of ~165 μs/layer
 would be **~7× less overhead** at this scale.
 
@@ -227,8 +227,8 @@ the bottleneck. At that point, consider:
 
 ## References
 
-- `ane-constraints.md` — INT8 bandwidth finding (no throughput gain on ANE)
-- `turboquant-zero-copy.md` — TurboQuant history and optimization attempts
-- `cache_bandwidth_bench.rs` — INT8 vs FP16 attention benchmark
-- `rotation.rs` — Hadamard rotation primitives for optional Phase 2
-- Orion constraints doc — confirms CPU-side cache management pattern
+- `ane-constraints.md` - INT8 bandwidth finding (no throughput gain on ANE)
+- `turboquant-zero-copy.md` - TurboQuant history and optimization attempts
+- `cache_bandwidth_bench.rs` - INT8 vs FP16 attention benchmark
+- `rotation.rs` - Hadamard rotation primitives for optional Phase 2
+- Orion constraints doc - confirms CPU-side cache management pattern

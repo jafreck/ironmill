@@ -5,7 +5,7 @@
 > Perplexity module, CLI integration, dataset prep script, and 9 unit tests
 > are complete in `crates/ironmill-bench/src/perplexity.rs`. Initial run on
 > Qwen3-0.6B confirms the pipeline works end-to-end (7.8 tok/s) but reports
-> PPL=inf — attention executes but does not yet produce correct logits.
+> PPL=inf - attention executes but does not yet produce correct logits.
 >
 > **Prerequisite**: ~~`AneInference::decode()` must produce correct logits~~ ✅ FP16 attention implemented (`c632f05`)
 >
@@ -41,7 +41,7 @@ Pre-tokenized WikiText-2 fixture (JSON)
          ▼
   ┌──────────────┐
   │ For each      │  AneInference::decode(token) → logits: Vec<f32>
-  │ token in seq  │  No sampling — we need the full logit distribution
+  │ token in seq  │  No sampling - we need the full logit distribution
   └──────┬───────┘
          │
          ▼
@@ -323,15 +323,15 @@ palettize-4, polar-4), it:
 Combine with existing weight fidelity in a unified report:
 
 ```
-Qwen3-0.6B — Quality Report (WikiText-2, 500 sequences)
+Qwen3-0.6B - Quality Report (WikiText-2, 500 sequences)
 ═══════════════════════════════════════════════════════════════════
 Optimization       SNR (dB)   Perplexity   Δ PPL     Size     Status
 ─────────────────  ─────────  ──────────   ───────   ──────   ──────
-FP32 baseline      ∞          12.41        —         2.2 GB   —
+FP32 baseline      ∞          12.41        -         2.2 GB   -
 FP16               78.3       12.41        +0.0%     1.1 GB   ✓ SAFE
 INT8               44.7       12.56        +1.2%     578 MB   ✓ SAFE
 Palettize 4-bit    25.1       14.12        +13.8%    ~300 MB  ⚠ WARN
-PolarQuant 4-bit   —          12.91        +4.0%     ~350 MB  ✓ SAFE
+PolarQuant 4-bit   -          12.91        +4.0%     ~350 MB  ✓ SAFE
 ═══════════════════════════════════════════════════════════════════
 Thresholds: SAFE <5%, WARN 5–15%, FAIL >15%
 ```
@@ -386,7 +386,7 @@ could reduce evaluation time by 10–50× depending on prefill throughput.
    4-bit, something is wrong with one of the passes.
 
 4. **Determinism**: Same config + same dataset = same PPL. Run twice to
-   confirm (no temperature sampling — greedy logit extraction only).
+   confirm (no temperature sampling - greedy logit extraction only).
 
 ### Cross-validation with external tools
 
@@ -400,11 +400,11 @@ To validate ironmill's perplexity numbers:
 
 ## Related documents
 
-- [TurboQuant E2E Inference](turboquant-e2e-inference.md) — current ANE
+- [TurboQuant E2E Inference](turboquant-e2e-inference.md) - current ANE
   inference status (attention not yet real)
-- [ANE Inference Optimizations](ane-inference-optimizations.md) — throughput
+- [ANE Inference Optimizations](ane-inference-optimizations.md) - throughput
   improvement roadmap
-- [Benchmark Results](../BENCHMARK_RESULTS.md) — current weight-level SNR
+- [Benchmark Results](../BENCHMARK_RESULTS.md) - current weight-level SNR
   numbers
 
 ## Future: Classification Accuracy
@@ -432,11 +432,11 @@ tests/fixtures/quality/sst2-200/
 
 **Expected report**:
 ```
-MobileNetV2 — Quality Impact
+MobileNetV2 - Quality Impact
 ═══════════════════════════════════════════════════════════════════
 Optimization       SNR (dB)   Top-1 Acc    Δ Acc     Size     Status
 ─────────────────  ─────────  ──────────   ───────   ──────   ──────
-FP32 baseline      ∞          71.8%        —         16 MB    —
+FP32 baseline      ∞          71.8%        -         16 MB    -
 FP16               73.6       71.8%        +0.0%     8 MB     ✓ SAFE
 INT8               42.7       71.2%        -0.8%     4 MB     ✓ SAFE
 Palettize 4-bit    18.8       68.3%        -4.9%     ~2 MB    ⚠ WARN
@@ -445,7 +445,7 @@ Thresholds: SAFE <2% drop, WARN 2–5%, FAIL >5%
 ```
 
 **Challenges**:
-- ImageNet fixtures cannot be redistributed (registration required) — download
+- ImageNet fixtures cannot be redistributed (registration required) - download
   on demand via `scripts/download-fixtures.sh`, gitignored
 - MobileNetV2 requires specific image preprocessing (resize, center crop,
   normalize with ImageNet mean/std)
@@ -466,15 +466,15 @@ baselines.
 - Compute WER via Levenshtein distance on word sequences
 
 **Challenges**:
-- Whisper uses an encoder-decoder architecture — the encoder output feeds into
+- Whisper uses an encoder-decoder architecture - the encoder output feeds into
   autoregressive decoding, which is a separate inference path from LLM decode
 - Audio preprocessing (80-bin log-mel spectrogram, 30s windows) is complex to
-  implement in Rust — pre-computed spectrograms as fixtures avoids this
+  implement in Rust - pre-computed spectrograms as fixtures avoids this
 - WER computation: use the `strsim` crate for edit distance
 
 **Recommended approach**: Implement in two phases:
 1. Encoder-only quality (compare encoder output tensors before/after
-   quantization — fast, no decoder needed)
+   quantization - fast, no decoder needed)
 2. Full pipeline WER with pre-computed mel spectrograms and a minimal greedy
    decoder
 

@@ -19,7 +19,7 @@ distinct responsibilities.
 ## Target Crate Architecture
 
 ```
-mil-rs                          (independent MIL/CoreML library — no ironmill dependency)
+mil-rs                          (independent MIL/CoreML library - no ironmill dependency)
 ├── ir/                         (Program, Function, Block, Operation, Value, TensorType)
 │   ├── pass.rs                 (Pass trait)
 │   ├── pipeline.rs             (PassPipeline orchestration)
@@ -88,7 +88,7 @@ ironmill-coreml-sys             (quarantined unsafe: CoreML ObjC FFI)
 └── model.rs                    (MLModel load/predict/extract with safe API)
 
 ironmill-cli                    (thin CLI, delegates to workflow APIs)
-ironmill-bench                  (benchmark harness — keeps 2 Mach API unsafe sites, see below)
+ironmill-bench                  (benchmark harness - keeps 2 Mach API unsafe sites, see below)
 ```
 
 ### Dependency Graph
@@ -148,12 +148,12 @@ These are genuinely reusable for anyone working with Apple's MIL/CoreML format:
 | Current location | Lines | Purpose |
 |---|---|---|
 | `ir/program.rs` | 213 | Program, Function, Block |
-| `ir/operation.rs` | 98 | Operation (minus ComputeUnit — see below) |
+| `ir/operation.rs` | 98 | Operation (minus ComputeUnit - see below) |
 | `ir/tensor.rs` | 63 | ScalarType, TensorType |
 | `ir/types.rs` | 37 | Value enum |
 | `ir/graph.rs` | 57 | Graph container |
 | `ir/pass.rs` | 13 | Pass trait |
-| `ir/pipeline.rs` | 1255 | PassPipeline (refactored — see below) |
+| `ir/pipeline.rs` | 1255 | PassPipeline (refactored - see below) |
 | `proto/mod.rs` | + generated | CoreML + ONNX protobuf types |
 | `convert/proto_to_ir.rs` | 684 | Protobuf → IR |
 | `convert/ir_to_proto.rs` | 2251 | IR → Protobuf |
@@ -274,7 +274,7 @@ AttentionDecomposePass)*
 
 **Exception:** `ironmill-bench` retains 2 unsafe sites for Mach `task_info` FFI
 (RSS measurement in `inference.rs:103-142`). This is benchmark-only instrumentation
-behind `#[cfg(target_os = "macos")]` — too narrow and domain-specific to justify a
+behind `#[cfg(target_os = "macos")]` - too narrow and domain-specific to justify a
 `-sys` crate. These 2 sites get `// SAFETY:` comments and
 `#[allow(unsafe_code)]` on the function, with the rest of the crate using
 `#![deny(unsafe_code)]`.
@@ -285,7 +285,7 @@ behind `#[cfg(target_os = "macos")]` — too narrow and domain-specific to justi
 
 1. Every `unsafe` block gets a `// SAFETY:` comment explaining the invariant
 2. `#![deny(unsafe_op_in_unsafe_fn)]` enforced in all -sys crates
-3. Every public function is safe — unsafe is only internal
+3. Every public function is safe - unsafe is only internal
 4. Duplicated ObjC FFI patterns (currently in both `mil-rs/ffi/ane.rs` and
    `ironmill-ane/runtime.rs`) consolidated into `ironmill-ane-sys::objc`
 5. Shared helpers: `msg_send_retained()`, `with_iosurface_locked()`,
@@ -448,16 +448,16 @@ The CLI becomes a thin argument parser delegating to these functions.
 ## Migration Order
 
 Each phase has acceptance criteria that must pass before proceeding to the next.
-All verification is local (`cargo build`, `cargo test`, manual ANE smoke tests) —
+All verification is local (`cargo build`, `cargo test`, manual ANE smoke tests) -
 CI runners lack ANE hardware.
 
 ### Phase 1: Quarantine unsafe (no behavior change)
 
-1. Create `ironmill-ane-sys` — extract and consolidate ANE FFI from
+1. Create `ironmill-ane-sys` - extract and consolidate ANE FFI from
    `mil-rs/src/ffi/ane.rs` and `ironmill-ane/src/runtime.rs`
-2. Create `ironmill-iosurface` — extract IOSurface FFI from
+2. Create `ironmill-iosurface` - extract IOSurface FFI from
    `ironmill-ane/src/tensor.rs`
-3. Create `ironmill-coreml-sys` — extract CoreML FFI from
+3. Create `ironmill-coreml-sys` - extract CoreML FFI from
    `ironmill-coreml/src/lib.rs`
 4. Add `// SAFETY:` comments to all remaining unsafe blocks
 5. Add `#![forbid(unsafe_code)]` to all non-sys crates (except `ironmill-bench`,
@@ -560,10 +560,10 @@ its `lib.rs` shrinks to re-exports + safe orchestration over the new sys crate.
 CI runners do not have ANE hardware. Testing is split into two tiers:
 
 ### CI (all platforms)
-- `cargo build --workspace` — compilation check
-- `cargo test --workspace` — unit tests (mocked hardware where needed)
-- `cargo clippy --workspace` — lint
-- `mil-rs` standalone build (`cargo build -p mil-rs`) — independence check
+- `cargo build --workspace` - compilation check
+- `cargo test --workspace` - unit tests (mocked hardware where needed)
+- `cargo clippy --workspace` - lint
+- `mil-rs` standalone build (`cargo build -p mil-rs`) - independence check
 
 ### Local (macOS with Apple Silicon)
 - ANE smoke test: compile a small model → load → eval → verify output

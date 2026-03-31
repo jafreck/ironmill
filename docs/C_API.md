@@ -47,7 +47,7 @@ The generated `mil_rs.h` declares all opaque types and function prototypes.
 
 ### Functions
 
-**Lifecycle — reading models:**
+**Lifecycle - reading models:**
 
 | Function | Returns |
 |----------|---------|
@@ -107,18 +107,18 @@ if (!model) {
 }
 ```
 
-The pointer from `mil_last_error()` is **borrowed** — do not free it. It
+The pointer from `mil_last_error()` is **borrowed** - do not free it. It
 remains valid until the next failing call on the same thread.
 
 ## Memory management rules
 
 1. Every `*_free()` function accepts null safely (no-op).
-2. **Never double-free** — once you call `mil_model_free(model)`, do not use
+2. **Never double-free** - once you call `mil_model_free(model)`, do not use
    `model` again.
 3. Strings returned by `mil_compile_model()` and
-   `mil_validation_report_to_json()` are **heap-allocated** — you must free
+   `mil_validation_report_to_json()` are **heap-allocated** - you must free
    them with `mil_string_free()`.
-4. The pointer from `mil_last_error()` is **not** heap-allocated — do **not**
+4. The pointer from `mil_last_error()` is **not** heap-allocated - do **not**
    pass it to `mil_string_free()`.
 
 ## Complete C example
@@ -183,7 +183,7 @@ int main(void) {
         mil_validation_report_free(report);
     }
 
-    // 7. Clean up — free every handle exactly once
+    // 7. Clean up - free every handle exactly once
     mil_model_free(coreml);
     mil_program_free(program);
     mil_model_free(onnx);

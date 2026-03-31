@@ -8,7 +8,7 @@
 Add a `compact_cache` module to `crates/ironmill-inference/src/ane/` that stores
 the KV cache as INT8 on the CPU side and dequantizes to FP16 staging tensors
 before each ANE attention eval. The ANE attention program is the same FP16
-program used by the baseline — no extra ANE ops.
+program used by the baseline - no extra ANE ops.
 
 ## Files to Create
 
@@ -24,8 +24,8 @@ pub use cache::{CompactCacheConfig, CompactCacheManager};
 
 Core implementation. Contains:
 
-- `CompactCacheConfig` — configuration struct
-- `CompactCacheManager` — per-layer INT8 storage, quantize/dequant, staging
+- `CompactCacheConfig` - configuration struct
+- `CompactCacheManager` - per-layer INT8 storage, quantize/dequant, staging
 
 ## Files to Modify
 
@@ -219,8 +219,8 @@ File: `crates/ironmill-inference/src/ane/compact_cache/cache.rs`
 
 - `CompactCacheConfig` struct
 - `CompactCacheManager::new(config, attn_alloc) -> Result<Self>`
-- `write_cache(layer, k, v)` — quantize + store
-- `prepare_attention(layer) -> Result<(&AneTensor, &AneTensor)>` — dequant + write staging
+- `write_cache(layer, k, v)` - quantize + store
+- `prepare_attention(layer) -> Result<(&AneTensor, &AneTensor)>` - dequant + write staging
 - `advance_seq_pos()`
 - `reset()`
 - `seq_len() -> usize`

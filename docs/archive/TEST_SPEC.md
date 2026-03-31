@@ -1,7 +1,7 @@
-# Test Design Spec — Optimization Features (Phases 5–8)
+# Test Design Spec - Optimization Features (Phases 5–8)
 
 Covers integration, CLI, and cross-feature interaction tests for all 22 tasks.
-Existing 432 unit tests cover passes in isolation — this spec fills the gaps.
+Existing 432 unit tests cover passes in isolation - this spec fills the gaps.
 
 ---
 
@@ -12,20 +12,20 @@ crates/mil-rs/tests/
 ├── integration.rs            (existing)
 ├── onnx_conversion.rs        (existing)
 ├── common/
-│   └── mod.rs                (NEW — shared test helpers)
-├── optimization_passes.rs    (NEW — Phase 5 integration tests)
-├── llm_features.rs           (NEW — Phase 6 integration tests)
-├── pipeline_features.rs      (NEW — Phase 7 integration tests)
-├── moe_features.rs           (NEW — Phase 8 integration tests)
-└── cross_feature.rs          (NEW — cross-phase composition tests)
+│   └── mod.rs                (NEW - shared test helpers)
+├── optimization_passes.rs    (NEW - Phase 5 integration tests)
+├── llm_features.rs           (NEW - Phase 6 integration tests)
+├── pipeline_features.rs      (NEW - Phase 7 integration tests)
+├── moe_features.rs           (NEW - Phase 8 integration tests)
+└── cross_feature.rs          (NEW - cross-phase composition tests)
 
 crates/ironmill-cli/tests/
-└── cli_integration.rs        (NEW — CLI flag and subcommand tests)
+└── cli_integration.rs        (NEW - CLI flag and subcommand tests)
 ```
 
 ---
 
-## 1. `optimization_passes.rs` — Phase 5 Integration (15 tests)
+## 1. `optimization_passes.rs` - Phase 5 Integration (15 tests)
 
 These verify that Phase 5 passes compose correctly when run through the
 full pipeline, not just in isolation.
@@ -112,7 +112,7 @@ annotations_match_validation
 
 ---
 
-## 2. `llm_features.rs` — Phase 6 Integration (10 tests)
+## 2. `llm_features.rs` - Phase 6 Integration (10 tests)
 
 ### 6.1 KV Cache
 
@@ -177,7 +177,7 @@ updatable_model_loss_references_output_tensor
 
 ---
 
-## 3. `pipeline_features.rs` — Phase 7 Integration (10 tests)
+## 3. `pipeline_features.rs` - Phase 7 Integration (10 tests)
 
 ### 7.1 Multi-ONNX Pipeline
 
@@ -240,7 +240,7 @@ split_with_different_quantization
 
 ---
 
-## 4. `moe_features.rs` — Phase 8 Integration (12 tests)
+## 4. `moe_features.rs` - Phase 8 Integration (12 tests)
 
 ### 8.1 MoE Detection & Splitting
 
@@ -347,9 +347,9 @@ backend_enum_defaults_to_xcrun
 
 ---
 
-## 5. `cross_feature.rs` — Cross-Phase Composition (8 tests)
+## 5. `cross_feature.rs` - Cross-Phase Composition (8 tests)
 
-These are the highest-value tests — they verify features from different
+These are the highest-value tests - they verify features from different
 phases compose without interference.
 
 ```
@@ -396,7 +396,7 @@ configurable_pipeline_with_all_new_passes
 
 ---
 
-## 6. `cli_integration.rs` — CLI Tests (20 tests)
+## 6. `cli_integration.rs` - CLI Tests (20 tests)
 
 All CLI tests use `cargo run -p ironmill-cli --quiet --` via `std::process::Command`.
 Tests that require model fixtures use `fixture_path()`.
@@ -486,7 +486,7 @@ cli_compile_invalid_epochs
 
 ---
 
-## Shared Test Utilities — `crates/mil-rs/tests/common/mod.rs`
+## Shared Test Utilities - `crates/mil-rs/tests/common/mod.rs`
 
 ```rust
 /// Path to test fixture files.
