@@ -4,7 +4,7 @@
 //! (IR passes → split → emit MIL → compile → load → eval), plus
 //! [`CompiledArtifacts`] for offline compilation inspection.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mil_rs::ir::ScalarType;
@@ -23,6 +23,7 @@ use mil_rs::ir::Pass;
 
 use super::device::{AneDevice, HardwareAneDevice};
 use crate::AneError;
+use crate::ane::bundle_manifest::{BundleManifest, BundleModelType, TensorDescriptorManifest};
 use crate::types::{ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor};
 
 /// Result type alias for ANE operations.
@@ -197,6 +198,122 @@ impl<D: AneDevice> AneModel<D> {
                     name: sub.name.clone(),
                     inputs: sub.inputs.clone(),
                     outputs: sub.outputs.clone(),
+                },
+                input_tensors,
+                output_tensors,
+            });
+        }
+
+        Ok(Self {
+            device,
+            sub_programs: loaded_subs,
+            cache,
+            config,
+            _work_dir: work_dir,
+        })
+    }
+
+    /// Load a pre-compiled `.ironml` bundle for execution.
+    ///
+    /// Reads the manifest and compiled artifacts from the bundle directory,
+    /// then compiles each sub-program's MIL text on the ANE device and
+    /// allocates I/O tensors. No IR passes or splitting needed.
+    pub fn from_bundle(device: Arc<D>, bundle_path: &Path, config: AneConfig) -> Result<Self> {
+        // 1. Read and parse manifest.json
+        let manifest_path = bundle_path.join("manifest.json");
+        let manifest_json = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to read manifest: {e}")))?;
+        let manifest: BundleManifest = serde_json::from_str(&manifest_json)
+            .map_err(|e| AneError::Other(anyhow::anyhow!("invalid manifest: {e}")))?;
+
+        // 2. Verify it's a simple bundle
+        if !matches!(manifest.model_type, BundleModelType::Simple) {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "AneModel::from_bundle only supports simple bundles, got {:?}",
+                manifest.model_type
+            )));
+        }
+
+        // 3. Initialize cache and work directory
+        let cache = ProgramCache::new(config.cache_dir.clone(), config.max_programs);
+        let work_dir = tempfile::tempdir()
+            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to create work dir: {e}")))?;
+
+        // 4. Process each sub-program from the manifest
+        let mut loaded_subs = Vec::new();
+
+        for sub_manifest in &manifest.sub_programs {
+            // 4a. Read MIL text
+            let mil_path = bundle_path
+                .join("programs")
+                .join(format!("{}.mil", sub_manifest.name));
+            let mil_text = std::fs::read_to_string(&mil_path).map_err(|e| {
+                AneError::Other(anyhow::anyhow!(
+                    "failed to read MIL text for '{}': {e}",
+                    sub_manifest.name
+                ))
+            })?;
+
+            // 4b. Read weight blob
+            let blob_path = bundle_path
+                .join("weights")
+                .join(format!("{}.bin", sub_manifest.name));
+            let weight_blob = std::fs::read(&blob_path).map_err(|e| {
+                AneError::Other(anyhow::anyhow!(
+                    "failed to read weight blob for '{}': {e}",
+                    sub_manifest.name
+                ))
+            })?;
+
+            // 4c. Extract individual weights from the combined BLOBFILE.
+            //
+            // The bundle stores all weights for a sub-program in a single
+            // BLOBFILE (128-byte header + concatenated raw weight data).
+            // device.compile() expects individual weight entries keyed by
+            // their MIL text path references, so we parse the MIL text to
+            // find each BLOBFILE reference and split the raw data.
+            let weight_refs = extract_weights_from_blob(&mil_text, &weight_blob)?;
+            let weight_slices: Vec<(&str, &[u8])> = weight_refs
+                .iter()
+                .map(|(path, data)| (path.as_str(), data.as_slice()))
+                .collect();
+
+            // 4d. Compile on the ANE device
+            let compiled = device.compile(&mil_text, &weight_slices)?;
+
+            // 4e. Convert manifest descriptors to TensorDescriptor
+            let inputs: Vec<TensorDescriptor> =
+                sub_manifest.inputs.iter().map(|td| td.into()).collect();
+            let outputs: Vec<TensorDescriptor> =
+                sub_manifest.outputs.iter().map(|td| td.into()).collect();
+
+            // 4f. Pre-allocate I/O tensors with uniform sizing
+            let input_shapes: Vec<_> = inputs.iter().map(|td| (td.shape, td.dtype)).collect();
+            let output_shapes: Vec<_> = outputs.iter().map(|td| (td.shape, td.dtype)).collect();
+            let input_alloc = uniform_alloc_size(&input_shapes);
+            let output_alloc = uniform_alloc_size(&output_shapes);
+
+            let input_tensors: Vec<AneTensor> = inputs
+                .iter()
+                .map(|td| {
+                    AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc)
+                        .map_err(Into::into)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let output_tensors: Vec<AneTensor> = outputs
+                .iter()
+                .map(|td| {
+                    AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc)
+                        .map_err(Into::into)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            loaded_subs.push(LoadedSubProgram {
+                program: compiled,
+                meta: SubProgramMeta {
+                    name: sub_manifest.name.clone(),
+                    inputs,
+                    outputs,
                 },
                 input_tensors,
                 output_tensors,
@@ -486,6 +603,122 @@ impl CompiledArtifacts {
         }
 
         Ok(warnings)
+    }
+}
+
+// ── Bundle weight extraction ─────────────────────────────────────
+
+/// BLOBFILE header size (file header + chunk descriptor).
+const BLOBFILE_HEADER_SIZE: usize = 128;
+
+/// Extract individual weight entries from a combined BLOBFILE blob.
+///
+/// The bundle stores all weights for a sub-program in a single BLOBFILE
+/// (128-byte header + concatenated raw weight data). `device.compile()`
+/// expects individual weight entries keyed by their MIL text path
+/// references (`@model_path/weights/<name>.bin`).
+///
+/// This function parses the MIL text to find each BLOBFILE reference,
+/// calculates the data size from the tensor's shape and dtype, then
+/// splits the raw data section accordingly.
+fn extract_weights_from_blob(mil_text: &str, weight_blob: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    // The raw data section starts after the 128-byte header.
+    let raw_data = if weight_blob.len() > BLOBFILE_HEADER_SIZE {
+        &weight_blob[BLOBFILE_HEADER_SIZE..]
+    } else {
+        // Empty or header-only blob — no weights.
+        return Ok(Vec::new());
+    };
+
+    let mut weights = Vec::new();
+    let mut data_offset: usize = 0;
+
+    for line in mil_text.lines() {
+        // Look for BLOBFILE references: ...val=tensor<dtype, [dims]>(BLOBFILE(path=string("..."), ...))
+        let Some(path) = extract_blobfile_path(line) else {
+            continue;
+        };
+        let Some(byte_size) = extract_weight_byte_size(line) else {
+            continue;
+        };
+
+        let end = data_offset + byte_size;
+        if end > raw_data.len() {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "weight '{}' needs {} bytes at offset {}, but blob data section is only {} bytes",
+                path,
+                byte_size,
+                data_offset,
+                raw_data.len()
+            )));
+        }
+
+        weights.push((path, raw_data[data_offset..end].to_vec()));
+        data_offset = end;
+    }
+
+    Ok(weights)
+}
+
+/// Extract the BLOBFILE path from a MIL text line.
+///
+/// Looks for `BLOBFILE(path=string("..."),` and returns the path string.
+fn extract_blobfile_path(line: &str) -> Option<String> {
+    let marker = "BLOBFILE(path=string(\"";
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Calculate the byte size of a weight tensor from its MIL text declaration.
+///
+/// Parses the val type `tensor<dtype, [d1, d2, ..., dN]>(BLOBFILE(...))` to
+/// extract the shape and scalar type, then computes `product(shape) * byte_size(dtype)`.
+fn extract_weight_byte_size(line: &str) -> Option<usize> {
+    // Find the val type just before BLOBFILE:
+    //   val=tensor<float16, [1, 64, 1, 128]>(BLOBFILE(...))
+    let blobfile_pos = line.find("BLOBFILE(")?;
+    // Walk backwards to find the tensor type: tensor<dtype, [dims]>(BLOBFILE
+    let before_blob = &line[..blobfile_pos];
+    // Find the last "tensor<" before BLOBFILE
+    let tensor_start = before_blob.rfind("tensor<")?;
+    let type_str = &before_blob[tensor_start..];
+
+    // Extract dtype: tensor<DTYPE, ...>
+    let dtype_start = "tensor<".len();
+    let dtype_end = type_str.find(',')?;
+    let dtype_str = type_str[dtype_start..dtype_end].trim();
+    let byte_size_per_elem = match dtype_str {
+        "float16" | "fp16" => 2,
+        "float32" | "fp32" => 4,
+        "int8" => 1,
+        "uint8" => 1,
+        "int16" => 2,
+        "int32" => 4,
+        _ => 2, // default to float16
+    };
+
+    // Extract dimensions: [..., [d1, d2, ..., dN]](BLOBFILE
+    let bracket_start = type_str.find('[')?;
+    let bracket_end = type_str.find(']')?;
+    let dims_str = &type_str[bracket_start + 1..bracket_end];
+    let num_elements: usize = dims_str
+        .split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .product();
+
+    Some(num_elements * byte_size_per_elem)
+}
+
+/// Convert a `TensorDescriptorManifest` to compile-crate's `TensorDescriptor`.
+impl From<&TensorDescriptorManifest> for TensorDescriptor {
+    fn from(td: &TensorDescriptorManifest) -> Self {
+        TensorDescriptor {
+            name: td.name.clone(),
+            shape: td.shape,
+            dtype: td.scalar_type(),
+        }
     }
 }
 
