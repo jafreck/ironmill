@@ -9,6 +9,11 @@
 
 Rust-native compiler and inference runtime for Apple's Neural Engine.
 
+> [!WARNING]
+> **ironmill is currently in alpha and under active development.** APIs, file
+> formats, and CLI interfaces may change without notice. Not recommended for
+> production use.
+
 </div>
 
 ironmill converts models from ONNX, SafeTensors, and GGUF into optimized
