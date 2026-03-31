@@ -18,11 +18,10 @@
 - `Drop for CompiledProgram` prevents cross-model handle leaks
 
 ### What Doesn't Work
-- **FP16 attention sub-programs fail to compile on ANE.** The splitter
-  emits `fp16_attn` sub-programs from the model graph (with `emit_attention: true`),
-  but `ANECCompile()` rejects them. All layers fall back to Q pass-through,
-  producing incorrect logits (PPL=inf).
-- **Root causes under investigation:**
+- **FP16 attention sub-programs fail to compile on ANE** due to bugs in
+  ironmill's MIL emission, not fundamental ANE limitations. The ANE handles
+  64+ op deep graphs (see [ANE Constraints](ane-constraints.md)). The
+  specific issues are in ironmill's split/emit pipeline:
   - Duplicate `z_output*` variable names in emitted MIL (naming bug in
     `build_sub_program` cross-boundary output assignment)
   - `strip_gather_ops` uses an overly aggressive whitelist that breaks
