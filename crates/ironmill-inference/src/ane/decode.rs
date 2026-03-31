@@ -149,10 +149,9 @@ struct AttnInputMap {
 
 /// A compiled sub-program with pre-allocated I/O tensors.
 ///
-/// Programs are compiled upfront but kept unloaded. During decode,
-/// each program is loaded → evaluated → unloaded on demand via
-/// `runtime.eval_compiled()`, keeping at most ~3 programs loaded
-/// simultaneously.
+/// Programs are compiled and loaded upfront via `device.compile()`.
+/// During decode, each program is evaluated via `device.eval()`.
+/// `D::Program`'s `Drop` releases hardware resources automatically.
 struct LoadedSubProgram<D: AneDevice> {
     program: D::Program,
     input_tensors: Vec<AneTensor>,
@@ -593,6 +592,18 @@ impl<D: AneDevice> AneInference<D> {
             })?;
         }
 
+        // 2c2. Inject second residual add into post_attn sub-programs.
+        // ONNX SkipLayerNorm fuses the second residual (skip_add + FFN_output)
+        // into the next layer's input norm. After splitting, post_attn outputs
+        // just FFN_output. Injecting the residual produces correct layer 0
+        // values but magnitudes explode through 28 layers, degrading PPL.
+        // Disabled until the underlying per-layer error is resolved.
+        // for sub in &mut model_split.programs {
+        //     if sub.name.ends_with("_post_attn") {
+        //         inject_ffn_residual(&mut sub.program);
+        //     }
+        // }
+
         // 2d. Fuse cache-write ops into pre_attn sub-programs (TurboQuant only).
         // This appends rotation + quantization ops so pre_attn directly outputs
         // quantized K/V, eliminating the separate cache-write ANE eval per layer.
@@ -1022,8 +1033,7 @@ impl<D: AneDevice> AneInference<D> {
                 AneError::Other(anyhow::anyhow!("FP16 attention MIL text failed: {e}"))
             })?;
             let attn_compiled = device.compile(&mil, &[])?;
-            // Keep loaded — it's only 1 program, well within budget.
-            // Using eval_raw avoids the ~5ms loadWithQoS cost per layer.
+            // Compiled and loaded by device.compile(); ready for device.eval().
 
             // Uniform alloc: all tensors in one eval must share the same alloc.
             // Include the mask tensor [1, 1, 1, msl] in the alloc calculation.
@@ -1710,6 +1720,90 @@ fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
 // ---------------------------------------------------------------------------
 // Compilation helpers
 // ---------------------------------------------------------------------------
+
+/// Inject the second residual add into a post_attn sub-program.
+///
+/// ONNX models using `SkipSimplifiedLayerNormalization` fuse the second
+/// residual into the next layer's input norm. After splitting, the post_attn
+/// output is `FFN(norm(skip_add))` instead of `skip_add + FFN(norm(skip_add))`.
+///
+/// This finds the `skip_add` variable and appends `add(skip_add, down_proj)`
+/// as the new output.
+#[allow(dead_code)]
+fn inject_ffn_residual(program: &mut mil_rs::ir::Program) {
+    use mil_rs::ir::{Operation, Value};
+
+    let func = match program.functions.values_mut().next() {
+        Some(f) => f,
+        None => return,
+    };
+
+    // Find the skip_add variable: an `add` op whose output name contains "skip_add".
+    let skip_add_name = func
+        .body
+        .operations
+        .iter()
+        .find(|op| {
+            op.op_type == "add"
+                && op
+                    .outputs
+                    .first()
+                    .map(|n| n.contains("skip_add"))
+                    .unwrap_or(false)
+        })
+        .and_then(|op| op.outputs.first().cloned());
+
+    let skip_add_name = match skip_add_name {
+        Some(n) => n,
+        None => return,
+    };
+
+    // Check if the output already includes a residual add referencing skip_add.
+    if let Some(out) = func.body.outputs.first() {
+        let already_has_residual = func.body.operations.iter().any(|op| {
+            op.outputs.iter().any(|o| o == out)
+                && op.op_type == "add"
+                && op
+                    .inputs
+                    .values()
+                    .any(|v| matches!(v, Value::Reference(r) if r == &skip_add_name))
+        });
+        if already_has_residual {
+            return;
+        }
+    }
+
+    let current_output = match func.body.outputs.first().cloned() {
+        Some(n) => n,
+        None => return,
+    };
+
+    // Get output type from the producing op.
+    let output_type = func
+        .body
+        .operations
+        .iter()
+        .find(|op| op.outputs.iter().any(|o| o == &current_output))
+        .and_then(|op| {
+            let idx = op.outputs.iter().position(|o| o == &current_output)?;
+            op.output_types.get(idx)?.clone()
+        });
+
+    // Append: new_output = add(skip_add, down_proj)
+    let new_output_name = format!("{current_output}_with_residual");
+    eprintln!(
+        "  [residual] injecting add({}, {}) → {}",
+        skip_add_name, current_output, new_output_name
+    );
+    let mut add_op = Operation::new("add", format!("{new_output_name}_op"))
+        .with_input("x", Value::Reference(skip_add_name))
+        .with_input("y", Value::Reference(current_output));
+    add_op.outputs = vec![new_output_name.clone()];
+    add_op.output_types = vec![output_type];
+
+    func.body.operations.push(add_op);
+    func.body.outputs = vec![new_output_name];
+}
 
 /// Inject TurboQuant cache-write ops into a pre_attn sub-program.
 ///
