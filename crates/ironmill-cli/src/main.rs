@@ -22,10 +22,8 @@ use ironmill_compile::mil::{
     program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx, write_mlpackage,
 };
 use ironmill_compile::mil::{print_model_summary, print_onnx_summary};
-#[allow(unused_imports)]
-use ironmill_compile::templates::{
-    TemplateOptions, weights_to_program, weights_to_program_with_options,
-};
+use ironmill_compile::templates::{TemplateOptions, weights_to_program_with_options};
+use ironmill_compile::weights::{GgufProvider, SafeTensorsProvider, WeightProvider};
 
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
 ///
@@ -412,7 +410,6 @@ struct CompileOpts {
     pipeline_config: Option<PathBuf>,
     annotate_compute_units: bool,
     ane_memory_budget: Option<String>,
-    #[allow(dead_code)] // Used in compile_from_weights once SafeTensorsProvider lands.
     ane: bool,
     runtime: RuntimeArg,
     kv_quant: KvQuantArg,
@@ -477,173 +474,124 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
     }
 }
 
-fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
-    let input_display = input_path.display();
-
-    // 1. Read ONNX model
-    println!("Reading ONNX model: {input_display}");
-    let onnx_model = read_onnx(input_path)
-        .with_context(|| format!("Failed to read ONNX model: {input_display}"))?;
-    print_onnx_summary(&onnx_model);
-
-    if opts.merge_lora {
-        println!("  LoRA merge: enabled (use --no-merge-lora to disable)");
+/// Build the optimization pass pipeline from CLI options.
+fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
+    if let Some(ref config_path) = opts.pipeline_config {
+        return PassPipeline::with_config(config_path)
+            .with_context(|| format!("Failed to load pipeline config: {}", config_path.display()));
     }
-    if opts.emit_adapter {
-        println!("  Note: --emit-adapter is reserved for future adapter export support.");
-    }
-    if !opts.adapters.is_empty() {
-        println!(
-            "  Note: --adapter is reserved for future external adapter loading ({} path(s) provided).",
-            opts.adapters.len()
-        );
-    }
-    println!();
 
-    // 2. Convert to MIL IR
-    println!("Converting to CoreML MIL IR...");
-    let config = ConversionConfig {
-        merge_lora: opts.merge_lora,
-        model_dir: input_path.parent().map(|p| p.to_path_buf()),
-    };
-    let result = onnx_to_program_with_config(&onnx_model, &config)
-        .context("Failed to convert ONNX model to MIL IR")?;
-    let mut program = result.program;
-    let warnings = result.warnings;
-    println!(
-        "  Converted: {} functions, {} ops",
-        program.functions.len(),
-        count_ops(&program)
-    );
-    println!();
+    let mut pipeline = PassPipeline::new();
 
-    // 3. Build the pass pipeline
-    let pipeline = if let Some(ref config_path) = opts.pipeline_config {
-        PassPipeline::with_config(config_path)
-            .with_context(|| format!("Failed to load pipeline config: {}", config_path.display()))?
+    if opts.no_fusion {
+        pipeline = pipeline.without_fusion();
+    }
+
+    // Parse and add input shapes
+    if !opts.input_shapes.is_empty() {
+        let mut shapes = HashMap::new();
+        for raw in &opts.input_shapes {
+            let (name, dims) = parse_input_shape(raw)?;
+            shapes.insert(name, dims);
+        }
+        pipeline = pipeline.with_shapes(shapes);
+    }
+
+    // Add quantization. If a quantize-config file is provided it takes
+    // precedence over the --quantize flag to avoid double quantization.
+    if let Some(ref config_path) = opts.quantize_config {
+        let pass = ironmill_compile::ane::passes::MixedPrecisionPass::from_config_file(config_path)
+            .context("Failed to configure mixed-precision from config file")?;
+        pipeline.add_pass(Box::new(pass));
     } else {
-        let mut pipeline = PassPipeline::new();
-
-        if opts.no_fusion {
-            pipeline = pipeline.without_fusion();
-        }
-
-        // Parse and add input shapes
-        if !opts.input_shapes.is_empty() {
-            let mut shapes = HashMap::new();
-            for raw in &opts.input_shapes {
-                let (name, dims) = parse_input_shape(raw)?;
-                shapes.insert(name, dims);
+        match opts.quantize.as_str() {
+            "fp16" => {
+                pipeline = pipeline
+                    .with_fp16()
+                    .context("Failed to configure FP16 quantization")?;
             }
-            pipeline = pipeline.with_shapes(shapes);
-        }
-
-        // Add quantization. If a quantize-config file is provided it takes
-        // precedence over the --quantize flag to avoid double quantization.
-        if let Some(ref config_path) = opts.quantize_config {
-            let pass =
-                ironmill_compile::ane::passes::MixedPrecisionPass::from_config_file(config_path)
-                    .context("Failed to configure mixed-precision from config file")?;
-            pipeline.add_pass(Box::new(pass));
-        } else {
-            match opts.quantize.as_str() {
-                "fp16" => {
-                    pipeline = pipeline
-                        .with_fp16()
-                        .context("Failed to configure FP16 quantization")?;
-                }
-                "int8" => {
-                    pipeline = pipeline
-                        .with_int8(opts.cal_data.clone())
-                        .context("Failed to configure INT8 quantization")?;
-                }
-                "mixed-fp16-int8" => {
-                    let config =
-                        ironmill_compile::ane::passes::MixedPrecisionConfig::preset_fp16_int8();
-                    let pass = ironmill_compile::ane::passes::MixedPrecisionPass::new(config);
-                    pipeline.add_pass(Box::new(pass));
-                }
-                "none" => {}
-                other => {
-                    bail!(
-                        "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int8', or 'mixed-fp16-int8'."
-                    )
-                }
+            "int8" => {
+                pipeline = pipeline
+                    .with_int8(opts.cal_data.clone())
+                    .context("Failed to configure INT8 quantization")?;
+            }
+            "mixed-fp16-int8" => {
+                let config =
+                    ironmill_compile::ane::passes::MixedPrecisionConfig::preset_fp16_int8();
+                let pass = ironmill_compile::ane::passes::MixedPrecisionPass::new(config);
+                pipeline.add_pass(Box::new(pass));
+            }
+            "none" => {}
+            other => {
+                bail!(
+                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int8', or 'mixed-fp16-int8'."
+                )
             }
         }
+    }
 
-        // Add palettization
-        if let Some(bits) = opts.palettize {
-            pipeline = pipeline
-                .with_palettize(bits)
-                .context("Failed to configure palettization")?;
-        }
+    // Add palettization
+    if let Some(bits) = opts.palettize {
+        pipeline = pipeline
+            .with_palettize(bits)
+            .context("Failed to configure palettization")?;
+    }
 
-        // Add PolarQuant
-        if let Some(bits) = opts.polar_quantize {
-            pipeline = pipeline
-                .with_polar_quant(bits)
-                .context("Failed to configure PolarQuant")?;
-        }
+    // Add PolarQuant
+    if let Some(bits) = opts.polar_quantize {
+        pipeline = pipeline
+            .with_polar_quant(bits)
+            .context("Failed to configure PolarQuant")?;
+    }
 
-        // Add compute unit annotations (should run last, after all transforms).
-        if opts.annotate_compute_units {
-            pipeline.add_pass(Box::new(
-                ironmill_compile::ane::passes::ComputeUnitAnnotationPass,
-            ));
-        }
+    // Add compute unit annotations (should run last, after all transforms).
+    if opts.annotate_compute_units {
+        pipeline.add_pass(Box::new(
+            ironmill_compile::ane::passes::ComputeUnitAnnotationPass,
+        ));
+    }
 
-        // Add op splitting for ANE memory budget
-        if let Some(ref budget_str) = opts.ane_memory_budget {
-            let budget = ironmill_compile::ane::passes::op_split::parse_memory_size(budget_str)
-                .map_err(|e| anyhow::anyhow!("invalid --ane-memory-budget: {e}"))?;
-            pipeline.add_pass(Box::new(
-                ironmill_compile::ane::passes::OpSplittingPass::new(budget),
-            ));
-            println!("  ANE memory budget: {budget_str} ({budget} bytes)");
-        }
+    // Add op splitting for ANE memory budget
+    if let Some(ref budget_str) = opts.ane_memory_budget {
+        let budget = ironmill_compile::ane::passes::op_split::parse_memory_size(budget_str)
+            .map_err(|e| anyhow::anyhow!("invalid --ane-memory-budget: {e}"))?;
+        pipeline.add_pass(Box::new(
+            ironmill_compile::ane::passes::OpSplittingPass::new(budget),
+        ));
+        println!("  ANE memory budget: {budget_str} ({budget} bytes)");
+    }
 
-        pipeline
-    };
+    Ok(pipeline)
+}
 
-    // 4. Run the pipeline
+/// Run the pass pipeline, handle output dispatch (MoE, speculative, CoreML, ANE-direct),
+/// and print warnings. Shared by both ONNX and weights compilation paths.
+fn compile_and_emit(
+    program: &mut ironmill_compile::mil::Program,
+    input_path: &Path,
+    opts: &CompileOpts,
+    warnings: Vec<String>,
+) -> Result<()> {
+    // Build and run the pass pipeline.
+    let pipeline = build_pass_pipeline(opts)?;
+
     println!("Running optimization passes...");
     let report = pipeline
-        .run(&mut program)
+        .run(program)
         .context("Optimization pipeline failed")?;
 
-    for result in &report.pass_results {
-        if result.ops_after < result.ops_before {
-            let diff = result.ops_before - result.ops_after;
-            let label = if diff == 1 { "op" } else { "ops" };
-            println!(
-                "  {}: removed {diff} {label} ({:.2?})",
-                result.name, result.elapsed
-            );
-        } else if result.ops_after > result.ops_before {
-            let diff = result.ops_after - result.ops_before;
-            let label = if diff == 1 { "op" } else { "ops" };
-            println!(
-                "  {}: added {diff} {label} ({:.2?})",
-                result.name, result.elapsed
-            );
-        } else {
-            println!("  {}: no changes ({:.2?})", result.name, result.elapsed);
-        }
-    }
-    println!("  Total pipeline time: {:.2?}", report.total_elapsed());
-    println!();
+    print_pipeline_report(&report);
 
-    // 5. MoE split (if requested)
+    // MoE split (if requested)
     if opts.moe_split {
         use ironmill_compile::convert::moe::{detect_moe, split_moe};
 
-        if let Some(topology) = detect_moe(&program) {
+        if let Some(topology) = detect_moe(program) {
             println!(
                 "MoE architecture detected: {} experts",
                 topology.expert_count
             );
-            let split_result = split_moe(&program, &topology);
+            let split_result = split_moe(program, &topology);
 
             let stem = input_path
                 .file_stem()
@@ -686,16 +634,16 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         }
     }
 
-    // 5b. MoE bundle (if requested) — single multi-function .mlpackage
+    // MoE bundle (if requested) — single multi-function .mlpackage
     if opts.moe_bundle {
         use ironmill_compile::convert::moe::{detect_moe, split_moe};
 
-        if let Some(topology) = detect_moe(&program) {
+        if let Some(topology) = detect_moe(program) {
             println!(
                 "MoE architecture detected: {} experts",
                 topology.expert_count
             );
-            let split_result = split_moe(&program, &topology);
+            let split_result = split_moe(program, &topology);
 
             let stem = input_path
                 .file_stem()
@@ -742,7 +690,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         }
     }
 
-    // 5c. MoE top-K fusion (if requested)
+    // MoE top-K fusion (if requested)
     if let Some(k) = opts.moe_fuse_topk {
         use ironmill_compile::convert::moe::{ExpertFrequencyProfile, fuse_top_k_experts};
 
@@ -760,20 +708,20 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                     profile_path.display()
                 );
                 // Detect expert count to build uniform profile
-                let expert_count = ironmill_compile::convert::moe::detect_moe(&program)
+                let expert_count = ironmill_compile::convert::moe::detect_moe(program)
                     .map(|t| t.expert_count)
                     .unwrap_or(k);
                 ExpertFrequencyProfile::uniform(expert_count)
             }
         } else {
             println!("  Note: --cal-data not provided, using uniform profile.");
-            let expert_count = ironmill_compile::convert::moe::detect_moe(&program)
+            let expert_count = ironmill_compile::convert::moe::detect_moe(program)
                 .map(|t| t.expert_count)
                 .unwrap_or(k);
             ExpertFrequencyProfile::uniform(expert_count)
         };
 
-        if let Some(fuse_result) = fuse_top_k_experts(&program, k, &profile) {
+        if let Some(fuse_result) = fuse_top_k_experts(program, k, &profile) {
             println!(
                 "MoE top-{k} fusion: kept experts {:?}, discarded {:?}",
                 fuse_result.kept_expert_indices, fuse_result.discarded_expert_indices
@@ -781,7 +729,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
             println!(
                 "  Fused program: {} ops (was {} ops)",
                 count_ops(&fuse_result.program),
-                count_ops(&program)
+                count_ops(program)
             );
 
             let stem = input_path
@@ -811,7 +759,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         }
     }
 
-    // 6. Handle model splitting for speculative decoding, or normal single-model output.
+    // Handle model splitting for speculative decoding, or normal single-model output.
     if let Some(n_layers) = opts.split_draft_layers {
         let stem = input_path
             .file_stem()
@@ -820,7 +768,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
         let split_pass = ModelSplitPass::new(n_layers);
         let split_result = split_pass
-            .split(&program)
+            .split(program)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("Failed to split model for speculative decoding")?;
 
@@ -912,10 +860,10 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                         "Updatable model: {} layer(s) marked for on-device training",
                         layer_names.len()
                     );
-                    program_to_updatable_model(&program, 9, &config)
+                    program_to_updatable_model(program, 9, &config)
                         .context("Failed to convert MIL IR to updatable CoreML protobuf")?
                 } else {
-                    program_to_model(&program, 9)
+                    program_to_model(program, 9)
                         .context("Failed to convert MIL IR to CoreML protobuf")?
                 };
 
@@ -947,13 +895,13 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
                     println!("Compiling for ANE direct runtime → {output_dir}");
 
-                    let artifacts = CompiledArtifacts::prepare(&program)
+                    let artifacts = CompiledArtifacts::prepare(program)
                         .context("ANE direct compilation failed")?;
 
-                    let warnings = artifacts
+                    let ane_warnings = artifacts
                         .validate()
                         .context("ANE artifact validation failed")?;
-                    for w in &warnings {
+                    for w in &ane_warnings {
                         println!("  ⚠ {w}");
                     }
 
@@ -974,7 +922,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         }
     }
 
-    // 9. Print warnings
+    // Print warnings
     if !warnings.is_empty() {
         println!();
         println!("Warnings:");
@@ -991,8 +939,77 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     Ok(())
 }
 
+/// Print a pipeline report summary.
+fn print_pipeline_report(report: &PipelineReport) {
+    for result in &report.pass_results {
+        if result.ops_after < result.ops_before {
+            let diff = result.ops_before - result.ops_after;
+            let label = if diff == 1 { "op" } else { "ops" };
+            println!(
+                "  {}: removed {diff} {label} ({:.2?})",
+                result.name, result.elapsed
+            );
+        } else if result.ops_after > result.ops_before {
+            let diff = result.ops_after - result.ops_before;
+            let label = if diff == 1 { "op" } else { "ops" };
+            println!(
+                "  {}: added {diff} {label} ({:.2?})",
+                result.name, result.elapsed
+            );
+        } else {
+            println!("  {}: no changes ({:.2?})", result.name, result.elapsed);
+        }
+    }
+    println!("  Total pipeline time: {:.2?}", report.total_elapsed());
+    println!();
+}
+
+fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
+    let input_display = input_path.display();
+
+    // 1. Read ONNX model
+    println!("Reading ONNX model: {input_display}");
+    let onnx_model = read_onnx(input_path)
+        .with_context(|| format!("Failed to read ONNX model: {input_display}"))?;
+    print_onnx_summary(&onnx_model);
+
+    if opts.merge_lora {
+        println!("  LoRA merge: enabled (use --no-merge-lora to disable)");
+    }
+    if opts.emit_adapter {
+        println!("  Note: --emit-adapter is reserved for future adapter export support.");
+    }
+    if !opts.adapters.is_empty() {
+        println!(
+            "  Note: --adapter is reserved for future external adapter loading ({} path(s) provided).",
+            opts.adapters.len()
+        );
+    }
+    println!();
+
+    // 2. Convert to MIL IR
+    println!("Converting to CoreML MIL IR...");
+    let config = ConversionConfig {
+        merge_lora: opts.merge_lora,
+        model_dir: input_path.parent().map(|p| p.to_path_buf()),
+    };
+    let result = onnx_to_program_with_config(&onnx_model, &config)
+        .context("Failed to convert ONNX model to MIL IR")?;
+    let mut program = result.program;
+    let warnings = result.warnings;
+    println!(
+        "  Converted: {} functions, {} ops",
+        program.functions.len(),
+        count_ops(&program)
+    );
+    println!();
+
+    // 3. Run shared pipeline + output
+    compile_and_emit(&mut program, input_path, opts, warnings)
+}
+
 /// Compile a model from SafeTensors or GGUF weight files.
-fn compile_from_weights(input_path: &Path, _opts: &CompileOpts) -> Result<()> {
+fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     let input_display = input_path.display();
 
     let is_gguf = input_path
@@ -1000,41 +1017,56 @@ fn compile_from_weights(input_path: &Path, _opts: &CompileOpts) -> Result<()> {
         .and_then(|e| e.to_str())
         .is_some_and(|e| e == "gguf");
 
-    if is_gguf {
-        bail!("GGUF format support is not yet implemented. Please use SafeTensors format.");
-    }
+    // 1. Load weight provider
+    let provider: Box<dyn WeightProvider> = if is_gguf {
+        println!("Loading GGUF model: {input_display}");
+        let p = GgufProvider::load(input_path)
+            .with_context(|| format!("Failed to load GGUF model: {input_display}"))?;
+        Box::new(p)
+    } else {
+        // SafeTensors — resolve model directory (accepts a .safetensors file or directory)
+        let model_dir = if input_path.is_dir() {
+            input_path.to_path_buf()
+        } else {
+            input_path
+                .parent()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Cannot determine model directory from: {input_display}")
+                })?
+                .to_path_buf()
+        };
+        println!("Loading SafeTensors model: {}", model_dir.display());
+        let p = SafeTensorsProvider::load(&model_dir).with_context(|| {
+            format!("Failed to load SafeTensors model: {}", model_dir.display())
+        })?;
+        Box::new(p)
+    };
 
-    // 1. Load weights
-    println!("Loading weights from: {input_display}");
-    println!("  Note: SafeTensors provider is a stub — using template for graph construction.");
+    println!("  Architecture: {}", provider.config().architecture);
+    println!("  Parameters: {} tensors", provider.tensor_names().len());
     println!();
 
-    // TODO(milestone-2): Replace this stub with real SafeTensorsProvider.
-    // For now, we construct the program using the template which will
-    // emit warnings for any missing weight tensors.
-    bail!(
-        "SafeTensors weight loading is not yet implemented (Milestone 2). \
-         The architecture template and CLI routing are ready — \
-         provide a SafeTensorsProvider implementation to enable end-to-end conversion."
-    );
+    // 2. Build MIL program from architecture template
+    let ane_mode = opts.ane || matches!(opts.runtime, RuntimeArg::AneDirect);
+    let template_opts = TemplateOptions { ane: ane_mode };
 
-    // When SafeTensorsProvider is implemented, the flow will be:
-    //
-    //   let provider = SafeTensorsProvider::load(input_path)?;
-    //
-    //   // Derive ANE template options from CLI flags.
-    //   let ane_mode = _opts.ane
-    //       || matches!(_opts.runtime, RuntimeArg::AneDirect);
-    //   let template_opts = TemplateOptions { ane: ane_mode };
-    //
-    //   let result = weights_to_program_with_options(&provider, &template_opts)?;
-    //   let mut program = result.program;
-    //   let warnings = result.warnings;
-    //
-    //   // Build and run the same pass pipeline as ONNX:
-    //   let pipeline = build_pass_pipeline(opts)?;
-    //   let report = pipeline.run(&mut program)?;
-    //   // ... write output ...
+    println!(
+        "Building MIL program from {} template...",
+        provider.config().architecture
+    );
+    let result = weights_to_program_with_options(provider.as_ref(), &template_opts)
+        .context("Failed to build MIL program from weights")?;
+    let mut program = result.program;
+    let warnings = result.warnings;
+    println!(
+        "  Built: {} functions, {} ops",
+        program.functions.len(),
+        count_ops(&program)
+    );
+    println!();
+
+    // 3. Run shared pipeline + output
+    compile_and_emit(&mut program, input_path, opts, warnings)
 }
 
 /// Compile a .mlpackage using xcrun coremlcompiler.
