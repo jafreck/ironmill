@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mil-rs", "crates/ironmill-compile", "crates/ironmill-cli", "crates/ironmill-coreml-sys", "crates/ironmill-ane-sys", "crates/ironmill-iosurface", "crates/ironmill-bench", "crates/ironmill-inference", "crates/burn-coreml", "crates/candle-coreml"]
+members = ["crates/mil-rs", "crates/ironmill-compile", "crates/ironmill-cli", "crates/ironmill-coreml-sys", "crates/ironmill-ane-sys", "crates/ironmill-metal-sys", "crates/ironmill-iosurface", "crates/ironmill-bench", "crates/ironmill-inference", "crates/burn-coreml", "crates/candle-coreml"]
 resolver = "2"
 
 [workspace.package]
@@ -14,6 +14,7 @@ mil-rs = { path = "crates/mil-rs", version = "0.1.0" }
 ironmill-compile = { path = "crates/ironmill-compile", version = "0.1.0" }
 ironmill-iosurface = { path = "crates/ironmill-iosurface", version = "0.1.0" }
 ironmill-ane-sys = { path = "crates/ironmill-ane-sys", version = "0.1.0" }
+ironmill-metal-sys = { path = "crates/ironmill-metal-sys", version = "0.1.0" }
 ironmill-coreml-sys = { path = "crates/ironmill-coreml-sys", version = "0.1.0" }
 ironmill-inference = { path = "crates/ironmill-inference", version = "0.1.0" }
 prost = "0.13"

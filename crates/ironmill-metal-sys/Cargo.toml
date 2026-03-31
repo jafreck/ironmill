@@ -1,0 +1,12 @@
+[package]
+name = "ironmill-metal-sys"
+description = "Safe FFI bindings for Apple Metal and MPS frameworks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+half = { workspace = true }
