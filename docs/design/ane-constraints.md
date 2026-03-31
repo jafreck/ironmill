@@ -24,6 +24,61 @@
 | Shape rejection | `C > ~768` AND `S < 32` | ANE rejects `[1,C,1,S]` I/O tensors matching this |
 | Below-minimum rejection | status `0x1d` | IOSurfaces below 16KB are rejected |
 
+### Data Type Constraints
+
+| Constraint | Details | Notes |
+|---|---|---|
+| Compute precision | FP16 only | ANE dequantizes INT8 to FP16 before compute — no native INT8 arithmetic |
+| INT8 support | Storage/transport only | `cast(int8→fp16)` ✅, `cast(fp16→int8)` ✅, but INT8 arithmetic (`add`/`mul` on int8) ❌ |
+| INT4/UINT4 support | Comprehensively rejected | All paths rejected: inputs, outputs, casts, consts, `constexpr_lut_to_dense`, `constexpr_blockwise_shift_scale` |
+| INT8 function outputs | ❌ Rejected | INT8 function *inputs* work, but INT8 *outputs* are rejected by the ANE compiler |
+
+### INT8 Cache Bandwidth: No Throughput Gain
+
+**Critical finding:** INT8 KV cache inputs provide **no throughput advantage**
+over FP16 on ANE, at any model size or sequence length tested. INT8 is
+consistently 3–30% *slower* than FP16 for the same attention computation.
+
+The ANE's `cast(int8→fp16)` op adds O(seq_len × kv_channels) work that is
+**not compensated** by reduced memory bandwidth. Even at cache sizes well
+beyond SRAM (~32 MB), FP16 outperforms INT8.
+
+**Benchmark methodology:** Identical attention MIL programs compiled and
+evaluated on ANE, differing only in cache input dtype (INT8 vs FP16).
+The "INT8 raw" column uses `cache_int8=true` with no dequant scale and
+no rotation — structurally identical to FP16 except for the `cast(int8→fp16)`.
+
+```
+Config                        INT8+TQ  INT8raw     FP16 raw/fp16    Cache
+                                 (μs)     (μs)     (μs)              (MB)
+────────────────────────────────────────────────────────────────────────
+Qwen3-0.6B @ 512                  255      245      225    0.92x     1.0
+Qwen3-0.6B @ 2048                 787      761      739    0.97x     4.0
+8B-style (8 KV) @ 512             634      612      590    0.96x     2.0
+8B-style (8 KV) @ 2048           2155     2146     2006    0.93x     8.0
+8B-style (8 KV) @ 4096           4187     4156     3901    0.94x    16.0
+8B MHA (32 KV) @ 2048            1971     1965     1429    0.73x    32.0
+8B MHA (32 KV) @ 4096            3811     3797     2681    0.71x    64.0
+8B MHA (32 KV) @ 8192            7450     7412     5172    0.70x   128.0
+8B GQA (8 KV) @ 8192             8145     8139     7622    0.94x    32.0
+```
+
+Key observations:
+- INT8+TQ vs INT8raw are nearly identical — dequant/rotation overhead is negligible
+- INT8raw vs FP16 shows **pure cast cost** — 3–30% slower depending on cache size
+- The gap *widens* at larger KV dimensions (32 KV heads: 30% slower at 128 MB cache)
+- Aligns with maderix's finding: "INT8 and FP16 deliver nearly identical throughput.
+  The ANE dequantizes INT8 weights to FP16 before compute."
+
+**Implication for TurboQuant:** INT8 KV cache on ANE provides **memory savings
+only** (50% cache reduction), never throughput gains. TQ's value proposition on
+ANE is enabling longer contexts within memory budgets, not faster inference.
+
+**Reproduce:**
+```sh
+cargo run -p ironmill-inference --example cache_bandwidth_bench --release
+```
+
 ### Compilation Constraints
 
 | Constraint | Limit | Notes |

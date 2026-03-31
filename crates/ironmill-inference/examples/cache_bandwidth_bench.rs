@@ -73,40 +73,74 @@ fn main() {
             head_dim: 128,
             max_seq_len: 4096,
         },
+        // MHA models (32 KV heads) — cache hits SRAM limit (~32MB) faster
+        // K+V cache at 4096: 32×128×4096×2=32MB (FP16) vs 16MB (INT8)
+        BenchConfig {
+            label: "8B MHA (32 KV) @ 2048",
+            num_heads: 32,
+            num_kv_heads: 32,
+            head_dim: 128,
+            max_seq_len: 2048,
+        },
+        BenchConfig {
+            label: "8B MHA (32 KV) @ 4096",
+            num_heads: 32,
+            num_kv_heads: 32,
+            head_dim: 128,
+            max_seq_len: 4096,
+        },
+        // Beyond SRAM — cache spills to DRAM
+        BenchConfig {
+            label: "8B MHA (32 KV) @ 8192",
+            num_heads: 32,
+            num_kv_heads: 32,
+            head_dim: 128,
+            max_seq_len: 8192,
+        },
+        BenchConfig {
+            label: "8B GQA (8 KV) @ 8192",
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            max_seq_len: 8192,
+        },
     ];
 
     println!(
-        "  {:30} {:>10} {:>10} {:>8} {:>8} {:>7}",
-        "Config", "INT8 (μs)", "FP16 (μs)", "Speedup", "INT8 MB", "FP16 MB"
+        "  {:28} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "Config", "INT8+TQ", "INT8raw", "FP16", "raw/fp16", "Cache"
     );
-    println!("  {}", "─".repeat(79));
+    println!(
+        "  {:28} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "", "(μs)", "(μs)", "(μs)", "", "(MB)"
+    );
+    println!("  {}", "─".repeat(72));
 
     for cfg in &configs {
         let result = bench_config(cfg);
         match result {
-            Ok((int8_us, fp16_us)) => {
+            Ok((int8_tq_us, int8_raw_us, fp16_us)) => {
                 let kv_ch = cfg.num_kv_heads * cfg.head_dim;
-                let int8_mb = 2.0 * kv_ch as f64 * cfg.max_seq_len as f64 / 1024.0 / 1024.0;
-                let fp16_mb = int8_mb * 2.0;
-                let speedup = fp16_us / int8_us;
+                let fp16_mb = 2.0 * kv_ch as f64 * cfg.max_seq_len as f64 * 2.0 / 1024.0 / 1024.0;
+                let speedup = fp16_us / int8_raw_us;
                 println!(
-                    "  {:30} {:>10.0} {:>10.0} {:>7.2}x {:>7.1} {:>7.1}",
-                    cfg.label, int8_us, fp16_us, speedup, int8_mb, fp16_mb
+                    "  {:28} {:>8.0} {:>8.0} {:>8.0} {:>7.2}x {:>7.1}",
+                    cfg.label, int8_tq_us, int8_raw_us, fp16_us, speedup, fp16_mb
                 );
             }
             Err(e) => {
-                println!("  {:30} FAILED: {e}", cfg.label);
+                println!("  {:28} FAILED: {e}", cfg.label);
             }
         }
     }
     println!();
 }
 
-fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64), String> {
+fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
     let kv_ch = cfg.num_kv_heads * cfg.head_dim;
     let q_ch = cfg.num_heads * cfg.head_dim;
 
-    // --- INT8 attention (TurboQuant path) ---
+    // --- INT8 attention (TurboQuant path: cast + dequant + rotation) ---
     let deq_scale = mil_emitter::compute_deq_scale(cfg.head_dim, 8);
     let attn_config_int8 = mil_emitter::AttentionMilConfig {
         num_heads: cfg.num_heads,
@@ -120,7 +154,23 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64), String> {
     };
     let (int8_mil, _) = mil_emitter::emit_attention_mil(&attn_config_int8);
     let int8_compiled = AneCompiler::compile_mil_text(&int8_mil, &[])
-        .map_err(|e| format!("INT8 attention compile failed: {e}"))?;
+        .map_err(|e| format!("INT8+TQ attention compile failed: {e}"))?;
+
+    // --- INT8 raw attention (cast only, no dequant, no rotation) ---
+    // Isolates the pure INT8→FP16 bandwidth cost
+    let attn_config_int8_raw = mil_emitter::AttentionMilConfig {
+        num_heads: cfg.num_heads,
+        num_kv_heads: cfg.num_kv_heads,
+        head_dim: cfg.head_dim,
+        max_seq_len: cfg.max_seq_len,
+        seq_len: cfg.max_seq_len,
+        dequant_scale: None,   // no dequant mul
+        unrotation_seed: None, // no rotation
+        cache_int8: true,      // still INT8 input → cast to fp16
+    };
+    let (int8_raw_mil, _) = mil_emitter::emit_attention_mil(&attn_config_int8_raw);
+    let int8_raw_compiled = AneCompiler::compile_mil_text(&int8_raw_mil, &[])
+        .map_err(|e| format!("INT8 raw attention compile failed: {e}"))?;
 
     // --- FP16 attention (baseline) ---
     let fp16_mil = mil_emitter::emit_fp16_attention_mil(
@@ -149,12 +199,15 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64), String> {
     let runtime = AneRuntime::new().map_err(|e| format!("Runtime init failed: {e}"))?;
     let int8_loaded = runtime
         .load_program(&int8_compiled)
-        .map_err(|e| format!("INT8 load failed: {e}"))?;
+        .map_err(|e| format!("INT8+TQ load failed: {e}"))?;
+    let int8_raw_loaded = runtime
+        .load_program(&int8_raw_compiled)
+        .map_err(|e| format!("INT8 raw load failed: {e}"))?;
     let fp16_loaded = runtime
         .load_program(&fp16_compiled)
         .map_err(|e| format!("FP16 load failed: {e}"))?;
 
-    // INT8 inputs: Q, K_cache(int8), V_cache(int8), rotation_matrix
+    // INT8+TQ inputs: Q, K_cache(int8), V_cache(int8), rotation_matrix
     let q_int8 = AneTensor::new_with_min_alloc(q_ch, 32, ScalarType::Float16, int8_alloc)
         .map_err(|e| format!("{e}"))?;
     let k_cache_int8 =
@@ -168,6 +221,24 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64), String> {
             .map_err(|e| format!("{e}"))?;
     let mut out_int8 = AneTensor::new_with_min_alloc(q_ch, 32, ScalarType::Float16, int8_alloc)
         .map_err(|e| format!("{e}"))?;
+
+    // INT8 raw inputs: Q, K_cache(int8), V_cache(int8) — no rotation tensor
+    let int8_raw_alloc = uniform_alloc_size(&[
+        ([1, q_ch, 1, 32], ScalarType::Float16),
+        ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Int8),
+        ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Int8),
+    ]);
+    let q_int8_raw = AneTensor::new_with_min_alloc(q_ch, 32, ScalarType::Float16, int8_raw_alloc)
+        .map_err(|e| format!("{e}"))?;
+    let k_cache_int8_raw =
+        AneTensor::new_with_min_alloc(kv_ch, cfg.max_seq_len, ScalarType::Int8, int8_raw_alloc)
+            .map_err(|e| format!("{e}"))?;
+    let v_cache_int8_raw =
+        AneTensor::new_with_min_alloc(kv_ch, cfg.max_seq_len, ScalarType::Int8, int8_raw_alloc)
+            .map_err(|e| format!("{e}"))?;
+    let mut out_int8_raw =
+        AneTensor::new_with_min_alloc(q_ch, 32, ScalarType::Float16, int8_raw_alloc)
+            .map_err(|e| format!("{e}"))?;
 
     // FP16 inputs: Q, K_cache(fp16), V_cache(fp16)
     let q_fp16 = AneTensor::new_with_min_alloc(q_ch, 32, ScalarType::Float16, fp16_alloc)
@@ -204,6 +275,29 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64), String> {
     int8_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let int8_p50 = int8_latencies[int8_latencies.len() / 2];
 
+    // --- Benchmark INT8 raw (cast-only, no dequant/rotation) ---
+    for _ in 0..WARMUP {
+        let _ = runtime.eval(
+            &int8_raw_loaded,
+            &[&q_int8_raw, &k_cache_int8_raw, &v_cache_int8_raw],
+            &mut [&mut out_int8_raw],
+        );
+    }
+    let mut int8_raw_latencies = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let t = Instant::now();
+        runtime
+            .eval(
+                &int8_raw_loaded,
+                &[&q_int8_raw, &k_cache_int8_raw, &v_cache_int8_raw],
+                &mut [&mut out_int8_raw],
+            )
+            .map_err(|e| format!("INT8 raw eval failed: {e}"))?;
+        int8_raw_latencies.push(t.elapsed().as_micros() as f64);
+    }
+    int8_raw_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let int8_raw_p50 = int8_raw_latencies[int8_raw_latencies.len() / 2];
+
     // --- Benchmark FP16 ---
     for _ in 0..WARMUP {
         let _ = runtime.eval(
@@ -227,5 +321,5 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64), String> {
     fp16_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let fp16_p50 = fp16_latencies[fp16_latencies.len() / 2];
 
-    Ok((int8_p50, fp16_p50))
+    Ok((int8_p50, int8_raw_p50, fp16_p50))
 }
