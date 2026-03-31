@@ -180,13 +180,14 @@ graph TD
     candle --> compile
     candle --> inference
 
-    inference --> compile
+    compile --> mil
+    compile --> ios
+
+    inference --> mil
     inference --> ane
     inference --> ios
     inference --> coremlsys
-
-    compile --> mil
-    compile --> ios
+    inference -.->|"compile" feature| compile
 
     ios --> mil
 ```

@@ -883,35 +883,30 @@ fn compile_and_emit(
             RuntimeArg::AneDirect => {
                 #[cfg(feature = "ane-direct")]
                 {
-                    use ironmill_inference::CompiledArtifacts;
+                    use ironmill_compile::ane::bundle::{AneCompileConfig, compile_model_bundle};
 
                     let output_dir = opts.output.clone().unwrap_or_else(|| {
                         let stem = input_path
                             .file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("model");
-                        format!("{stem}.ane")
+                        format!("{stem}.ironml")
                     });
 
                     println!("Compiling for ANE direct runtime → {output_dir}");
 
-                    let artifacts = CompiledArtifacts::prepare(program)
-                        .context("ANE direct compilation failed")?;
+                    let config = AneCompileConfig::default();
+                    let bundle = compile_model_bundle(program, &config)
+                        .context("ANE model bundle compilation failed")?;
 
-                    let ane_warnings = artifacts
-                        .validate()
-                        .context("ANE artifact validation failed")?;
-                    for w in &ane_warnings {
-                        println!("  ⚠ {w}");
-                    }
-
-                    artifacts
-                        .save(std::path::Path::new(&output_dir))
-                        .context("failed to save ANE artifacts")?;
+                    let output_path = std::path::Path::new(&output_dir);
+                    bundle
+                        .save(output_path)
+                        .context("Failed to save .ironml bundle")?;
 
                     println!(
                         "  ✓ {} sub-program(s) written to {output_dir}",
-                        artifacts.num_sub_programs(),
+                        bundle.sub_programs.len(),
                     );
                 }
                 #[cfg(not(feature = "ane-direct"))]

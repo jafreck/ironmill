@@ -479,7 +479,6 @@ dependencies = [
  "anyhow",
  "clap",
  "ironmill-compile",
- "ironmill-inference",
  "serde_json",
  "tempfile",
  "toml",
