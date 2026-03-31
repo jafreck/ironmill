@@ -11,8 +11,17 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use mil_rs::ir::{Pass, Program};
+
 use crate::ane::TensorDescriptor;
+use crate::ane::blobfile::BlobFileWriter;
+use crate::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use crate::ane::packing::InputPacking;
+use crate::ane::passes::{
+    AneConcatEliminationPass, AneLayoutPass, AneVariableNamingPass, AttentionDecomposePass,
+    OpSubstitutionPass,
+};
+use crate::ane::split::{SplitConfig, split_for_ane};
 
 // ---------------------------------------------------------------------------
 // Bundle types
@@ -200,6 +209,86 @@ impl From<&InputPacking> for BundleInputPacking {
             sizes: ip.sizes.clone(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Simple-path compilation
+// ---------------------------------------------------------------------------
+
+/// Configuration for simple model compilation.
+#[derive(Debug, Default)]
+pub struct AneCompileConfig {
+    /// Enable INT4 data type support.
+    pub enable_int4: bool,
+}
+
+/// Compile a MIL IR program into an ANE model bundle.
+///
+/// Runs the full ANE compilation pipeline:
+/// 1. ANE-specific passes (op substitution, layout, attention decompose,
+///    concat elimination, variable naming)
+/// 2. Split into sub-programs
+/// 3. Emit MIL text + weight blobs for each sub-program
+///
+/// The returned bundle can be saved to disk with [`AneModelBundle::save()`]
+/// and loaded by the inference engine without any compile-crate dependency.
+pub fn compile_model_bundle(
+    program: &Program,
+    config: &AneCompileConfig,
+) -> Result<AneModelBundle> {
+    // 1. Clone and run ANE-specific passes
+    let mut program = program.clone();
+    let passes: &[(&str, &dyn Pass)] = &[
+        ("OpSubstitution", &OpSubstitutionPass),
+        ("AneLayout", &AneLayoutPass),
+        ("AttentionDecompose", &AttentionDecomposePass),
+        ("AneConcatElimination", &AneConcatEliminationPass),
+        ("AneVariableNaming", &AneVariableNamingPass),
+    ];
+    for (name, pass) in passes {
+        pass.run(&mut program)
+            .map_err(|e| anyhow::anyhow!("{name} pass failed: {e}"))?;
+    }
+
+    // 2. Split into sub-programs
+    let split_config = SplitConfig::default();
+    let model_split = split_for_ane(&program, &split_config)?;
+
+    // 3. Emit MIL text + weight blob for each sub-program
+    let mil_config = MilTextConfig {
+        enable_int4: config.enable_int4,
+        ..MilTextConfig::default()
+    };
+    let mut sub_programs = Vec::with_capacity(model_split.programs.len());
+
+    for sub in &model_split.programs {
+        let (mil_text, weight_entries) = program_to_mil_text(&sub.program, &mil_config)
+            .map_err(|e| anyhow::anyhow!("MIL text emission failed for {}: {e}", sub.name))?;
+
+        let mut blob_writer = BlobFileWriter::new();
+        for entry in &weight_entries {
+            blob_writer.add_weight(&entry.name, &entry.data, entry.dtype);
+        }
+
+        sub_programs.push(SubProgramBundle {
+            name: sub.name.clone(),
+            mil_text,
+            weight_blob: blob_writer.as_bytes().to_vec(),
+            inputs: sub
+                .inputs
+                .iter()
+                .map(BundleTensorDescriptor::from)
+                .collect(),
+            outputs: sub
+                .outputs
+                .iter()
+                .map(BundleTensorDescriptor::from)
+                .collect(),
+            input_packing: None,
+        });
+    }
+
+    Ok(AneModelBundle { sub_programs })
 }
 
 // ---------------------------------------------------------------------------
