@@ -374,24 +374,20 @@ fn is_const_op(op: &Operation) -> bool {
 /// CPU fills before running the sub-program on ANE. Dead const ops that
 /// only fed gathers are cleaned up by subsequent DCE.
 fn strip_gather_ops(ops: &[Operation]) -> Vec<Operation> {
-    // Strip ops that ANE can't compile in the attention cluster:
-    // - gather (❌ ANE unsupported)
-    // - RoPE ops (contain split which is only compile-verified, unreliable in combination)
-    // - per-head norm ops (reduce_mean + pow pattern, move to CPU)
-    // Keep only: reshape, transpose, tile, matmul/conv, mul (scale), softmax, const, identity
-    let keep_types: &[&str] = &[
-        "reshape",
-        "transpose",
-        "tile",
-        "matmul",
-        "conv",
-        "mul",
-        "softmax",
-        "const",
-        "identity",
-    ];
+    // Strip ops that cause ANE compiler failures in the attention cluster:
+    // - `gather`: genuinely unsupported on ANE at runtime
+    // - `split` + surrounding RoPE rotation ops: `split` in combination with
+    //   matmul + softmax + tile triggers an ANE compiler bug (individually
+    //   verified but fails in combination). The RoPE rotation pattern is:
+    //   split → mul → sub → mul → add → concat
+    //
+    // All other ops (layer_norm, reduce_mean, pow, reshape, transpose,
+    // matmul, softmax, tile, mul, add, etc.) are ANE-supported and should
+    // be kept. The stripped values become cross-boundary inputs filled by
+    // the CPU at decode time.
+    let strip_types: &[&str] = &["gather", "split", "sub", "concat"];
     ops.iter()
-        .filter(|op| keep_types.contains(&op.op_type.as_str()))
+        .filter(|op| !strip_types.contains(&op.op_type.as_str()))
         .cloned()
         .collect()
 }
