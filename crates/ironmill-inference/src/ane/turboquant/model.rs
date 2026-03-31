@@ -5,6 +5,7 @@
 //! inline, eliminating CPU format conversions while retaining 2× memory savings.
 
 use ironmill_ane_sys::AneCompiler;
+use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels};
 use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard};
@@ -471,7 +472,10 @@ impl TurboQuantModel {
         let head_dim = config.head_dim;
 
         // --- cache-write sub-program ---
-        let (cw_mil, cw_weights) = mil_emitter::emit_cache_write_mil(&config);
+        let (cw_program, cw_weights) = mil_emitter::build_cache_write_program(&config);
+        let mil_config = MilTextConfig::default();
+        let (cw_mil, _) = program_to_mil_text(&cw_program, &mil_config)
+            .map_err(|e| AneError::Other(anyhow::anyhow!("cache-write MIL text failed: {e}")))?;
         // Weights are delivered as function inputs, not BLOBFILE — pass empty weights
         let cw_compiled =
             AneCompiler::compile_mil_text(&cw_mil, &[]).map_err(|e| AneError::CompileFailed {
@@ -492,7 +496,9 @@ impl TurboQuantModel {
             unrotation_seed: Some(config.rotation_seed),
             cache_int8: true,
         };
-        let (attn_mil, _attn_weights) = mil_emitter::emit_attention_mil(&attn_config);
+        let (attn_program, _attn_weights) = mil_emitter::build_attention_program(&attn_config);
+        let (attn_mil, _) = program_to_mil_text(&attn_program, &mil_config)
+            .map_err(|e| AneError::Other(anyhow::anyhow!("attention MIL text failed: {e}")))?;
         let attn_compiled =
             AneCompiler::compile_mil_text(&attn_mil, &[]).map_err(|e| AneError::CompileFailed {
                 status: 0,
@@ -502,8 +508,10 @@ impl TurboQuantModel {
 
         // --- QJL correction sub-program (optional) ---
         let qjl_program = if config.enable_qjl {
-            let (qjl_mil, _qjl_weights) =
-                mil_emitter::emit_qjl_correction_mil(&config, config.max_seq_len);
+            let (qjl_program, _qjl_weights) =
+                mil_emitter::build_qjl_program(&config, config.max_seq_len);
+            let (qjl_mil, _) = program_to_mil_text(&qjl_program, &mil_config)
+                .map_err(|e| AneError::Other(anyhow::anyhow!("QJL MIL text failed: {e}")))?;
             let qjl_compiled = AneCompiler::compile_mil_text(&qjl_mil, &[]).map_err(|e| {
                 AneError::CompileFailed {
                     status: 0,

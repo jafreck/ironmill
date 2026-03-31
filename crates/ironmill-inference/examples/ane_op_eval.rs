@@ -1031,11 +1031,14 @@ fn test_turboquant_int8_cache_pipeline() -> (bool, bool) {
 // compiles successfully on ANE (not just the hand-crafted pipeline above).
 
 fn test_generated_cache_write_mil() -> (bool, bool) {
+    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
     use ironmill_inference::ane::turboquant::TurboQuantConfig;
-    use ironmill_inference::ane::turboquant::mil_emitter::emit_cache_write_mil;
+    use ironmill_inference::ane::turboquant::mil_emitter::build_cache_write_program;
 
     let config = TurboQuantConfig::new(8, 128, 32, 32, 64, 1).unwrap();
-    let (mil_text, weights) = emit_cache_write_mil(&config);
+    let (program, weights) = build_cache_write_program(&config);
+    let mil_config = MilTextConfig::default();
+    let (mil_text, _) = program_to_mil_text(&program, &mil_config).unwrap();
     let weight_refs: Vec<(&str, &[u8])> = weights
         .iter()
         .map(|(n, d)| (n.as_str(), d.as_slice()))
@@ -1054,8 +1057,9 @@ fn test_generated_cache_write_mil() -> (bool, bool) {
 }
 
 fn test_generated_attention_mil() -> (bool, bool) {
+    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
     use ironmill_inference::ane::turboquant::mil_emitter::{
-        AttentionMilConfig, compute_deq_scale, emit_attention_mil,
+        AttentionMilConfig, build_attention_program, compute_deq_scale,
     };
 
     let deq_scale = compute_deq_scale(64, 8);
@@ -1069,7 +1073,9 @@ fn test_generated_attention_mil() -> (bool, bool) {
         unrotation_seed: Some(42),
         cache_int8: true,
     };
-    let (mil_text, _weights) = emit_attention_mil(&config);
+    let (program, _weights) = build_attention_program(&config);
+    let mil_config = MilTextConfig::default();
+    let (mil_text, _) = program_to_mil_text(&program, &mil_config).unwrap();
 
     match AneCompiler::compile_mil_text(&mil_text, &[]) {
         Ok(_ptr) => {
@@ -1084,14 +1090,17 @@ fn test_generated_attention_mil() -> (bool, bool) {
 }
 
 fn test_generated_qjl_mil() -> (bool, bool) {
+    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
     use ironmill_inference::ane::turboquant::TurboQuantConfig;
-    use ironmill_inference::ane::turboquant::mil_emitter::emit_qjl_correction_mil;
+    use ironmill_inference::ane::turboquant::mil_emitter::build_qjl_program;
 
     let config = TurboQuantConfig::new(8, 128, 32, 32, 64, 1).unwrap();
-    let (mil_text, weights) = emit_qjl_correction_mil(&config, 32);
+    let (program, weights) = build_qjl_program(&config, 32);
+    let mil_config = MilTextConfig::default();
+    let (mil_text, _) = program_to_mil_text(&program, &mil_config).unwrap();
     let weight_refs: Vec<(&str, &[u8])> = weights
         .iter()
-        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .map(|(n, d): &(String, Vec<u8>)| (n.as_str(), d.as_slice()))
         .collect();
 
     match AneCompiler::compile_mil_text(&mil_text, &[]) {
@@ -1107,8 +1116,9 @@ fn test_generated_qjl_mil() -> (bool, bool) {
 }
 
 fn test_generated_attention_gqa_mil() -> (bool, bool) {
+    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
     use ironmill_inference::ane::turboquant::mil_emitter::{
-        AttentionMilConfig, compute_deq_scale, emit_attention_mil,
+        AttentionMilConfig, build_attention_program, compute_deq_scale,
     };
 
     // GQA config: 32 query heads, 8 KV heads (4× expansion via tile)
@@ -1123,7 +1133,9 @@ fn test_generated_attention_gqa_mil() -> (bool, bool) {
         unrotation_seed: Some(42),
         cache_int8: true,
     };
-    let (mil_text, _weights) = emit_attention_mil(&config);
+    let (program, _weights) = build_attention_program(&config);
+    let mil_config = MilTextConfig::default();
+    let (mil_text, _) = program_to_mil_text(&program, &mil_config).unwrap();
 
     match AneCompiler::compile_mil_text(&mil_text, &[]) {
         Ok(_ptr) => {

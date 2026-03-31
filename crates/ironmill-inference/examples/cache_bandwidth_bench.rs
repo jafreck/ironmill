@@ -12,6 +12,7 @@
 use std::time::Instant;
 
 use ironmill_ane_sys::AneCompiler;
+use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use ironmill_inference::ane::AneRuntime;
 use ironmill_inference::ane::turboquant::mil_emitter;
 use ironmill_inference::ane::turboquant::{AttentionMilConfig, compute_deq_scale};
@@ -152,7 +153,10 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
         unrotation_seed: Some(42),
         cache_int8: true,
     };
-    let (int8_mil, _) = mil_emitter::emit_attention_mil(&attn_config_int8);
+    let (int8_program, _) = mil_emitter::build_attention_program(&attn_config_int8);
+    let mil_config = MilTextConfig::default();
+    let (int8_mil, _) = program_to_mil_text(&int8_program, &mil_config)
+        .map_err(|e| format!("INT8+TQ attention MIL text failed: {e}"))?;
     let int8_compiled = AneCompiler::compile_mil_text(&int8_mil, &[])
         .map_err(|e| format!("INT8+TQ attention compile failed: {e}"))?;
 
@@ -168,18 +172,22 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
         unrotation_seed: None, // no rotation
         cache_int8: true,      // still INT8 input → cast to fp16
     };
-    let (int8_raw_mil, _) = mil_emitter::emit_attention_mil(&attn_config_int8_raw);
+    let (int8_raw_program, _) = mil_emitter::build_attention_program(&attn_config_int8_raw);
+    let (int8_raw_mil, _) = program_to_mil_text(&int8_raw_program, &mil_config)
+        .map_err(|e| format!("INT8 raw attention MIL text failed: {e}"))?;
     let int8_raw_compiled = AneCompiler::compile_mil_text(&int8_raw_mil, &[])
         .map_err(|e| format!("INT8 raw attention compile failed: {e}"))?;
 
     // --- FP16 attention (baseline) ---
-    let fp16_mil = mil_emitter::emit_fp16_attention_mil(
+    let fp16_program = mil_emitter::build_fp16_attention_program(
         cfg.num_heads,
         cfg.num_kv_heads,
         cfg.head_dim,
         cfg.max_seq_len,
         cfg.max_seq_len,
     );
+    let (fp16_mil, _) = program_to_mil_text(&fp16_program, &mil_config)
+        .map_err(|e| format!("FP16 attention MIL text failed: {e}"))?;
     let fp16_compiled = AneCompiler::compile_mil_text(&fp16_mil, &[])
         .map_err(|e| format!("FP16 attention compile failed: {e}"))?;
 

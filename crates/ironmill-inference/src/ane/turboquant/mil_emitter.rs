@@ -1,13 +1,14 @@
-//! MIL text generation for TurboQuant ANE sub-programs.
+//! MIL IR construction for TurboQuant ANE sub-programs.
 //!
-//! Generates MIL text strings for the cache-write (quantization) and
-//! cache-read + attention (dequantization + SDPA) sub-programs that run
-//! on the Apple Neural Engine.
+//! Builds `mil_rs::ir::Program` objects for the cache-write (quantization)
+//! and cache-read + attention (dequantization + SDPA) sub-programs that run
+//! on the Apple Neural Engine. Programs are serialized to MIL text via
+//! `ironmill_compile::ane::mil_text::program_to_mil_text`.
 
 use half::f16;
 use mil_rs::ir::passes::beta_quantizer::beta_optimal_levels;
 use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard};
-use std::fmt::Write;
+use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 
 use super::model::TurboQuantConfig;
 
@@ -23,28 +24,29 @@ pub(crate) const MIN_IO_SEQ: usize = 32;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Standard MIL program wrapper used by the ANE compiler.
-fn mil_program_wrapper(func_body: &str) -> String {
-    // The buildInfo dict uses {{ }} as delimiters in MIL text.
-    // In Rust format!, {{ → { and }} → }, so we need quadruple braces
-    // for the outer dict delimiters.
-    format!(
-        "program(1.3)\n\
-         [buildInfo = dict<string, string>(\
-         {{{{\"coremlc-component-MIL\", \"3510.2.1\"}}, \
-         {{\"coremlc-version\", \"3505.4.1\"}}, \
-         {{\"coremltools-component-milinternal\", \"\"}}, \
-         {{\"coremltools-version\", \"9.0\"}}}})]\n\
-         {{\n\
-         {func_body}\n\
-         }}"
-    )
+/// Create an inline int32 tensor value for use as an op input (shape, axes, etc.).
+fn int32_tensor(values: &[i32]) -> Value {
+    Value::Tensor {
+        data: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        shape: vec![values.len()],
+        dtype: ScalarType::Int32,
+    }
 }
 
-/// Format a shape as MIL text, e.g. `[1,128,1,1]`.
-fn fmt_shape(shape: &[usize]) -> String {
-    let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
-    format!("[{}]", dims.join(","))
+/// Add a scalar const op to a block.
+fn add_const_op(block: &mut Block, name: &str, val: Value) {
+    let op = Operation::new("const", name)
+        .with_input("val", val)
+        .with_output(name);
+    block.add_op(op);
+}
+
+/// Add an int32 tensor const op to a block.
+fn add_const_tensor_op(block: &mut Block, name: &str, values: &[i32]) {
+    let op = Operation::new("const", name)
+        .with_input("val", int32_tensor(values))
+        .with_output(name);
+    block.add_op(op);
 }
 
 /// Generate the Hadamard rotation matrix as fp16 bytes.
@@ -102,7 +104,7 @@ pub fn compute_deq_scale(head_dim: usize, n_bits: u8) -> f32 {
 // Cache-write sub-program
 // ---------------------------------------------------------------------------
 
-/// Generate MIL text for the cache-write sub-program.
+/// Build the MIL IR program for the cache-write sub-program.
 ///
 /// Takes fp16 K/V projections and a rotation matrix, applies Hadamard
 /// rotation + Beta-optimal quantization, outputs fp16 values clamped
@@ -111,193 +113,156 @@ pub fn compute_deq_scale(head_dim: usize, n_bits: u8) -> f32 {
 ///
 /// # Inputs
 ///
-/// - `a_input0`: K projection `[1, kv_ch, 1, 1]` fp16
-/// - `a_input1`: V projection `[1, kv_ch, 1, 1]` fp16
+/// - `a_input0`: K projection `[1, kv_ch, 1, MIN_IO_SEQ]` fp16
+/// - `a_input1`: V projection `[1, kv_ch, 1, MIN_IO_SEQ]` fp16
 /// - `a_input2`: Rotation matrix `[1, 1, head_dim, head_dim]` fp16
 ///
 /// # Returns
 ///
-/// `(mil_text, weights)` where `weights` contains the rotation matrix
+/// `(program, weights)` where `weights` contains the rotation matrix
 /// fp16 bytes to populate the input IOSurface tensor.
-pub fn emit_cache_write_mil(config: &TurboQuantConfig) -> (String, Vec<(String, Vec<u8>)>) {
+pub fn build_cache_write_program(config: &TurboQuantConfig) -> (Program, Vec<(String, Vec<u8>)>) {
     let ch = config.num_kv_heads * config.head_dim;
-    let in_shape = fmt_shape(&[1, ch, 1, MIN_IO_SEQ]);
-    let rot_shape = fmt_shape(&[1, 1, config.head_dim, config.head_dim]);
-
+    let s = MIN_IO_SEQ;
     let inv_scale = compute_inv_scale(config.head_dim, config.n_bits);
 
-    let mut body = String::new();
     let mut weights: Vec<(String, Vec<u8>)> = Vec::new();
 
-    // Rotation matrix passed as function input (a_input2), not BLOBFILE.
-    // BLOBFILE weight references fail with compile_mil_text — see
-    // docs/archive/ane-blobfile-investigation.md for details.
+    // Rotation matrix passed as function input, not BLOBFILE.
     let rot_data = generate_rotation_weights(config.head_dim, config.rotation_seed);
     weights.push(("rotation_matrix".to_string(), rot_data));
 
-    // --- Build function body ---
-
-    writeln!(
-        body,
-        "        fp16 inv_scale = const()[name=string(\"inv_scale\"), val=fp16({inv_scale})];",
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        fp16 zero_point = const()[name=string(\"zero_point\"), val=fp16(0.0)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        fp16 clip_lo = const()[name=string(\"clip_lo\"), val=fp16(-128.0)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        fp16 clip_hi = const()[name=string(\"clip_hi\"), val=fp16(127.0)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
-    )
-    .unwrap();
-
-    // --- K pipeline (rotation_matrix = a_input2) ---
-    emit_quantize_chain(&mut body, "k", "a_input0", &in_shape, &rot_shape, config);
-
-    // --- V pipeline ---
-    emit_quantize_chain(&mut body, "v", "a_input1", &in_shape, &rot_shape, config);
-
-    // Assemble function — rotation matrix is a_input2
-    let func = format!(
-        "    func main<ios18>(tensor<fp16, {in_shape}> a_input0, \
-         tensor<fp16, {in_shape}> a_input1, \
-         tensor<fp16, {rot_shape}> a_input2) {{\n\
-         {body}\
-         \n    }} -> (z_output0, z_output1);"
+    let in_ty = TensorType::new(ScalarType::Float16, vec![1, ch, 1, s]);
+    let rot_ty = TensorType::new(
+        ScalarType::Float16,
+        vec![1, 1, config.head_dim, config.head_dim],
     );
 
-    let mil_text = mil_program_wrapper(&func);
-    (mil_text, weights)
+    let mut func = Function::new("main")
+        .with_input("k_proj", in_ty.clone())
+        .with_input("v_proj", in_ty)
+        .with_input("rot_mat", rot_ty);
+
+    // Shared constants
+    add_const_op(&mut func.body, "inv_scale", Value::Float(inv_scale as f64));
+    add_const_op(&mut func.body, "zero_point", Value::Float(0.0));
+    add_const_op(&mut func.body, "clip_lo", Value::Float(-128.0));
+    add_const_op(&mut func.body, "clip_hi", Value::Float(127.0));
+    add_const_op(&mut func.body, "bF", Value::Bool(false));
+
+    // K pipeline
+    build_quantize_chain(&mut func.body, "k", "k_proj", config, "k_out");
+    // V pipeline
+    build_quantize_chain(&mut func.body, "v", "v_proj", config, "v_out");
+
+    func.body.outputs.push("k_out".into());
+    func.body.outputs.push("v_out".into());
+
+    let mut program = Program::new("1.0.0");
+    program.add_function(func);
+
+    (program, weights)
 }
 
-/// Emit the quantization op chain for a single K or V tensor.
-fn emit_quantize_chain(
-    body: &mut String,
+/// Build the quantization op chain for a single K or V tensor.
+fn build_quantize_chain(
+    block: &mut Block,
     prefix: &str,
     input_name: &str,
-    _in_shape: &str,
-    rot_shape: &str,
     config: &TurboQuantConfig,
+    output_name: &str,
 ) {
     let ch = config.num_kv_heads * config.head_dim;
-    let _ = rot_shape; // rotation applied via matmul broadcast
-
     let s = MIN_IO_SEQ;
+    let reshape_4d = vec![1, config.num_kv_heads, config.head_dim, s];
+    let flat_shape = vec![1, ch, 1, s];
 
     // Reshape to [1, num_kv_heads, head_dim, S] for per-head rotation
-    let reshape_4d = fmt_shape(&[1, config.num_kv_heads, config.head_dim, s]);
     let reshaped = format!("{prefix}_reshaped");
-    writeln!(
-        body,
-        "        tensor<fp16, {reshape_4d}> {reshaped} = reshape(\
-         x={input_name}, shape=tensor<int32, [4]>([1,{},{},{s}]))\
-         [name=string(\"{reshaped}\")];",
-        config.num_kv_heads, config.head_dim
-    )
-    .unwrap();
+    let mut op = Operation::new("reshape", &reshaped)
+        .with_input("x", Value::Reference(input_name.into()))
+        .with_input(
+            "shape",
+            int32_tensor(&[
+                1,
+                config.num_kv_heads as i32,
+                config.head_dim as i32,
+                s as i32,
+            ]),
+        )
+        .with_output(&reshaped);
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, reshape_4d.clone()));
+    block.add_op(op);
 
-    // matmul: [1, 1, head_dim, head_dim] × [1, num_kv_heads, head_dim, 1]
-    // -> [1, num_kv_heads, head_dim, 1]  (rotation applied per head via broadcast)
+    // matmul: rotation × reshaped (broadcast over heads)
     let rotated = format!("{prefix}_rotated");
-    writeln!(
-        body,
-        "        tensor<fp16, {reshape_4d}> {rotated} = matmul(\
-         x=a_input2, y={reshaped}, transpose_x=bF, transpose_y=bF)\
-         [name=string(\"{rotated}\")];"
-    )
-    .unwrap();
+    let mut op = Operation::new("matmul", &rotated)
+        .with_input("x", Value::Reference("rot_mat".into()))
+        .with_input("y", Value::Reference(reshaped))
+        .with_input("transpose_x", Value::Reference("bF".into()))
+        .with_input("transpose_y", Value::Reference("bF".into()))
+        .with_output(&rotated);
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, reshape_4d));
+    block.add_op(op);
 
     // Reshape back to [1, ch, 1, S]
-    let flat_shape = fmt_shape(&[1, ch, 1, s]);
     let flat = format!("{prefix}_flat");
-    writeln!(
-        body,
-        "        tensor<fp16, {flat_shape}> {flat} = reshape(\
-         x={rotated}, shape=tensor<int32, [4]>([1,{ch},1,{s}]))\
-         [name=string(\"{flat}\")];"
-    )
-    .unwrap();
+    let mut op = Operation::new("reshape", &flat)
+        .with_input("x", Value::Reference(rotated))
+        .with_input("shape", int32_tensor(&[1, ch as i32, 1, s as i32]))
+        .with_output(&flat);
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, flat_shape.clone()));
+    block.add_op(op);
 
     // mul: scale to INT8 range
     let scaled = format!("{prefix}_scaled");
-    writeln!(
-        body,
-        "        tensor<fp16, {flat_shape}> {scaled} = mul(\
-         x={flat}, y=inv_scale)\
-         [name=string(\"{scaled}\")];"
-    )
-    .unwrap();
+    let op = Operation::new("mul", &scaled)
+        .with_input("x", Value::Reference(flat))
+        .with_input("y", Value::Reference("inv_scale".into()))
+        .with_output(&scaled);
+    block.add_op(op);
 
     // add: apply zero point
     let shifted = format!("{prefix}_shifted");
-    writeln!(
-        body,
-        "        tensor<fp16, {flat_shape}> {shifted} = add(\
-         x={scaled}, y=zero_point)\
-         [name=string(\"{shifted}\")];"
-    )
-    .unwrap();
+    let op = Operation::new("add", &shifted)
+        .with_input("x", Value::Reference(scaled))
+        .with_input("y", Value::Reference("zero_point".into()))
+        .with_output(&shifted);
+    block.add_op(op);
 
     // round
     let rounded = format!("{prefix}_rounded");
-    writeln!(
-        body,
-        "        tensor<fp16, {flat_shape}> {rounded} = round(\
-         x={shifted})\
-         [name=string(\"{rounded}\")];"
-    )
-    .unwrap();
+    let op = Operation::new("round", &rounded)
+        .with_input("x", Value::Reference(shifted))
+        .with_output(&rounded);
+    block.add_op(op);
 
     // clip to [-128, 127]
     let clamped = format!("{prefix}_clamped");
-    writeln!(
-        body,
-        "        tensor<fp16, {flat_shape}> {clamped} = clip(\
-         x={rounded}, alpha=clip_lo, beta=clip_hi)\
-         [name=string(\"{clamped}\")];"
-    )
-    .unwrap();
+    let op = Operation::new("clip", &clamped)
+        .with_input("x", Value::Reference(rounded))
+        .with_input("alpha", Value::Reference("clip_lo".into()))
+        .with_input("beta", Value::Reference("clip_hi".into()))
+        .with_output(&clamped);
+    block.add_op(op);
 
     // cast to int8 then back to fp16 for function output
     // (ANE rejects INT8 function outputs; the fp16 values are already
     // rounded/clamped to [-128, 127] so the cast is lossless)
     let int8_name = format!("{prefix}_int8");
-    writeln!(
-        body,
-        "        tensor<int8, {flat_shape}> {int8_name} = cast(\
-         x={clamped}, dtype=string(\"int8\"))\
-         [name=string(\"{int8_name}\")];"
-    )
-    .unwrap();
+    let mut op = Operation::new("cast", &int8_name)
+        .with_input("x", Value::Reference(clamped))
+        .with_input("dtype", Value::String("int8".into()))
+        .with_output(&int8_name);
+    op.output_types[0] = Some(TensorType::new(ScalarType::Int8, flat_shape.clone()));
+    block.add_op(op);
 
-    let output = if prefix == "k" {
-        "z_output0"
-    } else {
-        "z_output1"
-    };
-    writeln!(
-        body,
-        "        tensor<fp16, {flat_shape}> {output} = cast(\
-         x={int8_name}, dtype=string(\"fp16\"))\
-         [name=string(\"{output}\")];"
-    )
-    .unwrap();
+    let mut op = Operation::new("cast", output_name)
+        .with_input("x", Value::Reference(int8_name))
+        .with_input("dtype", Value::String("fp16".into()))
+        .with_output(output_name);
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, flat_shape));
+    block.add_op(op);
 }
 
 // ---------------------------------------------------------------------------
@@ -332,393 +297,328 @@ pub struct AttentionMilConfig {
     pub cache_int8: bool,
 }
 
-/// Generate MIL text for an attention sub-program.
+/// Build the MIL IR program for an attention sub-program.
 ///
 /// Produces a unified program that handles TurboQuant and plain FP16
 /// attention based on the config:
 ///
 /// - **TurboQuant (INT8 cache, Q-rotation)**: `cache_int8: true, dequant_scale: Some(..), unrotation_seed: Some(..)`
-///   → 4 inputs: Q(fp16), K_cache(int8), V_cache(int8), rotation_matrix(fp16)
+///   → 5 inputs: Q(fp16), K_cache(int8), V_cache(int8), rotation_matrix(fp16), mask(fp16)
 ///   → pipeline: slice → cast(int8→fp16) → mul(deq_scale) → rotate Q → attention → un-rotate output
-///   → O(1) rotation per token instead of O(seq_len) cache un-rotation
 ///
 /// - **FP16 baseline**: `cache_int8: false, dequant_scale: None, unrotation_seed: None`
-///   → 3 inputs: Q(fp16), K_cache(fp16), V_cache(fp16)
+///   → 4 inputs: Q(fp16), K_cache(fp16), V_cache(fp16), mask(fp16)
 ///   → pipeline: slice → attention
 ///
 /// # Returns
 ///
-/// `(mil_text, weights)` where `weights` contains the rotation matrix
+/// `(program, weights)` where `weights` contains the rotation matrix
 /// when rotation is enabled (empty otherwise).
-pub fn emit_attention_mil(config: &AttentionMilConfig) -> (String, Vec<(String, Vec<u8>)>) {
+pub fn build_attention_program(config: &AttentionMilConfig) -> (Program, Vec<(String, Vec<u8>)>) {
     let head_dim = config.head_dim;
     let num_heads = config.num_heads;
     let num_kv_heads = config.num_kv_heads;
     let seq_len = config.seq_len;
     let kv_ch = num_kv_heads * head_dim;
     let q_ch = num_heads * head_dim;
-
-    let q_shape = fmt_shape(&[1, q_ch, 1, MIN_IO_SEQ]);
-    let cache_dtype = if config.cache_int8 { "int8" } else { "fp16" };
-    let cache_shape = fmt_shape(&[1, kv_ch, 1, config.max_seq_len]);
-    let sliced_shape = fmt_shape(&[1, kv_ch, 1, seq_len]);
-
+    let s = MIN_IO_SEQ;
     let gqa_groups = num_heads / num_kv_heads;
-    let kv_head_4d = fmt_shape(&[1, num_kv_heads, head_dim, seq_len]);
-    let attn_head_4d = fmt_shape(&[1, num_heads, head_dim, seq_len]);
-    let q_head_4d = fmt_shape(&[1, num_heads, head_dim, MIN_IO_SEQ]);
-    let qk_shape = fmt_shape(&[1, num_heads, MIN_IO_SEQ, seq_len]);
-
     let scale_factor = 1.0 / (head_dim as f32).sqrt();
 
-    let mut body = String::new();
+    let cache_dtype = if config.cache_int8 {
+        ScalarType::Int8
+    } else {
+        ScalarType::Float16
+    };
+
+    let q_shape = vec![1, q_ch, 1, s];
+    let cache_shape = vec![1, kv_ch, 1, config.max_seq_len];
+    let sliced_shape = vec![1, kv_ch, 1, seq_len];
+    let kv_head_4d = vec![1, num_kv_heads, head_dim, seq_len];
+    let attn_head_4d = vec![1, num_heads, head_dim, seq_len];
+    let q_head_4d = vec![1, num_heads, head_dim, s];
+    let qk_shape = vec![1, num_heads, s, seq_len];
+    let mask_shape = vec![1, 1, 1, seq_len];
+    let rot_shape = vec![1, 1, head_dim, head_dim];
+
     let mut weights: Vec<(String, Vec<u8>)> = Vec::new();
 
-    // --- Optional: rotation matrix weight (delivered as a_input3) ---
-    // Q-rotation approach: we use the ROTATION matrix (not inverse) to
-    // rotate Q, then use it again to un-rotate the attention output.
-    let rot_shape = fmt_shape(&[1, 1, head_dim, head_dim]);
+    // Build function inputs (order determines a_input{i} naming)
+    let mut func = Function::new("main")
+        .with_input("q", TensorType::new(ScalarType::Float16, q_shape.clone()))
+        .with_input("k_cache", TensorType::new(cache_dtype, cache_shape.clone()))
+        .with_input("v_cache", TensorType::new(cache_dtype, cache_shape));
+
     if let Some(seed) = config.unrotation_seed {
         let rot_data = generate_rotation_weights(head_dim, seed);
         weights.push(("rotation_matrix".to_string(), rot_data));
+        func = func.with_input("rot_mat", TensorType::new(ScalarType::Float16, rot_shape));
     }
+
+    func = func.with_input("mask", TensorType::new(ScalarType::Float16, mask_shape));
 
     // --- Constants ---
-    if let Some(deq_scale) = config.dequant_scale {
-        writeln!(
-            body,
-            "        fp16 deq_scale = const()[name=string(\"deq_scale\"), val=fp16({deq_scale})];"
-        )
-        .unwrap();
+    if let Some(deq) = config.dequant_scale {
+        add_const_op(&mut func.body, "deq_scale", Value::Float(deq as f64));
     }
-
-    writeln!(
-        body,
-        "        fp16 scale_factor = const()[name=string(\"scale_factor\"), val=fp16({scale_factor})];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        int32 softmax_axis = const()[name=string(\"softmax_axis\"), val=int32(-1)];"
-    )
-    .unwrap();
+    add_const_op(
+        &mut func.body,
+        "scale_factor",
+        Value::Float(scale_factor as f64),
+    );
+    add_const_op(&mut func.body, "bF", Value::Bool(false));
+    add_const_op(&mut func.body, "bT", Value::Bool(true));
+    add_const_op(&mut func.body, "softmax_axis", Value::Int(-1));
 
     // slice_by_index constants
-    writeln!(
-        body,
-        "        tensor<int32, [4]> slice_begin = const()[name=string(\"slice_begin\"), \
-         val=tensor<int32, [4]>([0,0,0,0])];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        tensor<int32, [4]> slice_end_k = const()[name=string(\"slice_end_k\"), \
-         val=tensor<int32, [4]>([1,{kv_ch},1,{seq_len}])];"
-    )
-    .unwrap();
+    add_const_tensor_op(&mut func.body, "slice_begin", &[0, 0, 0, 0]);
+    add_const_tensor_op(
+        &mut func.body,
+        "slice_end_k",
+        &[1, kv_ch as i32, 1, seq_len as i32],
+    );
 
     // --- Slice K and V caches to [1, kv_ch, 1, seq_len] ---
     if config.cache_int8 {
         // INT8 cache: slice as int8, then cast to fp16
-        writeln!(
-            body,
-            "        tensor<int8, {sliced_shape}> k_sliced_i8 = slice_by_index(\
-             x=a_input1, begin=slice_begin, end=slice_end_k)\
-             [name=string(\"k_sliced_i8\")];"
-        )
-        .unwrap();
-        writeln!(
-            body,
-            "        tensor<fp16, {sliced_shape}> k_sliced = cast(\
-             x=k_sliced_i8, dtype=string(\"fp16\"))\
-             [name=string(\"k_sliced\")];"
-        )
-        .unwrap();
+        let mut op = Operation::new("slice_by_index", "k_sliced_i8")
+            .with_input("x", Value::Reference("k_cache".into()))
+            .with_input("begin", Value::Reference("slice_begin".into()))
+            .with_input("end", Value::Reference("slice_end_k".into()))
+            .with_output("k_sliced_i8");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Int8, sliced_shape.clone()));
+        func.body.add_op(op);
 
-        writeln!(
-            body,
-            "        tensor<int8, {sliced_shape}> v_sliced_i8 = slice_by_index(\
-             x=a_input2, begin=slice_begin, end=slice_end_k)\
-             [name=string(\"v_sliced_i8\")];"
-        )
-        .unwrap();
-        writeln!(
-            body,
-            "        tensor<fp16, {sliced_shape}> v_sliced = cast(\
-             x=v_sliced_i8, dtype=string(\"fp16\"))\
-             [name=string(\"v_sliced\")];"
-        )
-        .unwrap();
+        let mut op = Operation::new("cast", "k_sliced")
+            .with_input("x", Value::Reference("k_sliced_i8".into()))
+            .with_input("dtype", Value::String("fp16".into()))
+            .with_output("k_sliced");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, sliced_shape.clone()));
+        func.body.add_op(op);
+
+        let mut op = Operation::new("slice_by_index", "v_sliced_i8")
+            .with_input("x", Value::Reference("v_cache".into()))
+            .with_input("begin", Value::Reference("slice_begin".into()))
+            .with_input("end", Value::Reference("slice_end_k".into()))
+            .with_output("v_sliced_i8");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Int8, sliced_shape.clone()));
+        func.body.add_op(op);
+
+        let mut op = Operation::new("cast", "v_sliced")
+            .with_input("x", Value::Reference("v_sliced_i8".into()))
+            .with_input("dtype", Value::String("fp16".into()))
+            .with_output("v_sliced");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, sliced_shape.clone()));
+        func.body.add_op(op);
     } else {
         // FP16 cache: slice directly
-        writeln!(
-            body,
-            "        tensor<fp16, {sliced_shape}> k_sliced = slice_by_index(\
-             x=a_input1, begin=slice_begin, end=slice_end_k)\
-             [name=string(\"k_sliced\")];"
-        )
-        .unwrap();
+        let mut op = Operation::new("slice_by_index", "k_sliced")
+            .with_input("x", Value::Reference("k_cache".into()))
+            .with_input("begin", Value::Reference("slice_begin".into()))
+            .with_input("end", Value::Reference("slice_end_k".into()))
+            .with_output("k_sliced");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, sliced_shape.clone()));
+        func.body.add_op(op);
 
-        writeln!(
-            body,
-            "        tensor<fp16, {sliced_shape}> v_sliced = slice_by_index(\
-             x=a_input2, begin=slice_begin, end=slice_end_k)\
-             [name=string(\"v_sliced\")];"
-        )
-        .unwrap();
+        let mut op = Operation::new("slice_by_index", "v_sliced")
+            .with_input("x", Value::Reference("v_cache".into()))
+            .with_input("begin", Value::Reference("slice_begin".into()))
+            .with_input("end", Value::Reference("slice_end_k".into()))
+            .with_output("v_sliced");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, sliced_shape.clone()));
+        func.body.add_op(op);
     }
 
-    // --- Optional: dequantization (mul by scale, no un-rotation) ---
+    // --- Optional: dequantization ---
     let (k_ready, v_ready) = if config.dequant_scale.is_some() {
-        let mut k_name = "k_sliced".to_string();
-        let mut v_name = "v_sliced".to_string();
+        let mut op = Operation::new("mul", "k_dscaled")
+            .with_input("x", Value::Reference("k_sliced".into()))
+            .with_input("y", Value::Reference("deq_scale".into()))
+            .with_output("k_dscaled");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, sliced_shape.clone()));
+        func.body.add_op(op);
 
-        // mul(deq_scale) — same as before
-        writeln!(
-            body,
-            "        tensor<fp16, {sliced_shape}> k_dscaled = mul(\
-             x={k_name}, y=deq_scale)\
-             [name=string(\"k_dscaled\")];"
-        )
-        .unwrap();
-        writeln!(
-            body,
-            "        tensor<fp16, {sliced_shape}> v_dscaled = mul(\
-             x={v_name}, y=deq_scale)\
-             [name=string(\"v_dscaled\")];"
-        )
-        .unwrap();
-        k_name = "k_dscaled".to_string();
-        v_name = "v_dscaled".to_string();
+        let mut op = Operation::new("mul", "v_dscaled")
+            .with_input("x", Value::Reference("v_sliced".into()))
+            .with_input("y", Value::Reference("deq_scale".into()))
+            .with_output("v_dscaled");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, sliced_shape));
+        func.body.add_op(op);
 
-        (k_name, v_name)
+        ("k_dscaled", "v_dscaled")
     } else {
-        ("k_sliced".to_string(), "v_sliced".to_string())
+        ("k_sliced", "v_sliced")
     };
 
     // --- Attention computation ---
 
-    // Reshape Q: [1, q_ch, 1, S] -> [1, num_heads, head_dim, S]
-    let s = MIN_IO_SEQ;
-    writeln!(
-        body,
-        "        tensor<fp16, {q_head_4d}> q_reshaped = reshape(\
-         x=a_input0, shape=tensor<int32, [4]>([1,{num_heads},{head_dim},{s}]))\
-         [name=string(\"q_reshaped\")];"
-    )
-    .unwrap();
-
-    // --- Optional: Q-rotation (O(1) per token) ---
-    // Instead of un-rotating the entire K/V cache (O(seq_len)),
-    // rotate Q by R. Since ⟨R·Q, K_rot⟩ = ⟨Q, R⁻¹·K_rot⟩, the
-    // attention scores are identical.
-    let q_attn_name = if config.unrotation_seed.is_some() {
-        // matmul(rotation_matrix, q_reshaped):
-        //   [1, 1, head_dim, head_dim] × [1, num_heads, head_dim, S]
-        //   → [1, num_heads, head_dim, S]  (broadcast over heads)
-        writeln!(
-            body,
-            "        tensor<fp16, {q_head_4d}> q_rotated = matmul(\
-             x=a_input3, y=q_reshaped, transpose_x=bF, transpose_y=bF)\
-             [name=string(\"q_rotated\")];"
+    // Reshape Q: [1, q_ch, 1, S] → [1, num_heads, head_dim, S]
+    let mut op = Operation::new("reshape", "q_reshaped")
+        .with_input("x", Value::Reference("q".into()))
+        .with_input(
+            "shape",
+            int32_tensor(&[1, num_heads as i32, head_dim as i32, s as i32]),
         )
-        .unwrap();
+        .with_output("q_reshaped");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, q_head_4d.clone()));
+    func.body.add_op(op);
+
+    // Optional Q-rotation (O(1) per token)
+    let q_attn_name = if config.unrotation_seed.is_some() {
+        let mut op = Operation::new("matmul", "q_rotated")
+            .with_input("x", Value::Reference("rot_mat".into()))
+            .with_input("y", Value::Reference("q_reshaped".into()))
+            .with_input("transpose_x", Value::Reference("bF".into()))
+            .with_input("transpose_y", Value::Reference("bF".into()))
+            .with_output("q_rotated");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, q_head_4d));
+        func.body.add_op(op);
         "q_rotated"
     } else {
         "q_reshaped"
     };
 
-    // Reshape K: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
-    writeln!(
-        body,
-        "        tensor<fp16, {kv_head_4d}> k_heads = reshape(\
-         x={k_ready}, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
-         [name=string(\"k_heads\")];"
-    )
-    .unwrap();
-
-    // Reshape V: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
-    writeln!(
-        body,
-        "        tensor<fp16, {kv_head_4d}> v_heads = reshape(\
-         x={v_ready}, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
-         [name=string(\"v_heads\")];"
-    )
-    .unwrap();
-
-    // GQA head expansion: tile KV heads to match query heads when num_heads > num_kv_heads
-    let (k_attn_name, v_attn_name) = if gqa_groups > 1 {
-        writeln!(
-            body,
-            "        tensor<int32, [4]> gqa_reps = const()[name=string(\"gqa_reps\"), \
-             val=tensor<int32, [4]>([1,{gqa_groups},1,1])];"
+    // Reshape K: [1, kv_ch, 1, seq_len] → [1, num_kv_heads, head_dim, seq_len]
+    let mut op = Operation::new("reshape", "k_heads")
+        .with_input("x", Value::Reference(k_ready.into()))
+        .with_input(
+            "shape",
+            int32_tensor(&[1, num_kv_heads as i32, head_dim as i32, seq_len as i32]),
         )
-        .unwrap();
+        .with_output("k_heads");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, kv_head_4d.clone()));
+    func.body.add_op(op);
 
-        writeln!(
-            body,
-            "        tensor<fp16, {attn_head_4d}> k_attn = tile(\
-             x=k_heads, reps=gqa_reps)\
-             [name=string(\"k_attn\")];"
+    // Reshape V
+    let mut op = Operation::new("reshape", "v_heads")
+        .with_input("x", Value::Reference(v_ready.into()))
+        .with_input(
+            "shape",
+            int32_tensor(&[1, num_kv_heads as i32, head_dim as i32, seq_len as i32]),
         )
-        .unwrap();
+        .with_output("v_heads");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, kv_head_4d));
+    func.body.add_op(op);
 
-        writeln!(
-            body,
-            "        tensor<fp16, {attn_head_4d}> v_attn = tile(\
-             x=v_heads, reps=gqa_reps)\
-             [name=string(\"v_attn\")];"
-        )
-        .unwrap();
+    // GQA head expansion
+    let (k_attn, v_attn) = if gqa_groups > 1 {
+        add_const_tensor_op(&mut func.body, "gqa_reps", &[1, gqa_groups as i32, 1, 1]);
+
+        let mut op = Operation::new("tile", "k_attn")
+            .with_input("x", Value::Reference("k_heads".into()))
+            .with_input("reps", Value::Reference("gqa_reps".into()))
+            .with_output("k_attn");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, attn_head_4d.clone()));
+        func.body.add_op(op);
+
+        let mut op = Operation::new("tile", "v_attn")
+            .with_input("x", Value::Reference("v_heads".into()))
+            .with_input("reps", Value::Reference("gqa_reps".into()))
+            .with_output("v_attn");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, attn_head_4d));
+        func.body.add_op(op);
 
         ("k_attn", "v_attn")
     } else {
         ("k_heads", "v_heads")
     };
 
-    // QK = matmul(Q^T, K) -> [1, num_heads, S, seq_len]
-    writeln!(
-        body,
-        "        tensor<fp16, {qk_shape}> qk = matmul(\
-         x={q_attn_name}, y={k_attn_name}, transpose_x=bT, transpose_y=bF)\
-         [name=string(\"qk\")];"
-    )
-    .unwrap();
+    // QK = matmul(Q^T, K) → [1, num_heads, S, seq_len]
+    let mut op = Operation::new("matmul", "qk")
+        .with_input("x", Value::Reference(q_attn_name.into()))
+        .with_input("y", Value::Reference(k_attn.into()))
+        .with_input("transpose_x", Value::Reference("bT".into()))
+        .with_input("transpose_y", Value::Reference("bF".into()))
+        .with_output("qk");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, qk_shape.clone()));
+    func.body.add_op(op);
 
     // Scale QK
-    writeln!(
-        body,
-        "        tensor<fp16, {qk_shape}> qk_scaled = mul(\
-         x=qk, y=scale_factor)\
-         [name=string(\"qk_scaled\")];"
-    )
-    .unwrap();
+    let mut op = Operation::new("mul", "qk_scaled")
+        .with_input("x", Value::Reference("qk".into()))
+        .with_input("y", Value::Reference("scale_factor".into()))
+        .with_output("qk_scaled");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, qk_shape.clone()));
+    func.body.add_op(op);
 
-    // Apply causal mask: add -inf for future positions.
-    // mask_input is [1, 1, 1, seq_len] broadcasting to [1, num_heads, S, seq_len].
-    let mask_input_name = if config.unrotation_seed.is_some() {
-        "a_input4"
-    } else {
-        "a_input3"
-    };
-    let mask_shape = fmt_shape(&[1, 1, 1, seq_len]);
-    writeln!(
-        body,
-        "        tensor<fp16, {qk_shape}> qk_masked = add(\
-         x=qk_scaled, y={mask_input_name})\
-         [name=string(\"qk_masked\")];"
-    )
-    .unwrap();
+    // Apply causal mask
+    let mut op = Operation::new("add", "qk_masked")
+        .with_input("x", Value::Reference("qk_scaled".into()))
+        .with_input("y", Value::Reference("mask".into()))
+        .with_output("qk_masked");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, qk_shape.clone()));
+    func.body.add_op(op);
 
     // Softmax
-    writeln!(
-        body,
-        "        tensor<fp16, {qk_shape}> attn_weights = softmax(\
-         x=qk_masked, axis=softmax_axis)\
-         [name=string(\"attn_weights\")];"
-    )
-    .unwrap();
+    let mut op = Operation::new("softmax", "attn_weights")
+        .with_input("x", Value::Reference("qk_masked".into()))
+        .with_input("axis", Value::Reference("softmax_axis".into()))
+        .with_output("attn_weights");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, qk_shape));
+    func.body.add_op(op);
 
-    // attn_out = V x attn_weights^T -> [1, num_heads, head_dim, S]
-    // Swapped operands vs standard: produces [H, D, S] instead of [H, S, D],
-    // so the reshape to [1, q_ch, 1, S] preserves natural channel ordering
-    // where channel c maps to head c/head_dim, dim c%head_dim.
-    let attn_pre_shape = fmt_shape(&[1, num_heads, head_dim, s]);
-    writeln!(
-        body,
-        "        tensor<fp16, {attn_pre_shape}> attn_pre = matmul(\
-         x={v_attn_name}, y=attn_weights, transpose_x=bF, transpose_y=bT)\
-         [name=string(\"attn_pre\")];"
-    )
-    .unwrap();
+    // attn_out = V × attn_weights^T → [1, num_heads, head_dim, S]
+    let attn_pre_shape = vec![1, num_heads, head_dim, s];
+    let mut op = Operation::new("matmul", "attn_pre")
+        .with_input("x", Value::Reference(v_attn.into()))
+        .with_input("y", Value::Reference("attn_weights".into()))
+        .with_input("transpose_x", Value::Reference("bF".into()))
+        .with_input("transpose_y", Value::Reference("bT".into()))
+        .with_output("attn_pre");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, attn_pre_shape.clone()));
+    func.body.add_op(op);
 
-    // --- Optional: output un-rotation (O(1) per token) ---
-    // V is stored rotated in cache. The attention output is:
-    //   attn_pre = V_dequant · softmax(scores)^T
-    // where V_dequant ≈ R·V. So attn_pre rows are in the rotated space.
-    // Un-rotate: attn_out = R^T · attn_pre  (left-multiply by R^T)
+    // Optional output un-rotation
     let final_attn = if config.unrotation_seed.is_some() {
-        writeln!(
-            body,
-            "        tensor<fp16, {attn_pre_shape}> attn_unrot = matmul(\
-             x=a_input3, y=attn_pre, transpose_x=bT, transpose_y=bF)\
-             [name=string(\"attn_unrot\")];"
-        )
-        .unwrap();
+        let mut op = Operation::new("matmul", "attn_unrot")
+            .with_input("x", Value::Reference("rot_mat".into()))
+            .with_input("y", Value::Reference("attn_pre".into()))
+            .with_input("transpose_x", Value::Reference("bT".into()))
+            .with_input("transpose_y", Value::Reference("bF".into()))
+            .with_output("attn_unrot");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, attn_pre_shape));
+        func.body.add_op(op);
         "attn_unrot"
     } else {
         "attn_pre"
     };
 
     // Reshape to output: [1, q_ch, 1, S]
-    writeln!(
-        body,
-        "        tensor<fp16, {q_shape}> z_output0 = reshape(\
-         x={final_attn}, shape=tensor<int32, [4]>([1,{q_ch},1,{s}]))\
-         [name=string(\"z_output0\")];"
-    )
-    .unwrap();
+    let mut op = Operation::new("reshape", "attn_out")
+        .with_input("x", Value::Reference(final_attn.into()))
+        .with_input("shape", int32_tensor(&[1, q_ch as i32, 1, s as i32]))
+        .with_output("attn_out");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, q_shape));
+    func.body.add_op(op);
 
-    // Assemble function — input count depends on whether rotation is enabled.
-    // Mask input is always last: [1, 1, 1, seq_len] fp16 causal mask.
-    let func = if config.unrotation_seed.is_some() {
-        format!(
-            "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
-             tensor<{cache_dtype}, {cache_shape}> a_input1, \
-             tensor<{cache_dtype}, {cache_shape}> a_input2, \
-             tensor<fp16, {rot_shape}> a_input3, \
-             tensor<fp16, {mask_shape}> a_input4) {{\n\
-             {body}\
-             \n    }} -> (z_output0);"
-        )
-    } else {
-        format!(
-            "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
-             tensor<{cache_dtype}, {cache_shape}> a_input1, \
-             tensor<{cache_dtype}, {cache_shape}> a_input2, \
-             tensor<fp16, {mask_shape}> a_input3) {{\n\
-             {body}\
-             \n    }} -> (z_output0);"
-        )
-    };
+    func.body.outputs.push("attn_out".into());
 
-    let mil_text = mil_program_wrapper(&func);
-    (mil_text, weights)
+    let mut program = Program::new("1.0.0");
+    program.add_function(func);
+
+    (program, weights)
 }
 
-/// Generate MIL text for an FP16 attention sub-program (convenience wrapper).
+/// Build the MIL IR program for FP16 attention (convenience wrapper).
 ///
-/// Equivalent to calling `emit_attention_mil` with no dequantization or
+/// Equivalent to calling `build_attention_program` with no dequantization or
 /// unrotation. Operates on FP16 K/V cache tensors directly.
 ///
 /// # Inputs
 /// - `a_input0`: Q (rotated), `[1, q_ch, 1, MIN_IO_SEQ]` fp16
 /// - `a_input1`: K cache, `[1, kv_ch, 1, max_seq_len]` fp16
 /// - `a_input2`: V cache, `[1, kv_ch, 1, max_seq_len]` fp16
+/// - `a_input3`: Mask, `[1, 1, 1, seq_len]` fp16
 ///
 /// # Output
 /// - `z_output0`: attention output, `[1, q_ch, 1, MIN_IO_SEQ]` fp16
-pub fn emit_fp16_attention_mil(
+pub fn build_fp16_attention_program(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     max_seq_len: usize,
     seq_len: usize,
-) -> String {
+) -> Program {
     let config = AttentionMilConfig {
         num_heads,
         num_kv_heads,
@@ -729,15 +629,15 @@ pub fn emit_fp16_attention_mil(
         unrotation_seed: None,
         cache_int8: false,
     };
-    let (mil_text, _weights) = emit_attention_mil(&config);
-    mil_text
+    let (program, _weights) = build_attention_program(&config);
+    program
 }
 
 // ---------------------------------------------------------------------------
 // QJL correction sub-program
 // ---------------------------------------------------------------------------
 
-/// Generate MIL text for the QJL 1-bit bias correction sub-program.
+/// Build the MIL IR program for the QJL 1-bit bias correction sub-program.
 ///
 /// Takes raw Q tensor and pre-stored residual signs, computes
 /// the JL-based correction to attention logits.
@@ -749,145 +649,119 @@ pub fn emit_fp16_attention_mil(
 ///
 /// # Returns
 ///
-/// `(mil_text, weights)` — no weight blobs needed (only scalar consts).
-pub fn emit_qjl_correction_mil(
+/// `(program, weights)` — no weight blobs needed (only scalar consts).
+pub fn build_qjl_program(
     config: &TurboQuantConfig,
     seq_len: usize,
-) -> (String, Vec<(String, Vec<u8>)>) {
+) -> (Program, Vec<(String, Vec<u8>)>) {
     let head_dim = config.head_dim;
     let num_heads = config.num_heads;
     let num_kv_heads = config.num_kv_heads;
     let q_ch = num_heads * head_dim;
     let kv_ch = num_kv_heads * head_dim;
 
-    let q_shape = fmt_shape(&[1, q_ch, 1, 1]);
-    let q_head_shape = fmt_shape(&[1, num_heads, head_dim, 1]);
-    let residual_shape = fmt_shape(&[1, kv_ch, 1, seq_len]);
-    let residual_head_shape = fmt_shape(&[1, num_kv_heads, head_dim, seq_len]);
-    let correction_shape = fmt_shape(&[1, num_heads, 1, seq_len]);
+    let q_shape = vec![1, q_ch, 1, 1];
+    let q_head_shape = vec![1, num_heads, head_dim, 1];
+    let residual_shape = vec![1, kv_ch, 1, seq_len];
+    let residual_head_shape = vec![1, num_kv_heads, head_dim, seq_len];
+    let correction_shape = vec![1, num_heads, 1, seq_len];
 
     let qjl_scale = 1.0 / (head_dim as f32).sqrt();
 
-    let mut body = String::new();
-    let weights: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut func = Function::new("main")
+        .with_input("q", TensorType::new(ScalarType::Float16, q_shape))
+        .with_input(
+            "residual",
+            TensorType::new(ScalarType::Float16, residual_shape),
+        );
 
-    // --- Constants ---
+    // Constants
+    add_const_op(&mut func.body, "zero", Value::Float(0.0));
+    add_const_op(&mut func.body, "pos_one", Value::Float(1.0));
+    add_const_op(&mut func.body, "neg_one", Value::Float(-1.0));
+    add_const_op(&mut func.body, "qjl_scale", Value::Float(qjl_scale as f64));
+    add_const_op(&mut func.body, "bF", Value::Bool(false));
+    add_const_op(&mut func.body, "bT", Value::Bool(true));
 
-    writeln!(
-        body,
-        "        fp16 zero = const()[name=string(\"zero\"), val=fp16(0)];"
-    )
-    .unwrap();
+    // Reshape Q: [1, q_ch, 1, 1] → [1, num_heads, head_dim, 1]
+    let mut op = Operation::new("reshape", "q_reshaped")
+        .with_input("x", Value::Reference("q".into()))
+        .with_input(
+            "shape",
+            int32_tensor(&[1, num_heads as i32, head_dim as i32, 1]),
+        )
+        .with_output("q_reshaped");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, q_head_shape.clone()));
+    func.body.add_op(op);
 
-    writeln!(
-        body,
-        "        fp16 pos_one = const()[name=string(\"pos_one\"), val=fp16(1)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        fp16 neg_one = const()[name=string(\"neg_one\"), val=fp16(-1)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        fp16 qjl_scale = const()[name=string(\"qjl_scale\"), val=fp16({qjl_scale})];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
-    )
-    .unwrap();
-
-    // --- Reshape Q: [1, q_ch, 1, 1] -> [1, num_heads, head_dim, 1] ---
-
-    writeln!(
-        body,
-        "        tensor<fp16, {q_head_shape}> q_reshaped = reshape(\
-         x=a_input0, shape=tensor<int32, [4]>([1,{num_heads},{head_dim},1]))\
-         [name=string(\"q_reshaped\")];"
-    )
-    .unwrap();
-
-    // --- Sign extraction from reshaped Q ---
-
-    // greater(x=q_reshaped, y=zero) → q_pos (bool)
-    writeln!(
-        body,
-        "        tensor<bool, {q_head_shape}> q_pos = greater(\
-         x=q_reshaped, y=zero)\
-         [name=string(\"q_pos\")];"
-    )
-    .unwrap();
+    // greater(q_reshaped, zero) → q_pos (bool)
+    let mut op = Operation::new("greater", "q_pos")
+        .with_input("x", Value::Reference("q_reshaped".into()))
+        .with_input("y", Value::Reference("zero".into()))
+        .with_output("q_pos");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Bool, q_head_shape.clone()));
+    func.body.add_op(op);
 
     // select(cond=q_pos, a=pos_one, b=neg_one) → q_sign (fp16)
-    writeln!(
-        body,
-        "        tensor<fp16, {q_head_shape}> q_sign = select(\
-         cond=q_pos, a=pos_one, b=neg_one)\
-         [name=string(\"q_sign\")];"
-    )
-    .unwrap();
+    let mut op = Operation::new("select", "q_sign")
+        .with_input("cond", Value::Reference("q_pos".into()))
+        .with_input("a", Value::Reference("pos_one".into()))
+        .with_input("b", Value::Reference("neg_one".into()))
+        .with_output("q_sign");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, q_head_shape));
+    func.body.add_op(op);
 
-    // --- Reshape residual: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len] ---
+    // Reshape residual: [1, kv_ch, 1, seq_len] → [1, num_kv_heads, head_dim, seq_len]
+    let mut op = Operation::new("reshape", "residual_reshaped")
+        .with_input("x", Value::Reference("residual".into()))
+        .with_input(
+            "shape",
+            int32_tensor(&[1, num_kv_heads as i32, head_dim as i32, seq_len as i32]),
+        )
+        .with_output("residual_reshaped");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, residual_head_shape));
+    func.body.add_op(op);
 
-    writeln!(
-        body,
-        "        tensor<fp16, {residual_head_shape}> residual_reshaped = reshape(\
-         x=a_input1, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
-         [name=string(\"residual_reshaped\")];"
-    )
-    .unwrap();
+    // matmul(q_sign^T, residual_reshaped) → correction
+    let mut op = Operation::new("matmul", "correction")
+        .with_input("x", Value::Reference("q_sign".into()))
+        .with_input("y", Value::Reference("residual_reshaped".into()))
+        .with_input("transpose_x", Value::Reference("bT".into()))
+        .with_input("transpose_y", Value::Reference("bF".into()))
+        .with_output("correction");
+    op.output_types[0] = Some(TensorType::new(
+        ScalarType::Float16,
+        correction_shape.clone(),
+    ));
+    func.body.add_op(op);
 
-    // --- Correction computation ---
+    // mul(correction, qjl_scale) → output
+    let mut op = Operation::new("mul", "correction_scaled")
+        .with_input("x", Value::Reference("correction".into()))
+        .with_input("y", Value::Reference("qjl_scale".into()))
+        .with_output("correction_scaled");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, correction_shape));
+    func.body.add_op(op);
 
-    // matmul(x=q_sign, y=residual_reshaped, transpose_x=true, transpose_y=false)
-    // q_sign:            [1, num_heads, head_dim, 1]
-    // transpose_x=true:  [1, num_heads, 1, head_dim]
-    // residual_reshaped: [1, num_kv_heads, head_dim, seq_len]
-    // result:            [1, num_heads, 1, seq_len]
-    writeln!(
-        body,
-        "        tensor<fp16, {correction_shape}> correction = matmul(\
-         x=q_sign, y=residual_reshaped, transpose_x=bT, transpose_y=bF)\
-         [name=string(\"correction\")];"
-    )
-    .unwrap();
+    func.body.outputs.push("correction_scaled".into());
 
-    // mul(x=correction, y=qjl_scale) → z_output0
-    writeln!(
-        body,
-        "        tensor<fp16, {correction_shape}> z_output0 = mul(\
-         x=correction, y=qjl_scale)\
-         [name=string(\"z_output0\")];"
-    )
-    .unwrap();
+    let mut program = Program::new("1.0.0");
+    program.add_function(func);
 
-    // Assemble function
-    let func = format!(
-        "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
-         tensor<fp16, {residual_shape}> a_input1) {{\n\
-         {body}\
-         \n    }} -> (z_output0);"
-    );
-
-    let mil_text = mil_program_wrapper(&func);
-    (mil_text, weights)
+    (program, Vec::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+
+    /// Serialize a Program to MIL text for test assertions.
+    fn to_mil(program: &Program) -> String {
+        let config = MilTextConfig::default();
+        let (text, _) = program_to_mil_text(program, &config).expect("MIL text emission failed");
+        text
+    }
 
     fn test_config() -> TurboQuantConfig {
         TurboQuantConfig {
@@ -920,15 +794,17 @@ mod tests {
     #[test]
     fn cache_write_mil_is_valid_program() {
         let config = test_config();
-        let (mil, weights) = emit_cache_write_mil(&config);
+        let (program, weights) = build_cache_write_program(&config);
+        let mil = to_mil(&program);
 
         // Should start with program header
         assert!(mil.starts_with("program(1.3)"));
         // Should contain function declaration
         assert!(mil.contains("func main<ios18>"));
-        // Should have two inputs
+        // Should have three inputs (K, V, rotation matrix)
         assert!(mil.contains("a_input0"));
         assert!(mil.contains("a_input1"));
+        assert!(mil.contains("a_input2"));
         // Should have two outputs
         assert!(mil.contains("z_output0"));
         assert!(mil.contains("z_output1"));
@@ -948,15 +824,17 @@ mod tests {
     #[test]
     fn attention_mil_is_valid_program() {
         let config = test_tq_attn_config();
-        let (mil, weights) = emit_attention_mil(&config);
+        let (program, weights) = build_attention_program(&config);
+        let mil = to_mil(&program);
 
         assert!(mil.starts_with("program(1.3)"));
         assert!(mil.contains("func main<ios18>"));
-        // Four inputs: Q, K_cache, V_cache, rotation_matrix
+        // Five inputs: Q, K_cache, V_cache, rotation_matrix, mask
         assert!(mil.contains("a_input0"));
         assert!(mil.contains("a_input1"));
         assert!(mil.contains("a_input2"));
         assert!(mil.contains("a_input3"));
+        assert!(mil.contains("a_input4"));
         // One output
         assert!(mil.contains("z_output0"));
         // Cache inputs are INT8 with inline cast to fp16
@@ -992,7 +870,8 @@ mod tests {
     #[test]
     fn qjl_correction_mil_is_valid_program() {
         let config = test_config();
-        let (mil, weights) = emit_qjl_correction_mil(&config, 32);
+        let (program, weights) = build_qjl_program(&config, 32);
+        let mil = to_mil(&program);
 
         // Should start with program header
         assert!(mil.starts_with("program(1.3)"));
@@ -1026,7 +905,8 @@ mod tests {
             rotation_seed: 42,
             enable_qjl: true,
         };
-        let (mil, weights) = emit_qjl_correction_mil(&small, 16);
+        let (program, weights) = build_qjl_program(&small, 16);
+        let mil = to_mil(&program);
         assert!(mil.starts_with("program(1.3)"));
         assert!(mil.contains("func main<ios18>"));
         assert!(weights.is_empty());
@@ -1042,7 +922,8 @@ mod tests {
             rotation_seed: 123,
             enable_qjl: true,
         };
-        let (mil, weights) = emit_qjl_correction_mil(&large, 2048);
+        let (program, weights) = build_qjl_program(&large, 2048);
+        let mil = to_mil(&program);
         assert!(mil.starts_with("program(1.3)"));
         assert!(mil.contains("func main<ios18>"));
         assert!(weights.is_empty());
@@ -1058,7 +939,8 @@ mod tests {
             rotation_seed: 42,
             enable_qjl: true,
         };
-        let (mil, weights) = emit_qjl_correction_mil(&single, 1);
+        let (program, weights) = build_qjl_program(&single, 1);
+        let mil = to_mil(&program);
         assert!(mil.starts_with("program(1.3)"));
         assert!(mil.contains("func main<ios18>"));
         assert!(weights.is_empty());
@@ -1078,7 +960,8 @@ mod tests {
             unrotation_seed: Some(42),
             cache_int8: true,
         };
-        let (mil, _weights) = emit_attention_mil(&config);
+        let (program, _weights) = build_attention_program(&config);
+        let mil = to_mil(&program);
 
         // Should contain tile op for GQA expansion
         assert!(mil.contains("tile"), "GQA attention should use tile op");
@@ -1094,20 +977,23 @@ mod tests {
     fn attention_mil_mha_no_tile() {
         // MHA config: num_heads == num_kv_heads, no tile needed
         let config = test_tq_attn_config();
-        let (mil, _weights) = emit_attention_mil(&config);
+        let (program, _weights) = build_attention_program(&config);
+        let mil = to_mil(&program);
         assert!(!mil.contains("tile"), "MHA should not use tile op");
         assert!(!mil.contains("gqa_reps"), "MHA should not have gqa_reps");
     }
 
     #[test]
     fn fp16_attention_mil_is_valid_program() {
-        let mil = emit_fp16_attention_mil(32, 32, 64, 128, 128);
+        let program = build_fp16_attention_program(32, 32, 64, 128, 128);
+        let mil = to_mil(&program);
         assert!(mil.starts_with("program(1.3)"));
         assert!(mil.contains("func main<ios18>"));
-        // Three fp16 inputs: Q, K_cache, V_cache
+        // Four fp16 inputs: Q, K_cache, V_cache, mask
         assert!(mil.contains("a_input0"));
         assert!(mil.contains("a_input1"));
         assert!(mil.contains("a_input2"));
+        assert!(mil.contains("a_input3"));
         // All inputs are fp16 (no int8)
         assert!(!mil.contains("int8"), "FP16 attention should not use int8");
         // No dequantization ops
@@ -1115,18 +1001,10 @@ mod tests {
             !mil.contains("deq_scale"),
             "FP16 attention should not dequantize"
         );
+        // No unrotation (no 5th input)
         assert!(
-            !mil.contains("deq_offset"),
-            "FP16 attention should not dequantize"
-        );
-        // No unrotation
-        assert!(
-            !mil.contains("unrotated"),
-            "FP16 attention should not unrotate"
-        );
-        assert!(
-            !mil.contains("a_input3"),
-            "FP16 attention should have 3 inputs, not 4"
+            !mil.contains("a_input4"),
+            "FP16 attention should have 4 inputs, not 5"
         );
         // Should contain attention ops
         assert!(mil.contains("slice_by_index"));
@@ -1139,7 +1017,8 @@ mod tests {
     #[test]
     fn fp16_attention_mil_gqa_uses_tile() {
         // GQA: 32 query heads, 8 KV heads
-        let mil = emit_fp16_attention_mil(32, 8, 64, 128, 128);
+        let program = build_fp16_attention_program(32, 8, 64, 128, 128);
+        let mil = to_mil(&program);
         assert!(
             mil.contains("tile"),
             "FP16 GQA attention should use tile op"
@@ -1152,7 +1031,8 @@ mod tests {
     #[test]
     fn fp16_attention_mil_mha_no_tile() {
         // MHA: num_heads == num_kv_heads
-        let mil = emit_fp16_attention_mil(32, 32, 64, 128, 128);
+        let program = build_fp16_attention_program(32, 32, 64, 128, 128);
+        let mil = to_mil(&program);
         assert!(!mil.contains("tile"), "FP16 MHA should not use tile op");
         assert!(!mil.contains("gqa_reps"));
     }

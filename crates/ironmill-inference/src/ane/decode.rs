@@ -1034,7 +1034,11 @@ impl AneInference {
             let q_channels = nh * hd;
 
             // Compile hand-written FP16 attention MIL (shared across layers).
-            let mil = mil_emitter::emit_fp16_attention_mil(nh, nkv, hd, msl, msl);
+            let attn_program = mil_emitter::build_fp16_attention_program(nh, nkv, hd, msl, msl);
+            let mil_config = MilTextConfig::default();
+            let (mil, _) = program_to_mil_text(&attn_program, &mil_config).map_err(|e| {
+                AneError::Other(anyhow::anyhow!("FP16 attention MIL text failed: {e}"))
+            })?;
             let attn_compiled =
                 AneCompiler::compile_mil_text(&mil, &[]).map_err(|e| AneError::CompileFailed {
                     status: 0,
