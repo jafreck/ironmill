@@ -97,6 +97,9 @@ pub struct AneInference {
     rope_cache_dim: usize,
     /// Whether cache-write ops were fused into pre_attn sub-programs.
     cache_write_fused: bool,
+    /// Per-head Q/K normalization weights (Qwen3 feature).
+    /// Shape: [head_dim] each. Applied per-head after Q/K projection.
+    qk_norm_weights: Option<Vec<(Vec<f16>, Vec<f16>)>>,
 }
 
 /// CPU-side weight tensor for embedding/lm_head.
@@ -399,6 +402,9 @@ impl AneInference {
                 let theta = 1_000_000.0f32;
                 precompute_rope_cache(head_dim, max_pos, theta)
             });
+
+        // Extract per-layer QK norm weights (Qwen3 feature).
+        let qk_norm_weights = extract_qk_norm_weights(program);
 
         // 1. Run ANE-specific passes.
         // Note: AneConcatEliminationPass is NOT run here on the full program.
@@ -1127,6 +1133,7 @@ impl AneInference {
             rope_sin_cache,
             rope_cache_dim,
             cache_write_fused,
+            qk_norm_weights,
         })
     }
 
@@ -1362,6 +1369,14 @@ impl AneInference {
                 q_data.truncate(real_q_ch);
                 k_data.truncate(real_kv_ch);
                 v_data.truncate(real_kv_ch);
+
+                // Apply per-head QK normalization (Qwen3 feature).
+                if let Some(ref norms) = self.qk_norm_weights {
+                    if let Some((q_norm_w, k_norm_w)) = norms.get(layer_idx) {
+                        apply_per_head_rms_norm(&mut q_data, q_norm_w, self.head_dim);
+                        apply_per_head_rms_norm(&mut k_data, k_norm_w, self.head_dim);
+                    }
+                }
 
                 // Apply RoPE rotation on CPU. Pre_attn outputs unrotated Q/K
                 // because RoPE gather ops were stripped during compilation.
@@ -1599,8 +1614,21 @@ impl AneInference {
         if let Some(tq) = &mut self.turboquant {
             tq.reset();
         }
-        // FP16 cache data will be overwritten on subsequent writes;
-        // no need to zero it.
+        // Re-initialize the causal mask to all -inf.
+        if let Some(ref mut mask) = self.fp16_attn_mask {
+            let msl = self.max_seq_len;
+            let mask_data = vec![f16::NEG_INFINITY; msl];
+            let _ = mask.write_f16(&mask_data);
+        }
+        // Zero the FP16 KV caches for the new sequence.
+        if let Some(ref mut caches) = self.fp16_kv_caches {
+            for (k, v) in caches.iter_mut() {
+                let k_size = k.shape()[1] * k.shape()[3];
+                let v_size = v.shape()[1] * v.shape()[3];
+                let _ = k.write_f16(&vec![f16::ZERO; k_size]);
+                let _ = v.write_f16(&vec![f16::ZERO; v_size]);
+            }
+        }
     }
 
     /// Current sequence position.
@@ -1658,12 +1686,41 @@ fn apply_rope_rotation(data: &mut [f16], cos: &[f16], sin: &[f16], head_dim: usi
     for h in 0..num_heads {
         let base = h * head_dim;
         for i in 0..half_dim.min(cos.len()) {
-            let x0 = data[base + 2 * i].to_f32();
-            let x1 = data[base + 2 * i + 1].to_f32();
+            let x0 = data[base + i].to_f32();
+            let x1 = data[base + i + half_dim].to_f32();
             let c = cos[i].to_f32();
             let s = sin[i].to_f32();
-            data[base + 2 * i] = f16::from_f32(x0 * c - x1 * s);
-            data[base + 2 * i + 1] = f16::from_f32(x0 * s + x1 * c);
+            data[base + i] = f16::from_f32(x0 * c - x1 * s);
+            data[base + i + half_dim] = f16::from_f32(x0 * s + x1 * c);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QK normalization helper
+// ---------------------------------------------------------------------------
+
+/// Apply per-head RMSNorm to a Q or K vector on CPU.
+///
+/// `data` is `[num_heads * head_dim]`. `weight` is `[head_dim]`.
+/// Each head's `head_dim` values are independently RMS-normalized
+/// then multiplied by the weight.
+fn apply_per_head_rms_norm(data: &mut [f16], weight: &[f16], head_dim: usize) {
+    let eps = 1e-6f32;
+    let num_heads = data.len() / head_dim;
+    for h in 0..num_heads {
+        let base = h * head_dim;
+        let n = head_dim.min(weight.len());
+        let mut sum_sq = 0.0f32;
+        for i in 0..n {
+            let v = data[base + i].to_f32();
+            sum_sq += v * v;
+        }
+        let rms = (sum_sq / n as f32 + eps).sqrt();
+        let inv_rms = 1.0 / rms;
+        for i in 0..n {
+            let normed = data[base + i].to_f32() * inv_rms * weight[i].to_f32();
+            data[base + i] = f16::from_f32(normed);
         }
     }
 }
@@ -2299,6 +2356,88 @@ fn extract_1d_weight(
                         .collect()
                 };
                 return Some(values);
+            }
+        }
+    }
+    None
+}
+
+/// Extract per-layer QK normalization weights from the original program.
+///
+/// Qwen3 models apply per-head RMSNorm to Q and K after projection.
+/// Returns `Some(Vec<(q_norm, k_norm)>)` indexed by layer, or `None`
+/// if the model doesn't use QK normalization.
+fn extract_qk_norm_weights(program: &mil_rs::ir::Program) -> Option<Vec<(Vec<f16>, Vec<f16>)>> {
+    use mil_rs::ir::Value;
+
+    let func = program.main()?;
+
+    let mut q_norms: std::collections::BTreeMap<usize, Vec<f16>> =
+        std::collections::BTreeMap::new();
+    let mut k_norms: std::collections::BTreeMap<usize, Vec<f16>> =
+        std::collections::BTreeMap::new();
+
+    for op in &func.body.operations {
+        if op.op_type != "const" {
+            continue;
+        }
+        let name = op.name.to_lowercase();
+        let is_q_norm = name.contains("q_norm") && name.contains("weight");
+        let is_k_norm = name.contains("k_norm") && name.contains("weight");
+        if !is_q_norm && !is_k_norm {
+            continue;
+        }
+
+        let layer_idx = extract_layer_number_from_name(&name);
+        let layer_idx = match layer_idx {
+            Some(l) => l,
+            None => continue,
+        };
+
+        let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+        if let Some(Value::Tensor { data, shape, dtype }) = tensor {
+            if shape.len() == 1 {
+                let values: Vec<f16> = if *dtype == ScalarType::Float32 {
+                    data.chunks_exact(4)
+                        .map(|b| f16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                        .collect()
+                } else {
+                    data.chunks_exact(2)
+                        .map(|b| f16::from_le_bytes([b[0], b[1]]))
+                        .collect()
+                };
+                if is_q_norm {
+                    q_norms.insert(layer_idx, values);
+                } else {
+                    k_norms.insert(layer_idx, values);
+                }
+            }
+        }
+    }
+
+    if q_norms.is_empty() {
+        return None;
+    }
+
+    let num_layers = q_norms.keys().last().map(|&k| k + 1).unwrap_or(0);
+    let mut result = Vec::with_capacity(num_layers);
+    for i in 0..num_layers {
+        let q = q_norms.get(&i).cloned().unwrap_or_default();
+        let k = k_norms.get(&i).cloned().unwrap_or_default();
+        result.push((q, k));
+    }
+    eprintln!("  QK norm weights: {} layers", result.len());
+    Some(result)
+}
+
+/// Extract a layer number from an operation name.
+fn extract_layer_number_from_name(name: &str) -> Option<usize> {
+    for pattern in ["layers.", "layers_", "layer.", "layer_"] {
+        if let Some(idx) = name.find(pattern) {
+            let rest = &name[idx + pattern.len()..];
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !num_str.is_empty() {
+                return num_str.parse().ok();
             }
         }
     }
