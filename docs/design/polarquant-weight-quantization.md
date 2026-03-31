@@ -14,9 +14,13 @@ ANE's ~32 MB on-chip SRAM.
 
 | Model | FP16 | 4-bit PolarQuant | Reduction |
 |-------|------|-------------------|-----------|
-| Qwen3-0.6B | 1.5 GB | ~400 MB | 3.7× |
-| Qwen3-4B | 8.2 GB | ~2.2 GB | 3.7× |
-| Llama-3-8B | 16 GB | ~4.3 GB | 3.7× |
+| Qwen3-0.6B | 1.5 GB | ~400 MB | ~3.7× |
+| Qwen3-4B | 8.2 GB | ~2.2 GB | ~3.7× |
+| Llama-3-8B | 16 GB | ~4.3 GB | ~3.7× |
+
+The reduction is ~3.7× rather than the theoretical 4× (16÷4 bits) because
+small tensors below the `min_elements` threshold remain in FP16, and
+per-row norms add a small overhead.
 
 ## How PolarQuant Works
 
@@ -46,14 +50,16 @@ Output: LUT + indices + row_norms  (compressed representation)
 
 Raw weight distributions have outliers that degrade uniform quantization.
 The Hadamard rotation spreads information across all dimensions, producing
-a near-Gaussian distribution that the Beta-optimal quantizer handles well.
-The rotation matrix is never stored — it's regenerated from the seed.
+a distribution that the Beta-optimal quantizer handles well. The rotation
+matrix is never stored — it's regenerated from the seed.
 
 ### Beta-optimal quantizer
 
 Instead of uniform bin spacing, PolarQuant uses Lloyd-Max optimal levels
-derived from the Beta(dim/2, dim/2) distribution (the marginal
-distribution of a random unit vector's projection). This is implemented
+derived from the Beta(1/2, (dim-1)/2) distribution — the marginal
+distribution of a squared coordinate on the unit sphere S^{d-1}. After
+row-normalization and Hadamard rotation, each scalar in the weight
+matrix approximately follows this distribution. This is implemented
 in `beta_quantizer.rs`:
 
 - `beta_optimal_levels(dim, n_bits)` → reconstruction levels
@@ -87,12 +93,47 @@ For each `const` op with ≥ `min_elements` FP16/FP32 values:
 
 ### Rotation fusion
 
-When two adjacent linear layers both use PolarQuant with the same seed,
-the Hadamard rotation at the output of layer A and the inverse rotation
-at the input of layer B cancel out. `PolarRotationFusionPass` detects
-this pattern and eliminates the redundant rotation, saving compute.
+When two adjacent linear layers both use PolarQuant with the same seed
+and are connected only through safe elementwise ops (relu, add, mul,
+sub), the Hadamard rotation at the output of layer A and the inverse
+rotation at the input of layer B cancel out.
+`PolarRotationFusionPass` detects this pattern and eliminates the
+redundant rotation, saving compute. For unpaired boundary layers (e.g.,
+broken by softmax or layernorm), it inserts an explicit inverse-rotation
+matmul.
 
-## ANE Constraints — Important Caveat
+Note: Q/K/V projections and gate/up projections in standard transformers
+are parallel branches, not sequential — rotation fusion does not apply
+to them. It does apply to genuinely sequential linear chains, such as
+down-projection following an activation.
+
+## Backend-Specific Impact
+
+PolarQuant's benefits vary significantly by inference backend:
+
+| Benefit | ANE (private API) | CoreML GPU (public API) | Metal GPU (direct) |
+|---------|-------------------|-------------------------|---------------------|
+| Disk / distribution size | ✅ 3.7× smaller | ✅ 3.7× smaller | ✅ 3.7× smaller |
+| In-memory weight size | ❌ FP16 after dequant | ✅ compressed in VRAM | ✅ compressed in VRAM |
+| Throughput | ❌ no gain | ⚠️ marginal | ✅ bandwidth reduction |
+
+**Metal GPU (direct)** is the strongest fit. GPU inference is typically
+memory-bandwidth-bound; reading 4-bit weights instead of 16-bit reduces
+bandwidth pressure ~4× per matmul. The dequantization cost (LUT lookup
+per index) is trivially cheap in a Metal shader — a few ALU ops per
+element, easily hidden by the memory latency it saves. Weights stay
+compressed in `MTLBuffer`s, so a 7B model fits in ~4 GB VRAM instead
+of 14 GB.
+
+**CoreML GPU** handles `constexpr_lut_to_dense` natively and likely
+keeps weights compressed in VRAM, but Apple's documentation is vague
+on the runtime representation. Dequantization overhead is opaque.
+
+**ANE** cannot use compressed weights at runtime — the private API
+rejects `constexpr_lut_to_dense` and requires FP16 `const` ops.
+PolarQuant is useful only for smaller model files on disk.
+
+## ANE Constraints — Verified Limitations
 
 ### Supported MIL ops
 
@@ -102,11 +143,16 @@ corresponding to n_bits ∈ {1, 2, 4, 6, 8}.
 
 ### INT4 weight rejection — compile-time only
 
-ANE rejects INT4/UINT4 data types for runtime tensors. However,
-`constexpr_lut_to_dense` is a **compile-time** expansion — the ANE
-compiler dequantizes the weights during compilation and stores them
-in the `.espresso.net` blob in FP16 format. The quantization saves
-storage/transfer size, but the on-chip representation is still FP16.
+ANE rejects INT4/UINT4 data types for runtime tensors. The
+`constexpr_lut_to_dense` op is a **compile-time** expansion in CoreML's
+public API — the CoreML compiler dequantizes weights and passes FP16
+to the ANE backend.
+
+**Verified (2026-03):** ANE's private API (used by ironmill) **rejects
+`constexpr_lut_to_dense` outright** — `ANECCompile() FAILED`. The
+private API only accepts ops in the ANE native op set (conv, add, mul,
+etc.). The `constexpr_lut_to_dense` dequantization is performed by
+CoreML's compiler layer, not by ANE itself.
 
 **This is a critical limitation.** PolarQuant's memory savings apply to:
 - ✅ **Model file size on disk** (4-bit indices + small LUT)
@@ -114,30 +160,45 @@ storage/transfer size, but the on-chip representation is still FP16.
 - ✅ **Distribution size** (smaller downloads)
 
 But NOT to:
-- ❌ **ANE on-chip weight storage** (always FP16 after compilation)
-- ❌ **Runtime memory** (compiled blob is FP16-sized)
+- ❌ **ANE on-chip weight storage** (always FP16 after dequantization)
+- ❌ **Runtime memory** (FP16-sized after dequantization)
 - ❌ **Inference speed** (no reduced-precision arithmetic)
 
+For the ANE private API path, PolarQuant must **dequantize to FP16 on
+the CPU** before passing weights to the ANE compiler. The quantized
+format is used only for storage and distribution.
+
 For true on-chip compression, ANE would need runtime palettization
-support, which is not currently available through the private API.
-The GPU backend (via CoreML public API) DOES support runtime
-palettization and would benefit fully from PolarQuant.
+support, which is not available through either the private or public API.
+The GPU backend (via CoreML public API) DOES support
+`constexpr_lut_to_dense` and would benefit from smaller model files.
 
 ## Integration Plan
 
 ### Phase 1: Static weight compression (model file size)
 
-Wire `PolarQuantPass` into the ANE compilation pipeline:
+Since ANE's private API rejects `constexpr_lut_to_dense`, PolarQuant
+integration must use a **load-time dequantization** approach:
 
 ```
-ONNX → MIL IR → split → [PolarQuantPass(4-bit)] → MatmulToConv
-     → AneLayoutPass → compile → ANE blob
+Compressed file (4-bit PolarQuant)
+  → CPU dequantize to FP16 (on model load)
+  → MIL IR with FP16 const ops
+  → ANE compile pipeline
+  → ANE blob (FP16 weights)
 ```
 
-**Where it runs**: After splitting, before `compile_and_load_sub`.
-Each sub-program's weight `const` ops are quantized independently.
+This saves disk/distribution size but not runtime memory. The
+dequantization step runs once at model load time.
 
-**Configuration**: Add `--quantize polar:4` CLI flag to `ironmill-bench`.
+**Current status**: `PolarQuantPass` is wired into the MIL `PassPipeline`
+and accessible via `--polar-quantize <BITS>` in the CLI and bench tools
+for offline compression. A corresponding **dequantization pass** is
+needed to expand `constexpr_lut_to_dense` → FP16 `const` ops before
+ANE compilation.
+
+**Configuration**: `--polar-quantize 4` CLI flag exists in `ironmill-cli`
+and `ironmill-bench`.
 
 **Expected results**:
 - ONNX file → ~400 MB compressed (vs 1.5 GB FP16)
@@ -147,8 +208,9 @@ Each sub-program's weight `const` ops are quantized independently.
 ### Phase 2: Rotation fusion
 
 Run `PolarRotationFusionPass` after `PolarQuantPass` to cancel
-Hadamard rotations between consecutive linear layers (Q→K→V
-projections, gate→up→down FFN projections).
+Hadamard rotations between sequential linear layers connected through
+safe elementwise ops. This is already wired via `pipeline.with_polar_quant()`,
+which schedules both passes together.
 
 ### Phase 3: Combined with TurboQuant
 
@@ -186,8 +248,8 @@ analytically from the weight distribution after rotation.
 
 ## References
 
-- [PolarQuant paper](https://arxiv.org/abs/2502.02617) — Shwu et al., 2025
-- [TurboQuant](https://research.google/pubs/polarquant-quantizing-kv-caches-with-polar-transformation/) — Google Research
+- [PolarQuant paper](https://arxiv.org/abs/2502.02617) — Han, Kacham, Karbasi, Mirrokni, Zandieh, 2025
+- [TurboQuant paper](https://arxiv.org/abs/2504.19874) — Zandieh, Daliri, Hadian, Mirrokni, 2025
 - [AISTATS 2026 poster](https://virtual.aistats.org/virtual/2026/poster/11018) — Vector quantization generalization
 - `crates/mil-rs/src/ir/passes/polar_quantize.rs` — Implementation
 - `crates/mil-rs/src/ir/passes/beta_quantizer.rs` — Quantizer math

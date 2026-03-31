@@ -625,6 +625,23 @@ fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> String {
             .map(|b| b.to_string())
             .collect::<Vec<_>>()
             .join(","),
+        ScalarType::UInt16 => data
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        ScalarType::UInt32 => data
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        ScalarType::UInt64 => data
+            .chunks_exact(8)
+            .map(|b| {
+                u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]).to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(","),
         ScalarType::Bool => data
             .iter()
             .map(|&b| if b != 0 { "true" } else { "false" })
