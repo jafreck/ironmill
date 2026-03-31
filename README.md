@@ -9,12 +9,12 @@
 
 Rust-native model compiler and GPU inference runtime for Apple Silicon.
 
+</div>
+
 > [!WARNING]
 > **ironmill is currently in alpha and under active development.** APIs, file
 > formats, and CLI interfaces may change without notice. Not recommended for
 > production use.
-
-</div>
 
 ironmill compiles models from ONNX, SafeTensors, and GGUF into optimized
 representations and runs them on Apple Silicon GPUs via Metal/MPS. It also
