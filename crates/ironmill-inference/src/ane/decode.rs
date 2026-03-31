@@ -55,6 +55,8 @@ pub struct AneInference {
     layers: Vec<LayerPrograms>,
     /// LM head projection. ANE-accelerated when possible, CPU fallback otherwise.
     lm_head: LmHead,
+    /// Final RMSNorm weight applied before lm_head. Shape: [hidden_size].
+    final_norm_weight: Option<Vec<f16>>,
     /// Optional TurboQuant model (replaces layer attention when enabled).
     turboquant: Option<TurboQuantModel>,
     /// FP16 KV caches (used when TurboQuant is disabled).
@@ -705,6 +707,17 @@ impl AneInference {
             }
         });
 
+        // Extract the final RMSNorm weight from the lm_head sub-program.
+        // The splitter groups final_norm into the lm_head sub-program, but
+        // AneLmHead only does the linear projection. We must apply final
+        // norm on CPU before the projection.
+        let final_norm_weight = extract_1d_weight(lm_head_sub, "norm");
+        if let Some(ref w) = final_norm_weight {
+            eprintln!("  Final norm weight extracted ({} elements)", w.len());
+        } else {
+            eprintln!("warning: no final norm weight found in lm_head sub-program");
+        }
+
         // Try to compile lm_head as chunked ANE conv1×1. Falls back to CPU
         // if ANE compilation fails (e.g., unsupported shape or ANE unavailable).
         let lm_head = match AneLmHead::compile(&lm_head_cpu_weight) {
@@ -991,6 +1004,7 @@ impl AneInference {
             embed_weight,
             layers,
             lm_head,
+            final_norm_weight,
             turboquant,
             fp16_kv_caches,
             fp16_attn_compiled,
@@ -1258,12 +1272,18 @@ impl AneInference {
 
         self.seq_pos += 1;
 
-        // 3. LM head: ANE conv1×1 (chunked) or CPU fallback.
+        // 3. Final RMSNorm + LM head.
         let t0 = if profiling {
             Some(std::time::Instant::now())
         } else {
             None
         };
+
+        // Apply final RMSNorm before projecting to vocab logits.
+        if let Some(norm_w) = &self.final_norm_weight {
+            cpu_rms_norm(&mut hidden, norm_w);
+        }
+
         let logits = match &mut self.lm_head {
             LmHead::Ane(ane_lm_head) => ane_lm_head.forward(&hidden),
             LmHead::Cpu(weight) => cpu_lm_head_matmul(weight, &hidden),
@@ -1786,6 +1806,68 @@ fn extract_cpu_weight(
             shape,
         }
     })
+}
+
+/// Extract a 1D weight (e.g., RMSNorm gamma) from a sub-program.
+/// Finds the smallest 1D const tensor whose name contains `hint`.
+fn extract_1d_weight(
+    sub: &ironmill_compile::ane::split::SubProgram,
+    hint: &str,
+) -> Option<Vec<f16>> {
+    use mil_rs::ir::Value;
+
+    let func = sub.program.main()?;
+
+    for op in &func.body.operations {
+        if op.op_type != "const" {
+            continue;
+        }
+        // Check if the op name contains the hint (e.g., "norm").
+        let name_matches = op.name.to_lowercase().contains(hint);
+        if !name_matches {
+            continue;
+        }
+        let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+        if let Some(Value::Tensor { data, shape, dtype }) = tensor {
+            if shape.len() == 1 {
+                let values: Vec<f16> = if *dtype == ScalarType::Float32 {
+                    data.chunks_exact(4)
+                        .map(|b| {
+                            let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                            f16::from_f32(v)
+                        })
+                        .collect()
+                } else {
+                    data.chunks_exact(2)
+                        .map(|b| f16::from_le_bytes([b[0], b[1]]))
+                        .collect()
+                };
+                return Some(values);
+            }
+        }
+    }
+    None
+}
+
+/// CPU RMSNorm: normalize hidden state in-place using the given weight.
+/// RMSNorm(x) = x / sqrt(mean(x²) + eps) * weight
+fn cpu_rms_norm(hidden: &mut [f16], weight: &[f16]) {
+    let eps = 1e-6f32;
+    let n = hidden.len().min(weight.len());
+
+    // Compute RMS in f32 for numerical stability.
+    let mut sum_sq = 0.0f32;
+    for &h in hidden.iter().take(n) {
+        let v = h.to_f32();
+        sum_sq += v * v;
+    }
+    let rms = (sum_sq / n as f32 + eps).sqrt();
+    let inv_rms = 1.0 / rms;
+
+    for i in 0..n {
+        let normed = hidden[i].to_f32() * inv_rms * weight[i].to_f32();
+        hidden[i] = f16::from_f32(normed);
+    }
 }
 
 /// CPU embedding lookup: gather row `token_id` from the weight table.
