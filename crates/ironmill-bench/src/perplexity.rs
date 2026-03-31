@@ -98,6 +98,19 @@ pub fn evaluate_perplexity(
             let logits = inference.decode(token)?;
             let ce = cross_entropy(&logits, target);
             all_losses.push(ce);
+
+            if seq_idx == 0 && pos < 10 && std::env::var("IRONMILL_TRACE_CE").is_ok() {
+                let argmax = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                eprintln!(
+                    "  [ce] pos={} tok={} tgt={} argmax={} ce={:.2}",
+                    pos, token, target, argmax, ce
+                );
+            }
         }
 
         if (seq_idx + 1) % 10 == 0 || seq_idx + 1 == num_sequences {

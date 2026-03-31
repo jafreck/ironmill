@@ -518,20 +518,69 @@ pub fn build_attention_program(config: &AttentionMilConfig) -> (Program, Vec<(St
     op.output_types[0] = Some(TensorType::new(ScalarType::Float16, kv_head_4d));
     func.body.add_op(op);
 
-    // GQA head expansion
+    // GQA head expansion: repeat_interleave each KV head for its Q heads.
+    // tile() repeats the whole block ([kv0..kv7, kv0..kv7]), but GQA needs
+    // each head repeated consecutively ([kv0,kv0, kv1,kv1, ..., kv7,kv7]).
+    // Implement via reshape→tile→reshape:
+    //   [1, nkv, hd, seq] → [1, nkv, 1, hd, seq] → tile [1,1,G,1,1]
+    //   → [1, nkv, G, hd, seq] → reshape [1, nh, hd, seq]
     let (k_attn, v_attn) = if gqa_groups > 1 {
-        add_const_tensor_op(&mut func.body, "gqa_reps", &[1, gqa_groups as i32, 1, 1]);
+        let kv_unsqueezed = vec![1, num_kv_heads, 1, head_dim, seq_len];
+        let kv_tiled_5d = vec![1, num_kv_heads, gqa_groups, head_dim, seq_len];
 
-        let mut op = Operation::new("tile", "k_attn")
+        // Reshape K to 5D
+        add_const_tensor_op(
+            &mut func.body,
+            "k_unsqueeze_shape",
+            &kv_unsqueezed.iter().map(|&x| x as i32).collect::<Vec<_>>(),
+        );
+        let mut op = Operation::new("reshape", "k_unsqueeze")
             .with_input("x", Value::Reference("k_heads".into()))
+            .with_input("shape", Value::Reference("k_unsqueeze_shape".into()))
+            .with_output("k_unsqueeze");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, kv_unsqueezed.clone()));
+        func.body.add_op(op);
+
+        // Tile along the new axis (axis 2)
+        add_const_tensor_op(&mut func.body, "gqa_reps", &[1, 1, gqa_groups as i32, 1, 1]);
+        let mut op = Operation::new("tile", "k_tiled")
+            .with_input("x", Value::Reference("k_unsqueeze".into()))
             .with_input("reps", Value::Reference("gqa_reps".into()))
+            .with_output("k_tiled");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, kv_tiled_5d.clone()));
+        func.body.add_op(op);
+
+        // Reshape back to 4D: [1, nh, hd, seq]
+        add_const_tensor_op(
+            &mut func.body,
+            "attn_head_shape",
+            &attn_head_4d.iter().map(|&x| x as i32).collect::<Vec<_>>(),
+        );
+        let mut op = Operation::new("reshape", "k_attn")
+            .with_input("x", Value::Reference("k_tiled".into()))
+            .with_input("shape", Value::Reference("attn_head_shape".into()))
             .with_output("k_attn");
         op.output_types[0] = Some(TensorType::new(ScalarType::Float16, attn_head_4d.clone()));
         func.body.add_op(op);
 
-        let mut op = Operation::new("tile", "v_attn")
+        // Same for V
+        let mut op = Operation::new("reshape", "v_unsqueeze")
             .with_input("x", Value::Reference("v_heads".into()))
+            .with_input("shape", Value::Reference("k_unsqueeze_shape".into()))
+            .with_output("v_unsqueeze");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, kv_unsqueezed));
+        func.body.add_op(op);
+
+        let mut op = Operation::new("tile", "v_tiled")
+            .with_input("x", Value::Reference("v_unsqueeze".into()))
             .with_input("reps", Value::Reference("gqa_reps".into()))
+            .with_output("v_tiled");
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, kv_tiled_5d));
+        func.body.add_op(op);
+
+        let mut op = Operation::new("reshape", "v_attn")
+            .with_input("x", Value::Reference("v_tiled".into()))
+            .with_input("shape", Value::Reference("attn_head_shape".into()))
             .with_output("v_attn");
         op.output_types[0] = Some(TensorType::new(ScalarType::Float16, attn_head_4d));
         func.body.add_op(op);

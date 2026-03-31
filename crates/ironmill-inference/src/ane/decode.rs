@@ -1489,6 +1489,21 @@ impl<D: AneDevice> AneInference<D> {
                         })?;
                 }
                 hidden = read_f16_channels(&post_attn.output_tensors[0])?;
+
+                // Debug: trace last few layers for explosion diagnosis
+                if self.seq_pos == 0
+                    && layer_idx >= 24
+                    && std::env::var("IRONMILL_TRACE_LAST").is_ok()
+                {
+                    let f32s: Vec<f32> = hidden.iter().map(|x| x.to_f32()).collect();
+                    let absmax = f32s.iter().map(|x| x.abs()).fold(0f32, f32::max);
+                    let has_nan = f32s.iter().any(|x| x.is_nan());
+                    let has_inf = f32s.iter().any(|x| x.is_infinite());
+                    eprintln!(
+                        "  [L{:2}] absmax={:.2} nan={} inf={} first3=[{:.4},{:.4},{:.4}]",
+                        layer_idx, absmax, has_nan, has_inf, f32s[0], f32s[1], f32s[2]
+                    );
+                }
             } else {
                 // No post_attn sub-program — use attention output directly.
                 hidden = attn_out_data;
@@ -1517,10 +1532,38 @@ impl<D: AneDevice> AneInference<D> {
             cpu_rms_norm(&mut hidden, norm_w);
         }
 
+        // Debug: trace post-norm hidden and logits
+        if self.seq_pos <= 3 && std::env::var("IRONMILL_TRACE_LAST").is_ok() {
+            let f32s: Vec<f32> = hidden.iter().map(|x| x.to_f32()).collect();
+            let absmax = f32s.iter().map(|x| x.abs()).fold(0f32, f32::max);
+            eprintln!(
+                "  [norm] absmax={:.4} first3=[{:.4},{:.4},{:.4}]",
+                absmax, f32s[0], f32s[1], f32s[2]
+            );
+        }
+
         let logits = match &mut self.lm_head {
             LmHead::Ane(ane_lm_head) => ane_lm_head.forward(&hidden),
             LmHead::Cpu(weight) => cpu_lm_head_matmul(weight, &hidden),
         };
+
+        if self.seq_pos <= 3 && std::env::var("IRONMILL_TRACE_LAST").is_ok() {
+            if let Ok(ref l) = logits {
+                let max = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let argmax = l
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                eprintln!(
+                    "  [logits] max={:.4} argmax={} len={}",
+                    max,
+                    argmax,
+                    l.len()
+                );
+            }
+        }
 
         let d_lm_head = t0.map(|t| t.elapsed());
 
