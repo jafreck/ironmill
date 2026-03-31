@@ -12,6 +12,7 @@ compile_error!("ironmill-inference only supports macOS");
 pub mod ane;
 pub mod coreml;
 pub mod engine;
+pub mod gpu;
 pub mod sampling;
 pub mod types;
 

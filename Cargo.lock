@@ -525,6 +525,7 @@ dependencies = [
  "ironmill-compile",
  "ironmill-coreml-sys",
  "ironmill-iosurface",
+ "ironmill-metal-sys",
  "mil-rs",
  "serde",
  "serde_json",

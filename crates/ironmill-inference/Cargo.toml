@@ -13,6 +13,7 @@ ironmill-compile = { workspace = true, optional = true }
 ironmill-ane-sys = { workspace = true }
 ironmill-iosurface = { workspace = true }
 ironmill-coreml-sys = { workspace = true }
+ironmill-metal-sys = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }
