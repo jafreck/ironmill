@@ -241,6 +241,21 @@ fn test_mul() -> (bool, bool) {
     }
 }
 
+fn test_identity() -> (bool, bool) {
+    let mil = mil_program(
+        "        tensor<fp16, [1,32,1,32]> z_output0 = identity(x=a_input0)[name=string(\"z_output0\")];",
+        "tensor<fp16, [1,32,1,32]> a_input0",
+        "z_output0",
+    );
+    let a: Vec<f32> = (0..N).map(|i| (i as f32) * 0.1 - 50.0).collect();
+    let expected: Vec<f32> = a.clone();
+
+    match run_ane(&mil, &[f16v(&a)], &[(C, S)], &[(C, S)]) {
+        Some(out) => (true, check_results("identity", &out[0], &expected, 0.02)),
+        None => (false, false),
+    }
+}
+
 fn test_relu() -> (bool, bool) {
     let mil = mil_program(
         "        tensor<fp16, [1,32,1,32]> z_output0 = relu(x=a_input0)[name=string(\"z_output0\")];",
@@ -2076,6 +2091,7 @@ fn main() {
         ("sub", test_sub),
         ("mul", test_mul),
         ("relu", test_relu),
+        ("identity", test_identity),
         ("abs", test_abs),
         ("sign", test_sign),
         ("sqrt", test_sqrt),
