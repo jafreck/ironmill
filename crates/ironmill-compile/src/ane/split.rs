@@ -122,12 +122,6 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
                 sub_programs.push(build_sub_program(&pre_name, &pre, &type_map, Some(ops)));
             }
             if config.emit_attention && !attn.is_empty() {
-                // Strip gather ops (RoPE cos/sin cache lookup) from the
-                // attention cluster. Gather is unsupported on ANE; the
-                // gathered values become cross-boundary inputs filled by
-                // the CPU at decode time. The remaining RoPE arithmetic
-                // (split, mul, sub, add, concat) stays in the sub-program
-                // and is ANE-compatible.
                 let attn_stripped = strip_gather_ops(&attn);
                 let attn_name = format!("{name}_fp16_attn");
                 sub_programs.push(build_sub_program(
@@ -136,9 +130,24 @@ pub fn split_for_ane(program: &Program, config: &SplitConfig) -> Result<ModelSpl
                     &type_map,
                     Some(ops),
                 ));
-            }
-            if !post.is_empty() {
-                sub_programs.push(build_sub_program(&post_name, &post, &type_map, Some(ops)));
+                // Post-attn is separate from attention.
+                if !post.is_empty() {
+                    sub_programs.push(build_sub_program(&post_name, &post, &type_map, Some(ops)));
+                }
+            } else {
+                // Merge attention ops into post_attn for a deeper graph.
+                // The attention ops consume Q/K/V from pre_attn outputs;
+                // KV cache inputs are added by the decode loop.
+                let mut merged_post = attn;
+                merged_post.extend(post);
+                if !merged_post.is_empty() {
+                    sub_programs.push(build_sub_program(
+                        &post_name,
+                        &merged_post,
+                        &type_map,
+                        Some(ops),
+                    ));
+                }
             }
         } else {
             let sp = build_sub_program(name, ops, &type_map, None);
@@ -585,10 +594,7 @@ fn try_structural_split(
         return None;
     }
 
-    // 4. Attention block (pre_attn_set): projections + everything feeding
-    //    them + all attention ops + O-projection + the first residual add.
-    //    This keeps attention as part of a deep graph for maximum ANE
-    //    utilization, rather than isolating it in a shallow sub-program.
+    // 4. Pre-attn: the projections themselves + everything feeding into them.
     let mut pre_attn_set: HashSet<usize> = HashSet::new();
     for &proj in &proj_matmuls {
         pre_attn_set.insert(proj);
@@ -599,57 +605,31 @@ fn try_structural_split(
     //    reachable forward from softmax (excludes Q/K/V projections).
     let o_proj_idx = find_o_projection(ops, &graph, &softmax_indices, &proj_matmuls);
 
-    // 5b. Include attention ops + O-projection in the attention block.
-    //     Everything between Q/K/V projections and O-projection is attention.
-    if let Some(o_idx) = o_proj_idx {
-        // Walk backward from O-proj to include all attention ops.
-        let o_ancestors = graph.walk_backward(o_idx);
-        for &anc in &o_ancestors {
-            pre_attn_set.insert(anc);
-        }
-        pre_attn_set.insert(o_idx);
-        // Include the residual add immediately after O-proj (if present).
-        for &succ in &graph.forward[o_idx] {
-            if ops[succ].op_type == "add" {
-                pre_attn_set.insert(succ);
-                break;
-            }
-        }
-    } else {
-        // No O-proj found — include everything between projections and
-        // the softmax chain as attention.
-        for &s in &softmax_indices {
-            pre_attn_set.insert(s);
-            pre_attn_set.extend(graph.walk_backward(s));
-            pre_attn_set.extend(graph.walk_forward(s));
-        }
-    }
-
-    // 6. FFN block (post_attn_set): everything NOT in the attention block.
+    // 6. Post-attn: attention cluster + O-projection + FFN (everything
+    //    not in pre_attn). With emit_attention=false, the attention ops
+    //    are included in post_attn for a deeper graph.
+    //    With emit_attention=true, they become a separate sub-program.
     let mut post_attn_set: HashSet<usize> = HashSet::new();
-    for (i, _) in ops.iter().enumerate() {
-        if !pre_attn_set.contains(&i) {
-            post_attn_set.insert(i);
-        }
+    if let Some(o_idx) = o_proj_idx {
+        post_attn_set.insert(o_idx);
+        post_attn_set.extend(graph.walk_forward(o_idx));
     }
 
-    // Move const ops that exclusively feed one block into that block.
+    // Add const ops that exclusively feed post-attn ops.
     for (i, op) in ops.iter().enumerate() {
         if !is_const_op(op) || graph.forward[i].is_empty() {
             continue;
         }
-        let feeds_pre = graph.forward[i].iter().any(|c| pre_attn_set.contains(c));
-        let feeds_post = graph.forward[i].iter().any(|c| post_attn_set.contains(c));
-        if feeds_pre && !feeds_post {
-            post_attn_set.remove(&i);
-            pre_attn_set.insert(i);
+        if graph.forward[i].iter().all(|c| post_attn_set.contains(c)) {
+            post_attn_set.insert(i);
         }
     }
 
-    // 7. Collect attention block and FFN block in topological order.
-    //    The attention cluster is empty — attention ops are in pre_attn.
+    // 7. Collect pre-attn, attention cluster, and post-attn.
+    //    With emit_attention=false: attention ops go to post_attn.
+    //    With emit_attention=true: attention ops are separated.
     let mut pre_attn = Vec::new();
-    let mut attn_cluster = Vec::new(); // should remain empty with weight-aware split
+    let mut attn_cluster = Vec::new();
     let mut post_attn = Vec::new();
 
     for (i, op) in ops.iter().enumerate() {

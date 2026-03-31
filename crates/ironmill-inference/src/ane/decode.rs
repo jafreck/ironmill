@@ -458,14 +458,15 @@ impl AneInference {
         //     decode time, preserving all downstream references.
         replace_gather_with_inputs(&mut program);
 
-        // 2. Split each layer at the weight boundary into two deep programs:
-        //    - attn_block (pre_attn): norm → Q/K/V proj → attention → O-proj → residual
-        //    - ffn_block (post_attn): norm → gate/up proj → activation → down proj → residual
-        //    This keeps attention as part of a deep graph (~40-50 ops) for
-        //    maximum ANE utilization, while staying under the ~32 MB SRAM budget.
+        // 2. Split each layer into two deep sub-programs at the K/V boundary:
+        //    - pre_attn: norm → Q/K/V projections (+ Q/K norms, RoPE if present)
+        //    - post_attn: attention (using KV cache) → O-proj → residual → FFN
+        //    KV cache writes happen on CPU between pre_attn and post_attn.
+        //    The post_attn receives Q from pre_attn + K_cache/V_cache as inputs,
+        //    making it a deep graph (~40-50 ops) for maximum ANE utilization.
         let split_config = SplitConfig {
             split_attention: true,
-            emit_attention: false, // attention is included in pre_attn (attn_block)
+            emit_attention: false, // attention ops go into post_attn, not separate
             ..Default::default()
         };
         let mut model_split = split_for_ane(&program, &split_config)?;
@@ -484,11 +485,10 @@ impl AneInference {
             }
         }
 
-        // 2b. Pad function I/O to S≥32 (ANE rejects C>768, S<32 on I/O tensors).
-        //     Only pad the function inputs/outputs and their corresponding
-        //     TensorDescriptors — NOT internal op shapes. Internal ops
-        //     (especially attention reshapes) must keep their natural shapes
-        //     so dimension semantics are preserved.
+        // 2b. Pad all shapes to S≥32 (ANE rejects C>768, S<32 on I/O tensors).
+        //     Pad consistently: inputs, outputs, and all internal ops including
+        //     reshape constants. TypeRepropagationPass in compile_and_load_sub
+        //     will fix derived shapes (tile, matmul, etc.).
         const ANE_MIN_SEQ: usize = 32;
         for sub in &mut model_split.programs {
             if let Some(func) = sub.program.functions.values_mut().next() {
@@ -1766,7 +1766,80 @@ fn compile_and_load_sub(
     prune_unreferenced_inputs(&mut program);
     // Repropagate types after S≥32 padding may have changed shapes.
     let _ = TypeRepropagationPass.run(&mut program);
-    // Rename variables to ANE-friendly names per sub-program (not pre-split).
+
+    // Fix tile output types by resolving reps from const ops.
+    // TypeRepropagationPass can't resolve Reference-valued reps.
+    if let Some(func) = program.functions.values_mut().next() {
+        // Build a map of const op name → tensor data for reps lookup.
+        let const_data: std::collections::HashMap<String, Vec<u8>> = func
+            .body
+            .operations
+            .iter()
+            .filter(|op| op.op_type == "const")
+            .filter_map(|op| {
+                let name = op.outputs.first()?;
+                let data = match op.inputs.get("val").or_else(|| op.attributes.get("val"))? {
+                    mil_rs::ir::Value::Tensor { data, .. } => data.clone(),
+                    _ => return None,
+                };
+                Some((name.clone(), data))
+            })
+            .collect();
+
+        // Build a type map from function inputs + op outputs.
+        let mut local_types: std::collections::HashMap<String, Vec<Option<usize>>> =
+            std::collections::HashMap::new();
+        for (name, ty) in &func.inputs {
+            local_types.insert(name.clone(), ty.shape.clone());
+        }
+
+        for op in &mut func.body.operations {
+            // Record this op's output shape in local_types.
+            if let Some(out_name) = op.outputs.first() {
+                if let Some(Some(ty)) = op.output_types.first() {
+                    local_types.insert(out_name.clone(), ty.shape.clone());
+                }
+            }
+
+            if op.op_type == "tile" {
+                // Get reps data (inline or from const reference).
+                let reps_data: Option<Vec<u8>> = match op.inputs.get("reps") {
+                    Some(mil_rs::ir::Value::Tensor { data, .. }) => Some(data.clone()),
+                    Some(mil_rs::ir::Value::Reference(r)) => const_data.get(r).cloned(),
+                    _ => None,
+                };
+                // Get input shape.
+                let input_shape: Option<Vec<Option<usize>>> = match op.inputs.get("x") {
+                    Some(mil_rs::ir::Value::Reference(r)) => local_types.get(r).cloned(),
+                    _ => None,
+                };
+                if let (Some(reps_bytes), Some(in_shape)) = (reps_data, input_shape) {
+                    if reps_bytes.len() >= in_shape.len() * 4 {
+                        let mut out_shape = in_shape;
+                        for (i, chunk) in reps_bytes.chunks_exact(4).enumerate() {
+                            if i < out_shape.len() {
+                                let rep =
+                                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                        as usize;
+                                if let Some(d) = out_shape[i] {
+                                    out_shape[i] = Some(d * rep);
+                                }
+                            }
+                        }
+                        if let Some(Some(ty)) = op.output_types.first_mut() {
+                            ty.shape = out_shape.clone();
+                        }
+                        // Update local_types for downstream ops.
+                        if let Some(out_name) = op.outputs.first() {
+                            local_types.insert(out_name.clone(), out_shape);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Rename variables to ANE-friendly names per sub-program.
     let _ = AneVariableNamingPass.run(&mut program);
 
     let (mil_text, weight_entries) = program_to_mil_text(&program, mil_config).map_err(|e| {

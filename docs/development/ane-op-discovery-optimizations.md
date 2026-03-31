@@ -95,46 +95,7 @@ precision than the tanh approximation (0.001 vs 0.01 max error).
 
 ---
 
-## 3. INT8 Activation Quantization Pipeline
-
-**Enabled by:** `quantize` ✅ eval · `dequantize` ✅ eval · `cast fp16↔int8`
-✅ eval · `round` ✅ eval · `clip` ✅ eval
-
-### Problem
-
-ANE SRAM bandwidth is the throughput bottleneck for large models. FP16
-activations between layers consume 2 bytes per element through L2 SRAM.
-
-### What ironmill can do
-
-maderix demonstrated 1.88× throughput via INT8 W8A8 activation caching on
-M4. ironmill has now independently verified the full
-`quantize → dequantize` pipeline works on ANE, including in multi-op contexts
-(add→quantize→dequantize passes with max_err=0.0).
-
-Insert quantize/dequantize pairs between layers to halve SRAM bandwidth:
-
-```
-Layer N output (fp16) → quantize (int8) → [stored in SRAM at 1 byte/elem]
-                                         → dequantize (fp16) → Layer N+1 input
-```
-
-### Implementation
-
-- `ActivationQuantizationPass`: insert `quantize`/`dequantize` pairs between
-  transformer layers in the ANE-direct emitter
-- Extend TurboQuant from KV-cache-only to full activation INT8 caching
-- CLI flag: `--activation-quant int8`
-- Quality gate: measure perplexity impact from INT8 activation rounding
-
-### Expected impact
-
-1.5-2× throughput for memory-bandwidth-bound models on ANE, based on
-maderix's empirical results (18.6 TOPS FP16 → 35.1 TOPS INT8 W8A8).
-
----
-
-## 4. On-ANE Causal Attention Masking
+## 3. On-ANE Causal Attention Masking
 
 **Enabled by:** `greater` ✅ · `greater_equal` ✅ · `less` ✅ · `select` ✅ ·
 `cast fp16↔bool` ✅ · `logical_not` ✅
@@ -181,7 +142,7 @@ If the full attention block stays on ANE, the CPU roundtrip for masking
 
 ---
 
-## 5. `log` for On-ANE Loss & Log-Softmax
+## 4. `log` for On-ANE Loss & Log-Softmax
 
 **Enabled by:** `log(epsilon)` ✅ eval (max_err=0.005)
 
@@ -209,7 +170,7 @@ compiler rejects `log`; with it, `log` compiles and produces correct results.
 
 ---
 
-## 6. Single-Op Normalization via `reduce_l2_norm`
+## 5. Single-Op Normalization via `reduce_l2_norm`
 
 **Enabled by:** `reduce_l2_norm` ✅ compile · `reduce_log_sum_exp` ✅ eval
 
@@ -228,7 +189,7 @@ compiler rejects `log`; with it, `log` compiles and produces correct results.
 
 ---
 
-## 7. `pad` for Causal Convolution & Shape Alignment
+## 6. `pad` for Causal Convolution & Shape Alignment
 
 **Enabled by:** `pad` ✅ eval (max_err=0.025)
 
@@ -242,7 +203,7 @@ compiler rejects `log`; with it, `log` compiles and produces correct results.
 
 ---
 
-## 8. `inverse` for Direct Reciprocal
+## 7. `inverse` for Direct Reciprocal
 
 **Enabled by:** `inverse(epsilon)` ✅ eval (max_err=0.001)
 
@@ -261,7 +222,6 @@ any reciprocal computation.
 |---|---|---|---|
 | Full-ANE transformer (no CPU norm) | `layer_norm`, `rsqrt(eps)` | ❌ CPU fallback | ✅ |
 | Native exact GELU | `erf` | ❌ 7-op tanh decomp | ✅ 5-op exact |
-| INT8 activation pipeline | `quantize`, `dequantize` | ❌ unverified | ✅ 1.88× potential |
 | On-ANE causal masking | `greater`, `select`, bool cast | ❌ CPU masking | ✅ |
 | On-ANE logarithm | `log(eps)` | ❌ not possible | ✅ |
 | Single-op L2 norm | `reduce_l2_norm` | ❌ 4-op decomp | ✅ 2-op |

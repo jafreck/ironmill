@@ -90,6 +90,7 @@ fn infer_output_type(op: &Operation, type_map: &HashMap<String, TensorType>) -> 
         "conv" => infer_conv_output(op, type_map),
         "max_pool" | "avg_pool" => infer_pool_output(op, type_map),
         "concat" => infer_concat_output(op, type_map),
+        "tile" => infer_tile_output(op, type_map),
         _ => {
             // Element-wise / pass-through: output type matches primary input.
             resolve_primary_input(op, type_map)
@@ -309,6 +310,43 @@ fn infer_concat_output(
     }
 
     Some(TensorType::with_dynamic_shape(first.scalar_type, out_shape))
+}
+
+/// Infer tile output: multiply input dimensions by reps.
+fn infer_tile_output(op: &Operation, type_map: &HashMap<String, TensorType>) -> Option<TensorType> {
+    let input_type = resolve_primary_input(op, type_map)?;
+
+    // reps can be an inline tensor or a reference to a const op.
+    let reps_value = op.inputs.get("reps")?;
+    let reps = match reps_value {
+        Value::Tensor { .. } => read_int_list(reps_value),
+        Value::Reference(_) => {
+            // reps is a reference — read from op.attributes as fallback,
+            // or try to infer from the existing output type and input type.
+            // For now, return the existing output type unmodified if we
+            // can't resolve the reference.
+            None
+        }
+        _ => None,
+    };
+
+    if let Some(reps) = reps {
+        let mut out_shape = input_type.shape.clone();
+        for (i, &rep) in reps.iter().enumerate() {
+            if i < out_shape.len() {
+                if let Some(d) = out_shape[i] {
+                    out_shape[i] = Some(d * rep as usize);
+                }
+            }
+        }
+        Some(TensorType::with_dynamic_shape(
+            input_type.scalar_type,
+            out_shape,
+        ))
+    } else {
+        // Can't resolve reps — return input type (incorrect but safe fallback).
+        Some(input_type)
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

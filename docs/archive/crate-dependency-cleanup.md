@@ -1,4 +1,4 @@
-# Crate Dependency Cleanup
+# Crate Dependency Cleanup — COMPLETED
 
 User-facing crates reach around the core layer (`ironmill-compile`,
 `ironmill-inference`) to depend directly on low-level crates (`mil-rs`,
