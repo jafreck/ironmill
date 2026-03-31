@@ -1,5 +1,24 @@
 # ANE Op Discovery–Driven Optimizations
 
+> **⚠️ ARCHIVED — marginal impact.** These optimizations reduce op counts
+> within ANE sub-programs, but the dominant decode bottleneck is
+> **dispatch overhead** (~0.095ms × 3 dispatches/layer × N layers). At 28
+> layers that's ~8ms/token of pure dispatch cost. Intra-program op count
+> reductions (erf GELU, single-op reductions, inverse) are negligible
+> against this. The high-value optimization — reducing dispatch count via
+> sub-program fusion (pre_attn + attn + post_attn → 1 dispatch/layer) or
+> multi-layer fusion — is not covered here.
+>
+> Additionally, the "INT8 Activation Quantization Pipeline" section was
+> removed: it attributed a fabricated 1.88× W8A8 throughput claim to
+> maderix, whose actual findings show INT8 delivers no speedup over FP16
+> on ANE (the ANE dequantizes INT8 to FP16 before compute).
+>
+> Of the original 8 optimizations, only `pad` (#6) is already
+> implemented. Optimization #1 (zero CPU normalization) is largely
+> already realized — per-layer norms run on ANE; only the final norm
+> before lm_head remains on CPU.
+
 Concrete optimizations unlocked by ironmill's 52 novel ANE op discoveries.
 These capabilities are unique to ironmill - no other open-source project
 (maderix/ANE, Orion, Espresso, ANEgpt, hollance/neural-engine) has verified
