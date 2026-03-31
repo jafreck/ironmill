@@ -12,6 +12,8 @@ use mil_rs::ir::ScalarType;
 #[cfg(feature = "compile")]
 use ironmill_compile::ane::blobfile::BlobFileWriter;
 #[cfg(feature = "compile")]
+use ironmill_compile::ane::bundle::{AneCompileConfig, compile_model_bundle};
+#[cfg(feature = "compile")]
 use ironmill_compile::ane::cache::ProgramCache;
 #[cfg(feature = "compile")]
 use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
@@ -114,133 +116,21 @@ struct SubProgramMeta {
 impl<D: AneDevice> AneModel<D> {
     /// Compile a model from ironmill IR and load it for execution.
     ///
-    /// Pipeline:
-    /// 1. Run ANE-specific passes (op substitution, layout, attention decompose,
-    ///    concat elimination, variable naming)
-    /// 2. Split into sub-programs
-    /// 3. For each sub-program:
-    ///    a. Emit MIL text + collect weight blob entries
-    ///    b. Write BLOBFILE
-    ///    c. Check cache — skip compilation if cached
-    ///    d. Compile MIL text (or load from cache)
-    ///    e. Load compiled program into runtime
-    ///    f. Pre-allocate IOSurface tensors for I/O
-    /// 4. Return the assembled `AneModel`
+    /// Delegates to `compile_model_bundle()` to run the full ANE compilation
+    /// pipeline, saves to a temporary directory, then loads via `from_bundle()`.
     pub fn compile_and_load(
         device: Arc<D>,
         program: &mil_rs::ir::Program,
         config: AneConfig,
     ) -> Result<Self> {
-        // 1. Clone and run ANE-specific passes
-        let mut program = program.clone();
-        let passes: &[(&str, &dyn Pass)] = &[
-            ("OpSubstitution", &OpSubstitutionPass),
-            ("AneLayout", &AneLayoutPass),
-            ("AttentionDecompose", &AttentionDecomposePass),
-            ("AneConcatElimination", &AneConcatEliminationPass),
-            ("AneVariableNaming", &AneVariableNamingPass),
-        ];
-        for (name, pass) in passes {
-            pass.run(&mut program)
-                .map_err(|e| AneError::Other(anyhow::anyhow!("{name} pass failed: {e}")))?;
-        }
-
-        // 2. Split into sub-programs
-        let split_config = SplitConfig::default();
-        let model_split = split_for_ane(&program, &split_config)?;
-
-        // 3. Initialize cache
-        let mut cache = ProgramCache::new(config.cache_dir.clone(), config.max_programs);
-
-        // 4. Process each sub-program
-        let mil_config = MilTextConfig::default();
-        let mut loaded_subs = Vec::new();
-        let work_dir = tempfile::tempdir()
+        let bundle = compile_model_bundle(program, &AneCompileConfig::default())?;
+        let tmp = tempfile::tempdir()
             .map_err(|e| AneError::Other(anyhow::anyhow!("failed to create work dir: {e}")))?;
-
-        for sub in &model_split.programs {
-            // 4a. Emit MIL text + weight entries
-            let (mil_text, weight_entries) = program_to_mil_text(&sub.program, &mil_config)
-                .map_err(|e| {
-                    AneError::Other(anyhow::anyhow!(
-                        "MIL text emission failed for {}: {e}",
-                        sub.name
-                    ))
-                })?;
-
-            // 4b. Collect raw weight data for the compiler's weight dict.
-            let weight_refs: Vec<(String, Vec<u8>)> = weight_entries
-                .iter()
-                .map(|e| (e.path.clone(), e.data.clone()))
-                .collect();
-
-            // 4c. Check cache and 4d. Compile (or load from cache)
-            let cache_key = ProgramCache::make_key(
-                &mil_text,
-                &weight_refs
-                    .iter()
-                    .flat_map(|(_, d)| d.iter())
-                    .copied()
-                    .collect::<Vec<_>>(),
-            );
-
-            let weight_slices: Vec<(&str, &[u8])> = weight_refs
-                .iter()
-                .map(|(path, data)| (path.as_str(), data.as_slice()))
-                .collect();
-
-            let compiled = device.compile(&mil_text, &weight_slices)?;
-            cache.record_compilation();
-            if !cache.contains(&cache_key) {
-                if let Some(disk_path) = cache.disk_path_for(&cache_key) {
-                    std::fs::create_dir_all(&disk_path).ok();
-                    cache.insert(cache_key, disk_path);
-                }
-            }
-
-            // 4f. Pre-allocate I/O tensors with uniform sizing
-            let input_shapes: Vec<_> = sub.inputs.iter().map(|td| (td.shape, td.dtype)).collect();
-            let output_shapes: Vec<_> = sub.outputs.iter().map(|td| (td.shape, td.dtype)).collect();
-            let input_alloc = uniform_alloc_size(&input_shapes);
-            let output_alloc = uniform_alloc_size(&output_shapes);
-
-            let input_tensors: Vec<AneTensor> = sub
-                .inputs
-                .iter()
-                .map(|td| {
-                    AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, input_alloc)
-                        .map_err(Into::into)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let output_tensors: Vec<AneTensor> = sub
-                .outputs
-                .iter()
-                .map(|td| {
-                    AneTensor::new_with_min_alloc(td.shape[1], td.shape[3], td.dtype, output_alloc)
-                        .map_err(Into::into)
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            loaded_subs.push(LoadedSubProgram {
-                program: compiled,
-                meta: SubProgramMeta {
-                    name: sub.name.clone(),
-                    inputs: sub.inputs.iter().map(TensorDescriptor::from).collect(),
-                    outputs: sub.outputs.iter().map(TensorDescriptor::from).collect(),
-                },
-                input_tensors,
-                output_tensors,
-            });
-        }
-
-        Ok(Self {
-            device,
-            sub_programs: loaded_subs,
-            #[cfg(feature = "compile")]
-            cache,
-            config,
-            _work_dir: work_dir,
-        })
+        let bundle_path = tmp.path().join("model.ironml");
+        bundle
+            .save(&bundle_path)
+            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to save bundle: {e}")))?;
+        Self::from_bundle(device, &bundle_path, config)
     }
 }
 
