@@ -388,6 +388,122 @@ impl AneTensor {
         Ok(out)
     }
 
+    /// Copy column 0 from this FP16 tensor into a contiguous region of an
+    /// INT8 cache tensor, converting FP16→INT8 in a single locked pass
+    /// with zero intermediate allocations.
+    ///
+    /// Reads `C` FP16 values at strided positions (column 0 of each channel
+    /// row in this `[1, C, 1, S]` tensor), converts each to INT8, and writes
+    /// `C` contiguous bytes into `dst` at the given offset.
+    pub fn copy_column0_fp16_as_int8_to(
+        &self,
+        dst: &mut AneTensor,
+        dst_byte_offset: usize,
+    ) -> crate::Result<()> {
+        let channels = self.shape[1];
+        let src_s = self.shape[3];
+        let src_stride_bytes = src_s * 2; // FP16 = 2 bytes per element
+
+        let end = dst_byte_offset.checked_add(channels).ok_or_else(|| {
+            IOSurfaceError::CopyFailed(
+                "copy_column0_fp16_as_int8_to: offset + channels overflows".into(),
+            )
+        })?;
+        if end > dst.alloc_size {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "copy_column0_fp16_as_int8_to: offset {} + channels {} = {} exceeds dst alloc ({})",
+                dst_byte_offset, channels, end, dst.alloc_size
+            )));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            unsafe {
+                // Lock src read-only.
+                let rc = ffi::IOSurfaceLock(
+                    self.surface,
+                    ffi::IOSURFACE_LOCK_READ_ONLY,
+                    std::ptr::null_mut(),
+                );
+                if rc != 0 {
+                    return Err(IOSurfaceError::LockFailed(format!(
+                        "copy_column0_fp16_as_int8_to: IOSurfaceLock(src) failed (status {rc})"
+                    )));
+                }
+                let src_base = ffi::IOSurfaceGetBaseAddress(self.surface);
+                if src_base.is_null() {
+                    ffi::IOSurfaceUnlock(
+                        self.surface,
+                        ffi::IOSURFACE_LOCK_READ_ONLY,
+                        std::ptr::null_mut(),
+                    );
+                    return Err(IOSurfaceError::LockFailed(
+                        "copy_column0_fp16_as_int8_to: src base address null".into(),
+                    ));
+                }
+
+                // Lock dst read-write.
+                let rc = ffi::IOSurfaceLock(dst.surface, 0, std::ptr::null_mut());
+                if rc != 0 {
+                    ffi::IOSurfaceUnlock(
+                        self.surface,
+                        ffi::IOSURFACE_LOCK_READ_ONLY,
+                        std::ptr::null_mut(),
+                    );
+                    return Err(IOSurfaceError::LockFailed(format!(
+                        "copy_column0_fp16_as_int8_to: IOSurfaceLock(dst) failed (status {rc})"
+                    )));
+                }
+                let dst_base = ffi::IOSurfaceGetBaseAddress(dst.surface);
+                if dst_base.is_null() {
+                    ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut());
+                    ffi::IOSurfaceUnlock(
+                        self.surface,
+                        ffi::IOSURFACE_LOCK_READ_ONLY,
+                        std::ptr::null_mut(),
+                    );
+                    return Err(IOSurfaceError::LockFailed(
+                        "copy_column0_fp16_as_int8_to: dst base address null".into(),
+                    ));
+                }
+
+                let src_ptr = src_base as *const u8;
+                let dst_ptr = (dst_base as *mut u8).add(dst_byte_offset);
+
+                for c in 0..channels {
+                    let mut fp16_bytes = [0u8; 2];
+                    std::ptr::copy_nonoverlapping(
+                        src_ptr.add(c * src_stride_bytes),
+                        fp16_bytes.as_mut_ptr(),
+                        2,
+                    );
+                    let val = f16::from_le_bytes(fp16_bytes);
+                    // Values are already rounded/clamped to [-128, 127] by MIL program.
+                    *dst_ptr.add(c) = val.to_f32() as i8 as u8;
+                }
+
+                ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut());
+                ffi::IOSurfaceUnlock(
+                    self.surface,
+                    ffi::IOSURFACE_LOCK_READ_ONLY,
+                    std::ptr::null_mut(),
+                );
+            }
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            for c in 0..channels {
+                let src_off = c * src_stride_bytes;
+                let bytes = [self.buffer[src_off], self.buffer[src_off + 1]];
+                let val = f16::from_le_bytes(bytes);
+                dst.buffer[dst_byte_offset + c] = val.to_f32() as i8 as u8;
+            }
+            Ok(())
+        }
+    }
+
     /// Raw IOSurface pointer for ANE API calls.
     #[cfg(target_os = "macos")]
     pub fn as_ptr(&self) -> *mut c_void {
@@ -721,5 +837,90 @@ mod tests {
 
         let col0 = t.read_column0_f16().unwrap();
         assert_eq!(col0, data.to_vec());
+    }
+
+    #[test]
+    fn copy_column0_fp16_as_int8_basic() {
+        // Source: FP16 tensor [1, 4, 1, 32] with INT8-range values in col 0.
+        let mut src = AneTensor::new(4, 32, ScalarType::Float16).unwrap();
+        let mut src_data = vec![f16::ZERO; 4 * 32];
+        // Set column 0 values: indices 0, 32, 64, 96 (stride = 32).
+        src_data[0] = f16::from_f32(-128.0);
+        src_data[32] = f16::from_f32(0.0);
+        src_data[64] = f16::from_f32(42.0);
+        src_data[96] = f16::from_f32(127.0);
+        src.write_f16(&src_data).unwrap();
+
+        // Dest: INT8 tensor [1, 4, 1, 64].
+        let mut dst = AneTensor::new(4, 64, ScalarType::Int8).unwrap();
+
+        // Copy to byte offset 12 (simulating seq_pos=3, C=4 → offset=3*4=12).
+        src.copy_column0_fp16_as_int8_to(&mut dst, 12).unwrap();
+
+        let result = dst.read_bytes_at(12, 4).unwrap();
+        assert_eq!(result[0], (-128i8) as u8);
+        assert_eq!(result[1], 0u8);
+        assert_eq!(result[2], 42u8);
+        assert_eq!(result[3], 127u8);
+    }
+
+    #[test]
+    fn copy_column0_fp16_as_int8_negative_values() {
+        let mut src = AneTensor::new(3, 32, ScalarType::Float16).unwrap();
+        let mut src_data = vec![f16::ZERO; 3 * 32];
+        src_data[0] = f16::from_f32(-1.0);
+        src_data[32] = f16::from_f32(-50.0);
+        src_data[64] = f16::from_f32(100.0);
+        src.write_f16(&src_data).unwrap();
+
+        let mut dst = AneTensor::new(3, 32, ScalarType::Int8).unwrap();
+        src.copy_column0_fp16_as_int8_to(&mut dst, 0).unwrap();
+
+        let result = dst.read_bytes_at(0, 3).unwrap();
+        assert_eq!(result[0], (-1i8) as u8);
+        assert_eq!(result[1], (-50i8) as u8);
+        assert_eq!(result[2], 100u8);
+    }
+
+    #[test]
+    fn copy_column0_fp16_as_int8_matches_manual_path() {
+        let channels = 8;
+        let src_s = 32;
+        let dst_s = 64;
+        let mut src = AneTensor::new(channels, src_s, ScalarType::Float16).unwrap();
+
+        let test_values: Vec<f16> = [-128.0, -64.0, -1.0, 0.0, 1.0, 42.0, 100.0, 127.0]
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
+
+        let mut src_data = vec![f16::ZERO; channels * src_s];
+        for (c, val) in test_values.iter().enumerate() {
+            src_data[c * src_s] = *val;
+        }
+        src.write_f16(&src_data).unwrap();
+
+        // Old path: read → convert → write.
+        let col0 = src.read_column0_f16().unwrap();
+        let old_bytes: Vec<u8> = col0.iter().map(|v| (v.to_f32() as i8) as u8).collect();
+        let mut dst_old = AneTensor::new(channels, dst_s, ScalarType::Int8).unwrap();
+        dst_old.write_bytes_at(16, &old_bytes).unwrap();
+
+        // New path: direct copy.
+        let mut dst_new = AneTensor::new(channels, dst_s, ScalarType::Int8).unwrap();
+        src.copy_column0_fp16_as_int8_to(&mut dst_new, 16).unwrap();
+
+        // Compare.
+        let old_result = dst_old.read_bytes_at(16, channels).unwrap();
+        let new_result = dst_new.read_bytes_at(16, channels).unwrap();
+        assert_eq!(old_result, new_result, "direct copy must match manual path");
+    }
+
+    #[test]
+    fn copy_column0_fp16_as_int8_overflow_errors() {
+        let src = AneTensor::new(4, 32, ScalarType::Float16).unwrap();
+        let mut dst = AneTensor::new(4, 8, ScalarType::Int8).unwrap();
+        // dst alloc = max(4*8, 16384) = 16384. Writing 4 bytes at offset 16384 overflows.
+        assert!(src.copy_column0_fp16_as_int8_to(&mut dst, 16384).is_err());
     }
 }

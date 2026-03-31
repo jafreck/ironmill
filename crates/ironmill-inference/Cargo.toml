@@ -23,3 +23,15 @@ tempfile = { workspace = true }
 [features]
 default = []
 int4 = []
+
+[[example]]
+name = "ane_op_eval"
+path = "examples/ane_op_eval.rs"
+
+[[example]]
+name = "turboquant_bench"
+path = "examples/turboquant_bench.rs"
+
+[[example]]
+name = "turboquant_e2e_bench"
+path = "examples/turboquant_e2e_bench.rs"

@@ -1,4 +1,8 @@
-//! TurboQuant INT8 KV cache compression configuration and KV cache management.
+//! TurboQuant KV cache compression configuration and KV cache management.
+//!
+//! The KV cache stores INT8 values (1 byte/element) produced by rotation +
+//! Beta-optimal scalar quantization. The ANE attention program casts INT8→FP16
+//! inline, eliminating CPU format conversions while retaining 2× memory savings.
 
 use ironmill_ane_sys::AneCompiler;
 use mil_rs::ir::ScalarType;
@@ -14,12 +18,11 @@ use crate::ane::{AneError, Result};
 use ironmill_ane_sys::LoadedProgram;
 use ironmill_iosurface::AneTensor;
 
-/// Configuration for TurboQuant INT8 KV cache compression.
+/// Configuration for TurboQuant KV cache compression.
 ///
 /// Controls runtime KV cache quantization using rotation + Beta-optimal
-/// scalar quantization. Storage format is always INT8 (1 byte/element);
-/// `n_bits` controls the number of distinct quantization levels within
-/// the INT8 range.
+/// scalar quantization. Storage format is INT8 (1 byte/element);
+/// `n_bits` controls the number of distinct quantization levels.
 #[derive(Clone)]
 pub struct TurboQuantConfig {
     /// Number of quantization bits (1, 2, 4, 6, or 8).
@@ -119,11 +122,14 @@ impl TurboQuantConfig {
     }
 }
 
-/// Manages per-layer INT8 KV caches with TurboQuant quantization.
+/// Manages per-layer INT8 KV caches with TurboQuant compression.
+///
+/// Cache tensors store INT8 quantized values (1 byte/element). The ANE
+/// attention program casts INT8→FP16 inline before dequantization.
 #[allow(dead_code)]
 pub struct KvCacheManager {
     config: TurboQuantConfig,
-    /// Per-layer K caches: [num_kv_heads, max_seq_len, head_dim] as INT8.
+    /// Per-layer K caches: [num_kv_heads * head_dim, max_seq_len] as INT8.
     k_caches: Vec<AneTensor>,
     /// Per-layer V caches (same format).
     v_caches: Vec<AneTensor>,
@@ -216,7 +222,7 @@ impl KvCacheManager {
         })
     }
 
-    /// Write one token's worth of quantized K and V data into `layer`'s
+    /// Write one token's worth of INT8-quantized K and V data into `layer`'s
     /// caches at the current sequence position.
     ///
     /// When QJL is enabled, also computes and stores residual signs:
@@ -310,6 +316,67 @@ impl KvCacheManager {
     pub fn reset(&mut self) {
         self.seq_pos = 0;
     }
+
+    /// Write one token's cached K/V data directly from cache-write output
+    /// IOSurface tensors into the persistent INT8 cache.
+    ///
+    /// Performs an IOSurface-to-IOSurface strided copy with FP16→INT8
+    /// conversion in a single locked pass per tensor, eliminating the
+    /// intermediate `Vec<f16>` and `Vec<u8>` allocations from the old
+    /// `read_column0_f16` → convert → `write_bytes_at` path.
+    ///
+    /// When QJL is enabled, `k_original` must be provided for residual
+    /// sign computation.
+    ///
+    /// **Does not advance `seq_pos`.** Call [`advance_seq_pos`] once after
+    /// all layers have been updated for a given token.
+    pub fn update_cache_direct(
+        &mut self,
+        layer: usize,
+        cw_k_output: &AneTensor,
+        cw_v_output: &AneTensor,
+        k_original: Option<&[f16]>,
+    ) -> Result<()> {
+        if layer >= self.config.num_layers {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "layer index {layer} out of range (num_layers = {})",
+                self.config.num_layers
+            )));
+        }
+
+        if self.seq_pos >= self.config.max_seq_len {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "KV cache full: seq_pos {} >= max_seq_len {}",
+                self.seq_pos,
+                self.config.max_seq_len
+            )));
+        }
+
+        let token_elements = self.config.num_kv_heads * self.config.head_dim;
+        let byte_offset = self.seq_pos * token_elements;
+
+        // Direct IOSurface-to-IOSurface copy with FP16→INT8 conversion.
+        cw_k_output.copy_column0_fp16_as_int8_to(&mut self.k_caches[layer], byte_offset)?;
+        cw_v_output.copy_column0_fp16_as_int8_to(&mut self.v_caches[layer], byte_offset)?;
+
+        // QJL residual sign computation (still requires CPU read-back).
+        if let (Some(sign_caches), Some(k_orig)) = (&mut self.qjl_sign_caches, k_original) {
+            // Read back the quantized bytes we just wrote for dequant comparison.
+            let k_quantized = self.k_caches[layer].read_bytes_at(byte_offset, token_elements)?;
+            let signs = compute_qjl_signs(
+                &k_quantized,
+                k_orig,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.deq_scale,
+                self.config.rotation_seed,
+            );
+            let elem_offset = self.seq_pos * token_elements;
+            sign_caches[layer].write_f16_at(elem_offset, &signs)?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Compute QJL residual signs: `sign(K_original - K_dequantized)`.
@@ -358,32 +425,31 @@ fn compute_qjl_signs(
 ///
 /// Holds compiled cache-write (rotate + quantize) and attention (dequant +
 /// attention) sub-programs together with a [`KvCacheManager`] and an
-/// [`AneRuntime`] handle.
+/// [`AneRuntime`] handle. The KV cache stores INT8 values (1 byte/element);
+/// the ANE attention program casts INT8→FP16 inline before dequantization.
+///
+/// All TQ-facing tensors share a single uniform allocation size
+/// (`tq_alloc_size`), enabling zero-copy IOSurface passing from pre_attn
+/// outputs directly into cache-write and attention eval calls.
 #[allow(dead_code)]
 pub struct TurboQuantModel {
     config: TurboQuantConfig,
     cache: KvCacheManager,
-    /// Compiled cache-write sub-program (rotate + quantize K/V to INT8).
+    /// Compiled cache-write sub-program (rotate + quantize K/V).
     cache_write_program: LoadedProgram,
-    /// Compiled attention sub-program (dequant + attention).
+    /// Compiled attention sub-program (dequant + Q-rotate + attention + output un-rotate).
     attention_program: LoadedProgram,
     /// Optional QJL correction program.
     qjl_program: Option<LoadedProgram>,
-    /// Rotation matrix as IOSurface tensor (input to cache-write program).
+    /// Rotation matrix as IOSurface tensor (shared by cache-write and attention).
+    /// Cache-write uses it to rotate K/V before quantization.
+    /// Attention uses it to rotate Q and un-rotate the output.
     rotation_tensor: AneTensor,
-    /// Inverse rotation matrix as IOSurface tensor (input to attention program).
-    unrotation_tensor: AneTensor,
-    /// Uniform allocation size for cache-write program inputs/outputs.
-    cw_alloc_size: usize,
-    /// Uniform allocation size for attention program inputs/outputs.
-    attn_alloc_size: usize,
-    /// Staging buffers for external tensors that need alloc-size alignment.
-    /// ANE requires all input IOSurfaces in a single eval call to have
-    /// the same allocation size. Pre-attn outputs may have a different
-    /// alloc size, so we copy into these staging buffers before eval.
-    cw_k_staging: AneTensor,
-    cw_v_staging: AneTensor,
-    attn_q_staging: AneTensor,
+    /// Uniform allocation size shared by all TQ input tensors.
+    /// Pre-attn outputs must be allocated with this size for zero-copy.
+    tq_alloc_size: usize,
+    /// Uniform allocation size for cache-write outputs (may be smaller).
+    cw_output_alloc_size: usize,
     /// Pre-allocated cache-write output for K (reused across calls).
     cw_k_output: AneTensor,
     /// Pre-allocated cache-write output for V (reused across calls).
@@ -415,7 +481,18 @@ impl TurboQuantModel {
         let cache_write_program = runtime.load_program(&cw_compiled)?;
 
         // --- attention sub-program ---
-        let (attn_mil, attn_weights) = mil_emitter::emit_attention_mil(&config, config.max_seq_len);
+        let deq_scale = mil_emitter::compute_deq_scale(head_dim, config.n_bits);
+        let attn_config = mil_emitter::AttentionMilConfig {
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim,
+            max_seq_len: config.max_seq_len,
+            seq_len: config.max_seq_len,
+            dequant_scale: Some(deq_scale),
+            unrotation_seed: Some(config.rotation_seed),
+            cache_int8: true,
+        };
+        let (attn_mil, _attn_weights) = mil_emitter::emit_attention_mil(&attn_config);
         let attn_compiled =
             AneCompiler::compile_mil_text(&attn_mil, &[]).map_err(|e| AneError::CompileFailed {
                 status: 0,
@@ -438,83 +515,58 @@ impl TurboQuantModel {
             None
         };
 
-        // --- Compute uniform alloc sizes (ANE requires all tensors in one eval
-        //     to have the same allocation) ---
+        // --- Compute uniform alloc size (ANE requires all input tensors in
+        //     one eval to share the same allocation size) ---
+        //
+        // Use a single alloc size across both cache-write and attention
+        // input tensors. Pre-attn outputs are allocated with this same size,
+        // enabling zero-copy IOSurface passing (no staging copies).
         let kv_ch = config.num_kv_heads * head_dim;
         let q_ch = config.num_heads * head_dim;
 
-        // Cache-write inputs: K[kv_ch,S] fp16, V[kv_ch,S] fp16, R[hd,hd] fp16
-        // Cache-write outputs: K_q[kv_ch,S] fp16, V_q[kv_ch,S] fp16
-        let cw_alloc_size = ironmill_iosurface::uniform_alloc_size(&[
-            ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
-            ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
-            ([1, 1, head_dim, head_dim], ScalarType::Float16),
+        let tq_alloc_size = ironmill_iosurface::uniform_alloc_size(&[
+            // Cache-write inputs
+            ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16), // K_proj
+            ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16), // V_proj
+            ([1, 1, head_dim, head_dim], ScalarType::Float16), // rotation matrix
+            // Attention inputs (rotation_matrix is shared, same shape)
+            ([1, q_ch, 1, MIN_IO_SEQ], ScalarType::Float16), // Q
+            ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8), // K cache (INT8)
+            ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8), // V cache (INT8)
         ]);
 
-        // Attention inputs: Q[q_ch,S] fp16, K_cache[kv_ch,max_seq] i8,
-        //   V_cache[kv_ch,max_seq] i8, R_inv[hd,hd] fp16
-        // Attention output: out[q_ch,S] fp16
-        let attn_alloc_size = ironmill_iosurface::uniform_alloc_size(&[
-            ([1, q_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
-            ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),
-            ([1, kv_ch, 1, config.max_seq_len], ScalarType::Int8),
-            ([1, 1, head_dim, head_dim], ScalarType::Float16),
+        // Cache-write outputs only need to be uniform with each other.
+        let cw_output_alloc_size = ironmill_iosurface::uniform_alloc_size(&[
+            ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
+            ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
         ]);
 
-        // --- KV cache with uniform attention alloc ---
-        let cache = KvCacheManager::new_with_alloc(config.clone(), attn_alloc_size)?;
+        // --- KV cache with uniform alloc ---
+        let cache = KvCacheManager::new_with_alloc(config.clone(), tq_alloc_size)?;
 
-        // --- Rotation matrix IOSurface tensors ---
+        // --- Rotation matrix IOSurface tensor (shared by cache-write and attention) ---
+        // Q-rotation approach: the attention program uses the SAME rotation
+        // matrix as cache-write (to rotate Q and un-rotate output), not the
+        // inverse. This eliminates the need for a separate unrotation tensor.
         let rot_data = &cw_weights[0].1;
         let mut rotation_tensor =
-            AneTensor::new_with_min_alloc(head_dim, head_dim, ScalarType::Float16, cw_alloc_size)?;
+            AneTensor::new_with_min_alloc(head_dim, head_dim, ScalarType::Float16, tq_alloc_size)?;
         rotation_tensor.write_bytes_at(0, rot_data)?;
-
-        let unrot_data = &attn_weights[0].1;
-        let mut unrotation_tensor = AneTensor::new_with_min_alloc(
-            head_dim,
-            head_dim,
-            ScalarType::Float16,
-            attn_alloc_size,
-        )?;
-        unrotation_tensor.write_bytes_at(0, unrot_data)?;
-
-        // Pre-allocate staging buffers for external tensors (Q, K_proj, V_proj)
-        // that arrive from pre-attn sub-programs with a different alloc size.
-        let kv_channels = config.num_kv_heads * head_dim;
-        let q_channels = config.num_heads * head_dim;
-        let cw_k_staging = AneTensor::new_with_min_alloc(
-            kv_channels,
-            MIN_IO_SEQ,
-            ScalarType::Float16,
-            cw_alloc_size,
-        )?;
-        let cw_v_staging = AneTensor::new_with_min_alloc(
-            kv_channels,
-            MIN_IO_SEQ,
-            ScalarType::Float16,
-            cw_alloc_size,
-        )?;
-        let attn_q_staging = AneTensor::new_with_min_alloc(
-            q_channels,
-            MIN_IO_SEQ,
-            ScalarType::Float16,
-            attn_alloc_size,
-        )?;
 
         // Pre-allocate output tensors for step_attention() reuse.
         // These are overwritten on every eval call, so sharing across layers is safe.
+        let kv_channels = config.num_kv_heads * head_dim;
         let cw_k_output = AneTensor::new_with_min_alloc(
             kv_channels,
             MIN_IO_SEQ,
             ScalarType::Float16,
-            cw_alloc_size,
+            cw_output_alloc_size,
         )?;
         let cw_v_output = AneTensor::new_with_min_alloc(
             kv_channels,
             MIN_IO_SEQ,
             ScalarType::Float16,
-            cw_alloc_size,
+            cw_output_alloc_size,
         )?;
 
         Ok(Self {
@@ -524,12 +576,8 @@ impl TurboQuantModel {
             attention_program,
             qjl_program,
             rotation_tensor,
-            unrotation_tensor,
-            cw_alloc_size,
-            attn_alloc_size,
-            cw_k_staging,
-            cw_v_staging,
-            attn_q_staging,
+            tq_alloc_size,
+            cw_output_alloc_size,
             cw_k_output,
             cw_v_output,
             runtime,
@@ -570,6 +618,9 @@ impl TurboQuantModel {
     /// Takes Q, K_proj, V_proj as fp16 [`AneTensor`]s (single token).
     /// Returns attention output as fp16 [`AneTensor`].
     ///
+    /// Uses direct IOSurface-to-IOSurface copy for the cache update,
+    /// eliminating intermediate heap allocations.
+    ///
     /// **Note:** Does not advance `seq_pos`. Use [`step`] for full-model
     /// inference, which advances after all layers.
     pub fn step_attention(
@@ -579,60 +630,96 @@ impl TurboQuantModel {
         k_proj: &AneTensor,
         v_proj: &AneTensor,
     ) -> Result<AneTensor> {
-        // Copy column 0 directly from external tensors into staging buffers.
-        // ANE requires all input IOSurfaces in a single eval to have the same
-        // allocation size. Pre-attn outputs may have a different alloc size.
-        // Direct IOSurface-to-IOSurface strided copy avoids CPU Vec intermediaries.
-        self.cw_k_staging.copy_column0_from(k_proj)?;
-        self.cw_v_staging.copy_column0_from(v_proj)?;
-
         // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
+        //    Pre-attn outputs share tq_alloc_size, so no staging copy needed.
         self.runtime.eval(
             &self.cache_write_program,
-            &[
-                &self.cw_k_staging,
-                &self.cw_v_staging,
-                &self.rotation_tensor,
-            ],
+            &[k_proj, v_proj, &self.rotation_tensor],
             &mut [&mut self.cw_k_output, &mut self.cw_v_output],
         )?;
 
-        // 2. CPU cache interception: read fp16 values (rounded to integer),
-        //    convert to INT8 bytes, write to persistent cache.
-        //    Output is S=32 padded; read only column 0 to get actual values.
-        let k_f16 = self.cw_k_output.read_column0_f16()?;
-        let k_bytes: Vec<u8> = k_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
-        let v_f16 = self.cw_v_output.read_column0_f16()?;
-        let v_bytes: Vec<u8> = v_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
-
-        // Read original K_proj for QJL residual sign computation
+        // 2. Direct IOSurface-to-IOSurface copy: cache-write output → KV cache.
+        //    Reads FP16 column 0 from cache-write output, converts to INT8,
+        //    writes directly into cache IOSurface. Zero heap allocations.
         let k_original = if self.config.enable_qjl {
             Some(k_proj.read_f16()?)
         } else {
             None
         };
+        self.cache.update_cache_direct(
+            layer,
+            &self.cw_k_output,
+            &self.cw_v_output,
+            k_original.as_deref(),
+        )?;
 
-        self.cache
-            .update_cache(layer, &k_bytes, &v_bytes, k_original.as_deref())?;
-
-        // 3. Attention: Q + cached K/V + unrotation_matrix → output
-        self.attn_q_staging.copy_column0_from(q)?;
+        // 3. Attention: Q + cached K/V + rotation_matrix → output
+        //    Q shares tq_alloc_size with caches, so no staging copy needed.
+        //    The rotation matrix is used to rotate Q and un-rotate the output
+        //    (O(1) per token, instead of un-rotating the entire cache).
         let q_channels = self.config.num_heads * self.config.head_dim;
         let (k_cache, v_cache) = self.cache.cache_tensors(layer);
         let mut attn_out = AneTensor::new_with_min_alloc(
             q_channels,
             MIN_IO_SEQ,
             ScalarType::Float16,
-            self.attn_alloc_size,
+            self.tq_alloc_size,
         )?;
         self.runtime.eval(
             &self.attention_program,
-            &[
-                &self.attn_q_staging,
-                k_cache,
-                v_cache,
-                &self.unrotation_tensor,
-            ],
+            &[q, k_cache, v_cache, &self.rotation_tensor],
+            &mut [&mut attn_out],
+        )?;
+
+        Ok(attn_out)
+    }
+
+    /// Process one token through attention for a single layer (fused mode).
+    ///
+    /// In fused mode, the cache-write ops (rotation + quantization) have
+    /// been injected into the pre_attn sub-program, so K_quant and V_quant
+    /// arrive already quantized. This method skips the cache-write ANE eval
+    /// and goes directly to cache update + attention.
+    ///
+    /// `k_quant` and `v_quant` must be fp16 tensors with INT8-range values
+    /// (output of the fused cache-write chain in pre_attn).
+    ///
+    /// When QJL is enabled, `k_original` provides the unquantized K values
+    /// for residual sign computation.
+    pub fn step_attention_fused(
+        &mut self,
+        layer: usize,
+        q: &AneTensor,
+        k_quant: &AneTensor,
+        v_quant: &AneTensor,
+        k_original: Option<&AneTensor>,
+    ) -> Result<AneTensor> {
+        // 1. Direct IOSurface-to-IOSurface copy: pre_attn quantized output → KV cache.
+        let k_orig_data = if self.config.enable_qjl {
+            let t = k_original.ok_or_else(|| {
+                AneError::Other(anyhow::anyhow!(
+                    "QJL enabled but k_original not provided in fused mode"
+                ))
+            })?;
+            Some(t.read_f16()?)
+        } else {
+            None
+        };
+        self.cache
+            .update_cache_direct(layer, k_quant, v_quant, k_orig_data.as_deref())?;
+
+        // 2. Attention: Q + cached K/V + rotation_matrix → output
+        let q_channels = self.config.num_heads * self.config.head_dim;
+        let (k_cache, v_cache) = self.cache.cache_tensors(layer);
+        let mut attn_out = AneTensor::new_with_min_alloc(
+            q_channels,
+            MIN_IO_SEQ,
+            ScalarType::Float16,
+            self.tq_alloc_size,
+        )?;
+        self.runtime.eval(
+            &self.attention_program,
+            &[q, k_cache, v_cache, &self.rotation_tensor],
             &mut [&mut attn_out],
         )?;
 
@@ -664,13 +751,143 @@ impl TurboQuantModel {
         &self.config
     }
 
+    /// Required uniform allocation size for external tensors.
+    ///
+    /// All pre-attn output tensors (Q, K_proj, V_proj) must be allocated
+    /// with at least this size. This enables zero-copy IOSurface passing
+    /// directly into cache-write and attention eval calls.
+    pub fn alloc_size(&self) -> usize {
+        self.tq_alloc_size
+    }
+
     /// Required uniform allocation sizes for external tensors.
     ///
-    /// Returns `(cache_write_alloc, attention_alloc)`. All user-provided
-    /// tensors in a `step_attention` call must use these sizes:
-    /// - K_proj, V_proj: use `cache_write_alloc`
-    /// - Q: use `attention_alloc`
+    /// Returns `(tq_alloc_size, tq_alloc_size)`. Both values are the
+    /// same unified alloc size — kept as a pair for backward compatibility.
     pub fn alloc_sizes(&self) -> (usize, usize) {
-        (self.cw_alloc_size, self.attn_alloc_size)
+        (self.tq_alloc_size, self.tq_alloc_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mil_rs::ir::ScalarType;
+
+    fn test_config() -> TurboQuantConfig {
+        TurboQuantConfig {
+            n_bits: 8,
+            max_seq_len: 64,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 8,
+            num_layers: 2,
+            rotation_seed: 42,
+            enable_qjl: false,
+        }
+    }
+
+    #[test]
+    fn update_cache_direct_matches_update_cache() {
+        let config = test_config();
+        let channels = config.num_kv_heads * config.head_dim; // 32
+        let mut cache_old = KvCacheManager::new(config.clone()).unwrap();
+        let mut cache_new = KvCacheManager::new(config.clone()).unwrap();
+
+        // Create a mock cache-write output: FP16 [1, channels, 1, 32]
+        // with INT8-range values in column 0.
+        let mut cw_k = AneTensor::new(channels, 32, ScalarType::Float16).unwrap();
+        let mut cw_v = AneTensor::new(channels, 32, ScalarType::Float16).unwrap();
+
+        let mut k_data = vec![f16::ZERO; channels * 32];
+        let mut v_data = vec![f16::ZERO; channels * 32];
+        for c in 0..channels {
+            // Place INT8-range values in column 0 (offset c * 32).
+            k_data[c * 32] = f16::from_f32((c as i32 - 16) as f32);
+            v_data[c * 32] = f16::from_f32((c as i32 * 2 - 32) as f32);
+        }
+        cw_k.write_f16(&k_data).unwrap();
+        cw_v.write_f16(&v_data).unwrap();
+
+        // Old path: read → convert → write.
+        let k_f16 = cw_k.read_column0_f16().unwrap();
+        let k_bytes: Vec<u8> = k_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
+        let v_f16 = cw_v.read_column0_f16().unwrap();
+        let v_bytes: Vec<u8> = v_f16.iter().map(|v| (v.to_f32() as i8) as u8).collect();
+        cache_old.update_cache(0, &k_bytes, &v_bytes, None).unwrap();
+
+        // New path: direct.
+        cache_new
+            .update_cache_direct(0, &cw_k, &cw_v, None)
+            .unwrap();
+
+        // Compare: read back from both caches.
+        let byte_offset = 0; // seq_pos = 0
+        let old_k = cache_old.k_caches[0]
+            .read_bytes_at(byte_offset, channels)
+            .unwrap();
+        let new_k = cache_new.k_caches[0]
+            .read_bytes_at(byte_offset, channels)
+            .unwrap();
+        assert_eq!(old_k, new_k, "K cache: direct path must match old path");
+
+        let old_v = cache_old.v_caches[0]
+            .read_bytes_at(byte_offset, channels)
+            .unwrap();
+        let new_v = cache_new.v_caches[0]
+            .read_bytes_at(byte_offset, channels)
+            .unwrap();
+        assert_eq!(old_v, new_v, "V cache: direct path must match old path");
+    }
+
+    #[test]
+    fn update_cache_direct_multiple_positions() {
+        let config = test_config();
+        let channels = config.num_kv_heads * config.head_dim;
+        let mut cache = KvCacheManager::new(config).unwrap();
+
+        for pos in 0..4 {
+            let mut cw_k = AneTensor::new(channels, 32, ScalarType::Float16).unwrap();
+            let mut cw_v = AneTensor::new(channels, 32, ScalarType::Float16).unwrap();
+
+            let mut k_data = vec![f16::ZERO; channels * 32];
+            let mut v_data = vec![f16::ZERO; channels * 32];
+            for c in 0..channels {
+                k_data[c * 32] = f16::from_f32((pos * channels + c) as f32);
+                v_data[c * 32] = f16::from_f32(-((pos * channels + c) as f32));
+            }
+            cw_k.write_f16(&k_data).unwrap();
+            cw_v.write_f16(&v_data).unwrap();
+
+            cache.update_cache_direct(0, &cw_k, &cw_v, None).unwrap();
+            cache.advance_seq_pos();
+        }
+
+        assert_eq!(cache.seq_len(), 4);
+
+        // Verify token 2's data.
+        let byte_offset = 2 * channels;
+        let k_bytes = cache.k_caches[0]
+            .read_bytes_at(byte_offset, channels)
+            .unwrap();
+        for c in 0..channels {
+            let expected = (2 * channels + c) as i8 as u8;
+            assert_eq!(
+                k_bytes[c], expected,
+                "K cache mismatch at channel {c} for token 2"
+            );
+        }
+    }
+
+    #[test]
+    fn update_cache_direct_layer_bounds() {
+        let config = test_config();
+        let channels = config.num_kv_heads * config.head_dim;
+        let mut cache = KvCacheManager::new(config).unwrap();
+        let cw_k = AneTensor::new(channels, 32, ScalarType::Float16).unwrap();
+        let cw_v = AneTensor::new(channels, 32, ScalarType::Float16).unwrap();
+
+        // Layer 2 is out of bounds (num_layers = 2, valid indices are 0 and 1).
+        assert!(cache.update_cache_direct(2, &cw_k, &cw_v, None).is_err());
     }
 }

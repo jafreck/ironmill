@@ -50,7 +50,7 @@ fn fmt_shape(shape: &[usize]) -> String {
 /// Generate the Hadamard rotation matrix as fp16 bytes.
 ///
 /// Returns a `head_dim × head_dim` rotation matrix converted to fp16 LE bytes.
-fn generate_rotation_weights(head_dim: usize, seed: u64) -> Vec<u8> {
+pub(crate) fn generate_rotation_weights(head_dim: usize, seed: u64) -> Vec<u8> {
     let mut identity = vec![0.0f32; head_dim * head_dim];
     for i in 0..head_dim {
         identity[i * head_dim + i] = 1.0;
@@ -63,6 +63,9 @@ fn generate_rotation_weights(head_dim: usize, seed: u64) -> Vec<u8> {
 }
 
 /// Generate the inverse (un-rotation) matrix as fp16 bytes.
+///
+/// Used by QJL residual sign computation (CPU-side) when QJL is enabled.
+#[allow(dead_code)]
 fn generate_unrotation_weights(head_dim: usize, seed: u64) -> Vec<u8> {
     let mut identity = vec![0.0f32; head_dim * head_dim];
     for i in 0..head_dim {
@@ -79,7 +82,7 @@ fn generate_unrotation_weights(head_dim: usize, seed: u64) -> Vec<u8> {
 ///
 /// `inv_scale = 127.0 / max_level` where `max_level` is the largest
 /// Beta-optimal reconstruction level for the given dimension and bit-width.
-fn compute_inv_scale(head_dim: usize, n_bits: u8) -> f32 {
+pub(crate) fn compute_inv_scale(head_dim: usize, n_bits: u8) -> f32 {
     let levels = beta_optimal_levels(head_dim, n_bits);
     let max_level = levels.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     if max_level == 0.0 {
@@ -90,7 +93,7 @@ fn compute_inv_scale(head_dim: usize, n_bits: u8) -> f32 {
 }
 
 /// Compute the dequantization scale (inverse of `inv_scale`).
-fn compute_deq_scale(head_dim: usize, n_bits: u8) -> f32 {
+pub fn compute_deq_scale(head_dim: usize, n_bits: u8) -> f32 {
     let inv = compute_inv_scale(head_dim, n_bits);
     if inv == 0.0 { 1.0 } else { 1.0 / inv }
 }
@@ -301,283 +304,63 @@ fn emit_quantize_chain(
 // Attention sub-program
 // ---------------------------------------------------------------------------
 
-/// Generate MIL text for the cache-read + attention sub-program.
+/// Configuration for the unified attention MIL emitter.
 ///
-/// Reads INT8 cached K/V, dequantizes to fp16, un-rotates, and computes
-/// scaled dot-product attention.
+/// Controls whether dequantization and rotation stages are included
+/// in the generated MIL program.
+pub struct AttentionMilConfig {
+    /// Number of query attention heads.
+    pub num_heads: usize,
+    /// Number of KV attention heads (may differ for GQA).
+    pub num_kv_heads: usize,
+    /// Per-head dimension.
+    pub head_dim: usize,
+    /// Maximum sequence length (cache allocation size).
+    pub max_seq_len: usize,
+    /// Current sequence length to slice from the cache.
+    pub seq_len: usize,
+    /// When `Some(scale)`, emit `mul(deq_scale)` after slicing the cache.
+    pub dequant_scale: Option<f32>,
+    /// When `Some(seed)`, emit Hadamard rotation for Q and output un-rotation.
+    /// Uses the Q-rotation approach: rotate Q by R (O(1) per token) instead
+    /// of un-rotating the entire K/V cache by R⁻¹ (O(seq_len) per token).
+    /// The function will take an additional 4th input (rotation matrix)
+    /// and return the matrix as a weight blob.
+    pub unrotation_seed: Option<u64>,
+    /// When true, cache inputs are INT8 tensors and a `cast(int8→fp16)`
+    /// is emitted before any dequantization. This halves KV cache memory.
+    pub cache_int8: bool,
+}
+
+/// Generate MIL text for an attention sub-program.
 ///
-/// # Arguments
+/// Produces a unified program that handles TurboQuant and plain FP16
+/// attention based on the config:
 ///
-/// * `config` – TurboQuant configuration.
-/// * `seq_len` – Current sequence length to slice from the cache.
+/// - **TurboQuant (INT8 cache, Q-rotation)**: `cache_int8: true, dequant_scale: Some(..), unrotation_seed: Some(..)`
+///   → 4 inputs: Q(fp16), K_cache(int8), V_cache(int8), rotation_matrix(fp16)
+///   → pipeline: slice → cast(int8→fp16) → mul(deq_scale) → rotate Q → attention → un-rotate output
+///   → O(1) rotation per token instead of O(seq_len) cache un-rotation
+///
+/// - **FP16 baseline**: `cache_int8: false, dequant_scale: None, unrotation_seed: None`
+///   → 3 inputs: Q(fp16), K_cache(fp16), V_cache(fp16)
+///   → pipeline: slice → attention
 ///
 /// # Returns
 ///
-/// `(mil_text, weights)` where `weights` contains the inverse rotation matrix
-/// and dequantization constants.
-pub fn emit_attention_mil(
-    config: &TurboQuantConfig,
-    seq_len: usize,
-) -> (String, Vec<(String, Vec<u8>)>) {
+/// `(mil_text, weights)` where `weights` contains the rotation matrix
+/// when rotation is enabled (empty otherwise).
+pub fn emit_attention_mil(config: &AttentionMilConfig) -> (String, Vec<(String, Vec<u8>)>) {
     let head_dim = config.head_dim;
     let num_heads = config.num_heads;
     let num_kv_heads = config.num_kv_heads;
+    let seq_len = config.seq_len;
     let kv_ch = num_kv_heads * head_dim;
     let q_ch = num_heads * head_dim;
 
     let q_shape = fmt_shape(&[1, q_ch, 1, MIN_IO_SEQ]);
+    let cache_dtype = if config.cache_int8 { "int8" } else { "fp16" };
     let cache_shape = fmt_shape(&[1, kv_ch, 1, config.max_seq_len]);
-    let sliced_shape = fmt_shape(&[1, kv_ch, 1, seq_len]);
-    let rot_shape = fmt_shape(&[1, 1, head_dim, head_dim]);
-
-    let gqa_groups = num_heads / num_kv_heads; // >=1; validated by TurboQuantConfig
-    let kv_head_4d = fmt_shape(&[1, num_kv_heads, head_dim, seq_len]);
-    let attn_head_4d = fmt_shape(&[1, num_heads, head_dim, seq_len]);
-    let q_head_4d = fmt_shape(&[1, num_heads, head_dim, MIN_IO_SEQ]);
-    // QK shape: [1, num_heads, MIN_IO_SEQ, seq_len] after matmul with transpose
-    let qk_shape = fmt_shape(&[1, num_heads, MIN_IO_SEQ, seq_len]);
-
-    let deq_scale = compute_deq_scale(head_dim, config.n_bits);
-    let scale_factor = 1.0 / (head_dim as f32).sqrt();
-
-    let mut body = String::new();
-    let mut weights: Vec<(String, Vec<u8>)> = Vec::new();
-
-    // --- Un-rotation matrix delivered as function input (a_input3) ---
-    // BLOBFILE weight references fail with compile_mil_text — see
-    // docs/development/ane-blobfile-investigation.md
-    let unrot_data = generate_unrotation_weights(head_dim, config.rotation_seed);
-    weights.push(("unrotation_matrix".to_string(), unrot_data));
-
-    // --- Constants ---
-    writeln!(
-        body,
-        "        fp16 deq_scale = const()[name=string(\"deq_scale\"), val=fp16({deq_scale})];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        fp16 deq_offset = const()[name=string(\"deq_offset\"), val=fp16(0.0)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        fp16 scale_factor = const()[name=string(\"scale_factor\"), val=fp16({scale_factor})];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        int32 softmax_axis = const()[name=string(\"softmax_axis\"), val=int32(-1)];"
-    )
-    .unwrap();
-
-    // slice_by_index constants
-    writeln!(
-        body,
-        "        tensor<int32, [4]> slice_begin = const()[name=string(\"slice_begin\"), \
-         val=tensor<int32, [4]>([0,0,0,0])];"
-    )
-    .unwrap();
-
-    writeln!(
-        body,
-        "        tensor<int32, [4]> slice_end_k = const()[name=string(\"slice_end_k\"), \
-         val=tensor<int32, [4]>([1,{kv_ch},1,{seq_len}])];"
-    )
-    .unwrap();
-
-    // --- K dequant pipeline ---
-    emit_dequantize_chain(
-        &mut body,
-        "k",
-        "a_input1",
-        &cache_shape,
-        &sliced_shape,
-        &rot_shape,
-        config,
-        seq_len,
-    );
-
-    // --- V dequant pipeline ---
-    emit_dequantize_chain(
-        &mut body,
-        "v",
-        "a_input2",
-        &cache_shape,
-        &sliced_shape,
-        &rot_shape,
-        config,
-        seq_len,
-    );
-
-    // --- Attention computation ---
-
-    // Reshape Q: [1, q_ch, 1, S] -> [1, num_heads, head_dim, S]
-    let s = MIN_IO_SEQ;
-    writeln!(
-        body,
-        "        tensor<fp16, {q_head_4d}> q_reshaped = reshape(\
-         x=a_input0, shape=tensor<int32, [4]>([1,{num_heads},{head_dim},{s}]))\
-         [name=string(\"q_reshaped\")];"
-    )
-    .unwrap();
-
-    // Reshape K_unrotated: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
-    writeln!(
-        body,
-        "        tensor<fp16, {kv_head_4d}> k_heads = reshape(\
-         x=k_unrotated, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
-         [name=string(\"k_heads\")];"
-    )
-    .unwrap();
-
-    // Reshape V_unrotated: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
-    writeln!(
-        body,
-        "        tensor<fp16, {kv_head_4d}> v_heads = reshape(\
-         x=v_unrotated, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
-         [name=string(\"v_heads\")];"
-    )
-    .unwrap();
-
-    // GQA head expansion: tile KV heads to match query heads when num_heads > num_kv_heads
-    let (k_attn_name, v_attn_name) = if gqa_groups > 1 {
-        writeln!(
-            body,
-            "        tensor<int32, [4]> gqa_reps = const()[name=string(\"gqa_reps\"), \
-             val=tensor<int32, [4]>([1,{gqa_groups},1,1])];"
-        )
-        .unwrap();
-
-        writeln!(
-            body,
-            "        tensor<fp16, {attn_head_4d}> k_attn = tile(\
-             x=k_heads, reps=gqa_reps)\
-             [name=string(\"k_attn\")];"
-        )
-        .unwrap();
-
-        writeln!(
-            body,
-            "        tensor<fp16, {attn_head_4d}> v_attn = tile(\
-             x=v_heads, reps=gqa_reps)\
-             [name=string(\"v_attn\")];"
-        )
-        .unwrap();
-
-        ("k_attn", "v_attn")
-    } else {
-        // MHA: num_heads == num_kv_heads, no expansion needed
-        ("k_heads", "v_heads")
-    };
-
-    // QK = matmul(Q^T, K) -> [1, num_heads, S, seq_len]
-    // Q is [1, num_heads, head_dim, S], K is [1, num_heads, head_dim, seq_len]
-    // transpose_x=true -> Q^T is [1, num_heads, S, head_dim]
-    // Q^T x K -> [1, num_heads, S, seq_len]
-    writeln!(
-        body,
-        "        tensor<fp16, {qk_shape}> qk = matmul(\
-         x=q_reshaped, y={k_attn_name}, transpose_x=bT, transpose_y=bF)\
-         [name=string(\"qk\")];"
-    )
-    .unwrap();
-
-    // Scale QK
-    writeln!(
-        body,
-        "        tensor<fp16, {qk_shape}> qk_scaled = mul(\
-         x=qk, y=scale_factor)\
-         [name=string(\"qk_scaled\")];"
-    )
-    .unwrap();
-
-    // Softmax
-    writeln!(
-        body,
-        "        tensor<fp16, {qk_shape}> attn_weights = softmax(\
-         x=qk_scaled, axis=softmax_axis)\
-         [name=string(\"attn_weights\")];"
-    )
-    .unwrap();
-
-    // attn_out = attn_weights x V^T -> [1, num_heads, S, head_dim]
-    // attn_weights is [1, num_heads, S, seq_len]
-    // V is [1, num_heads, head_dim, seq_len]
-    // V^T is [1, num_heads, seq_len, head_dim]
-    // attn_weights x V^T = [1, num_heads, S, head_dim]
-    let attn_pre_shape = fmt_shape(&[1, num_heads, s, head_dim]);
-    writeln!(
-        body,
-        "        tensor<fp16, {attn_pre_shape}> attn_pre = matmul(\
-         x=attn_weights, y={v_attn_name}, transpose_x=bF, transpose_y=bT)\
-         [name=string(\"attn_pre\")];"
-    )
-    .unwrap();
-
-    // Reshape to output: [1, q_ch, 1, S]
-    writeln!(
-        body,
-        "        tensor<fp16, {q_shape}> z_output0 = reshape(\
-         x=attn_pre, shape=tensor<int32, [4]>([1,{q_ch},1,{s}]))\
-         [name=string(\"z_output0\")];"
-    )
-    .unwrap();
-
-    // Assemble function — un-rotation matrix is a_input3
-    let func = format!(
-        "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
-         tensor<int8, {cache_shape}> a_input1, \
-         tensor<int8, {cache_shape}> a_input2, \
-         tensor<fp16, {rot_shape}> a_input3) {{\n\
-         {body}\
-         \n    }} -> (z_output0);"
-    );
-
-    let mil_text = mil_program_wrapper(&func);
-    (mil_text, weights)
-}
-
-/// Generate MIL text for an FP16 attention sub-program.
-///
-/// Like TurboQuant's `emit_attention_mil` but operates on FP16 K/V
-/// cache tensors directly — no dequantization or unrotation needed.
-/// RoPE is applied on CPU before calling this program.
-///
-/// # Inputs
-/// - `a_input0`: Q (rotated), `[1, q_ch, 1, MIN_IO_SEQ]` fp16
-/// - `a_input1`: K cache, `[1, kv_ch, 1, max_seq_len]` fp16
-/// - `a_input2`: V cache, `[1, kv_ch, 1, max_seq_len]` fp16
-///
-/// # Output
-/// - `z_output0`: attention output, `[1, q_ch, 1, MIN_IO_SEQ]` fp16
-pub fn emit_fp16_attention_mil(
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    max_seq_len: usize,
-    seq_len: usize,
-) -> String {
-    let kv_ch = num_kv_heads * head_dim;
-    let q_ch = num_heads * head_dim;
-
-    let q_shape = fmt_shape(&[1, q_ch, 1, MIN_IO_SEQ]);
-    let cache_shape = fmt_shape(&[1, kv_ch, 1, max_seq_len]);
     let sliced_shape = fmt_shape(&[1, kv_ch, 1, seq_len]);
 
     let gqa_groups = num_heads / num_kv_heads;
@@ -589,8 +372,26 @@ pub fn emit_fp16_attention_mil(
     let scale_factor = 1.0 / (head_dim as f32).sqrt();
 
     let mut body = String::new();
+    let mut weights: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // --- Optional: rotation matrix weight (delivered as a_input3) ---
+    // Q-rotation approach: we use the ROTATION matrix (not inverse) to
+    // rotate Q, then use it again to un-rotate the attention output.
+    let rot_shape = fmt_shape(&[1, 1, head_dim, head_dim]);
+    if let Some(seed) = config.unrotation_seed {
+        let rot_data = generate_rotation_weights(head_dim, seed);
+        weights.push(("rotation_matrix".to_string(), rot_data));
+    }
 
     // --- Constants ---
+    if let Some(deq_scale) = config.dequant_scale {
+        writeln!(
+            body,
+            "        fp16 deq_scale = const()[name=string(\"deq_scale\"), val=fp16({deq_scale})];"
+        )
+        .unwrap();
+    }
+
     writeln!(
         body,
         "        fp16 scale_factor = const()[name=string(\"scale_factor\"), val=fp16({scale_factor})];"
@@ -631,23 +432,87 @@ pub fn emit_fp16_attention_mil(
     .unwrap();
 
     // --- Slice K and V caches to [1, kv_ch, 1, seq_len] ---
-    writeln!(
-        body,
-        "        tensor<fp16, {sliced_shape}> k_sliced = slice_by_index(\
-         x=a_input1, begin=slice_begin, end=slice_end_k)\
-         [name=string(\"k_sliced\")];"
-    )
-    .unwrap();
+    if config.cache_int8 {
+        // INT8 cache: slice as int8, then cast to fp16
+        writeln!(
+            body,
+            "        tensor<int8, {sliced_shape}> k_sliced_i8 = slice_by_index(\
+             x=a_input1, begin=slice_begin, end=slice_end_k)\
+             [name=string(\"k_sliced_i8\")];"
+        )
+        .unwrap();
+        writeln!(
+            body,
+            "        tensor<fp16, {sliced_shape}> k_sliced = cast(\
+             x=k_sliced_i8, dtype=string(\"fp16\"))\
+             [name=string(\"k_sliced\")];"
+        )
+        .unwrap();
 
-    writeln!(
-        body,
-        "        tensor<fp16, {sliced_shape}> v_sliced = slice_by_index(\
-         x=a_input2, begin=slice_begin, end=slice_end_k)\
-         [name=string(\"v_sliced\")];"
-    )
-    .unwrap();
+        writeln!(
+            body,
+            "        tensor<int8, {sliced_shape}> v_sliced_i8 = slice_by_index(\
+             x=a_input2, begin=slice_begin, end=slice_end_k)\
+             [name=string(\"v_sliced_i8\")];"
+        )
+        .unwrap();
+        writeln!(
+            body,
+            "        tensor<fp16, {sliced_shape}> v_sliced = cast(\
+             x=v_sliced_i8, dtype=string(\"fp16\"))\
+             [name=string(\"v_sliced\")];"
+        )
+        .unwrap();
+    } else {
+        // FP16 cache: slice directly
+        writeln!(
+            body,
+            "        tensor<fp16, {sliced_shape}> k_sliced = slice_by_index(\
+             x=a_input1, begin=slice_begin, end=slice_end_k)\
+             [name=string(\"k_sliced\")];"
+        )
+        .unwrap();
 
-    // --- Reshape Q: [1, q_ch, 1, S] -> [1, num_heads, head_dim, S] ---
+        writeln!(
+            body,
+            "        tensor<fp16, {sliced_shape}> v_sliced = slice_by_index(\
+             x=a_input2, begin=slice_begin, end=slice_end_k)\
+             [name=string(\"v_sliced\")];"
+        )
+        .unwrap();
+    }
+
+    // --- Optional: dequantization (mul by scale, no un-rotation) ---
+    let (k_ready, v_ready) = if config.dequant_scale.is_some() {
+        let mut k_name = "k_sliced".to_string();
+        let mut v_name = "v_sliced".to_string();
+
+        // mul(deq_scale) — same as before
+        writeln!(
+            body,
+            "        tensor<fp16, {sliced_shape}> k_dscaled = mul(\
+             x={k_name}, y=deq_scale)\
+             [name=string(\"k_dscaled\")];"
+        )
+        .unwrap();
+        writeln!(
+            body,
+            "        tensor<fp16, {sliced_shape}> v_dscaled = mul(\
+             x={v_name}, y=deq_scale)\
+             [name=string(\"v_dscaled\")];"
+        )
+        .unwrap();
+        k_name = "k_dscaled".to_string();
+        v_name = "v_dscaled".to_string();
+
+        (k_name, v_name)
+    } else {
+        ("k_sliced".to_string(), "v_sliced".to_string())
+    };
+
+    // --- Attention computation ---
+
+    // Reshape Q: [1, q_ch, 1, S] -> [1, num_heads, head_dim, S]
     let s = MIN_IO_SEQ;
     writeln!(
         body,
@@ -657,11 +522,31 @@ pub fn emit_fp16_attention_mil(
     )
     .unwrap();
 
+    // --- Optional: Q-rotation (O(1) per token) ---
+    // Instead of un-rotating the entire K/V cache (O(seq_len)),
+    // rotate Q by R. Since ⟨R·Q, K_rot⟩ = ⟨Q, R⁻¹·K_rot⟩, the
+    // attention scores are identical.
+    let q_attn_name = if config.unrotation_seed.is_some() {
+        // matmul(rotation_matrix, q_reshaped):
+        //   [1, 1, head_dim, head_dim] × [1, num_heads, head_dim, S]
+        //   → [1, num_heads, head_dim, S]  (broadcast over heads)
+        writeln!(
+            body,
+            "        tensor<fp16, {q_head_4d}> q_rotated = matmul(\
+             x=a_input3, y=q_reshaped, transpose_x=bF, transpose_y=bF)\
+             [name=string(\"q_rotated\")];"
+        )
+        .unwrap();
+        "q_rotated"
+    } else {
+        "q_reshaped"
+    };
+
     // Reshape K: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
     writeln!(
         body,
         "        tensor<fp16, {kv_head_4d}> k_heads = reshape(\
-         x=k_sliced, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
+         x={k_ready}, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
          [name=string(\"k_heads\")];"
     )
     .unwrap();
@@ -670,12 +555,12 @@ pub fn emit_fp16_attention_mil(
     writeln!(
         body,
         "        tensor<fp16, {kv_head_4d}> v_heads = reshape(\
-         x=v_sliced, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
+         x={v_ready}, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
          [name=string(\"v_heads\")];"
     )
     .unwrap();
 
-    // GQA head expansion: tile KV heads to match query heads
+    // GQA head expansion: tile KV heads to match query heads when num_heads > num_kv_heads
     let (k_attn_name, v_attn_name) = if gqa_groups > 1 {
         writeln!(
             body,
@@ -709,7 +594,7 @@ pub fn emit_fp16_attention_mil(
     writeln!(
         body,
         "        tensor<fp16, {qk_shape}> qk = matmul(\
-         x=q_reshaped, y={k_attn_name}, transpose_x=bT, transpose_y=bF)\
+         x={q_attn_name}, y={k_attn_name}, transpose_x=bT, transpose_y=bF)\
          [name=string(\"qk\")];"
     )
     .unwrap();
@@ -742,117 +627,88 @@ pub fn emit_fp16_attention_mil(
     )
     .unwrap();
 
+    // --- Optional: output un-rotation (O(1) per token) ---
+    // V is stored rotated in cache. The attention output is:
+    //   attn_pre = softmax(scores) · V_dequant^T
+    // where V_dequant ≈ R·V. So attn_pre columns are in the rotated space.
+    // Un-rotate: attn_out = attn_pre · R  (right-multiply by rotation matrix)
+    let final_attn = if config.unrotation_seed.is_some() {
+        writeln!(
+            body,
+            "        tensor<fp16, {attn_pre_shape}> attn_unrot = matmul(\
+             x=attn_pre, y=a_input3, transpose_x=bF, transpose_y=bF)\
+             [name=string(\"attn_unrot\")];"
+        )
+        .unwrap();
+        "attn_unrot"
+    } else {
+        "attn_pre"
+    };
+
     // Reshape to output: [1, q_ch, 1, S]
     writeln!(
         body,
         "        tensor<fp16, {q_shape}> z_output0 = reshape(\
-         x=attn_pre, shape=tensor<int32, [4]>([1,{q_ch},1,{s}]))\
+         x={final_attn}, shape=tensor<int32, [4]>([1,{q_ch},1,{s}]))\
          [name=string(\"z_output0\")];"
     )
     .unwrap();
 
-    // Assemble function — 3 inputs: Q, K_cache, V_cache (all fp16)
-    let func = format!(
-        "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
-         tensor<fp16, {cache_shape}> a_input1, \
-         tensor<fp16, {cache_shape}> a_input2) {{\n\
-         {body}\
-         \n    }} -> (z_output0);"
-    );
+    // Assemble function — input count depends on whether rotation is enabled
+    let func = if config.unrotation_seed.is_some() {
+        format!(
+            "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
+             tensor<{cache_dtype}, {cache_shape}> a_input1, \
+             tensor<{cache_dtype}, {cache_shape}> a_input2, \
+             tensor<fp16, {rot_shape}> a_input3) {{\n\
+             {body}\
+             \n    }} -> (z_output0);"
+        )
+    } else {
+        format!(
+            "    func main<ios18>(tensor<fp16, {q_shape}> a_input0, \
+             tensor<{cache_dtype}, {cache_shape}> a_input1, \
+             tensor<{cache_dtype}, {cache_shape}> a_input2) {{\n\
+             {body}\
+             \n    }} -> (z_output0);"
+        )
+    };
 
-    mil_program_wrapper(&func)
+    let mil_text = mil_program_wrapper(&func);
+    (mil_text, weights)
 }
 
-/// Emit the dequantization op chain for a single K or V cache tensor.
-#[allow(clippy::too_many_arguments)]
-fn emit_dequantize_chain(
-    body: &mut String,
-    prefix: &str,
-    input_name: &str,
-    cache_shape: &str,
-    sliced_shape: &str,
-    rot_shape: &str,
-    config: &TurboQuantConfig,
+/// Generate MIL text for an FP16 attention sub-program (convenience wrapper).
+///
+/// Equivalent to calling `emit_attention_mil` with no dequantization or
+/// unrotation. Operates on FP16 K/V cache tensors directly.
+///
+/// # Inputs
+/// - `a_input0`: Q (rotated), `[1, q_ch, 1, MIN_IO_SEQ]` fp16
+/// - `a_input1`: K cache, `[1, kv_ch, 1, max_seq_len]` fp16
+/// - `a_input2`: V cache, `[1, kv_ch, 1, max_seq_len]` fp16
+///
+/// # Output
+/// - `z_output0`: attention output, `[1, q_ch, 1, MIN_IO_SEQ]` fp16
+pub fn emit_fp16_attention_mil(
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
     seq_len: usize,
-) {
-    let _ = cache_shape;
-    let _ = rot_shape;
-    let head_dim = config.head_dim;
-    let num_kv_heads = config.num_kv_heads;
-    let kv_ch = num_kv_heads * head_dim;
-
-    // slice_by_index: extract [0..seq_len] from the cache
-    let sliced = format!("{prefix}_sliced");
-    writeln!(
-        body,
-        "        tensor<int8, {sliced_shape}> {sliced} = slice_by_index(\
-         x={input_name}, begin=slice_begin, end=slice_end_k)\
-         [name=string(\"{sliced}\")];"
-    )
-    .unwrap();
-
-    // cast int8 -> fp16
-    let fp16_name = format!("{prefix}_fp16");
-    writeln!(
-        body,
-        "        tensor<fp16, {sliced_shape}> {fp16_name} = cast(\
-         x={sliced}, dtype=string(\"fp16\"))\
-         [name=string(\"{fp16_name}\")];"
-    )
-    .unwrap();
-
-    // mul: apply dequantization scale
-    let scaled = format!("{prefix}_dscaled");
-    writeln!(
-        body,
-        "        tensor<fp16, {sliced_shape}> {scaled} = mul(\
-         x={fp16_name}, y=deq_scale)\
-         [name=string(\"{scaled}\")];"
-    )
-    .unwrap();
-
-    // sub: remove offset (zero for symmetric quantization)
-    let dequant = format!("{prefix}_dequant");
-    writeln!(
-        body,
-        "        tensor<fp16, {sliced_shape}> {dequant} = sub(\
-         x={scaled}, y=deq_offset)\
-         [name=string(\"{dequant}\")];"
-    )
-    .unwrap();
-
-    // Reshape for per-head un-rotation: [1, kv_ch, 1, seq_len] -> [1, num_kv_heads, head_dim, seq_len]
-    let head_shape = fmt_shape(&[1, num_kv_heads, head_dim, seq_len]);
-    let reshaped = format!("{prefix}_deq_reshaped");
-    writeln!(
-        body,
-        "        tensor<fp16, {head_shape}> {reshaped} = reshape(\
-         x={dequant}, shape=tensor<int32, [4]>([1,{num_kv_heads},{head_dim},{seq_len}]))\
-         [name=string(\"{reshaped}\")];"
-    )
-    .unwrap();
-
-    // matmul: un-rotate per head via broadcast
-    // [1, 1, head_dim, head_dim] × [1, num_kv_heads, head_dim, seq_len]
-    // -> [1, num_kv_heads, head_dim, seq_len]
-    let unrotated_head = format!("{prefix}_unrot_head");
-    writeln!(
-        body,
-        "        tensor<fp16, {head_shape}> {unrotated_head} = matmul(\
-         x=a_input3, y={reshaped}, transpose_x=bF, transpose_y=bF)\
-         [name=string(\"{unrotated_head}\")];"
-    )
-    .unwrap();
-
-    // Reshape back to [1, kv_ch, 1, seq_len]
-    let unrotated = format!("{prefix}_unrotated");
-    writeln!(
-        body,
-        "        tensor<fp16, {sliced_shape}> {unrotated} = reshape(\
-         x={unrotated_head}, shape=tensor<int32, [4]>([1,{kv_ch},1,{seq_len}]))\
-         [name=string(\"{unrotated}\")];"
-    )
-    .unwrap();
+) -> String {
+    let config = AttentionMilConfig {
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        max_seq_len,
+        seq_len,
+        dequant_scale: None,
+        unrotation_seed: None,
+        cache_int8: false,
+    };
+    let (mil_text, _weights) = emit_attention_mil(&config);
+    mil_text
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,6 +880,21 @@ mod tests {
         }
     }
 
+    fn test_tq_attn_config() -> AttentionMilConfig {
+        let tq = test_config();
+        let deq_scale = compute_deq_scale(tq.head_dim, tq.n_bits);
+        AttentionMilConfig {
+            num_heads: tq.num_heads,
+            num_kv_heads: tq.num_kv_heads,
+            head_dim: tq.head_dim,
+            max_seq_len: tq.max_seq_len,
+            seq_len: 32,
+            dequant_scale: Some(deq_scale),
+            unrotation_seed: Some(tq.rotation_seed),
+            cache_int8: true,
+        }
+    }
+
     #[test]
     fn cache_write_mil_is_valid_program() {
         let config = test_config();
@@ -1054,27 +925,33 @@ mod tests {
 
     #[test]
     fn attention_mil_is_valid_program() {
-        let config = test_config();
-        let (mil, weights) = emit_attention_mil(&config, 32);
+        let config = test_tq_attn_config();
+        let (mil, weights) = emit_attention_mil(&config);
 
         assert!(mil.starts_with("program(1.3)"));
         assert!(mil.contains("func main<ios18>"));
-        // Three inputs: Q, K_cache, V_cache
+        // Four inputs: Q, K_cache, V_cache, rotation_matrix
         assert!(mil.contains("a_input0"));
         assert!(mil.contains("a_input1"));
         assert!(mil.contains("a_input2"));
+        assert!(mil.contains("a_input3"));
         // One output
         assert!(mil.contains("z_output0"));
-        // Should contain dequant ops
-        assert!(mil.contains("slice_by_index"));
-        assert!(mil.contains("cast"));
+        // Cache inputs are INT8 with inline cast to fp16
+        assert!(
+            mil.contains("int8"),
+            "TQ attention should use int8 cache inputs"
+        );
+        assert!(mil.contains("cast"), "TQ attention should cast int8→fp16");
+        // Should contain dequant scale
+        assert!(mil.contains("deq_scale"));
         // Should contain attention ops
         assert!(mil.contains("softmax"));
         assert!(mil.contains("matmul"));
         assert!(mil.contains("scale_factor"));
-        // Should produce un-rotation matrix weight
+        // Should produce rotation matrix weight (for Q-rotation + output un-rotation)
         assert_eq!(weights.len(), 1);
-        assert_eq!(weights[0].0, "unrotation_matrix");
+        assert_eq!(weights[0].0, "rotation_matrix");
     }
 
     #[test]
@@ -1168,17 +1045,18 @@ mod tests {
     #[test]
     fn attention_mil_gqa_uses_tile() {
         // GQA config: 32 query heads, 8 KV heads (4x expansion)
-        let gqa_config = TurboQuantConfig {
-            n_bits: 8,
-            max_seq_len: 128,
+        let deq_scale = compute_deq_scale(64, 8);
+        let config = AttentionMilConfig {
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 64,
-            num_layers: 1,
-            rotation_seed: 42,
-            enable_qjl: false,
+            max_seq_len: 128,
+            seq_len: 32,
+            dequant_scale: Some(deq_scale),
+            unrotation_seed: Some(42),
+            cache_int8: true,
         };
-        let (mil, _weights) = emit_attention_mil(&gqa_config, 32);
+        let (mil, _weights) = emit_attention_mil(&config);
 
         // Should contain tile op for GQA expansion
         assert!(mil.contains("tile"), "GQA attention should use tile op");
@@ -1193,8 +1071,8 @@ mod tests {
     #[test]
     fn attention_mil_mha_no_tile() {
         // MHA config: num_heads == num_kv_heads, no tile needed
-        let config = test_config();
-        let (mil, _weights) = emit_attention_mil(&config, 32);
+        let config = test_tq_attn_config();
+        let (mil, _weights) = emit_attention_mil(&config);
         assert!(!mil.contains("tile"), "MHA should not use tile op");
         assert!(!mil.contains("gqa_reps"), "MHA should not have gqa_reps");
     }
