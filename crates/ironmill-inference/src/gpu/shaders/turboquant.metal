@@ -2,29 +2,56 @@
 using namespace metal;
 
 // ============================================================================
-// TurboQuant: Hadamard rotation + beta-optimal INT8 quantization for KV cache
+// TurboQuant: Hadamard rotation + quantized KV cache (INT8 or INT4)
 // ============================================================================
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+/// Compute the byte offset for a KV head's cache region.
+inline uint kv_cache_base(uint kv_head, uint max_seq_len, uint head_dim, uint n_bits) {
+    uint bytes_per_pos = (n_bits == 4) ? (head_dim / 2) : head_dim;
+    return kv_head * max_seq_len * bytes_per_pos;
+}
+
+/// Read one dequantized cache value.
+inline float read_quantized(device const char* cache, uint base,
+                            uint pos, uint dim, uint head_dim,
+                            uint n_bits, float deq_scale) {
+    if (n_bits == 4) {
+        uint packed_stride = head_dim / 2;
+        uint byte_idx = base + pos * packed_stride + dim / 2;
+        uchar packed = ((device const uchar*)cache)[byte_idx];
+        uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
+        // Sign-extend from 4 bits
+        int val = int(nibble);
+        if (val >= 8) val -= 16;
+        return float(val) * deq_scale;
+    } else {
+        return float(cache[base + pos * head_dim + dim]) * deq_scale;
+    }
+}
 
 // === Fused Cache Write ===
 //
-// Rotates K/V via Hadamard rotation matrix, quantizes to INT8, writes to cache.
+// Rotates K/V via Hadamard rotation matrix, quantizes, writes to cache.
+// Supports both INT8 (n_bits=8) and INT4 (n_bits=4) quantization.
 //
 // Buffers:
-//   buffer(0) kv_proj:          [num_kv_heads × head_dim]                  half
-//   buffer(1) rotation_matrix:  [head_dim × head_dim]                     half
-//   buffer(2) cache:            [num_kv_heads × max_seq_len × head_dim]   char (INT8)
+//   buffer(0) kv_proj:          [num_kv_heads × head_dim]           half
+//   buffer(1) rotation_matrix:  [head_dim × head_dim]               half
+//   buffer(2) cache:            see below                           char/packed
 //   buffer(3) num_kv_heads:     uint
 //   buffer(4) head_dim:         uint
 //   buffer(5) max_seq_len:      uint
 //   buffer(6) seq_pos:          uint  (current write position)
 //   buffer(7) inv_scale:        float (1/scale for quantization)
+//   buffer(8) n_bits:           uint  (4 or 8)
+//
+// Cache layout:
+//   INT8: [num_kv_heads × max_seq_len × head_dim]       1 byte per element
+//   INT4: [num_kv_heads × max_seq_len × head_dim/2]     2 elements packed per byte
 //
 // Dispatch: num_kv_heads threadgroups, head_dim threads per group.
-// Each threadgroup processes one KV head:
-//   1. Load input vector into shared memory
-//   2. Matrix-vector multiply with rotation_matrix (each thread computes one output)
-//   3. Quantize: round(clamp(rotated * inv_scale, -128, 127))
-//   4. Write INT8 to cache[head][seq_pos][dim]
 
 kernel void turboquant_cache_write(
     device const half* kv_proj          [[buffer(0)]],
@@ -35,26 +62,28 @@ kernel void turboquant_cache_write(
     constant uint& max_seq_len          [[buffer(5)]],
     constant uint& seq_pos              [[buffer(6)]],
     constant float& inv_scale           [[buffer(7)]],
+    constant uint& n_bits               [[buffer(8)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory for input vector (one head_dim row, max 4096 halfs = 8 KB)
     threadgroup half shared_input[4096];
+    threadgroup char shared_quant[4096];
 
     uint head_idx = tgid;
     if (head_idx >= num_kv_heads) return;
 
-    // Step 1: Cooperatively load input vector for this head into shared memory
+    // Step 1: Load input vector into shared memory
     uint input_base = head_idx * head_dim;
     for (uint i = tid; i < head_dim; i += tg_size) {
         shared_input[i] = kv_proj[input_base + i];
     }
-
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 2: Each thread computes one element of rotated = rotation_matrix @ input
-    // Thread tid computes output[tid] = dot(rotation_matrix[tid, :], input[:])
+    // Step 2: Rotate and quantize
+    float clamp_lo = (n_bits == 4) ? -8.0f : -128.0f;
+    float clamp_hi = (n_bits == 4) ?  7.0f :  127.0f;
+
     for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
         float acc = 0.0f;
         uint row_base = out_dim * head_dim;
@@ -62,45 +91,55 @@ kernel void turboquant_cache_write(
             acc += float(rotation_matrix[row_base + k]) * float(shared_input[k]);
         }
 
-        // Step 3: Quantize to INT8
-        float scaled = acc * inv_scale;
-        scaled = clamp(scaled, -128.0f, 127.0f);
+        float scaled = clamp(acc * inv_scale, clamp_lo, clamp_hi);
         char quantized = char(rint(scaled));
 
-        // Step 4: Write to cache at [head][seq_pos][dim]
-        uint cache_idx = (head_idx * max_seq_len + seq_pos) * head_dim + out_dim;
-        cache[cache_idx] = quantized;
+        if (n_bits == 4) {
+            shared_quant[out_dim] = quantized;
+        } else {
+            uint cache_idx = kv_cache_base(head_idx, max_seq_len, head_dim, 8)
+                           + seq_pos * head_dim + out_dim;
+            cache[cache_idx] = quantized;
+        }
+    }
+
+    // Step 3 (INT4 only): Pack pairs of 4-bit values into bytes
+    if (n_bits == 4) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint packed_stride = head_dim / 2;
+        uint base = kv_cache_base(head_idx, max_seq_len, head_dim, 4)
+                  + seq_pos * packed_stride;
+
+        for (uint d = tid * 2; d < head_dim; d += tg_size * 2) {
+            uchar lo = uchar(shared_quant[d]     & 0xF);
+            uchar hi = uchar(shared_quant[d + 1] & 0xF);
+            ((device uchar*)cache)[base + d / 2] = lo | (hi << 4);
+        }
     }
 }
 
 
 // === Fused TurboQuant Attention ===
 //
-// Performs full attention with INT8 KV cache using online softmax:
-//   1. Rotate Q to match K's rotated space
-//   2. For each position: dequantize K, compute score, update online softmax,
-//      rescale running V accumulator, accumulate weighted dequantized V
-//   3. Normalize V accumulator by softmax denominator
-//   4. Un-rotate output back to original space
+// Full attention with quantized KV cache using online softmax.
+// Supports both INT8 (n_bits=8) and INT4 (n_bits=4).
 //
 // Buffers:
-//   buffer(0)  q:               [num_heads × head_dim]                     half
-//   buffer(1)  k_cache:         [num_kv_heads × max_seq_len × head_dim]   char (INT8)
-//   buffer(2)  v_cache:         [num_kv_heads × max_seq_len × head_dim]   char (INT8)
-//   buffer(3)  rotation_matrix: [head_dim × head_dim]                     half
-//   buffer(4)  output:          [num_heads × head_dim]                     half
+//   buffer(0)  q:               [num_heads × head_dim]              half
+//   buffer(1)  k_cache:         quantized KV cache                  char/packed
+//   buffer(2)  v_cache:         quantized KV cache                  char/packed
+//   buffer(3)  rotation_matrix: [head_dim × head_dim]               half
+//   buffer(4)  output:          [num_heads × head_dim]              half
 //   buffer(5)  num_heads:       uint
 //   buffer(6)  num_kv_heads:    uint
 //   buffer(7)  head_dim:        uint
 //   buffer(8)  max_seq_len:     uint
-//   buffer(9)  seq_len:         uint  (number of valid positions in cache)
-//   buffer(10) deq_scale:       float (dequantization scale factor)
-//
-// GQA: heads_per_group = num_heads / num_kv_heads
-// Each attention head maps to kv_head = head_idx / heads_per_group
+//   buffer(9)  seq_len:         uint  (number of valid positions)
+//   buffer(10) deq_scale:       float
+//   buffer(11) n_bits:          uint  (4 or 8)
 //
 // Dispatch: num_heads threadgroups, head_dim threads per group.
-// Single-pass online softmax: no need to store or recompute scores.
 
 kernel void turboquant_attention(
     device const half* q                [[buffer(0)]],
@@ -114,16 +153,11 @@ kernel void turboquant_attention(
     constant uint& max_seq_len          [[buffer(8)]],
     constant uint& seq_len              [[buffer(9)]],
     constant float& deq_scale           [[buffer(10)]],
+    constant uint& n_bits               [[buffer(11)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory layout (within 32 KB):
-    //   shared_q_rot:  [256] float — rotated query vector
-    //   shared_reduce: [256] float — scratch for dot-product reductions
-    //   shared_output: [256] float — weighted V accumulator (in rotated space)
-    //   shared_softmax: [2] float  — [0]=running_max, [1]=running_sum
-    // For head_dim=256: (256*3 + 2) * 4 = 3080 bytes
     threadgroup float shared_q_rot[256];
     threadgroup float shared_reduce[256];
     threadgroup float shared_output[256];
@@ -136,7 +170,7 @@ kernel void turboquant_attention(
     uint kv_head = head_idx / heads_per_group;
     float scale = 1.0f / sqrt(float(head_dim));
     uint q_base = head_idx * head_dim;
-    uint kv_base = kv_head * max_seq_len * head_dim;
+    uint kv_base = kv_cache_base(kv_head, max_seq_len, head_dim, n_bits);
 
     // ---- Step 1: Rotate Q into shared memory ----
     for (uint d = tid; d < head_dim; d += tg_size) {
@@ -160,18 +194,16 @@ kernel void turboquant_attention(
 
     // ---- Step 2: Online softmax attention over sequence positions ----
     for (uint p = 0; p < seq_len; p++) {
-        uint k_offset = kv_base + p * head_dim;
-
         // Compute dot(Q_rot, dequant(K[p])) — parallel reduction
         float partial_dot = 0.0f;
         for (uint d = tid; d < head_dim; d += tg_size) {
-            float k_val = float(k_cache[k_offset + d]) * deq_scale;
+            float k_val = read_quantized(k_cache, kv_base, p, d, head_dim, n_bits, deq_scale);
             partial_dot += shared_q_rot[d] * k_val;
         }
         shared_reduce[tid] = partial_dot;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Round tg_size up to next power of 2 for reduction
+        // Tree reduction
         uint reduce_size = 1;
         while (reduce_size < tg_size) reduce_size <<= 1;
 
@@ -184,7 +216,7 @@ kernel void turboquant_attention(
 
         float score = shared_reduce[0] * scale;
 
-        // Online softmax: update max, compute rescale factor and new weight
+        // Online softmax update
         float old_max = shared_softmax[0];
         float new_max = max(old_max, score);
         float rescale = exp(old_max - new_max);
@@ -196,10 +228,9 @@ kernel void turboquant_attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Rescale existing accumulator and add weighted dequantized V
-        uint v_offset = kv_base + p * head_dim;
+        // Rescale accumulator and add weighted dequantized V
         for (uint d = tid; d < head_dim; d += tg_size) {
-            float v_val = float(v_cache[v_offset + d]) * deq_scale;
+            float v_val = read_quantized(v_cache, kv_base, p, d, head_dim, n_bits, deq_scale);
             shared_output[d] = shared_output[d] * rescale + weight * v_val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -213,8 +244,6 @@ kernel void turboquant_attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ---- Step 4: Un-rotate output ----
-    // For orthogonal rotation matrix R, R^{-1} = R^T.
-    // final[d] = sum_k( R^T[d][k] * output_rot[k] ) = sum_k( R[k][d] * output_rot[k] )
     uint out_base = head_idx * head_dim;
     for (uint d = tid; d < head_dim; d += tg_size) {
         float acc = 0.0f;
