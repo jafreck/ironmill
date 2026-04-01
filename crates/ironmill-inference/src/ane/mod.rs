@@ -5,7 +5,6 @@
 
 pub mod bundle_manifest;
 pub mod decode;
-#[allow(unsafe_code)]
 pub mod device;
 pub mod model;
 pub mod turboquant;

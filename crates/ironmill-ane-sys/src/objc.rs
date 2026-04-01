@@ -31,6 +31,17 @@ unsafe extern "C" {
     pub(crate) fn CFRelease(cf: *mut c_void);
 }
 
+// Mach kernel APIs for process information.
+unsafe extern "C" {
+    pub(crate) fn mach_task_self() -> u32;
+    pub(crate) fn task_info(
+        target_task: u32,
+        flavor: u32,
+        task_info_out: *mut u8,
+        task_info_count: *mut u32,
+    ) -> i32;
+}
+
 // ---------------------------------------------------------------------------
 // sel! macro — null-terminated C strings from Rust literals
 // ---------------------------------------------------------------------------

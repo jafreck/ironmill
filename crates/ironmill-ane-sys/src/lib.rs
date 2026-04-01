@@ -23,6 +23,7 @@ compile_error!("ironmill-ane-sys only supports macOS");
 pub mod compiler;
 pub mod error;
 pub(crate) mod objc;
+pub mod process;
 pub mod runtime;
 
 pub use compiler::AneCompiler;

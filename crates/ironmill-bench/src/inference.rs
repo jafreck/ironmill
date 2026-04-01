@@ -100,46 +100,11 @@ impl MemoryMetrics {
     }
 }
 
-/// Get current process RSS in bytes using mach_task_basic_info.
-#[allow(unsafe_code)]
+/// Get current process RSS in bytes.
 fn current_rss() -> u64 {
     #[cfg(target_os = "macos")]
     {
-        use mach2::kern_return::KERN_SUCCESS;
-        use mach2::task::task_info;
-        use mach2::task_info::MACH_TASK_BASIC_INFO;
-        use std::mem;
-
-        #[repr(C)]
-        struct MachTaskBasicInfo {
-            virtual_size: u64,
-            resident_size: u64,
-            resident_size_max: u64,
-            user_time: [u32; 2],   // time_value_t
-            system_time: [u32; 2], // time_value_t
-            policy: i32,
-            suspend_count: i32,
-        }
-
-        // SAFETY: `mach_task_self()` returns the current task port (always valid).
-        // `task_info` writes into `info` which is a properly aligned, zeroed
-        // struct with `count` set to its size in u32 words. On success the
-        // struct is fully initialized by the kernel.
-        let mut info: MachTaskBasicInfo = unsafe { mem::zeroed() };
-        let mut count = (mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<u32>()) as u32;
-        let kr = unsafe {
-            task_info(
-                mach2::traps::mach_task_self(),
-                MACH_TASK_BASIC_INFO,
-                &mut info as *mut _ as *mut i32,
-                &mut count,
-            )
-        };
-        if kr == KERN_SUCCESS {
-            info.resident_size
-        } else {
-            0
-        }
+        ironmill_ane_sys::process::current_rss()
     }
     #[cfg(not(target_os = "macos"))]
     {

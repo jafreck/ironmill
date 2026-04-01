@@ -57,10 +57,6 @@ pub struct HardwareProgram {
     pub(crate) loaded: ironmill_ane_sys::LoadedProgram,
 }
 
-// SAFETY: Both inner types are Send; HardwareProgram adds no shared state.
-#[allow(unsafe_code)]
-unsafe impl Send for HardwareProgram {}
-
 // ── HardwareAneDevice ────────────────────────────────────────────
 
 /// Real ANE device backed by [`ironmill_ane_sys::AneRuntime`].
