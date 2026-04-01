@@ -3,6 +3,8 @@
 //! Uses MPS for optimized matrix operations and custom Metal compute
 //! shaders for TurboQuant quantization, attention, and element-wise ops.
 
+#[cfg(feature = "compile")]
+pub mod bundle;
 pub mod config;
 pub mod dequant;
 pub mod error;

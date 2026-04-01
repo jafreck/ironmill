@@ -6,6 +6,8 @@
 //!
 //! Phase 1 — no bundle serialization; the provider is returned in-memory.
 
+pub mod bundle;
+
 use std::path::{Path, PathBuf};
 
 use mil_rs::convert::{ConversionConfig, onnx_to_program_with_config};
