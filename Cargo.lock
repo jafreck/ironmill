@@ -465,6 +465,7 @@ dependencies = [
  "ironmill-compile",
  "ironmill-inference",
  "ironmill-iosurface",
+ "ironmill-metal-sys",
  "mil-rs",
  "serde",
  "serde_json",

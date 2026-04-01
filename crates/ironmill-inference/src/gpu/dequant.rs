@@ -34,19 +34,35 @@ fn read_typed_f32(data: &[u8], byte_offset: usize, dtype: ScalarType) -> f32 {
 /// For 4-bit packing each byte holds two values: `lo | (hi << 4)`.
 /// For 2-bit packing each byte holds four values, etc.
 fn unpack_indices(packed: &[u8], n_bits: u8, total_elements: usize) -> Vec<usize> {
-    assert!(n_bits > 0 && n_bits <= 8 && 8 % n_bits == 0);
-    let mask: u8 = ((1u16 << n_bits) - 1) as u8;
-    let values_per_byte = (8 / n_bits) as usize;
-    let mut indices = Vec::with_capacity(total_elements);
+    if n_bits == 8 {
+        return packed
+            .iter()
+            .take(total_elements)
+            .map(|&b| b as usize)
+            .collect();
+    }
 
-    'outer: for &byte in packed {
-        for j in 0..values_per_byte {
-            if indices.len() >= total_elements {
-                break 'outer;
-            }
-            let shift = j as u8 * n_bits;
-            indices.push(((byte >> shift) & mask) as usize);
-        }
+    let mask = ((1u16 << n_bits) - 1) as u16;
+    let mut indices = Vec::with_capacity(total_elements);
+    let mut bit_offset = 0usize;
+
+    for _ in 0..total_elements {
+        let byte_pos = bit_offset / 8;
+        let bit_in_byte = bit_offset % 8;
+
+        // Read up to 2 bytes to handle values that span byte boundaries.
+        let hi = packed[byte_pos] as u16;
+        let lo = if byte_pos + 1 < packed.len() {
+            packed[byte_pos + 1] as u16
+        } else {
+            0
+        };
+        let word = (hi << 8) | lo;
+        let shift = 16 - n_bits as usize - bit_in_byte;
+        let idx = ((word >> shift) & mask) as usize;
+        indices.push(idx);
+
+        bit_offset += n_bits as usize;
     }
 
     indices
@@ -88,11 +104,16 @@ pub fn dequant_lut_to_dense(
     let norm_size = norms_dtype.byte_size();
 
     let unpacked = unpack_indices(indices, n_bits, work_total);
+    let max_lut_idx = lut.len() / entry_size;
 
     // Reconstruct f32 values from LUT.
     let mut f32_values: Vec<f32> = Vec::with_capacity(work_total);
     for flat_idx in 0..work_total {
         let lut_idx = unpacked[flat_idx];
+        assert!(
+            lut_idx < max_lut_idx,
+            "LUT index {lut_idx} out of bounds (max {max_lut_idx}) at element {flat_idx}/{work_total}"
+        );
         f32_values.push(read_typed_f32(lut, lut_idx * entry_size, lut_dtype));
     }
 
@@ -196,7 +217,7 @@ mod tests {
         // Byte 0x51 → indices 1 (0x01), 5  (0x05)
         let packed = vec![0xA3, 0x51];
         let result = unpack_indices(&packed, 4, 4);
-        assert_eq!(result, vec![3, 10, 1, 5]);
+        assert_eq!(result, vec![10, 3, 5, 1]);
     }
 
     #[test]
@@ -205,7 +226,7 @@ mod tests {
         // Byte 0b_11_10_01_00 = 0xE4 → indices 0, 1, 2, 3
         let packed = vec![0xE4];
         let result = unpack_indices(&packed, 2, 4);
-        assert_eq!(result, vec![0, 1, 2, 3]);
+        assert_eq!(result, vec![3, 2, 1, 0]);
     }
 
     #[test]
@@ -220,7 +241,7 @@ mod tests {
         // Ask for fewer elements than the packed data contains.
         let packed = vec![0xA3, 0x51];
         let result = unpack_indices(&packed, 4, 3);
-        assert_eq!(result, vec![3, 10, 1]);
+        assert_eq!(result, vec![10, 3, 5]);
     }
 
     // ── LUT dequantization ───────────────────────────────────────
@@ -236,13 +257,8 @@ mod tests {
         // 2×4 matrix of 4-bit indices:
         //   row 0: [0, 1, 2, 3]
         //   row 1: [4, 5, 6, 7]
-        //
-        // 4-bit packing (2 per byte, LSB-first):
-        //   byte 0: 0 | (1 << 4) = 0x10
-        //   byte 1: 2 | (3 << 4) = 0x32
-        //   byte 2: 4 | (5 << 4) = 0x54
-        //   byte 3: 6 | (7 << 4) = 0x76
-        let indices = vec![0x10, 0x32, 0x54, 0x76];
+        let raw_indices: Vec<usize> = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let indices = mil_rs::ir::passes::polar_quantize::pack_indices(&raw_indices, 4);
         let shape = vec![2, 4];
 
         // Row norms (FP16): row 0 = 2.0, row 1 = 0.5.
@@ -285,8 +301,8 @@ mod tests {
         }
 
         // 2-bit indices for a 1×4 matrix: [0, 1, 2, 3]
-        // Packed: 0b_11_10_01_00 = 0xE4
-        let indices = vec![0xE4];
+        let raw_indices: Vec<usize> = vec![0, 1, 2, 3];
+        let indices = mil_rs::ir::passes::polar_quantize::pack_indices(&raw_indices, 2);
         let shape = vec![1, 4];
 
         let mut norms = Vec::new();

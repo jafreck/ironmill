@@ -258,11 +258,13 @@ impl MilWeightProvider {
                 _ => unreachable!(),
             };
 
-            // Per-row symmetric INT4 round-to-nearest quantization.
-            // Each row: scale = absmax / 7.5, q = round(v/scale).clamp(-8,7),
-            // dequant = q * scale. Produces FP16 output directly.
-            let half = (1u32 << n_bits) as f32 / 2.0; // 8.0 for 4-bit
-            let max_q = half - 1.0; // 7.0
+            // Per-row symmetric INT4 quantization.
+            // Quantize inline and immediately dequantize to FP16 for Phase 1
+            // correctness validation. The weights carry the quantization noise
+            // but are stored as dense FP16.
+            let n_levels = 1usize << n_bits;
+            let half_n = n_levels as f32 / 2.0;
+            let max_q = half_n - 1.0;
 
             let mut dequant_data = Vec::with_capacity(total * 2);
             for r in 0..rows {
@@ -270,7 +272,7 @@ impl MilWeightProvider {
                 let absmax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-10);
                 let scale = absmax / (max_q + 0.5);
                 for &v in row {
-                    let q = (v / scale).round().clamp(-half, max_q);
+                    let q = (v / scale).round().clamp(-half_n, max_q);
                     let dq = q * scale;
                     dequant_data.extend_from_slice(&f16::from_f32(dq).to_le_bytes());
                 }

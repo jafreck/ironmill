@@ -396,7 +396,7 @@ mod polarquant_bench {
         println!("╚════════════╧═══════════╧═══════════╧═══════════╧══════════╧════════════╝\n");
 
         // Assertions.
-        // Note: force_cpu_dequant means GPU memory is the same (Phase 1).
+        // Phase 3: quantized weights stay packed in VRAM.
         // GPU memory reduction requires Phase 3 quantized kernels.
         assert!(
             ppl_delta < 200.0,
@@ -404,7 +404,7 @@ mod polarquant_bench {
         );
         assert!(pq_tps > 0.0, "PolarQuant should decode >0 tok/s");
         // Disk size reduction requires packed LUT storage (future work).
-        // With force_cpu_dequant, weights are stored as dense FP16.
+        // Disk size reduction requires packed LUT bundle format.
         if disk_delta > 10.0 {
             println!("  Disk reduction: {disk_delta:.1}%");
         }

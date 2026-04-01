@@ -25,6 +25,7 @@ half = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 mil-rs = { path = "../mil-rs" }
+ironmill-metal-sys = { path = "../ironmill-metal-sys" }
 
 [features]
 default = []

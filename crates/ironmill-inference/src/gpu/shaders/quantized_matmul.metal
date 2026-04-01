@@ -44,8 +44,8 @@ kernel void polarquant_matvec_int4(
     // Each lane strides by 32 (SIMD width) over packed bytes
     for (uint k = lane; k < half_K; k += 32) {
         uchar packed = B_packed[row_offset + k];
-        uchar lo_idx = packed & 0xF;
-        uchar hi_idx = (packed >> 4) & 0xF;
+        uchar lo_idx = (packed >> 4) & 0xF;
+        uchar hi_idx = packed & 0xF;
 
         float w0 = float(lut[lo_idx]) * norm;
         float w1 = float(lut[hi_idx]) * norm;
@@ -121,7 +121,7 @@ kernel void polarquant_matmul_int4(
             if (g_n < N && g_k < K) {
                 uint byte_idx = g_n * half_K + g_k / 2;
                 uchar packed  = B_packed[byte_idx];
-                uchar idx     = (g_k % 2 == 0) ? (packed & 0xF) : ((packed >> 4) & 0xF);
+                uchar idx     = (g_k % 2 == 0) ? ((packed >> 4) & 0xF) : (packed & 0xF);
                 val = lut[idx] * norms[g_n];
             }
             tg_b[i] = val;

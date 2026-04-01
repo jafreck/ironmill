@@ -215,6 +215,7 @@ mod tests {
                     n_bits: 4,
                     row_norms: vec![0x22; 16],
                     norms_dtype: ScalarType::Float16,
+                    polar_quant_seed: None,
                 },
             },
         );
@@ -275,6 +276,7 @@ mod tests {
                 n_bits,
                 row_norms,
                 norms_dtype,
+                ..
             } => {
                 assert_eq!(indices, &vec![0xAA; 64]);
                 assert_eq!(lut, &vec![0x11; 32]);
