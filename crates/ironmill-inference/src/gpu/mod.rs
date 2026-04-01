@@ -4,6 +4,7 @@
 //! shaders for TurboQuant quantization, attention, and element-wise ops.
 
 pub mod config;
+pub mod dequant;
 pub mod error;
 pub mod inference;
 pub mod ops;
