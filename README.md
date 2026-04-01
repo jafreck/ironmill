@@ -146,21 +146,21 @@ Open-source projects working with the ANE via private APIs:
 ```mermaid
 graph TD
     onnx["ONNX (.onnx)"]
-    safetensors["SafeTensors dir"]
-    gguf["GGUF file"]
     coreml_in["CoreML (.mlmodel/.mlpackage)"]
+    safetensors["SafeTensors"]
+    gguf["GGUF"]
 
-    mil["mil-rs<br/><i>MIL Intermediate Representation</i>"]
+    mil["MIL Program<br/><i>Model Intermediate Language</i>"]
 
-    onnx --> mil
-    safetensors --> mil
-    gguf --> mil
-    coreml_in --> mil
+    onnx -->|mil-rs| mil
+    coreml_in -->|mil-rs| mil
+    safetensors -->|"architecture template"| mil
+    gguf -->|"architecture template"| mil
 
-    compile["ironmill-compile<br/><i>Optimization + ANE Lowering</i>"]
+    compile["ironmill-compile"]
     mil --> compile
 
-    passes["Op fusion · Layout optimization · Quantization (FP16/INT8)<br/>Palettization · ANE op substitution · Attention decomposition<br/>MatMul→Conv lowering · Model splitting"]
+    passes["Optimization Passes<br/><i>DCE · Constant fold · Op fusion (Conv‑BN, Conv‑ReLU,<br/>Linear‑ReLU, LayerNorm, GELU, Residual) · Attention/GQA fusion<br/>Layout optimization · FP16 · INT8 · Palettization</i>"]
     compile --> passes
 
     proto["CoreML Proto"]
@@ -170,62 +170,65 @@ graph TD
     proto --> pkg
 
     xcrun["xcrun coremlcompiler"]
-    pkg --> xcrun
+    pkg -.->|optional| xcrun
 
-    mlmodelc[".mlmodelc<br/><i>ANE-ready artifact</i>"]
-    xcrun --> mlmodelc
+    mlmodelc[".mlmodelc<br/><i>Compiled model</i>"]
+    xcrun -.-> mlmodelc
+
+    ane["ANE Lowering<br/><i>MatMul→Conv · Op substitution · Attention decompose<br/>Layout · Concat elimination · Model split</i>"]
+    passes --> ane
+
+    bundle[".ironml bundle<br/><i>MIL text + weight blobs</i>"]
+    ane --> bundle
 ```
 
 ### Crate Structure
 
 ```mermaid
-graph TD
-    subgraph User-Facing
-        cli["cli"]
-        bench["bench"]
+%%{init: {'flowchart': {'curve': 'basis'}}}%%
+flowchart TD
+    subgraph user["User-Facing"]
+        direction LR
+        cli["ironmill-cli"]
+        bench["ironmill-bench"]
         burn["burn-coreml"]
         candle["candle-coreml"]
     end
 
-    subgraph Core
-        compile["compile"]
-        inference["inference"]
+    subgraph core["Core"]
+        direction LR
+        compile["ironmill-compile"]
+        inference["ironmill-inference"]
     end
 
-    subgraph System Bindings
-        ane["ane-sys"]
-        ios["iosurface"]
-        coremlsys["coreml-sys"]
-        metalsys["metal-sys"]
+    subgraph sys["System Bindings"]
+        direction LR
+        ane["ironmill-ane-sys"]
+        ios["ironmill-iosurface"]
+        coremlsys["ironmill-coreml-sys"]
+        metalsys["ironmill-metal-sys"]
     end
 
-    subgraph Foundation
+    subgraph found["Foundation"]
         mil["mil-rs"]
     end
 
     cli --> compile
-    cli -.-> inference
-
     bench --> compile
     bench --> inference
-    bench -.-> ios
-
+    bench -. "ane-direct" .-> ios
     burn --> compile
-    burn --> inference
-
+    burn -. "macos" .-> inference
     candle --> compile
-    candle --> inference
-
+    candle -. "macos" .-> inference
     compile --> mil
     compile --> ios
-
     inference --> mil
     inference --> ane
     inference --> ios
     inference --> coremlsys
-    inference -.->|"metal" feature| metalsys
-    inference -.->|"compile" feature| compile
-
+    inference -. "metal" .-> metalsys
+    inference -. "compile" .-> compile
     ios --> mil
 ```
 
