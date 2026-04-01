@@ -248,6 +248,7 @@ impl GpuInference {
                 max_seq_len: self.config.max_seq_len,
                 num_layers: mc.num_hidden_layers,
                 rotation_seed: self.config.rotation_seed,
+                outlier: None,
             };
             let tq_model = GpuTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -692,6 +693,7 @@ impl GpuInference {
                 let kv = self.kv_cache.as_ref().unwrap();
                 let (k_cache, v_cache) = kv.layer_caches(layer_idx);
                 let (k_scale, v_scale) = kv.layer_scales(layer_idx);
+                let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
                 let max_seq = self.config.max_seq_len as u32;
                 let n_bits = self.config.n_bits as u32;
 
@@ -704,10 +706,10 @@ impl GpuInference {
                 let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
                 for t in 0..token_count {
                     let token_offset = t * kv_head_stride_bytes;
-                    // Cache write K
+                    // Cache write K (with QJL residual correction)
                     enc.set_pipeline(&self.pipelines.turboquant_cache_write);
                     enc.set_buffer(&bufs.k_proj, token_offset, 0);
-                    enc.set_buffer(&tq.rotation_matrix, 0, 1);
+                    enc.set_buffer(&tq.rotation_signs, 0, 1);
                     enc.set_buffer(k_cache, 0, 2);
                     enc.set_bytes(&nkv.to_le_bytes(), 3);
                     enc.set_bytes(&hd.to_le_bytes(), 4);
@@ -716,11 +718,18 @@ impl GpuInference {
                     enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                     enc.set_bytes(&n_bits.to_le_bytes(), 8);
                     enc.set_buffer(k_scale, 0, 9);
+                    enc.set_buffer(&tq.codebook_buf, 0, 10);
+                    enc.set_buffer(&tq.boundaries_buf, 0, 11);
+                    enc.set_bytes(&tq.n_levels.to_le_bytes(), 12);
+                    enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                    enc.set_buffer(k_qjl_signs, 0, 14);
+                    enc.set_buffer(k_r_norms, 0, 15);
+                    enc.set_bytes(&1u32.to_le_bytes(), 16); // is_k_cache = 1
                     enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
-                    // Cache write V
+                    // Cache write V (no QJL)
                     enc.set_pipeline(&self.pipelines.turboquant_cache_write);
                     enc.set_buffer(&bufs.v_proj, token_offset, 0);
-                    enc.set_buffer(&tq.rotation_matrix, 0, 1);
+                    enc.set_buffer(&tq.rotation_signs, 0, 1);
                     enc.set_buffer(v_cache, 0, 2);
                     enc.set_bytes(&nkv.to_le_bytes(), 3);
                     enc.set_bytes(&hd.to_le_bytes(), 4);
@@ -729,6 +738,13 @@ impl GpuInference {
                     enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                     enc.set_bytes(&n_bits.to_le_bytes(), 8);
                     enc.set_buffer(v_scale, 0, 9);
+                    enc.set_buffer(&tq.codebook_buf, 0, 10);
+                    enc.set_buffer(&tq.boundaries_buf, 0, 11);
+                    enc.set_bytes(&tq.n_levels.to_le_bytes(), 12);
+                    enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                    enc.set_buffer(k_qjl_signs, 0, 14); // dummy — not written for V
+                    enc.set_buffer(k_r_norms, 0, 15); // dummy — not written for V
+                    enc.set_bytes(&0u32.to_le_bytes(), 16); // is_k_cache = 0
                     enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
                 }
 
@@ -743,7 +759,7 @@ impl GpuInference {
                     enc.set_buffer(&bufs.q_proj, q_offset, 0);
                     enc.set_buffer(k_cache, 0, 1);
                     enc.set_buffer(v_cache, 0, 2);
-                    enc.set_buffer(&tq.rotation_matrix, 0, 3);
+                    enc.set_buffer(&tq.rotation_signs, 0, 3);
                     enc.set_buffer(&bufs.attn_out, attn_out_offset, 4);
                     enc.set_bytes(&nh.to_le_bytes(), 5);
                     enc.set_bytes(&nkv.to_le_bytes(), 6);
@@ -754,6 +770,10 @@ impl GpuInference {
                     enc.set_bytes(&n_bits.to_le_bytes(), 11);
                     enc.set_buffer(k_scale, 0, 12);
                     enc.set_buffer(v_scale, 0, 13);
+                    enc.set_buffer(&tq.codebook_buf, 0, 14);
+                    enc.set_buffer(&tq.qjl_matrix, 0, 15);
+                    enc.set_buffer(k_qjl_signs, 0, 16);
+                    enc.set_buffer(k_r_norms, 0, 17);
                     enc.dispatch_threadgroups((nh as usize, 1, 1), (hd as usize, 1, 1));
                 }
                 enc.end_encoding();
@@ -1232,6 +1252,7 @@ impl InferenceEngine for GpuInference {
                 max_seq_len: self.config.max_seq_len,
                 num_layers: mc.num_hidden_layers,
                 rotation_seed: self.config.rotation_seed,
+                outlier: None,
             };
             let tq_model = GpuTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;

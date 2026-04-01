@@ -13,6 +13,8 @@ pub struct GpuPipelines {
     pub embedding_lookup: ComputePipeline,
     pub turboquant_cache_write: ComputePipeline,
     pub turboquant_attention: ComputePipeline,
+    pub turboquant_outlier_cache_write: ComputePipeline,
+    pub turboquant_outlier_attention: ComputePipeline,
     pub standard_attention: ComputePipeline,
     pub polarquant_matvec_int4: ComputePipeline,
     pub polarquant_matmul_int4: ComputePipeline,
@@ -96,6 +98,20 @@ impl GpuPipelines {
                 .create_compute_pipeline(
                     &tq_lib
                         .get_function("turboquant_attention")
+                        .map_err(GpuError::Metal)?,
+                )
+                .map_err(GpuError::Metal)?,
+            turboquant_outlier_cache_write: device
+                .create_compute_pipeline(
+                    &tq_lib
+                        .get_function("turboquant_outlier_cache_write")
+                        .map_err(GpuError::Metal)?,
+                )
+                .map_err(GpuError::Metal)?,
+            turboquant_outlier_attention: device
+                .create_compute_pipeline(
+                    &tq_lib
+                        .get_function("turboquant_outlier_attention")
                         .map_err(GpuError::Metal)?,
                 )
                 .map_err(GpuError::Metal)?,
@@ -270,7 +286,7 @@ pub fn encode_turboquant_cache_write(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
     kv_proj: &MetalBuffer,
-    rotation_matrix: &MetalBuffer,
+    rotation_signs: &MetalBuffer,
     cache: &MetalBuffer,
     num_kv_heads: u32,
     head_dim: u32,
@@ -278,10 +294,14 @@ pub fn encode_turboquant_cache_write(
     seq_pos: u32,
     inv_scale: f32,
     n_bits: u32,
+    scale_buf: &MetalBuffer,
+    codebook: &MetalBuffer,
+    boundaries: &MetalBuffer,
+    n_levels: u32,
 ) {
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(kv_proj, 0, 0);
-    encoder.set_buffer(rotation_matrix, 0, 1);
+    encoder.set_buffer(rotation_signs, 0, 1);
     encoder.set_buffer(cache, 0, 2);
     encoder.set_bytes(&num_kv_heads.to_le_bytes(), 3);
     encoder.set_bytes(&head_dim.to_le_bytes(), 4);
@@ -289,6 +309,10 @@ pub fn encode_turboquant_cache_write(
     encoder.set_bytes(&seq_pos.to_le_bytes(), 6);
     encoder.set_bytes(&inv_scale.to_le_bytes(), 7);
     encoder.set_bytes(&n_bits.to_le_bytes(), 8);
+    encoder.set_buffer(scale_buf, 0, 9);
+    encoder.set_buffer(codebook, 0, 10);
+    encoder.set_buffer(boundaries, 0, 11);
+    encoder.set_bytes(&n_levels.to_le_bytes(), 12);
     encoder.dispatch_threadgroups((num_kv_heads as usize, 1, 1), (head_dim as usize, 1, 1));
 }
 
@@ -300,7 +324,7 @@ pub fn encode_turboquant_attention(
     q: &MetalBuffer,
     k_cache: &MetalBuffer,
     v_cache: &MetalBuffer,
-    rotation_matrix: &MetalBuffer,
+    rotation_signs: &MetalBuffer,
     output: &MetalBuffer,
     num_heads: u32,
     num_kv_heads: u32,
@@ -309,12 +333,15 @@ pub fn encode_turboquant_attention(
     seq_len: u32,
     deq_scale: f32,
     n_bits: u32,
+    k_scale_buf: &MetalBuffer,
+    v_scale_buf: &MetalBuffer,
+    codebook: &MetalBuffer,
 ) {
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(q, 0, 0);
     encoder.set_buffer(k_cache, 0, 1);
     encoder.set_buffer(v_cache, 0, 2);
-    encoder.set_buffer(rotation_matrix, 0, 3);
+    encoder.set_buffer(rotation_signs, 0, 3);
     encoder.set_buffer(output, 0, 4);
     encoder.set_bytes(&num_heads.to_le_bytes(), 5);
     encoder.set_bytes(&num_kv_heads.to_le_bytes(), 6);
@@ -323,6 +350,9 @@ pub fn encode_turboquant_attention(
     encoder.set_bytes(&seq_len.to_le_bytes(), 9);
     encoder.set_bytes(&deq_scale.to_le_bytes(), 10);
     encoder.set_bytes(&n_bits.to_le_bytes(), 11);
+    encoder.set_buffer(k_scale_buf, 0, 12);
+    encoder.set_buffer(v_scale_buf, 0, 13);
+    encoder.set_buffer(codebook, 0, 14);
     encoder.dispatch_threadgroups((num_heads as usize, 1, 1), (head_dim as usize, 1, 1));
 }
 

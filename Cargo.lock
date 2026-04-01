@@ -543,6 +543,7 @@ dependencies = [
  "ironmill-iosurface",
  "ironmill-metal-sys",
  "mil-rs",
+ "rand",
  "serde",
  "serde_json",
  "tempfile",
