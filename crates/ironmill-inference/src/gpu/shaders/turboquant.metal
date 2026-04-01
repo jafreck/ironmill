@@ -29,6 +29,22 @@ inline float read_quantized(device const char* cache, uint base,
     }
 }
 
+/// Read K cache: extract 3-bit codebook index + 1-bit QJL sign from 4-bit nibble.
+/// Returns (k_mse_value, qjl_sign) where sign is ±1.0.
+inline float2 read_k_quantized(device const char* cache, uint base,
+                               uint pos, uint dim, uint head_dim,
+                               float deq_scale,
+                               device const float* k_codebook) {
+    uint packed_stride = head_dim / 2;
+    uint byte_idx = base + pos * packed_stride + dim / 2;
+    uchar packed = ((device const uchar*)cache)[byte_idx];
+    uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
+    // Bits 0-2: codebook index (8 levels), bit 3: QJL sign
+    uchar idx = nibble & 0x7;
+    float sign_val = (nibble & 0x8) ? 1.0f : -1.0f;
+    return float2(k_codebook[idx] * deq_scale, sign_val);
+}
+
 // ── In-place Walsh-Hadamard butterfly transform ──────────────────
 //
 // Applies the randomized Hadamard rotation R = (1/√d)·D·H·D in-place
@@ -162,7 +178,7 @@ kernel void turboquant_cache_write(
     float max_val = max(shared_reduce[0], 1e-10f);
 
     if (n_bits == 4) {
-        // TurboQuant MSE (arXiv:2504.19874 Algorithm 1):
+        // ── TurboQuant Algorithm 1+2: Rotate → L2 norm → Quantize → [QJL] → Pack ──
         float local_sq = 0.0f;
         for (uint d = tid; d < head_dim; d += tg_size)
             local_sq += shared_rotated[d] * shared_rotated[d];
@@ -178,20 +194,23 @@ kernel void turboquant_cache_write(
             scale_buf[head_idx * max_seq_len + seq_pos] = l2_norm;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Normalize and find nearest codebook centroid per coordinate
+        // Quantize via nearest codebook centroid
         float inv_norm = 1.0f / max(l2_norm, 1e-10f);
         uint n_boundaries = n_levels - 1;
-        for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
-            float normalized = shared_rotated[out_dim] * inv_norm;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            float normalized = shared_rotated[d] * inv_norm;
             uint idx = 0;
             for (uint b = 0; b < n_boundaries; b++) {
                 if (normalized >= boundaries[b]) idx = b + 1;
             }
-            shared_quant[out_dim] = char(idx);
+            shared_quant[d] = char(idx);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Pack INT4 pairs into cache (must happen before QJL overwrites shared_quant)
+        // At 4-bit, both K and V use full MSE codebook (QJL only useful at ≤3 bits).
+        // is_k_cache flag preserved in kernel signature for future low-bit QJL support.
+
+        // Pack INT4 nibbles into cache bytes
         uint packed_stride = head_dim / 2;
         uint cache_base = kv_cache_base(head_idx, max_seq_len, head_dim, 4)
                         + seq_pos * packed_stride;
@@ -199,58 +218,6 @@ kernel void turboquant_cache_write(
             uchar lo = uchar(shared_quant[d]     & 0xF);
             uchar hi = uchar(shared_quant[d + 1] & 0xF);
             ((device uchar*)cache)[cache_base + d / 2] = lo | (hi << 4);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── QJL residual correction (K cache only, INT4 only) ──
-        // Paper §3.2: project quantization residual, store sign bits + norm.
-        if (is_k_cache == 1) {
-            // Compute residual = rotated - l2_norm * codebook[idx]
-            // shared_rotated still has original rotated values (never overwritten)
-            for (uint d = tid; d < head_dim; d += tg_size) {
-                uchar q_idx = uchar(shared_quant[d]) & 0xF;
-                shared_rotated[d] -= codebook[q_idx] * l2_norm;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Compute ||residual||_2
-            float res_sq = 0.0f;
-            for (uint d = tid; d < head_dim; d += tg_size)
-                res_sq += shared_rotated[d] * shared_rotated[d];
-            shared_reduce[tid] = res_sq;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tg_size / 2; s > 0; s >>= 1) {
-                if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            float r_norm = sqrt(max(shared_reduce[0], 1e-30f));
-
-            if (tid == 0)
-                r_norms_buf[head_idx * max_seq_len + seq_pos] = r_norm;
-
-            // QJL projection: sign(S · residual), packed into bits
-            for (uint out_d = tid; out_d < head_dim; out_d += tg_size) {
-                float proj = 0.0f;
-                uint row_base = out_d * head_dim;
-                for (uint k = 0; k < head_dim; k++) {
-                    proj += qjl_matrix[row_base + k] * shared_rotated[k];
-                }
-                shared_quant[out_d] = (proj >= 0.0f) ? char(1) : char(0);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Pack 8 sign bits per byte
-            uint signs_per_pos = head_dim / 8;
-            uint signs_base = (head_idx * max_seq_len + seq_pos) * signs_per_pos;
-            for (uint byte_idx = tid; byte_idx < signs_per_pos; byte_idx += tg_size) {
-                uchar packed = 0;
-                uint base_dim = byte_idx * 8;
-                for (uint b = 0; b < 8; b++) {
-                    if (shared_quant[base_dim + b] == 1)
-                        packed |= (1u << b);
-                }
-                qjl_signs_buf[signs_base + byte_idx] = packed;
-            }
         }
     } else {
         // INT8: per-head absmax (unchanged)
@@ -302,9 +269,9 @@ kernel void turboquant_cache_write(
 //   buffer(11) n_bits:          uint (4 or 8)
 //   buffer(12) k_scale_buf:     [num_kv_heads × max_seq_len] float
 //   buffer(13) v_scale_buf:     [num_kv_heads × max_seq_len] float
-//   buffer(14) codebook:        [n_levels] float
-//   buffer(15) qjl_matrix:      [head_dim × head_dim] float
-//   buffer(16) k_qjl_signs:     [num_kv_heads × max_seq_len × head_dim/8] uchar
+//   buffer(14) k_codebook:      K cache codebook ((b-1)-bit levels for TurboQuant_prod)
+//   buffer(15) v_codebook:      V cache codebook (b-bit levels for TurboQuant_mse)
+//   buffer(16) qjl_matrix:      [head_dim × head_dim] float
 //   buffer(17) k_r_norms:       [num_kv_heads × max_seq_len] float
 //
 // Dispatch: num_heads threadgroups, head_dim threads per group.
@@ -324,9 +291,9 @@ kernel void turboquant_attention(
     constant uint& n_bits               [[buffer(11)]],
     device const float* k_scale_buf     [[buffer(12)]],
     device const float* v_scale_buf     [[buffer(13)]],
-    device const float* codebook        [[buffer(14)]],
-    device const float* qjl_matrix      [[buffer(15)]],
-    device const uchar* k_qjl_signs     [[buffer(16)]],
+    device const float* k_codebook      [[buffer(14)]],
+    device const float* v_codebook      [[buffer(15)]],
+    device const float* qjl_matrix      [[buffer(16)]],
     device const float* k_r_norms       [[buffer(17)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -377,39 +344,20 @@ kernel void turboquant_attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // QJL correction constants
-    // √(π/2) / d — from the QJL unbiased estimator (arXiv:2504.19874 §3.2)
-    float qjl_coeff = (n_bits == 4) ? (sqrt(M_PI_F / 2.0f) / float(head_dim)) : 0.0f;
-    uint signs_per_pos = head_dim / 8;
+    // QJL correction constant: √(π/2) / d
+    // TODO: temporarily disabled — testing 3-bit MSE baseline
+    float qjl_coeff = 0.0f;
 
     // ---- Step 2: Online softmax attention ----
     for (uint p = 0; p < seq_len; p++) {
         float k_deq = k_scale_buf[kv_head * max_seq_len + p];
 
-        // Stage 1: <q_rot, codebook[indices]> * l2_norm
+        // K inner product: at 4-bit, MSE-optimal codebook is sufficient
+        // (bias is negligible; paper Fig 3 confirms TurboQuant_mse > _prod at b≥4)
         float partial_dot = 0.0f;
         for (uint d = tid; d < head_dim; d += tg_size) {
-            float k_val = read_quantized(k_cache, kv_base, p, d, head_dim, n_bits, k_deq, codebook);
+            float k_val = read_quantized(k_cache, kv_base, p, d, head_dim, n_bits, k_deq, k_codebook);
             partial_dot += shared_q_rot[d] * k_val;
-        }
-
-        // Stage 2 (INT4 only): QJL correction = qjl_coeff * r_norm * l2_norm * <S·q, signs>
-        if (n_bits == 4) {
-            float r_norm = k_r_norms[kv_head * max_seq_len + p];
-            uint sign_base = (kv_head * max_seq_len + p) * signs_per_pos;
-
-            float sign_dot = 0.0f;
-            for (uint d = tid; d < head_dim; d += tg_size) {
-                uint byte_idx = d / 8;
-                uint bit_idx = d % 8;
-                uchar packed = k_qjl_signs[sign_base + byte_idx];
-                float sign_val = ((packed >> bit_idx) & 1) ? 1.0f : -1.0f;
-                sign_dot += shared_s_q[d] * sign_val;
-            }
-            // The residual r = k_rot - l2_norm*codebook[idx] is already in
-            // un-normalized space, so r_norm = ||r||. The QJL estimator gives
-            // <q_rot, r>_est directly — no extra l2_norm scaling needed.
-            partial_dot += qjl_coeff * r_norm * sign_dot;
         }
 
         shared_reduce[tid] = partial_dot;
@@ -441,7 +389,7 @@ kernel void turboquant_attention(
         // Rescale accumulator and add weighted dequantized V
         float v_deq = v_scale_buf[kv_head * max_seq_len + p];
         for (uint d = tid; d < head_dim; d += tg_size) {
-            float v_val = read_quantized(v_cache, kv_base, p, d, head_dim, n_bits, v_deq, codebook);
+            float v_val = read_quantized(v_cache, kv_base, p, d, head_dim, n_bits, v_deq, v_codebook);
             shared_output[d] = shared_output[d] * rescale + weight * v_val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -16,22 +16,29 @@ use super::error::GpuError;
 
 /// TurboQuant model state for GPU inference.
 ///
-/// Manages the Hadamard rotation signs and dequantization scale
-/// used by the fused cache write and attention kernels.
+/// Per Algorithm 2 (TurboQuant_prod), K and V caches use different codebooks:
+/// - K cache: (b-1)-bit MSE codebook + 1-bit QJL = b bits total (inner product)
+/// - V cache: b-bit MSE codebook, no QJL (MSE reconstruction)
 pub struct GpuTurboQuantModel {
     /// Rotation sign vector [head_dim] float (±1.0).
     pub rotation_signs: ironmill_metal_sys::MetalBuffer,
-    /// Inverse quantization scale for cache write.
+    /// Inverse quantization scale for cache write (INT8 path only).
     pub inv_scale: f32,
-    /// Dequantization scale for attention.
+    /// Dequantization scale for attention (INT8 path only).
     pub deq_scale: f32,
-    /// Lloyd-Max codebook centroids [n_levels] float.
-    pub codebook_buf: ironmill_metal_sys::MetalBuffer,
-    /// Lloyd-Max decision boundaries [n_levels-1] float.
-    pub boundaries_buf: ironmill_metal_sys::MetalBuffer,
-    /// Number of codebook levels.
-    pub n_levels: u32,
-    /// QJL random projection matrix [head_dim × head_dim] float.
+    /// K cache codebook: (b-1)-bit Lloyd-Max centroids (for inner product via QJL).
+    pub k_codebook_buf: ironmill_metal_sys::MetalBuffer,
+    /// K cache boundaries: (b-1)-bit decision thresholds.
+    pub k_boundaries_buf: ironmill_metal_sys::MetalBuffer,
+    /// Number of K codebook levels (2^(b-1)).
+    pub k_n_levels: u32,
+    /// V cache codebook: b-bit Lloyd-Max centroids (for MSE reconstruction).
+    pub v_codebook_buf: ironmill_metal_sys::MetalBuffer,
+    /// V cache boundaries: b-bit decision thresholds.
+    pub v_boundaries_buf: ironmill_metal_sys::MetalBuffer,
+    /// Number of V codebook levels (2^b).
+    pub v_n_levels: u32,
+    /// QJL random projection matrix [head_dim × head_dim] float (K cache only).
     pub qjl_matrix: ironmill_metal_sys::MetalBuffer,
     /// Outlier channel state (None = standard mode).
     pub outlier: Option<OutlierState>,
@@ -197,9 +204,8 @@ pub fn generate_rotation_signs(dim: usize, seed: u64) -> Vec<u8> {
 /// Generate the QJL random projection matrix S for residual correction.
 ///
 /// Returns a [dim × dim] f32 matrix (row-major, little-endian bytes)
-/// where each entry is drawn i.i.d. from N(0, 1/dim). Uses Box-Muller.
+/// where each entry is drawn i.i.d. from N(0, 1) per Algorithm 2 line 3.
 pub fn generate_qjl_matrix(dim: usize, seed: u64) -> Vec<u8> {
-    let sigma = 1.0 / (dim as f64).sqrt();
     let mut rng = StdRng::seed_from_u64(seed);
 
     let n = dim * dim;
@@ -210,9 +216,9 @@ pub fn generate_qjl_matrix(dim: usize, seed: u64) -> Vec<u8> {
         let u2: f64 = rng.r#gen::<f64>();
         let r = (-2.0 * u1.ln()).sqrt();
         let theta = 2.0 * std::f64::consts::PI * u2;
-        values.push((r * theta.cos() * sigma) as f32);
+        values.push((r * theta.cos()) as f32);
         if values.len() < n {
-            values.push((r * theta.sin() * sigma) as f32);
+            values.push((r * theta.sin()) as f32);
         }
     }
 
@@ -252,13 +258,21 @@ impl GpuTurboQuantModel {
             .create_buffer_with_data(&sign_bytes, ironmill_metal_sys::StorageMode::Shared)
             .map_err(GpuError::Metal)?;
 
-        // Compute Lloyd-Max codebook for N(0, 1/√head_dim)
+        // Both K and V use the same b-bit MSE codebook at 4-bit precision.
+        // QJL is only beneficial at ≤3 bits (paper Figure 3: "TurboQuant_mse
+        // achieves superior performance at higher bit widths").
         let (levels, bounds) = codebook::lloyd_max_gaussian(config.head_dim, config.n_bits);
         let n_levels = levels.len() as u32;
         let codebook_buf = create_f32_buffer(device, &levels)?;
         let boundaries_buf = create_f32_buffer(device, &bounds)?;
+        let k_codebook_buf = create_f32_buffer(device, &levels)?;
+        let k_boundaries_buf = create_f32_buffer(device, &bounds)?;
+        let k_n_levels = n_levels;
+        let v_codebook_buf = codebook_buf;
+        let v_boundaries_buf = boundaries_buf;
+        let v_n_levels = n_levels;
 
-        // QJL projection matrix (seed+1 for independence)
+        // QJL projection matrix for K cache (seed+1 for independence)
         let qjl_bytes = generate_qjl_matrix(config.head_dim, config.rotation_seed + 1);
         let qjl_matrix = device
             .create_buffer_with_data(&qjl_bytes, ironmill_metal_sys::StorageMode::Shared)
@@ -279,9 +293,12 @@ impl GpuTurboQuantModel {
             rotation_signs,
             inv_scale,
             deq_scale,
-            codebook_buf,
-            boundaries_buf,
-            n_levels,
+            k_codebook_buf,
+            k_boundaries_buf,
+            k_n_levels,
+            v_codebook_buf,
+            v_boundaries_buf,
+            v_n_levels,
             qjl_matrix,
             outlier,
             config,

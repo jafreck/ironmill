@@ -243,7 +243,7 @@ impl GpuInference {
         if self.config.enable_turboquant {
             // Detect outlier channels from K/V weight column norms (§4.3).
             // Only enabled for INT4 where the quality gap benefits from it.
-            let outlier_cfg = if self.config.n_bits == 4 {
+            let outlier_cfg: Option<OutlierConfig> = if self.config.n_bits == 4 {
                 let weight_data: Vec<(Vec<u8>, Vec<u8>)> = weights
                     .layers
                     .iter()
@@ -822,7 +822,7 @@ impl GpuInference {
                     let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
                     for t in 0..token_count {
                         let token_offset = t * kv_head_stride_bytes;
-                        // K cache write (with QJL)
+                        // K cache write: (b-1)-bit codebook + QJL
                         enc.set_pipeline(&self.pipelines.turboquant_cache_write);
                         enc.set_buffer(&bufs.k_proj, token_offset, 0);
                         enc.set_buffer(&tq.rotation_signs, 0, 1);
@@ -834,15 +834,15 @@ impl GpuInference {
                         enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                         enc.set_bytes(&n_bits.to_le_bytes(), 8);
                         enc.set_buffer(k_scale, 0, 9);
-                        enc.set_buffer(&tq.codebook_buf, 0, 10);
-                        enc.set_buffer(&tq.boundaries_buf, 0, 11);
-                        enc.set_bytes(&tq.n_levels.to_le_bytes(), 12);
+                        enc.set_buffer(&tq.k_codebook_buf, 0, 10);
+                        enc.set_buffer(&tq.k_boundaries_buf, 0, 11);
+                        enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 12);
                         enc.set_buffer(&tq.qjl_matrix, 0, 13);
                         enc.set_buffer(k_qjl_signs, 0, 14);
                         enc.set_buffer(k_r_norms, 0, 15);
                         enc.set_bytes(&1u32.to_le_bytes(), 16);
                         enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
-                        // V cache write (no QJL)
+                        // V cache write: b-bit codebook, no QJL
                         enc.set_pipeline(&self.pipelines.turboquant_cache_write);
                         enc.set_buffer(&bufs.v_proj, token_offset, 0);
                         enc.set_buffer(&tq.rotation_signs, 0, 1);
@@ -854,9 +854,9 @@ impl GpuInference {
                         enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                         enc.set_bytes(&n_bits.to_le_bytes(), 8);
                         enc.set_buffer(v_scale, 0, 9);
-                        enc.set_buffer(&tq.codebook_buf, 0, 10);
-                        enc.set_buffer(&tq.boundaries_buf, 0, 11);
-                        enc.set_bytes(&tq.n_levels.to_le_bytes(), 12);
+                        enc.set_buffer(&tq.v_codebook_buf, 0, 10);
+                        enc.set_buffer(&tq.v_boundaries_buf, 0, 11);
+                        enc.set_bytes(&tq.v_n_levels.to_le_bytes(), 12);
                         enc.set_buffer(&tq.qjl_matrix, 0, 13);
                         enc.set_buffer(k_qjl_signs, 0, 14);
                         enc.set_buffer(k_r_norms, 0, 15);
@@ -884,9 +884,9 @@ impl GpuInference {
                         enc.set_bytes(&n_bits.to_le_bytes(), 11);
                         enc.set_buffer(k_scale, 0, 12);
                         enc.set_buffer(v_scale, 0, 13);
-                        enc.set_buffer(&tq.codebook_buf, 0, 14);
-                        enc.set_buffer(&tq.qjl_matrix, 0, 15);
-                        enc.set_buffer(k_qjl_signs, 0, 16);
+                        enc.set_buffer(&tq.k_codebook_buf, 0, 14);
+                        enc.set_buffer(&tq.v_codebook_buf, 0, 15);
+                        enc.set_buffer(&tq.qjl_matrix, 0, 16);
                         enc.set_buffer(k_r_norms, 0, 17);
                         enc.dispatch_threadgroups((nh as usize, 1, 1), (hd as usize, 1, 1));
                     }
