@@ -17,7 +17,7 @@ use mil_rs::weights::{ModelConfig, WeightProvider};
 use super::config::GpuConfig;
 use super::error::GpuError;
 use super::ops;
-use super::turboquant::{GpuKvCache, GpuTurboQuantModel, TurboQuantGpuConfig};
+use super::turboquant::{GpuKvCache, GpuTurboQuantModel, OutlierConfig, TurboQuantGpuConfig};
 use super::weights::{GpuWeights, QuantizedWeight, WeightBuffer};
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
@@ -241,6 +241,46 @@ impl GpuInference {
         self.decode_matmuls = Some(decode_cache);
 
         if self.config.enable_turboquant {
+            // Detect outlier channels from K/V weight column norms (§4.3).
+            // Only enabled for INT4 where the quality gap benefits from it.
+            let outlier_cfg = if self.config.n_bits == 4 {
+                let weight_data: Vec<(Vec<u8>, Vec<u8>)> = weights
+                    .layers
+                    .iter()
+                    .filter_map(|lw| {
+                        if let (
+                            crate::gpu::weights::WeightBuffer::Dense(k_buf),
+                            crate::gpu::weights::WeightBuffer::Dense(v_buf),
+                        ) = (&lw.k_proj, &lw.v_proj)
+                        {
+                            let mut k_data = vec![0u8; k_buf.length()];
+                            let mut v_data = vec![0u8; v_buf.length()];
+                            k_buf.read_bytes(&mut k_data, 0).ok()?;
+                            v_buf.read_bytes(&mut v_data, 0).ok()?;
+                            Some((k_data, v_data))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !weight_data.is_empty() {
+                    let refs: Vec<(&[u8], &[u8])> = weight_data
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect();
+                    let out_features = mc.num_key_value_heads * mc.head_dim;
+                    Some(OutlierConfig::auto_from_weights(
+                        &refs,
+                        out_features,
+                        mc.head_dim,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let tq_config = TurboQuantGpuConfig {
                 n_bits: self.config.n_bits,
                 num_kv_heads: mc.num_key_value_heads,
@@ -248,7 +288,7 @@ impl GpuInference {
                 max_seq_len: self.config.max_seq_len,
                 num_layers: mc.num_hidden_layers,
                 rotation_seed: self.config.rotation_seed,
-                outlier: None,
+                outlier: outlier_cfg,
             };
             let tq_model = GpuTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -691,9 +731,6 @@ impl GpuInference {
             if enable_tq {
                 let tq = self.turboquant.as_ref().unwrap();
                 let kv = self.kv_cache.as_ref().unwrap();
-                let (k_cache, v_cache) = kv.layer_caches(layer_idx);
-                let (k_scale, v_scale) = kv.layer_scales(layer_idx);
-                let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
                 let max_seq = self.config.max_seq_len as u32;
                 let n_bits = self.config.n_bits as u32;
 
@@ -701,80 +738,158 @@ impl GpuInference {
                     .compute_encoder()
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-                // TurboQuant cache write — loop over tokens so each
-                // token is written at the correct seq_pos offset.
-                let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
-                for t in 0..token_count {
-                    let token_offset = t * kv_head_stride_bytes;
-                    // Cache write K (with QJL residual correction)
-                    enc.set_pipeline(&self.pipelines.turboquant_cache_write);
-                    enc.set_buffer(&bufs.k_proj, token_offset, 0);
-                    enc.set_buffer(&tq.rotation_signs, 0, 1);
-                    enc.set_buffer(k_cache, 0, 2);
-                    enc.set_bytes(&nkv.to_le_bytes(), 3);
-                    enc.set_bytes(&hd.to_le_bytes(), 4);
-                    enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                    enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
-                    enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-                    enc.set_bytes(&n_bits.to_le_bytes(), 8);
-                    enc.set_buffer(k_scale, 0, 9);
-                    enc.set_buffer(&tq.codebook_buf, 0, 10);
-                    enc.set_buffer(&tq.boundaries_buf, 0, 11);
-                    enc.set_bytes(&tq.n_levels.to_le_bytes(), 12);
-                    enc.set_buffer(&tq.qjl_matrix, 0, 13);
-                    enc.set_buffer(k_qjl_signs, 0, 14);
-                    enc.set_buffer(k_r_norms, 0, 15);
-                    enc.set_bytes(&1u32.to_le_bytes(), 16); // is_k_cache = 1
-                    enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
-                    // Cache write V (no QJL)
-                    enc.set_pipeline(&self.pipelines.turboquant_cache_write);
-                    enc.set_buffer(&bufs.v_proj, token_offset, 0);
-                    enc.set_buffer(&tq.rotation_signs, 0, 1);
-                    enc.set_buffer(v_cache, 0, 2);
-                    enc.set_bytes(&nkv.to_le_bytes(), 3);
-                    enc.set_bytes(&hd.to_le_bytes(), 4);
-                    enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                    enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
-                    enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-                    enc.set_bytes(&n_bits.to_le_bytes(), 8);
-                    enc.set_buffer(v_scale, 0, 9);
-                    enc.set_buffer(&tq.codebook_buf, 0, 10);
-                    enc.set_buffer(&tq.boundaries_buf, 0, 11);
-                    enc.set_bytes(&tq.n_levels.to_le_bytes(), 12);
-                    enc.set_buffer(&tq.qjl_matrix, 0, 13);
-                    enc.set_buffer(k_qjl_signs, 0, 14); // dummy — not written for V
-                    enc.set_buffer(k_r_norms, 0, 15); // dummy — not written for V
-                    enc.set_bytes(&0u32.to_le_bytes(), 16); // is_k_cache = 0
-                    enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
-                }
+                if let Some(ref outlier) = tq.outlier {
+                    // ── Outlier channel strategy dispatch ──
+                    let ((k_o_cache, v_o_cache), (k_n_cache, v_n_cache)) =
+                        kv.layer_outlier_caches(layer_idx);
+                    let ((k_o_scale, v_o_scale), (k_n_scale, v_n_scale)) =
+                        kv.layer_outlier_scales(layer_idx);
+                    let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
+                    let tg_size = std::cmp::max(
+                        outlier.d_outlier_padded as usize,
+                        outlier.d_non_padded as usize,
+                    );
 
-                // TurboQuant attention — loop over tokens with causal
-                // masking: each token attends to positions 0..seq_pos+t+1.
-                let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
-                for t in 0..token_count {
-                    let q_offset = t * q_head_stride_bytes;
-                    let attn_out_offset = t * q_head_stride_bytes;
-                    let current_seq_len = (seq_pos + t + 1) as u32;
-                    enc.set_pipeline(&self.pipelines.turboquant_attention);
-                    enc.set_buffer(&bufs.q_proj, q_offset, 0);
-                    enc.set_buffer(k_cache, 0, 1);
-                    enc.set_buffer(v_cache, 0, 2);
-                    enc.set_buffer(&tq.rotation_signs, 0, 3);
-                    enc.set_buffer(&bufs.attn_out, attn_out_offset, 4);
-                    enc.set_bytes(&nh.to_le_bytes(), 5);
-                    enc.set_bytes(&nkv.to_le_bytes(), 6);
-                    enc.set_bytes(&hd.to_le_bytes(), 7);
-                    enc.set_bytes(&max_seq.to_le_bytes(), 8);
-                    enc.set_bytes(&current_seq_len.to_le_bytes(), 9);
-                    enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
-                    enc.set_bytes(&n_bits.to_le_bytes(), 11);
-                    enc.set_buffer(k_scale, 0, 12);
-                    enc.set_buffer(v_scale, 0, 13);
-                    enc.set_buffer(&tq.codebook_buf, 0, 14);
-                    enc.set_buffer(&tq.qjl_matrix, 0, 15);
-                    enc.set_buffer(k_qjl_signs, 0, 16);
-                    enc.set_buffer(k_r_norms, 0, 17);
-                    enc.dispatch_threadgroups((nh as usize, 1, 1), (hd as usize, 1, 1));
+                    for t in 0..token_count {
+                        let token_offset = t * kv_head_stride_bytes;
+                        for (proj_buf, o_cache, n_cache, o_scale, n_scale) in [
+                            (&bufs.k_proj, k_o_cache, k_n_cache, k_o_scale, k_n_scale),
+                            (&bufs.v_proj, v_o_cache, v_n_cache, v_o_scale, v_n_scale),
+                        ] {
+                            enc.set_pipeline(&self.pipelines.turboquant_outlier_cache_write);
+                            enc.set_buffer(proj_buf, token_offset, 0);
+                            enc.set_buffer(&outlier.channel_indices, 0, 1);
+                            enc.set_buffer(o_cache, 0, 2);
+                            enc.set_buffer(n_cache, 0, 3);
+                            enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
+                            enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
+                            enc.set_buffer(&outlier.outlier_codebook, 0, 6);
+                            enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
+                            enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
+                            enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
+                            enc.set_buffer(o_scale, 0, 10);
+                            enc.set_buffer(n_scale, 0, 11);
+                            enc.set_bytes(&nkv.to_le_bytes(), 12);
+                            enc.set_bytes(&hd.to_le_bytes(), 13);
+                            enc.set_bytes(&max_seq.to_le_bytes(), 14);
+                            enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
+                            enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
+                            enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
+                            enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
+                            enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
+                            enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
+                            enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size, 1, 1));
+                        }
+                    }
+
+                    let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
+                    for t in 0..token_count {
+                        let q_offset = t * q_head_stride_bytes;
+                        let attn_out_offset = t * q_head_stride_bytes;
+                        let current_seq_len = (seq_pos + t + 1) as u32;
+                        enc.set_pipeline(&self.pipelines.turboquant_outlier_attention);
+                        enc.set_buffer(&bufs.q_proj, q_offset, 0);
+                        enc.set_buffer(k_o_cache, 0, 1);
+                        enc.set_buffer(v_o_cache, 0, 2);
+                        enc.set_buffer(k_n_cache, 0, 3);
+                        enc.set_buffer(v_n_cache, 0, 4);
+                        enc.set_buffer(&outlier.channel_indices, 0, 5);
+                        enc.set_buffer(&outlier.outlier_rotation_signs, 0, 6);
+                        enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 7);
+                        enc.set_buffer(&outlier.outlier_codebook, 0, 8);
+                        enc.set_buffer(&outlier.non_outlier_codebook, 0, 9);
+                        enc.set_buffer(&bufs.attn_out, attn_out_offset, 10);
+                        enc.set_buffer(k_o_scale, 0, 11);
+                        enc.set_buffer(v_o_scale, 0, 12);
+                        enc.set_buffer(k_n_scale, 0, 13);
+                        enc.set_buffer(v_n_scale, 0, 14);
+                        enc.set_bytes(&nh.to_le_bytes(), 15);
+                        enc.set_bytes(&nkv.to_le_bytes(), 16);
+                        enc.set_bytes(&hd.to_le_bytes(), 17);
+                        enc.set_bytes(&max_seq.to_le_bytes(), 18);
+                        enc.set_bytes(&current_seq_len.to_le_bytes(), 19);
+                        enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 20);
+                        enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 21);
+                        enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 22);
+                        enc.dispatch_threadgroups((nh as usize, 1, 1), (tg_size, 1, 1));
+                    }
+                } else {
+                    // ── Standard TurboQuant dispatch ──
+                    let (k_cache, v_cache) = kv.layer_caches(layer_idx);
+                    let (k_scale, v_scale) = kv.layer_scales(layer_idx);
+                    let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
+
+                    let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
+                    for t in 0..token_count {
+                        let token_offset = t * kv_head_stride_bytes;
+                        // K cache write (with QJL)
+                        enc.set_pipeline(&self.pipelines.turboquant_cache_write);
+                        enc.set_buffer(&bufs.k_proj, token_offset, 0);
+                        enc.set_buffer(&tq.rotation_signs, 0, 1);
+                        enc.set_buffer(k_cache, 0, 2);
+                        enc.set_bytes(&nkv.to_le_bytes(), 3);
+                        enc.set_bytes(&hd.to_le_bytes(), 4);
+                        enc.set_bytes(&max_seq.to_le_bytes(), 5);
+                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
+                        enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+                        enc.set_bytes(&n_bits.to_le_bytes(), 8);
+                        enc.set_buffer(k_scale, 0, 9);
+                        enc.set_buffer(&tq.codebook_buf, 0, 10);
+                        enc.set_buffer(&tq.boundaries_buf, 0, 11);
+                        enc.set_bytes(&tq.n_levels.to_le_bytes(), 12);
+                        enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                        enc.set_buffer(k_qjl_signs, 0, 14);
+                        enc.set_buffer(k_r_norms, 0, 15);
+                        enc.set_bytes(&1u32.to_le_bytes(), 16);
+                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
+                        // V cache write (no QJL)
+                        enc.set_pipeline(&self.pipelines.turboquant_cache_write);
+                        enc.set_buffer(&bufs.v_proj, token_offset, 0);
+                        enc.set_buffer(&tq.rotation_signs, 0, 1);
+                        enc.set_buffer(v_cache, 0, 2);
+                        enc.set_bytes(&nkv.to_le_bytes(), 3);
+                        enc.set_bytes(&hd.to_le_bytes(), 4);
+                        enc.set_bytes(&max_seq.to_le_bytes(), 5);
+                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
+                        enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+                        enc.set_bytes(&n_bits.to_le_bytes(), 8);
+                        enc.set_buffer(v_scale, 0, 9);
+                        enc.set_buffer(&tq.codebook_buf, 0, 10);
+                        enc.set_buffer(&tq.boundaries_buf, 0, 11);
+                        enc.set_bytes(&tq.n_levels.to_le_bytes(), 12);
+                        enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                        enc.set_buffer(k_qjl_signs, 0, 14);
+                        enc.set_buffer(k_r_norms, 0, 15);
+                        enc.set_bytes(&0u32.to_le_bytes(), 16);
+                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
+                    }
+
+                    let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
+                    for t in 0..token_count {
+                        let q_offset = t * q_head_stride_bytes;
+                        let attn_out_offset = t * q_head_stride_bytes;
+                        let current_seq_len = (seq_pos + t + 1) as u32;
+                        enc.set_pipeline(&self.pipelines.turboquant_attention);
+                        enc.set_buffer(&bufs.q_proj, q_offset, 0);
+                        enc.set_buffer(k_cache, 0, 1);
+                        enc.set_buffer(v_cache, 0, 2);
+                        enc.set_buffer(&tq.rotation_signs, 0, 3);
+                        enc.set_buffer(&bufs.attn_out, attn_out_offset, 4);
+                        enc.set_bytes(&nh.to_le_bytes(), 5);
+                        enc.set_bytes(&nkv.to_le_bytes(), 6);
+                        enc.set_bytes(&hd.to_le_bytes(), 7);
+                        enc.set_bytes(&max_seq.to_le_bytes(), 8);
+                        enc.set_bytes(&current_seq_len.to_le_bytes(), 9);
+                        enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
+                        enc.set_bytes(&n_bits.to_le_bytes(), 11);
+                        enc.set_buffer(k_scale, 0, 12);
+                        enc.set_buffer(v_scale, 0, 13);
+                        enc.set_buffer(&tq.codebook_buf, 0, 14);
+                        enc.set_buffer(&tq.qjl_matrix, 0, 15);
+                        enc.set_buffer(k_qjl_signs, 0, 16);
+                        enc.set_buffer(k_r_norms, 0, 17);
+                        enc.dispatch_threadgroups((nh as usize, 1, 1), (hd as usize, 1, 1));
+                    }
                 }
                 enc.end_encoding();
             } else {
