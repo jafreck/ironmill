@@ -15,7 +15,7 @@ use crate::ir::program::Program;
 use crate::ir::tensor::ScalarType;
 use crate::ir::types::Value;
 
-use super::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels, quantize_to_index};
+use super::beta_quantizer::quantize_to_index;
 use super::rotation::{pad_to_power_of_two, rotate_rows_hadamard};
 use super::tensor_utils::tensor_as_f32_slice;
 
@@ -148,14 +148,32 @@ impl Pass for PolarQuantPass {
                 // Apply randomised Hadamard rotation.
                 rotate_rows_hadamard(&mut padded_data, rows, padded_cols, self.seed);
 
-                // Beta-optimal quantisation levels and boundaries.
-                let levels = beta_optimal_levels(padded_cols, self.n_bits);
-                let boundaries = beta_optimal_boundaries(padded_cols, self.n_bits);
+                // Symmetric absmax quantizer.
+                // After normalization + Hadamard rotation, values are centered
+                // at 0. We use a symmetric uniform quantizer with 2^n_bits
+                // levels spanning [-absmax, +absmax].
+                let n_levels = 1usize << self.n_bits;
+                let absmax = padded_data
+                    .iter()
+                    .fold(0.0f32, |m, &v| m.max(v.abs()))
+                    .max(1e-10);
 
-                // Quantise every element to an index.
+                // Levels: uniformly spaced centroids in [-absmax, +absmax].
+                let step = 2.0 * absmax / n_levels as f32;
+                let levels: Vec<f32> = (0..n_levels)
+                    .map(|i| -absmax + step * (i as f32 + 0.5))
+                    .collect();
+
+                // Boundaries: midpoints between adjacent levels.
+                let boundaries: Vec<f32> = levels.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
+
+                // Quantise: clamp to [-absmax, absmax], find nearest level.
                 let all_indices: Vec<usize> = padded_data
                     .iter()
-                    .map(|&v| quantize_to_index(v, &boundaries) as usize)
+                    .map(|&v| {
+                        let clamped = v.clamp(-absmax, absmax);
+                        quantize_to_index(clamped, &boundaries) as usize
+                    })
                     .collect();
 
                 // Keep full padded indices — the downstream rotation fusion
@@ -305,7 +323,7 @@ fn fp16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
 }
 
 /// Pack assignment indices into n-bit packed bytes (MSB-first).
-fn pack_indices(indices: &[usize], n_bits: u8) -> Vec<u8> {
+pub fn pack_indices(indices: &[usize], n_bits: u8) -> Vec<u8> {
     if n_bits == 8 {
         return indices.iter().map(|&i| i as u8).collect();
     }

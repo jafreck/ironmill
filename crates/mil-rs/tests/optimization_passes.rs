@@ -1842,21 +1842,12 @@ fn polar_quant_handles_rank1() {
     pass.run(&mut program).unwrap();
 
     let ops = &program.functions["main"].body.operations;
+    // Rank-1 tensors (norms, biases) should be skipped — quantizing
+    // normalization weights causes catastrophic quality loss.
     assert_eq!(
-        ops[0].op_type, "constexpr_lut_to_dense",
-        "rank-1 tensor should be quantized"
+        ops[0].op_type, "const",
+        "rank-1 tensor should NOT be quantized"
     );
-    // Shape attribute should record [1024].
-    match ops[0].attributes.get("shape") {
-        Some(Value::Tensor { data, .. }) => {
-            let dims: Vec<u32> = data
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            assert_eq!(dims, vec![1024]);
-        }
-        other => panic!("expected shape tensor, got {other:?}"),
-    }
 }
 
 #[test]

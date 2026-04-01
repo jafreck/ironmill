@@ -71,68 +71,47 @@ pub fn dequant_lut_to_dense(
     polar_quant_seed: Option<u64>,
 ) -> Vec<u8> {
     let total_elements: usize = original_shape.iter().product();
-    let unpacked = unpack_indices(indices, n_bits, total_elements);
-    assert_eq!(
-        unpacked.len(),
-        total_elements,
-        "packed indices too short: got {} values, expected {} (shape {:?}, n_bits={})",
-        unpacked.len(),
-        total_elements,
-        original_shape,
-        n_bits,
-    );
-
-    // Reshape conceptually to [rows, cols].
     let cols = *original_shape.last().expect("shape must be non-empty");
     let rows = if cols == 0 { 0 } else { total_elements / cols };
+
+    // Only use padded dimensions when Hadamard rotation was applied
+    // (rotation requires power-of-2 cols). Per-row quantization without
+    // rotation packs indices at the original dimensions.
+    let work_cols = if polar_quant_seed.is_some() {
+        cols.next_power_of_two()
+    } else {
+        cols
+    };
+    let work_total = rows * work_cols;
 
     let entry_size = lut_dtype.byte_size();
     let norm_size = norms_dtype.byte_size();
 
+    let unpacked = unpack_indices(indices, n_bits, work_total);
+
     // Reconstruct f32 values from LUT.
-    let mut f32_values: Vec<f32> = Vec::with_capacity(total_elements);
-    for flat_idx in 0..total_elements {
+    let mut f32_values: Vec<f32> = Vec::with_capacity(work_total);
+    for flat_idx in 0..work_total {
         let lut_idx = unpacked[flat_idx];
         f32_values.push(read_typed_f32(lut, lut_idx * entry_size, lut_dtype));
     }
 
     // Apply inverse Hadamard rotation if a seed is present.
     if let Some(seed) = polar_quant_seed {
-        // Pad cols to power of two (matching what PolarQuantPass does).
-        let padded_cols = cols.next_power_of_two();
-        if padded_cols != cols {
-            // Re-unpack with padded shape to get full rotated data.
-            let padded_total = rows * padded_cols;
-            let padded_unpacked = unpack_indices(indices, n_bits, padded_total);
-            f32_values.clear();
-            for flat_idx in 0..padded_total {
-                let lut_idx = padded_unpacked[flat_idx];
-                f32_values.push(read_typed_f32(lut, lut_idx * entry_size, lut_dtype));
-            }
-            // Inverse rotation (self-inverse for symmetric Hadamard).
-            mil_rs::ir::passes::rotation::unrotate_rows_hadamard(
-                &mut f32_values,
-                rows,
-                padded_cols,
-                seed,
-            );
-            // Trim back to original cols.
-            let mut trimmed = Vec::with_capacity(total_elements);
-            for r in 0..rows {
-                trimmed.extend_from_slice(&f32_values[r * padded_cols..r * padded_cols + cols]);
-            }
-            f32_values = trimmed;
-        } else {
-            mil_rs::ir::passes::rotation::unrotate_rows_hadamard(&mut f32_values, rows, cols, seed);
-        }
+        mil_rs::ir::passes::rotation::unrotate_rows_hadamard(
+            &mut f32_values,
+            rows,
+            work_cols,
+            seed,
+        );
     }
 
-    // Multiply by per-row norms and convert to FP16.
+    // Trim padding and apply per-row norms, convert to FP16.
     let mut output = Vec::with_capacity(total_elements * 2);
     for row in 0..rows {
         let norm = read_typed_f32(row_norms, row * norm_size, norms_dtype);
         for col in 0..cols {
-            let value = f32_values[row * cols + col];
+            let value = f32_values[row * work_cols + col];
             let result = f16::from_f32(value * norm);
             output.extend_from_slice(&result.to_le_bytes());
         }

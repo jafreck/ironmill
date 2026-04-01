@@ -189,6 +189,106 @@ impl MilWeightProvider {
 
         Ok(Self { tensors, config })
     }
+
+    /// Build a provider by directly quantizing tensors from an existing
+    /// [`WeightProvider`], bypassing the MIL template system.
+    ///
+    /// This is the correct path for SafeTensors/GGUF inputs where the
+    /// template system may omit architecture-specific tensors (q_norm,
+    /// k_norm, biases, etc.).
+    pub fn from_weight_provider(
+        source: &dyn WeightProvider,
+        config: ModelConfig,
+        n_bits: u8,
+        min_elements: usize,
+        _seed: u64,
+    ) -> Result<Self, MilError> {
+        use half::f16;
+
+        let mut tensors = HashMap::new();
+
+        for name in source.tensor_names() {
+            let tensor = source.tensor(name)?;
+            let total: usize = tensor.shape.iter().product();
+            let rank = tensor.shape.len();
+            let is_float = matches!(tensor.dtype, ScalarType::Float16 | ScalarType::Float32);
+
+            // Only quantize 2D+ float tensors above the element threshold.
+            if rank < 2 || total < min_elements || !is_float {
+                tensors.insert(
+                    name.to_string(),
+                    ExtractedTensor {
+                        data: tensor.data.into_owned(),
+                        shape: tensor.shape.clone(),
+                        dtype: tensor.dtype,
+                        quant_info: QuantizationInfo::None,
+                    },
+                );
+                continue;
+            }
+
+            let cols = tensor.shape[rank - 1];
+            let rows: usize = tensor.shape[..rank - 1].iter().product();
+
+            if cols < 64 {
+                tensors.insert(
+                    name.to_string(),
+                    ExtractedTensor {
+                        data: tensor.data.into_owned(),
+                        shape: tensor.shape.clone(),
+                        dtype: tensor.dtype,
+                        quant_info: QuantizationInfo::None,
+                    },
+                );
+                continue;
+            }
+
+            // Convert to f32 for quantization.
+            let floats: Vec<f32> = match tensor.dtype {
+                ScalarType::Float16 => tensor
+                    .data
+                    .chunks_exact(2)
+                    .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect(),
+                ScalarType::Float32 => tensor
+                    .data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                _ => unreachable!(),
+            };
+
+            // Per-row symmetric INT4 round-to-nearest quantization.
+            // Each row: scale = absmax / 7.5, q = round(v/scale).clamp(-8,7),
+            // dequant = q * scale. Produces FP16 output directly.
+            let half = (1u32 << n_bits) as f32 / 2.0; // 8.0 for 4-bit
+            let max_q = half - 1.0; // 7.0
+
+            let mut dequant_data = Vec::with_capacity(total * 2);
+            for r in 0..rows {
+                let row = &floats[r * cols..(r + 1) * cols];
+                let absmax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-10);
+                let scale = absmax / (max_q + 0.5);
+                for &v in row {
+                    let q = (v / scale).round().clamp(-half, max_q);
+                    let dq = q * scale;
+                    dequant_data.extend_from_slice(&f16::from_f32(dq).to_le_bytes());
+                }
+            }
+
+            tensors.insert(
+                name.to_string(),
+                ExtractedTensor {
+                    data: dequant_data,
+                    shape: tensor.shape.clone(),
+                    dtype: ScalarType::Float16,
+                    quant_info: QuantizationInfo::None,
+                },
+            );
+        }
+
+        Ok(Self { tensors, config })
+    }
 }
 
 impl WeightProvider for MilWeightProvider {

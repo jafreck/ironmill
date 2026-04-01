@@ -40,18 +40,16 @@ pub struct GpuCompileBuilder {
     input: PathBuf,
     n_bits: u8,
     min_elements: usize,
+    seed: u64,
 }
 
 impl GpuCompileBuilder {
-    /// Create a new builder for the given input model path.
-    ///
-    /// The input can be an `.onnx`, `.safetensors`, or `.gguf` file, or a
-    /// HuggingFace model directory containing `config.json`.
     pub fn new(input: impl Into<PathBuf>) -> Self {
         Self {
             input: input.into(),
             n_bits: 4,
             min_elements: 1024,
+            seed: 42,
         }
     }
 
@@ -86,36 +84,51 @@ impl GpuCompileBuilder {
         }
 
         // 1. Detect format and import to Program + ModelConfig
-        let (mut program, config) = match detect_format(input) {
-            InputFormat::Onnx => import_onnx(input)?,
-            InputFormat::SafeTensors => import_safetensors(input)?,
-            InputFormat::Gguf => import_gguf(input)?,
-            InputFormat::Unsupported(ext) => {
-                return Err(CompileError::Other(format!(
-                    "unsupported input format '{ext}' for GPU compile. \
-                     Expected .onnx, .safetensors, .gguf, or a directory containing config.json."
-                )));
+        let format = detect_format(input);
+
+        match format {
+            InputFormat::Onnx => {
+                // ONNX: import → run passes → extract via MilWeightProvider.
+                let (mut program, config) = import_onnx(input)?;
+
+                let mut pipeline = PassPipeline::new();
+                let mut pq_pass = PolarQuantPass::new(self.n_bits);
+                pq_pass.min_elements = self.min_elements;
+                pipeline.add_pass(Box::new(pq_pass));
+                pipeline.add_pass(Box::new(TypeRepropagationPass));
+                let _report = pipeline.run(&mut program)?;
+
+                let provider = MilWeightProvider::new(&program, config)?;
+                Ok(provider)
             }
-        };
+            InputFormat::SafeTensors | InputFormat::Gguf => {
+                // SafeTensors/GGUF: load the provider directly and quantize
+                // weight tensors in-memory. This avoids the template system
+                // which is designed for CoreML/ANE and omits architecture-
+                // specific tensors (q_norm, k_norm, etc.).
+                let base_provider: Box<dyn WeightProvider> = match format {
+                    InputFormat::SafeTensors => {
+                        Box::new(crate::weights::SafeTensorsProvider::load(input)?)
+                    }
+                    InputFormat::Gguf => Box::new(crate::weights::GgufProvider::load(input)?),
+                    _ => unreachable!(),
+                };
+                let config = base_provider.config().clone();
 
-        // 2. Build pass pipeline with PolarQuant only (no rotation fusion).
-        //    PolarRotationFusionPass is for CoreML's MIL execution where
-        //    rotations cancel between adjacent layers. For GPU weight
-        //    extraction, we need the seed preserved so dequant can apply
-        //    the inverse Hadamard rotation.
-        let mut pipeline = PassPipeline::new();
-
-        let mut pq_pass = PolarQuantPass::new(self.n_bits);
-        pq_pass.min_elements = self.min_elements;
-        pipeline.add_pass(Box::new(pq_pass));
-        pipeline.add_pass(Box::new(TypeRepropagationPass));
-
-        // 3. Run passes
-        let _report = pipeline.run(&mut program)?;
-
-        // 4. Wrap in MilWeightProvider
-        let provider = MilWeightProvider::new(&program, config)?;
-        Ok(provider)
+                let provider = MilWeightProvider::from_weight_provider(
+                    base_provider.as_ref(),
+                    config,
+                    self.n_bits,
+                    self.min_elements,
+                    self.seed,
+                )?;
+                Ok(provider)
+            }
+            InputFormat::Unsupported(ext) => Err(CompileError::Other(format!(
+                "unsupported input format '{ext}' for GPU compile. \
+                 Expected .onnx, .safetensors, .gguf, or a directory containing config.json."
+            ))),
+        }
     }
 }
 
@@ -171,22 +184,6 @@ fn import_onnx(path: &Path) -> Result<(Program, ModelConfig), CompileError> {
         derive_config_from_program(&result.program)?
     };
 
-    Ok((result.program, config))
-}
-
-/// Import a SafeTensors model directory.
-fn import_safetensors(path: &Path) -> Result<(Program, ModelConfig), CompileError> {
-    let provider = crate::weights::SafeTensorsProvider::load(path)?;
-    let config = provider.config().clone();
-    let result = crate::templates::weights_to_program(&provider)?;
-    Ok((result.program, config))
-}
-
-/// Import a GGUF model file.
-fn import_gguf(path: &Path) -> Result<(Program, ModelConfig), CompileError> {
-    let provider = crate::weights::GgufProvider::load(path)?;
-    let config = provider.config().clone();
-    let result = crate::templates::weights_to_program(&provider)?;
     Ok((result.program, config))
 }
 
