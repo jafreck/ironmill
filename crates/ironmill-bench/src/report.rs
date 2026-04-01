@@ -523,6 +523,79 @@ fn format_markdown(report: &BenchReport) -> String {
     out
 }
 
+/// Entry for the GPU quantized inference comparison table.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct GpuComparisonEntry {
+    pub config: String,
+    pub perplexity: Option<f64>,
+    pub tok_per_sec: f64,
+    pub ms_per_tok: f64,
+    pub gpu_mb: f64,
+}
+
+/// Format a GPU quantized inference comparison table.
+///
+/// The first entry is used as the baseline for ΔPPL and ΔMem columns.
+#[allow(dead_code)]
+pub fn format_gpu_comparison_table(entries: &[GpuComparisonEntry]) -> String {
+    let mut out = String::new();
+
+    writeln!(
+        out,
+        "{:<20} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "Config", "PPL", "tok/s", "ms/tok", "GPU MB", "ΔPPL", "ΔMem"
+    )
+    .unwrap();
+    writeln!(out, "{}", "─".repeat(72)).unwrap();
+
+    let baseline_ppl = entries.first().and_then(|e| e.perplexity);
+    let baseline_mem = entries.first().map(|e| e.gpu_mb);
+
+    for (i, entry) in entries.iter().enumerate() {
+        let ppl_str = entry
+            .perplexity
+            .map_or("—".to_string(), |p| format!("{:.1}", p));
+
+        let delta_ppl = if i == 0 {
+            "—".to_string()
+        } else {
+            match (entry.perplexity, baseline_ppl) {
+                (Some(p), Some(bp)) if bp > 0.0 => {
+                    format!("{:+.1}%", (p - bp) / bp * 100.0)
+                }
+                _ => "—".to_string(),
+            }
+        };
+
+        let delta_mem = if i == 0 {
+            "—".to_string()
+        } else {
+            match baseline_mem {
+                Some(bm) if bm > 0.0 => {
+                    format!("{:+.0}%", (entry.gpu_mb - bm) / bm * 100.0)
+                }
+                _ => "—".to_string(),
+            }
+        };
+
+        writeln!(
+            out,
+            "{:<20} {:>8} {:>8.1} {:>8.1} {:>8.0} {:>8} {:>8}",
+            entry.config,
+            ppl_str,
+            entry.tok_per_sec,
+            entry.ms_per_tok,
+            entry.gpu_mb,
+            delta_ppl,
+            delta_mem
+        )
+        .unwrap();
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

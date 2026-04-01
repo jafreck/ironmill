@@ -62,6 +62,11 @@ impl GpuBundleProvider {
         })
     }
 
+    /// Access the bundle manifest for quantization info and metadata.
+    pub fn manifest(&self) -> &GpuBundleManifest {
+        &self.manifest
+    }
+
     /// Read a file relative to the bundle root.
     fn read_file(&self, relative_path: &str) -> Result<Vec<u8>, MilError> {
         fs::read(self.bundle_path.join(relative_path))

@@ -366,6 +366,7 @@ fn main() -> Result<()> {
         {
             use ironmill_compile::weights::SafeTensorsProvider;
             use ironmill_inference::engine::InferenceEngine;
+            use ironmill_inference::gpu::bundle::GpuBundleProvider;
             use ironmill_inference::gpu::{GpuConfig, GpuInference};
 
             eprintln!("\n  Metal GPU Backend Benchmark");
@@ -398,7 +399,162 @@ fn main() -> Result<()> {
                 ),
             ];
 
+            let mut gpu_ppl_results: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+
             for model_cfg in &matrix.models {
+                // Check if this is a pre-compiled .ironml-gpu bundle
+                let is_gpu_bundle = model_cfg
+                    .path
+                    .extension()
+                    .map_or(false, |ext| ext == "ironml-gpu");
+
+                if is_gpu_bundle {
+                    let provider = match GpuBundleProvider::open(&model_cfg.path) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "  ✗ failed to open GPU bundle {}: {e}",
+                                model_cfg.path.display()
+                            );
+                            continue;
+                        }
+                    };
+
+                    let quant_info = &provider.manifest().quantization;
+                    let config_label = format!("PQ-INT{}", quant_info.n_bits);
+
+                    eprintln!("  Metal/{config_label}: {} (bundle)...", model_cfg.name);
+
+                    let gpu_config = GpuConfig {
+                        enable_turboquant: false,
+                        ..GpuConfig::default()
+                    };
+
+                    let mut engine = match GpuInference::new(gpu_config.clone()) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!("  ✗ Metal GPU init failed: {e}");
+                            continue;
+                        }
+                    };
+
+                    let load_start = std::time::Instant::now();
+                    let gpu_before = engine.gpu_allocated_bytes();
+                    if let Err(e) = engine.load_weights(&provider, gpu_config.clone()) {
+                        eprintln!("  ✗ Metal bundle load failed: {e}");
+                        continue;
+                    }
+                    let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+                    let gpu_after = engine.gpu_allocated_bytes();
+                    let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
+                    let gpu_growth_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
+                    eprintln!(
+                        "  ✓ loaded in {load_time_ms:.1}ms (GPU: {gpu_mb:.1} MB, model: {gpu_growth_mb:.1} MB)"
+                    );
+
+                    let prompt_tokens: Vec<u32> = vec![9707, 1879];
+
+                    let mut run_results = Vec::new();
+                    for run_idx in 0..matrix.settings.runs {
+                        engine.reset();
+
+                        if let Err(e) = engine.prefill(&prompt_tokens) {
+                            eprintln!("  ✗ prefill failed: {e}");
+                            continue;
+                        }
+
+                        let mut last_token = prompt_tokens.last().copied().unwrap_or(0);
+                        for _ in 0..matrix.settings.warmup {
+                            match engine.decode_step(last_token) {
+                                Ok(logits) => {
+                                    last_token = logits
+                                        .iter()
+                                        .enumerate()
+                                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                        .map(|(i, _)| i as u32)
+                                        .unwrap_or(0);
+                                }
+                                Err(e) => {
+                                    eprintln!("  ✗ warmup decode failed: {e}");
+                                    break;
+                                }
+                            }
+                        }
+
+                        let mut latencies = Vec::with_capacity(matrix.settings.iterations);
+                        for _ in 0..matrix.settings.iterations {
+                            let t0 = std::time::Instant::now();
+                            match engine.decode_step(last_token) {
+                                Ok(logits) => {
+                                    let elapsed = t0.elapsed();
+                                    latencies.push(elapsed);
+                                    last_token = logits
+                                        .iter()
+                                        .enumerate()
+                                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                        .map(|(i, _)| i as u32)
+                                        .unwrap_or(0);
+                                }
+                                Err(e) => {
+                                    eprintln!("  ✗ decode failed at iteration: {e}");
+                                    break;
+                                }
+                            }
+                        }
+
+                        if latencies.is_empty() {
+                            continue;
+                        }
+
+                        let latencies_ms: Vec<f64> =
+                            latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+
+                        let label = format!(
+                            "{}/{}/metal-{}/run{run_idx}",
+                            model_cfg.name, "default", config_label
+                        );
+                        run_results.push(compute_stats(&label, &latencies_ms));
+                    }
+
+                    if !run_results.is_empty() {
+                        let label = format!("{}/metal-{config_label}", model_cfg.name);
+                        let mut aggregated = aggregate_runs(&label, &run_results);
+
+                        let tok_per_sec = 1000.0 / aggregated.pooled.median;
+                        aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
+                        aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
+
+                        eprintln!(
+                            "  ✓ {config_label}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms | GPU: {gpu_mb:.1} MB",
+                            aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
+                        );
+
+                        let measured_memory = MemorySummary {
+                            rss_after_load_mb: gpu_mb,
+                            peak_rss_mb: gpu_mb,
+                            rss_growth_mb: gpu_growth_mb,
+                            model_file_size_mb: 0.0,
+                            efficiency_ratio: 0.0,
+                        };
+
+                        report_rows.push(ReportRow {
+                            model: model_cfg.name.clone(),
+                            optimization: "default".to_string(),
+                            backend: format!("metal-{config_label}"),
+                            kv_quant: "none".to_string(),
+                            result: aggregated,
+                            significance: None,
+                            energy: None,
+                            utilization: None,
+                            memory: Some(measured_memory),
+                            load_time_ms: Some(load_time_ms),
+                        });
+                    }
+
+                    continue;
+                }
+
                 // Load weights once, reuse across configs
                 let model_dir = if model_cfg.path.is_dir() {
                     model_cfg.path.clone()
@@ -575,17 +731,108 @@ fn main() -> Result<()> {
                 };
 
                 let model_cfg = matrix.models.first().unwrap();
-                let model_dir = if model_cfg.path.is_dir() {
-                    model_cfg.path.clone()
-                } else {
-                    model_cfg.path.parent().unwrap().to_path_buf()
-                };
+                let first_is_bundle = model_cfg
+                    .path
+                    .extension()
+                    .map_or(false, |ext| ext == "ironml-gpu");
 
-                let provider = SafeTensorsProvider::load(&model_dir)
-                    .map_err(|e| anyhow::anyhow!("weight load: {e}"))?;
+                // SafeTensors PPL evaluation (skip if first model is a bundle)
+                if !first_is_bundle {
+                    let model_dir = if model_cfg.path.is_dir() {
+                        model_cfg.path.clone()
+                    } else {
+                        model_cfg.path.parent().unwrap().to_path_buf()
+                    };
 
-                for (config_name, gpu_config) in &configs {
-                    eprintln!("  Evaluating {config_name}...");
+                    let provider = SafeTensorsProvider::load(&model_dir)
+                        .map_err(|e| anyhow::anyhow!("weight load: {e}"))?;
+
+                    for (config_name, gpu_config) in &configs {
+                        eprintln!("  Evaluating {config_name}...");
+
+                        let mut engine = GpuInference::new(gpu_config.clone())
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let gpu_before = engine.gpu_allocated_bytes();
+                        engine
+                            .load_weights(&provider, gpu_config.clone())
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let gpu_after = engine.gpu_allocated_bytes();
+                        let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
+                        let model_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
+                        eprintln!("  GPU memory: {gpu_mb:.1} MB (model: {model_mb:.1} MB)");
+
+                        let num_seqs = cli.perplexity_sequences.min(dataset.num_sequences);
+                        let mut all_losses = Vec::new();
+                        let start = std::time::Instant::now();
+
+                        for (seq_idx, sequence) in
+                            dataset.sequences.iter().take(num_seqs).enumerate()
+                        {
+                            engine.reset();
+                            if sequence.len() < 2 {
+                                continue;
+                            }
+                            for pos in 0..sequence.len() - 1 {
+                                let token = sequence[pos];
+                                let target = sequence[pos + 1];
+                                let logits = engine
+                                    .decode_step(token)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let ce = perplexity::cross_entropy(&logits, target);
+                                all_losses.push(ce);
+                            }
+                            let running_ppl = perplexity::perplexity_from_losses(&all_losses);
+                            let elapsed = start.elapsed().as_secs_f64();
+                            let tok_per_sec = all_losses.len() as f64 / elapsed;
+                            eprintln!(
+                                "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
+                                seq_idx + 1,
+                                num_seqs,
+                                running_ppl,
+                                all_losses.len(),
+                                tok_per_sec,
+                            );
+                        }
+
+                        let ppl = perplexity::perplexity_from_losses(&all_losses);
+                        let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
+                        eprintln!(
+                            "  ✓ {config_name}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
+                            ppl, avg_ce
+                        );
+                        gpu_ppl_results.insert(config_name.to_string(), ppl);
+                    }
+                }
+
+                // Bundle PPL evaluation
+                for bundle_cfg in &matrix.models {
+                    let is_bundle = bundle_cfg
+                        .path
+                        .extension()
+                        .map_or(false, |ext| ext == "ironml-gpu");
+                    if !is_bundle {
+                        continue;
+                    }
+
+                    let provider = match GpuBundleProvider::open(&bundle_cfg.path) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "  ✗ failed to open GPU bundle {}: {e}",
+                                bundle_cfg.path.display()
+                            );
+                            continue;
+                        }
+                    };
+
+                    let quant_info = &provider.manifest().quantization;
+                    let config_label = format!("PQ-INT{}", quant_info.n_bits);
+                    eprintln!("  Evaluating {config_label} (bundle)...");
+
+                    let gpu_config = GpuConfig {
+                        enable_turboquant: false,
+                        ..GpuConfig::default()
+                    };
 
                     let mut engine = GpuInference::new(gpu_config.clone())
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -604,6 +851,9 @@ fn main() -> Result<()> {
 
                     for (seq_idx, sequence) in dataset.sequences.iter().take(num_seqs).enumerate() {
                         engine.reset();
+                        if sequence.len() < 2 {
+                            continue;
+                        }
                         for pos in 0..sequence.len() - 1 {
                             let token = sequence[pos];
                             let target = sequence[pos + 1];
@@ -629,10 +879,37 @@ fn main() -> Result<()> {
                     let ppl = perplexity::perplexity_from_losses(&all_losses);
                     let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
                     eprintln!(
-                        "  ✓ {config_name}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
+                        "  ✓ {config_label}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
                         ppl, avg_ce
                     );
+                    gpu_ppl_results.insert(config_label, ppl);
                 }
+            }
+
+            // ── GPU Quantized Inference Comparison Table ──
+            let metal_rows: Vec<&ReportRow> = report_rows
+                .iter()
+                .filter(|r| r.backend.starts_with("metal-"))
+                .collect();
+
+            if metal_rows.len() > 1 {
+                let entries: Vec<report::GpuComparisonEntry> = metal_rows
+                    .iter()
+                    .map(|row| {
+                        let config_key = row.backend.strip_prefix("metal-").unwrap_or(&row.backend);
+                        report::GpuComparisonEntry {
+                            config: config_key.to_string(),
+                            perplexity: gpu_ppl_results.get(config_key).copied(),
+                            tok_per_sec: row.result.pooled.tokens_per_sec.unwrap_or(0.0),
+                            ms_per_tok: row.result.pooled.median,
+                            gpu_mb: row.memory.as_ref().map_or(0.0, |m| m.rss_after_load_mb),
+                        }
+                    })
+                    .collect();
+
+                eprintln!("\n  GPU Quantized Inference Comparison");
+                eprintln!("  {}", "─".repeat(40));
+                eprint!("{}", report::format_gpu_comparison_table(&entries));
             }
         }
         #[cfg(not(feature = "metal"))]
