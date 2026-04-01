@@ -52,15 +52,15 @@ inline void hadamard_rotate_inplace(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Step 2: In-place butterfly (unnormalized Walsh-Hadamard)
-    for (uint half = 1; half < head_dim; half *= 2) {
+    for (uint step = 1; step < head_dim; step *= 2) {
         for (uint i = tid; i < head_dim / 2; i += tg_size) {
-            uint block = i / half;
-            uint offset = i % half;
-            uint j = block * (half * 2) + offset;
+            uint block = i / step;
+            uint offset = i % step;
+            uint j = block * (step * 2) + offset;
             float a = shared_data[j];
-            float b = shared_data[j + half];
+            float b = shared_data[j + step];
             shared_data[j] = a + b;
-            shared_data[j + half] = a - b;
+            shared_data[j + step] = a - b;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -406,7 +406,10 @@ kernel void turboquant_attention(
                 float sign_val = ((packed >> bit_idx) & 1) ? 1.0f : -1.0f;
                 sign_dot += shared_s_q[d] * sign_val;
             }
-            partial_dot += qjl_coeff * r_norm * k_deq * sign_dot;
+            // The residual r = k_rot - l2_norm*codebook[idx] is already in
+            // un-normalized space, so r_norm = ||r||. The QJL estimator gives
+            // <q_rot, r>_est directly — no extra l2_norm scaling needed.
+            partial_dot += qjl_coeff * r_norm * sign_dot;
         }
 
         shared_reduce[tid] = partial_dot;
@@ -586,10 +589,10 @@ kernel void turboquant_outlier_cache_write(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared_outlier[2048];
-    threadgroup float shared_non_outlier[2048];
+    threadgroup float shared_outlier[256];
+    threadgroup float shared_non_outlier[256];
     threadgroup float shared_reduce[256];
-    threadgroup char shared_quant[2048];
+    threadgroup char shared_quant[256];
 
     uint head_idx = tgid;
     if (head_idx >= num_kv_heads) return;
@@ -682,11 +685,11 @@ kernel void turboquant_outlier_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared_q_outlier[2048];
-    threadgroup float shared_q_non_outlier[2048];
+    threadgroup float shared_q_outlier[256];
+    threadgroup float shared_q_non_outlier[256];
     threadgroup float shared_reduce[256];
-    threadgroup float shared_output_outlier[2048];
-    threadgroup float shared_output_non_outlier[2048];
+    threadgroup float shared_output_outlier[256];
+    threadgroup float shared_output_non_outlier[256];
     threadgroup float shared_softmax[2];
 
     uint head_idx = tgid;
