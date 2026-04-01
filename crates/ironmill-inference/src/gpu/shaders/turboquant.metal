@@ -96,8 +96,26 @@ kernel void turboquant_cache_write(
         local_max = max(local_max, fabs(acc));
     }
 
-    // Step 3: Parallel max reduction across threads to find head absmax
+    // Step 3: Compute per-head scale.
+    //
+    // INT8: use absmax (fine with 256 levels).
+    // INT4: use L2 norm / sqrt(head_dim) × coverage_factor.
+    //   After Hadamard rotation of a unit-direction vector, each coordinate
+    //   has std ≈ 1/sqrt(d). Absmax ≈ 3.2×std, wasting most INT4 levels on
+    //   empty tails. L2-based scaling gives ~3× better resolution.
+    //   coverage_factor = 2.5 clips ~1% of values but uses levels efficiently.
+    float local_sq = 0.0f;
+    for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
+        float v = shared_rotated[out_dim];
+        local_sq += v * v;
+    }
+
+    // Parallel reduction for both max and sum-of-squares
     shared_reduce[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Separate sum-of-squares reduction (reuse shared_quant as temp)
+    ((threadgroup float*)shared_quant)[tid] = local_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint reduce_size = 1;
@@ -105,14 +123,28 @@ kernel void turboquant_cache_write(
     for (uint stride = reduce_size / 2; stride > 0; stride >>= 1) {
         if (tid < stride && (tid + stride) < tg_size) {
             shared_reduce[tid] = max(shared_reduce[tid], shared_reduce[tid + stride]);
+            ((threadgroup float*)shared_quant)[tid] += ((threadgroup float*)shared_quant)[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float max_val = max(shared_reduce[0], 1e-10f);  // avoid div-by-zero
+    float max_val = max(shared_reduce[0], 1e-10f);
+    float l2_norm = sqrt(max(((threadgroup float*)shared_quant)[0], 1e-20f));
     float quant_max = (n_bits == 4) ? 7.0f : 127.0f;
-    float dyn_inv_scale = quant_max / max_val;
-    float dyn_deq_scale = max_val / quant_max;
+
+    // INT4: scale from L2 norm with coverage factor (clip at ~2.5σ)
+    // INT8: keep absmax (256 levels is enough)
+    float scale_val;
+    if (n_bits == 4) {
+        float sigma = l2_norm / sqrt(float(head_dim));
+        float coverage = 2.5f;
+        scale_val = max(sigma * coverage, 1e-10f);
+    } else {
+        scale_val = max_val;
+    }
+
+    float dyn_inv_scale = quant_max / scale_val;
+    float dyn_deq_scale = scale_val / quant_max;
 
     // Write per-head per-position dequantization scale
     if (tid == 0) {
