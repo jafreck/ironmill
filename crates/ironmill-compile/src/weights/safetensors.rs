@@ -151,7 +151,7 @@ impl WeightProvider for SafeTensorsProvider {
     fn tensor(&self, name: &str) -> std::result::Result<WeightTensor<'_>, MilError> {
         // Check LoRA-merged tensors first.
         if let Some((data, shape, dtype)) = self.lora_merged.get(name) {
-            return Ok(WeightTensor::owned(data.clone(), shape.clone(), *dtype));
+            return Ok(WeightTensor::borrowed(data, shape.clone(), *dtype));
         }
 
         let loc = self

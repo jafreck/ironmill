@@ -12,6 +12,7 @@
 //!
 //! Split-shard files are auto-discovered by filename pattern.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -399,15 +400,18 @@ struct GgufTensorLocation {
 
 /// Weight provider backed by one or more GGUF files.
 ///
-/// Tensor data is memory-mapped and dequantized lazily on each `tensor()`
-/// call, keeping memory usage proportional to the on-disk quantized size
-/// rather than the full FP16 expansion.
+/// Tensor data is memory-mapped and dequantized lazily on the first
+/// `tensor()` call for each name. Subsequent calls return cached data.
+/// This keeps memory proportional to the tensors actually accessed rather
+/// than the full model.
 pub struct GgufProvider {
     config: ModelConfig,
     /// Memory-mapped shard files, kept alive for the provider lifetime.
     mmaps: Vec<Mmap>,
     /// Tensor metadata indexed by HuggingFace-canonical name.
     tensor_index: HashMap<String, GgufTensorLocation>,
+    /// Cache of already-dequantized tensors, populated lazily.
+    cache: RefCell<HashMap<String, Vec<u8>>>,
 }
 
 impl GgufProvider {
@@ -545,6 +549,7 @@ impl GgufProvider {
             config,
             mmaps,
             tensor_index,
+            cache: RefCell::new(HashMap::new()),
         })
     }
 }
@@ -556,9 +561,22 @@ impl WeightProvider for GgufProvider {
             .get(name)
             .ok_or_else(|| MilError::Validation(format!("GGUF: tensor not found: {name}")))?;
 
+        // Check cache first to avoid re-dequantizing.
+        if let Some(cached) = self.cache.borrow().get(name) {
+            return Ok(WeightTensor::owned(
+                cached.clone(),
+                loc.dimensions.clone(),
+                ScalarType::Float16,
+            ));
+        }
+
         let mmap = &self.mmaps[loc.shard_index];
         let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
         let fp16_data = dequantize_to_fp16(raw, loc.num_elements, loc.ggml_type)?;
+
+        self.cache
+            .borrow_mut()
+            .insert(name.to_string(), fp16_data.clone());
 
         Ok(WeightTensor::owned(
             fp16_data,
