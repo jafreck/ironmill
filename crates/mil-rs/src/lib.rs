@@ -56,6 +56,8 @@ pub mod ir;
 pub mod proto;
 /// Readers for `.mlmodel`, `.mlpackage`, and `.onnx` files.
 pub mod reader;
+/// Weight provider trait and model configuration types.
+pub mod weights;
 /// Writers for `.mlmodel` and `.mlpackage` files.
 pub mod writer;
 

@@ -9,10 +9,10 @@
 use std::any::Any;
 
 use half::f16;
-use ironmill_compile::weights::{ModelConfig, WeightProvider};
 use ironmill_metal_sys::{
     CommandBufferStatus, MetalBuffer, MetalDevice, MpsMatrix, MpsMatrixMultiply, StorageMode,
 };
+use mil_rs::weights::{ModelConfig, WeightProvider};
 
 use super::config::GpuConfig;
 use super::error::GpuError;
@@ -208,10 +208,9 @@ impl GpuInference {
 
     /// Load model weights directly from a [`WeightProvider`], bypassing
     /// the type-erased [`InferenceEngine::load`] interface.
-    #[cfg(feature = "compile")]
     pub fn load_weights(
         &mut self,
-        provider: &dyn ironmill_compile::weights::WeightProvider,
+        provider: &dyn mil_rs::weights::WeightProvider,
         config: GpuConfig,
     ) -> Result<(), InferenceError> {
         self.config = config;

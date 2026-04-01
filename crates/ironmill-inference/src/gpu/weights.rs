@@ -1,7 +1,7 @@
 //! Weight loading from SafeTensors/GGUF into Metal buffers.
 
-use ironmill_compile::weights::{ModelConfig, WeightProvider};
 use ironmill_metal_sys::{MetalBuffer, MetalDevice, StorageMode};
+use mil_rs::weights::{ModelConfig, WeightProvider};
 
 use super::error::GpuError;
 

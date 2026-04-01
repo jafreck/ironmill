@@ -25,7 +25,7 @@ tempfile = { workspace = true }
 default = []
 int4 = []
 compile = ["dep:ironmill-compile"]
-metal = ["dep:ironmill-metal-sys", "compile"]
+metal = ["dep:ironmill-metal-sys"]
 
 [[example]]
 name = "ane_op_eval"
