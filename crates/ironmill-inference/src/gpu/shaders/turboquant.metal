@@ -1,6 +1,20 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Lloyd-Max N(0,1) codebook scaled by 1/sqrt(128), for d=128.
+// Pre-computed, data-independent, model-independent.
+constant float LM_CODEBOOK_D128[16] = {
+    -0.2415290770f, -0.1828770139f, -0.1430164465f, -0.1110361998f,
+    -0.0832919159f, -0.0580498533f, -0.0342989480f, -0.0113486245f,
+     0.0113486245f,  0.0342989480f,  0.0580498533f,  0.0832919159f,
+     0.1110361998f,  0.1430164465f,  0.1828770139f,  0.2415290770f
+};
+constant float LM_BOUNDARIES_D128[15] = {
+    -0.2122030454f, -0.1629467302f, -0.1270263231f, -0.0971640578f, -0.0706708846f,
+    -0.0461744006f, -0.0228237863f,  0.0000000000f,  0.0228237863f,  0.0461744006f,
+     0.0706708846f,  0.0971640578f,  0.1270263231f,  0.1629467302f,  0.2122030454f
+};
+
 // ============================================================================
 // TurboQuant: Hadamard rotation + quantized KV cache (INT8 or INT4)
 // ============================================================================
@@ -22,10 +36,10 @@ inline float read_quantized(device const char* cache, uint base,
         uint byte_idx = base + pos * packed_stride + dim / 2;
         uchar packed = ((device const uchar*)cache)[byte_idx];
         uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
-        // Sign-extend from 4 bits
-        int val = int(nibble);
-        if (val >= 8) val -= 16;
-        return float(val) * deq_scale;
+        // Codebook lookup: nibble is index into Lloyd-Max centroids.
+        // deq_scale = L2 norm of the original vector.
+        // Centroids are defined in constant memory below.
+        return LM_CODEBOOK_D128[nibble] * deq_scale;
     } else {
         return float(cache[base + pos * head_dim + dim]) * deq_scale;
     }
@@ -117,34 +131,36 @@ kernel void turboquant_cache_write(
     float max_val = max(shared_reduce[0], 1e-10f);
 
     if (n_bits == 4) {
-        // TurboQuant MSE with outlier handling: per-group absmax (g=32).
-        // Each group of 32 dims gets its own absmax/7.5 scale.
-        // Outlier channels are isolated in their own groups.
-        uint n_groups = head_dim / 32;
-        uint scale_stride = n_groups;
-        threadgroup float shared_grp_scale[4];
-
-        for (uint g = 0; g < n_groups; g++) {
-            float gmax = 0.0f;
-            for (uint d = g * 32 + tid; d < (g + 1) * 32 && d < head_dim; d += tg_size)
-                gmax = max(gmax, fabs(shared_rotated[d]));
-            shared_reduce[tid] = gmax;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tg_size / 2; s > 0; s >>= 1) {
-                if (tid < s) shared_reduce[tid] = max(shared_reduce[tid], shared_reduce[tid + s]);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (tid == 0) shared_grp_scale[g] = max(shared_reduce[0], 1e-10f) / 7.5f;
+        // TurboQuant MSE (arXiv:2504.19874 Algorithm 1):
+        // 1. Compute L2 norm of rotated vector
+        // 2. Normalize to unit direction
+        // 3. Quantize each coordinate via Lloyd-Max codebook (nearest centroid)
+        // 4. Store L2 norm as the single dequantization scale
+        float local_sq = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size)
+            local_sq += shared_rotated[d] * shared_rotated[d];
+        shared_reduce[tid] = local_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        if (tid < n_groups)
-            scale_buf[head_idx * max_seq_len * scale_stride + seq_pos * scale_stride + tid] = shared_grp_scale[tid];
+        float l2_norm = sqrt(max(shared_reduce[0], 1e-20f));
+
+        if (tid == 0)
+            scale_buf[head_idx * max_seq_len + seq_pos] = l2_norm;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        // Normalize and find nearest codebook centroid per coordinate
+        float inv_norm = 1.0f / max(l2_norm, 1e-10f);
         for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
-            float s = shared_grp_scale[out_dim / 32];
-            float scaled = clamp(rint(shared_rotated[out_dim] / s), -8.0f, 7.0f);
-            shared_quant[out_dim] = char(int(scaled));
+            float normalized = shared_rotated[out_dim] * inv_norm;
+            // Binary search through 15 boundaries
+            uint idx = 0;
+            for (uint b = 0; b < 15; b++) {
+                if (normalized >= LM_BOUNDARIES_D128[b]) idx = b + 1;
+            }
+            shared_quant[out_dim] = char(idx);
         }
     } else {
         // INT8: per-head absmax (unchanged)
@@ -259,12 +275,9 @@ kernel void turboquant_attention(
     // ---- Step 2: Online softmax attention over sequence positions ----
     for (uint p = 0; p < seq_len; p++) {
         // Per-position dequantization scale for K
+        float k_deq = k_scale_buf[kv_head * max_seq_len + p];
         float partial_dot = 0.0f;
-        uint gs = (n_bits == 4) ? (head_dim / 32) : 1;
         for (uint d = tid; d < head_dim; d += tg_size) {
-            float k_deq = (n_bits == 4)
-                ? k_scale_buf[kv_head * max_seq_len * gs + p * gs + d / 32]
-                : k_scale_buf[kv_head * max_seq_len + p];
             float k_val = read_quantized(k_cache, kv_base, p, d, head_dim, n_bits, k_deq);
             partial_dot += shared_q_rot[d] * k_val;
         }
@@ -297,10 +310,8 @@ kernel void turboquant_attention(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Rescale accumulator and add weighted dequantized V
+        float v_deq = v_scale_buf[kv_head * max_seq_len + p];
         for (uint d = tid; d < head_dim; d += tg_size) {
-            float v_deq = (n_bits == 4)
-                ? v_scale_buf[kv_head * max_seq_len * gs + p * gs + d / 32]
-                : v_scale_buf[kv_head * max_seq_len + p];
             float v_val = read_quantized(v_cache, kv_base, p, d, head_dim, n_bits, v_deq);
             shared_output[d] = shared_output[d] * rescale + weight * v_val;
         }
