@@ -64,29 +64,35 @@ impl Default for ConversionConfig {
 /// LoRA adapter merging is enabled by default; use
 /// [`onnx_to_program_with_config`] to control this behavior.
 ///
+/// Initializer data is moved out of `model` to avoid a multi-GB clone.
+/// The model's graph initializers will be empty after this call.
+///
 /// # Errors
 ///
 /// Returns [`MilError::Validation`] if the model has no graph.
-pub fn onnx_to_program(model: &ModelProto) -> Result<ConversionResult> {
+pub fn onnx_to_program(model: &mut ModelProto) -> Result<ConversionResult> {
     onnx_to_program_with_config(model, &ConversionConfig::default())
 }
 
 /// Convert an ONNX [`ModelProto`] into a MIL IR [`Program`] using the
 /// supplied [`ConversionConfig`].
 ///
+/// Initializer data is moved out of `model` to avoid a multi-GB clone.
+/// The model's graph initializers will be empty after this call.
+///
 /// # Errors
 ///
 /// Returns [`MilError::Validation`] if the model has no graph.
 pub fn onnx_to_program_with_config(
-    model: &ModelProto,
+    model: &mut ModelProto,
     config: &ConversionConfig,
 ) -> Result<ConversionResult> {
     let graph = model
         .graph
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| MilError::Validation("ONNX model has no graph".into()))?;
 
-    let opset = extract_opset_version(model);
+    let opset = extract_opset_version_from_imports(&model.opset_import);
     let mut warnings = Vec::new();
     let function = convert_graph(
         graph,
@@ -112,16 +118,24 @@ pub fn onnx_to_program_with_config(
 // ---------------------------------------------------------------------------
 
 /// Convert an ONNX [`GraphProto`] into a MIL [`Function`].
+///
+/// Takes `&mut GraphProto` so that initializer data can be moved out via
+/// `std::mem::take` instead of cloned. The graph's `initializer` list
+/// will be empty after this call.
 fn convert_graph(
-    graph: &GraphProto,
+    graph: &mut GraphProto,
     _opset: i64,
     warnings: &mut Vec<String>,
     merge_lora_weights: bool,
     model_dir: Option<&Path>,
 ) -> Result<Function> {
+    // Move initializers out of the graph to avoid a multi-GB clone.
+    // Metadata (name, dims, data_type) in each TensorProto remains intact;
+    // only the heavy byte buffers are moved via `extract_tensor_raw_data_take`.
+    let mut initializers = std::mem::take(&mut graph.initializer);
+
     // 1. Collect initializer names for fast lookup.
-    let initializer_names: HashSet<&str> =
-        graph.initializer.iter().map(|t| t.name.as_str()).collect();
+    let initializer_names: HashSet<String> = initializers.iter().map(|t| t.name.clone()).collect();
 
     // 2. Real inputs are graph inputs that are NOT initializers.
     let real_inputs: Vec<&ValueInfoProto> = graph
@@ -158,7 +172,7 @@ fn convert_graph(
     }
     // Initializers also have known types.  int64 is narrowed to int32
     // for CoreML compatibility, so update the type accordingly.
-    for tensor in &graph.initializer {
+    for tensor in &initializers {
         if let Ok(mut dtype) = onnx_dtype_to_scalar(tensor.data_type) {
             if dtype == ScalarType::Int64 {
                 dtype = ScalarType::Int32;
@@ -176,11 +190,6 @@ fn convert_graph(
     //    This modifies the initializer data in-place so the const ops below
     //    contain the merged weights. LoRA-specific initializers (A, B, alpha)
     //    are removed from the set so they don't become const ops.
-    //
-    // Clone the initializer list so we can *take* ownership of weight byte
-    // buffers (via `std::mem::take`) instead of cloning each one.  The
-    // metadata (name, dims, data_type) remains intact for later loops.
-    let mut initializers = graph.initializer.clone();
     let mut init_data: HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)> = HashMap::new();
     for tensor in initializers.iter_mut() {
         if let Ok(dtype) = onnx_dtype_to_scalar(tensor.data_type) {
@@ -1274,10 +1283,10 @@ const QLORA_SUFFIXES: &[&str] = &[
 /// A primary name is the base tensor that downstream nodes reference (e.g.
 /// `model.layers.0.mlp.gate_proj.weight`). Auxiliary tensors (scales, qzeros, …)
 /// are not returned as keys.
-fn detect_prequantized_weights<'a>(names: &'a HashSet<&str>) -> HashMap<&'a str, PreQuantFormat> {
+fn detect_prequantized_weights(names: &HashSet<String>) -> HashMap<&str, PreQuantFormat> {
     let mut result = HashMap::new();
 
-    for &name in names {
+    for name in names {
         // --- QLoRA detection ---
         if name.ends_with(".quant_state.bitsandbytes__nf4") {
             let base = name.trim_end_matches(".quant_state.bitsandbytes__nf4");
@@ -1308,7 +1317,7 @@ fn detect_prequantized_weights<'a>(names: &'a HashSet<&str>) -> HashMap<&'a str,
                 // loop match the weight tensor name (not the `.qweight` tensor).
                 // However the *primary* tensor in GPTQ graphs is the qweight
                 // itself, so we key on that.
-                result.insert(name.as_ref(), fmt);
+                result.insert(name.as_str(), fmt);
             }
         }
     }
@@ -1495,9 +1504,8 @@ fn tensor_type_from_type_proto(tp: &TypeProto) -> Result<TensorType> {
 ///
 /// The default domain is represented by an empty string. If no default is
 /// found, returns `0`.
-fn extract_opset_version(model: &ModelProto) -> i64 {
-    model
-        .opset_import
+fn extract_opset_version_from_imports(imports: &[crate::proto::onnx::OperatorSetIdProto]) -> i64 {
+    imports
         .iter()
         .find(|os| os.domain.is_empty())
         .map(|os| os.version)
@@ -1589,8 +1597,8 @@ mod tests {
 
     #[test]
     fn mnist_conversion() {
-        let model = read_onnx(fixture("mnist.onnx")).unwrap();
-        let result = onnx_to_program(&model).unwrap();
+        let mut model = read_onnx(fixture("mnist.onnx")).unwrap();
+        let result = onnx_to_program(&mut model).unwrap();
         let program = &result.program;
 
         // Should produce a program with one function.
@@ -1631,8 +1639,8 @@ mod tests {
 
     #[test]
     fn squeezenet_conversion() {
-        let model = read_onnx(fixture("squeezenet1.1.onnx")).unwrap();
-        let result = onnx_to_program(&model).unwrap();
+        let mut model = read_onnx(fixture("squeezenet1.1.onnx")).unwrap();
+        let result = onnx_to_program(&mut model).unwrap();
         let program = &result.program;
 
         let main = program.main().expect("should have a main function");
@@ -1659,11 +1667,11 @@ mod tests {
 
     #[test]
     fn empty_graph() {
-        let model = ModelProto {
+        let mut model = ModelProto {
             graph: Some(GraphProto::default()),
             ..Default::default()
         };
-        let result = onnx_to_program(&model).unwrap();
+        let result = onnx_to_program(&mut model).unwrap();
         let main = result.program.main().expect("should have main");
         assert!(main.inputs.is_empty());
         assert!(main.body.operations.is_empty());
@@ -1672,14 +1680,15 @@ mod tests {
 
     #[test]
     fn no_graph_is_error() {
-        let model = ModelProto::default();
-        assert!(onnx_to_program(&model).is_err());
+        let mut model = ModelProto::default();
+        assert!(onnx_to_program(&mut model).is_err());
     }
 
     #[test]
     fn initializers_become_const_ops() {
-        let model = read_onnx(fixture("mnist.onnx")).unwrap();
-        let result = onnx_to_program(&model).unwrap();
+        let mut model = read_onnx(fixture("mnist.onnx")).unwrap();
+        let num_initializers = model.graph.as_ref().unwrap().initializer.len();
+        let result = onnx_to_program(&mut model).unwrap();
         let main = result.program.main().unwrap();
 
         let const_ops: Vec<_> = main
@@ -1689,10 +1698,9 @@ mod tests {
             .filter(|op| op.op_type == "const")
             .collect();
 
-        let graph = model.graph.as_ref().unwrap();
         assert_eq!(
             const_ops.len(),
-            graph.initializer.len(),
+            num_initializers,
             "each initializer should produce a const op"
         );
 
@@ -1708,12 +1716,18 @@ mod tests {
 
     #[test]
     fn real_inputs_exclude_initializers() {
-        let model = read_onnx(fixture("mnist.onnx")).unwrap();
-        let graph = model.graph.as_ref().unwrap();
+        let mut model = read_onnx(fixture("mnist.onnx")).unwrap();
 
-        let init_names: HashSet<&str> = graph.initializer.iter().map(|t| t.name.as_str()).collect();
+        let init_names: HashSet<String> = model
+            .graph
+            .as_ref()
+            .unwrap()
+            .initializer
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
 
-        let result = onnx_to_program(&model).unwrap();
+        let result = onnx_to_program(&mut model).unwrap();
         let main = result.program.main().unwrap();
 
         // No function input should share a name with an initializer.
@@ -1728,15 +1742,15 @@ mod tests {
     #[test]
     fn opset_version_extracted() {
         let model = read_onnx(fixture("mnist.onnx")).unwrap();
-        let opset = extract_opset_version(&model);
+        let opset = extract_opset_version_from_imports(&model.opset_import);
         assert!(opset > 0, "opset version should be > 0, got {opset}");
     }
 
     #[test]
     fn operation_count_reasonable() {
-        let model = read_onnx(fixture("mnist.onnx")).unwrap();
-        let graph = model.graph.as_ref().unwrap();
-        let result = onnx_to_program(&model).unwrap();
+        let mut model = read_onnx(fixture("mnist.onnx")).unwrap();
+        let num_nodes = model.graph.as_ref().unwrap().node.len();
+        let result = onnx_to_program(&mut model).unwrap();
         let main = result.program.main().unwrap();
 
         let non_const_ops: usize = main
@@ -1748,10 +1762,9 @@ mod tests {
 
         // Each ONNX node produces at least one operation, possibly more.
         assert!(
-            non_const_ops >= graph.node.len(),
+            non_const_ops >= num_nodes,
             "should have at least as many non-const ops ({non_const_ops}) \
-             as ONNX nodes ({})",
-            graph.node.len()
+             as ONNX nodes ({num_nodes})",
         );
     }
 
@@ -1817,13 +1830,14 @@ mod tests {
 
     #[test]
     fn detect_gptq_format() {
-        let names: HashSet<&str> = [
+        let names: HashSet<String> = [
             "layer.0.weight.qweight",
             "layer.0.weight.qzeros",
             "layer.0.weight.scales",
             "layer.0.weight.g_idx",
         ]
         .into_iter()
+        .map(String::from)
         .collect();
         let detected = detect_prequantized_weights(&names);
         assert_eq!(detected.len(), 1);
@@ -1835,12 +1849,13 @@ mod tests {
 
     #[test]
     fn detect_awq_format() {
-        let names: HashSet<&str> = [
+        let names: HashSet<String> = [
             "layer.awq.0.weight.qweight",
             "layer.awq.0.weight.qzeros",
             "layer.awq.0.weight.scales",
         ]
         .into_iter()
+        .map(String::from)
         .collect();
         let detected = detect_prequantized_weights(&names);
         assert_eq!(detected.len(), 1);
@@ -1852,12 +1867,13 @@ mod tests {
 
     #[test]
     fn detect_qlora_format() {
-        let names: HashSet<&str> = [
+        let names: HashSet<String> = [
             "model.layers.0.mlp.gate_proj.weight",
             "model.layers.0.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4",
             "model.layers.0.mlp.gate_proj.weight.quant_state.absmax",
         ]
         .into_iter()
+        .map(String::from)
         .collect();
         let detected = detect_prequantized_weights(&names);
         assert_eq!(detected.len(), 1);
@@ -1869,7 +1885,10 @@ mod tests {
 
     #[test]
     fn detect_no_prequantized_formats() {
-        let names: HashSet<&str> = ["weight", "bias", "running_mean"].into_iter().collect();
+        let names: HashSet<String> = ["weight", "bias", "running_mean"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let detected = detect_prequantized_weights(&names);
         assert!(detected.is_empty());
     }

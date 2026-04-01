@@ -196,12 +196,12 @@ impl CompileBuilder {
         // 1. Detect format and read/convert to Program
         let mut program = match detect_format(input) {
             InputFormat::Onnx => {
-                let onnx_model = read_onnx(input)?;
+                let mut onnx_model = read_onnx(input)?;
                 let config = ConversionConfig {
                     merge_lora: true,
                     model_dir: input.parent().map(|p| p.to_path_buf()),
                 };
-                let result = onnx_to_program_with_config(&onnx_model, &config)?;
+                let result = onnx_to_program_with_config(&mut onnx_model, &config)?;
                 result.program
             }
             InputFormat::MlModel => {

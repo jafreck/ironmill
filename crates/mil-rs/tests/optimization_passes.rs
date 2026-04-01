@@ -2028,8 +2028,8 @@ fn polar_quant_on_whisper_tiny_encoder() {
         return;
     }
 
-    let onnx = mil_rs::read_onnx(&path).unwrap();
-    let cr = mil_rs::onnx_to_program(&onnx).unwrap();
+    let mut onnx = mil_rs::read_onnx(&path).unwrap();
+    let cr = mil_rs::onnx_to_program(&mut onnx).unwrap();
     let mut program = cr.program;
 
     let pass = PolarQuantPass::new(4);
@@ -2060,8 +2060,8 @@ fn polar_quant_on_distilbert() {
         return;
     }
 
-    let onnx = mil_rs::read_onnx(&path).unwrap();
-    let cr = mil_rs::onnx_to_program(&onnx).unwrap();
+    let mut onnx = mil_rs::read_onnx(&path).unwrap();
+    let cr = mil_rs::onnx_to_program(&mut onnx).unwrap();
     let mut program = cr.program;
 
     let pass = PolarQuantPass::new(4);
@@ -2092,8 +2092,8 @@ fn polar_quant_on_vit_base() {
         return;
     }
 
-    let onnx = mil_rs::read_onnx(&path).unwrap();
-    let cr = mil_rs::onnx_to_program(&onnx).unwrap();
+    let mut onnx = mil_rs::read_onnx(&path).unwrap();
+    let cr = mil_rs::onnx_to_program(&mut onnx).unwrap();
     let mut program = cr.program;
 
     let pass = PolarQuantPass::new(4);

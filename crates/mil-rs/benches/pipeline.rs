@@ -27,9 +27,12 @@ fn whisper_fixture() -> Option<PathBuf> {
 fn bench_onnx_to_program(c: &mut Criterion) {
     let mut group = c.benchmark_group("onnx_to_program");
     for &model in MODELS {
-        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        let mut onnx = read_onnx(fixture_path(model)).expect("read_onnx");
         group.bench_with_input(BenchmarkId::new("parse", model), &onnx, |b, onnx| {
-            b.iter(|| onnx_to_program(onnx).expect("onnx_to_program"));
+            b.iter(|| {
+                let mut model = onnx.clone();
+                onnx_to_program(&mut model).expect("onnx_to_program")
+            });
         });
     }
     group.finish();
@@ -38,8 +41,8 @@ fn bench_onnx_to_program(c: &mut Criterion) {
 fn bench_pipeline_default(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline_default");
     for &model in MODELS {
-        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
-        let base = onnx_to_program(&onnx).expect("onnx_to_program");
+        let mut onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        let base = onnx_to_program(&mut onnx).expect("onnx_to_program");
         group.bench_with_input(BenchmarkId::new("run", model), &base.program, |b, prog| {
             b.iter(|| {
                 let mut p = prog.clone();
@@ -53,8 +56,8 @@ fn bench_pipeline_default(c: &mut Criterion) {
 fn bench_pipeline_fp16(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline_fp16");
     for &model in MODELS {
-        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
-        let base = onnx_to_program(&onnx).expect("onnx_to_program");
+        let mut onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        let base = onnx_to_program(&mut onnx).expect("onnx_to_program");
         group.bench_with_input(BenchmarkId::new("run", model), &base.program, |b, prog| {
             b.iter(|| {
                 let mut p = prog.clone();
@@ -72,8 +75,8 @@ fn bench_pipeline_fp16(c: &mut Criterion) {
 fn bench_pipeline_int8(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline_int8");
     for &model in MODELS {
-        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
-        let base = onnx_to_program(&onnx).expect("onnx_to_program");
+        let mut onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        let base = onnx_to_program(&mut onnx).expect("onnx_to_program");
         group.bench_with_input(BenchmarkId::new("run", model), &base.program, |b, prog| {
             b.iter(|| {
                 let mut p = prog.clone();
@@ -91,8 +94,8 @@ fn bench_pipeline_int8(c: &mut Criterion) {
 fn bench_pipeline_palettize_4bit(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline_palettize_4bit");
     for &model in MODELS {
-        let onnx = read_onnx(fixture_path(model)).expect("read_onnx");
-        let base = onnx_to_program(&onnx).expect("onnx_to_program");
+        let mut onnx = read_onnx(fixture_path(model)).expect("read_onnx");
+        let base = onnx_to_program(&mut onnx).expect("onnx_to_program");
         group.bench_with_input(BenchmarkId::new("run", model), &base.program, |b, prog| {
             b.iter(|| {
                 let mut p = prog.clone();
@@ -117,8 +120,8 @@ fn bench_whisper_pipeline(c: &mut Criterion) {
             return;
         }
     };
-    let onnx = read_onnx(&path).expect("read whisper onnx");
-    let base = onnx_to_program(&onnx).expect("onnx_to_program whisper");
+    let mut onnx = read_onnx(&path).expect("read whisper onnx");
+    let base = onnx_to_program(&mut onnx).expect("onnx_to_program whisper");
 
     let mut group = c.benchmark_group("whisper_medium_encoder");
     group.sample_size(10);

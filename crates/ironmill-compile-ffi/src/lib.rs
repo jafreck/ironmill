@@ -172,13 +172,13 @@ pub extern "C" fn mil_model_free(model: *mut MilModel) {
 ///
 /// Returns null on error; call [`mil_last_error`] for the message.
 #[unsafe(no_mangle)]
-pub extern "C" fn mil_onnx_to_program(model: *const MilModel) -> *mut MilProgram {
+pub extern "C" fn mil_onnx_to_program(model: *mut MilModel) -> *mut MilProgram {
     if model.is_null() {
         set_last_error("mil_onnx_to_program: model is null");
         return std::ptr::null_mut();
     }
-    let model = unsafe { &*model };
-    let onnx = match &model.0 {
+    let model = unsafe { &mut *model };
+    let onnx = match &mut model.0 {
         MilModelInner::Onnx(proto) => proto,
         MilModelInner::CoreMl(_) => {
             set_last_error("mil_onnx_to_program: model is CoreML, not ONNX");
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn onnx_to_program_null_returns_null() {
-        let p = mil_onnx_to_program(std::ptr::null());
+        let p = mil_onnx_to_program(std::ptr::null_mut());
         assert!(p.is_null());
         assert!(!mil_last_error().is_null());
     }

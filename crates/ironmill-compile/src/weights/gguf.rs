@@ -561,6 +561,27 @@ impl WeightProvider for GgufProvider {
             .get(name)
             .ok_or_else(|| MilError::Validation(format!("GGUF: tensor not found: {name}")))?;
 
+        // F16 data can be borrowed directly from the mmap — no
+        // dequantization or caching needed.
+        if loc.ggml_type == GgmlType::F16 {
+            let mmap = &self.mmaps[loc.shard_index];
+            let expected = loc
+                .num_elements
+                .checked_mul(2)
+                .ok_or_else(|| MilError::Validation("GGUF: F16 size overflow".into()))?;
+            if loc.byte_len < expected {
+                return Err(MilError::Validation(
+                    "GGUF: F16 tensor data too short".into(),
+                ));
+            }
+            let raw = &mmap[loc.abs_offset..loc.abs_offset + expected];
+            return Ok(WeightTensor::borrowed(
+                raw,
+                loc.dimensions.clone(),
+                ScalarType::Float16,
+            ));
+        }
+
         // Check cache first to avoid re-dequantizing.
         if let Some(cached) = self.cache.borrow().get(name) {
             return Ok(WeightTensor::owned(
@@ -574,12 +595,12 @@ impl WeightProvider for GgufProvider {
         let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
         let fp16_data = dequantize_to_fp16(raw, loc.num_elements, loc.ggml_type)?;
 
-        self.cache
-            .borrow_mut()
-            .insert(name.to_string(), fp16_data.clone());
+        // Move the original into the cache; clone for the caller.
+        let result = fp16_data.clone();
+        self.cache.borrow_mut().insert(name.to_string(), fp16_data);
 
         Ok(WeightTensor::owned(
-            fp16_data,
+            result,
             loc.dimensions.clone(),
             ScalarType::Float16,
         ))

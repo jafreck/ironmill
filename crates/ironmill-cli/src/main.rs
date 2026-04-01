@@ -1013,7 +1013,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 1. Read ONNX model
     println!("Reading ONNX model: {input_display}");
-    let onnx_model = read_onnx(input_path)
+    let mut onnx_model = read_onnx(input_path)
         .with_context(|| format!("Failed to read ONNX model: {input_display}"))?;
     print_onnx_summary(&onnx_model);
 
@@ -1037,7 +1037,7 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         merge_lora: opts.merge_lora,
         model_dir: input_path.parent().map(|p| p.to_path_buf()),
     };
-    let result = onnx_to_program_with_config(&onnx_model, &config)
+    let result = onnx_to_program_with_config(&mut onnx_model, &config)
         .context("Failed to convert ONNX model to MIL IR")?;
     let mut program = result.program;
     let warnings = result.warnings;
@@ -1200,14 +1200,14 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
 
     let report = match ext.as_str() {
         "onnx" => {
-            let onnx_model = read_onnx(input_path)
+            let mut onnx_model = read_onnx(input_path)
                 .with_context(|| format!("Failed to read ONNX model: {input}"))?;
             if is_text {
                 println!("✓ ONNX model parsed successfully");
                 println!("  Converting to MIL IR...");
             }
 
-            let result = onnx_to_program_with_config(&onnx_model, &ConversionConfig::default())
+            let result = onnx_to_program_with_config(&mut onnx_model, &ConversionConfig::default())
                 .context("Failed to convert ONNX model to MIL IR")?;
 
             if is_text {
@@ -1379,13 +1379,14 @@ fn cmd_pipeline_report(input: &str, config_a: &Path, config_b: &Path) -> Result<
     }
 
     println!("Reading ONNX model: {input}");
-    let onnx_model =
+    let mut onnx_model =
         read_onnx(input_path).with_context(|| format!("Failed to read ONNX model: {input}"))?;
 
     println!("Converting to MIL IR...");
-    let result_a = onnx_to_program_with_config(&onnx_model, &ConversionConfig::default())
-        .context("Failed to convert ONNX model")?;
-    let result_b = onnx_to_program_with_config(&onnx_model, &ConversionConfig::default())
+    let result_a =
+        onnx_to_program_with_config(&mut onnx_model.clone(), &ConversionConfig::default())
+            .context("Failed to convert ONNX model")?;
+    let result_b = onnx_to_program_with_config(&mut onnx_model, &ConversionConfig::default())
         .context("Failed to convert ONNX model")?;
     let mut program_a = result_a.program;
     let mut program_b = result_b.program;

@@ -165,12 +165,12 @@ fn detect_format(path: &Path) -> InputFormat {
 
 /// Import an ONNX model, returning the MIL program and a derived `ModelConfig`.
 fn import_onnx(path: &Path) -> Result<(Program, ModelConfig), CompileError> {
-    let onnx_model = read_onnx(path)?;
+    let mut onnx_model = read_onnx(path)?;
     let conv_config = ConversionConfig {
         merge_lora: true,
         model_dir: path.parent().map(|p| p.to_path_buf()),
     };
-    let result = onnx_to_program_with_config(&onnx_model, &conv_config)?;
+    let result = onnx_to_program_with_config(&mut onnx_model, &conv_config)?;
 
     // Attempt to load config.json from the same directory as the ONNX file.
     let config = if let Some(parent) = path.parent() {

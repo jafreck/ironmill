@@ -88,7 +88,7 @@ fn main() {
 
     let onnx_path = "tests/fixtures/qwen3-0.6b.onnx";
     println!("  Loading ONNX model from {onnx_path}...");
-    let onnx = match mil_rs::reader::onnx::read_onnx(onnx_path) {
+    let mut onnx = match mil_rs::reader::onnx::read_onnx(onnx_path) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("  ✗ Failed to read ONNX model: {e}");
@@ -105,7 +105,8 @@ fn main() {
         model_dir,
         ..Default::default()
     };
-    let program = match mil_rs::convert::onnx_graph::onnx_to_program_with_config(&onnx, &config) {
+    let program = match mil_rs::convert::onnx_graph::onnx_to_program_with_config(&mut onnx, &config)
+    {
         Ok(c) => c.program,
         Err(e) => {
             eprintln!("  ✗ ONNX conversion failed: {e}");

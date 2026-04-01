@@ -52,9 +52,9 @@ fn count_ops(program: &Program) -> usize {
 
 /// Convert an ONNX fixture to a MIL Program, returning the ConversionResult.
 fn convert_fixture(name: &str) -> ConversionResult {
-    let onnx =
+    let mut onnx =
         read_onnx(fixture_path(name)).unwrap_or_else(|e| panic!("failed to read {name}: {e}"));
-    onnx_to_program(&onnx).unwrap_or_else(|e| panic!("failed to convert {name} to MIL IR: {e}"))
+    onnx_to_program(&mut onnx).unwrap_or_else(|e| panic!("failed to convert {name} to MIL IR: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -64,10 +64,10 @@ fn convert_fixture(name: &str) -> ConversionResult {
 #[test]
 fn convert_mnist_onnx_to_mlpackage() {
     // 1. Read MNIST ONNX
-    let onnx = read_onnx(fixture_path("mnist.onnx")).expect("failed to read mnist.onnx");
+    let mut onnx = read_onnx(fixture_path("mnist.onnx")).expect("failed to read mnist.onnx");
 
     // 2. Convert to MIL IR
-    let result = onnx_to_program(&onnx).expect("onnx_to_program failed for MNIST");
+    let result = onnx_to_program(&mut onnx).expect("onnx_to_program failed for MNIST");
 
     // 3. MNIST uses only basic ops — expect no warnings
     assert!(
@@ -106,11 +106,11 @@ fn convert_mnist_onnx_to_mlpackage() {
 #[test]
 fn convert_squeezenet_onnx_to_mlpackage() {
     // 1. Read SqueezeNet ONNX
-    let onnx =
+    let mut onnx =
         read_onnx(fixture_path("squeezenet1.1.onnx")).expect("failed to read squeezenet1.1.onnx");
 
     // 2. Convert to MIL IR
-    let result = onnx_to_program(&onnx).expect("onnx_to_program failed for SqueezeNet");
+    let result = onnx_to_program(&mut onnx).expect("onnx_to_program failed for SqueezeNet");
 
     // 3. SqueezeNet may have unsupported-op warnings — just ensure they're reasonable
     for warning in &result.warnings {
@@ -257,24 +257,24 @@ fn compile_squeezenet_end_to_end() {
 fn conversion_preserves_io_shapes() {
     use mil_rs::proto::onnx::type_proto;
 
-    let onnx = read_onnx(fixture_path("mnist.onnx")).expect("failed to read mnist.onnx");
-    let graph = onnx.graph.as_ref().expect("ONNX model should have a graph");
+    let mut onnx = read_onnx(fixture_path("mnist.onnx")).expect("failed to read mnist.onnx");
 
-    // Collect ONNX input names (excluding initializers)
-    let initializer_names: std::collections::HashSet<&str> =
-        graph.initializer.iter().map(|t| t.name.as_str()).collect();
-
-    let onnx_input_names: Vec<&str> = graph
-        .input
-        .iter()
-        .filter(|vi| !initializer_names.contains(vi.name.as_str()))
-        .map(|vi| vi.name.as_str())
-        .collect();
-
-    let _onnx_output_names: Vec<&str> = graph.output.iter().map(|vi| vi.name.as_str()).collect();
+    // Capture data from graph before conversion (which drains initializers).
+    let onnx_input_names: Vec<String>;
+    {
+        let graph = onnx.graph.as_ref().expect("ONNX model should have a graph");
+        let initializer_names: std::collections::HashSet<&str> =
+            graph.initializer.iter().map(|t| t.name.as_str()).collect();
+        onnx_input_names = graph
+            .input
+            .iter()
+            .filter(|vi| !initializer_names.contains(vi.name.as_str()))
+            .map(|vi| vi.name.clone())
+            .collect();
+    }
 
     // Convert to MIL IR
-    let result = onnx_to_program(&onnx).expect("onnx_to_program failed");
+    let result = onnx_to_program(&mut onnx).expect("onnx_to_program failed");
     let program = result.program;
 
     let main_fn = program
@@ -297,7 +297,7 @@ fn conversion_preserves_io_shapes() {
         assert!(
             mil_input_names
                 .iter()
-                .any(|n| n.contains(onnx_name) || onnx_name.contains(n)),
+                .any(|n| n.contains(onnx_name.as_str()) || onnx_name.contains(n)),
             "ONNX input '{onnx_name}' should have a corresponding MIL input \
              (MIL inputs: {mil_input_names:?})"
         );
@@ -309,7 +309,9 @@ fn conversion_preserves_io_shapes() {
         "MIL function body should have outputs"
     );
 
-    // Verify ONNX output shapes are tensor-typed
+    // Verify ONNX output shapes are tensor-typed (output metadata is not
+    // drained by conversion — only initializers are consumed).
+    let graph = onnx.graph.as_ref().expect("graph should still exist");
     for output in &graph.output {
         if let Some(type_proto) = &output.r#type {
             if let Some(type_proto::Value::TensorType(_)) = &type_proto.value {

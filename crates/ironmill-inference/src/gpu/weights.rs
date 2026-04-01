@@ -297,7 +297,13 @@ fn load_dense_buffer(
         .tensor(name)
         .map_err(|e| GpuError::WeightLoading(format!("{name}: {e}")))?;
     let data = match &tensor.quant_info {
-        QuantizationInfo::None => tensor.data.into_owned(),
+        QuantizationInfo::None => {
+            // Zero-copy: pass borrowed data directly to Metal without
+            // allocating an intermediate Vec.
+            return device
+                .create_buffer_with_data(&tensor.data, StorageMode::Shared)
+                .map_err(GpuError::Metal);
+        }
         QuantizationInfo::LutToDense {
             lut,
             lut_dtype,

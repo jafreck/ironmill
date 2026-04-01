@@ -248,7 +248,7 @@ fn convert_stage(stage: &StageConfig, base_dir: &Path) -> Result<(Program, Vec<S
     if let Some(onnx_path) = &stage.onnx {
         // ONNX source
         let full_path = base_dir.join(onnx_path);
-        let onnx_model = read_onnx(&full_path).map_err(|e| {
+        let mut onnx_model = read_onnx(&full_path).map_err(|e| {
             MilError::Validation(format!(
                 "stage '{}': failed to read ONNX file '{}': {e}",
                 stage.name,
@@ -256,7 +256,7 @@ fn convert_stage(stage: &StageConfig, base_dir: &Path) -> Result<(Program, Vec<S
             ))
         })?;
 
-        let result = onnx_to_program(&onnx_model).map_err(|e| {
+        let result = onnx_to_program(&mut onnx_model).map_err(|e| {
             MilError::Validation(format!(
                 "stage '{}': ONNX conversion failed: {e}",
                 stage.name

@@ -25,8 +25,8 @@ fn compile_onnx_to_mlmodelc(onnx_name: &str) -> (tempfile::TempDir, PathBuf) {
     let onnx_path = fixture_path(onnx_name);
     assert!(onnx_path.exists(), "fixture {onnx_name} not found");
 
-    let model_proto = read_onnx(&onnx_path).expect("read_onnx failed");
-    let result = onnx_to_program(&model_proto).expect("onnx_to_program failed");
+    let mut model_proto = read_onnx(&onnx_path).expect("read_onnx failed");
+    let result = onnx_to_program(&mut model_proto).expect("onnx_to_program failed");
     let mut program = result.program;
 
     ConstantFoldPass.run(&mut program).unwrap();

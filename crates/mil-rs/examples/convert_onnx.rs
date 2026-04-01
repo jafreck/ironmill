@@ -15,11 +15,11 @@ fn main() -> anyhow::Result<()> {
 
     // 1. Read the ONNX model.
     println!("Reading ONNX model: {input}");
-    let onnx_model = read_onnx(input)?;
+    let mut onnx_model = read_onnx(input)?;
 
     // 2. Convert to the MIL IR.
     println!("Converting to MIL IR...");
-    let result = onnx_to_program(&onnx_model)?;
+    let result = onnx_to_program(&mut onnx_model)?;
     let mut program = result.program;
 
     if !result.warnings.is_empty() {

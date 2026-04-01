@@ -27,12 +27,12 @@ pub fn compile_model(
 
     std::fs::create_dir_all(&entry_dir)?;
 
-    let (onnx, model_dir) = ironmill_compile::mil::read_onnx_with_dir(&model.path)?;
+    let (mut onnx, model_dir) = ironmill_compile::mil::read_onnx_with_dir(&model.path)?;
     let config = ironmill_compile::mil::ConversionConfig {
         model_dir: Some(model_dir),
         ..Default::default()
     };
-    let conversion_result = ironmill_compile::mil::onnx_to_program_with_config(&onnx, &config)?;
+    let conversion_result = ironmill_compile::mil::onnx_to_program_with_config(&mut onnx, &config)?;
     let mut program = conversion_result.program;
 
     let mut pipeline = ironmill_compile::mil::PassPipeline::default();
@@ -76,12 +76,12 @@ pub fn build_optimized_program(
     model: &ModelConfig,
     opt: &OptConfig,
 ) -> Result<ironmill_compile::mil::Program> {
-    let (onnx, model_dir) = ironmill_compile::mil::read_onnx_with_dir(&model.path)?;
+    let (mut onnx, model_dir) = ironmill_compile::mil::read_onnx_with_dir(&model.path)?;
     let config = ironmill_compile::mil::ConversionConfig {
         model_dir: Some(model_dir),
         ..Default::default()
     };
-    let conversion_result = ironmill_compile::mil::onnx_to_program_with_config(&onnx, &config)?;
+    let conversion_result = ironmill_compile::mil::onnx_to_program_with_config(&mut onnx, &config)?;
     let mut program = conversion_result.program;
 
     let mut pipeline = ironmill_compile::mil::PassPipeline::default();

@@ -30,8 +30,8 @@ fn count_ops(program: &Program) -> usize {
 }
 
 fn base_program() -> Program {
-    let onnx = read_onnx(fixture_path("squeezenet1.1.onnx")).expect("read squeezenet");
-    onnx_to_program(&onnx).expect("onnx_to_program").program
+    let mut onnx = read_onnx(fixture_path("squeezenet1.1.onnx")).expect("read squeezenet");
+    onnx_to_program(&mut onnx).expect("onnx_to_program").program
 }
 
 fn bench_passes(c: &mut Criterion) {

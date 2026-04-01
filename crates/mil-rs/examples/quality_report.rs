@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         .to_string_lossy();
     println!("Model: {model_name}\n");
 
-    let (onnx_model, model_dir) = read_onnx_with_dir(input)?;
+    let (mut onnx_model, model_dir) = read_onnx_with_dir(input)?;
     let conversion_config = ConversionConfig {
         model_dir: Some(model_dir),
         ..Default::default()
@@ -73,13 +73,13 @@ fn main() -> anyhow::Result<()> {
 
     for (label, make_base_pipeline, make_opt_pipeline) in &combos {
         // Baseline: default passes only (same graph structure, no quantization).
-        let result_base = onnx_to_program_with_config(&onnx_model, &conversion_config)?;
+        let result_base = onnx_to_program_with_config(&mut onnx_model.clone(), &conversion_config)?;
         let mut baseline = result_base.program;
         let base_pipeline = make_base_pipeline()?;
         base_pipeline.run(&mut baseline)?;
 
         // Optimized: default passes + the specific quantization/palettization.
-        let result_opt = onnx_to_program_with_config(&onnx_model, &conversion_config)?;
+        let result_opt = onnx_to_program_with_config(&mut onnx_model.clone(), &conversion_config)?;
         let mut optimized = result_opt.program;
         let opt_pipeline = make_opt_pipeline()?;
         let report = opt_pipeline.run(&mut optimized)?;
