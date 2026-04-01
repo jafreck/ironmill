@@ -494,7 +494,7 @@ impl GpuInference {
 
             // Q projection
             let q_weight_mat = MpsMatrix::from_buffer(
-                &lw.q_proj,
+                lw.q_proj.as_dense(),
                 mc.num_attention_heads * mc.head_dim,
                 h,
                 row_bytes_h,
@@ -510,9 +510,13 @@ impl GpuInference {
             lm.q.encode(&cmd_buf, &norm_mat, &q_weight_mat, &q_result_mat);
 
             // K projection
-            let k_weight_mat =
-                MpsMatrix::from_buffer(&lw.k_proj, mc.num_kv_heads() * mc.head_dim, h, row_bytes_h)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let k_weight_mat = MpsMatrix::from_buffer(
+                lw.k_proj.as_dense(),
+                mc.num_kv_heads() * mc.head_dim,
+                h,
+                row_bytes_h,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let k_result_mat = MpsMatrix::from_buffer(
                 &bufs.k_proj,
                 token_count,
@@ -523,9 +527,13 @@ impl GpuInference {
             lm.k.encode(&cmd_buf, &norm_mat, &k_weight_mat, &k_result_mat);
 
             // V projection
-            let v_weight_mat =
-                MpsMatrix::from_buffer(&lw.v_proj, mc.num_kv_heads() * mc.head_dim, h, row_bytes_h)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let v_weight_mat = MpsMatrix::from_buffer(
+                lw.v_proj.as_dense(),
+                mc.num_kv_heads() * mc.head_dim,
+                h,
+                row_bytes_h,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let v_result_mat = MpsMatrix::from_buffer(
                 &bufs.v_proj,
                 token_count,
@@ -747,7 +755,7 @@ impl GpuInference {
             )
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let o_weight_mat = MpsMatrix::from_buffer(
-                &lw.o_proj,
+                lw.o_proj.as_dense(),
                 h,
                 mc.num_attention_heads * mc.head_dim,
                 row_bytes_qo,
@@ -797,16 +805,18 @@ impl GpuInference {
             let norm_mat2 = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-            let gate_weight_mat = MpsMatrix::from_buffer(&lw.gate_proj, inter, h, row_bytes_h)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let gate_weight_mat =
+                MpsMatrix::from_buffer(lw.gate_proj.as_dense(), inter, h, row_bytes_h)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let gate_result_mat =
                 MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             lm.gate
                 .encode(&cmd_buf, &norm_mat2, &gate_weight_mat, &gate_result_mat);
 
-            let up_weight_mat = MpsMatrix::from_buffer(&lw.up_proj, inter, h, row_bytes_h)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let up_weight_mat =
+                MpsMatrix::from_buffer(lw.up_proj.as_dense(), inter, h, row_bytes_h)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let up_result_mat =
                 MpsMatrix::from_buffer(&bufs.ffn_up, token_count, inter, row_bytes_inter)
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -833,8 +843,9 @@ impl GpuInference {
             let gate_out_mat =
                 MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let down_weight_mat = MpsMatrix::from_buffer(&lw.down_proj, h, inter, row_bytes_inter)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let down_weight_mat =
+                MpsMatrix::from_buffer(lw.down_proj.as_dense(), h, inter, row_bytes_inter)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let down_result_mat =
                 MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
