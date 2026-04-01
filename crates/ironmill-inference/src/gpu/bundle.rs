@@ -96,7 +96,7 @@ impl WeightProvider for GpuBundleProvider {
                     str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
 
                 Ok(WeightTensor {
-                    data: Cow::Owned(indices.clone()),
+                    data: Cow::Owned(Vec::new()),
                     shape: shape.clone(),
                     dtype,
                     quant_info: QuantizationInfo::LutToDense {

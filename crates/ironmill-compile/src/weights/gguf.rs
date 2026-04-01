@@ -375,11 +375,22 @@ struct GgufTensorInfo {
 // Owned dequantized tensor
 // ---------------------------------------------------------------------------
 
-/// A fully dequantized weight tensor stored as owned bytes.
-struct OwnedWeightTensor {
-    data: Vec<u8>,
-    shape: Vec<usize>,
-    dtype: ScalarType,
+/// Location of a tensor within the mmapped GGUF shards.
+///
+/// Stores enough metadata to lazily dequantize without re-parsing headers.
+struct GgufTensorLocation {
+    /// Index into `GgufProvider::mmaps`.
+    shard_index: usize,
+    /// Absolute byte offset within the mmap.
+    abs_offset: usize,
+    /// Raw byte length on disk.
+    byte_len: usize,
+    /// Number of elements in the tensor.
+    num_elements: usize,
+    /// GGML quantization type.
+    ggml_type: GgmlType,
+    /// Tensor shape.
+    dimensions: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -388,12 +399,15 @@ struct OwnedWeightTensor {
 
 /// Weight provider backed by one or more GGUF files.
 ///
-/// All quantized tensors are dequantized to FP16 at load time and stored
-/// in an in-memory HashMap. The HuggingFace-canonical tensor names are used
-/// as keys so that architecture templates can consume them transparently.
+/// Tensor data is memory-mapped and dequantized lazily on each `tensor()`
+/// call, keeping memory usage proportional to the on-disk quantized size
+/// rather than the full FP16 expansion.
 pub struct GgufProvider {
     config: ModelConfig,
-    tensors: HashMap<String, OwnedWeightTensor>,
+    /// Memory-mapped shard files, kept alive for the provider lifetime.
+    mmaps: Vec<Mmap>,
+    /// Tensor metadata indexed by HuggingFace-canonical name.
+    tensor_index: HashMap<String, GgufTensorLocation>,
 }
 
 impl GgufProvider {
@@ -405,9 +419,10 @@ impl GgufProvider {
     pub fn load(path: &Path) -> Result<Self, MilError> {
         let shard_paths = discover_shards(path)?;
         let mut all_metadata: HashMap<String, MetadataValue> = HashMap::new();
-        let mut all_tensors: HashMap<String, OwnedWeightTensor> = HashMap::new();
+        let mut tensor_index: HashMap<String, GgufTensorLocation> = HashMap::new();
+        let mut mmaps = Vec::with_capacity(shard_paths.len());
 
-        for shard_path in &shard_paths {
+        for (shard_idx, shard_path) in shard_paths.iter().enumerate() {
             let file = std::fs::File::open(shard_path)?;
             // SAFETY: we treat the mmap as read-only and do not mutate it.
             let mmap = unsafe { Mmap::map(&file)? };
@@ -468,7 +483,7 @@ impl GgufProvider {
             let header_end = reader.position();
             let data_section_start = align_offset(header_end, ALIGNMENT)?;
 
-            // --- Dequantize each tensor ---
+            // --- Index each tensor's location for lazy dequantization ---
             for info in &tensor_infos {
                 let abs_offset = data_section_start
                     .checked_add(info.offset as usize)
@@ -507,42 +522,53 @@ impl GgufProvider {
                     )));
                 }
 
-                let raw = &data[abs_offset..end];
-                let fp16_data = dequantize_to_fp16(raw, num_elements, info.ggml_type)?;
-
-                // GGUF dimensions are stored in row-major order already
                 let hf_name = remap_tensor_name(&info.name);
-                all_tensors.insert(
+                tensor_index.insert(
                     hf_name,
-                    OwnedWeightTensor {
-                        data: fp16_data,
-                        shape: info.dimensions.clone(),
-                        dtype: ScalarType::Float16,
+                    GgufTensorLocation {
+                        shard_index: shard_idx,
+                        abs_offset,
+                        byte_len,
+                        num_elements,
+                        ggml_type: info.ggml_type,
+                        dimensions: info.dimensions.clone(),
                     },
                 );
             }
+
+            mmaps.push(mmap);
         }
 
         let config = extract_model_config(&all_metadata)?;
 
         Ok(Self {
             config,
-            tensors: all_tensors,
+            mmaps,
+            tensor_index,
         })
     }
 }
 
 impl WeightProvider for GgufProvider {
     fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError> {
-        let t = self
-            .tensors
+        let loc = self
+            .tensor_index
             .get(name)
             .ok_or_else(|| MilError::Validation(format!("GGUF: tensor not found: {name}")))?;
-        Ok(WeightTensor::borrowed(&t.data, t.shape.clone(), t.dtype))
+
+        let mmap = &self.mmaps[loc.shard_index];
+        let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
+        let fp16_data = dequantize_to_fp16(raw, loc.num_elements, loc.ggml_type)?;
+
+        Ok(WeightTensor::owned(
+            fp16_data,
+            loc.dimensions.clone(),
+            ScalarType::Float16,
+        ))
     }
 
     fn tensor_names(&self) -> Vec<&str> {
-        self.tensors.keys().map(|s| s.as_str()).collect()
+        self.tensor_index.keys().map(|s| s.as_str()).collect()
     }
 
     fn config(&self) -> &ModelConfig {
@@ -550,7 +576,7 @@ impl WeightProvider for GgufProvider {
     }
 
     fn has_tensor(&self, name: &str) -> bool {
-        self.tensors.contains_key(name)
+        self.tensor_index.contains_key(name)
     }
 }
 

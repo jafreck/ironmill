@@ -102,7 +102,7 @@ impl MilWeightProvider {
                     // The stored data is the packed indices (the primary payload
                     // consumers will unpack during GPU dispatch).
                     let extracted = ExtractedTensor {
-                        data: indices_data.clone(),
+                        data: Vec::new(),
                         shape: original_shape.clone(),
                         dtype: indices_dtype,
                         quant_info: QuantizationInfo::LutToDense {
@@ -298,7 +298,7 @@ impl MilWeightProvider {
             tensors.insert(
                 name.to_string(),
                 ExtractedTensor {
-                    data: packed.clone(),
+                    data: Vec::new(),
                     shape: tensor.shape.clone(),
                     dtype: ScalarType::UInt8,
                     quant_info: QuantizationInfo::LutToDense {
