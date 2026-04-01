@@ -8,10 +8,10 @@ use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ironmill_compile::gpu::bundle::{
+use ironmill_core::gpu::bundle::{
     GpuBundleManifest, TensorManifest, deserialize_model_config, str_to_scalar_type,
 };
-use ironmill_compile::weights::{ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
+use ironmill_core::weights::{ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
 use mil_rs::MilError;
 
 use super::error::GpuError;
@@ -179,7 +179,7 @@ mod tests {
     }
 
     fn test_config() -> ModelConfig {
-        use ironmill_compile::weights::Architecture;
+        use ironmill_core::weights::Architecture;
         ModelConfig {
             architecture: Architecture::Llama,
             hidden_size: 2048,

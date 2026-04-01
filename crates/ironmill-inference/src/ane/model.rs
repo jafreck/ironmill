@@ -44,9 +44,8 @@ pub struct TensorDescriptor {
     pub dtype: ScalarType,
 }
 
-#[cfg(feature = "compile")]
-impl From<&ironmill_compile::ane::TensorDescriptor> for TensorDescriptor {
-    fn from(td: &ironmill_compile::ane::TensorDescriptor) -> Self {
+impl From<&ironmill_core::ane::TensorDescriptor> for TensorDescriptor {
+    fn from(td: &ironmill_core::ane::TensorDescriptor) -> Self {
         Self {
             name: td.name.clone(),
             shape: td.shape,
