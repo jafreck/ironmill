@@ -199,6 +199,7 @@ flowchart TD
         direction LR
         compile["ironmill-compile"]
         inference["ironmill-inference"]
+        corelib["ironmill-core"]
     end
 
     subgraph sys["System Bindings"]
@@ -221,14 +222,17 @@ flowchart TD
     burn -. "macos" .-> inference
     candle --> compile
     candle -. "macos" .-> inference
+    compile --> corelib
     compile --> mil
     compile --> ios
+    inference --> corelib
     inference --> mil
     inference --> ane
     inference --> ios
     inference --> coremlsys
     inference -. "metal" .-> metalsys
     inference -. "compile" .-> compile
+    corelib --> mil
     ios --> mil
 ```
 
@@ -237,6 +241,7 @@ flowchart TD
 | [`mil-rs`](crates/mil-rs/) | Core MIL IR library: read/write CoreML models, ONNX conversion, proto↔IR, pass pipeline |
 | [`ironmill-compile`](crates/ironmill-compile/) | Compilation pipeline: ANE lowering passes, CoreML build API, templates, weight providers |
 | [`ironmill-inference`](crates/ironmill-inference/) | Inference engine: ANE-direct, CoreML, and Metal GPU backends, decode loop, TurboQuant, sampling |
+| [`ironmill-core`](crates/ironmill-core/) | Shared types: bundle manifest schemas, weight provider traits, model configs |
 | [`ironmill-ane-sys`](crates/ironmill-ane-sys/) | Safe FFI bindings for Apple Neural Engine private APIs (macOS-only) |
 | [`ironmill-iosurface`](crates/ironmill-iosurface/) | IOSurface tensor management for ANE I/O (macOS-only) |
 | [`ironmill-coreml-sys`](crates/ironmill-coreml-sys/) | CoreML runtime bindings via objc2 (macOS-only) |

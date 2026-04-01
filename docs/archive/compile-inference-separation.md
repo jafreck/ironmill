@@ -230,7 +230,6 @@ Updated crate dependency graph after separation:
 
 ```
 cli --> compile
-cli -.-> inference
 
 bench --> compile
 bench --> inference
@@ -242,15 +241,19 @@ burn --> inference
 candle --> compile
 candle --> inference
 
+compile --> ironmill-core
 compile --> mil
 compile --> ironmill-iosurface
 
+inference --> ironmill-core
 inference --> mil
 inference --> ane-sys
 inference --> ironmill-iosurface
 inference --> coreml-sys
 inference -.-> compile           (optional, behind "compile" feature)
+inference -.-> metal-sys         (optional, behind "metal" feature)
 
+ironmill-core --> mil
 ironmill-iosurface --> mil
 ```
 
