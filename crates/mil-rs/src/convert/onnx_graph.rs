@@ -176,11 +176,16 @@ fn convert_graph(
     //    This modifies the initializer data in-place so the const ops below
     //    contain the merged weights. LoRA-specific initializers (A, B, alpha)
     //    are removed from the set so they don't become const ops.
+    //
+    // Clone the initializer list so we can *take* ownership of weight byte
+    // buffers (via `std::mem::take`) instead of cloning each one.  The
+    // metadata (name, dims, data_type) remains intact for later loops.
+    let mut initializers = graph.initializer.clone();
     let mut init_data: HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)> = HashMap::new();
-    for tensor in &graph.initializer {
+    for tensor in initializers.iter_mut() {
         if let Ok(dtype) = onnx_dtype_to_scalar(tensor.data_type) {
             let shape: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-            let data = extract_tensor_raw_data(tensor, dtype, model_dir);
+            let data = extract_tensor_raw_data_take(tensor, dtype, model_dir);
             init_data.insert(tensor.name.clone(), (data, shape, dtype));
         }
     }
@@ -227,7 +232,7 @@ fn convert_graph(
     //      their quantization rather than emitting plain `const` ops.
     let mut block = Block::new();
     let prequant = detect_prequantized_weights(&initializer_names);
-    for tensor in &graph.initializer {
+    for tensor in &initializers {
         // Skip LoRA-only tensors — they've been merged into base weights.
         if lora_names.contains(tensor.name.as_str()) {
             continue;
@@ -240,7 +245,7 @@ fn convert_graph(
 
         if let Some(fmt) = prequant.get(tensor.name.as_str()) {
             // Pre-quantized weights get special handling.
-            match prequantized_to_op(tensor, *fmt, &graph.initializer, model_dir) {
+            match prequantized_to_op(tensor, *fmt, &mut init_data) {
                 Ok(mut op) => {
                     stamp_output_types(&mut op, &onnx_type_map);
                     block.add_op(op);
@@ -993,6 +998,78 @@ pub(crate) fn extract_tensor_raw_data(
     }
 }
 
+/// Like [`extract_tensor_raw_data`] but takes ownership of the proto's byte
+/// buffers via [`std::mem::take`], avoiding a full clone of the weight data.
+/// The `TensorProto`'s data fields will be empty afterwards.
+fn extract_tensor_raw_data_take(
+    tensor: &mut TensorProto,
+    dtype: ScalarType,
+    model_dir: Option<&Path>,
+) -> Vec<u8> {
+    // External data is loaded from disk — nothing to take from the proto.
+    if tensor.data_location == 1 {
+        if let Some(dir) = model_dir {
+            return load_external_tensor_data(&tensor.external_data, dir);
+        } else {
+            eprintln!(
+                "warning: tensor '{}' uses external data but no model directory provided",
+                tensor.name
+            );
+            return Vec::new();
+        }
+    }
+
+    // Move raw_data out of the proto instead of cloning.
+    let raw = std::mem::take(&mut tensor.raw_data);
+    if !raw.is_empty() {
+        return raw;
+    }
+
+    // Typed fields: take ownership and convert to little-endian bytes.
+    match dtype {
+        ScalarType::Float32 => std::mem::take(&mut tensor.float_data)
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        ScalarType::Float64 => std::mem::take(&mut tensor.double_data)
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        ScalarType::Int32 => std::mem::take(&mut tensor.int32_data)
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        ScalarType::Int64 => std::mem::take(&mut tensor.int64_data)
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        ScalarType::UInt64 => std::mem::take(&mut tensor.uint64_data)
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        ScalarType::UInt8 | ScalarType::Bool => std::mem::take(&mut tensor.int32_data)
+            .into_iter()
+            .flat_map(|v| (v as u8).to_le_bytes())
+            .collect(),
+        ScalarType::Int8 => std::mem::take(&mut tensor.int32_data)
+            .into_iter()
+            .flat_map(|v| (v as i8).to_le_bytes())
+            .collect(),
+        ScalarType::UInt16 => std::mem::take(&mut tensor.int32_data)
+            .into_iter()
+            .flat_map(|v| (v as u16).to_le_bytes())
+            .collect(),
+        ScalarType::Int16 | ScalarType::Float16 => std::mem::take(&mut tensor.int32_data)
+            .into_iter()
+            .flat_map(|v| (v as i16).to_le_bytes())
+            .collect(),
+        ScalarType::UInt32 => std::mem::take(&mut tensor.int32_data)
+            .into_iter()
+            .flat_map(|v| (v as u32).to_le_bytes())
+            .collect(),
+    }
+}
+
 /// Load tensor data from an external file referenced by ONNX `external_data` entries.
 fn load_external_tensor_data(
     external_data: &[crate::proto::onnx::StringStringEntryProto],
@@ -1267,13 +1344,46 @@ fn is_prequant_auxiliary(name: &str, prequant: &HashMap<&str, PreQuantFormat>) -
 ///
 /// The emitted op has `op_type = "const"` with an extra `quantization_format`
 /// attribute so that downstream passes know not to re-quantize it.
+///
+/// Tensor data is moved out of `init_data` instead of re-extracting from the
+/// protobuf, avoiding an extra clone of the weight bytes.
 fn prequantized_to_op(
     tensor: &TensorProto,
     fmt: PreQuantFormat,
-    all_initializers: &[TensorProto],
-    model_dir: Option<&Path>,
+    init_data: &mut HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)>,
 ) -> Result<Operation> {
-    let mut op = initializer_to_const(tensor, model_dir)?;
+    // Build the primary const op from init_data (move, not clone).
+    let (mut raw_bytes, shape, mut dtype) = init_data.remove(&tensor.name).ok_or_else(|| {
+        MilError::UnsupportedOp(format!(
+            "no extracted data for pre-quantized tensor '{}'",
+            tensor.name
+        ))
+    })?;
+
+    // Narrow int64 → int32 for CoreML compatibility.
+    if dtype == ScalarType::Int64 {
+        raw_bytes = raw_bytes
+            .chunks_exact(8)
+            .flat_map(|c| {
+                let v = i64::from_le_bytes(c.try_into().unwrap());
+                (v as i32).to_le_bytes()
+            })
+            .collect();
+        dtype = ScalarType::Int32;
+    }
+
+    let mut op = Operation::new("const", &tensor.name);
+    op = op.with_output(&tensor.name);
+    op.attributes
+        .insert("onnx_name".into(), Value::String(tensor.name.clone()));
+    op.attributes.insert(
+        "val".into(),
+        Value::Tensor {
+            data: raw_bytes,
+            shape,
+            dtype,
+        },
+    );
 
     let fmt_str = match fmt {
         PreQuantFormat::QLoRA => "qlora",
@@ -1295,23 +1405,19 @@ fn prequantized_to_op(
         PreQuantFormat::Gptq | PreQuantFormat::Awq => GPTQ_AWQ_SUFFIXES,
     };
 
-    // Attach auxiliary tensors as attributes keyed by their suffix.
+    // Attach auxiliary tensors as attributes, moving data from init_data.
     for &suffix in suffixes {
         let aux_name = format!("{base}{suffix}");
-        if let Some(aux_tensor) = all_initializers.iter().find(|t| t.name == aux_name) {
-            if let Ok(aux_dtype) = onnx_dtype_to_scalar(aux_tensor.data_type) {
-                let shape: Vec<usize> = aux_tensor.dims.iter().map(|&d| d as usize).collect();
-                let raw = extract_tensor_raw_data(aux_tensor, aux_dtype, None);
-                let attr_key = suffix.trim_start_matches('.').replace('.', "_");
-                op.attributes.insert(
-                    attr_key,
-                    Value::Tensor {
-                        data: raw,
-                        shape,
-                        dtype: aux_dtype,
-                    },
-                );
-            }
+        if let Some((aux_data, aux_shape, aux_dtype)) = init_data.remove(&aux_name) {
+            let attr_key = suffix.trim_start_matches('.').replace('.', "_");
+            op.attributes.insert(
+                attr_key,
+                Value::Tensor {
+                    data: aux_data,
+                    shape: aux_shape,
+                    dtype: aux_dtype,
+                },
+            );
         }
     }
 
