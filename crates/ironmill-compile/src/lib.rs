@@ -59,8 +59,3 @@ pub mod mil {
         pub use mil_rs::ir::passes::tensor_utils;
     }
 }
-
-/// C-compatible FFI API (enable with `--features c-api`).
-#[cfg(feature = "c-api")]
-#[allow(unsafe_code)]
-pub mod c_api;

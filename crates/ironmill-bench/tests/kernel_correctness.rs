@@ -149,8 +149,8 @@ fn polarquant_matvec_int4_correctness() {
     cmd_buf.wait_until_completed();
 
     // Read back results
-    let c_ptr = c_buf.contents() as *const u8;
-    let c_data = unsafe { std::slice::from_raw_parts(c_ptr, n * 2) };
+    let mut c_data = vec![0u8; n * 2];
+    c_buf.read_bytes(&mut c_data, 0).expect("read C buffer");
     let mut gpu_output = vec![0.0f32; n];
     for i in 0..n {
         gpu_output[i] = f16::from_le_bytes([c_data[i * 2], c_data[i * 2 + 1]]).to_f32();

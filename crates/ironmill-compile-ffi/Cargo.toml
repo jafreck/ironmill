@@ -1,0 +1,12 @@
+[package]
+name = "ironmill-compile-ffi"
+description = "C-compatible FFI API for ironmill-compile and mil-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ironmill-compile = { workspace = true }
+mil-rs = { path = "../mil-rs" }

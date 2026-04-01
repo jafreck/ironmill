@@ -22,6 +22,9 @@ anyhow = { workspace = true }
 statrs = { workspace = true }
 half = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 mil-rs = { path = "../mil-rs" }

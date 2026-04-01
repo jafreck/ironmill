@@ -262,64 +262,74 @@ impl AneTensor {
             // SAFETY: Both surfaces are locked before access, base addresses
             // are verified non-null, and the strided copy stays within each
             // surface's allocation bounds (channels * stride ≤ alloc_size).
-            unsafe {
-                let rc = ffi::IOSurfaceLock(
+            let rc = unsafe {
+                ffi::IOSurfaceLock(
                     src.surface,
                     ffi::IOSURFACE_LOCK_READ_ONLY,
                     std::ptr::null_mut(),
-                );
-                if rc != 0 {
-                    return Err(IOSurfaceError::LockFailed(format!(
-                        "copy_column0_from: IOSurfaceLock(src) failed (status {rc})"
-                    )));
-                }
-                let src_base = ffi::IOSurfaceGetBaseAddress(src.surface);
-                if src_base.is_null() {
+                )
+            };
+            if rc != 0 {
+                return Err(IOSurfaceError::LockFailed(format!(
+                    "copy_column0_from: IOSurfaceLock(src) failed (status {rc})"
+                )));
+            }
+            let src_base = unsafe { ffi::IOSurfaceGetBaseAddress(src.surface) };
+            if src_base.is_null() {
+                unsafe {
                     ffi::IOSurfaceUnlock(
                         src.surface,
                         ffi::IOSURFACE_LOCK_READ_ONLY,
                         std::ptr::null_mut(),
                     );
-                    return Err(IOSurfaceError::LockFailed(
-                        "copy_column0_from: IOSurfaceGetBaseAddress(src) returned null".into(),
-                    ));
                 }
+                return Err(IOSurfaceError::LockFailed(
+                    "copy_column0_from: IOSurfaceGetBaseAddress(src) returned null".into(),
+                ));
+            }
 
-                let rc = ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
-                if rc != 0 {
+            let rc = unsafe { ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut()) };
+            if rc != 0 {
+                unsafe {
                     ffi::IOSurfaceUnlock(
                         src.surface,
                         ffi::IOSURFACE_LOCK_READ_ONLY,
                         std::ptr::null_mut(),
                     );
-                    return Err(IOSurfaceError::LockFailed(format!(
-                        "copy_column0_from: IOSurfaceLock(dst) failed (status {rc})"
-                    )));
                 }
-                let dst_base = ffi::IOSurfaceGetBaseAddress(self.surface);
-                if dst_base.is_null() {
-                    ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
+                return Err(IOSurfaceError::LockFailed(format!(
+                    "copy_column0_from: IOSurfaceLock(dst) failed (status {rc})"
+                )));
+            }
+            let dst_base = unsafe { ffi::IOSurfaceGetBaseAddress(self.surface) };
+            if dst_base.is_null() {
+                unsafe { ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut()) };
+                unsafe {
                     ffi::IOSurfaceUnlock(
                         src.surface,
                         ffi::IOSURFACE_LOCK_READ_ONLY,
                         std::ptr::null_mut(),
                     );
-                    return Err(IOSurfaceError::LockFailed(
-                        "copy_column0_from: IOSurfaceGetBaseAddress(dst) returned null".into(),
-                    ));
                 }
+                return Err(IOSurfaceError::LockFailed(
+                    "copy_column0_from: IOSurfaceGetBaseAddress(dst) returned null".into(),
+                ));
+            }
 
-                let src_ptr = src_base as *const u8;
-                let dst_ptr = dst_base as *mut u8;
-                for c in 0..channels {
+            let src_ptr = src_base as *const u8;
+            let dst_ptr = dst_base as *mut u8;
+            for c in 0..channels {
+                unsafe {
                     std::ptr::copy_nonoverlapping(
                         src_ptr.add(c * src_stride),
                         dst_ptr.add(c * dst_stride),
                         bpe,
                     );
                 }
+            }
 
-                ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
+            unsafe { ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut()) };
+            unsafe {
                 ffi::IOSurfaceUnlock(
                     src.surface,
                     ffi::IOSURFACE_LOCK_READ_ONLY,
@@ -418,71 +428,81 @@ impl AneTensor {
 
         #[cfg(target_os = "macos")]
         {
-            unsafe {
-                // Lock src read-only.
-                let rc = ffi::IOSurfaceLock(
+            // Lock src read-only.
+            let rc = unsafe {
+                ffi::IOSurfaceLock(
                     self.surface,
                     ffi::IOSURFACE_LOCK_READ_ONLY,
                     std::ptr::null_mut(),
-                );
-                if rc != 0 {
-                    return Err(IOSurfaceError::LockFailed(format!(
-                        "copy_column0_fp16_as_int8_to: IOSurfaceLock(src) failed (status {rc})"
-                    )));
-                }
-                let src_base = ffi::IOSurfaceGetBaseAddress(self.surface);
-                if src_base.is_null() {
+                )
+            };
+            if rc != 0 {
+                return Err(IOSurfaceError::LockFailed(format!(
+                    "copy_column0_fp16_as_int8_to: IOSurfaceLock(src) failed (status {rc})"
+                )));
+            }
+            let src_base = unsafe { ffi::IOSurfaceGetBaseAddress(self.surface) };
+            if src_base.is_null() {
+                unsafe {
                     ffi::IOSurfaceUnlock(
                         self.surface,
                         ffi::IOSURFACE_LOCK_READ_ONLY,
                         std::ptr::null_mut(),
                     );
-                    return Err(IOSurfaceError::LockFailed(
-                        "copy_column0_fp16_as_int8_to: src base address null".into(),
-                    ));
                 }
+                return Err(IOSurfaceError::LockFailed(
+                    "copy_column0_fp16_as_int8_to: src base address null".into(),
+                ));
+            }
 
-                // Lock dst read-write.
-                let rc = ffi::IOSurfaceLock(dst.surface, 0, std::ptr::null_mut());
-                if rc != 0 {
+            // Lock dst read-write.
+            let rc = unsafe { ffi::IOSurfaceLock(dst.surface, 0, std::ptr::null_mut()) };
+            if rc != 0 {
+                unsafe {
                     ffi::IOSurfaceUnlock(
                         self.surface,
                         ffi::IOSURFACE_LOCK_READ_ONLY,
                         std::ptr::null_mut(),
                     );
-                    return Err(IOSurfaceError::LockFailed(format!(
-                        "copy_column0_fp16_as_int8_to: IOSurfaceLock(dst) failed (status {rc})"
-                    )));
                 }
-                let dst_base = ffi::IOSurfaceGetBaseAddress(dst.surface);
-                if dst_base.is_null() {
-                    ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut());
+                return Err(IOSurfaceError::LockFailed(format!(
+                    "copy_column0_fp16_as_int8_to: IOSurfaceLock(dst) failed (status {rc})"
+                )));
+            }
+            let dst_base = unsafe { ffi::IOSurfaceGetBaseAddress(dst.surface) };
+            if dst_base.is_null() {
+                unsafe { ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut()) };
+                unsafe {
                     ffi::IOSurfaceUnlock(
                         self.surface,
                         ffi::IOSURFACE_LOCK_READ_ONLY,
                         std::ptr::null_mut(),
                     );
-                    return Err(IOSurfaceError::LockFailed(
-                        "copy_column0_fp16_as_int8_to: dst base address null".into(),
-                    ));
                 }
+                return Err(IOSurfaceError::LockFailed(
+                    "copy_column0_fp16_as_int8_to: dst base address null".into(),
+                ));
+            }
 
-                let src_ptr = src_base as *const u8;
-                let dst_ptr = (dst_base as *mut u8).add(dst_byte_offset);
+            let src_ptr = src_base as *const u8;
+            let dst_ptr = unsafe { (dst_base as *mut u8).add(dst_byte_offset) };
 
-                for c in 0..channels {
-                    let mut fp16_bytes = [0u8; 2];
+            for c in 0..channels {
+                let mut fp16_bytes = [0u8; 2];
+                unsafe {
                     std::ptr::copy_nonoverlapping(
                         src_ptr.add(c * src_stride_bytes),
                         fp16_bytes.as_mut_ptr(),
                         2,
                     );
-                    let val = f16::from_le_bytes(fp16_bytes);
-                    // Values are already rounded/clamped to [-128, 127] by MIL program.
-                    *dst_ptr.add(c) = val.to_f32() as i8 as u8;
                 }
+                let val = f16::from_le_bytes(fp16_bytes);
+                // Values are already rounded/clamped to [-128, 127] by MIL program.
+                unsafe { *dst_ptr.add(c) = val.to_f32() as i8 as u8 };
+            }
 
-                ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut());
+            unsafe { ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut()) };
+            unsafe {
                 ffi::IOSurfaceUnlock(
                     self.surface,
                     ffi::IOSURFACE_LOCK_READ_ONLY,
@@ -574,23 +594,21 @@ impl AneTensor {
         // SAFETY: `self.surface` is a valid IOSurface pointer obtained from
         // IOSurfaceCreate and not yet released. Lock/unlock pairs are
         // correctly matched, and base address is verified non-null.
-        unsafe {
-            let rc = ffi::IOSurfaceLock(self.surface, options, std::ptr::null_mut());
-            if rc != 0 {
-                return Err(IOSurfaceError::LockFailed(format!(
-                    "IOSurfaceLock failed (status {rc})"
-                )));
-            }
-            let base = ffi::IOSurfaceGetBaseAddress(self.surface);
-            if base.is_null() {
-                ffi::IOSurfaceUnlock(self.surface, options, std::ptr::null_mut());
-                return Err(IOSurfaceError::LockFailed(
-                    "IOSurfaceGetBaseAddress returned null".into(),
-                ));
-            }
-            f(base);
-            ffi::IOSurfaceUnlock(self.surface, options, std::ptr::null_mut());
+        let rc = unsafe { ffi::IOSurfaceLock(self.surface, options, std::ptr::null_mut()) };
+        if rc != 0 {
+            return Err(IOSurfaceError::LockFailed(format!(
+                "IOSurfaceLock failed (status {rc})"
+            )));
         }
+        let base = unsafe { ffi::IOSurfaceGetBaseAddress(self.surface) };
+        if base.is_null() {
+            unsafe { ffi::IOSurfaceUnlock(self.surface, options, std::ptr::null_mut()) };
+            return Err(IOSurfaceError::LockFailed(
+                "IOSurfaceGetBaseAddress returned null".into(),
+            ));
+        }
+        f(base);
+        unsafe { ffi::IOSurfaceUnlock(self.surface, options, std::ptr::null_mut()) };
         Ok(())
     }
 }

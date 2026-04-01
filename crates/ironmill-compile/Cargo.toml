@@ -24,4 +24,3 @@ glob-match = { workspace = true }
 toml = { workspace = true }
 
 [features]
-c-api = []

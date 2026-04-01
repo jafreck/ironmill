@@ -466,6 +466,7 @@ dependencies = [
  "ironmill-inference",
  "ironmill-iosurface",
  "ironmill-metal-sys",
+ "mach2",
  "mil-rs",
  "serde",
  "serde_json",
@@ -504,6 +505,14 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "ironmill-compile-ffi"
+version = "0.1.0"
+dependencies = [
+ "ironmill-compile",
+ "mil-rs",
 ]
 
 [[package]]
@@ -647,6 +656,15 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "mach2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "matrixmultiply"

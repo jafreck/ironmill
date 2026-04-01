@@ -105,21 +105,10 @@ impl MemoryMetrics {
 fn current_rss() -> u64 {
     #[cfg(target_os = "macos")]
     {
+        use mach2::kern_return::KERN_SUCCESS;
+        use mach2::task::task_info;
+        use mach2::task_info::MACH_TASK_BASIC_INFO;
         use std::mem;
-        // SAFETY: These are standard Mach kernel ABI functions available on all
-        // macOS versions. The signatures match the system headers.
-        unsafe extern "C" {
-            fn mach_task_self() -> u32;
-            fn task_info(
-                target_task: u32,
-                flavor: u32,
-                task_info_out: *mut u8,
-                task_info_count: *mut u32,
-            ) -> i32;
-        }
-
-        // MACH_TASK_BASIC_INFO = 20
-        const MACH_TASK_BASIC_INFO: u32 = 20;
 
         #[repr(C)]
         struct MachTaskBasicInfo {
@@ -134,18 +123,22 @@ fn current_rss() -> u64 {
 
         // SAFETY: `mach_task_self()` returns the current task port (always valid).
         // `task_info` writes into `info` which is a properly aligned, zeroed
-        // struct with `count` set to its size in u32 words. On success (kr == 0)
-        // the struct is fully initialized by the kernel.
-        unsafe {
-            let mut info: MachTaskBasicInfo = mem::zeroed();
-            let mut count = (mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<u32>()) as u32;
-            let kr = task_info(
-                mach_task_self(),
+        // struct with `count` set to its size in u32 words. On success the
+        // struct is fully initialized by the kernel.
+        let mut info: MachTaskBasicInfo = unsafe { mem::zeroed() };
+        let mut count = (mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<u32>()) as u32;
+        let kr = unsafe {
+            task_info(
+                mach2::traps::mach_task_self(),
                 MACH_TASK_BASIC_INFO,
-                &mut info as *mut _ as *mut u8,
+                &mut info as *mut _ as *mut i32,
                 &mut count,
-            );
-            if kr == 0 { info.resident_size } else { 0 }
+            )
+        };
+        if kr == KERN_SUCCESS {
+            info.resident_size
+        } else {
+            0
         }
     }
     #[cfg(not(target_os = "macos"))]

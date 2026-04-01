@@ -96,53 +96,58 @@ pub(crate) fn create_iosurface(alloc_size: usize) -> crate::Result<*mut c_void> 
     // - IOSurfaceCreate takes a valid CFDictionary
     // - All CF objects are released after use
     // - Return value is checked for null before use
-    unsafe {
-        let dict = ffi::CFDictionaryCreateMutable(
+    let dict = unsafe {
+        ffi::CFDictionaryCreateMutable(
             ffi::kCFAllocatorDefault,
             5,
             std::ptr::addr_of!(ffi::kCFTypeDictionaryKeyCallBacks) as *const c_void,
             std::ptr::addr_of!(ffi::kCFTypeDictionaryValueCallBacks) as *const c_void,
-        );
-        if dict.is_null() {
-            return Err(IOSurfaceError::AllocFailed(
-                "CFDictionaryCreateMutable returned null".into(),
-            ));
-        }
+        )
+    };
+    if dict.is_null() {
+        return Err(IOSurfaceError::AllocFailed(
+            "CFDictionaryCreateMutable returned null".into(),
+        ));
+    }
 
-        let alloc_i64 = alloc_size as i64;
-        let one_i64: i64 = 1;
-        let props: [(*const c_void, i64); 5] = [
+    let alloc_i64 = alloc_size as i64;
+    let one_i64: i64 = 1;
+    // SAFETY: These extern statics are valid IOSurface/CoreFoundation dictionary keys.
+    let props: [(*const c_void, i64); 5] = unsafe {
+        [
             (ffi::kIOSurfaceAllocSize, alloc_i64),
             (ffi::kIOSurfaceWidth, alloc_i64),
             (ffi::kIOSurfaceHeight, one_i64),
             (ffi::kIOSurfaceBytesPerElement, one_i64),
             (ffi::kIOSurfaceBytesPerRow, alloc_i64),
-        ];
+        ]
+    };
 
-        let mut cf_numbers = Vec::with_capacity(5);
-        for &(key, value) in &props {
-            let num = ffi::CFNumberCreate(
+    let mut cf_numbers = Vec::with_capacity(5);
+    for &(key, value) in &props {
+        let num = unsafe {
+            ffi::CFNumberCreate(
                 ffi::kCFAllocatorDefault,
                 ffi::CF_NUMBER_SINT64_TYPE,
                 &value as *const i64 as *const c_void,
-            );
-            ffi::CFDictionarySetValue(dict, key, num);
-            cf_numbers.push(num);
-        }
-
-        let surface = ffi::IOSurfaceCreate(dict);
-
-        for num in cf_numbers {
-            ffi::CFRelease(num);
-        }
-        ffi::CFRelease(dict);
-
-        if surface.is_null() {
-            return Err(IOSurfaceError::AllocFailed(
-                "IOSurfaceCreate returned null".into(),
-            ));
-        }
-
-        Ok(surface)
+            )
+        };
+        unsafe { ffi::CFDictionarySetValue(dict, key, num) };
+        cf_numbers.push(num);
     }
+
+    let surface = unsafe { ffi::IOSurfaceCreate(dict) };
+
+    for num in cf_numbers {
+        unsafe { ffi::CFRelease(num) };
+    }
+    unsafe { ffi::CFRelease(dict) };
+
+    if surface.is_null() {
+        return Err(IOSurfaceError::AllocFailed(
+            "IOSurfaceCreate returned null".into(),
+        ));
+    }
+
+    Ok(surface)
 }

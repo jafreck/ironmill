@@ -135,7 +135,6 @@ impl AneDevice for HardwareAneDevice {
         Ok(HardwareProgram { compiled, loaded })
     }
 
-    #[allow(unsafe_code)]
     fn eval(
         &self,
         program: &HardwareProgram,

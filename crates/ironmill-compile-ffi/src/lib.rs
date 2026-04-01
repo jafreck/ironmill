@@ -66,7 +66,7 @@ pub struct MilProgram(mil_rs::ir::Program);
 ///
 /// Created by [`mil_validate_ane`]. Must be freed with
 /// [`mil_validation_report_free`].
-pub struct MilValidationReport(crate::ane::validate::ValidationReport);
+pub struct MilValidationReport(ironmill_compile::ane::validate::ValidationReport);
 
 // ---------------------------------------------------------------------------
 // Thread-local error state
@@ -315,7 +315,7 @@ pub extern "C" fn mil_compile_model(
         set_last_error("mil_compile_model: output_dir is null or invalid UTF-8");
         return std::ptr::null_mut();
     };
-    match crate::coreml::compiler::compile_model(input, output) {
+    match ironmill_compile::coreml::compiler::compile_model(input, output) {
         Ok(path) => match CString::new(path.to_string_lossy().into_owned()) {
             Ok(cs) => cs.into_raw(),
             Err(e) => {
@@ -333,7 +333,7 @@ pub extern "C" fn mil_compile_model(
 /// Check whether `xcrun coremlcompiler` is available on this system.
 #[unsafe(no_mangle)]
 pub extern "C" fn mil_is_compiler_available() -> bool {
-    crate::coreml::compiler::is_compiler_available()
+    ironmill_compile::coreml::compiler::is_compiler_available()
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +351,7 @@ pub extern "C" fn mil_validate_ane(program: *const MilProgram) -> *mut MilValida
         return std::ptr::null_mut();
     }
     let program = unsafe { &*program };
-    let report = crate::ane::validate::validate_ane_compatibility(&program.0);
+    let report = ironmill_compile::ane::validate::validate_ane_compatibility(&program.0);
     Box::into_raw(Box::new(MilValidationReport(report)))
 }
 
@@ -366,7 +366,7 @@ pub extern "C" fn mil_validation_report_to_json(report: *const MilValidationRepo
         return std::ptr::null_mut();
     }
     let report = unsafe { &*report };
-    let json = crate::ane::validate::validation_report_to_json(&report.0);
+    let json = ironmill_compile::ane::validate::validation_report_to_json(&report.0);
     match CString::new(json) {
         Ok(cs) => cs.into_raw(),
         Err(e) => {
