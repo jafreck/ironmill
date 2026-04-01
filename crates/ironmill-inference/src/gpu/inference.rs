@@ -18,7 +18,7 @@ use super::config::GpuConfig;
 use super::error::GpuError;
 use super::ops;
 use super::turboquant::{GpuKvCache, GpuTurboQuantModel, TurboQuantGpuConfig};
-use super::weights::GpuWeights;
+use super::weights::{GpuWeights, QuantizedWeight, WeightBuffer};
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
 
@@ -148,13 +148,13 @@ struct MpsMatmulCache {
 }
 
 struct LayerMatmuls {
-    q: MpsMatrixMultiply,
-    k: MpsMatrixMultiply,
-    v: MpsMatrixMultiply,
-    o: MpsMatrixMultiply,
-    gate: MpsMatrixMultiply,
-    up: MpsMatrixMultiply,
-    down: MpsMatrixMultiply,
+    q: Option<MpsMatrixMultiply>,
+    k: Option<MpsMatrixMultiply>,
+    v: Option<MpsMatrixMultiply>,
+    o: Option<MpsMatrixMultiply>,
+    gate: Option<MpsMatrixMultiply>,
+    up: Option<MpsMatrixMultiply>,
+    down: Option<MpsMatrixMultiply>,
 }
 
 // ── GpuInference ────────────────────────────────────────────────
@@ -236,7 +236,7 @@ impl GpuInference {
         self.rope_cos = Some(cos);
         self.rope_sin = Some(sin);
 
-        let decode_cache = Self::build_matmul_cache(&self.device, mc, 1)
+        let decode_cache = Self::build_matmul_cache(&self.device, mc, &weights, 1)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.decode_matmuls = Some(decode_cache);
 
@@ -320,6 +320,7 @@ impl GpuInference {
     fn build_matmul_cache(
         device: &MetalDevice,
         mc: &ModelConfig,
+        weights: &GpuWeights,
         token_count: usize,
     ) -> Result<MpsMatmulCache, GpuError> {
         let h = mc.hidden_size;
@@ -349,16 +350,30 @@ impl GpuInference {
                 .map_err(GpuError::Metal)
             };
 
+        // Only create MPS matmul instances for Dense weights; Quantized
+        // projections use the custom compute kernel path instead.
+        let dense_matmul = |wb: &WeightBuffer,
+                            rows: usize,
+                            cols: usize,
+                            inner: usize|
+         -> Result<Option<MpsMatrixMultiply>, GpuError> {
+            match wb {
+                WeightBuffer::Dense(_) => Ok(Some(make_matmul(rows, cols, inner)?)),
+                WeightBuffer::Quantized(_) => Ok(None),
+            }
+        };
+
         let mut layer_matmuls = Vec::with_capacity(mc.num_hidden_layers);
-        for _ in 0..mc.num_hidden_layers {
+        for i in 0..mc.num_hidden_layers {
+            let lw = &weights.layers[i];
             layer_matmuls.push(LayerMatmuls {
-                q: make_matmul(token_count, nh * hd, h)?,
-                k: make_matmul(token_count, nkv * hd, h)?,
-                v: make_matmul(token_count, nkv * hd, h)?,
-                o: make_matmul(token_count, h, nh * hd)?,
-                gate: make_matmul(token_count, inter, h)?,
-                up: make_matmul(token_count, inter, h)?,
-                down: make_matmul(token_count, h, inter)?,
+                q: dense_matmul(&lw.q_proj, token_count, nh * hd, h)?,
+                k: dense_matmul(&lw.k_proj, token_count, nkv * hd, h)?,
+                v: dense_matmul(&lw.v_proj, token_count, nkv * hd, h)?,
+                o: dense_matmul(&lw.o_proj, token_count, h, nh * hd)?,
+                gate: dense_matmul(&lw.gate_proj, token_count, inter, h)?,
+                up: dense_matmul(&lw.up_proj, token_count, inter, h)?,
+                down: dense_matmul(&lw.down_proj, token_count, h, inter)?,
             });
         }
 
@@ -406,7 +421,7 @@ impl GpuInference {
             .as_ref()
             .is_none_or(|c| c.token_count != token_count);
         if need_rebuild {
-            let cache = Self::build_matmul_cache(&self.device, &mc, token_count)
+            let cache = Self::build_matmul_cache(&self.device, &mc, weights, token_count)
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             self.decode_matmuls = Some(cache);
         }
@@ -482,8 +497,9 @@ impl GpuInference {
                 enc.end_encoding();
             }
 
-            // Steps 3-5: Q/K/V projections via MPS matmul.
-            // MPS matmul encodes directly onto the command buffer.
+            // Steps 3-5: Q/K/V projections — dispatch by weight type.
+            // Dense weights use MPS matmul (encodes directly onto cmd_buf).
+            // Quantized weights use a compute encoder with the PolarQuant kernel.
             let row_bytes_h = h * 2; // FP16
             let row_bytes_qo = (mc.num_attention_heads * mc.head_dim) * 2;
             let row_bytes_kv = (mc.num_kv_heads() * mc.head_dim) * 2;
@@ -493,55 +509,124 @@ impl GpuInference {
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
             // Q projection
-            let q_weight_mat = MpsMatrix::from_buffer(
-                lw.q_proj.as_dense(),
-                mc.num_attention_heads * mc.head_dim,
-                h,
-                row_bytes_h,
-            )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let q_result_mat = MpsMatrix::from_buffer(
-                &bufs.q_proj,
-                token_count,
-                mc.num_attention_heads * mc.head_dim,
-                row_bytes_qo,
-            )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            lm.q.encode(&cmd_buf, &norm_mat, &q_weight_mat, &q_result_mat);
+            match &lw.q_proj {
+                WeightBuffer::Dense(buf) => {
+                    let q_weight_mat = MpsMatrix::from_buffer(
+                        buf,
+                        mc.num_attention_heads * mc.head_dim,
+                        h,
+                        row_bytes_h,
+                    )
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let q_result_mat = MpsMatrix::from_buffer(
+                        &bufs.q_proj,
+                        token_count,
+                        mc.num_attention_heads * mc.head_dim,
+                        row_bytes_qo,
+                    )
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.q.as_ref().unwrap().encode(
+                        &cmd_buf,
+                        &norm_mat,
+                        &q_weight_mat,
+                        &q_result_mat,
+                    );
+                }
+                WeightBuffer::Quantized(q) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    encode_polarquant_matmul(
+                        &enc,
+                        &bufs.norm_out,
+                        q,
+                        &bufs.q_proj,
+                        &self.pipelines,
+                        token_count,
+                    );
+                    enc.end_encoding();
+                }
+            }
 
             // K projection
-            let k_weight_mat = MpsMatrix::from_buffer(
-                lw.k_proj.as_dense(),
-                mc.num_kv_heads() * mc.head_dim,
-                h,
-                row_bytes_h,
-            )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let k_result_mat = MpsMatrix::from_buffer(
-                &bufs.k_proj,
-                token_count,
-                mc.num_kv_heads() * mc.head_dim,
-                row_bytes_kv,
-            )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            lm.k.encode(&cmd_buf, &norm_mat, &k_weight_mat, &k_result_mat);
+            match &lw.k_proj {
+                WeightBuffer::Dense(buf) => {
+                    let k_weight_mat = MpsMatrix::from_buffer(
+                        buf,
+                        mc.num_kv_heads() * mc.head_dim,
+                        h,
+                        row_bytes_h,
+                    )
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let k_result_mat = MpsMatrix::from_buffer(
+                        &bufs.k_proj,
+                        token_count,
+                        mc.num_kv_heads() * mc.head_dim,
+                        row_bytes_kv,
+                    )
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.k.as_ref().unwrap().encode(
+                        &cmd_buf,
+                        &norm_mat,
+                        &k_weight_mat,
+                        &k_result_mat,
+                    );
+                }
+                WeightBuffer::Quantized(q) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    encode_polarquant_matmul(
+                        &enc,
+                        &bufs.norm_out,
+                        q,
+                        &bufs.k_proj,
+                        &self.pipelines,
+                        token_count,
+                    );
+                    enc.end_encoding();
+                }
+            }
 
             // V projection
-            let v_weight_mat = MpsMatrix::from_buffer(
-                lw.v_proj.as_dense(),
-                mc.num_kv_heads() * mc.head_dim,
-                h,
-                row_bytes_h,
-            )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let v_result_mat = MpsMatrix::from_buffer(
-                &bufs.v_proj,
-                token_count,
-                mc.num_kv_heads() * mc.head_dim,
-                row_bytes_kv,
-            )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            lm.v.encode(&cmd_buf, &norm_mat, &v_weight_mat, &v_result_mat);
+            match &lw.v_proj {
+                WeightBuffer::Dense(buf) => {
+                    let v_weight_mat = MpsMatrix::from_buffer(
+                        buf,
+                        mc.num_kv_heads() * mc.head_dim,
+                        h,
+                        row_bytes_h,
+                    )
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let v_result_mat = MpsMatrix::from_buffer(
+                        &bufs.v_proj,
+                        token_count,
+                        mc.num_kv_heads() * mc.head_dim,
+                        row_bytes_kv,
+                    )
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.v.as_ref().unwrap().encode(
+                        &cmd_buf,
+                        &norm_mat,
+                        &v_weight_mat,
+                        &v_result_mat,
+                    );
+                }
+                WeightBuffer::Quantized(q) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    encode_polarquant_matmul(
+                        &enc,
+                        &bufs.norm_out,
+                        q,
+                        &bufs.v_proj,
+                        &self.pipelines,
+                        token_count,
+                    );
+                    enc.end_encoding();
+                }
+            }
 
             // QK normalization (Qwen3): per-head RMSNorm on Q and K before RoPE.
             if let (Some(q_norm_w), Some(k_norm_w)) = (&lw.q_norm, &lw.k_norm) {
@@ -747,24 +832,47 @@ impl GpuInference {
             }
 
             // Step 9: Output projection
-            let attn_mat = MpsMatrix::from_buffer(
-                &bufs.attn_out,
-                token_count,
-                mc.num_attention_heads * mc.head_dim,
-                row_bytes_qo,
-            )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let o_weight_mat = MpsMatrix::from_buffer(
-                lw.o_proj.as_dense(),
-                h,
-                mc.num_attention_heads * mc.head_dim,
-                row_bytes_qo,
-            )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let ffn_down_mat_for_o =
-                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+            match &lw.o_proj {
+                WeightBuffer::Dense(buf) => {
+                    let attn_mat = MpsMatrix::from_buffer(
+                        &bufs.attn_out,
+                        token_count,
+                        mc.num_attention_heads * mc.head_dim,
+                        row_bytes_qo,
+                    )
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            lm.o.encode(&cmd_buf, &attn_mat, &o_weight_mat, &ffn_down_mat_for_o);
+                    let o_weight_mat = MpsMatrix::from_buffer(
+                        buf,
+                        h,
+                        mc.num_attention_heads * mc.head_dim,
+                        row_bytes_qo,
+                    )
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let ffn_down_mat_for_o =
+                        MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.o.as_ref().unwrap().encode(
+                        &cmd_buf,
+                        &attn_mat,
+                        &o_weight_mat,
+                        &ffn_down_mat_for_o,
+                    );
+                }
+                WeightBuffer::Quantized(q) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    encode_polarquant_matmul(
+                        &enc,
+                        &bufs.attn_out,
+                        q,
+                        &bufs.ffn_down,
+                        &self.pipelines,
+                        token_count,
+                    );
+                    enc.end_encoding();
+                }
+            }
 
             // Step 10: Residual add — hidden = hidden_state + o_proj_out
             // hidden_state still contains the pre-norm value (our residual).
@@ -805,23 +913,67 @@ impl GpuInference {
             let norm_mat2 = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-            let gate_weight_mat =
-                MpsMatrix::from_buffer(lw.gate_proj.as_dense(), inter, h, row_bytes_h)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let gate_result_mat =
-                MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            lm.gate
-                .encode(&cmd_buf, &norm_mat2, &gate_weight_mat, &gate_result_mat);
+            // Gate projection
+            match &lw.gate_proj {
+                WeightBuffer::Dense(buf) => {
+                    let gate_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let gate_result_mat =
+                        MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.gate.as_ref().unwrap().encode(
+                        &cmd_buf,
+                        &norm_mat2,
+                        &gate_weight_mat,
+                        &gate_result_mat,
+                    );
+                }
+                WeightBuffer::Quantized(q) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    encode_polarquant_matmul(
+                        &enc,
+                        &bufs.norm_out,
+                        q,
+                        &bufs.ffn_gate,
+                        &self.pipelines,
+                        token_count,
+                    );
+                    enc.end_encoding();
+                }
+            }
 
-            let up_weight_mat =
-                MpsMatrix::from_buffer(lw.up_proj.as_dense(), inter, h, row_bytes_h)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let up_result_mat =
-                MpsMatrix::from_buffer(&bufs.ffn_up, token_count, inter, row_bytes_inter)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            lm.up
-                .encode(&cmd_buf, &norm_mat2, &up_weight_mat, &up_result_mat);
+            // Up projection
+            match &lw.up_proj {
+                WeightBuffer::Dense(buf) => {
+                    let up_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let up_result_mat =
+                        MpsMatrix::from_buffer(&bufs.ffn_up, token_count, inter, row_bytes_inter)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.up.as_ref().unwrap().encode(
+                        &cmd_buf,
+                        &norm_mat2,
+                        &up_weight_mat,
+                        &up_result_mat,
+                    );
+                }
+                WeightBuffer::Quantized(q) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    encode_polarquant_matmul(
+                        &enc,
+                        &bufs.norm_out,
+                        q,
+                        &bufs.ffn_up,
+                        &self.pipelines,
+                        token_count,
+                    );
+                    enc.end_encoding();
+                }
+            }
 
             // Step 14: SiLU gate
             {
@@ -840,17 +992,38 @@ impl GpuInference {
             }
 
             // Step 15: Down projection
-            let gate_out_mat =
-                MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let down_weight_mat =
-                MpsMatrix::from_buffer(lw.down_proj.as_dense(), h, inter, row_bytes_inter)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let down_result_mat =
-                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            lm.down
-                .encode(&cmd_buf, &gate_out_mat, &down_weight_mat, &down_result_mat);
+            match &lw.down_proj {
+                WeightBuffer::Dense(buf) => {
+                    let gate_out_mat =
+                        MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let down_weight_mat = MpsMatrix::from_buffer(buf, h, inter, row_bytes_inter)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let down_result_mat =
+                        MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.down.as_ref().unwrap().encode(
+                        &cmd_buf,
+                        &gate_out_mat,
+                        &down_weight_mat,
+                        &down_result_mat,
+                    );
+                }
+                WeightBuffer::Quantized(q) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    encode_polarquant_matmul(
+                        &enc,
+                        &bufs.ffn_gate,
+                        q,
+                        &bufs.ffn_down,
+                        &self.pipelines,
+                        token_count,
+                    );
+                    enc.end_encoding();
+                }
+            }
 
             // Step 16: Residual add — hidden = residual + ffn_down
             {
@@ -952,6 +1125,58 @@ impl ModelConfigExt for ModelConfig {
     }
 }
 
+// ── PolarQuant kernel dispatch ──────────────────────────────────
+
+/// Encode a PolarQuant quantized matmul or matvec via compute kernel.
+///
+/// Dispatches to the correct Metal kernel based on `n_bits` and token count:
+/// - m=1: matvec (one threadgroup per output row)
+/// - m>1: tiled matmul
+fn encode_polarquant_matmul(
+    encoder: &ironmill_metal_sys::ComputeEncoder,
+    input: &MetalBuffer,
+    weight: &QuantizedWeight,
+    output: &MetalBuffer,
+    pipelines: &super::ops::GpuPipelines,
+    m: usize,
+) {
+    let (n, k) = weight.shape; // (out_features, in_features)
+
+    let pipeline = match (weight.n_bits, m) {
+        (4, 1) => &pipelines.polarquant_matvec_int4,
+        (4, _) => &pipelines.polarquant_matmul_int4,
+        (8, 1) => &pipelines.polarquant_matvec_int8,
+        (8, _) => &pipelines.polarquant_matmul_int8,
+        _ => panic!("unsupported n_bits: {}", weight.n_bits),
+    };
+
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(input, 0, 0);
+    encoder.set_buffer(&weight.indices, 0, 1);
+    encoder.set_buffer(&weight.lut, 0, 2);
+    encoder.set_buffer(&weight.norms, 0, 3);
+    encoder.set_buffer(output, 0, 4);
+
+    if m == 1 {
+        // matvec: one threadgroup per output row
+        encoder.set_bytes(&(n as u32).to_le_bytes(), 5);
+        encoder.set_bytes(&(k as u32).to_le_bytes(), 6);
+        let threads_per_group = 32; // SIMD width
+        encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
+    } else {
+        // matmul: tiled
+        encoder.set_bytes(&(m as u32).to_le_bytes(), 5);
+        encoder.set_bytes(&(n as u32).to_le_bytes(), 6);
+        encoder.set_bytes(&(k as u32).to_le_bytes(), 7);
+        let tile_m = 8;
+        let tile_n = 32;
+        encoder.dispatch_threadgroups(
+            ((n + tile_n - 1) / tile_n, (m + tile_m - 1) / tile_m, 1),
+            (tile_n, tile_m, 1),
+        );
+    }
+}
+
 // ── InferenceEngine implementation ──────────────────────────────
 
 impl InferenceEngine for GpuInference {
@@ -990,7 +1215,7 @@ impl InferenceEngine for GpuInference {
         self.rope_sin = Some(sin);
 
         // Build MPS matmul cache for single-token decode.
-        let decode_cache = Self::build_matmul_cache(&self.device, mc, 1)
+        let decode_cache = Self::build_matmul_cache(&self.device, mc, &weights, 1)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.decode_matmuls = Some(decode_cache);
 
