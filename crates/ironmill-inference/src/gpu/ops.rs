@@ -179,7 +179,10 @@ pub fn encode_rms_norm(
     encoder.set_bytes(&hidden_size.to_le_bytes(), 3);
     encoder.set_bytes(&token_count.to_le_bytes(), 4);
     encoder.set_bytes(&eps.to_le_bytes(), 5);
-    encoder.dispatch_threadgroups((token_count as usize, 1, 1), (hidden_size as usize, 1, 1));
+    // Cap threadgroup size to Metal's 1024-thread limit. The shader uses a
+    // strided loop so it handles hidden_size > tg_size correctly.
+    let tg_size = 1024.min(hidden_size as usize);
+    encoder.dispatch_threadgroups((token_count as usize, 1, 1), (tg_size, 1, 1));
 }
 
 /// Encode SiLU-gated activation.
