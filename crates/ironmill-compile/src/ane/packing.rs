@@ -33,18 +33,7 @@ fn rewrite_refs(val: &mut Value, rename_map: &HashMap<String, String>) {
 use crate::ane::Result;
 use ironmill_iosurface::AneTensor;
 
-// ---------------------------------------------------------------------------
-// Packing metadata
-// ---------------------------------------------------------------------------
-
-/// Describes how multiple logical inputs were packed into a single tensor.
-#[derive(Debug, Clone)]
-pub struct InputPacking {
-    /// Spatial offset for each original input within the packed tensor.
-    pub offsets: Vec<usize>,
-    /// Spatial size (S dimension) of each original input.
-    pub sizes: Vec<usize>,
-}
+pub use ironmill_core::ane::packing::InputPacking;
 
 // ---------------------------------------------------------------------------
 // Transform
