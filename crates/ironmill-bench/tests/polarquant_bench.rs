@@ -184,7 +184,7 @@ mod polarquant_bench {
             .build()
             .expect("PolarQuant compile failed");
         let pq_config = GpuConfig {
-            force_cpu_dequant: true,
+            force_cpu_dequant: false,
             ..config
         };
         let (_engine_pq, pq_gpu_mb, pq_load_ms) = load_gpu_engine(&pq_provider, pq_config);
@@ -227,7 +227,7 @@ mod polarquant_bench {
             .build()
             .expect("PolarQuant compile failed");
         let pq_config = GpuConfig {
-            force_cpu_dequant: true,
+            force_cpu_dequant: false,
             ..config
         };
         let (mut engine_pq, pq_gpu_mb, _) = load_gpu_engine(&pq_provider, pq_config);
@@ -338,7 +338,7 @@ mod polarquant_bench {
 
         let config = GpuConfig::default();
         let pq_config = GpuConfig {
-            force_cpu_dequant: true,
+            force_cpu_dequant: false,
             ..config.clone()
         };
         let decode_tokens = 50;

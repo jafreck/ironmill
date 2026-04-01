@@ -258,33 +258,59 @@ impl MilWeightProvider {
                 _ => unreachable!(),
             };
 
-            // Per-row symmetric INT4 quantization.
-            // Quantize inline and immediately dequantize to FP16 for Phase 1
-            // correctness validation. The weights carry the quantization noise
-            // but are stored as dense FP16.
+            // Per-row symmetric INT4 quantization with LUT + packed storage.
+            // Levels match inline RTN: integer {-8..+7} / 7.5.
             let n_levels = 1usize << n_bits;
             let half_n = n_levels as f32 / 2.0;
-            let max_q = half_n - 1.0;
+            let norm_factor = half_n - 0.5; // 7.5 for 4-bit
+            let levels: Vec<f32> = (0..n_levels)
+                .map(|i| (i as f32 - half_n) / norm_factor)
+                .collect();
+            let boundaries: Vec<f32> = levels.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
 
-            let mut dequant_data = Vec::with_capacity(total * 2);
+            let mut all_indices = Vec::with_capacity(total);
+            let mut row_norms_f32 = Vec::with_capacity(rows);
             for r in 0..rows {
                 let row = &floats[r * cols..(r + 1) * cols];
                 let absmax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-10);
-                let scale = absmax / (max_q + 0.5);
+                row_norms_f32.push(absmax);
                 for &v in row {
-                    let q = (v / scale).round().clamp(-half_n, max_q);
-                    let dq = q * scale;
-                    dequant_data.extend_from_slice(&f16::from_f32(dq).to_le_bytes());
+                    let normalized = (v / absmax).clamp(-1.0, 1.0);
+                    let idx = boundaries
+                        .iter()
+                        .position(|&b| normalized < b)
+                        .unwrap_or(n_levels - 1);
+                    all_indices.push(idx);
                 }
             }
+
+            use mil_rs::ir::passes::polar_quantize::pack_indices;
+            let packed = pack_indices(&all_indices, n_bits);
+            let lut_data: Vec<u8> = levels
+                .iter()
+                .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+                .collect();
+            let norms_data: Vec<u8> = row_norms_f32
+                .iter()
+                .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+                .collect();
 
             tensors.insert(
                 name.to_string(),
                 ExtractedTensor {
-                    data: dequant_data,
+                    data: packed.clone(),
                     shape: tensor.shape.clone(),
-                    dtype: ScalarType::Float16,
-                    quant_info: QuantizationInfo::None,
+                    dtype: ScalarType::UInt8,
+                    quant_info: QuantizationInfo::LutToDense {
+                        lut: lut_data,
+                        lut_dtype: ScalarType::Float16,
+                        indices: packed,
+                        original_shape: tensor.shape.clone(),
+                        n_bits,
+                        row_norms: norms_data,
+                        norms_dtype: ScalarType::Float16,
+                        polar_quant_seed: None,
+                    },
                 },
             );
         }
