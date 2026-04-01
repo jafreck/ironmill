@@ -14,6 +14,10 @@ pub struct GpuPipelines {
     pub turboquant_cache_write: ComputePipeline,
     pub turboquant_attention: ComputePipeline,
     pub standard_attention: ComputePipeline,
+    pub polarquant_matvec_int4: ComputePipeline,
+    pub polarquant_matmul_int4: ComputePipeline,
+    pub polarquant_matvec_int8: ComputePipeline,
+    pub polarquant_matmul_int8: ComputePipeline,
 }
 
 impl GpuPipelines {
@@ -26,6 +30,7 @@ impl GpuPipelines {
         let embed_src = include_str!("shaders/embedding.metal");
         let tq_src = include_str!("shaders/turboquant.metal");
         let attn_src = include_str!("shaders/attention.metal");
+        let qmm_src = include_str!("shaders/quantized_matmul.metal");
 
         let norm_lib = device
             .compile_shader_source(norm_src)
@@ -47,6 +52,9 @@ impl GpuPipelines {
             .map_err(GpuError::Metal)?;
         let attn_lib = device
             .compile_shader_source(attn_src)
+            .map_err(GpuError::Metal)?;
+        let qmm_lib = device
+            .compile_shader_source(qmm_src)
             .map_err(GpuError::Metal)?;
 
         Ok(Self {
@@ -95,6 +103,34 @@ impl GpuPipelines {
                 .create_compute_pipeline(
                     &attn_lib
                         .get_function("standard_attention")
+                        .map_err(GpuError::Metal)?,
+                )
+                .map_err(GpuError::Metal)?,
+            polarquant_matvec_int4: device
+                .create_compute_pipeline(
+                    &qmm_lib
+                        .get_function("polarquant_matvec_int4")
+                        .map_err(GpuError::Metal)?,
+                )
+                .map_err(GpuError::Metal)?,
+            polarquant_matmul_int4: device
+                .create_compute_pipeline(
+                    &qmm_lib
+                        .get_function("polarquant_matmul_int4")
+                        .map_err(GpuError::Metal)?,
+                )
+                .map_err(GpuError::Metal)?,
+            polarquant_matvec_int8: device
+                .create_compute_pipeline(
+                    &qmm_lib
+                        .get_function("polarquant_matvec_int8")
+                        .map_err(GpuError::Metal)?,
+                )
+                .map_err(GpuError::Metal)?,
+            polarquant_matmul_int8: device
+                .create_compute_pipeline(
+                    &qmm_lib
+                        .get_function("polarquant_matmul_int8")
                         .map_err(GpuError::Metal)?,
                 )
                 .map_err(GpuError::Metal)?,
