@@ -146,7 +146,8 @@ pub fn write_gpu_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::weights::WeightTensor;
+    use crate::weights::{ModelConfig, WeightTensor};
+    use mil_rs::ir::ScalarType;
     use std::borrow::Cow;
 
     /// Minimal provider for testing the bundle writer.
@@ -222,6 +223,7 @@ mod tests {
                     n_bits: 4,
                     row_norms: vec![0x22; 16],
                     norms_dtype: ScalarType::Float16,
+                    polar_quant_seed: None,
                 },
             },
         );
