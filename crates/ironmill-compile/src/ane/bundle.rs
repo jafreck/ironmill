@@ -55,7 +55,7 @@ pub struct SubProgramBundle {
     pub input_packing: Option<BundleInputPacking>,
 }
 
-pub use ironmill_core::ane::bundle::{
+use ironmill_core::ane::bundle::{
     BundleArchitecture, BundleInputPacking, BundleManifest, BundleModelType,
     BundleTensorDescriptor, DecodeManifest, LayerManifest, LmHeadManifest, SubProgramManifest,
 };

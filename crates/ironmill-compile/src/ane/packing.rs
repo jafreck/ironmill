@@ -33,7 +33,7 @@ fn rewrite_refs(val: &mut Value, rename_map: &HashMap<String, String>) {
 use crate::ane::Result;
 use ironmill_iosurface::AneTensor;
 
-pub use ironmill_core::ane::packing::InputPacking;
+use ironmill_core::ane::packing::InputPacking;
 
 // ---------------------------------------------------------------------------
 // Transform
@@ -181,7 +181,7 @@ pub fn pack_inputs(sub: &mut SubProgram) -> Option<InputPacking> {
     func_mut.inputs = vec![(packed_name.clone(), packed_type)];
 
     // Update sub-program input descriptors.
-    sub.inputs = vec![crate::ane::TensorDescriptor {
+    sub.inputs = vec![ironmill_core::ane::TensorDescriptor {
         name: packed_name,
         shape: [1, max_c, 1, total_s],
         dtype,
@@ -290,7 +290,7 @@ mod tests {
 
         let inputs = input_specs
             .iter()
-            .map(|&(n, c, s)| crate::ane::TensorDescriptor {
+            .map(|&(n, c, s)| ironmill_core::ane::TensorDescriptor {
                 name: n.to_string(),
                 shape: [1, c, 1, s],
                 dtype,
@@ -299,7 +299,7 @@ mod tests {
 
         let out_c = input_specs[0].1;
         let out_s = input_specs[0].2;
-        let outputs = vec![crate::ane::TensorDescriptor {
+        let outputs = vec![ironmill_core::ane::TensorDescriptor {
             name: final_output,
             shape: [1, out_c, 1, out_s],
             dtype,

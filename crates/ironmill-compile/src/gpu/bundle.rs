@@ -22,9 +22,9 @@ use std::path::Path;
 use crate::error::CompileError;
 use crate::weights::{QuantizationInfo, WeightProvider};
 
-pub use ironmill_core::gpu::bundle::{
-    GpuBundleManifest, QuantizationManifest, TensorManifest, deserialize_model_config,
-    scalar_type_to_str, serialize_model_config, str_to_scalar_type,
+use ironmill_core::gpu::bundle::{
+    GpuBundleManifest, QuantizationManifest, TensorManifest, scalar_type_to_str,
+    serialize_model_config,
 };
 
 // ── Filename helpers ────────────────────────────────────────────────────
@@ -147,6 +147,7 @@ pub fn write_gpu_bundle(
 mod tests {
     use super::*;
     use crate::weights::{ModelConfig, WeightTensor};
+    use ironmill_core::gpu::bundle::{deserialize_model_config, str_to_scalar_type};
     use mil_rs::ir::ScalarType;
     use std::borrow::Cow;
 

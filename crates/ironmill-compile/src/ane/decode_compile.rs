@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use half::f16;
 use mil_rs::ir::{Operation, Program, ScalarType, TensorType, Value};
 
-use crate::ane::TensorDescriptor;
 use crate::ane::split::SubProgram;
+use ironmill_core::ane::TensorDescriptor;
 
 // ---------------------------------------------------------------------------
 // RoPE cache extraction

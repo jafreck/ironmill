@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mil_rs::ir::{Function, Operation, Program, TensorType, Value};
 
-use crate::ane::{Result, TensorDescriptor};
+use crate::ane::Result;
+use ironmill_core::ane::TensorDescriptor;
 
 // ---------------------------------------------------------------------------
 // Public types

@@ -10,8 +10,6 @@ pub mod passes;
 pub mod split;
 pub mod validate;
 
-pub use ironmill_core::ane::TensorDescriptor;
-
 /// Errors produced by the ANE compilation pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum AneCompileError {
