@@ -494,6 +494,7 @@ dependencies = [
  "glob-match",
  "half",
  "indexmap",
+ "ironmill-core",
  "ironmill-iosurface",
  "memmap2",
  "mil-rs",
@@ -503,6 +504,17 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "ironmill-core"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "mil-rs",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -525,6 +537,7 @@ dependencies = [
  "half",
  "ironmill-ane-sys",
  "ironmill-compile",
+ "ironmill-core",
  "ironmill-coreml-sys",
  "ironmill-iosurface",
  "ironmill-metal-sys",

@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Inference engine for ironmill (ANE + CoreML backends)"
 
 [dependencies]
+ironmill-core = { workspace = true }
 mil-rs = { workspace = true }
 ironmill-compile = { workspace = true, optional = true }
 ironmill-ane-sys = { workspace = true }
