@@ -21,6 +21,7 @@ toml = { workspace = true }
 glob-match = { workspace = true }
 rand = { workspace = true }
 statrs = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

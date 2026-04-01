@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use crate::convert::lora::{detect_lora_adapters, lora_initializer_names, merge_lora};
+use crate::convert::lora;
 use crate::convert::onnx_to_mil::convert_node;
 use crate::error::{MilError, Result};
 use crate::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
@@ -185,11 +185,7 @@ fn convert_graph(
         }
     }
 
-    // 4. Detect and merge LoRA adapter weights into base initializers
-    //    (only when merge_lora_weights is true).
-    //    This modifies the initializer data in-place so the const ops below
-    //    contain the merged weights. LoRA-specific initializers (A, B, alpha)
-    //    are removed from the set so they don't become const ops.
+    // Extract raw byte data from each initializer via mem::take (no clone).
     let mut init_data: HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)> = HashMap::new();
     for tensor in initializers.iter_mut() {
         if let Ok(dtype) = onnx_dtype_to_scalar(tensor.data_type) {
@@ -199,38 +195,86 @@ fn convert_graph(
         }
     }
 
-    let lora_names = if merge_lora_weights {
-        let lora_inputs: Vec<_> = init_data
-            .iter()
-            .map(|(n, (d, s, dt))| (n.clone(), d.clone(), s.clone(), *dt))
-            .collect();
-        let adapters = detect_lora_adapters(&lora_inputs);
+    // 4. Detect and merge LoRA adapter weights into base initializers
+    //    (only when merge_lora_weights is true).
+    //
+    //    Works directly on `init_data`, removing A/B/alpha entries and merging
+    //    into the base weight in-place. Only LoRA adapter bytes are allocated
+    //    temporarily (not all weight data).
+    let lora_names: std::collections::HashSet<String> = if merge_lora_weights {
+        let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        if !adapters.is_empty() {
-            for adapter in &adapters {
-                if let Some((base_data, base_shape, base_dtype)) =
-                    init_data.get_mut(&adapter.base_name)
-                {
-                    match merge_lora(base_data, base_shape, *base_dtype, adapter) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            warnings.push(format!(
-                                "LoRA merge failed for '{}': {e}",
-                                adapter.base_name
-                            ));
-                        }
-                    }
-                } else {
-                    warnings.push(format!(
-                        "LoRA adapter targets '{}' but no matching base weight found",
-                        adapter.base_name
-                    ));
-                }
+        // Phase 1: find LoRA A tensor names.
+        let a_names: Vec<String> = init_data
+            .keys()
+            .filter(|n| n.ends_with(".lora_A.weight"))
+            .cloned()
+            .collect();
+
+        // Phase 2: for each pair, remove A/B/alpha, merge into base.
+        for a_name in &a_names {
+            let prefix = match a_name.strip_suffix(".lora_A.weight") {
+                Some(p) => p,
+                None => continue,
+            };
+            let b_name = format!("{prefix}.lora_B.weight");
+            let base_name = format!("{prefix}.weight");
+            let alpha_name = format!("{prefix}.lora_alpha");
+
+            if !init_data.contains_key(&b_name) {
+                continue;
             }
-            lora_initializer_names(&adapters)
-        } else {
-            std::collections::HashSet::new()
+
+            // Remove A, B, alpha from init_data (no longer emitted as const ops).
+            let Some((a_data, a_shape, a_dtype)) = init_data.remove(a_name) else {
+                continue;
+            };
+            let Some((b_data, b_shape, b_dtype)) = init_data.remove(&b_name) else {
+                continue;
+            };
+            let alpha_entry = init_data.remove(&alpha_name);
+
+            if a_dtype != b_dtype || a_shape.len() != 2 || b_shape.len() != 2 {
+                continue;
+            }
+
+            let alpha = alpha_entry.and_then(|(data, shape, dtype)| {
+                let numel: usize = shape.iter().product();
+                if numel == 1 {
+                    lora::scalar_from_bytes(&data, dtype)
+                } else {
+                    None
+                }
+            });
+
+            if let Some((base_data, base_shape, base_dtype)) = init_data.get_mut(&base_name) {
+                match lora::merge_lora_weights(
+                    base_data,
+                    base_shape,
+                    &a_data,
+                    &[a_shape[0], a_shape[1]],
+                    &b_data,
+                    &[b_shape[0], b_shape[1]],
+                    *base_dtype,
+                    alpha,
+                ) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warnings.push(format!("LoRA merge failed for '{base_name}': {e}"));
+                    }
+                }
+            } else {
+                warnings.push(format!(
+                    "LoRA adapter targets '{base_name}' but no matching base weight found"
+                ));
+            }
+
+            consumed.insert(a_name.clone());
+            consumed.insert(b_name);
+            consumed.insert(alpha_name);
         }
+
+        consumed
     } else {
         std::collections::HashSet::new()
     };

@@ -692,6 +692,7 @@ dependencies = [
  "half",
  "indexmap",
  "ironmill-compile",
+ "memmap2",
  "prost",
  "prost-build",
  "rand",

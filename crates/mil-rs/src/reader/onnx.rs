@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use memmap2::Mmap;
 use prost::Message;
 
 use crate::error::{MilError, Result};
@@ -9,8 +10,9 @@ use crate::proto::onnx::ModelProto;
 
 /// Read an ONNX `.onnx` file and deserialize it into a [`ModelProto`].
 ///
-/// ONNX models are stored as a single protobuf binary containing the full
-/// model graph, weights (initializers), and metadata.
+/// The file is memory-mapped so that prost decodes directly from mapped
+/// pages, avoiding a full-file heap allocation. The mmap is dropped after
+/// decoding, leaving only the prost-owned structures in memory.
 ///
 /// # Errors
 ///
@@ -25,9 +27,12 @@ use crate::proto::onnx::ModelProto;
 /// let model = read_onnx("model.onnx").unwrap();
 /// println!("IR version: {}", model.ir_version);
 /// ```
+#[allow(unsafe_code)]
 pub fn read_onnx(path: impl AsRef<Path>) -> Result<ModelProto> {
-    let bytes = std::fs::read(path.as_ref())?;
-    let model = ModelProto::decode(&bytes[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
+    let file = std::fs::File::open(path.as_ref())?;
+    // SAFETY: the file is read-only and the mmap is dropped after decoding.
+    let mmap = unsafe { Mmap::map(&file)? };
+    let model = ModelProto::decode(&mmap[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
     Ok(model)
 }
 
@@ -35,11 +40,14 @@ pub fn read_onnx(path: impl AsRef<Path>) -> Result<ModelProto> {
 ///
 /// The directory is needed to resolve external data files referenced by
 /// `TensorProto.data_location == EXTERNAL`.
+#[allow(unsafe_code)]
 pub fn read_onnx_with_dir(path: impl AsRef<Path>) -> Result<(ModelProto, PathBuf)> {
     let path = path.as_ref();
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let bytes = std::fs::read(path)?;
-    let model = ModelProto::decode(&bytes[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
+    let file = std::fs::File::open(path)?;
+    // SAFETY: the file is read-only and the mmap is dropped after decoding.
+    let mmap = unsafe { Mmap::map(&file)? };
+    let model = ModelProto::decode(&mmap[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
     Ok((model, dir))
 }
 
