@@ -13,6 +13,8 @@ use ironmill_compile::ane::validate::{print_validation_report, validation_report
 use ironmill_compile::convert::pipeline::{convert_pipeline, parse_pipeline_manifest};
 #[allow(unused_imports)]
 use ironmill_compile::coreml::compiler::{compile_model, is_compiler_available};
+use ironmill_compile::gpu::GpuCompileBuilder;
+use ironmill_compile::gpu::bundle::write_gpu_bundle;
 use ironmill_compile::mil::PassPipeline;
 use ironmill_compile::mil::PipelineReport;
 #[allow(unused_imports)]
@@ -385,6 +387,19 @@ fn parse_input_shape(s: &str) -> Result<(String, Vec<usize>)> {
     Ok((name.to_string(), dims))
 }
 
+/// Parse a `--quantize` value like `"polarquant-4"` into the bit-width (e.g. 4).
+fn parse_polarquant_bits(s: &str) -> Result<u8> {
+    let bits_str = s.strip_prefix("polarquant-").ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid GPU quantization format: expected 'polarquant-N' (e.g. 'polarquant-4'), got '{s}'"
+        )
+    })?;
+    let bits: u8 = bits_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid bit-width '{bits_str}' in quantization '{s}'"))?;
+    Ok(bits)
+}
+
 struct CompileOpts {
     output: Option<String>,
     target: String,
@@ -425,6 +440,10 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
 
     if opts.max_seq_len == 0 {
         bail!("--max-seq-len must be at least 1");
+    }
+
+    if opts.target == "gpu" {
+        return compile_for_gpu(input_path, &opts);
     }
 
     if opts.target != "all" && opts.target != "cpu-and-ne" {
@@ -472,6 +491,36 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
             );
         }
     }
+}
+
+/// GPU compilation path: builds a PolarQuant provider and writes a `.ironml-gpu` bundle.
+fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
+    let mut builder = GpuCompileBuilder::new(input_path);
+
+    // Reject conflicting quantization flags.
+    if opts.quantize != "none" && opts.polar_quantize.is_some() {
+        anyhow::bail!("Cannot specify both --quantize and --polar-quantize. Use only one.");
+    }
+
+    // Apply PolarQuant from --quantize (e.g. "polarquant-4") or --polar-quantize
+    if opts.quantize != "none" {
+        let n_bits = parse_polarquant_bits(&opts.quantize)?;
+        builder = builder.polar_quantize(n_bits);
+    } else if let Some(n_bits) = opts.polar_quantize {
+        builder = builder.polar_quantize(n_bits);
+    }
+
+    let provider = builder.build().context("GPU compilation failed")?;
+
+    let output = opts
+        .output
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| input_path.with_extension("ironml-gpu"));
+
+    write_gpu_bundle(&provider, &output).context("Failed to write GPU bundle")?;
+    println!("Wrote GPU bundle to {}", output.display());
+    Ok(())
 }
 
 /// Build the optimization pass pipeline from CLI options.
