@@ -215,7 +215,7 @@ impl GpuInference {
     ) -> Result<(), InferenceError> {
         self.config = config;
 
-        let weights = GpuWeights::load(&self.device, provider)
+        let weights = GpuWeights::load(&self.device, provider, self.config.force_cpu_dequant)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
         let mc = &weights.config;
@@ -1190,8 +1190,12 @@ impl InferenceEngine for GpuInference {
         self.config = gpu_artifacts.config.clone();
 
         // Load weights into Metal buffers.
-        let weights = GpuWeights::load(&self.device, gpu_artifacts.weights)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        let weights = GpuWeights::load(
+            &self.device,
+            gpu_artifacts.weights,
+            self.config.force_cpu_dequant,
+        )
+        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
         let mc = &weights.config;
         self.model_config = Some(mc.clone());

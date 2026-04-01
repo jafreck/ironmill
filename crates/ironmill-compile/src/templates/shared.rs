@@ -34,6 +34,7 @@ pub(super) fn emit_weight_const(
                         dtype: tensor.dtype,
                     },
                 )
+                .with_attr("onnx_name", Value::String(weight_name.to_string()))
                 .with_output(const_name);
             block.add_op(op);
             Ok(())

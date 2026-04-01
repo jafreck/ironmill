@@ -107,6 +107,7 @@ impl WeightProvider for GpuBundleProvider {
                         n_bits: *n_bits,
                         row_norms,
                         norms_dtype: dtype,
+                        polar_quant_seed: None, // Bundle tensors are pre-unrotated
                     },
                 })
             }

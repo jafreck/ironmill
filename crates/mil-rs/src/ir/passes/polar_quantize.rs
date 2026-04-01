@@ -109,12 +109,17 @@ impl Pass for PolarQuantPass {
 
                 // ── Phase 2: compute quantisation ─────────────────────────
                 let rank = shape.len();
-                let (rows, cols) = if rank >= 2 {
+
+                // Skip 1D tensors (layer norms, biases) — quantizing
+                // normalization weights causes catastrophic quality loss.
+                if rank < 2 {
+                    continue;
+                }
+
+                let (rows, cols) = {
                     let cols = shape[rank - 1];
                     let rows: usize = shape[..rank - 1].iter().product();
                     (rows, cols)
-                } else {
-                    (1usize, shape[0])
                 };
 
                 // The Beta distribution requires dim >= 2, and PolarQuant's

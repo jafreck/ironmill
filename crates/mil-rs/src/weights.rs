@@ -86,6 +86,9 @@ pub enum QuantizationInfo {
         n_bits: u8,
         row_norms: Vec<u8>,
         norms_dtype: ScalarType,
+        /// Hadamard rotation seed. When present, inverse rotation must be
+        /// applied after LUT reconstruction to recover original weights.
+        polar_quant_seed: Option<u64>,
     },
     /// INT8 affine quantization: (quantized - zero_point) * scale.
     /// Produced by `constexpr_affine_dequantize` in MIL IR.

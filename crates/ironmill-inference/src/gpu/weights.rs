@@ -84,7 +84,11 @@ impl GpuWeights {
     /// Load model weights from a [`WeightProvider`] into Metal buffers.
     ///
     /// Weights are loaded into shared-mode buffers for CPU→GPU transfer.
-    pub fn load(device: &MetalDevice, provider: &dyn WeightProvider) -> Result<Self, GpuError> {
+    pub fn load(
+        device: &MetalDevice,
+        provider: &dyn WeightProvider,
+        force_cpu_dequant: bool,
+    ) -> Result<Self, GpuError> {
         let config = provider.config().clone();
         let num_layers = config.num_hidden_layers;
 
@@ -103,21 +107,25 @@ impl GpuWeights {
                     device,
                     provider,
                     &format!("{prefix}.self_attn.q_proj.weight"),
+                    force_cpu_dequant,
                 )?,
                 k_proj: load_weight_buffer(
                     device,
                     provider,
                     &format!("{prefix}.self_attn.k_proj.weight"),
+                    force_cpu_dequant,
                 )?,
                 v_proj: load_weight_buffer(
                     device,
                     provider,
                     &format!("{prefix}.self_attn.v_proj.weight"),
+                    force_cpu_dequant,
                 )?,
                 o_proj: load_weight_buffer(
                     device,
                     provider,
                     &format!("{prefix}.self_attn.o_proj.weight"),
+                    force_cpu_dequant,
                 )?,
                 post_attn_norm: load_dense_buffer(
                     device,
@@ -128,16 +136,19 @@ impl GpuWeights {
                     device,
                     provider,
                     &format!("{prefix}.mlp.gate_proj.weight"),
+                    force_cpu_dequant,
                 )?,
                 up_proj: load_weight_buffer(
                     device,
                     provider,
                     &format!("{prefix}.mlp.up_proj.weight"),
+                    force_cpu_dequant,
                 )?,
                 down_proj: load_weight_buffer(
                     device,
                     provider,
                     &format!("{prefix}.mlp.down_proj.weight"),
+                    force_cpu_dequant,
                 )?,
                 q_norm: if provider.has_tensor(&format!("{prefix}.self_attn.q_norm.weight")) {
                     Some(load_dense_buffer(
@@ -187,6 +198,7 @@ fn load_weight_buffer(
     device: &MetalDevice,
     provider: &dyn WeightProvider,
     name: &str,
+    force_cpu_dequant: bool,
 ) -> Result<WeightBuffer, GpuError> {
     let tensor = provider
         .tensor(name)
@@ -200,34 +212,53 @@ fn load_weight_buffer(
         }
         QuantizationInfo::LutToDense {
             lut,
+            lut_dtype,
             indices,
             original_shape,
             n_bits,
             row_norms,
-            ..
+            norms_dtype,
+            polar_quant_seed,
         } => {
-            let indices_buf = device
-                .create_buffer_with_data(indices, StorageMode::Shared)
-                .map_err(GpuError::Metal)?;
-            let lut_buf = device
-                .create_buffer_with_data(lut, StorageMode::Shared)
-                .map_err(GpuError::Metal)?;
-            let norms_buf = device
-                .create_buffer_with_data(row_norms, StorageMode::Shared)
-                .map_err(GpuError::Metal)?;
-            let rows = original_shape[0];
-            let cols = if original_shape.len() > 1 {
-                original_shape[1]
+            if force_cpu_dequant {
+                let data = dequant_lut_to_dense(
+                    indices,
+                    lut,
+                    *lut_dtype,
+                    original_shape,
+                    *n_bits,
+                    row_norms,
+                    *norms_dtype,
+                    *polar_quant_seed,
+                );
+                let buf = device
+                    .create_buffer_with_data(&data, StorageMode::Shared)
+                    .map_err(GpuError::Metal)?;
+                Ok(WeightBuffer::Dense(buf))
             } else {
-                1
-            };
-            Ok(WeightBuffer::Quantized(QuantizedWeight {
-                indices: indices_buf,
-                lut: lut_buf,
-                norms: norms_buf,
-                n_bits: *n_bits,
-                shape: (rows, cols),
-            }))
+                let indices_buf = device
+                    .create_buffer_with_data(indices, StorageMode::Shared)
+                    .map_err(GpuError::Metal)?;
+                let lut_buf = device
+                    .create_buffer_with_data(lut, StorageMode::Shared)
+                    .map_err(GpuError::Metal)?;
+                let norms_buf = device
+                    .create_buffer_with_data(row_norms, StorageMode::Shared)
+                    .map_err(GpuError::Metal)?;
+                let rows = original_shape[0];
+                let cols = if original_shape.len() > 1 {
+                    original_shape[1]
+                } else {
+                    1
+                };
+                Ok(WeightBuffer::Quantized(QuantizedWeight {
+                    indices: indices_buf,
+                    lut: lut_buf,
+                    norms: norms_buf,
+                    n_bits: *n_bits,
+                    shape: (rows, cols),
+                }))
+            }
         }
         QuantizationInfo::AffineDequantize {
             scale,
@@ -275,6 +306,7 @@ fn load_dense_buffer(
             n_bits,
             row_norms,
             norms_dtype,
+            polar_quant_seed,
         } => dequant_lut_to_dense(
             indices,
             lut,
@@ -283,6 +315,7 @@ fn load_dense_buffer(
             *n_bits,
             row_norms,
             *norms_dtype,
+            *polar_quant_seed,
         ),
         QuantizationInfo::AffineDequantize {
             scale,

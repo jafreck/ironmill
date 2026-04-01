@@ -93,6 +93,12 @@ impl MilWeightProvider {
                         .cloned()
                         .unwrap_or_else(|| (Vec::new(), lut_dtype));
 
+                    // Extract polar_quant_seed for Hadamard rotation.
+                    let polar_quant_seed = match op.attributes.get("polar_quant_seed") {
+                        Some(Value::Int(v)) => Some(*v as u64),
+                        _ => None,
+                    };
+
                     // The stored data is the packed indices (the primary payload
                     // consumers will unpack during GPU dispatch).
                     let extracted = ExtractedTensor {
@@ -107,6 +113,7 @@ impl MilWeightProvider {
                             n_bits,
                             row_norms,
                             norms_dtype,
+                            polar_quant_seed,
                         },
                     };
                     tensors.insert(name, extracted);

@@ -16,6 +16,10 @@ pub struct GpuConfig {
     pub rotation_seed: u64,
     /// Number of quantization bits for TurboQuant KV cache (4 or 8).
     pub n_bits: u8,
+    /// When true, always dequantize weights to FP16 on the CPU before
+    /// creating Metal buffers (Phase 1 load-time dequant). When false,
+    /// keep quantized weights packed in VRAM and use custom kernels.
+    pub force_cpu_dequant: bool,
 }
 
 impl Default for GpuConfig {
@@ -27,6 +31,7 @@ impl Default for GpuConfig {
             enable_turboquant: true,
             rotation_seed: 42,
             n_bits: 8,
+            force_cpu_dequant: false,
         }
     }
 }

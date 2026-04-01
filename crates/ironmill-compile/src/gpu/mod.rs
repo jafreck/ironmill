@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 
 use mil_rs::convert::{ConversionConfig, onnx_to_program_with_config};
 use mil_rs::ir::passes::PolarQuantPass;
-use mil_rs::ir::passes::PolarRotationFusionPass;
 use mil_rs::ir::passes::TypeRepropagationPass;
 use mil_rs::ir::{PassPipeline, Program};
 use mil_rs::reader::read_onnx;
@@ -99,13 +98,16 @@ impl GpuCompileBuilder {
             }
         };
 
-        // 2. Build pass pipeline with PolarQuant
+        // 2. Build pass pipeline with PolarQuant only (no rotation fusion).
+        //    PolarRotationFusionPass is for CoreML's MIL execution where
+        //    rotations cancel between adjacent layers. For GPU weight
+        //    extraction, we need the seed preserved so dequant can apply
+        //    the inverse Hadamard rotation.
         let mut pipeline = PassPipeline::new();
 
         let mut pq_pass = PolarQuantPass::new(self.n_bits);
         pq_pass.min_elements = self.min_elements;
         pipeline.add_pass(Box::new(pq_pass));
-        pipeline.add_pass(Box::new(PolarRotationFusionPass::new()));
         pipeline.add_pass(Box::new(TypeRepropagationPass));
 
         // 3. Run passes

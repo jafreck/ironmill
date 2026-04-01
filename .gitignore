@@ -1,5 +1,5 @@
+# Rust build artifacts
 /target
-*.DS_Store
 
 # Large test fixtures — download with ./scripts/download-fixtures.sh
 tests/fixtures/*.onnx
@@ -14,3 +14,37 @@ tests/fixtures/Qwen3-0.6B/
 .build/
 test-vt/
 test-q/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+._*
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# Compiled artifacts
+*.metallib
+*.o
+*.dylib
+*.so
+*.a
+
+# Temporary files
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
