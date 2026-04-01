@@ -15,6 +15,8 @@ pub mod ane;
 pub mod convert;
 /// CoreML compilation via `xcrun coremlcompiler` and the high-level build API.
 pub mod coreml;
+/// GPU-targeted compilation: PolarQuant passes → MilWeightProvider.
+pub mod gpu;
 /// Architecture templates that construct MIL IR programs from weight tensors.
 pub mod templates;
 /// Weight providers for SafeTensors and GGUF formats.
