@@ -112,11 +112,13 @@ pub fn dequant_affine(
     scale: &[u8],
     zero_point: &[u8],
     scale_dtype: ScalarType,
+    zero_point_dtype: ScalarType,
     axis: Option<usize>,
     shape: &[usize],
 ) -> Vec<u8> {
     let total_elements: usize = shape.iter().product();
-    let elem_size = scale_dtype.byte_size();
+    let scale_elem_size = scale_dtype.byte_size();
+    let zp_elem_size = zero_point_dtype.byte_size();
 
     let mut output = Vec::with_capacity(total_elements * 2);
 
@@ -128,8 +130,8 @@ pub fn dequant_affine(
 
             for i in 0..total_elements {
                 let axis_idx = (i / stride) % axis_size;
-                let s = read_typed_f32(scale, axis_idx * elem_size, scale_dtype);
-                let z = read_typed_f32(zero_point, axis_idx * elem_size, scale_dtype);
+                let s = read_typed_f32(scale, axis_idx * scale_elem_size, scale_dtype);
+                let z = read_typed_f32(zero_point, axis_idx * zp_elem_size, zero_point_dtype);
                 let q = quantized_data[i] as i8 as f32;
                 let result = f16::from_f32((q - z) * s);
                 output.extend_from_slice(&result.to_le_bytes());
@@ -138,7 +140,7 @@ pub fn dequant_affine(
         None => {
             // Per-tensor: single scale and zero_point.
             let s = read_typed_f32(scale, 0, scale_dtype);
-            let z = read_typed_f32(zero_point, 0, scale_dtype);
+            let z = read_typed_f32(zero_point, 0, zero_point_dtype);
 
             for i in 0..total_elements {
                 let q = quantized_data[i] as i8 as f32;
@@ -308,6 +310,7 @@ mod tests {
             &scale,
             &zero_point,
             ScalarType::Float32,
+            ScalarType::Float32,
             None,
             &shape,
         );
@@ -342,6 +345,7 @@ mod tests {
             &scale,
             &zero_point,
             ScalarType::Float16,
+            ScalarType::Float16,
             Some(0),
             &shape,
         );
@@ -372,6 +376,7 @@ mod tests {
             &quantized,
             &scale,
             &zero_point,
+            ScalarType::Float32,
             ScalarType::Float32,
             None,
             &shape,

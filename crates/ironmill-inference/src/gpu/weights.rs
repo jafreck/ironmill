@@ -1,8 +1,9 @@
 //! Weight loading from SafeTensors/GGUF into Metal buffers.
 
 use ironmill_metal_sys::{MetalBuffer, MetalDevice, StorageMode};
-use mil_rs::weights::{ModelConfig, WeightProvider};
+use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightProvider};
 
+use super::dequant::{dequant_affine, dequant_lut_to_dense};
 use super::error::GpuError;
 
 /// All model weights loaded into Metal buffers, organized by layer.
@@ -152,7 +153,42 @@ fn load_weight_buffer(
     let tensor = provider
         .tensor(name)
         .map_err(|e| GpuError::WeightLoading(format!("{name}: {e}")))?;
+    let data = match &tensor.quant_info {
+        QuantizationInfo::None => tensor.data.into_owned(),
+        QuantizationInfo::LutToDense {
+            lut,
+            lut_dtype,
+            indices,
+            original_shape,
+            n_bits,
+            row_norms,
+            norms_dtype,
+        } => dequant_lut_to_dense(
+            indices,
+            lut,
+            *lut_dtype,
+            original_shape,
+            *n_bits,
+            row_norms,
+            *norms_dtype,
+        ),
+        QuantizationInfo::AffineDequantize {
+            scale,
+            zero_point,
+            scale_dtype,
+            zero_point_dtype,
+            axis,
+        } => dequant_affine(
+            &tensor.data,
+            scale,
+            zero_point,
+            *scale_dtype,
+            *zero_point_dtype,
+            *axis,
+            &tensor.shape,
+        ),
+    };
     device
-        .create_buffer_with_data(&tensor.data, StorageMode::Shared)
+        .create_buffer_with_data(&data, StorageMode::Shared)
         .map_err(GpuError::Metal)
 }
