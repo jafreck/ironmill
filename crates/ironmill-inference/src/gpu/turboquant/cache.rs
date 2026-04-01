@@ -47,7 +47,15 @@ impl GpuKvCache {
             config.head_dim
         };
         let cache_size = config.num_kv_heads * config.max_seq_len * elements_per_pos;
-        let scale_size = config.num_kv_heads * config.max_seq_len * std::mem::size_of::<f32>();
+        // INT4: per-group scales (group_size=32) → 4 scales per head per position
+        // INT8: per-head scales → 1 scale per head per position
+        let scales_per_pos = if config.n_bits == 4 {
+            config.head_dim / 32
+        } else {
+            1
+        };
+        let scale_size =
+            config.num_kv_heads * config.max_seq_len * scales_per_pos * std::mem::size_of::<f32>();
         let mut k_caches = Vec::with_capacity(config.num_layers);
         let mut v_caches = Vec::with_capacity(config.num_layers);
         let mut k_scales = Vec::with_capacity(config.num_layers);

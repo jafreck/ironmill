@@ -104,65 +104,59 @@ kernel void turboquant_cache_write(
     //   has std ≈ 1/sqrt(d). Absmax ≈ 3.2×std, wasting most INT4 levels on
     //   empty tails. L2-based scaling gives ~3× better resolution.
     //   coverage_factor = 2.5 clips ~1% of values but uses levels efficiently.
-    float local_sq = 0.0f;
-    for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
-        float v = shared_rotated[out_dim];
-        local_sq += v * v;
-    }
-
-    // Parallel reduction for both max and sum-of-squares
     shared_reduce[tid] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Separate sum-of-squares reduction (reuse shared_quant as temp)
-    ((threadgroup float*)shared_quant)[tid] = local_sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     uint reduce_size = 1;
     while (reduce_size < tg_size) reduce_size <<= 1;
     for (uint stride = reduce_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && (tid + stride) < tg_size) {
+        if (tid < stride && (tid + stride) < tg_size)
             shared_reduce[tid] = max(shared_reduce[tid], shared_reduce[tid + stride]);
-            ((threadgroup float*)shared_quant)[tid] += ((threadgroup float*)shared_quant)[tid + stride];
-        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     float max_val = max(shared_reduce[0], 1e-10f);
-    float l2_norm = sqrt(max(((threadgroup float*)shared_quant)[0], 1e-20f));
-    float quant_max = (n_bits == 4) ? 7.0f : 127.0f;
 
-    // INT4: scale from L2 norm with coverage factor (clip at ~2.5σ)
-    // INT8: keep absmax (256 levels is enough)
-    float scale_val;
     if (n_bits == 4) {
-        float sigma = l2_norm / sqrt(float(head_dim));
-        float coverage = 2.5f;
-        scale_val = max(sigma * coverage, 1e-10f);
+        // TurboQuant MSE with outlier handling: per-group absmax (g=32).
+        // Each group of 32 dims gets its own absmax/7.5 scale.
+        // Outlier channels are isolated in their own groups.
+        uint n_groups = head_dim / 32;
+        uint scale_stride = n_groups;
+        threadgroup float shared_grp_scale[4];
+
+        for (uint g = 0; g < n_groups; g++) {
+            float gmax = 0.0f;
+            for (uint d = g * 32 + tid; d < (g + 1) * 32 && d < head_dim; d += tg_size)
+                gmax = max(gmax, fabs(shared_rotated[d]));
+            shared_reduce[tid] = gmax;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tg_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_reduce[tid] = max(shared_reduce[tid], shared_reduce[tid + s]);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) shared_grp_scale[g] = max(shared_reduce[0], 1e-10f) / 7.5f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid < n_groups)
+            scale_buf[head_idx * max_seq_len * scale_stride + seq_pos * scale_stride + tid] = shared_grp_scale[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
+            float s = shared_grp_scale[out_dim / 32];
+            float scaled = clamp(rint(shared_rotated[out_dim] / s), -8.0f, 7.0f);
+            shared_quant[out_dim] = char(int(scaled));
+        }
     } else {
-        scale_val = max_val;
-    }
+        // INT8: per-head absmax (unchanged)
+        float dyn_inv_scale = 127.0f / max_val;
+        float dyn_deq_scale = max_val / 127.0f;
+        if (tid == 0)
+            scale_buf[head_idx * max_seq_len + seq_pos] = dyn_deq_scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float dyn_inv_scale = quant_max / scale_val;
-    float dyn_deq_scale = scale_val / quant_max;
-
-    // Write per-head per-position dequantization scale
-    if (tid == 0) {
-        scale_buf[head_idx * max_seq_len + seq_pos] = dyn_deq_scale;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Step 4: Quantize using dynamic per-head absmax scale
-    float clamp_lo = (n_bits == 4) ? -8.0f : -128.0f;
-    float clamp_hi = (n_bits == 4) ?  7.0f :  127.0f;
-
-    for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
-        float scaled = clamp(shared_rotated[out_dim] * dyn_inv_scale, clamp_lo, clamp_hi);
-        char quantized = char(rint(scaled));
-
-        if (n_bits == 4) {
-            shared_quant[out_dim] = quantized;
-        } else {
+        for (uint out_dim = tid; out_dim < head_dim; out_dim += tg_size) {
+            float scaled = clamp(shared_rotated[out_dim] * dyn_inv_scale, -128.0f, 127.0f);
+            char quantized = char(rint(scaled));
             uint cache_idx = kv_cache_base(head_idx, max_seq_len, head_dim, 8)
                            + seq_pos * head_dim + out_dim;
             cache[cache_idx] = quantized;
@@ -265,11 +259,12 @@ kernel void turboquant_attention(
     // ---- Step 2: Online softmax attention over sequence positions ----
     for (uint p = 0; p < seq_len; p++) {
         // Per-position dequantization scale for K
-        float k_deq = k_scale_buf[kv_head * max_seq_len + p];
-
-        // Compute dot(Q_rot, dequant(K[p])) — parallel reduction
         float partial_dot = 0.0f;
+        uint gs = (n_bits == 4) ? (head_dim / 32) : 1;
         for (uint d = tid; d < head_dim; d += tg_size) {
+            float k_deq = (n_bits == 4)
+                ? k_scale_buf[kv_head * max_seq_len * gs + p * gs + d / 32]
+                : k_scale_buf[kv_head * max_seq_len + p];
             float k_val = read_quantized(k_cache, kv_base, p, d, head_dim, n_bits, k_deq);
             partial_dot += shared_q_rot[d] * k_val;
         }
@@ -302,8 +297,10 @@ kernel void turboquant_attention(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Rescale accumulator and add weighted dequantized V
-        float v_deq = v_scale_buf[kv_head * max_seq_len + p];
         for (uint d = tid; d < head_dim; d += tg_size) {
+            float v_deq = (n_bits == 4)
+                ? v_scale_buf[kv_head * max_seq_len * gs + p * gs + d / 32]
+                : v_scale_buf[kv_head * max_seq_len + p];
             float v_val = read_quantized(v_cache, kv_base, p, d, head_dim, n_bits, v_deq);
             shared_output[d] = shared_output[d] * rescale + weight * v_val;
         }
