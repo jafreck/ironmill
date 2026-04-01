@@ -1,7 +1,5 @@
 //! ANE compilation pipeline: passes, splitting, packing, validation, and caching.
 
-use mil_rs::ir::ScalarType;
-
 pub mod blobfile;
 pub mod bundle;
 pub mod cache;
@@ -12,13 +10,7 @@ pub mod passes;
 pub mod split;
 pub mod validate;
 
-/// Describes an ANE tensor's name, shape, and element type.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TensorDescriptor {
-    pub name: String,
-    pub shape: [usize; 4],
-    pub dtype: ScalarType,
-}
+pub use ironmill_core::ane::TensorDescriptor;
 
 /// Errors produced by the ANE compilation pipeline.
 #[derive(Debug, thiserror::Error)]
