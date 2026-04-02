@@ -20,18 +20,22 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("ironmill-ane-sys only supports macOS");
 
+pub mod buffers_ready;
 pub mod compiler;
 pub mod device;
 pub mod error;
+pub mod events;
 pub mod iosurface;
 pub(crate) mod objc;
 pub mod perf;
 pub mod process;
 pub mod runtime;
 
+pub use buffers_ready::{InputBuffersReady, OutputSetEnqueue};
 pub use compiler::AneCompiler;
 pub use device::{DeviceController, DeviceInfo};
 pub use error::AneSysError;
+pub use events::{SharedEvents, SharedSignalEvent, SharedWaitEvent};
 pub use iosurface::{AneBuffer, AneIOSurfaceObject};
 pub use perf::{PerformanceStats, PerformanceStatsIOSurface, QoSMapper};
 pub use runtime::AneRuntime;
