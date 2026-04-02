@@ -92,11 +92,6 @@ struct MilTextEmitter<'a> {
     config: &'a MilTextConfig,
     output: String,
     weight_entries: Vec<WeightBlobEntry>,
-    /// Running byte offset into the weight blob file.
-    /// Running byte offset into the weight blob file (unused now that
-    /// each weight gets its own BLOBFILE with offset=64).
-    #[allow(dead_code)]
-    weight_offset: u64,
     /// Maps original variable names → emitted names for I/O renaming.
     rename_map: HashMap<String, String>,
     /// Maps variable names → their tensor types (for output type inference).
@@ -109,7 +104,6 @@ impl<'a> MilTextEmitter<'a> {
             config,
             output: String::new(),
             weight_entries: Vec::new(),
-            weight_offset: WEIGHT_BLOB_HEADER_BYTES,
             rename_map: HashMap::new(),
             type_map: HashMap::new(),
         }
@@ -452,21 +446,6 @@ impl<'a> MilTextEmitter<'a> {
             .unwrap_or_else(|| name.to_string())
     }
 
-    /// Find the output type for a given output name by searching operations.
-    #[allow(dead_code)]
-    fn find_output_type(&self, func: &Function, output_name: &str) -> Option<TensorType> {
-        for op in &func.body.operations {
-            for (i, out) in op.outputs.iter().enumerate() {
-                if out == output_name {
-                    if let Some(Some(ty)) = op.output_types.get(i) {
-                        return Some(ty.clone());
-                    }
-                }
-            }
-        }
-        None
-    }
-
     /// Infer output type from input references using the type map.
     /// Most element-wise ops (add, mul, relu, etc.) preserve the type
     /// of their first tensor input.
@@ -621,12 +600,6 @@ fn to_ane_weight_shape(shape: &[usize]) -> Vec<usize> {
             s
         }
     }
-}
-
-/// Align a byte count up to the given alignment boundary.
-#[allow(dead_code)]
-fn align_up(value: u64, alignment: u64) -> u64 {
-    (value + alignment - 1) & !(alignment - 1)
 }
 
 /// Format raw tensor bytes as a comma-separated list of element values.
@@ -1037,16 +1010,6 @@ mod tests {
             }),
             "tensor<int32, [3]>([1,1,128])"
         );
-    }
-
-    #[test]
-    fn mil_text_align_up() {
-        assert_eq!(align_up(0, 64), 0);
-        assert_eq!(align_up(1, 64), 64);
-        assert_eq!(align_up(64, 64), 64);
-        assert_eq!(align_up(65, 64), 128);
-        assert_eq!(align_up(100, 64), 128);
-        assert_eq!(align_up(128, 64), 128);
     }
 
     #[test]
