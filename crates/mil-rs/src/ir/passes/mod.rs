@@ -10,6 +10,7 @@
 pub mod affine_quantize;
 pub mod attention_fusion;
 pub mod awq_quantize;
+pub mod awq_scale_fusion;
 pub mod beta_quantizer;
 pub mod bn_weight_fold;
 pub mod constant_fold;
@@ -39,6 +40,7 @@ pub mod spinquant;
 
 pub use affine_quantize::{AffineQuantizePass, BitWidth};
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
+pub use awq_scale_fusion::AwqScaleFusionPass;
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
 pub use constant_fold::ConstantFoldPass;
 pub use d2quant::D2QuantPass;
