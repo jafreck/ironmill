@@ -7,7 +7,7 @@
 use std::ffi::c_void;
 
 use crate::error::AneSysError;
-use crate::objc::{CFRelease, get_class, objc_msgSend, sel, sel_registerName};
+use crate::objc::{CFRelease, get_class, objc_msgSend, objc_retain, sel, sel_registerName};
 
 // ───────────────────────────────────────────────────────────────────
 // AneIOSurfaceObject
@@ -373,5 +373,97 @@ impl AneBuffer {
 impl std::fmt::Debug for AneBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AneBuffer").field("raw", &self.raw).finish()
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// IOSurfaceOutputSets
+// ───────────────────────────────────────────────────────────────────
+
+/// Safe wrapper around `_ANEIOSurfaceOutputSets`.
+///
+/// Pairs a stats `IOSurfaceRef` with an `NSArray` of output buffers.
+/// Each instance owns a retained ObjC object handle that is released
+/// on drop via `CFRelease`.
+pub struct IOSurfaceOutputSets {
+    raw: *mut c_void,
+}
+
+unsafe impl Send for IOSurfaceOutputSets {}
+
+impl Drop for IOSurfaceOutputSets {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                CFRelease(self.raw);
+            }
+            self.raw = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl IOSurfaceOutputSets {
+    /// Return the raw ObjC object pointer.
+    pub fn as_raw(&self) -> *mut c_void {
+        self.raw
+    }
+
+    /// `+[_ANEIOSurfaceOutputSets objectWithstatsSurRef:outputBuffer:]`
+    ///
+    /// Factory — creates an output-sets object from a raw `IOSurfaceRef` and
+    /// an `NSArray` of output buffers.
+    ///
+    /// # Safety
+    ///
+    /// `stats_sur_ref` must be a valid `IOSurfaceRef` and `output_buffer` a
+    /// valid `NSArray` pointer.
+    pub unsafe fn object_with_stats_sur_ref(
+        stats_sur_ref: *mut c_void,
+        output_buffer: *mut c_void,
+    ) -> Result<Self, AneSysError> {
+        let cls = get_class("_ANEIOSurfaceOutputSets")?;
+
+        type MsgFn =
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+        let sel = unsafe { sel_registerName(sel!("objectWithstatsSurRef:outputBuffer:")) };
+        let f: MsgFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let obj = unsafe { f(cls, sel, stats_sur_ref, output_buffer) };
+        if obj.is_null() {
+            return Err(AneSysError::NullPointer {
+                context: "objectWithstatsSurRef:outputBuffer: returned null".into(),
+            });
+        }
+        objc_retain(obj);
+
+        Ok(Self { raw: obj })
+    }
+
+    /// `-[_ANEIOSurfaceOutputSets statsSurRef]`
+    ///
+    /// Returns the raw `IOSurfaceRef` (`^{__IOSurface=}`).
+    pub fn stats_sur_ref(&self) -> *mut c_void {
+        type MsgFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        let sel = unsafe { sel_registerName(sel!("statsSurRef")) };
+        let f: MsgFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(self.raw, sel) }
+    }
+
+    /// `-[_ANEIOSurfaceOutputSets outputBuffer]`
+    ///
+    /// Returns the `NSArray` of output buffers (raw ObjC pointer).
+    pub fn output_buffer(&self) -> *mut c_void {
+        type MsgFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        let sel = unsafe { sel_registerName(sel!("outputBuffer")) };
+        let f: MsgFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(self.raw, sel) }
+    }
+}
+
+impl std::fmt::Debug for IOSurfaceOutputSets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IOSurfaceOutputSets")
+            .field("raw", &self.raw)
+            .finish()
     }
 }
