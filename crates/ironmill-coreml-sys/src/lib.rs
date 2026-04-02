@@ -236,7 +236,11 @@ impl Model {
             let mut shape = Vec::new();
             for j in 0..shape_arr.count() {
                 let num: &NSNumber = &shape_arr.objectAtIndex(j);
-                shape.push(num.as_isize() as usize);
+                let dim = num.as_isize();
+                if dim < 0 {
+                    bail!("invalid negative dimension {} in output shape", dim);
+                }
+                shape.push(dim as usize);
             }
 
             // SAFETY: Accessing the element count from a valid multi-array.

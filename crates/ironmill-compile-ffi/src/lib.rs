@@ -79,7 +79,8 @@ thread_local! {
 /// Store a human-readable error message in thread-local state.
 fn set_last_error(msg: &str) {
     LAST_ERROR.with(|e| {
-        *e.borrow_mut() = CString::new(msg).ok();
+        let sanitized = msg.replace('\0', "\\0");
+        *e.borrow_mut() = CString::new(sanitized).ok();
     });
 }
 
@@ -365,14 +366,30 @@ pub extern "C" fn mil_validation_report_to_json(report: *const MilValidationRepo
         set_last_error("mil_validation_report_to_json: report is null");
         return std::ptr::null_mut();
     }
-    let report = unsafe { &*report };
-    let json = ironmill_compile::ane::validate::validation_report_to_json(&report.0);
-    match CString::new(json) {
-        Ok(cs) => cs.into_raw(),
-        Err(e) => {
-            set_last_error(&format!(
-                "mil_validation_report_to_json: JSON contains null byte: {e}"
-            ));
+    let result = std::panic::catch_unwind(|| {
+        let report = unsafe { &*report };
+        let json = ironmill_compile::ane::validate::validation_report_to_json(&report.0);
+        match CString::new(json) {
+            Ok(cs) => cs.into_raw(),
+            Err(e) => {
+                set_last_error(&format!(
+                    "mil_validation_report_to_json: JSON contains null byte: {e}"
+                ));
+                std::ptr::null_mut()
+            }
+        }
+    });
+    match result {
+        Ok(ptr) => ptr,
+        Err(panic) => {
+            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                format!("mil_validation_report_to_json: panic: {s}")
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                format!("mil_validation_report_to_json: panic: {s}")
+            } else {
+                "mil_validation_report_to_json: panic (unknown payload)".to_string()
+            };
+            set_last_error(&msg);
             std::ptr::null_mut()
         }
     }
