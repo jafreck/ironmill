@@ -621,6 +621,7 @@ dependencies = [
  "ironmill-coreml-sys",
  "ironmill-iosurface",
  "ironmill-metal-sys",
+ "ironmill-mlx-sys",
  "mil-rs",
  "rand",
  "serde",

@@ -14,6 +14,7 @@ ironmill-ane-sys = { workspace = true }
 ironmill-iosurface = { workspace = true }
 ironmill-coreml-sys = { workspace = true }
 ironmill-metal-sys = { workspace = true, optional = true }
+ironmill-mlx-sys = { workspace = true, optional = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -26,7 +27,7 @@ tempfile = { workspace = true }
 default = []
 int4 = []
 metal = ["dep:ironmill-metal-sys"]
-mlx = []  # Placeholder: will gate ironmill-mlx-sys dependency in MLX-FP16 task
+mlx = ["dep:ironmill-mlx-sys"]
 
 [[example]]
 name = "ane_op_eval"

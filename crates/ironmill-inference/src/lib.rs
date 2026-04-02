@@ -14,6 +14,8 @@ pub mod coreml;
 pub mod engine;
 #[cfg(feature = "metal")]
 pub mod gpu;
+#[cfg(feature = "mlx")]
+pub mod mlx;
 pub mod sampling;
 pub mod types;
 

@@ -17,6 +17,7 @@ ironmill-iosurface = { path = "crates/ironmill-iosurface", version = "0.1.0" }
 ironmill-ane-sys = { path = "crates/ironmill-ane-sys", version = "0.1.0" }
 ironmill-metal-sys = { path = "crates/ironmill-metal-sys", version = "0.1.0" }
 ironmill-coreml-sys = { path = "crates/ironmill-coreml-sys", version = "0.1.0" }
+ironmill-mlx-sys = { path = "crates/ironmill-mlx-sys", version = "0.1.0" }
 ironmill-inference = { path = "crates/ironmill-inference", version = "0.1.0" }
 prost = "0.13"
 prost-build = "0.13"
