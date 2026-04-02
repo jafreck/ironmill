@@ -420,10 +420,14 @@ generation and weight rotation application. SpinQuant replaces the
 fixed Hadamard with a learned matrix while keeping the same rotation
 insertion points and absorption logic.
 
-**Note:** This phase requires the calibration runner to support
-full forward passes with loss computation (slightly more than the
-activation-capture needed for AWQ/GPTQ). The MLX backend is well-suited
-for this since it supports autograd for rotation optimization.
+**Note:** This phase does NOT require autograd. The quantization step
+(rounding) is non-differentiable — even the SpinQuant paper approximates
+gradients with the Straight-Through Estimator. Since rotation matrices
+are small (~4096×4096, ~6 per model), derivative-free optimization
+(CMA-ES, evolutionary search, or even grid search over Cayley parameters)
+works well by repeatedly evaluating forward-pass loss through the Metal
+engine. This keeps the entire quantization pipeline free of autograd
+dependencies.
 
 ### Phase 5: QuIP# Pass (Lattice Codebook Quantization)
 
@@ -605,11 +609,13 @@ GPU buffers between layers. Adding hooks means reading them back to CPU
 at tap points (`MTLBuffer.contents()` per layer). This is a one-time
 calibration cost, not a hot path.
 
-**Exception — SpinQuant (Phase 4):** Rotation optimization requires
-gradients (loss → rotation matrix updates). This is the one case where
-MLX's autograd capability is genuinely useful. All other methods (MinMax,
-AWQ, GPTQ, QuIP#, D2Quant) only need forward passes and can use the
-Metal engine directly.
+This covers all 6 phases. Even SpinQuant's rotation optimization (Phase 4)
+does not require autograd — the quantization step is non-differentiable
+(rounding), so the paper uses the Straight-Through Estimator (STE) to
+approximate gradients anyway. Since the rotation matrices are small
+(e.g., 4096×4096, ~6 per model), derivative-free optimization (CMA-ES or
+grid search) can find good rotations by evaluating forward-pass loss
+repeatedly through the Metal engine. No autograd framework needed.
 
 ### 2. INT4 packing format
 
@@ -641,7 +647,7 @@ User-configurable include/exclude patterns.
 | 1. Calibration infra | Activation hooks on Metal inference engine | Low-Medium | MetalInference prefill |
 | 2. AWQ pass | Per-channel scaling + INT4 quantize + MIL rewrite | Medium | Phase 0 INT4 |
 | 3. GPTQ pass | Hessian + Cholesky + error compensation | High | Phase 0 INT4 |
-| 4. SpinQuant pass | Cayley rotation optimization + absorption | Medium-High | PolarQuant rotation.rs, MLX autograd |
+| 4. SpinQuant pass | Cayley rotation optimization + absorption | Medium | PolarQuant rotation.rs, Metal engine |
 | 5. QuIP# pass | E8 lattice codebook + Hadamard | High | PolarQuant + palettize LUT |
 | 6. D2Quant pass | Dual-scale + LayerNorm correction | Medium | Phase 0 + calibration |
 
