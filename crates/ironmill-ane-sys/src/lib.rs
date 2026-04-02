@@ -36,6 +36,7 @@ pub mod request;
 pub mod token;
 pub mod util;
 pub mod validate;
+pub mod virtual_client;
 pub mod weight;
 
 pub use buffers_ready::{InputBuffersReady, OutputSetEnqueue};
@@ -55,5 +56,8 @@ pub use util::{AneCloneHelper, AneErrors, AneLog};
 pub use validate::{
     RawValidateFn, get_validate_network_supported_version, validate_mil_network_on_host_ptr,
     validate_mlir_network_on_host_ptr,
+};
+pub use virtual_client::{
+    BuildVersionInfo, DeviceExtendedInfo, DeviceInfoInner, VirtANEModel, VirtualClient,
 };
 pub use weight::{ModelInstanceParameters, ProcedureData, Weight};
