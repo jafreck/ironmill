@@ -20,7 +20,7 @@ use super::config::MetalConfig;
 use super::error::MetalError;
 use super::ops;
 use super::turboquant::{MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantMetalConfig};
-use super::weights::{MetalWeights, QuantizedWeight, WeightBuffer};
+use super::weights::{LayerWeights, MetalWeights, QuantizedWeight, WeightBuffer};
 use crate::calibration::ActivationHook;
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
@@ -574,18 +574,16 @@ impl MetalInference {
         for layer_idx in 0..mc.num_hidden_layers {
             let lw = &weights.layers[layer_idx];
             let lm = &matmuls.layer_matmuls[layer_idx];
+            let pipelines = self.pipelines();
 
             // norm_out already contains the input-norm result:
             //   • layer 0: computed by the standalone dispatch above
             //   • layer 1+: produced by the previous layer's fused end-of-layer kernel
 
             // Steps 3-5: Q/K/V projections — dispatch by weight type.
-            // Dense weights use MPS matmul (encodes directly onto cmd_buf).
-            // Quantized weights use a compute encoder with the PolarQuant kernel.
             let row_bytes_h = h * 2; // FP16
             let row_bytes_qo = (mc.num_attention_heads * mc.head_dim) * 2;
             let row_bytes_kv = (mc.num_kv_heads() * mc.head_dim) * 2;
-            let row_bytes_inter = inter * 2;
 
             let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -593,7 +591,6 @@ impl MetalInference {
             // Q / K / V projections
             let qkv_out_features = mc.num_attention_heads * mc.head_dim;
             let kv_out_features = mc.num_kv_heads() * mc.head_dim;
-            let pipelines = self.pipelines();
             for (weight, output_buf, matmul, out_features, row_bytes_out) in [
                 (
                     &lw.q_proj,
@@ -633,464 +630,73 @@ impl MetalInference {
                 )?;
             }
 
-            // QK normalization (Qwen3): per-head RMSNorm on Q and K before RoPE.
-            if let (Some(q_norm_w), Some(k_norm_w)) = (&lw.q_norm, &lw.k_norm) {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_rms_norm(
-                    &enc,
-                    &self.pipelines().rms_norm,
-                    &ops::RmsNormParams {
-                        input: &bufs.q_proj,
-                        weight: q_norm_w,
-                        output: &bufs.q_proj,
-                        hidden_size: hd,
-                        token_count: token_count as u32 * nh,
-                        eps,
-                    },
-                );
-                ops::encode_rms_norm(
-                    &enc,
-                    &self.pipelines().rms_norm,
-                    &ops::RmsNormParams {
-                        input: &bufs.k_proj,
-                        weight: k_norm_w,
-                        output: &bufs.k_proj,
-                        hidden_size: hd,
-                        token_count: token_count as u32 * nkv,
-                        eps,
-                    },
-                );
-                enc.end_encoding();
-            }
+            // Step 6: QK normalization (Qwen3) + RoPE
+            encode_qk_norm_and_rope(
+                &cmd_buf,
+                pipelines,
+                bufs,
+                lw.q_norm.as_ref(),
+                lw.k_norm.as_ref(),
+                rope_cos,
+                rope_sin,
+                nh,
+                nkv,
+                hd,
+                seq_pos,
+                token_count,
+                eps,
+            )?;
 
-            // Step 6: RoPE on Q and K
-            {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_rope(
-                    &enc,
-                    &self.pipelines().rope,
-                    &ops::RopeParams {
-                        qk: &bufs.q_proj,
-                        cos_cache: rope_cos,
-                        sin_cache: rope_sin,
-                        num_heads: nh,
-                        head_dim: hd,
-                        seq_offset: seq_pos as u32,
-                        token_count: token_count as u32,
-                    },
-                );
-                ops::encode_rope(
-                    &enc,
-                    &self.pipelines().rope,
-                    &ops::RopeParams {
-                        qk: &bufs.k_proj,
-                        cos_cache: rope_cos,
-                        sin_cache: rope_sin,
-                        num_heads: nkv,
-                        head_dim: hd,
-                        seq_offset: seq_pos as u32,
-                        token_count: token_count as u32,
-                    },
-                );
-                enc.end_encoding();
-            }
-
-            // Steps 7-8: Cache write + attention
-            if enable_tq {
-                let tq = self
-                    .turboquant
-                    .as_ref()
-                    .expect("turboquant must be initialized when enable_tq is true");
-                let kv = self
-                    .kv_cache
-                    .as_ref()
-                    .expect("kv_cache must be initialized when enable_tq is true");
-                let max_seq = self.config.max_seq_len as u32;
-                let n_bits = self.config.n_bits as u32;
-
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-
-                if let Some(ref outlier) = tq.outlier {
-                    // ── Outlier channel strategy dispatch ──
-                    let ((k_o_cache, v_o_cache), (k_n_cache, v_n_cache)) =
-                        kv.layer_outlier_caches(layer_idx);
-                    let ((k_o_scale, v_o_scale), (k_n_scale, v_n_scale)) =
-                        kv.layer_outlier_scales(layer_idx);
-                    let (k_o_r_norms, k_n_r_norms) = kv.layer_outlier_r_norms(layer_idx);
-                    let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
-                    let tg_size = std::cmp::max(
-                        outlier.d_outlier_padded as usize,
-                        outlier.d_non_padded as usize,
-                    );
-
-                    for t in 0..token_count {
-                        let token_offset = t * kv_head_stride_bytes;
-                        // K cache: (b-1)-bit codebook + QJL
-                        enc.set_pipeline(&self.pipelines().turboquant_outlier_cache_write);
-                        enc.set_buffer(&bufs.k_proj, token_offset, 0);
-                        enc.set_buffer(&outlier.channel_indices, 0, 1);
-                        enc.set_buffer(k_o_cache, 0, 2);
-                        enc.set_buffer(k_n_cache, 0, 3);
-                        enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
-                        enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
-                        enc.set_buffer(&outlier.k_outlier_codebook, 0, 6);
-                        enc.set_buffer(&outlier.k_outlier_boundaries, 0, 7);
-                        enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 8);
-                        enc.set_buffer(&outlier.k_non_outlier_boundaries, 0, 9);
-                        enc.set_buffer(k_o_scale, 0, 10);
-                        enc.set_buffer(k_n_scale, 0, 11);
-                        enc.set_bytes(&nkv.to_le_bytes(), 12);
-                        enc.set_bytes(&hd.to_le_bytes(), 13);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 14);
-                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
-                        enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
-                        enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
-                        enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
-                        enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 19);
-                        enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 20);
-                        enc.set_bytes(&1u32.to_le_bytes(), 21); // is_k_cache = 1
-                        enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
-                        enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
-                        enc.set_buffer(k_o_r_norms, 0, 24);
-                        enc.set_buffer(k_n_r_norms, 0, 25);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
-                        // V cache: b-bit codebook, no QJL
-                        enc.set_pipeline(&self.pipelines().turboquant_outlier_cache_write);
-                        enc.set_buffer(&bufs.v_proj, token_offset, 0);
-                        enc.set_buffer(&outlier.channel_indices, 0, 1);
-                        enc.set_buffer(v_o_cache, 0, 2);
-                        enc.set_buffer(v_n_cache, 0, 3);
-                        enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
-                        enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
-                        enc.set_buffer(&outlier.outlier_codebook, 0, 6);
-                        enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
-                        enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
-                        enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
-                        enc.set_buffer(v_o_scale, 0, 10);
-                        enc.set_buffer(v_n_scale, 0, 11);
-                        enc.set_bytes(&nkv.to_le_bytes(), 12);
-                        enc.set_bytes(&hd.to_le_bytes(), 13);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 14);
-                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
-                        enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
-                        enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
-                        enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
-                        enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
-                        enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
-                        enc.set_bytes(&0u32.to_le_bytes(), 21); // is_k_cache = 0
-                        enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
-                        enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
-                        enc.set_buffer(k_o_r_norms, 0, 24);
-                        enc.set_buffer(k_n_r_norms, 0, 25);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
-                    }
-
-                    let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
-                    for t in 0..token_count {
-                        let q_offset = t * q_head_stride_bytes;
-                        let attn_out_offset = t * q_head_stride_bytes;
-                        let current_seq_len = (seq_pos + t + 1) as u32;
-                        enc.set_pipeline(&self.pipelines().turboquant_outlier_attention);
-                        enc.set_buffer(&bufs.q_proj, q_offset, 0);
-                        enc.set_buffer(k_o_cache, 0, 1);
-                        enc.set_buffer(v_o_cache, 0, 2);
-                        enc.set_buffer(k_n_cache, 0, 3);
-                        enc.set_buffer(v_n_cache, 0, 4);
-                        enc.set_buffer(&outlier.channel_indices, 0, 5);
-                        enc.set_buffer(&outlier.outlier_rotation_signs, 0, 6);
-                        enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 7);
-                        enc.set_buffer(&outlier.k_outlier_codebook, 0, 8);
-                        enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 9);
-                        enc.set_buffer(&bufs.attn_out, attn_out_offset, 10);
-                        enc.set_buffer(k_o_scale, 0, 11);
-                        enc.set_buffer(v_o_scale, 0, 12);
-                        enc.set_buffer(k_n_scale, 0, 13);
-                        enc.set_buffer(v_n_scale, 0, 14);
-                        enc.set_bytes(&nh.to_le_bytes(), 15);
-                        enc.set_bytes(&nkv.to_le_bytes(), 16);
-                        enc.set_bytes(&hd.to_le_bytes(), 17);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 18);
-                        enc.set_bytes(&current_seq_len.to_le_bytes(), 19);
-                        enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 20);
-                        enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 21);
-                        enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 22);
-                        enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 23);
-                        enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 24);
-                        enc.set_buffer(k_o_r_norms, 0, 25);
-                        enc.set_buffer(k_n_r_norms, 0, 26);
-                        enc.set_buffer(&outlier.outlier_codebook, 0, 27);
-                        enc.set_buffer(&outlier.non_outlier_codebook, 0, 28);
-                        enc.dispatch_threadgroups((nh as usize, 1, 1), (tg_size.min(1024), 1, 1));
-                    }
-                } else {
-                    // ── Standard TurboQuant dispatch ──
-                    let (k_cache, v_cache) = kv.layer_caches(layer_idx);
-                    let (k_scale, v_scale) = kv.layer_scales(layer_idx);
-                    let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
-
-                    let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
-                    for t in 0..token_count {
-                        let token_offset = t * kv_head_stride_bytes;
-                        // K cache write: (b-1)-bit codebook + QJL
-                        enc.set_pipeline(&self.pipelines().turboquant_cache_write);
-                        enc.set_buffer(&bufs.k_proj, token_offset, 0);
-                        enc.set_buffer(&tq.rotation_signs, 0, 1);
-                        enc.set_buffer(k_cache, 0, 2);
-                        enc.set_bytes(&nkv.to_le_bytes(), 3);
-                        enc.set_bytes(&hd.to_le_bytes(), 4);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
-                        enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-                        enc.set_bytes(&n_bits.to_le_bytes(), 8);
-                        enc.set_buffer(k_scale, 0, 9);
-                        enc.set_buffer(&tq.k_codebook_buf, 0, 10);
-                        enc.set_buffer(&tq.k_boundaries_buf, 0, 11);
-                        enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 12);
-                        enc.set_buffer(&tq.qjl_matrix, 0, 13);
-                        enc.set_buffer(k_qjl_signs, 0, 14);
-                        enc.set_buffer(k_r_norms, 0, 15);
-                        enc.set_bytes(&1u32.to_le_bytes(), 16);
-                        enc.dispatch_threadgroups(
-                            (nkv as usize, 1, 1),
-                            ((hd as usize).min(1024), 1, 1),
-                        );
-                        // V cache write: b-bit codebook, no QJL
-                        enc.set_pipeline(&self.pipelines().turboquant_cache_write);
-                        enc.set_buffer(&bufs.v_proj, token_offset, 0);
-                        enc.set_buffer(&tq.rotation_signs, 0, 1);
-                        enc.set_buffer(v_cache, 0, 2);
-                        enc.set_bytes(&nkv.to_le_bytes(), 3);
-                        enc.set_bytes(&hd.to_le_bytes(), 4);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
-                        enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-                        enc.set_bytes(&n_bits.to_le_bytes(), 8);
-                        enc.set_buffer(v_scale, 0, 9);
-                        enc.set_buffer(&tq.v_codebook_buf, 0, 10);
-                        enc.set_buffer(&tq.v_boundaries_buf, 0, 11);
-                        enc.set_bytes(&tq.v_n_levels.to_le_bytes(), 12);
-                        enc.set_buffer(&tq.qjl_matrix, 0, 13);
-                        enc.set_buffer(k_qjl_signs, 0, 14);
-                        enc.set_buffer(k_r_norms, 0, 15);
-                        enc.set_bytes(&0u32.to_le_bytes(), 16);
-                        enc.dispatch_threadgroups(
-                            (nkv as usize, 1, 1),
-                            ((hd as usize).min(1024), 1, 1),
-                        );
-                    }
-
-                    let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
-                    for t in 0..token_count {
-                        let q_offset = t * q_head_stride_bytes;
-                        let attn_out_offset = t * q_head_stride_bytes;
-                        let current_seq_len = (seq_pos + t + 1) as u32;
-                        enc.set_pipeline(&self.pipelines().turboquant_attention);
-                        enc.set_buffer(&bufs.q_proj, q_offset, 0);
-                        enc.set_buffer(k_cache, 0, 1);
-                        enc.set_buffer(v_cache, 0, 2);
-                        enc.set_buffer(&tq.rotation_signs, 0, 3);
-                        enc.set_buffer(&bufs.attn_out, attn_out_offset, 4);
-                        enc.set_bytes(&nh.to_le_bytes(), 5);
-                        enc.set_bytes(&nkv.to_le_bytes(), 6);
-                        enc.set_bytes(&hd.to_le_bytes(), 7);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 8);
-                        enc.set_bytes(&current_seq_len.to_le_bytes(), 9);
-                        enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
-                        enc.set_bytes(&n_bits.to_le_bytes(), 11);
-                        enc.set_buffer(k_scale, 0, 12);
-                        enc.set_buffer(v_scale, 0, 13);
-                        enc.set_buffer(&tq.k_codebook_buf, 0, 14);
-                        enc.set_buffer(&tq.v_codebook_buf, 0, 15);
-                        enc.set_buffer(&tq.qjl_matrix, 0, 16);
-                        enc.set_buffer(k_r_norms, 0, 17);
-                        enc.dispatch_threadgroups(
-                            (nh as usize, 1, 1),
-                            ((hd as usize).min(1024), 1, 1),
-                        );
-                    }
-                }
-                enc.end_encoding();
-            } else {
-                // FP16 KV cache path — scatter projections into cache on GPU.
-                let fp16_kv = self
-                    .fp16_kv_cache
-                    .as_ref()
-                    .expect("fp16_kv_cache must be initialized for FP16 KV cache path");
-                let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
-                let max_seq = self.config.max_seq_len as u32;
-
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-
-                // Scatter K and V projections into their caches entirely on GPU.
-                ops::encode_kv_scatter(
-                    &enc,
-                    &self.pipelines().kv_scatter,
-                    &ops::KvScatterParams {
-                        proj: &bufs.k_proj,
-                        cache: k_cache,
-                        seq_pos: seq_pos as u32,
-                        token_count: token_count as u32,
-                        num_kv_heads: nkv,
-                        head_dim: hd,
-                        max_seq_len: max_seq,
-                    },
-                );
-                ops::encode_kv_scatter(
-                    &enc,
-                    &self.pipelines().kv_scatter,
-                    &ops::KvScatterParams {
-                        proj: &bufs.v_proj,
-                        cache: v_cache,
-                        seq_pos: seq_pos as u32,
-                        token_count: token_count as u32,
-                        num_kv_heads: nkv,
-                        head_dim: hd,
-                        max_seq_len: max_seq,
-                    },
-                );
-
-                // Standard attention — loop over tokens with causal
-                // masking so each token attends only to 0..seq_pos+t+1.
-                let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
-                for t in 0..token_count {
-                    let q_offset = t * q_head_stride_bytes;
-                    let attn_out_offset = t * q_head_stride_bytes;
-                    let current_seq_len = (seq_pos + t + 1) as u32;
-                    enc.set_pipeline(&self.pipelines().standard_attention);
-                    enc.set_buffer(&bufs.q_proj, q_offset, 0);
-                    enc.set_buffer(k_cache, 0, 1);
-                    enc.set_buffer(v_cache, 0, 2);
-                    enc.set_buffer(&bufs.attn_out, attn_out_offset, 3);
-                    enc.set_bytes(&nh.to_le_bytes(), 4);
-                    enc.set_bytes(&nkv.to_le_bytes(), 5);
-                    enc.set_bytes(&hd.to_le_bytes(), 6);
-                    enc.set_bytes(&max_seq.to_le_bytes(), 7);
-                    enc.set_bytes(&current_seq_len.to_le_bytes(), 8);
-                    enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
-                }
-                enc.end_encoding();
-            }
+            // Steps 7-8: KV cache write + attention
+            encode_kv_cache_and_attention(
+                &cmd_buf,
+                pipelines,
+                bufs,
+                self.turboquant.as_ref(),
+                self.kv_cache.as_ref(),
+                self.fp16_kv_cache.as_ref(),
+                self.config.max_seq_len,
+                self.config.n_bits,
+                layer_idx,
+                seq_pos,
+                token_count,
+                nh,
+                nkv,
+                hd,
+                enable_tq,
+            )?;
 
             // Step 9: Output projection
-            match &lw.o_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.attn_out,
-                                packed_buf,
-                                &bufs.ffn_down,
-                                h as u32,
-                                (mc.num_attention_heads * mc.head_dim) as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let attn_mat = MpsMatrix::from_buffer(
-                                &bufs.attn_out,
-                                token_count,
-                                mc.num_attention_heads * mc.head_dim,
-                                row_bytes_qo,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let o_weight_mat = MpsMatrix::from_buffer(
-                                buf,
-                                h,
-                                mc.num_attention_heads * mc.head_dim,
-                                row_bytes_qo,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let ffn_down_mat_for_o =
-                                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.o.dense().encode(
-                                &cmd_buf,
-                                &attn_mat,
-                                &o_weight_mat,
-                                &ffn_down_mat_for_o,
-                            );
-                        }
-                    } else {
-                        let attn_mat = MpsMatrix::from_buffer(
-                            &bufs.attn_out,
-                            token_count,
-                            mc.num_attention_heads * mc.head_dim,
-                            row_bytes_qo,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let o_weight_mat = MpsMatrix::from_buffer(
-                            buf,
-                            h,
-                            mc.num_attention_heads * mc.head_dim,
-                            row_bytes_qo,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let ffn_down_mat_for_o =
-                            MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.o.dense().encode(
-                            &cmd_buf,
-                            &attn_mat,
-                            &o_weight_mat,
-                            &ffn_down_mat_for_o,
-                        );
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.attn_out,
-                        q,
-                        &bufs.ffn_down,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-                WeightBuffer::AffineQuantized(aq) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
-                    enc.end_encoding();
-                    let (n, k) = aq.shape;
-                    let input_mat = MpsMatrix::from_buffer(&bufs.attn_out, token_count, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_down, token_count, n, n * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.o.dense()
-                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
-                }
-            }
+            let attn_mat = MpsMatrix::from_buffer(
+                &bufs.attn_out,
+                token_count,
+                mc.num_attention_heads * mc.head_dim,
+                row_bytes_qo,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            encode_projection(
+                &cmd_buf,
+                &bufs.attn_out,
+                &attn_mat,
+                &lw.o_proj,
+                &bufs.ffn_down,
+                &lm.o,
+                pipelines,
+                token_count,
+                h,
+                mc.num_attention_heads * mc.head_dim,
+                row_bytes_qo,
+                row_bytes_h,
+            )?;
 
             // Step 10-11 (fused): Residual add + post-attention RMSNorm
-            // hidden_state still holds the pre-norm value (our skip connection).
-            // Produces both the normalized output (for MLP) and the raw residual
-            // (for the next skip connection) in a single kernel dispatch.
             {
                 let enc = cmd_buf
                     .compute_encoder()
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_fused_residual_rms_norm(
                     &enc,
-                    &self.pipelines().fused_residual_rms_norm,
+                    &pipelines.fused_residual_rms_norm,
                     &ops::FusedResidualRmsNormParams {
                         a: &bufs.hidden_state,           // a: skip connection (pre-norm hidden)
                         b: &bufs.ffn_down,               // b: o_proj output
@@ -1105,329 +711,24 @@ impl MetalInference {
                 enc.end_encoding();
             }
 
-            // Steps 12-13: Gate and Up projections
-            let norm_mat2 = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            // Steps 12-15: FFN block (gate + up + SiLU + down)
+            encode_ffn_block(&cmd_buf, pipelines, bufs, lw, lm, h, inter, token_count)?;
 
-            // Gate projection
-            match &lw.gate_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.norm_out,
-                                packed_buf,
-                                &bufs.ffn_gate,
-                                inter as u32,
-                                h as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let gate_weight_mat =
-                                MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let gate_result_mat = MpsMatrix::from_buffer(
-                                &bufs.ffn_gate,
-                                token_count,
-                                inter,
-                                row_bytes_inter,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.gate.dense().encode(
-                                &cmd_buf,
-                                &norm_mat2,
-                                &gate_weight_mat,
-                                &gate_result_mat,
-                            );
-                        }
-                    } else {
-                        let gate_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let gate_result_mat = MpsMatrix::from_buffer(
-                            &bufs.ffn_gate,
-                            token_count,
-                            inter,
-                            row_bytes_inter,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.gate.dense().encode(
-                            &cmd_buf,
-                            &norm_mat2,
-                            &gate_weight_mat,
-                            &gate_result_mat,
-                        );
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.norm_out,
-                        q,
-                        &bufs.ffn_gate,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-                WeightBuffer::AffineQuantized(aq) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
-                    enc.end_encoding();
-                    let (n, k) = aq.shape;
-                    let input_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, n, n * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.gate
-                        .dense()
-                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
-                }
-            }
-
-            // Up projection
-            match &lw.up_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.norm_out,
-                                packed_buf,
-                                &bufs.ffn_up,
-                                inter as u32,
-                                h as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let up_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let up_result_mat = MpsMatrix::from_buffer(
-                                &bufs.ffn_up,
-                                token_count,
-                                inter,
-                                row_bytes_inter,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.up.dense().encode(
-                                &cmd_buf,
-                                &norm_mat2,
-                                &up_weight_mat,
-                                &up_result_mat,
-                            );
-                        }
-                    } else {
-                        let up_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let up_result_mat = MpsMatrix::from_buffer(
-                            &bufs.ffn_up,
-                            token_count,
-                            inter,
-                            row_bytes_inter,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.up
-                            .dense()
-                            .encode(&cmd_buf, &norm_mat2, &up_weight_mat, &up_result_mat);
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.norm_out,
-                        q,
-                        &bufs.ffn_up,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-                WeightBuffer::AffineQuantized(aq) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
-                    enc.end_encoding();
-                    let (n, k) = aq.shape;
-                    let input_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_up, token_count, n, n * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.up
-                        .dense()
-                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
-                }
-            }
-
-            // Step 14: SiLU gate
-            {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_silu_gate(
-                    &enc,
-                    &self.pipelines().silu_gate,
-                    &bufs.ffn_gate,
-                    &bufs.ffn_up,
-                    &bufs.ffn_gate, // in-place output into gate buffer
-                    (token_count * inter) as u32,
-                );
-                enc.end_encoding();
-            }
-
-            // Step 15: Down projection
-            match &lw.down_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.ffn_gate,
-                                packed_buf,
-                                &bufs.ffn_down,
-                                h as u32,
-                                inter as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let gate_out_mat = MpsMatrix::from_buffer(
-                                &bufs.ffn_gate,
-                                token_count,
-                                inter,
-                                row_bytes_inter,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let down_weight_mat =
-                                MpsMatrix::from_buffer(buf, h, inter, row_bytes_inter)
-                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let down_result_mat =
-                                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.down.dense().encode(
-                                &cmd_buf,
-                                &gate_out_mat,
-                                &down_weight_mat,
-                                &down_result_mat,
-                            );
-                        }
-                    } else {
-                        let gate_out_mat = MpsMatrix::from_buffer(
-                            &bufs.ffn_gate,
-                            token_count,
-                            inter,
-                            row_bytes_inter,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let down_weight_mat =
-                            MpsMatrix::from_buffer(buf, h, inter, row_bytes_inter)
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let down_result_mat =
-                            MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.down.dense().encode(
-                            &cmd_buf,
-                            &gate_out_mat,
-                            &down_weight_mat,
-                            &down_result_mat,
-                        );
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.ffn_gate,
-                        q,
-                        &bufs.ffn_down,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-                WeightBuffer::AffineQuantized(aq) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
-                    enc.end_encoding();
-                    let (n, k) = aq.shape;
-                    let input_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_down, token_count, n, n * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.down
-                        .dense()
-                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
-                }
-            }
-
-            // Step 16 (fused): Residual add + next layer's input RMSNorm
-            // For all but the last layer, fuse the post-MLP residual add with
-            // the next layer's input norm.  The last layer does a standalone
-            // residual add — the final norm lives outside the loop.
-            if layer_idx + 1 < mc.num_hidden_layers {
-                let next_lw = &weights.layers[layer_idx + 1];
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_fused_residual_rms_norm(
-                    &enc,
-                    &self.pipelines().fused_residual_rms_norm,
-                    &ops::FusedResidualRmsNormParams {
-                        a: &bufs.residual,                   // a: post-attn residual
-                        b: &bufs.ffn_down,                   // b: down_proj output
-                        weight: &next_lw.input_norm,         // weight: next layer's input norm
-                        normed_output: &bufs.norm_out, // normed output → next layer's attention
-                        residual_output: &bufs.hidden_state, // residual output → next layer's skip
-                        eps,
-                        hidden_size: h as u32,
-                        token_count: token_count as u32,
-                    },
-                );
-                enc.end_encoding();
+            // Step 16: Residual add + next layer's input norm (or standalone for last layer)
+            let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
+                Some(&weights.layers[layer_idx + 1].input_norm)
             } else {
-                // Last layer: standalone residual add (final norm is separate).
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_residual_add(
-                    &enc,
-                    &self.pipelines().residual_add,
-                    &bufs.residual,
-                    &bufs.ffn_down,
-                    &bufs.hidden_state,
-                    (token_count * h) as u32,
-                );
-                enc.end_encoding();
-            }
+                None
+            };
+            encode_end_of_layer_residual(
+                &cmd_buf,
+                pipelines,
+                bufs,
+                next_norm,
+                h,
+                token_count,
+                eps,
+            )?;
         }
 
         // Step 17: Final RMSNorm
@@ -1698,19 +999,18 @@ impl MetalInference {
                 .queue
                 .command_buffer()
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let pipelines = self.pipelines();
 
             // Steps 3-5: Q/K/V projections
             let row_bytes_h = h * 2;
             let row_bytes_qo = (mc.num_attention_heads * mc.head_dim) * 2;
             let row_bytes_kv = (mc.num_kv_heads() * mc.head_dim) * 2;
-            let row_bytes_inter = inter * 2;
 
             let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
             let qkv_out_features = mc.num_attention_heads * mc.head_dim;
             let kv_out_features = mc.num_kv_heads() * mc.head_dim;
-            let pipelines = self.pipelines();
             for (weight, output_buf, matmul, out_features, row_bytes_out) in [
                 (
                     &lw.q_proj,
@@ -1750,442 +1050,64 @@ impl MetalInference {
                 )?;
             }
 
-            // QK normalization (Qwen3)
-            if let (Some(q_norm_w), Some(k_norm_w)) = (&lw.q_norm, &lw.k_norm) {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_rms_norm(
-                    &enc,
-                    &self.pipelines().rms_norm,
-                    &ops::RmsNormParams {
-                        input: &bufs.q_proj,
-                        weight: q_norm_w,
-                        output: &bufs.q_proj,
-                        hidden_size: hd,
-                        token_count: token_count as u32 * nh,
-                        eps,
-                    },
-                );
-                ops::encode_rms_norm(
-                    &enc,
-                    &self.pipelines().rms_norm,
-                    &ops::RmsNormParams {
-                        input: &bufs.k_proj,
-                        weight: k_norm_w,
-                        output: &bufs.k_proj,
-                        hidden_size: hd,
-                        token_count: token_count as u32 * nkv,
-                        eps,
-                    },
-                );
-                enc.end_encoding();
-            }
+            // Step 6: QK normalization (Qwen3) + RoPE
+            encode_qk_norm_and_rope(
+                &cmd_buf,
+                pipelines,
+                bufs,
+                lw.q_norm.as_ref(),
+                lw.k_norm.as_ref(),
+                rope_cos,
+                rope_sin,
+                nh,
+                nkv,
+                hd,
+                seq_pos,
+                token_count,
+                eps,
+            )?;
 
-            // Step 6: RoPE
-            {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_rope(
-                    &enc,
-                    &self.pipelines().rope,
-                    &ops::RopeParams {
-                        qk: &bufs.q_proj,
-                        cos_cache: rope_cos,
-                        sin_cache: rope_sin,
-                        num_heads: nh,
-                        head_dim: hd,
-                        seq_offset: seq_pos as u32,
-                        token_count: token_count as u32,
-                    },
-                );
-                ops::encode_rope(
-                    &enc,
-                    &self.pipelines().rope,
-                    &ops::RopeParams {
-                        qk: &bufs.k_proj,
-                        cos_cache: rope_cos,
-                        sin_cache: rope_sin,
-                        num_heads: nkv,
-                        head_dim: hd,
-                        seq_offset: seq_pos as u32,
-                        token_count: token_count as u32,
-                    },
-                );
-                enc.end_encoding();
-            }
-
-            // Steps 7-8: Cache write + attention
-            if enable_tq {
-                let tq = self
-                    .turboquant
-                    .as_ref()
-                    .expect("turboquant must be initialized when enable_tq is true");
-                let kv = self
-                    .kv_cache
-                    .as_ref()
-                    .expect("kv_cache must be initialized when enable_tq is true");
-                let max_seq = self.config.max_seq_len as u32;
-                let n_bits = self.config.n_bits as u32;
-
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-
-                if let Some(ref outlier) = tq.outlier {
-                    let ((k_o_cache, v_o_cache), (k_n_cache, v_n_cache)) =
-                        kv.layer_outlier_caches(layer_idx);
-                    let ((k_o_scale, v_o_scale), (k_n_scale, v_n_scale)) =
-                        kv.layer_outlier_scales(layer_idx);
-                    let (k_o_r_norms, k_n_r_norms) = kv.layer_outlier_r_norms(layer_idx);
-                    let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
-                    let tg_size = std::cmp::max(
-                        outlier.d_outlier_padded as usize,
-                        outlier.d_non_padded as usize,
-                    );
-
-                    for t in 0..token_count {
-                        let token_offset = t * kv_head_stride_bytes;
-                        enc.set_pipeline(&self.pipelines().turboquant_outlier_cache_write);
-                        enc.set_buffer(&bufs.k_proj, token_offset, 0);
-                        enc.set_buffer(&outlier.channel_indices, 0, 1);
-                        enc.set_buffer(k_o_cache, 0, 2);
-                        enc.set_buffer(k_n_cache, 0, 3);
-                        enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
-                        enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
-                        enc.set_buffer(&outlier.k_outlier_codebook, 0, 6);
-                        enc.set_buffer(&outlier.k_outlier_boundaries, 0, 7);
-                        enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 8);
-                        enc.set_buffer(&outlier.k_non_outlier_boundaries, 0, 9);
-                        enc.set_buffer(k_o_scale, 0, 10);
-                        enc.set_buffer(k_n_scale, 0, 11);
-                        enc.set_bytes(&nkv.to_le_bytes(), 12);
-                        enc.set_bytes(&hd.to_le_bytes(), 13);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 14);
-                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
-                        enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
-                        enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
-                        enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
-                        enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 19);
-                        enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 20);
-                        enc.set_bytes(&1u32.to_le_bytes(), 21);
-                        enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
-                        enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
-                        enc.set_buffer(k_o_r_norms, 0, 24);
-                        enc.set_buffer(k_n_r_norms, 0, 25);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
-                        enc.set_pipeline(&self.pipelines().turboquant_outlier_cache_write);
-                        enc.set_buffer(&bufs.v_proj, token_offset, 0);
-                        enc.set_buffer(&outlier.channel_indices, 0, 1);
-                        enc.set_buffer(v_o_cache, 0, 2);
-                        enc.set_buffer(v_n_cache, 0, 3);
-                        enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
-                        enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
-                        enc.set_buffer(&outlier.outlier_codebook, 0, 6);
-                        enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
-                        enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
-                        enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
-                        enc.set_buffer(v_o_scale, 0, 10);
-                        enc.set_buffer(v_n_scale, 0, 11);
-                        enc.set_bytes(&nkv.to_le_bytes(), 12);
-                        enc.set_bytes(&hd.to_le_bytes(), 13);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 14);
-                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
-                        enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
-                        enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
-                        enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
-                        enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
-                        enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
-                        enc.set_bytes(&0u32.to_le_bytes(), 21);
-                        enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
-                        enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
-                        enc.set_buffer(k_o_r_norms, 0, 24);
-                        enc.set_buffer(k_n_r_norms, 0, 25);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
-                    }
-
-                    let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
-                    for t in 0..token_count {
-                        let q_offset = t * q_head_stride_bytes;
-                        let attn_out_offset = t * q_head_stride_bytes;
-                        let current_seq_len = (seq_pos + t + 1) as u32;
-                        enc.set_pipeline(&self.pipelines().turboquant_outlier_attention);
-                        enc.set_buffer(&bufs.q_proj, q_offset, 0);
-                        enc.set_buffer(k_o_cache, 0, 1);
-                        enc.set_buffer(v_o_cache, 0, 2);
-                        enc.set_buffer(k_n_cache, 0, 3);
-                        enc.set_buffer(v_n_cache, 0, 4);
-                        enc.set_buffer(&outlier.channel_indices, 0, 5);
-                        enc.set_buffer(&outlier.outlier_rotation_signs, 0, 6);
-                        enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 7);
-                        enc.set_buffer(&outlier.k_outlier_codebook, 0, 8);
-                        enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 9);
-                        enc.set_buffer(&bufs.attn_out, attn_out_offset, 10);
-                        enc.set_buffer(k_o_scale, 0, 11);
-                        enc.set_buffer(v_o_scale, 0, 12);
-                        enc.set_buffer(k_n_scale, 0, 13);
-                        enc.set_buffer(v_n_scale, 0, 14);
-                        enc.set_bytes(&nh.to_le_bytes(), 15);
-                        enc.set_bytes(&nkv.to_le_bytes(), 16);
-                        enc.set_bytes(&hd.to_le_bytes(), 17);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 18);
-                        enc.set_bytes(&current_seq_len.to_le_bytes(), 19);
-                        enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 20);
-                        enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 21);
-                        enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 22);
-                        enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 23);
-                        enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 24);
-                        enc.set_buffer(k_o_r_norms, 0, 25);
-                        enc.set_buffer(k_n_r_norms, 0, 26);
-                        enc.set_buffer(&outlier.outlier_codebook, 0, 27);
-                        enc.set_buffer(&outlier.non_outlier_codebook, 0, 28);
-                        enc.dispatch_threadgroups((nh as usize, 1, 1), (tg_size.min(1024), 1, 1));
-                    }
-                } else {
-                    let (k_cache, v_cache) = kv.layer_caches(layer_idx);
-                    let (k_scale, v_scale) = kv.layer_scales(layer_idx);
-                    let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
-
-                    let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
-                    for t in 0..token_count {
-                        let token_offset = t * kv_head_stride_bytes;
-                        enc.set_pipeline(&self.pipelines().turboquant_cache_write);
-                        enc.set_buffer(&bufs.k_proj, token_offset, 0);
-                        enc.set_buffer(&tq.rotation_signs, 0, 1);
-                        enc.set_buffer(k_cache, 0, 2);
-                        enc.set_bytes(&nkv.to_le_bytes(), 3);
-                        enc.set_bytes(&hd.to_le_bytes(), 4);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
-                        enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-                        enc.set_bytes(&n_bits.to_le_bytes(), 8);
-                        enc.set_buffer(k_scale, 0, 9);
-                        enc.set_buffer(&tq.k_codebook_buf, 0, 10);
-                        enc.set_buffer(&tq.k_boundaries_buf, 0, 11);
-                        enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 12);
-                        enc.set_buffer(&tq.qjl_matrix, 0, 13);
-                        enc.set_buffer(k_qjl_signs, 0, 14);
-                        enc.set_buffer(k_r_norms, 0, 15);
-                        enc.set_bytes(&1u32.to_le_bytes(), 16);
-                        enc.dispatch_threadgroups(
-                            (nkv as usize, 1, 1),
-                            ((hd as usize).min(1024), 1, 1),
-                        );
-                        enc.set_pipeline(&self.pipelines().turboquant_cache_write);
-                        enc.set_buffer(&bufs.v_proj, token_offset, 0);
-                        enc.set_buffer(&tq.rotation_signs, 0, 1);
-                        enc.set_buffer(v_cache, 0, 2);
-                        enc.set_bytes(&nkv.to_le_bytes(), 3);
-                        enc.set_bytes(&hd.to_le_bytes(), 4);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
-                        enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-                        enc.set_bytes(&n_bits.to_le_bytes(), 8);
-                        enc.set_buffer(v_scale, 0, 9);
-                        enc.set_buffer(&tq.v_codebook_buf, 0, 10);
-                        enc.set_buffer(&tq.v_boundaries_buf, 0, 11);
-                        enc.set_bytes(&tq.v_n_levels.to_le_bytes(), 12);
-                        enc.set_buffer(&tq.qjl_matrix, 0, 13);
-                        enc.set_buffer(k_qjl_signs, 0, 14);
-                        enc.set_buffer(k_r_norms, 0, 15);
-                        enc.set_bytes(&0u32.to_le_bytes(), 16);
-                        enc.dispatch_threadgroups(
-                            (nkv as usize, 1, 1),
-                            ((hd as usize).min(1024), 1, 1),
-                        );
-                    }
-
-                    let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
-                    for t in 0..token_count {
-                        let q_offset = t * q_head_stride_bytes;
-                        let attn_out_offset = t * q_head_stride_bytes;
-                        let current_seq_len = (seq_pos + t + 1) as u32;
-                        enc.set_pipeline(&self.pipelines().turboquant_attention);
-                        enc.set_buffer(&bufs.q_proj, q_offset, 0);
-                        enc.set_buffer(k_cache, 0, 1);
-                        enc.set_buffer(v_cache, 0, 2);
-                        enc.set_buffer(&tq.rotation_signs, 0, 3);
-                        enc.set_buffer(&bufs.attn_out, attn_out_offset, 4);
-                        enc.set_bytes(&nh.to_le_bytes(), 5);
-                        enc.set_bytes(&nkv.to_le_bytes(), 6);
-                        enc.set_bytes(&hd.to_le_bytes(), 7);
-                        enc.set_bytes(&max_seq.to_le_bytes(), 8);
-                        enc.set_bytes(&current_seq_len.to_le_bytes(), 9);
-                        enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
-                        enc.set_bytes(&n_bits.to_le_bytes(), 11);
-                        enc.set_buffer(k_scale, 0, 12);
-                        enc.set_buffer(v_scale, 0, 13);
-                        enc.set_buffer(&tq.k_codebook_buf, 0, 14);
-                        enc.set_buffer(&tq.v_codebook_buf, 0, 15);
-                        enc.set_buffer(&tq.qjl_matrix, 0, 16);
-                        enc.set_buffer(k_r_norms, 0, 17);
-                        enc.dispatch_threadgroups(
-                            (nh as usize, 1, 1),
-                            ((hd as usize).min(1024), 1, 1),
-                        );
-                    }
-                }
-                enc.end_encoding();
-            } else {
-                let fp16_kv = self
-                    .fp16_kv_cache
-                    .as_ref()
-                    .expect("fp16_kv_cache must be initialized for FP16 KV cache path");
-                let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
-                let max_seq = self.config.max_seq_len as u32;
-
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-
-                ops::encode_kv_scatter(
-                    &enc,
-                    &self.pipelines().kv_scatter,
-                    &ops::KvScatterParams {
-                        proj: &bufs.k_proj,
-                        cache: k_cache,
-                        seq_pos: seq_pos as u32,
-                        token_count: token_count as u32,
-                        num_kv_heads: nkv,
-                        head_dim: hd,
-                        max_seq_len: max_seq,
-                    },
-                );
-                ops::encode_kv_scatter(
-                    &enc,
-                    &self.pipelines().kv_scatter,
-                    &ops::KvScatterParams {
-                        proj: &bufs.v_proj,
-                        cache: v_cache,
-                        seq_pos: seq_pos as u32,
-                        token_count: token_count as u32,
-                        num_kv_heads: nkv,
-                        head_dim: hd,
-                        max_seq_len: max_seq,
-                    },
-                );
-
-                let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
-                for t in 0..token_count {
-                    let q_offset = t * q_head_stride_bytes;
-                    let attn_out_offset = t * q_head_stride_bytes;
-                    let current_seq_len = (seq_pos + t + 1) as u32;
-                    enc.set_pipeline(&self.pipelines().standard_attention);
-                    enc.set_buffer(&bufs.q_proj, q_offset, 0);
-                    enc.set_buffer(k_cache, 0, 1);
-                    enc.set_buffer(v_cache, 0, 2);
-                    enc.set_buffer(&bufs.attn_out, attn_out_offset, 3);
-                    enc.set_bytes(&nh.to_le_bytes(), 4);
-                    enc.set_bytes(&nkv.to_le_bytes(), 5);
-                    enc.set_bytes(&hd.to_le_bytes(), 6);
-                    enc.set_bytes(&max_seq.to_le_bytes(), 7);
-                    enc.set_bytes(&current_seq_len.to_le_bytes(), 8);
-                    enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
-                }
-                enc.end_encoding();
-            }
+            // Steps 7-8: KV cache write + attention
+            encode_kv_cache_and_attention(
+                &cmd_buf,
+                pipelines,
+                bufs,
+                self.turboquant.as_ref(),
+                self.kv_cache.as_ref(),
+                self.fp16_kv_cache.as_ref(),
+                self.config.max_seq_len,
+                self.config.n_bits,
+                layer_idx,
+                seq_pos,
+                token_count,
+                nh,
+                nkv,
+                hd,
+                enable_tq,
+            )?;
 
             // Step 9: Output projection
-            match &lw.o_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.attn_out,
-                                packed_buf,
-                                &bufs.ffn_down,
-                                h as u32,
-                                (mc.num_attention_heads * mc.head_dim) as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let attn_mat = MpsMatrix::from_buffer(
-                                &bufs.attn_out,
-                                token_count,
-                                mc.num_attention_heads * mc.head_dim,
-                                row_bytes_qo,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let o_weight_mat = MpsMatrix::from_buffer(
-                                buf,
-                                h,
-                                mc.num_attention_heads * mc.head_dim,
-                                row_bytes_qo,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let ffn_down_mat_for_o =
-                                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.o.dense().encode(
-                                &cmd_buf,
-                                &attn_mat,
-                                &o_weight_mat,
-                                &ffn_down_mat_for_o,
-                            );
-                        }
-                    } else {
-                        let attn_mat = MpsMatrix::from_buffer(
-                            &bufs.attn_out,
-                            token_count,
-                            mc.num_attention_heads * mc.head_dim,
-                            row_bytes_qo,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let o_weight_mat = MpsMatrix::from_buffer(
-                            buf,
-                            h,
-                            mc.num_attention_heads * mc.head_dim,
-                            row_bytes_qo,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let ffn_down_mat_for_o =
-                            MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.o.dense().encode(
-                            &cmd_buf,
-                            &attn_mat,
-                            &o_weight_mat,
-                            &ffn_down_mat_for_o,
-                        );
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.attn_out,
-                        q,
-                        &bufs.ffn_down,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-                WeightBuffer::AffineQuantized(aq) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
-                    enc.end_encoding();
-                    let (n, k) = aq.shape;
-                    let input_mat = MpsMatrix::from_buffer(&bufs.attn_out, token_count, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_down, token_count, n, n * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.o.dense()
-                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
-                }
-            }
+            let attn_mat = MpsMatrix::from_buffer(
+                &bufs.attn_out,
+                token_count,
+                mc.num_attention_heads * mc.head_dim,
+                row_bytes_qo,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            encode_projection(
+                &cmd_buf,
+                &bufs.attn_out,
+                &attn_mat,
+                &lw.o_proj,
+                &bufs.ffn_down,
+                &lm.o,
+                pipelines,
+                token_count,
+                h,
+                mc.num_attention_heads * mc.head_dim,
+                row_bytes_qo,
+                row_bytes_h,
+            )?;
 
             // Step 10-11 (fused): Residual add + post-attention RMSNorm
             {
@@ -2194,7 +1116,7 @@ impl MetalInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_fused_residual_rms_norm(
                     &enc,
-                    &self.pipelines().fused_residual_rms_norm,
+                    &pipelines.fused_residual_rms_norm,
                     &ops::FusedResidualRmsNormParams {
                         a: &bufs.hidden_state,
                         b: &bufs.ffn_down,
@@ -2243,326 +1165,26 @@ impl MetalInference {
                 .queue
                 .command_buffer()
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let pipelines = self.pipelines();
 
-            // Steps 12-13: Gate and Up projections
-            let norm_mat2 = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            // Steps 12-15: FFN block (gate + up + SiLU + down)
+            encode_ffn_block(&cmd_buf, pipelines, bufs, lw, lm, h, inter, token_count)?;
 
-            // Gate projection
-            match &lw.gate_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.norm_out,
-                                packed_buf,
-                                &bufs.ffn_gate,
-                                inter as u32,
-                                h as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let gate_weight_mat =
-                                MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let gate_result_mat = MpsMatrix::from_buffer(
-                                &bufs.ffn_gate,
-                                token_count,
-                                inter,
-                                row_bytes_inter,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.gate.dense().encode(
-                                &cmd_buf,
-                                &norm_mat2,
-                                &gate_weight_mat,
-                                &gate_result_mat,
-                            );
-                        }
-                    } else {
-                        let gate_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let gate_result_mat = MpsMatrix::from_buffer(
-                            &bufs.ffn_gate,
-                            token_count,
-                            inter,
-                            row_bytes_inter,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.gate.dense().encode(
-                            &cmd_buf,
-                            &norm_mat2,
-                            &gate_weight_mat,
-                            &gate_result_mat,
-                        );
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.norm_out,
-                        q,
-                        &bufs.ffn_gate,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-                WeightBuffer::AffineQuantized(aq) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
-                    enc.end_encoding();
-                    let (n, k) = aq.shape;
-                    let input_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, n, n * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.gate
-                        .dense()
-                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
-                }
-            }
-
-            // Up projection
-            match &lw.up_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.norm_out,
-                                packed_buf,
-                                &bufs.ffn_up,
-                                inter as u32,
-                                h as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let up_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let up_result_mat = MpsMatrix::from_buffer(
-                                &bufs.ffn_up,
-                                token_count,
-                                inter,
-                                row_bytes_inter,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.up.dense().encode(
-                                &cmd_buf,
-                                &norm_mat2,
-                                &up_weight_mat,
-                                &up_result_mat,
-                            );
-                        }
-                    } else {
-                        let up_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let up_result_mat = MpsMatrix::from_buffer(
-                            &bufs.ffn_up,
-                            token_count,
-                            inter,
-                            row_bytes_inter,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.up
-                            .dense()
-                            .encode(&cmd_buf, &norm_mat2, &up_weight_mat, &up_result_mat);
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.norm_out,
-                        q,
-                        &bufs.ffn_up,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-                WeightBuffer::AffineQuantized(aq) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
-                    enc.end_encoding();
-                    let (n, k) = aq.shape;
-                    let input_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_up, token_count, n, n * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.up
-                        .dense()
-                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
-                }
-            }
-
-            // Step 14: SiLU gate
-            {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_silu_gate(
-                    &enc,
-                    &self.pipelines().silu_gate,
-                    &bufs.ffn_gate,
-                    &bufs.ffn_up,
-                    &bufs.ffn_gate,
-                    (token_count * inter) as u32,
-                );
-                enc.end_encoding();
-            }
-
-            // Step 15: Down projection
-            match &lw.down_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.ffn_gate,
-                                packed_buf,
-                                &bufs.ffn_down,
-                                h as u32,
-                                inter as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let gate_out_mat = MpsMatrix::from_buffer(
-                                &bufs.ffn_gate,
-                                token_count,
-                                inter,
-                                row_bytes_inter,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let down_weight_mat =
-                                MpsMatrix::from_buffer(buf, h, inter, row_bytes_inter)
-                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let down_result_mat =
-                                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.down.dense().encode(
-                                &cmd_buf,
-                                &gate_out_mat,
-                                &down_weight_mat,
-                                &down_result_mat,
-                            );
-                        }
-                    } else {
-                        let gate_out_mat = MpsMatrix::from_buffer(
-                            &bufs.ffn_gate,
-                            token_count,
-                            inter,
-                            row_bytes_inter,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let down_weight_mat =
-                            MpsMatrix::from_buffer(buf, h, inter, row_bytes_inter)
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let down_result_mat =
-                            MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.down.dense().encode(
-                            &cmd_buf,
-                            &gate_out_mat,
-                            &down_weight_mat,
-                            &down_result_mat,
-                        );
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.ffn_gate,
-                        q,
-                        &bufs.ffn_down,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-                WeightBuffer::AffineQuantized(aq) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
-                    enc.end_encoding();
-                    let (n, k) = aq.shape;
-                    let input_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_down, token_count, n, n * 2)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.down
-                        .dense()
-                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
-                }
-            }
-
-            // Step 16: Residual add + next layer's input norm (or standalone residual for last layer)
-            if layer_idx + 1 < mc.num_hidden_layers {
-                let next_lw = &weights.layers[layer_idx + 1];
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_fused_residual_rms_norm(
-                    &enc,
-                    &self.pipelines().fused_residual_rms_norm,
-                    &ops::FusedResidualRmsNormParams {
-                        a: &bufs.residual,
-                        b: &bufs.ffn_down,
-                        weight: &next_lw.input_norm,
-                        normed_output: &bufs.norm_out,
-                        residual_output: &bufs.hidden_state,
-                        eps,
-                        hidden_size: h as u32,
-                        token_count: token_count as u32,
-                    },
-                );
-                enc.end_encoding();
+            // Step 16: Residual add + next layer's input norm (or standalone for last layer)
+            let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
+                Some(&weights.layers[layer_idx + 1].input_norm)
             } else {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_residual_add(
-                    &enc,
-                    &self.pipelines().residual_add,
-                    &bufs.residual,
-                    &bufs.ffn_down,
-                    &bufs.hidden_state,
-                    (token_count * h) as u32,
-                );
-                enc.end_encoding();
-            }
+                None
+            };
+            encode_end_of_layer_residual(
+                &cmd_buf,
+                pipelines,
+                bufs,
+                next_norm,
+                h,
+                token_count,
+                eps,
+            )?;
 
             // ── End-of-layer commit ─────────────────────────────
             // This makes norm_out readable for the next iteration's attn_norm capture
@@ -2939,6 +1561,508 @@ fn encode_polarquant_matmul(
             ((n + tile_n - 1) / tile_n, (m + tile_m - 1) / tile_m, 1),
             (tile_n, tile_m, 1),
         );
+    }
+    Ok(())
+}
+
+// ── Shared decode helpers ──────────────────────────────────────
+
+/// Encode QK normalization (Qwen3) and RoPE for Q and K projections.
+fn encode_qk_norm_and_rope(
+    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    pipelines: &super::ops::MetalPipelines,
+    bufs: &IntermediateBuffers,
+    q_norm: Option<&MetalBuffer>,
+    k_norm: Option<&MetalBuffer>,
+    rope_cos: &MetalBuffer,
+    rope_sin: &MetalBuffer,
+    nh: u32,
+    nkv: u32,
+    hd: u32,
+    seq_pos: usize,
+    token_count: usize,
+    eps: f32,
+) -> Result<(), InferenceError> {
+    if let (Some(q_norm_w), Some(k_norm_w)) = (q_norm, k_norm) {
+        let enc = cmd_buf
+            .compute_encoder()
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        ops::encode_rms_norm(
+            &enc,
+            &pipelines.rms_norm,
+            &ops::RmsNormParams {
+                input: &bufs.q_proj,
+                weight: q_norm_w,
+                output: &bufs.q_proj,
+                hidden_size: hd,
+                token_count: token_count as u32 * nh,
+                eps,
+            },
+        );
+        ops::encode_rms_norm(
+            &enc,
+            &pipelines.rms_norm,
+            &ops::RmsNormParams {
+                input: &bufs.k_proj,
+                weight: k_norm_w,
+                output: &bufs.k_proj,
+                hidden_size: hd,
+                token_count: token_count as u32 * nkv,
+                eps,
+            },
+        );
+        enc.end_encoding();
+    }
+
+    {
+        let enc = cmd_buf
+            .compute_encoder()
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        ops::encode_rope(
+            &enc,
+            &pipelines.rope,
+            &ops::RopeParams {
+                qk: &bufs.q_proj,
+                cos_cache: rope_cos,
+                sin_cache: rope_sin,
+                num_heads: nh,
+                head_dim: hd,
+                seq_offset: seq_pos as u32,
+                token_count: token_count as u32,
+            },
+        );
+        ops::encode_rope(
+            &enc,
+            &pipelines.rope,
+            &ops::RopeParams {
+                qk: &bufs.k_proj,
+                cos_cache: rope_cos,
+                sin_cache: rope_sin,
+                num_heads: nkv,
+                head_dim: hd,
+                seq_offset: seq_pos as u32,
+                token_count: token_count as u32,
+            },
+        );
+        enc.end_encoding();
+    }
+
+    Ok(())
+}
+
+/// Encode KV cache write and attention dispatch.
+///
+/// Handles TurboQuant (outlier and standard) and FP16 KV cache paths.
+fn encode_kv_cache_and_attention(
+    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    pipelines: &super::ops::MetalPipelines,
+    bufs: &IntermediateBuffers,
+    turboquant: Option<&MetalTurboQuantModel>,
+    kv_cache: Option<&MetalKvCache>,
+    fp16_kv_cache: Option<&Fp16KvCache>,
+    max_seq_len: usize,
+    n_bits: usize,
+    layer_idx: usize,
+    seq_pos: usize,
+    token_count: usize,
+    nh: u32,
+    nkv: u32,
+    hd: u32,
+    enable_tq: bool,
+) -> Result<(), InferenceError> {
+    let max_seq = max_seq_len as u32;
+    let n_bits = n_bits as u32;
+
+    if enable_tq {
+        let tq = turboquant.expect("turboquant must be initialized when enable_tq is true");
+        let kv = kv_cache.expect("kv_cache must be initialized when enable_tq is true");
+
+        let enc = cmd_buf
+            .compute_encoder()
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+        if let Some(ref outlier) = tq.outlier {
+            // ── Outlier channel strategy dispatch ──
+            let ((k_o_cache, v_o_cache), (k_n_cache, v_n_cache)) =
+                kv.layer_outlier_caches(layer_idx);
+            let ((k_o_scale, v_o_scale), (k_n_scale, v_n_scale)) =
+                kv.layer_outlier_scales(layer_idx);
+            let (k_o_r_norms, k_n_r_norms) = kv.layer_outlier_r_norms(layer_idx);
+            let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
+            let tg_size = std::cmp::max(
+                outlier.d_outlier_padded as usize,
+                outlier.d_non_padded as usize,
+            );
+
+            for t in 0..token_count {
+                let token_offset = t * kv_head_stride_bytes;
+                // K cache: (b-1)-bit codebook + QJL
+                enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
+                enc.set_buffer(&bufs.k_proj, token_offset, 0);
+                enc.set_buffer(&outlier.channel_indices, 0, 1);
+                enc.set_buffer(k_o_cache, 0, 2);
+                enc.set_buffer(k_n_cache, 0, 3);
+                enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
+                enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
+                enc.set_buffer(&outlier.k_outlier_codebook, 0, 6);
+                enc.set_buffer(&outlier.k_outlier_boundaries, 0, 7);
+                enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 8);
+                enc.set_buffer(&outlier.k_non_outlier_boundaries, 0, 9);
+                enc.set_buffer(k_o_scale, 0, 10);
+                enc.set_buffer(k_n_scale, 0, 11);
+                enc.set_bytes(&nkv.to_le_bytes(), 12);
+                enc.set_bytes(&hd.to_le_bytes(), 13);
+                enc.set_bytes(&max_seq.to_le_bytes(), 14);
+                enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
+                enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
+                enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
+                enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
+                enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 19);
+                enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 20);
+                enc.set_bytes(&1u32.to_le_bytes(), 21); // is_k_cache = 1
+                enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
+                enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
+                enc.set_buffer(k_o_r_norms, 0, 24);
+                enc.set_buffer(k_n_r_norms, 0, 25);
+                enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
+                // V cache: b-bit codebook, no QJL
+                enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
+                enc.set_buffer(&bufs.v_proj, token_offset, 0);
+                enc.set_buffer(&outlier.channel_indices, 0, 1);
+                enc.set_buffer(v_o_cache, 0, 2);
+                enc.set_buffer(v_n_cache, 0, 3);
+                enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
+                enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
+                enc.set_buffer(&outlier.outlier_codebook, 0, 6);
+                enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
+                enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
+                enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
+                enc.set_buffer(v_o_scale, 0, 10);
+                enc.set_buffer(v_n_scale, 0, 11);
+                enc.set_bytes(&nkv.to_le_bytes(), 12);
+                enc.set_bytes(&hd.to_le_bytes(), 13);
+                enc.set_bytes(&max_seq.to_le_bytes(), 14);
+                enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
+                enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
+                enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
+                enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
+                enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
+                enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
+                enc.set_bytes(&0u32.to_le_bytes(), 21); // is_k_cache = 0
+                enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
+                enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
+                enc.set_buffer(k_o_r_norms, 0, 24);
+                enc.set_buffer(k_n_r_norms, 0, 25);
+                enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
+            }
+
+            let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
+            for t in 0..token_count {
+                let q_offset = t * q_head_stride_bytes;
+                let attn_out_offset = t * q_head_stride_bytes;
+                let current_seq_len = (seq_pos + t + 1) as u32;
+                enc.set_pipeline(&pipelines.turboquant_outlier_attention);
+                enc.set_buffer(&bufs.q_proj, q_offset, 0);
+                enc.set_buffer(k_o_cache, 0, 1);
+                enc.set_buffer(v_o_cache, 0, 2);
+                enc.set_buffer(k_n_cache, 0, 3);
+                enc.set_buffer(v_n_cache, 0, 4);
+                enc.set_buffer(&outlier.channel_indices, 0, 5);
+                enc.set_buffer(&outlier.outlier_rotation_signs, 0, 6);
+                enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 7);
+                enc.set_buffer(&outlier.k_outlier_codebook, 0, 8);
+                enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 9);
+                enc.set_buffer(&bufs.attn_out, attn_out_offset, 10);
+                enc.set_buffer(k_o_scale, 0, 11);
+                enc.set_buffer(v_o_scale, 0, 12);
+                enc.set_buffer(k_n_scale, 0, 13);
+                enc.set_buffer(v_n_scale, 0, 14);
+                enc.set_bytes(&nh.to_le_bytes(), 15);
+                enc.set_bytes(&nkv.to_le_bytes(), 16);
+                enc.set_bytes(&hd.to_le_bytes(), 17);
+                enc.set_bytes(&max_seq.to_le_bytes(), 18);
+                enc.set_bytes(&current_seq_len.to_le_bytes(), 19);
+                enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 20);
+                enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 21);
+                enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 22);
+                enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 23);
+                enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 24);
+                enc.set_buffer(k_o_r_norms, 0, 25);
+                enc.set_buffer(k_n_r_norms, 0, 26);
+                enc.set_buffer(&outlier.outlier_codebook, 0, 27);
+                enc.set_buffer(&outlier.non_outlier_codebook, 0, 28);
+                enc.dispatch_threadgroups((nh as usize, 1, 1), (tg_size.min(1024), 1, 1));
+            }
+        } else {
+            // ── Standard TurboQuant dispatch ──
+            let (k_cache, v_cache) = kv.layer_caches(layer_idx);
+            let (k_scale, v_scale) = kv.layer_scales(layer_idx);
+            let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
+
+            let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
+            for t in 0..token_count {
+                let token_offset = t * kv_head_stride_bytes;
+                // K cache write: (b-1)-bit codebook + QJL
+                enc.set_pipeline(&pipelines.turboquant_cache_write);
+                enc.set_buffer(&bufs.k_proj, token_offset, 0);
+                enc.set_buffer(&tq.rotation_signs, 0, 1);
+                enc.set_buffer(k_cache, 0, 2);
+                enc.set_bytes(&nkv.to_le_bytes(), 3);
+                enc.set_bytes(&hd.to_le_bytes(), 4);
+                enc.set_bytes(&max_seq.to_le_bytes(), 5);
+                enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
+                enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+                enc.set_bytes(&n_bits.to_le_bytes(), 8);
+                enc.set_buffer(k_scale, 0, 9);
+                enc.set_buffer(&tq.k_codebook_buf, 0, 10);
+                enc.set_buffer(&tq.k_boundaries_buf, 0, 11);
+                enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 12);
+                enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                enc.set_buffer(k_qjl_signs, 0, 14);
+                enc.set_buffer(k_r_norms, 0, 15);
+                enc.set_bytes(&1u32.to_le_bytes(), 16);
+                enc.dispatch_threadgroups((nkv as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
+                // V cache write: b-bit codebook, no QJL
+                enc.set_pipeline(&pipelines.turboquant_cache_write);
+                enc.set_buffer(&bufs.v_proj, token_offset, 0);
+                enc.set_buffer(&tq.rotation_signs, 0, 1);
+                enc.set_buffer(v_cache, 0, 2);
+                enc.set_bytes(&nkv.to_le_bytes(), 3);
+                enc.set_bytes(&hd.to_le_bytes(), 4);
+                enc.set_bytes(&max_seq.to_le_bytes(), 5);
+                enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
+                enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+                enc.set_bytes(&n_bits.to_le_bytes(), 8);
+                enc.set_buffer(v_scale, 0, 9);
+                enc.set_buffer(&tq.v_codebook_buf, 0, 10);
+                enc.set_buffer(&tq.v_boundaries_buf, 0, 11);
+                enc.set_bytes(&tq.v_n_levels.to_le_bytes(), 12);
+                enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                enc.set_buffer(k_qjl_signs, 0, 14);
+                enc.set_buffer(k_r_norms, 0, 15);
+                enc.set_bytes(&0u32.to_le_bytes(), 16);
+                enc.dispatch_threadgroups((nkv as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
+            }
+
+            let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
+            for t in 0..token_count {
+                let q_offset = t * q_head_stride_bytes;
+                let attn_out_offset = t * q_head_stride_bytes;
+                let current_seq_len = (seq_pos + t + 1) as u32;
+                enc.set_pipeline(&pipelines.turboquant_attention);
+                enc.set_buffer(&bufs.q_proj, q_offset, 0);
+                enc.set_buffer(k_cache, 0, 1);
+                enc.set_buffer(v_cache, 0, 2);
+                enc.set_buffer(&tq.rotation_signs, 0, 3);
+                enc.set_buffer(&bufs.attn_out, attn_out_offset, 4);
+                enc.set_bytes(&nh.to_le_bytes(), 5);
+                enc.set_bytes(&nkv.to_le_bytes(), 6);
+                enc.set_bytes(&hd.to_le_bytes(), 7);
+                enc.set_bytes(&max_seq.to_le_bytes(), 8);
+                enc.set_bytes(&current_seq_len.to_le_bytes(), 9);
+                enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
+                enc.set_bytes(&n_bits.to_le_bytes(), 11);
+                enc.set_buffer(k_scale, 0, 12);
+                enc.set_buffer(v_scale, 0, 13);
+                enc.set_buffer(&tq.k_codebook_buf, 0, 14);
+                enc.set_buffer(&tq.v_codebook_buf, 0, 15);
+                enc.set_buffer(&tq.qjl_matrix, 0, 16);
+                enc.set_buffer(k_r_norms, 0, 17);
+                enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
+            }
+        }
+        enc.end_encoding();
+    } else {
+        // FP16 KV cache path — scatter projections into cache on GPU.
+        let fp16_kv =
+            fp16_kv_cache.expect("fp16_kv_cache must be initialized for FP16 KV cache path");
+        let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
+
+        let enc = cmd_buf
+            .compute_encoder()
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+        // Scatter K and V projections into their caches entirely on GPU.
+        ops::encode_kv_scatter(
+            &enc,
+            &pipelines.kv_scatter,
+            &ops::KvScatterParams {
+                proj: &bufs.k_proj,
+                cache: k_cache,
+                seq_pos: seq_pos as u32,
+                token_count: token_count as u32,
+                num_kv_heads: nkv,
+                head_dim: hd,
+                max_seq_len: max_seq,
+            },
+        );
+        ops::encode_kv_scatter(
+            &enc,
+            &pipelines.kv_scatter,
+            &ops::KvScatterParams {
+                proj: &bufs.v_proj,
+                cache: v_cache,
+                seq_pos: seq_pos as u32,
+                token_count: token_count as u32,
+                num_kv_heads: nkv,
+                head_dim: hd,
+                max_seq_len: max_seq,
+            },
+        );
+
+        // Standard attention — loop over tokens with causal
+        // masking so each token attends only to 0..seq_pos+t+1.
+        let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
+        for t in 0..token_count {
+            let q_offset = t * q_head_stride_bytes;
+            let attn_out_offset = t * q_head_stride_bytes;
+            let current_seq_len = (seq_pos + t + 1) as u32;
+            enc.set_pipeline(&pipelines.standard_attention);
+            enc.set_buffer(&bufs.q_proj, q_offset, 0);
+            enc.set_buffer(k_cache, 0, 1);
+            enc.set_buffer(v_cache, 0, 2);
+            enc.set_buffer(&bufs.attn_out, attn_out_offset, 3);
+            enc.set_bytes(&nh.to_le_bytes(), 4);
+            enc.set_bytes(&nkv.to_le_bytes(), 5);
+            enc.set_bytes(&hd.to_le_bytes(), 6);
+            enc.set_bytes(&max_seq.to_le_bytes(), 7);
+            enc.set_bytes(&current_seq_len.to_le_bytes(), 8);
+            enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
+        }
+        enc.end_encoding();
+    }
+
+    Ok(())
+}
+
+/// Encode the FFN block: gate + up projections, SiLU activation, and down projection.
+fn encode_ffn_block(
+    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    pipelines: &super::ops::MetalPipelines,
+    bufs: &IntermediateBuffers,
+    lw: &LayerWeights,
+    lm: &LayerMatmuls,
+    h: usize,
+    inter: usize,
+    token_count: usize,
+) -> Result<(), InferenceError> {
+    let row_bytes_h = h * 2;
+    let row_bytes_inter = inter * 2;
+
+    let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
+        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+    // Gate projection
+    encode_projection(
+        cmd_buf,
+        &bufs.norm_out,
+        &norm_mat,
+        &lw.gate_proj,
+        &bufs.ffn_gate,
+        &lm.gate,
+        pipelines,
+        token_count,
+        inter,
+        h,
+        row_bytes_h,
+        row_bytes_inter,
+    )?;
+
+    // Up projection
+    encode_projection(
+        cmd_buf,
+        &bufs.norm_out,
+        &norm_mat,
+        &lw.up_proj,
+        &bufs.ffn_up,
+        &lm.up,
+        pipelines,
+        token_count,
+        inter,
+        h,
+        row_bytes_h,
+        row_bytes_inter,
+    )?;
+
+    // SiLU gate
+    {
+        let enc = cmd_buf
+            .compute_encoder()
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        ops::encode_silu_gate(
+            &enc,
+            &pipelines.silu_gate,
+            &bufs.ffn_gate,
+            &bufs.ffn_up,
+            &bufs.ffn_gate, // in-place output into gate buffer
+            (token_count * inter) as u32,
+        );
+        enc.end_encoding();
+    }
+
+    // Down projection
+    let gate_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
+        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+    encode_projection(
+        cmd_buf,
+        &bufs.ffn_gate,
+        &gate_mat,
+        &lw.down_proj,
+        &bufs.ffn_down,
+        &lm.down,
+        pipelines,
+        token_count,
+        h,
+        inter,
+        row_bytes_inter,
+        row_bytes_h,
+    )?;
+
+    Ok(())
+}
+
+/// Encode end-of-layer residual: fused with next layer's norm, or standalone for the last layer.
+fn encode_end_of_layer_residual(
+    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    pipelines: &super::ops::MetalPipelines,
+    bufs: &IntermediateBuffers,
+    next_input_norm: Option<&MetalBuffer>,
+    h: usize,
+    token_count: usize,
+    eps: f32,
+) -> Result<(), InferenceError> {
+    if let Some(norm_weight) = next_input_norm {
+        let enc = cmd_buf
+            .compute_encoder()
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        ops::encode_fused_residual_rms_norm(
+            &enc,
+            &pipelines.fused_residual_rms_norm,
+            &ops::FusedResidualRmsNormParams {
+                a: &bufs.residual,
+                b: &bufs.ffn_down,
+                weight: norm_weight,
+                normed_output: &bufs.norm_out,
+                residual_output: &bufs.hidden_state,
+                eps,
+                hidden_size: h as u32,
+                token_count: token_count as u32,
+            },
+        );
+        enc.end_encoding();
+    } else {
+        let enc = cmd_buf
+            .compute_encoder()
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        ops::encode_residual_add(
+            &enc,
+            &pipelines.residual_add,
+            &bufs.residual,
+            &bufs.ffn_down,
+            &bufs.hidden_state,
+            (token_count * h) as u32,
+        );
+        enc.end_encoding();
     }
     Ok(())
 }
