@@ -29,6 +29,7 @@ pub mod iosurface;
 pub(crate) mod objc;
 pub mod perf;
 pub mod process;
+pub mod request;
 pub mod runtime;
 
 pub use buffers_ready::{InputBuffersReady, OutputSetEnqueue};
@@ -38,6 +39,7 @@ pub use error::AneSysError;
 pub use events::{SharedEvents, SharedSignalEvent, SharedWaitEvent};
 pub use iosurface::{AneBuffer, AneIOSurfaceObject};
 pub use perf::{PerformanceStats, PerformanceStatsIOSurface, QoSMapper};
+pub use request::{AneRequest, ChainingRequest};
 pub use runtime::AneRuntime;
 
 use std::ffi::c_void;
