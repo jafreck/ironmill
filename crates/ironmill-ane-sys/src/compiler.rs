@@ -118,10 +118,11 @@ impl AneCompiler {
         mil_text: &str,
         weights: &[(&str, &[u8])],
     ) -> Result<CompiledProgram, AneSysError> {
-        // 0. Check budget
-        let current = COMPILE_COUNT.load(Ordering::Relaxed);
-        if current >= ANE_COMPILE_LIMIT {
-            return Err(AneSysError::BudgetExhausted { count: current });
+        // 0. Check budget (atomic to avoid TOCTOU race)
+        let prev = COMPILE_COUNT.fetch_add(1, Ordering::SeqCst);
+        if prev >= ANE_COMPILE_LIMIT {
+            COMPILE_COUNT.fetch_sub(1, Ordering::SeqCst);
+            return Err(AneSysError::BudgetExhausted { count: prev });
         }
 
         if mil_text.is_empty() {
@@ -350,8 +351,6 @@ impl AneCompiler {
             CFRelease(mil_data);
             CFRelease(weight_dict);
         }
-
-        COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
 
         Ok(CompiledProgram { model })
     }
@@ -606,7 +605,7 @@ fn populate_tmp_dir(hex_id: &str, mil_text: &str, weights: &[(&str, &[u8])]) {
                 data.len(),
                 full_path.display()
             );
-            let blob = make_blobfile(data);
+            let blob = make_blobfile(data).unwrap_or_default();
             let _ = std::fs::write(&full_path, &blob);
         }
     }
@@ -619,8 +618,14 @@ fn populate_tmp_dir(hex_id: &str, mil_text: &str, weights: &[(&str, &[u8])]) {
 /// Create a BLOBFILE in Orion's format from raw weight data.
 ///
 /// Format: 128-byte header (file header + chunk descriptor) + data.
-pub fn make_blobfile(data: &[u8]) -> Vec<u8> {
+pub fn make_blobfile(data: &[u8]) -> Result<Vec<u8>, AneSysError> {
     let data_size = data.len();
+    if data_size > u32::MAX as usize {
+        return Err(AneSysError::InvalidInput(format!(
+            "BLOBFILE data size {} exceeds u32::MAX",
+            data_size
+        )));
+    }
     let total = 128 + data_size;
     let mut buf = vec![0u8; total];
 
@@ -642,7 +647,7 @@ pub fn make_blobfile(data: &[u8]) -> Vec<u8> {
     // Weight data (bytes 128+)
     buf[128..].copy_from_slice(data);
 
-    buf
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -654,7 +659,7 @@ fn build_multi_weight_dict(weights: &[(&str, &[u8])]) -> Result<*mut c_void, Ane
     let outer_dict = ns_mutable_dict()?;
 
     for (path_key, data) in weights {
-        let blob = make_blobfile(data);
+        let blob = make_blobfile(data)?;
         let data_nsdata = create_nsdata(&blob)?;
         let offset_num = create_nsnumber(64)?;
 

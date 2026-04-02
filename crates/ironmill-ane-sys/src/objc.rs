@@ -202,16 +202,27 @@ pub(crate) fn create_nsnumber(value: i64) -> Result<*mut c_void, AneSysError> {
 
 /// Create an `NSNumber` from an `i64` via `+[NSNumber numberWithLongLong:]`.
 /// Returns an autoreleased object.
-pub(crate) fn ns_number_autoreleased(value: i64) -> *mut c_void {
+pub(crate) fn ns_number_autoreleased(value: i64) -> Result<*mut c_void, AneSysError> {
     // SAFETY: objc_getClass with a valid null-terminated class name.
     let cls = unsafe { objc_getClass(sel!("NSNumber")) };
+    if cls.is_null() {
+        return Err(AneSysError::FrameworkNotFound(
+            "NSNumber class not found".into(),
+        ));
+    }
     type NumFn = unsafe extern "C" fn(*mut c_void, *mut c_void, i64) -> *mut c_void;
     // SAFETY: sel_registerName with a valid null-terminated selector.
     let sel = unsafe { sel_registerName(sel!("numberWithLongLong:")) };
     // SAFETY: transmute objc_msgSend to the correct signature.
     let f: NumFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
     // SAFETY: cls is a valid class pointer; value is a plain i64.
-    unsafe { f(cls, sel, value) }
+    let obj = unsafe { f(cls, sel, value) };
+    if obj.is_null() {
+        return Err(AneSysError::CompilationFailed(
+            "failed to create NSNumber (autoreleased)".into(),
+        ));
+    }
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -246,16 +257,27 @@ pub(crate) fn ns_empty_dict() -> Result<*mut c_void, AneSysError> {
 /// Create an empty `NSDictionary` (autoreleased, infallible).
 ///
 /// Used by the runtime where Foundation classes are already resolved.
-pub(crate) fn ns_empty_dict_unchecked() -> *mut c_void {
+pub(crate) fn ns_empty_dict_unchecked() -> Result<*mut c_void, AneSysError> {
     // SAFETY: objc_getClass with a valid null-terminated class name.
     let cls = unsafe { objc_getClass(sel!("NSDictionary")) };
+    if cls.is_null() {
+        return Err(AneSysError::FrameworkNotFound(
+            "NSDictionary class not found".into(),
+        ));
+    }
     type NewFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
     // SAFETY: sel_registerName with a valid null-terminated selector.
     let new_sel = unsafe { sel_registerName(sel!("new")) };
     // SAFETY: transmute objc_msgSend to the correct signature.
     let f: NewFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
     // SAFETY: sending +new to a valid class pointer.
-    unsafe { f(cls, new_sel) }
+    let obj = unsafe { f(cls, new_sel) };
+    if obj.is_null() {
+        return Err(AneSysError::CompilationFailed(
+            "failed to create NSDictionary (unchecked)".into(),
+        ));
+    }
+    Ok(obj)
 }
 
 /// Create an empty `NSMutableDictionary`.
@@ -299,16 +321,27 @@ pub(crate) fn ns_dict_set(dict: *mut c_void, key: *mut c_void, value: *mut c_voi
 // ---------------------------------------------------------------------------
 
 /// Create an empty `NSMutableArray`.
-pub(crate) fn ns_mutable_array() -> *mut c_void {
+pub(crate) fn ns_mutable_array() -> Result<*mut c_void, AneSysError> {
     // SAFETY: objc_getClass with a valid null-terminated class name.
     let cls = unsafe { objc_getClass(sel!("NSMutableArray")) };
+    if cls.is_null() {
+        return Err(AneSysError::FrameworkNotFound(
+            "NSMutableArray class not found".into(),
+        ));
+    }
     type NewFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
     // SAFETY: sel_registerName with a valid null-terminated selector.
     let new_sel = unsafe { sel_registerName(sel!("new")) };
     // SAFETY: transmute objc_msgSend to the correct signature.
     let f: NewFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
     // SAFETY: sending +new to a valid class pointer.
-    unsafe { f(cls, new_sel) }
+    let obj = unsafe { f(cls, new_sel) };
+    if obj.is_null() {
+        return Err(AneSysError::CompilationFailed(
+            "failed to create NSMutableArray".into(),
+        ));
+    }
+    Ok(obj)
 }
 
 /// Append an object to an `NSMutableArray`.
@@ -388,6 +421,8 @@ pub(crate) fn create_nsurl_from_path(path: &std::path::Path) -> Result<*mut c_vo
     // SAFETY: objc_getClass with a valid null-terminated class name.
     let nsurl_cls = unsafe { objc_getClass(sel!("NSURL")) };
     if nsurl_cls.is_null() {
+        // SAFETY: CFRelease on retained NSString.
+        unsafe { CFRelease(nsstring) };
         return Err(AneSysError::FrameworkNotFound(
             "NSURL class not found".into(),
         ));
@@ -402,6 +437,11 @@ pub(crate) fn create_nsurl_from_path(path: &std::path::Path) -> Result<*mut c_vo
     let send: FileUrlWithPathFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
     // SAFETY: nsurl_cls is a valid class; nsstring is a valid NSString.
     let url = unsafe { send(nsurl_cls, sel, nsstring) };
+
+    // Release the NSString now that NSURL has consumed it.
+    // SAFETY: CFRelease on retained NSString.
+    unsafe { CFRelease(nsstring) };
+
     if url.is_null() {
         return Err(AneSysError::CompilationFailed(
             "failed to create NSURL from path".into(),

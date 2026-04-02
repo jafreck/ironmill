@@ -94,6 +94,11 @@ impl MetalBuffer {
                 "cannot write_bytes to a Private buffer".into(),
             ));
         }
+        if self.mode == StorageMode::Managed {
+            return Err(MetalSysError::InvalidArgument(
+                "cannot write_bytes to a Managed buffer".into(),
+            ));
+        }
         let len = self.length();
         if offset.checked_add(data.len()).is_none_or(|end| end > len) {
             return Err(MetalSysError::InvalidArgument(format!(

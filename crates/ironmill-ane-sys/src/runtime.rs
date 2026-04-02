@@ -149,25 +149,25 @@ impl AneRuntime {
         }
 
         // Wrap inputs in _ANEIOSurfaceObject and build index arrays
-        let in_arr = ns_mutable_array();
-        let in_idx = ns_mutable_array();
+        let in_arr = ns_mutable_array()?;
+        let in_idx = ns_mutable_array()?;
         for (i, &surface) in input_surfaces.iter().enumerate() {
             let wrapped = self.wrap_iosurface(surface)?;
             ns_array_add(in_arr, wrapped);
-            ns_array_add(in_idx, ns_number_autoreleased(i as i64));
+            ns_array_add(in_idx, ns_number_autoreleased(i as i64)?);
         }
 
         // Wrap outputs
-        let out_arr = ns_mutable_array();
-        let out_idx = ns_mutable_array();
+        let out_arr = ns_mutable_array()?;
+        let out_idx = ns_mutable_array()?;
         for (i, &surface) in output_surfaces.iter().enumerate() {
             let wrapped = self.wrap_iosurface(surface)?;
             ns_array_add(out_arr, wrapped);
-            ns_array_add(out_idx, ns_number_autoreleased(i as i64));
+            ns_array_add(out_idx, ns_number_autoreleased(i as i64)?);
         }
 
         // Build _ANERequest
-        let zero = ns_number_autoreleased(0);
+        let zero = ns_number_autoreleased(0)?;
         type RequestFn = unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
@@ -217,7 +217,7 @@ impl AneRuntime {
         }
 
         // Evaluate: [model evaluateWithQoS:21 options:@{} request:req error:&e]
-        let empty_dict = ns_empty_dict_unchecked();
+        let empty_dict = ns_empty_dict_unchecked()?;
         let mut error: *mut c_void = std::ptr::null_mut();
 
         type EvalFn = unsafe extern "C" fn(
@@ -281,8 +281,7 @@ impl AneRuntime {
         ) -> i8;
         // SAFETY: transmute objc_msgSend to the correct signature.
         let load_fn: LoadFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        let empty_dict = ns_empty_dict_unchecked();
-        // SAFETY: program.model/sel/empty_dict are valid; error is a valid out-pointer.
+        let empty_dict = ns_empty_dict_unchecked()?;
         let ok = unsafe { load_fn(program.model, sel, ANE_QOS, empty_dict, &mut error) };
         // SAFETY: CFRelease on the dictionary.
         unsafe { CFRelease(empty_dict) };
