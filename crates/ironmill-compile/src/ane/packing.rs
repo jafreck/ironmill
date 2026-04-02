@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 
-use half::f16;
 use mil_rs::ir::{Operation, ScalarType, TensorType, Value};
 
 use crate::ane::split::SubProgram;
@@ -30,9 +29,6 @@ fn rewrite_refs(val: &mut Value, rename_map: &HashMap<String, String>) {
         _ => {}
     }
 }
-use crate::ane::Result;
-use ironmill_iosurface::AneTensor;
-
 use ironmill_core::ane::packing::InputPacking;
 
 // ---------------------------------------------------------------------------
@@ -191,36 +187,6 @@ pub fn pack_inputs(sub: &mut SubProgram) -> Option<InputPacking> {
         offsets,
         sizes: spatial_sizes,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Runtime helpers
-// ---------------------------------------------------------------------------
-
-/// Write multiple logical inputs into a single spatially-packed ANE tensor.
-///
-/// Each `inputs[i]` contains C elements for one token. They are placed
-/// at spatial offsets `packing.offsets[i]` within the packed tensor,
-/// mirroring the `slice_by_size` decomposition in the MIL.
-pub fn write_packed_inputs(
-    tensor: &mut AneTensor,
-    inputs: &[&[f16]],
-    packing: &InputPacking,
-) -> Result<()> {
-    let [_, channels, _, total_s] = tensor.shape();
-    let mut packed = vec![f16::ZERO; channels * total_s];
-    for (i, data) in inputs.iter().enumerate() {
-        if i >= packing.offsets.len() {
-            break;
-        }
-        let offset = packing.offsets[i];
-        let c = data.len().min(channels);
-        for ch in 0..c {
-            // NCHW layout: element (ch, s) is at flat index ch * total_s + s
-            packed[ch * total_s + offset] = data[ch];
-        }
-    }
-    Ok(tensor.write_f16(&packed)?)
 }
 
 // ---------------------------------------------------------------------------

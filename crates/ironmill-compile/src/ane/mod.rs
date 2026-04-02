@@ -16,18 +16,10 @@ pub enum AneCompileError {
     CompileFailed { status: u32, context: String },
     #[error("ANE evaluation failed (status {status}): {context}")]
     EvalFailed { status: u32, context: String },
-    #[error("IOSurface error: {0}")]
-    SurfaceError(String),
     #[error("compile budget exhausted: used {used} of {limit}")]
     BudgetExhausted { used: usize, limit: usize },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
-}
-
-impl From<ironmill_iosurface::IOSurfaceError> for AneCompileError {
-    fn from(e: ironmill_iosurface::IOSurfaceError) -> Self {
-        AneCompileError::SurfaceError(e.to_string())
-    }
 }
 
 /// Result type for ANE compilation operations.
