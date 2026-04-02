@@ -9,9 +9,9 @@ use serde::Deserialize;
 
 use super::pass::Pass;
 use super::passes::{
-    AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass,
-    ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass, GeluLinearFusionPass,
-    GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass,
+    AffineQuantizePass, AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass,
+    ConvBatchNormWeightFoldPass, ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass,
+    GeluLinearFusionPass, GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass,
     LayerNormLinearFusionPass, LayoutOptimizationPass, LinearReluFusionPass, PalettizePass,
     PolarQuantPass, PolarRotationFusionPass, ResidualAddFusionPass, ShapeMaterializePass,
     TypeRepropagationPass,
@@ -27,6 +27,7 @@ pub struct PassPipeline {
     passes: Vec<Box<dyn Pass>>,
     has_fp16: bool,
     has_int8: bool,
+    has_int4: bool,
     has_palettize: bool,
     has_polar_quant: bool,
 }
@@ -75,6 +76,7 @@ const KNOWN_PASSES: &[&str] = &[
     "type-repropagation",
     "fp16-quantization",
     "int8-quantization",
+    "int4-quantize",
     "palettization",
     "polar-quantization",
     "shape-materialization",
@@ -108,6 +110,13 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
                 _ => Granularity::PerChannel,
             };
             Ok(Box::new(Int8QuantizePass::new(cal_dir, granularity)))
+        }
+        "int4-quantize" => {
+            let group_size = params
+                .get("group_size")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(128) as usize;
+            Ok(Box::new(AffineQuantizePass::int4_per_group(group_size)))
         }
         "palettization" => {
             let n_bits_i64 = params
@@ -189,6 +198,7 @@ impl std::fmt::Debug for PassPipeline {
             .field("passes", &self.pass_names())
             .field("has_fp16", &self.has_fp16)
             .field("has_int8", &self.has_int8)
+            .field("has_int4", &self.has_int4)
             .field("has_palettize", &self.has_palettize)
             .field("has_polar_quant", &self.has_polar_quant)
             .finish()
@@ -227,6 +237,7 @@ impl PassPipeline {
             ],
             has_fp16: false,
             has_int8: false,
+            has_int4: false,
             has_palettize: false,
             has_polar_quant: false,
         }
@@ -264,6 +275,7 @@ impl PassPipeline {
         let mut passes: Vec<Box<dyn Pass>> = Vec::new();
         let mut has_fp16 = false;
         let mut has_int8 = false;
+        let mut has_int4 = false;
         let mut has_palettize = false;
         let mut has_polar_quant = false;
 
@@ -313,6 +325,20 @@ impl PassPipeline {
                     }
                     has_int8 = true;
                 }
+                "int4-quantize" => {
+                    if has_int8 {
+                        return Err(MilError::Validation(
+                            "INT4 and INT8 quantization are mutually exclusive".into(),
+                        ));
+                    }
+                    if has_polar_quant {
+                        return Err(MilError::Validation(
+                            "polar-quantization is mutually exclusive with int4 quantization"
+                                .into(),
+                        ));
+                    }
+                    has_int4 = true;
+                }
                 "palettization" => {
                     if has_int8 {
                         return Err(MilError::Validation(
@@ -345,6 +371,7 @@ impl PassPipeline {
             passes,
             has_fp16,
             has_int8,
+            has_int4,
             has_palettize,
             has_polar_quant,
         })
@@ -379,12 +406,69 @@ impl PassPipeline {
                 "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
             ));
         }
+        if self.has_int4 {
+            return Err(MilError::Validation(
+                "INT4 and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
         self.has_int8 = true;
         self.passes.push(Box::new(Int8QuantizePass::new(
             cal_dir,
             Granularity::PerChannel,
         )));
         Ok(self)
+    }
+
+    /// Add INT4 affine weight quantization with per-group granularity.
+    ///
+    /// Inserts `AffineQuantizePass::int4_per_group(group_size)` after fusion
+    /// passes. Mutually exclusive with INT8 and polar quantization.
+    pub fn with_int4(mut self, group_size: usize) -> Result<Self> {
+        if self.has_int8 {
+            return Err(MilError::Validation(
+                "INT4 and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_polar_quant {
+            return Err(MilError::Validation(
+                "polar-quantization is mutually exclusive with int4 quantization".into(),
+            ));
+        }
+        if self.has_palettize {
+            return Err(MilError::Validation(
+                "palettization is mutually exclusive with int4 quantization".into(),
+            ));
+        }
+        self.has_int4 = true;
+        // Insert before type-repropagation (last pass in default pipeline).
+        let insert_pos = self
+            .passes
+            .iter()
+            .position(|p| p.name() == "type-repropagation")
+            .unwrap_or(self.passes.len());
+        self.passes.insert(
+            insert_pos,
+            Box::new(AffineQuantizePass::int4_per_group(group_size)),
+        );
+        Ok(self)
+    }
+
+    /// Add AWQ (Activation-aware Weight Quantization).
+    ///
+    /// Stub: calibration-data-aware quantization is not yet implemented.
+    pub fn with_awq(self, _group_size: usize) -> Result<Self> {
+        Err(MilError::Validation(
+            "AWQ requires calibration data and is not yet implemented".into(),
+        ))
+    }
+
+    /// Add GPTQ weight quantization.
+    ///
+    /// Stub: calibration-data-aware quantization is not yet implemented.
+    pub fn with_gptq(self, _group_size: usize) -> Result<Self> {
+        Err(MilError::Validation(
+            "GPTQ requires calibration data and is not yet implemented".into(),
+        ))
     }
 
     /// Add weight palettization. Errors if INT8 is already added or palettization was already configured.
@@ -397,6 +481,11 @@ impl PassPipeline {
         if self.has_int8 {
             return Err(MilError::Validation(
                 "INT8 quantization and palettization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_int4 {
+            return Err(MilError::Validation(
+                "INT4 quantization and palettization are mutually exclusive".into(),
             ));
         }
         if self.has_polar_quant {
@@ -420,9 +509,9 @@ impl PassPipeline {
     /// at the specified bit-width (2 or 4). Automatically schedules
     /// the rotation fusion pass after quantization.
     pub fn with_polar_quant(mut self, n_bits: u8) -> Result<Self> {
-        if self.has_fp16 || self.has_int8 || self.has_palettize {
+        if self.has_fp16 || self.has_int8 || self.has_palettize || self.has_int4 {
             return Err(MilError::Validation(
-                "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
+                "polar-quantization is mutually exclusive with fp16/int4/int8/palettization".into(),
             ));
         }
         if n_bits != 2 && n_bits != 4 {
@@ -1115,5 +1204,104 @@ name = "dead-code-elimination"
 "#;
         let pipeline = PassPipeline::from_config_str(toml).unwrap();
         assert_eq!(pipeline.pass_names(), vec!["dead-code-elimination"]);
+    }
+
+    // ── INT4 pipeline tests ───────────────────────────────────────────
+
+    #[test]
+    fn with_int4_builds_pipeline() {
+        let pipeline = PassPipeline::new().with_int4(128).unwrap();
+        let names = pipeline.pass_names();
+        assert!(
+            names.contains(&"affine-quantization"),
+            "expected affine-quantization pass, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn with_int4_default_group_size() {
+        let pipeline = PassPipeline::new().with_int4(32).unwrap();
+        let names = pipeline.pass_names();
+        assert!(names.contains(&"affine-quantization"));
+    }
+
+    #[test]
+    fn int4_and_int8_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int8(None).unwrap();
+        let result = pipeline.with_int4(128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn int4_and_polar_quant_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_polar_quant(4).unwrap();
+        let result = pipeline.with_int4(128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn int4_plus_fp16_is_allowed() {
+        let pipeline = PassPipeline::new()
+            .with_fp16()
+            .unwrap()
+            .with_int4(128)
+            .unwrap();
+        let names = pipeline.pass_names();
+        assert!(names.contains(&"fp16-quantization"));
+        assert!(names.contains(&"affine-quantization"));
+    }
+
+    #[test]
+    fn config_int4_quantize() {
+        let toml = r#"
+[[passes]]
+name = "int4-quantize"
+[passes.params]
+group_size = 64
+"#;
+        let pipeline = PassPipeline::from_config_str(toml).unwrap();
+        assert_eq!(pipeline.pass_names(), vec!["affine-quantization"]);
+    }
+
+    #[test]
+    fn config_int4_quantize_default_group_size() {
+        let toml = r#"
+[[passes]]
+name = "int4-quantize"
+"#;
+        let pipeline = PassPipeline::from_config_str(toml).unwrap();
+        assert_eq!(pipeline.pass_names(), vec!["affine-quantization"]);
+    }
+
+    #[test]
+    fn awq_stub_returns_error() {
+        let result = PassPipeline::new().with_awq(128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("calibration data"),
+            "expected calibration error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn gptq_stub_returns_error() {
+        let result = PassPipeline::new().with_gptq(128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("calibration data"),
+            "expected calibration error, got: {err}"
+        );
     }
 }
