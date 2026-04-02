@@ -60,13 +60,22 @@ pub fn write_mlpackage(model: &Model, path: impl AsRef<Path>) -> Result<()> {
 
 /// Generate a random UUID v4 string (uppercase, no external dependency).
 fn random_uuid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    // Simple xorshift-based PRNG seeded from the clock.
-    let mut state = seed as u64 | 1;
+    let pid = std::process::id() as u64;
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // Combine time, PID, and counter to avoid collisions.
+    let seed = (nanos as u64) ^ (pid << 32) ^ count.wrapping_mul(0x9E3779B97F4A7C15);
+    // Simple xorshift-based PRNG seeded from the combined value.
+    let mut state = seed | 1;
     let mut bytes = [0u8; 16];
     for chunk in bytes.chunks_exact_mut(8) {
         state ^= state << 13;

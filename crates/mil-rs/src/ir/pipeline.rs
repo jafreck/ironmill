@@ -114,9 +114,9 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
                 .get("n_bits")
                 .and_then(|v| v.as_integer())
                 .unwrap_or(4);
-            if !matches!(n_bits_i64, 2 | 4 | 6 | 8) {
+            if !matches!(n_bits_i64, 1 | 2 | 4 | 6 | 8) {
                 return Err(MilError::Validation(format!(
-                    "palettize n_bits must be 2, 4, 6, or 8, got {n_bits_i64}"
+                    "palettize n_bits must be 1, 2, 4, 6, or 8, got {n_bits_i64}"
                 )));
             }
             let n_bits = n_bits_i64 as u8;

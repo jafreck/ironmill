@@ -5,7 +5,7 @@
 
 use half::f16;
 
-use crate::error::Result;
+use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::ScalarType;
@@ -103,7 +103,7 @@ impl Pass for PalettizePass {
                     } => {
                         let f = match dtype {
                             ScalarType::Float32 => tensor_as_f32_slice(data),
-                            ScalarType::Float16 => fp16_bytes_to_f32(data),
+                            ScalarType::Float16 => fp16_bytes_to_f32(data)?,
                             _ => unreachable!(),
                         };
                         (f, shape.clone(), *dtype)
@@ -195,7 +195,7 @@ impl Pass for GroupedPalettizePass {
                     } => {
                         let f = match dtype {
                             ScalarType::Float32 => tensor_as_f32_slice(data),
-                            ScalarType::Float16 => fp16_bytes_to_f32(data),
+                            ScalarType::Float16 => fp16_bytes_to_f32(data)?,
                             _ => unreachable!(),
                         };
                         (f, shape.clone(), *dtype)
@@ -383,14 +383,17 @@ fn bits_for(n: usize) -> u8 {
 }
 
 /// Convert raw FP16 little-endian bytes to `Vec<f32>`.
-fn fp16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
-    debug_assert!(
-        data.len() % 2 == 0,
-        "FP16 tensor data length must be a multiple of 2"
-    );
-    data.chunks_exact(2)
+fn fp16_bytes_to_f32(data: &[u8]) -> Result<Vec<f32>> {
+    if data.len() % 2 != 0 {
+        return Err(MilError::Validation(format!(
+            "FP16 tensor data length must be a multiple of 2, got {}",
+            data.len()
+        )));
+    }
+    Ok(data
+        .chunks_exact(2)
         .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-        .collect()
+        .collect())
 }
 
 /// Pack assignment indices into n-bit packed bytes.

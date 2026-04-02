@@ -5,7 +5,7 @@
 
 use half::f16;
 
-use crate::error::Result;
+use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
@@ -36,10 +36,10 @@ impl Pass for Fp16QuantizePass {
             // Convert operations in the function body.
             for op in &mut function.body.operations {
                 for value in op.inputs.values_mut() {
-                    quantize_value(value);
+                    quantize_value(value)?;
                 }
                 for value in op.attributes.values_mut() {
-                    quantize_value(value);
+                    quantize_value(value)?;
                 }
                 // Update output type annotations to match the new dtype.
                 for tt in op.output_types.iter_mut().flatten() {
@@ -76,14 +76,14 @@ impl Pass for Fp16QuantizePass {
 }
 
 /// Recursively quantize a [`Value`] from FP32 to FP16 where applicable.
-fn quantize_value(value: &mut Value) {
+fn quantize_value(value: &mut Value) -> Result<()> {
     match value {
         Value::Tensor {
             data,
             shape: _,
             dtype,
         } if *dtype == ScalarType::Float32 => {
-            *data = fp32_to_fp16_bytes(data);
+            *data = fp32_to_fp16_bytes(data)?;
             *dtype = ScalarType::Float16;
         }
         Value::Float(f) => {
@@ -102,22 +102,25 @@ fn quantize_value(value: &mut Value) {
         }
         Value::List(items) => {
             for item in items {
-                quantize_value(item);
+                quantize_value(item)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Convert raw FP32 bytes to FP16 bytes using truncation.
 ///
 /// Reads the input as little-endian `f32` values, converts each to `f16`
 /// via [`f16::from_f32`], and returns the resulting bytes.
-fn fp32_to_fp16_bytes(data: &[u8]) -> Vec<u8> {
-    debug_assert!(
-        data.len() % 4 == 0,
-        "FP32 tensor data length must be a multiple of 4"
-    );
+fn fp32_to_fp16_bytes(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() % 4 != 0 {
+        return Err(MilError::Validation(format!(
+            "FP32 tensor data length must be a multiple of 4, got {}",
+            data.len()
+        )));
+    }
 
     let mut out = Vec::with_capacity(data.len() / 2);
     for chunk in data.chunks_exact(4) {
@@ -125,7 +128,7 @@ fn fp32_to_fp16_bytes(data: &[u8]) -> Vec<u8> {
         let h = f16::from_f32(f);
         out.extend_from_slice(&h.to_le_bytes());
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]

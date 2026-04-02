@@ -82,7 +82,8 @@ fn cancel_inverse_transposes(block: &mut Block) {
             None => continue,
         };
 
-        if compose_perms(&perm_a, &perm_b).as_deref() == Some(&[0, 1, 2, 3]) {
+        let identity: Vec<usize> = (0..perm_a.len()).collect();
+        if compose_perms(&perm_a, &perm_b).as_deref() == Some(&identity[..]) {
             // Check single-consumer: op_a's output should only be consumed by op_b.
             if is_single_consumer(block, &b_input, bi) {
                 let a_input = match op_a.inputs.get("x") {
