@@ -29,6 +29,7 @@ pub mod iosurface;
 pub(crate) mod objc;
 pub mod perf;
 pub mod process;
+pub mod program;
 pub mod request;
 pub mod runtime;
 
@@ -39,6 +40,7 @@ pub use error::AneSysError;
 pub use events::{SharedEvents, SharedSignalEvent, SharedWaitEvent};
 pub use iosurface::{AneBuffer, AneIOSurfaceObject};
 pub use perf::{PerformanceStats, PerformanceStatsIOSurface, QoSMapper};
+pub use program::ProgramForEvaluation;
 pub use request::{AneRequest, ChainingRequest};
 pub use runtime::AneRuntime;
 
