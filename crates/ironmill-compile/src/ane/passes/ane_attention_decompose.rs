@@ -40,6 +40,19 @@ fn decompose_in_block(block: &mut Block) {
             continue;
         };
 
+        // If decomposition failed (missing required inputs), skip this op.
+        let new_ops = match new_ops {
+            Some(ops) => ops,
+            None => {
+                eprintln!(
+                    "warning: skipping decomposition of '{}' ({}): missing required input",
+                    block.operations[i].name, block.operations[i].op_type
+                );
+                i += 1;
+                continue;
+            }
+        };
+
         let original_output = block.operations[i]
             .outputs
             .first()
@@ -64,12 +77,11 @@ fn decompose_in_block(block: &mut Block) {
 }
 
 /// Resolve Q, K, V, and optional mask inputs from the SDPA op.
-fn get_input(op: &Operation, primary: &str, fallback: &str) -> Value {
+fn get_input(op: &Operation, primary: &str, fallback: &str) -> Option<Value> {
     op.inputs
         .get(primary)
         .or_else(|| op.inputs.get(fallback))
         .cloned()
-        .unwrap_or_else(|| Value::Reference("_unknown".into()))
 }
 
 fn get_mask(op: &Operation) -> Option<Value> {
@@ -80,11 +92,11 @@ fn get_mask(op: &Operation) -> Option<Value> {
 }
 
 /// Decompose a single SDPA op into matmul→scale→[mask→]softmax→matmul.
-fn decompose_sdpa(op: &Operation) -> Vec<Operation> {
+fn decompose_sdpa(op: &Operation) -> Option<Vec<Operation>> {
     let base = &op.name;
-    let q = get_input(op, "query", "q");
-    let k = get_input(op, "key", "k");
-    let v = get_input(op, "value", "v");
+    let q = get_input(op, "query", "q")?;
+    let k = get_input(op, "key", "k")?;
+    let v = get_input(op, "value", "v")?;
     let mask = get_mask(op);
 
     let output_name = op
@@ -168,20 +180,19 @@ fn decompose_sdpa(op: &Operation) -> Vec<Operation> {
             .with_output(&output_name),
     );
 
-    ops
+    Some(ops)
 }
-
 /// Decompose a single GQA op into matmul→scale→softmax→matmul.
 ///
 /// GQA inputs use uppercase names (`Q`, `K`, `V`) as produced by
 /// [`GqaFusionPass`](super::attention_fusion::GqaFusionPass).
 /// K/V head expansion is handled separately by the structural split,
 /// so this decomposition only produces the standard attention pattern.
-fn decompose_gqa(op: &Operation) -> Vec<Operation> {
+fn decompose_gqa(op: &Operation) -> Option<Vec<Operation>> {
     let base = &op.name;
-    let q = get_input(op, "Q", "query");
-    let k = get_input(op, "K", "key");
-    let v = get_input(op, "V", "value");
+    let q = get_input(op, "Q", "query")?;
+    let k = get_input(op, "K", "key")?;
+    let v = get_input(op, "V", "value")?;
     let mask = get_mask(op);
 
     let output_name = op
@@ -263,7 +274,7 @@ fn decompose_gqa(op: &Operation) -> Vec<Operation> {
             .with_output(&output_name),
     );
 
-    ops
+    Some(ops)
 }
 
 #[cfg(test)]

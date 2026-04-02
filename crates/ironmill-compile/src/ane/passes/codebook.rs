@@ -453,6 +453,7 @@ fn optimize_codebook_patterns(block: &mut Block) {
     }
 
     let mut remove_indices: Vec<usize> = Vec::new();
+    let mut insert_ops: Vec<(usize, Operation)> = Vec::new();
 
     for (pat_num, pattern) in patterns.iter().enumerate() {
         let num_codebooks = pattern.gathers.len();
@@ -493,22 +494,42 @@ fn optimize_codebook_patterns(block: &mut Block) {
         // Rewire downstream references.
         replace_reference(block, &pattern.final_output, &fused_output);
 
-        // Collect indices to remove.
+        // Track the position of the first matched op so we insert the fused op there.
+        let mut first_pattern_idx = usize::MAX;
         for g in &pattern.gathers {
+            first_pattern_idx = first_pattern_idx.min(g.const_idx).min(g.gather_idx);
             remove_indices.push(g.const_idx);
             remove_indices.push(g.gather_idx);
         }
+        for &ai in &pattern.add_indices {
+            first_pattern_idx = first_pattern_idx.min(ai);
+        }
         remove_indices.extend_from_slice(&pattern.add_indices);
 
-        // Append fused op.
-        block.operations.push(fused_op);
+        // Track where to insert the fused op (along with its index among
+        // old ops so we can adjust after removals).
+        insert_ops.push((first_pattern_idx, fused_op));
     }
 
-    // Remove old ops in reverse index order.
+    // Remove old ops in reverse index order, then insert fused ops at correct positions.
     remove_indices.sort_unstable();
     remove_indices.dedup();
-    for idx in remove_indices.into_iter().rev() {
+
+    // Sort insertions by position for stable processing.
+    insert_ops.sort_by_key(|(pos, _)| *pos);
+
+    // Remove old ops in reverse order.
+    for &idx in remove_indices.iter().rev() {
         block.operations.remove(idx);
+    }
+
+    // Adjust insert positions: for each insertion position, subtract the number
+    // of removed indices that were before it.
+    for (k, (orig_pos, fused_op)) in insert_ops.into_iter().enumerate() {
+        let removed_before = remove_indices.iter().filter(|&&ri| ri < orig_pos).count();
+        let adjusted = orig_pos - removed_before + k;
+        let clamped = adjusted.min(block.operations.len());
+        block.operations.insert(clamped, fused_op);
     }
 }
 

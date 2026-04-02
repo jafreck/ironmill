@@ -276,9 +276,15 @@ impl Pass for MixedPrecisionPass {
                         }
 
                         let val = if in_inputs {
-                            op.inputs.remove("val").unwrap()
+                            match op.inputs.remove("val") {
+                                Some(v) => v,
+                                None => continue,
+                            }
                         } else {
-                            op.attributes.remove("val").unwrap()
+                            match op.attributes.remove("val") {
+                                Some(v) => v,
+                                None => continue,
+                            }
                         };
 
                         if let Value::Tensor {
@@ -589,9 +595,15 @@ impl PerExpertQuantPass {
         }
 
         let val = if in_inputs {
-            op.inputs.remove("val").unwrap()
+            match op.inputs.remove("val") {
+                Some(v) => v,
+                None => return,
+            }
         } else {
-            op.attributes.remove("val").unwrap()
+            match op.attributes.remove("val") {
+                Some(v) => v,
+                None => return,
+            }
         };
 
         if let Value::Tensor { data, shape, dtype } = val {
@@ -717,9 +729,15 @@ impl Pass for PerExpertQuantPass {
                             continue;
                         }
                         let val = if in_inputs {
-                            op.inputs.remove("val").unwrap()
+                            match op.inputs.remove("val") {
+                                Some(v) => v,
+                                None => continue,
+                            }
                         } else {
-                            op.attributes.remove("val").unwrap()
+                            match op.attributes.remove("val") {
+                                Some(v) => v,
+                                None => continue,
+                            }
                         };
                         if let Value::Tensor {
                             data,

@@ -79,8 +79,31 @@ fn substitute_in_block(block: &mut Block) {
             if let Some(new_ops) = try_substitute_rsqrt(block, i) {
                 let original_output = op.outputs.first().cloned().unwrap();
                 let last_output = new_ops.last().unwrap().outputs.first().cloned().unwrap();
-                // Find and remove the sqrt op that feeds this real_div.
+                // Find the sqrt op that feeds this real_div.
                 let sqrt_idx = find_sqrt_feeding_real_div(block, i);
+
+                // Before removing sqrt, check if other ops reference its output.
+                let sqrt_has_other_consumers = sqrt_idx.is_some_and(|si| {
+                    let sqrt_output = block.operations[si]
+                        .outputs
+                        .first()
+                        .cloned()
+                        .unwrap_or_default();
+                    block.operations.iter().enumerate().any(|(idx, o)| {
+                        idx != i
+                            && idx != si
+                            && o.inputs
+                                .values()
+                                .any(|v| matches!(v, Value::Reference(n) if n == &sqrt_output))
+                    }) || block.outputs.contains(&sqrt_output)
+                });
+
+                // If another op consumes the sqrt output, skip the substitution.
+                if sqrt_has_other_consumers {
+                    i += 1;
+                    continue;
+                }
+
                 // Remove the real_div first (it's at index i).
                 block.operations.remove(i);
                 // If sqrt was before real_div, its index is still valid.
@@ -98,7 +121,9 @@ fn substitute_in_block(block: &mut Block) {
                         }
                         i = insert_at + count;
                     } else {
-                        // sqrt was after real_div (unusual).
+                        // sqrt was after real_div (unusual); adjust for real_div removal.
+                        let adj_si = si - 1;
+                        block.operations.remove(adj_si);
                         let count = new_ops.len();
                         for (j, new_op) in new_ops.into_iter().enumerate() {
                             block.operations.insert(i + j, new_op);
@@ -130,7 +155,7 @@ fn substitute_in_block(block: &mut Block) {
         }
 
         let replacements = match op.op_type.as_str() {
-            "gelu" => Some(substitute_gelu(op)),
+            "gelu" => substitute_gelu(op),
             _ => None,
         };
 
@@ -187,13 +212,9 @@ fn substitute_in_block(block: &mut Block) {
 ///   11. `mul`   — x · (1 + tanh(...))
 ///   12. `const` — 0.5
 ///   13. `mul`   — 0.5 · x · (1 + tanh(...))
-fn substitute_gelu(op: &Operation) -> Vec<Operation> {
+fn substitute_gelu(op: &Operation) -> Option<Vec<Operation>> {
     let base = &op.name;
-    let x_input = op
-        .inputs
-        .get("x")
-        .cloned()
-        .unwrap_or_else(|| Value::Reference("_unknown".into()));
+    let x_input = op.inputs.get("x").cloned()?;
 
     // Constants
     let coeff = 0.044715_f64;
@@ -289,7 +310,7 @@ fn substitute_gelu(op: &Operation) -> Vec<Operation> {
         .with_input("y", Value::Reference(x_times_inner_name.clone()))
         .with_output(&output_name);
 
-    vec![
+    Some(vec![
         mul_x_sq,
         mul_x_cu,
         coeff_const,
@@ -303,7 +324,7 @@ fn substitute_gelu(op: &Operation) -> Vec<Operation> {
         mul_x_inner,
         half_const,
         mul_half,
-    ]
+    ])
 }
 
 // ---- Pattern-based substitutions -------------------------------------------
