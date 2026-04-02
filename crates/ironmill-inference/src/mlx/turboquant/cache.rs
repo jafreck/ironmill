@@ -192,7 +192,11 @@ impl MlxKvCache {
             self.max_seq_len as u32,
             self.seq_pos as u32,
             self.n_bits as u32,
-            model.codebook.len() as u32, // n_levels
+            if is_k_cache {
+                model.k_codebook.len() as u32
+            } else {
+                model.v_codebook.len() as u32
+            },
             if is_k_cache { 1 } else { 0 },
         ];
         let params_bytes: Vec<u8> = params_data.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -210,17 +214,23 @@ impl MlxKvCache {
         let qjl_signs = &self.k_qjl_signs.as_ref().unwrap()[layer];
         let r_norms = &self.k_r_norms.as_ref().unwrap()[layer];
 
+        let (codebook_arr, boundaries_arr) = if is_k_cache {
+            (&model.k_codebook_arr, &model.k_boundaries_arr)
+        } else {
+            (&model.v_codebook_arr, &model.v_boundaries_arr)
+        };
+
         let inputs: Vec<&MlxArray> = vec![
-            kv_proj,               // 0
-            &self.rotation_signs,  // 1
-            cache,                 // 2
-            scales,                // 3
-            &model.codebook_arr,   // 4
-            &model.boundaries_arr, // 5
-            qjl,                   // 6
-            qjl_signs,             // 7
-            r_norms,               // 8
-            &params_arr,           // 9
+            kv_proj,              // 0
+            &self.rotation_signs, // 1
+            cache,                // 2
+            scales,               // 3
+            codebook_arr,         // 4
+            boundaries_arr,       // 5
+            qjl,                  // 6
+            qjl_signs,            // 7
+            r_norms,              // 8
+            &params_arr,          // 9
         ];
 
         let result = metal_kernel(
@@ -282,8 +292,8 @@ impl MlxKvCache {
             &self.rotation_signs,  // 3
             &self.k_scales[layer], // 4
             &self.v_scales[layer], // 5
-            &model.codebook_arr,   // 6: k_codebook
-            &model.codebook_arr,   // 7: v_codebook (same at 4-bit)
+            &model.k_codebook_arr, // 6: k_codebook ((b-1)-bit for QJL)
+            &model.v_codebook_arr, // 7: v_codebook (b-bit for MSE)
             qjl,                   // 8
             r_norms,               // 9
             &params_arr,           // 10

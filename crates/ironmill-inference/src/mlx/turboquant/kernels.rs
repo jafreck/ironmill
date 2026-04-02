@@ -241,6 +241,39 @@ inline void hadamard_rotate_inplace_cw(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        // Stage 2 (K cache only): QJL residual correction (Algorithm 2)
+        if (is_k_cache == 1) {
+            float local_sq_e = 0.0f;
+            for (uint d = tid; d < head_dim; d += tg_size) {
+                float normalized = shared_rotated[d] * inv_norm;
+                float dequant_val = codebook[uint(shared_quant[d])];
+                float residual = normalized - dequant_val;
+                shared_rotated[d] = residual;
+                local_sq_e += residual * residual;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            shared_reduce[tid] = local_sq_e;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tg_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            float r_e_norm = sqrt(max(shared_reduce[0], 1e-20f));
+            if (tid == 0)
+                r_norms_buf[head_idx * max_seq_len + seq_pos] = r_e_norm;
+
+            for (uint d = tid; d < head_dim; d += tg_size) {
+                float proj = 0.0f;
+                uint row_base = d * head_dim;
+                for (uint k = 0; k < head_dim; k++)
+                    proj += qjl_matrix[row_base + k] * shared_rotated[k];
+                uchar sign_bit = (proj >= 0.0f) ? uchar(0x8) : uchar(0x0);
+                shared_quant[d] = char(uchar(shared_quant[d]) | sign_bit);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
         // Pack INT4 nibbles
         uint packed_stride = head_dim / 2;
         uint cache_base = kv_cache_base_cw(head_idx, max_seq_len, head_dim, 4)
@@ -323,6 +356,21 @@ inline float read_quantized_tile_attn(threadgroup const char* tile,
     } else {
         return float(tile[pos * head_dim + dim]) * deq_scale;
     }
+}
+
+/// Read K value + QJL sign from a threadgroup-shared tile.
+/// Returns (k_mse_value, qjl_sign ±1.0).
+inline float2 read_k_quantized_tile_attn(threadgroup const char* tile,
+                                         uint pos, uint dim, uint head_dim,
+                                         float deq_scale,
+                                         device const float* k_codebook) {
+    uint packed_stride = head_dim / 2;
+    uint byte_idx = pos * packed_stride + dim / 2;
+    uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
+    uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
+    uchar idx = nibble & 0x7;
+    float sign_val = (nibble & 0x8) ? 1.0f : -1.0f;
+    return float2(k_codebook[idx] * deq_scale, sign_val);
 }
 
 inline void hadamard_rotate_inplace_attn(
@@ -427,6 +475,11 @@ inline void hadamard_rotate_inplace_attn(
 
     uint bytes_per_pos = (n_bits == 4) ? (head_dim / 2) : head_dim;
 
+    // QJL correction coefficient: √(π/2) / d per Algorithm 2
+    float qjl_factor = (n_bits == 4)
+        ? sqrt(3.14159265f / 2.0f) / float(head_dim)
+        : 0.0f;
+
     // Tiled flash attention
     for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
         uint tile_end = min(tile_start + TILE, seq_len);
@@ -440,14 +493,25 @@ inline void hadamard_rotate_inplace_attn(
             tile_scales[i] = k_scale_buf[kv_head * max_seq_len + tile_start + i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute QK^T
+        // Compute QK^T with QJL correction
         for (uint p = 0; p < actual_tile; p++) {
             float k_deq = tile_scales[p];
             float partial_dot = 0.0f;
-            for (uint d = tid; d < head_dim; d += tg_size) {
-                float k_val = read_quantized_tile_attn(
-                    kv_tile_raw, p, d, head_dim, n_bits, k_deq, k_codebook);
-                partial_dot += shared_q_rot[d] * k_val;
+            float partial_qjl = 0.0f;
+
+            if (n_bits == 4) {
+                for (uint d = tid; d < head_dim; d += tg_size) {
+                    float2 kq = read_k_quantized_tile_attn(
+                        kv_tile_raw, p, d, head_dim, k_deq, k_codebook);
+                    partial_dot += shared_q_rot[d] * kq.x;
+                    partial_qjl += shared_s_q[d] * kq.y;
+                }
+            } else {
+                for (uint d = tid; d < head_dim; d += tg_size) {
+                    float k_val = read_quantized_tile_attn(
+                        kv_tile_raw, p, d, head_dim, n_bits, k_deq, k_codebook);
+                    partial_dot += shared_q_rot[d] * k_val;
+                }
             }
 
             shared_reduce[tid] = partial_dot;
@@ -459,7 +523,23 @@ inline void hadamard_rotate_inplace_attn(
                     shared_reduce[tid] += shared_reduce[tid + s];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            if (tid == 0) tile_scores[p] = shared_reduce[0] * scale;
+            float base_score = shared_reduce[0];
+
+            float qjl_correction = 0.0f;
+            if (n_bits == 4) {
+                shared_reduce[tid] = partial_qjl;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = rs / 2; s > 0; s >>= 1) {
+                    if (tid < s && (tid + s) < tg_size)
+                        shared_reduce[tid] += shared_reduce[tid + s];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                float r_e = k_r_norms[kv_head * max_seq_len + tile_start + p];
+                qjl_correction = k_deq * r_e * qjl_factor * shared_reduce[0];
+            }
+
+            if (tid == 0)
+                tile_scores[p] = (base_score + qjl_correction) * scale;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 

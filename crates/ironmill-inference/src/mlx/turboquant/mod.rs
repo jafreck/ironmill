@@ -75,20 +75,28 @@ pub struct MlxOutlierCache {
 
 /// TurboQuant model state for MLX inference.
 ///
-/// Holds the rotation signs, codebook, and optional outlier/QJL state.
-/// Initialised from [`ModelConfig`] + [`MlxConfig`] using the same
-/// codebook generation as the GPU backend.
+/// Per Algorithm 2 (TurboQuant_prod), K and V caches use different codebooks:
+/// - K cache: (b-1)-bit MSE codebook + 1-bit QJL = b bits total
+/// - V cache: b-bit MSE codebook, no QJL
 pub struct MlxTurboQuantModel {
     /// Rotation sign vector `[head_dim]` Float32 (±1.0).
     pub rotation_signs: MlxArray,
-    /// Lloyd-Max codebook centroids (Rust-side, for reference).
-    pub codebook: Vec<f32>,
-    /// Codebook centroids as an MLX array `[n_levels]` Float32.
-    pub codebook_arr: MlxArray,
-    /// Decision boundaries (Rust-side).
-    pub boundaries: Vec<f32>,
-    /// Boundaries as an MLX array `[n_levels - 1]` Float32.
-    pub boundaries_arr: MlxArray,
+    /// K cache codebook centroids (Rust-side): (b-1)-bit at 4-bit, b-bit at 8-bit.
+    pub k_codebook: Vec<f32>,
+    /// K codebook as MLX array `[k_n_levels]` Float32.
+    pub k_codebook_arr: MlxArray,
+    /// K boundaries (Rust-side).
+    pub k_boundaries: Vec<f32>,
+    /// K boundaries as MLX array.
+    pub k_boundaries_arr: MlxArray,
+    /// V cache codebook centroids (Rust-side): b-bit.
+    pub v_codebook: Vec<f32>,
+    /// V codebook as MLX array `[v_n_levels]` Float32.
+    pub v_codebook_arr: MlxArray,
+    /// V boundaries (Rust-side).
+    pub v_boundaries: Vec<f32>,
+    /// V boundaries as MLX array.
+    pub v_boundaries_arr: MlxArray,
     /// Number of quantization bits (4 or 8).
     pub n_bits: u8,
     /// Outlier channel configuration (None = standard mode).
@@ -124,15 +132,37 @@ impl MlxTurboQuantModel {
         let rotation_signs =
             MlxArray::from_data_copy(&sign_bytes, &[head_dim], MlxDtype::Float32, stream)?;
 
-        // Generate codebook via Lloyd-Max
-        let (levels, bounds) = lloyd_max_gaussian(head_dim, n_bits);
-        let codebook_bytes: Vec<u8> = levels.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let codebook_arr =
-            MlxArray::from_data_copy(&codebook_bytes, &[levels.len()], MlxDtype::Float32, stream)?;
-        let boundaries_bytes: Vec<u8> = bounds.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let boundaries_arr = MlxArray::from_data_copy(
-            &boundaries_bytes,
-            &[bounds.len()],
+        // Generate K codebook: (b-1)-bit for INT4 (3-bit + 1-bit QJL), b-bit for INT8
+        let k_bits = if n_bits == 4 { n_bits - 1 } else { n_bits };
+        let (k_levels, k_bounds) = lloyd_max_gaussian(head_dim, k_bits);
+        let k_codebook_bytes: Vec<u8> = k_levels.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let k_codebook_arr = MlxArray::from_data_copy(
+            &k_codebook_bytes,
+            &[k_levels.len()],
+            MlxDtype::Float32,
+            stream,
+        )?;
+        let k_boundaries_bytes: Vec<u8> = k_bounds.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let k_boundaries_arr = MlxArray::from_data_copy(
+            &k_boundaries_bytes,
+            &[k_bounds.len()],
+            MlxDtype::Float32,
+            stream,
+        )?;
+
+        // Generate V codebook: b-bit (full precision, no QJL)
+        let (v_levels, v_bounds) = lloyd_max_gaussian(head_dim, n_bits);
+        let v_codebook_bytes: Vec<u8> = v_levels.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let v_codebook_arr = MlxArray::from_data_copy(
+            &v_codebook_bytes,
+            &[v_levels.len()],
+            MlxDtype::Float32,
+            stream,
+        )?;
+        let v_boundaries_bytes: Vec<u8> = v_bounds.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let v_boundaries_arr = MlxArray::from_data_copy(
+            &v_boundaries_bytes,
+            &[v_bounds.len()],
             MlxDtype::Float32,
             stream,
         )?;
@@ -149,10 +179,14 @@ impl MlxTurboQuantModel {
 
         Ok(Self {
             rotation_signs,
-            codebook: levels,
-            codebook_arr,
-            boundaries: bounds,
-            boundaries_arr,
+            k_codebook: k_levels,
+            k_codebook_arr,
+            k_boundaries: k_bounds,
+            k_boundaries_arr,
+            v_codebook: v_levels,
+            v_codebook_arr,
+            v_boundaries: v_bounds,
+            v_boundaries_arr,
             n_bits,
             outlier_config: None,
             outlier_model: None,

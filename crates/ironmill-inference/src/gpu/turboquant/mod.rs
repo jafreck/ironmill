@@ -258,19 +258,22 @@ impl GpuTurboQuantModel {
             .create_buffer_with_data(&sign_bytes, ironmill_metal_sys::StorageMode::Shared)
             .map_err(GpuError::Metal)?;
 
-        // Both K and V use the same b-bit MSE codebook at 4-bit precision.
-        // QJL is only beneficial at ≤3 bits (paper Figure 3: "TurboQuant_mse
-        // achieves superior performance at higher bit widths").
-        let (levels, bounds) = codebook::lloyd_max_gaussian(config.head_dim, config.n_bits);
-        let n_levels = levels.len() as u32;
-        let codebook_buf = create_f32_buffer(device, &levels)?;
-        let boundaries_buf = create_f32_buffer(device, &bounds)?;
-        let k_codebook_buf = create_f32_buffer(device, &levels)?;
-        let k_boundaries_buf = create_f32_buffer(device, &bounds)?;
-        let k_n_levels = n_levels;
-        let v_codebook_buf = codebook_buf;
-        let v_boundaries_buf = boundaries_buf;
-        let v_n_levels = n_levels;
+        // Per Algorithm 2 (TurboQuant_prod): K cache uses (b-1)-bit MSE
+        // codebook + 1-bit QJL = b bits total. V cache uses b-bit MSE codebook.
+        // At INT8, QJL overhead is negligible so both use 8-bit.
+        let (k_levels, k_bounds) = if config.n_bits == 4 {
+            codebook::lloyd_max_gaussian(config.head_dim, config.n_bits - 1)
+        } else {
+            codebook::lloyd_max_gaussian(config.head_dim, config.n_bits)
+        };
+        let k_n_levels = k_levels.len() as u32;
+        let k_codebook_buf = create_f32_buffer(device, &k_levels)?;
+        let k_boundaries_buf = create_f32_buffer(device, &k_bounds)?;
+
+        let (v_levels, v_bounds) = codebook::lloyd_max_gaussian(config.head_dim, config.n_bits);
+        let v_n_levels = v_levels.len() as u32;
+        let v_codebook_buf = create_f32_buffer(device, &v_levels)?;
+        let v_boundaries_buf = create_f32_buffer(device, &v_bounds)?;
 
         // QJL projection matrix for K cache (seed+1 for independence)
         let qjl_bytes = generate_qjl_matrix(config.head_dim, config.rotation_seed + 1);
