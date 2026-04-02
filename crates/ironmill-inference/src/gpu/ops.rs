@@ -20,6 +20,7 @@ pub struct GpuPipelines {
     pub polarquant_matmul_int4: ComputePipeline,
     pub polarquant_matvec_int8: ComputePipeline,
     pub polarquant_matmul_int8: ComputePipeline,
+    pub kv_scatter: ComputePipeline,
 }
 
 impl GpuPipelines {
@@ -33,6 +34,7 @@ impl GpuPipelines {
         let tq_src = include_str!("shaders/turboquant.metal");
         let attn_src = include_str!("shaders/attention.metal");
         let qmm_src = include_str!("shaders/quantized_matmul.metal");
+        let kv_scatter_src = include_str!("shaders/kv_scatter.metal");
 
         let norm_lib = device
             .compile_shader_source(norm_src)
@@ -57,6 +59,9 @@ impl GpuPipelines {
             .map_err(GpuError::Metal)?;
         let qmm_lib = device
             .compile_shader_source(qmm_src)
+            .map_err(GpuError::Metal)?;
+        let kv_scatter_lib = device
+            .compile_shader_source(kv_scatter_src)
             .map_err(GpuError::Metal)?;
 
         Ok(Self {
@@ -147,6 +152,13 @@ impl GpuPipelines {
                 .create_compute_pipeline(
                     &qmm_lib
                         .get_function("polarquant_matmul_int8")
+                        .map_err(GpuError::Metal)?,
+                )
+                .map_err(GpuError::Metal)?,
+            kv_scatter: device
+                .create_compute_pipeline(
+                    &kv_scatter_lib
+                        .get_function("kv_scatter")
                         .map_err(GpuError::Metal)?,
                 )
                 .map_err(GpuError::Metal)?,
@@ -385,4 +397,36 @@ pub fn encode_standard_attention(
     encoder.set_bytes(&max_seq_len.to_le_bytes(), 7);
     encoder.set_bytes(&seq_len.to_le_bytes(), 8);
     encoder.dispatch_threadgroups((num_heads as usize, 1, 1), (head_dim as usize, 1, 1));
+}
+
+/// Encode KV scatter — copy projections into FP16 KV cache on GPU.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_kv_scatter(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    proj: &MetalBuffer,
+    cache: &MetalBuffer,
+    seq_pos: u32,
+    token_count: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    max_seq_len: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(proj, 0, 0);
+    encoder.set_buffer(cache, 0, 1);
+    encoder.set_bytes(&seq_pos.to_le_bytes(), 2);
+    encoder.set_bytes(&token_count.to_le_bytes(), 3);
+    encoder.set_bytes(&num_kv_heads.to_le_bytes(), 4);
+    encoder.set_bytes(&head_dim.to_le_bytes(), 5);
+    encoder.set_bytes(&max_seq_len.to_le_bytes(), 6);
+    let tg_x = (head_dim as usize).min(256);
+    encoder.dispatch_threads(
+        (
+            head_dim as usize,
+            num_kv_heads as usize,
+            token_count as usize,
+        ),
+        (tg_x, 1, 1),
+    );
 }

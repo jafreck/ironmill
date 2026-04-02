@@ -475,7 +475,7 @@ impl GpuInference {
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
         // Create command buffer.
-        let mut cmd_buf = self
+        let cmd_buf = self
             .queue
             .command_buffer()
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -893,57 +893,39 @@ impl GpuInference {
                 }
                 enc.end_encoding();
             } else {
-                // FP16 KV cache path
+                // FP16 KV cache path — scatter projections into cache on GPU.
                 let fp16_kv = self.fp16_kv_cache.as_ref().unwrap();
                 let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
                 let max_seq = self.config.max_seq_len as u32;
 
-                // Must commit current command buffer so MPS matmul results
-                // are available for CPU-side KV cache scatter.
-                cmd_buf.commit();
-                cmd_buf.wait_until_completed();
-                cmd_buf = self
-                    .queue
-                    .command_buffer()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-
-                // Write K/V into FP16 cache at seq_pos via buffer copy.
-                // Each K/V projection is [token_count × num_kv_heads × head_dim] FP16.
-                // Cache layout: [num_kv_heads × max_seq × head_dim] FP16.
-                // For simplicity, write via CPU side since buffers are Shared.
-                let kv_size = mc.num_kv_heads() * mc.head_dim * token_count * 2;
-                let mut k_data = vec![0u8; kv_size];
-                let mut v_data = vec![0u8; kv_size];
-                bufs.k_proj
-                    .read_bytes(&mut k_data, 0)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                bufs.v_proj
-                    .read_bytes(&mut v_data, 0)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-
-                // Write token-by-token into the cache (interleaving heads).
-                // Projection layout: [token × nkv × hd] row-major.
-                // Cache layout: [nkv × max_seq × hd] row-major.
-                for t in 0..token_count {
-                    for head in 0..mc.num_kv_heads() {
-                        let src_off =
-                            (t * mc.num_kv_heads() * mc.head_dim + head * mc.head_dim) * 2;
-                        let dst_off = (head * self.config.max_seq_len * mc.head_dim
-                            + (seq_pos + t) * mc.head_dim)
-                            * 2;
-                        let len = mc.head_dim * 2;
-                        k_cache
-                            .write_bytes(&k_data[src_off..src_off + len], dst_off)
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        v_cache
-                            .write_bytes(&v_data[src_off..src_off + len], dst_off)
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    }
-                }
-
                 let enc = cmd_buf
                     .compute_encoder()
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+                // Scatter K and V projections into their caches entirely on GPU.
+                ops::encode_kv_scatter(
+                    &enc,
+                    &self.pipelines.kv_scatter,
+                    &bufs.k_proj,
+                    k_cache,
+                    seq_pos as u32,
+                    token_count as u32,
+                    nkv,
+                    hd,
+                    max_seq,
+                );
+                ops::encode_kv_scatter(
+                    &enc,
+                    &self.pipelines.kv_scatter,
+                    &bufs.v_proj,
+                    v_cache,
+                    seq_pos as u32,
+                    token_count as u32,
+                    nkv,
+                    hd,
+                    max_seq,
+                );
+
                 // Standard attention — loop over tokens with causal
                 // masking so each token attends only to 0..seq_pos+t+1.
                 let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
