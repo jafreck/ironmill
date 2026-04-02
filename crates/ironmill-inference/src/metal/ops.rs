@@ -204,6 +204,111 @@ impl MetalPipelines {
     }
 }
 
+// ── Parameter structs ────────────────────────────────────────────
+
+/// Parameters for [`encode_rms_norm`].
+pub struct RmsNormParams<'a> {
+    pub input: &'a MetalBuffer,
+    pub weight: &'a MetalBuffer,
+    pub output: &'a MetalBuffer,
+    pub hidden_size: u32,
+    pub token_count: u32,
+    pub eps: f32,
+}
+
+/// Parameters for [`encode_rope`].
+pub struct RopeParams<'a> {
+    pub qk: &'a MetalBuffer,
+    pub cos_cache: &'a MetalBuffer,
+    pub sin_cache: &'a MetalBuffer,
+    pub num_heads: u32,
+    pub head_dim: u32,
+    pub seq_offset: u32,
+    pub token_count: u32,
+}
+
+/// Parameters for [`encode_embedding_lookup`].
+pub struct EmbeddingLookupParams<'a> {
+    pub token_ids: &'a MetalBuffer,
+    pub embedding_table: &'a MetalBuffer,
+    pub output: &'a MetalBuffer,
+    pub hidden_size: u32,
+    pub token_count: u32,
+    pub vocab_size: u32,
+}
+
+/// Parameters for [`encode_turboquant_cache_write`].
+pub struct TurboquantCacheWriteParams<'a> {
+    pub kv_proj: &'a MetalBuffer,
+    pub rotation_signs: &'a MetalBuffer,
+    pub cache: &'a MetalBuffer,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub max_seq_len: u32,
+    pub seq_pos: u32,
+    pub inv_scale: f32,
+    pub n_bits: u32,
+    pub scale_buf: &'a MetalBuffer,
+    pub codebook: &'a MetalBuffer,
+    pub boundaries: &'a MetalBuffer,
+    pub n_levels: u32,
+}
+
+/// Parameters for [`encode_turboquant_attention`].
+pub struct TurboquantAttentionParams<'a> {
+    pub q: &'a MetalBuffer,
+    pub k_cache: &'a MetalBuffer,
+    pub v_cache: &'a MetalBuffer,
+    pub rotation_signs: &'a MetalBuffer,
+    pub output: &'a MetalBuffer,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub max_seq_len: u32,
+    pub seq_len: u32,
+    pub deq_scale: f32,
+    pub n_bits: u32,
+    pub k_scale_buf: &'a MetalBuffer,
+    pub v_scale_buf: &'a MetalBuffer,
+    pub codebook: &'a MetalBuffer,
+}
+
+/// Parameters for [`encode_standard_attention`].
+pub struct StandardAttentionParams<'a> {
+    pub q: &'a MetalBuffer,
+    pub k_cache: &'a MetalBuffer,
+    pub v_cache: &'a MetalBuffer,
+    pub output: &'a MetalBuffer,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub max_seq_len: u32,
+    pub seq_len: u32,
+}
+
+/// Parameters for [`encode_kv_scatter`].
+pub struct KvScatterParams<'a> {
+    pub proj: &'a MetalBuffer,
+    pub cache: &'a MetalBuffer,
+    pub seq_pos: u32,
+    pub token_count: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub max_seq_len: u32,
+}
+
+/// Parameters for [`encode_fused_residual_rms_norm`].
+pub struct FusedResidualRmsNormParams<'a> {
+    pub a: &'a MetalBuffer,
+    pub b: &'a MetalBuffer,
+    pub weight: &'a MetalBuffer,
+    pub normed_output: &'a MetalBuffer,
+    pub residual_output: &'a MetalBuffer,
+    pub eps: f32,
+    pub hidden_size: u32,
+    pub token_count: u32,
+}
+
 // ── Dispatch helpers ─────────────────────────────────────────────
 //
 // These encode kernel dispatches into a ComputeEncoder without
@@ -211,28 +316,22 @@ impl MetalPipelines {
 // buffer per token.
 
 /// Encode an RMSNorm operation.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_rms_norm(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    input: &MetalBuffer,
-    weight: &MetalBuffer,
-    output: &MetalBuffer,
-    hidden_size: u32,
-    token_count: u32,
-    eps: f32,
+    params: &RmsNormParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(input, 0, 0);
-    encoder.set_buffer(weight, 0, 1);
-    encoder.set_buffer(output, 0, 2);
-    encoder.set_bytes(&hidden_size.to_le_bytes(), 3);
-    encoder.set_bytes(&token_count.to_le_bytes(), 4);
-    encoder.set_bytes(&eps.to_le_bytes(), 5);
+    encoder.set_buffer(params.input, 0, 0);
+    encoder.set_buffer(params.weight, 0, 1);
+    encoder.set_buffer(params.output, 0, 2);
+    encoder.set_bytes(&params.hidden_size.to_le_bytes(), 3);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 4);
+    encoder.set_bytes(&params.eps.to_le_bytes(), 5);
     // Cap threadgroup size to Metal's 1024-thread limit. The shader uses a
     // strided loop so it handles hidden_size > tg_size correctly.
-    let tg_size = 1024.min(hidden_size as usize);
-    encoder.dispatch_threadgroups((token_count as usize, 1, 1), (tg_size, 1, 1));
+    let tg_size = 1024.min(params.hidden_size as usize);
+    encoder.dispatch_threadgroups((params.token_count as usize, 1, 1), (tg_size, 1, 1));
 }
 
 /// Encode SiLU-gated activation.
@@ -256,29 +355,22 @@ pub fn encode_silu_gate(
 }
 
 /// Encode RoPE application.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_rope(
-    encoder: &ComputeEncoder,
-    pipeline: &ComputePipeline,
-    qk: &MetalBuffer,
-    cos_cache: &MetalBuffer,
-    sin_cache: &MetalBuffer,
-    num_heads: u32,
-    head_dim: u32,
-    seq_offset: u32,
-    token_count: u32,
-) {
+pub fn encode_rope(encoder: &ComputeEncoder, pipeline: &ComputePipeline, params: &RopeParams<'_>) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(qk, 0, 0);
-    encoder.set_buffer(cos_cache, 0, 1);
-    encoder.set_buffer(sin_cache, 0, 2);
-    encoder.set_bytes(&num_heads.to_le_bytes(), 3);
-    encoder.set_bytes(&head_dim.to_le_bytes(), 4);
-    encoder.set_bytes(&seq_offset.to_le_bytes(), 5);
-    encoder.set_bytes(&token_count.to_le_bytes(), 6);
-    let half_dim = head_dim / 2;
+    encoder.set_buffer(params.qk, 0, 0);
+    encoder.set_buffer(params.cos_cache, 0, 1);
+    encoder.set_buffer(params.sin_cache, 0, 2);
+    encoder.set_bytes(&params.num_heads.to_le_bytes(), 3);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 4);
+    encoder.set_bytes(&params.seq_offset.to_le_bytes(), 5);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 6);
+    let half_dim = params.head_dim / 2;
     encoder.dispatch_threads(
-        (half_dim as usize, num_heads as usize, token_count as usize),
+        (
+            half_dim as usize,
+            params.num_heads as usize,
+            params.token_count as usize,
+        ),
         (half_dim.min(256) as usize, 1, 1),
     );
 }
@@ -304,29 +396,23 @@ pub fn encode_residual_add(
 }
 
 /// Encode embedding lookup.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_embedding_lookup(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    token_ids: &MetalBuffer,
-    embedding_table: &MetalBuffer,
-    output: &MetalBuffer,
-    hidden_size: u32,
-    token_count: u32,
-    vocab_size: u32,
+    params: &EmbeddingLookupParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(token_ids, 0, 0);
-    encoder.set_buffer(embedding_table, 0, 1);
-    encoder.set_buffer(output, 0, 2);
-    encoder.set_bytes(&hidden_size.to_le_bytes(), 3);
-    encoder.set_bytes(&token_count.to_le_bytes(), 4);
-    encoder.set_bytes(&vocab_size.to_le_bytes(), 5);
-    let tg_size = 256.min(hidden_size as usize);
+    encoder.set_buffer(params.token_ids, 0, 0);
+    encoder.set_buffer(params.embedding_table, 0, 1);
+    encoder.set_buffer(params.output, 0, 2);
+    encoder.set_bytes(&params.hidden_size.to_le_bytes(), 3);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 4);
+    encoder.set_bytes(&params.vocab_size.to_le_bytes(), 5);
+    let tg_size = 256.min(params.hidden_size as usize);
     encoder.dispatch_threadgroups(
         (
-            (hidden_size as usize).div_ceil(tg_size),
-            token_count as usize,
+            (params.hidden_size as usize).div_ceil(tg_size),
+            params.token_count as usize,
             1,
         ),
         (tg_size, 1, 1),
@@ -334,144 +420,103 @@ pub fn encode_embedding_lookup(
 }
 
 /// Encode TurboQuant cache write.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_turboquant_cache_write(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    kv_proj: &MetalBuffer,
-    rotation_signs: &MetalBuffer,
-    cache: &MetalBuffer,
-    num_kv_heads: u32,
-    head_dim: u32,
-    max_seq_len: u32,
-    seq_pos: u32,
-    inv_scale: f32,
-    n_bits: u32,
-    scale_buf: &MetalBuffer,
-    codebook: &MetalBuffer,
-    boundaries: &MetalBuffer,
-    n_levels: u32,
+    params: &TurboquantCacheWriteParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(kv_proj, 0, 0);
-    encoder.set_buffer(rotation_signs, 0, 1);
-    encoder.set_buffer(cache, 0, 2);
-    encoder.set_bytes(&num_kv_heads.to_le_bytes(), 3);
-    encoder.set_bytes(&head_dim.to_le_bytes(), 4);
-    encoder.set_bytes(&max_seq_len.to_le_bytes(), 5);
-    encoder.set_bytes(&seq_pos.to_le_bytes(), 6);
-    encoder.set_bytes(&inv_scale.to_le_bytes(), 7);
-    encoder.set_bytes(&n_bits.to_le_bytes(), 8);
-    encoder.set_buffer(scale_buf, 0, 9);
-    encoder.set_buffer(codebook, 0, 10);
-    encoder.set_buffer(boundaries, 0, 11);
-    encoder.set_bytes(&n_levels.to_le_bytes(), 12);
-    encoder.dispatch_threadgroups((num_kv_heads as usize, 1, 1), (head_dim as usize, 1, 1));
+    encoder.set_buffer(params.kv_proj, 0, 0);
+    encoder.set_buffer(params.rotation_signs, 0, 1);
+    encoder.set_buffer(params.cache, 0, 2);
+    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 3);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 4);
+    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 5);
+    encoder.set_bytes(&params.seq_pos.to_le_bytes(), 6);
+    encoder.set_bytes(&params.inv_scale.to_le_bytes(), 7);
+    encoder.set_bytes(&params.n_bits.to_le_bytes(), 8);
+    encoder.set_buffer(params.scale_buf, 0, 9);
+    encoder.set_buffer(params.codebook, 0, 10);
+    encoder.set_buffer(params.boundaries, 0, 11);
+    encoder.set_bytes(&params.n_levels.to_le_bytes(), 12);
+    encoder.dispatch_threadgroups(
+        (params.num_kv_heads as usize, 1, 1),
+        (params.head_dim as usize, 1, 1),
+    );
 }
 
 /// Encode TurboQuant attention.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_turboquant_attention(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    q: &MetalBuffer,
-    k_cache: &MetalBuffer,
-    v_cache: &MetalBuffer,
-    rotation_signs: &MetalBuffer,
-    output: &MetalBuffer,
-    num_heads: u32,
-    num_kv_heads: u32,
-    head_dim: u32,
-    max_seq_len: u32,
-    seq_len: u32,
-    deq_scale: f32,
-    n_bits: u32,
-    k_scale_buf: &MetalBuffer,
-    v_scale_buf: &MetalBuffer,
-    codebook: &MetalBuffer,
+    params: &TurboquantAttentionParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(q, 0, 0);
-    encoder.set_buffer(k_cache, 0, 1);
-    encoder.set_buffer(v_cache, 0, 2);
-    encoder.set_buffer(rotation_signs, 0, 3);
-    encoder.set_buffer(output, 0, 4);
-    encoder.set_bytes(&num_heads.to_le_bytes(), 5);
-    encoder.set_bytes(&num_kv_heads.to_le_bytes(), 6);
-    encoder.set_bytes(&head_dim.to_le_bytes(), 7);
-    encoder.set_bytes(&max_seq_len.to_le_bytes(), 8);
-    encoder.set_bytes(&seq_len.to_le_bytes(), 9);
-    encoder.set_bytes(&deq_scale.to_le_bytes(), 10);
-    encoder.set_bytes(&n_bits.to_le_bytes(), 11);
-    encoder.set_buffer(k_scale_buf, 0, 12);
-    encoder.set_buffer(v_scale_buf, 0, 13);
-    encoder.set_buffer(codebook, 0, 14);
+    encoder.set_buffer(params.q, 0, 0);
+    encoder.set_buffer(params.k_cache, 0, 1);
+    encoder.set_buffer(params.v_cache, 0, 2);
+    encoder.set_buffer(params.rotation_signs, 0, 3);
+    encoder.set_buffer(params.output, 0, 4);
+    encoder.set_bytes(&params.num_heads.to_le_bytes(), 5);
+    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 6);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 7);
+    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 8);
+    encoder.set_bytes(&params.seq_len.to_le_bytes(), 9);
+    encoder.set_bytes(&params.deq_scale.to_le_bytes(), 10);
+    encoder.set_bytes(&params.n_bits.to_le_bytes(), 11);
+    encoder.set_buffer(params.k_scale_buf, 0, 12);
+    encoder.set_buffer(params.v_scale_buf, 0, 13);
+    encoder.set_buffer(params.codebook, 0, 14);
     // HEAD_DIM is now exact — clamp to Metal's 1024-thread limit only.
     encoder.dispatch_threadgroups(
-        (num_heads as usize, 1, 1),
-        ((head_dim as usize).min(1024), 1, 1),
+        (params.num_heads as usize, 1, 1),
+        ((params.head_dim as usize).min(1024), 1, 1),
     );
 }
 
 /// Encode standard FP16 attention.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_standard_attention(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    q: &MetalBuffer,
-    k_cache: &MetalBuffer,
-    v_cache: &MetalBuffer,
-    output: &MetalBuffer,
-    num_heads: u32,
-    num_kv_heads: u32,
-    head_dim: u32,
-    max_seq_len: u32,
-    seq_len: u32,
+    params: &StandardAttentionParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(q, 0, 0);
-    encoder.set_buffer(k_cache, 0, 1);
-    encoder.set_buffer(v_cache, 0, 2);
-    encoder.set_buffer(output, 0, 3);
-    encoder.set_bytes(&num_heads.to_le_bytes(), 4);
-    encoder.set_bytes(&num_kv_heads.to_le_bytes(), 5);
-    encoder.set_bytes(&head_dim.to_le_bytes(), 6);
-    encoder.set_bytes(&max_seq_len.to_le_bytes(), 7);
-    encoder.set_bytes(&seq_len.to_le_bytes(), 8);
+    encoder.set_buffer(params.q, 0, 0);
+    encoder.set_buffer(params.k_cache, 0, 1);
+    encoder.set_buffer(params.v_cache, 0, 2);
+    encoder.set_buffer(params.output, 0, 3);
+    encoder.set_bytes(&params.num_heads.to_le_bytes(), 4);
+    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 5);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 6);
+    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 7);
+    encoder.set_bytes(&params.seq_len.to_le_bytes(), 8);
     // HEAD_DIM is now exact — clamp to Metal's 1024-thread limit only.
     encoder.dispatch_threadgroups(
-        (num_heads as usize, 1, 1),
-        ((head_dim as usize).min(1024), 1, 1),
+        (params.num_heads as usize, 1, 1),
+        ((params.head_dim as usize).min(1024), 1, 1),
     );
 }
 
 /// Encode KV scatter — copy projections into FP16 KV cache on GPU.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_kv_scatter(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    proj: &MetalBuffer,
-    cache: &MetalBuffer,
-    seq_pos: u32,
-    token_count: u32,
-    num_kv_heads: u32,
-    head_dim: u32,
-    max_seq_len: u32,
+    params: &KvScatterParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(proj, 0, 0);
-    encoder.set_buffer(cache, 0, 1);
-    encoder.set_bytes(&seq_pos.to_le_bytes(), 2);
-    encoder.set_bytes(&token_count.to_le_bytes(), 3);
-    encoder.set_bytes(&num_kv_heads.to_le_bytes(), 4);
-    encoder.set_bytes(&head_dim.to_le_bytes(), 5);
-    encoder.set_bytes(&max_seq_len.to_le_bytes(), 6);
-    let tg_x = (head_dim as usize).min(256);
+    encoder.set_buffer(params.proj, 0, 0);
+    encoder.set_buffer(params.cache, 0, 1);
+    encoder.set_bytes(&params.seq_pos.to_le_bytes(), 2);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 3);
+    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 4);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 5);
+    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 6);
+    let tg_x = (params.head_dim as usize).min(256);
     encoder.dispatch_threads(
         (
-            head_dim as usize,
-            num_kv_heads as usize,
-            token_count as usize,
+            params.head_dim as usize,
+            params.num_kv_heads as usize,
+            params.token_count as usize,
         ),
         (tg_x, 1, 1),
     );
@@ -506,28 +551,20 @@ pub fn encode_matvec(
 /// Computes `residual = a + b` and `normed = rms_norm(residual, weight)` in a
 /// single kernel dispatch, avoiding the intermediate global-memory round-trip
 /// that two separate dispatches would require.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_fused_residual_rms_norm(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    a: &MetalBuffer,
-    b: &MetalBuffer,
-    weight: &MetalBuffer,
-    normed_output: &MetalBuffer,
-    residual_output: &MetalBuffer,
-    eps: f32,
-    hidden_size: u32,
-    token_count: u32,
+    params: &FusedResidualRmsNormParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(a, 0, 0);
-    encoder.set_buffer(b, 0, 1);
-    encoder.set_buffer(weight, 0, 2);
-    encoder.set_buffer(normed_output, 0, 3);
-    encoder.set_buffer(residual_output, 0, 4);
-    encoder.set_bytes(&eps.to_le_bytes(), 5);
-    encoder.set_bytes(&hidden_size.to_le_bytes(), 6);
-    encoder.set_bytes(&token_count.to_le_bytes(), 7);
-    let tg_size = 1024.min(hidden_size as usize);
-    encoder.dispatch_threadgroups((token_count as usize, 1, 1), (tg_size, 1, 1));
+    encoder.set_buffer(params.a, 0, 0);
+    encoder.set_buffer(params.b, 0, 1);
+    encoder.set_buffer(params.weight, 0, 2);
+    encoder.set_buffer(params.normed_output, 0, 3);
+    encoder.set_buffer(params.residual_output, 0, 4);
+    encoder.set_bytes(&params.eps.to_le_bytes(), 5);
+    encoder.set_bytes(&params.hidden_size.to_le_bytes(), 6);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 7);
+    let tg_size = 1024.min(params.hidden_size as usize);
+    encoder.dispatch_threadgroups((params.token_count as usize, 1, 1), (tg_size, 1, 1));
 }

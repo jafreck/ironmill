@@ -25,7 +25,8 @@ pub use ir_to_proto::{
     program_to_multi_function_model, program_to_updatable_model,
 };
 pub use lora::{
-    LoraAdapter, detect_lora_adapters, lora_initializer_names, merge_lora, merge_lora_weights,
+    LoraAdapter, LoraWeights, detect_lora_adapters, lora_initializer_names, merge_lora,
+    merge_lora_weights,
 };
 pub use onnx_graph::{
     ConversionConfig, detect_autoregressive_pattern, onnx_to_program, onnx_to_program_with_config,

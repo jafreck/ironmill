@@ -439,12 +439,14 @@ fn detect_and_merge_lora(
         lora::merge_lora_weights(
             &mut base_data,
             &base_shape,
-            &adapter.a_data,
-            &adapter.a_shape,
-            &adapter.b_data,
-            &adapter.b_shape,
-            base_dtype,
-            adapter.alpha,
+            &lora::LoraWeights {
+                lora_a: &adapter.a_data,
+                lora_a_shape: &adapter.a_shape,
+                lora_b: &adapter.b_data,
+                lora_b_shape: &adapter.b_shape,
+                dtype: base_dtype,
+                alpha: adapter.alpha,
+            },
         )?;
 
         merged.insert(base_name, (base_data, base_shape, base_dtype));

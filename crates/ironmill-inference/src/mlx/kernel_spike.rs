@@ -42,17 +42,17 @@ mod tests {
             }
         "#;
 
-        let result = metal_kernel::metal_kernel(
-            "add_kernel",
-            &[&a, &b],
-            &[],
+        let result = metal_kernel::metal_kernel(&metal_kernel::MetalKernelParams {
+            name: "add_kernel",
+            inputs: &[&a, &b],
+            outputs: &[],
             source,
-            [4, 1, 1],
-            [4, 1, 1],
-            &[&[4]],
-            &[MlxDtype::Float32],
-            &stream,
-        )
+            grid: [4, 1, 1],
+            threadgroup: [4, 1, 1],
+            output_shapes: &[&[4]],
+            output_dtypes: &[MlxDtype::Float32],
+            stream: &stream,
+        })
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
@@ -92,17 +92,17 @@ mod tests {
             }
         "#;
 
-        let result = metal_kernel::metal_kernel(
-            "shared_mem_test",
-            &[&input],
-            &[],
+        let result = metal_kernel::metal_kernel(&metal_kernel::MetalKernelParams {
+            name: "shared_mem_test",
+            inputs: &[&input],
+            outputs: &[],
             source,
-            [n, 1, 1],
-            [256, 1, 1],
-            &[&[n]],
-            &[MlxDtype::Float32],
-            &stream,
-        )
+            grid: [n, 1, 1],
+            threadgroup: [256, 1, 1],
+            output_shapes: &[&[n]],
+            output_dtypes: &[MlxDtype::Float32],
+            stream: &stream,
+        })
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
@@ -158,17 +158,17 @@ mod tests {
         "#;
 
         let input_refs: Vec<&MlxArray> = inputs.iter().collect();
-        let result = metal_kernel::metal_kernel(
-            "sum_13",
-            &input_refs,
-            &[],
+        let result = metal_kernel::metal_kernel(&metal_kernel::MetalKernelParams {
+            name: "sum_13",
+            inputs: &input_refs,
+            outputs: &[],
             source,
-            [n, 1, 1],
-            [64, 1, 1],
-            &[&[n]],
-            &[MlxDtype::Float32],
-            &stream,
-        )
+            grid: [n, 1, 1],
+            threadgroup: [64, 1, 1],
+            output_shapes: &[&[n]],
+            output_dtypes: &[MlxDtype::Float32],
+            stream: &stream,
+        })
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
@@ -230,17 +230,17 @@ mod tests {
         "#;
 
         let input_refs: Vec<&MlxArray> = inputs.iter().collect();
-        let result = metal_kernel::metal_kernel(
-            "sum_17",
-            &input_refs,
-            &[],
+        let result = metal_kernel::metal_kernel(&metal_kernel::MetalKernelParams {
+            name: "sum_17",
+            inputs: &input_refs,
+            outputs: &[],
             source,
-            [n, 1, 1],
-            [32, 1, 1],
-            &[&[n]],
-            &[MlxDtype::Float32],
-            &stream,
-        )
+            grid: [n, 1, 1],
+            threadgroup: [32, 1, 1],
+            output_shapes: &[&[n]],
+            output_dtypes: &[MlxDtype::Float32],
+            stream: &stream,
+        })
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
@@ -282,17 +282,17 @@ mod tests {
             }
         "#;
 
-        let result = metal_kernel::metal_kernel(
-            "geometry_test",
-            &[&input],
-            &[],
+        let result = metal_kernel::metal_kernel(&metal_kernel::MetalKernelParams {
+            name: "geometry_test",
+            inputs: &[&input],
+            outputs: &[],
             source,
-            [head_dim, num_heads, 1],
-            [128, 1, 1],
-            &[&[total]],
-            &[MlxDtype::Float32],
-            &stream,
-        )
+            grid: [head_dim, num_heads, 1],
+            threadgroup: [128, 1, 1],
+            output_shapes: &[&[total]],
+            output_dtypes: &[MlxDtype::Float32],
+            stream: &stream,
+        })
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
@@ -337,17 +337,17 @@ mod tests {
 
         // First call (cold JIT).
         let t0 = std::time::Instant::now();
-        let r1 = metal_kernel::metal_kernel(
-            "noop_kernel",
-            &[&input],
-            &[],
+        let r1 = metal_kernel::metal_kernel(&metal_kernel::MetalKernelParams {
+            name: "noop_kernel",
+            inputs: &[&input],
+            outputs: &[],
             source,
-            [1024, 1, 1],
-            [256, 1, 1],
-            &[&[1024]],
-            &[MlxDtype::Float32],
-            &stream,
-        )
+            grid: [1024, 1, 1],
+            threadgroup: [256, 1, 1],
+            output_shapes: &[&[1024]],
+            output_dtypes: &[MlxDtype::Float32],
+            stream: &stream,
+        })
         .unwrap();
         eval(&[&r1[0]]).unwrap();
         let cold_time = t0.elapsed();
@@ -355,17 +355,17 @@ mod tests {
         // Subsequent calls (should be cached).
         let t1 = std::time::Instant::now();
         for _ in 0..10 {
-            let r = metal_kernel::metal_kernel(
-                "noop_kernel",
-                &[&input],
-                &[],
+            let r = metal_kernel::metal_kernel(&metal_kernel::MetalKernelParams {
+                name: "noop_kernel",
+                inputs: &[&input],
+                outputs: &[],
                 source,
-                [1024, 1, 1],
-                [256, 1, 1],
-                &[&[1024]],
-                &[MlxDtype::Float32],
-                &stream,
-            )
+                grid: [1024, 1, 1],
+                threadgroup: [256, 1, 1],
+                output_shapes: &[&[1024]],
+                output_dtypes: &[MlxDtype::Float32],
+                stream: &stream,
+            })
             .unwrap();
             eval(&[&r[0]]).unwrap();
         }

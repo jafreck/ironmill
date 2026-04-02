@@ -28,6 +28,6 @@ pub use buffer::{MetalBuffer, StorageMode};
 pub use command::{CommandBuffer, CommandBufferStatus, CommandQueue, ComputeEncoder};
 pub use device::{GpuFamily, MetalDevice};
 pub use error::MetalSysError;
-pub use mps::{MpsMatrix, MpsMatrixMultiply};
+pub use mps::{MpsMatrix, MpsMatrixMultiply, MpsMatrixMultiplyConfig};
 pub use pipeline::ComputePipeline;
 pub use shader::{ShaderFunction, ShaderLibrary};

@@ -10,7 +10,8 @@ use std::any::Any;
 
 use half::f16;
 use ironmill_metal_sys::{
-    CommandBufferStatus, MetalBuffer, MetalDevice, MpsMatrix, MpsMatrixMultiply, StorageMode,
+    CommandBufferStatus, MetalBuffer, MetalDevice, MpsMatrix, MpsMatrixMultiply,
+    MpsMatrixMultiplyConfig, StorageMode,
 };
 use mil_rs::weights::{ModelConfig, WeightProvider};
 
@@ -417,13 +418,16 @@ impl MetalInference {
         let make_matmul =
             |rows: usize, cols: usize, inner: usize| -> Result<MpsMatrixMultiply, MetalError> {
                 MpsMatrixMultiply::new(
-                    device, false, // transpose_left
-                    true,  // transpose_right (weights are [out, in])
-                    rows,  // result_rows = token_count
-                    cols,  // result_columns = out_features
-                    inner, // interior_columns = in_features
-                    1.0,   // alpha
-                    0.0,   // beta
+                    device,
+                    &MpsMatrixMultiplyConfig {
+                        transpose_left: false,
+                        transpose_right: true,   // weights are [out, in]
+                        result_rows: rows,       // token_count
+                        result_columns: cols,    // out_features
+                        interior_columns: inner, // in_features
+                        alpha: 1.0,
+                        beta: 0.0,
+                    },
                 )
                 .map_err(MetalError::Metal)
             };
@@ -531,12 +535,14 @@ impl MetalInference {
             ops::encode_embedding_lookup(
                 &enc,
                 &self.pipelines().embedding_lookup,
-                &bufs.token_ids_buf,
-                &weights.embedding,
-                &bufs.hidden_state,
-                h as u32,
-                token_count as u32,
-                vocab as u32,
+                &ops::EmbeddingLookupParams {
+                    token_ids: &bufs.token_ids_buf,
+                    embedding_table: &weights.embedding,
+                    output: &bufs.hidden_state,
+                    hidden_size: h as u32,
+                    token_count: token_count as u32,
+                    vocab_size: vocab as u32,
+                },
             );
             enc.end_encoding();
         }
@@ -559,12 +565,14 @@ impl MetalInference {
             ops::encode_rms_norm(
                 &enc,
                 &self.pipelines().rms_norm,
-                &bufs.hidden_state,
-                &lw0.input_norm,
-                &bufs.norm_out,
-                h as u32,
-                token_count as u32,
-                eps,
+                &ops::RmsNormParams {
+                    input: &bufs.hidden_state,
+                    weight: &lw0.input_norm,
+                    output: &bufs.norm_out,
+                    hidden_size: h as u32,
+                    token_count: token_count as u32,
+                    eps,
+                },
             );
             enc.end_encoding();
         }
@@ -809,22 +817,26 @@ impl MetalInference {
                 ops::encode_rms_norm(
                     &enc,
                     &self.pipelines().rms_norm,
-                    &bufs.q_proj,
-                    q_norm_w,
-                    &bufs.q_proj,
-                    hd,
-                    token_count as u32 * nh,
-                    eps,
+                    &ops::RmsNormParams {
+                        input: &bufs.q_proj,
+                        weight: q_norm_w,
+                        output: &bufs.q_proj,
+                        hidden_size: hd,
+                        token_count: token_count as u32 * nh,
+                        eps,
+                    },
                 );
                 ops::encode_rms_norm(
                     &enc,
                     &self.pipelines().rms_norm,
-                    &bufs.k_proj,
-                    k_norm_w,
-                    &bufs.k_proj,
-                    hd,
-                    token_count as u32 * nkv,
-                    eps,
+                    &ops::RmsNormParams {
+                        input: &bufs.k_proj,
+                        weight: k_norm_w,
+                        output: &bufs.k_proj,
+                        hidden_size: hd,
+                        token_count: token_count as u32 * nkv,
+                        eps,
+                    },
                 );
                 enc.end_encoding();
             }
@@ -837,24 +849,28 @@ impl MetalInference {
                 ops::encode_rope(
                     &enc,
                     &self.pipelines().rope,
-                    &bufs.q_proj,
-                    rope_cos,
-                    rope_sin,
-                    nh,
-                    hd,
-                    seq_pos as u32,
-                    token_count as u32,
+                    &ops::RopeParams {
+                        qk: &bufs.q_proj,
+                        cos_cache: rope_cos,
+                        sin_cache: rope_sin,
+                        num_heads: nh,
+                        head_dim: hd,
+                        seq_offset: seq_pos as u32,
+                        token_count: token_count as u32,
+                    },
                 );
                 ops::encode_rope(
                     &enc,
                     &self.pipelines().rope,
-                    &bufs.k_proj,
-                    rope_cos,
-                    rope_sin,
-                    nkv,
-                    hd,
-                    seq_pos as u32,
-                    token_count as u32,
+                    &ops::RopeParams {
+                        qk: &bufs.k_proj,
+                        cos_cache: rope_cos,
+                        sin_cache: rope_sin,
+                        num_heads: nkv,
+                        head_dim: hd,
+                        seq_offset: seq_pos as u32,
+                        token_count: token_count as u32,
+                    },
                 );
                 enc.end_encoding();
             }
@@ -1093,24 +1109,28 @@ impl MetalInference {
                 ops::encode_kv_scatter(
                     &enc,
                     &self.pipelines().kv_scatter,
-                    &bufs.k_proj,
-                    k_cache,
-                    seq_pos as u32,
-                    token_count as u32,
-                    nkv,
-                    hd,
-                    max_seq,
+                    &ops::KvScatterParams {
+                        proj: &bufs.k_proj,
+                        cache: k_cache,
+                        seq_pos: seq_pos as u32,
+                        token_count: token_count as u32,
+                        num_kv_heads: nkv,
+                        head_dim: hd,
+                        max_seq_len: max_seq,
+                    },
                 );
                 ops::encode_kv_scatter(
                     &enc,
                     &self.pipelines().kv_scatter,
-                    &bufs.v_proj,
-                    v_cache,
-                    seq_pos as u32,
-                    token_count as u32,
-                    nkv,
-                    hd,
-                    max_seq,
+                    &ops::KvScatterParams {
+                        proj: &bufs.v_proj,
+                        cache: v_cache,
+                        seq_pos: seq_pos as u32,
+                        token_count: token_count as u32,
+                        num_kv_heads: nkv,
+                        head_dim: hd,
+                        max_seq_len: max_seq,
+                    },
                 );
 
                 // Standard attention — loop over tokens with causal
@@ -1231,14 +1251,16 @@ impl MetalInference {
                 ops::encode_fused_residual_rms_norm(
                     &enc,
                     &self.pipelines().fused_residual_rms_norm,
-                    &bufs.hidden_state, // a: skip connection (pre-norm hidden)
-                    &bufs.ffn_down,     // b: o_proj output
-                    &lw.post_attn_norm, // weight: post-attention norm
-                    &bufs.norm_out,     // normed output → MLP input
-                    &bufs.residual,     // residual output → next skip connection
-                    eps,
-                    h as u32,
-                    token_count as u32,
+                    &ops::FusedResidualRmsNormParams {
+                        a: &bufs.hidden_state,           // a: skip connection (pre-norm hidden)
+                        b: &bufs.ffn_down,               // b: o_proj output
+                        weight: &lw.post_attn_norm,      // weight: post-attention norm
+                        normed_output: &bufs.norm_out,   // normed output → MLP input
+                        residual_output: &bufs.residual, // residual output → next skip connection
+                        eps,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                    },
                 );
                 enc.end_encoding();
             }
@@ -1488,14 +1510,16 @@ impl MetalInference {
                 ops::encode_fused_residual_rms_norm(
                     &enc,
                     &self.pipelines().fused_residual_rms_norm,
-                    &bufs.residual,      // a: post-attn residual
-                    &bufs.ffn_down,      // b: down_proj output
-                    &next_lw.input_norm, // weight: next layer's input norm
-                    &bufs.norm_out,      // normed output → next layer's attention
-                    &bufs.hidden_state,  // residual output → next layer's skip
-                    eps,
-                    h as u32,
-                    token_count as u32,
+                    &ops::FusedResidualRmsNormParams {
+                        a: &bufs.residual,                   // a: post-attn residual
+                        b: &bufs.ffn_down,                   // b: down_proj output
+                        weight: &next_lw.input_norm,         // weight: next layer's input norm
+                        normed_output: &bufs.norm_out, // normed output → next layer's attention
+                        residual_output: &bufs.hidden_state, // residual output → next layer's skip
+                        eps,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                    },
                 );
                 enc.end_encoding();
             } else {
@@ -1523,12 +1547,14 @@ impl MetalInference {
             ops::encode_rms_norm(
                 &enc,
                 &self.pipelines().rms_norm,
-                &bufs.hidden_state,
-                &weights.final_norm,
-                &bufs.norm_out,
-                h as u32,
-                token_count as u32,
-                eps,
+                &ops::RmsNormParams {
+                    input: &bufs.hidden_state,
+                    weight: &weights.final_norm,
+                    output: &bufs.norm_out,
+                    hidden_size: h as u32,
+                    token_count: token_count as u32,
+                    eps,
+                },
             );
             enc.end_encoding();
         }

@@ -15,8 +15,8 @@ use mil_rs::convert::onnx_graph::ConversionResult;
 use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 
 use super::shared::{
-    emit_attention, emit_embedding, emit_lm_head, emit_mlp_gelu, emit_residual_add, emit_rms_norm,
-    emit_rope_tables,
+    LayerContext, emit_attention, emit_embedding, emit_lm_head, emit_mlp_gelu, emit_residual_add,
+    emit_rms_norm, emit_rope_tables,
 };
 
 /// Build a complete MIL [`Program`] for a Gemma-family model.
@@ -66,16 +66,14 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
     // Transformer layers.
     let mut hidden = embed_normed;
     for layer_idx in 0..config.num_hidden_layers {
-        hidden = emit_gemma_transformer_layer(
-            block,
+        let ctx = LayerContext {
             provider,
-            &config,
+            config: &config,
             layer_idx,
-            &hidden,
-            &rope_cos,
-            &rope_sin,
-            &mut warnings,
-        )?;
+            rope_cos: &rope_cos,
+            rope_sin: &rope_sin,
+        };
+        hidden = emit_gemma_transformer_layer(block, &ctx, &hidden, &mut warnings)?;
     }
 
     // Final RMSNorm.
@@ -137,66 +135,64 @@ fn emit_embedding_norm(
 
 /// Emit a Gemma transformer layer.
 /// Same structure as LLaMA but uses GELU activation in MLP.
-#[allow(clippy::too_many_arguments)]
 fn emit_gemma_transformer_layer(
     block: &mut Block,
-    provider: &dyn WeightProvider,
-    config: &crate::weights::ModelConfig,
-    layer_idx: usize,
+    ctx: &LayerContext<'_>,
     input: &str,
-    rope_cos: &str,
-    rope_sin: &str,
     warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
-    let prefix = format!("model.layers.{layer_idx}");
+    let prefix = format!("model.layers.{}", ctx.layer_idx);
 
     // 1. Input RMSNorm
     let normed_attn = emit_rms_norm(
         block,
-        provider,
-        config,
+        ctx.provider,
+        ctx.config,
         &format!("{prefix}.input_layernorm"),
         input,
-        &format!("l{layer_idx}_input_norm"),
+        &format!("l{}_input_norm", ctx.layer_idx),
         warnings,
     )?;
 
     // 2. Self-attention (standard LLaMA-style, no bias)
-    let attn_out = emit_attention(
-        block,
-        provider,
-        config,
-        layer_idx,
-        &normed_attn,
-        rope_cos,
-        rope_sin,
-        warnings,
-    )?;
+    let attn_out = emit_attention(block, ctx, &normed_attn, warnings)?;
 
     // 3. Residual add
     let post_attn = emit_residual_add(
         block,
         input,
         &attn_out,
-        &format!("l{layer_idx}_post_attn_residual"),
+        &format!("l{}_post_attn_residual", ctx.layer_idx),
     );
 
     // 4. Post-attention RMSNorm
     let normed_mlp = emit_rms_norm(
         block,
-        provider,
-        config,
+        ctx.provider,
+        ctx.config,
         &format!("{prefix}.post_attention_layernorm"),
         &post_attn,
-        &format!("l{layer_idx}_post_attn_norm"),
+        &format!("l{}_post_attn_norm", ctx.layer_idx),
         warnings,
     )?;
 
     // 5. MLP with GELU activation (Gemma-specific)
-    let mlp_out = emit_mlp_gelu(block, provider, config, layer_idx, &normed_mlp, warnings)?;
+    let mlp_out = emit_mlp_gelu(
+        block,
+        ctx.provider,
+        ctx.config,
+        ctx.layer_idx,
+        &normed_mlp,
+        warnings,
+    )?;
 
     // 6. Residual add
-    let layer_out = emit_residual_add(block, &post_attn, &mlp_out, &format!("l{layer_idx}_output"));
+    let layer_out = emit_residual_add(
+        block,
+        &post_attn,
+        &mlp_out,
+        &format!("l{}_output", ctx.layer_idx),
+    );
 
     Ok(layer_out)
 }

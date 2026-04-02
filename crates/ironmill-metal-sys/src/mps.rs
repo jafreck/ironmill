@@ -28,28 +28,29 @@ pub struct MpsMatrixMultiply {
 unsafe impl Send for MpsMatrixMultiply {}
 unsafe impl Sync for MpsMatrixMultiply {}
 
+/// Configuration for creating an [`MpsMatrixMultiply`] kernel.
+pub struct MpsMatrixMultiplyConfig {
+    /// Whether to transpose the left matrix.
+    pub transpose_left: bool,
+    /// Whether to transpose the right matrix.
+    pub transpose_right: bool,
+    /// Number of rows in the result matrix.
+    pub result_rows: usize,
+    /// Number of columns in the result matrix.
+    pub result_columns: usize,
+    /// The shared dimension (columns of left / rows of right).
+    pub interior_columns: usize,
+    /// Scalar multiplier for the product.
+    pub alpha: f64,
+    /// Scalar multiplier for the existing result (for accumulate).
+    pub beta: f64,
+}
+
 impl MpsMatrixMultiply {
     /// Create a new MPS matrix multiplication kernel.
-    ///
-    /// # Arguments
-    /// * `device` — The Metal device to create the kernel on.
-    /// * `transpose_left` — Whether to transpose the left matrix.
-    /// * `transpose_right` — Whether to transpose the right matrix.
-    /// * `result_rows` — Number of rows in the result matrix.
-    /// * `result_columns` — Number of columns in the result matrix.
-    /// * `interior_columns` — The shared dimension (columns of left / rows of right).
-    /// * `alpha` — Scalar multiplier for the product.
-    /// * `beta` — Scalar multiplier for the existing result (for accumulate).
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &MetalDevice,
-        transpose_left: bool,
-        transpose_right: bool,
-        result_rows: usize,
-        result_columns: usize,
-        interior_columns: usize,
-        alpha: f64,
-        beta: f64,
+        config: &MpsMatrixMultiplyConfig,
     ) -> Result<Self, MetalSysError> {
         let cls = unsafe { objc::objc_getClass(sel!("MPSMatrixMultiplication")) };
         if cls.is_null() {
@@ -93,13 +94,13 @@ impl MpsMatrixMultiply {
                 obj,
                 init_sel,
                 device.as_raw_ptr(),
-                transpose_left,
-                transpose_right,
-                result_rows,
-                result_columns,
-                interior_columns,
-                alpha,
-                beta,
+                config.transpose_left,
+                config.transpose_right,
+                config.result_rows,
+                config.result_columns,
+                config.interior_columns,
+                config.alpha,
+                config.beta,
             )
         };
         if raw.is_null() {

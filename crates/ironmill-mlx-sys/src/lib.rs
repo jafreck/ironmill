@@ -25,7 +25,7 @@ pub use array::MlxArray;
 pub use device::MlxDevice;
 pub use error::MlxSysError;
 pub use fast_ops::{rms_norm, rope, scaled_dot_product_attention};
-pub use metal_kernel::metal_kernel;
+pub use metal_kernel::{MetalKernelParams, metal_kernel};
 pub use ops::{
     add, broadcast_to, concat, expand_dims, matmul, multiply, reshape, silu, slice, transpose,
     transpose_axes,

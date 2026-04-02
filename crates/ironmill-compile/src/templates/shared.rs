@@ -8,6 +8,18 @@ use crate::weights::{ModelConfig, WeightProvider};
 use mil_rs::MilError;
 use mil_rs::ir::{Block, Operation, ScalarType, Value};
 
+/// Immutable context shared across layer-level template emission.
+///
+/// Groups the read-only state that is threaded through every layer helper,
+/// keeping function signatures short.
+pub(super) struct LayerContext<'a> {
+    pub provider: &'a dyn WeightProvider,
+    pub config: &'a ModelConfig,
+    pub layer_idx: usize,
+    pub rope_cos: &'a str,
+    pub rope_sin: &'a str,
+}
+
 // ---------------------------------------------------------------------------
 // Weight / constant emission
 // ---------------------------------------------------------------------------
@@ -523,66 +535,57 @@ pub(super) fn emit_lm_head(
 
 /// Emit the standard self-attention block with Q/K/V projections, RoPE, GQA,
 /// scaled dot-product attention, and output projection.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_attention(
     block: &mut Block,
-    provider: &dyn WeightProvider,
-    config: &ModelConfig,
-    layer_idx: usize,
+    ctx: &LayerContext<'_>,
     input: &str,
-    rope_cos: &str,
-    rope_sin: &str,
     warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
-    let prefix = format!("model.layers.{layer_idx}.self_attn");
+    let prefix = format!("model.layers.{}.self_attn", ctx.layer_idx);
 
     // Q/K/V projections
     let q = emit_linear(
         block,
-        provider,
+        ctx.provider,
         &format!("{prefix}.q_proj"),
         input,
-        &format!("l{layer_idx}_q_proj"),
+        &format!("l{}_q_proj", ctx.layer_idx),
         warnings,
     )?;
     let k = emit_linear(
         block,
-        provider,
+        ctx.provider,
         &format!("{prefix}.k_proj"),
         input,
-        &format!("l{layer_idx}_k_proj"),
+        &format!("l{}_k_proj", ctx.layer_idx),
         warnings,
     )?;
     let v = emit_linear(
         block,
-        provider,
+        ctx.provider,
         &format!("{prefix}.v_proj"),
         input,
-        &format!("l{layer_idx}_v_proj"),
+        &format!("l{}_v_proj", ctx.layer_idx),
         warnings,
     )?;
 
-    emit_attention_core(
-        block, config, layer_idx, &prefix, &q, &k, &v, rope_cos, rope_sin, provider, warnings,
-    )
+    emit_attention_core(block, ctx, &prefix, &q, &k, &v, warnings)
 }
 
 /// Core attention computation shared across architectures.
 /// Takes already-projected Q, K, V and emits reshape, RoPE, GQA, scaled dot-product, output projection.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_attention_core(
     block: &mut Block,
-    config: &ModelConfig,
-    layer_idx: usize,
+    ctx: &LayerContext<'_>,
     prefix: &str,
     q: &str,
     k: &str,
     v: &str,
-    rope_cos: &str,
-    rope_sin: &str,
-    provider: &dyn WeightProvider,
     warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
+    let layer_idx = ctx.layer_idx;
+    let config = ctx.config;
+
     // Reshape Q for multi-head: [batch, seq, hidden] -> [batch, seq, n_heads, head_dim]
     let q_reshaped = emit_reshape(
         block,
@@ -641,8 +644,15 @@ pub(super) fn emit_attention_core(
     );
 
     // Apply RoPE to Q and K
-    let (q_roped, k_roped) =
-        emit_rotary_embedding(block, config, &q_t, &k_t, layer_idx, rope_cos, rope_sin);
+    let (q_roped, k_roped) = emit_rotary_embedding(
+        block,
+        config,
+        &q_t,
+        &k_t,
+        layer_idx,
+        ctx.rope_cos,
+        ctx.rope_sin,
+    );
 
     // GQA: expand K and V heads when using grouped query attention
     let (k_expanded, v_expanded) = if config.num_attention_heads != config.num_key_value_heads {
@@ -749,7 +759,7 @@ pub(super) fn emit_attention_core(
     // Output projection
     let o_proj = emit_linear(
         block,
-        provider,
+        ctx.provider,
         &format!("{prefix}.o_proj"),
         &attn_flat,
         &format!("l{layer_idx}_o_proj"),

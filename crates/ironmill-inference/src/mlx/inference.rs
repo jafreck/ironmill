@@ -486,17 +486,17 @@ impl MlxInference {
             let params = MlxArray::from_data_copy(&params_bytes, &[2], MlxDtype::Uint32, stream)?;
             let inputs: &[&MlxArray] = &[x, &qw.indices, &qw.lut, &qw.norms, &params];
 
-            let result = ironmill_mlx_sys::metal_kernel(
-                "polarquant_matvec",
+            let result = ironmill_mlx_sys::metal_kernel(&ironmill_mlx_sys::MetalKernelParams {
+                name: "polarquant_matvec",
                 inputs,
-                &[],
-                POLARQUANT_SOURCE,
-                [n, 1, 1],
-                [32, 1, 1],
+                outputs: &[],
+                source: POLARQUANT_SOURCE,
+                grid: [n, 1, 1],
+                threadgroup: [32, 1, 1],
                 output_shapes,
-                &output_dtypes,
+                output_dtypes: &output_dtypes,
                 stream,
-            )?;
+            })?;
             return result.into_iter().next().ok_or_else(|| {
                 MlxError::WeightLoading("quantized matvec returned no outputs".into())
             });
@@ -508,17 +508,17 @@ impl MlxInference {
         let params = MlxArray::from_data_copy(&params_bytes, &[3], MlxDtype::Uint32, stream)?;
         let inputs: &[&MlxArray] = &[x, &qw.indices, &qw.lut, &qw.norms, &params];
 
-        let result = ironmill_mlx_sys::metal_kernel(
-            "polarquant_matmul",
+        let result = ironmill_mlx_sys::metal_kernel(&ironmill_mlx_sys::MetalKernelParams {
+            name: "polarquant_matmul",
             inputs,
-            &[],
-            POLARQUANT_SOURCE,
-            [(n + 31) / 32, (m + 7) / 8, 1],
-            [32, 8, 1],
+            outputs: &[],
+            source: POLARQUANT_SOURCE,
+            grid: [(n + 31) / 32, (m + 7) / 8, 1],
+            threadgroup: [32, 8, 1],
             output_shapes,
-            &output_dtypes,
+            output_dtypes: &output_dtypes,
             stream,
-        )?;
+        })?;
         result
             .into_iter()
             .next()

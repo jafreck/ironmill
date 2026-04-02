@@ -116,13 +116,15 @@ fn convert_matmul_to_conv(block: &mut Block) {
         // Build replacement ops.
         let new_ops = build_conv_replacement(
             &base,
-            x_input,
-            transposed,
-            cin,
-            cout,
-            dtype,
             &output_name,
-            output_types,
+            ConvReplacementParams {
+                x_input,
+                weight_data: transposed,
+                cin,
+                cout,
+                dtype,
+                output_types,
+            },
         );
         let count = new_ops.len();
 
@@ -161,17 +163,21 @@ fn transpose_weight(data: &[u8], cin: usize, cout: usize, element_size: usize) -
     result
 }
 
+/// Parameters for building a conv replacement for a matmul op.
+struct ConvReplacementParams {
+    pub x_input: Value,
+    pub weight_data: Vec<u8>,
+    pub cin: usize,
+    pub cout: usize,
+    pub dtype: mil_rs::ir::ScalarType,
+    pub output_types: Vec<Option<mil_rs::ir::TensorType>>,
+}
+
 /// Build the conv op and its parameter consts, matching Orion's `orion_mil_linear`.
-#[allow(clippy::too_many_arguments)]
 fn build_conv_replacement(
     base: &str,
-    x_input: Value,
-    weight_data: Vec<u8>,
-    cin: usize,
-    cout: usize,
-    dtype: mil_rs::ir::ScalarType,
     output_name: &str,
-    output_types: Vec<Option<mil_rs::ir::TensorType>>,
+    params: ConvReplacementParams,
 ) -> Vec<Operation> {
     let pt_name = format!("{base}_conv_pt");
     let st_name = format!("{base}_conv_st");
@@ -212,15 +218,15 @@ fn build_conv_replacement(
         .with_input(
             "val",
             Value::Tensor {
-                data: weight_data,
-                shape: vec![cout, cin, 1, 1],
-                dtype,
+                data: params.weight_data,
+                shape: vec![params.cout, params.cin, 1, 1],
+                dtype: params.dtype,
             },
         )
         .with_output(&w_name);
 
     let mut conv = Operation::new("conv", format!("{base}_conv"))
-        .with_input("x", x_input)
+        .with_input("x", params.x_input)
         .with_input("weight", Value::Reference(w_name.clone()))
         .with_input("pad_type", Value::Reference(pt_name.clone()))
         .with_input("strides", Value::Reference(st_name.clone()))
@@ -228,7 +234,7 @@ fn build_conv_replacement(
         .with_input("dilations", Value::Reference(dl_name.clone()))
         .with_input("groups", Value::Reference(gr_name.clone()))
         .with_output(output_name);
-    conv.output_types = output_types;
+    conv.output_types = params.output_types;
 
     vec![pt, st, pd, dl, gr, w, conv]
 }

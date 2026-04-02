@@ -18,8 +18,8 @@ use mil_rs::convert::onnx_graph::ConversionResult;
 use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 
 use super::shared::{
-    emit_embedding, emit_gqa_expand, emit_linear, emit_reshape, emit_residual_add, emit_rms_norm,
-    emit_rope_tables, emit_rotary_embedding, emit_transpose, emit_weight_const,
+    LayerContext, emit_embedding, emit_gqa_expand, emit_linear, emit_reshape, emit_residual_add,
+    emit_rms_norm, emit_rope_tables, emit_rotary_embedding, emit_transpose, emit_weight_const,
 };
 
 /// Build a complete MIL [`Program`] for a LLaMA-family model.
@@ -84,7 +84,6 @@ enum FunctionMode {
 }
 
 /// Build a single LLaMA function for the given mode.
-#[allow(clippy::too_many_arguments)]
 fn build_function(
     func_name: &str,
     provider: &dyn WeightProvider,
@@ -140,22 +139,38 @@ fn build_function(
     // Transformer layers.
     let mut hidden = embed_out;
     for layer_idx in 0..config.num_hidden_layers {
-        hidden = emit_transformer_layer(
-            block, provider, config, layer_idx, &hidden, &rope_cos, &rope_sin, warnings, ane,
-        )?;
+        let ctx = LayerContext {
+            provider,
+            config,
+            layer_idx,
+            rope_cos: &rope_cos,
+            rope_sin: &rope_sin,
+        };
+        hidden = emit_transformer_layer(block, &ctx, &hidden, warnings, ane)?;
     }
 
     // Final RMSNorm.
-    let normed = emit_norm(
-        block,
-        provider,
-        config,
-        "model.norm",
-        &hidden,
-        "final_norm",
-        warnings,
-        ane,
-    )?;
+    let normed = if ane {
+        emit_rms_norm_ane(
+            block,
+            provider,
+            config,
+            "model.norm",
+            &hidden,
+            "final_norm",
+            warnings,
+        )?
+    } else {
+        emit_rms_norm(
+            block,
+            provider,
+            config,
+            "model.norm",
+            &hidden,
+            "final_norm",
+            warnings,
+        )?
+    };
 
     // LM head projection.
     let logits = emit_lm_head(block, provider, config, &normed, warnings, ane)?;
@@ -177,61 +192,44 @@ fn build_function(
 // Transformer layer
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn emit_transformer_layer(
     block: &mut Block,
-    provider: &dyn WeightProvider,
-    config: &ModelConfig,
-    layer_idx: usize,
+    ctx: &LayerContext<'_>,
     input: &str,
-    rope_cos: &str,
-    rope_sin: &str,
     warnings: &mut Vec<String>,
     ane: bool,
 ) -> Result<String, MilError> {
-    let prefix = format!("model.layers.{layer_idx}");
+    let prefix = format!("model.layers.{}", ctx.layer_idx);
 
     // 1. Input RMSNorm
     let normed_attn = emit_norm(
         block,
-        provider,
-        config,
+        ctx,
         &format!("{prefix}.input_layernorm"),
         input,
-        &format!("l{layer_idx}_input_norm"),
+        &format!("l{}_input_norm", ctx.layer_idx),
         warnings,
         ane,
     )?;
 
     // 2. Self-attention
-    let attn_out = emit_attention(
-        block,
-        provider,
-        config,
-        layer_idx,
-        &normed_attn,
-        rope_cos,
-        rope_sin,
-        warnings,
-        ane,
-    )?;
+    let attn_out = emit_attention(block, ctx, &normed_attn, warnings, ane)?;
 
     // 3. Residual add (input + attn_out)
     let post_attn = emit_residual_add(
         block,
         input,
         &attn_out,
-        &format!("l{layer_idx}_post_attn_residual"),
+        &format!("l{}_post_attn_residual", ctx.layer_idx),
     );
 
     // 4. Post-attention RMSNorm
     let normed_mlp = emit_norm(
         block,
-        provider,
-        config,
+        ctx,
         &format!("{prefix}.post_attention_layernorm"),
         &post_attn,
-        &format!("l{layer_idx}_post_attn_norm"),
+        &format!("l{}_post_attn_norm", ctx.layer_idx),
         warnings,
         ane,
     )?;
@@ -239,16 +237,21 @@ fn emit_transformer_layer(
     // 5. MLP
     let mlp_out = emit_mlp(
         block,
-        provider,
-        config,
-        layer_idx,
+        ctx.provider,
+        ctx.config,
+        ctx.layer_idx,
         &normed_mlp,
         warnings,
         ane,
     )?;
 
     // 6. Residual add (post_attn + mlp_out)
-    let layer_out = emit_residual_add(block, &post_attn, &mlp_out, &format!("l{layer_idx}_output"));
+    let layer_out = emit_residual_add(
+        block,
+        &post_attn,
+        &mlp_out,
+        &format!("l{}_output", ctx.layer_idx),
+    );
 
     Ok(layer_out)
 }
@@ -257,18 +260,16 @@ fn emit_transformer_layer(
 // Self-attention
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn emit_attention(
     block: &mut Block,
-    provider: &dyn WeightProvider,
-    config: &ModelConfig,
-    layer_idx: usize,
+    ctx: &LayerContext<'_>,
     input: &str,
-    rope_cos: &str,
-    rope_sin: &str,
     warnings: &mut Vec<String>,
     ane: bool,
 ) -> Result<String, MilError> {
+    let layer_idx = ctx.layer_idx;
+    let config = ctx.config;
+    let provider = ctx.provider;
     let prefix = format!("model.layers.{layer_idx}.self_attn");
 
     // Q/K/V projections
@@ -360,8 +361,15 @@ fn emit_attention(
     );
 
     // Apply RoPE to Q and K
-    let (q_roped, k_roped) =
-        emit_rotary_embedding(block, config, &q_t, &k_t, layer_idx, rope_cos, rope_sin);
+    let (q_roped, k_roped) = emit_rotary_embedding(
+        block,
+        config,
+        &q_t,
+        &k_t,
+        layer_idx,
+        ctx.rope_cos,
+        ctx.rope_sin,
+    );
 
     // KV-cache update (ANE mode): write new K/V into the cache, read full
     // cache for attention.  In standard mode, skip cache entirely.
@@ -726,11 +734,9 @@ fn emit_projection_ane(
 }
 
 /// Dispatch to either high-level [`emit_rms_norm`] or the ANE-decomposed form.
-#[allow(clippy::too_many_arguments)]
 fn emit_norm(
     block: &mut Block,
-    provider: &dyn WeightProvider,
-    config: &ModelConfig,
+    ctx: &LayerContext<'_>,
     weight_prefix: &str,
     input: &str,
     op_prefix: &str,
@@ -740,8 +746,8 @@ fn emit_norm(
     if ane {
         emit_rms_norm_ane(
             block,
-            provider,
-            config,
+            ctx.provider,
+            ctx.config,
             weight_prefix,
             input,
             op_prefix,
@@ -750,8 +756,8 @@ fn emit_norm(
     } else {
         emit_rms_norm(
             block,
-            provider,
-            config,
+            ctx.provider,
+            ctx.config,
             weight_prefix,
             input,
             op_prefix,
@@ -766,7 +772,6 @@ fn emit_norm(
 /// Concatenating `[x, −x]` produces a zero-mean tensor whose variance equals
 /// `mean(x²)`, so a standard LayerNorm on the doubled tensor is equivalent
 /// to RMSNorm on the original. We slice the first half to recover the result.
-#[allow(clippy::too_many_arguments)]
 fn emit_rms_norm_ane(
     block: &mut Block,
     provider: &dyn WeightProvider,

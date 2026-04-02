@@ -14,7 +14,7 @@ use mil_rs::convert::onnx_graph::ConversionResult;
 use mil_rs::ir::{Function, Program, ScalarType, TensorType};
 
 use super::shared::{
-    emit_attention_core, emit_embedding, emit_linear, emit_lm_head, emit_mlp_silu,
+    LayerContext, emit_attention_core, emit_embedding, emit_linear, emit_lm_head, emit_mlp_silu,
     emit_residual_add, emit_rms_norm, emit_rope_tables,
 };
 
@@ -60,16 +60,14 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
     // Transformer layers.
     let mut hidden = embed_out;
     for layer_idx in 0..config.num_hidden_layers {
-        hidden = emit_qwen_transformer_layer(
-            block,
+        let ctx = LayerContext {
             provider,
-            &config,
+            config: &config,
             layer_idx,
-            &hidden,
-            &rope_cos,
-            &rope_sin,
-            &mut warnings,
-        )?;
+            rope_cos: &rope_cos,
+            rope_sin: &rope_sin,
+        };
+        hidden = emit_qwen_transformer_layer(block, &ctx, &hidden, &mut warnings)?;
     }
 
     // Final RMSNorm.
@@ -106,66 +104,64 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
 
 /// Emit a Qwen transformer layer. Same structure as LLaMA but uses
 /// Qwen-specific attention (with bias on Q/K/V projections).
-#[allow(clippy::too_many_arguments)]
 fn emit_qwen_transformer_layer(
     block: &mut mil_rs::ir::Block,
-    provider: &dyn WeightProvider,
-    config: &crate::weights::ModelConfig,
-    layer_idx: usize,
+    ctx: &LayerContext<'_>,
     input: &str,
-    rope_cos: &str,
-    rope_sin: &str,
     warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
-    let prefix = format!("model.layers.{layer_idx}");
+    let prefix = format!("model.layers.{}", ctx.layer_idx);
 
     // 1. Input RMSNorm
     let normed_attn = emit_rms_norm(
         block,
-        provider,
-        config,
+        ctx.provider,
+        ctx.config,
         &format!("{prefix}.input_layernorm"),
         input,
-        &format!("l{layer_idx}_input_norm"),
+        &format!("l{}_input_norm", ctx.layer_idx),
         warnings,
     )?;
 
     // 2. Qwen attention (with bias)
-    let attn_out = emit_qwen_attention(
-        block,
-        provider,
-        config,
-        layer_idx,
-        &normed_attn,
-        rope_cos,
-        rope_sin,
-        warnings,
-    )?;
+    let attn_out = emit_qwen_attention(block, ctx, &normed_attn, warnings)?;
 
     // 3. Residual add
     let post_attn = emit_residual_add(
         block,
         input,
         &attn_out,
-        &format!("l{layer_idx}_post_attn_residual"),
+        &format!("l{}_post_attn_residual", ctx.layer_idx),
     );
 
     // 4. Post-attention RMSNorm
     let normed_mlp = emit_rms_norm(
         block,
-        provider,
-        config,
+        ctx.provider,
+        ctx.config,
         &format!("{prefix}.post_attention_layernorm"),
         &post_attn,
-        &format!("l{layer_idx}_post_attn_norm"),
+        &format!("l{}_post_attn_norm", ctx.layer_idx),
         warnings,
     )?;
 
     // 5. MLP (SwiGLU, same as LLaMA)
-    let mlp_out = emit_mlp_silu(block, provider, config, layer_idx, &normed_mlp, warnings)?;
+    let mlp_out = emit_mlp_silu(
+        block,
+        ctx.provider,
+        ctx.config,
+        ctx.layer_idx,
+        &normed_mlp,
+        warnings,
+    )?;
 
     // 6. Residual add
-    let layer_out = emit_residual_add(block, &post_attn, &mlp_out, &format!("l{layer_idx}_output"));
+    let layer_out = emit_residual_add(
+        block,
+        &post_attn,
+        &mlp_out,
+        &format!("l{}_output", ctx.layer_idx),
+    );
 
     Ok(layer_out)
 }
@@ -176,49 +172,42 @@ fn emit_qwen_transformer_layer(
 
 /// Emit Qwen attention. Like LLaMA attention but Q/K/V projections include
 /// bias terms when present in the weight provider.
-#[allow(clippy::too_many_arguments)]
 fn emit_qwen_attention(
     block: &mut mil_rs::ir::Block,
-    provider: &dyn WeightProvider,
-    config: &crate::weights::ModelConfig,
-    layer_idx: usize,
+    ctx: &LayerContext<'_>,
     input: &str,
-    rope_cos: &str,
-    rope_sin: &str,
     warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
-    let prefix = format!("model.layers.{layer_idx}.self_attn");
+    let prefix = format!("model.layers.{}.self_attn", ctx.layer_idx);
 
     // Q/K/V projections — emit_linear automatically picks up bias when present.
     let q = emit_linear(
         block,
-        provider,
+        ctx.provider,
         &format!("{prefix}.q_proj"),
         input,
-        &format!("l{layer_idx}_q_proj"),
+        &format!("l{}_q_proj", ctx.layer_idx),
         warnings,
     )?;
     let k = emit_linear(
         block,
-        provider,
+        ctx.provider,
         &format!("{prefix}.k_proj"),
         input,
-        &format!("l{layer_idx}_k_proj"),
+        &format!("l{}_k_proj", ctx.layer_idx),
         warnings,
     )?;
     let v = emit_linear(
         block,
-        provider,
+        ctx.provider,
         &format!("{prefix}.v_proj"),
         input,
-        &format!("l{layer_idx}_v_proj"),
+        &format!("l{}_v_proj", ctx.layer_idx),
         warnings,
     )?;
 
     // Delegate to shared attention core (reshape, RoPE, GQA, dot-product, o_proj)
-    emit_attention_core(
-        block, config, layer_idx, &prefix, &q, &k, &v, rope_cos, rope_sin, provider, warnings,
-    )
+    emit_attention_core(block, ctx, &prefix, &q, &k, &v, warnings)
 }
 
 #[cfg(test)]

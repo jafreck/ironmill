@@ -242,48 +242,47 @@ pub fn lora_initializer_names(adapters: &[LoraAdapter]) -> std::collections::Has
     names
 }
 
+/// LoRA adapter weight matrices for merging into base weights.
+pub struct LoraWeights<'a> {
+    /// LoRA A matrix bytes (row-major, `[rank, in_features]`).
+    pub lora_a: &'a [u8],
+    /// Shape of A: `[rank, in_features]`.
+    pub lora_a_shape: &'a [usize],
+    /// LoRA B matrix bytes (row-major, `[out_features, rank]`).
+    pub lora_b: &'a [u8],
+    /// Shape of B: `[out_features, rank]`.
+    pub lora_b_shape: &'a [usize],
+    /// Element data type (must be `Float32` or `Float16`).
+    pub dtype: ScalarType,
+    /// Optional scaling factor. When `None`, defaults to `rank` (scale = 1.0).
+    pub alpha: Option<f64>,
+}
+
 /// Format-agnostic LoRA merge kernel.
 ///
 /// Applies `W_new = W + (alpha / rank) * B @ A` to the base weight buffer
 /// in-place. This function operates on raw byte buffers and does not depend
 /// on any specific model format (ONNX, SafeTensors, etc.).
-///
-/// # Arguments
-///
-/// * `base` — Mutable base weight buffer (row-major, `[out_features, in_features]`).
-/// * `base_shape` — Shape of the base weight: `[out_features, in_features]`.
-/// * `lora_a` — LoRA A matrix bytes (row-major, `[rank, in_features]`).
-/// * `lora_a_shape` — Shape of A: `[rank, in_features]`.
-/// * `lora_b` — LoRA B matrix bytes (row-major, `[out_features, rank]`).
-/// * `lora_b_shape` — Shape of B: `[out_features, rank]`.
-/// * `dtype` — Element data type (must be `Float32` or `Float16`).
-/// * `alpha` — Optional scaling factor. When `None`, defaults to `rank` (scale = 1.0).
-#[allow(clippy::too_many_arguments)]
 pub fn merge_lora_weights(
     base: &mut Vec<u8>,
     base_shape: &[usize],
-    lora_a: &[u8],
-    lora_a_shape: &[usize],
-    lora_b: &[u8],
-    lora_b_shape: &[usize],
-    dtype: ScalarType,
-    alpha: Option<f64>,
+    lora: &LoraWeights<'_>,
 ) -> Result<()> {
     if base_shape.len() != 2 {
         return Err(MilError::Validation(format!(
             "LoRA merge requires 2-D base weight, got shape {base_shape:?}"
         )));
     }
-    if lora_a_shape.len() != 2 || lora_b_shape.len() != 2 {
+    if lora.lora_a_shape.len() != 2 || lora.lora_b_shape.len() != 2 {
         return Err(MilError::Validation("LoRA A and B must be 2-D".into()));
     }
 
     let out_features = base_shape[0];
     let in_features = base_shape[1];
-    let rank = lora_a_shape[0];
-    let a_in = lora_a_shape[1];
-    let b_out = lora_b_shape[0];
-    let b_rank = lora_b_shape[1];
+    let rank = lora.lora_a_shape[0];
+    let a_in = lora.lora_a_shape[1];
+    let b_out = lora.lora_b_shape[0];
+    let b_rank = lora.lora_b_shape[1];
 
     if a_in != in_features {
         return Err(MilError::Validation(format!(
@@ -301,9 +300,9 @@ pub fn merge_lora_weights(
         )));
     }
 
-    let scale = alpha.unwrap_or(rank as f64) / rank as f64;
+    let scale = lora.alpha.unwrap_or(rank as f64) / rank as f64;
 
-    let dtype_size = match dtype {
+    let dtype_size = match lora.dtype {
         ScalarType::Float32 => 4,
         ScalarType::Float16 => 2,
         other => {
@@ -321,28 +320,28 @@ pub fn merge_lora_weights(
         )));
     }
     let expected_a = rank * a_in * dtype_size;
-    if lora_a.len() < expected_a {
+    if lora.lora_a.len() < expected_a {
         return Err(MilError::Validation(format!(
             "LoRA A buffer too small: got {} bytes, expected {expected_a}",
-            lora_a.len()
+            lora.lora_a.len()
         )));
     }
     let expected_b = b_out * b_rank * dtype_size;
-    if lora_b.len() < expected_b {
+    if lora.lora_b.len() < expected_b {
         return Err(MilError::Validation(format!(
             "LoRA B buffer too small: got {} bytes, expected {expected_b}",
-            lora_b.len()
+            lora.lora_b.len()
         )));
     }
 
-    match dtype {
+    match lora.dtype {
         ScalarType::Float32 => {
             merge_f32_raw(
                 base,
                 out_features,
                 in_features,
-                lora_a,
-                lora_b,
+                lora.lora_a,
+                lora.lora_b,
                 rank,
                 scale as f32,
             );
@@ -352,8 +351,8 @@ pub fn merge_lora_weights(
                 base,
                 out_features,
                 in_features,
-                lora_a,
-                lora_b,
+                lora.lora_a,
+                lora.lora_b,
                 rank,
                 scale as f32,
             );

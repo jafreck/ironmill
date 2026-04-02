@@ -304,16 +304,15 @@ fn merge_lora_adapters(
         });
 
         if let Some((base_data, base_shape, base_dtype)) = init_data.get_mut(&base_name) {
-            if let Err(e) = lora::merge_lora_weights(
-                base_data,
-                base_shape,
-                &a_data,
-                &[a_shape[0], a_shape[1]],
-                &b_data,
-                &[b_shape[0], b_shape[1]],
-                *base_dtype,
+            let lora = lora::LoraWeights {
+                lora_a: &a_data,
+                lora_a_shape: &[a_shape[0], a_shape[1]],
+                lora_b: &b_data,
+                lora_b_shape: &[b_shape[0], b_shape[1]],
+                dtype: *base_dtype,
                 alpha,
-            ) {
+            };
+            if let Err(e) = lora::merge_lora_weights(base_data, base_shape, &lora) {
                 warnings.push(format!("LoRA merge failed for '{base_name}': {e}"));
             }
         } else {

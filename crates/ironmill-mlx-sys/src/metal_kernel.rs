@@ -10,35 +10,27 @@ use crate::ffi;
 #[cfg(not(mlx_stub))]
 use std::ffi::CString;
 
+/// Parameters for launching a custom Metal kernel via mlx-c.
+pub struct MetalKernelParams<'a> {
+    pub name: &'a str,
+    pub inputs: &'a [&'a MlxArray],
+    pub outputs: &'a [&'a MlxArray],
+    pub source: &'a str,
+    pub grid: [usize; 3],
+    pub threadgroup: [usize; 3],
+    pub output_shapes: &'a [&'a [usize]],
+    pub output_dtypes: &'a [MlxDtype],
+    pub stream: &'a MlxStream,
+}
+
 /// Launch a custom Metal kernel via mlx-c.
 ///
 /// This wraps the `mlx_fast_metal_kernel` + config API and returns the output
 /// arrays.
-#[allow(clippy::too_many_arguments)]
-pub fn metal_kernel(
-    name: &str,
-    inputs: &[&MlxArray],
-    _outputs: &[&MlxArray],
-    source: &str,
-    grid: [usize; 3],
-    threadgroup: [usize; 3],
-    output_shapes: &[&[usize]],
-    output_dtypes: &[MlxDtype],
-    stream: &MlxStream,
-) -> Result<Vec<MlxArray>, MlxSysError> {
+pub fn metal_kernel(params: &MetalKernelParams<'_>) -> Result<Vec<MlxArray>, MlxSysError> {
     #[cfg(mlx_stub)]
     {
-        let _ = (
-            name,
-            inputs,
-            _outputs,
-            source,
-            grid,
-            threadgroup,
-            output_shapes,
-            output_dtypes,
-            stream,
-        );
+        let _ = params;
         Err(MlxSysError::KernelCompile(
             "mlx-c not available (stub mode)".into(),
         ))
@@ -46,20 +38,21 @@ pub fn metal_kernel(
 
     #[cfg(not(mlx_stub))]
     {
-        let c_name = CString::new(name).map_err(|e| MlxSysError::KernelCompile(e.to_string()))?;
+        let c_name =
+            CString::new(params.name).map_err(|e| MlxSysError::KernelCompile(e.to_string()))?;
         let c_source =
-            CString::new(source).map_err(|e| MlxSysError::KernelCompile(e.to_string()))?;
+            CString::new(params.source).map_err(|e| MlxSysError::KernelCompile(e.to_string()))?;
 
         // Build input / output name vectors. Use generic names since the
         // original API didn't require explicit names.
-        let input_names: Vec<CString> = (0..inputs.len())
+        let input_names: Vec<CString> = (0..params.inputs.len())
             .map(|i| {
                 CString::new(format!("input{i}")).map_err(|e| {
                     MlxSysError::KernelCompile(format!("invalid kernel parameter name: {e}"))
                 })
             })
             .collect::<Result<_, _>>()?;
-        let output_names: Vec<CString> = (0..output_shapes.len())
+        let output_names: Vec<CString> = (0..params.output_shapes.len())
             .map(|i| {
                 CString::new(format!("output{i}")).map_err(|e| {
                     MlxSysError::KernelCompile(format!("invalid kernel parameter name: {e}"))
@@ -109,20 +102,20 @@ pub fn metal_kernel(
         unsafe {
             ffi::mlx_fast_metal_kernel_config_set_grid(
                 config,
-                grid[0] as i32,
-                grid[1] as i32,
-                grid[2] as i32,
+                params.grid[0] as i32,
+                params.grid[1] as i32,
+                params.grid[2] as i32,
             );
             ffi::mlx_fast_metal_kernel_config_set_thread_group(
                 config,
-                threadgroup[0] as i32,
-                threadgroup[1] as i32,
-                threadgroup[2] as i32,
+                params.threadgroup[0] as i32,
+                params.threadgroup[1] as i32,
+                params.threadgroup[2] as i32,
             );
         }
 
         // Add output specifications.
-        for (shape, &dtype) in output_shapes.iter().zip(output_dtypes.iter()) {
+        for (shape, &dtype) in params.output_shapes.iter().zip(params.output_dtypes.iter()) {
             let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
             unsafe {
                 ffi::mlx_fast_metal_kernel_config_add_output_arg(
@@ -145,7 +138,7 @@ pub fn metal_kernel(
                 "mlx_vector_array_new returned null (input_vec)".into(),
             ));
         }
-        for arr in inputs {
+        for arr in params.inputs {
             unsafe { ffi::mlx_vector_array_append_value(input_vec, arr.raw) };
         }
 
@@ -162,7 +155,13 @@ pub fn metal_kernel(
             ));
         }
         let ret = unsafe {
-            ffi::mlx_fast_metal_kernel_apply(&mut output_vec, kernel, input_vec, config, stream.raw)
+            ffi::mlx_fast_metal_kernel_apply(
+                &mut output_vec,
+                kernel,
+                input_vec,
+                config,
+                params.stream.raw,
+            )
         };
 
         // Cleanup kernel resources.

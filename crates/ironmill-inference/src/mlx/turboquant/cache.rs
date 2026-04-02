@@ -4,7 +4,7 @@
 //! data as [`MlxArray`]s and dispatches cache-write / attention kernels
 //! via [`metal_kernel`].
 
-use ironmill_mlx_sys::{MlxArray, MlxDtype, MlxStream, metal_kernel};
+use ironmill_mlx_sys::{MetalKernelParams, MlxArray, MlxDtype, MlxStream, metal_kernel};
 
 use super::{MlxOutlierCache, MlxTurboQuantModel};
 use crate::mlx::error::MlxError;
@@ -248,17 +248,17 @@ impl MlxKvCache {
             "{head_dim_header}{}",
             super::kernels::TURBOQUANT_CACHE_WRITE
         );
-        let result = metal_kernel(
-            "turboquant_cache_write",
-            &inputs,
-            &[],
-            &source,
-            [self.num_kv_heads, 1, 1],
-            [self.head_dim.min(1024), 1, 1],
-            &[&[1]], // dummy output shape
-            &[MlxDtype::Float32],
+        let result = metal_kernel(&MetalKernelParams {
+            name: "turboquant_cache_write",
+            inputs: &inputs,
+            outputs: &[],
+            source: &source,
+            grid: [self.num_kv_heads, 1, 1],
+            threadgroup: [self.head_dim.min(1024), 1, 1],
+            output_shapes: &[&[1]], // dummy output shape
+            output_dtypes: &[MlxDtype::Float32],
             stream,
-        )?;
+        })?;
 
         result
             .into_iter()
@@ -321,17 +321,17 @@ impl MlxKvCache {
             self.head_dim / 2
         );
         let source = format!("{head_dim_header}{}", super::kernels::TURBOQUANT_ATTENTION);
-        let result = metal_kernel(
-            "turboquant_attention",
-            &inputs,
-            &[],
-            &source,
-            [num_heads, 1, 1],
-            [self.head_dim.min(1024), 1, 1],
-            &[&[output_size]],
-            &[MlxDtype::Float16],
+        let result = metal_kernel(&MetalKernelParams {
+            name: "turboquant_attention",
+            inputs: &inputs,
+            outputs: &[],
+            source: &source,
+            grid: [num_heads, 1, 1],
+            threadgroup: [self.head_dim.min(1024), 1, 1],
+            output_shapes: &[&[output_size]],
+            output_dtypes: &[MlxDtype::Float16],
             stream,
-        )?;
+        })?;
 
         result
             .into_iter()
@@ -418,17 +418,17 @@ impl MlxKvCache {
             "{head_dim_header}{}",
             super::kernels::TURBOQUANT_OUTLIER_CACHE_WRITE
         );
-        let result = metal_kernel(
-            "turboquant_outlier_cache_write",
-            &inputs,
-            &[],
-            &source,
-            [self.num_kv_heads, 1, 1],
-            [tg_size, 1, 1],
-            &[&[1]],
-            &[MlxDtype::Float32],
+        let result = metal_kernel(&MetalKernelParams {
+            name: "turboquant_outlier_cache_write",
+            inputs: &inputs,
+            outputs: &[],
+            source: &source,
+            grid: [self.num_kv_heads, 1, 1],
+            threadgroup: [tg_size, 1, 1],
+            output_shapes: &[&[1]],
+            output_dtypes: &[MlxDtype::Float32],
             stream,
-        )?;
+        })?;
 
         result.into_iter().next().ok_or_else(|| {
             MlxError::WeightLoading("outlier K cache write returned no outputs".into())
@@ -514,17 +514,17 @@ impl MlxKvCache {
             "{head_dim_header}{}",
             super::kernels::TURBOQUANT_OUTLIER_CACHE_WRITE
         );
-        let result = metal_kernel(
-            "turboquant_outlier_cache_write",
-            &inputs,
-            &[],
-            &source,
-            [self.num_kv_heads, 1, 1],
-            [tg_size, 1, 1],
-            &[&[1]],
-            &[MlxDtype::Float32],
+        let result = metal_kernel(&MetalKernelParams {
+            name: "turboquant_outlier_cache_write",
+            inputs: &inputs,
+            outputs: &[],
+            source: &source,
+            grid: [self.num_kv_heads, 1, 1],
+            threadgroup: [tg_size, 1, 1],
+            output_shapes: &[&[1]],
+            output_dtypes: &[MlxDtype::Float32],
             stream,
-        )?;
+        })?;
 
         result.into_iter().next().ok_or_else(|| {
             MlxError::WeightLoading("outlier V cache write returned no outputs".into())
@@ -612,17 +612,17 @@ impl MlxKvCache {
             "{head_dim_header}{}",
             super::kernels::TURBOQUANT_OUTLIER_ATTENTION
         );
-        let result = metal_kernel(
-            "turboquant_outlier_attention",
-            &inputs,
-            &[],
-            &source,
-            [num_heads, 1, 1],
-            [tg_size, 1, 1],
-            &[&[output_size]],
-            &[MlxDtype::Float16],
+        let result = metal_kernel(&MetalKernelParams {
+            name: "turboquant_outlier_attention",
+            inputs: &inputs,
+            outputs: &[],
+            source: &source,
+            grid: [num_heads, 1, 1],
+            threadgroup: [tg_size, 1, 1],
+            output_shapes: &[&[output_size]],
+            output_dtypes: &[MlxDtype::Float16],
             stream,
-        )?;
+        })?;
 
         result
             .into_iter()
