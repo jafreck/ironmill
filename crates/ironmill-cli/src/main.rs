@@ -583,8 +583,386 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
     Ok(pipeline)
 }
 
-/// Run the pass pipeline, handle output dispatch (MoE, speculative, CoreML, ANE-direct),
-/// and print warnings. Shared by both ONNX and weights compilation paths.
+/// Derive a base stem from `--output` (stripping any extension) or from the
+/// input filename. Used by modes that emit multiple output files.
+fn resolve_output_stem(output: Option<&str>, input_path: &Path) -> String {
+    if let Some(out) = output {
+        let p = Path::new(out);
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(out)
+            .to_string()
+    } else {
+        input_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model")
+            .to_string()
+    }
+}
+
+/// Resolve a single output path from `--output` or `{input_stem}{default_suffix}`.
+fn resolve_output_path(output: Option<&str>, input_path: &Path, default_suffix: &str) -> String {
+    if let Some(out) = output {
+        out.to_string()
+    } else {
+        let stem = input_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model");
+        format!("{stem}{default_suffix}")
+    }
+}
+
+/// MoE split: write per-expert .mlpackage files and a manifest.
+/// Returns `Ok(true)` if MoE was detected and handled.
+fn emit_moe_split(
+    program: &mut ironmill_compile::mil::Program,
+    input_path: &Path,
+    opts: &CompileOpts,
+) -> Result<bool> {
+    if !opts.moe_split {
+        return Ok(false);
+    }
+
+    use ironmill_compile::convert::moe::{detect_moe, split_moe};
+
+    let topology = match detect_moe(program) {
+        Some(t) => t,
+        None => {
+            println!(
+                "Note: --moe-split specified but no MoE pattern detected. Producing single output."
+            );
+            return Ok(false);
+        }
+    };
+
+    println!(
+        "MoE architecture detected: {} experts",
+        topology.expert_count
+    );
+    let split_result = split_moe(program, &topology);
+    let stem = resolve_output_stem(opts.output.as_deref(), input_path);
+
+    // Write shared program
+    let shared_model = program_to_model(&split_result.shared, 9)
+        .context("Failed to convert shared program to CoreML")?;
+    let shared_path = format!("{stem}-shared.mlpackage");
+    println!("  Writing shared layers: {shared_path}");
+    write_mlpackage(&shared_model, &shared_path)
+        .with_context(|| format!("Failed to write {shared_path}"))?;
+
+    // Write per-expert programs
+    for (i, expert) in split_result.experts.iter().enumerate() {
+        let expert_model = program_to_model(expert, 9)
+            .with_context(|| format!("Failed to convert expert {i} to CoreML"))?;
+        let expert_path = format!("{stem}-expert-{i}.mlpackage");
+        println!("  Writing expert {i}: {expert_path}");
+        write_mlpackage(&expert_model, &expert_path)
+            .with_context(|| format!("Failed to write {expert_path}"))?;
+    }
+
+    // Write manifest
+    let manifest_path = format!("{stem}-manifest.json");
+    let manifest_json = serde_json::to_string_pretty(&split_result.manifest)
+        .context("Failed to serialize MoE manifest")?;
+    std::fs::write(&manifest_path, &manifest_json)
+        .with_context(|| format!("Failed to write {manifest_path}"))?;
+    println!("  Wrote manifest: {manifest_path}");
+
+    println!();
+    println!("MoE split complete.");
+    Ok(true)
+}
+
+/// MoE bundle: write a single multi-function .mlpackage with all experts.
+/// Returns `Ok(true)` if MoE was detected and handled.
+fn emit_moe_bundle(
+    program: &mut ironmill_compile::mil::Program,
+    input_path: &Path,
+    opts: &CompileOpts,
+) -> Result<bool> {
+    if !opts.moe_bundle {
+        return Ok(false);
+    }
+
+    use ironmill_compile::convert::moe::{detect_moe, split_moe};
+
+    let topology = match detect_moe(program) {
+        Some(t) => t,
+        None => {
+            println!(
+                "Note: --moe-bundle specified but no MoE pattern detected. Producing single output."
+            );
+            return Ok(false);
+        }
+    };
+
+    println!(
+        "MoE architecture detected: {} experts",
+        topology.expert_count
+    );
+    let split_result = split_moe(program, &topology);
+
+    let bundle_model = program_to_multi_function_model(&split_result, 9)
+        .context("Failed to convert MoE programs to multi-function CoreML model")?;
+
+    let bundle_path = resolve_output_path(opts.output.as_deref(), input_path, "-bundle.mlpackage");
+    println!(
+        "  Writing multi-function bundle ({} experts): {bundle_path}",
+        topology.expert_count
+    );
+    write_mlpackage(&bundle_model, &bundle_path)
+        .with_context(|| format!("Failed to write {bundle_path}"))?;
+
+    // Write manifest alongside the bundle
+    let manifest_path = format!(
+        "{}-manifest.json",
+        bundle_path
+            .strip_suffix(".mlpackage")
+            .unwrap_or(&bundle_path)
+    );
+    let manifest_json = serde_json::to_string_pretty(&split_result.manifest)
+        .context("Failed to serialize MoE manifest")?;
+    std::fs::write(&manifest_path, &manifest_json)
+        .with_context(|| format!("Failed to write {manifest_path}"))?;
+    println!("  Wrote manifest: {manifest_path}");
+
+    compile_output(&bundle_path);
+
+    println!();
+    println!("MoE bundle complete.");
+    Ok(true)
+}
+
+/// MoE top-K fusion: fuse the most frequently activated experts into a dense model.
+/// Returns `Ok(true)` if fusion was performed.
+fn emit_topk_fusion(
+    program: &mut ironmill_compile::mil::Program,
+    input_path: &Path,
+    opts: &CompileOpts,
+) -> Result<bool> {
+    let k = match opts.moe_fuse_topk {
+        Some(k) => k,
+        None => return Ok(false),
+    };
+
+    use ironmill_compile::convert::moe::{ExpertFrequencyProfile, fuse_top_k_experts};
+
+    // Load or build frequency profile
+    let profile = if let Some(ref cal_dir) = opts.cal_data {
+        let profile_path = cal_dir.join("expert_profile.json");
+        if profile_path.exists() {
+            let json = std::fs::read_to_string(&profile_path)
+                .with_context(|| format!("Failed to read {}", profile_path.display()))?;
+            ExpertFrequencyProfile::from_json(&json)
+                .with_context(|| format!("Failed to parse {}", profile_path.display()))?
+        } else {
+            println!(
+                "  Note: {} not found, using uniform profile.",
+                profile_path.display()
+            );
+            let expert_count = ironmill_compile::convert::moe::detect_moe(program)
+                .map(|t| t.expert_count)
+                .unwrap_or(k);
+            ExpertFrequencyProfile::uniform(expert_count)
+        }
+    } else {
+        println!("  Note: --cal-data not provided, using uniform profile.");
+        let expert_count = ironmill_compile::convert::moe::detect_moe(program)
+            .map(|t| t.expert_count)
+            .unwrap_or(k);
+        ExpertFrequencyProfile::uniform(expert_count)
+    };
+
+    let fuse_result = match fuse_top_k_experts(program, k, &profile)? {
+        Some(r) => r,
+        None => {
+            println!(
+                "Note: --moe-fuse-topk specified but no MoE pattern detected. Producing single output."
+            );
+            return Ok(false);
+        }
+    };
+
+    println!(
+        "MoE top-{k} fusion: kept experts {:?}, discarded {:?}",
+        fuse_result.kept_expert_indices, fuse_result.discarded_expert_indices
+    );
+    println!(
+        "  Fused program: {} ops (was {} ops)",
+        count_ops(&fuse_result.program),
+        count_ops(program)
+    );
+
+    let output_path = resolve_output_path(opts.output.as_deref(), input_path, "-fused.mlpackage");
+    let model = program_to_model(&fuse_result.program, 9)
+        .context("Failed to convert fused program to CoreML")?;
+    println!("  Writing fused model: {output_path}");
+    write_mlpackage(&model, &output_path)
+        .with_context(|| format!("Failed to write {output_path}"))?;
+
+    compile_output(&output_path);
+
+    println!();
+    println!("MoE top-{k} fusion complete.");
+    Ok(true)
+}
+
+/// Speculative decoding split: produce draft and verifier .mlpackage files.
+fn emit_speculative_split(
+    program: &mut ironmill_compile::mil::Program,
+    input_path: &Path,
+    opts: &CompileOpts,
+    n_layers: usize,
+) -> Result<()> {
+    let stem = resolve_output_stem(opts.output.as_deref(), input_path);
+    let output_parent = opts
+        .output
+        .as_deref()
+        .map(|o| Path::new(o).parent().unwrap_or(Path::new(".")));
+
+    let build_path = |suffix: &str| -> String {
+        match output_parent {
+            Some(parent) => parent
+                .join(format!("{stem}{suffix}"))
+                .to_string_lossy()
+                .into_owned(),
+            None => format!("{stem}{suffix}"),
+        }
+    };
+
+    let split_pass = ModelSplitPass::new(n_layers);
+    let split_result = split_pass
+        .split(program)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("Failed to split model for speculative decoding")?;
+
+    // Write draft model
+    let draft_path = build_path("-draft.mlpackage");
+    let draft_model = program_to_model(&split_result.draft, 9)
+        .context("Failed to convert draft MIL IR to CoreML protobuf")?;
+    println!("Writing draft model ({n_layers} layers): {draft_path}");
+    write_mlpackage(&draft_model, &draft_path)
+        .with_context(|| format!("Failed to write draft mlpackage: {draft_path}"))?;
+
+    // Write verifier model
+    let verifier_path = build_path("-verifier.mlpackage");
+    let verifier_model = program_to_model(&split_result.verifier, 9)
+        .context("Failed to convert verifier MIL IR to CoreML protobuf")?;
+    println!("Writing verifier model (full): {verifier_path}");
+    write_mlpackage(&verifier_model, &verifier_path)
+        .with_context(|| format!("Failed to write verifier mlpackage: {verifier_path}"))?;
+
+    compile_output(&draft_path);
+    compile_output(&verifier_path);
+    Ok(())
+}
+
+/// Standard CoreML output: produce a single .mlpackage (optionally updatable).
+fn emit_coreml(
+    program: &mut ironmill_compile::mil::Program,
+    input_path: &Path,
+    opts: &CompileOpts,
+) -> Result<()> {
+    let model = if let Some(ref layers) = opts.updatable_layers {
+        let layer_names: Vec<String> = layers
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        anyhow::ensure!(
+            opts.epochs > 0,
+            "--epochs must be a positive integer, got {}",
+            opts.epochs
+        );
+        anyhow::ensure!(
+            opts.learning_rate > 0.0 && opts.learning_rate.is_finite(),
+            "--learning-rate must be a positive finite number, got {}",
+            opts.learning_rate
+        );
+
+        let loss_fn = match opts.loss_function.as_str() {
+            "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,
+            "categorical-cross-entropy" => LossFunction::CategoricalCrossEntropy,
+            other => bail!(
+                "unknown loss function: '{}'. Valid: mse, mean-squared-error, categorical-cross-entropy",
+                other
+            ),
+        };
+        let opt = match opts.optimizer_type.as_str() {
+            "adam" => UpdateOptimizer::Adam,
+            "sgd" => UpdateOptimizer::Sgd,
+            other => bail!("unknown optimizer: '{}'. Valid: adam, sgd", other),
+        };
+
+        let config = UpdatableModelConfig {
+            updatable_layers: layer_names.clone(),
+            learning_rate: opts.learning_rate,
+            epochs: opts.epochs,
+            loss_function: loss_fn,
+            optimizer: opt,
+        };
+
+        println!(
+            "Updatable model: {} layer(s) marked for on-device training",
+            layer_names.len()
+        );
+        program_to_updatable_model(program, 9, &config)
+            .context("Failed to convert MIL IR to updatable CoreML protobuf")?
+    } else {
+        program_to_model(program, 9).context("Failed to convert MIL IR to CoreML protobuf")?
+    };
+
+    let output_path = resolve_output_path(opts.output.as_deref(), input_path, ".mlpackage");
+    println!("Writing CoreML package: {output_path}");
+    write_mlpackage(&model, &output_path)
+        .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
+
+    compile_output(&output_path);
+    Ok(())
+}
+
+/// ANE-direct output: compile to a `.ironml` bundle for the direct ANE runtime.
+fn emit_ane_direct(
+    program: &mut ironmill_compile::mil::Program,
+    input_path: &Path,
+    opts: &CompileOpts,
+) -> Result<()> {
+    #[cfg(feature = "ane-direct")]
+    {
+        use ironmill_compile::ane::bundle::{AneCompileConfig, compile_model_bundle};
+
+        let output_dir = resolve_output_path(opts.output.as_deref(), input_path, ".ironml");
+
+        println!("Compiling for ANE direct runtime → {output_dir}");
+
+        let config = AneCompileConfig::default();
+        let bundle = compile_model_bundle(program, &config)
+            .context("ANE model bundle compilation failed")?;
+
+        let output_path = std::path::Path::new(&output_dir);
+        bundle
+            .save(output_path)
+            .context("Failed to save .ironml bundle")?;
+
+        println!(
+            "  ✓ {} sub-program(s) written to {output_dir}",
+            bundle.sub_programs.len(),
+        );
+    }
+    #[cfg(not(feature = "ane-direct"))]
+    {
+        let _ = (program, input_path, opts);
+        anyhow::bail!("ANE direct runtime requires --features ane-direct");
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+/// Run the pass pipeline, dispatch to the appropriate output handler, and
+/// print warnings. Shared by both ONNX and weights compilation paths.
 fn compile_and_emit(
     program: &mut ironmill_compile::mil::Program,
     input_path: &Path,
@@ -601,353 +979,21 @@ fn compile_and_emit(
 
     print_pipeline_report(&report);
 
-    // MoE split (if requested)
-    if opts.moe_split {
-        use ironmill_compile::convert::moe::{detect_moe, split_moe};
-
-        if let Some(topology) = detect_moe(program) {
-            println!(
-                "MoE architecture detected: {} experts",
-                topology.expert_count
-            );
-            let split_result = split_moe(program, &topology);
-
-            let stem = if let Some(ref out) = opts.output {
-                // Use --output as the base stem, stripping any known extension
-                let p = std::path::Path::new(out);
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(out)
-                    .to_string()
-            } else {
-                input_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("model")
-                    .to_string()
-            };
-
-            // Write shared program
-            let shared_model = program_to_model(&split_result.shared, 9)
-                .context("Failed to convert shared program to CoreML")?;
-            let shared_path = format!("{stem}-shared.mlpackage");
-            println!("  Writing shared layers: {shared_path}");
-            write_mlpackage(&shared_model, &shared_path)
-                .with_context(|| format!("Failed to write {shared_path}"))?;
-
-            // Write per-expert programs
-            for (i, expert) in split_result.experts.iter().enumerate() {
-                let expert_model = program_to_model(expert, 9)
-                    .with_context(|| format!("Failed to convert expert {i} to CoreML"))?;
-                let expert_path = format!("{stem}-expert-{i}.mlpackage");
-                println!("  Writing expert {i}: {expert_path}");
-                write_mlpackage(&expert_model, &expert_path)
-                    .with_context(|| format!("Failed to write {expert_path}"))?;
-            }
-
-            // Write manifest
-            let manifest_path = format!("{stem}-manifest.json");
-            let manifest_json = serde_json::to_string_pretty(&split_result.manifest)
-                .context("Failed to serialize MoE manifest")?;
-            std::fs::write(&manifest_path, &manifest_json)
-                .with_context(|| format!("Failed to write {manifest_path}"))?;
-            println!("  Wrote manifest: {manifest_path}");
-
-            println!();
-            println!("MoE split complete.");
-            return Ok(());
-        } else {
-            println!(
-                "Note: --moe-split specified but no MoE pattern detected. Producing single output."
-            );
-        }
+    // MoE modes return early (no warnings / "Conversion complete" footer).
+    if emit_moe_split(program, input_path, opts)?
+        || emit_moe_bundle(program, input_path, opts)?
+        || emit_topk_fusion(program, input_path, opts)?
+    {
+        return Ok(());
     }
 
-    // MoE bundle (if requested) — single multi-function .mlpackage
-    if opts.moe_bundle {
-        use ironmill_compile::convert::moe::{detect_moe, split_moe};
-
-        if let Some(topology) = detect_moe(program) {
-            println!(
-                "MoE architecture detected: {} experts",
-                topology.expert_count
-            );
-            let split_result = split_moe(program, &topology);
-
-            let stem = input_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("model");
-
-            // Bundle all experts as functions in a single model.
-            let bundle_model = program_to_multi_function_model(&split_result, 9)
-                .context("Failed to convert MoE programs to multi-function CoreML model")?;
-
-            let bundle_path = opts
-                .output
-                .clone()
-                .unwrap_or_else(|| format!("{stem}-bundle.mlpackage"));
-            println!(
-                "  Writing multi-function bundle ({} experts): {bundle_path}",
-                topology.expert_count
-            );
-            write_mlpackage(&bundle_model, &bundle_path)
-                .with_context(|| format!("Failed to write {bundle_path}"))?;
-
-            // Write manifest alongside the bundle
-            let manifest_path = format!(
-                "{}-manifest.json",
-                bundle_path
-                    .strip_suffix(".mlpackage")
-                    .unwrap_or(&bundle_path)
-            );
-            let manifest_json = serde_json::to_string_pretty(&split_result.manifest)
-                .context("Failed to serialize MoE manifest")?;
-            std::fs::write(&manifest_path, &manifest_json)
-                .with_context(|| format!("Failed to write {manifest_path}"))?;
-            println!("  Wrote manifest: {manifest_path}");
-
-            compile_output(&bundle_path);
-
-            println!();
-            println!("MoE bundle complete.");
-            return Ok(());
-        } else {
-            println!(
-                "Note: --moe-bundle specified but no MoE pattern detected. Producing single output."
-            );
-        }
-    }
-
-    // MoE top-K fusion (if requested)
-    if let Some(k) = opts.moe_fuse_topk {
-        use ironmill_compile::convert::moe::{ExpertFrequencyProfile, fuse_top_k_experts};
-
-        // Load or build frequency profile
-        let profile = if let Some(ref cal_dir) = opts.cal_data {
-            let profile_path = cal_dir.join("expert_profile.json");
-            if profile_path.exists() {
-                let json = std::fs::read_to_string(&profile_path)
-                    .with_context(|| format!("Failed to read {}", profile_path.display()))?;
-                ExpertFrequencyProfile::from_json(&json)
-                    .with_context(|| format!("Failed to parse {}", profile_path.display()))?
-            } else {
-                println!(
-                    "  Note: {} not found, using uniform profile.",
-                    profile_path.display()
-                );
-                // Detect expert count to build uniform profile
-                let expert_count = ironmill_compile::convert::moe::detect_moe(program)
-                    .map(|t| t.expert_count)
-                    .unwrap_or(k);
-                ExpertFrequencyProfile::uniform(expert_count)
-            }
-        } else {
-            println!("  Note: --cal-data not provided, using uniform profile.");
-            let expert_count = ironmill_compile::convert::moe::detect_moe(program)
-                .map(|t| t.expert_count)
-                .unwrap_or(k);
-            ExpertFrequencyProfile::uniform(expert_count)
-        };
-
-        if let Some(fuse_result) = fuse_top_k_experts(program, k, &profile)? {
-            println!(
-                "MoE top-{k} fusion: kept experts {:?}, discarded {:?}",
-                fuse_result.kept_expert_indices, fuse_result.discarded_expert_indices
-            );
-            println!(
-                "  Fused program: {} ops (was {} ops)",
-                count_ops(&fuse_result.program),
-                count_ops(program)
-            );
-
-            let stem = input_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("model");
-
-            let output_path = opts
-                .output
-                .clone()
-                .unwrap_or_else(|| format!("{stem}-fused.mlpackage"));
-            let model = program_to_model(&fuse_result.program, 9)
-                .context("Failed to convert fused program to CoreML")?;
-            println!("  Writing fused model: {output_path}");
-            write_mlpackage(&model, &output_path)
-                .with_context(|| format!("Failed to write {output_path}"))?;
-
-            compile_output(&output_path);
-
-            println!();
-            println!("MoE top-{k} fusion complete.");
-            return Ok(());
-        } else {
-            println!(
-                "Note: --moe-fuse-topk specified but no MoE pattern detected. Producing single output."
-            );
-        }
-    }
-
-    // Handle model splitting for speculative decoding, or normal single-model output.
+    // Speculative split or standard single-model output.
     if let Some(n_layers) = opts.split_draft_layers {
-        let stem = input_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("model");
-
-        let split_pass = ModelSplitPass::new(n_layers);
-        let split_result = split_pass
-            .split(program)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("Failed to split model for speculative decoding")?;
-
-        // Write draft model
-        let draft_path = opts
-            .output
-            .as_deref()
-            .map(|o| {
-                let p = Path::new(o);
-                let s = p.file_stem().and_then(|s| s.to_str()).unwrap_or(stem);
-                let parent = p.parent().unwrap_or(Path::new("."));
-                parent
-                    .join(format!("{s}-draft.mlpackage"))
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_else(|| format!("{stem}-draft.mlpackage"));
-
-        let draft_model = program_to_model(&split_result.draft, 9)
-            .context("Failed to convert draft MIL IR to CoreML protobuf")?;
-        println!("Writing draft model ({n_layers} layers): {draft_path}");
-        write_mlpackage(&draft_model, &draft_path)
-            .with_context(|| format!("Failed to write draft mlpackage: {draft_path}"))?;
-
-        // Write verifier model
-        let verifier_path = opts
-            .output
-            .as_deref()
-            .map(|o| {
-                let p = Path::new(o);
-                let s = p.file_stem().and_then(|s| s.to_str()).unwrap_or(stem);
-                let parent = p.parent().unwrap_or(Path::new("."));
-                parent
-                    .join(format!("{s}-verifier.mlpackage"))
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_else(|| format!("{stem}-verifier.mlpackage"));
-
-        let verifier_model = program_to_model(&split_result.verifier, 9)
-            .context("Failed to convert verifier MIL IR to CoreML protobuf")?;
-        println!("Writing verifier model (full): {verifier_path}");
-        write_mlpackage(&verifier_model, &verifier_path)
-            .with_context(|| format!("Failed to write verifier mlpackage: {verifier_path}"))?;
-
-        // Compile both
-        compile_output(&draft_path);
-        compile_output(&verifier_path);
+        emit_speculative_split(program, input_path, opts, n_layers)?;
     } else {
-        // Normal single-model output.
         match opts.runtime {
-            RuntimeArg::CoreMl => {
-                let model = if let Some(ref layers) = opts.updatable_layers {
-                    let layer_names: Vec<String> = layers
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-
-                    anyhow::ensure!(
-                        opts.epochs > 0,
-                        "--epochs must be a positive integer, got {}",
-                        opts.epochs
-                    );
-                    anyhow::ensure!(
-                        opts.learning_rate > 0.0 && opts.learning_rate.is_finite(),
-                        "--learning-rate must be a positive finite number, got {}",
-                        opts.learning_rate
-                    );
-
-                    let loss_fn = match opts.loss_function.as_str() {
-                        "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,
-                        "categorical-cross-entropy" => LossFunction::CategoricalCrossEntropy,
-                        other => bail!(
-                            "unknown loss function: '{}'. Valid: mse, mean-squared-error, categorical-cross-entropy",
-                            other
-                        ),
-                    };
-                    let opt = match opts.optimizer_type.as_str() {
-                        "adam" => UpdateOptimizer::Adam,
-                        "sgd" => UpdateOptimizer::Sgd,
-                        other => bail!("unknown optimizer: '{}'. Valid: adam, sgd", other),
-                    };
-
-                    let config = UpdatableModelConfig {
-                        updatable_layers: layer_names.clone(),
-                        learning_rate: opts.learning_rate,
-                        epochs: opts.epochs,
-                        loss_function: loss_fn,
-                        optimizer: opt,
-                    };
-
-                    println!(
-                        "Updatable model: {} layer(s) marked for on-device training",
-                        layer_names.len()
-                    );
-                    program_to_updatable_model(program, 9, &config)
-                        .context("Failed to convert MIL IR to updatable CoreML protobuf")?
-                } else {
-                    program_to_model(program, 9)
-                        .context("Failed to convert MIL IR to CoreML protobuf")?
-                };
-
-                let output_path = opts.output.clone().unwrap_or_else(|| {
-                    let stem = input_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("model");
-                    format!("{stem}.mlpackage")
-                });
-                println!("Writing CoreML package: {output_path}");
-                write_mlpackage(&model, &output_path)
-                    .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
-
-                compile_output(&output_path);
-            }
-            RuntimeArg::AneDirect => {
-                #[cfg(feature = "ane-direct")]
-                {
-                    use ironmill_compile::ane::bundle::{AneCompileConfig, compile_model_bundle};
-
-                    let output_dir = opts.output.clone().unwrap_or_else(|| {
-                        let stem = input_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("model");
-                        format!("{stem}.ironml")
-                    });
-
-                    println!("Compiling for ANE direct runtime → {output_dir}");
-
-                    let config = AneCompileConfig::default();
-                    let bundle = compile_model_bundle(program, &config)
-                        .context("ANE model bundle compilation failed")?;
-
-                    let output_path = std::path::Path::new(&output_dir);
-                    bundle
-                        .save(output_path)
-                        .context("Failed to save .ironml bundle")?;
-
-                    println!(
-                        "  ✓ {} sub-program(s) written to {output_dir}",
-                        bundle.sub_programs.len(),
-                    );
-                }
-                #[cfg(not(feature = "ane-direct"))]
-                {
-                    anyhow::bail!("ANE direct runtime requires --features ane-direct");
-                }
-            }
+            RuntimeArg::CoreMl => emit_coreml(program, input_path, opts)?,
+            RuntimeArg::AneDirect => emit_ane_direct(program, input_path, opts)?,
         }
     }
 
