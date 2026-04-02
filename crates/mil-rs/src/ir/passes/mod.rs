@@ -44,6 +44,7 @@ pub use awq_scale_fusion::AwqScaleFusionPass;
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
 pub use constant_fold::ConstantFoldPass;
 pub use d2quant::D2QuantPass;
+pub use d2quant::dac::DacPass;
 pub use dead_code::DeadCodeEliminationPass;
 pub use fp16_quantize::Fp16QuantizePass;
 pub use identity_elim::IdentityEliminationPass;

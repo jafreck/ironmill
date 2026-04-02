@@ -5,6 +5,7 @@
 //! This yields lower quantization error than a single-scale approach at
 //! the same bit-width (2 or 3 bits).
 
+pub mod dac;
 pub mod dual_scale;
 
 use super::tensor_utils::tensor_as_f32_slice;
