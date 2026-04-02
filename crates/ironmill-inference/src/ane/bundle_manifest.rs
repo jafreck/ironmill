@@ -5,7 +5,9 @@
 //! full compile pipeline.
 
 use half::f16;
+use ironmill_core::ane::bundle::LmHeadKind;
 use ironmill_iosurface::AneTensor;
+use mil_rs::ir::ScalarType;
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -40,7 +42,7 @@ pub struct SubProgramManifest {
 pub struct TensorDescriptorManifest {
     pub name: String,
     pub shape: [usize; 4],
-    pub dtype: String,
+    pub dtype: ScalarType,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,7 +73,7 @@ pub struct ArchitectureManifest {
 
 #[derive(Debug, Deserialize)]
 pub struct LmHeadManifest {
-    pub kind: String,
+    pub kind: LmHeadKind,
     pub vocab_size: usize,
     pub hidden_size: usize,
     #[serde(default)]
@@ -89,15 +91,9 @@ pub struct LayerManifest {
 }
 
 impl TensorDescriptorManifest {
+    /// Returns the scalar type of this tensor.
     pub fn scalar_type(&self) -> mil_rs::ir::ScalarType {
-        match self.dtype.as_str() {
-            "Float16" => mil_rs::ir::ScalarType::Float16,
-            "Float32" => mil_rs::ir::ScalarType::Float32,
-            "Int32" => mil_rs::ir::ScalarType::Int32,
-            "Int8" => mil_rs::ir::ScalarType::Int8,
-            "UInt8" => mil_rs::ir::ScalarType::UInt8,
-            _ => mil_rs::ir::ScalarType::Float16,
-        }
+        self.dtype
     }
 }
 

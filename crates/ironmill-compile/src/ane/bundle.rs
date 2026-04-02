@@ -58,7 +58,8 @@ pub struct SubProgramBundle {
 
 use ironmill_core::ane::bundle::{
     BundleArchitecture, BundleInputPacking, BundleManifest, BundleModelType,
-    BundleTensorDescriptor, DecodeManifest, LayerManifest, LmHeadManifest, SubProgramManifest,
+    BundleTensorDescriptor, DecodeManifest, LayerManifest, LmHeadKind, LmHeadManifest,
+    SubProgramManifest,
 };
 
 /// Compiled autoregressive decode model.
@@ -639,7 +640,7 @@ fn emit_sub_program_bundle(
                     BundleTensorDescriptor {
                         name: name.clone(),
                         shape,
-                        dtype: format!("{:?}", ty.scalar_type),
+                        dtype: ty.scalar_type,
                     }
                 })
                 .collect()
@@ -667,7 +668,7 @@ fn emit_sub_program_bundle(
                             Some(BundleTensorDescriptor {
                                 name: out_name.clone(),
                                 shape,
-                                dtype: format!("{:?}", ty.scalar_type),
+                                dtype: ty.scalar_type,
                             })
                         })
                 })
@@ -888,7 +889,7 @@ impl AneDecodeBundle {
                     chunk_manifests.push(save_sub_program(&sp, &programs_dir, &weights_dir)?);
                 }
                 LmHeadManifest {
-                    kind: "ane".to_string(),
+                    kind: LmHeadKind::Ane,
                     vocab_size: *vocab_size,
                     hidden_size: *hidden_size,
                     chunks: chunk_manifests,
@@ -901,7 +902,7 @@ impl AneDecodeBundle {
             } => {
                 fs::write(cpu_weights_dir.join("lm_head.bin"), weight_data)?;
                 LmHeadManifest {
-                    kind: "cpu".to_string(),
+                    kind: LmHeadKind::Cpu,
                     vocab_size: *vocab_size,
                     hidden_size: *hidden_size,
                     chunks: Vec::new(),

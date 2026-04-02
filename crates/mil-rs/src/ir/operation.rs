@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 
 use super::tensor::TensorType;
 use super::types::Value;
@@ -33,6 +34,20 @@ impl fmt::Display for ComputeUnit {
     }
 }
 
+impl FromStr for ComputeUnit {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ane" => Ok(ComputeUnit::Ane),
+            "gpu" => Ok(ComputeUnit::Gpu),
+            "cpu" => Ok(ComputeUnit::Cpu),
+            "any" => Ok(ComputeUnit::Any),
+            other => Err(format!("unknown compute unit: {other}")),
+        }
+    }
+}
+
 /// A single operation in the MIL graph.
 ///
 /// Operations correspond to MIL ops (e.g., `conv`, `matmul`, `relu`, `softmax`)
@@ -57,6 +72,9 @@ pub struct Operation {
 
     /// Operation-specific attributes (e.g., kernel size, stride, padding).
     pub attributes: HashMap<String, Value>,
+
+    /// Compute unit preference for this operation.
+    pub compute_unit: Option<ComputeUnit>,
 }
 
 impl Operation {
@@ -69,6 +87,7 @@ impl Operation {
             outputs: Vec::new(),
             output_types: Vec::new(),
             attributes: HashMap::new(),
+            compute_unit: None,
         }
     }
 
@@ -93,21 +112,11 @@ impl Operation {
 
     /// Get the compute unit preference for this operation, if set.
     pub fn compute_unit(&self) -> Option<ComputeUnit> {
-        match self.attributes.get("compute_unit") {
-            Some(Value::String(s)) => match s.as_str() {
-                "ane" => Some(ComputeUnit::Ane),
-                "gpu" => Some(ComputeUnit::Gpu),
-                "cpu" => Some(ComputeUnit::Cpu),
-                "any" => Some(ComputeUnit::Any),
-                _ => None,
-            },
-            _ => None,
-        }
+        self.compute_unit
     }
 
     /// Set the compute unit preference for this operation.
     pub fn set_compute_unit(&mut self, cu: ComputeUnit) {
-        self.attributes
-            .insert("compute_unit".to_string(), Value::String(cu.to_string()));
+        self.compute_unit = Some(cu);
     }
 }

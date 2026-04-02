@@ -137,6 +137,12 @@ fn convert_operation(proto: &mil_spec::Operation) -> Result<Operation> {
         attributes.insert(attr_name.clone(), convert_value(attr_val)?);
     }
 
+    // Extract compute_unit from attributes into the dedicated field.
+    let compute_unit = attributes.remove("compute_unit").and_then(|v| match v {
+        Value::String(s) => s.parse::<crate::ir::ComputeUnit>().ok(),
+        _ => None,
+    });
+
     Ok(Operation {
         op_type: proto.r#type.clone(),
         name,
@@ -144,6 +150,7 @@ fn convert_operation(proto: &mil_spec::Operation) -> Result<Operation> {
         outputs: output_names,
         output_types,
         attributes,
+        compute_unit,
     })
 }
 

@@ -1,5 +1,5 @@
 /// Tensor data types supported by MIL / CoreML.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ScalarType {
     Float16,
     Float32,

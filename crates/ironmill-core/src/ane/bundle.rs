@@ -1,5 +1,6 @@
 //! ANE bundle manifest schema types.
 
+use mil_rs::ir::ScalarType;
 use serde::{Deserialize, Serialize};
 
 /// Architecture metadata for decode bundles.
@@ -19,13 +20,12 @@ pub struct BundleArchitecture {
 /// Tensor descriptor for bundle manifest (serializable).
 ///
 /// This is the bundle-format equivalent of the compile-crate's
-/// [`TensorDescriptor`]. Uses a string dtype for JSON compatibility.
+/// [`TensorDescriptor`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleTensorDescriptor {
     pub name: String,
     pub shape: [usize; 4],
-    /// Scalar type as a string, e.g. `"Float16"`, `"Float32"`.
-    pub dtype: String,
+    pub dtype: ScalarType,
 }
 
 /// Input packing metadata for bundle manifest (serializable).
@@ -76,11 +76,18 @@ pub struct DecodeManifest {
     pub layers: Vec<LayerManifest>,
 }
 
+/// Whether the LM head runs on ANE or CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LmHeadKind {
+    Ane,
+    Cpu,
+}
+
 /// Manifest entry for the LM head.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LmHeadManifest {
-    /// `"ane"` or `"cpu"`.
-    pub kind: String,
+    pub kind: LmHeadKind,
     pub vocab_size: usize,
     pub hidden_size: usize,
     /// ANE chunk sub-program manifests (empty for CPU fallback).
@@ -106,7 +113,7 @@ impl From<&super::TensorDescriptor> for BundleTensorDescriptor {
         Self {
             name: td.name.clone(),
             shape: td.shape,
-            dtype: crate::gpu::bundle::scalar_type_to_str(td.dtype).to_string(),
+            dtype: td.dtype,
         }
     }
 }
