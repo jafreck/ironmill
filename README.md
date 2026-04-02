@@ -52,7 +52,7 @@ artifacts for each inference backend:
 - **MIL IR:** full read/write/manipulation of Apple's Model Intermediate Language
 - **General optimization:** dead code elimination, constant folding, op fusion
   (conv+batchnorm, conv+relu, linear+relu, SDPA)
-- **Quantization:** FP16, INT8 weight-only, 2/4/6/8-bit weight palettization (PolarQuant)
+- **Quantization:** FP16, INT8 weight-only, 2/4/6/8-bit weight quantization (PolarQuant)
 - **ANE lowering:** matmul→conv1×1, layout optimization, op substitution,
   automatic model splitting into ANE-sized sub-programs
 - **Output formats:**
