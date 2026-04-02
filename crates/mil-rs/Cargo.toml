@@ -27,8 +27,6 @@ memmap2 = { workspace = true }
 anyhow = { workspace = true }
 tempfile = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
-ironmill-compile = { workspace = true }
-safetensors = { workspace = true }
 
 [[bench]]
 name = "pipeline"

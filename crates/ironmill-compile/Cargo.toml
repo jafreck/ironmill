@@ -23,3 +23,6 @@ glob-match = { workspace = true }
 toml = { workspace = true }
 
 [features]
+
+[dev-dependencies]
+prost = { workspace = true }
