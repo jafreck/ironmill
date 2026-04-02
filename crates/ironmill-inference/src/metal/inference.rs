@@ -202,10 +202,17 @@ pub struct MetalInference {
     intermediate_buffers: Option<IntermediateBuffers>,
     rope_cos: Option<MetalBuffer>,
     rope_sin: Option<MetalBuffer>,
-    /// MPS matmul cache for decode (token_count=1).
+    /// MPS matmul cache for prefill (variable token_count > 1).
     decode_matmuls: Option<MpsMatmulCache>,
+    /// MPS matmul cache for single-token decode (token_count=1), preserved
+    /// across prefill→decode transitions so it never needs rebuilding.
+    decode_matmuls_t1: Option<MpsMatmulCache>,
     config: MetalConfig,
     model_config: Option<ModelConfig>,
+    /// Pre-allocated buffer for FP16 logits readback.
+    logits_fp16_buf: Vec<u8>,
+    /// Pre-allocated buffer for serializing token IDs to GPU.
+    token_bytes_buf: Vec<u8>,
     seq_pos: usize,
 }
 
@@ -235,8 +242,11 @@ impl MetalInference {
             rope_cos: None,
             rope_sin: None,
             decode_matmuls: None,
+            decode_matmuls_t1: None,
             config,
             model_config: None,
+            logits_fp16_buf: Vec::new(),
+            token_bytes_buf: Vec::new(),
             seq_pos: 0,
         })
     }
@@ -255,6 +265,9 @@ impl MetalInference {
 
         let mc = &weights.config;
         self.model_config = Some(mc.clone());
+
+        // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
+        self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);
 
         // Compile Metal shader pipelines with the model's head_dim.
         let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim)
@@ -276,9 +289,10 @@ impl MetalInference {
         self.rope_cos = Some(cos);
         self.rope_sin = Some(sin);
 
-        let decode_cache = Self::build_matmul_cache(&self.device, mc, &weights, 1)
+        let decode_cache_t1 = Self::build_matmul_cache(&self.device, mc, &weights, 1)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-        self.decode_matmuls = Some(decode_cache);
+        self.decode_matmuls_t1 = Some(decode_cache_t1);
+        self.decode_matmuls = None;
 
         if self.config.enable_turboquant {
             // Outlier channel strategy (§4.3) is disabled for now.
@@ -452,8 +466,7 @@ impl MetalInference {
         let mc = self
             .model_config
             .as_ref()
-            .ok_or(InferenceError::NotLoaded)?
-            .clone();
+            .ok_or(InferenceError::NotLoaded)?;
         let bufs = self
             .intermediate_buffers
             .as_ref()
@@ -472,25 +485,33 @@ impl MetalInference {
         let eps = mc.rms_norm_eps as f32;
         let enable_tq = self.config.enable_turboquant && self.turboquant.is_some();
 
-        // Build or reuse MPS matmul cache for this token count.
-        let need_rebuild = self
-            .decode_matmuls
-            .as_ref()
-            .is_none_or(|c| c.token_count != token_count);
-        if need_rebuild {
-            let cache = Self::build_matmul_cache(&self.device, &mc, weights, token_count)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            self.decode_matmuls = Some(cache);
-        }
-        let matmuls = self
-            .decode_matmuls
-            .as_ref()
-            .expect("decode_matmuls must be populated — rebuilt in ensure_decode_matmuls");
+        // Use the pre-built single-token matmul cache for decode steps;
+        // only rebuild the general cache for prefill (token_count > 1).
+        let matmuls = if token_count == 1 {
+            self.decode_matmuls_t1
+                .as_ref()
+                .ok_or(InferenceError::NotLoaded)?
+        } else {
+            let need_rebuild = self
+                .decode_matmuls
+                .as_ref()
+                .is_none_or(|c| c.token_count != token_count);
+            if need_rebuild {
+                let cache = Self::build_matmul_cache(&self.device, mc, weights, token_count)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                self.decode_matmuls = Some(cache);
+            }
+            self.decode_matmuls
+                .as_ref()
+                .expect("decode_matmuls must be populated")
+        };
 
-        // Write token IDs to GPU buffer.
-        let token_bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
+        // Write token IDs to GPU buffer (reuse persistent buffer).
+        self.token_bytes_buf.clear();
+        self.token_bytes_buf
+            .extend(token_ids.iter().flat_map(|t| t.to_le_bytes()));
         bufs.token_ids_buf
-            .write_bytes(&token_bytes, 0)
+            .write_bytes(&self.token_bytes_buf, 0)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
         // Create command buffer.
@@ -1489,12 +1510,13 @@ impl MetalInference {
         // Step 20: Read logits for the last token position → Vec<f32>.
         let last_token_offset = (token_count - 1) * vocab * 2; // FP16 offset in bytes
         let logits_byte_count = vocab * 2;
-        let mut logits_fp16 = vec![0u8; logits_byte_count];
+        self.logits_fp16_buf.resize(logits_byte_count, 0);
         bufs.logits
-            .read_bytes(&mut logits_fp16, last_token_offset)
+            .read_bytes(&mut self.logits_fp16_buf, last_token_offset)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-        let logits: Vec<f32> = logits_fp16
+        let logits: Vec<f32> = self
+            .logits_fp16_buf
             .chunks_exact(2)
             .map(|chunk| {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -2942,6 +2964,9 @@ impl InferenceEngine for MetalInference {
         let mc = &weights.config;
         self.model_config = Some(mc.clone());
 
+        // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
+        self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);
+
         // Compile Metal shader pipelines with the model's head_dim so
         // shared memory is sized exactly via #define HEAD_DIM.
         let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim)
@@ -2967,9 +2992,10 @@ impl InferenceEngine for MetalInference {
         self.rope_sin = Some(sin);
 
         // Build MPS matmul cache for single-token decode.
-        let decode_cache = Self::build_matmul_cache(&self.device, mc, &weights, 1)
+        let decode_cache_t1 = Self::build_matmul_cache(&self.device, mc, &weights, 1)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-        self.decode_matmuls = Some(decode_cache);
+        self.decode_matmuls_t1 = Some(decode_cache_t1);
+        self.decode_matmuls = None;
 
         // Initialize KV cache.
         if self.config.enable_turboquant {
