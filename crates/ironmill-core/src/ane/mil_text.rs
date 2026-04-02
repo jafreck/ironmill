@@ -189,7 +189,13 @@ impl<'a> MilTextEmitter<'a> {
             .or_else(|| self.infer_output_type_from_inputs(op));
         let type_str = match &output_type {
             Some(ty) => self.format_tensor_type(ty),
-            None => "tensor<fp16, [1]>".to_string(),
+            None => {
+                eprintln!(
+                    "warning: could not infer output type for op '{}', falling back to tensor<fp16, [1]>",
+                    op.name
+                );
+                "tensor<fp16, [1]>".to_string()
+            }
         };
 
         // Register this output's type for downstream inference.
@@ -647,7 +653,20 @@ fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> String {
             .map(|&b| if b != 0 { "true" } else { "false" })
             .collect::<Vec<_>>()
             .join(","),
-        _ => "0".to_string(),
+        ScalarType::Float64 => data
+            .chunks_exact(8)
+            .map(|b| {
+                format_float(f64::from_le_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ]))
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        ScalarType::Int16 => data
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
     }
 }
 

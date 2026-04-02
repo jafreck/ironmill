@@ -106,7 +106,7 @@ impl From<&super::TensorDescriptor> for BundleTensorDescriptor {
         Self {
             name: td.name.clone(),
             shape: td.shape,
-            dtype: format!("{:?}", td.dtype),
+            dtype: crate::gpu::bundle::scalar_type_to_str(td.dtype).to_string(),
         }
     }
 }
