@@ -642,10 +642,20 @@ fn compile_and_emit(
             );
             let split_result = split_moe(program, &topology);
 
-            let stem = input_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("model");
+            let stem = if let Some(ref out) = opts.output {
+                // Use --output as the base stem, stripping any known extension
+                let p = std::path::Path::new(out);
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(out)
+                    .to_string()
+            } else {
+                input_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("model")
+                    .to_string()
+            };
 
             // Write shared program
             let shared_model = program_to_model(&split_result.shared, 9)
@@ -890,11 +900,16 @@ fn compile_and_emit(
 
                     let loss_fn = match opts.loss_function.as_str() {
                         "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,
-                        _ => LossFunction::CategoricalCrossEntropy,
+                        "categorical-cross-entropy" => LossFunction::CategoricalCrossEntropy,
+                        other => bail!(
+                            "unknown loss function: '{}'. Valid: mse, mean-squared-error, categorical-cross-entropy",
+                            other
+                        ),
                     };
                     let opt = match opts.optimizer_type.as_str() {
                         "adam" => UpdateOptimizer::Adam,
-                        _ => UpdateOptimizer::Sgd,
+                        "sgd" => UpdateOptimizer::Sgd,
+                        other => bail!("unknown optimizer: '{}'. Valid: adam, sgd", other),
                     };
 
                     let config = UpdatableModelConfig {

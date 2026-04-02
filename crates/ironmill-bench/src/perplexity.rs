@@ -44,7 +44,7 @@ pub struct PerplexityResult {
 pub fn cross_entropy(logits: &[f32], target: u32) -> f64 {
     let target = target as usize;
     if target >= logits.len() {
-        return 0.0;
+        return (logits.len() as f64).ln();
     }
 
     // log-softmax = logit[target] - log(sum(exp(logits)))

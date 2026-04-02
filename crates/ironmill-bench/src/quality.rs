@@ -97,6 +97,7 @@ fn reconstruct_from_lut_op(
     let n_bits = match lut_f32.len() {
         2 => 1,
         4 => 2,
+        8 => 3,
         16 => 4,
         64 => 6,
         256 => 8,

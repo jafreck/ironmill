@@ -846,13 +846,17 @@ fn main() -> Result<()> {
                             );
                         }
 
-                        let ppl = perplexity::perplexity_from_losses(&all_losses);
-                        let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
-                        eprintln!(
-                            "  ✓ {config_name}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
-                            ppl, avg_ce
-                        );
-                        gpu_ppl_results.insert(config_name.to_string(), ppl);
+                        if all_losses.is_empty() {
+                            eprintln!("  ⚠ {config_name}: no valid losses computed");
+                        } else {
+                            let ppl = perplexity::perplexity_from_losses(&all_losses);
+                            let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
+                            eprintln!(
+                                "  ✓ {config_name}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
+                                ppl, avg_ce
+                            );
+                            gpu_ppl_results.insert(config_name.to_string(), ppl);
+                        }
                     }
                 }
 
@@ -928,13 +932,17 @@ fn main() -> Result<()> {
                         );
                     }
 
-                    let ppl = perplexity::perplexity_from_losses(&all_losses);
-                    let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
-                    eprintln!(
-                        "  ✓ {config_label}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
-                        ppl, avg_ce
-                    );
-                    gpu_ppl_results.insert(config_label, ppl);
+                    if all_losses.is_empty() {
+                        eprintln!("  ⚠ {config_label}: no valid losses computed");
+                    } else {
+                        let ppl = perplexity::perplexity_from_losses(&all_losses);
+                        let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
+                        eprintln!(
+                            "  ✓ {config_label}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
+                            ppl, avg_ce
+                        );
+                        gpu_ppl_results.insert(config_label, ppl);
+                    }
                 }
             }
 
@@ -1295,7 +1303,7 @@ fn main() -> Result<()> {
     }
 
     #[cfg(not(feature = "ane-direct"))]
-    if cli.perplexity {
+    if cli.perplexity && !has_metal {
         eprintln!("Perplexity evaluation requires --features ane-direct");
         eprintln!("Run: cargo run -p ironmill-bench --features ane-direct -- --perplexity ...");
     }
