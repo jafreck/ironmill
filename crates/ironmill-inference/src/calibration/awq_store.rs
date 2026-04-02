@@ -1,0 +1,223 @@
+//! AWQ-style activation store: lightweight per-channel magnitude statistics.
+
+use std::collections::HashMap;
+
+use half::f16;
+
+use super::hook::{ActivationHook, store_key};
+
+/// Per-channel magnitude statistics accumulated over calibration tokens.
+#[derive(Debug, Clone)]
+pub struct ChannelMagnitudes {
+    /// Running mean of |x| per channel.
+    pub mean_abs: Vec<f32>,
+    /// Running max of |x| per channel.
+    pub max_abs: Vec<f32>,
+    /// Total number of tokens (rows) observed so far.
+    pub sample_count: usize,
+}
+
+impl ChannelMagnitudes {
+    /// Create a zero-initialised accumulator for `n_features` channels.
+    pub fn new(n_features: usize) -> Self {
+        Self {
+            mean_abs: vec![0.0; n_features],
+            max_abs: vec![0.0; n_features],
+            sample_count: 0,
+        }
+    }
+
+    /// Incrementally update statistics from a flattened activation slice.
+    ///
+    /// `activation` has length `n_tokens × n_features` in row-major order.
+    /// The update uses a numerically-stable running mean.
+    pub fn update(&mut self, activation: &[f16], n_features: usize) {
+        assert!(
+            !activation.is_empty() && activation.len() % n_features == 0,
+            "activation length {} is not a multiple of n_features {}",
+            activation.len(),
+            n_features,
+        );
+        let n_tokens = activation.len() / n_features;
+
+        // Accumulate sum-of-abs and max-of-abs for each channel across all
+        // tokens in this batch.
+        let mut batch_sum = vec![0.0f32; n_features];
+        let mut batch_max = vec![0.0f32; n_features];
+
+        for t in 0..n_tokens {
+            let row = &activation[t * n_features..(t + 1) * n_features];
+            for (c, &val) in row.iter().enumerate() {
+                let abs_val = val.to_f32().abs();
+                batch_sum[c] += abs_val;
+                if abs_val > batch_max[c] {
+                    batch_max[c] = abs_val;
+                }
+            }
+        }
+
+        let old_count = self.sample_count as f32;
+        let new_count = (self.sample_count + n_tokens) as f32;
+
+        for c in 0..n_features {
+            // Weighted combination of old running mean and new batch mean.
+            self.mean_abs[c] = (self.mean_abs[c] * old_count + batch_sum[c]) / new_count;
+            if batch_max[c] > self.max_abs[c] {
+                self.max_abs[c] = batch_max[c];
+            }
+        }
+
+        self.sample_count += n_tokens;
+    }
+}
+
+/// Activation store for AWQ-style quantisation.
+///
+/// Accumulates per-channel magnitude statistics for each linear projection
+/// in each transformer layer. Memory cost is O(n_features) per projection.
+#[derive(Debug, Clone)]
+pub struct AwqActivationStore {
+    /// Maps `"layer_{i}_{name}"` → per-channel magnitude statistics.
+    pub magnitudes: HashMap<String, ChannelMagnitudes>,
+}
+
+impl AwqActivationStore {
+    pub fn new() -> Self {
+        Self {
+            magnitudes: HashMap::new(),
+        }
+    }
+}
+
+impl Default for AwqActivationStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActivationHook for AwqActivationStore {
+    fn on_linear_input(&mut self, layer: usize, name: &str, activation: &[f16], n_features: usize) {
+        if activation.is_empty() || n_features == 0 {
+            return;
+        }
+        let key = store_key(layer, name);
+        let mag = self
+            .magnitudes
+            .entry(key)
+            .or_insert_with(|| ChannelMagnitudes::new(n_features));
+        debug_assert_eq!(
+            mag.mean_abs.len(),
+            n_features,
+            "n_features changed between calls"
+        );
+        mag.update(activation, n_features);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f16s(vals: &[f32]) -> Vec<f16> {
+        vals.iter().copied().map(f16::from_f32).collect()
+    }
+
+    #[test]
+    fn channel_magnitudes_single_token() {
+        let mut mag = ChannelMagnitudes::new(3);
+        let act = f16s(&[1.0, -2.0, 3.0]);
+        mag.update(&act, 3);
+
+        assert_eq!(mag.sample_count, 1);
+        assert!((mag.mean_abs[0] - 1.0).abs() < 1e-2);
+        assert!((mag.mean_abs[1] - 2.0).abs() < 1e-2);
+        assert!((mag.mean_abs[2] - 3.0).abs() < 1e-2);
+        assert!((mag.max_abs[0] - 1.0).abs() < 1e-2);
+        assert!((mag.max_abs[1] - 2.0).abs() < 1e-2);
+        assert!((mag.max_abs[2] - 3.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn channel_magnitudes_multi_token() {
+        let mut mag = ChannelMagnitudes::new(2);
+        // Two tokens: [1, -4], [3, 2]
+        let act = f16s(&[1.0, -4.0, 3.0, 2.0]);
+        mag.update(&act, 2);
+
+        assert_eq!(mag.sample_count, 2);
+        // mean_abs[0] = (1+3)/2 = 2.0, mean_abs[1] = (4+2)/2 = 3.0
+        assert!((mag.mean_abs[0] - 2.0).abs() < 1e-2);
+        assert!((mag.mean_abs[1] - 3.0).abs() < 1e-2);
+        // max_abs[0] = 3, max_abs[1] = 4
+        assert!((mag.max_abs[0] - 3.0).abs() < 1e-2);
+        assert!((mag.max_abs[1] - 4.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn channel_magnitudes_streaming() {
+        let mut mag = ChannelMagnitudes::new(2);
+
+        // First batch: single token [2, 6]
+        mag.update(&f16s(&[2.0, 6.0]), 2);
+        assert_eq!(mag.sample_count, 1);
+        assert!((mag.mean_abs[0] - 2.0).abs() < 1e-2);
+        assert!((mag.mean_abs[1] - 6.0).abs() < 1e-2);
+
+        // Second batch: single token [4, 2]
+        mag.update(&f16s(&[4.0, 2.0]), 2);
+        assert_eq!(mag.sample_count, 2);
+        // mean_abs[0] = (2+4)/2 = 3.0, mean_abs[1] = (6+2)/2 = 4.0
+        assert!((mag.mean_abs[0] - 3.0).abs() < 1e-2);
+        assert!((mag.mean_abs[1] - 4.0).abs() < 1e-2);
+        // max_abs[0] = 4, max_abs[1] = 6
+        assert!((mag.max_abs[0] - 4.0).abs() < 1e-2);
+        assert!((mag.max_abs[1] - 6.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn awq_store_via_hook_trait() {
+        let mut store = AwqActivationStore::new();
+
+        // 1 token × 2 features
+        let act1 = f16s(&[1.0, 2.0]);
+        store.on_linear_input(0, "q_proj", &act1, 2);
+
+        assert!(store.magnitudes.contains_key("layer_0_q_proj"));
+        let mag = &store.magnitudes["layer_0_q_proj"];
+        assert_eq!(mag.sample_count, 1);
+        assert_eq!(mag.mean_abs.len(), 2);
+
+        // 2 tokens × 2 features
+        let act = f16s(&[1.0, 2.0, 3.0, 4.0]);
+        store.on_linear_input(0, "q_proj", &act, 2);
+        let mag = &store.magnitudes["layer_0_q_proj"];
+        assert_eq!(mag.sample_count, 3); // 1 + 2
+    }
+
+    #[test]
+    fn awq_store_multiple_projections() {
+        let mut store = AwqActivationStore::new();
+        store.on_linear_input(0, "q_proj", &f16s(&[1.0, 2.0]), 2);
+        store.on_linear_input(0, "k_proj", &f16s(&[3.0, 4.0, 5.0]), 3);
+        store.on_linear_input(1, "q_proj", &f16s(&[6.0]), 1);
+
+        assert_eq!(store.magnitudes.len(), 3);
+        assert!(store.magnitudes.contains_key("layer_0_q_proj"));
+        assert!(store.magnitudes.contains_key("layer_0_k_proj"));
+        assert!(store.magnitudes.contains_key("layer_1_q_proj"));
+    }
+
+    #[test]
+    #[should_panic(expected = "not a multiple")]
+    fn channel_magnitudes_bad_shape() {
+        let mut mag = ChannelMagnitudes::new(3);
+        mag.update(&f16s(&[1.0, 2.0]), 3); // 2 is not a multiple of 3
+    }
+
+    #[test]
+    fn awq_store_ignores_empty_activation() {
+        let mut store = AwqActivationStore::new();
+        store.on_linear_input(0, "q_proj", &[], 0);
+        assert!(store.magnitudes.is_empty());
+    }
+}
