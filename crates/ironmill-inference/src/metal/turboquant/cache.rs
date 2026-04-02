@@ -14,7 +14,6 @@ use crate::metal::error::MetalError;
 ///   INT4: `[num_kv_heads × max_seq_len × head_dim / 2]` (2 elements/byte)
 /// Layout per scale buffer:
 ///   `[num_kv_heads × max_seq_len]` (1 f32 per head per position)
-#[allow(dead_code)]
 pub struct MetalKvCache {
     /// K cache per layer.
     k_caches: Vec<MetalBuffer>,
@@ -57,14 +56,8 @@ pub struct MetalKvCache {
 
     /// Current sequence position.
     seq_pos: usize,
-    /// Number of KV heads.
-    num_kv_heads: usize,
     /// Maximum sequence length.
     max_seq_len: usize,
-    /// Dimension per head.
-    head_dim: usize,
-    /// Quantization bits (4 or 8).
-    n_bits: u8,
 }
 
 impl MetalKvCache {
@@ -224,10 +217,7 @@ impl MetalKvCache {
             k_outlier_r_norms,
             k_non_outlier_r_norms,
             seq_pos: 0,
-            num_kv_heads: config.num_kv_heads,
             max_seq_len: config.max_seq_len,
-            head_dim: config.head_dim,
-            n_bits: config.n_bits,
         })
     }
 

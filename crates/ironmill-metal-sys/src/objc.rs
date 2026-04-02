@@ -21,8 +21,6 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     pub(crate) fn CFRelease(cf: *mut c_void);
-    #[allow(dead_code)]
-    pub(crate) fn CFRetain(cf: *mut c_void) -> *mut c_void;
 }
 
 // ---------------------------------------------------------------------------

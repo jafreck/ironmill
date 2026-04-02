@@ -145,44 +145,10 @@ fn check_results(name: &str, actual: &[f16], expected: &[f32], atol: f32) -> boo
     }
 }
 
-/// Compare bool results (stored as f16: 0.0=false, 1.0=true).
-#[allow(dead_code)]
-fn check_bool_results(name: &str, actual: &[f16], expected: &[bool]) -> bool {
-    if actual.len() != expected.len() {
-        println!(
-            "    ❌ {name}: length mismatch (got {}, expected {})",
-            actual.len(),
-            expected.len()
-        );
-        return false;
-    }
-    for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
-        let a_bool = a.to_f32() != 0.0;
-        if a_bool != e {
-            println!("    ❌ {name}: FAIL at [{i}] got={a_bool} expected={e}");
-            return false;
-        }
-    }
-    println!("    ✅ {name}: PASS");
-    true
-}
-
 // ── Helpers to build f16 input data ─────────────────────────────────────
 
 fn f16v(vals: &[f32]) -> Vec<f16> {
     vals.iter().map(|&v| f16::from_f32(v)).collect()
-}
-
-/// Pad an f16 vector to fill a [1, C, 1, S] tensor.
-#[allow(dead_code)]
-fn f16_padded(vals: &[f32], channels: usize, seq_len: usize) -> Vec<f16> {
-    let mut out = vec![f16::ZERO; channels * seq_len];
-    for (i, &v) in vals.iter().enumerate() {
-        if i < out.len() {
-            out[i] = f16::from_f32(v);
-        }
-    }
-    out
 }
 
 // ── Test cases ──────────────────────────────────────────────────────────

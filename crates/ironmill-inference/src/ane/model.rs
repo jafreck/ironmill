@@ -70,8 +70,6 @@ impl Default for AneConfig {
 pub struct AneModel<D: AneDevice> {
     device: Arc<D>,
     sub_programs: Vec<LoadedSubProgram<D>>,
-    #[allow(dead_code)]
-    config: AneConfig,
     /// Scratch directory for compiler inputs (BLOBFILEs). Cleaned up on drop.
     _work_dir: tempfile::TempDir,
 }
@@ -84,8 +82,6 @@ struct LoadedSubProgram<D: AneDevice> {
 }
 
 struct SubProgramMeta {
-    #[allow(dead_code)]
-    name: String,
     inputs: Vec<TensorDescriptor>,
     outputs: Vec<TensorDescriptor>,
 }
@@ -96,7 +92,7 @@ impl<D: AneDevice> AneModel<D> {
     /// Reads the manifest and compiled artifacts from the bundle directory,
     /// then compiles each sub-program's MIL text on the ANE device and
     /// allocates I/O tensors. No IR passes or splitting needed.
-    pub fn from_bundle(device: Arc<D>, bundle_path: &Path, config: AneConfig) -> Result<Self> {
+    pub fn from_bundle(device: Arc<D>, bundle_path: &Path, _config: AneConfig) -> Result<Self> {
         // 1. Read and parse manifest.json
         let manifest_path = bundle_path.join("manifest.json");
         let manifest_json = std::fs::read_to_string(&manifest_path)
@@ -201,11 +197,7 @@ impl<D: AneDevice> AneModel<D> {
 
             loaded_subs.push(LoadedSubProgram {
                 program: compiled,
-                meta: SubProgramMeta {
-                    name: sub_manifest.name.clone(),
-                    inputs,
-                    outputs,
-                },
+                meta: SubProgramMeta { inputs, outputs },
                 input_tensors,
                 output_tensors,
             });
@@ -214,7 +206,6 @@ impl<D: AneDevice> AneModel<D> {
         Ok(Self {
             device,
             sub_programs: loaded_subs,
-            config,
             _work_dir: work_dir,
         })
     }

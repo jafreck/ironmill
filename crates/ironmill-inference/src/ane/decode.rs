@@ -69,23 +69,17 @@ pub struct AneInference<D: AneDevice> {
     /// Current sequence position.
     seq_pos: usize,
     /// Number of KV heads (for FP16 cache management).
-    #[allow(dead_code)]
     num_kv_heads: usize,
     /// Head dimension.
-    #[allow(dead_code)]
     head_dim: usize,
     /// Maximum sequence length for FP16 caches.
-    #[allow(dead_code)]
     max_seq_len: usize,
     /// Pre-extracted RoPE cos/sin cache tables (from model consts).
     /// Flat f16 arrays: `[num_positions * values_per_position]`.
     /// Indexed as `cache[pos * rope_cache_dim .. (pos+1) * rope_cache_dim]`.
-    #[allow(dead_code)]
     rope_cos_cache: Vec<f16>,
-    #[allow(dead_code)]
     rope_sin_cache: Vec<f16>,
     /// Number of f16 values per position in the RoPE cache.
-    #[allow(dead_code)]
     rope_cache_dim: usize,
     /// Whether cache-write ops were fused into pre_attn sub-programs.
     cache_write_fused: bool,
@@ -106,16 +100,12 @@ struct CpuWeight {
 struct LayerPrograms<D: AneDevice> {
     pre_attn: LoadedSubProgram<D>,
     /// FP16 attention sub-program. Only compiled in baseline mode;
-    /// in TurboQuant mode this is `None`. Retained for future use
-    /// (model-extracted attention path).
-    #[allow(dead_code)]
+    /// in TurboQuant mode this is `None`.
     fp16_attn: Option<LoadedSubProgram<D>>,
     /// Post-attention sub-program. `None` for layers where all ops
     /// fall within the attention cluster (e.g., position-only layers).
     post_attn: Option<LoadedSubProgram<D>>,
     /// Input mapping for fp16_attn (which tensor indices are Q/K/V/cos/sin).
-    /// Retained for future use (model-extracted attention path).
-    #[allow(dead_code)]
     attn_input_map: Option<AttnInputMap>,
 }
 
@@ -125,9 +115,6 @@ struct LayerPrograms<D: AneDevice> {
 /// sub-program's inputs are determined by `build_sub_program` in alphabetical
 /// order. This map records which index is which so `decode()` writes
 /// the correct data to the correct input tensor.
-///
-/// Retained for future use (model-extracted attention path).
-#[allow(dead_code)]
 struct AttnInputMap {
     q_idx: usize,
     k_idx: usize,
@@ -176,11 +163,9 @@ const LM_HEAD_MIN_SEQ: usize = 32;
 /// ≤16384 output channels. Each chunk is compiled as a separate conv1×1
 /// ANE program. At inference time, all chunks are evaluated and their
 /// outputs concatenated to produce the full logits vector.
-#[allow(dead_code)]
 struct AneLmHead<D: AneDevice> {
     chunks: Vec<LmHeadChunk<D>>,
     vocab_size: usize,
-    hidden_size: usize,
     device: Arc<D>,
 }
 
@@ -286,7 +271,6 @@ impl<D: AneDevice> AneLmHead<D> {
         Ok(Self {
             chunks,
             vocab_size,
-            hidden_size,
             device,
         })
     }
@@ -1349,89 +1333,6 @@ fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
 // Compilation helpers
 // ---------------------------------------------------------------------------
 
-/// Inject the second residual add into a post_attn sub-program.
-///
-/// ONNX models using `SkipSimplifiedLayerNormalization` fuse the second
-/// residual into the next layer's input norm. After splitting, the post_attn
-/// output is `FFN(norm(skip_add))` instead of `skip_add + FFN(norm(skip_add))`.
-///
-/// This finds the `skip_add` variable and appends `add(skip_add, down_proj)`
-/// as the new output.
-#[allow(dead_code)]
-fn inject_ffn_residual(program: &mut mil_rs::ir::Program) {
-    use mil_rs::ir::{Operation, Value};
-
-    let func = match program.functions.values_mut().next() {
-        Some(f) => f,
-        None => return,
-    };
-
-    // Find the skip_add variable: an `add` op whose output name contains "skip_add".
-    let skip_add_name = func
-        .body
-        .operations
-        .iter()
-        .find(|op| {
-            op.op_type == "add"
-                && op
-                    .outputs
-                    .first()
-                    .map(|n| n.contains("skip_add"))
-                    .unwrap_or(false)
-        })
-        .and_then(|op| op.outputs.first().cloned());
-
-    let skip_add_name = match skip_add_name {
-        Some(n) => n,
-        None => return,
-    };
-
-    // Check if the output already includes a residual add referencing skip_add.
-    if let Some(out) = func.body.outputs.first() {
-        let already_has_residual = func.body.operations.iter().any(|op| {
-            op.outputs.iter().any(|o| o == out)
-                && op.op_type == "add"
-                && op
-                    .inputs
-                    .values()
-                    .any(|v| matches!(v, Value::Reference(r) if r == &skip_add_name))
-        });
-        if already_has_residual {
-            return;
-        }
-    }
-
-    let current_output = match func.body.outputs.first().cloned() {
-        Some(n) => n,
-        None => return,
-    };
-
-    // Get output type from the producing op.
-    let output_type = func
-        .body
-        .operations
-        .iter()
-        .find(|op| op.outputs.iter().any(|o| o == &current_output))
-        .and_then(|op| {
-            let idx = op.outputs.iter().position(|o| o == &current_output)?;
-            op.output_types.get(idx)?.clone()
-        });
-
-    // Append: new_output = add(skip_add, down_proj)
-    let new_output_name = format!("{current_output}_with_residual");
-    eprintln!(
-        "  [residual] injecting add({}, {}) → {}",
-        skip_add_name, current_output, new_output_name
-    );
-    let mut add_op = Operation::new("add", format!("{new_output_name}_op"))
-        .with_input("x", Value::Reference(skip_add_name))
-        .with_input("y", Value::Reference(current_output));
-    add_op.outputs = vec![new_output_name.clone()];
-    add_op.output_types = vec![output_type];
-
-    func.body.operations.push(add_op);
-    func.body.outputs = vec![new_output_name];
-}
 // ---------------------------------------------------------------------------
 // Bundle loading helpers
 // ---------------------------------------------------------------------------

@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use mil_rs::ir::ScalarType;
-use mil_rs::ir::passes::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels};
-use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard};
+use mil_rs::ir::passes::beta_quantizer::beta_optimal_levels;
+use mil_rs::ir::passes::rotation::unrotate_rows_hadamard;
 
 use half::f16;
 
@@ -127,7 +127,6 @@ impl TurboQuantConfig {
 ///
 /// Cache tensors store INT8 quantized values (1 byte/element). The ANE
 /// attention program casts INT8→FP16 inline before dequantization.
-#[allow(dead_code)]
 pub struct KvCacheManager {
     config: TurboQuantConfig,
     /// Per-layer K caches: [num_kv_heads * head_dim, max_seq_len] as INT8.
@@ -136,12 +135,6 @@ pub struct KvCacheManager {
     v_caches: Vec<AneTensor>,
     /// Current sequence position (next write index).
     seq_pos: usize,
-    /// Precomputed Beta-optimal quantization levels [2^n_bits].
-    quant_levels: Vec<f32>,
-    /// Precomputed quantization boundaries [2^n_bits - 1].
-    quant_boundaries: Vec<f32>,
-    /// Precomputed Hadamard rotation matrix [head_dim × head_dim].
-    rotation_matrix: Vec<f32>,
     /// Dequantization scale: 1.0 / inv_scale.
     deq_scale: f32,
     /// Optional: per-layer QJL residual sign caches (fp16 ±1).
@@ -177,15 +170,6 @@ impl KvCacheManager {
         }
 
         let quant_levels = beta_optimal_levels(config.head_dim, config.n_bits);
-        let quant_boundaries = beta_optimal_boundaries(config.head_dim, config.n_bits);
-
-        // Precompute Hadamard rotation matrix by rotating an identity matrix.
-        let dim = config.head_dim;
-        let mut rotation_matrix = vec![0.0f32; dim * dim];
-        for i in 0..dim {
-            rotation_matrix[i * dim + i] = 1.0;
-        }
-        rotate_rows_hadamard(&mut rotation_matrix, dim, dim, config.rotation_seed);
 
         // Precompute dequantization scale.
         let max_level = quant_levels.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -215,9 +199,6 @@ impl KvCacheManager {
             k_caches,
             v_caches,
             seq_pos: 0,
-            quant_levels,
-            quant_boundaries,
-            rotation_matrix,
             deq_scale,
             qjl_sign_caches,
         })
@@ -432,7 +413,6 @@ fn compute_qjl_signs(
 /// All TQ-facing tensors share a single uniform allocation size
 /// (`tq_alloc_size`), enabling zero-copy IOSurface passing from pre_attn
 /// outputs directly into cache-write and attention eval calls.
-#[allow(dead_code)]
 pub struct TurboQuantModel<D: AneDevice> {
     config: TurboQuantConfig,
     cache: KvCacheManager,
@@ -449,8 +429,6 @@ pub struct TurboQuantModel<D: AneDevice> {
     /// Uniform allocation size shared by all TQ input tensors.
     /// Pre-attn outputs must be allocated with this size for zero-copy.
     tq_alloc_size: usize,
-    /// Uniform allocation size for cache-write outputs (may be smaller).
-    cw_output_alloc_size: usize,
     /// Pre-allocated cache-write output for K (reused across calls).
     cw_k_output: AneTensor,
     /// Pre-allocated cache-write output for V (reused across calls).
@@ -617,7 +595,6 @@ impl<D: AneDevice> TurboQuantModel<D> {
             qjl_program,
             rotation_tensor,
             tq_alloc_size,
-            cw_output_alloc_size,
             cw_k_output,
             cw_v_output,
             qjl_correction,

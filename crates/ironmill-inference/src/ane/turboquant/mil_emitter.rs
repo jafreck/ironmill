@@ -7,7 +7,7 @@
 
 use half::f16;
 use mil_rs::ir::passes::beta_quantizer::beta_optimal_levels;
-use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard};
+use mil_rs::ir::passes::rotation::rotate_rows_hadamard;
 use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 
 use super::model::TurboQuantConfig;
@@ -58,22 +58,6 @@ pub(crate) fn generate_rotation_weights(head_dim: usize, seed: u64) -> Vec<u8> {
         identity[i * head_dim + i] = 1.0;
     }
     rotate_rows_hadamard(&mut identity, head_dim, head_dim, seed);
-    identity
-        .iter()
-        .flat_map(|&v| f16::from_f32(v).to_le_bytes())
-        .collect()
-}
-
-/// Generate the inverse (un-rotation) matrix as fp16 bytes.
-///
-/// Used by QJL residual sign computation (CPU-side) when QJL is enabled.
-#[allow(dead_code)]
-fn generate_unrotation_weights(head_dim: usize, seed: u64) -> Vec<u8> {
-    let mut identity = vec![0.0f32; head_dim * head_dim];
-    for i in 0..head_dim {
-        identity[i * head_dim + i] = 1.0;
-    }
-    unrotate_rows_hadamard(&mut identity, head_dim, head_dim, seed);
     identity
         .iter()
         .flat_map(|&v| f16::from_f32(v).to_le_bytes())

@@ -15,7 +15,6 @@ pub(crate) mod ffi {
         pub fn IOSurfaceGetBaseAddress(surface: *mut c_void) -> *mut c_void;
         pub fn IOSurfaceLock(surface: *mut c_void, options: u32, seed: *mut u32) -> i32;
         pub fn IOSurfaceUnlock(surface: *mut c_void, options: u32, seed: *mut u32) -> i32;
-        pub fn IOSurfaceGetAllocSize(surface: *mut c_void) -> usize;
     }
 
     #[link(name = "IOSurface", kind = "framework")]
