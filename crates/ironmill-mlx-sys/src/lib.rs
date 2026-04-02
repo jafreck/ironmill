@@ -62,10 +62,12 @@ pub enum MlxDtype {
     Float16 = 9,
     /// IEEE 754 single precision (32-bit float).
     Float32 = 10,
+    /// IEEE 754 double precision (64-bit float).
+    Float64 = 11,
     /// Brain floating point (16-bit).
-    Bfloat16 = 11,
+    Bfloat16 = 12,
     /// Complex 64-bit (two 32-bit floats).
-    Complex64 = 12,
+    Complex64 = 13,
 }
 
 impl MlxDtype {
@@ -75,7 +77,7 @@ impl MlxDtype {
             MlxDtype::Bool | MlxDtype::Uint8 | MlxDtype::Int8 => 1,
             MlxDtype::Uint16 | MlxDtype::Int16 | MlxDtype::Float16 | MlxDtype::Bfloat16 => 2,
             MlxDtype::Uint32 | MlxDtype::Int32 | MlxDtype::Float32 => 4,
-            MlxDtype::Uint64 | MlxDtype::Int64 | MlxDtype::Complex64 => 8,
+            MlxDtype::Uint64 | MlxDtype::Int64 | MlxDtype::Float64 | MlxDtype::Complex64 => 8,
         }
     }
 
@@ -93,6 +95,7 @@ impl MlxDtype {
             MlxDtype::Int64 => "int64",
             MlxDtype::Float16 => "float16",
             MlxDtype::Float32 => "float32",
+            MlxDtype::Float64 => "float64",
             MlxDtype::Bfloat16 => "bfloat16",
             MlxDtype::Complex64 => "complex64",
         }
@@ -112,8 +115,9 @@ impl MlxDtype {
             8 => Some(MlxDtype::Int64),
             9 => Some(MlxDtype::Float16),
             10 => Some(MlxDtype::Float32),
-            11 => Some(MlxDtype::Bfloat16),
-            12 => Some(MlxDtype::Complex64),
+            11 => Some(MlxDtype::Float64),
+            12 => Some(MlxDtype::Bfloat16),
+            13 => Some(MlxDtype::Complex64),
             _ => None,
         }
     }
@@ -131,156 +135,100 @@ impl std::fmt::Display for MlxDtype {
 
 /// Raw FFI bindings to mlx-c.
 ///
-/// When mlx-c is available (no `mlx_stub` cfg), real bindings are used.
-/// Otherwise opaque pointer types and stub externs are declared so the crate
-/// compiles without the native library.
+/// When mlx-c is available (no `mlx_stub` cfg), real bindings are used via
+/// bindgen-generated code.  Otherwise minimal stub types are declared so the
+/// safe wrappers compile without the native library.
+#[cfg(not(mlx_stub))]
 pub(crate) mod ffi {
-    #![allow(non_camel_case_types)]
-
-    use std::ffi::c_void;
-
-    // Opaque handle types — always available regardless of stub mode.
-    pub type mlx_array = *mut c_void;
-    pub type mlx_stream = *mut c_void;
-    pub type mlx_device = *mut c_void;
-    #[allow(dead_code)]
-    pub type mlx_string = *mut c_void;
-    pub type mlx_vector_array = *mut c_void;
-
-    // When real bindings are generated, include them.
-    #[cfg(not(mlx_stub))]
+    #![allow(
+        non_upper_case_globals,
+        non_camel_case_types,
+        non_snake_case,
+        dead_code
+    )]
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}
 
-    // When in stub mode, declare the extern signatures so the safe wrappers
-    // compile.  The linker is never invoked in stub mode because every call
-    // site returns an error before reaching FFI.
-    #[cfg(mlx_stub)]
-    #[allow(dead_code)]
+#[cfg(mlx_stub)]
+pub(crate) mod ffi {
+    #![allow(
+        non_upper_case_globals,
+        non_camel_case_types,
+        non_snake_case,
+        dead_code
+    )]
+    use std::os::raw::{c_int, c_uint, c_void};
+
+    pub type mlx_dtype = c_uint;
+    pub type mlx_device_type = c_uint;
+
+    pub const mlx_device_type__MLX_CPU: mlx_device_type = 0;
+    pub const mlx_device_type__MLX_GPU: mlx_device_type = 1;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct mlx_array_ {
+        pub ctx: *mut c_void,
+    }
+    pub type mlx_array = mlx_array_;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct mlx_device_ {
+        pub ctx: *mut c_void,
+    }
+    pub type mlx_device = mlx_device_;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct mlx_stream_ {
+        pub ctx: *mut c_void,
+    }
+    pub type mlx_stream = mlx_stream_;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct mlx_vector_array_ {
+        pub ctx: *mut c_void,
+    }
+    pub type mlx_vector_array = mlx_vector_array_;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct mlx_vector_string_ {
+        pub ctx: *mut c_void,
+    }
+    pub type mlx_vector_string = mlx_vector_string_;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct mlx_optional_float_ {
+        pub value: f32,
+        pub has_value: bool,
+    }
+    pub type mlx_optional_float = mlx_optional_float_;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct mlx_fast_metal_kernel_config_ {
+        pub ctx: *mut c_void,
+    }
+    pub type mlx_fast_metal_kernel_config = mlx_fast_metal_kernel_config_;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct mlx_fast_metal_kernel_ {
+        pub ctx: *mut c_void,
+    }
+    pub type mlx_fast_metal_kernel = mlx_fast_metal_kernel_;
+
+    // Stub extern declarations for free functions used in Drop impls.
+    // The linker is never invoked in stub mode.
     unsafe extern "C" {
-        // Lifecycle
-        pub fn mlx_retain(obj: *mut c_void);
-        pub fn mlx_free(obj: *mut c_void);
-
-        // Array construction
-        pub fn mlx_array_from_data(
-            data: *const c_void,
-            shape: *const i32,
-            ndim: i32,
-            dtype: u32,
-        ) -> mlx_array;
-        pub fn mlx_array_from_float(val: f32) -> mlx_array;
-
-        // Array queries
-        pub fn mlx_array_dtype(arr: mlx_array) -> u32;
-        pub fn mlx_array_ndim(arr: mlx_array) -> i32;
-        pub fn mlx_array_size(arr: mlx_array) -> i32;
-        pub fn mlx_array_itemsize(arr: mlx_array) -> usize;
-        pub fn mlx_array_shape(arr: mlx_array) -> *const i32;
-        pub fn mlx_array_data_ptr(arr: mlx_array) -> *const c_void;
-
-        // Device
-        pub fn mlx_default_device() -> mlx_device;
-        pub fn mlx_device_new(device_type: i32) -> mlx_device;
-
-        // Stream
-        pub fn mlx_stream_new(device: mlx_device) -> mlx_stream;
-        pub fn mlx_default_gpu_stream() -> mlx_stream;
-
-        // Eval
-        pub fn mlx_eval(arr: mlx_array);
-        pub fn mlx_async_eval(arr: mlx_array);
-
-        // Memory management
-        pub fn mlx_metal_clear_cache();
-
-        // Ops
-        pub fn mlx_matmul(a: mlx_array, b: mlx_array, stream: mlx_stream) -> mlx_array;
-        pub fn mlx_add(a: mlx_array, b: mlx_array, stream: mlx_stream) -> mlx_array;
-        pub fn mlx_multiply(a: mlx_array, b: mlx_array, stream: mlx_stream) -> mlx_array;
-        pub fn mlx_reshape(
-            a: mlx_array,
-            shape: *const i32,
-            ndim: i32,
-            stream: mlx_stream,
-        ) -> mlx_array;
-        pub fn mlx_transpose_all(a: mlx_array, stream: mlx_stream) -> mlx_array;
-        pub fn mlx_transpose(
-            a: mlx_array,
-            axes: *const i32,
-            num_axes: i32,
-            stream: mlx_stream,
-        ) -> mlx_array;
-        pub fn mlx_concatenate(
-            arrays: mlx_vector_array,
-            axis: i32,
-            stream: mlx_stream,
-        ) -> mlx_array;
-        pub fn mlx_broadcast_to(
-            a: mlx_array,
-            shape: *const i32,
-            ndim: i32,
-            stream: mlx_stream,
-        ) -> mlx_array;
-        pub fn mlx_sigmoid(a: mlx_array, stream: mlx_stream) -> mlx_array;
-        pub fn mlx_slice(
-            a: mlx_array,
-            start: *const i32,
-            stop: *const i32,
-            strides: *const i32,
-            ndim: i32,
-            stream: mlx_stream,
-        ) -> mlx_array;
-        pub fn mlx_expand_dims(
-            a: mlx_array,
-            axes: *const i32,
-            naxes: i32,
-            stream: mlx_stream,
-        ) -> mlx_array;
-
-        // Fast ops
-        pub fn mlx_fast_rms_norm(
-            x: mlx_array,
-            weight: mlx_array,
-            eps: f32,
-            stream: mlx_stream,
-        ) -> mlx_array;
-        pub fn mlx_fast_rope(
-            x: mlx_array,
-            dims: i32,
-            traditional: bool,
-            base: f32,
-            scale: f32,
-            offset: i32,
-            stream: mlx_stream,
-        ) -> mlx_array;
-        pub fn mlx_fast_scaled_dot_product_attention(
-            q: mlx_array,
-            k: mlx_array,
-            v: mlx_array,
-            scale: f32,
-            mask: mlx_array,
-            stream: mlx_stream,
-        ) -> mlx_array;
-
-        // Metal kernel
-        pub fn mlx_fast_metal_kernel(
-            name: *const std::ffi::c_char,
-            inputs: mlx_vector_array,
-            outputs: mlx_vector_array,
-            source: *const std::ffi::c_char,
-            grid: *const usize,
-            threadgroup: *const usize,
-            output_shapes: *const *const i32,
-            output_shape_ndims: *const i32,
-            output_dtypes: *const u32,
-            num_outputs: i32,
-            stream: mlx_stream,
-        ) -> mlx_vector_array;
-
-        // Vector array helpers
-        pub fn mlx_vector_array_new() -> mlx_vector_array;
-        pub fn mlx_vector_array_add(vec: mlx_vector_array, arr: mlx_array);
-        pub fn mlx_vector_array_get(vec: mlx_vector_array, index: i32) -> mlx_array;
-        pub fn mlx_vector_array_size(vec: mlx_vector_array) -> i32;
+        pub fn mlx_array_free(arr: mlx_array) -> c_int;
+        pub fn mlx_array_new() -> mlx_array;
+        pub fn mlx_array_set(arr: *mut mlx_array, src: mlx_array) -> c_int;
+        pub fn mlx_device_free(dev: mlx_device) -> c_int;
+        pub fn mlx_stream_free(stream: mlx_stream) -> c_int;
     }
 }

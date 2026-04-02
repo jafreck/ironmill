@@ -1,7 +1,5 @@
 //! Safe wrapper for MLX streams and evaluation.
 
-use std::ffi::c_void;
-
 use crate::device::MlxDevice;
 use crate::error::MlxSysError;
 use crate::ffi;
@@ -14,7 +12,7 @@ use crate::ffi;
 ///
 /// Streams in MLX represent an ordered sequence of operations on a device.
 pub struct MlxStream {
-    raw: *mut c_void,
+    pub(crate) raw: ffi::mlx_stream,
 }
 
 // SAFETY: MLX streams are thread-safe reference-counted handles.
@@ -32,8 +30,8 @@ impl MlxStream {
 
         #[cfg(not(mlx_stub))]
         {
-            let raw = unsafe { ffi::mlx_stream_new(device.as_raw_ptr()) };
-            if raw.is_null() {
+            let raw = unsafe { ffi::mlx_stream_new_device(device.raw) };
+            if raw.ctx.is_null() {
                 return Err(MlxSysError::MlxC("failed to create stream".into()));
             }
             Ok(Self { raw })
@@ -49,25 +47,20 @@ impl MlxStream {
 
         #[cfg(not(mlx_stub))]
         {
-            let raw = unsafe { ffi::mlx_default_gpu_stream() };
-            if raw.is_null() {
+            let raw = unsafe { ffi::mlx_default_gpu_stream_new() };
+            if raw.ctx.is_null() {
                 return Err(MlxSysError::MlxC("failed to get default GPU stream".into()));
             }
             Ok(Self { raw })
         }
     }
-
-    /// Returns the raw stream pointer.
-    pub fn as_raw_ptr(&self) -> *mut c_void {
-        self.raw
-    }
 }
 
 impl Drop for MlxStream {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { ffi::mlx_free(self.raw) };
-            self.raw = std::ptr::null_mut();
+        if !self.raw.ctx.is_null() {
+            unsafe { ffi::mlx_stream_free(self.raw) };
+            self.raw.ctx = std::ptr::null_mut();
         }
     }
 }
@@ -90,7 +83,10 @@ pub fn eval(outputs: &[&crate::array::MlxArray]) -> Result<(), MlxSysError> {
     #[cfg(not(mlx_stub))]
     {
         for arr in outputs {
-            unsafe { ffi::mlx_eval(arr.as_raw_ptr()) };
+            let ret = unsafe { ffi::mlx_array_eval(arr.raw) };
+            if ret != 0 {
+                return Err(MlxSysError::MlxC("mlx_array_eval failed".into()));
+            }
         }
         Ok(())
     }
@@ -108,8 +104,14 @@ pub fn async_eval(outputs: &[&crate::array::MlxArray]) -> Result<(), MlxSysError
 
     #[cfg(not(mlx_stub))]
     {
+        let vec = unsafe { ffi::mlx_vector_array_new() };
         for arr in outputs {
-            unsafe { ffi::mlx_async_eval(arr.as_raw_ptr()) };
+            unsafe { ffi::mlx_vector_array_append_value(vec, arr.raw) };
+        }
+        let ret = unsafe { ffi::mlx_async_eval(vec) };
+        unsafe { ffi::mlx_vector_array_free(vec) };
+        if ret != 0 {
+            return Err(MlxSysError::MlxC("mlx_async_eval failed".into()));
         }
         Ok(())
     }
@@ -119,7 +121,7 @@ pub fn async_eval(outputs: &[&crate::array::MlxArray]) -> Result<(), MlxSysError
 // Metal memory management
 // ---------------------------------------------------------------------------
 
-/// Clear MLX's internal Metal buffer cache.
+/// Clear MLX's internal buffer cache.
 ///
 /// This releases pooled Metal buffers back to the system. Useful after
 /// `reset()` or after processing long sequences to prevent memory
@@ -133,7 +135,10 @@ pub fn metal_clear_cache() -> Result<(), MlxSysError> {
 
     #[cfg(not(mlx_stub))]
     {
-        unsafe { ffi::mlx_metal_clear_cache() };
+        let ret = unsafe { ffi::mlx_clear_cache() };
+        if ret != 0 {
+            return Err(MlxSysError::MlxC("mlx_clear_cache failed".into()));
+        }
         Ok(())
     }
 }

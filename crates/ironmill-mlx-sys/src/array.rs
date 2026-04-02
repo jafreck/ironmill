@@ -1,7 +1,5 @@
 //! Safe wrapper for MLX arrays.
 
-use std::ffi::c_void;
-
 use crate::MlxDtype;
 use crate::error::MlxSysError;
 use crate::ffi;
@@ -16,7 +14,7 @@ use crate::stream::MlxStream;
 /// Arrays in MLX are lazily evaluated — data is not computed until
 /// [`crate::stream::eval`] or [`crate::stream::async_eval`] is called.
 pub struct MlxArray {
-    raw: *mut c_void,
+    pub(crate) raw: ffi::mlx_array,
 }
 
 // SAFETY: MLX arrays are reference-counted and thread-safe.
@@ -24,13 +22,14 @@ unsafe impl Send for MlxArray {}
 unsafe impl Sync for MlxArray {}
 
 impl MlxArray {
-    /// Create an `MlxArray` from a raw pointer.
+    /// Create an `MlxArray` from an `ffi::mlx_array` value.
     ///
     /// # Safety
     ///
-    /// The pointer must be a valid, retained `mlx_array` handle.
+    /// The value must be a valid, owned `mlx_array` handle (the caller
+    /// transfers ownership).
     #[cfg_attr(mlx_stub, allow(dead_code))]
-    pub(crate) unsafe fn from_raw(raw: *mut c_void) -> Self {
+    pub(crate) unsafe fn from_raw(raw: ffi::mlx_array) -> Self {
         Self { raw }
     }
 
@@ -54,14 +53,14 @@ impl MlxArray {
                 .map(|&s| i32::try_from(s).unwrap_or(i32::MAX))
                 .collect();
             let raw = unsafe {
-                ffi::mlx_array_from_data(
-                    data.as_ptr() as *const c_void,
+                ffi::mlx_array_new_data(
+                    data.as_ptr() as *const std::ffi::c_void,
                     shape_i32.as_ptr(),
                     shape_i32.len() as i32,
                     dtype as u32,
                 )
             };
-            if raw.is_null() {
+            if raw.ctx.is_null() {
                 return Err(MlxSysError::MlxC("failed to create array from data".into()));
             }
             Ok(Self { raw })
@@ -82,8 +81,8 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
-            let raw = unsafe { ffi::mlx_array_from_float(val) };
-            if raw.is_null() {
+            let raw = unsafe { ffi::mlx_array_new_float(val) };
+            if raw.ctx.is_null() {
                 return Err(MlxSysError::MlxC("failed to create scalar array".into()));
             }
             Ok(Self { raw })
@@ -99,7 +98,7 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
-            let ndim = unsafe { ffi::mlx_array_ndim(self.raw) } as usize;
+            let ndim = unsafe { ffi::mlx_array_ndim(self.raw) };
             let shape_ptr = unsafe { ffi::mlx_array_shape(self.raw) };
             if shape_ptr.is_null() || ndim == 0 {
                 return Vec::new();
@@ -132,7 +131,7 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
-            unsafe { ffi::mlx_array_ndim(self.raw) as usize }
+            unsafe { ffi::mlx_array_ndim(self.raw) }
         }
     }
 
@@ -145,7 +144,7 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
-            unsafe { ffi::mlx_array_size(self.raw) as usize }
+            unsafe { ffi::mlx_array_size(self.raw) }
         }
     }
 
@@ -179,7 +178,9 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
-            let ptr = unsafe { ffi::mlx_array_data_ptr(self.raw) };
+            // Use mlx_array_data_uint8 as a generic byte pointer; caller
+            // guarantees T matches the real dtype.
+            let ptr = unsafe { ffi::mlx_array_data_uint8(self.raw) };
             if ptr.is_null() {
                 return Err(MlxSysError::MlxC(
                     "array data pointer is null (not yet evaluated?)".into(),
@@ -192,26 +193,33 @@ impl MlxArray {
         }
     }
 
-    /// Returns the raw `mlx_array` pointer.
-    pub fn as_raw_ptr(&self) -> *mut c_void {
+    /// Returns the raw `ffi::mlx_array` handle (Copy).
+    pub fn as_mlx_array(&self) -> ffi::mlx_array {
         self.raw
     }
 }
 
 impl Clone for MlxArray {
     fn clone(&self) -> Self {
-        if !self.raw.is_null() {
-            unsafe { ffi::mlx_retain(self.raw) };
+        #[cfg(not(mlx_stub))]
+        {
+            let mut new_arr = unsafe { ffi::mlx_array_new() };
+            unsafe { ffi::mlx_array_set(&mut new_arr, self.raw) };
+            Self { raw: new_arr }
         }
-        Self { raw: self.raw }
+
+        #[cfg(mlx_stub)]
+        {
+            Self { raw: self.raw }
+        }
     }
 }
 
 impl Drop for MlxArray {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { ffi::mlx_free(self.raw) };
-            self.raw = std::ptr::null_mut();
+        if !self.raw.ctx.is_null() {
+            unsafe { ffi::mlx_array_free(self.raw) };
+            self.raw.ctx = std::ptr::null_mut();
         }
     }
 }

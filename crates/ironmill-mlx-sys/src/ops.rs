@@ -8,15 +8,15 @@ use crate::stream::MlxStream;
 use crate::ffi;
 
 // ---------------------------------------------------------------------------
-// Helper — check a returned array pointer
+// Helper — run an op that writes into an output mlx_array
 // ---------------------------------------------------------------------------
 
 #[cfg(not(mlx_stub))]
-fn check_array(raw: *mut std::ffi::c_void, op: &str) -> Result<MlxArray, MlxSysError> {
-    if raw.is_null() {
-        return Err(MlxSysError::MlxC(format!("{op} returned null")));
+fn check_ret(ret: i32, op: &str) -> Result<(), MlxSysError> {
+    if ret != 0 {
+        return Err(MlxSysError::MlxC(format!("{op} failed (error code {ret})")));
     }
-    Ok(unsafe { MlxArray::from_raw(raw) })
+    Ok(())
 }
 
 #[cfg(mlx_stub)]
@@ -38,8 +38,10 @@ pub fn matmul(a: &MlxArray, b: &MlxArray, stream: &MlxStream) -> Result<MlxArray
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe { ffi::mlx_matmul(a.as_raw_ptr(), b.as_raw_ptr(), stream.as_raw_ptr()) };
-        check_array(raw, "matmul")
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe { ffi::mlx_matmul(&mut result, a.raw, b.raw, stream.raw) };
+        check_ret(ret, "matmul")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -53,8 +55,10 @@ pub fn add(a: &MlxArray, b: &MlxArray, stream: &MlxStream) -> Result<MlxArray, M
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe { ffi::mlx_add(a.as_raw_ptr(), b.as_raw_ptr(), stream.as_raw_ptr()) };
-        check_array(raw, "add")
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe { ffi::mlx_add(&mut result, a.raw, b.raw, stream.raw) };
+        check_ret(ret, "add")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -68,8 +72,10 @@ pub fn multiply(a: &MlxArray, b: &MlxArray, stream: &MlxStream) -> Result<MlxArr
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe { ffi::mlx_multiply(a.as_raw_ptr(), b.as_raw_ptr(), stream.as_raw_ptr()) };
-        check_array(raw, "multiply")
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe { ffi::mlx_multiply(&mut result, a.raw, b.raw, stream.raw) };
+        check_ret(ret, "multiply")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -87,15 +93,18 @@ pub fn reshape(
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe {
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe {
             ffi::mlx_reshape(
-                a.as_raw_ptr(),
+                &mut result,
+                a.raw,
                 new_shape.as_ptr(),
-                new_shape.len() as i32,
-                stream.as_raw_ptr(),
+                new_shape.len(),
+                stream.raw,
             )
         };
-        check_array(raw, "reshape")
+        check_ret(ret, "reshape")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -109,8 +118,10 @@ pub fn transpose(a: &MlxArray, stream: &MlxStream) -> Result<MlxArray, MlxSysErr
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe { ffi::mlx_transpose_all(a.as_raw_ptr(), stream.as_raw_ptr()) };
-        check_array(raw, "transpose")
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe { ffi::mlx_transpose(&mut result, a.raw, stream.raw) };
+        check_ret(ret, "transpose")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -128,15 +139,12 @@ pub fn transpose_axes(
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe {
-            ffi::mlx_transpose(
-                a.as_raw_ptr(),
-                axes.as_ptr(),
-                axes.len() as i32,
-                stream.as_raw_ptr(),
-            )
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe {
+            ffi::mlx_transpose_axes(&mut result, a.raw, axes.as_ptr(), axes.len(), stream.raw)
         };
-        check_array(raw, "transpose_axes")
+        check_ret(ret, "transpose_axes")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -153,14 +161,17 @@ pub fn silu(a: &MlxArray, stream: &MlxStream) -> Result<MlxArray, MlxSysError> {
     #[cfg(not(mlx_stub))]
     {
         // silu(x) = x * sigmoid(x)
-        let sig = unsafe { ffi::mlx_sigmoid(a.as_raw_ptr(), stream.as_raw_ptr()) };
-        if sig.is_null() {
-            return Err(MlxSysError::MlxC("sigmoid returned null".into()));
+        let mut sig = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe { ffi::mlx_sigmoid(&mut sig, a.raw, stream.raw) };
+        if ret != 0 {
+            unsafe { ffi::mlx_array_free(sig) };
+            return Err(MlxSysError::MlxC("sigmoid failed".into()));
         }
-        let raw = unsafe { ffi::mlx_multiply(a.as_raw_ptr(), sig, stream.as_raw_ptr()) };
-        // Free the intermediate sigmoid result.
-        unsafe { ffi::mlx_free(sig) };
-        check_array(raw, "silu")
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe { ffi::mlx_multiply(&mut result, a.raw, sig, stream.raw) };
+        unsafe { ffi::mlx_array_free(sig) };
+        check_ret(ret, "silu")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -180,18 +191,22 @@ pub fn slice(
 
     #[cfg(not(mlx_stub))]
     {
-        let ndim = start.len() as i32;
-        let raw = unsafe {
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe {
             ffi::mlx_slice(
-                a.as_raw_ptr(),
+                &mut result,
+                a.raw,
                 start.as_ptr(),
+                start.len(),
                 stop.as_ptr(),
+                stop.len(),
                 strides.as_ptr(),
-                ndim,
-                stream.as_raw_ptr(),
+                strides.len(),
+                stream.raw,
             )
         };
-        check_array(raw, "slice")
+        check_ret(ret, "slice")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -209,15 +224,12 @@ pub fn expand_dims(
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe {
-            ffi::mlx_expand_dims(
-                a.as_raw_ptr(),
-                axes.as_ptr(),
-                axes.len() as i32,
-                stream.as_raw_ptr(),
-            )
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe {
+            ffi::mlx_expand_dims_axes(&mut result, a.raw, axes.as_ptr(), axes.len(), stream.raw)
         };
-        check_array(raw, "expand_dims")
+        check_ret(ret, "expand_dims")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -236,15 +248,14 @@ pub fn concat(
     #[cfg(not(mlx_stub))]
     {
         let vec = unsafe { ffi::mlx_vector_array_new() };
-        if vec.is_null() {
-            return Err(MlxSysError::MlxC("failed to create vector_array".into()));
-        }
         for arr in arrays {
-            unsafe { ffi::mlx_vector_array_add(vec, arr.as_raw_ptr()) };
+            unsafe { ffi::mlx_vector_array_append_value(vec, arr.raw) };
         }
-        let raw = unsafe { ffi::mlx_concatenate(vec, axis, stream.as_raw_ptr()) };
-        unsafe { ffi::mlx_free(vec) };
-        check_array(raw, "concat")
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe { ffi::mlx_concatenate_axis(&mut result, vec, axis, stream.raw) };
+        unsafe { ffi::mlx_vector_array_free(vec) };
+        check_ret(ret, "concat")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -262,14 +273,11 @@ pub fn broadcast_to(
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe {
-            ffi::mlx_broadcast_to(
-                a.as_raw_ptr(),
-                shape.as_ptr(),
-                shape.len() as i32,
-                stream.as_raw_ptr(),
-            )
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe {
+            ffi::mlx_broadcast_to(&mut result, a.raw, shape.as_ptr(), shape.len(), stream.raw)
         };
-        check_array(raw, "broadcast_to")
+        check_ret(ret, "broadcast_to")?;
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }

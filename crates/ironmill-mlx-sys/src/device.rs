@@ -1,18 +1,7 @@
 //! Safe wrapper for MLX devices.
 
-use std::ffi::c_void;
-
 use crate::error::MlxSysError;
 use crate::ffi;
-
-// ---------------------------------------------------------------------------
-// Device type constants
-// ---------------------------------------------------------------------------
-
-#[cfg(not(mlx_stub))]
-const MLX_DEVICE_CPU: i32 = 0;
-#[cfg(not(mlx_stub))]
-const MLX_DEVICE_GPU: i32 = 1;
 
 // ---------------------------------------------------------------------------
 // MlxDevice
@@ -20,7 +9,7 @@ const MLX_DEVICE_GPU: i32 = 1;
 
 /// Safe wrapper around an mlx-c device handle.
 pub struct MlxDevice {
-    raw: *mut c_void,
+    pub(crate) raw: ffi::mlx_device,
 }
 
 // SAFETY: MLX devices are thread-safe reference-counted handles.
@@ -37,8 +26,8 @@ impl MlxDevice {
 
         #[cfg(not(mlx_stub))]
         {
-            let raw = unsafe { ffi::mlx_device_new(MLX_DEVICE_GPU) };
-            if raw.is_null() {
+            let raw = unsafe { ffi::mlx_device_new_type(ffi::mlx_device_type__MLX_GPU, 0) };
+            if raw.ctx.is_null() {
                 return Err(MlxSysError::MlxC("failed to create GPU device".into()));
             }
             Ok(Self { raw })
@@ -54,25 +43,20 @@ impl MlxDevice {
 
         #[cfg(not(mlx_stub))]
         {
-            let raw = unsafe { ffi::mlx_device_new(MLX_DEVICE_CPU) };
-            if raw.is_null() {
+            let raw = unsafe { ffi::mlx_device_new_type(ffi::mlx_device_type__MLX_CPU, 0) };
+            if raw.ctx.is_null() {
                 return Err(MlxSysError::MlxC("failed to create CPU device".into()));
             }
             Ok(Self { raw })
         }
     }
-
-    /// Returns the raw device pointer.
-    pub fn as_raw_ptr(&self) -> *mut c_void {
-        self.raw
-    }
 }
 
 impl Drop for MlxDevice {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { ffi::mlx_free(self.raw) };
-            self.raw = std::ptr::null_mut();
+        if !self.raw.ctx.is_null() {
+            unsafe { ffi::mlx_device_free(self.raw) };
+            self.raw.ctx = std::ptr::null_mut();
         }
     }
 }

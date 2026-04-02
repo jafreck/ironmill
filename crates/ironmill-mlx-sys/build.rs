@@ -18,7 +18,7 @@ fn main() {
 
         if include_dir.exists() && lib_dir.exists() {
             println!("cargo:rustc-link-search=native={}", lib_dir.display());
-            println!("cargo:rustc-link-lib=mlx");
+            println!("cargo:rustc-link-lib=mlxc");
             println!("cargo:rustc-link-lib=c++");
 
             generate_bindings(&include_dir);
@@ -47,7 +47,7 @@ fn main() {
         let include_dir = dst.join("include");
 
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
-        println!("cargo:rustc-link-lib=mlx");
+        println!("cargo:rustc-link-lib=mlxc");
         println!("cargo:rustc-link-lib=c++");
 
         generate_bindings(&include_dir);

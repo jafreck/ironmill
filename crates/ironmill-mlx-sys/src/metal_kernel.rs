@@ -1,4 +1,4 @@
-//! Safe wrapper for `mlx_fast_metal_kernel()`.
+//! Safe wrapper for `mlx_fast_metal_kernel`.
 
 use crate::MlxDtype;
 use crate::array::MlxArray;
@@ -8,16 +8,17 @@ use crate::stream::MlxStream;
 #[cfg(not(mlx_stub))]
 use crate::ffi;
 #[cfg(not(mlx_stub))]
-use std::ffi::{CString, c_void};
+use std::ffi::CString;
 
 /// Launch a custom Metal kernel via mlx-c.
 ///
-/// This wraps `mlx_fast_metal_kernel` and returns the output arrays.
+/// This wraps the `mlx_fast_metal_kernel` + config API and returns the output
+/// arrays.
 #[allow(clippy::too_many_arguments)]
 pub fn metal_kernel(
     name: &str,
     inputs: &[&MlxArray],
-    outputs: &[&MlxArray],
+    _outputs: &[&MlxArray],
     source: &str,
     grid: [usize; 3],
     threadgroup: [usize; 3],
@@ -30,7 +31,7 @@ pub fn metal_kernel(
         let _ = (
             name,
             inputs,
-            outputs,
+            _outputs,
             source,
             grid,
             threadgroup,
@@ -49,76 +50,127 @@ pub fn metal_kernel(
         let c_source =
             CString::new(source).map_err(|e| MlxSysError::KernelCompile(e.to_string()))?;
 
-        // Build input vector array.
-        let input_vec = unsafe { ffi::mlx_vector_array_new() };
-        for arr in inputs {
-            unsafe { ffi::mlx_vector_array_add(input_vec, arr.as_raw_ptr()) };
-        }
-
-        // Build output vector array.
-        let output_vec = unsafe { ffi::mlx_vector_array_new() };
-        for arr in outputs {
-            unsafe { ffi::mlx_vector_array_add(output_vec, arr.as_raw_ptr()) };
-        }
-
-        // Convert output shapes to C-compatible format.
-        let shapes_i32: Vec<Vec<i32>> = output_shapes
-            .iter()
-            .map(|s| s.iter().map(|&d| d as i32).collect())
+        // Build input / output name vectors. Use generic names since the
+        // original API didn't require explicit names.
+        let input_names: Vec<CString> = (0..inputs.len())
+            .map(|i| CString::new(format!("input{i}")).unwrap())
             .collect();
-        let shape_ptrs: Vec<*const i32> = shapes_i32.iter().map(|s| s.as_ptr()).collect();
-        let shape_ndims: Vec<i32> = shapes_i32.iter().map(|s| s.len() as i32).collect();
+        let output_names: Vec<CString> = (0..output_shapes.len())
+            .map(|i| CString::new(format!("output{i}")).unwrap())
+            .collect();
 
-        // Convert dtypes.
-        let dtypes_u32: Vec<u32> = output_dtypes.iter().map(|&d| d as u32).collect();
+        let input_name_ptrs: Vec<*const std::ffi::c_char> =
+            input_names.iter().map(|s| s.as_ptr()).collect();
+        let output_name_ptrs: Vec<*const std::ffi::c_char> =
+            output_names.iter().map(|s| s.as_ptr()).collect();
 
-        let result = unsafe {
-            ffi::mlx_fast_metal_kernel(
-                c_name.as_ptr(),
-                input_vec,
-                output_vec,
-                c_source.as_ptr(),
-                grid.as_ptr(),
-                threadgroup.as_ptr(),
-                shape_ptrs.as_ptr(),
-                shape_ndims.as_ptr(),
-                dtypes_u32.as_ptr(),
-                output_dtypes.len() as i32,
-                stream.as_raw_ptr(),
+        let in_names_vec = unsafe {
+            ffi::mlx_vector_string_new_data(
+                input_name_ptrs.as_ptr() as *mut *const std::ffi::c_char,
+                input_name_ptrs.len(),
+            )
+        };
+        let out_names_vec = unsafe {
+            ffi::mlx_vector_string_new_data(
+                output_name_ptrs.as_ptr() as *mut *const std::ffi::c_char,
+                output_name_ptrs.len(),
             )
         };
 
-        // Free the input/output vector handles.
+        // Create the metal kernel object.
+        let empty_header = c"";
+        let kernel = unsafe {
+            ffi::mlx_fast_metal_kernel_new(
+                c_name.as_ptr(),
+                in_names_vec,
+                out_names_vec,
+                c_source.as_ptr(),
+                empty_header.as_ptr(),
+                false, // ensure_row_contiguous
+                false, // atomic_outputs
+            )
+        };
+
         unsafe {
-            ffi::mlx_free(input_vec as *mut c_void);
-            ffi::mlx_free(output_vec as *mut c_void);
+            ffi::mlx_vector_string_free(in_names_vec);
+            ffi::mlx_vector_string_free(out_names_vec);
         }
 
-        if result.is_null() {
+        // Build the config.
+        let config = unsafe { ffi::mlx_fast_metal_kernel_config_new() };
+        unsafe {
+            ffi::mlx_fast_metal_kernel_config_set_grid(
+                config,
+                grid[0] as i32,
+                grid[1] as i32,
+                grid[2] as i32,
+            );
+            ffi::mlx_fast_metal_kernel_config_set_thread_group(
+                config,
+                threadgroup[0] as i32,
+                threadgroup[1] as i32,
+                threadgroup[2] as i32,
+            );
+        }
+
+        // Add output specifications.
+        for (shape, &dtype) in output_shapes.iter().zip(output_dtypes.iter()) {
+            let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
+            unsafe {
+                ffi::mlx_fast_metal_kernel_config_add_output_arg(
+                    config,
+                    shape_i32.as_ptr(),
+                    shape_i32.len(),
+                    dtype as u32,
+                );
+            }
+        }
+
+        // Build input vector array.
+        let input_vec = unsafe { ffi::mlx_vector_array_new() };
+        for arr in inputs {
+            unsafe { ffi::mlx_vector_array_append_value(input_vec, arr.raw) };
+        }
+
+        // Apply the kernel.
+        let mut output_vec = unsafe { ffi::mlx_vector_array_new() };
+        let ret = unsafe {
+            ffi::mlx_fast_metal_kernel_apply(&mut output_vec, kernel, input_vec, config, stream.raw)
+        };
+
+        // Cleanup kernel resources.
+        unsafe {
+            ffi::mlx_fast_metal_kernel_free(kernel);
+            ffi::mlx_fast_metal_kernel_config_free(config);
+            ffi::mlx_vector_array_free(input_vec);
+        }
+
+        if ret != 0 {
+            unsafe { ffi::mlx_vector_array_free(output_vec) };
             return Err(MlxSysError::KernelCompile(
-                "mlx_fast_metal_kernel returned null".into(),
+                "mlx_fast_metal_kernel_apply failed".into(),
             ));
         }
 
         // Extract results from the returned vector array.
-        let n = unsafe { ffi::mlx_vector_array_size(result) };
-        let mut out = Vec::with_capacity(n as usize);
+        let n = unsafe { ffi::mlx_vector_array_size(output_vec) };
+        let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let arr = unsafe { ffi::mlx_vector_array_get(result, i) };
-            if arr.is_null() {
-                // Free the result vector before returning error.
-                unsafe { ffi::mlx_free(result as *mut c_void) };
+            let mut arr = unsafe { ffi::mlx_array_new() };
+            let ret = unsafe { ffi::mlx_vector_array_get(&mut arr, output_vec, i) };
+            if ret != 0 || arr.ctx.is_null() {
+                unsafe {
+                    ffi::mlx_array_free(arr);
+                    ffi::mlx_vector_array_free(output_vec);
+                }
                 return Err(MlxSysError::KernelCompile(format!(
                     "null array at index {i} in kernel output"
                 )));
             }
-            // Retain since we're taking ownership.
-            unsafe { ffi::mlx_retain(arr) };
             out.push(unsafe { MlxArray::from_raw(arr) });
         }
 
-        // Free the result vector.
-        unsafe { ffi::mlx_free(result as *mut c_void) };
+        unsafe { ffi::mlx_vector_array_free(output_vec) };
 
         Ok(out)
     }

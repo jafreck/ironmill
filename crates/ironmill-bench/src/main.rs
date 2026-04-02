@@ -970,17 +970,155 @@ fn main() -> Result<()> {
         }
     }
 
-    // ── MLX backend (future) ──
+    // ── MLX backend ──
     if has_mlx {
         #[cfg(feature = "mlx")]
         {
-            eprintln!("error: MLX backend not yet implemented");
-            eprintln!("  The MLX backend will be added by the MLX-FP16 task.");
+            use ironmill_compile::weights::SafeTensorsProvider;
+            use ironmill_inference::engine::InferenceEngine;
+            use ironmill_inference::mlx::{MlxConfig, MlxInference};
+
+            eprintln!("\n  MLX GPU Backend Benchmark");
+            eprintln!("  {}", "─".repeat(40));
+
+            for model_cfg in &matrix.models {
+                let model_dir = if model_cfg.path.is_dir() {
+                    model_cfg.path.clone()
+                } else if let Some(parent) = model_cfg.path.parent() {
+                    parent.to_path_buf()
+                } else {
+                    eprintln!(
+                        "  ✗ cannot determine model directory for {}",
+                        model_cfg.name
+                    );
+                    continue;
+                };
+
+                let provider = match SafeTensorsProvider::load(&model_dir) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "  ✗ failed to load weights from {}: {e}",
+                            model_dir.display()
+                        );
+                        continue;
+                    }
+                };
+
+                let config_label = "fp16";
+                eprintln!("  MLX/{config_label}: {}...", model_cfg.name);
+
+                let mlx_config = MlxConfig::default();
+                let mut engine = match MlxInference::new(mlx_config.clone()) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("  ✗ MLX init failed: {e}");
+                        continue;
+                    }
+                };
+
+                let load_start = std::time::Instant::now();
+                if let Err(e) = engine.load_weights(&provider, mlx_config) {
+                    eprintln!("  ✗ MLX weight load failed: {e}");
+                    continue;
+                }
+                let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("  ✓ loaded in {load_time_ms:.1}ms");
+
+                let prompt_tokens: Vec<u32> = vec![9707, 1879];
+
+                let mut run_results = Vec::new();
+                for run_idx in 0..matrix.settings.runs {
+                    engine.reset();
+
+                    if let Err(e) = engine.prefill(&prompt_tokens) {
+                        eprintln!("  ✗ prefill failed: {e}");
+                        continue;
+                    }
+
+                    let mut last_token = prompt_tokens.last().copied().unwrap_or(0);
+                    for _ in 0..matrix.settings.warmup {
+                        match engine.decode_step(last_token) {
+                            Ok(logits) => {
+                                last_token = logits
+                                    .iter()
+                                    .enumerate()
+                                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                    .map(|(i, _)| i as u32)
+                                    .unwrap_or(0);
+                            }
+                            Err(e) => {
+                                eprintln!("  ✗ warmup decode failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+
+                    let mut latencies = Vec::with_capacity(matrix.settings.iterations);
+                    for _ in 0..matrix.settings.iterations {
+                        let t0 = std::time::Instant::now();
+                        match engine.decode_step(last_token) {
+                            Ok(logits) => {
+                                let elapsed = t0.elapsed();
+                                latencies.push(elapsed);
+                                last_token = logits
+                                    .iter()
+                                    .enumerate()
+                                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                    .map(|(i, _)| i as u32)
+                                    .unwrap_or(0);
+                            }
+                            Err(e) => {
+                                eprintln!("  ✗ decode failed at iteration: {e}");
+                                break;
+                            }
+                        }
+                    }
+
+                    if latencies.is_empty() {
+                        continue;
+                    }
+
+                    let latencies_ms: Vec<f64> =
+                        latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+
+                    let label = format!(
+                        "{}/{}/mlx-{config_label}/run{run_idx}",
+                        model_cfg.name, "default"
+                    );
+                    run_results.push(compute_stats(&label, &latencies_ms));
+                }
+
+                if !run_results.is_empty() {
+                    let label = format!("{}/mlx-{config_label}", model_cfg.name);
+                    let mut aggregated = aggregate_runs(&label, &run_results);
+
+                    let tok_per_sec = 1000.0 / aggregated.pooled.median;
+                    aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
+                    aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
+
+                    eprintln!(
+                        "  ✓ {config_label}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms",
+                        aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
+                    );
+
+                    report_rows.push(ReportRow {
+                        model: model_cfg.name.clone(),
+                        optimization: "default".to_string(),
+                        backend: format!("mlx-{config_label}"),
+                        kv_quant: "none".to_string(),
+                        result: aggregated,
+                        significance: None,
+                        energy: None,
+                        utilization: None,
+                        memory: None,
+                        load_time_ms: Some(load_time_ms),
+                    });
+                }
+            }
         }
         #[cfg(not(feature = "mlx"))]
         {
-            // Unreachable: Mlx variant is absent when the feature is off, so
-            // has_mlx is always false. Keep the branch for completeness.
             eprintln!("warning: --backend mlx requires --features mlx, skipping");
         }
     }

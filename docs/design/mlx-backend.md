@@ -59,8 +59,8 @@ Full decode pipeline (single token):
 
 Key components:
 - `ironmill-metal-sys` — safe Rust wrappers for Metal, MPS, command buffers, compute pipelines
-- `gpu::ops` — `GpuPipelines` compiles and dispatches 8 custom `.metal` kernels
-- `gpu::turboquant` — INT8 KV cache with Hadamard rotation, per-head absmax scaling
+- `gpu::ops` — `GpuPipelines` compiles and dispatches 14 kernel functions across 8 `.metal` shader files
+- `gpu::turboquant` — INT4/INT8 KV cache with Hadamard rotation, per-head absmax scaling, outlier channel strategy
 - `gpu::weights` — loads `WeightProvider` tensors into `MetalBuffer`s
 - `gpu::inference` — `GpuInference` implements `InferenceEngine`, orchestrates the pipeline
 
@@ -96,7 +96,7 @@ Full decode pipeline (single token):
  14. mlx_eval()          ← single materialization point
 ```
 
-### Pipeline Mapping — TurboQuant INT8 KV Cache (Phase 3)
+### Pipeline Mapping — TurboQuant INT4/INT8 KV Cache (Phase 3)
 
 With TurboQuant, per-layer `eval()` calls are required to materialize
 the quantized cache before attention reads it. This narrows the lazy
@@ -142,9 +142,9 @@ backend currently performs.
 
 ```
 crates/
-  ironmill-mlx-sys/                  NEW — FFI bindings to mlx-c
+  ironmill-mlx-sys/                  NEW — unsafe FFI bindings to mlx-c
     Cargo.toml
-    build.rs                         find/build mlx-c, bindgen
+    build.rs                         find/build mlx-c via CMake, generate bindings with bindgen
     src/
       lib.rs                         safe wrappers: MlxArray, MlxStream, MlxDevice
       array.rs                       array creation, data access, dtype mapping
@@ -161,12 +161,20 @@ crates/
         config.rs                    MlxConfig (analogous to GpuConfig)
         error.rs                     MlxError wrapping MlxSysError → InferenceError
         inference.rs                 MlxInference: impl InferenceEngine
-        weights.rs                   WeightProvider → MlxArray loading
+        weights.rs                   WeightProvider → MlxArray loading (dense + quantized)
+        quantized_matmul.rs          PolarQuant INT4/INT8 matmul kernels adapted for MLX
         turboquant/
-          mod.rs                     MlxTurboQuantModel (Hadamard matrix, scales)
-          cache.rs                   MlxKvCache (INT8 arrays + scale arrays)
-          kernels.rs                 adapted TurboQuant kernel source + dispatch
+          mod.rs                     MlxTurboQuantModel (rotation signs, codebooks, scales)
+          cache.rs                   MlxKvCache (INT4/INT8 arrays + scale arrays + outlier split)
+          kernels.rs                 adapted TurboQuant + outlier kernel source + dispatch
 ```
+
+**Note on `ironmill-mlx-sys` build approach:** unlike `ironmill-metal-sys`
+which uses bare `#[link(name = "Metal", kind = "framework")]` directives
+(no `build.rs`), `ironmill-mlx-sys` requires a `build.rs` because mlx-c
+is not a system framework — it must be built from source via CMake or
+located via `MLX_DIR`. This is new build complexity not present in the
+existing FFI crate.
 
 ### Feature Gating
 
@@ -245,6 +253,35 @@ a one-time cost and the copy is negligible compared to inference.
 
 ```rust
 // mlx/weights.rs
+
+/// Mirrors gpu::weights::WeightBuffer — projections may be dense or quantized.
+pub enum MlxWeightBuffer {
+    Dense(MlxArray),
+    Quantized(MlxQuantizedWeight),
+}
+
+pub struct MlxQuantizedWeight {
+    pub indices: MlxArray,
+    pub lut: MlxArray,
+    pub norms: MlxArray,
+    pub n_bits: u8,
+    pub shape: (usize, usize),
+}
+
+pub struct MlxLayerWeights {
+    pub input_norm: MlxArray,
+    pub q_proj: MlxWeightBuffer,
+    pub k_proj: MlxWeightBuffer,
+    pub v_proj: MlxWeightBuffer,
+    pub o_proj: MlxWeightBuffer,
+    pub post_attn_norm: MlxArray,
+    pub gate_proj: MlxWeightBuffer,
+    pub up_proj: MlxWeightBuffer,
+    pub down_proj: MlxWeightBuffer,
+    pub q_norm: Option<MlxArray>,
+    pub k_norm: Option<MlxArray>,
+}
+
 pub struct MlxWeights {
     pub embedding: MlxArray,
     pub layers: Vec<MlxLayerWeights>,
@@ -254,14 +291,62 @@ pub struct MlxWeights {
 }
 
 fn load_weight(stream: &MlxStream, provider: &dyn WeightProvider, name: &str)
-    -> Result<MlxArray, MlxError>
+    -> Result<MlxWeightBuffer, MlxError>
 {
     let tensor = provider.tensor(name)
         .map_err(|e| MlxError::WeightLoading(format!("{name}: {e}")))?;
-    // Copy into MLX-owned memory to decouple from provider lifetime
-    MlxArray::from_data_copy(&tensor.data, &tensor.shape, tensor.dtype.to_mlx(), stream)
+    match &tensor.quant_info {
+        QuantizationInfo::None => {
+            let arr = MlxArray::from_data_copy(
+                &tensor.data, &tensor.shape, tensor.dtype.to_mlx(), stream,
+            )?;
+            Ok(MlxWeightBuffer::Dense(arr))
+        }
+        QuantizationInfo::LutToDense { n_bits, .. } => {
+            // Load packed indices, LUT, and norms as separate MlxArrays.
+            // Dispatched via adapted PolarQuant kernels at inference time.
+            let (indices, lut, norms) = unpack_lut_quant(&tensor)?;
+            Ok(MlxWeightBuffer::Quantized(MlxQuantizedWeight {
+                indices: MlxArray::from_data_copy(&indices.data, &indices.shape, indices.dtype.to_mlx(), stream)?,
+                lut: MlxArray::from_data_copy(&lut.data, &lut.shape, lut.dtype.to_mlx(), stream)?,
+                norms: MlxArray::from_data_copy(&norms.data, &norms.shape, norms.dtype.to_mlx(), stream)?,
+                n_bits: *n_bits,
+                shape: (tensor.shape[0], tensor.shape[1]),
+            }))
+        }
+        QuantizationInfo::AffineDequantize { .. } => {
+            // CPU-side dequantize to dense, same as MPS backend
+            let dense = dequant_affine(&tensor)?;
+            let arr = MlxArray::from_data_copy(
+                &dense.data, &dense.shape, dense.dtype.to_mlx(), stream,
+            )?;
+            Ok(MlxWeightBuffer::Dense(arr))
+        }
+    }
 }
 ```
+
+For quantized weights, matmul dispatch branches on the weight type:
+
+```rust
+fn matmul_or_quantized(
+    input: &MlxArray, weight: &MlxWeightBuffer, output_name: &str, stream: &MlxStream,
+) -> Result<MlxArray, MlxError> {
+    match weight {
+        MlxWeightBuffer::Dense(w) => Ok(mlx_matmul(input, w)),
+        MlxWeightBuffer::Quantized(q) => {
+            // Dispatch adapted PolarQuant kernel (INT4 or INT8, matvec or matmul)
+            mlx_polarquant_matmul(input, q, stream)
+        }
+    }
+}
+```
+
+The 4 PolarQuant kernel variants (`polarquant_matvec_int4`,
+`polarquant_matmul_int4`, `polarquant_matvec_int8`,
+`polarquant_matmul_int8`) are selected by `n_bits` and whether the
+input is a single token (matvec) or multi-token (matmul), matching the
+MPS backend's dispatch logic.
 
 ### Artifacts and InferenceEngine Entry Point
 
@@ -303,15 +388,18 @@ head to its corresponding KV head via `q_head / gqa_group_size`.
 
 ### TurboQuant Integration
 
-TurboQuant's core operations are:
-1. **Cache write:** Hadamard rotate → absmax scale → quantize to INT8 → store
-2. **Attention:** dequantize K/V → scale → QK matmul → causal mask → softmax → ×V
-3. **QJL correction** *(optional)*: Johnson-Lindenstrauss sign-based error correction
+The MPS backend has 6 TurboQuant-related kernel functions:
 
-These are fused multi-step operations with custom memory layouts.
-MLX's built-in quantization doesn't support per-head-per-position
-dynamic scaling or Hadamard rotation. These stay as custom Metal
-kernels.
+1. `turboquant_cache_write` — standard cache write (Hadamard rotate → absmax → quantize → store)
+2. `turboquant_attention` — standard attention (dequant K/V → scale → QK → softmax → ×V)
+3. `turboquant_outlier_cache_write` — outlier channel split cache write
+4. `turboquant_outlier_attention` — outlier channel split attention
+5. QJL sign computation (within cache write)
+6. QJL residual correction (post-attention)
+
+All 6 must be ported. MLX's built-in quantization doesn't support
+per-head-per-position dynamic scaling or Hadamard rotation. These
+stay as custom Metal kernels.
 
 **Kernel porting (not reuse):** the existing `.metal` shader source
 cannot be used verbatim with `mlx_fast_metal_kernel()`. The MPS
@@ -326,58 +414,115 @@ Key porting concerns:
 - `metal_kernel` may impose constraints on threadgroup shared memory
   declarations (TurboQuant attention uses up to 4×4096 bytes of
   threadgroup memory)
-- Input/output count limits in the `metal_kernel` API
+- Input/output count limits in the `metal_kernel` API (outlier
+  attention may need even more buffers than standard attention's 14)
 - The dispatch grid/threadgroup geometry must be specified through
   MLX's API rather than Metal's `dispatchThreadgroups`
 
 These concerns should be validated in the Phase 2.5 spike before
 committing to the full TurboQuant port.
 
+#### Standard Cache (INT4/INT8)
+
 ```rust
 // mlx/turboquant/cache.rs
 pub struct MlxKvCache {
-    k_caches: Vec<MlxArray>,      // per-layer [num_kv_heads, max_seq_len, head_dim] INT8
+    // Standard path (INT4/INT8 without outlier split)
+    k_caches: Vec<MlxArray>,      // per-layer [num_kv_heads, max_seq_len, head_dim] INT8/INT4
     v_caches: Vec<MlxArray>,      // same
     k_scales: Vec<MlxArray>,      // per-layer [num_kv_heads, max_seq_len] FP32
     v_scales: Vec<MlxArray>,      // same
-    rotation_matrix: MlxArray,    // [head_dim, head_dim] FP16
+    rotation_signs: MlxArray,     // [head_dim] FP32 — per-element ±1.0 signs
+
+    // Outlier channel split (active when OutlierConfig is present)
+    outlier: Option<MlxOutlierCache>,
+
+    // QJL correction (optional, enabled via config)
+    qjl_matrix: Option<MlxArray>,       // [head_dim, head_dim] FP16
+    k_qjl_signs: Option<Vec<MlxArray>>, // per-layer [num_kv_heads, max_seq_len, head_dim/8]
+    k_r_norms: Option<Vec<MlxArray>>,   // per-layer [num_kv_heads, max_seq_len]
+}
+```
+
+#### Outlier Channel Split
+
+The outlier strategy (Section 4.3 of the TurboQuant paper) separates
+high-variance channels into a separate cache with independent
+quantization. This uses dedicated kernels
+(`turboquant_outlier_cache_write`, `turboquant_outlier_attention`)
+that split channels by index before quantization.
+
+```rust
+pub struct MlxOutlierCache {
+    // Outlier channels — quantized at potentially different bit width
+    k_outlier_caches: Vec<MlxArray>,
+    v_outlier_caches: Vec<MlxArray>,
+    k_outlier_scales: Vec<MlxArray>,
+    v_outlier_scales: Vec<MlxArray>,
+    // Non-outlier channels
+    k_non_outlier_caches: Vec<MlxArray>,
+    v_non_outlier_caches: Vec<MlxArray>,
+    k_non_outlier_scales: Vec<MlxArray>,
+    v_non_outlier_scales: Vec<MlxArray>,
+    // Shared config
+    outlier_rotation_signs: MlxArray,
+    non_outlier_rotation_signs: MlxArray,
+    channel_indices: MlxArray,
 }
 
+pub struct OutlierConfig {
+    pub outlier_channels: Vec<usize>,
+    pub outlier_bits: u8,
+    pub non_outlier_bits: u8,
+}
+```
+
+When `OutlierConfig` is present, cache write dispatches the outlier
+kernel variant instead of the standard one, and attention reads from
+both outlier and non-outlier caches, combining results.
+
+#### QJL Correction
+
+QJL (Johnson-Lindenstrauss) residual correction runs as an additional
+custom kernel after the attention output. It computes sign-based
+sketches during cache write and applies a correction term during
+attention to reduce quantization error. The QJL matrix is a
+`[head_dim, head_dim]` Gaussian random projection, stored once per
+model.
+
+#### Cache Write Dispatch
+
+```rust
 impl MlxKvCache {
     pub fn write_k(&mut self, layer: usize, k: &MlxArray, pos: usize,
                    stream: &MlxStream) -> Result<(), MlxError>
     {
-        // Dispatch adapted turboquant_cache_write kernel for K
-        // Inputs: k, rotation_matrix, position
-        // Outputs: k_caches[layer] slice, k_scales[layer] slice
-        mlx_fast_metal_kernel(
-            "turboquant_cache_write",
-            &[k, &self.rotation_matrix],
-            &[&self.k_caches[layer], &self.k_scales[layer]],
-            TURBOQUANT_CACHE_WRITE_SOURCE,  // adapted kernel body
-            grid, threadgroup, stream,
-        )
+        if let Some(outlier) = &mut self.outlier {
+            // Outlier path: split channels, quantize separately
+            mlx_fast_metal_kernel(
+                "turboquant_outlier_cache_write",
+                &[k, &outlier.outlier_rotation_signs,
+                  &outlier.non_outlier_rotation_signs, &outlier.channel_indices],
+                &[&outlier.k_outlier_caches[layer], &outlier.k_outlier_scales[layer],
+                  &outlier.k_non_outlier_caches[layer], &outlier.k_non_outlier_scales[layer]],
+                TURBOQUANT_OUTLIER_CACHE_WRITE_SOURCE,
+                grid, threadgroup, stream,
+            )
+        } else {
+            // Standard path
+            mlx_fast_metal_kernel(
+                "turboquant_cache_write",
+                &[k, &self.rotation_signs],
+                &[&self.k_caches[layer], &self.k_scales[layer]],
+                TURBOQUANT_CACHE_WRITE_SOURCE,
+                grid, threadgroup, stream,
+            )
+        }
     }
 
-    pub fn write_v(&mut self, layer: usize, v: &MlxArray, pos: usize,
-                   stream: &MlxStream) -> Result<(), MlxError>
-    {
-        // Same kernel, separate dispatch for V
-        mlx_fast_metal_kernel(
-            "turboquant_cache_write",
-            &[v, &self.rotation_matrix],
-            &[&self.v_caches[layer], &self.v_scales[layer]],
-            TURBOQUANT_CACHE_WRITE_SOURCE,
-            grid, threadgroup, stream,
-        )
-    }
+    // write_v follows the same pattern
 }
 ```
-
-QJL correction, if enabled, runs as an additional custom kernel after
-the attention output. It is intentionally deferred to Phase 3 — the
-core TurboQuant pipeline (cache write + attention) is validated first,
-then QJL is added and verified against MPS backend numerical output.
 
 ### Synchronization Strategy
 
@@ -505,20 +650,33 @@ risks GPU scheduling contention.
 
 ### Benchmark Integration
 
-The `ironmill-bench` harness supports backend selection. Add an MLX
-arm:
+The `ironmill-bench` harness supports backend selection via a unified
+`--backend` flag. Currently the CLI uses `--backend` for CoreML compute
+units (`cpu`, `gpu`, `ane`) and `--metal` as a separate boolean flag.
+This should be consolidated into a single `--backend` flag that selects
+any backend:
 
 ```toml
 # ironmill-bench/Cargo.toml
 [features]
+default = []
+ane-direct = ["dep:ironmill-iosurface"]
+metal = ["ironmill-inference/metal"]
 mlx = ["ironmill-inference/mlx"]
 ```
 
 ```rust
-// ironmill-bench CLI
---backend metal   // existing
---backend mlx     // new
+// ironmill-bench CLI — unified backend selection
+--backend cpu      // CoreML CPU-only
+--backend gpu      // CoreML CPU+GPU
+--backend ane      // CoreML CPU+ANE
+--backend coreml   // CoreML all compute units
+--backend metal    // Metal/MPS backend
+--backend mlx      // MLX backend (new)
 ```
+
+Multiple backends can be specified to compare in a single run:
+`--backend metal --backend mlx`.
 
 **Benchmark success criteria:**
 - **Phase 2 (FP16):** MLX decode tok/s ≥ MPS FP16 decode tok/s on
@@ -559,9 +717,10 @@ with a tight loop).
 1. Create `ironmill-inference/src/mlx/` module structure with
    `error.rs`, `config.rs`, `weights.rs`, `inference.rs`
 2. Define `MlxArtifacts`, `MlxConfig`, `MlxError`
-3. Implement `MlxWeights::load()` from `WeightProvider`
+3. Implement `MlxWeights::load()` from `WeightProvider` (dense + quantized)
 4. Implement `MlxInference` with `InferenceEngine` trait
-5. Full decode pipeline using MLX built-in ops only
+5. Full decode pipeline using MLX built-in ops (dense weights) and
+   adapted PolarQuant kernels (quantized weights)
 6. FP16 KV cache using `mlx_fast_scaled_dot_product_attention`
 7. Prefill with chunking support
 8. Wire into `ironmill-bench --backend mlx`
@@ -576,46 +735,63 @@ Before committing to the full TurboQuant port, validate that MLX's
 1. Port the simplest custom kernel (`rms_norm` or `silu_gate`) to
    `metal_kernel` as a proof of concept
 2. Verify threadgroup shared memory works (needed for attention)
-3. Test with 10+ input buffers (needed for TurboQuant attention: 14)
+3. Test with 14+ input buffers (needed for TurboQuant attention: 14,
+   outlier variants may need more)
 4. Measure dispatch overhead vs. direct Metal encoding
 5. Document any API limitations or required kernel adaptations
 
 **Go/no-go gate:** if `metal_kernel` cannot support threadgroup shared
 memory or sufficient buffer count, evaluate alternatives:
 - Use MLX's C++ custom op API (requires cxx bridge)
-- Fall back to direct Metal dispatch for TurboQuant kernels only
-  (hybrid: MLX for standard ops, Metal for TurboQuant)
+- Fall back to direct Metal dispatch for TurboQuant + PolarQuant
+  kernels only (hybrid: MLX for standard ops, Metal for custom kernels)
 
 ### Phase 3: TurboQuant on MLX
 
 1. Adapt `turboquant_cache_write` kernel body for `metal_kernel` API
    - Separate K and V into independent dispatches
    - Map `[[buffer(N)]]` bindings to ordered input/output arrays
+   - Include QJL sign computation (QJL projection matrix, sign buffers,
+     and R-norm buffers are part of the cache-write kernel interface)
 2. Adapt `turboquant_attention` kernel body similarly
-3. Implement `MlxKvCache` with per-layer INT8 cache + FP32 scale arrays
-4. Implement `MlxTurboQuantModel` (Hadamard matrix, quantization scales)
+   - Include QJL residual correction (the `qjl_coeff * S·q_rot`
+     correction term is computed inside the attention kernel)
+3. Implement `MlxKvCache` with per-layer INT4/INT8 cache + FP32 scale
+   arrays + QJL sign/norm buffers
+4. Implement `MlxTurboQuantModel` (rotation signs, QJL matrix,
+   codebooks, scales)
 5. Wire TurboQuant into `MlxInference` decode loop with per-layer eval
-6. Verify numerical parity with MPS TurboQuant output
-7. Add QJL correction kernel (if used)
-8. Benchmark INT8 path against MPS backend
+6. Verify numerical parity with MPS TurboQuant output (INT8)
+7. Adapt `turboquant_outlier_cache_write` kernel for `metal_kernel` API
+8. Adapt `turboquant_outlier_attention` kernel similarly
+9. Implement `MlxOutlierCache` and `OutlierConfig`
+10. Verify numerical parity with MPS outlier path output (INT4)
+11. Adapt PolarQuant matmul kernels (`polarquant_matvec_int4`,
+    `polarquant_matmul_int4`, `polarquant_matvec_int8`,
+    `polarquant_matmul_int8`) for `metal_kernel` API
+12. Implement `MlxWeightBuffer::Quantized` dispatch with bit-width and
+    matvec/matmul selection (matching MPS backend logic)
+16. Benchmark INT4/INT8 path against MPS backend
 
 ### Phase 4: Optimization
 
 1. Profile `eval()` placement — minimize sync points per layer
 2. Experiment with `mlx_async_eval` for prefill chunk overlap
 3. Benchmark prefill throughput (MLX batched matmul vs MPS)
-4. Evaluate MLX's built-in quantized matmul for weight-only INT4/INT8
+4. Evaluate MLX's built-in quantized matmul as alternative to ported
+   PolarQuant kernels for weight-only INT4/INT8
 5. Profile cross-layer fusion (region B → region A)
 
 ## Risks and Open Questions
 
-- **`metal_kernel` API limitations (HIGH):** the existing TurboQuant
-  kernels use 10-14 buffer bindings, threadgroup shared memory (up to
-  4×4096 bytes), and custom dispatch geometries. `metal_kernel` may
-  not support all of these. The Phase 2.5 spike is designed to
+- **`metal_kernel` API limitations (HIGH):** the 10 TurboQuant +
+  PolarQuant kernels use 10-14 buffer bindings, threadgroup shared
+  memory (up to 4×4096 bytes), and custom dispatch geometries.
+  The outlier variants may require even more buffers. `metal_kernel`
+  may not support all of these. The Phase 2.5 spike is designed to
   validate this before committing engineering effort to Phase 3. If
   `metal_kernel` is insufficient, a hybrid approach (MLX for standard
-  ops, direct Metal for TurboQuant) remains viable.
+  ops, direct Metal for TurboQuant/PolarQuant) remains viable.
 
 - **mlx-c reference counting:** MLX C++ objects use reference counting
   exposed via `mlx_retain`/`mlx_free` in the C API. The safe Rust
@@ -660,7 +836,7 @@ memory or sufficient buffer count, evaluate alternatives:
 |--------|----------|-----------|
 | Integration level | New backend, not replacement | MPS backend is stable and well-tested |
 | FFI target | mlx-c (C API) | Rust FFI to C is straightforward; avoids cxx bridge complexity |
-| TurboQuant approach | Adapt kernel bodies for `metal_kernel` API | Kernel math is proven; signatures need rework for MLX dispatch model |
+| TurboQuant approach | Adapt all 6 TurboQuant + 4 PolarQuant kernel bodies for `metal_kernel` API | Kernel math is proven; signatures need rework for MLX dispatch model |
 | Feature flag | Independent `mlx` feature | No coupling to `metal` feature |
 | KV cache first pass | FP16 via MLX built-in SDPA | Simplest path to validate end-to-end correctness |
 | Weight loading | Copy into MLX-owned memory | Avoids lifetime hazards with mmap'd `Cow::Borrowed` data |

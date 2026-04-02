@@ -102,6 +102,43 @@ impl MlxInference {
         })
     }
 
+    /// Load weights from a provider (convenience method that avoids
+    /// the `&dyn Any` lifetime constraints of `InferenceEngine::load`).
+    pub fn load_weights(
+        &mut self,
+        weights: &dyn WeightProvider,
+        config: MlxConfig,
+    ) -> Result<(), MlxError> {
+        self.config = config;
+
+        let stream = MlxStream::default_gpu()?;
+        let loaded = MlxWeights::load(weights, &stream)?;
+        let num_layers = loaded.config.num_hidden_layers;
+
+        self.k_cache = vec![None; num_layers];
+        self.v_cache = vec![None; num_layers];
+
+        if self.config.enable_turboquant {
+            let tq_model = MlxTurboQuantModel::new(&loaded.config, &self.config, &stream)?;
+            let tq_cache = MlxKvCache::new(
+                &tq_model,
+                loaded.config.num_key_value_heads,
+                self.config.max_seq_len,
+                loaded.config.head_dim,
+                num_layers,
+                &stream,
+            )?;
+            self.tq_model = Some(tq_model);
+            self.tq_cache = Some(tq_cache);
+        }
+
+        self.stream = Some(stream);
+        self.weights = Some(loaded);
+        self.seq_pos = 0;
+
+        Ok(())
+    }
+
     /// Run the transformer pipeline for a batch of tokens.
     ///
     /// This builds a lazy MLX computation graph and evaluates it with

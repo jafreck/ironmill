@@ -6,8 +6,6 @@ use crate::stream::MlxStream;
 
 #[cfg(not(mlx_stub))]
 use crate::ffi;
-#[cfg(not(mlx_stub))]
-use std::ffi::c_void;
 
 // ---------------------------------------------------------------------------
 // Fast operations
@@ -28,18 +26,14 @@ pub fn rms_norm(
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe {
-            ffi::mlx_fast_rms_norm(
-                x.as_raw_ptr(),
-                weight.as_raw_ptr(),
-                eps,
-                stream.as_raw_ptr(),
-            )
-        };
-        if raw.is_null() {
-            return Err(MlxSysError::MlxC("rms_norm returned null".into()));
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret =
+            unsafe { ffi::mlx_fast_rms_norm(&mut result, x.raw, weight.raw, eps, stream.raw) };
+        if ret != 0 {
+            unsafe { ffi::mlx_array_free(result) };
+            return Err(MlxSysError::MlxC("rms_norm failed".into()));
         }
-        Ok(unsafe { MlxArray::from_raw(raw) })
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -61,21 +55,33 @@ pub fn rope(
 
     #[cfg(not(mlx_stub))]
     {
-        let raw = unsafe {
+        let opt_base = ffi::mlx_optional_float {
+            value: base,
+            has_value: true,
+        };
+        // No custom frequencies — pass an empty/null array.
+        let null_freqs = ffi::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe {
             ffi::mlx_fast_rope(
-                x.as_raw_ptr(),
+                &mut result,
+                x.raw,
                 dims,
                 traditional,
-                base,
+                opt_base,
                 scale,
                 offset,
-                stream.as_raw_ptr(),
+                null_freqs,
+                stream.raw,
             )
         };
-        if raw.is_null() {
-            return Err(MlxSysError::MlxC("rope returned null".into()));
+        if ret != 0 {
+            unsafe { ffi::mlx_array_free(result) };
+            return Err(MlxSysError::MlxC("rope failed".into()));
         }
-        Ok(unsafe { MlxArray::from_raw(raw) })
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
 
@@ -96,25 +102,39 @@ pub fn scaled_dot_product_attention(
 
     #[cfg(not(mlx_stub))]
     {
-        let mask_ptr: *mut c_void = match mask {
-            Some(m) => m.as_raw_ptr(),
-            None => std::ptr::null_mut(),
+        let null_arr = ffi::mlx_array {
+            ctx: std::ptr::null_mut(),
         };
-        let raw = unsafe {
+
+        // Determine mask mode and mask array.
+        let (mask_mode_cstr, mask_arr) = match mask {
+            Some(m) => {
+                // "array" tells mlx-c to use the provided mask array.
+                (c"array", m.raw)
+            }
+            None => (c"", null_arr),
+        };
+
+        let mut result = unsafe { ffi::mlx_array_new() };
+        let ret = unsafe {
             ffi::mlx_fast_scaled_dot_product_attention(
-                q.as_raw_ptr(),
-                k.as_raw_ptr(),
-                v.as_raw_ptr(),
+                &mut result,
+                q.raw,
+                k.raw,
+                v.raw,
                 scale,
-                mask_ptr,
-                stream.as_raw_ptr(),
+                mask_mode_cstr.as_ptr(),
+                mask_arr,
+                null_arr, // sinks
+                stream.raw,
             )
         };
-        if raw.is_null() {
+        if ret != 0 {
+            unsafe { ffi::mlx_array_free(result) };
             return Err(MlxSysError::MlxC(
-                "scaled_dot_product_attention returned null".into(),
+                "scaled_dot_product_attention failed".into(),
             ));
         }
-        Ok(unsafe { MlxArray::from_raw(raw) })
+        Ok(unsafe { MlxArray::from_raw(result) })
     }
 }
