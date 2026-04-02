@@ -1,24 +1,12 @@
-#ifndef HEAD_DIM
-#define HEAD_DIM 128
-#endif
-#define HEAD_DIM_PACKED (HEAD_DIM / 2)
-
-#include <metal_stdlib>
-using namespace metal;
-
-// ============================================================================
 // TurboQuant: Hadamard rotation + quantized KV cache (INT8 or INT4)
-// ============================================================================
+//
+// Shared helpers (kv_cache_base, read_quantized_tile,
+// hadamard_rotate_inplace) are prepended at compile time from
+// src/shaders/turboquant_helpers.metal.
 
-// ── Helpers ──────────────────────────────────────────────────────
+// ── Metal-only helper: device-pointer dequant (non-tiled access) ─
 
-/// Compute the byte offset for a KV head's cache region.
-inline uint kv_cache_base(uint kv_head, uint max_seq_len, uint head_dim, uint n_bits) {
-    uint bytes_per_pos = (n_bits == 4) ? (head_dim / 2) : head_dim;
-    return kv_head * max_seq_len * bytes_per_pos;
-}
-
-/// Read one dequantized cache value (INT4 with codebook from buffer).
+/// Read one dequantized cache value directly from device memory.
 inline float read_quantized(device const char* cache, uint base,
                             uint pos, uint dim, uint head_dim,
                             uint n_bits, float deq_scale,
@@ -32,97 +20,6 @@ inline float read_quantized(device const char* cache, uint base,
     } else {
         return float(cache[base + pos * head_dim + dim]) * deq_scale;
     }
-}
-
-/// Read one dequantized value from a threadgroup-shared tile (flash attention).
-inline float read_quantized_tile(threadgroup const char* tile,
-                                 uint pos, uint dim, uint head_dim,
-                                 uint n_bits, float deq_scale,
-                                 device const float* codebook) {
-    if (n_bits == 4) {
-        uint packed_stride = head_dim / 2;
-        uint byte_idx = pos * packed_stride + dim / 2;
-        uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
-        uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
-        return codebook[nibble] * deq_scale;
-    } else {
-        return float(tile[pos * head_dim + dim]) * deq_scale;
-    }
-}
-
-/// Read K cache: extract 3-bit codebook index + 1-bit QJL sign from 4-bit nibble.
-/// Returns (k_mse_value, qjl_sign) where sign is ±1.0.
-inline float2 read_k_quantized(device const char* cache, uint base,
-                               uint pos, uint dim, uint head_dim,
-                               float deq_scale,
-                               device const float* k_codebook) {
-    uint packed_stride = head_dim / 2;
-    uint byte_idx = base + pos * packed_stride + dim / 2;
-    uchar packed = ((device const uchar*)cache)[byte_idx];
-    uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
-    // Bits 0-2: codebook index (8 levels), bit 3: QJL sign
-    uchar idx = nibble & 0x7;
-    float sign_val = (nibble & 0x8) ? 1.0f : -1.0f;
-    return float2(k_codebook[idx] * deq_scale, sign_val);
-}
-
-/// Read K value + QJL sign from a threadgroup-shared tile (flash attention).
-/// Returns (k_mse_value, qjl_sign) where sign is ±1.0.
-inline float2 read_k_quantized_tile(threadgroup const char* tile,
-                                    uint pos, uint dim, uint head_dim,
-                                    float deq_scale,
-                                    device const float* k_codebook) {
-    uint packed_stride = head_dim / 2;
-    uint byte_idx = pos * packed_stride + dim / 2;
-    uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
-    uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
-    uchar idx = nibble & 0x7;
-    float sign_val = (nibble & 0x8) ? 1.0f : -1.0f;
-    return float2(k_codebook[idx] * deq_scale, sign_val);
-}
-
-// ── In-place Walsh-Hadamard butterfly transform ──────────────────
-//
-// Applies the randomized Hadamard rotation R = (1/√d)·D·H·D in-place
-// on a threadgroup-shared buffer. O(d log d) compute, O(d) storage for
-// the sign vector (vs O(d²) for the dense matrix approach).
-//
-// `shared_data` must have at least `head_dim` elements.
-// `rotation_signs` holds d floats (±1.0).
-
-inline void hadamard_rotate_inplace(
-    threadgroup float* shared_data,
-    device const float* rotation_signs,
-    uint head_dim,
-    uint tid,
-    uint tg_size)
-{
-    // Step 1: Apply diagonal sign matrix D
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        shared_data[d] *= rotation_signs[d];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Step 2: In-place butterfly (unnormalized Walsh-Hadamard)
-    for (uint step = 1; step < head_dim; step *= 2) {
-        for (uint i = tid; i < head_dim / 2; i += tg_size) {
-            uint block = i / step;
-            uint offset = i % step;
-            uint j = block * (step * 2) + offset;
-            float a = shared_data[j];
-            float b = shared_data[j + step];
-            shared_data[j] = a + b;
-            shared_data[j + step] = a - b;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Step 3: Apply D again (R = D·H·D is symmetric and self-inverse)
-    float scale = 1.0f / sqrt(float(head_dim));
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        shared_data[d] *= rotation_signs[d] * scale;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 // === Fused Cache Write ===
@@ -983,19 +880,17 @@ kernel void turboquant_outlier_attention(
             float partial_qjl_o = 0.0f;
             float partial_qjl_n = 0.0f;
 
-            // Outlier K with QJL signs
+            // Outlier K dequant
             for (uint d = tid; d < d_outlier_padded; d += tg_size) {
-                float2 kq = read_k_quantized_tile(
+                float k_val = read_quantized_tile_int4(
                     outlier_kv_tile, p, d, d_outlier_padded, k_o_deq, outlier_codebook);
-                partial_dot += shared_q_outlier[d] * kq.x;
-                partial_qjl_o += shared_s_q_outlier[d] * kq.y;
+                partial_dot += shared_q_outlier[d] * k_val;
             }
-            // Non-outlier K with QJL signs
+            // Non-outlier K dequant
             for (uint d = tid; d < d_non_padded; d += tg_size) {
-                float2 kq = read_k_quantized_tile(
+                float k_val = read_quantized_tile_int4(
                     non_outlier_kv_tile, p, d, d_non_padded, k_n_deq, non_outlier_codebook);
-                partial_dot += shared_q_non_outlier[d] * kq.x;
-                partial_qjl_n += shared_s_q_non[d] * kq.y;
+                partial_dot += shared_q_non_outlier[d] * k_val;
             }
 
             // Reduce base dot product

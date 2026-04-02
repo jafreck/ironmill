@@ -1,8 +1,11 @@
-// Shared helper functions for MLX TurboQuant kernels.
+// Shared TurboQuant helper functions for Metal and MLX backends.
 //
-// Prepended at compile time (via concat!(include_str!(...))) to each
-// TurboQuant kernel source before it is handed to MLX's metal_kernel().
-// Do NOT add [[kernel]] functions here — only inline utilities.
+// This file is prepended (via include_str!) to both the Metal and MLX
+// TurboQuant kernel sources at compile time.  Keep only inline utility
+// functions here — no [[kernel]] entry points.
+
+#ifndef TURBOQUANT_HELPERS_METAL
+#define TURBOQUANT_HELPERS_METAL
 
 #include <metal_stdlib>
 using namespace metal;
@@ -16,6 +19,7 @@ using namespace metal;
 
 // ── Cache addressing ────────────────────────────────────────────
 
+/// Compute the byte offset for a KV head's cache region.
 inline uint kv_cache_base(uint kv_head, uint max_seq_len, uint head_dim, uint n_bits) {
     uint bytes_per_pos = (n_bits == 4) ? (head_dim / 2) : head_dim;
     return kv_head * max_seq_len * bytes_per_pos;
@@ -24,7 +28,7 @@ inline uint kv_cache_base(uint kv_head, uint max_seq_len, uint head_dim, uint n_
 // ── Quantized tile readers ──────────────────────────────────────
 
 /// Read a dequantized scalar from a threadgroup-shared KV tile.
-/// Supports both INT4 (packed nibble) and INT8 layouts.
+/// Supports both INT4 (packed nibble + codebook) and INT8 layouts.
 inline float read_quantized_tile(threadgroup const char* tile,
                                  uint pos, uint dim, uint head_dim,
                                  uint n_bits, float deq_scale,
@@ -40,7 +44,7 @@ inline float read_quantized_tile(threadgroup const char* tile,
     }
 }
 
-/// INT4-only variant (no n_bits parameter). Used by outlier kernels
+/// INT4-only variant (no n_bits branch). Used by outlier kernels
 /// which always operate in INT4 mode.
 inline float read_quantized_tile_int4(threadgroup const char* tile,
                                       uint pos, uint dim, uint head_dim,
@@ -53,31 +57,26 @@ inline float read_quantized_tile_int4(threadgroup const char* tile,
     return codebook[nibble] * deq_scale;
 }
 
-/// Read K value + QJL sign from a threadgroup-shared tile (INT4).
-/// Returns (k_mse_value, qjl_sign ±1.0).
-inline float2 read_k_quantized_tile(threadgroup const char* tile,
-                                    uint pos, uint dim, uint head_dim,
-                                    float deq_scale,
-                                    device const float* k_codebook) {
-    uint packed_stride = head_dim / 2;
-    uint byte_idx = pos * packed_stride + dim / 2;
-    uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
-    uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
-    uchar idx = nibble & 0x7;
-    float sign_val = (nibble & 0x8) ? 1.0f : -1.0f;
-    return float2(k_codebook[idx] * deq_scale, sign_val);
-}
-
-// ── Hadamard butterfly rotation ─────────────────────────────────
+// ── In-place Walsh-Hadamard butterfly transform ─────────────────
+//
+// Applies the randomized Hadamard rotation R = (1/√d)·D·H·D in-place
+// on a threadgroup-shared buffer.  O(d log d) compute, O(d) storage for
+// the sign vector (vs O(d²) for the dense matrix approach).
+//
+// `shared_data` must have at least `head_dim` elements.
+// `rotation_signs` holds d floats (±1.0).
 
 inline void hadamard_rotate_inplace(
     threadgroup float* shared_data,
     device const float* rotation_signs,
     uint head_dim, uint tid, uint tg_size)
 {
+    // Step 1: Apply diagonal sign matrix D
     for (uint d = tid; d < head_dim; d += tg_size)
         shared_data[d] *= rotation_signs[d];
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: In-place butterfly (unnormalized Walsh-Hadamard)
     for (uint step = 1; step < head_dim; step *= 2) {
         for (uint i = tid; i < head_dim / 2; i += tg_size) {
             uint block = i / step;
@@ -90,8 +89,12 @@ inline void hadamard_rotate_inplace(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+
+    // Step 3: Apply D again and scale (R = D·H·D is self-inverse)
     float scale = 1.0f / sqrt(float(head_dim));
     for (uint d = tid; d < head_dim; d += tg_size)
         shared_data[d] *= rotation_signs[d] * scale;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
+
+#endif // TURBOQUANT_HELPERS_METAL

@@ -3,7 +3,7 @@
 // Performs attention with dual-group (outlier + non-outlier) quantized
 // KV cache plus QJL correction on both groups.
 // Helpers (hadamard_rotate_inplace, read_quantized_tile_int4,
-// read_k_quantized_tile) are prepended at compile time from mlx_helpers.metal.
+// read_quantized_tile_int4) are prepended at compile time from src/shaders/turboquant_helpers.metal.
 
 [[kernel]] void turboquant_outlier_attention(
     device const half* q                            [[buffer(0)]],
@@ -140,14 +140,12 @@
             float partial_qjl_n = 0.0f;
 
             for (uint d = tid; d < d_outlier_padded; d += tg_size) {
-                float2 kq = read_k_quantized_tile(outlier_kv_tile, p, d, d_outlier_padded, k_o_deq, outlier_codebook);
-                partial_dot += shared_q_outlier[d] * kq.x;
-                partial_qjl_o += shared_s_q_outlier[d] * kq.y;
+                float k_val = read_quantized_tile_int4(outlier_kv_tile, p, d, d_outlier_padded, k_o_deq, outlier_codebook);
+                partial_dot += shared_q_outlier[d] * k_val;
             }
             for (uint d = tid; d < d_non_padded; d += tg_size) {
-                float2 kq = read_k_quantized_tile(non_outlier_kv_tile, p, d, d_non_padded, k_n_deq, non_outlier_codebook);
-                partial_dot += shared_q_non_outlier[d] * kq.x;
-                partial_qjl_n += shared_s_q_non[d] * kq.y;
+                float k_val = read_quantized_tile_int4(non_outlier_kv_tile, p, d, d_non_padded, k_n_deq, non_outlier_codebook);
+                partial_dot += shared_q_non_outlier[d] * k_val;
             }
 
             shared_reduce[tid] = partial_dot;

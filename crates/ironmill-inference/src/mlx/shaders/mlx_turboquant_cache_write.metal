@@ -3,7 +3,7 @@
 // Rotates K/V via Hadamard butterfly, quantizes to INT4 or INT8,
 // and writes to the quantized KV cache.
 // Helpers (hadamard_rotate_inplace, kv_cache_base, etc.) are
-// prepended at compile time from mlx_helpers.metal.
+// prepended at compile time from src/shaders/turboquant_helpers.metal.
 
 [[kernel]] void turboquant_cache_write(
     device const half* kv_proj          [[buffer(0)]],

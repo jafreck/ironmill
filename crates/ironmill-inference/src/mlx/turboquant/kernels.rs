@@ -27,7 +27,7 @@
 ///   9: params [7] uint32 — packed {num_kv_heads, head_dim, max_seq_len, seq_pos, n_bits, n_levels, is_k_cache}
 ///  Output 0: dummy [1] float (kernel writes to cache in-place)
 pub const TURBOQUANT_CACHE_WRITE: &str = concat!(
-    include_str!("../shaders/mlx_helpers.metal"),
+    include_str!("../../shaders/turboquant_helpers.metal"),
     "\n",
     include_str!("../shaders/mlx_turboquant_cache_write.metal"),
 );
@@ -48,7 +48,7 @@ pub const TURBOQUANT_CACHE_WRITE: &str = concat!(
 ///  10: params [6] uint32 — {num_heads, num_kv_heads, head_dim, max_seq_len, seq_len, n_bits}
 ///  Output 0: output [num_heads × head_dim] half
 pub const TURBOQUANT_ATTENTION: &str = concat!(
-    include_str!("../shaders/mlx_helpers.metal"),
+    include_str!("../../shaders/turboquant_helpers.metal"),
     "\n",
     include_str!("../shaders/mlx_turboquant_attention.metal"),
 );
@@ -68,7 +68,7 @@ pub const TURBOQUANT_ATTENTION: &str = concat!(
 ///  16: params [10] uint
 ///  Output 0: dummy [1] float
 pub const TURBOQUANT_OUTLIER_CACHE_WRITE: &str = concat!(
-    include_str!("../shaders/mlx_helpers.metal"),
+    include_str!("../../shaders/turboquant_helpers.metal"),
     "\n",
     include_str!("../shaders/mlx_turboquant_outlier_cache_write.metal"),
 );
@@ -88,7 +88,7 @@ pub const TURBOQUANT_OUTLIER_CACHE_WRITE: &str = concat!(
 ///  20: params [8] uint
 ///  Output 0: output [num_heads × head_dim] half
 pub const TURBOQUANT_OUTLIER_ATTENTION: &str = concat!(
-    include_str!("../shaders/mlx_helpers.metal"),
+    include_str!("../../shaders/turboquant_helpers.metal"),
     "\n",
     include_str!("../shaders/mlx_turboquant_outlier_attention.metal"),
 );

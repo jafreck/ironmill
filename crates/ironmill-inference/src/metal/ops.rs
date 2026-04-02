@@ -41,8 +41,9 @@ impl MetalPipelines {
         let rope_src = include_str!("shaders/rope.metal");
         let elem_src = include_str!("shaders/elementwise.metal");
         let embed_src = include_str!("shaders/embedding.metal");
+        let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
         let tq_src_raw = include_str!("shaders/turboquant.metal");
-        let tq_src = format!("{head_dim_header}{tq_src_raw}");
+        let tq_src = format!("{head_dim_header}{tq_helpers}\n{tq_src_raw}");
         let attn_src_raw = include_str!("shaders/attention.metal");
         let attn_src = format!("{head_dim_header}{attn_src_raw}");
         let qmm_src = include_str!("shaders/quantized_matmul.metal");

@@ -3,7 +3,7 @@
 // Splits KV into outlier and non-outlier channel groups, applies
 // independent TurboQuant quantization to each group.
 // Helpers (hadamard_rotate_inplace, etc.) are prepended at compile
-// time from mlx_helpers.metal.
+// time from src/shaders/turboquant_helpers.metal.
 
 [[kernel]] void turboquant_outlier_cache_write(
     device const half* kv_proj                      [[buffer(0)]],
