@@ -1665,7 +1665,8 @@ impl<D: AneDevice> AneInference<D> {
         let mut generated = Vec::with_capacity(max_tokens);
 
         for _ in 0..max_tokens {
-            let token_id = sample_token(&logits, temperature);
+            let token_id = sample_token(&logits, temperature)
+                .ok_or_else(|| AneError::SurfaceError("sampling produced empty logits".into()))?;
 
             // EOS detection (common EOS token IDs).
             if is_eos_token(token_id, DEFAULT_EOS_TOKENS) {

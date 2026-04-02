@@ -153,7 +153,7 @@ impl Pass for GptqQuantizePass {
                         self.block_size,
                         self.group_size,
                         qmax_f,
-                    );
+                    )?;
 
                     // Emit the constexpr_affine_dequantize op.
                     emit_gptq_result(op, &quantized, &shape, self.group_size, qmax_f, self.bits);
@@ -192,14 +192,13 @@ fn gptq_quantize_weight(
     block_size: usize,
     group_size: usize,
     qmax: f32,
-) -> GptqResult {
+) -> Result<GptqResult> {
     // 1. Finalize Hessian: apply scaling (2 / sample_count) and dampening.
     let mut h = xtx.to_vec();
-    finalize_hessian(&mut h, in_features, sample_count, dampening);
+    finalize_hessian(&mut h, in_features, sample_count, dampening)?;
 
     // 2. Cholesky decompose H → L (H = L · Lᵀ).
-    let l = cholesky_decompose(&h, in_features)
-        .expect("GPTQ: Hessian Cholesky decomposition failed — matrix not positive definite");
+    let l = cholesky_decompose(&h, in_features)?;
 
     // 3. Pre-compute per-group scales and zero_points from the ORIGINAL
     //    weights. The quantization grid is fixed; error compensation only
@@ -251,7 +250,7 @@ fn gptq_quantize_weight(
         // Pre-compute H⁻¹ rows for columns in this block.
         let h_inv_rows: Vec<Vec<f32>> = (col..col_end)
             .map(|c| cholesky_inverse_row(&l, in_features, c))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         // Reset error buffer for this block.
         for row_buf in err_buf.iter_mut() {
@@ -313,11 +312,11 @@ fn gptq_quantize_weight(
         col = col_end;
     }
 
-    GptqResult {
+    Ok(GptqResult {
         quantized: q_out,
         scales,
         zero_points,
-    }
+    })
 }
 
 /// Emit the `constexpr_affine_dequantize` op from GPTQ results.

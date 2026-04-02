@@ -1041,7 +1041,7 @@ fn infer_output_type(
             {
                 data.chunks_exact(4)
                     .map(|c| {
-                        let d = u32::from_le_bytes(c.try_into().unwrap());
+                        let d = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                         mil_spec::Dimension {
                             dimension: Some(mil_spec::dimension::Dimension::Constant(
                                 mil_spec::dimension::ConstantDimension { size: d as u64 },
@@ -1349,8 +1349,13 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         ScalarType::Float32 => {
             let floats: Vec<f32> = data
                 .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+                .map(|c| -> Result<f32> {
+                    let bytes: [u8; 4] = c.try_into().map_err(|_| {
+                        MilError::Validation("corrupted f32 tensor data: incomplete element".into())
+                    })?;
+                    Ok(f32::from_le_bytes(bytes))
+                })
+                .collect::<Result<Vec<f32>>>()?;
             mil_spec::tensor_value::Value::Floats(mil_spec::tensor_value::RepeatedFloats {
                 values: floats,
             })
@@ -1358,8 +1363,13 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         ScalarType::Float64 => {
             let doubles: Vec<f64> = data
                 .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+                .map(|c| -> Result<f64> {
+                    let bytes: [u8; 8] = c.try_into().map_err(|_| {
+                        MilError::Validation("corrupted f64 tensor data: incomplete element".into())
+                    })?;
+                    Ok(f64::from_le_bytes(bytes))
+                })
+                .collect::<Result<Vec<f64>>>()?;
             mil_spec::tensor_value::Value::Doubles(mil_spec::tensor_value::RepeatedDoubles {
                 values: doubles,
             })
@@ -1367,8 +1377,13 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         ScalarType::Int32 => {
             let ints: Vec<i32> = data
                 .chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+                .map(|c| -> Result<i32> {
+                    let bytes: [u8; 4] = c.try_into().map_err(|_| {
+                        MilError::Validation("corrupted i32 tensor data: incomplete element".into())
+                    })?;
+                    Ok(i32::from_le_bytes(bytes))
+                })
+                .collect::<Result<Vec<i32>>>()?;
             mil_spec::tensor_value::Value::Ints(mil_spec::tensor_value::RepeatedInts {
                 values: ints,
             })
@@ -1376,8 +1391,13 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         ScalarType::Int64 | ScalarType::UInt64 => {
             let longs: Vec<i64> = data
                 .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+                .map(|c| -> Result<i64> {
+                    let bytes: [u8; 8] = c.try_into().map_err(|_| {
+                        MilError::Validation("corrupted i64 tensor data: incomplete element".into())
+                    })?;
+                    Ok(i64::from_le_bytes(bytes))
+                })
+                .collect::<Result<Vec<i64>>>()?;
             mil_spec::tensor_value::Value::LongInts(mil_spec::tensor_value::RepeatedLongInts {
                 values: longs,
             })

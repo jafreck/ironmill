@@ -66,7 +66,12 @@ fn convert_function(name: &str, proto: &mil_spec::Function) -> Result<Function> 
     let block = if let Some(b) = proto.block_specializations.get(&proto.opset) {
         convert_block(b)?
     } else if proto.block_specializations.len() == 1 {
-        let b = proto.block_specializations.values().next().unwrap();
+        let b = proto.block_specializations.values().next().ok_or_else(|| {
+            MilError::Protobuf(format!(
+                "function '{}': block specialization disappeared unexpectedly",
+                name
+            ))
+        })?;
         convert_block(b)?
     } else if proto.block_specializations.is_empty() {
         Block::new()
@@ -157,7 +162,10 @@ fn convert_argument(arg: &mil_spec::Argument) -> Result<Value> {
 
     match values.len() {
         0 => Err(MilError::Protobuf("argument has no bindings".to_string())),
-        1 => Ok(values.into_iter().next().unwrap()),
+        1 => Ok(values
+            .into_iter()
+            .next()
+            .ok_or_else(|| MilError::Protobuf("argument has empty binding list".to_string()))?),
         _ => Ok(Value::List(values)),
     }
 }

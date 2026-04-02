@@ -8,6 +8,8 @@
 #[cfg(test)]
 use faer::prelude::*;
 
+use crate::error::MilError;
+
 /// Finalize the Hessian from accumulated X^T X.
 ///
 /// Applies scaling and diagonal dampening so the result is suitable for
@@ -17,21 +19,27 @@ use faer::prelude::*;
 ///
 /// Operates **in-place** on the row-major `xtx` buffer.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `sample_count` is zero or if `xtx.len() != n_features²`.
-pub fn finalize_hessian(xtx: &mut [f32], n_features: usize, sample_count: usize, dampening: f64) {
-    assert!(
-        sample_count > 0,
-        "finalize_hessian: sample_count must be > 0"
-    );
-    assert_eq!(
-        xtx.len(),
-        n_features * n_features,
-        "finalize_hessian: xtx length {} != n_features² {}",
-        xtx.len(),
-        n_features * n_features,
-    );
+/// Returns `Err` if `sample_count` is zero or if `xtx.len() != n_features²`.
+pub fn finalize_hessian(
+    xtx: &mut [f32],
+    n_features: usize,
+    sample_count: usize,
+    dampening: f64,
+) -> crate::error::Result<()> {
+    if sample_count == 0 {
+        return Err(MilError::Validation(
+            "finalize_hessian: sample_count must be > 0".to_string(),
+        ));
+    }
+    if xtx.len() != n_features * n_features {
+        return Err(MilError::Validation(format!(
+            "finalize_hessian: xtx length {} != n_features² {}",
+            xtx.len(),
+            n_features * n_features,
+        )));
+    }
 
     let n = n_features;
     let scale = 2.0 / sample_count as f64;
@@ -49,6 +57,8 @@ pub fn finalize_hessian(xtx: &mut [f32], n_features: usize, sample_count: usize,
     for i in 0..n {
         xtx[i * n + i] += damp_val;
     }
+
+    Ok(())
 }
 
 /// Cholesky-decompose a symmetric positive-definite matrix.
@@ -58,23 +68,23 @@ pub fn finalize_hessian(xtx: &mut [f32], n_features: usize, sample_count: usize,
 ///
 /// # Errors
 ///
-/// Returns `Err` if the matrix is not positive-definite.
-pub fn cholesky_decompose(h: &[f32], n: usize) -> Result<Vec<f32>, String> {
-    assert_eq!(
-        h.len(),
-        n * n,
-        "cholesky_decompose: h length {} != n² {}",
-        h.len(),
-        n * n,
-    );
+/// Returns `Err` if the matrix is not positive-definite or dimensions are wrong.
+pub fn cholesky_decompose(h: &[f32], n: usize) -> crate::error::Result<Vec<f32>> {
+    if h.len() != n * n {
+        return Err(MilError::Validation(format!(
+            "cholesky_decompose: h length {} != n² {}",
+            h.len(),
+            n * n,
+        )));
+    }
 
     let mat = faer::Mat::<f64>::from_fn(n, n, |i, j| h[i * n + j] as f64);
 
     let cholesky = mat.cholesky(faer::Side::Lower).map_err(|e| {
-        format!(
+        MilError::Validation(format!(
             "Cholesky decomposition failed: non-positive-definite minor at index {}",
             e.non_positive_definite_minor
-        )
+        ))
     })?;
 
     let l = cholesky.compute_l();
@@ -99,18 +109,22 @@ pub fn cholesky_decompose(h: &[f32], n: usize) -> Result<Vec<f32>, String> {
 ///
 /// The result `x` is H⁻¹[row, :].
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `l.len() != n²` or `row >= n`.
-pub fn cholesky_inverse_row(l: &[f32], n: usize, row: usize) -> Vec<f32> {
-    assert_eq!(
-        l.len(),
-        n * n,
-        "cholesky_inverse_row: l length {} != n² {}",
-        l.len(),
-        n * n,
-    );
-    assert!(row < n, "cholesky_inverse_row: row {row} >= n {n}");
+/// Returns `Err` if `l.len() != n²` or `row >= n`.
+pub fn cholesky_inverse_row(l: &[f32], n: usize, row: usize) -> crate::error::Result<Vec<f32>> {
+    if l.len() != n * n {
+        return Err(MilError::Validation(format!(
+            "cholesky_inverse_row: l length {} != n² {}",
+            l.len(),
+            n * n,
+        )));
+    }
+    if row >= n {
+        return Err(MilError::Validation(format!(
+            "cholesky_inverse_row: row {row} >= n {n}",
+        )));
+    }
 
     // Work in f64 for stability.
     let l64: Vec<f64> = l.iter().map(|&x| x as f64).collect();
@@ -148,24 +162,24 @@ pub fn cholesky_inverse_row(l: &[f32], n: usize, row: usize) -> Vec<f32> {
 /// Returns H⁻¹ as a row-major flat slice.  Suitable for small matrices
 /// or testing; for large matrices prefer [`cholesky_inverse_row`].
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `l.len() != n²`.
-pub fn cholesky_inverse(l: &[f32], n: usize) -> Vec<f32> {
-    assert_eq!(
-        l.len(),
-        n * n,
-        "cholesky_inverse: l length {} != n² {}",
-        l.len(),
-        n * n,
-    );
+/// Returns `Err` if `l.len() != n²`.
+pub fn cholesky_inverse(l: &[f32], n: usize) -> crate::error::Result<Vec<f32>> {
+    if l.len() != n * n {
+        return Err(MilError::Validation(format!(
+            "cholesky_inverse: l length {} != n² {}",
+            l.len(),
+            n * n,
+        )));
+    }
 
     let mut result = vec![0.0f32; n * n];
     for row in 0..n {
-        let inv_row = cholesky_inverse_row(l, n, row);
+        let inv_row = cholesky_inverse_row(l, n, row)?;
         result[row * n..row * n + n].copy_from_slice(&inv_row);
     }
-    result
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +274,7 @@ mod tests {
         // damp = 0.01 * 13 = 0.13
         // H_final = [[8.13, 12], [12, 18.13]]
         let mut xtx = vec![4.0, 6.0, 6.0, 9.0];
-        finalize_hessian(&mut xtx, 2, 1, 0.01);
+        finalize_hessian(&mut xtx, 2, 1, 0.01).unwrap();
 
         assert!((xtx[0] - 8.13).abs() < TOL, "H[0,0] = {}", xtx[0]);
         assert!((xtx[1] - 12.0).abs() < TOL, "H[0,1] = {}", xtx[1]);
@@ -273,7 +287,7 @@ mod tests {
         // X^T X = [[10, 0], [0, 10]], sample_count = 5, dampening = 0
         // H = 2/5 · [[10,0],[0,10]] = [[4,0],[0,4]]
         let mut xtx = vec![10.0, 0.0, 0.0, 10.0];
-        finalize_hessian(&mut xtx, 2, 5, 0.0);
+        finalize_hessian(&mut xtx, 2, 5, 0.0).unwrap();
 
         assert!((xtx[0] - 4.0).abs() < TOL);
         assert!((xtx[1]).abs() < TOL);
@@ -284,17 +298,20 @@ mod tests {
     #[test]
     fn finalize_hessian_zero_dampening() {
         let mut xtx = vec![4.0, 2.0, 2.0, 5.0];
-        finalize_hessian(&mut xtx, 2, 2, 0.0);
+        finalize_hessian(&mut xtx, 2, 2, 0.0).unwrap();
         // H = 2/2 * xtx = xtx (no change from dampening)
         assert!((xtx[0] - 4.0).abs() < TOL);
         assert!((xtx[3] - 5.0).abs() < TOL);
     }
 
     #[test]
-    #[should_panic(expected = "sample_count must be > 0")]
     fn finalize_hessian_zero_samples() {
         let mut xtx = vec![1.0; 4];
-        finalize_hessian(&mut xtx, 2, 0, 0.01);
+        let err = finalize_hessian(&mut xtx, 2, 0, 0.01).unwrap_err();
+        assert!(
+            err.to_string().contains("sample_count must be > 0"),
+            "unexpected error: {err}"
+        );
     }
 
     // -- cholesky_decompose tests ---------------------------------------------
@@ -350,10 +367,10 @@ mod tests {
             1.0, 3.0, 6.0,
         ];
         let l = cholesky_decompose(&h, 3).unwrap();
-        let full_inv = cholesky_inverse(&l, 3);
+        let full_inv = cholesky_inverse(&l, 3).unwrap();
 
         for row in 0..3 {
-            let single_row = cholesky_inverse_row(&l, 3, row);
+            let single_row = cholesky_inverse_row(&l, 3, row).unwrap();
             for j in 0..3 {
                 let diff = (single_row[j] - full_inv[row * 3 + j]).abs();
                 assert!(
@@ -379,7 +396,7 @@ mod tests {
              0.5,  1.0,  2.0,  6.0,
         ];
         let l = cholesky_decompose(&h, 4).unwrap();
-        let h_inv = cholesky_inverse(&l, 4);
+        let h_inv = cholesky_inverse(&l, 4).unwrap();
         let product = mat_mul(&h, &h_inv, 4);
         let id = eye(4);
         assert_mat_approx(&product, &id, 4, 1e-3, "H * H^{-1} vs I (4×4)");
@@ -400,7 +417,7 @@ mod tests {
         }
 
         let l = cholesky_decompose(&h, n).unwrap();
-        let h_inv = cholesky_inverse(&l, n);
+        let h_inv = cholesky_inverse(&l, n).unwrap();
         let product = mat_mul(&h, &h_inv, n);
         let id = eye(n);
         assert_mat_approx(&product, &id, n, 1e-3, "H * H^{-1} vs I (8×8)");
@@ -415,7 +432,7 @@ mod tests {
             1.0, 3.0, 6.0,
         ];
         let l = cholesky_decompose(&h, 3).unwrap();
-        let h_inv = cholesky_inverse(&l, 3);
+        let h_inv = cholesky_inverse(&l, 3).unwrap();
 
         // H⁻¹ should be symmetric.
         for i in 0..3 {
@@ -453,7 +470,7 @@ mod tests {
         );
 
         // With dampening applied through finalize_hessian, it should succeed.
-        finalize_hessian(&mut xtx, n, 1, 0.01);
+        finalize_hessian(&mut xtx, n, 1, 0.01).unwrap();
         let l = cholesky_decompose(&xtx, n).expect("dampened matrix should be positive definite");
 
         // Verify L * L^T ≈ dampened H.
@@ -462,7 +479,7 @@ mod tests {
         assert_mat_approx(&reconstructed, &xtx, n, TOL, "dampened L*L^T vs H");
 
         // And the inverse should be computable.
-        let h_inv = cholesky_inverse(&l, n);
+        let h_inv = cholesky_inverse(&l, n).unwrap();
         let product = mat_mul(&xtx, &h_inv, n);
         let id = eye(n);
         assert_mat_approx(&product, &id, n, 1e-2, "dampened H * H^{-1} vs I");
@@ -478,7 +495,7 @@ mod tests {
         #[rustfmt::skip]
         let h = vec![4.0, 2.0, 2.0, 5.0];
         let l = cholesky_decompose(&h, 2).unwrap();
-        let h_inv = cholesky_inverse(&l, 2);
+        let h_inv = cholesky_inverse(&l, 2).unwrap();
 
         assert!((h_inv[0] - 0.3125).abs() < TOL, "H^-1[0,0]={}", h_inv[0]);
         assert!((h_inv[1] - (-0.125)).abs() < TOL, "H^-1[0,1]={}", h_inv[1]);

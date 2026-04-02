@@ -7,9 +7,11 @@
 ///
 /// - `temperature <= 0`: greedy (argmax).
 /// - `temperature > 0`: temperature-scaled softmax sampling.
-pub fn sample_token(logits: &[f32], temperature: f32) -> u32 {
+///
+/// Returns `None` when `logits` is empty.
+pub fn sample_token(logits: &[f32], temperature: f32) -> Option<u32> {
     if logits.is_empty() {
-        return 0;
+        return None;
     }
 
     if temperature <= 0.0 {
@@ -17,9 +19,8 @@ pub fn sample_token(logits: &[f32], temperature: f32) -> u32 {
         let (idx, _) = logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .unwrap_or((0, &0.0));
-        return idx as u32;
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
+        return Some(idx as u32);
     }
 
     // Temperature-scaled softmax sampling.
@@ -38,10 +39,10 @@ pub fn sample_token(logits: &[f32], temperature: f32) -> u32 {
     for (i, &p) in probs.iter().enumerate() {
         cumulative += p;
         if cumulative >= threshold {
-            return i as u32;
+            return Some(i as u32);
         }
     }
-    (logits.len() - 1) as u32
+    Some((logits.len() - 1) as u32)
 }
 
 /// Simple pseudo-random f32 in [0, 1) using a thread-local xorshift.
@@ -85,12 +86,12 @@ mod tests {
     #[test]
     fn greedy_sampling_picks_argmax() {
         let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-        assert_eq!(sample_token(&logits, 0.0), 3);
+        assert_eq!(sample_token(&logits, 0.0), Some(3));
     }
 
     #[test]
     fn greedy_sampling_empty_logits() {
-        assert_eq!(sample_token(&[], 0.0), 0);
+        assert_eq!(sample_token(&[], 0.0), None);
     }
 
     #[test]
@@ -111,7 +112,7 @@ mod tests {
     #[test]
     fn temperature_sampling_produces_valid_token() {
         let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let token = sample_token(&logits, 1.0);
+        let token = sample_token(&logits, 1.0).unwrap();
         assert!(token < 5);
     }
 }

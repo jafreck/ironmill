@@ -29,7 +29,9 @@ pub fn dequant_lut_to_dense(
     polar_quant_seed: Option<u64>,
 ) -> anyhow::Result<Vec<u8>> {
     let total_elements: usize = original_shape.iter().product();
-    let cols = *original_shape.last().expect("shape must be non-empty");
+    let cols = *original_shape
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("shape must be non-empty"))?;
     let rows = if cols == 0 { 0 } else { total_elements / cols };
 
     // Only use padded dimensions when Hadamard rotation was applied
