@@ -6,9 +6,10 @@
 //! `ironmill_core::ane::mil_text::program_to_mil_text`.
 
 use half::f16;
-use mil_rs::ir::passes::beta_quantizer::beta_optimal_levels;
 use mil_rs::ir::passes::rotation::rotate_rows_hadamard;
 use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
+
+use crate::turboquant::codebook::lloyd_max_gaussian;
 
 use super::model::TurboQuantConfig;
 
@@ -64,12 +65,12 @@ pub(crate) fn generate_rotation_weights(head_dim: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Compute the quantization scale for mapping Beta-optimal levels into INT8.
+/// Compute the quantization scale for mapping Lloyd-Max codebook centroids into INT8.
 ///
-/// `inv_scale = 127.0 / max_level` where `max_level` is the largest
-/// Beta-optimal reconstruction level for the given dimension and bit-width.
+/// `inv_scale = 127.0 / max_level` where `max_level` is the largest absolute
+/// Lloyd-Max centroid for the given dimension and bit-width.
 pub(crate) fn compute_inv_scale(head_dim: usize, n_bits: u8) -> f32 {
-    let levels = beta_optimal_levels(head_dim, n_bits);
+    let (levels, _) = lloyd_max_gaussian(head_dim, n_bits);
     let max_level = levels.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     if max_level == 0.0 {
         1.0
@@ -91,9 +92,14 @@ pub fn compute_deq_scale(head_dim: usize, n_bits: u8) -> f32 {
 /// Build the MIL IR program for the cache-write sub-program.
 ///
 /// Takes fp16 K/V projections and a rotation matrix, applies Hadamard
-/// rotation + Beta-optimal quantization, outputs fp16 values clamped
-/// to INT8 range (cast to INT8 → back to fp16 since ANE rejects INT8
-/// function outputs).
+/// rotation + Lloyd-Max codebook quantization via `greater`/`select`
+/// chains, outputs fp16 values at INT8 codes (cast to INT8 → back to fp16
+/// since ANE rejects INT8 function outputs).
+///
+/// The codebook `boundaries` and `levels` are precomputed by the caller
+/// via `lloyd_max_gaussian(head_dim, n_bits)` from the shared codebook
+/// module. Internally, levels are mapped to INT8 range and embedded as
+/// scalar constants in the MIL program.
 ///
 /// # Inputs
 ///
@@ -105,10 +111,26 @@ pub fn compute_deq_scale(head_dim: usize, n_bits: u8) -> f32 {
 ///
 /// `(program, weights)` where `weights` contains the rotation matrix
 /// fp16 bytes to populate the input IOSurface tensor.
-pub fn build_cache_write_program(config: &TurboQuantConfig) -> (Program, Vec<(String, Vec<u8>)>) {
+pub fn build_cache_write_program(
+    config: &TurboQuantConfig,
+    boundaries: &[f32],
+    levels: &[f32],
+) -> (Program, Vec<(String, Vec<u8>)>) {
     let ch = config.num_kv_heads * config.head_dim;
     let s = MIN_IO_SEQ;
-    let inv_scale = compute_inv_scale(config.head_dim, config.n_bits);
+    let n_levels = levels.len();
+
+    // Pre-compute INT8-range level values from codebook centroids.
+    let max_level = levels.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let inv_scale = if max_level == 0.0 {
+        1.0
+    } else {
+        127.0 / max_level
+    };
+    let int8_levels: Vec<f64> = levels
+        .iter()
+        .map(|&l| (l * inv_scale).round() as f64)
+        .collect();
 
     let mut weights: Vec<(String, Vec<u8>)> = Vec::new();
 
@@ -128,16 +150,22 @@ pub fn build_cache_write_program(config: &TurboQuantConfig) -> (Program, Vec<(St
         .with_input("rot_mat", rot_ty);
 
     // Shared constants
-    add_const_op(&mut func.body, "inv_scale", Value::Float(inv_scale as f64));
-    add_const_op(&mut func.body, "zero_point", Value::Float(0.0));
-    add_const_op(&mut func.body, "clip_lo", Value::Float(-128.0));
-    add_const_op(&mut func.body, "clip_hi", Value::Float(127.0));
     add_const_op(&mut func.body, "bF", Value::Bool(false));
 
+    // Codebook boundary constants (shared by K and V chains)
+    for (i, &b) in boundaries.iter().enumerate() {
+        add_const_op(&mut func.body, &format!("cb_b{i}"), Value::Float(b as f64));
+    }
+
+    // Codebook INT8-mapped level constants (shared by K and V chains)
+    for (i, &l) in int8_levels.iter().enumerate() {
+        add_const_op(&mut func.body, &format!("cb_l{i}"), Value::Float(l));
+    }
+
     // K pipeline
-    build_quantize_chain(&mut func.body, "k", "k_proj", config, "k_out");
+    build_quantize_chain(&mut func.body, "k", "k_proj", config, n_levels, "k_out");
     // V pipeline
-    build_quantize_chain(&mut func.body, "v", "v_proj", config, "v_out");
+    build_quantize_chain(&mut func.body, "v", "v_proj", config, n_levels, "v_out");
 
     func.body.outputs.push("k_out".into());
     func.body.outputs.push("v_out".into());
@@ -148,18 +176,25 @@ pub fn build_cache_write_program(config: &TurboQuantConfig) -> (Program, Vec<(St
     (program, weights)
 }
 
-/// Build the quantization op chain for a single K or V tensor.
+/// Build the codebook quantization op chain for a single K or V tensor.
+///
+/// Uses Lloyd-Max codebook boundaries and levels expressed as a chain
+/// of `greater`/`select` ops. The `n_levels` parameter determines the
+/// codebook size; boundary and level constants are referenced by name
+/// (`cb_b{i}`, `cb_l{i}`) from the parent block.
 fn build_quantize_chain(
     block: &mut Block,
     prefix: &str,
     input_name: &str,
     config: &TurboQuantConfig,
+    n_levels: usize,
     output_name: &str,
 ) {
     let ch = config.num_kv_heads * config.head_dim;
     let s = MIN_IO_SEQ;
     let reshape_4d = vec![1, config.num_kv_heads, config.head_dim, s];
     let flat_shape = vec![1, ch, 1, s];
+    let n_boundaries = n_levels - 1;
 
     // Reshape to [1, num_kv_heads, head_dim, S] for per-head rotation
     let reshaped = format!("{prefix}_reshaped");
@@ -198,44 +233,60 @@ fn build_quantize_chain(
     op.output_types[0] = Some(TensorType::new(ScalarType::Float16, flat_shape.clone()));
     block.add_op(op);
 
-    // mul: scale to INT8 range
-    let scaled = format!("{prefix}_scaled");
-    let op = Operation::new("mul", &scaled)
-        .with_input("x", Value::Reference(flat))
-        .with_input("y", Value::Reference("inv_scale".into()))
-        .with_output(&scaled);
-    block.add_op(op);
+    // --- Lloyd-Max codebook quantization via greater/select chain ---
+    //
+    // For each element x in the flattened tensor, compare against each
+    // boundary and select the corresponding INT8-mapped level:
+    //   c_i = greater(x, boundary_i)        for i in 0..n_boundaries
+    //   q   = select(c_0, level_1, level_0)
+    //   q   = select(c_1, level_2, q)
+    //   ...
+    //   q   = select(c_{n-2}, level_{n-1}, q)
 
-    // add: apply zero point
-    let shifted = format!("{prefix}_shifted");
-    let op = Operation::new("add", &shifted)
-        .with_input("x", Value::Reference(scaled))
-        .with_input("y", Value::Reference("zero_point".into()))
-        .with_output(&shifted);
-    block.add_op(op);
+    // Emit greater ops: compare input against each boundary
+    for i in 0..n_boundaries {
+        let gt_name = format!("{prefix}_gt{i}");
+        let mut op = Operation::new("greater", &gt_name)
+            .with_input("x", Value::Reference(flat.clone()))
+            .with_input("y", Value::Reference(format!("cb_b{i}")))
+            .with_output(&gt_name);
+        op.output_types[0] = Some(TensorType::new(ScalarType::Bool, flat_shape.clone()));
+        block.add_op(op);
+    }
 
-    // round
-    let rounded = format!("{prefix}_rounded");
-    let op = Operation::new("round", &rounded)
-        .with_input("x", Value::Reference(shifted))
-        .with_output(&rounded);
-    block.add_op(op);
+    // Emit select chain: map to INT8-range level values
+    let quantized = format!("{prefix}_quantized");
+    let mut prev_sel = String::new();
+    for i in 0..n_boundaries {
+        let sel_name = if i == n_boundaries - 1 {
+            quantized.clone()
+        } else {
+            format!("{prefix}_sel{i}")
+        };
 
-    // clip to [-128, 127]
-    let clamped = format!("{prefix}_clamped");
-    let op = Operation::new("clip", &clamped)
-        .with_input("x", Value::Reference(rounded))
-        .with_input("alpha", Value::Reference("clip_lo".into()))
-        .with_input("beta", Value::Reference("clip_hi".into()))
-        .with_output(&clamped);
-    block.add_op(op);
+        let b_input = if i == 0 {
+            Value::Reference("cb_l0".into())
+        } else {
+            Value::Reference(prev_sel.clone())
+        };
+
+        let mut op = Operation::new("select", &sel_name)
+            .with_input("cond", Value::Reference(format!("{prefix}_gt{i}")))
+            .with_input("a", Value::Reference(format!("cb_l{}", i + 1)))
+            .with_input("b", b_input)
+            .with_output(&sel_name);
+        op.output_types[0] = Some(TensorType::new(ScalarType::Float16, flat_shape.clone()));
+        block.add_op(op);
+
+        prev_sel = sel_name;
+    }
 
     // cast to int8 then back to fp16 for function output
     // (ANE rejects INT8 function outputs; the fp16 values are already
-    // rounded/clamped to [-128, 127] so the cast is lossless)
+    // at exact INT8 codes so the cast is lossless)
     let int8_name = format!("{prefix}_int8");
     let mut op = Operation::new("cast", &int8_name)
-        .with_input("x", Value::Reference(clamped))
+        .with_input("x", Value::Reference(quantized))
         .with_input("dtype", Value::String("int8".into()))
         .with_output(&int8_name);
     op.output_types[0] = Some(TensorType::new(ScalarType::Int8, flat_shape.clone()));
@@ -872,7 +923,8 @@ mod tests {
     #[test]
     fn cache_write_mil_is_valid_program() {
         let config = test_config();
-        let (program, weights) = build_cache_write_program(&config);
+        let (levels, boundaries) = lloyd_max_gaussian(config.head_dim, config.n_bits);
+        let (program, weights) = build_cache_write_program(&config, &boundaries, &levels);
         let mil = to_mil(&program);
 
         // Should start with program header
@@ -886,10 +938,10 @@ mod tests {
         // Should have two outputs
         assert!(mil.contains("z_output0"));
         assert!(mil.contains("z_output1"));
-        // Should contain quantization ops
+        // Should contain quantization ops (codebook greater/select chain)
         assert!(mil.contains("matmul"));
-        assert!(mil.contains("round"));
-        assert!(mil.contains("clip"));
+        assert!(mil.contains("greater"));
+        assert!(mil.contains("select"));
         assert!(mil.contains("cast"));
         assert!(mil.contains("int8"));
         // Should produce rotation matrix weight

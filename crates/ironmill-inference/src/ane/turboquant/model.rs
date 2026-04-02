@@ -1,14 +1,14 @@
 //! TurboQuant KV cache compression configuration and KV cache management.
 //!
 //! The KV cache stores INT8 values (1 byte/element) produced by rotation +
-//! Beta-optimal scalar quantization. The ANE attention program casts INT8→FP16
+//! Lloyd-Max codebook quantization. The ANE attention program casts INT8→FP16
 //! inline, eliminating CPU format conversions while retaining 2× memory savings.
 
 use std::sync::Arc;
 
+use crate::turboquant::codebook::lloyd_max_gaussian;
 use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use mil_rs::ir::ScalarType;
-use mil_rs::ir::passes::beta_quantizer::beta_optimal_levels;
 use mil_rs::ir::passes::rotation::unrotate_rows_hadamard;
 
 use half::f16;
@@ -21,13 +21,13 @@ use ironmill_iosurface::AneTensor;
 
 /// Configuration for TurboQuant KV cache compression.
 ///
-/// Controls runtime KV cache quantization using rotation + Beta-optimal
-/// scalar quantization. Storage format is INT8 (1 byte/element);
+/// Controls runtime KV cache quantization using rotation + Lloyd-Max
+/// codebook quantization. Storage format is INT8 (1 byte/element);
 /// `n_bits` controls the number of distinct quantization levels.
 #[derive(Clone)]
 pub struct TurboQuantConfig {
     /// Number of quantization bits (1, 2, 4, 6, or 8).
-    /// Controls quality via 2^n_bits distinct Beta-optimal levels
+    /// Controls quality via 2^n_bits distinct Lloyd-Max codebook levels
     /// mapped into the [-128, 127] INT8 range.
     pub n_bits: u8,
     /// Maximum sequence length for cache allocation.
@@ -169,7 +169,7 @@ impl KvCacheManager {
             )?);
         }
 
-        let quant_levels = beta_optimal_levels(config.head_dim, config.n_bits);
+        let (quant_levels, _boundaries) = lloyd_max_gaussian(config.head_dim, config.n_bits);
 
         // Precompute dequantization scale.
         let max_level = quant_levels.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -457,7 +457,9 @@ impl<D: AneDevice> TurboQuantModel<D> {
         let head_dim = config.head_dim;
 
         // --- cache-write sub-program ---
-        let (cw_program, cw_weights) = mil_emitter::build_cache_write_program(&config);
+        let (codebook_levels, codebook_boundaries) = lloyd_max_gaussian(head_dim, config.n_bits);
+        let (cw_program, cw_weights) =
+            mil_emitter::build_cache_write_program(&config, &codebook_boundaries, &codebook_levels);
         let mil_config = MilTextConfig::default();
         let (cw_mil, _) = program_to_mil_text(&cw_program, &mil_config)
             .map_err(|e| AneError::Other(anyhow::anyhow!("cache-write MIL text failed: {e}")))?;
