@@ -10,9 +10,11 @@
 //!   Accumulates the Hessian X^T X for second-order weight updates.
 
 mod awq_store;
+pub mod dataset;
 mod gptq_store;
 mod hook;
 
 pub use awq_store::{AwqActivationStore, ChannelMagnitudes};
+pub use dataset::CalibrationDataset;
 pub use gptq_store::{GptqActivationStore, HessianAccumulator};
 pub use hook::ActivationHook;
