@@ -69,7 +69,7 @@ struct CompileArgs {
     #[arg(short, long, default_value = "all")]
     target: String,
 
-    /// Quantization mode: "none", "fp16", "int8", "mixed-fp16-int8", "awq", "d2quant".
+    /// Quantization mode: "none", "fp16", "int4", "int8", "mixed-fp16-int8", "awq", "d2quant".
     #[arg(short, long, default_value = "none")]
     quantize: String,
 
@@ -569,6 +569,12 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
                     .with_awq(channel_magnitudes, 128)
                     .context("Failed to configure AWQ quantization")?;
             }
+            "int4" => {
+                let group_size = 128; // industry standard
+                pipeline = pipeline
+                    .with_int4(group_size)
+                    .context("Failed to configure INT4 quantization")?;
+            }
             "d2quant" => {
                 let bits = opts.bits.unwrap_or(2);
                 if bits != 2 && bits != 3 {
@@ -581,7 +587,7 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
             "none" => {}
             other => {
                 bail!(
-                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int8', 'mixed-fp16-int8', 'awq', or 'd2quant'."
+                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int4', 'int8', 'mixed-fp16-int8', 'awq', or 'd2quant'."
                 )
             }
         }
