@@ -187,7 +187,7 @@ impl<D: AneDevice> AneLmHead<D> {
     /// Uses donor/patch optimization: all full-size chunks share the same
     /// MIL text (same `hidden_size` × `LM_HEAD_MAX_CHUNK_CH` conv1×1).
     /// Only the first full-size chunk is compiled; the rest reuse its
-    /// compiled `net.plist` via `AneCompiler::patch_weights`.
+    /// compiled `net.plist` via `model::patch_weights`.
     fn compile(device: Arc<D>, weight: &CpuWeight) -> Result<Self> {
         let [vocab_size, hidden_size] = weight.shape;
 
