@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::ir::operation::Operation;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
-use crate::ir::tensor::ScalarType;
+use crate::ir::tensor::{ScalarType, TensorType};
 use crate::ir::types::Value;
 
 use super::beta_quantizer::quantize_to_index;
@@ -52,260 +52,316 @@ impl Pass for PolarQuantPass {
 
     fn run(&self, program: &mut Program) -> Result<()> {
         let k = 1usize << self.n_bits;
-
-        // CoreML constexpr_lut_to_dense only accepts LUT sizes in
-        // {2, 4, 16, 64, 256}. Reject unsupported sizes early.
-        const VALID_LUT_SIZES: &[usize] = &[2, 4, 16, 64, 256];
-        if !VALID_LUT_SIZES.contains(&k) {
-            return Err(crate::error::MilError::Validation(format!(
-                "PolarQuant: n_bits={} produces LUT size {} which is not supported by CoreML \
-                 (valid LUT sizes: 2, 4, 16, 64, 256 → n_bits ∈ {{1, 2, 4, 6, 8}})",
-                self.n_bits, k
-            )));
-        }
+        validate_lut_size(self.n_bits, k)?;
 
         for function in program.functions.values_mut() {
-            // Collected post-loop insertions: (original_op_index, new_ops_to_insert_after).
             let mut insertions: Vec<(usize, Vec<Operation>)> = Vec::new();
-            // Collected reference replacements: (old_output, new_mul_output).
             let mut replacements: Vec<(String, String)> = Vec::new();
 
             for i in 0..function.body.operations.len() {
-                // ── Phase 1: read-only extraction ──────────────────────────
-                let (floats, shape, original_output, op_name, original_dtype) = {
-                    let op = &function.body.operations[i];
-                    if op.op_type != "const" {
-                        continue;
-                    }
-
-                    let val = match op.inputs.get("val").or_else(|| op.attributes.get("val")) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-
-                    let (floats, shape, original_dtype) = match val {
-                        Value::Tensor {
-                            data,
-                            shape,
-                            dtype: dtype @ ScalarType::Float32,
-                        } => (tensor_as_f32_slice(data), shape.clone(), *dtype),
-                        Value::Tensor {
-                            data,
-                            shape,
-                            dtype: dtype @ ScalarType::Float16,
-                        } => (fp16_bytes_to_f32(data), shape.clone(), *dtype),
-                        _ => continue,
-                    };
-
-                    let numel: usize = shape.iter().product();
-                    if numel < self.min_elements {
-                        continue;
-                    }
-
-                    let original_output = op.outputs.first().cloned().unwrap_or_default();
-                    let op_name = op.name.clone();
-                    (floats, shape, original_output, op_name, original_dtype)
+                let eligible =
+                    extract_eligible_tensor(&function.body.operations[i], self.min_elements);
+                let info = match eligible {
+                    Some(t) => t,
+                    None => continue,
                 };
 
-                // ── Phase 2: compute quantisation ─────────────────────────
-                let rank = shape.len();
-
-                // Skip 1D tensors (layer norms, biases) — quantizing
-                // normalization weights causes catastrophic quality loss.
-                if rank < 2 {
-                    continue;
-                }
-
-                let (rows, cols) = {
-                    let cols = shape[rank - 1];
-                    let rows: usize = shape[..rank - 1].iter().product();
-                    (rows, cols)
+                let quant = match compute_quantization(&info, self.n_bits, self.seed) {
+                    Some(q) => q,
+                    None => continue,
                 };
 
-                // The Beta distribution requires dim >= 2, and PolarQuant's
-                // statistical guarantees are only meaningful for N >= 64.
-                if cols < 64 {
-                    continue;
-                }
+                rewrite_op_in_place(
+                    &mut function.body.operations[i],
+                    &quant,
+                    &info,
+                    k,
+                    self.seed,
+                );
 
-                // Pad columns to next power of two.
-                let (mut padded_data, padded_cols) = pad_to_power_of_two(&floats, rows, cols);
-
-                // Compute row norms and normalise each row to unit length.
-                let mut row_norms = vec![0.0f32; rows];
-                for r in 0..rows {
-                    let row = &padded_data[r * padded_cols..(r + 1) * padded_cols];
-                    let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    row_norms[r] = norm;
-                    if norm > 0.0 {
-                        let row_mut = &mut padded_data[r * padded_cols..(r + 1) * padded_cols];
-                        for x in row_mut.iter_mut() {
-                            *x /= norm;
-                        }
-                    }
-                }
-
-                // Apply randomised Hadamard rotation.
-                rotate_rows_hadamard(&mut padded_data, rows, padded_cols, self.seed);
-
-                // Symmetric absmax quantizer.
-                // After normalization + Hadamard rotation, values are centered
-                // at 0. We use a symmetric uniform quantizer with 2^n_bits
-                // levels spanning [-absmax, +absmax].
-                let n_levels = 1usize << self.n_bits;
-                let absmax = padded_data
-                    .iter()
-                    .fold(0.0f32, |m, &v| m.max(v.abs()))
-                    .max(1e-10);
-
-                // Levels: uniformly spaced centroids in [-absmax, +absmax].
-                let step = 2.0 * absmax / n_levels as f32;
-                let levels: Vec<f32> = (0..n_levels)
-                    .map(|i| -absmax + step * (i as f32 + 0.5))
-                    .collect();
-
-                // Boundaries: midpoints between adjacent levels.
-                let boundaries: Vec<f32> = levels.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
-
-                // Quantise: clamp to [-absmax, absmax], find nearest level.
-                let all_indices: Vec<usize> = padded_data
-                    .iter()
-                    .map(|&v| {
-                        let clamped = v.clamp(-absmax, absmax);
-                        quantize_to_index(clamped, &boundaries) as usize
-                    })
-                    .collect();
-
-                // Keep full padded indices — the downstream rotation fusion
-                // pass inserts a slice_by_index to trim back to original
-                // dimensions after un-rotation.
-
-                // Pack indices at n_bits per element.
-                let packed = pack_indices(&all_indices, self.n_bits);
-
-                // Padded output shape: same as original but with last dim = padded_cols.
-                let padded_shape = {
-                    let mut s = shape.clone();
-                    *s.last_mut().unwrap() = padded_cols;
-                    s
-                };
-
-                // LUT: Beta-optimal levels stored in the original weight dtype.
-                let lut_data: Vec<u8> = match original_dtype {
-                    ScalarType::Float16 => levels
-                        .iter()
-                        .flat_map(|&v| f16::from_f32(v).to_le_bytes())
-                        .collect(),
-                    _ => levels.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                };
-                let lut_value = Value::Tensor {
-                    data: lut_data,
-                    shape: vec![k],
-                    dtype: original_dtype,
-                };
-
-                let indices_value = Value::Tensor {
-                    data: packed.clone(),
-                    shape: vec![packed.len()],
-                    dtype: ScalarType::UInt8,
-                };
-
-                // Original shape as UInt32 tensor.
-                let shape_bytes: Vec<u8> = shape
-                    .iter()
-                    .flat_map(|&d| (d as u32).to_le_bytes())
-                    .collect();
-                let shape_value = Value::Tensor {
-                    data: shape_bytes,
-                    shape: vec![shape.len()],
-                    dtype: ScalarType::UInt32,
-                };
-
-                // ── Phase 3: mutate the original op ───────────────────────
-                let op = &mut function.body.operations[i];
-                op.op_type = "constexpr_lut_to_dense".to_string();
-                op.inputs.remove("val");
-                op.attributes.remove("val");
-                op.attributes.insert("lut".to_string(), lut_value);
-                op.attributes.insert("indices".to_string(), indices_value);
-                op.attributes.insert("shape".to_string(), shape_value);
-                op.attributes
-                    .insert("polar_quant_seed".to_string(), Value::Int(self.seed as i64));
-
-                // Update output type to use the padded shape.
-                // CoreML requires constexpr_lut_to_dense output dtype == LUT dtype.
-                use crate::ir::tensor::TensorType;
-                if !op.output_types.is_empty() {
-                    op.output_types[0] =
-                        Some(TensorType::new(original_dtype, padded_shape.clone()));
-                }
-
-                // ── Phase 4: build row-norms const + mul ops ──────────────
-                let norms_output = format!("{original_output}_polar_norms");
-                let mul_output = format!("{original_output}_polar_scaled");
-
-                let norms_data: Vec<u8> = match original_dtype {
-                    ScalarType::Float16 => row_norms
-                        .iter()
-                        .flat_map(|&v| f16::from_f32(v).to_le_bytes())
-                        .collect(),
-                    _ => row_norms.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                };
-
-                let norms_shape = {
-                    let mut s = padded_shape.clone();
-                    *s.last_mut().unwrap() = 1;
-                    s
-                };
-
-                let mut norms_op = Operation::new("const", format!("{op_name}_polar_norms"))
-                    .with_input(
-                        "val",
-                        Value::Tensor {
-                            data: norms_data,
-                            shape: norms_shape.clone(),
-                            dtype: original_dtype,
-                        },
-                    )
-                    .with_output(&norms_output);
-                norms_op.output_types[0] = Some(TensorType::new(original_dtype, norms_shape));
-
-                let mut mul_op = Operation::new("mul", format!("{op_name}_polar_mul"))
-                    .with_input("x", Value::Reference(original_output.clone()))
-                    .with_input("y", Value::Reference(norms_output))
-                    .with_output(&mul_output);
-                mul_op.output_types[0] = Some(TensorType::new(original_dtype, padded_shape));
+                let (norms_op, mul_op, mul_output) = build_norm_mul_ops(&info, &quant);
 
                 insertions.push((i, vec![norms_op, mul_op]));
-                replacements.push((original_output, mul_output));
+                replacements.push((info.original_output.clone(), mul_output));
             }
 
-            // Insert new ops after the loop (adjust indices for prior insertions).
-            for (offset, (idx, new_ops)) in insertions.into_iter().enumerate() {
-                let insert_at = idx + 1 + offset * 2;
-                for (j, op) in new_ops.into_iter().enumerate() {
-                    function.body.operations.insert(insert_at + j, op);
-                }
-            }
+            apply_insertions(&mut function.body.operations, &insertions);
+            patch_references(&mut function.body, &replacements);
+        }
+        Ok(())
+    }
+}
 
-            // Rewire downstream references from the original const output to
-            // the mul output. Then restore the mul op's own `x` input which
-            // must still point to the original (dequantised) output.
-            for (old_name, new_name) in &replacements {
-                super::replace_reference(&mut function.body, old_name, new_name);
-                // The mul op's `x` input was also rewritten — fix it back.
-                for op in &mut function.body.operations {
-                    if op.op_type == "mul" && op.outputs.iter().any(|o| o == new_name) {
-                        if let Some(x_val) = op.inputs.get_mut("x") {
-                            if matches!(x_val, Value::Reference(r) if r == new_name) {
-                                *x_val = Value::Reference(old_name.clone());
-                            }
-                        }
+// ── Phase helpers ───────────────────────────────────────────────────────────
+
+/// Extracted information about an eligible const tensor.
+struct EligibleTensor {
+    floats: Vec<f32>,
+    shape: Vec<usize>,
+    original_output: String,
+    op_name: String,
+    original_dtype: ScalarType,
+}
+
+/// Results of quantizing a tensor.
+struct QuantizedTensor {
+    packed: Vec<u8>,
+    levels: Vec<f32>,
+    row_norms: Vec<f32>,
+    padded_shape: Vec<usize>,
+}
+
+/// Validate that the LUT size is accepted by CoreML.
+fn validate_lut_size(n_bits: u8, k: usize) -> Result<()> {
+    const VALID_LUT_SIZES: &[usize] = &[2, 4, 16, 64, 256];
+    if !VALID_LUT_SIZES.contains(&k) {
+        return Err(crate::error::MilError::Validation(format!(
+            "PolarQuant: n_bits={} produces LUT size {} which is not supported by CoreML \
+             (valid LUT sizes: 2, 4, 16, 64, 256 → n_bits ∈ {{1, 2, 4, 6, 8}})",
+            n_bits, k
+        )));
+    }
+    Ok(())
+}
+
+/// Phase 1: check whether an op is an eligible const tensor and extract its data.
+fn extract_eligible_tensor(op: &Operation, min_elements: usize) -> Option<EligibleTensor> {
+    if op.op_type != "const" {
+        return None;
+    }
+
+    let val = op.inputs.get("val").or_else(|| op.attributes.get("val"))?;
+
+    let (floats, shape, original_dtype) = match val {
+        Value::Tensor {
+            data,
+            shape,
+            dtype: dtype @ ScalarType::Float32,
+        } => (tensor_as_f32_slice(data), shape.clone(), *dtype),
+        Value::Tensor {
+            data,
+            shape,
+            dtype: dtype @ ScalarType::Float16,
+        } => (fp16_bytes_to_f32(data), shape.clone(), *dtype),
+        _ => return None,
+    };
+
+    let numel: usize = shape.iter().product();
+    if numel < min_elements {
+        return None;
+    }
+
+    Some(EligibleTensor {
+        floats,
+        shape,
+        original_output: op.outputs.first().cloned().unwrap_or_default(),
+        op_name: op.name.clone(),
+        original_dtype,
+    })
+}
+
+/// Phase 2: normalise, rotate, and quantise the tensor.
+///
+/// Returns `None` for tensors that don't meet shape requirements (rank < 2
+/// or last dimension < 64).
+fn compute_quantization(info: &EligibleTensor, n_bits: u8, seed: u64) -> Option<QuantizedTensor> {
+    let rank = info.shape.len();
+    // Skip 1D tensors (layer norms, biases).
+    if rank < 2 {
+        return None;
+    }
+
+    let cols = info.shape[rank - 1];
+    let rows: usize = info.shape[..rank - 1].iter().product();
+
+    // PolarQuant's statistical guarantees require N >= 64.
+    if cols < 64 {
+        return None;
+    }
+
+    let (mut padded_data, padded_cols) = pad_to_power_of_two(&info.floats, rows, cols);
+
+    // Compute row norms and normalise each row to unit length.
+    let mut row_norms = vec![0.0f32; rows];
+    for r in 0..rows {
+        let row = &padded_data[r * padded_cols..(r + 1) * padded_cols];
+        let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+        row_norms[r] = norm;
+        if norm > 0.0 {
+            let row_mut = &mut padded_data[r * padded_cols..(r + 1) * padded_cols];
+            for x in row_mut.iter_mut() {
+                *x /= norm;
+            }
+        }
+    }
+
+    rotate_rows_hadamard(&mut padded_data, rows, padded_cols, seed);
+
+    // Symmetric absmax quantizer.
+    let n_levels = 1usize << n_bits;
+    let absmax = padded_data
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(v.abs()))
+        .max(1e-10);
+
+    let step = 2.0 * absmax / n_levels as f32;
+    let levels: Vec<f32> = (0..n_levels)
+        .map(|i| -absmax + step * (i as f32 + 0.5))
+        .collect();
+
+    let boundaries: Vec<f32> = levels.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
+
+    let all_indices: Vec<usize> = padded_data
+        .iter()
+        .map(|&v| {
+            let clamped = v.clamp(-absmax, absmax);
+            quantize_to_index(clamped, &boundaries) as usize
+        })
+        .collect();
+
+    let packed = pack_indices(&all_indices, n_bits);
+
+    let mut padded_shape = info.shape.clone();
+    *padded_shape.last_mut().unwrap() = padded_cols;
+
+    Some(QuantizedTensor {
+        packed,
+        levels,
+        row_norms,
+        padded_shape,
+    })
+}
+
+/// Phase 3: mutate the original const op into `constexpr_lut_to_dense`.
+fn rewrite_op_in_place(
+    op: &mut Operation,
+    quant: &QuantizedTensor,
+    info: &EligibleTensor,
+    k: usize,
+    seed: u64,
+) {
+    let lut_data: Vec<u8> = match info.original_dtype {
+        ScalarType::Float16 => quant
+            .levels
+            .iter()
+            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+            .collect(),
+        _ => quant.levels.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    };
+    let lut_value = Value::Tensor {
+        data: lut_data,
+        shape: vec![k],
+        dtype: info.original_dtype,
+    };
+
+    let indices_value = Value::Tensor {
+        data: quant.packed.clone(),
+        shape: vec![quant.packed.len()],
+        dtype: ScalarType::UInt8,
+    };
+
+    let shape_bytes: Vec<u8> = info
+        .shape
+        .iter()
+        .flat_map(|&d| (d as u32).to_le_bytes())
+        .collect();
+    let shape_value = Value::Tensor {
+        data: shape_bytes,
+        shape: vec![info.shape.len()],
+        dtype: ScalarType::UInt32,
+    };
+
+    op.op_type = "constexpr_lut_to_dense".to_string();
+    op.inputs.remove("val");
+    op.attributes.remove("val");
+    op.attributes.insert("lut".to_string(), lut_value);
+    op.attributes.insert("indices".to_string(), indices_value);
+    op.attributes.insert("shape".to_string(), shape_value);
+    op.attributes
+        .insert("polar_quant_seed".to_string(), Value::Int(seed as i64));
+
+    if !op.output_types.is_empty() {
+        op.output_types[0] = Some(TensorType::new(
+            info.original_dtype,
+            quant.padded_shape.clone(),
+        ));
+    }
+}
+
+/// Phase 4: build the row-norms const and mul ops for rescaling.
+fn build_norm_mul_ops(
+    info: &EligibleTensor,
+    quant: &QuantizedTensor,
+) -> (Operation, Operation, String) {
+    let norms_output = format!("{}_polar_norms", info.original_output);
+    let mul_output = format!("{}_polar_scaled", info.original_output);
+
+    let norms_data: Vec<u8> = match info.original_dtype {
+        ScalarType::Float16 => quant
+            .row_norms
+            .iter()
+            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+            .collect(),
+        _ => quant
+            .row_norms
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+    };
+
+    let mut norms_shape = quant.padded_shape.clone();
+    *norms_shape.last_mut().unwrap() = 1;
+
+    let mut norms_op = Operation::new("const", format!("{}_polar_norms", info.op_name))
+        .with_input(
+            "val",
+            Value::Tensor {
+                data: norms_data,
+                shape: norms_shape.clone(),
+                dtype: info.original_dtype,
+            },
+        )
+        .with_output(&norms_output);
+    norms_op.output_types[0] = Some(TensorType::new(info.original_dtype, norms_shape));
+
+    let mut mul_op = Operation::new("mul", format!("{}_polar_mul", info.op_name))
+        .with_input("x", Value::Reference(info.original_output.clone()))
+        .with_input("y", Value::Reference(norms_output))
+        .with_output(&mul_output);
+    mul_op.output_types[0] = Some(TensorType::new(
+        info.original_dtype,
+        quant.padded_shape.clone(),
+    ));
+
+    (norms_op, mul_op, mul_output)
+}
+
+/// Insert new ops after their original positions, adjusting indices for
+/// prior insertions (each insertion adds 2 ops).
+fn apply_insertions(ops: &mut Vec<Operation>, insertions: &[(usize, Vec<Operation>)]) {
+    for (offset, (idx, new_ops)) in insertions.iter().enumerate() {
+        let insert_at = idx + 1 + offset * 2;
+        for (j, op) in new_ops.iter().enumerate() {
+            ops.insert(insert_at + j, op.clone());
+        }
+    }
+}
+
+/// Rewire downstream references from original const outputs to mul outputs,
+/// then restore the mul op's own `x` input back to the original.
+fn patch_references(body: &mut crate::ir::program::Block, replacements: &[(String, String)]) {
+    for (old_name, new_name) in replacements {
+        super::replace_reference(body, old_name, new_name);
+        // The mul op's `x` input was also rewritten — fix it back.
+        for op in &mut body.operations {
+            if op.op_type == "mul" && op.outputs.iter().any(|o| o == new_name) {
+                if let Some(Value::Reference(r)) = op.inputs.get_mut("x") {
+                    if r == new_name {
+                        *r = old_name.clone();
                     }
                 }
             }
         }
-        Ok(())
     }
 }
 
