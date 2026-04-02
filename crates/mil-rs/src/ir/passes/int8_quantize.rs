@@ -199,6 +199,9 @@ impl Pass for Int8QuantizePass {
                             op.output_types.push(Some(out_type));
                         }
                     }
+
+                    // INT8 quantization always uses 8-bit width.
+                    op.attributes.insert("bit_width".to_string(), Value::Int(8));
                 }
             }
         }

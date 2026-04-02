@@ -90,14 +90,20 @@ pub enum QuantizationInfo {
         /// applied after LUT reconstruction to recover original weights.
         polar_quant_seed: Option<u64>,
     },
-    /// INT8 affine quantization: (quantized - zero_point) * scale.
+    /// Affine quantization: (quantized - zero_point) * scale.
     /// Produced by `constexpr_affine_dequantize` in MIL IR.
+    /// Supports INT4 and INT8 bit widths, and optional per-group granularity.
     AffineDequantize {
         scale: Vec<u8>,
         zero_point: Vec<u8>,
         scale_dtype: ScalarType,
         zero_point_dtype: ScalarType,
         axis: Option<usize>,
+        /// Quantization bit width (4 or 8). Defaults to 8 for legacy models.
+        bit_width: u8,
+        /// Per-group size along the quantization axis. `None` means
+        /// per-tensor or per-channel granularity.
+        group_size: Option<usize>,
     },
 }
 

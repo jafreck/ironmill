@@ -143,6 +143,17 @@ impl MilWeightProvider {
                         _ => None,
                     };
 
+                    // Default bit_width=8 for backward compat with legacy INT8 models.
+                    let bit_width = match op.attributes.get("bit_width") {
+                        Some(Value::Int(v)) => *v as u8,
+                        _ => 8,
+                    };
+
+                    let group_size = match op.attributes.get("group_size") {
+                        Some(Value::Int(v)) => Some(*v as usize),
+                        _ => None,
+                    };
+
                     let extracted = ExtractedTensor {
                         data: quantized_data,
                         shape: quantized_shape,
@@ -153,6 +164,8 @@ impl MilWeightProvider {
                             scale_dtype,
                             zero_point_dtype: zp_dtype,
                             axis,
+                            bit_width,
+                            group_size,
                         },
                     };
                     tensors.insert(name, extracted);

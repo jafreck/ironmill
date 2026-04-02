@@ -2276,4 +2276,112 @@ mod tests {
             "should have state descriptor for my_cache, got: {names:?}"
         );
     }
+
+    #[test]
+    fn round_trip_affine_dequantize_with_bit_width_and_group_size() {
+        // Build a constexpr_affine_dequantize op with bit_width and group_size.
+        let quantized_data = Value::Tensor {
+            data: vec![0, 5, 10, 15, 0, 5, 10, 15],
+            shape: vec![2, 4],
+            dtype: ScalarType::UInt8,
+        };
+        let scale_bytes: Vec<u8> = [0.1_f32, 0.2, 0.3, 0.4]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let zp_bytes: Vec<u8> = [0.0_f32, 0.0, 0.0, 0.0]
+            .iter()
+            .flat_map(|z| z.to_le_bytes())
+            .collect();
+
+        let op = Operation::new("constexpr_affine_dequantize", "w_quant")
+            .with_attr("quantized_data", quantized_data)
+            .with_attr(
+                "scale",
+                Value::Tensor {
+                    data: scale_bytes,
+                    shape: vec![2, 2],
+                    dtype: ScalarType::Float32,
+                },
+            )
+            .with_attr(
+                "zero_point",
+                Value::Tensor {
+                    data: zp_bytes,
+                    shape: vec![2, 2],
+                    dtype: ScalarType::Float32,
+                },
+            )
+            .with_attr("axis", Value::Int(1))
+            .with_attr("bit_width", Value::Int(4))
+            .with_attr("group_size", Value::Int(2))
+            .with_output("w_quant");
+
+        let mut block = Block::new();
+        block.add_op(op);
+        block.outputs.push("w_quant".into());
+
+        let func = Function {
+            name: "main".to_string(),
+            inputs: vec![],
+            body: block,
+        };
+
+        let mut program = Program::new("1");
+        program.add_function(func);
+
+        let model = program_to_model(&program, 7).unwrap();
+        let recovered = model_to_program(&model).unwrap();
+
+        let attrs = &recovered.functions["main"].body.operations[0].attributes;
+        assert_eq!(attrs.get("bit_width"), Some(&Value::Int(4)));
+        assert_eq!(attrs.get("group_size"), Some(&Value::Int(2)));
+        assert_eq!(
+            recovered.functions["main"].body.operations[0].op_type,
+            "constexpr_affine_dequantize"
+        );
+    }
+
+    #[test]
+    fn round_trip_legacy_affine_dequantize_without_metadata() {
+        // Simulate a legacy model: constexpr_affine_dequantize without
+        // bit_width or group_size attributes. Should round-trip cleanly
+        // and the attributes should simply be absent (callers default).
+        let quantized_data = Value::Tensor {
+            data: vec![0, 128, 255, 64],
+            shape: vec![4],
+            dtype: ScalarType::UInt8,
+        };
+
+        let op = Operation::new("constexpr_affine_dequantize", "w_quant")
+            .with_attr("quantized_data", quantized_data)
+            .with_attr("scale", Value::Float(0.01))
+            .with_attr("zero_point", Value::Float(128.0))
+            .with_attr("axis", Value::Int(0))
+            .with_output("w_quant");
+
+        let mut block = Block::new();
+        block.add_op(op);
+        block.outputs.push("w_quant".into());
+
+        let func = Function {
+            name: "main".to_string(),
+            inputs: vec![],
+            body: block,
+        };
+
+        let mut program = Program::new("1");
+        program.add_function(func);
+
+        let model = program_to_model(&program, 7).unwrap();
+        let recovered = model_to_program(&model).unwrap();
+
+        let attrs = &recovered.functions["main"].body.operations[0].attributes;
+        // Legacy model: no bit_width or group_size attributes.
+        assert!(attrs.get("bit_width").is_none());
+        assert!(attrs.get("group_size").is_none());
+        // Other attrs should survive.
+        assert!(attrs.get("quantized_data").is_some());
+        assert!(attrs.get("scale").is_some());
+    }
 }

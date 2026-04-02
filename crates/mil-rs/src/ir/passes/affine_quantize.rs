@@ -37,6 +37,14 @@ impl BitWidth {
             BitWidth::Eight => 255.0,
         }
     }
+
+    /// Return the numeric bit width (4 or 8).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            BitWidth::Four => 4,
+            BitWidth::Eight => 8,
+        }
+    }
 }
 
 /// Generalized affine weight quantization pass.
@@ -101,6 +109,7 @@ impl Pass for AffineQuantizePass {
 
     fn run(&self, program: &mut Program) -> Result<()> {
         let qmax = self.bits.qmax();
+        let bit_width = self.bits.as_u8();
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
@@ -158,6 +167,10 @@ impl Pass for AffineQuantizePass {
                             emit_per_tensor(op, &floats, &shape, qmax);
                         }
                     }
+
+                    // Store bit_width as an attribute for downstream consumers.
+                    op.attributes
+                        .insert("bit_width".to_string(), Value::Int(bit_width as i64));
                 }
             }
         }
@@ -984,5 +997,119 @@ mod tests {
         assert!(q.is_empty());
         assert_eq!(s, 1.0);
         assert_eq!(zp, 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // bit_width / group_size metadata tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn int4_per_tensor_emits_bit_width_4() {
+        let values = [0.0_f32, 1.0, 2.0, 3.0];
+        let mut program = make_program(&values, vec![4]);
+
+        AffineQuantizePass::int4_per_tensor()
+            .run(&mut program)
+            .unwrap();
+
+        let op = &program.functions["main"].body.operations[0];
+        assert_eq!(op.attributes.get("bit_width"), Some(&Value::Int(4)));
+        // No group_size for per-tensor.
+        assert!(op.attributes.get("group_size").is_none());
+    }
+
+    #[test]
+    fn int8_per_tensor_emits_bit_width_8() {
+        let values = [0.0_f32, 1.0, 2.0, 3.0];
+        let mut program = make_program(&values, vec![4]);
+
+        AffineQuantizePass::int8_per_tensor()
+            .run(&mut program)
+            .unwrap();
+
+        let op = &program.functions["main"].body.operations[0];
+        assert_eq!(op.attributes.get("bit_width"), Some(&Value::Int(8)));
+        assert!(op.attributes.get("group_size").is_none());
+    }
+
+    #[test]
+    fn int4_per_group_emits_bit_width_and_group_size() {
+        let values = [0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let mut program = make_program(&values, vec![2, 4]);
+
+        AffineQuantizePass::int4_per_group(2)
+            .run(&mut program)
+            .unwrap();
+
+        let op = &program.functions["main"].body.operations[0];
+        assert_eq!(op.attributes.get("bit_width"), Some(&Value::Int(4)));
+        assert_eq!(op.attributes.get("group_size"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn int8_pass_emits_bit_width_8() {
+        let values = [0.0_f32, 1.0, 2.0, 3.0];
+        let mut program = make_program(&values, vec![4]);
+
+        Int8QuantizePass::weight_only().run(&mut program).unwrap();
+
+        let op = &program.functions["main"].body.operations[0];
+        assert_eq!(op.attributes.get("bit_width"), Some(&Value::Int(8)));
+    }
+
+    #[test]
+    fn int4_per_group_proto_round_trip() {
+        use crate::convert::ir_to_proto::program_to_model;
+        use crate::convert::proto_to_ir::model_to_program;
+
+        let values = [0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let mut program = make_program(&values, vec![2, 4]);
+        program.version = "1".to_string();
+
+        AffineQuantizePass::int4_per_group(2)
+            .run(&mut program)
+            .unwrap();
+
+        // Round-trip through proto.
+        let model = program_to_model(&program, 7).unwrap();
+        let recovered = model_to_program(&model).unwrap();
+
+        let op = &recovered.functions["main"].body.operations[0];
+        assert_eq!(op.op_type, "constexpr_affine_dequantize");
+        assert_eq!(op.attributes.get("bit_width"), Some(&Value::Int(4)));
+        assert_eq!(op.attributes.get("group_size"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn legacy_int8_without_bit_width_defaults_correctly() {
+        // Simulate a legacy constexpr_affine_dequantize op without bit_width
+        // or group_size attributes (as would exist in models saved before
+        // this feature was added).
+        let quantized_data = Value::Tensor {
+            data: vec![0, 128, 255, 64],
+            shape: vec![4],
+            dtype: ScalarType::UInt8,
+        };
+
+        let op = Operation::new("constexpr_affine_dequantize", "w_quant")
+            .with_attr("quantized_data", quantized_data)
+            .with_attr("scale", Value::Float(0.01))
+            .with_attr("zero_point", Value::Float(128.0))
+            .with_attr("axis", Value::Int(0))
+            .with_output("w_quant");
+
+        // No bit_width or group_size attributes — default extraction
+        // should give bit_width=8, group_size=None.
+        let bit_width = match op.attributes.get("bit_width") {
+            Some(Value::Int(v)) => *v as u8,
+            _ => 8,
+        };
+        let group_size = match op.attributes.get("group_size") {
+            Some(Value::Int(v)) => Some(*v as usize),
+            _ => None,
+        };
+
+        assert_eq!(bit_width, 8);
+        assert_eq!(group_size, None);
     }
 }
