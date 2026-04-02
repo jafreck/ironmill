@@ -146,11 +146,13 @@ impl MetalTurboQuantModel {
         // Per Algorithm 2 (TurboQuant_prod): K cache uses (b-1)-bit MSE
         // codebook + 1-bit QJL = b bits total. V cache uses b-bit MSE codebook.
         // At INT8, QJL overhead is negligible so both use 8-bit.
-        let (k_levels, k_bounds) = if config.n_bits == 4 {
-            codebook::lloyd_max_gaussian(config.head_dim, config.n_bits - 1)
-        } else {
-            codebook::lloyd_max_gaussian(config.head_dim, config.n_bits)
-        };
+        // K codebook: use full b-bit for both K and V.
+        // The (b-1)-bit + 1-bit-QJL-sign approach (Algorithm 2) trades codebook
+        // precision for inner-product correction, but with d projections in
+        // d dimensions the estimator variance (π/(2d)) exceeds the quantization
+        // error (1/d), making the correction counterproductive. Using full b-bit
+        // for K (same as V) gives better results empirically.
+        let (k_levels, k_bounds) = codebook::lloyd_max_gaussian(config.head_dim, config.n_bits);
         let k_n_levels = k_levels.len() as u32;
         let k_codebook_buf = create_f32_buffer(device, &k_levels)?;
         let k_boundaries_buf = create_f32_buffer(device, &k_bounds)?;

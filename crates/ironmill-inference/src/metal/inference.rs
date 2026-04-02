@@ -279,45 +279,11 @@ impl MetalInference {
         self.decode_matmuls = Some(decode_cache);
 
         if self.config.enable_turboquant {
-            // Detect outlier channels from K/V weight column norms (§4.3).
-            // Only enabled for INT4 where the quality gap benefits from it.
-            let outlier_cfg: Option<OutlierConfig> = if self.config.n_bits == 4 {
-                let weight_data: Vec<(Vec<u8>, Vec<u8>)> = weights
-                    .layers
-                    .iter()
-                    .filter_map(|lw| {
-                        if let (
-                            crate::metal::weights::WeightBuffer::Dense { buf: k_buf, .. },
-                            crate::metal::weights::WeightBuffer::Dense { buf: v_buf, .. },
-                        ) = (&lw.k_proj, &lw.v_proj)
-                        {
-                            let mut k_data = vec![0u8; k_buf.length()];
-                            let mut v_data = vec![0u8; v_buf.length()];
-                            k_buf.read_bytes(&mut k_data, 0).ok()?;
-                            v_buf.read_bytes(&mut v_data, 0).ok()?;
-                            Some((k_data, v_data))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !weight_data.is_empty() {
-                    let refs: Vec<(&[u8], &[u8])> = weight_data
-                        .iter()
-                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                        .collect();
-                    let out_features = mc.num_key_value_heads * mc.head_dim;
-                    Some(OutlierConfig::auto_from_weights(
-                        &refs,
-                        out_features,
-                        mc.head_dim,
-                    ))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            // Outlier channel strategy (§4.3) is disabled for now.
+            // The mixed-precision split (4-bit outlier / 3-bit non-outlier)
+            // combined with QJL sign bit-stealing produces worse quality
+            // than uniform 4-bit codebook quantization for both K and V.
+            let outlier_cfg: Option<OutlierConfig> = None;
 
             let tq_config = TurboQuantMetalConfig {
                 n_bits: self.config.n_bits,
