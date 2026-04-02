@@ -4,6 +4,7 @@ use ironmill_metal_sys::{MetalBuffer, MetalDevice, StorageMode};
 
 use super::TurboQuantMetalConfig;
 use crate::metal::error::MetalError;
+use crate::turboquant::cache_layout::TurboQuantCacheLayout;
 
 /// GPU-resident quantized KV cache for TurboQuant inference.
 ///
@@ -65,18 +66,18 @@ impl MetalKvCache {
     ///
     /// Uses shared storage mode for CPU-side inspection during development.
     pub fn new(device: &MetalDevice, config: &TurboQuantMetalConfig) -> Result<Self, MetalError> {
-        let elements_per_pos = if config.n_bits == 4 {
-            config.head_dim / 2
-        } else {
-            config.head_dim
-        };
-        let cache_size = config.num_kv_heads * config.max_seq_len * elements_per_pos;
-        // 1 scale (L2 norm or absmax) per head per position
-        let scale_size = config.num_kv_heads * config.max_seq_len * std::mem::size_of::<f32>();
+        let layout = TurboQuantCacheLayout::new(
+            config.num_kv_heads,
+            config.head_dim,
+            config.max_seq_len,
+            config.num_layers,
+            config.n_bits,
+            config.outlier.as_ref(),
+        );
 
-        // QJL sign bits: head_dim/8 bytes per head per position
-        let qjl_signs_size = config.num_kv_heads * config.max_seq_len * (config.head_dim / 8);
-        // QJL residual norms: 1 f32 per head per position (same as scale_size)
+        let cache_size = layout.cache_bytes;
+        let scale_size = layout.scale_bytes();
+        let qjl_signs_size = layout.qjl_signs_bytes;
         let qjl_r_norm_size = scale_size;
 
         let mut k_caches = Vec::with_capacity(config.num_layers);
@@ -121,19 +122,11 @@ impl MetalKvCache {
 
         // Outlier cache buffers (allocated even when not used — zero-sized
         // buffers are fine and simplify dispatch).
-        let (outlier_cache_size, non_outlier_cache_size) =
-            if let Some(ref outlier_cfg) = config.outlier {
-                let d_o_padded = outlier_cfg.outlier_channels.len().next_power_of_two();
-                let d_n = config.head_dim - outlier_cfg.outlier_channels.len();
-                let d_n_padded = d_n.next_power_of_two();
-                // Both groups use 4-bit packing (outlier at full levels, non-outlier at fewer)
-                (
-                    config.num_kv_heads * config.max_seq_len * (d_o_padded / 2),
-                    config.num_kv_heads * config.max_seq_len * (d_n_padded / 2),
-                )
-            } else {
-                (1, 1) // minimal allocation when not used
-            };
+        let (outlier_cache_size, non_outlier_cache_size) = if let Some(ref ol) = layout.outlier {
+            (ol.outlier_cache_bytes, ol.non_outlier_cache_bytes)
+        } else {
+            (1, 1) // minimal allocation when not used
+        };
 
         let mut k_outlier_caches = Vec::with_capacity(config.num_layers);
         let mut v_outlier_caches = Vec::with_capacity(config.num_layers);

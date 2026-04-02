@@ -8,6 +8,7 @@ use ironmill_mlx_sys::{MetalKernelParams, MlxArray, MlxDtype, MlxStream, metal_k
 
 use super::{MlxOutlierCache, MlxTurboQuantModel};
 use crate::mlx::error::MlxError;
+use crate::turboquant::cache_layout::TurboQuantCacheLayout;
 
 /// MLX-resident quantized KV cache for TurboQuant inference.
 ///
@@ -81,17 +82,23 @@ impl MlxKvCache {
         stream: &MlxStream,
     ) -> Result<Self, MlxError> {
         let n_bits = model.n_bits;
-        let elements_per_pos = if n_bits == 4 { head_dim / 2 } else { head_dim };
-        let cache_size = num_kv_heads * max_seq_len * elements_per_pos;
-        let scale_count = num_kv_heads * max_seq_len;
+        let layout = TurboQuantCacheLayout::new(
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+            num_layers,
+            n_bits,
+            model.outlier_config.as_ref(),
+        );
+
+        let cache_size = layout.cache_bytes;
+        let scale_count = layout.scale_count;
+        let qjl_signs_size = layout.qjl_signs_bytes;
 
         let mut k_caches = Vec::with_capacity(num_layers);
         let mut v_caches = Vec::with_capacity(num_layers);
         let mut k_scales = Vec::with_capacity(num_layers);
         let mut v_scales = Vec::with_capacity(num_layers);
-
-        // QJL arrays
-        let qjl_signs_size = num_kv_heads * max_seq_len * (head_dim / 8);
         let mut k_qjl_signs = Vec::with_capacity(num_layers);
         let mut k_r_norms = Vec::with_capacity(num_layers);
 
@@ -105,12 +112,9 @@ impl MlxKvCache {
         }
 
         // Outlier cache allocation
-        let outlier = if let Some(ref outlier_cfg) = model.outlier_config {
-            let d_o_padded = outlier_cfg.outlier_channels.len().next_power_of_two();
-            let d_n = head_dim - outlier_cfg.outlier_channels.len();
-            let d_n_padded = d_n.next_power_of_two();
-            let o_cache_size = num_kv_heads * max_seq_len * (d_o_padded / 2);
-            let n_cache_size = num_kv_heads * max_seq_len * (d_n_padded / 2);
+        let outlier = if let Some(ref ol) = layout.outlier {
+            let o_cache_size = ol.outlier_cache_bytes;
+            let n_cache_size = ol.non_outlier_cache_bytes;
 
             let mut k_outlier = Vec::with_capacity(num_layers);
             let mut v_outlier = Vec::with_capacity(num_layers);
