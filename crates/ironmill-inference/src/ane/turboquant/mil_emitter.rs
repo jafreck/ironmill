@@ -307,6 +307,83 @@ fn build_quantize_chain(
 }
 
 // ---------------------------------------------------------------------------
+// Single-tensor cache-write sub-program (asymmetric K/V quantization)
+// ---------------------------------------------------------------------------
+
+/// Build a MIL IR program that quantizes a single tensor (K or V).
+///
+/// Used for asymmetric K/V quantization where K and V have different
+/// codebook bit-widths. The program takes one projection tensor and a
+/// rotation matrix, applies Hadamard rotation + Lloyd-Max codebook
+/// quantization, and outputs a single quantized tensor.
+///
+/// # Inputs
+///
+/// - `a_input0`: projection `[1, kv_ch, 1, MIN_IO_SEQ]` fp16
+/// - `a_input1`: Rotation matrix `[1, 1, head_dim, head_dim]` fp16
+///
+/// # Returns
+///
+/// `(program, weights)` where `weights` contains the rotation matrix
+/// fp16 bytes to populate the input IOSurface tensor.
+pub fn build_single_cache_write_program(
+    config: &TurboQuantConfig,
+    boundaries: &[f32],
+    levels: &[f32],
+) -> (Program, Vec<(String, Vec<u8>)>) {
+    let ch = config.num_kv_heads * config.head_dim;
+    let s = MIN_IO_SEQ;
+    let n_levels = levels.len();
+
+    // Pre-compute INT8-range level values from codebook centroids.
+    let max_level = levels.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let inv_scale = if max_level == 0.0 {
+        1.0
+    } else {
+        127.0 / max_level
+    };
+    let int8_levels: Vec<f64> = levels
+        .iter()
+        .map(|&l| (l * inv_scale).round() as f64)
+        .collect();
+
+    let mut weights: Vec<(String, Vec<u8>)> = Vec::new();
+
+    let rot_data = generate_rotation_weights(config.head_dim, config.rotation_seed);
+    weights.push(("rotation_matrix".to_string(), rot_data));
+
+    let in_ty = TensorType::new(ScalarType::Float16, vec![1, ch, 1, s]);
+    let rot_ty = TensorType::new(
+        ScalarType::Float16,
+        vec![1, 1, config.head_dim, config.head_dim],
+    );
+
+    let mut func = Function::new("main")
+        .with_input("proj", in_ty)
+        .with_input("rot_mat", rot_ty);
+
+    // Constants
+    add_const_op(&mut func.body, "bF", Value::Bool(false));
+
+    for (i, &b) in boundaries.iter().enumerate() {
+        add_const_op(&mut func.body, &format!("cb_b{i}"), Value::Float(b as f64));
+    }
+
+    for (i, &l) in int8_levels.iter().enumerate() {
+        add_const_op(&mut func.body, &format!("cb_l{i}"), Value::Float(l));
+    }
+
+    build_quantize_chain(&mut func.body, "t", "proj", config, n_levels, "out");
+
+    func.body.outputs.push("out".into());
+
+    let mut program = Program::new("1.0.0");
+    program.add_function(func);
+
+    (program, weights)
+}
+
+// ---------------------------------------------------------------------------
 // Attention sub-program
 // ---------------------------------------------------------------------------
 
@@ -325,8 +402,14 @@ pub struct AttentionMilConfig {
     pub max_seq_len: usize,
     /// Current sequence length to slice from the cache.
     pub seq_len: usize,
-    /// When `Some(scale)`, emit `mul(deq_scale)` after slicing the cache.
+    /// When `Some(scale)`, emit `mul(deq_scale)` after slicing the K cache.
+    /// Also used for V unless `v_dequant_scale` is set.
     pub dequant_scale: Option<f32>,
+    /// When `Some(scale)`, emit a separate `mul(v_deq_scale)` for V.
+    /// Used for asymmetric K/V quantization where K and V have different
+    /// codebook bit-widths and therefore different dequantization scales.
+    /// When `None`, `dequant_scale` is used for both K and V.
+    pub v_dequant_scale: Option<f32>,
     /// When `Some(seed)`, emit Hadamard rotation for Q and output un-rotation.
     /// Uses the Q-rotation approach: rotate Q by R (O(1) per token) instead
     /// of un-rotating the entire K/V cache by R⁻¹ (O(seq_len) per token).
@@ -420,6 +503,10 @@ pub fn build_attention_program(config: &AttentionMilConfig) -> (Program, Vec<(St
     if let Some(deq) = config.dequant_scale {
         add_const_op(&mut func.body, "deq_scale", Value::Float(deq as f64));
     }
+    // Separate V dequant scale for asymmetric K/V quantization.
+    if let Some(v_deq) = config.v_dequant_scale {
+        add_const_op(&mut func.body, "v_deq_scale", Value::Float(v_deq as f64));
+    }
     add_const_op(
         &mut func.body,
         "scale_factor",
@@ -489,6 +576,7 @@ pub fn build_attention_program(config: &AttentionMilConfig) -> (Program, Vec<(St
     }
 
     // --- Optional: dequantization ---
+    // When v_dequant_scale is set (asymmetric K/V), V uses a separate scale.
     let (k_ready, v_ready) = if config.dequant_scale.is_some() {
         let mut op = Operation::new("mul", "k_dscaled")
             .with_input("x", Value::Reference("k_sliced".into()))
@@ -497,9 +585,14 @@ pub fn build_attention_program(config: &AttentionMilConfig) -> (Program, Vec<(St
         op.output_types[0] = Some(TensorType::new(ScalarType::Float16, sliced_shape.clone()));
         func.body.add_op(op);
 
+        let v_scale_ref = if config.v_dequant_scale.is_some() {
+            "v_deq_scale"
+        } else {
+            "deq_scale"
+        };
         let mut op = Operation::new("mul", "v_dscaled")
             .with_input("x", Value::Reference("v_sliced".into()))
-            .with_input("y", Value::Reference("deq_scale".into()))
+            .with_input("y", Value::Reference(v_scale_ref.into()))
             .with_output("v_dscaled");
         op.output_types[0] = Some(TensorType::new(ScalarType::Float16, sliced_shape));
         func.body.add_op(op);
@@ -747,6 +840,7 @@ pub fn build_fp16_attention_program(
         max_seq_len,
         seq_len,
         dequant_scale: None,
+        v_dequant_scale: None,
         unrotation_seed: None,
         cache_int8: false,
         enable_qjl: false,
@@ -1089,6 +1183,7 @@ mod tests {
             num_layers: 1,
             rotation_seed: 42,
             enable_qjl: false,
+            asymmetric_kv: false,
             qos: 33,
         }
     }
@@ -1103,6 +1198,7 @@ mod tests {
             max_seq_len: tq.max_seq_len,
             seq_len: 32,
             dequant_scale: Some(deq_scale),
+            v_dequant_scale: None,
             unrotation_seed: Some(tq.rotation_seed),
             cache_int8: true,
             enable_qjl: false,
@@ -1223,6 +1319,7 @@ mod tests {
             num_layers: 1,
             rotation_seed: 42,
             enable_qjl: true,
+            asymmetric_kv: false,
             qos: 33,
         };
         let (program, weights) = build_qjl_program(&small, 16);
@@ -1241,6 +1338,7 @@ mod tests {
             num_layers: 32,
             rotation_seed: 123,
             enable_qjl: true,
+            asymmetric_kv: false,
             qos: 33,
         };
         let (program, weights) = build_qjl_program(&large, 2048);
@@ -1259,6 +1357,7 @@ mod tests {
             num_layers: 1,
             rotation_seed: 42,
             enable_qjl: true,
+            asymmetric_kv: false,
             qos: 33,
         };
         let (program, weights) = build_qjl_program(&single, 1);
@@ -1279,6 +1378,7 @@ mod tests {
             max_seq_len: 128,
             seq_len: 32,
             dequant_scale: Some(deq_scale),
+            v_dequant_scale: None,
             unrotation_seed: Some(42),
             cache_int8: true,
             enable_qjl: false,

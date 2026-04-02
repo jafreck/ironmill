@@ -44,6 +44,19 @@ pub struct TurboQuantConfig {
     pub rotation_seed: u64,
     /// Enable QJL 1-bit bias correction.
     pub enable_qjl: bool,
+    /// Enable asymmetric K/V quantization.
+    ///
+    /// When true, K uses `(n_bits - 1)`-bit codebook and V uses `n_bits`-bit
+    /// codebook. This matches Metal's precision allocation: K uses fewer bits
+    /// because QJL correction compensates, while V gets full precision since
+    /// it doesn't benefit from QJL.
+    ///
+    /// Requires `n_bits >= 2` (so K gets at least 1-bit codebook).
+    ///
+    /// Compile budget impact: doubles cache-write programs (1 → 2 total).
+    /// The second program is compiled via `compile_patched()` which does not
+    /// consume an ANE compile budget slot.
+    pub asymmetric_kv: bool,
     /// ANE QoS level for compile/load/eval.
     /// Defaults to user-interactive (33) for interactive decode.
     pub qos: u32,
@@ -96,6 +109,7 @@ impl TurboQuantConfig {
             num_layers,
             rotation_seed: 42,
             enable_qjl: false,
+            asymmetric_kv: false,
             // QoSMapper::ane_user_interactive_task_qos() == 33
             qos: 33,
         })
@@ -111,6 +125,33 @@ impl TurboQuantConfig {
     pub fn with_rotation_seed(mut self, seed: u64) -> Self {
         self.rotation_seed = seed;
         self
+    }
+
+    /// Enable or disable asymmetric K/V quantization.
+    ///
+    /// When enabled, K uses `(n_bits - 1)`-bit codebook and V uses
+    /// `n_bits`-bit codebook. Requires `n_bits >= 2`.
+    pub fn with_asymmetric_kv(mut self, enable: bool) -> Self {
+        self.asymmetric_kv = enable;
+        self
+    }
+
+    /// Effective K codebook bit-width.
+    ///
+    /// Returns `n_bits - 1` when asymmetric K/V is enabled, `n_bits` otherwise.
+    pub fn k_bits(&self) -> u8 {
+        if self.asymmetric_kv {
+            self.n_bits - 1
+        } else {
+            self.n_bits
+        }
+    }
+
+    /// Effective V codebook bit-width.
+    ///
+    /// Always returns `n_bits` (V always uses full precision).
+    pub fn v_bits(&self) -> u8 {
+        self.n_bits
     }
 
     /// Construct a `TurboQuantConfig` from detected model architecture.
@@ -174,9 +215,11 @@ impl KvCacheManager {
             )?);
         }
 
-        let (quant_levels, _boundaries) = lloyd_max_gaussian(config.head_dim, config.n_bits);
+        // Precompute dequantization scale for K (used by QJL sign computation).
+        // When asymmetric K/V is enabled, K uses (n_bits - 1)-bit codebook.
+        let k_bits = config.k_bits();
+        let (quant_levels, _boundaries) = lloyd_max_gaussian(config.head_dim, k_bits);
 
-        // Precompute dequantization scale.
         let max_level = quant_levels.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let deq_scale = if max_level == 0.0 {
             1.0
@@ -425,7 +468,22 @@ pub struct TurboQuantModel<D: AneDevice> {
     ///
     /// This program already fuses both K and V quantization into a single
     /// eval dispatch. See `mil_emitter::build_cache_write_program()` docs.
-    cache_write_program: D::Program,
+    ///
+    /// When `asymmetric_kv` is enabled, this is `None` (saving a compile
+    /// budget slot) and `k_cache_write_program` / `v_cache_write_program`
+    /// are used instead.
+    cache_write_program: Option<D::Program>,
+    /// Compiled K-only cache-write sub-program (asymmetric K/V).
+    ///
+    /// Uses `(n_bits - 1)`-bit codebook. Only populated when
+    /// `config.asymmetric_kv` is true.
+    k_cache_write_program: Option<D::Program>,
+    /// Compiled V-only cache-write sub-program (asymmetric K/V).
+    ///
+    /// Uses `n_bits`-bit codebook. Only populated when
+    /// `config.asymmetric_kv` is true. Compiled via `compile_patched()`
+    /// to avoid consuming an ANE compile budget slot.
+    v_cache_write_program: Option<D::Program>,
     /// Compiled attention sub-program (dequant + Q-rotate + attention + output un-rotate).
     attention_program: D::Program,
     /// Optional QJL correction program.
@@ -472,25 +530,90 @@ impl<D: AneDevice> TurboQuantModel<D> {
     pub fn compile(device: Arc<D>, config: TurboQuantConfig) -> Result<Self> {
         let head_dim = config.head_dim;
 
-        // --- cache-write sub-program ---
-        let (codebook_levels, codebook_boundaries) = lloyd_max_gaussian(head_dim, config.n_bits);
-        let (cw_program, cw_weights) =
-            mil_emitter::build_cache_write_program(&config, &codebook_boundaries, &codebook_levels);
+        // Validate asymmetric K/V constraints.
+        if config.asymmetric_kv && config.n_bits < 2 {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "asymmetric_kv requires n_bits >= 2 (got {}), \
+                 so K can use at least 1-bit codebook",
+                config.n_bits
+            )));
+        }
+
         let mil_config = MilTextConfig::default();
-        let (cw_mil, _) = program_to_mil_text(&cw_program, &mil_config)
-            .map_err(|e| AneError::Other(anyhow::anyhow!("cache-write MIL text failed: {e}")))?;
-        // Weights are delivered as function inputs, not BLOBFILE — pass empty weights
-        let cache_write_program = device.compile(&cw_mil, &[], config.qos)?;
+
+        // --- cache-write sub-program(s) ---
+        //
+        // Symmetric (default): one fused program for both K and V (same codebook).
+        // Asymmetric: separate K and V programs with different codebook bit-widths.
+        //   - K: (n_bits - 1)-bit codebook (QJL correction compensates)
+        //   - V: n_bits-bit codebook (full precision, no QJL benefit)
+        //
+        // Compile budget: symmetric uses 1 slot, asymmetric uses 1 slot for K +
+        // compile_patched() for V (0 budget cost). Total: still 1 compile slot.
+        // Only compile the fused cache-write program when NOT using asymmetric
+        // K/V. Asymmetric mode uses separate K and V programs below, so the
+        // fused program would waste an ANE compile budget slot per layer.
+        let cache_write_program = if !config.asymmetric_kv {
+            let (codebook_levels, codebook_boundaries) =
+                lloyd_max_gaussian(head_dim, config.n_bits);
+            let (cw_program, _cw_weights) = mil_emitter::build_cache_write_program(
+                &config,
+                &codebook_boundaries,
+                &codebook_levels,
+            );
+            let (cw_mil, _) = program_to_mil_text(&cw_program, &mil_config).map_err(|e| {
+                AneError::Other(anyhow::anyhow!("cache-write MIL text failed: {e}"))
+            })?;
+            // Weights are delivered as function inputs, not BLOBFILE — pass empty weights
+            Some(device.compile(&cw_mil, &[], config.qos)?)
+        } else {
+            None
+        };
+
+        let (k_cache_write_program, v_cache_write_program) = if config.asymmetric_kv {
+            let k_bits = config.k_bits();
+            let v_bits = config.v_bits();
+
+            // K cache-write: (n_bits - 1)-bit codebook
+            let (k_levels, k_boundaries) = lloyd_max_gaussian(head_dim, k_bits);
+            let (k_program, _k_weights) =
+                mil_emitter::build_single_cache_write_program(&config, &k_boundaries, &k_levels);
+            let (k_mil, _) = program_to_mil_text(&k_program, &mil_config).map_err(|e| {
+                AneError::Other(anyhow::anyhow!("K cache-write MIL text failed: {e}"))
+            })?;
+            let k_compiled = device.compile(&k_mil, &[], config.qos)?;
+
+            // V cache-write: n_bits-bit codebook.
+            // Use compile_patched() to avoid consuming an ANE compile budget slot.
+            let (v_levels, v_boundaries) = lloyd_max_gaussian(head_dim, v_bits);
+            let (v_program, _v_weights) =
+                mil_emitter::build_single_cache_write_program(&config, &v_boundaries, &v_levels);
+            let (v_mil, _) = program_to_mil_text(&v_program, &mil_config).map_err(|e| {
+                AneError::Other(anyhow::anyhow!("V cache-write MIL text failed: {e}"))
+            })?;
+            let v_compiled = device.compile_patched(&k_compiled, &v_mil, &[], config.qos)?;
+
+            (Some(k_compiled), Some(v_compiled))
+        } else {
+            (None, None)
+        };
 
         // --- attention sub-program ---
-        let deq_scale = mil_emitter::compute_deq_scale(head_dim, config.n_bits);
+        // When asymmetric, K and V have different dequant scales.
+        let k_deq_scale = mil_emitter::compute_deq_scale(head_dim, config.k_bits());
+        let v_deq_scale = if config.asymmetric_kv {
+            Some(mil_emitter::compute_deq_scale(head_dim, config.v_bits()))
+        } else {
+            None
+        };
         let attn_config = mil_emitter::AttentionMilConfig {
             num_heads: config.num_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim,
             max_seq_len: config.max_seq_len,
             seq_len: config.max_seq_len,
-            dequant_scale: Some(deq_scale),
+            dequant_scale: Some(k_deq_scale),
+            v_dequant_scale: v_deq_scale,
             unrotation_seed: Some(config.rotation_seed),
             cache_int8: true,
             enable_qjl: config.enable_qjl,
@@ -556,10 +679,11 @@ impl<D: AneDevice> TurboQuantModel<D> {
         // Q-rotation approach: the attention program uses the SAME rotation
         // matrix as cache-write (to rotate Q and un-rotate output), not the
         // inverse. This eliminates the need for a separate unrotation tensor.
-        let rot_data = &cw_weights[0].1;
+        let rot_data =
+            mil_emitter::generate_rotation_weights(config.head_dim, config.rotation_seed);
         let mut rotation_tensor =
             AneTensor::new_with_min_alloc(head_dim, head_dim, ScalarType::Float16, tq_alloc_size)?;
-        rotation_tensor.write_bytes_at(0, rot_data)?;
+        rotation_tensor.write_bytes_at(0, &rot_data)?;
 
         // Pre-allocate output tensors for step_attention() reuse.
         // These are overwritten on every eval call, so sharing across layers is safe.
@@ -609,6 +733,8 @@ impl<D: AneDevice> TurboQuantModel<D> {
             config,
             cache,
             cache_write_program,
+            k_cache_write_program,
+            v_cache_write_program,
             attention_program,
             qjl_program,
             fused_ffn_program: None,
@@ -721,14 +847,39 @@ impl<D: AneDevice> TurboQuantModel<D> {
         k_proj: &AneTensor,
         v_proj: &AneTensor,
     ) -> Result<AneTensor> {
-        // 1. Cache-write: K_proj, V_proj, rotation_matrix → K_quant, V_quant
-        //    Pre-attn outputs share tq_alloc_size, so no staging copy needed.
-        self.device.eval(
-            &self.cache_write_program,
-            &[k_proj, v_proj, &self.rotation_tensor],
-            &mut [&mut self.cw_k_output, &mut self.cw_v_output],
-            self.config.qos,
-        )?;
+        // 1. Cache-write: quantize K and V projections.
+        //    Asymmetric path: separate K and V evals with different codebooks.
+        //    Symmetric path: single fused eval for both K and V.
+        if let (Some(k_prog), Some(v_prog)) =
+            (&self.k_cache_write_program, &self.v_cache_write_program)
+        {
+            // Asymmetric K/V: K uses (n_bits-1)-bit codebook,
+            //                 V uses n_bits-bit codebook.
+            self.device.eval(
+                k_prog,
+                &[k_proj, &self.rotation_tensor],
+                &mut [&mut self.cw_k_output],
+                self.config.qos,
+            )?;
+            self.device.eval(
+                v_prog,
+                &[v_proj, &self.rotation_tensor],
+                &mut [&mut self.cw_v_output],
+                self.config.qos,
+            )?;
+        } else if let Some(cw_prog) = &self.cache_write_program {
+            // Symmetric: single fused cache-write program.
+            self.device.eval(
+                cw_prog,
+                &[k_proj, v_proj, &self.rotation_tensor],
+                &mut [&mut self.cw_k_output, &mut self.cw_v_output],
+                self.config.qos,
+            )?;
+        } else {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "no cache-write program available: neither asymmetric nor fused program compiled"
+            )));
+        }
 
         // 2. Direct IOSurface-to-IOSurface copy: cache-write output → KV cache.
         //    Reads FP16 column 0 from cache-write output, converts to INT8,
@@ -981,6 +1132,7 @@ mod tests {
             num_layers: 2,
             rotation_seed: 42,
             enable_qjl: false,
+            asymmetric_kv: false,
             qos: 33,
         }
     }

@@ -150,6 +150,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
         max_seq_len: cfg.max_seq_len,
         seq_len: cfg.max_seq_len,
         dequant_scale: Some(deq_scale),
+        v_dequant_scale: None,
         unrotation_seed: Some(42),
         cache_int8: true,
         enable_qjl: false,
@@ -174,9 +175,10 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
         head_dim: cfg.head_dim,
         max_seq_len: cfg.max_seq_len,
         seq_len: cfg.max_seq_len,
-        dequant_scale: None,   // no dequant mul
-        unrotation_seed: None, // no rotation
-        cache_int8: true,      // still INT8 input → cast to fp16
+        dequant_scale: None,
+        v_dequant_scale: None,
+        unrotation_seed: None,
+        cache_int8: true,
         enable_qjl: false,
     };
     let (int8_raw_program, _) = mil_emitter::build_attention_program(&attn_config_int8_raw);

@@ -1114,7 +1114,10 @@ impl<D: AneDevice> AneInference<D> {
                     };
                     tq.step_attention_fused(layer_idx, q, k_quant, v_quant, k_original)
                 } else {
-                    // Non-fused path: pre_attn outputs raw K_proj/V_proj
+                    // Non-fused path: pre_attn outputs raw K_proj/V_proj.
+                    // When asymmetric K/V quantization is enabled,
+                    // step_attention() internally dispatches separate K and V
+                    // cache-write evals with different codebook bit-widths.
                     let k_proj = if num_pre_outputs > 1 {
                         &layer.pre_attn.output_tensors[1]
                     } else {
