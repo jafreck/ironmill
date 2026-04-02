@@ -1,9 +1,7 @@
 //! Comprehensive wrappers for `_ANEInMemoryModel` and
 //! `_ANEInMemoryModelDescriptor`.
 //!
-//! All compile/load/eval logic that was previously split across `compiler.rs`
-//! and `runtime.rs` now lives here.  Those modules are thin backward-compat
-//! re-exports.
+//! All compile/load/eval logic lives here.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -629,9 +627,6 @@ impl Drop for InMemoryModel {
 
 /// Compile MIL text into a ready-to-evaluate model (compile + load in one
 /// step).
-///
-/// This is the primary entry point — equivalent to the old
-/// `AneCompiler::compile_mil_text`.
 pub fn compile_mil_text(
     mil_text: &str,
     weights: &[(&str, &[u8])],
@@ -874,6 +869,14 @@ pub fn eval(
     }
 
     Ok(())
+}
+
+/// Check whether the ANE is available on this system.
+pub fn is_available() -> bool {
+    if ane_framework().is_err() {
+        return false;
+    }
+    get_class("_ANEInMemoryModel").is_ok()
 }
 
 /// Number of compilations performed in this process.

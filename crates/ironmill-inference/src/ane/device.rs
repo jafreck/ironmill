@@ -1,8 +1,9 @@
 //! `AneDevice` trait and `HardwareAneDevice` implementation.
 //!
 //! Defines the hardware dispatch contract for the Apple Neural Engine and
-//! provides `HardwareAneDevice` which wraps [`ironmill_ane_sys`] behind the
-//! trait. Consumers can swap in test doubles without touching real hardware.
+//! provides `HardwareAneDevice` which wraps [`ironmill_ane_sys::model`]
+//! behind the trait. Consumers can swap in test doubles without touching
+//! real hardware.
 
 use std::sync::Mutex;
 
@@ -13,8 +14,8 @@ use ironmill_iosurface::AneTensor;
 
 /// Hardware dispatch contract for the Apple Neural Engine.
 ///
-/// Abstracts compile → load → eval lifecycle so that tests and
-/// benchmarks can substitute a mock or recording device.
+/// Abstracts compile → eval lifecycle so that tests and benchmarks can
+/// substitute a mock or recording device.
 pub trait AneDevice: Send + Sync {
     /// An opaque compiled program handle. Drop releases hardware resources.
     type Program: Send;
@@ -50,22 +51,21 @@ pub trait AneDevice: Send + Sync {
 
 /// A program compiled and loaded on real ANE hardware.
 ///
-/// `CompiledProgram` and `LoadedProgram` implement `Drop` themselves,
-/// so `HardwareProgram` gets automatic cleanup.
+/// Wraps an [`ironmill_ane_sys::InMemoryModel`] which owns the retained
+/// `_ANEInMemoryModel` handle.
 pub struct HardwareProgram {
-    pub(crate) compiled: ironmill_ane_sys::CompiledProgram,
-    pub(crate) loaded: ironmill_ane_sys::LoadedProgram,
+    pub(crate) model: ironmill_ane_sys::InMemoryModel,
 }
 
 // ── HardwareAneDevice ────────────────────────────────────────────
 
-/// Real ANE device backed by [`ironmill_ane_sys::AneRuntime`].
+/// Real ANE device backed by [`ironmill_ane_sys::model`].
 ///
-/// The inner runtime is wrapped in a `Mutex` because `AneRuntime` is
-/// `Send` but not `Sync` (the underlying Objective-C classes are not
-/// thread-safe). The `Mutex` makes `HardwareAneDevice` `Sync`.
+/// Eval calls are serialised through a `Mutex` because the underlying
+/// Objective-C classes are not thread-safe.
 pub struct HardwareAneDevice {
-    runtime: Mutex<ironmill_ane_sys::AneRuntime>,
+    /// Serialises ANE eval calls.
+    eval_lock: Mutex<()>,
 }
 
 /// Convert an [`ironmill_ane_sys::AneSysError`] into an [`AneError`].
@@ -91,12 +91,15 @@ fn map_sys_err(e: ironmill_ane_sys::AneSysError) -> AneError {
 impl HardwareAneDevice {
     /// Create a new `HardwareAneDevice`.
     ///
-    /// Initialises the ANE runtime; returns an error if the Apple Neural
-    /// Engine is not available on this system.
+    /// Checks that the ANE framework is available; returns an error if not.
     pub fn new() -> Result<Self> {
-        let runtime = ironmill_ane_sys::AneRuntime::new().map_err(map_sys_err)?;
+        if !ironmill_ane_sys::model::is_available() {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "ANE is not available on this system"
+            )));
+        }
         Ok(Self {
-            runtime: Mutex::new(runtime),
+            eval_lock: Mutex::new(()),
         })
     }
 }
@@ -106,13 +109,9 @@ impl AneDevice for HardwareAneDevice {
     type Program = HardwareProgram;
 
     fn compile(&self, mil_text: &str, weights: &[(&str, &[u8])]) -> Result<HardwareProgram> {
-        let compiled = ironmill_ane_sys::AneCompiler::compile_mil_text(mil_text, weights)
-            .map_err(map_sys_err)?;
-
-        let rt = self.runtime.lock().expect("ANE runtime lock poisoned");
-        let loaded = rt.load_program(&compiled).map_err(map_sys_err)?;
-
-        Ok(HardwareProgram { compiled, loaded })
+        let model =
+            ironmill_ane_sys::model::compile_mil_text(mil_text, weights).map_err(map_sys_err)?;
+        Ok(HardwareProgram { model })
     }
 
     fn compile_patched(
@@ -121,14 +120,9 @@ impl AneDevice for HardwareAneDevice {
         mil_text: &str,
         weights: &[(&str, &[u8])],
     ) -> Result<HardwareProgram> {
-        let compiled =
-            ironmill_ane_sys::AneCompiler::patch_weights(&donor.compiled, mil_text, weights)
-                .map_err(map_sys_err)?;
-
-        let rt = self.runtime.lock().expect("ANE runtime lock poisoned");
-        let loaded = rt.load_program(&compiled).map_err(map_sys_err)?;
-
-        Ok(HardwareProgram { compiled, loaded })
+        let model = ironmill_ane_sys::model::patch_weights(&donor.model, mil_text, weights)
+            .map_err(map_sys_err)?;
+        Ok(HardwareProgram { model })
     }
 
     fn eval(
@@ -153,17 +147,17 @@ impl AneDevice for HardwareAneDevice {
         let input_ptrs: Vec<*mut std::ffi::c_void> = inputs.iter().map(|t| t.as_ptr()).collect();
         let output_ptrs: Vec<*mut std::ffi::c_void> = outputs.iter().map(|t| t.as_ptr()).collect();
 
-        let rt = self.runtime.lock().expect("ANE runtime lock poisoned");
-        rt.eval(&program.loaded, &input_ptrs, &output_ptrs)
+        let _guard = self.eval_lock.lock().expect("ANE eval lock poisoned");
+        ironmill_ane_sys::model::eval(&program.model, &input_ptrs, &output_ptrs)
             .map_err(map_sys_err)
     }
 
     fn compile_count(&self) -> usize {
-        ironmill_ane_sys::AneCompiler::compile_count()
+        ironmill_ane_sys::model::compile_count()
     }
 
     fn remaining_budget(&self) -> usize {
-        ironmill_ane_sys::AneCompiler::remaining_budget()
+        ironmill_ane_sys::model::remaining_budget()
     }
 }
 
