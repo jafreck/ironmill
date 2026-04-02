@@ -22,29 +22,114 @@ use crate::types::Logits;
 
 // ── Embedded PolarQuant kernel source ───────────────────────────
 
-/// Metal kernel for PolarQuant dequant + matvec.
+/// Metal kernel for PolarQuant dequant + matvec (INT4, decode path M=1).
 ///
-/// Each thread computes one output element by reconstructing the weight
-/// row from packed LUT indices and norms, then dotting with the input.
-/// This is a placeholder that will be replaced with the optimized kernel
-/// from the MLX-TURBOQUANT task.
+/// Adapted from `gpu/shaders/quantized_matmul.metal` for the MLX
+/// `metal_kernel` buffer convention.  Inputs are bound sequentially:
+///   buffer(0) = A [1, K]          half   (input activation)
+///   buffer(1) = B_packed [N, K/2] uchar  (packed 4-bit indices)
+///   buffer(2) = lut [16]          half   (reconstruction look-up table)
+///   buffer(3) = norms [N]         half   (per-row normalization)
+///   buffer(4) = params [2]        uint   (N, K)
+///   buffer(5) = C [1, N]          half   (output — MLX output slot)
+///
+/// Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
+/// Each SIMD group computes one output row via strided reduction.
 const POLARQUANT_MATVEC_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
 [[kernel]] void polarquant_matvec(
-    device const half* x          [[buffer(0)]],
-    device const uchar* indices   [[buffer(1)]],
-    device const half* lut        [[buffer(2)]],
-    device const half* norms      [[buffer(3)]],
-    device half* output           [[buffer(4)]],
-    uint2 tid [[thread_position_in_grid]])
+    device const half *A            [[buffer(0)]],
+    device const uchar *B_packed    [[buffer(1)]],
+    constant half *lut              [[buffer(2)]],
+    device const half *norms        [[buffer(3)]],
+    device const uint *params       [[buffer(4)]],
+    device half *C                  [[buffer(5)]],
+    uint tid  [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
 {
-    // Placeholder: output[row] = 0 for now.
-    // Full implementation comes with MLX-TURBOQUANT.
-    uint row = tid.x;
-    uint batch = tid.y;
-    output[batch * gridDim.x + row] = half(0.0);
+    uint N = params[0];
+    uint K = params[1];
+    if (tid >= N) return;
+
+    uint half_K = K / 2;
+    uint row_offset = tid * half_K;
+    float norm = float(norms[tid]);
+    float acc = 0.0f;
+
+    for (uint k = lane; k < half_K; k += 32) {
+        uchar packed = B_packed[row_offset + k];
+        uchar lo_idx = (packed >> 4) & 0xF;
+        uchar hi_idx = packed & 0xF;
+        float w0 = float(lut[lo_idx]) * norm;
+        float w1 = float(lut[hi_idx]) * norm;
+        uint k2 = k * 2;
+        acc += float(A[k2])     * w0;
+        acc += float(A[k2 + 1]) * w1;
+    }
+
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        C[tid] = half(acc);
+    }
+}
+"#;
+
+/// Metal kernel for PolarQuant dequant + tiled GEMM (INT4, prefill path M>1).
+///
+/// Adapted from `gpu/shaders/quantized_matmul.metal` for MLX.
+///   buffer(0) = A [M, K]          half
+///   buffer(1) = B_packed [N, K/2] uchar
+///   buffer(2) = lut [16]          half
+///   buffer(3) = norms [N]         half
+///   buffer(4) = params [3]        uint   (M, N, K)
+///   buffer(5) = C [M, N]          half   (output)
+///
+/// Dispatch: (ceil(N/32), ceil(M/8), 1) threadgroups, (32, 8, 1) threads.
+const POLARQUANT_MATMUL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant constexpr uint TILE_M = 8;
+constant constexpr uint TILE_N = 32;
+constant constexpr uint TILE_K = 32;
+
+[[kernel]] void polarquant_matmul(
+    device const half *A            [[buffer(0)]],
+    device const uchar *B_packed    [[buffer(1)]],
+    constant half *lut              [[buffer(2)]],
+    device const half *norms        [[buffer(3)]],
+    device const uint *params       [[buffer(4)]],
+    device half *C                  [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 lid  [[thread_position_in_threadgroup]])
+{
+    uint M = params[0];
+    uint N = params[1];
+    uint K = params[2];
+
+    uint col = tgid.x * TILE_N + lid.x;
+    uint row = tgid.y * TILE_M + lid.y;
+
+    if (row >= M || col >= N) return;
+
+    uint half_K = K / 2;
+    float norm = float(norms[col]);
+    float acc = 0.0f;
+
+    for (uint k = 0; k < half_K; k++) {
+        uchar packed = B_packed[col * half_K + k];
+        uchar lo_idx = (packed >> 4) & 0xF;
+        uchar hi_idx = packed & 0xF;
+        float w0 = float(lut[lo_idx]) * norm;
+        float w1 = float(lut[hi_idx]) * norm;
+        uint k2 = k * 2;
+        acc += float(A[row * K + k2])     * w0;
+        acc += float(A[row * K + k2 + 1]) * w1;
+    }
+
+    C[row * N + col] = half(acc);
 }
 "#;
 
@@ -478,9 +563,11 @@ impl MlxInference {
 
     /// Quantized matmul using a custom Metal kernel for PolarQuant weights.
     ///
-    /// Dispatches the PolarQuant dequant+matvec kernel which reads packed
-    /// indices, LUT, and norms, reconstructs weights on-the-fly, and
-    /// computes the matrix-vector product. Kernel source is embedded inline.
+    /// For M=1 (decode): dispatches the SIMD-group matvec kernel — one
+    /// threadgroup per output row with 32 threads for lane-strided reduction.
+    ///
+    /// For M>1 (prefill): dispatches a tiled GEMM kernel — (32, 8) thread
+    /// tiles over the output matrix.
     fn quantized_matmul(
         &self,
         x: &MlxArray,
@@ -490,36 +577,53 @@ impl MlxInference {
         let x_shape = x.shape();
         let m = if x_shape.len() >= 2 { x_shape[0] } else { 1 };
         let n = qw.n;
-        let _k = qw.k;
+        let k = qw.k;
 
         let output_shape = [m, n];
         let output_shapes: &[&[usize]] = &[&output_shape];
         let output_dtypes = [MlxDtype::Float16];
 
-        // PolarQuant dequant+matvec kernel.
-        // Each thread computes one output element by reconstructing
-        // the weight row from packed indices + LUT and dotting with input.
-        let kernel_source = POLARQUANT_MATVEC_SOURCE;
+        // Create a small uint32 array for dimension parameters.
+        if m == 1 {
+            // Decode path: one SIMD group per output row.
+            let params_data = [n as u32, k as u32];
+            let params_bytes: Vec<u8> = params_data.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let params = MlxArray::from_data_copy(&params_bytes, &[2], MlxDtype::Uint32, stream)?;
+            let inputs: &[&MlxArray] = &[x, &qw.indices, &qw.lut, &qw.norms, &params];
 
-        let grid_x = n;
-        let grid_y = m;
-        let tg_size = 256usize;
+            let result = ironmill_mlx_sys::metal_kernel(
+                "polarquant_matvec",
+                inputs,
+                &[],
+                POLARQUANT_MATVEC_SOURCE,
+                [n, 1, 1],
+                [32, 1, 1],
+                output_shapes,
+                &output_dtypes,
+                stream,
+            )?;
+            return result.into_iter().next().ok_or_else(|| {
+                MlxError::WeightLoading("quantized matvec returned no outputs".into())
+            });
+        }
 
-        let inputs: &[&MlxArray] = &[x, &qw.indices, &qw.lut, &qw.norms];
-        let outputs: &[&MlxArray] = &[];
+        // Prefill path: tiled GEMM.
+        let params_data = [m as u32, n as u32, k as u32];
+        let params_bytes: Vec<u8> = params_data.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let params = MlxArray::from_data_copy(&params_bytes, &[3], MlxDtype::Uint32, stream)?;
+        let inputs: &[&MlxArray] = &[x, &qw.indices, &qw.lut, &qw.norms, &params];
 
         let result = ironmill_mlx_sys::metal_kernel(
-            "polarquant_matvec",
+            "polarquant_matmul",
             inputs,
-            outputs,
-            kernel_source,
-            [grid_x, grid_y, 1],
-            [tg_size, 1, 1],
+            &[],
+            POLARQUANT_MATMUL_SOURCE,
+            [(n + 31) / 32, (m + 7) / 8, 1],
+            [32, 8, 1],
             output_shapes,
             &output_dtypes,
             stream,
         )?;
-
         result
             .into_iter()
             .next()

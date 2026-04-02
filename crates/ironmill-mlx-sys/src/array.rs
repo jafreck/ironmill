@@ -217,6 +217,7 @@ impl Clone for MlxArray {
 
 impl Drop for MlxArray {
     fn drop(&mut self) {
+        #[cfg(not(mlx_stub))]
         if !self.raw.ctx.is_null() {
             unsafe { ffi::mlx_array_free(self.raw) };
             self.raw.ctx = std::ptr::null_mut();

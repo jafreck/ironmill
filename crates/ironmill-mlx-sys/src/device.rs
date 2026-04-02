@@ -8,6 +8,7 @@ use crate::ffi;
 // ---------------------------------------------------------------------------
 
 /// Safe wrapper around an mlx-c device handle.
+#[cfg_attr(mlx_stub, allow(dead_code))]
 pub struct MlxDevice {
     pub(crate) raw: ffi::mlx_device,
 }
@@ -54,6 +55,7 @@ impl MlxDevice {
 
 impl Drop for MlxDevice {
     fn drop(&mut self) {
+        #[cfg(not(mlx_stub))]
         if !self.raw.ctx.is_null() {
             unsafe { ffi::mlx_device_free(self.raw) };
             self.raw.ctx = std::ptr::null_mut();

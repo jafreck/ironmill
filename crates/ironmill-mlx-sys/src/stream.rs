@@ -11,6 +11,7 @@ use crate::ffi;
 /// Safe wrapper around an mlx-c stream handle.
 ///
 /// Streams in MLX represent an ordered sequence of operations on a device.
+#[cfg_attr(mlx_stub, allow(dead_code))]
 pub struct MlxStream {
     pub(crate) raw: ffi::mlx_stream,
 }
@@ -58,6 +59,7 @@ impl MlxStream {
 
 impl Drop for MlxStream {
     fn drop(&mut self) {
+        #[cfg(not(mlx_stub))]
         if !self.raw.ctx.is_null() {
             unsafe { ffi::mlx_stream_free(self.raw) };
             self.raw.ctx = std::ptr::null_mut();

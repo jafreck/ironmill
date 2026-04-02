@@ -157,7 +157,7 @@ pub(crate) mod ffi {
         non_snake_case,
         dead_code
     )]
-    use std::os::raw::{c_int, c_uint, c_void};
+    use std::os::raw::{c_uint, c_void};
 
     pub type mlx_dtype = c_uint;
     pub type mlx_device_type = c_uint;
@@ -221,14 +221,4 @@ pub(crate) mod ffi {
         pub ctx: *mut c_void,
     }
     pub type mlx_fast_metal_kernel = mlx_fast_metal_kernel_;
-
-    // Stub extern declarations for free functions used in Drop impls.
-    // The linker is never invoked in stub mode.
-    unsafe extern "C" {
-        pub fn mlx_array_free(arr: mlx_array) -> c_int;
-        pub fn mlx_array_new() -> mlx_array;
-        pub fn mlx_array_set(arr: *mut mlx_array, src: mlx_array) -> c_int;
-        pub fn mlx_device_free(dev: mlx_device) -> c_int;
-        pub fn mlx_stream_free(stream: mlx_stream) -> c_int;
-    }
 }
