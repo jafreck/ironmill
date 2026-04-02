@@ -5,12 +5,166 @@
 
 #![allow(dead_code)]
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use mil_rs::ir::passes::tensor_utils::f32_slice_to_bytes;
 use mil_rs::{
     Function, Operation, Program, ScalarType, TensorType, Value, model_to_program, program_to_model,
 };
+use safetensors::Dtype;
+use safetensors::tensor::TensorView;
+
+// ---------------------------------------------------------------------------
+// Tiny-model dimension constants shared across e2e tests
+// ---------------------------------------------------------------------------
+
+pub const HIDDEN: usize = 32;
+pub const INTERMEDIATE: usize = 64;
+pub const NUM_LAYERS: usize = 2;
+pub const NUM_HEADS: usize = 4;
+pub const NUM_KV_HEADS: usize = 2;
+pub const HEAD_DIM: usize = 8; // HIDDEN / NUM_HEADS
+pub const VOCAB: usize = 100;
+pub const MAX_POS: usize = 64;
+
+// ---------------------------------------------------------------------------
+// E2E tensor / model helpers
+// ---------------------------------------------------------------------------
+
+/// Zero-filled FP16 byte buffer for a tensor with the given shape.
+pub fn zeros_f16(shape: &[usize]) -> Vec<u8> {
+    let n: usize = shape.iter().product();
+    vec![0u8; n * 2]
+}
+
+/// Build a config JSON string for a HuggingFace-style model directory.
+///
+/// `model_type` is e.g. `"llama"` or `"qwen2"`.
+pub fn config_json(model_type: &str) -> String {
+    serde_json::json!({
+        "model_type": model_type,
+        "hidden_size": HIDDEN,
+        "intermediate_size": INTERMEDIATE,
+        "num_hidden_layers": NUM_LAYERS,
+        "num_attention_heads": NUM_HEADS,
+        "num_key_value_heads": NUM_KV_HEADS,
+        "vocab_size": VOCAB,
+        "max_position_embeddings": MAX_POS,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "head_dim": HEAD_DIM,
+        "tie_word_embeddings": false
+    })
+    .to_string()
+}
+
+/// Build the base set of LLaMA-style weight tensors (no biases).
+///
+/// Returns `(name, data, shape)` triples suitable for safetensors serialization.
+pub fn build_llama_base_tensors() -> Vec<(String, Vec<u8>, Vec<usize>)> {
+    let mut tensors = Vec::new();
+
+    let mut add = |name: &str, shape: &[usize]| {
+        tensors.push((name.to_string(), zeros_f16(shape), shape.to_vec()));
+    };
+
+    add("model.embed_tokens.weight", &[VOCAB, HIDDEN]);
+
+    for i in 0..NUM_LAYERS {
+        let p = format!("model.layers.{i}");
+        add(
+            &format!("{p}.self_attn.q_proj.weight"),
+            &[NUM_HEADS * HEAD_DIM, HIDDEN],
+        );
+        add(
+            &format!("{p}.self_attn.k_proj.weight"),
+            &[NUM_KV_HEADS * HEAD_DIM, HIDDEN],
+        );
+        add(
+            &format!("{p}.self_attn.v_proj.weight"),
+            &[NUM_KV_HEADS * HEAD_DIM, HIDDEN],
+        );
+        add(
+            &format!("{p}.self_attn.o_proj.weight"),
+            &[HIDDEN, NUM_HEADS * HEAD_DIM],
+        );
+        add(
+            &format!("{p}.mlp.gate_proj.weight"),
+            &[INTERMEDIATE, HIDDEN],
+        );
+        add(&format!("{p}.mlp.up_proj.weight"), &[INTERMEDIATE, HIDDEN]);
+        add(
+            &format!("{p}.mlp.down_proj.weight"),
+            &[HIDDEN, INTERMEDIATE],
+        );
+        add(&format!("{p}.input_layernorm.weight"), &[HIDDEN]);
+        add(&format!("{p}.post_attention_layernorm.weight"), &[HIDDEN]);
+    }
+
+    add("model.norm.weight", &[HIDDEN]);
+    add("lm_head.weight", &[VOCAB, HIDDEN]);
+
+    tensors
+}
+
+/// Write a safetensors model directory with the given config JSON and tensors.
+pub fn write_safetensors_model_dir(
+    dir: &Path,
+    config: &str,
+    tensors: &[(String, Vec<u8>, Vec<usize>)],
+) {
+    fs::write(dir.join("config.json"), config).unwrap();
+
+    let views: Vec<(String, TensorView<'_>)> = tensors
+        .iter()
+        .map(|(name, data, shape)| {
+            let tv = TensorView::new(Dtype::F16, shape.clone(), data).unwrap();
+            (name.clone(), tv)
+        })
+        .collect();
+
+    let bytes = safetensors::serialize(views, None).unwrap();
+    fs::write(dir.join("model.safetensors"), bytes).unwrap();
+}
+
+/// Assert that a program has valid LLM IR structure (const, linear, rms_norm, add ops).
+pub fn assert_valid_llm_ir(program: &Program) {
+    let main = program.main().expect("program should have a main function");
+
+    assert!(
+        !main.body.operations.is_empty(),
+        "main function body should have operations"
+    );
+    assert!(
+        !main.body.outputs.is_empty(),
+        "main function should have outputs"
+    );
+
+    let op_types: Vec<&str> = main
+        .body
+        .operations
+        .iter()
+        .map(|op| op.op_type.as_str())
+        .collect();
+
+    assert!(
+        op_types.contains(&"const"),
+        "program should contain const ops, got: {op_types:?}"
+    );
+    assert!(
+        op_types.contains(&"linear"),
+        "program should contain linear ops, got: {op_types:?}"
+    );
+    assert!(
+        op_types.contains(&"rms_norm"),
+        "program should contain rms_norm ops, got: {op_types:?}"
+    );
+    assert!(
+        op_types.contains(&"add"),
+        "program should contain add ops, got: {op_types:?}"
+    );
+}
 
 /// CoreML spec version used for test conversions.
 pub const SPEC_VERSION: i32 = 8;

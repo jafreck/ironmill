@@ -4,24 +4,14 @@
 //! tensors, loads it through `GgufProvider`, and converts to a MIL IR program.
 //! No network access required.
 
+mod common;
+
 use std::fs;
 
+use common::*;
 use ironmill_compile::templates::weights_to_program;
 use ironmill_compile::weights::gguf::GgufProvider;
 use ironmill_compile::weights::{Architecture, WeightProvider};
-
-// ---------------------------------------------------------------------------
-// Config constants (must match GGUF metadata)
-// ---------------------------------------------------------------------------
-
-const HIDDEN: usize = 32;
-const INTERMEDIATE: usize = 64;
-const NUM_LAYERS: usize = 2;
-const NUM_HEADS: usize = 4;
-const NUM_KV_HEADS: usize = 2;
-const HEAD_DIM: usize = 8;
-const VOCAB: usize = 100;
-const MAX_POS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // GGUF binary builder
@@ -260,43 +250,7 @@ fn gguf_weights_to_program_produces_valid_ir() {
 
     let result = weights_to_program(&provider).expect("weights_to_program should succeed");
 
-    let main = result
-        .program
-        .main()
-        .expect("program should have a main function");
-
-    assert!(
-        !main.body.operations.is_empty(),
-        "main function body should have operations"
-    );
-    assert!(
-        !main.body.outputs.is_empty(),
-        "main function should have outputs"
-    );
-
-    let op_types: Vec<&str> = main
-        .body
-        .operations
-        .iter()
-        .map(|op| op.op_type.as_str())
-        .collect();
-
-    assert!(
-        op_types.contains(&"const"),
-        "program should contain const ops, got: {op_types:?}"
-    );
-    assert!(
-        op_types.contains(&"linear"),
-        "program should contain linear ops, got: {op_types:?}"
-    );
-    assert!(
-        op_types.contains(&"rms_norm"),
-        "program should contain rms_norm ops, got: {op_types:?}"
-    );
-    assert!(
-        op_types.contains(&"add"),
-        "program should contain add ops, got: {op_types:?}"
-    );
+    assert_valid_llm_ir(&result.program);
 }
 
 #[test]
