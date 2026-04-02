@@ -21,7 +21,7 @@ pub(super) fn emit_weight_const(
     provider: &dyn WeightProvider,
     weight_name: &str,
     const_name: &str,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<(), MilError> {
     match provider.tensor(weight_name) {
         Ok(tensor) => {
@@ -39,21 +39,9 @@ pub(super) fn emit_weight_const(
             block.add_op(op);
             Ok(())
         }
-        Err(e) => {
-            warnings.push(format!("missing weight {weight_name}: {e}"));
-            let op = Operation::new("const", const_name)
-                .with_attr(
-                    "val",
-                    Value::Tensor {
-                        data: Vec::new(),
-                        shape: vec![0],
-                        dtype: ScalarType::Float16,
-                    },
-                )
-                .with_output(const_name);
-            block.add_op(op);
-            Ok(())
-        }
+        Err(e) => Err(MilError::Validation(format!(
+            "missing required weight '{weight_name}': {e}"
+        ))),
     }
 }
 
@@ -658,6 +646,12 @@ pub(super) fn emit_attention_core(
 
     // GQA: expand K and V heads when using grouped query attention
     let (k_expanded, v_expanded) = if config.num_attention_heads != config.num_key_value_heads {
+        if config.num_attention_heads % config.num_key_value_heads != 0 {
+            return Err(MilError::Validation(format!(
+                "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+                config.num_attention_heads, config.num_key_value_heads
+            )));
+        }
         let n_rep = config.num_attention_heads / config.num_key_value_heads;
         let k_exp = emit_gqa_expand(block, &k_roped, n_rep, config, layer_idx, "k");
         let v_exp = emit_gqa_expand(block, &v_t, n_rep, config, layer_idx, "v");

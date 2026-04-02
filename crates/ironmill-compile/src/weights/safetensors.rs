@@ -200,20 +200,25 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
 
     let architecture = Architecture::from_str(model_type)?;
 
-    let hidden_size = json_usize(&json, "hidden_size").unwrap_or(0);
-    let intermediate_size = json_usize(&json, "intermediate_size").unwrap_or(0);
-    let num_hidden_layers = json_usize(&json, "num_hidden_layers").unwrap_or(0);
-    let num_attention_heads = json_usize(&json, "num_attention_heads").unwrap_or(0);
+    let hidden_size = json_usize(&json, "hidden_size").ok_or_else(|| {
+        MilError::Validation("missing required field 'hidden_size' in config.json".into())
+    })?;
+    let intermediate_size = json_usize(&json, "intermediate_size").ok_or_else(|| {
+        MilError::Validation("missing required field 'intermediate_size' in config.json".into())
+    })?;
+    let num_hidden_layers = json_usize(&json, "num_hidden_layers").ok_or_else(|| {
+        MilError::Validation("missing required field 'num_hidden_layers' in config.json".into())
+    })?;
+    let num_attention_heads = json_usize(&json, "num_attention_heads").ok_or_else(|| {
+        MilError::Validation("missing required field 'num_attention_heads' in config.json".into())
+    })?;
     let num_key_value_heads =
         json_usize(&json, "num_key_value_heads").unwrap_or(num_attention_heads);
-    let head_dim = json_usize(&json, "head_dim").unwrap_or_else(|| {
-        if num_attention_heads > 0 {
-            ModelConfig::default_head_dim(hidden_size, num_attention_heads)
-        } else {
-            0
-        }
-    });
-    let vocab_size = json_usize(&json, "vocab_size").unwrap_or(0);
+    let head_dim = json_usize(&json, "head_dim")
+        .unwrap_or_else(|| ModelConfig::default_head_dim(hidden_size, num_attention_heads));
+    let vocab_size = json_usize(&json, "vocab_size").ok_or_else(|| {
+        MilError::Validation("missing required field 'vocab_size' in config.json".into())
+    })?;
     let max_position_embeddings = json_usize(&json, "max_position_embeddings").unwrap_or(0);
     let rms_norm_eps = json_f64(&json, "rms_norm_eps").unwrap_or(1e-6);
     let rope_theta = json_f64(&json, "rope_theta").unwrap_or(10000.0);

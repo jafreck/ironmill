@@ -275,7 +275,13 @@ impl CompileBuilder {
         // 7. Optionally compile to .mlmodelc
         let mlmodelc = if self.compile_mlmodelc && is_compiler_available() {
             let output_dir = output_path.parent().unwrap_or(Path::new("."));
-            compile_model(&output_path, output_dir).ok()
+            match compile_model(&output_path, output_dir) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    eprintln!("Warning: model compilation failed: {e}");
+                    None
+                }
+            }
         } else {
             None
         };

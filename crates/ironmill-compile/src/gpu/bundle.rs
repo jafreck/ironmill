@@ -56,7 +56,7 @@ pub fn write_gpu_bundle(
     let tensor_names = provider.tensor_names();
 
     let mut tensors = HashMap::new();
-    let mut global_n_bits: u8 = 4;
+    let mut global_n_bits: Option<u8> = None;
 
     for name in &tensor_names {
         let tensor = provider.tensor(name)?;
@@ -72,7 +72,16 @@ pub fn write_gpu_bundle(
                 row_norms,
                 ..
             } => {
-                global_n_bits = *n_bits;
+                match global_n_bits {
+                    None => global_n_bits = Some(*n_bits),
+                    Some(prev) if prev != *n_bits => {
+                        eprintln!(
+                            "Warning: tensor '{name}' has n_bits={} but global_n_bits is already {prev}",
+                            n_bits
+                        );
+                    }
+                    _ => {}
+                }
 
                 let indices_file = format!("weights/{sanitized}.bin");
                 let lut_file = format!("weights/{sanitized}.lut");
@@ -129,7 +138,7 @@ pub fn write_gpu_bundle(
         model_config: serialize_model_config(config),
         quantization: QuantizationManifest {
             method: "polarquant".to_string(),
-            n_bits: global_n_bits,
+            n_bits: global_n_bits.unwrap_or(4),
             seed: 42,
             min_elements: 1024,
         },

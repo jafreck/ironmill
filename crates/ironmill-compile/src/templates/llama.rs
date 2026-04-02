@@ -374,6 +374,12 @@ fn emit_attention(
 
     // GQA: expand K and V heads to match num_attention_heads when using grouped query attention
     let (k_expanded, v_expanded) = if config.num_attention_heads != config.num_key_value_heads {
+        if config.num_attention_heads % config.num_key_value_heads != 0 {
+            return Err(MilError::Validation(format!(
+                "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+                config.num_attention_heads, config.num_key_value_heads
+            )));
+        }
         let n_rep = config.num_attention_heads / config.num_key_value_heads;
         let k_exp = emit_gqa_expand(block, &k_for_attn, n_rep, config, layer_idx, "k");
         let v_exp = emit_gqa_expand(block, &v_for_attn, n_rep, config, layer_idx, "v");

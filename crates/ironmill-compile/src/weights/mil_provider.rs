@@ -84,6 +84,11 @@ impl MilWeightProvider {
 
                     // Derive n_bits from the LUT element count.
                     let lut_elements = lut_data.len() / lut_dtype.byte_size();
+                    if !lut_elements.is_power_of_two() {
+                        return Err(MilError::Validation(format!(
+                            "LUT element count {lut_elements} is not a power of two for tensor '{name}'"
+                        )));
+                    }
                     let n_bits = (lut_elements as f64).log2() as u8;
 
                     // Look up the corresponding row norms.
