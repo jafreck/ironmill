@@ -85,7 +85,8 @@ pub fn evaluate_perplexity(
         .map(|m| m.min(dataset.num_sequences))
         .unwrap_or(dataset.num_sequences);
 
-    let mut all_losses = Vec::new();
+    let mut running_sum: f64 = 0.0;
+    let mut loss_count: usize = 0;
     let start = std::time::Instant::now();
 
     for (seq_idx, sequence) in dataset.sequences.iter().take(num_sequences).enumerate() {
@@ -97,7 +98,8 @@ pub fn evaluate_perplexity(
 
             let logits = inference.decode(token)?;
             let ce = cross_entropy(&logits, target);
-            all_losses.push(ce);
+            running_sum += ce;
+            loss_count += 1;
 
             if seq_idx == 0 && pos < 10 && std::env::var("IRONMILL_TRACE_CE").is_ok() {
                 let argmax = logits
@@ -114,32 +116,32 @@ pub fn evaluate_perplexity(
         }
 
         if (seq_idx + 1) % 10 == 0 || seq_idx + 1 == num_sequences {
-            let running_ppl = perplexity_from_losses(&all_losses);
+            let running_ppl = (running_sum / loss_count as f64).exp();
             let elapsed = start.elapsed().as_secs_f64();
-            let tok_per_sec = all_losses.len() as f64 / elapsed;
+            let tok_per_sec = loss_count as f64 / elapsed;
             eprintln!(
                 "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
                 seq_idx + 1,
                 num_sequences,
                 running_ppl,
-                all_losses.len(),
+                loss_count,
                 tok_per_sec,
             );
         }
     }
 
-    let perplexity = perplexity_from_losses(&all_losses);
-    let avg_cross_entropy = if all_losses.is_empty() {
+    let avg_cross_entropy = if loss_count == 0 {
         f64::INFINITY
     } else {
-        all_losses.iter().sum::<f64>() / all_losses.len() as f64
+        running_sum / loss_count as f64
     };
+    let perplexity = avg_cross_entropy.exp();
 
     Ok(PerplexityResult {
         config_name: String::new(),
         perplexity,
         avg_cross_entropy,
-        num_tokens_evaluated: all_losses.len(),
+        num_tokens_evaluated: loss_count,
         num_sequences,
     })
 }

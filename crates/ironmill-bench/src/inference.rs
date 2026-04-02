@@ -124,7 +124,6 @@ pub fn run_inference(
     }
 
     let mut latencies = Vec::with_capacity(iterations);
-    let mut predict_times = Vec::with_capacity(iterations);
     let mut total_iteration_times = Vec::with_capacity(iterations);
     let mut peak_rss = rss_after_load;
 
@@ -139,7 +138,6 @@ pub fn run_inference(
         let iter_time = iter_start.elapsed();
 
         latencies.push(predict_time);
-        predict_times.push(predict_time);
         total_iteration_times.push(iter_time);
 
         // Sample RSS periodically (every 100 iterations)
@@ -157,7 +155,7 @@ pub fn run_inference(
     }
 
     let utilization = UtilizationMetrics {
-        predict_times,
+        predict_times: latencies.clone(),
         total_iteration_times,
     };
 
