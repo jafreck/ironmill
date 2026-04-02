@@ -780,7 +780,7 @@ fn compile_and_emit(
             ExpertFrequencyProfile::uniform(expert_count)
         };
 
-        if let Some(fuse_result) = fuse_top_k_experts(program, k, &profile) {
+        if let Some(fuse_result) = fuse_top_k_experts(program, k, &profile)? {
             println!(
                 "MoE top-{k} fusion: kept experts {:?}, discarded {:?}",
                 fuse_result.kept_expert_indices, fuse_result.discarded_expert_indices

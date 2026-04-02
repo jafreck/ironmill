@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::MilError;
 use crate::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 
 // ---------------------------------------------------------------------------
@@ -126,14 +127,25 @@ impl ExpertFrequencyProfile {
     ///
     /// Expert keys are parsed as `usize`.  Keys that don't parse are
     /// silently ignored.
-    pub fn top_k(&self, k: usize) -> Vec<usize> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MilError::Validation`] if any frequency value is NaN or
+    /// infinite.
+    pub fn top_k(&self, k: usize) -> Result<Vec<usize>, MilError> {
+        if self.expert_frequencies.values().any(|v| !v.is_finite()) {
+            return Err(MilError::Validation(
+                "expert frequency profile contains NaN or infinite values".into(),
+            ));
+        }
+
         let mut entries: Vec<(usize, f64)> = self
             .expert_frequencies
             .iter()
             .filter_map(|(key, &freq)| key.parse::<usize>().ok().map(|id| (id, freq)))
             .collect();
-        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        entries.into_iter().take(k).map(|(id, _)| id).collect()
+        entries.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Ok(entries.into_iter().take(k).map(|(id, _)| id).collect())
     }
 
     /// Build a uniform profile where every expert has equal frequency.
@@ -259,21 +271,32 @@ pub fn split_moe(program: &Program, topology: &MoeTopology) -> MoeSplitResult {
 /// 4. Removes router/gating ops since expert selection is now static.
 ///
 /// Returns `None` if no MoE pattern is detected or if K is zero.
+///
+/// # Errors
+///
+/// Returns [`MilError::Validation`] if the frequency profile contains
+/// non-finite values.
 pub fn fuse_top_k_experts(
     program: &Program,
     k: usize,
     profile: &ExpertFrequencyProfile,
-) -> Option<MoeFuseResult> {
+) -> Result<Option<MoeFuseResult>, MilError> {
     if k == 0 {
-        return None;
+        return Ok(None);
     }
 
-    let topology = detect_moe(program)?;
-    let func = program.main()?;
+    let topology = match detect_moe(program) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let func = match program.main() {
+        Some(f) => f,
+        None => return Ok(None),
+    };
     let ops = &func.body.operations;
 
     // Select top-K expert indices
-    let mut selected = profile.top_k(k);
+    let mut selected = profile.top_k(k)?;
     // Clamp to available experts
     selected.retain(|&id| id < topology.expert_count);
     if selected.is_empty() {
@@ -449,11 +472,11 @@ pub fn fuse_top_k_experts(
     let mut fused_program = Program::new(&program.version);
     fused_program.add_function(fused_func);
 
-    Some(MoeFuseResult {
+    Ok(Some(MoeFuseResult {
         program: fused_program,
         kept_expert_indices: selected,
         discarded_expert_indices: discarded,
-    })
+    }))
 }
 
 /// Rewire a [`Value`] reference: if it points to a name not in
@@ -1373,7 +1396,7 @@ mod tests {
     fn profile_top_k_ordering() {
         let json = r#"{"expert_frequencies": {"0": 0.10, "1": 0.45, "2": 0.30, "3": 0.15}}"#;
         let profile = ExpertFrequencyProfile::from_json(json).unwrap();
-        let top2 = profile.top_k(2);
+        let top2 = profile.top_k(2).unwrap();
         assert_eq!(top2, vec![1, 2]);
     }
 
@@ -1381,8 +1404,22 @@ mod tests {
     fn profile_top_k_clamps_to_available() {
         let json = r#"{"expert_frequencies": {"0": 0.5, "1": 0.5}}"#;
         let profile = ExpertFrequencyProfile::from_json(json).unwrap();
-        let top5 = profile.top_k(5);
+        let top5 = profile.top_k(5).unwrap();
         assert_eq!(top5.len(), 2);
+    }
+
+    #[test]
+    fn profile_top_k_rejects_nan() {
+        let mut profile = ExpertFrequencyProfile::uniform(2);
+        profile.expert_frequencies.insert("0".into(), f64::NAN);
+        assert!(profile.top_k(2).is_err());
+    }
+
+    #[test]
+    fn profile_top_k_rejects_infinity() {
+        let mut profile = ExpertFrequencyProfile::uniform(2);
+        profile.expert_frequencies.insert("1".into(), f64::INFINITY);
+        assert!(profile.top_k(2).is_err());
     }
 
     #[test]
@@ -1479,9 +1516,9 @@ mod tests {
             r#"{"expert_frequencies": {"0": 0.10, "1": 0.45, "2": 0.30, "3": 0.15}}"#;
         let profile = ExpertFrequencyProfile::from_json(profile_json).unwrap();
 
-        let result = fuse_top_k_experts(&program, 2, &profile).expect("should fuse");
-
-        // Kept experts 1 and 2 (highest freq)
+        let result = fuse_top_k_experts(&program, 2, &profile)
+            .expect("no error")
+            .expect("should fuse");
         assert_eq!(result.kept_expert_indices, vec![1, 2]);
         assert_eq!(result.discarded_expert_indices, vec![0, 3]);
 
@@ -1535,8 +1572,9 @@ mod tests {
         let profile_json = r#"{"expert_frequencies": {"0": 0.7, "1": 0.3}}"#;
         let profile = ExpertFrequencyProfile::from_json(profile_json).unwrap();
 
-        let result = fuse_top_k_experts(&program, 1, &profile).expect("should fuse");
-        assert_eq!(result.kept_expert_indices, vec![0]);
+        let result = fuse_top_k_experts(&program, 1, &profile)
+            .expect("no error")
+            .expect("should fuse");
         assert_eq!(result.discarded_expert_indices, vec![1]);
 
         let fused_func = result.program.main().unwrap();
@@ -1563,14 +1601,14 @@ mod tests {
         program.add_function(func);
 
         let profile = ExpertFrequencyProfile::uniform(2);
-        assert!(fuse_top_k_experts(&program, 1, &profile).is_none());
+        assert!(fuse_top_k_experts(&program, 1, &profile).unwrap().is_none());
     }
 
     #[test]
     fn fuse_returns_none_for_k_zero() {
         let program = make_named_moe_program();
         let profile = ExpertFrequencyProfile::uniform(2);
-        assert!(fuse_top_k_experts(&program, 0, &profile).is_none());
+        assert!(fuse_top_k_experts(&program, 0, &profile).unwrap().is_none());
     }
 
     #[test]
@@ -1578,7 +1616,9 @@ mod tests {
         let program = make_named_moe_program();
         let profile = ExpertFrequencyProfile::uniform(2);
 
-        let result = fuse_top_k_experts(&program, 2, &profile).expect("should fuse");
+        let result = fuse_top_k_experts(&program, 2, &profile)
+            .expect("no error")
+            .expect("should fuse");
         // Both experts kept
         assert_eq!(result.kept_expert_indices.len(), 2);
         assert!(result.discarded_expert_indices.is_empty());
@@ -1590,7 +1630,9 @@ mod tests {
         let profile_json = r#"{"expert_frequencies": {"0": 0.6, "1": 0.4}}"#;
         let profile = ExpertFrequencyProfile::from_json(profile_json).unwrap();
 
-        let result = fuse_top_k_experts(&program, 1, &profile).expect("should fuse");
+        let result = fuse_top_k_experts(&program, 1, &profile)
+            .expect("no error")
+            .expect("should fuse");
         let fused_func = result.program.main().unwrap();
 
         // The shared embedding op should still be present

@@ -115,9 +115,7 @@ impl Pass for PalettizePass {
                     continue;
                 }
 
-                let (centroids, assignments) = kmeans(&floats, k, self.max_iter);
-
-                // Build LUT tensor (centroids as f32 bytes).
+                let (centroids, assignments) = kmeans(&floats, k, self.max_iter)?;
                 let lut_data: Vec<u8> = match original_dtype {
                     ScalarType::Float16 => centroids
                         .iter()
@@ -210,7 +208,7 @@ impl Pass for GroupedPalettizePass {
                 // Need at least 2-D tensor to group along the output channel
                 // (first) dimension. Fall back to ungrouped for 1-D tensors.
                 if shape.len() < 2 {
-                    let (centroids, assignments) = kmeans(&floats, k, self.max_iter);
+                    let (centroids, assignments) = kmeans(&floats, k, self.max_iter)?;
                     apply_lut_transform(
                         op,
                         &centroids,
@@ -231,7 +229,7 @@ impl Pass for GroupedPalettizePass {
                 // a single index space. If n_groups * k > 256 the indices would
                 // exceed the 8-bit packing limit — fall back to ungrouped.
                 if n_groups * k > 256 {
-                    let (centroids, assignments) = kmeans(&floats, k, self.max_iter);
+                    let (centroids, assignments) = kmeans(&floats, k, self.max_iter)?;
                     apply_lut_transform(
                         op,
                         &centroids,
@@ -256,7 +254,7 @@ impl Pass for GroupedPalettizePass {
                     let elem_end = ch_end * elements_per_channel;
                     let group_data = &floats[elem_start..elem_end];
 
-                    let (centroids, assignments) = kmeans(group_data, k, self.max_iter);
+                    let (centroids, assignments) = kmeans(group_data, k, self.max_iter)?;
 
                     all_lut_values.extend_from_slice(&centroids);
                     // Offset indices so each group occupies its own range.
@@ -409,7 +407,9 @@ fn pack_indices(indices: &[usize], n_bits: u8) -> Vec<u8> {
     let mask = (1u16 << n_bits) - 1;
     let total_bits = indices.len() * n_bits as usize;
     let n_bytes = total_bits.div_ceil(8);
-    let mut packed = vec![0u8; n_bytes];
+    // Allocate one extra byte so the last value's lo byte always has a
+    // valid destination, then truncate back to the true output size.
+    let mut packed = vec![0u8; n_bytes + 1];
 
     for (i, &idx) in indices.iter().enumerate() {
         let bit_offset = i * n_bits as usize;
@@ -421,11 +421,10 @@ fn pack_indices(indices: &[usize], n_bits: u8) -> Vec<u8> {
         let shifted = val << (16 - n_bits as usize - bit_in_byte);
         let [hi, lo] = shifted.to_be_bytes();
         packed[byte_pos] |= hi;
-        if byte_pos + 1 < n_bytes {
-            packed[byte_pos + 1] |= lo;
-        }
+        packed[byte_pos + 1] |= lo;
     }
 
+    packed.truncate(n_bytes);
     packed
 }
 

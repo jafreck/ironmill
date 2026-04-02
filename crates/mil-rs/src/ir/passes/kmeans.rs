@@ -3,6 +3,8 @@
 //! Used by [`PalettizePass`](super::palettize::PalettizePass) to compress
 //! weight tensors into lookup-table palettes.
 
+use crate::error::{MilError, Result};
+
 /// Run k-means clustering on 1-D `data` producing `k` centroids.
 ///
 /// Returns `(centroids, assignments)` where `centroids` has length `k` and
@@ -10,11 +12,22 @@
 ///
 /// Uses kmeans++ initialization and converges when assignments stabilise or
 /// `max_iter` iterations have been performed.
-pub fn kmeans(data: &[f32], k: usize, max_iter: usize) -> (Vec<f32>, Vec<usize>) {
+///
+/// # Errors
+///
+/// Returns [`MilError::Validation`] if any element of `data` is NaN or
+/// infinite.
+pub fn kmeans(data: &[f32], k: usize, max_iter: usize) -> Result<(Vec<f32>, Vec<usize>)> {
     assert!(k > 0, "k must be at least 1");
 
+    if data.iter().any(|x| !x.is_finite()) {
+        return Err(MilError::Validation(
+            "k-means input contains NaN or infinite values".into(),
+        ));
+    }
+
     if data.is_empty() {
-        return (vec![0.0; k], vec![]);
+        return Ok((vec![0.0; k], vec![]));
     }
 
     // If k >= n_values, each value gets its own centroid.
@@ -23,7 +36,7 @@ pub fn kmeans(data: &[f32], k: usize, max_iter: usize) -> (Vec<f32>, Vec<usize>)
         let mut centroids: Vec<f32> = data.to_vec();
         centroids.resize(k, *data.last().unwrap());
         let assignments: Vec<usize> = (0..n).collect();
-        return (centroids, assignments);
+        return Ok((centroids, assignments));
     }
 
     // Deduplicate — if there are fewer unique values than k, cap k.
@@ -49,7 +62,7 @@ pub fn kmeans(data: &[f32], k: usize, max_iter: usize) -> (Vec<f32>, Vec<usize>)
         centroids.resize(k, pad_val);
     }
 
-    (centroids, assignments)
+    Ok((centroids, assignments))
 }
 
 /// kmeans++ initialization: greedily pick centroids that are spread out.
@@ -83,7 +96,7 @@ fn kmeans_pp_init(data: &[f32], k: usize) -> Vec<f32> {
             .iter()
             .enumerate()
             .filter(|(i, _)| !chosen_indices.contains(i))
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i)
             .unwrap_or(0);
 
@@ -104,7 +117,7 @@ fn assign(data: &[f32], centroids: &[f32]) -> Vec<usize> {
                 .min_by(|(_, a), (_, b)| {
                     let da = (x - **a).abs();
                     let db = (x - **b).abs();
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    da.total_cmp(&db)
                 })
                 .map(|(i, _)| i)
                 .unwrap_or(0)
@@ -135,7 +148,7 @@ fn update_centroids(data: &[f32], centroids: &mut [f32], assignments: &mut [usiz
                 .max_by(|(i, a), (j, b)| {
                     let da = (**a - centroids[assignments[*i]]).abs();
                     let db = (**b - centroids[assignments[*j]]).abs();
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    da.total_cmp(&db)
                 })
                 .map(|(idx, _)| idx)
                 .unwrap();
@@ -162,7 +175,7 @@ mod tests {
     fn basic_convergence() {
         // Two clear clusters around 0.0 and 10.0
         let data: Vec<f32> = vec![0.0, 0.1, 0.2, 10.0, 10.1, 10.2];
-        let (centroids, assignments) = kmeans(&data, 2, 100);
+        let (centroids, assignments) = kmeans(&data, 2, 100).unwrap();
 
         assert_eq!(centroids.len(), 2);
         // Each point in the first cluster should share an assignment, likewise
@@ -177,7 +190,7 @@ mod tests {
     #[test]
     fn all_same_values() {
         let data = vec![5.0; 20];
-        let (centroids, assignments) = kmeans(&data, 4, 50);
+        let (centroids, assignments) = kmeans(&data, 4, 50).unwrap();
 
         // With only 1 unique value, effective_k = 1; remaining centroids are
         // padded to the requested k.
@@ -190,7 +203,7 @@ mod tests {
     #[test]
     fn k_greater_than_n_values() {
         let data = vec![1.0, 2.0, 3.0];
-        let (centroids, assignments) = kmeans(&data, 8, 50);
+        let (centroids, assignments) = kmeans(&data, 8, 50).unwrap();
 
         assert_eq!(centroids.len(), 8);
         assert_eq!(assignments.len(), 3);
@@ -220,7 +233,7 @@ mod tests {
     #[test]
     fn empty_data() {
         let data: Vec<f32> = vec![];
-        let (centroids, assignments) = kmeans(&data, 4, 50);
+        let (centroids, assignments) = kmeans(&data, 4, 50).unwrap();
         assert_eq!(centroids.len(), 4);
         assert!(assignments.is_empty());
     }
@@ -228,9 +241,21 @@ mod tests {
     #[test]
     fn single_element() {
         let data = vec![42.0];
-        let (centroids, assignments) = kmeans(&data, 2, 50);
+        let (centroids, assignments) = kmeans(&data, 2, 50).unwrap();
         assert_eq!(centroids.len(), 2);
         assert_eq!(assignments.len(), 1);
+    }
+
+    #[test]
+    fn rejects_nan() {
+        let data = vec![1.0, f32::NAN, 3.0];
+        assert!(kmeans(&data, 2, 50).is_err());
+    }
+
+    #[test]
+    fn rejects_infinity() {
+        let data = vec![1.0, f32::INFINITY, 3.0];
+        assert!(kmeans(&data, 2, 50).is_err());
     }
 
     #[test]
@@ -241,7 +266,7 @@ mod tests {
                 data.push(center + i as f32 * 0.1);
             }
         }
-        let (centroids, assignments) = kmeans(&data, 4, 100);
+        let (centroids, assignments) = kmeans(&data, 4, 100).unwrap();
         assert_eq!(centroids.len(), 4);
 
         // Points in the same original cluster should share an assignment.

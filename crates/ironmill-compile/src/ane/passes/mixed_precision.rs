@@ -614,7 +614,10 @@ impl PerExpertQuantPass {
             };
 
             let k = 1usize << n_bits;
-            let (centroids, assignments) = kmeans(&floats, k, 100);
+            let (centroids, assignments) = match kmeans(&floats, k, 100) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
 
             let lut_bytes: Vec<u8> = centroids.iter().flat_map(|c| c.to_le_bytes()).collect();
             let packed_indices = pack_indices(&assignments, n_bits);
