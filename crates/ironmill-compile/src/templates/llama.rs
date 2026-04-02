@@ -396,75 +396,15 @@ fn emit_attention(
         (k_for_attn, v_for_attn)
     };
 
-    // Transpose K for matmul: [batch, n_heads, head_dim, seq]
-    let k_t2 = emit_transpose(
+    // Scaled dot-product attention: QK^T / sqrt(d) + mask → softmax → AV
+    let attn_output = emit_sdpa(
         block,
+        layer_idx,
+        config.head_dim,
+        &q_roped,
         &k_expanded,
-        &format!("l{layer_idx}_k_transpose2"),
-        &[0, 1, 3, 2],
+        &v_expanded,
     );
-
-    // QK^T matmul
-    let qk = {
-        let out_name = format!("l{layer_idx}_qk_matmul");
-        let op = Operation::new("matmul", format!("l{layer_idx}_qk_matmul_op"))
-            .with_input("x", Value::Reference(q_roped))
-            .with_input("y", Value::Reference(k_t2))
-            .with_output(&out_name);
-        block.add_op(op);
-        out_name
-    };
-
-    // Scale by 1/sqrt(head_dim)
-    let scale = {
-        let scale_val = 1.0 / (config.head_dim as f64).sqrt();
-        let scale_const = format!("l{layer_idx}_attn_scale_const");
-        let op = Operation::new("const", &scale_const)
-            .with_attr("val", Value::Float(scale_val))
-            .with_output(&scale_const);
-        block.add_op(op);
-
-        let out_name = format!("l{layer_idx}_attn_scaled");
-        let op = Operation::new("mul", format!("l{layer_idx}_attn_scale_op"))
-            .with_input("x", Value::Reference(qk))
-            .with_input("y", Value::Reference(scale_const))
-            .with_output(&out_name);
-        block.add_op(op);
-        out_name
-    };
-
-    // Apply causal mask
-    let masked = {
-        let out_name = format!("l{layer_idx}_attn_masked");
-        let op = Operation::new("add", format!("l{layer_idx}_attn_mask_op"))
-            .with_input("x", Value::Reference(scale))
-            .with_input("y", Value::Reference("causal_mask".into()))
-            .with_output(&out_name);
-        block.add_op(op);
-        out_name
-    };
-
-    // Softmax
-    let attn_weights = {
-        let out_name = format!("l{layer_idx}_attn_weights");
-        let op = Operation::new("softmax", format!("l{layer_idx}_softmax_op"))
-            .with_input("x", Value::Reference(masked))
-            .with_attr("axis", Value::Int(-1))
-            .with_output(&out_name);
-        block.add_op(op);
-        out_name
-    };
-
-    // Attention @ V
-    let attn_output = {
-        let out_name = format!("l{layer_idx}_attn_output");
-        let op = Operation::new("matmul", format!("l{layer_idx}_av_matmul_op"))
-            .with_input("x", Value::Reference(attn_weights))
-            .with_input("y", Value::Reference(v_expanded))
-            .with_output(&out_name);
-        block.add_op(op);
-        out_name
-    };
 
     // Transpose back: [batch, n_heads, seq, head_dim] -> [batch, seq, n_heads, head_dim]
     let attn_transposed = emit_transpose(
@@ -494,6 +434,89 @@ fn emit_attention(
     )?;
 
     Ok(o_proj)
+}
+
+// ---------------------------------------------------------------------------
+// Scaled dot-product attention (QK^T / sqrt(d) + mask → softmax → AV)
+// ---------------------------------------------------------------------------
+
+/// Emit the core scaled dot-product attention: transpose K, compute QK^T,
+/// scale by 1/sqrt(head_dim), apply causal mask, softmax, and multiply by V.
+fn emit_sdpa(
+    block: &mut Block,
+    layer_idx: usize,
+    head_dim: usize,
+    q: &str,
+    k: &str,
+    v: &str,
+) -> String {
+    // Transpose K: [batch, heads, head_dim, seq]
+    let k_t = emit_transpose(
+        block,
+        k,
+        &format!("l{layer_idx}_k_transpose2"),
+        &[0, 1, 3, 2],
+    );
+
+    // QK^T matmul
+    let qk = {
+        let out_name = format!("l{layer_idx}_qk_matmul");
+        let op = Operation::new("matmul", format!("l{layer_idx}_qk_matmul_op"))
+            .with_input("x", Value::Reference(q.to_string()))
+            .with_input("y", Value::Reference(k_t))
+            .with_output(&out_name);
+        block.add_op(op);
+        out_name
+    };
+
+    // Scale by 1/sqrt(head_dim)
+    let scaled = {
+        let scale_val = 1.0 / (head_dim as f64).sqrt();
+        let scale_const = format!("l{layer_idx}_attn_scale_const");
+        let op = Operation::new("const", &scale_const)
+            .with_attr("val", Value::Float(scale_val))
+            .with_output(&scale_const);
+        block.add_op(op);
+
+        let out_name = format!("l{layer_idx}_attn_scaled");
+        let op = Operation::new("mul", format!("l{layer_idx}_attn_scale_op"))
+            .with_input("x", Value::Reference(qk))
+            .with_input("y", Value::Reference(scale_const))
+            .with_output(&out_name);
+        block.add_op(op);
+        out_name
+    };
+
+    // Apply causal mask
+    let masked = {
+        let out_name = format!("l{layer_idx}_attn_masked");
+        let op = Operation::new("add", format!("l{layer_idx}_attn_mask_op"))
+            .with_input("x", Value::Reference(scaled))
+            .with_input("y", Value::Reference("causal_mask".into()))
+            .with_output(&out_name);
+        block.add_op(op);
+        out_name
+    };
+
+    // Softmax
+    let weights = {
+        let out_name = format!("l{layer_idx}_attn_weights");
+        let op = Operation::new("softmax", format!("l{layer_idx}_softmax_op"))
+            .with_input("x", Value::Reference(masked))
+            .with_attr("axis", Value::Int(-1))
+            .with_output(&out_name);
+        block.add_op(op);
+        out_name
+    };
+
+    // Attention @ V
+    let out_name = format!("l{layer_idx}_attn_output");
+    let op = Operation::new("matmul", format!("l{layer_idx}_av_matmul_op"))
+        .with_input("x", Value::Reference(weights))
+        .with_input("y", Value::Reference(v.to_string()))
+        .with_output(&out_name);
+    block.add_op(op);
+    out_name
 }
 
 // ---------------------------------------------------------------------------

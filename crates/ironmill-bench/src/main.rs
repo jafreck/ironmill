@@ -138,6 +138,186 @@ struct Cli {
     perplexity_dataset: PathBuf,
 }
 
+/// Run CoreML benchmark loop across models × optimizations × compute units.
+fn run_coreml_benchmarks(
+    matrix: &config::BenchMatrix,
+    compute_units: &[ironmill_inference::coreml_runtime::ComputeUnits],
+    cache_dir: &std::path::Path,
+    no_cache: bool,
+    power_enabled: bool,
+    idle_power: &Option<power::PowerMetrics>,
+    report_rows: &mut Vec<ReportRow>,
+) -> Result<()> {
+    for model_cfg in &matrix.models {
+        let model_flops = compute_model_flops(model_cfg);
+        if let Some(flops) = model_flops {
+            eprintln!(
+                "  Model FLOPs: {:.2}G ({:.2}M MACs)",
+                flops as f64 / 1e9,
+                flops as f64 / 2e6
+            );
+        }
+
+        for opt_cfg in &matrix.optimizations {
+            eprintln!("Compiling {} with {}...", model_cfg.name, opt_cfg.name);
+            let mlmodelc = compiler::compile_model(model_cfg, opt_cfg, cache_dir, no_cache)?;
+
+            for &cu in compute_units {
+                eprintln!("  Running inference ({cu})...");
+
+                let power_sampler = if power_enabled {
+                    let expected_duration_sec =
+                        matrix.settings.iterations as f64 * 0.001 * matrix.settings.runs as f64;
+                    let samples = (expected_duration_sec * 10.0).max(20.0) as usize;
+                    power::PowerSampler::start(100, samples)
+                } else {
+                    None
+                };
+
+                let mut run_results = Vec::new();
+                let mut last_utilization = None;
+                let mut last_memory = None;
+                let mut last_load_time = None;
+
+                for run_idx in 0..matrix.settings.runs {
+                    let result = inference::run_inference(
+                        &mlmodelc,
+                        cu,
+                        matrix.settings.iterations,
+                        matrix.settings.warmup,
+                    )?;
+
+                    last_load_time = Some(result.load_time.as_secs_f64() * 1000.0);
+                    last_utilization = result.utilization;
+                    last_memory = result.memory;
+
+                    let latencies_ms: Vec<f64> = result
+                        .latencies
+                        .iter()
+                        .map(|d| d.as_secs_f64() * 1000.0)
+                        .collect();
+
+                    let label =
+                        format!("{}/{}/{}/run{}", model_cfg.name, opt_cfg.name, cu, run_idx);
+                    run_results.push(compute_stats_with_flops(&label, &latencies_ms, model_flops));
+                }
+
+                let label = format!("{}/{}/{}", model_cfg.name, opt_cfg.name, cu);
+                let aggregated = aggregate_runs(&label, &run_results);
+
+                let energy = power_sampler.and_then(|sampler| {
+                    let power_metrics = sampler.finish()?;
+                    Some(power::compute_energy_metrics(
+                        power_metrics,
+                        idle_power.clone(),
+                        aggregated.pooled.inferences_per_sec,
+                        aggregated.pooled.median / 1000.0,
+                        aggregated.pooled.tflops,
+                        aggregated.pooled.tokens_per_sec,
+                    ))
+                });
+
+                let utilization_summary = last_utilization
+                    .as_ref()
+                    .map(UtilizationSummary::from_metrics);
+                let memory_summary = last_memory.as_ref().map(MemorySummary::from_metrics);
+
+                report_rows.push(ReportRow {
+                    model: model_cfg.name.clone(),
+                    optimization: opt_cfg.name.clone(),
+                    backend: cu.to_string(),
+                    kv_quant: opt_cfg.kv_quant.to_string(),
+                    result: aggregated,
+                    significance: None,
+                    energy,
+                    utilization: utilization_summary,
+                    memory: memory_summary,
+                    load_time_ms: last_load_time,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply Welch t-test significance against a named baseline optimization.
+fn apply_baseline_significance(report_rows: &mut [ReportRow], baseline_name: &str, alpha: f64) {
+    let baseline_rows: Vec<_> = report_rows
+        .iter()
+        .filter(|r| r.optimization == *baseline_name)
+        .cloned()
+        .collect();
+
+    for row in report_rows.iter_mut() {
+        if row.optimization == *baseline_name {
+            continue;
+        }
+        if let Some(bl) = baseline_rows
+            .iter()
+            .find(|b| b.model == row.model && b.backend == row.backend)
+        {
+            let sig = welch_t_test(&bl.result.pooled, &row.result.pooled, alpha);
+            row.significance = Some(sig);
+        }
+    }
+}
+
+/// Run weight fidelity quality benchmarks for quantized optimizations.
+fn run_quality_eval(matrix: &config::BenchMatrix) {
+    eprintln!("\nRunning weight fidelity quality benchmarks...");
+    let mut summaries = Vec::new();
+
+    for model_cfg in &matrix.models {
+        for opt_cfg in &matrix.optimizations {
+            let (method, bits) = match (&opt_cfg.polar_quantize, &opt_cfg.palettize) {
+                (Some(b), _) => ("polar", *b),
+                (_, Some(b)) => ("palettize", *b),
+                _ => continue,
+            };
+
+            eprintln!(
+                "  Quality: {} with {} ({}-bit)...",
+                model_cfg.name, opt_cfg.name, bits
+            );
+
+            match compiler::build_optimized_program(model_cfg, opt_cfg) {
+                Ok(program) => {
+                    let results = quality::measure_program_quality(&program, method, bits);
+                    if let Some(summary) = quality::summarize_quality(&model_cfg.name, &results) {
+                        summaries.push(summary);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("    ✗ failed: {e}");
+                }
+            }
+        }
+    }
+
+    if !summaries.is_empty() {
+        eprintln!();
+        eprint!("{}", quality::format_quality_summary(&summaries));
+    } else {
+        eprintln!("  No quantized optimizations to measure.");
+    }
+}
+
+/// Convert report rows to baseline entries for save/compare.
+fn build_baseline_entries(rows: &[ReportRow]) -> Vec<baseline::BaselineEntry> {
+    rows.iter()
+        .map(|row| baseline::BaselineEntry {
+            model: row.model.clone(),
+            optimization: row.optimization.clone(),
+            backend: row.backend.clone(),
+            median_ms: row.result.pooled.median,
+            mean_ms: row.result.pooled.mean,
+            p95_ms: row.result.pooled.p95,
+            inferences_per_sec: row.result.pooled.inferences_per_sec,
+            tflops: row.result.pooled.tflops,
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -233,104 +413,16 @@ fn main() -> Result<()> {
     let run_coreml_bench = run_latency_bench && !compute_units.is_empty();
 
     if run_coreml_bench {
-        for model_cfg in &matrix.models {
-            // Compute model FLOPs if we can parse the model
-            let model_flops = compute_model_flops(model_cfg);
-            if let Some(flops) = model_flops {
-                eprintln!(
-                    "  Model FLOPs: {:.2}G ({:.2}M MACs)",
-                    flops as f64 / 1e9,
-                    flops as f64 / 2e6
-                );
-            }
-
-            for opt_cfg in &matrix.optimizations {
-                eprintln!("Compiling {} with {}...", model_cfg.name, opt_cfg.name);
-                let mlmodelc =
-                    compiler::compile_model(model_cfg, opt_cfg, &cache_dir, cli.no_cache)?;
-
-                for &cu in &compute_units {
-                    eprintln!("  Running inference ({cu})...");
-
-                    // Start power sampling if enabled
-                    let power_sampler = if power_enabled {
-                        let expected_duration_sec =
-                            matrix.settings.iterations as f64 * 0.001 * matrix.settings.runs as f64;
-                        let samples = (expected_duration_sec * 10.0).max(20.0) as usize;
-                        power::PowerSampler::start(100, samples)
-                    } else {
-                        None
-                    };
-
-                    let mut run_results = Vec::new();
-                    let mut last_utilization = None;
-                    let mut last_memory = None;
-                    let mut last_load_time = None;
-
-                    for run_idx in 0..matrix.settings.runs {
-                        let result = inference::run_inference(
-                            &mlmodelc,
-                            cu,
-                            matrix.settings.iterations,
-                            matrix.settings.warmup,
-                        )?;
-
-                        last_load_time = Some(result.load_time.as_secs_f64() * 1000.0);
-                        last_utilization = result.utilization;
-                        last_memory = result.memory;
-
-                        let latencies_ms: Vec<f64> = result
-                            .latencies
-                            .iter()
-                            .map(|d| d.as_secs_f64() * 1000.0)
-                            .collect();
-
-                        let label =
-                            format!("{}/{}/{}/run{}", model_cfg.name, opt_cfg.name, cu, run_idx);
-                        run_results.push(compute_stats_with_flops(
-                            &label,
-                            &latencies_ms,
-                            model_flops,
-                        ));
-                    }
-
-                    let label = format!("{}/{}/{}", model_cfg.name, opt_cfg.name, cu);
-                    let aggregated = aggregate_runs(&label, &run_results);
-
-                    // Collect power metrics
-                    let energy = power_sampler.and_then(|sampler| {
-                        let power_metrics = sampler.finish()?;
-                        Some(power::compute_energy_metrics(
-                            power_metrics,
-                            idle_power.clone(),
-                            aggregated.pooled.inferences_per_sec,
-                            aggregated.pooled.median / 1000.0,
-                            aggregated.pooled.tflops,
-                            aggregated.pooled.tokens_per_sec,
-                        ))
-                    });
-
-                    let utilization_summary = last_utilization
-                        .as_ref()
-                        .map(UtilizationSummary::from_metrics);
-                    let memory_summary = last_memory.as_ref().map(MemorySummary::from_metrics);
-
-                    report_rows.push(ReportRow {
-                        model: model_cfg.name.clone(),
-                        optimization: opt_cfg.name.clone(),
-                        backend: cu.to_string(),
-                        kv_quant: opt_cfg.kv_quant.to_string(),
-                        result: aggregated,
-                        significance: None,
-                        energy,
-                        utilization: utilization_summary,
-                        memory: memory_summary,
-                        load_time_ms: last_load_time,
-                    });
-                }
-            }
-        }
-    } // end run_coreml_bench
+        run_coreml_benchmarks(
+            &matrix,
+            &compute_units,
+            &cache_dir,
+            cli.no_cache,
+            power_enabled,
+            &idle_power,
+            &mut report_rows,
+        )?;
+    }
 
     // ── ANE-direct and Metal benchmarks (independent of CoreML) ──
 
@@ -1132,24 +1224,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(baseline_name) = &cli.baseline {
-        let baseline_rows: Vec<_> = report_rows
-            .iter()
-            .filter(|r| r.optimization == *baseline_name)
-            .cloned()
-            .collect();
-
-        for row in &mut report_rows {
-            if row.optimization == *baseline_name {
-                continue;
-            }
-            if let Some(bl) = baseline_rows
-                .iter()
-                .find(|b| b.model == row.model && b.backend == row.backend)
-            {
-                let sig = welch_t_test(&bl.result.pooled, &row.result.pooled, cli.alpha);
-                row.significance = Some(sig);
-            }
-        }
+        apply_baseline_significance(&mut report_rows, baseline_name, cli.alpha);
     }
 
     let bench_report = BenchReport {
@@ -1161,46 +1236,8 @@ fn main() -> Result<()> {
         print!("{}", report::format_report(&bench_report, cli.output));
     }
 
-    // Quality benchmarks — measure weight fidelity impact of quantization
     if cli.quality {
-        eprintln!("\nRunning weight fidelity quality benchmarks...");
-        let mut summaries = Vec::new();
-
-        for model_cfg in &matrix.models {
-            for opt_cfg in &matrix.optimizations {
-                // Only run quality for quantized optimizations
-                let (method, bits) = match (&opt_cfg.polar_quantize, &opt_cfg.palettize) {
-                    (Some(b), _) => ("polar", *b),
-                    (_, Some(b)) => ("palettize", *b),
-                    _ => continue,
-                };
-
-                eprintln!(
-                    "  Quality: {} with {} ({}-bit)...",
-                    model_cfg.name, opt_cfg.name, bits
-                );
-
-                match compiler::build_optimized_program(model_cfg, opt_cfg) {
-                    Ok(program) => {
-                        let results = quality::measure_program_quality(&program, method, bits);
-                        if let Some(summary) = quality::summarize_quality(&model_cfg.name, &results)
-                        {
-                            summaries.push(summary);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("    ✗ failed: {e}");
-                    }
-                }
-            }
-        }
-
-        if !summaries.is_empty() {
-            eprintln!();
-            eprint!("{}", quality::format_quality_summary(&summaries));
-        } else {
-            eprintln!("  No quantized optimizations to measure.");
-        }
+        run_quality_eval(&matrix);
     }
 
     // Perplexity evaluation — measure model quality via cross-entropy on text corpus
@@ -1310,21 +1347,7 @@ fn main() -> Result<()> {
 
     // Save baseline if requested
     if let Some(baseline_name) = &cli.save_baseline {
-        let entries: Vec<baseline::BaselineEntry> = bench_report
-            .rows
-            .iter()
-            .map(|row| baseline::BaselineEntry {
-                model: row.model.clone(),
-                optimization: row.optimization.clone(),
-                backend: row.backend.clone(),
-                median_ms: row.result.pooled.median,
-                mean_ms: row.result.pooled.mean,
-                p95_ms: row.result.pooled.p95,
-                inferences_per_sec: row.result.pooled.inferences_per_sec,
-                tflops: row.result.pooled.tflops,
-            })
-            .collect();
-
+        let entries = build_baseline_entries(&bench_report.rows);
         let path = baseline::save_baseline(baseline_name, &entries)?;
         eprintln!("Baseline saved: {}", path.display());
     }
@@ -1332,21 +1355,7 @@ fn main() -> Result<()> {
     // Compare against baseline if requested
     if let Some(baseline_name) = &cli.compare_baseline {
         let baseline_data = baseline::load_baseline(baseline_name)?;
-        let current_entries: Vec<baseline::BaselineEntry> = bench_report
-            .rows
-            .iter()
-            .map(|row| baseline::BaselineEntry {
-                model: row.model.clone(),
-                optimization: row.optimization.clone(),
-                backend: row.backend.clone(),
-                median_ms: row.result.pooled.median,
-                mean_ms: row.result.pooled.mean,
-                p95_ms: row.result.pooled.p95,
-                inferences_per_sec: row.result.pooled.inferences_per_sec,
-                tflops: row.result.pooled.tflops,
-            })
-            .collect();
-
+        let current_entries = build_baseline_entries(&bench_report.rows);
         let regression_report =
             baseline::compare_against_baseline(&baseline_data, &current_entries);
         eprintln!(

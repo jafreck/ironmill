@@ -1021,6 +1021,101 @@ impl<D: AneDevice> AneInference<D> {
     }
 
     // -----------------------------------------------------------------------
+    // Decode helpers
+    // -----------------------------------------------------------------------
+
+    /// Execute the post-attention sub-program (O proj + residual + FFN) for one layer.
+    fn run_post_attn_layer(
+        &mut self,
+        layer_idx: usize,
+        attn_out_data: &[f16],
+        hidden: &[f16],
+        num_pre_outputs: usize,
+        hw_profiling: bool,
+        hw_post_attn_ns: &mut u64,
+    ) -> Result<Vec<f16>> {
+        let layer = &mut self.layers[layer_idx];
+        if let Some(ref mut post_attn) = layer.post_attn {
+            if let Some(ref packing) = post_attn.input_packing {
+                // Packed: write all logical inputs into the single tensor.
+                if packing.offsets.len() > 1 && num_pre_outputs > 3 {
+                    let mut residual_buf = Vec::new();
+                    read_f16_channels(&layer.pre_attn.output_tensors[3], &mut residual_buf)?;
+                    let [_, channels, _, total_s] = post_attn.input_tensors[0].shape();
+                    let packed = &mut self.scratch.packed_residual;
+                    packed.clear();
+                    packed.resize(channels * total_s, f16::ZERO);
+                    let c0 = attn_out_data.len().min(channels);
+                    for ch in 0..c0 {
+                        packed[ch * total_s + packing.offsets[0]] = attn_out_data[ch];
+                    }
+                    let c1 = residual_buf.len().min(channels);
+                    for ch in 0..c1 {
+                        packed[ch * total_s + packing.offsets[1]] = residual_buf[ch];
+                    }
+                    post_attn.input_tensors[0].write_f16(packed)?;
+                } else {
+                    super::bundle_manifest::write_packed_inputs(
+                        &mut post_attn.input_tensors[0],
+                        &[attn_out_data],
+                        packing,
+                    )?;
+                }
+            } else {
+                write_f16_padded(
+                    &mut post_attn.input_tensors[0],
+                    attn_out_data,
+                    &mut self.scratch.padded,
+                )?;
+                if post_attn.input_tensors.len() > 1 {
+                    write_f16_padded(
+                        &mut post_attn.input_tensors[1],
+                        hidden,
+                        &mut self.scratch.padded,
+                    )?;
+                }
+            }
+            {
+                let in_refs: Vec<&AneTensor> = post_attn.input_tensors.iter().collect();
+                let mut out_refs: Vec<&mut AneTensor> =
+                    post_attn.output_tensors.iter_mut().collect();
+                ane_eval(
+                    &*self.device,
+                    &post_attn.program,
+                    &in_refs,
+                    &mut out_refs,
+                    self.qos,
+                    hw_profiling,
+                    hw_post_attn_ns,
+                )
+                .map_err(|e| {
+                    AneError::Other(anyhow::anyhow!(
+                        "layer {layer_idx} post_attn eval failed: {e}"
+                    ))
+                })?;
+            }
+            let mut new_hidden = Vec::new();
+            read_f16_channels(&post_attn.output_tensors[0], &mut new_hidden)?;
+
+            // Debug: trace last few layers for explosion diagnosis
+            if self.seq_pos == 0 && layer_idx >= 24 && std::env::var("IRONMILL_TRACE_LAST").is_ok()
+            {
+                let f32s: Vec<f32> = new_hidden.iter().map(|x| x.to_f32()).collect();
+                let absmax = f32s.iter().map(|x| x.abs()).fold(0f32, f32::max);
+                let has_nan = f32s.iter().any(|x| x.is_nan());
+                let has_inf = f32s.iter().any(|x| x.is_infinite());
+                eprintln!(
+                    "  [L{:2}] absmax={:.2} nan={} inf={} first3=[{:.4},{:.4},{:.4}]",
+                    layer_idx, absmax, has_nan, has_inf, f32s[0], f32s[1], f32s[2]
+                );
+            }
+            Ok(new_hidden)
+        } else {
+            Ok(attn_out_data.to_vec())
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Decode
     // -----------------------------------------------------------------------
 
@@ -1050,7 +1145,7 @@ impl<D: AneDevice> AneInference<D> {
         let mut q_buf = std::mem::take(&mut self.scratch.q_data);
         let mut k_buf = std::mem::take(&mut self.scratch.k_data);
         let mut v_buf = std::mem::take(&mut self.scratch.v_data);
-        let mut residual_buf = std::mem::take(&mut self.scratch.residual);
+        let residual_buf = std::mem::take(&mut self.scratch.residual);
 
         // 2. Per-layer: pre_attn → attention → post_attn
         let num_layers = self.layers.len();
@@ -1436,96 +1531,14 @@ impl<D: AneDevice> AneInference<D> {
             } else {
                 None
             };
-            let layer = &mut self.layers[layer_idx];
-            if let Some(ref mut post_attn) = layer.post_attn {
-                if let Some(ref packing) = post_attn.input_packing {
-                    // Packed: write all logical inputs into the single tensor.
-                    if packing.offsets.len() > 1 && num_pre_outputs > 3 {
-                        read_f16_channels(&layer.pre_attn.output_tensors[3], &mut residual_buf)?;
-                        // Build the packed buffer using scratch (avoids per-layer allocation).
-                        let [_, channels, _, total_s] = post_attn.input_tensors[0].shape();
-                        let packed = &mut self.scratch.packed_residual;
-                        packed.clear();
-                        packed.resize(channels * total_s, f16::ZERO);
-                        let c0 = attn_out.len().min(channels);
-                        for ch in 0..c0 {
-                            packed[ch * total_s + packing.offsets[0]] = attn_out[ch];
-                        }
-                        let c1 = residual_buf.len().min(channels);
-                        for ch in 0..c1 {
-                            packed[ch * total_s + packing.offsets[1]] = residual_buf[ch];
-                        }
-                        post_attn.input_tensors[0].write_f16(packed)?;
-                    } else {
-                        super::bundle_manifest::write_packed_inputs(
-                            &mut post_attn.input_tensors[0],
-                            &[&attn_out],
-                            packing,
-                        )?;
-                    }
-                } else {
-                    write_f16_padded(
-                        &mut post_attn.input_tensors[0],
-                        &attn_out,
-                        &mut self.scratch.padded,
-                    )?;
-                    // Write residual (pre-layer hidden state) to the second input.
-                    // The residual flows directly from the decode loop's hidden state,
-                    // not from a pre_attn output, since the 3-way split (pre_attn/
-                    // attention/post_attn) doesn't pass the residual through pre_attn.
-                    if post_attn.input_tensors.len() > 1 {
-                        write_f16_padded(
-                            &mut post_attn.input_tensors[1],
-                            &hidden,
-                            &mut self.scratch.padded,
-                        )?;
-                    }
-                }
-                {
-                    let in_refs: Vec<&AneTensor> = post_attn.input_tensors.iter().collect();
-                    let mut out_refs: Vec<&mut AneTensor> =
-                        post_attn.output_tensors.iter_mut().collect();
-                    ane_eval(
-                        &*self.device,
-                        &post_attn.program,
-                        &in_refs,
-                        &mut out_refs,
-                        self.qos,
-                        hw_profiling,
-                        &mut hw_post_attn_ns,
-                    )
-                    .map_err(|e| {
-                        AneError::Other(anyhow::anyhow!(
-                            "layer {layer_idx} post_attn eval failed: {e}"
-                        ))
-                    })?;
-                }
-                read_f16_channels(&post_attn.output_tensors[0], &mut hidden)?;
-
-                // Debug: trace last few layers for explosion diagnosis
-                if self.seq_pos == 0
-                    && layer_idx >= 24
-                    && std::env::var("IRONMILL_TRACE_LAST").is_ok()
-                {
-                    let f32s: Vec<f32> = hidden.iter().map(|x| x.to_f32()).collect();
-                    let absmax = f32s.iter().map(|x| x.abs()).fold(0f32, f32::max);
-                    let has_nan = f32s.iter().any(|x| x.is_nan());
-                    let has_inf = f32s.iter().any(|x| x.is_infinite());
-                    eprintln!(
-                        "  [L{:2}] absmax={:.2} nan={} inf={} first3=[{:.4},{:.4},{:.4}]",
-                        layer_idx, absmax, has_nan, has_inf, f32s[0], f32s[1], f32s[2]
-                    );
-                }
-            } else {
-                // TODO: Fused FFN path disabled — requires post-attention fusion
-                // (O-proj + first residual + RMSNorm) to produce correct results.
-                // The fused FFN MIL program and compile_fused_ffn() are ready, but
-                // the decode loop cannot use them until the intermediate steps
-                // between attention output and FFN input are also fused or handled
-                // on CPU. See spec Task 3, "Output proj + residual add + RMSNorm"
-                // fusion opportunity.
-                std::mem::swap(&mut hidden, &mut attn_out);
-            }
+            hidden = self.run_post_attn_layer(
+                layer_idx,
+                &attn_out,
+                &hidden,
+                num_pre_outputs,
+                hw_profiling,
+                &mut hw_post_attn_ns,
+            )?;
             if let Some(t) = t0 {
                 d_post_attn += t.elapsed();
             }

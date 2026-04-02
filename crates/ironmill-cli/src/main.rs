@@ -664,6 +664,20 @@ fn resolve_output_path(output: Option<&str>, input_path: &Path, default_suffix: 
     }
 }
 
+/// Convert a MIL program to CoreML, write as .mlpackage, and print status.
+fn write_coreml_package(
+    program: &ironmill_compile::mil::Program,
+    output_path: &str,
+    label: &str,
+) -> Result<()> {
+    let model = program_to_model(program, 9)
+        .with_context(|| format!("Failed to convert {label} to CoreML"))?;
+    println!("  Writing {label}: {output_path}");
+    write_mlpackage(&model, output_path)
+        .with_context(|| format!("Failed to write {output_path}"))?;
+    Ok(())
+}
+
 /// MoE split: write per-expert .mlpackage files and a manifest.
 /// Returns `Ok(true)` if MoE was detected and handled.
 fn emit_moe_split(
@@ -694,22 +708,12 @@ fn emit_moe_split(
     let split_result = split_moe(program, &topology);
     let stem = resolve_output_stem(opts.output.as_deref(), input_path);
 
-    // Write shared program
-    let shared_model = program_to_model(&split_result.shared, COREML_SPEC_VERSION)
-        .context("Failed to convert shared program to CoreML")?;
     let shared_path = format!("{stem}-shared.mlpackage");
-    println!("  Writing shared layers: {shared_path}");
-    write_mlpackage(&shared_model, &shared_path)
-        .with_context(|| format!("Failed to write {shared_path}"))?;
+    write_coreml_package(&split_result.shared, &shared_path, "shared layers")?;
 
-    // Write per-expert programs
     for (i, expert) in split_result.experts.iter().enumerate() {
-        let expert_model = program_to_model(expert, COREML_SPEC_VERSION)
-            .with_context(|| format!("Failed to convert expert {i} to CoreML"))?;
         let expert_path = format!("{stem}-expert-{i}.mlpackage");
-        println!("  Writing expert {i}: {expert_path}");
-        write_mlpackage(&expert_model, &expert_path)
-            .with_context(|| format!("Failed to write {expert_path}"))?;
+        write_coreml_package(expert, &expert_path, &format!("expert {i}"))?;
     }
 
     // Write manifest
@@ -846,12 +850,7 @@ fn emit_topk_fusion(
     );
 
     let output_path = resolve_output_path(opts.output.as_deref(), input_path, "-fused.mlpackage");
-    let model = program_to_model(&fuse_result.program, COREML_SPEC_VERSION)
-        .context("Failed to convert fused program to CoreML")?;
-    println!("  Writing fused model: {output_path}");
-    write_mlpackage(&model, &output_path)
-        .with_context(|| format!("Failed to write {output_path}"))?;
-
+    write_coreml_package(&fuse_result.program, &output_path, "fused model")?;
     compile_output(&output_path);
 
     println!();
@@ -888,21 +887,19 @@ fn emit_speculative_split(
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("Failed to split model for speculative decoding")?;
 
-    // Write draft model
     let draft_path = build_path("-draft.mlpackage");
-    let draft_model = program_to_model(&split_result.draft, COREML_SPEC_VERSION)
-        .context("Failed to convert draft MIL IR to CoreML protobuf")?;
-    println!("Writing draft model ({n_layers} layers): {draft_path}");
-    write_mlpackage(&draft_model, &draft_path)
-        .with_context(|| format!("Failed to write draft mlpackage: {draft_path}"))?;
+    write_coreml_package(
+        &split_result.draft,
+        &draft_path,
+        &format!("draft model ({n_layers} layers)"),
+    )?;
 
-    // Write verifier model
     let verifier_path = build_path("-verifier.mlpackage");
-    let verifier_model = program_to_model(&split_result.verifier, COREML_SPEC_VERSION)
-        .context("Failed to convert verifier MIL IR to CoreML protobuf")?;
-    println!("Writing verifier model (full): {verifier_path}");
-    write_mlpackage(&verifier_model, &verifier_path)
-        .with_context(|| format!("Failed to write verifier mlpackage: {verifier_path}"))?;
+    write_coreml_package(
+        &split_result.verifier,
+        &verifier_path,
+        "verifier model (full)",
+    )?;
 
     compile_output(&draft_path);
     compile_output(&verifier_path);
