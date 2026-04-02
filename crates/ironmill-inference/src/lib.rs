@@ -17,6 +17,7 @@ pub mod gpu;
 #[cfg(feature = "mlx")]
 pub mod mlx;
 pub mod sampling;
+pub mod turboquant;
 pub mod types;
 
 // Re-exports for convenience.
