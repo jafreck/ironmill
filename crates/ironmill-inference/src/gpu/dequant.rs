@@ -4,17 +4,18 @@
 //! and affine-quantized tensors into dense FP16 buffers before uploading
 //! to Metal.
 
+use anyhow::bail;
 use half::f16;
 use mil_rs::ir::ScalarType;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Read a single scalar from `data` at the given byte offset, returning `f32`.
-fn read_typed_f32(data: &[u8], byte_offset: usize, dtype: ScalarType) -> f32 {
+fn read_typed_f32(data: &[u8], byte_offset: usize, dtype: ScalarType) -> anyhow::Result<f32> {
     match dtype {
         ScalarType::Float16 => {
             let bytes = [data[byte_offset], data[byte_offset + 1]];
-            f16::from_le_bytes(bytes).to_f32()
+            Ok(f16::from_le_bytes(bytes).to_f32())
         }
         ScalarType::Float32 => {
             let bytes = [
@@ -23,9 +24,9 @@ fn read_typed_f32(data: &[u8], byte_offset: usize, dtype: ScalarType) -> f32 {
                 data[byte_offset + 2],
                 data[byte_offset + 3],
             ];
-            f32::from_le_bytes(bytes)
+            Ok(f32::from_le_bytes(bytes))
         }
-        other => panic!("unsupported dtype for dequantization: {other:?}"),
+        other => bail!("unsupported dtype for dequantization: {other:?}"),
     }
 }
 
@@ -85,7 +86,7 @@ pub fn dequant_lut_to_dense(
     row_norms: &[u8],
     norms_dtype: ScalarType,
     polar_quant_seed: Option<u64>,
-) -> Vec<u8> {
+) -> anyhow::Result<Vec<u8>> {
     let total_elements: usize = original_shape.iter().product();
     let cols = *original_shape.last().expect("shape must be non-empty");
     let rows = if cols == 0 { 0 } else { total_elements / cols };
@@ -110,11 +111,12 @@ pub fn dequant_lut_to_dense(
     let mut f32_values: Vec<f32> = Vec::with_capacity(work_total);
     for flat_idx in 0..work_total {
         let lut_idx = unpacked[flat_idx];
-        assert!(
-            lut_idx < max_lut_idx,
-            "LUT index {lut_idx} out of bounds (max {max_lut_idx}) at element {flat_idx}/{work_total}"
-        );
-        f32_values.push(read_typed_f32(lut, lut_idx * entry_size, lut_dtype));
+        if lut_idx >= max_lut_idx {
+            bail!(
+                "LUT index {lut_idx} out of bounds (max {max_lut_idx}) at element {flat_idx}/{work_total}"
+            );
+        }
+        f32_values.push(read_typed_f32(lut, lut_idx * entry_size, lut_dtype)?);
     }
 
     // Apply inverse Hadamard rotation if a seed is present.
@@ -130,7 +132,7 @@ pub fn dequant_lut_to_dense(
     // Trim padding and apply per-row norms, convert to FP16.
     let mut output = Vec::with_capacity(total_elements * 2);
     for row in 0..rows {
-        let norm = read_typed_f32(row_norms, row * norm_size, norms_dtype);
+        let norm = read_typed_f32(row_norms, row * norm_size, norms_dtype)?;
         for col in 0..cols {
             let value = f32_values[row * work_cols + col];
             let result = f16::from_f32(value * norm);
@@ -138,7 +140,7 @@ pub fn dequant_lut_to_dense(
         }
     }
 
-    output
+    Ok(output)
 }
 
 /// Dequantize an affine-quantized tensor to FP16 bytes.
@@ -153,7 +155,7 @@ pub fn dequant_affine(
     zero_point_dtype: ScalarType,
     axis: Option<usize>,
     shape: &[usize],
-) -> Vec<u8> {
+) -> anyhow::Result<Vec<u8>> {
     let total_elements: usize = shape.iter().product();
     let scale_elem_size = scale_dtype.byte_size();
     let zp_elem_size = zero_point_dtype.byte_size();
@@ -168,8 +170,8 @@ pub fn dequant_affine(
 
             for i in 0..total_elements {
                 let axis_idx = (i / stride) % axis_size;
-                let s = read_typed_f32(scale, axis_idx * scale_elem_size, scale_dtype);
-                let z = read_typed_f32(zero_point, axis_idx * zp_elem_size, zero_point_dtype);
+                let s = read_typed_f32(scale, axis_idx * scale_elem_size, scale_dtype)?;
+                let z = read_typed_f32(zero_point, axis_idx * zp_elem_size, zero_point_dtype)?;
                 let q = quantized_data[i] as i8 as f32;
                 let result = f16::from_f32((q - z) * s);
                 output.extend_from_slice(&result.to_le_bytes());
@@ -177,8 +179,8 @@ pub fn dequant_affine(
         }
         None => {
             // Per-tensor: single scale and zero_point.
-            let s = read_typed_f32(scale, 0, scale_dtype);
-            let z = read_typed_f32(zero_point, 0, zero_point_dtype);
+            let s = read_typed_f32(scale, 0, scale_dtype)?;
+            let z = read_typed_f32(zero_point, 0, zero_point_dtype)?;
 
             for i in 0..total_elements {
                 let q = quantized_data[i] as i8 as f32;
@@ -188,7 +190,7 @@ pub fn dequant_affine(
         }
     }
 
-    output
+    Ok(output)
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -275,7 +277,8 @@ mod tests {
             &norms,
             ScalarType::Float16,
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(output.len(), 2 * 4 * 2); // 8 elements × 2 bytes
 
@@ -317,7 +320,8 @@ mod tests {
             &norms,
             ScalarType::Float32,
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(output.len(), 4 * 2);
 
@@ -348,7 +352,8 @@ mod tests {
             ScalarType::Float32,
             None,
             &shape,
-        );
+        )
+        .unwrap();
 
         assert_eq!(output.len(), 4 * 2);
 
@@ -383,7 +388,8 @@ mod tests {
             ScalarType::Float16,
             Some(0),
             &shape,
-        );
+        )
+        .unwrap();
 
         assert_eq!(output.len(), 6 * 2);
 
@@ -415,7 +421,8 @@ mod tests {
             ScalarType::Float32,
             None,
             &shape,
-        );
+        )
+        .unwrap();
 
         // i8 interpretation: 128u8 = -128i8
         // (-128 - 0) * 1.0 = -128.0

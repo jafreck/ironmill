@@ -170,7 +170,10 @@ fn bytes_per_element(dtype: &str) -> usize {
         "fp16" => 2,
         "fp32" | "int32" => 4,
         "int8" | "uint8" | "bool" => 1,
-        _ => 2, // default to fp16
+        other => {
+            eprintln!("warning: unknown dtype '{other}', defaulting to fp16 (2 bytes)");
+            2
+        }
     }
 }
 
@@ -222,7 +225,7 @@ pub fn extract_weight_entries_from_bundle(
         let before = &mil_text[..abs_pos];
         let tensor_size = if let Some(tensor_start) = before.rfind("val=tensor<") {
             parse_tensor_byte_size(&mil_text[tensor_start..abs_pos])
-        } else if let Some(tensor_start) = before.rfind("val=tensor<") {
+        } else if let Some(tensor_start) = before.rfind("tensor<") {
             parse_tensor_byte_size(&mil_text[tensor_start..abs_pos])
         } else {
             // Fallback: try parsing just "tensor<...>(" before BLOBFILE

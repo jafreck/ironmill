@@ -620,7 +620,7 @@ impl GpuInference {
                         &bufs.q_proj,
                         &self.pipelines,
                         token_count,
-                    );
+                    )?;
                     enc.end_encoding();
                 }
             }
@@ -699,7 +699,7 @@ impl GpuInference {
                         &bufs.k_proj,
                         &self.pipelines,
                         token_count,
-                    );
+                    )?;
                     enc.end_encoding();
                 }
             }
@@ -778,7 +778,7 @@ impl GpuInference {
                         &bufs.v_proj,
                         &self.pipelines,
                         token_count,
-                    );
+                    )?;
                     enc.end_encoding();
                 }
             }
@@ -1182,7 +1182,7 @@ impl GpuInference {
                         &bufs.ffn_down,
                         &self.pipelines,
                         token_count,
-                    );
+                    )?;
                     enc.end_encoding();
                 }
             }
@@ -1279,7 +1279,7 @@ impl GpuInference {
                         &bufs.ffn_gate,
                         &self.pipelines,
                         token_count,
-                    );
+                    )?;
                     enc.end_encoding();
                 }
             }
@@ -1348,7 +1348,7 @@ impl GpuInference {
                         &bufs.ffn_up,
                         &self.pipelines,
                         token_count,
-                    );
+                    )?;
                     enc.end_encoding();
                 }
             }
@@ -1441,7 +1441,7 @@ impl GpuInference {
                         &bufs.ffn_down,
                         &self.pipelines,
                         token_count,
-                    );
+                    )?;
                     enc.end_encoding();
                 }
             }
@@ -1616,7 +1616,7 @@ fn encode_polarquant_matmul(
     output: &MetalBuffer,
     pipelines: &super::ops::GpuPipelines,
     m: usize,
-) {
+) -> Result<(), InferenceError> {
     let (n, k) = weight.shape; // (out_features, in_features)
 
     let pipeline = match (weight.n_bits, m) {
@@ -1624,7 +1624,12 @@ fn encode_polarquant_matmul(
         (4, _) => &pipelines.polarquant_matmul_int4,
         (8, 1) => &pipelines.polarquant_matvec_int8,
         (8, _) => &pipelines.polarquant_matmul_int8,
-        _ => panic!("unsupported n_bits: {}", weight.n_bits),
+        _ => {
+            return Err(InferenceError::Runtime(format!(
+                "unsupported n_bits: {}",
+                weight.n_bits
+            )));
+        }
     };
 
     encoder.set_pipeline(pipeline);
@@ -1652,9 +1657,8 @@ fn encode_polarquant_matmul(
             (tile_n, tile_m, 1),
         );
     }
+    Ok(())
 }
-
-// ── InferenceEngine implementation ──────────────────────────────
 
 impl InferenceEngine for GpuInference {
     fn load(&mut self, artifacts: &dyn Any) -> Result<(), InferenceError> {

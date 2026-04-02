@@ -48,14 +48,18 @@ impl RuntimeModel for CoremlRuntimeModel {
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
-                _ => vec![0.0f32; t.numel()],
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "unsupported input dtype {:?} for CoreML prediction — only Float32 is supported",
+                        other
+                    ));
+                }
             };
             pi.add_multi_array(&t.name, &t.shape, MultiArrayDataType::Float32, &data_f32)?;
         }
         // Run prediction — output features not yet extracted as RuntimeTensor.
         let _output = self.model.predict(&pi)?;
-        // Return empty for now; full output extraction requires iterating
-        // over MLFeatureProvider which is model-specific.
+        // TODO: extract prediction outputs — currently returns empty
         Ok(vec![])
     }
 }

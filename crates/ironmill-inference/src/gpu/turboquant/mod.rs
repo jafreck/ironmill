@@ -264,10 +264,11 @@ fn create_u32_buffer(
 impl GpuTurboQuantModel {
     /// Initialize TurboQuant with rotation signs and quantization scales.
     pub fn new(device: &MetalDevice, config: TurboQuantGpuConfig) -> Result<Self, GpuError> {
-        assert!(
-            config.head_dim.is_power_of_two(),
-            "head_dim must be a power of two for Walsh-Hadamard butterfly"
-        );
+        if !config.head_dim.is_power_of_two() {
+            return Err(GpuError::Config(
+                "head_dim must be a power of two for Walsh-Hadamard butterfly".to_string(),
+            ));
+        }
 
         let sign_bytes = generate_rotation_signs(config.head_dim, config.rotation_seed);
         let rotation_signs = device

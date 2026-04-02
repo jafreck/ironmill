@@ -394,7 +394,12 @@ fn extract_weight_byte_size(line: &str) -> Option<usize> {
         "uint8" => 1,
         "int16" => 2,
         "int32" => 4,
-        _ => 2, // default to float16
+        other => {
+            eprintln!(
+                "warning: unknown dtype '{other}' in tensor type annotation, defaulting to fp16 (2 bytes)"
+            );
+            2
+        }
     };
 
     // Extract dimensions: [..., [d1, d2, ..., dN]](BLOBFILE
@@ -450,8 +455,10 @@ impl RuntimeModel for AneRuntimeModel {
     }
 
     fn predict(&self, _inputs: &[RuntimeTensor]) -> anyhow::Result<Vec<RuntimeTensor>> {
+        // TODO: ANE RuntimeModel::predict is not yet implemented
         Err(anyhow::anyhow!(
-            "ANE predict through RuntimeModel requires loading a pre-compiled bundle"
+            "ANE predict through RuntimeModel is not yet implemented — \
+             use AneModel::from_bundle() and AneModel::predict() directly for ANE inference"
         ))
     }
 }

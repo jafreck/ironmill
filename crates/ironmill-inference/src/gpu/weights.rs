@@ -23,11 +23,13 @@ pub enum WeightBuffer {
 
 impl WeightBuffer {
     /// Get the underlying buffer for MPS matmul (Dense only).
-    /// Panics if called on Quantized — callers must check type first.
-    pub fn as_dense(&self) -> &MetalBuffer {
+    /// Returns an error if called on a Quantized variant.
+    pub fn as_dense(&self) -> anyhow::Result<&MetalBuffer> {
         match self {
-            WeightBuffer::Dense { buf, .. } => buf,
-            WeightBuffer::Quantized(_) => panic!("expected dense buffer"),
+            WeightBuffer::Dense { buf, .. } => Ok(buf),
+            WeightBuffer::Quantized(_) => Err(anyhow::anyhow!(
+                "expected dense buffer, got quantized weight"
+            )),
         }
     }
 
@@ -310,7 +312,7 @@ fn load_weight_buffer(
                     row_norms,
                     *norms_dtype,
                     *polar_quant_seed,
-                );
+                )?;
                 let buf = device
                     .create_buffer_with_data(&data, StorageMode::Shared)
                     .map_err(GpuError::Metal)?;
@@ -357,7 +359,7 @@ fn load_weight_buffer(
                 *zero_point_dtype,
                 *axis,
                 &tensor.shape,
-            );
+            )?;
             let buf = device
                 .create_buffer_with_data(&data, StorageMode::Shared)
                 .map_err(GpuError::Metal)?;
@@ -406,7 +408,7 @@ fn load_dense_buffer(
             row_norms,
             *norms_dtype,
             *polar_quant_seed,
-        ),
+        )?,
         QuantizationInfo::AffineDequantize {
             scale,
             zero_point,
@@ -421,7 +423,7 @@ fn load_dense_buffer(
             *zero_point_dtype,
             *axis,
             &tensor.shape,
-        ),
+        )?,
     };
     device
         .create_buffer_with_data(&data, StorageMode::Shared)
