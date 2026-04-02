@@ -670,7 +670,7 @@ fn write_coreml_package(
     output_path: &str,
     label: &str,
 ) -> Result<()> {
-    let model = program_to_model(program, 9)
+    let model = program_to_model(program, COREML_SPEC_VERSION)
         .with_context(|| format!("Failed to convert {label} to CoreML"))?;
     println!("  Writing {label}: {output_path}");
     write_mlpackage(&model, output_path)
