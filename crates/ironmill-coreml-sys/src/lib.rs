@@ -19,6 +19,7 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
 
 // ── ComputeUnits ──────────────────────────────────────────────────
 
+/// Which hardware compute units a CoreML model may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ComputeUnits {
     CpuOnly,
@@ -66,6 +67,7 @@ impl ComputeUnits {
 
 // ── MultiArrayDataType ────────────────────────────────────────────
 
+/// Element data type for CoreML multi-array tensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MultiArrayDataType {
     Float32,
@@ -97,20 +99,27 @@ impl MultiArrayDataType {
 
 // ── InputFeature / InputDescription ───────────────────────────────
 
+/// A single multi-array input feature with name, shape, and element type.
 #[derive(Debug, Clone)]
 pub struct InputFeature {
+    /// Feature name.
     pub name: String,
+    /// Tensor shape.
     pub shape: Vec<usize>,
+    /// Element data type.
     pub data_type: MultiArrayDataType,
 }
 
+/// Description of a CoreML model's input features.
 #[derive(Debug, Clone)]
 pub struct InputDescription {
+    /// Multi-array input features required by the model.
     pub features: Vec<InputFeature>,
 }
 
 // ── Model ─────────────────────────────────────────────────────────
 
+/// A loaded CoreML model backed by `MLModel`.
 pub struct Model {
     inner: Retained<MLModel>,
 }
@@ -261,11 +270,13 @@ impl Model {
 
 // ── PredictionInput ───────────────────────────────────────────────
 
+/// Builder for CoreML prediction inputs backed by `MLDictionaryFeatureProvider`.
 pub struct PredictionInput {
     inner: Retained<MLDictionaryFeatureProvider>,
 }
 
 impl PredictionInput {
+    /// Create an empty prediction input.
     pub fn new() -> anyhow::Result<Self> {
         let empty_dict: Retained<NSDictionary<NSString, objc2::runtime::AnyObject>> =
             NSDictionary::new();
@@ -281,6 +292,7 @@ impl PredictionInput {
         Ok(Self { inner: provider })
     }
 
+    /// Add a multi-array feature with the given name, shape, type, and f32 data.
     pub fn add_multi_array(
         &mut self,
         name: &str,
@@ -373,6 +385,7 @@ impl PredictionInput {
 
 // ── PredictionOutput ──────────────────────────────────────────────
 
+/// Output of a CoreML model prediction, wrapping an `MLFeatureProvider`.
 pub struct PredictionOutput {
     inner: Retained<ProtocolObject<dyn MLFeatureProvider>>,
 }

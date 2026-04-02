@@ -59,6 +59,7 @@ pub struct MemorySummary {
 }
 
 impl UtilizationSummary {
+    /// Build a summary from raw utilization metrics.
     pub fn from_metrics(m: &UtilizationMetrics) -> Self {
         Self {
             predict_pct: m.utilization_pct(),
@@ -68,6 +69,7 @@ impl UtilizationSummary {
 }
 
 impl MemorySummary {
+    /// Build a summary from raw memory metrics.
     pub fn from_metrics(m: &MemoryMetrics) -> Self {
         Self {
             rss_after_load_mb: m.rss_after_load as f64 / (1024.0 * 1024.0),
@@ -117,6 +119,7 @@ pub struct StructuredResult {
     pub memory: Option<MemorySummary>,
 }
 
+/// Latency statistics for a benchmark result.
 #[derive(Debug, Clone, Serialize)]
 pub struct LatencyStats {
     pub mean_ms: f64,
@@ -127,6 +130,7 @@ pub struct LatencyStats {
     pub cv: f64,
 }
 
+/// Throughput statistics for a benchmark result.
 #[derive(Debug, Clone, Serialize)]
 pub struct ThroughputStats {
     pub inferences_per_sec: f64,

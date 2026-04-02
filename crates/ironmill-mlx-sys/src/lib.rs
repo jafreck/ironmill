@@ -13,12 +13,19 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("ironmill-mlx-sys only supports macOS");
 
+/// N-dimensional array type backed by MLX.
 pub mod array;
+/// Device selection (CPU / GPU).
 pub mod device;
+/// Error types for MLX operations.
 pub mod error;
+/// Fused operations (RMS norm, RoPE, scaled dot-product attention).
 pub mod fast_ops;
+/// Custom Metal kernel dispatch.
 pub mod metal_kernel;
+/// Element-wise and tensor operations.
 pub mod ops;
+/// Stream (execution queue) management.
 pub mod stream;
 
 pub use array::MlxArray;
