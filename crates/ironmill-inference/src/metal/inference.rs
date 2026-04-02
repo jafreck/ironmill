@@ -412,6 +412,11 @@ impl MetalInference {
                     Ok(ProjectionMatmul::Dense(make_matmul(rows, cols, inner)?))
                 }
                 WeightBuffer::Quantized(_) => Ok(ProjectionMatmul::Quantized),
+                // AffineQuantized gets a Dense matmul — the dequant kernel
+                // produces FP16 weights consumed by MPS.
+                WeightBuffer::AffineQuantized(_) => {
+                    Ok(ProjectionMatmul::Dense(make_matmul(rows, cols, inner)?))
+                }
             }
         };
 
@@ -1036,6 +1041,22 @@ impl MetalInference {
                     )?;
                     enc.end_encoding();
                 }
+                WeightBuffer::AffineQuantized(aq) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
+                    enc.end_encoding();
+                    let (n, k) = aq.shape;
+                    let input_mat = MpsMatrix::from_buffer(&bufs.attn_out, token_count, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_down, token_count, n, n * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.o.dense()
+                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
+                }
             }
 
             // Step 10-11 (fused): Residual add + post-attention RMSNorm
@@ -1135,6 +1156,23 @@ impl MetalInference {
                     )?;
                     enc.end_encoding();
                 }
+                WeightBuffer::AffineQuantized(aq) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
+                    enc.end_encoding();
+                    let (n, k) = aq.shape;
+                    let input_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, n, n * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.gate
+                        .dense()
+                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
+                }
             }
 
             // Up projection
@@ -1200,6 +1238,23 @@ impl MetalInference {
                         token_count,
                     )?;
                     enc.end_encoding();
+                }
+                WeightBuffer::AffineQuantized(aq) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
+                    enc.end_encoding();
+                    let (n, k) = aq.shape;
+                    let input_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_up, token_count, n, n * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.up
+                        .dense()
+                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
                 }
             }
 
@@ -1293,6 +1348,23 @@ impl MetalInference {
                         token_count,
                     )?;
                     enc.end_encoding();
+                }
+                WeightBuffer::AffineQuantized(aq) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
+                    enc.end_encoding();
+                    let (n, k) = aq.shape;
+                    let input_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_down, token_count, n, n * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.down
+                        .dense()
+                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
                 }
             }
 
@@ -1585,6 +1657,7 @@ impl MetalInference {
                 let rb_start = Instant::now();
                 // Allocate as u16 to guarantee 2-byte alignment for f16 reinterpret.
                 let mut readback_u16 = vec![0u16; norm_readback_bytes / 2];
+                #[allow(unsafe_code)]
                 let readback = unsafe {
                     std::slice::from_raw_parts_mut(
                         readback_u16.as_mut_ptr() as *mut u8,
@@ -2074,6 +2147,22 @@ impl MetalInference {
                     )?;
                     enc.end_encoding();
                 }
+                WeightBuffer::AffineQuantized(aq) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
+                    enc.end_encoding();
+                    let (n, k) = aq.shape;
+                    let input_mat = MpsMatrix::from_buffer(&bufs.attn_out, token_count, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_down, token_count, n, n * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.o.dense()
+                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
+                }
             }
 
             // Step 10-11 (fused): Residual add + post-attention RMSNorm
@@ -2113,6 +2202,7 @@ impl MetalInference {
             {
                 let rb_start = Instant::now();
                 let mut readback_u16 = vec![0u16; norm_readback_bytes / 2];
+                #[allow(unsafe_code)]
                 let readback = unsafe {
                     std::slice::from_raw_parts_mut(
                         readback_u16.as_mut_ptr() as *mut u8,
@@ -2204,6 +2294,23 @@ impl MetalInference {
                     )?;
                     enc.end_encoding();
                 }
+                WeightBuffer::AffineQuantized(aq) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
+                    enc.end_encoding();
+                    let (n, k) = aq.shape;
+                    let input_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, n, n * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.gate
+                        .dense()
+                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
+                }
             }
 
             // Up projection
@@ -2269,6 +2376,23 @@ impl MetalInference {
                         token_count,
                     )?;
                     enc.end_encoding();
+                }
+                WeightBuffer::AffineQuantized(aq) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
+                    enc.end_encoding();
+                    let (n, k) = aq.shape;
+                    let input_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_up, token_count, n, n * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.up
+                        .dense()
+                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
                 }
             }
 
@@ -2362,6 +2486,23 @@ impl MetalInference {
                         token_count,
                     )?;
                     enc.end_encoding();
+                }
+                WeightBuffer::AffineQuantized(aq) => {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    ops::encode_int4_dequantize(&enc, &self.pipelines().int4_dequantize, aq);
+                    enc.end_encoding();
+                    let (n, k) = aq.shape;
+                    let input_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    let result_mat = MpsMatrix::from_buffer(&bufs.ffn_down, token_count, n, n * 2)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    lm.down
+                        .dense()
+                        .encode(&cmd_buf, &input_mat, &weight_mat, &result_mat);
                 }
             }
 
@@ -2700,6 +2841,24 @@ fn encode_projection(
             encode_polarquant_matmul(&enc, input_buf, q, output_buf, pipelines, token_count)?;
             enc.end_encoding();
         }
+        WeightBuffer::AffineQuantized(aq) => {
+            // Step 1: Dequantize INT4 → FP16 via compute kernel.
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            ops::encode_int4_dequantize(&enc, &pipelines.int4_dequantize, aq);
+            enc.end_encoding();
+
+            // Step 2: MPS matmul using the dequantized FP16 weight buffer.
+            let (n, k) = aq.shape;
+            let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let result_mat = MpsMatrix::from_buffer(output_buf, token_count, n, row_bytes_out)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            matmul
+                .dense()
+                .encode(cmd_buf, input_mat, &weight_mat, &result_mat);
+        }
     }
     Ok(())
 }
@@ -3015,5 +3174,30 @@ mod calibration_tests {
         for (_, _, byte_count) in &stats.captures {
             assert_eq!(*byte_count, token_count * hidden_size * 2);
         }
+    }
+
+    /// Verify the INT4 dequant shader compiles on the current Metal device.
+    #[test]
+    fn int4_dequant_shader_compiles_on_device() {
+        use ironmill_metal_sys::MetalDevice;
+
+        let device = match MetalDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("Skipping — no Metal device available");
+                return;
+            }
+        };
+
+        let src = include_str!("shaders/int4_dequant.metal");
+        let lib = device
+            .compile_shader_source(src)
+            .expect("int4_dequant.metal should compile");
+        let func = lib
+            .get_function("int4_dequantize")
+            .expect("int4_dequantize function should exist");
+        let _pipeline = device
+            .create_compute_pipeline(&func)
+            .expect("should create compute pipeline");
     }
 }

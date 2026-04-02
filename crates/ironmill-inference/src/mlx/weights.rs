@@ -281,8 +281,8 @@ fn load_weight_buffer(
             scale_dtype,
             zero_point_dtype,
             axis,
+            ..
         } => {
-            // CPU dequant to dense FP16, then load as MlxArray.
             let fp16_data = dequant_affine_to_fp16(
                 &tensor.data,
                 scale,
@@ -348,6 +348,7 @@ fn load_dense_array(
             scale_dtype,
             zero_point_dtype,
             axis,
+            ..
         } => {
             let fp16_data = dequant_affine_to_fp16(
                 &tensor.data,

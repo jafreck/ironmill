@@ -20,27 +20,31 @@ pub enum WeightBuffer {
     },
     /// Packed quantized buffer for custom kernel.
     Quantized(QuantizedWeight),
+    /// INT4 affine-quantized weight kept packed on GPU.
+    /// Dequantized to FP16 at inference time via a Metal compute kernel
+    /// before feeding into MPS matmul.
+    AffineQuantized(AffineQuantizedWeight),
 }
 
 impl WeightBuffer {
     /// Get the underlying buffer for MPS matmul (Dense only).
-    /// Returns an error if called on a Quantized variant.
+    /// Returns an error if called on a Quantized or AffineQuantized variant.
     pub fn as_dense(&self) -> anyhow::Result<&MetalBuffer> {
         match self {
             WeightBuffer::Dense { buf, .. } => Ok(buf),
-            WeightBuffer::Quantized(_) => Err(anyhow::anyhow!(
+            WeightBuffer::Quantized(_) | WeightBuffer::AffineQuantized(_) => Err(anyhow::anyhow!(
                 "expected dense buffer, got quantized weight"
             )),
         }
     }
 
     /// Get the pre-packed blocked buffer for the custom matvec kernel.
-    /// Returns `None` for Quantized weights or Dense weights where packing
-    /// was not possible (dimensions not multiples of 8).
+    /// Returns `None` for Quantized/AffineQuantized weights or Dense weights
+    /// where packing was not possible (dimensions not multiples of 8).
     pub fn packed_buf(&self) -> Option<&MetalBuffer> {
         match self {
             WeightBuffer::Dense { packed, .. } => packed.as_ref(),
-            WeightBuffer::Quantized(_) => None,
+            WeightBuffer::Quantized(_) | WeightBuffer::AffineQuantized(_) => None,
         }
     }
 }
@@ -58,6 +62,25 @@ pub struct QuantizedWeight {
     pub n_bits: u8,
     /// `(out_features, in_features)`.
     pub shape: (usize, usize),
+}
+
+/// INT4 affine-quantized weight stored as packed bytes with per-group
+/// scales and zero points on GPU. Dequantized to FP16 at dispatch time
+/// via the `int4_dequantize` Metal compute kernel.
+pub struct AffineQuantizedWeight {
+    /// Packed INT4 data: 2 values per byte, low nibble first.
+    pub data: MetalBuffer,
+    /// Per-group FP16 scales.
+    pub scales: MetalBuffer,
+    /// Per-group FP16 zero points.
+    pub zeros: MetalBuffer,
+    /// Number of elements sharing one scale/zero pair.
+    pub group_size: u32,
+    /// `(out_features, in_features)` — logical element dimensions.
+    pub shape: (usize, usize),
+    /// Pre-allocated FP16 output buffer for dequantized weights.
+    /// Size: `out_features * in_features * 2` bytes.
+    pub dequant_buf: MetalBuffer,
 }
 
 /// Weights for a single transformer layer (type alias over shared layout).
@@ -281,7 +304,60 @@ fn load_weight_buffer(
             scale_dtype,
             zero_point_dtype,
             axis,
+            bit_width,
+            group_size,
         } => {
+            // INT4 with per-group quantization: keep packed on GPU and
+            // dequantize at inference time via the int4_dequantize kernel.
+            if *bit_width == 4 && !force_cpu_dequant {
+                let (n, k) = dense_shape(&tensor.shape);
+                let total_elements = n * k;
+                let gs = group_size.unwrap_or(total_elements);
+
+                let data_buf = device
+                    .create_buffer_with_data(&tensor.data, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+
+                // Convert scales and zeros to FP16 bytes for the GPU.
+                let scales_f16 = super::dequant::convert_params_to_f16(
+                    scale,
+                    *scale_dtype,
+                    *axis,
+                    &tensor.shape,
+                    gs,
+                )?;
+                let zeros_f16 = super::dequant::convert_params_to_f16(
+                    zero_point,
+                    *zero_point_dtype,
+                    *axis,
+                    &tensor.shape,
+                    gs,
+                )?;
+
+                let scales_buf = device
+                    .create_buffer_with_data(&scales_f16, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+                let zeros_buf = device
+                    .create_buffer_with_data(&zeros_f16, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+
+                // Pre-allocate the FP16 output buffer for dequantized weights.
+                let dequant_bytes = total_elements * 2; // FP16 = 2 bytes
+                let dequant_buf = device
+                    .create_buffer(dequant_bytes, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+
+                return Ok(WeightBuffer::AffineQuantized(AffineQuantizedWeight {
+                    data: data_buf,
+                    scales: scales_buf,
+                    zeros: zeros_buf,
+                    group_size: gs as u32,
+                    shape: (n, k),
+                    dequant_buf,
+                }));
+            }
+
+            // INT8 or forced CPU dequant: fall back to CPU dequantization.
             let data = dequant_affine(
                 &tensor.data,
                 scale,
@@ -346,6 +422,7 @@ fn load_dense_buffer(
             scale_dtype,
             zero_point_dtype,
             axis,
+            ..
         } => dequant_affine(
             &tensor.data,
             scale,
