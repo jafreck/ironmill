@@ -45,18 +45,20 @@ ironmill validate model.onnx
 
 ### Compiler
 
-ironmill-compile lowers models through a pipeline of optimization passes
-targeting Apple's Neural Engine:
+The compiler imports models from multiple formats and produces optimized
+artifacts for each inference backend:
 
 - **Model import:** ONNX, SafeTensors, GGUF, CoreML (.mlmodel/.mlpackage)
 - **MIL IR:** full read/write/manipulation of Apple's Model Intermediate Language
-- **Optimization passes:** dead code elimination, constant folding, identity removal
-- **Op fusion:** conv+batchnorm, conv+relu, linear+relu, scaled dot-product attention
-- **ANE lowering:** matmul→conv1×1, layout optimization, op substitution, shape materialization
-- **Quantization:** FP16, INT8 weight-only (with optional calibration data)
-- **Weight palettization:** 2/4/6/8-bit k-means compression
-- **Model splitting:** automatic partitioning into ANE-sized sub-programs
-- **CoreML output:** .mlpackage/.mlmodel with optional `xcrun coremlcompiler` compilation
+- **General optimization:** dead code elimination, constant folding, op fusion
+  (conv+batchnorm, conv+relu, linear+relu, SDPA)
+- **Quantization:** FP16, INT8 weight-only, 2/4/6/8-bit weight palettization (PolarQuant)
+- **ANE lowering:** matmul→conv1×1, layout optimization, op substitution,
+  automatic model splitting into ANE-sized sub-programs
+- **Output formats:**
+  - `.mlpackage` for the CoreML backend (with optional `xcrun coremlcompiler` compilation)
+  - `.ironml` bundles for the ANE Direct backend (MIL text + weight blobs)
+  - `.ironml-gpu` bundles for the Metal GPU backend
 
 ### Inference Runtime
 
