@@ -10,8 +10,8 @@ use serde::Deserialize;
 use super::pass::Pass;
 use super::passes::awq_quantize::AwqQuantizePass;
 use super::passes::{
-    AffineQuantizePass, AttentionFusionPass, AwqScaleFusionPass, ConstantFoldPass,
-    ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass, D2QuantPass,
+    AffineQuantizePass, AttentionFusionPass, AwqScaleFusionPass, ChannelStats, ConstantFoldPass,
+    ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass, D2QuantPass, DacPass,
     DeadCodeEliminationPass, Fp16QuantizePass, GeluLinearFusionPass, GqaFusionPass, Granularity,
     IdentityEliminationPass, Int8QuantizePass, LayerNormLinearFusionPass, LayoutOptimizationPass,
     LinearReluFusionPass, PalettizePass, PolarQuantPass, PolarRotationFusionPass, QuipSharpPass,
@@ -475,6 +475,11 @@ impl PassPipeline {
                 "INT8 and D2Quant quantization are mutually exclusive".into(),
             ));
         }
+        if self.has_gptq {
+            return Err(MilError::Validation(
+                "INT8 and GPTQ quantization are mutually exclusive".into(),
+            ));
+        }
         if self.has_spinquant {
             return Err(MilError::Validation(
                 "INT8 and SpinQuant are mutually exclusive".into(),
@@ -521,6 +526,11 @@ impl PassPipeline {
         if self.has_d2quant {
             return Err(MilError::Validation(
                 "INT4 and D2Quant quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_gptq {
+            return Err(MilError::Validation(
+                "INT4 and GPTQ quantization are mutually exclusive".into(),
             ));
         }
         if self.has_spinquant {
@@ -586,6 +596,11 @@ impl PassPipeline {
                 "AWQ and D2Quant quantization are mutually exclusive".into(),
             ));
         }
+        if self.has_gptq {
+            return Err(MilError::Validation(
+                "AWQ and GPTQ quantization are mutually exclusive".into(),
+            ));
+        }
         if self.has_spinquant {
             return Err(MilError::Validation(
                 "AWQ and SpinQuant are mutually exclusive".into(),
@@ -625,6 +640,16 @@ impl PassPipeline {
         if self.has_int8 {
             return Err(MilError::Validation(
                 "GPTQ and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_int4 {
+            return Err(MilError::Validation(
+                "GPTQ and INT4 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_awq {
+            return Err(MilError::Validation(
+                "GPTQ and AWQ quantization are mutually exclusive".into(),
             ));
         }
         if self.has_palettize {
@@ -854,6 +879,7 @@ impl PassPipeline {
         bits: u8,
         group_size: usize,
         outlier_threshold: f32,
+        dac_stats: Option<(HashMap<String, ChannelStats>, HashMap<String, ChannelStats>)>,
     ) -> Result<Self> {
         if self.has_int8 {
             return Err(MilError::Validation(
@@ -905,6 +931,16 @@ impl PassPipeline {
             insert_pos,
             Box::new(D2QuantPass::new(bits, group_size, outlier_threshold)),
         );
+        if let Some((fp16_stats, quant_stats)) = dac_stats {
+            let dac_pos = insert_pos + 1;
+            self.passes.insert(
+                dac_pos,
+                Box::new(DacPass {
+                    fp16_stats,
+                    quant_stats,
+                }),
+            );
+        }
         Ok(self)
     }
 
@@ -915,9 +951,10 @@ impl PassPipeline {
     /// This composes rotation + quantization in a single pipeline step.
     ///
     /// Mutually exclusive with all other weight quantization methods.
+    #[cfg(feature = "gptq")]
     pub fn with_spinquant(
         mut self,
-        _rotation_config: SpinQuantConfig,
+        rotation_config: SpinQuantConfig,
         _quantize_method: SpinQuantMethod,
     ) -> Result<Self> {
         if self.has_int8 {
@@ -961,10 +998,29 @@ impl PassPipeline {
             ));
         }
         self.has_spinquant = true;
-        // TODO: Insert SpinQuantPass before type-repropagation once the
-        // pass implementation is available. The SpinQuantPass will internally
-        // handle rotation learning + quantization dispatch.
+        let mut pass = super::passes::spinquant::SpinQuantPass::new();
+        pass.rotation_epochs = rotation_config.rotation_epochs;
+        pass.bits = rotation_config.bits;
+        pass.group_size = 128;
+        let insert_pos = self
+            .passes
+            .iter()
+            .position(|p| p.name() == "type-repropagation")
+            .unwrap_or(self.passes.len());
+        self.passes.insert(insert_pos, Box::new(pass));
         Ok(self)
+    }
+
+    /// Add SpinQuant (stub when `gptq` feature is disabled).
+    #[cfg(not(feature = "gptq"))]
+    pub fn with_spinquant(
+        self,
+        _rotation_config: SpinQuantConfig,
+        _quantize_method: SpinQuantMethod,
+    ) -> Result<Self> {
+        Err(MilError::Validation(
+            "SpinQuant requires the 'gptq' feature".into(),
+        ))
     }
 
     /// Add shape materialization with user-provided shapes.
@@ -2040,7 +2096,9 @@ name = "int4-quantize"
 
     #[test]
     fn with_d2quant_builds_pipeline() {
-        let pipeline = PassPipeline::new().with_d2quant(2, 128, 0.99).unwrap();
+        let pipeline = PassPipeline::new()
+            .with_d2quant(2, 128, 0.99, None)
+            .unwrap();
         let names = pipeline.pass_names();
         assert!(
             names.contains(&"d2quant"),
@@ -2050,7 +2108,9 @@ name = "int4-quantize"
 
     #[test]
     fn d2quant_inserts_before_type_repropagation() {
-        let pipeline = PassPipeline::new().with_d2quant(2, 128, 0.99).unwrap();
+        let pipeline = PassPipeline::new()
+            .with_d2quant(2, 128, 0.99, None)
+            .unwrap();
         let names = pipeline.pass_names();
         let d2_pos = names.iter().position(|n| *n == "d2quant").unwrap();
         let reprop_pos = names
@@ -2066,7 +2126,7 @@ name = "int4-quantize"
     #[test]
     fn d2quant_and_int4_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_int4(128).unwrap();
-        let result = pipeline.with_d2quant(2, 128, 0.99);
+        let result = pipeline.with_d2quant(2, 128, 0.99, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2078,7 +2138,7 @@ name = "int4-quantize"
     #[test]
     fn d2quant_and_int8_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_int8(None).unwrap();
-        let result = pipeline.with_d2quant(2, 128, 0.99);
+        let result = pipeline.with_d2quant(2, 128, 0.99, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2092,7 +2152,7 @@ name = "int4-quantize"
         let pipeline = PassPipeline::new()
             .with_awq(sample_magnitudes(), 128)
             .unwrap();
-        let result = pipeline.with_d2quant(2, 128, 0.99);
+        let result = pipeline.with_d2quant(2, 128, 0.99, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2104,7 +2164,7 @@ name = "int4-quantize"
     #[test]
     fn d2quant_and_quip_sharp_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_quip_sharp(2, 42).unwrap();
-        let result = pipeline.with_d2quant(2, 128, 0.99);
+        let result = pipeline.with_d2quant(2, 128, 0.99, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2115,7 +2175,9 @@ name = "int4-quantize"
 
     #[test]
     fn d2quant_blocks_subsequent_awq() {
-        let pipeline = PassPipeline::new().with_d2quant(2, 128, 0.99).unwrap();
+        let pipeline = PassPipeline::new()
+            .with_d2quant(2, 128, 0.99, None)
+            .unwrap();
         let result = pipeline.with_awq(sample_magnitudes(), 128);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -2130,7 +2192,7 @@ name = "int4-quantize"
         let pipeline = PassPipeline::new()
             .with_fp16()
             .unwrap()
-            .with_d2quant(2, 128, 0.99)
+            .with_d2quant(2, 128, 0.99, None)
             .unwrap();
         let names = pipeline.pass_names();
         assert!(names.contains(&"fp16-quantization"));
@@ -2148,12 +2210,10 @@ name = "int4-quantize"
         let pipeline = PassPipeline::new()
             .with_spinquant(config, SpinQuantMethod::MinMax { group_size: 128 })
             .unwrap();
-        // SpinQuantPass is not yet implemented, so no pass is inserted,
-        // but the flag should be set (verified via mutual exclusivity).
         let names = pipeline.pass_names();
         assert!(
-            names.contains(&"type-repropagation"),
-            "pipeline should still have standard passes"
+            names.contains(&"spin-quantization"),
+            "expected spin-quantization pass, got: {names:?}"
         );
     }
 
@@ -2225,7 +2285,9 @@ name = "int4-quantize"
 
     #[test]
     fn spinquant_and_d2quant_mutually_exclusive() {
-        let pipeline = PassPipeline::new().with_d2quant(2, 128, 0.99).unwrap();
+        let pipeline = PassPipeline::new()
+            .with_d2quant(2, 128, 0.99, None)
+            .unwrap();
         let config = SpinQuantConfig {
             rotation_epochs: 100,
             bits: 4,
@@ -2285,8 +2347,8 @@ name = "int4-quantize"
         let pipeline = PassPipeline::new().with_spinquant(config, method).unwrap();
         let names = pipeline.pass_names();
         assert!(
-            names.contains(&"type-repropagation"),
-            "pipeline should still have standard passes"
+            names.contains(&"spin-quantization"),
+            "expected spin-quantization pass, got: {names:?}"
         );
     }
 }

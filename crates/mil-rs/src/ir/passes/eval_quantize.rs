@@ -192,8 +192,8 @@ fn truncate_name(name: &str, max_len: usize) -> String {
 fn dequantize_op(op: &Operation) -> Option<Vec<f32>> {
     match op.op_type.as_str() {
         "constexpr_affine_dequantize" => dequantize_affine_op(op),
-        // Future: implement LUT and dual-scale dequantization.
-        "constexpr_lut_to_dense" | "constexpr_dual_scale_dequantize" => None,
+        "constexpr_lut_to_dense" => dequantize_lut_op(op),
+        "constexpr_dual_scale_dequantize" => dequantize_dual_scale_op(op),
         _ => None,
     }
 }
@@ -290,6 +290,202 @@ fn extract_f32_params(value: Option<&Value>) -> Option<Vec<f32>> {
         }) => Some(tensor_as_f32_slice(data)),
         _ => None,
     }
+}
+
+/// Dequantize a `constexpr_lut_to_dense` op (QuIP#-style codebook quantization).
+///
+/// Attributes:
+/// - `lut`: f32 tensor of codebook entries
+/// - `indices`: UInt8 tensor of packed indices
+/// - `shape`: output tensor shape
+/// - `quip_sharp_scales` (optional): f32 per-group scales
+fn dequantize_lut_op(op: &Operation) -> Option<Vec<f32>> {
+    let lut = extract_f32_params(op.attributes.get("lut"))?;
+
+    let indices_bytes = match op.attributes.get("indices") {
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::UInt8,
+            ..
+        }) => data.as_slice(),
+        _ => return None,
+    };
+
+    let shape = match op.attributes.get("shape") {
+        Some(Value::Tensor {
+            data,
+            shape: s,
+            dtype: ScalarType::Int32,
+        }) => {
+            let ints = data
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+                .collect::<Vec<_>>();
+            if ints.is_empty() { s.clone() } else { ints }
+        }
+        Some(Value::List(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::Int(i) => Some(*i as usize),
+                _ => None,
+            })
+            .collect(),
+        _ => return None,
+    };
+
+    let n_elements: usize = shape.iter().product();
+    if n_elements == 0 {
+        return Some(vec![]);
+    }
+
+    // Determine bits per index from LUT size: lut has 2^n_bits entries.
+    let n_bits = match lut.len() {
+        0 => return None,
+        n => {
+            let mut bits = 0u32;
+            let mut v = n;
+            while v > 1 {
+                v >>= 1;
+                bits += 1;
+            }
+            if 1 << bits != n {
+                return None; // LUT size not a power of 2
+            }
+            bits as usize
+        }
+    };
+
+    // Unpack indices from bytes. Each byte may contain multiple indices
+    // packed from LSB to MSB.
+    let mask = (1u8 << n_bits) - 1;
+    let indices_per_byte = 8 / n_bits;
+    let mut unpacked = Vec::with_capacity(n_elements);
+    for &byte in indices_bytes {
+        for sub in 0..indices_per_byte {
+            if unpacked.len() >= n_elements {
+                break;
+            }
+            let idx = (byte >> (sub * n_bits)) & mask;
+            unpacked.push(idx as usize);
+        }
+    }
+
+    if unpacked.len() < n_elements {
+        return None;
+    }
+
+    // Look up each index in the codebook.
+    let mut result: Vec<f32> = unpacked[..n_elements]
+        .iter()
+        .map(|&idx| if idx < lut.len() { lut[idx] } else { 0.0 })
+        .collect();
+
+    // Apply optional QuIP# per-group scales.
+    if let Some(scales) = extract_f32_params(op.attributes.get("quip_sharp_scales")) {
+        if !scales.is_empty() {
+            let group_size = n_elements / scales.len();
+            if group_size > 0 {
+                for (i, val) in result.iter_mut().enumerate() {
+                    let g = i / group_size;
+                    if g < scales.len() {
+                        *val *= scales[g];
+                    }
+                }
+            }
+        }
+    }
+
+    Some(result)
+}
+
+/// Dequantize a `constexpr_dual_scale_dequantize` op (D2Quant-style).
+///
+/// Uses normal scale/zero for regular elements and outlier scale/zero for
+/// elements flagged in the outlier mask.
+///
+/// Attributes:
+/// - `quantized_data`: UInt8 packed data
+/// - `normal_scale`, `normal_zero`: f32 per-group params for normal elements
+/// - `outlier_scale`, `outlier_zero`: f32 per-group params for outliers
+/// - `outlier_mask`: UInt8 bitmask
+/// - `group_size`: int
+/// - `bit_width`: int (default 4)
+fn dequantize_dual_scale_op(op: &Operation) -> Option<Vec<f32>> {
+    let quantized_bytes = match op.attributes.get("quantized_data") {
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::UInt8,
+            ..
+        }) => data.as_slice(),
+        _ => return None,
+    };
+
+    let normal_scales = extract_f32_params(op.attributes.get("normal_scale"))?;
+    let normal_zeros = extract_f32_params(op.attributes.get("normal_zero"))?;
+    let outlier_scales = extract_f32_params(op.attributes.get("outlier_scale"))?;
+    let outlier_zeros = extract_f32_params(op.attributes.get("outlier_zero"))?;
+
+    let outlier_mask_bytes = match op.attributes.get("outlier_mask") {
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::UInt8,
+            ..
+        }) => data.as_slice(),
+        _ => return None,
+    };
+
+    let group_size = match op.attributes.get("group_size") {
+        Some(Value::Int(g)) => *g as usize,
+        _ => return None,
+    };
+
+    let bit_width = match op.attributes.get("bit_width") {
+        Some(Value::Int(b)) => *b as usize,
+        _ => 4,
+    };
+
+    if bit_width == 0 || group_size == 0 {
+        return None;
+    }
+
+    // Unpack quantized values from packed bytes.
+    let mask = (1u32 << bit_width) - 1;
+    let vals_per_byte = 8 / bit_width;
+    let mut quant_vals = Vec::new();
+    for &byte in quantized_bytes {
+        for sub in 0..vals_per_byte {
+            let q = ((byte as u32) >> (sub * bit_width)) & mask;
+            quant_vals.push(q as f32);
+        }
+    }
+
+    // Unpack outlier mask: 1 bit per element, packed LSB-first.
+    let mut outlier_flags = Vec::new();
+    for &byte in outlier_mask_bytes {
+        for bit in 0..8 {
+            outlier_flags.push((byte >> bit) & 1 != 0);
+        }
+    }
+
+    let n_elements = quant_vals.len().min(outlier_flags.len());
+    let mut result = vec![0.0f32; n_elements];
+
+    for i in 0..n_elements {
+        let g = i / group_size;
+        let q = quant_vals[i];
+
+        if i < outlier_flags.len() && outlier_flags[i] {
+            let scale = outlier_scales.get(g).copied().unwrap_or(1.0);
+            let zero = outlier_zeros.get(g).copied().unwrap_or(0.0);
+            result[i] = (q - zero) * scale;
+        } else {
+            let scale = normal_scales.get(g).copied().unwrap_or(1.0);
+            let zero = normal_zeros.get(g).copied().unwrap_or(0.0);
+            result[i] = (q - zero) * scale;
+        }
+    }
+
+    Some(result)
 }
 
 // ---------------------------------------------------------------------------

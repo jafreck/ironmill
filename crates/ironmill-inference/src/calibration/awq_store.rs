@@ -95,6 +95,44 @@ impl Default for AwqActivationStore {
     }
 }
 
+impl AwqActivationStore {
+    /// Convert to the format expected by `AwqQuantizePass`.
+    ///
+    /// The Metal hook captures activations at norm outputs (`"layer_{i}_attn_norm"`,
+    /// `"layer_{i}_ffn_norm"`). The MIL pass needs per-weight-op magnitudes.
+    /// Since each norm output feeds multiple projections (attn_norm → Q/K/V/O,
+    /// ffn_norm → gate/up/down), we duplicate the magnitudes for each projection.
+    ///
+    /// `weight_names` maps const-op output names to (layer_index, projection_group).
+    /// projection_group is `"attn"` or `"ffn"`.
+    pub fn to_channel_magnitudes(
+        &self,
+        weight_names: &[(String, usize, &str)],
+    ) -> HashMap<String, Vec<f32>> {
+        let mut result = HashMap::new();
+        for (name, layer_idx, group) in weight_names {
+            let store_key = format!("layer_{}_{}_norm", layer_idx, group);
+            if let Some(mag) = self.magnitudes.get(&store_key) {
+                result.insert(name.clone(), mag.mean_abs.clone());
+            }
+        }
+        result
+    }
+
+    /// Simpler conversion: map all stored magnitudes using a key transform.
+    /// Each stored key `"layer_{i}_{name}"` gets mapped to all weight op names
+    /// that match the layer. Caller provides the mapping.
+    pub fn to_pass_format(&self, key_map: &HashMap<String, String>) -> HashMap<String, Vec<f32>> {
+        let mut result = HashMap::new();
+        for (weight_name, store_key) in key_map {
+            if let Some(mag) = self.magnitudes.get(store_key) {
+                result.insert(weight_name.clone(), mag.mean_abs.clone());
+            }
+        }
+        result
+    }
+}
+
 impl ActivationHook for AwqActivationStore {
     fn on_linear_input(&mut self, layer: usize, name: &str, activation: &[f16], n_features: usize) {
         if activation.is_empty() || n_features == 0 {
@@ -219,5 +257,59 @@ mod tests {
         let mut store = AwqActivationStore::new();
         store.on_linear_input(0, "q_proj", &[], 0);
         assert!(store.magnitudes.is_empty());
+    }
+
+    #[test]
+    fn to_channel_magnitudes_maps_norm_to_projections() {
+        let mut store = AwqActivationStore::new();
+        store.on_linear_input(0, "attn_norm", &f16s(&[1.0, 2.0]), 2);
+        store.on_linear_input(0, "ffn_norm", &f16s(&[3.0, 4.0]), 2);
+
+        let weight_names = vec![
+            ("layers.0.self_attn.q_proj.weight".into(), 0, "attn"),
+            ("layers.0.self_attn.k_proj.weight".into(), 0, "attn"),
+            ("layers.0.mlp.gate_proj.weight".into(), 0, "ffn"),
+            ("layers.1.self_attn.q_proj.weight".into(), 1, "attn"), // no data
+        ];
+
+        let result = store.to_channel_magnitudes(&weight_names);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains_key("layers.0.self_attn.q_proj.weight"));
+        assert!(result.contains_key("layers.0.self_attn.k_proj.weight"));
+        assert!(result.contains_key("layers.0.mlp.gate_proj.weight"));
+        assert!(!result.contains_key("layers.1.self_attn.q_proj.weight"));
+
+        // attn_norm and q_proj should share the same magnitudes
+        let q = &result["layers.0.self_attn.q_proj.weight"];
+        let k = &result["layers.0.self_attn.k_proj.weight"];
+        assert_eq!(q, k);
+        assert!((q[0] - 1.0).abs() < 1e-2);
+        assert!((q[1] - 2.0).abs() < 1e-2);
+
+        let gate = &result["layers.0.mlp.gate_proj.weight"];
+        assert!((gate[0] - 3.0).abs() < 1e-2);
+        assert!((gate[1] - 4.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn to_pass_format_maps_via_key_map() {
+        let mut store = AwqActivationStore::new();
+        store.on_linear_input(0, "attn_norm", &f16s(&[5.0, 6.0]), 2);
+
+        let mut key_map = HashMap::new();
+        key_map.insert("weight_op_q".to_string(), "layer_0_attn_norm".to_string());
+        key_map.insert(
+            "weight_op_missing".to_string(),
+            "layer_99_attn_norm".to_string(),
+        );
+
+        let result = store.to_pass_format(&key_map);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("weight_op_q"));
+        assert!(!result.contains_key("weight_op_missing"));
+
+        let mags = &result["weight_op_q"];
+        assert!((mags[0] - 5.0).abs() < 1e-2);
+        assert!((mags[1] - 6.0).abs() < 1e-2);
     }
 }

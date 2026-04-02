@@ -3039,6 +3039,21 @@ impl InferenceEngine for MetalInference {
     }
 }
 
+impl crate::calibration::CalibratingEngine for MetalInference {
+    fn prefill_with_hooks(
+        &mut self,
+        tokens: &[u32],
+        hooks: &mut dyn ActivationHook,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.prefill_with_hooks(tokens, hooks)?;
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        InferenceEngine::reset(self);
+    }
+}
+
 // ── Calibration tests ──────────────────────────────────────────
 //
 // These tests require a real Metal device (macOS only) and a loaded model.
@@ -3097,6 +3112,21 @@ mod calibration_tests {
         }
 
         let _ = _assert_hook_methods;
+    }
+
+    /// Verify that `MetalInference` implements `CalibratingEngine` and the
+    /// trait methods compile with the expected signatures.
+    #[test]
+    fn calibrating_engine_impl_compiles() {
+        use crate::calibration::{AwqActivationStore, CalibratingEngine};
+
+        fn _assert_calibrating_engine(engine: &mut MetalInference) {
+            let mut store = AwqActivationStore::new();
+            let _ = CalibratingEngine::prefill_with_hooks(engine, &[1, 2, 3], &mut store);
+            CalibratingEngine::reset(engine);
+        }
+
+        let _ = _assert_calibrating_engine;
     }
 
     /// Verify that `bytes_as_f16` correctly reinterprets raw bytes.

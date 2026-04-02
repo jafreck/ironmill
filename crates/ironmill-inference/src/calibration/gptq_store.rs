@@ -101,6 +101,29 @@ impl Default for GptqActivationStore {
     }
 }
 
+impl GptqActivationStore {
+    /// Convert to the format expected by GPTQ quantization passes.
+    ///
+    /// The Metal hook captures activations with keys like `"layer_0_q_proj"`.
+    /// The MIL pass needs Hessian data keyed by const-op output names.
+    /// Caller provides the mapping from weight op names to store keys.
+    pub fn to_pass_format(
+        &self,
+        key_map: &HashMap<String, String>,
+    ) -> HashMap<String, (Vec<f32>, usize, usize)> {
+        let mut result = HashMap::new();
+        for (weight_name, store_key) in key_map {
+            if let Some(acc) = self.hessians.get(store_key) {
+                result.insert(
+                    weight_name.clone(),
+                    (acc.xtx.clone(), acc.n_features, acc.sample_count),
+                );
+            }
+        }
+        result
+    }
+}
+
 impl ActivationHook for GptqActivationStore {
     fn on_linear_input(&mut self, layer: usize, name: &str, activation: &[f16], n_features: usize) {
         if activation.is_empty() || n_features == 0 {
@@ -215,5 +238,36 @@ mod tests {
     fn hessian_bad_shape() {
         let mut acc = HessianAccumulator::new(3);
         acc.accumulate(&f16s(&[1.0, 2.0]), 3);
+    }
+
+    #[test]
+    fn to_pass_format_maps_hessians_via_key_map() {
+        let mut store = GptqActivationStore::new();
+        // 1 token × 2 features: X = [[2, 3]]  →  X^T X = [[4, 6], [6, 9]]
+        store.on_linear_input(0, "q_proj", &f16s(&[2.0, 3.0]), 2);
+
+        let mut key_map = HashMap::new();
+        key_map.insert(
+            "layers.0.q_proj.weight".to_string(),
+            "layer_0_q_proj".to_string(),
+        );
+        key_map.insert(
+            "layers.0.missing.weight".to_string(),
+            "layer_99_q_proj".to_string(),
+        );
+
+        let result = store.to_pass_format(&key_map);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("layers.0.q_proj.weight"));
+        assert!(!result.contains_key("layers.0.missing.weight"));
+
+        let (xtx, n_features, sample_count) = &result["layers.0.q_proj.weight"];
+        assert_eq!(*n_features, 2);
+        assert_eq!(*sample_count, 1);
+        assert_eq!(xtx.len(), 4);
+        assert!((xtx[0] - 4.0).abs() < 1e-2);
+        assert!((xtx[1] - 6.0).abs() < 1e-2);
+        assert!((xtx[2] - 6.0).abs() < 1e-2);
+        assert!((xtx[3] - 9.0).abs() < 1e-2);
     }
 }
