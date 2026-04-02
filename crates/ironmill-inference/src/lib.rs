@@ -11,6 +11,8 @@ compile_error!("ironmill-inference only supports macOS");
 
 pub mod ane;
 pub mod coreml;
+#[cfg(any(feature = "metal", feature = "mlx"))]
+mod dequant;
 pub mod engine;
 #[cfg(feature = "metal")]
 pub mod metal;
