@@ -20,118 +20,11 @@ use super::weights::{MlxWeightBuffer, MlxWeights};
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
 
-// ── Embedded PolarQuant kernel source ───────────────────────────
+// ── PolarQuant kernel source ────────────────────────────────────
 
-/// Metal kernel for PolarQuant dequant + matvec (INT4, decode path M=1).
-///
-/// Adapted from `gpu/shaders/quantized_matmul.metal` for the MLX
-/// `metal_kernel` buffer convention.  Inputs are bound sequentially:
-///   buffer(0) = A [1, K]          half   (input activation)
-///   buffer(1) = B_packed [N, K/2] uchar  (packed 4-bit indices)
-///   buffer(2) = lut [16]          half   (reconstruction look-up table)
-///   buffer(3) = norms [N]         half   (per-row normalization)
-///   buffer(4) = params [2]        uint   (N, K)
-///   buffer(5) = C [1, N]          half   (output — MLX output slot)
-///
-/// Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
-/// Each SIMD group computes one output row via strided reduction.
-const POLARQUANT_MATVEC_SOURCE: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-[[kernel]] void polarquant_matvec(
-    device const half *A            [[buffer(0)]],
-    device const uchar *B_packed    [[buffer(1)]],
-    constant half *lut              [[buffer(2)]],
-    device const half *norms        [[buffer(3)]],
-    device const uint *params       [[buffer(4)]],
-    device half *C                  [[buffer(5)]],
-    uint tid  [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]])
-{
-    uint N = params[0];
-    uint K = params[1];
-    if (tid >= N) return;
-
-    uint half_K = K / 2;
-    uint row_offset = tid * half_K;
-    float norm = float(norms[tid]);
-    float acc = 0.0f;
-
-    for (uint k = lane; k < half_K; k += 32) {
-        uchar packed = B_packed[row_offset + k];
-        uchar lo_idx = (packed >> 4) & 0xF;
-        uchar hi_idx = packed & 0xF;
-        float w0 = float(lut[lo_idx]) * norm;
-        float w1 = float(lut[hi_idx]) * norm;
-        uint k2 = k * 2;
-        acc += float(A[k2])     * w0;
-        acc += float(A[k2 + 1]) * w1;
-    }
-
-    acc = simd_sum(acc);
-    if (lane == 0) {
-        C[tid] = half(acc);
-    }
-}
-"#;
-
-/// Metal kernel for PolarQuant dequant + tiled GEMM (INT4, prefill path M>1).
-///
-/// Adapted from `gpu/shaders/quantized_matmul.metal` for MLX.
-///   buffer(0) = A [M, K]          half
-///   buffer(1) = B_packed [N, K/2] uchar
-///   buffer(2) = lut [16]          half
-///   buffer(3) = norms [N]         half
-///   buffer(4) = params [3]        uint   (M, N, K)
-///   buffer(5) = C [M, N]          half   (output)
-///
-/// Dispatch: (ceil(N/32), ceil(M/8), 1) threadgroups, (32, 8, 1) threads.
-const POLARQUANT_MATMUL_SOURCE: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-constant constexpr uint TILE_M = 8;
-constant constexpr uint TILE_N = 32;
-constant constexpr uint TILE_K = 32;
-
-[[kernel]] void polarquant_matmul(
-    device const half *A            [[buffer(0)]],
-    device const uchar *B_packed    [[buffer(1)]],
-    constant half *lut              [[buffer(2)]],
-    device const half *norms        [[buffer(3)]],
-    device const uint *params       [[buffer(4)]],
-    device half *C                  [[buffer(5)]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint2 lid  [[thread_position_in_threadgroup]])
-{
-    uint M = params[0];
-    uint N = params[1];
-    uint K = params[2];
-
-    uint col = tgid.x * TILE_N + lid.x;
-    uint row = tgid.y * TILE_M + lid.y;
-
-    if (row >= M || col >= N) return;
-
-    uint half_K = K / 2;
-    float norm = float(norms[col]);
-    float acc = 0.0f;
-
-    for (uint k = 0; k < half_K; k++) {
-        uchar packed = B_packed[col * half_K + k];
-        uchar lo_idx = (packed >> 4) & 0xF;
-        uchar hi_idx = packed & 0xF;
-        float w0 = float(lut[lo_idx]) * norm;
-        float w1 = float(lut[hi_idx]) * norm;
-        uint k2 = k * 2;
-        acc += float(A[row * K + k2])     * w0;
-        acc += float(A[row * K + k2 + 1]) * w1;
-    }
-
-    C[row * N + col] = half(acc);
-}
-"#;
+/// All PolarQuant kernel variants, loaded from `shaders/mlx_polarquant.metal`.
+/// Individual kernels are selected by name when calling `metal_kernel()`.
+const POLARQUANT_SOURCE: &str = include_str!("shaders/mlx_polarquant.metal");
 
 // ── Public artifacts type for load() ────────────────────────────
 
@@ -597,7 +490,7 @@ impl MlxInference {
                 "polarquant_matvec",
                 inputs,
                 &[],
-                POLARQUANT_MATVEC_SOURCE,
+                POLARQUANT_SOURCE,
                 [n, 1, 1],
                 [32, 1, 1],
                 output_shapes,
@@ -619,7 +512,7 @@ impl MlxInference {
             "polarquant_matmul",
             inputs,
             &[],
-            POLARQUANT_MATMUL_SOURCE,
+            POLARQUANT_SOURCE,
             [(n + 31) / 32, (m + 7) / 8, 1],
             [32, 8, 1],
             output_shapes,

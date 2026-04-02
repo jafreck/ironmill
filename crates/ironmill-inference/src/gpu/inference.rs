@@ -137,6 +137,31 @@ impl IntermediateBuffers {
     }
 }
 
+/// Per-projection matmul state: Dense weights use MPS matrix multiplication
+/// while Quantized weights use a custom compute-shader path and carry no MPS
+/// object.
+enum ProjectionMatmul {
+    Dense(MpsMatrixMultiply),
+    Quantized,
+}
+
+impl ProjectionMatmul {
+    /// Returns the MPS matmul for a Dense projection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a `Quantized` projection — callers must only invoke
+    /// this inside a [`WeightBuffer::Dense`] branch.
+    fn dense(&self) -> &MpsMatrixMultiply {
+        match self {
+            Self::Dense(m) => m,
+            Self::Quantized => unreachable!(
+                "dense() called on Quantized projection — weight type / matmul mismatch"
+            ),
+        }
+    }
+}
+
 /// Cached MPS matmul instances for a given token count.
 struct MpsMatmulCache {
     /// Token count these were built for.
@@ -148,13 +173,13 @@ struct MpsMatmulCache {
 }
 
 struct LayerMatmuls {
-    q: Option<MpsMatrixMultiply>,
-    k: Option<MpsMatrixMultiply>,
-    v: Option<MpsMatrixMultiply>,
-    o: Option<MpsMatrixMultiply>,
-    gate: Option<MpsMatrixMultiply>,
-    up: Option<MpsMatrixMultiply>,
-    down: Option<MpsMatrixMultiply>,
+    q: ProjectionMatmul,
+    k: ProjectionMatmul,
+    v: ProjectionMatmul,
+    o: ProjectionMatmul,
+    gate: ProjectionMatmul,
+    up: ProjectionMatmul,
+    down: ProjectionMatmul,
 }
 
 // ── GpuInference ────────────────────────────────────────────────
@@ -405,14 +430,16 @@ impl GpuInference {
 
         // Only create MPS matmul instances for Dense weights; Quantized
         // projections use the custom compute kernel path instead.
-        let dense_matmul = |wb: &WeightBuffer,
-                            rows: usize,
-                            cols: usize,
-                            inner: usize|
-         -> Result<Option<MpsMatrixMultiply>, GpuError> {
+        let projection_matmul = |wb: &WeightBuffer,
+                                 rows: usize,
+                                 cols: usize,
+                                 inner: usize|
+         -> Result<ProjectionMatmul, GpuError> {
             match wb {
-                WeightBuffer::Dense { .. } => Ok(Some(make_matmul(rows, cols, inner)?)),
-                WeightBuffer::Quantized(_) => Ok(None),
+                WeightBuffer::Dense { .. } => {
+                    Ok(ProjectionMatmul::Dense(make_matmul(rows, cols, inner)?))
+                }
+                WeightBuffer::Quantized(_) => Ok(ProjectionMatmul::Quantized),
             }
         };
 
@@ -420,13 +447,13 @@ impl GpuInference {
         for i in 0..mc.num_hidden_layers {
             let lw = &weights.layers[i];
             layer_matmuls.push(LayerMatmuls {
-                q: dense_matmul(&lw.q_proj, token_count, nh * hd, h)?,
-                k: dense_matmul(&lw.k_proj, token_count, nkv * hd, h)?,
-                v: dense_matmul(&lw.v_proj, token_count, nkv * hd, h)?,
-                o: dense_matmul(&lw.o_proj, token_count, h, nh * hd)?,
-                gate: dense_matmul(&lw.gate_proj, token_count, inter, h)?,
-                up: dense_matmul(&lw.up_proj, token_count, inter, h)?,
-                down: dense_matmul(&lw.down_proj, token_count, h, inter)?,
+                q: projection_matmul(&lw.q_proj, token_count, nh * hd, h)?,
+                k: projection_matmul(&lw.k_proj, token_count, nkv * hd, h)?,
+                v: projection_matmul(&lw.v_proj, token_count, nkv * hd, h)?,
+                o: projection_matmul(&lw.o_proj, token_count, h, nh * hd)?,
+                gate: projection_matmul(&lw.gate_proj, token_count, inter, h)?,
+                up: projection_matmul(&lw.up_proj, token_count, inter, h)?,
+                down: projection_matmul(&lw.down_proj, token_count, h, inter)?,
             });
         }
 
@@ -594,14 +621,8 @@ impl GpuInference {
                                 row_bytes_qo,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.q.as_ref().expect(
-                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                            ).encode(
-                                &cmd_buf,
-                                &norm_mat,
-                                &q_weight_mat,
-                                &q_result_mat,
-                            );
+                            lm.q.dense()
+                                .encode(&cmd_buf, &norm_mat, &q_weight_mat, &q_result_mat);
                         }
                     } else {
                         let q_weight_mat = MpsMatrix::from_buffer(
@@ -618,14 +639,8 @@ impl GpuInference {
                             row_bytes_qo,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.q.as_ref().expect(
-                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                        ).encode(
-                            &cmd_buf,
-                            &norm_mat,
-                            &q_weight_mat,
-                            &q_result_mat,
-                        );
+                        lm.q.dense()
+                            .encode(&cmd_buf, &norm_mat, &q_weight_mat, &q_result_mat);
                     }
                 }
                 WeightBuffer::Quantized(q) => {
@@ -677,14 +692,8 @@ impl GpuInference {
                                 row_bytes_kv,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.k.as_ref().expect(
-                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                            ).encode(
-                                &cmd_buf,
-                                &norm_mat,
-                                &k_weight_mat,
-                                &k_result_mat,
-                            );
+                            lm.k.dense()
+                                .encode(&cmd_buf, &norm_mat, &k_weight_mat, &k_result_mat);
                         }
                     } else {
                         let k_weight_mat = MpsMatrix::from_buffer(
@@ -701,14 +710,8 @@ impl GpuInference {
                             row_bytes_kv,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.k.as_ref().expect(
-                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                        ).encode(
-                            &cmd_buf,
-                            &norm_mat,
-                            &k_weight_mat,
-                            &k_result_mat,
-                        );
+                        lm.k.dense()
+                            .encode(&cmd_buf, &norm_mat, &k_weight_mat, &k_result_mat);
                     }
                 }
                 WeightBuffer::Quantized(q) => {
@@ -760,14 +763,8 @@ impl GpuInference {
                                 row_bytes_kv,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.v.as_ref().expect(
-                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                            ).encode(
-                                &cmd_buf,
-                                &norm_mat,
-                                &v_weight_mat,
-                                &v_result_mat,
-                            );
+                            lm.v.dense()
+                                .encode(&cmd_buf, &norm_mat, &v_weight_mat, &v_result_mat);
                         }
                     } else {
                         let v_weight_mat = MpsMatrix::from_buffer(
@@ -784,14 +781,8 @@ impl GpuInference {
                             row_bytes_kv,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.v.as_ref().expect(
-                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                        ).encode(
-                            &cmd_buf,
-                            &norm_mat,
-                            &v_weight_mat,
-                            &v_result_mat,
-                        );
+                        lm.v.dense()
+                            .encode(&cmd_buf, &norm_mat, &v_weight_mat, &v_result_mat);
                     }
                 }
                 WeightBuffer::Quantized(q) => {
@@ -1180,9 +1171,7 @@ impl GpuInference {
                             let ffn_down_mat_for_o =
                                 MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
                                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.o.as_ref().expect(
-                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                            ).encode(
+                            lm.o.dense().encode(
                                 &cmd_buf,
                                 &attn_mat,
                                 &o_weight_mat,
@@ -1207,9 +1196,7 @@ impl GpuInference {
                         let ffn_down_mat_for_o =
                             MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.o.as_ref().expect(
-                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                        ).encode(
+                        lm.o.dense().encode(
                             &cmd_buf,
                             &attn_mat,
                             &o_weight_mat,
@@ -1289,9 +1276,7 @@ impl GpuInference {
                                 row_bytes_inter,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.gate.as_ref().expect(
-                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                            ).encode(
+                            lm.gate.dense().encode(
                                 &cmd_buf,
                                 &norm_mat2,
                                 &gate_weight_mat,
@@ -1308,9 +1293,7 @@ impl GpuInference {
                             row_bytes_inter,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.gate.as_ref().expect(
-                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                        ).encode(
+                        lm.gate.dense().encode(
                             &cmd_buf,
                             &norm_mat2,
                             &gate_weight_mat,
@@ -1362,9 +1345,7 @@ impl GpuInference {
                                 row_bytes_inter,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.up.as_ref().expect(
-                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                            ).encode(
+                            lm.up.dense().encode(
                                 &cmd_buf,
                                 &norm_mat2,
                                 &up_weight_mat,
@@ -1381,14 +1362,9 @@ impl GpuInference {
                             row_bytes_inter,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.up.as_ref().expect(
-                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                        ).encode(
-                            &cmd_buf,
-                            &norm_mat2,
-                            &up_weight_mat,
-                            &up_result_mat,
-                        );
+                        lm.up
+                            .dense()
+                            .encode(&cmd_buf, &norm_mat2, &up_weight_mat, &up_result_mat);
                     }
                 }
                 WeightBuffer::Quantized(q) => {
@@ -1455,9 +1431,7 @@ impl GpuInference {
                             let down_result_mat =
                                 MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
                                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.down.as_ref().expect(
-                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                            ).encode(
+                            lm.down.dense().encode(
                                 &cmd_buf,
                                 &gate_out_mat,
                                 &down_weight_mat,
@@ -1478,9 +1452,7 @@ impl GpuInference {
                         let down_result_mat =
                             MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.down.as_ref().expect(
-                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
-                        ).encode(
+                        lm.down.dense().encode(
                             &cmd_buf,
                             &gate_out_mat,
                             &down_weight_mat,
