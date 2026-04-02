@@ -29,6 +29,22 @@ inline float read_quantized(device const char* cache, uint base,
     }
 }
 
+/// Read one dequantized value from a threadgroup-shared tile (flash attention).
+inline float read_quantized_tile(threadgroup const char* tile,
+                                 uint pos, uint dim, uint head_dim,
+                                 uint n_bits, float deq_scale,
+                                 device const float* codebook) {
+    if (n_bits == 4) {
+        uint packed_stride = head_dim / 2;
+        uint byte_idx = pos * packed_stride + dim / 2;
+        uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
+        uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
+        return codebook[nibble] * deq_scale;
+    } else {
+        return float(tile[pos * head_dim + dim]) * deq_scale;
+    }
+}
+
 /// Read K cache: extract 3-bit codebook index + 1-bit QJL sign from 4-bit nibble.
 /// Returns (k_mse_value, qjl_sign) where sign is ±1.0.
 inline float2 read_k_quantized(device const char* cache, uint base,
@@ -274,7 +290,7 @@ kernel void turboquant_cache_write(
 //   buffer(16) qjl_matrix:      [head_dim × head_dim] float
 //   buffer(17) k_r_norms:       [num_kv_heads × max_seq_len] float
 //
-// Dispatch: num_heads threadgroups, head_dim threads per group.
+// Dispatch: num_heads threadgroups, min(head_dim, 1024) threads per group.
 
 kernel void turboquant_attention(
     device const half* q                [[buffer(0)]],
@@ -299,11 +315,29 @@ kernel void turboquant_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared_q_rot[256];
-    threadgroup float shared_s_q[256];     // S · q_rot for QJL correction
-    threadgroup float shared_reduce[256];
-    threadgroup float shared_output[256];
-    threadgroup float shared_softmax[2];   // [0]=max, [1]=sum
+    // Shared memory budget (head_dim=256, INT8 worst case):
+    //   shared_q_rot:  256 × 4 =  1,024 B
+    //   shared_s_q:    256 × 4 =  1,024 B
+    //   kv_tile_raw:   32 × 256 = 8,192 B (char; aliased K/V)
+    //   tile_scales:   32 × 4   =   128 B
+    //   shared_reduce: 256 × 4  = 1,024 B
+    //   tile_scores:   32 × 4   =   128 B
+    //   shared_output: 256 × 4  = 1,024 B
+    //   softmax/corr:  3 × 4    =    12 B
+    //   Total: ~12.6 KB (within 32 KB limit)
+    constexpr uint TILE = 32;
+    constexpr uint MAX_DIM = 256;
+
+    threadgroup float shared_q_rot[MAX_DIM];
+    threadgroup float shared_s_q[MAX_DIM];
+    threadgroup char  kv_tile_raw[TILE * MAX_DIM];
+    threadgroup float tile_scales[TILE];
+    threadgroup float shared_reduce[MAX_DIM];
+    threadgroup float tile_scores[TILE];
+    threadgroup float shared_output[MAX_DIM];
+    threadgroup float softmax_max[1];
+    threadgroup float softmax_sum[1];
+    threadgroup float tile_correction[1];
 
     uint head_idx = tgid;
     if (head_idx >= num_heads) return;
@@ -339,64 +373,106 @@ kernel void turboquant_attention(
         shared_output[d] = 0.0f;
     }
     if (tid == 0) {
-        shared_softmax[0] = -INFINITY;
-        shared_softmax[1] = 0.0f;
+        softmax_max[0] = -INFINITY;
+        softmax_sum[0] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // QJL correction constant: √(π/2) / d
-    // TODO: temporarily disabled — testing 3-bit MSE baseline
+    // QJL correction constant (currently disabled — testing MSE baseline)
     float qjl_coeff = 0.0f;
 
-    // ---- Step 2: Online softmax attention ----
-    for (uint p = 0; p < seq_len; p++) {
-        float k_deq = k_scale_buf[kv_head * max_seq_len + p];
+    uint bytes_per_pos = (n_bits == 4) ? (head_dim / 2) : head_dim;
 
-        // K inner product: at 4-bit, MSE-optimal codebook is sufficient
-        // (bias is negligible; paper Fig 3 confirms TurboQuant_mse > _prod at b≥4)
-        float partial_dot = 0.0f;
-        for (uint d = tid; d < head_dim; d += tg_size) {
-            float k_val = read_quantized(k_cache, kv_base, p, d, head_dim, n_bits, k_deq, k_codebook);
-            partial_dot += shared_q_rot[d] * k_val;
+    // ---- Step 2: Tiled flash attention ----
+    for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
+        uint tile_end = min(tile_start + TILE, seq_len);
+        uint actual_tile = tile_end - tile_start;
+
+        // Cooperative load of K tile raw bytes into threadgroup SRAM
+        uint tile_bytes = actual_tile * bytes_per_pos;
+        for (uint i = tid; i < tile_bytes; i += tg_size) {
+            kv_tile_raw[i] = k_cache[kv_base + tile_start * bytes_per_pos + i];
         }
-
-        shared_reduce[tid] = partial_dot;
+        for (uint i = tid; i < actual_tile; i += tg_size) {
+            tile_scales[i] = k_scale_buf[kv_head * max_seq_len + tile_start + i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Tree reduction
-        uint reduce_size = 1;
-        while (reduce_size < tg_size) reduce_size <<= 1;
-        for (uint stride = reduce_size / 2; stride > 0; stride >>= 1) {
-            if (tid < stride && (tid + stride) < tg_size)
-                shared_reduce[tid] += shared_reduce[tid + stride];
+        // Compute QK^T for every position in the tile
+        for (uint p = 0; p < actual_tile; p++) {
+            float k_deq = tile_scales[p];
+            float partial_dot = 0.0f;
+            for (uint d = tid; d < head_dim; d += tg_size) {
+                float k_val = read_quantized_tile(
+                    kv_tile_raw, p, d, head_dim, n_bits, k_deq, k_codebook);
+                partial_dot += shared_q_rot[d] * k_val;
+            }
+
+            // Tree reduction
+            shared_reduce[tid] = partial_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint rs = 1;
+            while (rs < tg_size) rs <<= 1;
+            for (uint s = rs / 2; s > 0; s >>= 1) {
+                if (tid < s && (tid + s) < tg_size)
+                    shared_reduce[tid] += shared_reduce[tid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) tile_scores[p] = shared_reduce[0] * scale;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        float score = shared_reduce[0] * scale;
-
-        // Online softmax update
-        float old_max = shared_softmax[0];
-        float new_max = max(old_max, score);
-        float rescale = exp(old_max - new_max);
-        float weight = exp(score - new_max);
-
+        // ---- Per-tile online softmax ----
         if (tid == 0) {
-            shared_softmax[0] = new_max;
-            shared_softmax[1] = shared_softmax[1] * rescale + weight;
+            float tm = -INFINITY;
+            for (uint p = 0; p < actual_tile; p++)
+                tm = max(tm, tile_scores[p]);
+
+            float old_max = softmax_max[0];
+            float new_max = max(old_max, tm);
+            float corr = exp(old_max - new_max);
+
+            tile_correction[0] = corr;
+            softmax_max[0] = new_max;
+            softmax_sum[0] = softmax_sum[0] * corr;
+
+            for (uint p = 0; p < actual_tile; p++) {
+                float w = exp(tile_scores[p] - new_max);
+                tile_scores[p] = w;
+                softmax_sum[0] += w;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Rescale accumulator and add weighted dequantized V
-        float v_deq = v_scale_buf[kv_head * max_seq_len + p];
-        for (uint d = tid; d < head_dim; d += tg_size) {
-            float v_val = read_quantized(v_cache, kv_base, p, d, head_dim, n_bits, v_deq, v_codebook);
-            shared_output[d] = shared_output[d] * rescale + weight * v_val;
+        // Rescale accumulator
+        float corr = tile_correction[0];
+        for (uint d = tid; d < head_dim; d += tg_size)
+            shared_output[d] *= corr;
+
+        // Load V tile raw bytes (aliasing K tile memory)
+        for (uint i = tid; i < tile_bytes; i += tg_size) {
+            kv_tile_raw[i] = v_cache[kv_base + tile_start * bytes_per_pos + i];
+        }
+        for (uint i = tid; i < actual_tile; i += tg_size) {
+            tile_scales[i] = v_scale_buf[kv_head * max_seq_len + tile_start + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate weighted V from tile
+        for (uint p = 0; p < actual_tile; p++) {
+            float w = tile_scores[p];
+            float v_deq = tile_scales[p];
+            for (uint d = tid; d < head_dim; d += tg_size) {
+                float v_val = read_quantized_tile(
+                    kv_tile_raw, p, d, head_dim, n_bits, v_deq, v_codebook);
+                shared_output[d] += w * v_val;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ---- Step 3: Normalize ----
-    float denom = shared_softmax[1];
+    float denom = max(softmax_sum[0], 1e-10f);
     for (uint d = tid; d < head_dim; d += tg_size) {
         shared_output[d] /= denom;
     }
@@ -603,7 +679,7 @@ kernel void turboquant_outlier_cache_write(
 //
 // Buffers mirror the cache write kernel, plus Q and output buffers.
 //
-// Dispatch: num_heads threadgroups, max(d_outlier_padded, d_non_padded) threads.
+// Dispatch: num_heads threadgroups, min(max(d_outlier_padded, d_non_padded), 1024) threads.
 
 kernel void turboquant_outlier_attention(
     device const half* q                            [[buffer(0)]],
@@ -633,12 +709,35 @@ kernel void turboquant_outlier_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared_q_outlier[256];
-    threadgroup float shared_q_non_outlier[256];
-    threadgroup float shared_reduce[256];
-    threadgroup float shared_output_outlier[256];
-    threadgroup float shared_output_non_outlier[256];
-    threadgroup float shared_softmax[2];
+    // Shared memory budget (head_dim=256 worst case):
+    //   shared_q_outlier:     256 × 4 =  1,024 B
+    //   shared_q_non_outlier: 256 × 4 =  1,024 B
+    //   outlier_kv_tile:      32 × 128 = 4,096 B (INT4 packed, aliased K/V)
+    //   non_outlier_kv_tile:  32 × 128 = 4,096 B
+    //   o/n_tile_scales:      2 × 32 × 4 = 256 B
+    //   shared_reduce:        256 × 4 =  1,024 B
+    //   tile_scores:          32 × 4  =    128 B
+    //   output_outlier:       256 × 4 =  1,024 B
+    //   output_non_outlier:   256 × 4 =  1,024 B
+    //   softmax/corr:         3 × 4   =     12 B
+    //   Total: ~13.7 KB (within 32 KB limit)
+    constexpr uint TILE = 32;
+    constexpr uint MAX_DIM = 256;
+    constexpr uint MAX_PACKED = 128; // MAX_DIM / 2 for INT4
+
+    threadgroup float shared_q_outlier[MAX_DIM];
+    threadgroup float shared_q_non_outlier[MAX_DIM];
+    threadgroup char  outlier_kv_tile[TILE * MAX_PACKED];
+    threadgroup char  non_outlier_kv_tile[TILE * MAX_PACKED];
+    threadgroup float o_tile_scales[TILE];
+    threadgroup float n_tile_scales[TILE];
+    threadgroup float shared_reduce[MAX_DIM];
+    threadgroup float tile_scores[TILE];
+    threadgroup float shared_output_outlier[MAX_DIM];
+    threadgroup float shared_output_non_outlier[MAX_DIM];
+    threadgroup float softmax_max[1];
+    threadgroup float softmax_sum[1];
+    threadgroup float tile_correction[1];
 
     uint head_idx = tgid;
     if (head_idx >= num_heads) return;
@@ -650,7 +749,6 @@ kernel void turboquant_outlier_attention(
     uint n_non = head_dim - n_outlier;
 
     // ---- Load and rotate Q for both groups ----
-    // Outlier Q channels
     for (uint i = tid; i < d_outlier_padded; i += tg_size) {
         if (i < n_outlier) {
             shared_q_outlier[i] = float(q[q_base + channel_indices[i]]);
@@ -670,78 +768,138 @@ kernel void turboquant_outlier_attention(
     hadamard_rotate_inplace(shared_q_outlier, outlier_rotation_signs, d_outlier_padded, tid, tg_size);
     hadamard_rotate_inplace(shared_q_non_outlier, non_outlier_rotation_signs, d_non_padded, tid, tg_size);
 
-    // Zero output accumulators (in rotated space, un-rotated at the end)
+    // Zero output accumulators
     for (uint d = tid; d < d_outlier_padded; d += tg_size)
         shared_output_outlier[d] = 0.0f;
     for (uint d = tid; d < d_non_padded; d += tg_size)
         shared_output_non_outlier[d] = 0.0f;
     if (tid == 0) {
-        shared_softmax[0] = -INFINITY;
-        shared_softmax[1] = 0.0f;
+        softmax_max[0] = -INFINITY;
+        softmax_sum[0] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint o_bytes_per_pos = d_outlier_padded / 2;
     uint n_bytes_per_pos = d_non_padded / 2;
+    uint o_base = kv_head * max_seq_len * o_bytes_per_pos;
+    uint n_base = kv_head * max_seq_len * n_bytes_per_pos;
 
-    // ---- Online softmax attention ----
-    for (uint p = 0; p < seq_len; p++) {
-        // Compute Q · K dot product across both groups
-        float k_o_deq = k_outlier_scales[kv_head * max_seq_len + p];
-        float k_n_deq = k_non_outlier_scales[kv_head * max_seq_len + p];
+    // ---- Tiled flash attention ----
+    for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
+        uint tile_end = min(tile_start + TILE, seq_len);
+        uint actual_tile = tile_end - tile_start;
 
-        float partial_dot = 0.0f;
-        // Outlier K contribution
-        uint o_base = kv_head * max_seq_len * o_bytes_per_pos;
-        for (uint d = tid; d < d_outlier_padded; d += tg_size) {
-            float k_val = read_quantized(k_outlier_cache, o_base, p, d, d_outlier_padded, 4, k_o_deq, outlier_codebook);
-            partial_dot += shared_q_outlier[d] * k_val;
+        // Cooperative load of K tiles into threadgroup SRAM
+        uint o_tile_bytes = actual_tile * o_bytes_per_pos;
+        for (uint i = tid; i < o_tile_bytes; i += tg_size) {
+            outlier_kv_tile[i] = k_outlier_cache[o_base + tile_start * o_bytes_per_pos + i];
         }
-        // Non-outlier K contribution
-        uint n_base = kv_head * max_seq_len * n_bytes_per_pos;
-        for (uint d = tid; d < d_non_padded; d += tg_size) {
-            float k_val = read_quantized(k_non_outlier_cache, n_base, p, d, d_non_padded, 4, k_n_deq, non_outlier_codebook);
-            partial_dot += shared_q_non_outlier[d] * k_val;
+        uint n_tile_bytes = actual_tile * n_bytes_per_pos;
+        for (uint i = tid; i < n_tile_bytes; i += tg_size) {
+            non_outlier_kv_tile[i] = k_non_outlier_cache[n_base + tile_start * n_bytes_per_pos + i];
         }
-
-        shared_reduce[tid] = partial_dot;
+        for (uint i = tid; i < actual_tile; i += tg_size) {
+            o_tile_scales[i] = k_outlier_scales[kv_head * max_seq_len + tile_start + i];
+            n_tile_scales[i] = k_non_outlier_scales[kv_head * max_seq_len + tile_start + i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint reduce_size = 1;
-        while (reduce_size < tg_size) reduce_size <<= 1;
-        for (uint stride = reduce_size / 2; stride > 0; stride >>= 1) {
-            if (tid < stride && (tid + stride) < tg_size)
-                shared_reduce[tid] += shared_reduce[tid + stride];
+
+        // Compute Q · K dot product for each position in tile
+        for (uint p = 0; p < actual_tile; p++) {
+            float k_o_deq = o_tile_scales[p];
+            float k_n_deq = n_tile_scales[p];
+
+            float partial_dot = 0.0f;
+            // Outlier K contribution
+            for (uint d = tid; d < d_outlier_padded; d += tg_size) {
+                float k_val = read_quantized_tile(
+                    outlier_kv_tile, p, d, d_outlier_padded, 4, k_o_deq, outlier_codebook);
+                partial_dot += shared_q_outlier[d] * k_val;
+            }
+            // Non-outlier K contribution
+            for (uint d = tid; d < d_non_padded; d += tg_size) {
+                float k_val = read_quantized_tile(
+                    non_outlier_kv_tile, p, d, d_non_padded, 4, k_n_deq, non_outlier_codebook);
+                partial_dot += shared_q_non_outlier[d] * k_val;
+            }
+
+            // Tree reduction
+            shared_reduce[tid] = partial_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint rs = 1;
+            while (rs < tg_size) rs <<= 1;
+            for (uint s = rs / 2; s > 0; s >>= 1) {
+                if (tid < s && (tid + s) < tg_size)
+                    shared_reduce[tid] += shared_reduce[tid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) tile_scores[p] = shared_reduce[0] * scale;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        float score = shared_reduce[0] * scale;
 
-        // Online softmax update
-        float old_max = shared_softmax[0];
-        float new_max = max(old_max, score);
-        float rescale = exp(old_max - new_max);
-        float weight = exp(score - new_max);
+        // ---- Per-tile online softmax ----
         if (tid == 0) {
-            shared_softmax[0] = new_max;
-            shared_softmax[1] = shared_softmax[1] * rescale + weight;
+            float tm = -INFINITY;
+            for (uint p = 0; p < actual_tile; p++)
+                tm = max(tm, tile_scores[p]);
+
+            float old_max = softmax_max[0];
+            float new_max = max(old_max, tm);
+            float corr = exp(old_max - new_max);
+
+            tile_correction[0] = corr;
+            softmax_max[0] = new_max;
+            softmax_sum[0] = softmax_sum[0] * corr;
+
+            for (uint p = 0; p < actual_tile; p++) {
+                float w = exp(tile_scores[p] - new_max);
+                tile_scores[p] = w;
+                softmax_sum[0] += w;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Rescale both accumulators
+        float corr = tile_correction[0];
+        for (uint d = tid; d < d_outlier_padded; d += tg_size)
+            shared_output_outlier[d] *= corr;
+        for (uint d = tid; d < d_non_padded; d += tg_size)
+            shared_output_non_outlier[d] *= corr;
+
+        // Load V tiles (aliasing K tile memory)
+        for (uint i = tid; i < o_tile_bytes; i += tg_size) {
+            outlier_kv_tile[i] = v_outlier_cache[o_base + tile_start * o_bytes_per_pos + i];
+        }
+        for (uint i = tid; i < n_tile_bytes; i += tg_size) {
+            non_outlier_kv_tile[i] = v_non_outlier_cache[n_base + tile_start * n_bytes_per_pos + i];
+        }
+        for (uint i = tid; i < actual_tile; i += tg_size) {
+            o_tile_scales[i] = v_outlier_scales[kv_head * max_seq_len + tile_start + i];
+            n_tile_scales[i] = v_non_outlier_scales[kv_head * max_seq_len + tile_start + i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Accumulate weighted V from both groups
-        float v_o_deq = v_outlier_scales[kv_head * max_seq_len + p];
-        for (uint d = tid; d < d_outlier_padded; d += tg_size) {
-            float v_val = read_quantized(v_outlier_cache, o_base, p, d, d_outlier_padded, 4, v_o_deq, outlier_codebook);
-            shared_output_outlier[d] = shared_output_outlier[d] * rescale + weight * v_val;
-        }
-        float v_n_deq = v_non_outlier_scales[kv_head * max_seq_len + p];
-        for (uint d = tid; d < d_non_padded; d += tg_size) {
-            float v_val = read_quantized(v_non_outlier_cache, n_base, p, d, d_non_padded, 4, v_n_deq, non_outlier_codebook);
-            shared_output_non_outlier[d] = shared_output_non_outlier[d] * rescale + weight * v_val;
+        for (uint p = 0; p < actual_tile; p++) {
+            float w = tile_scores[p];
+            float v_o_deq = o_tile_scales[p];
+            for (uint d = tid; d < d_outlier_padded; d += tg_size) {
+                float v_val = read_quantized_tile(
+                    outlier_kv_tile, p, d, d_outlier_padded, 4, v_o_deq, outlier_codebook);
+                shared_output_outlier[d] += w * v_val;
+            }
+            float v_n_deq = n_tile_scales[p];
+            for (uint d = tid; d < d_non_padded; d += tg_size) {
+                float v_val = read_quantized_tile(
+                    non_outlier_kv_tile, p, d, d_non_padded, 4, v_n_deq, non_outlier_codebook);
+                shared_output_non_outlier[d] += w * v_val;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ---- Normalize ----
-    float denom = shared_softmax[1];
+    float denom = max(softmax_sum[0], 1e-10f);
     for (uint d = tid; d < d_outlier_padded; d += tg_size)
         shared_output_outlier[d] /= denom;
     for (uint d = tid; d < d_non_padded; d += tg_size)

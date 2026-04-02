@@ -928,7 +928,7 @@ impl GpuInference {
                         enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 20);
                         enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 21);
                         enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 22);
-                        enc.dispatch_threadgroups((nh as usize, 1, 1), (tg_size, 1, 1));
+                        enc.dispatch_threadgroups((nh as usize, 1, 1), (tg_size.min(1024), 1, 1));
                     }
                 } else {
                     // ── Standard TurboQuant dispatch ──
@@ -1005,7 +1005,10 @@ impl GpuInference {
                         enc.set_buffer(&tq.v_codebook_buf, 0, 15);
                         enc.set_buffer(&tq.qjl_matrix, 0, 16);
                         enc.set_buffer(k_r_norms, 0, 17);
-                        enc.dispatch_threadgroups((nh as usize, 1, 1), (hd as usize, 1, 1));
+                        enc.dispatch_threadgroups(
+                            (nh as usize, 1, 1),
+                            ((hd as usize).min(1024), 1, 1),
+                        );
                     }
                 }
                 enc.end_encoding();
@@ -1060,7 +1063,7 @@ impl GpuInference {
                     enc.set_bytes(&hd.to_le_bytes(), 6);
                     enc.set_bytes(&max_seq.to_le_bytes(), 7);
                     enc.set_bytes(&current_seq_len.to_le_bytes(), 8);
-                    enc.dispatch_threadgroups((nh as usize, 1, 1), (hd as usize, 1, 1));
+                    enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
                 }
                 enc.end_encoding();
             }

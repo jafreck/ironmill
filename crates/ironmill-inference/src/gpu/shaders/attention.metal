@@ -1,10 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Standard FP16 attention (no quantization, no rotation).
-// For use when TurboQuant is disabled.
+// Tiled flash attention — standard FP16 (no quantization, no rotation).
+// Loads KV cache in tiles into threadgroup SRAM to reduce global memory
+// bandwidth. Uses online softmax (per-tile) for numerical stability.
 //
-// Buffers:
+// Buffers (unchanged):
 //   buffer(0) q:         [num_heads × head_dim]                     half
 //   buffer(1) k_cache:   [num_kv_heads × max_seq_len × head_dim]   half
 //   buffer(2) v_cache:   [num_kv_heads × max_seq_len × head_dim]   half
@@ -15,11 +16,9 @@ using namespace metal;
 //   buffer(7) max_seq_len:  uint
 //   buffer(8) seq_len:      uint  (number of valid positions in cache)
 //
-// Standard scaled dot-product attention with GQA support.
 // GQA: kv_head = head_idx / (num_heads / num_kv_heads)
 //
-// Dispatch: num_heads threadgroups, head_dim threads per group.
-// Uses online softmax for numerical stability.
+// Dispatch: num_heads threadgroups, min(head_dim, 1024) threads per group.
 
 kernel void standard_attention(
     device const half* q         [[buffer(0)]],
@@ -35,14 +34,25 @@ kernel void standard_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory (within 32 KB budget):
-    //   q_local:    [head_dim] float    — query vector for this head
-    //   reduction:  [head_dim] float    — scratch for parallel reductions
-    //   output_acc: [head_dim] float    — weighted V accumulator
-    // For head_dim=256: 256 * 3 * 4 = 3072 bytes
-    threadgroup float shared_q[256];
-    threadgroup float shared_reduce[256];
-    threadgroup float shared_output[256];
+    // Shared memory budget (head_dim=256 worst case):
+    //   shared_q:      256 × 4       =  1,024 B
+    //   kv_tile:       32 × 256 × 2  = 16,384 B  (half; aliased K then V)
+    //   shared_reduce: 256 × 4       =  1,024 B
+    //   tile_scores:   32 × 4        =    128 B
+    //   shared_output: 256 × 4       =  1,024 B
+    //   softmax/corr:  3 × 4         =     12 B
+    //   Total: ~19.6 KB  (within 32 KB limit)
+    constexpr uint TILE = 32;
+    constexpr uint MAX_DIM = 256;
+
+    threadgroup float shared_q[MAX_DIM];
+    threadgroup half  kv_tile[TILE * MAX_DIM];
+    threadgroup float shared_reduce[MAX_DIM];
+    threadgroup float tile_scores[TILE];
+    threadgroup float shared_output[MAX_DIM];
+    threadgroup float softmax_max[1];
+    threadgroup float softmax_sum[1];
+    threadgroup float tile_correction[1];
 
     uint head_idx = tgid;
     if (head_idx >= num_heads) return;
@@ -52,81 +62,104 @@ kernel void standard_attention(
 
     float scale = 1.0f / sqrt(float(head_dim));
 
-    // Load Q vector for this head into shared memory
+    // Load Q vector into shared memory and zero accumulator
     uint q_base = head_idx * head_dim;
     for (uint d = tid; d < head_dim; d += tg_size) {
         shared_q[d] = float(q[q_base + d]);
-    }
-
-    // Zero output accumulator
-    for (uint d = tid; d < head_dim; d += tg_size) {
         shared_output[d] = 0.0f;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint kv_base = kv_head * max_seq_len * head_dim;
-
-    // ---- Online softmax + weighted V accumulation ----
-    // We maintain running max and denominator to avoid a separate softmax pass.
-    // When a new max is found, we rescale the existing accumulator.
-
-    // Thread 0 tracks softmax state; all threads participate in dot products
-    // and V accumulation.
-    threadgroup float softmax_max[1];
-    threadgroup float softmax_sum[1];
-
     if (tid == 0) {
         softmax_max[0] = -INFINITY;
         softmax_sum[0] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint p = 0; p < seq_len; p++) {
-        uint k_offset = kv_base + p * head_dim;
+    uint kv_base = kv_head * max_seq_len * head_dim;
 
-        // Compute dot(Q, K[p]) — parallel reduction
-        float partial_dot = 0.0f;
-        for (uint d = tid; d < head_dim; d += tg_size) {
-            partial_dot += shared_q[d] * float(k_cache[k_offset + d]);
+    // ---- Tiled flash attention ----
+    for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
+        uint tile_end = min(tile_start + TILE, seq_len);
+        uint actual_tile = tile_end - tile_start;
+
+        // Cooperative load of K tile into threadgroup SRAM
+        uint k_elems = actual_tile * head_dim;
+        for (uint i = tid; i < k_elems; i += tg_size) {
+            uint p = i / head_dim;
+            uint d = i % head_dim;
+            kv_tile[p * head_dim + d] =
+                k_cache[kv_base + (tile_start + p) * head_dim + d];
         }
-        shared_reduce[tid] = partial_dot;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Round tg_size up to next power of 2 for reduction
-        uint reduce_size = 1;
-        while (reduce_size < tg_size) reduce_size <<= 1;
-
-        for (uint stride = reduce_size / 2; stride > 0; stride >>= 1) {
-            if (tid < stride && (tid + stride) < tg_size) {
-                shared_reduce[tid] += shared_reduce[tid + stride];
+        // Compute QK^T for every position in the tile
+        for (uint p = 0; p < actual_tile; p++) {
+            float partial_dot = 0.0f;
+            for (uint d = tid; d < head_dim; d += tg_size) {
+                partial_dot += shared_q[d] * float(kv_tile[p * head_dim + d]);
             }
+
+            // Tree reduction
+            shared_reduce[tid] = partial_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint rs = 1;
+            while (rs < tg_size) rs <<= 1;
+            for (uint s = rs / 2; s > 0; s >>= 1) {
+                if (tid < s && (tid + s) < tg_size)
+                    shared_reduce[tid] += shared_reduce[tid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) tile_scores[p] = shared_reduce[0] * scale;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        float score = shared_reduce[0] * scale;
-
-        // Online softmax update (thread 0 computes new max/sum)
-        float old_max = softmax_max[0];
-        float new_max = max(old_max, score);
-        float rescale = exp(old_max - new_max);
-        float weight = exp(score - new_max);
-
+        // ---- Per-tile online softmax ----
         if (tid == 0) {
-            softmax_sum[0] = softmax_sum[0] * rescale + weight;
+            float tm = -INFINITY;
+            for (uint p = 0; p < actual_tile; p++)
+                tm = max(tm, tile_scores[p]);
+
+            float old_max = softmax_max[0];
+            float new_max = max(old_max, tm);
+            float corr = exp(old_max - new_max);
+
+            tile_correction[0] = corr;
             softmax_max[0] = new_max;
+            softmax_sum[0] = softmax_sum[0] * corr;
+
+            for (uint p = 0; p < actual_tile; p++) {
+                float w = exp(tile_scores[p] - new_max);
+                tile_scores[p] = w;
+                softmax_sum[0] += w;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Rescale existing accumulator and add weighted V
-        uint v_offset = kv_base + p * head_dim;
-        for (uint d = tid; d < head_dim; d += tg_size) {
-            shared_output[d] = shared_output[d] * rescale + weight * float(v_cache[v_offset + d]);
+        // Rescale accumulator by correction factor
+        float corr = tile_correction[0];
+        for (uint d = tid; d < head_dim; d += tg_size)
+            shared_output[d] *= corr;
+
+        // Load V tile (aliasing K tile memory)
+        uint v_elems = actual_tile * head_dim;
+        for (uint i = tid; i < v_elems; i += tg_size) {
+            uint p = i / head_dim;
+            uint d = i % head_dim;
+            kv_tile[p * head_dim + d] =
+                v_cache[kv_base + (tile_start + p) * head_dim + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate weighted V from tile
+        for (uint p = 0; p < actual_tile; p++) {
+            float w = tile_scores[p];
+            for (uint d = tid; d < head_dim; d += tg_size)
+                shared_output[d] += w * float(kv_tile[p * head_dim + d]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Normalize by softmax denominator and write output
-    float denom = softmax_sum[0];
+    // Normalize and write output
+    float denom = max(softmax_sum[0], 1e-10f);
     uint out_base = head_idx * head_dim;
     for (uint d = tid; d < head_dim; d += tg_size) {
         output[out_base + d] = half(shared_output[d] / denom);
