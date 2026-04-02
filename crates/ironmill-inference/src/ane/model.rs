@@ -67,6 +67,18 @@ pub struct AneConfig {
     /// chaining fails. **Experimental — the ANE chaining API is
     /// undocumented and runtime behavior may vary by hardware.**
     pub enable_chaining: bool,
+    /// Enable MIL program fusion to reduce per-eval dispatch overhead.
+    ///
+    /// When set, fused programs are used where available:
+    /// - Cache-write K/V fusion (already the default — `build_cache_write_program`
+    ///   produces a single program for both K and V).
+    /// - FFN fusion: gate_proj + SiLU + up_proj + down_proj combined into a
+    ///   single program, saving 2-3 eval dispatches per layer.
+    ///
+    /// Fused programs may have higher op counts and larger I/O tensor
+    /// allocations. Falls back to unfused execution if a fused program
+    /// fails to compile or exceeds ANE limits.
+    pub enable_fusion: bool,
 }
 
 impl Default for AneConfig {
@@ -79,6 +91,7 @@ impl Default for AneConfig {
             qos: 33,
             enable_profiling: false,
             enable_chaining: false,
+            enable_fusion: false,
         }
     }
 }

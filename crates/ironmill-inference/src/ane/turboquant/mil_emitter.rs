@@ -91,6 +91,12 @@ pub fn compute_deq_scale(head_dim: usize, n_bits: u8) -> f32 {
 
 /// Build the MIL IR program for the cache-write sub-program.
 ///
+/// **Note:** This program already fuses K and V cache-write into a single
+/// MIL program. Both projections share the same codebook boundary/level
+/// constants and rotation matrix, and are quantized in parallel within
+/// one `eval()` dispatch. No separate `build_fused_cache_write_program()`
+/// is needed — this function IS the fused cache-write program.
+///
 /// Takes fp16 K/V projections and a rotation matrix, applies Hadamard
 /// rotation + Lloyd-Max codebook quantization via `greater`/`select`
 /// chains, outputs fp16 values at INT8 codes (cast to INT8 → back to fp16
@@ -879,6 +885,188 @@ pub fn build_qjl_program(
     (program, Vec::new())
 }
 
+// ---------------------------------------------------------------------------
+// Fused FFN sub-program
+// ---------------------------------------------------------------------------
+
+/// Configuration for the fused FFN MIL program.
+///
+/// The fused program combines gate_proj, SiLU activation, up_proj
+/// multiplication, and down_proj into a single ANE program:
+///
+/// ```text
+/// output = down_proj(SiLU(gate_proj(x)) * up_proj(x))
+/// ```
+///
+/// This saves 2-3 eval dispatches compared to running each linear
+/// projection as a separate ANE program.
+///
+/// **Note on op count:** The fused FFN program contains ~9 compute ops
+/// (3 conv + 1 sigmoid + 2 mul + 3 const weight tensors). This exceeds
+/// the 16-op chain confirmed by the ANE probe and should be tested with
+/// a dedicated compile check before deployment.
+pub struct FusedFfnConfig {
+    /// Hidden dimension (model width).
+    pub hidden_dim: usize,
+    /// Intermediate FFN dimension (typically 4× or ~2.7× hidden_dim).
+    pub intermediate_dim: usize,
+}
+
+/// Build the MIL IR program for a fused SwiGLU FFN.
+///
+/// Combines gate_proj, SiLU, up_proj, and down_proj into a single program.
+/// The gate_proj and up_proj operate in parallel on the input, then
+/// the gated result is projected back down:
+///
+/// ```text
+/// gate   = conv1x1(x, gate_weight)     [1, inter_dim, 1, S]
+/// silu   = gate × σ(gate)              [1, inter_dim, 1, S]
+/// up     = conv1x1(x, up_weight)       [1, inter_dim, 1, S]
+/// gated  = silu × up                   [1, inter_dim, 1, S]
+/// output = conv1x1(gated, down_weight) [1, hidden_dim, 1, S]
+/// ```
+///
+/// Weight tensors are embedded as const ops in the MIL program. When
+/// serialized via `program_to_mil_text`, they become BLOBFILE references.
+/// The weight data must be provided as fp16 LE bytes in conv weight
+/// layout: `[out_channels, in_channels, 1, 1]`.
+///
+/// # Inputs
+///
+/// - `a_input0`: hidden state `[1, hidden_dim, 1, MIN_IO_SEQ]` fp16
+///
+/// # Outputs
+///
+/// - `z_output0`: FFN output `[1, hidden_dim, 1, MIN_IO_SEQ]` fp16
+///
+/// # Returns
+///
+/// The MIL program. Weight data is embedded in the program's const ops
+/// and will be extracted as `WeightBlobEntry` items by `program_to_mil_text`.
+pub fn build_fused_ffn_program(
+    config: &FusedFfnConfig,
+    gate_proj_weight: &[u8],
+    up_proj_weight: &[u8],
+    down_proj_weight: &[u8],
+) -> Program {
+    let hidden = config.hidden_dim;
+    let inter = config.intermediate_dim;
+    let s = MIN_IO_SEQ;
+
+    let in_shape = vec![1, hidden, 1, s];
+    let inter_shape = vec![1, inter, 1, s];
+
+    let mut func = Function::new("main")
+        .with_input("x", TensorType::new(ScalarType::Float16, in_shape.clone()));
+
+    // --- Conv shared constants ---
+    add_const_op(&mut func.body, "pad_type", Value::String("valid".into()));
+    add_const_tensor_op(&mut func.body, "strides", &[1, 1]);
+    add_const_tensor_op(&mut func.body, "pad", &[0, 0, 0, 0]);
+    add_const_tensor_op(&mut func.body, "dilations", &[1, 1]);
+    add_const_op(&mut func.body, "groups", Value::Int(1));
+
+    // --- Weight constants (become BLOBFILE entries when serialized) ---
+    // gate_proj: [intermediate_dim, hidden_dim, 1, 1]
+    add_const_op(
+        &mut func.body,
+        "gate_weight",
+        Value::Tensor {
+            data: gate_proj_weight.to_vec(),
+            shape: vec![inter, hidden, 1, 1],
+            dtype: ScalarType::Float16,
+        },
+    );
+    // up_proj: [intermediate_dim, hidden_dim, 1, 1]
+    add_const_op(
+        &mut func.body,
+        "up_weight",
+        Value::Tensor {
+            data: up_proj_weight.to_vec(),
+            shape: vec![inter, hidden, 1, 1],
+            dtype: ScalarType::Float16,
+        },
+    );
+    // down_proj: [hidden_dim, intermediate_dim, 1, 1]
+    add_const_op(
+        &mut func.body,
+        "down_weight",
+        Value::Tensor {
+            data: down_proj_weight.to_vec(),
+            shape: vec![hidden, inter, 1, 1],
+            dtype: ScalarType::Float16,
+        },
+    );
+
+    // --- gate_proj: conv1×1(x, gate_weight) → [1, inter, 1, S] ---
+    let mut op = Operation::new("conv", "gate_out")
+        .with_input("x", Value::Reference("x".into()))
+        .with_input("weight", Value::Reference("gate_weight".into()))
+        .with_input("strides", Value::Reference("strides".into()))
+        .with_input("pad", Value::Reference("pad".into()))
+        .with_input("dilations", Value::Reference("dilations".into()))
+        .with_input("groups", Value::Reference("groups".into()))
+        .with_input("pad_type", Value::Reference("pad_type".into()))
+        .with_output("gate_out");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, inter_shape.clone()));
+    func.body.add_op(op);
+
+    // --- SiLU(gate) = gate × σ(gate) ---
+    let mut op = Operation::new("sigmoid", "gate_sigmoid")
+        .with_input("x", Value::Reference("gate_out".into()))
+        .with_output("gate_sigmoid");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, inter_shape.clone()));
+    func.body.add_op(op);
+
+    let mut op = Operation::new("mul", "silu_out")
+        .with_input("x", Value::Reference("gate_out".into()))
+        .with_input("y", Value::Reference("gate_sigmoid".into()))
+        .with_output("silu_out");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, inter_shape.clone()));
+    func.body.add_op(op);
+
+    // --- up_proj: conv1×1(x, up_weight) → [1, inter, 1, S] ---
+    let mut op = Operation::new("conv", "up_out")
+        .with_input("x", Value::Reference("x".into()))
+        .with_input("weight", Value::Reference("up_weight".into()))
+        .with_input("strides", Value::Reference("strides".into()))
+        .with_input("pad", Value::Reference("pad".into()))
+        .with_input("dilations", Value::Reference("dilations".into()))
+        .with_input("groups", Value::Reference("groups".into()))
+        .with_input("pad_type", Value::Reference("pad_type".into()))
+        .with_output("up_out");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, inter_shape.clone()));
+    func.body.add_op(op);
+
+    // --- gated = SiLU(gate) × up ---
+    let mut op = Operation::new("mul", "gated")
+        .with_input("x", Value::Reference("silu_out".into()))
+        .with_input("y", Value::Reference("up_out".into()))
+        .with_output("gated");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, inter_shape));
+    func.body.add_op(op);
+
+    // --- down_proj: conv1×1(gated, down_weight) → [1, hidden, 1, S] ---
+    let mut op = Operation::new("conv", "ffn_out")
+        .with_input("x", Value::Reference("gated".into()))
+        .with_input("weight", Value::Reference("down_weight".into()))
+        .with_input("strides", Value::Reference("strides".into()))
+        .with_input("pad", Value::Reference("pad".into()))
+        .with_input("dilations", Value::Reference("dilations".into()))
+        .with_input("groups", Value::Reference("groups".into()))
+        .with_input("pad_type", Value::Reference("pad_type".into()))
+        .with_output("ffn_out");
+    op.output_types[0] = Some(TensorType::new(ScalarType::Float16, in_shape));
+    func.body.add_op(op);
+
+    func.body.outputs.push("ffn_out".into());
+
+    let mut program = Program::new("1.0.0");
+    program.add_function(func);
+
+    program
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,5 +1358,67 @@ mod tests {
         let mil = to_mil(&program);
         assert!(!mil.contains("tile"), "FP16 MHA should not use tile op");
         assert!(!mil.contains("gqa_reps"));
+    }
+
+    #[test]
+    fn fused_ffn_mil_is_valid_program() {
+        let hidden = 64;
+        let inter = 128;
+        let config = FusedFfnConfig {
+            hidden_dim: hidden,
+            intermediate_dim: inter,
+        };
+
+        // Dummy weight data (fp16 bytes, correct sizes for conv [out, in, 1, 1]).
+        let gate_w = vec![0u8; inter * hidden * 2];
+        let up_w = vec![0u8; inter * hidden * 2];
+        let down_w = vec![0u8; hidden * inter * 2];
+
+        let program = build_fused_ffn_program(&config, &gate_w, &up_w, &down_w);
+        let mil = to_mil(&program);
+
+        // Should start with program header
+        assert!(mil.starts_with("program(1.3)"));
+        // Should contain function declaration
+        assert!(mil.contains("func main<ios18>"));
+        // One input (hidden state)
+        assert!(mil.contains("a_input0"));
+        // One output (FFN output)
+        assert!(mil.contains("z_output0"));
+        // Should contain conv ops for gate/up/down projections
+        assert!(
+            mil.contains("conv"),
+            "fused FFN should contain conv ops for linear projections"
+        );
+        // Should contain SiLU activation (sigmoid + mul)
+        assert!(
+            mil.contains("sigmoid"),
+            "fused FFN should contain sigmoid for SiLU"
+        );
+        assert!(mil.contains("mul"), "fused FFN should contain mul ops");
+        // Should contain weight BLOBFILE references
+        assert!(
+            mil.contains("BLOBFILE"),
+            "fused FFN should embed weight tensors as BLOBFILEs"
+        );
+    }
+
+    #[test]
+    fn cache_write_is_already_fused_kv() {
+        // Verify that build_cache_write_program produces a single program
+        // that handles BOTH K and V quantization (no separate K/V programs
+        // needed). This is documented in the function's doc comment.
+        let config = test_config();
+        let (levels, boundaries) = lloyd_max_gaussian(config.head_dim, config.n_bits);
+        let (program, _) = build_cache_write_program(&config, &boundaries, &levels);
+        let mil = to_mil(&program);
+
+        // Should have two outputs: K_quant and V_quant
+        assert!(mil.contains("z_output0"), "should output K_quant");
+        assert!(mil.contains("z_output1"), "should output V_quant");
+        // Should have three inputs: K_proj, V_proj, rotation_matrix
+        assert!(mil.contains("a_input0"), "should take K_proj");
+        assert!(mil.contains("a_input1"), "should take V_proj");
+        assert!(mil.contains("a_input2"), "should take rotation_matrix");
     }
 }

@@ -422,11 +422,22 @@ pub struct TurboQuantModel<D: AneDevice> {
     config: TurboQuantConfig,
     cache: KvCacheManager,
     /// Compiled cache-write sub-program (rotate + quantize K/V).
+    ///
+    /// This program already fuses both K and V quantization into a single
+    /// eval dispatch. See `mil_emitter::build_cache_write_program()` docs.
     cache_write_program: D::Program,
     /// Compiled attention sub-program (dequant + Q-rotate + attention + output un-rotate).
     attention_program: D::Program,
     /// Optional QJL correction program.
     qjl_program: Option<D::Program>,
+    /// Optional fused FFN program (gate_proj + SiLU + up_proj + down_proj).
+    ///
+    /// When present, `step_ffn()` runs the full FFN as a single eval dispatch.
+    /// Compiled when fusion is enabled and FFN weight data is provided at
+    /// compile time. Falls back to the bundle's `post_attn` program otherwise.
+    fused_ffn_program: Option<D::Program>,
+    /// Hidden dimension for FFN I/O tensor allocation.
+    ffn_hidden_dim: usize,
     /// Rotation matrix as IOSurface tensor (shared by cache-write and attention).
     /// Cache-write uses it to rotate K/V before quantization.
     /// Attention uses it to rotate Q and un-rotate the output.
@@ -600,6 +611,8 @@ impl<D: AneDevice> TurboQuantModel<D> {
             cache_write_program,
             attention_program,
             qjl_program,
+            fused_ffn_program: None,
+            ffn_hidden_dim: 0,
             rotation_tensor,
             tq_alloc_size,
             cw_k_output,
@@ -608,6 +621,53 @@ impl<D: AneDevice> TurboQuantModel<D> {
             mask_tensor,
             device,
         })
+    }
+
+    /// Compile and attach a fused FFN program.
+    ///
+    /// Call after [`compile()`] when FFN weight data is available and
+    /// fusion is enabled. The fused program combines gate_proj + SiLU +
+    /// up_proj + down_proj into a single eval dispatch.
+    ///
+    /// Weight data must be fp16 LE bytes in conv weight layout
+    /// `[out_channels, in_channels, 1, 1]`:
+    /// - `gate_proj_weight`: `[intermediate_dim, hidden_dim, 1, 1]`
+    /// - `up_proj_weight`: `[intermediate_dim, hidden_dim, 1, 1]`
+    /// - `down_proj_weight`: `[hidden_dim, intermediate_dim, 1, 1]`
+    pub fn compile_fused_ffn(
+        &mut self,
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        gate_proj_weight: &[u8],
+        up_proj_weight: &[u8],
+        down_proj_weight: &[u8],
+    ) -> Result<()> {
+        let ffn_config = mil_emitter::FusedFfnConfig {
+            hidden_dim,
+            intermediate_dim,
+        };
+        let program = mil_emitter::build_fused_ffn_program(
+            &ffn_config,
+            gate_proj_weight,
+            up_proj_weight,
+            down_proj_weight,
+        );
+        let mil_config = MilTextConfig::default();
+        let (mil_text, weight_entries) = program_to_mil_text(&program, &mil_config)
+            .map_err(|e| AneError::Other(anyhow::anyhow!("fused FFN MIL text failed: {e}")))?;
+
+        let weight_slices: Vec<(&str, &[u8])> = weight_entries
+            .iter()
+            .map(|w| (w.path.as_str(), w.data.as_slice()))
+            .collect();
+
+        let compiled = self
+            .device
+            .compile(&mil_text, &weight_slices, self.config.qos)?;
+
+        self.fused_ffn_program = Some(compiled);
+        self.ffn_hidden_dim = hidden_dim;
+        Ok(())
     }
 
     /// Run one token through all layers of the model.
@@ -811,6 +871,38 @@ impl<D: AneDevice> TurboQuantModel<D> {
         }
 
         Ok(attn_out)
+    }
+
+    /// Run the fused FFN program for a single layer.
+    ///
+    /// Takes the hidden state (attention output + residual, after post-attn
+    /// norm) and returns the FFN output. Requires a fused FFN program to
+    /// have been compiled via [`compile_fused_ffn()`].
+    ///
+    /// Returns `None` if no fused FFN program is available (caller should
+    /// fall back to the bundle's `post_attn` program).
+    pub fn step_ffn(&mut self, hidden: &AneTensor) -> Result<Option<AneTensor>> {
+        let ffn_prog = match &self.fused_ffn_program {
+            Some(prog) => prog,
+            None => return Ok(None),
+        };
+
+        let mut ffn_out = AneTensor::new_with_min_alloc(
+            self.ffn_hidden_dim,
+            MIN_IO_SEQ,
+            ScalarType::Float16,
+            self.tq_alloc_size,
+        )?;
+
+        self.device
+            .eval(ffn_prog, &[hidden], &mut [&mut ffn_out], self.config.qos)?;
+
+        Ok(Some(ffn_out))
+    }
+
+    /// Whether a fused FFN program has been compiled.
+    pub fn has_fused_ffn(&self) -> bool {
+        self.fused_ffn_program.is_some()
     }
 
     /// Reset cache for a new conversation.

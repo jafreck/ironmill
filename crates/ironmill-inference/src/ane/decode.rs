@@ -96,6 +96,14 @@ pub struct AneInference<D: AneDevice> {
     /// to eliminate per-layer CPU↔ANE roundtrips. Falls back to
     /// per-layer eval on failure.
     enable_chaining: bool,
+    /// Program fusion enabled. When `true` and a fused FFN program is
+    /// available in TurboQuant, `step_ffn()` is used instead of the
+    /// bundle's `post_attn` program. Falls back to `post_attn` when the
+    /// fused FFN program is not compiled or not available.
+    ///
+    /// Cache-write K/V fusion is always active (the cache-write program
+    /// inherently fuses both K and V quantization into one dispatch).
+    enable_fusion: bool,
 }
 
 /// CPU-side weight tensor for embedding/lm_head.
@@ -746,6 +754,7 @@ impl<D: AneDevice> AneInference<D> {
             qk_norm_weights,
             enable_profiling: false,
             enable_chaining: false,
+            enable_fusion: false,
         })
     }
 
@@ -767,6 +776,18 @@ impl<D: AneDevice> AneInference<D> {
     /// Disabled by default. **Experimental.**
     pub fn set_chaining(&mut self, enable: bool) {
         self.enable_chaining = enable;
+    }
+
+    /// Enable or disable MIL program fusion.
+    ///
+    /// When enabled and a fused FFN program is available in TurboQuant,
+    /// `step_ffn()` is used instead of the bundle's `post_attn` eval.
+    /// Falls back to `post_attn` when the fused FFN is not compiled.
+    ///
+    /// Cache-write K/V fusion is always active regardless of this flag
+    /// (the cache-write program inherently fuses both K and V).
+    pub fn set_fusion(&mut self, enable: bool) {
+        self.enable_fusion = enable;
     }
 
     // -----------------------------------------------------------------------
@@ -1295,7 +1316,50 @@ impl<D: AneDevice> AneInference<D> {
                 }
             } else {
                 // No post_attn sub-program — use attention output directly.
-                hidden = attn_out_data;
+                // When fusion is enabled and a fused FFN program is available,
+                // run the FFN on the attention output. This path activates when
+                // the bundle compiler didn't produce a post_attn program (all
+                // ops fell within the attention cluster).
+                //
+                // Note: the fused FFN covers only the gate_proj + SiLU +
+                // up_proj + down_proj chain. O-proj, residual additions, and
+                // RMSNorm are handled separately (they're typically part of
+                // pre_attn or the attention sub-program). When post_attn IS
+                // present, it already fuses all of these into a single eval.
+                if self.enable_fusion {
+                    if let Some(ref mut tq) = self.turboquant {
+                        if tq.has_fused_ffn() {
+                            let mut ffn_input = AneTensor::new_with_min_alloc(
+                                attn_out_data.len(),
+                                MIN_IO_SEQ,
+                                ScalarType::Float16,
+                                tq.alloc_size(),
+                            )?;
+                            write_f16_padded(&mut ffn_input, &attn_out_data)?;
+                            if let Some(ffn_out) = tq.step_ffn(&ffn_input)? {
+                                let ffn_out_data = read_f16_channels(&ffn_out)?;
+                                // Apply residual: hidden = hidden + ffn_out.
+                                // The fused FFN only computes gate_proj + SiLU +
+                                // up_proj + down_proj; the residual connection
+                                // must be added on the CPU (the unfused post_attn
+                                // program handles this internally).
+                                hidden = hidden
+                                    .iter()
+                                    .zip(ffn_out_data.iter())
+                                    .map(|(h, f)| *h + *f)
+                                    .collect();
+                            } else {
+                                hidden = attn_out_data;
+                            }
+                        } else {
+                            hidden = attn_out_data;
+                        }
+                    } else {
+                        hidden = attn_out_data;
+                    }
+                } else {
+                    hidden = attn_out_data;
+                }
             }
             if let Some(t) = t0 {
                 d_post_attn += t.elapsed();
