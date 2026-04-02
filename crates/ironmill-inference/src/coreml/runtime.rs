@@ -40,7 +40,7 @@ impl RuntimeModel for CoremlRuntimeModel {
     }
 
     fn predict(&self, inputs: &[RuntimeTensor]) -> anyhow::Result<Vec<RuntimeTensor>> {
-        let mut pi = PredictionInput::new();
+        let mut pi = PredictionInput::new()?;
         for t in inputs {
             let data_f32: Vec<f32> = match t.dtype {
                 ElementType::Float32 => t

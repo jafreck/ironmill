@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::Result;
+use crate::error::{MilError, Result};
 use crate::ir::ScalarType;
 use crate::ir::{Block, Function, Operation, Program, TensorType, Value};
 use crate::proto::mil_spec;
@@ -551,7 +551,12 @@ pub fn program_to_multi_function_model(
     }
 
     // Build the MIL Program proto with all functions.
-    let version: i64 = split.shared.version.parse().unwrap_or(1);
+    let version: i64 = split.shared.version.parse().map_err(|_| {
+        MilError::Validation(format!(
+            "invalid program version string: '{}'",
+            split.shared.version
+        ))
+    })?;
     let proto_program = mil_spec::Program {
         version,
         functions: all_functions,
@@ -757,7 +762,12 @@ fn convert_operation_stub(
 // ---------------------------------------------------------------------------
 
 fn convert_program(program: &Program) -> Result<mil_spec::Program> {
-    let version: i64 = program.version.parse().unwrap_or(1);
+    let version: i64 = program.version.parse().map_err(|_| {
+        MilError::Validation(format!(
+            "invalid program version string: '{}'",
+            program.version
+        ))
+    })?;
 
     let mut functions = HashMap::new();
     for (name, func) in &program.functions {
@@ -1143,13 +1153,15 @@ fn convert_value_to_argument(value: &Value) -> Result<mil_spec::Argument> {
                 .iter()
                 .map(|v| {
                     let Value::Reference(name) = v else {
-                        unreachable!()
+                        return Err(MilError::Validation(
+                            "expected Value::Reference in list binding".to_string(),
+                        ));
                     };
-                    mil_spec::argument::Binding {
+                    Ok(mil_spec::argument::Binding {
                         binding: Some(mil_spec::argument::binding::Binding::Name(name.clone())),
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             return Ok(mil_spec::Argument {
                 arguments: bindings,
             });
@@ -1241,11 +1253,13 @@ fn value_type_for(value: &Value) -> Option<mil_spec::ValueType> {
 
 /// Try to encode a list of scalar `Value`s as a 1D `TensorValue`.
 ///
-/// Returns `Some((tensor_value, data_type))` if all items are the same
-/// scalar type (Int, Float, or Bool), `None` otherwise.
-fn try_list_as_tensor(items: &[Value]) -> Option<(mil_spec::TensorValue, mil_spec::DataType)> {
+/// Returns `Ok(Some((tensor_value, data_type)))` if all items are the same
+/// scalar type (Int, Float, or Bool), `Ok(None)` otherwise.
+fn try_list_as_tensor(
+    items: &[Value],
+) -> Result<Option<(mil_spec::TensorValue, mil_spec::DataType)>> {
     if items.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Check if all items are ints.
@@ -1253,18 +1267,22 @@ fn try_list_as_tensor(items: &[Value]) -> Option<(mil_spec::TensorValue, mil_spe
         let ints: Vec<i32> = items
             .iter()
             .map(|v| {
-                let Value::Int(i) = v else { unreachable!() };
-                *i as i32
+                let Value::Int(i) = v else {
+                    return Err(MilError::Validation(
+                        "expected Value::Int in list".to_string(),
+                    ));
+                };
+                Ok(*i as i32)
             })
-            .collect();
-        return Some((
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some((
             mil_spec::TensorValue {
                 value: Some(mil_spec::tensor_value::Value::Ints(
                     mil_spec::tensor_value::RepeatedInts { values: ints },
                 )),
             },
             mil_spec::DataType::Int32,
-        ));
+        )));
     }
 
     // Check if all items are floats.
@@ -1272,18 +1290,22 @@ fn try_list_as_tensor(items: &[Value]) -> Option<(mil_spec::TensorValue, mil_spe
         let floats: Vec<f32> = items
             .iter()
             .map(|v| {
-                let Value::Float(f) = v else { unreachable!() };
-                *f as f32
+                let Value::Float(f) = v else {
+                    return Err(MilError::Validation(
+                        "expected Value::Float in list".to_string(),
+                    ));
+                };
+                Ok(*f as f32)
             })
-            .collect();
-        return Some((
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some((
             mil_spec::TensorValue {
                 value: Some(mil_spec::tensor_value::Value::Floats(
                     mil_spec::tensor_value::RepeatedFloats { values: floats },
                 )),
             },
             mil_spec::DataType::Float32,
-        ));
+        )));
     }
 
     // Check if all items are bools.
@@ -1291,30 +1313,36 @@ fn try_list_as_tensor(items: &[Value]) -> Option<(mil_spec::TensorValue, mil_spe
         let bools: Vec<bool> = items
             .iter()
             .map(|v| {
-                let Value::Bool(b) = v else { unreachable!() };
-                *b
+                let Value::Bool(b) = v else {
+                    return Err(MilError::Validation(
+                        "expected Value::Bool in list".to_string(),
+                    ));
+                };
+                Ok(*b)
             })
-            .collect();
-        return Some((
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some((
             mil_spec::TensorValue {
                 value: Some(mil_spec::tensor_value::Value::Bools(
                     mil_spec::tensor_value::RepeatedBools { values: bools },
                 )),
             },
             mil_spec::DataType::Bool,
-        ));
+        )));
     }
 
-    None
+    Ok(None)
 }
 
 /// Encode a `Value::Tensor` into the appropriate typed `TensorValue`.
 ///
 /// Uses typed repeated fields (floats, ints, etc.) so that `coremlcompiler`
 /// can verify element counts against the declared tensor type.
-fn convert_tensor_data(value: &Value) -> mil_spec::TensorValue {
+fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
     let Value::Tensor { data, dtype, .. } = value else {
-        unreachable!("convert_tensor_data called with non-Tensor value");
+        return Err(MilError::Validation(
+            "convert_tensor_data called with non-Tensor value".to_string(),
+        ));
     };
 
     let tv_value = match dtype {
@@ -1367,9 +1395,9 @@ fn convert_tensor_data(value: &Value) -> mil_spec::TensorValue {
         }),
     };
 
-    mil_spec::TensorValue {
+    Ok(mil_spec::TensorValue {
         value: Some(tv_value),
-    }
+    })
 }
 
 /// Convert an IR `Value` into a proto `Value`.
@@ -1456,7 +1484,7 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
             // In MIL, homogeneous lists of scalars are represented as 1D
             // tensors. Only use a proto ListValue for heterogeneous/nested
             // lists or lists of references.
-            if let Some((tv, dt)) = try_list_as_tensor(items) {
+            if let Some((tv, dt)) = try_list_as_tensor(items)? {
                 let len = items.len();
                 let tensor_type = mil_spec::ValueType {
                     r#type: Some(mil_spec::value_type::Type::TensorType(
@@ -1507,7 +1535,7 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
         Value::Tensor { .. } => {
             // Encode tensor using the typed storage that matches its dtype,
             // so coremlcompiler can verify element counts correctly.
-            let tv = convert_tensor_data(value);
+            let tv = convert_tensor_data(value)?;
             (
                 Some(value::Value::ImmediateValue(value::ImmediateValue {
                     value: Some(value::immediate_value::Value::Tensor(tv)),

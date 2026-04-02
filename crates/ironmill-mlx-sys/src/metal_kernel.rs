@@ -53,11 +53,19 @@ pub fn metal_kernel(
         // Build input / output name vectors. Use generic names since the
         // original API didn't require explicit names.
         let input_names: Vec<CString> = (0..inputs.len())
-            .map(|i| CString::new(format!("input{i}")).unwrap())
-            .collect();
+            .map(|i| {
+                CString::new(format!("input{i}")).map_err(|e| {
+                    MlxSysError::KernelCompile(format!("invalid kernel parameter name: {e}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
         let output_names: Vec<CString> = (0..output_shapes.len())
-            .map(|i| CString::new(format!("output{i}")).unwrap())
-            .collect();
+            .map(|i| {
+                CString::new(format!("output{i}")).map_err(|e| {
+                    MlxSysError::KernelCompile(format!("invalid kernel parameter name: {e}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         let input_name_ptrs: Vec<*const std::ffi::c_char> =
             input_names.iter().map(|s| s.as_ptr()).collect();

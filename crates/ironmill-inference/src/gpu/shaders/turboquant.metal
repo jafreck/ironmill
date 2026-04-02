@@ -1,3 +1,8 @@
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#define HEAD_DIM_PACKED (HEAD_DIM / 2)
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -173,9 +178,9 @@ kernel void turboquant_cache_write(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared_rotated[4096];
-    threadgroup float shared_reduce[512];
-    threadgroup char shared_quant[4096];
+    threadgroup float shared_rotated[HEAD_DIM];
+    threadgroup float shared_reduce[HEAD_DIM];
+    threadgroup char shared_quant[HEAD_DIM];
 
     uint head_idx = tgid;
     if (head_idx >= num_kv_heads) return;
@@ -282,9 +287,11 @@ kernel void turboquant_cache_write(
         uint packed_stride = head_dim / 2;
         uint cache_base = kv_cache_base(head_idx, max_seq_len, head_dim, 4)
                         + seq_pos * packed_stride;
+        // Note: head_dim is guaranteed power-of-two (always even) by Rust-side validation,
+        // so d+1 < head_dim always holds. Guard kept for defensive correctness.
         for (uint d = tid * 2; d < head_dim; d += tg_size * 2) {
             uchar lo = uchar(shared_quant[d]     & 0xF);
-            uchar hi = uchar(shared_quant[d + 1] & 0xF);
+            uchar hi = (d + 1 < head_dim) ? uchar(shared_quant[d + 1] & 0xF) : 0;
             ((device uchar*)cache)[cache_base + d / 2] = lo | (hi << 4);
         }
     } else {
@@ -367,26 +374,24 @@ kernel void turboquant_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory budget (head_dim=512 worst case):
-    //   shared_q_rot:  512 × 4 =  2,048 B
-    //   shared_s_q:    512 × 4 =  2,048 B
-    //   kv_tile_raw:   32 × 512 = 16,384 B (char; aliased K/V)
-    //   tile_scales:   32 × 4   =    128 B
-    //   shared_reduce: 512 × 4  =  2,048 B
-    //   tile_scores:   32 × 4   =    128 B
-    //   shared_output: 512 × 4  =  2,048 B
-    //   softmax/corr:  3 × 4    =     12 B
-    //   Total: ~24.8 KB (within 32 KB limit)
+    // Shared memory sized exactly to HEAD_DIM (injected at compile time).
+    //   shared_q_rot:  HEAD_DIM × 4     B
+    //   shared_s_q:    HEAD_DIM × 4     B
+    //   kv_tile_raw:   32 × HEAD_DIM    B (char; aliased K/V)
+    //   tile_scales:   32 × 4           B
+    //   shared_reduce: HEAD_DIM × 4     B
+    //   tile_scores:   32 × 4           B
+    //   shared_output: HEAD_DIM × 4     B
+    //   softmax/corr:  3 × 4            B
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 512;
 
-    threadgroup float shared_q_rot[MAX_DIM];
-    threadgroup float shared_s_q[MAX_DIM];
-    threadgroup char  kv_tile_raw[TILE * MAX_DIM];
+    threadgroup float shared_q_rot[HEAD_DIM];
+    threadgroup float shared_s_q[HEAD_DIM];
+    threadgroup char  kv_tile_raw[TILE * HEAD_DIM];
     threadgroup float tile_scales[TILE];
-    threadgroup float shared_reduce[MAX_DIM];
+    threadgroup float shared_reduce[HEAD_DIM];
     threadgroup float tile_scores[TILE];
-    threadgroup float shared_output[MAX_DIM];
+    threadgroup float shared_output[HEAD_DIM];
     threadgroup float softmax_max[1];
     threadgroup float softmax_sum[1];
     threadgroup float tile_correction[1];
@@ -707,10 +712,10 @@ kernel void turboquant_outlier_cache_write(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared_outlier[512];
-    threadgroup float shared_non_outlier[512];
-    threadgroup float shared_reduce[512];
-    threadgroup char shared_quant[512];
+    threadgroup float shared_outlier[HEAD_DIM];
+    threadgroup float shared_non_outlier[HEAD_DIM];
+    threadgroup float shared_reduce[HEAD_DIM];
+    threadgroup char shared_quant[HEAD_DIM];
 
     uint head_idx = tgid;
     if (head_idx >= num_kv_heads) return;
@@ -933,36 +938,33 @@ kernel void turboquant_outlier_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory budget (head_dim=512 worst case):
-    //   shared_q_outlier:     512 × 4 =  2,048 B
-    //   shared_q_non_outlier: 512 × 4 =  2,048 B
-    //   shared_s_q_outlier:   512 × 4 =  2,048 B
-    //   shared_s_q_non:       512 × 4 =  2,048 B
-    //   outlier_kv_tile:      32 × 256 = 8,192 B (INT4 packed, aliased K/V)
-    //   non_outlier_kv_tile:  32 × 256 = 8,192 B
-    //   o/n_tile_scales:      2 × 32 × 4 = 256 B
-    //   shared_reduce:        512 × 4 =  2,048 B
-    //   tile_scores:          32 × 4  =    128 B
-    //   output_outlier:       512 × 4 =  2,048 B
-    //   output_non_outlier:   512 × 4 =  2,048 B
-    //   softmax/corr:         3 × 4   =     12 B
-    //   Total: ~31.1 KB (within 32 KB limit)
+    // Shared memory sized exactly to HEAD_DIM (injected at compile time).
+    //   shared_q_outlier:     HEAD_DIM × 4         B
+    //   shared_q_non_outlier: HEAD_DIM × 4         B
+    //   shared_s_q_outlier:   HEAD_DIM × 4         B
+    //   shared_s_q_non:       HEAD_DIM × 4         B
+    //   outlier_kv_tile:      32 × HEAD_DIM_PACKED B (INT4 packed, aliased K/V)
+    //   non_outlier_kv_tile:  32 × HEAD_DIM_PACKED B
+    //   o/n_tile_scales:      2 × 32 × 4           B
+    //   shared_reduce:        HEAD_DIM × 4         B
+    //   tile_scores:          32 × 4               B
+    //   output_outlier:       HEAD_DIM × 4         B
+    //   output_non_outlier:   HEAD_DIM × 4         B
+    //   softmax/corr:         3 × 4                B
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 512;
-    constexpr uint MAX_PACKED = MAX_DIM / 2; // 256 for INT4
 
-    threadgroup float shared_q_outlier[MAX_DIM];
-    threadgroup float shared_q_non_outlier[MAX_DIM];
-    threadgroup float shared_s_q_outlier[MAX_DIM];
-    threadgroup float shared_s_q_non[MAX_DIM];
-    threadgroup char  outlier_kv_tile[TILE * MAX_PACKED];
-    threadgroup char  non_outlier_kv_tile[TILE * MAX_PACKED];
+    threadgroup float shared_q_outlier[HEAD_DIM];
+    threadgroup float shared_q_non_outlier[HEAD_DIM];
+    threadgroup float shared_s_q_outlier[HEAD_DIM];
+    threadgroup float shared_s_q_non[HEAD_DIM];
+    threadgroup char  outlier_kv_tile[TILE * HEAD_DIM_PACKED];
+    threadgroup char  non_outlier_kv_tile[TILE * HEAD_DIM_PACKED];
     threadgroup float o_tile_scales[TILE];
     threadgroup float n_tile_scales[TILE];
-    threadgroup float shared_reduce[MAX_DIM];
+    threadgroup float shared_reduce[HEAD_DIM];
     threadgroup float tile_scores[TILE];
-    threadgroup float shared_output_outlier[MAX_DIM];
-    threadgroup float shared_output_non_outlier[MAX_DIM];
+    threadgroup float shared_output_outlier[HEAD_DIM];
+    threadgroup float shared_output_non_outlier[HEAD_DIM];
     threadgroup float softmax_max[1];
     threadgroup float softmax_sum[1];
     threadgroup float tile_correction[1];

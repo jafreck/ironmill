@@ -266,7 +266,7 @@ pub struct PredictionInput {
 }
 
 impl PredictionInput {
-    pub fn new() -> Self {
+    pub fn new() -> anyhow::Result<Self> {
         let empty_dict: Retained<NSDictionary<NSString, objc2::runtime::AnyObject>> =
             NSDictionary::new();
         // SAFETY: Creating a dictionary feature provider from a valid (empty) NSDictionary.
@@ -276,9 +276,9 @@ impl PredictionInput {
                 &empty_dict,
             )
         }
-        .expect("failed to create empty MLDictionaryFeatureProvider");
+        .map_err(|e| anyhow::anyhow!("failed to create empty MLDictionaryFeatureProvider: {e}"))?;
 
-        Self { inner: provider }
+        Ok(Self { inner: provider })
     }
 
     pub fn add_multi_array(
@@ -368,12 +368,6 @@ impl PredictionInput {
 
         self.inner = provider;
         Ok(())
-    }
-}
-
-impl Default for PredictionInput {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -493,7 +487,7 @@ pub struct OutputTensorData {
 
 /// Build a dummy input (zeros) from a model's input description, suitable for benchmarking.
 pub fn build_dummy_input(desc: &InputDescription) -> anyhow::Result<PredictionInput> {
-    let mut input = PredictionInput::new();
+    let mut input = PredictionInput::new()?;
     for feat in &desc.features {
         let total: usize = feat
             .shape

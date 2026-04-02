@@ -1300,7 +1300,8 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
     match format {
         "text" => print_validation_report(&report),
         "json" => {
-            let json = validation_report_to_json(&report);
+            let json = validation_report_to_json(&report)
+                .context("Failed to serialize validation report")?;
             println!("{json}");
         }
         _ => bail!("Unsupported --format '{format}'. Expected 'text' or 'json'."),

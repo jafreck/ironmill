@@ -32,9 +32,11 @@ fn main() {
     }
 
     // Try to find mlx-c source to build via CMake.
-    let vendored_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
-        .join("vendor")
-        .join("mlx-c");
+    let vendored_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo"),
+    )
+    .join("vendor")
+    .join("mlx-c");
 
     if vendored_dir.join("CMakeLists.txt").exists() {
         let dst = cmake::Config::new(&vendored_dir)
@@ -82,7 +84,8 @@ fn generate_bindings(include_dir: &std::path::Path) {
         .generate()
         .expect("failed to generate mlx-c bindings");
 
-    let out_path = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("bindings.rs");
+    let out_path = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo"))
+        .join("bindings.rs");
     bindings
         .write_to_file(&out_path)
         .expect("failed to write mlx-c bindings");

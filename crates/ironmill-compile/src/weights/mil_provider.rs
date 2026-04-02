@@ -260,7 +260,11 @@ impl MilWeightProvider {
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
-                _ => unreachable!(),
+                other => {
+                    return Err(MilError::Validation(format!(
+                        "unsupported dtype {other:?} for quantization of tensor '{name}'"
+                    )));
+                }
             };
 
             // Per-row symmetric INT4 quantization with LUT + packed storage.

@@ -166,7 +166,7 @@ struct LayerMatmuls {
 pub struct GpuInference {
     device: MetalDevice,
     queue: ironmill_metal_sys::CommandQueue,
-    pipelines: super::ops::GpuPipelines,
+    pipelines: Option<super::ops::GpuPipelines>,
     weights: Option<GpuWeights>,
     turboquant: Option<GpuTurboQuantModel>,
     kv_cache: Option<GpuKvCache>,
@@ -182,16 +182,23 @@ pub struct GpuInference {
 }
 
 impl GpuInference {
+    /// Access compiled pipelines — panics if `load()` hasn't been called yet.
+    fn pipelines(&self) -> &super::ops::GpuPipelines {
+        self.pipelines
+            .as_ref()
+            .expect("pipelines not compiled — call load() first")
+    }
+
     /// Create a new GPU inference engine (device + queue + shader pipelines).
     pub fn new(config: GpuConfig) -> Result<Self, GpuError> {
         config.validate().map_err(|e| GpuError::Config(e))?;
         let device = MetalDevice::system_default().map_err(GpuError::Metal)?;
         let queue = device.create_command_queue().map_err(GpuError::Metal)?;
-        let pipelines = super::ops::GpuPipelines::compile(&device)?;
+        // Pipelines are compiled in load() once head_dim is known.
         Ok(Self {
             device,
             queue,
-            pipelines,
+            pipelines: None,
             weights: None,
             turboquant: None,
             kv_cache: None,
@@ -220,6 +227,11 @@ impl GpuInference {
 
         let mc = &weights.config;
         self.model_config = Some(mc.clone());
+
+        // Compile Metal shader pipelines with the model's head_dim.
+        let pipelines = super::ops::GpuPipelines::compile(&self.device, mc.head_dim)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        self.pipelines = Some(pipelines);
 
         let max_prefill = self.config.prefill_chunk_size.unwrap_or(512).max(1);
         let bufs = IntermediateBuffers::allocate(&self.device, max_prefill, mc)
@@ -455,12 +467,6 @@ impl GpuInference {
         let vocab = mc.vocab_size;
         let eps = mc.rms_norm_eps as f32;
         let enable_tq = self.config.enable_turboquant && self.turboquant.is_some();
-        if enable_tq {
-            assert!(
-                hd <= 512,
-                "head_dim {hd} exceeds MAX_DIM 512 for TurboQuant kernels"
-            );
-        }
 
         // Build or reuse MPS matmul cache for this token count.
         let need_rebuild = self
@@ -472,7 +478,10 @@ impl GpuInference {
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             self.decode_matmuls = Some(cache);
         }
-        let matmuls = self.decode_matmuls.as_ref().unwrap();
+        let matmuls = self
+            .decode_matmuls
+            .as_ref()
+            .expect("decode_matmuls must be populated — rebuilt in ensure_decode_matmuls");
 
         // Write token IDs to GPU buffer.
         let token_bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
@@ -494,7 +503,7 @@ impl GpuInference {
 
             ops::encode_embedding_lookup(
                 &enc,
-                &self.pipelines.embedding_lookup,
+                &self.pipelines().embedding_lookup,
                 &bufs.token_ids_buf,
                 &weights.embedding,
                 &bufs.hidden_state,
@@ -522,7 +531,7 @@ impl GpuInference {
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
-                &self.pipelines.rms_norm,
+                &self.pipelines().rms_norm,
                 &bufs.hidden_state,
                 &lw0.input_norm,
                 &bufs.norm_out,
@@ -562,7 +571,7 @@ impl GpuInference {
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                             ops::encode_matvec(
                                 &enc,
-                                &self.pipelines.matvec,
+                                &self.pipelines().matvec,
                                 &bufs.norm_out,
                                 packed_buf,
                                 &bufs.q_proj,
@@ -585,7 +594,9 @@ impl GpuInference {
                                 row_bytes_qo,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.q.as_ref().unwrap().encode(
+                            lm.q.as_ref().expect(
+                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                            ).encode(
                                 &cmd_buf,
                                 &norm_mat,
                                 &q_weight_mat,
@@ -607,7 +618,9 @@ impl GpuInference {
                             row_bytes_qo,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.q.as_ref().unwrap().encode(
+                        lm.q.as_ref().expect(
+                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                        ).encode(
                             &cmd_buf,
                             &norm_mat,
                             &q_weight_mat,
@@ -624,7 +637,7 @@ impl GpuInference {
                         &bufs.norm_out,
                         q,
                         &bufs.q_proj,
-                        &self.pipelines,
+                        self.pipelines(),
                         token_count,
                     )?;
                     enc.end_encoding();
@@ -641,7 +654,7 @@ impl GpuInference {
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                             ops::encode_matvec(
                                 &enc,
-                                &self.pipelines.matvec,
+                                &self.pipelines().matvec,
                                 &bufs.norm_out,
                                 packed_buf,
                                 &bufs.k_proj,
@@ -664,7 +677,9 @@ impl GpuInference {
                                 row_bytes_kv,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.k.as_ref().unwrap().encode(
+                            lm.k.as_ref().expect(
+                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                            ).encode(
                                 &cmd_buf,
                                 &norm_mat,
                                 &k_weight_mat,
@@ -686,7 +701,9 @@ impl GpuInference {
                             row_bytes_kv,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.k.as_ref().unwrap().encode(
+                        lm.k.as_ref().expect(
+                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                        ).encode(
                             &cmd_buf,
                             &norm_mat,
                             &k_weight_mat,
@@ -703,7 +720,7 @@ impl GpuInference {
                         &bufs.norm_out,
                         q,
                         &bufs.k_proj,
-                        &self.pipelines,
+                        self.pipelines(),
                         token_count,
                     )?;
                     enc.end_encoding();
@@ -720,7 +737,7 @@ impl GpuInference {
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                             ops::encode_matvec(
                                 &enc,
-                                &self.pipelines.matvec,
+                                &self.pipelines().matvec,
                                 &bufs.norm_out,
                                 packed_buf,
                                 &bufs.v_proj,
@@ -743,7 +760,9 @@ impl GpuInference {
                                 row_bytes_kv,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.v.as_ref().unwrap().encode(
+                            lm.v.as_ref().expect(
+                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                            ).encode(
                                 &cmd_buf,
                                 &norm_mat,
                                 &v_weight_mat,
@@ -765,7 +784,9 @@ impl GpuInference {
                             row_bytes_kv,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.v.as_ref().unwrap().encode(
+                        lm.v.as_ref().expect(
+                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                        ).encode(
                             &cmd_buf,
                             &norm_mat,
                             &v_weight_mat,
@@ -782,7 +803,7 @@ impl GpuInference {
                         &bufs.norm_out,
                         q,
                         &bufs.v_proj,
-                        &self.pipelines,
+                        self.pipelines(),
                         token_count,
                     )?;
                     enc.end_encoding();
@@ -796,7 +817,7 @@ impl GpuInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_rms_norm(
                     &enc,
-                    &self.pipelines.rms_norm,
+                    &self.pipelines().rms_norm,
                     &bufs.q_proj,
                     q_norm_w,
                     &bufs.q_proj,
@@ -806,7 +827,7 @@ impl GpuInference {
                 );
                 ops::encode_rms_norm(
                     &enc,
-                    &self.pipelines.rms_norm,
+                    &self.pipelines().rms_norm,
                     &bufs.k_proj,
                     k_norm_w,
                     &bufs.k_proj,
@@ -824,7 +845,7 @@ impl GpuInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_rope(
                     &enc,
-                    &self.pipelines.rope,
+                    &self.pipelines().rope,
                     &bufs.q_proj,
                     rope_cos,
                     rope_sin,
@@ -835,7 +856,7 @@ impl GpuInference {
                 );
                 ops::encode_rope(
                     &enc,
-                    &self.pipelines.rope,
+                    &self.pipelines().rope,
                     &bufs.k_proj,
                     rope_cos,
                     rope_sin,
@@ -849,8 +870,14 @@ impl GpuInference {
 
             // Steps 7-8: Cache write + attention
             if enable_tq {
-                let tq = self.turboquant.as_ref().unwrap();
-                let kv = self.kv_cache.as_ref().unwrap();
+                let tq = self
+                    .turboquant
+                    .as_ref()
+                    .expect("turboquant must be initialized when enable_tq is true");
+                let kv = self
+                    .kv_cache
+                    .as_ref()
+                    .expect("kv_cache must be initialized when enable_tq is true");
                 let max_seq = self.config.max_seq_len as u32;
                 let n_bits = self.config.n_bits as u32;
 
@@ -874,7 +901,7 @@ impl GpuInference {
                     for t in 0..token_count {
                         let token_offset = t * kv_head_stride_bytes;
                         // K cache: (b-1)-bit codebook + QJL
-                        enc.set_pipeline(&self.pipelines.turboquant_outlier_cache_write);
+                        enc.set_pipeline(&self.pipelines().turboquant_outlier_cache_write);
                         enc.set_buffer(&bufs.k_proj, token_offset, 0);
                         enc.set_buffer(&outlier.channel_indices, 0, 1);
                         enc.set_buffer(k_o_cache, 0, 2);
@@ -901,9 +928,9 @@ impl GpuInference {
                         enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
                         enc.set_buffer(k_o_r_norms, 0, 24);
                         enc.set_buffer(k_n_r_norms, 0, 25);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(512), 1, 1));
+                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
                         // V cache: b-bit codebook, no QJL
-                        enc.set_pipeline(&self.pipelines.turboquant_outlier_cache_write);
+                        enc.set_pipeline(&self.pipelines().turboquant_outlier_cache_write);
                         enc.set_buffer(&bufs.v_proj, token_offset, 0);
                         enc.set_buffer(&outlier.channel_indices, 0, 1);
                         enc.set_buffer(v_o_cache, 0, 2);
@@ -930,7 +957,7 @@ impl GpuInference {
                         enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
                         enc.set_buffer(k_o_r_norms, 0, 24);
                         enc.set_buffer(k_n_r_norms, 0, 25);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(512), 1, 1));
+                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
                     }
 
                     let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
@@ -938,7 +965,7 @@ impl GpuInference {
                         let q_offset = t * q_head_stride_bytes;
                         let attn_out_offset = t * q_head_stride_bytes;
                         let current_seq_len = (seq_pos + t + 1) as u32;
-                        enc.set_pipeline(&self.pipelines.turboquant_outlier_attention);
+                        enc.set_pipeline(&self.pipelines().turboquant_outlier_attention);
                         enc.set_buffer(&bufs.q_proj, q_offset, 0);
                         enc.set_buffer(k_o_cache, 0, 1);
                         enc.set_buffer(v_o_cache, 0, 2);
@@ -980,7 +1007,7 @@ impl GpuInference {
                     for t in 0..token_count {
                         let token_offset = t * kv_head_stride_bytes;
                         // K cache write: (b-1)-bit codebook + QJL
-                        enc.set_pipeline(&self.pipelines.turboquant_cache_write);
+                        enc.set_pipeline(&self.pipelines().turboquant_cache_write);
                         enc.set_buffer(&bufs.k_proj, token_offset, 0);
                         enc.set_buffer(&tq.rotation_signs, 0, 1);
                         enc.set_buffer(k_cache, 0, 2);
@@ -1000,10 +1027,10 @@ impl GpuInference {
                         enc.set_bytes(&1u32.to_le_bytes(), 16);
                         enc.dispatch_threadgroups(
                             (nkv as usize, 1, 1),
-                            ((hd as usize).min(512), 1, 1),
+                            ((hd as usize).min(1024), 1, 1),
                         );
                         // V cache write: b-bit codebook, no QJL
-                        enc.set_pipeline(&self.pipelines.turboquant_cache_write);
+                        enc.set_pipeline(&self.pipelines().turboquant_cache_write);
                         enc.set_buffer(&bufs.v_proj, token_offset, 0);
                         enc.set_buffer(&tq.rotation_signs, 0, 1);
                         enc.set_buffer(v_cache, 0, 2);
@@ -1023,7 +1050,7 @@ impl GpuInference {
                         enc.set_bytes(&0u32.to_le_bytes(), 16);
                         enc.dispatch_threadgroups(
                             (nkv as usize, 1, 1),
-                            ((hd as usize).min(512), 1, 1),
+                            ((hd as usize).min(1024), 1, 1),
                         );
                     }
 
@@ -1032,7 +1059,7 @@ impl GpuInference {
                         let q_offset = t * q_head_stride_bytes;
                         let attn_out_offset = t * q_head_stride_bytes;
                         let current_seq_len = (seq_pos + t + 1) as u32;
-                        enc.set_pipeline(&self.pipelines.turboquant_attention);
+                        enc.set_pipeline(&self.pipelines().turboquant_attention);
                         enc.set_buffer(&bufs.q_proj, q_offset, 0);
                         enc.set_buffer(k_cache, 0, 1);
                         enc.set_buffer(v_cache, 0, 2);
@@ -1060,7 +1087,10 @@ impl GpuInference {
                 enc.end_encoding();
             } else {
                 // FP16 KV cache path — scatter projections into cache on GPU.
-                let fp16_kv = self.fp16_kv_cache.as_ref().unwrap();
+                let fp16_kv = self
+                    .fp16_kv_cache
+                    .as_ref()
+                    .expect("fp16_kv_cache must be initialized for FP16 KV cache path");
                 let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
                 let max_seq = self.config.max_seq_len as u32;
 
@@ -1071,7 +1101,7 @@ impl GpuInference {
                 // Scatter K and V projections into their caches entirely on GPU.
                 ops::encode_kv_scatter(
                     &enc,
-                    &self.pipelines.kv_scatter,
+                    &self.pipelines().kv_scatter,
                     &bufs.k_proj,
                     k_cache,
                     seq_pos as u32,
@@ -1082,7 +1112,7 @@ impl GpuInference {
                 );
                 ops::encode_kv_scatter(
                     &enc,
-                    &self.pipelines.kv_scatter,
+                    &self.pipelines().kv_scatter,
                     &bufs.v_proj,
                     v_cache,
                     seq_pos as u32,
@@ -1099,7 +1129,7 @@ impl GpuInference {
                     let q_offset = t * q_head_stride_bytes;
                     let attn_out_offset = t * q_head_stride_bytes;
                     let current_seq_len = (seq_pos + t + 1) as u32;
-                    enc.set_pipeline(&self.pipelines.standard_attention);
+                    enc.set_pipeline(&self.pipelines().standard_attention);
                     enc.set_buffer(&bufs.q_proj, q_offset, 0);
                     enc.set_buffer(k_cache, 0, 1);
                     enc.set_buffer(v_cache, 0, 2);
@@ -1124,7 +1154,7 @@ impl GpuInference {
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                             ops::encode_matvec(
                                 &enc,
-                                &self.pipelines.matvec,
+                                &self.pipelines().matvec,
                                 &bufs.attn_out,
                                 packed_buf,
                                 &bufs.ffn_down,
@@ -1150,7 +1180,9 @@ impl GpuInference {
                             let ffn_down_mat_for_o =
                                 MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
                                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.o.as_ref().unwrap().encode(
+                            lm.o.as_ref().expect(
+                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                            ).encode(
                                 &cmd_buf,
                                 &attn_mat,
                                 &o_weight_mat,
@@ -1175,7 +1207,9 @@ impl GpuInference {
                         let ffn_down_mat_for_o =
                             MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.o.as_ref().unwrap().encode(
+                        lm.o.as_ref().expect(
+                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                        ).encode(
                             &cmd_buf,
                             &attn_mat,
                             &o_weight_mat,
@@ -1192,7 +1226,7 @@ impl GpuInference {
                         &bufs.attn_out,
                         q,
                         &bufs.ffn_down,
-                        &self.pipelines,
+                        self.pipelines(),
                         token_count,
                     )?;
                     enc.end_encoding();
@@ -1209,7 +1243,7 @@ impl GpuInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_fused_residual_rms_norm(
                     &enc,
-                    &self.pipelines.fused_residual_rms_norm,
+                    &self.pipelines().fused_residual_rms_norm,
                     &bufs.hidden_state, // a: skip connection (pre-norm hidden)
                     &bufs.ffn_down,     // b: o_proj output
                     &lw.post_attn_norm, // weight: post-attention norm
@@ -1236,7 +1270,7 @@ impl GpuInference {
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                             ops::encode_matvec(
                                 &enc,
-                                &self.pipelines.matvec,
+                                &self.pipelines().matvec,
                                 &bufs.norm_out,
                                 packed_buf,
                                 &bufs.ffn_gate,
@@ -1255,7 +1289,9 @@ impl GpuInference {
                                 row_bytes_inter,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.gate.as_ref().unwrap().encode(
+                            lm.gate.as_ref().expect(
+                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                            ).encode(
                                 &cmd_buf,
                                 &norm_mat2,
                                 &gate_weight_mat,
@@ -1272,7 +1308,9 @@ impl GpuInference {
                             row_bytes_inter,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.gate.as_ref().unwrap().encode(
+                        lm.gate.as_ref().expect(
+                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                        ).encode(
                             &cmd_buf,
                             &norm_mat2,
                             &gate_weight_mat,
@@ -1289,7 +1327,7 @@ impl GpuInference {
                         &bufs.norm_out,
                         q,
                         &bufs.ffn_gate,
-                        &self.pipelines,
+                        self.pipelines(),
                         token_count,
                     )?;
                     enc.end_encoding();
@@ -1306,7 +1344,7 @@ impl GpuInference {
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                             ops::encode_matvec(
                                 &enc,
-                                &self.pipelines.matvec,
+                                &self.pipelines().matvec,
                                 &bufs.norm_out,
                                 packed_buf,
                                 &bufs.ffn_up,
@@ -1324,7 +1362,9 @@ impl GpuInference {
                                 row_bytes_inter,
                             )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.up.as_ref().unwrap().encode(
+                            lm.up.as_ref().expect(
+                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                            ).encode(
                                 &cmd_buf,
                                 &norm_mat2,
                                 &up_weight_mat,
@@ -1341,7 +1381,9 @@ impl GpuInference {
                             row_bytes_inter,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.up.as_ref().unwrap().encode(
+                        lm.up.as_ref().expect(
+                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                        ).encode(
                             &cmd_buf,
                             &norm_mat2,
                             &up_weight_mat,
@@ -1358,7 +1400,7 @@ impl GpuInference {
                         &bufs.norm_out,
                         q,
                         &bufs.ffn_up,
-                        &self.pipelines,
+                        self.pipelines(),
                         token_count,
                     )?;
                     enc.end_encoding();
@@ -1372,7 +1414,7 @@ impl GpuInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_silu_gate(
                     &enc,
-                    &self.pipelines.silu_gate,
+                    &self.pipelines().silu_gate,
                     &bufs.ffn_gate,
                     &bufs.ffn_up,
                     &bufs.ffn_gate, // in-place output into gate buffer
@@ -1391,7 +1433,7 @@ impl GpuInference {
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                             ops::encode_matvec(
                                 &enc,
-                                &self.pipelines.matvec,
+                                &self.pipelines().matvec,
                                 &bufs.ffn_gate,
                                 packed_buf,
                                 &bufs.ffn_down,
@@ -1413,7 +1455,9 @@ impl GpuInference {
                             let down_result_mat =
                                 MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
                                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.down.as_ref().unwrap().encode(
+                            lm.down.as_ref().expect(
+                                "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                            ).encode(
                                 &cmd_buf,
                                 &gate_out_mat,
                                 &down_weight_mat,
@@ -1434,7 +1478,9 @@ impl GpuInference {
                         let down_result_mat =
                             MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
                                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.down.as_ref().unwrap().encode(
+                        lm.down.as_ref().expect(
+                            "matmul cache must be populated for Dense weights — rebuilt in ensure_decode_matmuls",
+                        ).encode(
                             &cmd_buf,
                             &gate_out_mat,
                             &down_weight_mat,
@@ -1451,7 +1497,7 @@ impl GpuInference {
                         &bufs.ffn_gate,
                         q,
                         &bufs.ffn_down,
-                        &self.pipelines,
+                        self.pipelines(),
                         token_count,
                     )?;
                     enc.end_encoding();
@@ -1469,7 +1515,7 @@ impl GpuInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_fused_residual_rms_norm(
                     &enc,
-                    &self.pipelines.fused_residual_rms_norm,
+                    &self.pipelines().fused_residual_rms_norm,
                     &bufs.residual,      // a: post-attn residual
                     &bufs.ffn_down,      // b: down_proj output
                     &next_lw.input_norm, // weight: next layer's input norm
@@ -1487,7 +1533,7 @@ impl GpuInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_residual_add(
                     &enc,
-                    &self.pipelines.residual_add,
+                    &self.pipelines().residual_add,
                     &bufs.residual,
                     &bufs.ffn_down,
                     &bufs.hidden_state,
@@ -1504,7 +1550,7 @@ impl GpuInference {
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
-                &self.pipelines.rms_norm,
+                &self.pipelines().rms_norm,
                 &bufs.hidden_state,
                 &weights.final_norm,
                 &bufs.norm_out,
@@ -1525,7 +1571,7 @@ impl GpuInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_matvec(
                     &enc,
-                    &self.pipelines.matvec,
+                    &self.pipelines().matvec,
                     &bufs.norm_out,
                     packed_buf,
                     &bufs.logits,
@@ -1692,6 +1738,12 @@ impl InferenceEngine for GpuInference {
 
         let mc = &weights.config;
         self.model_config = Some(mc.clone());
+
+        // Compile Metal shader pipelines with the model's head_dim so
+        // shared memory is sized exactly via #define HEAD_DIM.
+        let pipelines = super::ops::GpuPipelines::compile(&self.device, mc.head_dim)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        self.pipelines = Some(pipelines);
 
         // Allocate intermediate buffers (sized for single-token decode;
         // prefill will rebuild the matmul cache for larger token counts).

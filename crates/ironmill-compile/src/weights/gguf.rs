@@ -312,7 +312,9 @@ impl<'a> BinReader<'a> {
 
     /// Read a GGUF string: u64 length followed by UTF-8 bytes (not null-terminated).
     fn read_gguf_string(&mut self) -> Result<String, MilError> {
-        let len = self.read_u64()? as usize;
+        let len = usize::try_from(self.read_u64()?).map_err(|_| {
+            MilError::Validation("GGUF: string length exceeds platform limit".into())
+        })?;
         let bytes = self.read_bytes(len)?;
         String::from_utf8(bytes.to_vec())
             .map_err(|e| MilError::Validation(format!("GGUF: invalid UTF-8 in string: {e}")))
@@ -336,7 +338,9 @@ impl<'a> BinReader<'a> {
             9 => {
                 // Array: element type (u32) + count (u64) + elements
                 let elem_type = self.read_u32()?;
-                let count = self.read_u64()? as usize;
+                let count = usize::try_from(self.read_u64()?).map_err(|_| {
+                    MilError::Validation("GGUF: array count exceeds platform limit".into())
+                })?;
                 if count > 1_000_000 {
                     return Err(MilError::Validation(format!(
                         "GGUF metadata array count {count} exceeds limit"
@@ -447,8 +451,12 @@ impl GgufProvider {
                 )));
             }
 
-            let tensor_count = reader.read_u64()? as usize;
-            let metadata_kv_count = reader.read_u64()? as usize;
+            let tensor_count = usize::try_from(reader.read_u64()?).map_err(|_| {
+                MilError::Validation("GGUF: tensor count exceeds platform limit".into())
+            })?;
+            let metadata_kv_count = usize::try_from(reader.read_u64()?).map_err(|_| {
+                MilError::Validation("GGUF: metadata KV count exceeds platform limit".into())
+            })?;
 
             // --- Metadata KV pairs ---
             for _ in 0..metadata_kv_count {
@@ -462,10 +470,14 @@ impl GgufProvider {
             let mut tensor_infos = Vec::with_capacity(tensor_count);
             for _ in 0..tensor_count {
                 let name = reader.read_gguf_string()?;
-                let n_dims = reader.read_u32()? as usize;
+                let n_dims = usize::try_from(reader.read_u32()?).map_err(|_| {
+                    MilError::Validation("GGUF: dimension count exceeds platform limit".into())
+                })?;
                 let mut dimensions = Vec::with_capacity(n_dims);
                 for _ in 0..n_dims {
-                    dimensions.push(reader.read_u64()? as usize);
+                    dimensions.push(usize::try_from(reader.read_u64()?).map_err(|_| {
+                        MilError::Validation("GGUF: dimension value exceeds platform limit".into())
+                    })?);
                 }
                 let ggml_type = GgmlType::from_u32(reader.read_u32()?)?;
                 let offset = reader.read_u64()?;

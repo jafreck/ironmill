@@ -331,7 +331,9 @@ pub fn pack_indices(indices: &[usize], n_bits: u8) -> Vec<u8> {
     let mask = (1u16 << n_bits) - 1;
     let total_bits = indices.len() * n_bits as usize;
     let n_bytes = total_bits.div_ceil(8);
-    let mut packed = vec![0u8; n_bytes];
+    // Allocate one extra byte so the last value's lo byte always has a
+    // valid destination, then truncate back to the true output size.
+    let mut packed = vec![0u8; n_bytes + 1];
 
     for (i, &idx) in indices.iter().enumerate() {
         let bit_offset = i * n_bits as usize;
@@ -342,11 +344,10 @@ pub fn pack_indices(indices: &[usize], n_bits: u8) -> Vec<u8> {
         let shifted = val << (16 - n_bits as usize - bit_in_byte);
         let [hi, lo] = shifted.to_be_bytes();
         packed[byte_pos] |= hi;
-        if byte_pos + 1 < n_bytes {
-            packed[byte_pos + 1] |= lo;
-        }
+        packed[byte_pos + 1] |= lo;
     }
 
+    packed.truncate(n_bytes);
     packed
 }
 

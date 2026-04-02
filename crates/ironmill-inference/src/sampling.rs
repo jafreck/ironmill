@@ -13,12 +13,12 @@ pub fn sample_token(logits: &[f32], temperature: f32) -> u32 {
     }
 
     if temperature <= 0.0 {
-        // Greedy: argmax.
+        // Greedy: argmax. `total_cmp` gives deterministic ordering even with NaN logits.
         let (idx, _) = logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap();
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .unwrap_or((0, &0.0));
         return idx as u32;
     }
 

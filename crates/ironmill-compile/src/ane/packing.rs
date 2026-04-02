@@ -142,12 +142,7 @@ pub fn pack_inputs(sub: &mut SubProgram) -> Option<InputPacking> {
 
     // Now mutably access the function to apply changes.
     // Program::main_mut() doesn't exist, so access via functions map.
-    let func_mut = sub
-        .program
-        .functions
-        .values_mut()
-        .next()
-        .expect("sub-program must have a function");
+    let func_mut = sub.program.functions.values_mut().next()?;
 
     // Replace references in the existing body ops: original input names → unpacked names.
     let rename_map: HashMap<String, String> = original_names

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use mil_rs::error::Result;
+use mil_rs::error::{MilError, Result};
 use mil_rs::ir::{Function, Operation, Program, ScalarType, TensorType, Value};
 
 /// Configuration for the MIL text emitter.
@@ -68,6 +68,22 @@ pub fn program_to_mil_text(
     Ok((emitter.output, emitter.weight_entries))
 }
 
+/// Byte offset into each per-weight BLOBFILE. The ANE weight blob file format
+/// reserves a 64-byte header before the raw tensor data begins.
+const WEIGHT_BLOB_HEADER_BYTES: u64 = 64;
+
+/// MIL spec version emitted in `program(...)`.
+const MIL_SPEC_VERSION: &str = "1.3";
+
+/// CoreML compiler MIL component version (`coremlc-component-MIL`).
+const COREMLC_MIL_VERSION: &str = "3510.2.1";
+
+/// CoreML compiler version (`coremlc-version`).
+const COREMLC_VERSION: &str = "3505.4.1";
+
+/// CoreML Tools version (`coremltools-version`).
+const COREMLTOOLS_VERSION: &str = "9.0";
+
 // Internal attributes that should not appear in the text output.
 const SKIP_ATTRIBUTES: &[&str] = &["compute_unit", "fused_activation", "has_fused_bn"];
 
@@ -93,25 +109,26 @@ impl<'a> MilTextEmitter<'a> {
             config,
             output: String::new(),
             weight_entries: Vec::new(),
-            weight_offset: 64,
+            weight_offset: WEIGHT_BLOB_HEADER_BYTES,
             rename_map: HashMap::new(),
             type_map: HashMap::new(),
         }
     }
 
     fn emit_program(&mut self, program: &Program) -> Result<()> {
-        // Always emit version 1.3 for ANE compatibility.
+        // Always emit the ANE-compatible MIL spec version.
         let _ = &program.version; // acknowledge the field
-        writeln!(self.output, "program(1.3)").unwrap();
+        writeln!(self.output, "program({})", MIL_SPEC_VERSION).unwrap();
 
         // Required buildInfo attribute block.
-        self.output.push_str(concat!(
-            "[buildInfo = dict<string, string>({{",
-            "\"coremlc-component-MIL\", \"3510.2.1\"}, ",
-            "{\"coremlc-version\", \"3505.4.1\"}, ",
-            "{\"coremltools-component-milinternal\", \"\"}, ",
-            "{\"coremltools-version\", \"9.0\"}})]",
-        ));
+        write!(
+            self.output,
+            "[buildInfo = dict<string, string>({{{{\"coremlc-component-MIL\", \"{COREMLC_MIL_VERSION}\"}}, \
+             {{\"coremlc-version\", \"{COREMLC_VERSION}\"}}, \
+             {{\"coremltools-component-milinternal\", \"\"}}, \
+             {{\"coremltools-version\", \"{COREMLTOOLS_VERSION}\"}}}})]",
+        )
+        .unwrap();
         self.output.push('\n');
 
         writeln!(self.output, "{{").unwrap();
@@ -191,10 +208,13 @@ impl<'a> MilTextEmitter<'a> {
             Some(ty) => self.format_tensor_type(ty),
             None => {
                 eprintln!(
-                    "warning: could not infer output type for op '{}', falling back to tensor<fp16, [1]>",
-                    op.name
+                    "error: could not infer output type for op '{}' (type: {})",
+                    op.name, op.op_type
                 );
-                "tensor<fp16, [1]>".to_string()
+                return Err(MilError::Validation(format!(
+                    "cannot infer output type for op '{}' (type: {})",
+                    op.name, op.op_type
+                )));
             }
         };
 
@@ -296,7 +316,7 @@ impl<'a> MilTextEmitter<'a> {
                     name: op.name.clone(),
                     path: weight_path.clone(),
                     data: data.clone(),
-                    offset: 64,
+                    offset: WEIGHT_BLOB_HEADER_BYTES,
                     dtype: *dtype,
                     shape: shape.clone(),
                 });
@@ -306,7 +326,7 @@ impl<'a> MilTextEmitter<'a> {
 
                 writeln!(
                     self.output,
-                    "        {type_str} {output_name} = const()[name=string(\"{output_name}\"), val={type_str}(BLOBFILE(path=string(\"{weight_path}\"), offset=uint64(64)))];",
+                    "        {type_str} {output_name} = const()[name=string(\"{output_name}\"), val={type_str}(BLOBFILE(path=string(\"{weight_path}\"), offset=uint64({WEIGHT_BLOB_HEADER_BYTES})))];",
                 )
                 .unwrap();
             }
@@ -492,13 +512,28 @@ impl<'a> MilTextEmitter<'a> {
         let rank = shape.len() as i64;
         for &axis in &axes {
             let normalized = if axis < 0 {
-                (rank + axis) as usize
+                let n = rank + axis;
+                if n < 0 {
+                    eprintln!(
+                        "warning: reduce op '{}' has axis {} out of range for rank {}; \
+                         returning input type unchanged",
+                        op.name, axis, rank
+                    );
+                    return input_ty.clone();
+                }
+                n as usize
             } else {
                 axis as usize
             };
-            if normalized < shape.len() {
-                shape[normalized] = Some(1);
+            if normalized >= shape.len() {
+                eprintln!(
+                    "warning: reduce op '{}' has axis {} (normalized {}) out of range for rank {}; \
+                     returning input type unchanged",
+                    op.name, axis, normalized, rank
+                );
+                return input_ty.clone();
             }
+            shape[normalized] = Some(1);
         }
 
         TensorType {
@@ -598,6 +633,15 @@ fn align_up(value: u64, alignment: u64) -> u64 {
 ///
 /// Used for inline tensor literals in op arguments (e.g., reshape shape).
 fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> String {
+    let elem_size = dtype.byte_size();
+    debug_assert!(
+        elem_size <= 1 || data.len() % elem_size == 0,
+        "data length {} is not divisible by dtype size {} for {:?}",
+        data.len(),
+        elem_size,
+        dtype,
+    );
+
     match dtype {
         ScalarType::Int32 => data
             .chunks_exact(4)

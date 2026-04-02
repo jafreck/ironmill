@@ -1,3 +1,7 @@
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -34,23 +38,20 @@ kernel void standard_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory budget (head_dim=512 worst case):
-    //   shared_q:      512 × 4       =  2,048 B
-    //   kv_tile:       32 × 512 × 2  = 32,768 B  (half; aliased K then V)
-    //   shared_reduce: 512 × 4       =  2,048 B
-    //   tile_scores:   32 × 4        =    128 B
-    //   shared_output: 512 × 4       =  2,048 B
-    //   softmax/corr:  3 × 4         =     12 B
-    //   Total: ~39.1 KB  (NOTE: exceeds 32 KB for head_dim=512;
-    //    half kv_tile dominates. Actual usage depends on runtime head_dim.)
+    // Shared memory sized exactly to HEAD_DIM (injected at compile time).
+    //   shared_q:      HEAD_DIM × 4      B
+    //   kv_tile:       32 × HEAD_DIM × 2 B  (half; aliased K then V)
+    //   shared_reduce: HEAD_DIM × 4      B
+    //   tile_scores:   32 × 4            B
+    //   shared_output: HEAD_DIM × 4      B
+    //   softmax/corr:  3 × 4             B
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 512;
 
-    threadgroup float shared_q[MAX_DIM];
-    threadgroup half  kv_tile[TILE * MAX_DIM];
-    threadgroup float shared_reduce[MAX_DIM];
+    threadgroup float shared_q[HEAD_DIM];
+    threadgroup half  kv_tile[TILE * HEAD_DIM];
+    threadgroup float shared_reduce[HEAD_DIM];
     threadgroup float tile_scores[TILE];
-    threadgroup float shared_output[MAX_DIM];
+    threadgroup float shared_output[HEAD_DIM];
     threadgroup float softmax_max[1];
     threadgroup float softmax_sum[1];
     threadgroup float tile_correction[1];

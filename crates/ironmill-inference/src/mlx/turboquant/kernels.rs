@@ -137,6 +137,11 @@ inline void turboquant_quantize_group(
 ///  Output 0: dummy [1] float (kernel writes to cache in-place)
 pub const TURBOQUANT_CACHE_WRITE: &str = concat!(
     r#"
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#define HEAD_DIM_PACKED (HEAD_DIM / 2)
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -195,9 +200,9 @@ inline void hadamard_rotate_inplace_cw(
     uint n_levels     = params[5];
     uint is_k_cache   = params[6];
 
-    threadgroup float shared_rotated[4096];
-    threadgroup float shared_reduce[512];
-    threadgroup char shared_quant[4096];
+    threadgroup float shared_rotated[HEAD_DIM];
+    threadgroup float shared_reduce[HEAD_DIM];
+    threadgroup char shared_quant[HEAD_DIM];
 
     uint head_idx = tgid;
     if (head_idx >= num_kv_heads) return;
@@ -335,6 +340,11 @@ inline void hadamard_rotate_inplace_cw(
 ///  10: params [5] uint32 — {num_heads, num_kv_heads, head_dim, max_seq_len, seq_len, n_bits}
 ///  Output 0: output [num_heads × head_dim] half
 pub const TURBOQUANT_ATTENTION: &str = r#"
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#define HEAD_DIM_PACKED (HEAD_DIM / 2)
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -424,15 +434,14 @@ inline void hadamard_rotate_inplace_attn(
     uint n_bits       = params[5];
 
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 512;
 
-    threadgroup float shared_q_rot[MAX_DIM];
-    threadgroup float shared_s_q[MAX_DIM];
-    threadgroup char  kv_tile_raw[TILE * MAX_DIM];
+    threadgroup float shared_q_rot[HEAD_DIM];
+    threadgroup float shared_s_q[HEAD_DIM];
+    threadgroup char  kv_tile_raw[TILE * HEAD_DIM];
     threadgroup float tile_scales[TILE];
-    threadgroup float shared_reduce[MAX_DIM];
+    threadgroup float shared_reduce[HEAD_DIM];
     threadgroup float tile_scores[TILE];
-    threadgroup float shared_output[MAX_DIM];
+    threadgroup float shared_output[HEAD_DIM];
     threadgroup float softmax_max[1];
     threadgroup float softmax_sum[1];
     threadgroup float tile_correction[1];
@@ -626,6 +635,11 @@ inline void hadamard_rotate_inplace_attn(
 ///      n_outlier, d_outlier_padded, d_non_padded, outlier_n_levels, non_outlier_n_levels}
 ///  Output 0: dummy [1] float
 pub const TURBOQUANT_OUTLIER_CACHE_WRITE: &str = r#"
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#define HEAD_DIM_PACKED (HEAD_DIM / 2)
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -689,10 +703,10 @@ inline void hadamard_rotate_inplace_ocw(
     uint non_outlier_n_levels = params[8];
     uint is_k_cache        = params[9];
 
-    threadgroup float shared_outlier[512];
-    threadgroup float shared_non_outlier[512];
-    threadgroup float shared_reduce[512];
-    threadgroup char shared_quant[512];
+    threadgroup float shared_outlier[HEAD_DIM];
+    threadgroup float shared_non_outlier[HEAD_DIM];
+    threadgroup float shared_reduce[HEAD_DIM];
+    threadgroup char shared_quant[HEAD_DIM];
 
     uint head_idx = tgid;
     if (head_idx >= num_kv_heads) return;
@@ -895,6 +909,11 @@ inline void hadamard_rotate_inplace_ocw(
 ///      seq_len, n_outlier, d_outlier_padded, d_non_padded}
 ///  Output 0: output [num_heads × head_dim] half
 pub const TURBOQUANT_OUTLIER_ATTENTION: &str = r#"
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#define HEAD_DIM_PACKED (HEAD_DIM / 2)
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -985,21 +1004,19 @@ inline float2 read_k_quantized_tile_oa(threadgroup const char* tile,
     uint d_non_padded     = params[7];
 
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 512;
-    constexpr uint MAX_PACKED = MAX_DIM / 2;
 
-    threadgroup float shared_q_outlier[MAX_DIM];
-    threadgroup float shared_q_non_outlier[MAX_DIM];
-    threadgroup float shared_s_q_outlier[MAX_DIM];
-    threadgroup float shared_s_q_non[MAX_DIM];
-    threadgroup char  outlier_kv_tile[TILE * MAX_PACKED];
-    threadgroup char  non_outlier_kv_tile[TILE * MAX_PACKED];
+    threadgroup float shared_q_outlier[HEAD_DIM];
+    threadgroup float shared_q_non_outlier[HEAD_DIM];
+    threadgroup float shared_s_q_outlier[HEAD_DIM];
+    threadgroup float shared_s_q_non[HEAD_DIM];
+    threadgroup char  outlier_kv_tile[TILE * HEAD_DIM_PACKED];
+    threadgroup char  non_outlier_kv_tile[TILE * HEAD_DIM_PACKED];
     threadgroup float o_tile_scales[TILE];
     threadgroup float n_tile_scales[TILE];
-    threadgroup float shared_reduce[MAX_DIM];
+    threadgroup float shared_reduce[HEAD_DIM];
     threadgroup float tile_scores[TILE];
-    threadgroup float shared_output_outlier[MAX_DIM];
-    threadgroup float shared_output_non_outlier[MAX_DIM];
+    threadgroup float shared_output_outlier[HEAD_DIM];
+    threadgroup float shared_output_non_outlier[HEAD_DIM];
     threadgroup float softmax_max[1];
     threadgroup float softmax_sum[1];
     threadgroup float tile_correction[1];

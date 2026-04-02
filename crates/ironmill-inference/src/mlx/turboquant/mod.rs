@@ -145,10 +145,6 @@ impl MlxTurboQuantModel {
             head_dim.is_power_of_two(),
             "head_dim must be a power of two for Walsh-Hadamard butterfly"
         );
-        assert!(
-            head_dim <= 512,
-            "head_dim must be <= 512 for TurboQuant kernel shared memory"
-        );
 
         // Generate rotation signs
         let sign_data = generate_rotation_signs(head_dim, rotation_seed);

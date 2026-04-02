@@ -204,7 +204,7 @@ fn validate_json_report_structure() {
     program.add_function(func);
 
     let report = validate_ane_compatibility(&program);
-    let json_str = validation_report_to_json(&report);
+    let json_str = validation_report_to_json(&report).expect("JSON should serialize");
     let json: serde_json::Value = serde_json::from_str(&json_str).expect("should parse JSON");
 
     // Per-op ane_eligible field

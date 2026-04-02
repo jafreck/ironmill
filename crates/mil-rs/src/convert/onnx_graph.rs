@@ -1135,7 +1135,15 @@ fn load_external_tensor_data(
     for entry in external_data {
         match entry.key.as_str() {
             "location" => location = Some(entry.value.clone()),
-            "offset" => offset = entry.value.parse().unwrap_or(0),
+            "offset" => {
+                offset = match entry.value.parse() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("error: invalid external data offset '{}': {e}", entry.value);
+                        return Vec::new();
+                    }
+                };
+            }
             "length" => length = entry.value.parse().ok(),
             _ => {}
         }

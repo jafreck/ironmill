@@ -27,14 +27,24 @@ pub struct GpuPipelines {
 
 impl GpuPipelines {
     /// Compile all Metal shaders and create pipeline states.
-    pub fn compile(device: &MetalDevice) -> Result<Self, GpuError> {
+    ///
+    /// `head_dim` is injected into TurboQuant and attention shaders via
+    /// `#define HEAD_DIM` so shared memory is sized exactly.
+    pub fn compile(device: &MetalDevice, head_dim: usize) -> Result<Self, GpuError> {
+        let head_dim_header = format!(
+            "#define HEAD_DIM {head_dim}\n#define HEAD_DIM_PACKED {}\n",
+            head_dim / 2
+        );
+
         let norm_src = include_str!("shaders/normalization.metal");
         let act_src = include_str!("shaders/activation.metal");
         let rope_src = include_str!("shaders/rope.metal");
         let elem_src = include_str!("shaders/elementwise.metal");
         let embed_src = include_str!("shaders/embedding.metal");
-        let tq_src = include_str!("shaders/turboquant.metal");
-        let attn_src = include_str!("shaders/attention.metal");
+        let tq_src_raw = include_str!("shaders/turboquant.metal");
+        let tq_src = format!("{head_dim_header}{tq_src_raw}");
+        let attn_src_raw = include_str!("shaders/attention.metal");
+        let attn_src = format!("{head_dim_header}{attn_src_raw}");
         let qmm_src = include_str!("shaders/quantized_matmul.metal");
         let kv_scatter_src = include_str!("shaders/kv_scatter.metal");
         let matvec_src = include_str!("shaders/matvec.metal");
@@ -56,10 +66,10 @@ impl GpuPipelines {
             .compile_shader_source(embed_src)
             .map_err(GpuError::Metal)?;
         let tq_lib = device
-            .compile_shader_source(tq_src)
+            .compile_shader_source(&tq_src)
             .map_err(GpuError::Metal)?;
         let attn_lib = device
-            .compile_shader_source(attn_src)
+            .compile_shader_source(&attn_src)
             .map_err(GpuError::Metal)?;
         let qmm_lib = device
             .compile_shader_source(qmm_src)
@@ -390,11 +400,10 @@ pub fn encode_turboquant_attention(
     encoder.set_buffer(k_scale_buf, 0, 12);
     encoder.set_buffer(v_scale_buf, 0, 13);
     encoder.set_buffer(codebook, 0, 14);
-    // Clamp threadgroup size to MAX_DIM=256 from turboquant.metal to
-    // prevent shared-memory out-of-bounds access.
+    // HEAD_DIM is now exact — clamp to Metal's 1024-thread limit only.
     encoder.dispatch_threadgroups(
         (num_heads as usize, 1, 1),
-        ((head_dim as usize).min(256), 1, 1),
+        ((head_dim as usize).min(1024), 1, 1),
     );
 }
 
@@ -423,11 +432,10 @@ pub fn encode_standard_attention(
     encoder.set_bytes(&head_dim.to_le_bytes(), 6);
     encoder.set_bytes(&max_seq_len.to_le_bytes(), 7);
     encoder.set_bytes(&seq_len.to_le_bytes(), 8);
-    // Clamp threadgroup size to MAX_DIM=256 from attention.metal to
-    // prevent shared-memory out-of-bounds access.
+    // HEAD_DIM is now exact — clamp to Metal's 1024-thread limit only.
     encoder.dispatch_threadgroups(
         (num_heads as usize, 1, 1),
-        ((head_dim as usize).min(256), 1, 1),
+        ((head_dim as usize).min(1024), 1, 1),
     );
 }
 

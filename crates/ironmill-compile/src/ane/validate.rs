@@ -212,8 +212,8 @@ pub fn print_validation_report(report: &ValidationReport) {
 }
 
 /// Serialize a validation report to a JSON string.
-pub fn validation_report_to_json(report: &ValidationReport) -> String {
-    serde_json::to_string_pretty(report).expect("report serialization should not fail")
+pub fn validation_report_to_json(report: &ValidationReport) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,7 +1336,7 @@ mod tests {
         ];
         let report = validate_ane_compatibility(&make_program(ops));
 
-        let json = validation_report_to_json(&report);
+        let json = validation_report_to_json(&report).expect("JSON should serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("JSON should be valid");
 
         assert!(parsed.get("ane_compatible").is_some());

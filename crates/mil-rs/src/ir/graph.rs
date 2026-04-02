@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::error::Result;
+use crate::error::{MilError, Result};
 
 use super::Operation;
+use super::types::Value;
 
 /// A MIL computation graph.
 ///
@@ -51,7 +52,69 @@ impl Graph {
     /// - No duplicate operation names
     /// - Outputs reference existing values
     pub fn validate(&self) -> Result<()> {
-        // TODO: implement full validation
+        // Collect all defined values: graph inputs + operation outputs.
+        let mut defined: HashSet<&str> = HashSet::new();
+        for name in &self.inputs {
+            defined.insert(name.as_str());
+        }
+
+        // Check for duplicate operation names.
+        let mut op_names: HashSet<&str> = HashSet::new();
+        for op in &self.operations {
+            if !op.name.is_empty() && !op_names.insert(op.name.as_str()) {
+                return Err(MilError::Validation(format!(
+                    "duplicate operation name: '{}'",
+                    op.name
+                )));
+            }
+            for out in &op.outputs {
+                defined.insert(out.as_str());
+            }
+        }
+
+        // Check that all value references in operation inputs resolve.
+        for op in &self.operations {
+            for (param, value) in &op.inputs {
+                Self::check_refs(value, &defined, &op.name, param)?;
+            }
+        }
+
+        // Check that graph outputs reference existing values.
+        for out in &self.outputs {
+            if !defined.contains(out.as_str()) {
+                return Err(MilError::Validation(format!(
+                    "graph output '{}' references undefined value",
+                    out
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Recursively check that all `Value::Reference`s within a value resolve.
+    fn check_refs(
+        value: &Value,
+        defined: &HashSet<&str>,
+        op_name: &str,
+        param: &str,
+    ) -> Result<()> {
+        match value {
+            Value::Reference(name) => {
+                if !defined.contains(name.as_str()) {
+                    return Err(MilError::UndefinedValue(format!(
+                        "operation '{}' input '{}' references undefined value '{}'",
+                        op_name, param, name
+                    )));
+                }
+            }
+            Value::List(items) => {
+                for item in items {
+                    Self::check_refs(item, defined, op_name, param)?;
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 }

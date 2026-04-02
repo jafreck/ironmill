@@ -369,6 +369,15 @@ pub extern "C" fn mil_validation_report_to_json(report: *const MilValidationRepo
     let result = std::panic::catch_unwind(|| {
         let report = unsafe { &*report };
         let json = ironmill_compile::ane::validate::validation_report_to_json(&report.0);
+        let json = match json {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(&format!(
+                    "mil_validation_report_to_json: serialization failed: {e}"
+                ));
+                return std::ptr::null_mut();
+            }
+        };
         match CString::new(json) {
             Ok(cs) => cs.into_raw(),
             Err(e) => {

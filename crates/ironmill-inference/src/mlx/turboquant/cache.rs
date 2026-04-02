@@ -239,13 +239,22 @@ impl MlxKvCache {
             &params_arr,          // 9
         ];
 
+        let head_dim_header = format!(
+            "#define HEAD_DIM {}\n#define HEAD_DIM_PACKED {}\n",
+            self.head_dim,
+            self.head_dim / 2
+        );
+        let source = format!(
+            "{head_dim_header}{}",
+            super::kernels::TURBOQUANT_CACHE_WRITE
+        );
         let result = metal_kernel(
             "turboquant_cache_write",
             &inputs,
             &[],
-            super::kernels::TURBOQUANT_CACHE_WRITE,
+            &source,
             [self.num_kv_heads, 1, 1],
-            [self.head_dim.min(512), 1, 1],
+            [self.head_dim.min(1024), 1, 1],
             &[&[1]], // dummy output shape
             &[MlxDtype::Float32],
             stream,
@@ -306,13 +315,19 @@ impl MlxKvCache {
         ];
 
         let output_size = num_heads * self.head_dim;
+        let head_dim_header = format!(
+            "#define HEAD_DIM {}\n#define HEAD_DIM_PACKED {}\n",
+            self.head_dim,
+            self.head_dim / 2
+        );
+        let source = format!("{head_dim_header}{}", super::kernels::TURBOQUANT_ATTENTION);
         let result = metal_kernel(
             "turboquant_attention",
             &inputs,
             &[],
-            super::kernels::TURBOQUANT_ATTENTION,
+            &source,
             [num_heads, 1, 1],
-            [self.head_dim.min(512), 1, 1],
+            [self.head_dim.min(1024), 1, 1],
             &[&[output_size]],
             &[MlxDtype::Float16],
             stream,
@@ -392,13 +407,22 @@ impl MlxKvCache {
             &params_arr,                                 // 16
         ];
 
-        let tg_size = d_outlier_padded.max(d_non_padded).min(512);
+        let tg_size = d_outlier_padded.max(d_non_padded).min(1024);
 
+        let head_dim_header = format!(
+            "#define HEAD_DIM {}\n#define HEAD_DIM_PACKED {}\n",
+            self.head_dim,
+            self.head_dim / 2
+        );
+        let source = format!(
+            "{head_dim_header}{}",
+            super::kernels::TURBOQUANT_OUTLIER_CACHE_WRITE
+        );
         let result = metal_kernel(
             "turboquant_outlier_cache_write",
             &inputs,
             &[],
-            super::kernels::TURBOQUANT_OUTLIER_CACHE_WRITE,
+            &source,
             [self.num_kv_heads, 1, 1],
             [tg_size, 1, 1],
             &[&[1]],
@@ -479,13 +503,22 @@ impl MlxKvCache {
             &params_arr,                                 // 16
         ];
 
-        let tg_size = d_outlier_padded.max(d_non_padded).min(512);
+        let tg_size = d_outlier_padded.max(d_non_padded).min(1024);
 
+        let head_dim_header = format!(
+            "#define HEAD_DIM {}\n#define HEAD_DIM_PACKED {}\n",
+            self.head_dim,
+            self.head_dim / 2
+        );
+        let source = format!(
+            "{head_dim_header}{}",
+            super::kernels::TURBOQUANT_OUTLIER_CACHE_WRITE
+        );
         let result = metal_kernel(
             "turboquant_outlier_cache_write",
             &inputs,
             &[],
-            super::kernels::TURBOQUANT_OUTLIER_CACHE_WRITE,
+            &source,
             [self.num_kv_heads, 1, 1],
             [tg_size, 1, 1],
             &[&[1]],
@@ -568,13 +601,22 @@ impl MlxKvCache {
         ];
 
         let output_size = num_heads * self.head_dim;
-        let tg_size = d_outlier_padded.max(d_non_padded).min(512);
+        let tg_size = d_outlier_padded.max(d_non_padded).min(1024);
 
+        let head_dim_header = format!(
+            "#define HEAD_DIM {}\n#define HEAD_DIM_PACKED {}\n",
+            self.head_dim,
+            self.head_dim / 2
+        );
+        let source = format!(
+            "{head_dim_header}{}",
+            super::kernels::TURBOQUANT_OUTLIER_ATTENTION
+        );
         let result = metal_kernel(
             "turboquant_outlier_attention",
             &inputs,
             &[],
-            super::kernels::TURBOQUANT_OUTLIER_ATTENTION,
+            &source,
             [num_heads, 1, 1],
             [tg_size, 1, 1],
             &[&[output_size]],

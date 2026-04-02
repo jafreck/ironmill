@@ -269,10 +269,6 @@ impl GpuTurboQuantModel {
                 "head_dim must be a power of two for Walsh-Hadamard butterfly".to_string(),
             ));
         }
-        assert!(
-            config.head_dim <= 512,
-            "head_dim must be <= 512 for TurboQuant kernel shared memory"
-        );
 
         let sign_bytes = generate_rotation_signs(config.head_dim, config.rotation_seed);
         let rotation_signs = device

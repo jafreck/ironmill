@@ -100,7 +100,7 @@ impl CoreMlModel {
         &self,
         inputs: &[(&str, &[usize], &[f32])],
     ) -> anyhow::Result<Vec<OutputTensor>> {
-        let mut pred_input = PredictionInput::new();
+        let mut pred_input = PredictionInput::new()?;
         for &(name, shape, data) in inputs {
             pred_input.add_multi_array(name, shape, MultiArrayDataType::Float32, data)?;
         }

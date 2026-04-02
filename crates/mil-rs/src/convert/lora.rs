@@ -214,8 +214,12 @@ pub fn merge_lora(
     match base_dtype {
         ScalarType::Float32 => merge_f32(base_data, out_features, in_features, adapter, scale),
         ScalarType::Float16 => merge_f16(base_data, out_features, in_features, adapter, scale),
-        // unreachable: unsupported dtypes already rejected above
-        _ => unreachable!(),
+        other => {
+            return Err(MilError::Validation(format!(
+                "LoRA merge unsupported for dtype {:?} on '{}'",
+                other, adapter.base_name
+            )));
+        }
     }
 
     Ok(())

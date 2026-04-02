@@ -107,7 +107,7 @@ impl CoreMlInference {
         &self,
         inputs: &[(&str, &[usize], &[f32])],
     ) -> anyhow::Result<ironmill_inference::coreml_runtime::PredictionOutput> {
-        let mut pi = PredictionInput::new();
+        let mut pi = PredictionInput::new()?;
         for &(name, shape, data) in inputs {
             pi.add_multi_array(name, shape, MultiArrayDataType::Float32, data)?;
         }

@@ -948,7 +948,11 @@ pub fn parse_memory_size(s: &str) -> std::result::Result<usize, String> {
         other => return Err(format!("unknown size suffix: '{other}'")),
     };
 
-    Ok((num * multiplier) as usize)
+    let bytes = num * multiplier;
+    if !bytes.is_finite() || bytes < 0.0 || bytes > usize::MAX as f64 {
+        return Err(format!("memory size overflows: '{s}'"));
+    }
+    Ok(bytes as usize)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

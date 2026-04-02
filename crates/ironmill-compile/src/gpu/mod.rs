@@ -111,7 +111,11 @@ impl GpuCompileBuilder {
                         Box::new(crate::weights::SafeTensorsProvider::load(input)?)
                     }
                     InputFormat::Gguf => Box::new(crate::weights::GgufProvider::load(input)?),
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(CompileError::Other(
+                            "unexpected input format in SafeTensors/GGUF branch".into(),
+                        ));
+                    }
                 };
                 let config = base_provider.config().clone();
 
