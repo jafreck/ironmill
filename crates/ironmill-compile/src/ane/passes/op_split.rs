@@ -240,6 +240,157 @@ fn tiles_needed(total_mem: usize, budget: usize) -> usize {
     total_mem.div_ceil(budget)
 }
 
+// ── Shared tile/slice helpers ──────────────────────────────────────────
+
+/// Parameters for [`emit_slice_op`].
+struct SliceParams<'a> {
+    name: &'a str,
+    out_name: &'a str,
+    input_val: &'a Value,
+    slice_dim: usize,
+    rank: usize,
+    start: usize,
+    end: usize,
+    output_type: Option<TensorType>,
+}
+
+/// Build a `slice_by_index` operation that slices `input_val` along
+/// `slice_dim` from `start..end` in a tensor of the given `rank`.
+///
+/// If `output_type` is provided it is set on the resulting op.
+fn emit_slice_op(p: &SliceParams<'_>) -> Operation {
+    let mut op = Operation::new("slice_by_index", p.name).with_output(p.out_name);
+    op.inputs.insert("x".to_string(), p.input_val.clone());
+    op.attributes.insert(
+        "begin".to_string(),
+        Value::List(
+            (0..p.rank)
+                .map(|i| {
+                    if i == p.slice_dim {
+                        Value::Int(p.start as i64)
+                    } else {
+                        Value::Int(0)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    op.attributes.insert(
+        "end".to_string(),
+        Value::List(
+            (0..p.rank)
+                .map(|i| {
+                    if i == p.slice_dim {
+                        Value::Int(p.end as i64)
+                    } else {
+                        Value::Int(-1) // full extent
+                    }
+                })
+                .collect(),
+        ),
+    );
+    op.output_types = vec![p.output_type.clone()];
+    op
+}
+
+/// Build a `slice_by_index` for a 1-D bias tensor (start..end).
+fn emit_bias_slice(
+    name: &str,
+    out_name: &str,
+    bias_val: &Value,
+    start: usize,
+    end: usize,
+    dtype: ScalarType,
+) -> Operation {
+    let tile_size = end - start;
+    emit_slice_op(&SliceParams {
+        name,
+        out_name,
+        input_val: bias_val,
+        slice_dim: 0,
+        rank: 1,
+        start,
+        end,
+        output_type: Some(TensorType::new(dtype, vec![tile_size])),
+    })
+}
+
+/// Build a `concat` operation that joins `tile_outputs` along `axis`,
+/// producing the value named `out_name`.
+fn emit_concat_tiles(
+    name: &str,
+    out_name: &str,
+    tile_outputs: &[String],
+    axis: i64,
+    original_output_type: &[Option<TensorType>],
+) -> Operation {
+    let mut op = Operation::new("concat", name).with_output(out_name);
+    op.inputs.insert(
+        "values".to_string(),
+        Value::List(
+            tile_outputs
+                .iter()
+                .map(|n| Value::Reference(n.clone()))
+                .collect(),
+        ),
+    );
+    op.attributes.insert("axis".to_string(), Value::Int(axis));
+    if let Some(oty) = original_output_type.first() {
+        op.output_types = vec![oty.clone()];
+    } else {
+        op.output_types = vec![None];
+    }
+    op
+}
+
+/// Build a tiled copy of `orig` that replaces specific inputs with
+/// sliced references and adjusts one dimension of the output type.
+///
+/// `input_rewrites` maps input key → replacement `Value`.
+/// `output_dim` / `tile_size` specify which shape dimension to resize.
+/// When `drop_attrs` is non-empty those attribute keys are omitted.
+fn emit_tiled_op(
+    orig: &Operation,
+    tile_name: &str,
+    tile_out: &str,
+    input_rewrites: &[(&str, Value)],
+    output_dim: usize,
+    tile_size: usize,
+    drop_attrs: &[&str],
+) -> Operation {
+    let mut tile_op = Operation::new(&orig.op_type, tile_name).with_output(tile_out);
+
+    let rewrite_map: HashMap<&str, &Value> = input_rewrites.iter().map(|(k, v)| (*k, v)).collect();
+    for (k, v) in &orig.inputs {
+        if let Some(new_v) = rewrite_map.get(k.as_str()) {
+            tile_op.inputs.insert(k.clone(), (*new_v).clone());
+        } else {
+            tile_op.inputs.insert(k.clone(), v.clone());
+        }
+    }
+
+    for (k, v) in &orig.attributes {
+        if !drop_attrs.contains(&k.as_str()) {
+            tile_op.attributes.insert(k.clone(), v.clone());
+        }
+    }
+
+    if let Some(Some(orig_tt)) = orig.output_types.first() {
+        let mut tile_shape = orig_tt.shape.clone();
+        if output_dim < tile_shape.len() {
+            tile_shape[output_dim] = Some(tile_size);
+        }
+        tile_op.output_types = vec![Some(TensorType::with_dynamic_shape(
+            orig_tt.scalar_type,
+            tile_shape,
+        ))];
+    } else {
+        tile_op.output_types = vec![None];
+    }
+
+    tile_op
+}
+
 // ── MatMul / Linear splitting ─────────────────────────────────────────
 
 /// Split a matmul/linear into tiles along the output (K) dimension.
@@ -286,6 +437,10 @@ fn split_matmul_op(
         .first()
         .ok_or_else(|| MilError::Validation(format!("op '{}' has no outputs", op.name)))?;
 
+    let weight_rank = resolve_input_rank(op, weight_key, type_map).unwrap_or(2);
+    let weight_type = resolve_input_type(op, weight_key, type_map);
+    let output_dim = weight_rank - 1; // last dim = K
+
     let mut tile_ops = Vec::with_capacity(n_tiles + 1);
     let mut tile_outputs = Vec::with_capacity(n_tiles);
 
@@ -294,150 +449,70 @@ fn split_matmul_op(
         let tile_k_end = (t + 1) * k_dim / n_tiles;
         let tile_k = tile_k_end - tile_k_start;
 
-        let tile_name = format!("{base_name}_tile{t}");
-        let tile_out = format!("{original_output}_tile{t}");
-
-        // Build the slice operation for the weight.
-        let weight_slice_name = format!("{base_name}_wslice{t}");
+        // Slice weight.
         let weight_slice_out = format!("{base_name}_wslice{t}_out");
-
-        let mut slice_op =
-            Operation::new("slice_by_index", &weight_slice_name).with_output(&weight_slice_out);
-
-        // Forward the weight input.
-        if let Some(w) = op.inputs.get(weight_key) {
-            slice_op.inputs.insert("x".to_string(), w.clone());
-        }
-
-        // begin / end for the last dimension.
-        let weight_rank = resolve_input_rank(op, weight_key, type_map).unwrap_or(2);
-        slice_op.attributes.insert(
-            "begin".to_string(),
-            Value::List(
-                (0..weight_rank)
-                    .map(|i| {
-                        if i == weight_rank - 1 {
-                            Value::Int(tile_k_start as i64)
-                        } else {
-                            Value::Int(0)
-                        }
-                    })
-                    .collect(),
-            ),
-        );
-        slice_op.attributes.insert(
-            "end".to_string(),
-            Value::List(
-                (0..weight_rank)
-                    .map(|i| {
-                        if i == weight_rank - 1 {
-                            Value::Int(tile_k_end as i64)
-                        } else {
-                            Value::Int(-1) // full extent
-                        }
-                    })
-                    .collect(),
-            ),
-        );
-        // Set output type for the sliced weight.
-        if let Some(wt) = resolve_input_type(op, weight_key, type_map) {
+        let slice_output_type = weight_type.as_ref().map(|wt| {
             let mut sliced_shape = wt.shape.clone();
             if let Some(last) = sliced_shape.last_mut() {
                 *last = Some(tile_k);
             }
-            slice_op.output_types = vec![Some(TensorType::with_dynamic_shape(
-                wt.scalar_type,
-                sliced_shape,
-            ))];
+            TensorType::with_dynamic_shape(wt.scalar_type, sliced_shape)
+        });
+
+        if let Some(w) = op.inputs.get(weight_key) {
+            tile_ops.push(emit_slice_op(&SliceParams {
+                name: &format!("{base_name}_wslice{t}"),
+                out_name: &weight_slice_out,
+                input_val: w,
+                slice_dim: output_dim,
+                rank: weight_rank,
+                start: tile_k_start,
+                end: tile_k_end,
+                output_type: slice_output_type,
+            }));
         }
 
-        tile_ops.push(slice_op);
+        // Bias slice for linear ops.
+        let mut input_rewrites: Vec<(&str, Value)> =
+            vec![(weight_key, Value::Reference(weight_slice_out.clone()))];
 
-        // Build the tile matmul/linear.
-        let mut tile_op = Operation::new(&op.op_type, &tile_name).with_output(&tile_out);
-
-        // Copy all inputs, replacing the weight with the slice.
-        for (k, v) in &op.inputs {
-            if k == weight_key {
-                tile_op
-                    .inputs
-                    .insert(k.clone(), Value::Reference(weight_slice_out.clone()));
-            } else {
-                tile_op.inputs.insert(k.clone(), v.clone());
-            }
-        }
-
-        // Copy attributes (e.g. transpose flags).
-        tile_op.attributes = op.attributes.clone();
-
-        // Set output type for the tile.
-        if let Some(Some(orig_tt)) = op.output_types.first() {
-            let mut tile_shape = orig_tt.shape.clone();
-            if let Some(last) = tile_shape.last_mut() {
-                *last = Some(tile_k);
-            }
-            tile_op.output_types = vec![Some(TensorType::with_dynamic_shape(
-                orig_tt.scalar_type,
-                tile_shape,
-            ))];
-        } else {
-            tile_op.output_types = vec![None];
-        }
-
-        // For linear ops, also copy bias-slice if a bias exists.
         if op.op_type == "linear" {
             if let Some(bias) = op.inputs.get("bias") {
-                let bias_slice_name = format!("{base_name}_bslice{t}");
                 let bias_slice_out = format!("{base_name}_bslice{t}_out");
-                let mut bias_slice =
-                    Operation::new("slice_by_index", &bias_slice_name).with_output(&bias_slice_out);
-                bias_slice.inputs.insert("x".to_string(), bias.clone());
-                bias_slice.attributes.insert(
-                    "begin".to_string(),
-                    Value::List(vec![Value::Int(tile_k_start as i64)]),
-                );
-                bias_slice.attributes.insert(
-                    "end".to_string(),
-                    Value::List(vec![Value::Int(tile_k_end as i64)]),
-                );
-                bias_slice.output_types = vec![Some(TensorType::new(weight_dtype, vec![tile_k]))];
-
-                tile_op
-                    .inputs
-                    .insert("bias".to_string(), Value::Reference(bias_slice_out));
-                tile_ops.push(bias_slice);
+                tile_ops.push(emit_bias_slice(
+                    &format!("{base_name}_bslice{t}"),
+                    &bias_slice_out,
+                    bias,
+                    tile_k_start,
+                    tile_k_end,
+                    weight_dtype,
+                ));
+                input_rewrites.push(("bias", Value::Reference(bias_slice_out)));
             }
         }
 
-        tile_outputs.push(tile_out.clone());
-        tile_ops.push(tile_op);
+        // Tile matmul/linear.
+        let tile_out = format!("{original_output}_tile{t}");
+        tile_ops.push(emit_tiled_op(
+            op,
+            &format!("{base_name}_tile{t}"),
+            &tile_out,
+            &input_rewrites,
+            output_dim,
+            tile_k,
+            &[],
+        ));
+
+        tile_outputs.push(tile_out);
     }
 
-    // Concat tile outputs.
-    let concat_out = original_output.clone();
-    let concat_name = format!("{base_name}_concat");
-    let mut concat_op = Operation::new("concat", &concat_name).with_output(&concat_out);
-    concat_op.inputs.insert(
-        "values".to_string(),
-        Value::List(
-            tile_outputs
-                .iter()
-                .map(|n| Value::Reference(n.clone()))
-                .collect(),
-        ),
-    );
-    concat_op
-        .attributes
-        .insert("axis".to_string(), Value::Int(-1));
-
-    // Preserve original output type on the concat.
-    if let Some(oty) = op.output_types.first() {
-        concat_op.output_types = vec![oty.clone()];
-    } else {
-        concat_op.output_types = vec![None];
-    }
-
-    tile_ops.push(concat_op);
+    tile_ops.push(emit_concat_tiles(
+        &format!("{base_name}_concat"),
+        original_output,
+        &tile_outputs,
+        -1,
+        &op.output_types,
+    ));
     Ok(Some(tile_ops))
 }
 
@@ -474,6 +549,11 @@ fn split_conv_op(
         .first()
         .ok_or_else(|| MilError::Validation(format!("op '{}' has no outputs", op.name)))?;
 
+    let weight_rank = resolve_input_rank(op, "weight", type_map).unwrap_or(4);
+    let weight_type = resolve_input_type(op, "weight", type_map);
+    let slice_dim = 0; // C_out
+    let output_channel_dim = 1; // dim 1 in [N, C, H, W]
+
     let mut tile_ops = Vec::with_capacity(n_tiles + 1);
     let mut tile_outputs = Vec::with_capacity(n_tiles);
 
@@ -483,137 +563,67 @@ fn split_conv_op(
         let tile_ch = ch_end - ch_start;
 
         // Slice weight along dim 0.
-        let wslice_name = format!("{base_name}_wslice{t}");
         let wslice_out = format!("{base_name}_wslice{t}_out");
-        let mut wslice = Operation::new("slice_by_index", &wslice_name).with_output(&wslice_out);
-        if let Some(w) = op.inputs.get("weight") {
-            wslice.inputs.insert("x".to_string(), w.clone());
-        }
-
-        let weight_rank = resolve_input_rank(op, "weight", type_map).unwrap_or(4);
-        wslice.attributes.insert(
-            "begin".to_string(),
-            Value::List(
-                (0..weight_rank)
-                    .map(|i| {
-                        if i == 0 {
-                            Value::Int(ch_start as i64)
-                        } else {
-                            Value::Int(0)
-                        }
-                    })
-                    .collect(),
-            ),
-        );
-        wslice.attributes.insert(
-            "end".to_string(),
-            Value::List(
-                (0..weight_rank)
-                    .map(|i| {
-                        if i == 0 {
-                            Value::Int(ch_end as i64)
-                        } else {
-                            Value::Int(-1)
-                        }
-                    })
-                    .collect(),
-            ),
-        );
-
-        // Set sliced weight output type.
-        if let Some(wt) = resolve_input_type(op, "weight", type_map) {
+        let slice_output_type = weight_type.as_ref().map(|wt| {
             let mut sliced = wt.shape.clone();
             if let Some(first) = sliced.first_mut() {
                 *first = Some(tile_ch);
             }
-            wslice.output_types =
-                vec![Some(TensorType::with_dynamic_shape(wt.scalar_type, sliced))];
-        }
-        tile_ops.push(wslice);
+            TensorType::with_dynamic_shape(wt.scalar_type, sliced)
+        });
 
-        // Slice bias if present.
+        if let Some(w) = op.inputs.get("weight") {
+            tile_ops.push(emit_slice_op(&SliceParams {
+                name: &format!("{base_name}_wslice{t}"),
+                out_name: &wslice_out,
+                input_val: w,
+                slice_dim,
+                rank: weight_rank,
+                start: ch_start,
+                end: ch_end,
+                output_type: slice_output_type,
+            }));
+        }
+
+        // Bias slice.
+        let mut input_rewrites: Vec<(&str, Value)> =
+            vec![("weight", Value::Reference(wslice_out.clone()))];
+
         if let Some(bias) = op.inputs.get("bias") {
-            let bslice_name = format!("{base_name}_bslice{t}");
             let bslice_out = format!("{base_name}_bslice{t}_out");
-            let mut bslice =
-                Operation::new("slice_by_index", &bslice_name).with_output(&bslice_out);
-            bslice.inputs.insert("x".to_string(), bias.clone());
-            bslice.attributes.insert(
-                "begin".to_string(),
-                Value::List(vec![Value::Int(ch_start as i64)]),
-            );
-            bslice.attributes.insert(
-                "end".to_string(),
-                Value::List(vec![Value::Int(ch_end as i64)]),
-            );
-            bslice.output_types = vec![Some(TensorType::new(weight_dtype, vec![tile_ch]))];
-            tile_ops.push(bslice);
+            tile_ops.push(emit_bias_slice(
+                &format!("{base_name}_bslice{t}"),
+                &bslice_out,
+                bias,
+                ch_start,
+                ch_end,
+                weight_dtype,
+            ));
+            input_rewrites.push(("bias", Value::Reference(bslice_out)));
         }
 
         // Tile conv.
-        let tile_name = format!("{base_name}_tile{t}");
         let tile_out = format!("{original_output}_tile{t}");
-        let mut tile_op = Operation::new(&op.op_type, &tile_name).with_output(&tile_out);
-
-        for (k, v) in &op.inputs {
-            if k == "weight" {
-                tile_op
-                    .inputs
-                    .insert(k.clone(), Value::Reference(wslice_out.clone()));
-            } else if k == "bias" {
-                let bslice_out = format!("{base_name}_bslice{t}_out");
-                tile_op
-                    .inputs
-                    .insert(k.clone(), Value::Reference(bslice_out));
-            } else {
-                tile_op.inputs.insert(k.clone(), v.clone());
-            }
-        }
-        tile_op.attributes = op.attributes.clone();
-
-        // Output type: same as original but with tile_ch channels.
-        if let Some(Some(orig_tt)) = op.output_types.first() {
-            let mut tile_shape = orig_tt.shape.clone();
-            // Channel dim is typically dim 1 in [N, C, H, W].
-            if tile_shape.len() >= 2 {
-                tile_shape[1] = Some(tile_ch);
-            }
-            tile_op.output_types = vec![Some(TensorType::with_dynamic_shape(
-                orig_tt.scalar_type,
-                tile_shape,
-            ))];
-        } else {
-            tile_op.output_types = vec![None];
-        }
+        tile_ops.push(emit_tiled_op(
+            op,
+            &format!("{base_name}_tile{t}"),
+            &tile_out,
+            &input_rewrites,
+            output_channel_dim,
+            tile_ch,
+            &[],
+        ));
 
         tile_outputs.push(tile_out);
-        tile_ops.push(tile_op);
     }
 
-    // Concat along channel dim (axis=1 for NCHW).
-    let concat_out = original_output.clone();
-    let concat_name = format!("{base_name}_concat");
-    let mut concat_op = Operation::new("concat", &concat_name).with_output(&concat_out);
-    concat_op.inputs.insert(
-        "values".to_string(),
-        Value::List(
-            tile_outputs
-                .iter()
-                .map(|n| Value::Reference(n.clone()))
-                .collect(),
-        ),
-    );
-    concat_op
-        .attributes
-        .insert("axis".to_string(), Value::Int(1));
-
-    if let Some(oty) = op.output_types.first() {
-        concat_op.output_types = vec![oty.clone()];
-    } else {
-        concat_op.output_types = vec![None];
-    }
-
-    tile_ops.push(concat_op);
+    tile_ops.push(emit_concat_tiles(
+        &format!("{base_name}_concat"),
+        original_output,
+        &tile_outputs,
+        1,
+        &op.output_types,
+    ));
     Ok(Some(tile_ops))
 }
 
@@ -677,6 +687,14 @@ pub fn split_attention_heads(
             continue;
         }
 
+        let weight_key = if op.op_type == "linear" {
+            "weight"
+        } else {
+            "y"
+        };
+        let input_rank = resolve_input_rank(&op, "x", type_map).unwrap_or(3);
+        let weight_rank = resolve_input_rank(&op, weight_key, type_map).unwrap_or(2);
+
         let mut new_ops = Vec::new();
         let mut head_outputs = Vec::new();
 
@@ -685,137 +703,63 @@ pub fn split_attention_heads(
             let h_end = (h + 1) * head_dim;
 
             // Slice input along the head dimension (last axis).
-            let input_key = "x";
-            let in_slice_name = format!("{base_name}_head{h}_in");
             let in_slice_out = format!("{base_name}_head{h}_in_out");
-            let mut in_slice =
-                Operation::new("slice_by_index", &in_slice_name).with_output(&in_slice_out);
-            if let Some(inp) = op.inputs.get(input_key) {
-                in_slice.inputs.insert("x".to_string(), inp.clone());
+            if let Some(inp) = op.inputs.get("x") {
+                new_ops.push(emit_slice_op(&SliceParams {
+                    name: &format!("{base_name}_head{h}_in"),
+                    out_name: &in_slice_out,
+                    input_val: inp,
+                    slice_dim: input_rank - 1,
+                    rank: input_rank,
+                    start: h_start,
+                    end: h_end,
+                    output_type: None,
+                }));
             }
-            let input_rank = resolve_input_rank(&op, input_key, type_map).unwrap_or(3);
-            in_slice.attributes.insert(
-                "begin".to_string(),
-                Value::List(
-                    (0..input_rank)
-                        .map(|i| {
-                            if i == input_rank - 1 {
-                                Value::Int(h_start as i64)
-                            } else {
-                                Value::Int(0)
-                            }
-                        })
-                        .collect(),
-                ),
-            );
-            in_slice.attributes.insert(
-                "end".to_string(),
-                Value::List(
-                    (0..input_rank)
-                        .map(|i| {
-                            if i == input_rank - 1 {
-                                Value::Int(h_end as i64)
-                            } else {
-                                Value::Int(-1)
-                            }
-                        })
-                        .collect(),
-                ),
-            );
-            in_slice.output_types = vec![None];
-            new_ops.push(in_slice);
 
-            // Slice weight.
-            let weight_key = if op.op_type == "linear" {
-                "weight"
-            } else {
-                "y"
-            };
-            let w_slice_name = format!("{base_name}_head{h}_w");
+            // Slice weight along dim 0 (output features).
             let w_slice_out = format!("{base_name}_head{h}_w_out");
-            let mut w_slice =
-                Operation::new("slice_by_index", &w_slice_name).with_output(&w_slice_out);
             if let Some(w) = op.inputs.get(weight_key) {
-                w_slice.inputs.insert("x".to_string(), w.clone());
+                new_ops.push(emit_slice_op(&SliceParams {
+                    name: &format!("{base_name}_head{h}_w"),
+                    out_name: &w_slice_out,
+                    input_val: w,
+                    slice_dim: 0,
+                    rank: weight_rank,
+                    start: h_start,
+                    end: h_end,
+                    output_type: None,
+                }));
             }
-            let weight_rank = resolve_input_rank(&op, weight_key, type_map).unwrap_or(2);
-            // Slice both dims of weight for head: rows [h_start..h_end], cols [h_start..h_end].
-            // For per-head weight: slice along dim 0 (output features).
-            w_slice.attributes.insert(
-                "begin".to_string(),
-                Value::List(
-                    (0..weight_rank)
-                        .map(|i| {
-                            if i == 0 {
-                                Value::Int(h_start as i64)
-                            } else {
-                                Value::Int(0)
-                            }
-                        })
-                        .collect(),
-                ),
-            );
-            w_slice.attributes.insert(
-                "end".to_string(),
-                Value::List(
-                    (0..weight_rank)
-                        .map(|i| {
-                            if i == 0 {
-                                Value::Int(h_end as i64)
-                            } else {
-                                Value::Int(-1)
-                            }
-                        })
-                        .collect(),
-                ),
-            );
-            w_slice.output_types = vec![None];
-            new_ops.push(w_slice);
 
             // Per-head matmul/linear.
-            let head_name = format!("{base_name}_head{h}");
             let head_out = format!("{original_output}_head{h}");
-            let mut head_op = Operation::new(&op.op_type, &head_name).with_output(&head_out);
-            head_op
-                .inputs
-                .insert(input_key.to_string(), Value::Reference(in_slice_out));
-            head_op
-                .inputs
-                .insert(weight_key.to_string(), Value::Reference(w_slice_out));
-            // Copy other inputs/attrs but drop n_heads.
-            for (k, v) in &op.attributes {
-                if k != "n_heads" {
-                    head_op.attributes.insert(k.clone(), v.clone());
-                }
-            }
+            let mut head_op = emit_tiled_op(
+                &op,
+                &format!("{base_name}_head{h}"),
+                &head_out,
+                &[
+                    ("x", Value::Reference(in_slice_out)),
+                    (weight_key, Value::Reference(w_slice_out)),
+                ],
+                0, // output_dim unused — we override output_types below
+                0,
+                &["n_heads"],
+            );
+            // Attention head tiles don't carry output type info.
             head_op.output_types = vec![None];
 
             head_outputs.push(head_out);
             new_ops.push(head_op);
         }
 
-        // Concat heads.
-        let concat_out = original_output.clone();
-        let concat_name = format!("{base_name}_head_concat");
-        let mut concat_op = Operation::new("concat", &concat_name).with_output(&concat_out);
-        concat_op.inputs.insert(
-            "values".to_string(),
-            Value::List(
-                head_outputs
-                    .iter()
-                    .map(|n| Value::Reference(n.clone()))
-                    .collect(),
-            ),
-        );
-        concat_op
-            .attributes
-            .insert("axis".to_string(), Value::Int(-1));
-        if let Some(oty) = op.output_types.first() {
-            concat_op.output_types = vec![oty.clone()];
-        } else {
-            concat_op.output_types = vec![None];
-        }
-        new_ops.push(concat_op);
+        new_ops.push(emit_concat_tiles(
+            &format!("{base_name}_head_concat"),
+            &original_output,
+            &head_outputs,
+            -1,
+            &op.output_types,
+        ));
 
         block.operations.splice(idx..=idx, new_ops.iter().cloned());
         idx += new_ops.len();
