@@ -206,31 +206,6 @@ mod tests {
             .count()
     }
 
-    /// Assert that a transpose op has the expected permutation.
-    fn assert_perm(op: &Operation, expected: &[i64]) {
-        assert_eq!(op.op_type, "transpose");
-        let perm = op.inputs.get("perm").expect("transpose should have perm");
-        let got: Vec<i64> = match perm {
-            Value::List(items) => items
-                .iter()
-                .map(|v| match v {
-                    Value::Int(n) => *n,
-                    _ => panic!("perm items should be Int"),
-                })
-                .collect(),
-            Value::Tensor {
-                data,
-                dtype: crate::ir::tensor::ScalarType::Int32,
-                ..
-            } => data
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64)
-                .collect(),
-            _ => panic!("perm should be a List or int32 Tensor, got {:?}", perm),
-        };
-        assert_eq!(got, expected);
-    }
-
     /// Build a transpose [`Operation`] with the given perm stored as an i32
     /// tensor (mirrors the representation produced by the ONNX importer).
     fn make_transpose_op(name: &str, input: &str, output: &str, perm: &[i64]) -> Operation {

@@ -471,7 +471,7 @@ fn read_int_list_input(op: &Operation, name: &str) -> Option<Vec<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::program::{Block, Function};
+    use crate::ir::program::Function;
 
     fn run_pass(program: &mut Program) {
         TypeRepropagationPass.run(program).unwrap();
