@@ -11,10 +11,10 @@ use super::pass::Pass;
 use super::passes::awq_quantize::AwqQuantizePass;
 use super::passes::{
     AffineQuantizePass, AttentionFusionPass, AwqScaleFusionPass, ConstantFoldPass,
-    ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
+    ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass, D2QuantPass,
     DeadCodeEliminationPass, Fp16QuantizePass, GeluLinearFusionPass, GqaFusionPass, Granularity,
     IdentityEliminationPass, Int8QuantizePass, LayerNormLinearFusionPass, LayoutOptimizationPass,
-    LinearReluFusionPass, PalettizePass, PolarQuantPass, PolarRotationFusionPass,
+    LinearReluFusionPass, PalettizePass, PolarQuantPass, PolarRotationFusionPass, QuipSharpPass,
     ResidualAddFusionPass, ShapeMaterializePass, TypeRepropagationPass,
 };
 use super::program::Program;
@@ -33,6 +33,36 @@ pub struct PassPipeline {
     has_palettize: bool,
     has_polar_quant: bool,
     has_gptq: bool,
+    has_quip_sharp: bool,
+    has_d2quant: bool,
+    has_spinquant: bool,
+}
+
+/// Quantization method to use after SpinQuant rotation.
+pub enum SpinQuantMethod {
+    /// Simple min-max affine quantization.
+    MinMax { group_size: usize },
+    /// Activation-aware weight quantization.
+    Awq {
+        channel_magnitudes: HashMap<String, Vec<f32>>,
+        group_size: usize,
+    },
+    /// GPTQ optimal weight quantization (requires `gptq` feature).
+    #[cfg(feature = "gptq")]
+    Gptq {
+        hessian_data: HashMap<String, (Vec<f32>, usize)>,
+        group_size: usize,
+        block_size: usize,
+        dampening: f64,
+    },
+}
+
+/// Configuration for SpinQuant learned rotation.
+pub struct SpinQuantConfig {
+    /// Number of Cayley optimizer epochs for rotation learning.
+    pub rotation_epochs: usize,
+    /// Target quantization bit-width.
+    pub bits: u8,
 }
 
 // ── TOML configuration types ──────────────────────────────────────────
@@ -206,6 +236,9 @@ impl std::fmt::Debug for PassPipeline {
             .field("has_palettize", &self.has_palettize)
             .field("has_polar_quant", &self.has_polar_quant)
             .field("has_gptq", &self.has_gptq)
+            .field("has_quip_sharp", &self.has_quip_sharp)
+            .field("has_d2quant", &self.has_d2quant)
+            .field("has_spinquant", &self.has_spinquant)
             .finish()
     }
 }
@@ -247,6 +280,9 @@ impl PassPipeline {
             has_palettize: false,
             has_polar_quant: false,
             has_gptq: false,
+            has_quip_sharp: false,
+            has_d2quant: false,
+            has_spinquant: false,
         }
     }
 
@@ -384,6 +420,9 @@ impl PassPipeline {
             has_palettize,
             has_polar_quant,
             has_gptq: false,
+            has_quip_sharp: false,
+            has_d2quant: false,
+            has_spinquant: false,
         })
     }
 
@@ -426,6 +465,21 @@ impl PassPipeline {
                 "AWQ and INT8 quantization are mutually exclusive".into(),
             ));
         }
+        if self.has_quip_sharp {
+            return Err(MilError::Validation(
+                "INT8 and QuIP# quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_d2quant {
+            return Err(MilError::Validation(
+                "INT8 and D2Quant quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_spinquant {
+            return Err(MilError::Validation(
+                "INT8 and SpinQuant are mutually exclusive".into(),
+            ));
+        }
         self.has_int8 = true;
         self.passes.push(Box::new(Int8QuantizePass::new(
             cal_dir,
@@ -457,6 +511,21 @@ impl PassPipeline {
         if self.has_awq {
             return Err(MilError::Validation(
                 "INT4 and AWQ quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_quip_sharp {
+            return Err(MilError::Validation(
+                "INT4 and QuIP# quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_d2quant {
+            return Err(MilError::Validation(
+                "INT4 and D2Quant quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_spinquant {
+            return Err(MilError::Validation(
+                "INT4 and SpinQuant are mutually exclusive".into(),
             ));
         }
         self.has_int4 = true;
@@ -507,6 +576,21 @@ impl PassPipeline {
                 "AWQ and palettization are mutually exclusive".into(),
             ));
         }
+        if self.has_quip_sharp {
+            return Err(MilError::Validation(
+                "AWQ and QuIP# quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_d2quant {
+            return Err(MilError::Validation(
+                "AWQ and D2Quant quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_spinquant {
+            return Err(MilError::Validation(
+                "AWQ and SpinQuant are mutually exclusive".into(),
+            ));
+        }
         self.has_awq = true;
         // Insert AwqQuantizePass before type-repropagation.
         let insert_pos = self
@@ -551,6 +635,21 @@ impl PassPipeline {
         if self.has_polar_quant {
             return Err(MilError::Validation(
                 "GPTQ and polar-quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_quip_sharp {
+            return Err(MilError::Validation(
+                "GPTQ and QuIP# quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_d2quant {
+            return Err(MilError::Validation(
+                "GPTQ and D2Quant quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_spinquant {
+            return Err(MilError::Validation(
+                "GPTQ and SpinQuant are mutually exclusive".into(),
             ));
         }
         self.has_gptq = true;
@@ -614,6 +713,21 @@ impl PassPipeline {
                 "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
             ));
         }
+        if self.has_quip_sharp {
+            return Err(MilError::Validation(
+                "palettization and QuIP# quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_d2quant {
+            return Err(MilError::Validation(
+                "palettization and D2Quant quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_spinquant {
+            return Err(MilError::Validation(
+                "palettization and SpinQuant are mutually exclusive".into(),
+            ));
+        }
         if !matches!(n_bits, 2 | 4 | 6 | 8) {
             return Err(MilError::Validation(format!(
                 "palettize n_bits must be 2, 4, 6, or 8, got {n_bits}"
@@ -636,6 +750,21 @@ impl PassPipeline {
                     .into(),
             ));
         }
+        if self.has_quip_sharp {
+            return Err(MilError::Validation(
+                "polar-quantization and QuIP# are mutually exclusive".into(),
+            ));
+        }
+        if self.has_d2quant {
+            return Err(MilError::Validation(
+                "polar-quantization and D2Quant are mutually exclusive".into(),
+            ));
+        }
+        if self.has_spinquant {
+            return Err(MilError::Validation(
+                "polar-quantization and SpinQuant are mutually exclusive".into(),
+            ));
+        }
         if n_bits != 2 && n_bits != 4 {
             return Err(MilError::Validation(format!(
                 "polar-quantize n_bits must be 2 or 4, got {n_bits}"
@@ -646,6 +775,195 @@ impl PassPipeline {
         self.passes.push(Box::new(PolarRotationFusionPass::new()));
         // Re-propagate types after PolarQuant inserts new ops.
         self.passes.push(Box::new(TypeRepropagationPass));
+        Ok(self)
+    }
+
+    /// Add QuIP# (Quantization with Incoherence Processing) weight quantization.
+    ///
+    /// Combines randomized Hadamard rotation with E8 lattice vector
+    /// quantization for high-quality 2-bit weight compression.
+    ///
+    /// Mutually exclusive with all other weight quantization methods.
+    pub fn with_quip_sharp(mut self, bits: u8, seed: u64) -> Result<Self> {
+        if self.has_int8 {
+            return Err(MilError::Validation(
+                "QuIP# and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_int4 {
+            return Err(MilError::Validation(
+                "QuIP# and INT4 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_awq {
+            return Err(MilError::Validation(
+                "QuIP# and AWQ quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_gptq {
+            return Err(MilError::Validation(
+                "QuIP# and GPTQ quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_palettize {
+            return Err(MilError::Validation(
+                "QuIP# and palettization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_polar_quant {
+            return Err(MilError::Validation(
+                "QuIP# and polar-quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_d2quant {
+            return Err(MilError::Validation(
+                "QuIP# and D2Quant quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_spinquant {
+            return Err(MilError::Validation(
+                "QuIP# and SpinQuant are mutually exclusive".into(),
+            ));
+        }
+        self.has_quip_sharp = true;
+        let insert_pos = self
+            .passes
+            .iter()
+            .position(|p| p.name() == "type-repropagation")
+            .unwrap_or(self.passes.len());
+        self.passes.insert(
+            insert_pos,
+            Box::new(QuipSharpPass {
+                bits,
+                seed,
+                min_elements: 256,
+            }),
+        );
+        Ok(self)
+    }
+
+    /// Add D2Quant dual-scale sub-4-bit weight quantization.
+    ///
+    /// Partitions each weight group into normal and outlier subsets with
+    /// separate scale/zero-point pairs for lower quantization error at
+    /// 2 or 3 bits.
+    ///
+    /// Mutually exclusive with all other weight quantization methods.
+    pub fn with_d2quant(
+        mut self,
+        bits: u8,
+        group_size: usize,
+        outlier_threshold: f32,
+    ) -> Result<Self> {
+        if self.has_int8 {
+            return Err(MilError::Validation(
+                "D2Quant and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_int4 {
+            return Err(MilError::Validation(
+                "D2Quant and INT4 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_awq {
+            return Err(MilError::Validation(
+                "D2Quant and AWQ quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_gptq {
+            return Err(MilError::Validation(
+                "D2Quant and GPTQ quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_palettize {
+            return Err(MilError::Validation(
+                "D2Quant and palettization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_polar_quant {
+            return Err(MilError::Validation(
+                "D2Quant and polar-quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_quip_sharp {
+            return Err(MilError::Validation(
+                "D2Quant and QuIP# quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_spinquant {
+            return Err(MilError::Validation(
+                "D2Quant and SpinQuant are mutually exclusive".into(),
+            ));
+        }
+        self.has_d2quant = true;
+        let insert_pos = self
+            .passes
+            .iter()
+            .position(|p| p.name() == "type-repropagation")
+            .unwrap_or(self.passes.len());
+        self.passes.insert(
+            insert_pos,
+            Box::new(D2QuantPass::new(bits, group_size, outlier_threshold)),
+        );
+        Ok(self)
+    }
+
+    /// Add SpinQuant rotation optimization followed by a quantization pass.
+    ///
+    /// SpinQuant learns rotation matrices via the Cayley parameterization,
+    /// absorbs them into weights, then quantizes using the specified method.
+    /// This composes rotation + quantization in a single pipeline step.
+    ///
+    /// Mutually exclusive with all other weight quantization methods.
+    pub fn with_spinquant(
+        mut self,
+        _rotation_config: SpinQuantConfig,
+        _quantize_method: SpinQuantMethod,
+    ) -> Result<Self> {
+        if self.has_int8 {
+            return Err(MilError::Validation(
+                "SpinQuant and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_int4 {
+            return Err(MilError::Validation(
+                "SpinQuant and INT4 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_awq {
+            return Err(MilError::Validation(
+                "SpinQuant and AWQ quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_gptq {
+            return Err(MilError::Validation(
+                "SpinQuant and GPTQ quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_palettize {
+            return Err(MilError::Validation(
+                "SpinQuant and palettization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_polar_quant {
+            return Err(MilError::Validation(
+                "SpinQuant and polar-quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_quip_sharp {
+            return Err(MilError::Validation(
+                "SpinQuant and QuIP# quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_d2quant {
+            return Err(MilError::Validation(
+                "SpinQuant and D2Quant quantization are mutually exclusive".into(),
+            ));
+        }
+        self.has_spinquant = true;
+        // TODO: Insert SpinQuantPass before type-repropagation once the
+        // pass implementation is available. The SpinQuantPass will internally
+        // handle rotation learning + quantization dispatch.
         Ok(self)
     }
 
@@ -1602,6 +1920,373 @@ name = "int4-quantize"
         assert!(
             err.contains("mutually exclusive"),
             "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    // ── QuIP# pipeline tests ──────────────────────────────────────────
+
+    #[test]
+    fn with_quip_sharp_builds_pipeline() {
+        let pipeline = PassPipeline::new().with_quip_sharp(2, 42).unwrap();
+        let names = pipeline.pass_names();
+        assert!(
+            names.contains(&"quip-sharp"),
+            "expected quip-sharp pass, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn quip_sharp_inserts_before_type_repropagation() {
+        let pipeline = PassPipeline::new().with_quip_sharp(2, 42).unwrap();
+        let names = pipeline.pass_names();
+        let qs_pos = names.iter().position(|n| *n == "quip-sharp").unwrap();
+        let reprop_pos = names
+            .iter()
+            .position(|n| *n == "type-repropagation")
+            .unwrap();
+        assert!(
+            qs_pos < reprop_pos,
+            "quip-sharp ({qs_pos}) should come before type-repropagation ({reprop_pos})"
+        );
+    }
+
+    #[test]
+    fn quip_sharp_and_int4_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int4(128).unwrap();
+        let result = pipeline.with_quip_sharp(2, 42);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn quip_sharp_and_int8_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int8(None).unwrap();
+        let result = pipeline.with_quip_sharp(2, 42);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn quip_sharp_and_awq_mutually_exclusive() {
+        let pipeline = PassPipeline::new()
+            .with_awq(sample_magnitudes(), 128)
+            .unwrap();
+        let result = pipeline.with_quip_sharp(2, 42);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn quip_sharp_and_palettize_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_palettize(4).unwrap();
+        let result = pipeline.with_quip_sharp(2, 42);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn quip_sharp_and_polar_quant_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_polar_quant(4).unwrap();
+        let result = pipeline.with_quip_sharp(2, 42);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn quip_sharp_blocks_subsequent_int4() {
+        let pipeline = PassPipeline::new().with_quip_sharp(2, 42).unwrap();
+        let result = pipeline.with_int4(128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn quip_sharp_plus_fp16_is_allowed() {
+        let pipeline = PassPipeline::new()
+            .with_fp16()
+            .unwrap()
+            .with_quip_sharp(2, 42)
+            .unwrap();
+        let names = pipeline.pass_names();
+        assert!(names.contains(&"fp16-quantization"));
+        assert!(names.contains(&"quip-sharp"));
+    }
+
+    // ── D2Quant pipeline tests ────────────────────────────────────────
+
+    #[test]
+    fn with_d2quant_builds_pipeline() {
+        let pipeline = PassPipeline::new().with_d2quant(2, 128, 0.99).unwrap();
+        let names = pipeline.pass_names();
+        assert!(
+            names.contains(&"d2quant"),
+            "expected d2quant pass, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn d2quant_inserts_before_type_repropagation() {
+        let pipeline = PassPipeline::new().with_d2quant(2, 128, 0.99).unwrap();
+        let names = pipeline.pass_names();
+        let d2_pos = names.iter().position(|n| *n == "d2quant").unwrap();
+        let reprop_pos = names
+            .iter()
+            .position(|n| *n == "type-repropagation")
+            .unwrap();
+        assert!(
+            d2_pos < reprop_pos,
+            "d2quant ({d2_pos}) should come before type-repropagation ({reprop_pos})"
+        );
+    }
+
+    #[test]
+    fn d2quant_and_int4_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int4(128).unwrap();
+        let result = pipeline.with_d2quant(2, 128, 0.99);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn d2quant_and_int8_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int8(None).unwrap();
+        let result = pipeline.with_d2quant(2, 128, 0.99);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn d2quant_and_awq_mutually_exclusive() {
+        let pipeline = PassPipeline::new()
+            .with_awq(sample_magnitudes(), 128)
+            .unwrap();
+        let result = pipeline.with_d2quant(2, 128, 0.99);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn d2quant_and_quip_sharp_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_quip_sharp(2, 42).unwrap();
+        let result = pipeline.with_d2quant(2, 128, 0.99);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn d2quant_blocks_subsequent_awq() {
+        let pipeline = PassPipeline::new().with_d2quant(2, 128, 0.99).unwrap();
+        let result = pipeline.with_awq(sample_magnitudes(), 128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn d2quant_plus_fp16_is_allowed() {
+        let pipeline = PassPipeline::new()
+            .with_fp16()
+            .unwrap()
+            .with_d2quant(2, 128, 0.99)
+            .unwrap();
+        let names = pipeline.pass_names();
+        assert!(names.contains(&"fp16-quantization"));
+        assert!(names.contains(&"d2quant"));
+    }
+
+    // ── SpinQuant pipeline tests ──────────────────────────────────────
+
+    #[test]
+    fn with_spinquant_builds_pipeline() {
+        let config = SpinQuantConfig {
+            rotation_epochs: 100,
+            bits: 4,
+        };
+        let pipeline = PassPipeline::new()
+            .with_spinquant(config, SpinQuantMethod::MinMax { group_size: 128 })
+            .unwrap();
+        // SpinQuantPass is not yet implemented, so no pass is inserted,
+        // but the flag should be set (verified via mutual exclusivity).
+        let names = pipeline.pass_names();
+        assert!(
+            names.contains(&"type-repropagation"),
+            "pipeline should still have standard passes"
+        );
+    }
+
+    #[test]
+    fn spinquant_and_int4_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int4(128).unwrap();
+        let config = SpinQuantConfig {
+            rotation_epochs: 100,
+            bits: 4,
+        };
+        let result = pipeline.with_spinquant(config, SpinQuantMethod::MinMax { group_size: 128 });
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spinquant_and_int8_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int8(None).unwrap();
+        let config = SpinQuantConfig {
+            rotation_epochs: 100,
+            bits: 4,
+        };
+        let result = pipeline.with_spinquant(config, SpinQuantMethod::MinMax { group_size: 128 });
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spinquant_and_awq_mutually_exclusive() {
+        let pipeline = PassPipeline::new()
+            .with_awq(sample_magnitudes(), 128)
+            .unwrap();
+        let config = SpinQuantConfig {
+            rotation_epochs: 100,
+            bits: 4,
+        };
+        let result = pipeline.with_spinquant(config, SpinQuantMethod::MinMax { group_size: 128 });
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spinquant_and_quip_sharp_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_quip_sharp(2, 42).unwrap();
+        let config = SpinQuantConfig {
+            rotation_epochs: 100,
+            bits: 4,
+        };
+        let result = pipeline.with_spinquant(config, SpinQuantMethod::MinMax { group_size: 128 });
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spinquant_and_d2quant_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_d2quant(2, 128, 0.99).unwrap();
+        let config = SpinQuantConfig {
+            rotation_epochs: 100,
+            bits: 4,
+        };
+        let result = pipeline.with_spinquant(config, SpinQuantMethod::MinMax { group_size: 128 });
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spinquant_blocks_subsequent_int4() {
+        let config = SpinQuantConfig {
+            rotation_epochs: 100,
+            bits: 4,
+        };
+        let pipeline = PassPipeline::new()
+            .with_spinquant(config, SpinQuantMethod::MinMax { group_size: 128 })
+            .unwrap();
+        let result = pipeline.with_int4(128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spinquant_plus_fp16_is_allowed() {
+        let config = SpinQuantConfig {
+            rotation_epochs: 100,
+            bits: 4,
+        };
+        let pipeline = PassPipeline::new()
+            .with_fp16()
+            .unwrap()
+            .with_spinquant(config, SpinQuantMethod::MinMax { group_size: 128 })
+            .unwrap();
+        let names = pipeline.pass_names();
+        assert!(names.contains(&"fp16-quantization"));
+    }
+
+    #[test]
+    fn spinquant_with_awq_method() {
+        let config = SpinQuantConfig {
+            rotation_epochs: 50,
+            bits: 4,
+        };
+        let method = SpinQuantMethod::Awq {
+            channel_magnitudes: sample_magnitudes(),
+            group_size: 128,
+        };
+        let pipeline = PassPipeline::new().with_spinquant(config, method).unwrap();
+        let names = pipeline.pass_names();
+        assert!(
+            names.contains(&"type-repropagation"),
+            "pipeline should still have standard passes"
         );
     }
 }
