@@ -22,6 +22,41 @@ use report::{BenchReport, MemorySummary, OutputFormat, ReportRow, UtilizationSum
 #[allow(unused_imports)]
 use stats::{aggregate_runs, compute_stats, compute_stats_with_flops, welch_t_test};
 
+/// Backends to benchmark.
+/// Values: coreml-cpu, coreml-gpu, coreml-ane, coreml-all, metal, mlx
+#[derive(Clone, Debug, PartialEq, clap::ValueEnum)]
+enum Backend {
+    /// CoreML with CPU-only compute units
+    CoremlCpu,
+    /// CoreML with CPU + GPU compute units
+    CoremlGpu,
+    /// CoreML with CPU + ANE compute units
+    CoremlAne,
+    /// CoreML with all compute units
+    CoremlAll,
+    /// Direct Metal GPU backend (custom kernels + MPS)
+    Metal,
+    /// MLX GPU backend (lazy evaluation + automatic fusion)
+    #[cfg(feature = "mlx")]
+    Mlx,
+}
+
+impl Backend {
+    /// Return the CoreML `ComputeUnits` for CoreML variants, or `None` for non-CoreML backends.
+    fn compute_units(&self) -> Option<ironmill_inference::coreml_runtime::ComputeUnits> {
+        use ironmill_inference::coreml_runtime::ComputeUnits;
+        match self {
+            Backend::CoremlCpu => Some(ComputeUnits::CpuOnly),
+            Backend::CoremlGpu => Some(ComputeUnits::CpuAndGpu),
+            Backend::CoremlAne => Some(ComputeUnits::CpuAndNeuralEngine),
+            Backend::CoremlAll => Some(ComputeUnits::All),
+            Backend::Metal => None,
+            #[cfg(feature = "mlx")]
+            Backend::Mlx => None,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "ironmill-bench", about = "Inference benchmark harness")]
 struct Cli {
@@ -45,9 +80,10 @@ struct Cli {
     #[arg(short, long, default_value = "3")]
     runs: usize,
 
-    /// Backend filter: cpu, gpu, ane, all (default: cpu,gpu,ane)
-    #[arg(short, long)]
-    backend: Vec<String>,
+    /// Backends to benchmark. May be specified multiple times.
+    /// Values: coreml-cpu, coreml-gpu, coreml-ane, coreml-all, metal, mlx
+    #[arg(short, long, value_delimiter = ',')]
+    backend: Vec<Backend>,
 
     /// Output format
     #[arg(short, long, default_value = "table", value_enum)]
@@ -68,10 +104,6 @@ struct Cli {
     /// Also benchmark the ANE direct runtime (experimental, requires --features ane-direct).
     #[arg(long)]
     ane_direct: bool,
-
-    /// Benchmark the Metal GPU backend (experimental, requires --features metal).
-    #[arg(long)]
-    metal: bool,
 
     /// Remove all cached compilation artifacts
     #[arg(long)]
@@ -146,17 +178,37 @@ fn main() -> Result<()> {
         backends: if cli.backend.is_empty() {
             vec!["cpu".to_string(), "gpu".to_string(), "ane".to_string()]
         } else {
-            cli.backend.clone()
+            cli.backend
+                .iter()
+                .filter_map(|b| b.compute_units())
+                .map(|cu| cu.to_string())
+                .collect()
         },
     };
 
-    let compute_units: Vec<ironmill_inference::coreml_runtime::ComputeUnits> = matrix
-        .settings
-        .backends
-        .iter()
-        .map(|b| b.parse::<ironmill_inference::coreml_runtime::ComputeUnits>())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("invalid backend: {e}"))?;
+    // Extract CoreML compute-units from the unified --backend flag.
+    // Default (no --backend): run all three CoreML backends.
+    let compute_units: Vec<ironmill_inference::coreml_runtime::ComputeUnits> =
+        if cli.backend.is_empty() {
+            use ironmill_inference::coreml_runtime::ComputeUnits;
+            vec![
+                ComputeUnits::CpuOnly,
+                ComputeUnits::CpuAndGpu,
+                ComputeUnits::CpuAndNeuralEngine,
+            ]
+        } else {
+            cli.backend
+                .iter()
+                .filter_map(|b| b.compute_units())
+                .collect()
+        };
+
+    let has_metal = cli.backend.contains(&Backend::Metal);
+
+    #[cfg(feature = "mlx")]
+    let has_mlx = cli.backend.contains(&Backend::Mlx);
+    #[cfg(not(feature = "mlx"))]
+    let has_mlx = false;
 
     // Power sampling setup
     let power_enabled = cli.power && power::is_power_available();
@@ -175,10 +227,10 @@ fn main() -> Result<()> {
     let mut report_rows = Vec::new();
 
     // Skip the main benchmark loop if only perplexity is requested
-    // or only metal/ane-direct are requested (they have their own paths)
-    let run_latency_bench = !cli.perplexity || cli.ane_direct || cli.metal || cli.quality;
-    let run_coreml_bench = run_latency_bench
-        && (!cli.metal || cli.ane_direct || !cli.backend.is_empty() || cli.quality);
+    // or only metal/mlx/ane-direct are requested (they have their own paths)
+    let run_latency_bench =
+        !cli.perplexity || cli.ane_direct || has_metal || has_mlx || cli.quality;
+    let run_coreml_bench = run_latency_bench && !compute_units.is_empty();
 
     if run_coreml_bench {
         for model_cfg in &matrix.models {
@@ -361,7 +413,7 @@ fn main() -> Result<()> {
         }
     }
 
-    if cli.metal {
+    if has_metal {
         #[cfg(feature = "metal")]
         {
             use ironmill_compile::weights::SafeTensorsProvider;
@@ -914,7 +966,22 @@ fn main() -> Result<()> {
         }
         #[cfg(not(feature = "metal"))]
         {
-            eprintln!("warning: --metal requires --features metal, skipping");
+            eprintln!("warning: --backend metal requires --features metal, skipping");
+        }
+    }
+
+    // ── MLX backend (future) ──
+    if has_mlx {
+        #[cfg(feature = "mlx")]
+        {
+            eprintln!("error: MLX backend not yet implemented");
+            eprintln!("  The MLX backend will be added by the MLX-FP16 task.");
+        }
+        #[cfg(not(feature = "mlx"))]
+        {
+            // Unreachable: Mlx variant is absent when the feature is off, so
+            // has_mlx is always false. Keep the branch for completeness.
+            eprintln!("warning: --backend mlx requires --features mlx, skipping");
         }
     }
 

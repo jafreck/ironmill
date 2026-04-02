@@ -26,6 +26,7 @@ tempfile = { workspace = true }
 default = []
 int4 = []
 metal = ["dep:ironmill-metal-sys"]
+mlx = []  # Placeholder: will gate ironmill-mlx-sys dependency in MLX-FP16 task
 
 [[example]]
 name = "ane_op_eval"

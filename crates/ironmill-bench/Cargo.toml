@@ -35,6 +35,7 @@ ironmill-metal-sys = { path = "../ironmill-metal-sys" }
 default = []
 ane-direct = ["dep:ironmill-iosurface"]
 metal = ["ironmill-inference/metal"]
+mlx = ["ironmill-inference/mlx"]
 
 [[example]]
 name = "turboquant_e2e_bench"

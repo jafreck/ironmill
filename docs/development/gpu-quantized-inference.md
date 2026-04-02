@@ -778,7 +778,7 @@ projections get `default_n_bits`.
 #### Sensitivity analysis tool
 
 ```
-ironmill-bench --metal --sensitivity --model model.safetensors
+ironmill-bench --backend metal --sensitivity --model model.safetensors
 ```
 
 Quantizes each layer independently, measures per-layer PPL impact,
@@ -814,7 +814,7 @@ $ ironmill compile --target gpu --quantize polarquant-4 model.safetensors --dry-
 
 ### E. Benchmark comparison table
 
-The `--metal` bench path produces a structured comparison with measured
+The Metal backend (`--backend metal`) produces a structured comparison with measured
 metrics:
 
 | Metric | Source | Notes |
