@@ -1,6 +1,6 @@
 //! TurboQuant ANE benchmark — measures compile + per-token attention latency.
 //!
-//! Run with: cargo run -p ironmill-inference --example turboquant_bench --release
+//! Run with: cargo run -p ironmill-bench --example turboquant_bench --release
 //!
 //! Tests TurboQuantModel with real model dimensions (Qwen3-0.6B architecture).
 

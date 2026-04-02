@@ -1,7 +1,7 @@
 //! TurboQuant E2E inference benchmark — FP16 baseline vs INT8 TurboQuant.
 //!
 //! Usage:
-//!   cargo run -p ironmill-inference --example turboquant_e2e_bench --release [-- MODE]
+//!   cargo run -p ironmill-bench --example turboquant_e2e_bench --release [-- MODE]
 //!
 //! MODE:
 //!   fp16       Run FP16 baseline only

@@ -3,7 +3,7 @@
 //! Tests whether TurboQuant's INT8 cache provides real throughput gains
 //! over FP16 at larger model dimensions and longer sequence lengths.
 //!
-//! Run with: cargo run -p ironmill-inference --example cache_bandwidth_bench --release
+//! Run with: cargo run -p ironmill-bench --example cache_bandwidth_bench --release
 //!
 //! This is a synthetic benchmark — no model weights needed. It compiles
 //! and evaluates only the attention sub-program with configurable

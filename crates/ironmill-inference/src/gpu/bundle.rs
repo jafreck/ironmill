@@ -138,44 +138,98 @@ impl WeightProvider for GpuBundleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironmill_compile::gpu::bundle::write_gpu_bundle;
     use mil_rs::ir::ScalarType;
     use std::collections::HashMap;
 
-    /// Minimal provider for round-trip testing.
-    struct MockProvider {
-        tensors: HashMap<String, OwnedTensor>,
-        config: ModelConfig,
+    /// Write a minimal `.ironml-gpu` bundle directory from raw components.
+    fn write_test_bundle(
+        bundle_path: &Path,
+        config: &ModelConfig,
+        tensors: &[(
+            &str,            // canonical name
+            &str,            // sanitized name (for files)
+            &[u8],           // data
+            Vec<usize>,      // shape
+            &str,            // dtype string
+            Option<TestLut>, // quantization info
+        )],
+    ) {
+        let weights_dir = bundle_path.join("weights");
+        fs::create_dir_all(&weights_dir).unwrap();
+
+        let mut tensor_map = serde_json::Map::new();
+        for (name, sanitized, data, shape, dtype, quant) in tensors {
+            match quant {
+                Some(lut) => {
+                    fs::write(weights_dir.join(format!("{sanitized}.bin")), &lut.indices).unwrap();
+                    fs::write(weights_dir.join(format!("{sanitized}.lut")), &lut.lut).unwrap();
+                    fs::write(weights_dir.join(format!("{sanitized}.nrm")), &lut.norms).unwrap();
+                    tensor_map.insert(
+                        name.to_string(),
+                        serde_json::json!({
+                            "format": "lut_to_dense",
+                            "indices_file": format!("weights/{sanitized}.bin"),
+                            "lut_file": format!("weights/{sanitized}.lut"),
+                            "norms_file": format!("weights/{sanitized}.nrm"),
+                            "shape": shape,
+                            "n_bits": lut.n_bits,
+                            "dtype": dtype,
+                        }),
+                    );
+                }
+                None => {
+                    fs::write(weights_dir.join(format!("{sanitized}.bin")), data).unwrap();
+                    tensor_map.insert(
+                        name.to_string(),
+                        serde_json::json!({
+                            "format": "dense",
+                            "file": format!("weights/{sanitized}.bin"),
+                            "shape": shape,
+                            "dtype": dtype,
+                        }),
+                    );
+                }
+            }
+        }
+
+        let manifest = serde_json::json!({
+            "format_version": 1,
+            "model_config": {
+                "architecture": format!("{:?}", config.architecture).to_lowercase(),
+                "hidden_size": config.hidden_size,
+                "intermediate_size": config.intermediate_size,
+                "num_hidden_layers": config.num_hidden_layers,
+                "num_attention_heads": config.num_attention_heads,
+                "num_key_value_heads": config.num_key_value_heads,
+                "head_dim": config.head_dim,
+                "vocab_size": config.vocab_size,
+                "max_position_embeddings": config.max_position_embeddings,
+                "rms_norm_eps": config.rms_norm_eps,
+                "rope_theta": config.rope_theta,
+                "tie_word_embeddings": config.tie_word_embeddings,
+                "extra": config.extra,
+            },
+            "quantization": {
+                "method": "none",
+                "n_bits": 16,
+                "seed": 42,
+                "min_elements": 1024,
+            },
+            "tensors": tensor_map,
+        });
+
+        fs::write(
+            bundle_path.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 
-    struct OwnedTensor {
-        data: Vec<u8>,
-        shape: Vec<usize>,
-        dtype: ScalarType,
-        quant_info: QuantizationInfo,
-    }
-
-    impl WeightProvider for MockProvider {
-        fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError> {
-            let t = self
-                .tensors
-                .get(name)
-                .ok_or_else(|| MilError::UndefinedValue(name.to_string()))?;
-            Ok(WeightTensor {
-                data: Cow::Borrowed(&t.data),
-                shape: t.shape.clone(),
-                dtype: t.dtype,
-                quant_info: t.quant_info.clone(),
-            })
-        }
-
-        fn tensor_names(&self) -> Vec<&str> {
-            self.tensors.keys().map(|s| s.as_str()).collect()
-        }
-
-        fn config(&self) -> &ModelConfig {
-            &self.config
-        }
+    struct TestLut {
+        indices: Vec<u8>,
+        lut: Vec<u8>,
+        norms: Vec<u8>,
+        n_bits: u32,
     }
 
     fn test_config() -> ModelConfig {
@@ -197,44 +251,35 @@ mod tests {
         }
     }
 
-    fn mock_provider() -> MockProvider {
-        let mut tensors = HashMap::new();
-
-        // Quantized tensor
-        tensors.insert(
-            "model.layers.0.self_attn.q_proj.weight".to_string(),
-            OwnedTensor {
-                data: vec![0xAA; 64],
-                shape: vec![2048, 2048],
-                dtype: ScalarType::Float16,
-                quant_info: QuantizationInfo::LutToDense {
-                    lut: vec![0x11; 32],
-                    lut_dtype: ScalarType::Float16,
-                    indices: vec![0xAA; 64],
-                    original_shape: vec![2048, 2048],
-                    n_bits: 4,
-                    row_norms: vec![0x22; 16],
-                    norms_dtype: ScalarType::Float16,
-                    polar_quant_seed: None,
-                },
-            },
+    fn write_mock_bundle(bundle_path: &Path) {
+        let config = test_config();
+        write_test_bundle(
+            bundle_path,
+            &config,
+            &[
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "model_layers_0_self_attn_q_proj_weight",
+                    &[], // data unused for quantized
+                    vec![2048, 2048],
+                    "float16",
+                    Some(TestLut {
+                        indices: vec![0xAA; 64],
+                        lut: vec![0x11; 32],
+                        norms: vec![0x22; 16],
+                        n_bits: 4,
+                    }),
+                ),
+                (
+                    "model.embed_tokens.weight",
+                    "model_embed_tokens_weight",
+                    &[0xBB; 128],
+                    vec![32000, 2048],
+                    "float16",
+                    None,
+                ),
+            ],
         );
-
-        // Dense tensor
-        tensors.insert(
-            "model.embed_tokens.weight".to_string(),
-            OwnedTensor {
-                data: vec![0xBB; 128],
-                shape: vec![32000, 2048],
-                dtype: ScalarType::Float16,
-                quant_info: QuantizationInfo::None,
-            },
-        );
-
-        MockProvider {
-            tensors,
-            config: test_config(),
-        }
     }
 
     #[test]
@@ -242,8 +287,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bundle_path = dir.path().join("test.ironml-gpu");
 
-        let provider = mock_provider();
-        write_gpu_bundle(&provider, &bundle_path).unwrap();
+        write_mock_bundle(&bundle_path);
 
         let reader = GpuBundleProvider::open(&bundle_path).unwrap();
         let tensor = reader.tensor("model.embed_tokens.weight").unwrap();
@@ -259,8 +303,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bundle_path = dir.path().join("test.ironml-gpu");
 
-        let provider = mock_provider();
-        write_gpu_bundle(&provider, &bundle_path).unwrap();
+        write_mock_bundle(&bundle_path);
 
         let reader = GpuBundleProvider::open(&bundle_path).unwrap();
         let tensor = reader
@@ -295,12 +338,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bundle_path = dir.path().join("test.ironml-gpu");
 
-        let provider = mock_provider();
-        write_gpu_bundle(&provider, &bundle_path).unwrap();
+        write_mock_bundle(&bundle_path);
 
         let reader = GpuBundleProvider::open(&bundle_path).unwrap();
         let config = reader.config();
-        let original = provider.config();
+        let original = test_config();
 
         assert_eq!(config.architecture, original.architecture);
         assert_eq!(config.hidden_size, original.hidden_size);
@@ -313,14 +355,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bundle_path = dir.path().join("test.ironml-gpu");
 
-        let provider = mock_provider();
-        write_gpu_bundle(&provider, &bundle_path).unwrap();
+        write_mock_bundle(&bundle_path);
 
         let reader = GpuBundleProvider::open(&bundle_path).unwrap();
         let mut names = reader.tensor_names();
         names.sort();
 
-        let mut expected = provider.tensor_names();
+        let mut expected = vec![
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        ];
         expected.sort();
 
         assert_eq!(names, expected);
@@ -337,8 +381,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bundle_path = dir.path().join("test.ironml-gpu");
 
-        let provider = mock_provider();
-        write_gpu_bundle(&provider, &bundle_path).unwrap();
+        write_mock_bundle(&bundle_path);
 
         let reader = GpuBundleProvider::open(&bundle_path).unwrap();
         let result = reader.tensor("nonexistent.tensor");

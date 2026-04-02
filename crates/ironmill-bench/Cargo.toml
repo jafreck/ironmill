@@ -12,8 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 ironmill-compile = { workspace = true }
+ironmill-core = { workspace = true }
 ironmill-inference = { path = "../ironmill-inference" }
 ironmill-iosurface = { path = "../ironmill-iosurface", optional = true }
+mil-rs = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,11 +29,24 @@ tempfile = { workspace = true }
 ironmill-ane-sys = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
-mil-rs = { path = "../mil-rs" }
 ironmill-metal-sys = { path = "../ironmill-metal-sys" }
 
 [features]
 default = []
 ane-direct = ["dep:ironmill-iosurface"]
 metal = ["ironmill-inference/metal"]
+
+[[example]]
+name = "turboquant_e2e_bench"
+path = "examples/turboquant_e2e_bench.rs"
+required-features = ["ane-direct"]
+
+[[example]]
+name = "turboquant_bench"
+path = "examples/turboquant_bench.rs"
+required-features = ["ane-direct"]
+
+[[example]]
+name = "cache_bandwidth_bench"
+path = "examples/cache_bandwidth_bench.rs"
+required-features = ["ane-direct"]

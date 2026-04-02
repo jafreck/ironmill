@@ -26,12 +26,12 @@ use crate::ane::decode_compile::{
     inject_cache_write_ops, inject_ffn_residual, precompute_rope_cache, prune_unreferenced_inputs,
     replace_gather_with_inputs,
 };
-use crate::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use crate::ane::passes::{
     AneArgPromotionPass, AneConcatEliminationPass, AneLayoutPass, AneMatmulToConvPass,
     AneVariableNamingPass, AttentionDecomposePass, OpSubstitutionPass,
 };
 use crate::ane::split::{SplitConfig, SubProgram, split_for_ane};
+use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 
 // ---------------------------------------------------------------------------
 // Bundle types
