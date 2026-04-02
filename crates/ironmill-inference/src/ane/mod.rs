@@ -10,7 +10,7 @@ pub mod model;
 pub mod turboquant;
 
 pub use decode::AneInference;
-pub use device::{AneDevice, HardwareAneDevice, HardwareProgram};
+pub use device::{AneDevice, HardwareAneDevice, HardwareProgram, HwPerfStats};
 pub use model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
 
 // Re-export error/result from the parent module for local convenience.

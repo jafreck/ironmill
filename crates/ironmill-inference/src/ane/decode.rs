@@ -88,6 +88,9 @@ pub struct AneInference<D: AneDevice> {
     /// Per-head Q/K normalization weights (Qwen3 feature).
     /// Shape: [head_dim] each. Applied per-head after Q/K projection.
     qk_norm_weights: Option<Vec<(Vec<f16>, Vec<f16>)>>,
+    /// ANE hardware profiling enabled. When `true`, `eval_with_stats()`
+    /// is used and per-layer HW timing is printed after each decode.
+    enable_profiling: bool,
 }
 
 /// CPU-side weight tensor for embedding/lm_head.
@@ -281,6 +284,20 @@ impl<D: AneDevice> AneLmHead<D> {
 
     /// Run the lm_head projection on ANE, returning logits as f32.
     fn forward(&mut self, hidden: &[f16]) -> Result<Vec<f32>> {
+        self.forward_inner(hidden, false, &mut 0)
+    }
+
+    /// Like [`forward`] but optionally collects hardware timing.
+    fn forward_profiled(&mut self, hidden: &[f16], hw_ns: &mut u64) -> Result<Vec<f32>> {
+        self.forward_inner(hidden, true, hw_ns)
+    }
+
+    fn forward_inner(
+        &mut self,
+        hidden: &[f16],
+        enable_profiling: bool,
+        hw_ns: &mut u64,
+    ) -> Result<Vec<f32>> {
         let mut logits = Vec::with_capacity(self.vocab_size);
 
         for chunk in &mut self.chunks {
@@ -288,11 +305,14 @@ impl<D: AneDevice> AneLmHead<D> {
             write_f16_padded(&mut chunk.input_tensor, hidden)?;
 
             // Eval conv1×1 on ANE (program stays loaded).
-            self.device.eval(
+            ane_eval(
+                &*self.device,
                 &chunk.program,
                 &[&chunk.input_tensor],
                 &mut [&mut chunk.output_tensor],
                 self.qos,
+                enable_profiling,
+                hw_ns,
             )?;
 
             // Read output logits from column 0 of each channel.
@@ -336,6 +356,35 @@ fn emit_lm_head_chunk_mil(hidden_size: usize, out_channels: usize) -> String {
          }}"
     )
 }
+
+/// The default perf_stats_mask used for hardware profiling (all bits set).
+const PROFILE_PERF_MASK: u32 = 0xFFFFFFFF;
+
+/// Run an ANE eval, optionally collecting hardware performance stats.
+///
+/// When `enable_profiling` is `false` this is a plain `device.eval()` call
+/// with zero extra overhead (a single predictable branch).
+fn ane_eval<D: AneDevice>(
+    device: &D,
+    program: &D::Program,
+    inputs: &[&AneTensor],
+    outputs: &mut [&mut AneTensor],
+    qos: u32,
+    enable_profiling: bool,
+    hw_ns_accum: &mut u64,
+) -> Result<()> {
+    if enable_profiling {
+        if let Some(stats) =
+            device.eval_with_stats(program, inputs, outputs, qos, PROFILE_PERF_MASK)?
+        {
+            *hw_ns_accum += stats.hw_execution_time_ns;
+        }
+    } else {
+        device.eval(program, inputs, outputs, qos)?;
+    }
+    Ok(())
+}
+
 // Construction
 // ---------------------------------------------------------------------------
 
@@ -690,7 +739,18 @@ impl<D: AneDevice> AneInference<D> {
             rope_cache_dim,
             cache_write_fused,
             qk_norm_weights,
+            enable_profiling: false,
         })
+    }
+
+    /// Enable or disable ANE hardware profiling.
+    ///
+    /// When enabled, each `decode()` call collects per-layer HW execution
+    /// time from the ANE and prints a profiling summary.
+    /// When disabled (the default), the normal eval path is used with
+    /// zero overhead.
+    pub fn set_profiling(&mut self, enable: bool) {
+        self.enable_profiling = enable;
     }
 
     // -----------------------------------------------------------------------
@@ -734,6 +794,13 @@ impl<D: AneDevice> AneInference<D> {
         let mut d_attn = std::time::Duration::ZERO;
         let mut d_post_attn = std::time::Duration::ZERO;
 
+        // HW profiling accumulators (only non-zero when enable_profiling is true).
+        let hw_profiling = self.enable_profiling;
+        let mut hw_pre_attn_ns: u64 = 0;
+        let mut hw_attn_ns: u64 = 0;
+        let mut hw_post_attn_ns: u64 = 0;
+        let mut hw_lm_head_ns: u64 = 0;
+
         let effective_layers = std::env::var("IRONMILL_MAX_LAYERS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -753,13 +820,20 @@ impl<D: AneDevice> AneInference<D> {
                 let in_refs: Vec<&AneTensor> = layer.pre_attn.input_tensors.iter().collect();
                 let mut out_refs: Vec<&mut AneTensor> =
                     layer.pre_attn.output_tensors.iter_mut().collect();
-                self.device
-                    .eval(&layer.pre_attn.program, &in_refs, &mut out_refs, self.qos)
-                    .map_err(|e| {
-                        AneError::Other(anyhow::anyhow!(
-                            "layer {layer_idx} pre_attn eval failed: {e}"
-                        ))
-                    })?;
+                ane_eval(
+                    &*self.device,
+                    &layer.pre_attn.program,
+                    &in_refs,
+                    &mut out_refs,
+                    self.qos,
+                    hw_profiling,
+                    &mut hw_pre_attn_ns,
+                )
+                .map_err(|e| {
+                    AneError::Other(anyhow::anyhow!(
+                        "layer {layer_idx} pre_attn eval failed: {e}"
+                    ))
+                })?;
             }
             if let Some(t) = t0 {
                 d_pre_attn += t.elapsed();
@@ -872,13 +946,20 @@ impl<D: AneDevice> AneInference<D> {
                     let in_refs: Vec<&AneTensor> = attn.input_tensors.iter().collect();
                     let mut out_refs: Vec<&mut AneTensor> =
                         attn.output_tensors.iter_mut().collect();
-                    self.device
-                        .eval(&attn.program, &in_refs, &mut out_refs, self.qos)
-                        .map_err(|e| {
-                            AneError::Other(anyhow::anyhow!(
-                                "layer {layer_idx} fp16_attn eval failed: {e}"
-                            ))
-                        })?;
+                    ane_eval(
+                        &*self.device,
+                        &attn.program,
+                        &in_refs,
+                        &mut out_refs,
+                        self.qos,
+                        hw_profiling,
+                        &mut hw_attn_ns,
+                    )
+                    .map_err(|e| {
+                        AneError::Other(anyhow::anyhow!(
+                            "layer {layer_idx} fp16_attn eval failed: {e}"
+                        ))
+                    })?;
                 }
 
                 let result = read_f16_channels(&attn.output_tensors[0])?;
@@ -984,18 +1065,20 @@ impl<D: AneDevice> AneInference<D> {
                     let mask = self.fp16_attn_mask.as_ref().unwrap();
                     write_f16_padded(q_staging, &q_data)?;
                     let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
-                    self.device
-                        .eval(
-                            fp16_program,
-                            &[q_staging, k_cache, v_cache, mask],
-                            &mut [out_staging],
-                            self.qos,
-                        )
-                        .map_err(|e| {
-                            AneError::Other(anyhow::anyhow!(
-                                "layer {layer_idx} fp16_attn eval failed: {e}"
-                            ))
-                        })?;
+                    ane_eval(
+                        &*self.device,
+                        fp16_program,
+                        &[q_staging, k_cache, v_cache, mask],
+                        &mut [out_staging],
+                        self.qos,
+                        hw_profiling,
+                        &mut hw_attn_ns,
+                    )
+                    .map_err(|e| {
+                        AneError::Other(anyhow::anyhow!(
+                            "layer {layer_idx} fp16_attn eval failed: {e}"
+                        ))
+                    })?;
                     read_f16_channels(out_staging)?
                 } else {
                     // No compiled attention — return Q as pass-through.
@@ -1057,13 +1140,20 @@ impl<D: AneDevice> AneInference<D> {
                     let in_refs: Vec<&AneTensor> = post_attn.input_tensors.iter().collect();
                     let mut out_refs: Vec<&mut AneTensor> =
                         post_attn.output_tensors.iter_mut().collect();
-                    self.device
-                        .eval(&post_attn.program, &in_refs, &mut out_refs, self.qos)
-                        .map_err(|e| {
-                            AneError::Other(anyhow::anyhow!(
-                                "layer {layer_idx} post_attn eval failed: {e}"
-                            ))
-                        })?;
+                    ane_eval(
+                        &*self.device,
+                        &post_attn.program,
+                        &in_refs,
+                        &mut out_refs,
+                        self.qos,
+                        hw_profiling,
+                        &mut hw_post_attn_ns,
+                    )
+                    .map_err(|e| {
+                        AneError::Other(anyhow::anyhow!(
+                            "layer {layer_idx} post_attn eval failed: {e}"
+                        ))
+                    })?;
                 }
                 hidden = read_f16_channels(&post_attn.output_tensors[0])?;
 
@@ -1120,6 +1210,9 @@ impl<D: AneDevice> AneInference<D> {
         }
 
         let logits = match &mut self.lm_head {
+            LmHead::Ane(ane_lm_head) if hw_profiling => {
+                ane_lm_head.forward_profiled(&hidden, &mut hw_lm_head_ns)
+            }
             LmHead::Ane(ane_lm_head) => ane_lm_head.forward(&hidden),
             LmHead::Cpu(weight) => cpu_lm_head_matmul(weight, &hidden),
         };
@@ -1155,6 +1248,19 @@ impl<D: AneDevice> AneInference<D> {
                 d_post_attn.as_secs_f64() * 1000.0,
                 d_lm_head.unwrap().as_secs_f64() * 1000.0,
                 total.as_secs_f64() * 1000.0,
+            );
+        }
+
+        if hw_profiling {
+            let hw_total = hw_pre_attn_ns + hw_attn_ns + hw_post_attn_ns + hw_lm_head_ns;
+            eprintln!(
+                "[hw_profile] token {}: pre_attn={:.1}µs attn={:.1}µs post_attn={:.1}µs lm_head={:.1}µs total={:.1}µs",
+                self.seq_pos - 1,
+                hw_pre_attn_ns as f64 / 1000.0,
+                hw_attn_ns as f64 / 1000.0,
+                hw_post_attn_ns as f64 / 1000.0,
+                hw_lm_head_ns as f64 / 1000.0,
+                hw_total as f64 / 1000.0,
             );
         }
 

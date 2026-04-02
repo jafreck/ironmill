@@ -43,11 +43,35 @@ pub trait AneDevice: Send + Sync {
         qos: u32,
     ) -> Result<()>;
 
+    /// Evaluate with hardware performance stats collection.
+    ///
+    /// Returns `Some(stats)` when the device supports profiling, `None`
+    /// otherwise (the default implementation falls back to [`eval`]).
+    fn eval_with_stats(
+        &self,
+        program: &Self::Program,
+        inputs: &[&AneTensor],
+        outputs: &mut [&mut AneTensor],
+        qos: u32,
+        perf_stats_mask: u32,
+    ) -> Result<Option<HwPerfStats>> {
+        let _ = perf_stats_mask;
+        self.eval(program, inputs, outputs, qos)?;
+        Ok(None)
+    }
+
     /// Number of programs compiled so far.
     fn compile_count(&self) -> usize;
 
     /// Remaining compile budget before ANE refuses.
     fn remaining_budget(&self) -> usize;
+}
+
+/// Hardware performance stats from a single ANE evaluation.
+#[derive(Debug, Clone, Default)]
+pub struct HwPerfStats {
+    /// Hardware execution time in nanoseconds.
+    pub hw_execution_time_ns: u64,
 }
 
 // ── HardwareProgram ──────────────────────────────────────────────
@@ -160,6 +184,45 @@ impl AneDevice for HardwareAneDevice {
         let _guard = self.eval_lock.lock().expect("ANE eval lock poisoned");
         ironmill_ane_sys::model::eval(&program.model, &input_ptrs, &output_ptrs, qos)
             .map_err(map_sys_err)
+    }
+
+    fn eval_with_stats(
+        &self,
+        program: &HardwareProgram,
+        inputs: &[&AneTensor],
+        outputs: &mut [&mut AneTensor],
+        qos: u32,
+        perf_stats_mask: u32,
+    ) -> Result<Option<HwPerfStats>> {
+        if inputs.is_empty() {
+            return Err(AneError::EvalFailed {
+                status: 0,
+                context: "at least one input tensor is required".into(),
+            });
+        }
+        if outputs.is_empty() {
+            return Err(AneError::EvalFailed {
+                status: 0,
+                context: "at least one output tensor is required".into(),
+            });
+        }
+
+        let input_ptrs: Vec<*mut std::ffi::c_void> = inputs.iter().map(|t| t.as_ptr()).collect();
+        let output_ptrs: Vec<*mut std::ffi::c_void> = outputs.iter().map(|t| t.as_ptr()).collect();
+
+        let _guard = self.eval_lock.lock().expect("ANE eval lock poisoned");
+        let stats = ironmill_ane_sys::model::eval_with_stats(
+            &program.model,
+            &input_ptrs,
+            &output_ptrs,
+            qos,
+            perf_stats_mask,
+        )
+        .map_err(map_sys_err)?;
+
+        Ok(Some(HwPerfStats {
+            hw_execution_time_ns: stats.hw_execution_time(),
+        }))
     }
 
     fn compile_count(&self) -> usize {

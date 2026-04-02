@@ -395,6 +395,37 @@ impl InMemoryModel {
         Ok(())
     }
 
+    /// Evaluate with performance statistics collection.
+    ///
+    /// Sets `perf_stats_mask` on this model, attaches a fresh
+    /// [`PerformanceStats`](crate::perf::PerformanceStats) to the request,
+    /// evaluates, and returns the populated stats.  The original mask is
+    /// restored afterward.
+    ///
+    /// # Safety
+    ///
+    /// `request` must contain valid `_ANEIOSurfaceObject` inputs/outputs.
+    pub unsafe fn eval_with_stats(
+        &self,
+        qos: u32,
+        request: &crate::request::AneRequest,
+        perf_stats_mask: u32,
+    ) -> Result<crate::perf::PerformanceStats, AneSysError> {
+        let old_mask = self.perf_stats_mask();
+        self.set_perf_stats_mask(perf_stats_mask);
+
+        let stats = crate::perf::PerformanceStats::with_hw_execution_ns(0)?;
+        // SAFETY: caller guarantees the request is valid; stats.as_raw() is
+        // a retained _ANEPerformanceStats pointer.
+        unsafe { request.set_perf_stats(stats.as_raw()) };
+
+        let result = unsafe { self.evaluate(qos, request.as_raw()) };
+
+        self.set_perf_stats_mask(old_mask);
+        result?;
+        Ok(stats)
+    }
+
     // -- Compiled-model queries ----------------------------------------------
 
     /// Whether a compiled model already exists on disk for this model.
@@ -780,6 +811,48 @@ pub fn eval(
     output_surfaces: &[*mut c_void],
     qos: u32,
 ) -> Result<(), AneSysError> {
+    eval_inner(
+        model,
+        input_surfaces,
+        output_surfaces,
+        qos,
+        std::ptr::null_mut(),
+    )
+}
+
+/// Evaluate a model and collect hardware performance stats.
+///
+/// Like [`eval`] but sets `perf_stats_mask` on the model before evaluation,
+/// passes a [`PerformanceStats`](crate::perf::PerformanceStats) collector to
+/// the request, and returns the populated stats.  The original mask is
+/// restored afterward.
+pub fn eval_with_stats(
+    model: &InMemoryModel,
+    input_surfaces: &[*mut c_void],
+    output_surfaces: &[*mut c_void],
+    qos: u32,
+    perf_stats_mask: u32,
+) -> Result<crate::perf::PerformanceStats, AneSysError> {
+    let old_mask = model.perf_stats_mask();
+    model.set_perf_stats_mask(perf_stats_mask);
+
+    let stats = crate::perf::PerformanceStats::with_hw_execution_ns(0)?;
+    let result = eval_inner(model, input_surfaces, output_surfaces, qos, stats.as_raw());
+
+    model.set_perf_stats_mask(old_mask);
+    result?;
+    Ok(stats)
+}
+
+/// Shared eval implementation.  `perf_stats` is passed to the request
+/// factory; null disables stats collection.
+fn eval_inner(
+    model: &InMemoryModel,
+    input_surfaces: &[*mut c_void],
+    output_surfaces: &[*mut c_void],
+    qos: u32,
+    perf_stats: *mut c_void,
+) -> Result<(), AneSysError> {
     if input_surfaces.is_empty() {
         return Err(AneSysError::EvalFailed {
             status: 0,
@@ -893,7 +966,7 @@ pub fn eval(
                 out_arr,
                 out_idx,
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                perf_stats,
                 zero,
             );
 

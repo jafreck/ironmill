@@ -56,6 +56,95 @@ fn has_ane() -> bool {
 }
 
 // =========================================================================
+// IOSurface helpers (for eval probes)
+// =========================================================================
+
+#[link(name = "IOSurface", kind = "framework")]
+unsafe extern "C" {
+    fn IOSurfaceCreate(properties: *const c_void) -> *mut c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFAllocatorDefault: *const c_void;
+    static kCFTypeDictionaryKeyCallBacks: u8;
+    static kCFTypeDictionaryValueCallBacks: u8;
+
+    fn CFDictionaryCreateMutable(
+        allocator: *const c_void,
+        capacity: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> *mut c_void;
+    fn CFDictionarySetValue(dict: *mut c_void, key: *const c_void, value: *const c_void);
+    fn CFNumberCreate(
+        allocator: *const c_void,
+        number_type: i64,
+        value_ptr: *const c_void,
+    ) -> *mut c_void;
+    fn CFRelease(cf: *mut c_void);
+}
+
+#[link(name = "IOSurface", kind = "framework")]
+unsafe extern "C" {
+    static kIOSurfaceAllocSize: *const c_void;
+    static kIOSurfaceWidth: *const c_void;
+    static kIOSurfaceHeight: *const c_void;
+    static kIOSurfaceBytesPerElement: *const c_void;
+    static kIOSurfaceBytesPerRow: *const c_void;
+}
+
+/// Create a minimal IOSurface for probe eval tests.
+/// Returns an IOSurfaceRef (must be CFReleased by the caller).
+fn create_probe_iosurface() -> *mut c_void {
+    const ALLOC_SIZE: i64 = 16384; // ANE minimum
+    const ONE: i64 = 1;
+    const CF_NUMBER_SINT64_TYPE: i64 = 4;
+
+    unsafe {
+        let dict = CFDictionaryCreateMutable(
+            kCFAllocatorDefault,
+            5,
+            std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks) as *const c_void,
+            std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks) as *const c_void,
+        );
+        if dict.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        let props: [(*const c_void, i64); 5] = [
+            (kIOSurfaceAllocSize, ALLOC_SIZE),
+            (kIOSurfaceWidth, ALLOC_SIZE),
+            (kIOSurfaceHeight, ONE),
+            (kIOSurfaceBytesPerElement, ONE),
+            (kIOSurfaceBytesPerRow, ALLOC_SIZE),
+        ];
+
+        let mut cf_nums: Vec<*mut c_void> = Vec::new();
+        for &(key, value) in &props {
+            let num = CFNumberCreate(
+                kCFAllocatorDefault,
+                CF_NUMBER_SINT64_TYPE,
+                &value as *const i64 as *const c_void,
+            );
+            if !num.is_null() {
+                CFDictionarySetValue(dict, key, num);
+                cf_nums.push(num);
+            }
+        }
+
+        let surface = IOSurfaceCreate(dict);
+
+        for num in cf_nums {
+            CFRelease(num);
+        }
+        CFRelease(dict);
+
+        surface
+    }
+}
+
+// =========================================================================
 // Probe 1 — MIL Op Support Matrix  (~25 compiles)
 // =========================================================================
 
@@ -1201,4 +1290,176 @@ fn probe_budget_and_lifecycle() {
         "  is_vm:             {:?}",
         DeviceInfo::is_virtual_machine()
     );
+}
+
+// =========================================================================
+// Probe 12 — Performance Stats Bits  (1 compile)
+// =========================================================================
+
+#[test]
+#[ignore]
+fn probe_perf_stats_bits() {
+    if !has_ane() {
+        eprintln!("SKIP: no ANE hardware");
+        return;
+    }
+    eprintln!("\n╔══════════════════════════════════════════════╗");
+    eprintln!("║  PROBE 12: Performance Stats Bits            ║");
+    eprintln!("╚══════════════════════════════════════════════╝\n");
+    eprintln!(
+        "Budget remaining: {}\n",
+        ironmill_ane_sys::model::remaining_budget()
+    );
+
+    // Compile a simple model (1 compile budget)
+    let model = match try_compile(
+        "add (perf bits probe)",
+        &mil(
+            "        tensor<fp16, [1,4,1,4]> out = add(x=a_input0, y=a_input0)[name=string(\"out\")];",
+            "tensor<fp16, [1,4,1,4]> a_input0",
+            "out",
+        ),
+    ) {
+        Some(m) => m,
+        None => {
+            eprintln!("  Cannot compile model for perf bits probe");
+            return;
+        }
+    };
+
+    // Create I/O IOSurfaces
+    let input_surface = create_probe_iosurface();
+    let output_surface = create_probe_iosurface();
+    if input_surface.is_null() || output_surface.is_null() {
+        eprintln!("  Failed to create IOSurfaces for probe");
+        return;
+    }
+
+    // Baseline: eval without stats to ensure it works
+    match ironmill_ane_sys::model::eval(
+        &model,
+        &[input_surface],
+        &[output_surface],
+        ironmill_ane_sys::model::ANE_QOS,
+    ) {
+        Ok(()) => eprintln!("  Baseline eval: OK\n"),
+        Err(e) => {
+            eprintln!("  Baseline eval failed: {e}");
+            unsafe {
+                CFRelease(input_surface);
+                CFRelease(output_surface);
+            }
+            return;
+        }
+    }
+
+    // Probe each of the 32 perf_stats_mask bits
+    eprintln!(
+        "  {:>4}  {:>10}  {:>16}  {:>16}",
+        "bit", "mask", "hw_exec_ns", "counter_data"
+    );
+    eprintln!("  {}", "-".repeat(52));
+
+    let mut active_bits: Vec<u32> = Vec::new();
+
+    for bit in 0..32u32 {
+        let mask = 1u32 << bit;
+        match ironmill_ane_sys::model::eval_with_stats(
+            &model,
+            &[input_surface],
+            &[output_surface],
+            ironmill_ane_sys::model::ANE_QOS,
+            mask,
+        ) {
+            Ok(stats) => {
+                // Guard: check raw data before calling typed accessors.
+                // Some perf_stats_mask values leave the stats object unpopulated,
+                // and accessing ObjC properties on it throws an uncatchable exception.
+                if stats.p_stats_raw_data().is_null() {
+                    eprintln!(
+                        "  {:>4}  0x{:08x}  {:>16}  {:>16}",
+                        bit, mask, "-", "(no raw data)"
+                    );
+                    continue;
+                }
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let hw_ns = stats.hw_execution_time();
+                    let counter = stats.perf_counter_data();
+                    (hw_ns, !counter.is_null())
+                }));
+
+                match result {
+                    Ok((hw_ns, has_counter)) => {
+                        if hw_ns != 0 || has_counter {
+                            active_bits.push(bit);
+                        }
+                        eprintln!(
+                            "  {:>4}  0x{:08x}  {:>16}  {:>16}",
+                            bit,
+                            mask,
+                            hw_ns,
+                            if has_counter { "non-null" } else { "null" }
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "  {:>4}  0x{:08x}  {:>16}  {:>16}",
+                            bit, mask, "PANIC", "(caught)"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  {:>4}  0x{:08x}  eval failed: {e}", bit, mask);
+            }
+        }
+    }
+
+    // Also try all-bits-set
+    eprintln!();
+    match ironmill_ane_sys::model::eval_with_stats(
+        &model,
+        &[input_surface],
+        &[output_surface],
+        ironmill_ane_sys::model::ANE_QOS,
+        0xFFFFFFFF,
+    ) {
+        Ok(stats) => {
+            if stats.p_stats_raw_data().is_null() {
+                eprintln!("  all-bits (0xFFFFFFFF): no raw data in stats object");
+            } else {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let hw_ns = stats.hw_execution_time();
+                    let counter = stats.perf_counter_data();
+                    (hw_ns, counter.is_null())
+                }));
+                match result {
+                    Ok((hw_ns, is_null)) => {
+                        eprintln!(
+                            "  all-bits (0xFFFFFFFF): hw_exec_ns={hw_ns}  counter_data={}",
+                            if is_null { "null" } else { "non-null" }
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!("  all-bits (0xFFFFFFFF): stats access panicked (caught)");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("  all-bits (0xFFFFFFFF): eval failed: {e}");
+        }
+    }
+
+    // Summary
+    eprintln!(
+        "\n  Active bits (non-zero hw_exec or counter): {:?}",
+        active_bits
+    );
+
+    unsafe {
+        CFRelease(input_surface);
+        CFRelease(output_surface);
+    }
 }

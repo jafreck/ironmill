@@ -55,6 +55,11 @@ pub struct AneConfig {
     /// ANE QoS level for compile/load/eval.
     /// Defaults to user-interactive (33) for interactive inference.
     pub qos: u32,
+    /// Enable ANE hardware performance profiling.
+    /// When set, `eval_with_stats()` is used instead of `eval()` and a
+    /// per-layer timing summary is printed after each decode step.
+    /// Has zero overhead when disabled (the normal eval path is used).
+    pub enable_profiling: bool,
 }
 
 impl Default for AneConfig {
@@ -65,6 +70,7 @@ impl Default for AneConfig {
             enable_int4: false,
             // QoSMapper::ane_user_interactive_task_qos() == 33
             qos: 33,
+            enable_profiling: false,
         }
     }
 }
@@ -493,5 +499,6 @@ mod tests {
         assert!(c.cache_dir.is_none());
         assert!(!c.enable_int4);
         assert_eq!(c.qos, 33);
+        assert!(!c.enable_profiling);
     }
 }
