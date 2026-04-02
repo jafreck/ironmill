@@ -146,9 +146,12 @@ impl MlxTurboQuantModel {
         let rotation_signs =
             MlxArray::from_data_copy(&sign_bytes, &[head_dim], MlxDtype::Float32, stream)?;
 
-        // Generate K codebook: (b-1)-bit for INT4 (3-bit + 1-bit QJL), b-bit for INT8
-        let k_bits = if n_bits == 4 { n_bits - 1 } else { n_bits };
-        let (k_levels, k_bounds) = lloyd_max_gaussian(head_dim, k_bits);
+        // K codebook: use full b-bit for both K and V.
+        // The (b-1)-bit + 1-bit-QJL-sign approach (Algorithm 2) trades codebook
+        // precision for inner-product correction, but with d projections in
+        // d dimensions the estimator variance (π/(2d)) exceeds the quantization
+        // error (1/d), making the correction counterproductive.
+        let (k_levels, k_bounds) = lloyd_max_gaussian(head_dim, n_bits);
         let k_codebook_bytes: Vec<u8> = k_levels.iter().flat_map(|v| v.to_le_bytes()).collect();
         let k_codebook_arr = MlxArray::from_data_copy(
             &k_codebook_bytes,

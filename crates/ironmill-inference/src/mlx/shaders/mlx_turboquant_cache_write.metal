@@ -75,39 +75,6 @@
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Stage 2 (K cache only): QJL residual correction (Algorithm 2)
-        if (is_k_cache == 1) {
-            float local_sq_e = 0.0f;
-            for (uint d = tid; d < head_dim; d += tg_size) {
-                float normalized = shared_rotated[d] * inv_norm;
-                float dequant_val = codebook[uint(shared_quant[d])];
-                float residual = normalized - dequant_val;
-                shared_rotated[d] = residual;
-                local_sq_e += residual * residual;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            shared_reduce[tid] = local_sq_e;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tg_size / 2; s > 0; s >>= 1) {
-                if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            float r_e_norm = sqrt(max(shared_reduce[0], 1e-20f));
-            if (tid == 0)
-                r_norms_buf[head_idx * max_seq_len + seq_pos] = r_e_norm;
-
-            for (uint d = tid; d < head_dim; d += tg_size) {
-                float proj = 0.0f;
-                uint row_base = d * head_dim;
-                for (uint k = 0; k < head_dim; k++)
-                    proj += qjl_matrix[row_base + k] * shared_rotated[k];
-                uchar sign_bit = (proj >= 0.0f) ? uchar(0x8) : uchar(0x0);
-                shared_quant[d] = char(uchar(shared_quant[d]) | sign_bit);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
         // Pack INT4 nibbles
         uint packed_stride = head_dim / 2;
         uint cache_base = kv_cache_base(head_idx, max_seq_len, head_dim, 4)
