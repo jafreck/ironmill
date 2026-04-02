@@ -5,14 +5,15 @@
 //! as separate index/LUT/norms arrays for dispatch via custom kernels;
 //! affine-quantized weights are dequantized to dense FP16 on the CPU.
 
-use half::f16;
 use ironmill_mlx_sys::{MlxArray, MlxDtype, MlxStream};
 use mil_rs::ir::ScalarType;
 use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightProvider};
 
 use super::error::MlxError;
-use crate::dequant::{read_typed_f32, unpack_indices};
-use crate::weight_loading::{self, LoadedLayer, WeightVisitor};
+use crate::dequant::dequant_affine_to_fp16;
+use crate::weight_loading::{
+    self, CpuDequant, LoadedLayer, WeightVisitor, dequant_tensor_to_dense,
+};
 
 // ── Weight buffer types ─────────────────────────────────────────
 
@@ -132,88 +133,53 @@ fn scalar_to_mlx_dtype(st: ScalarType) -> MlxDtype {
     }
 }
 
-// ── CPU dequant: affine → FP16 bytes ────────────────────────────
+// ── CPU dequant operations for MLX ───────────────────────────────
 
-fn dequant_affine_to_fp16(
-    data: &[u8],
-    scale: &[u8],
-    zero_point: &[u8],
-    scale_dtype: ScalarType,
-    zero_point_dtype: ScalarType,
-    _axis: Option<usize>,
-    shape: &[usize],
-) -> anyhow::Result<Vec<u8>> {
-    let num_elements: usize = shape.iter().product();
-    let mut output = Vec::with_capacity(num_elements * 2);
+/// CPU dequant operations for the MLX backend.
+struct MlxDequantOps;
 
-    let scale_elem_size = scale_dtype.byte_size();
-    let zp_elem_size = zero_point_dtype.byte_size();
-
-    for i in 0..num_elements {
-        let q_val = data[i] as f32;
-        let s_idx = if scale.len() / scale_elem_size > 1 {
-            // Per-channel scale: index by row.
-            let cols = if shape.len() > 1 { shape[1] } else { 1 };
-            i / cols
-        } else {
-            0
-        };
-        let s = read_typed_f32(scale, s_idx * scale_elem_size, scale_dtype)?;
-        let zp = if zero_point.is_empty() {
-            0.0
-        } else {
-            let zp_idx = s_idx.min(zero_point.len() / zp_elem_size - 1);
-            read_typed_f32(zero_point, zp_idx * zp_elem_size, zero_point_dtype)?
-        };
-        let val = (q_val - zp) * s;
-        let h = f16::from_f32(val);
-        output.extend_from_slice(&h.to_le_bytes());
+impl CpuDequant for MlxDequantOps {
+    fn dequant_lut(
+        indices: &[u8],
+        lut: &[u8],
+        lut_dtype: ScalarType,
+        original_shape: &[usize],
+        n_bits: u8,
+        row_norms: &[u8],
+        norms_dtype: ScalarType,
+        polar_quant_seed: Option<u64>,
+    ) -> anyhow::Result<Vec<u8>> {
+        crate::dequant::dequant_lut_to_fp16(
+            indices,
+            lut,
+            lut_dtype,
+            original_shape,
+            n_bits,
+            row_norms,
+            norms_dtype,
+            polar_quant_seed,
+        )
     }
 
-    Ok(output)
-}
-
-// ── CPU dequant: LUT → FP16 bytes ───────────────────────────────
-
-fn dequant_lut_to_fp16(
-    indices: &[u8],
-    lut: &[u8],
-    lut_dtype: ScalarType,
-    original_shape: &[usize],
-    n_bits: u8,
-    row_norms: &[u8],
-    norms_dtype: ScalarType,
-    _polar_quant_seed: Option<u64>,
-) -> anyhow::Result<Vec<u8>> {
-    let num_elements: usize = original_shape.iter().product();
-    let cols = if original_shape.len() > 1 {
-        original_shape[1]
-    } else {
-        num_elements
-    };
-    let rows = num_elements / cols;
-
-    let palette_size = 1usize << n_bits;
-    let lut_elem_size = lut_dtype.byte_size();
-
-    let unpacked = unpack_indices(indices, n_bits, num_elements);
-
-    let mut output = Vec::with_capacity(num_elements * 2);
-
-    for row in 0..rows {
-        let norm = read_typed_f32(row_norms, row * norms_dtype.byte_size(), norms_dtype)?;
-        let lut_row_offset = row * palette_size * lut_elem_size;
-
-        for col in 0..cols {
-            let idx = unpacked[row * cols + col];
-            let lut_val = read_typed_f32(lut, lut_row_offset + idx * lut_elem_size, lut_dtype)?;
-            let val = lut_val * norm;
-            let h = f16::from_f32(val);
-            output.extend_from_slice(&h.to_le_bytes());
-        }
+    fn dequant_affine(
+        data: &[u8],
+        scale: &[u8],
+        zero_point: &[u8],
+        scale_dtype: ScalarType,
+        zero_point_dtype: ScalarType,
+        axis: Option<usize>,
+        shape: &[usize],
+    ) -> anyhow::Result<Vec<u8>> {
+        dequant_affine_to_fp16(
+            data,
+            scale,
+            zero_point,
+            scale_dtype,
+            zero_point_dtype,
+            axis,
+            shape,
+        )
     }
-
-    Ok(output)
 }
 
 // ── Load a single weight into an MlxWeightBuffer ────────────────
@@ -310,59 +276,9 @@ fn load_dense_array(
     let tensor = provider
         .tensor(name)
         .map_err(|e| MlxError::WeightLoading(format!("{name}: {e}")))?;
-
-    match &tensor.quant_info {
-        QuantizationInfo::None => {
-            let dtype = scalar_to_mlx_dtype(tensor.dtype);
-            let arr = MlxArray::from_data_copy(&tensor.data, &tensor.shape, dtype, stream)?;
-            Ok(arr)
-        }
-        QuantizationInfo::LutToDense {
-            lut,
-            lut_dtype,
-            indices,
-            original_shape,
-            n_bits,
-            row_norms,
-            norms_dtype,
-            polar_quant_seed,
-        } => {
-            let fp16_data = dequant_lut_to_fp16(
-                indices,
-                lut,
-                *lut_dtype,
-                original_shape,
-                *n_bits,
-                row_norms,
-                *norms_dtype,
-                *polar_quant_seed,
-            )
-            .map_err(|e| MlxError::WeightLoading(e.to_string()))?;
-            let arr =
-                MlxArray::from_data_copy(&fp16_data, original_shape, MlxDtype::Float16, stream)?;
-            Ok(arr)
-        }
-        QuantizationInfo::AffineDequantize {
-            scale,
-            zero_point,
-            scale_dtype,
-            zero_point_dtype,
-            axis,
-            ..
-        } => {
-            let fp16_data = dequant_affine_to_fp16(
-                &tensor.data,
-                scale,
-                zero_point,
-                *scale_dtype,
-                *zero_point_dtype,
-                *axis,
-                &tensor.shape,
-            )
-            .map_err(|e| MlxError::WeightLoading(e.to_string()))?;
-            let arr =
-                MlxArray::from_data_copy(&fp16_data, &tensor.shape, MlxDtype::Float16, stream)?;
-            Ok(arr)
-        }
-    }
+    let dense = dequant_tensor_to_dense::<MlxDequantOps>(&tensor)
+        .map_err(|e| MlxError::WeightLoading(e.to_string()))?;
+    let dtype = scalar_to_mlx_dtype(dense.dtype);
+    let arr = MlxArray::from_data_copy(&dense.bytes, dense.shape, dtype, stream)?;
+    Ok(arr)
 }

@@ -5,7 +5,10 @@
 //! own buffer types; [`load_model_weights`] walks the standard LLaMA/Qwen
 //! layout and calls the visitor for every tensor.
 
-use mil_rs::weights::{ModelConfig, WeightProvider};
+use std::borrow::Cow;
+
+use mil_rs::ir::ScalarType;
+use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
 
 // ── Generic layer / model structs ───────────────────────────────
 
@@ -134,4 +137,127 @@ pub fn load_model_weights<V: WeightVisitor>(
         final_norm,
         config,
     })
+}
+
+// ── Shared helpers ──────────────────────────────────────────────
+
+/// Extract `(rows, cols)` from a weight shape `[N, K]`.
+///
+/// For 1-D tensors, returns `(1, N)` — treating the weight as a single row.
+pub(crate) fn dense_shape(shape: &[usize]) -> (usize, usize) {
+    match shape.len() {
+        1 => (1, shape[0]),
+        _ => (shape[0], shape[1]),
+    }
+}
+
+// ── CPU dequant dispatch ────────────────────────────────────────
+
+/// Dense tensor data after optional CPU dequantization.
+///
+/// For unquantized tensors the raw bytes are borrowed via [`Cow::Borrowed`].
+/// For quantized tensors the data is dequantized to FP16 and owned.
+pub struct DenseData<'a> {
+    /// Byte data — either borrowed (unquantized) or owned (dequantized FP16).
+    pub bytes: Cow<'a, [u8]>,
+    /// Tensor shape.
+    pub shape: &'a [usize],
+    /// Element data type — original for unquantized, `Float16` for dequantized.
+    pub dtype: ScalarType,
+}
+
+/// Backend-specific CPU dequantization operations.
+///
+/// Each backend implements this to select its preferred routines for
+/// LUT-palettized and affine-quantized formats.
+pub trait CpuDequant {
+    /// Dequantize a LUT-encoded tensor to FP16 bytes.
+    fn dequant_lut(
+        indices: &[u8],
+        lut: &[u8],
+        lut_dtype: ScalarType,
+        original_shape: &[usize],
+        n_bits: u8,
+        row_norms: &[u8],
+        norms_dtype: ScalarType,
+        polar_quant_seed: Option<u64>,
+    ) -> anyhow::Result<Vec<u8>>;
+
+    /// Dequantize an affine-quantized tensor to FP16 bytes.
+    fn dequant_affine(
+        data: &[u8],
+        scale: &[u8],
+        zero_point: &[u8],
+        scale_dtype: ScalarType,
+        zero_point_dtype: ScalarType,
+        axis: Option<usize>,
+        shape: &[usize],
+    ) -> anyhow::Result<Vec<u8>>;
+}
+
+/// Dequantize a [`WeightTensor`] to a dense representation using the
+/// backend-specific routines from [`CpuDequant`].
+///
+/// Matches on [`QuantizationInfo`] and dispatches to the appropriate
+/// dequantization method, returning borrowed raw bytes for unquantized
+/// tensors or owned FP16 bytes for quantized tensors.
+pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
+    tensor: &'a WeightTensor<'a>,
+) -> anyhow::Result<DenseData<'a>> {
+    match &tensor.quant_info {
+        QuantizationInfo::None => Ok(DenseData {
+            bytes: Cow::Borrowed(&tensor.data),
+            shape: &tensor.shape,
+            dtype: tensor.dtype,
+        }),
+        QuantizationInfo::LutToDense {
+            lut,
+            lut_dtype,
+            indices,
+            original_shape,
+            n_bits,
+            row_norms,
+            norms_dtype,
+            polar_quant_seed,
+        } => {
+            let data = D::dequant_lut(
+                indices,
+                lut,
+                *lut_dtype,
+                original_shape,
+                *n_bits,
+                row_norms,
+                *norms_dtype,
+                *polar_quant_seed,
+            )?;
+            Ok(DenseData {
+                bytes: Cow::Owned(data),
+                shape: original_shape,
+                dtype: ScalarType::Float16,
+            })
+        }
+        QuantizationInfo::AffineDequantize {
+            scale,
+            zero_point,
+            scale_dtype,
+            zero_point_dtype,
+            axis,
+            ..
+        } => {
+            let data = D::dequant_affine(
+                &tensor.data,
+                scale,
+                zero_point,
+                *scale_dtype,
+                *zero_point_dtype,
+                *axis,
+                &tensor.shape,
+            )?;
+            Ok(DenseData {
+                bytes: Cow::Owned(data),
+                shape: &tensor.shape,
+                dtype: ScalarType::Float16,
+            })
+        }
+    }
 }

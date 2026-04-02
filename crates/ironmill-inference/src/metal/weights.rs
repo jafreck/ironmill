@@ -1,11 +1,14 @@
 //! Weight loading from SafeTensors/GGUF into Metal buffers.
 
 use ironmill_metal_sys::{MetalBuffer, MetalDevice, StorageMode};
+use mil_rs::ir::ScalarType;
 use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightProvider};
 
 use super::dequant::{dequant_affine, dequant_lut_to_dense};
 use super::error::MetalError;
-use crate::weight_loading::{self, LoadedLayer, WeightVisitor};
+use crate::weight_loading::{
+    self, CpuDequant, LoadedLayer, WeightVisitor, dense_shape, dequant_tensor_to_dense,
+};
 
 /// A weight buffer that is either dense FP16 or packed quantized data.
 pub enum WeightBuffer {
@@ -166,14 +169,6 @@ impl MetalWeights {
     }
 }
 
-/// Extract (N, K) from a weight tensor shape [N, K]. Returns (1, N) for 1-D.
-fn dense_shape(shape: &[usize]) -> (usize, usize) {
-    match shape.len() {
-        1 => (1, shape[0]),
-        _ => (shape[0], shape[1]),
-    }
-}
-
 /// Pack a row-major [N, K] FP16 weight buffer into blocked [N/8, K/8, 8, 8] format.
 ///
 /// Returns `None` if N or K is not a multiple of 8.
@@ -219,6 +214,53 @@ fn pack_weight_blocked(
         .create_buffer_with_data(&dst, StorageMode::Shared)
         .map_err(MetalError::Metal)?;
     Ok(Some(buf))
+}
+
+/// CPU dequant operations for the Metal backend.
+struct MetalDequantOps;
+
+impl CpuDequant for MetalDequantOps {
+    fn dequant_lut(
+        indices: &[u8],
+        lut: &[u8],
+        lut_dtype: ScalarType,
+        original_shape: &[usize],
+        n_bits: u8,
+        row_norms: &[u8],
+        norms_dtype: ScalarType,
+        polar_quant_seed: Option<u64>,
+    ) -> anyhow::Result<Vec<u8>> {
+        dequant_lut_to_dense(
+            indices,
+            lut,
+            lut_dtype,
+            original_shape,
+            n_bits,
+            row_norms,
+            norms_dtype,
+            polar_quant_seed,
+        )
+    }
+
+    fn dequant_affine(
+        data: &[u8],
+        scale: &[u8],
+        zero_point: &[u8],
+        scale_dtype: ScalarType,
+        zero_point_dtype: ScalarType,
+        axis: Option<usize>,
+        shape: &[usize],
+    ) -> anyhow::Result<Vec<u8>> {
+        super::dequant::dequant_affine(
+            data,
+            scale,
+            zero_point,
+            scale_dtype,
+            zero_point_dtype,
+            axis,
+            shape,
+        )
+    }
 }
 
 /// Load a single weight tensor into a [`WeightBuffer`].
@@ -389,51 +431,8 @@ fn load_dense_buffer(
     let tensor = provider
         .tensor(name)
         .map_err(|e| MetalError::WeightLoading(format!("{name}: {e}")))?;
-    let data = match &tensor.quant_info {
-        QuantizationInfo::None => {
-            // Zero-copy: pass borrowed data directly to Metal without
-            // allocating an intermediate Vec.
-            return device
-                .create_buffer_with_data(&tensor.data, StorageMode::Shared)
-                .map_err(MetalError::Metal);
-        }
-        QuantizationInfo::LutToDense {
-            lut,
-            lut_dtype,
-            indices,
-            original_shape,
-            n_bits,
-            row_norms,
-            norms_dtype,
-            polar_quant_seed,
-        } => dequant_lut_to_dense(
-            indices,
-            lut,
-            *lut_dtype,
-            original_shape,
-            *n_bits,
-            row_norms,
-            *norms_dtype,
-            *polar_quant_seed,
-        )?,
-        QuantizationInfo::AffineDequantize {
-            scale,
-            zero_point,
-            scale_dtype,
-            zero_point_dtype,
-            axis,
-            ..
-        } => dequant_affine(
-            &tensor.data,
-            scale,
-            zero_point,
-            *scale_dtype,
-            *zero_point_dtype,
-            *axis,
-            &tensor.shape,
-        )?,
-    };
+    let dense = dequant_tensor_to_dense::<MetalDequantOps>(&tensor)?;
     device
-        .create_buffer_with_data(&data, StorageMode::Shared)
+        .create_buffer_with_data(&dense.bytes, StorageMode::Shared)
         .map_err(MetalError::Metal)
 }
