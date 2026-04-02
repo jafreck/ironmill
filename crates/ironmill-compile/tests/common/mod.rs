@@ -3,13 +3,13 @@
 //! Provides builder functions for creating realistic test programs
 //! and utility functions for validation and serialization.
 
-use std::collections::HashMap;
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
 use mil_rs::ir::passes::tensor_utils::f32_slice_to_bytes;
 use mil_rs::{
-    Block, Function, Operation, PassPipeline, PipelineReport, Program, ScalarType, TensorType,
-    Value, model_to_program, program_to_model,
+    Function, Operation, Program, ScalarType, TensorType, Value, model_to_program, program_to_model,
 };
 
 /// CoreML spec version used for test conversions.
@@ -521,14 +521,6 @@ pub fn build_const_program(shape: &[usize], dtype: ScalarType) -> Program {
     program
 }
 
-/// Run default pipeline and return the report.
-pub fn run_default_pipeline(program: &mut Program) -> PipelineReport {
-    let pipeline = PassPipeline::new();
-    pipeline
-        .run(program)
-        .expect("default pipeline should succeed")
-}
-
 /// Serialize program to Model proto and back, verify round-trip.
 pub fn assert_serialization_roundtrip(program: &Program) {
     let model = program_to_model(program, SPEC_VERSION).expect("program_to_model should succeed");
@@ -561,20 +553,6 @@ pub fn serialized_size(program: &Program) -> usize {
     use prost::Message;
     let model = program_to_model(program, SPEC_VERSION).expect("program_to_model should succeed");
     model.encode_to_vec().len()
-}
-
-/// Run CLI command and return (success, stdout, stderr).
-pub fn run_cli(args: &[&str]) -> (bool, String, String) {
-    let output = std::process::Command::new("cargo")
-        .args(["run", "-p", "ironmill-cli", "--quiet", "--"])
-        .args(args)
-        .output()
-        .expect("failed to run CLI");
-
-    let success = output.status.success();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (success, stdout, stderr)
 }
 
 /// Count total operations in a program.

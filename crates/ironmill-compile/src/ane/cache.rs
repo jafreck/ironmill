@@ -44,9 +44,6 @@ struct CacheEntry {
     key: ProgramKey,
     /// Path to cached compiled program on disk (if disk caching enabled).
     disk_path: Option<PathBuf>,
-    /// Whether this was loaded from disk (vs compiled this session).
-    #[allow(dead_code)]
-    from_disk: bool,
 }
 
 impl ProgramCache {
@@ -101,7 +98,6 @@ impl ProgramCache {
         // If key already exists, update it and move to end
         if let Some(&idx) = self.index.get(&key) {
             self.entries[idx].disk_path = Some(disk_path);
-            self.entries[idx].from_disk = false;
             self.move_to_end(idx);
             return;
         }
@@ -116,7 +112,6 @@ impl ProgramCache {
         self.entries.push(CacheEntry {
             key,
             disk_path: Some(disk_path),
-            from_disk: false,
         });
     }
 
@@ -244,7 +239,6 @@ impl ProgramCache {
                 self.entries.push(CacheEntry {
                     key,
                     disk_path: Some(path),
-                    from_disk: true,
                 });
             }
         }

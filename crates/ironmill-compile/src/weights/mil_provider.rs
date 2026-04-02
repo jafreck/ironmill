@@ -419,7 +419,7 @@ fn u32_bytes_to_usize_vec(bytes: &[u8]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mil_rs::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
+    use mil_rs::{Function, Operation, Program, ScalarType, TensorType, Value};
 
     fn dummy_config() -> ModelConfig {
         ModelConfig {

@@ -5,13 +5,13 @@
 
 mod common;
 
-use mil_rs::ir::passes::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
+use mil_rs::ir::passes::tensor_utils::f32_slice_to_bytes;
 use mil_rs::ir::passes::{
     Fp16QuantizePass, Granularity, Int8QuantizePass, LayoutOptimizationPass, PolarQuantPass,
 };
 use mil_rs::{
-    Block, ComputeUnit, Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorType,
-    Value, model_to_program, program_to_model,
+    ComputeUnit, Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorType, Value,
+    model_to_program, program_to_model,
 };
 
 use ironmill_compile::ane::passes::{

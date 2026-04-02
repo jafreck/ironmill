@@ -406,10 +406,6 @@ struct ExpertEntry {
     expert_id: usize,
     /// Quantization strategy.
     strategy: ExpertQuantStrategy,
-    /// Activation frequency (0.0–1.0), informational / for diagnostics.
-    #[serde(default)]
-    #[allow(dead_code)]
-    activation_frequency: f64,
 }
 
 /// Top-level JSON schema for the per-expert configuration file.

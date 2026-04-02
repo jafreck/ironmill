@@ -19,14 +19,6 @@ use std::path::Path;
 
 use mil_rs::ir::ScalarType;
 
-/// Size of the file header in bytes.
-#[allow(dead_code)]
-const FILE_HEADER_SIZE: usize = 64;
-
-/// Size of the chunk descriptor in bytes.
-#[allow(dead_code)]
-const CHUNK_DESC_SIZE: usize = 64;
-
 /// Offset where weight data begins (after header + chunk descriptor).
 const DATA_START: usize = 128;
 
