@@ -22,12 +22,14 @@ compile_error!("ironmill-ane-sys only supports macOS");
 
 pub mod compiler;
 pub mod error;
+pub mod iosurface;
 pub(crate) mod objc;
 pub mod process;
 pub mod runtime;
 
 pub use compiler::AneCompiler;
 pub use error::AneSysError;
+pub use iosurface::{AneBuffer, AneIOSurfaceObject};
 pub use runtime::AneRuntime;
 
 use std::ffi::c_void;
