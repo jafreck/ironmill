@@ -21,6 +21,8 @@ pub mod mlx;
 pub mod sampling;
 pub mod turboquant;
 pub mod types;
+#[cfg(any(feature = "metal", feature = "mlx"))]
+mod weight_loading;
 
 // Re-exports for convenience.
 pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};

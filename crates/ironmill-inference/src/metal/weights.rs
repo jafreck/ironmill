@@ -5,6 +5,7 @@ use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightProvider};
 
 use super::dequant::{dequant_affine, dequant_lut_to_dense};
 use super::error::MetalError;
+use crate::weight_loading::{self, LoadedLayer, WeightVisitor};
 
 /// A weight buffer that is either dense FP16 or packed quantized data.
 pub enum WeightBuffer {
@@ -59,6 +60,9 @@ pub struct QuantizedWeight {
     pub shape: (usize, usize),
 }
 
+/// Weights for a single transformer layer (type alias over shared layout).
+pub type LayerWeights = LoadedLayer<MetalBuffer, WeightBuffer>;
+
 /// All model weights loaded into Metal buffers, organized by layer.
 pub struct MetalWeights {
     /// Embedding table [vocab_size × hidden_size] FP16.
@@ -75,30 +79,32 @@ pub struct MetalWeights {
     pub config: ModelConfig,
 }
 
-/// Weights for a single transformer layer.
-pub struct LayerWeights {
-    /// Input layernorm [hidden_size] FP16.
-    pub input_norm: MetalBuffer,
-    /// Q projection [num_heads × head_dim, hidden_size].
-    pub q_proj: WeightBuffer,
-    /// K projection [num_kv_heads × head_dim, hidden_size].
-    pub k_proj: WeightBuffer,
-    /// V projection [num_kv_heads × head_dim, hidden_size].
-    pub v_proj: WeightBuffer,
-    /// Output projection [hidden_size, num_heads × head_dim].
-    pub o_proj: WeightBuffer,
-    /// Post-attention layernorm [hidden_size] FP16.
-    pub post_attn_norm: MetalBuffer,
-    /// Gate projection [intermediate_size, hidden_size].
-    pub gate_proj: WeightBuffer,
-    /// Up projection [intermediate_size, hidden_size].
-    pub up_proj: WeightBuffer,
-    /// Down projection [hidden_size, intermediate_size].
-    pub down_proj: WeightBuffer,
-    /// Optional Q normalization weight [head_dim] FP16 (Qwen3 QK norm).
-    pub q_norm: Option<MetalBuffer>,
-    /// Optional K normalization weight [head_dim] FP16 (Qwen3 QK norm).
-    pub k_norm: Option<MetalBuffer>,
+/// Backend-specific visitor that loads tensors into Metal buffers.
+struct MetalVisitor<'a> {
+    device: &'a MetalDevice,
+    force_cpu_dequant: bool,
+}
+
+impl WeightVisitor for MetalVisitor<'_> {
+    type Dense = MetalBuffer;
+    type Weight = WeightBuffer;
+    type Error = MetalError;
+
+    fn load_dense(
+        &self,
+        provider: &dyn WeightProvider,
+        name: &str,
+    ) -> Result<MetalBuffer, MetalError> {
+        load_dense_buffer(self.device, provider, name)
+    }
+
+    fn load_weight(
+        &self,
+        provider: &dyn WeightProvider,
+        name: &str,
+    ) -> Result<WeightBuffer, MetalError> {
+        load_weight_buffer(self.device, provider, name, self.force_cpu_dequant)
+    }
 }
 
 impl MetalWeights {
@@ -110,89 +116,12 @@ impl MetalWeights {
         provider: &dyn WeightProvider,
         force_cpu_dequant: bool,
     ) -> Result<Self, MetalError> {
-        let config = provider.config().clone();
-        let num_layers = config.num_hidden_layers;
-
-        let embedding = load_dense_buffer(device, provider, "model.embed_tokens.weight")?;
-
-        let mut layers = Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            let prefix = format!("model.layers.{i}");
-            layers.push(LayerWeights {
-                input_norm: load_dense_buffer(
-                    device,
-                    provider,
-                    &format!("{prefix}.input_layernorm.weight"),
-                )?,
-                q_proj: load_weight_buffer(
-                    device,
-                    provider,
-                    &format!("{prefix}.self_attn.q_proj.weight"),
-                    force_cpu_dequant,
-                )?,
-                k_proj: load_weight_buffer(
-                    device,
-                    provider,
-                    &format!("{prefix}.self_attn.k_proj.weight"),
-                    force_cpu_dequant,
-                )?,
-                v_proj: load_weight_buffer(
-                    device,
-                    provider,
-                    &format!("{prefix}.self_attn.v_proj.weight"),
-                    force_cpu_dequant,
-                )?,
-                o_proj: load_weight_buffer(
-                    device,
-                    provider,
-                    &format!("{prefix}.self_attn.o_proj.weight"),
-                    force_cpu_dequant,
-                )?,
-                post_attn_norm: load_dense_buffer(
-                    device,
-                    provider,
-                    &format!("{prefix}.post_attention_layernorm.weight"),
-                )?,
-                gate_proj: load_weight_buffer(
-                    device,
-                    provider,
-                    &format!("{prefix}.mlp.gate_proj.weight"),
-                    force_cpu_dequant,
-                )?,
-                up_proj: load_weight_buffer(
-                    device,
-                    provider,
-                    &format!("{prefix}.mlp.up_proj.weight"),
-                    force_cpu_dequant,
-                )?,
-                down_proj: load_weight_buffer(
-                    device,
-                    provider,
-                    &format!("{prefix}.mlp.down_proj.weight"),
-                    force_cpu_dequant,
-                )?,
-                q_norm: if provider.has_tensor(&format!("{prefix}.self_attn.q_norm.weight")) {
-                    Some(load_dense_buffer(
-                        device,
-                        provider,
-                        &format!("{prefix}.self_attn.q_norm.weight"),
-                    )?)
-                } else {
-                    None
-                },
-                k_norm: if provider.has_tensor(&format!("{prefix}.self_attn.k_norm.weight")) {
-                    Some(load_dense_buffer(
-                        device,
-                        provider,
-                        &format!("{prefix}.self_attn.k_norm.weight"),
-                    )?)
-                } else {
-                    None
-                },
-            });
-        }
-
-        let final_norm = load_dense_buffer(device, provider, "model.norm.weight")?;
+        let visitor = MetalVisitor {
+            device,
+            force_cpu_dequant,
+        };
+        let core = weight_loading::load_model_weights(&visitor, provider)?;
+        let config = core.config;
 
         let lm_head = if config.tie_word_embeddings {
             load_dense_buffer(device, provider, "model.embed_tokens.weight")?
@@ -204,9 +133,9 @@ impl MetalWeights {
             pack_weight_blocked(device, &lm_head, config.vocab_size, config.hidden_size)?;
 
         Ok(Self {
-            embedding,
-            layers,
-            final_norm,
+            embedding: core.embedding,
+            layers: core.layers,
+            final_norm: core.final_norm,
             lm_head,
             lm_head_packed,
             config,

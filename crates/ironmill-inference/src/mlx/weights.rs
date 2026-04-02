@@ -12,6 +12,7 @@ use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightProvider};
 
 use super::error::MlxError;
 use crate::dequant::{read_typed_f32, unpack_indices};
+use crate::weight_loading::{self, LoadedLayer, WeightVisitor};
 
 // ── Weight buffer types ─────────────────────────────────────────
 
@@ -41,33 +42,10 @@ pub struct MlxQuantizedWeight {
     pub k: usize,
 }
 
-// ── Per-layer weights ───────────────────────────────────────────
+// ── Per-layer weights (type alias over shared layout) ───────────
 
 /// Weights for a single transformer layer stored as MLX arrays.
-pub struct MlxLayerWeights {
-    /// Input layernorm weight `[hidden_size]` FP16.
-    pub input_norm: MlxArray,
-    /// Q projection `[num_heads × head_dim, hidden_size]`.
-    pub q_proj: MlxWeightBuffer,
-    /// K projection `[num_kv_heads × head_dim, hidden_size]`.
-    pub k_proj: MlxWeightBuffer,
-    /// V projection `[num_kv_heads × head_dim, hidden_size]`.
-    pub v_proj: MlxWeightBuffer,
-    /// Output projection `[hidden_size, num_heads × head_dim]`.
-    pub o_proj: MlxWeightBuffer,
-    /// Post-attention layernorm weight `[hidden_size]` FP16.
-    pub post_attn_norm: MlxArray,
-    /// Gate projection `[intermediate_size, hidden_size]`.
-    pub gate_proj: MlxWeightBuffer,
-    /// Up projection `[intermediate_size, hidden_size]`.
-    pub up_proj: MlxWeightBuffer,
-    /// Down projection `[hidden_size, intermediate_size]`.
-    pub down_proj: MlxWeightBuffer,
-    /// Optional Q normalization weight `[head_dim]` FP16 (Qwen3 QK norm).
-    pub q_norm: Option<MlxArray>,
-    /// Optional K normalization weight `[head_dim]` FP16 (Qwen3 QK norm).
-    pub k_norm: Option<MlxArray>,
-}
+pub type MlxLayerWeights = LoadedLayer<MlxArray, MlxWeightBuffer>;
 
 // ── Full model weights ──────────────────────────────────────────
 
@@ -85,85 +63,35 @@ pub struct MlxWeights {
     pub config: ModelConfig,
 }
 
+/// Backend-specific visitor that loads tensors into MLX arrays.
+struct MlxVisitor<'a> {
+    stream: &'a MlxStream,
+}
+
+impl WeightVisitor for MlxVisitor<'_> {
+    type Dense = MlxArray;
+    type Weight = MlxWeightBuffer;
+    type Error = MlxError;
+
+    fn load_dense(&self, provider: &dyn WeightProvider, name: &str) -> Result<MlxArray, MlxError> {
+        load_dense_array(provider, name, self.stream)
+    }
+
+    fn load_weight(
+        &self,
+        provider: &dyn WeightProvider,
+        name: &str,
+    ) -> Result<MlxWeightBuffer, MlxError> {
+        load_weight_buffer(provider, name, self.stream)
+    }
+}
+
 impl MlxWeights {
     /// Load model weights from a [`WeightProvider`] into MLX arrays.
     pub fn load(provider: &dyn WeightProvider, stream: &MlxStream) -> Result<Self, MlxError> {
-        let config = provider.config().clone();
-        let num_layers = config.num_hidden_layers;
-
-        let embedding = load_dense_array(provider, "model.embed_tokens.weight", stream)?;
-
-        let mut layers = Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            let prefix = format!("model.layers.{i}");
-            layers.push(MlxLayerWeights {
-                input_norm: load_dense_array(
-                    provider,
-                    &format!("{prefix}.input_layernorm.weight"),
-                    stream,
-                )?,
-                q_proj: load_weight_buffer(
-                    provider,
-                    &format!("{prefix}.self_attn.q_proj.weight"),
-                    stream,
-                )?,
-                k_proj: load_weight_buffer(
-                    provider,
-                    &format!("{prefix}.self_attn.k_proj.weight"),
-                    stream,
-                )?,
-                v_proj: load_weight_buffer(
-                    provider,
-                    &format!("{prefix}.self_attn.v_proj.weight"),
-                    stream,
-                )?,
-                o_proj: load_weight_buffer(
-                    provider,
-                    &format!("{prefix}.self_attn.o_proj.weight"),
-                    stream,
-                )?,
-                post_attn_norm: load_dense_array(
-                    provider,
-                    &format!("{prefix}.post_attention_layernorm.weight"),
-                    stream,
-                )?,
-                gate_proj: load_weight_buffer(
-                    provider,
-                    &format!("{prefix}.mlp.gate_proj.weight"),
-                    stream,
-                )?,
-                up_proj: load_weight_buffer(
-                    provider,
-                    &format!("{prefix}.mlp.up_proj.weight"),
-                    stream,
-                )?,
-                down_proj: load_weight_buffer(
-                    provider,
-                    &format!("{prefix}.mlp.down_proj.weight"),
-                    stream,
-                )?,
-                q_norm: if provider.has_tensor(&format!("{prefix}.self_attn.q_norm.weight")) {
-                    Some(load_dense_array(
-                        provider,
-                        &format!("{prefix}.self_attn.q_norm.weight"),
-                        stream,
-                    )?)
-                } else {
-                    None
-                },
-                k_norm: if provider.has_tensor(&format!("{prefix}.self_attn.k_norm.weight")) {
-                    Some(load_dense_array(
-                        provider,
-                        &format!("{prefix}.self_attn.k_norm.weight"),
-                        stream,
-                    )?)
-                } else {
-                    None
-                },
-            });
-        }
-
-        let final_norm = load_dense_array(provider, "model.norm.weight", stream)?;
+        let visitor = MlxVisitor { stream };
+        let core = weight_loading::load_model_weights(&visitor, provider)?;
+        let config = core.config;
 
         let lm_head = if config.tie_word_embeddings {
             MlxWeightBuffer::Dense(load_dense_array(
@@ -176,9 +104,9 @@ impl MlxWeights {
         };
 
         Ok(Self {
-            embedding,
-            layers,
-            final_norm,
+            embedding: core.embedding,
+            layers: core.layers,
+            final_norm: core.final_norm,
             lm_head,
             config,
         })
