@@ -28,6 +28,9 @@ pub mod tensor_utils;
 pub mod type_repropagate;
 pub(crate) mod util;
 
+#[cfg(feature = "gptq")]
+pub mod gptq;
+
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
 pub use constant_fold::ConstantFoldPass;
