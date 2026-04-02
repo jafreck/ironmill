@@ -69,8 +69,7 @@ tradeoffs:
 | Custom compute kernels | ✅ | — | ✅ |
 | INT8 KV cache (TurboQuant) | ✅ | — | ✅ |
 | Hardware scheduling | Manual | Apple-managed | Manual |
-| API stability | Public (Metal/MPS) | Public (CoreML) | Private (reverse-engineered) |
-| Maturity | **Primary** | **Basic** | **Experimental** |
+| Backing tech | Metal / MPS | CoreML (CPU, GPU, ANE) | ANE private API |
 
 #### Metal GPU
 
