@@ -14,6 +14,7 @@ use mil_rs::weights::WeightProvider;
 
 use super::config::MlxConfig;
 use super::error::MlxError;
+use super::turboquant::{MlxKvCache, MlxTurboQuantModel};
 use super::weights::{MlxWeightBuffer, MlxWeights};
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
@@ -72,6 +73,10 @@ pub struct MlxInference {
     /// Per-layer V cache: `[batch=1, num_kv_heads, seq_len, head_dim]` FP16.
     v_cache: Vec<Option<MlxArray>>,
     seq_pos: usize,
+    /// TurboQuant model state (initialized when `enable_turboquant` is true).
+    tq_model: Option<MlxTurboQuantModel>,
+    /// TurboQuant quantized KV cache (initialized when `enable_turboquant` is true).
+    tq_cache: Option<MlxKvCache>,
 }
 
 impl MlxInference {
@@ -85,6 +90,8 @@ impl MlxInference {
             k_cache: Vec::new(),
             v_cache: Vec::new(),
             seq_pos: 0,
+            tq_model: None,
+            tq_cache: None,
         })
     }
 
@@ -103,12 +110,14 @@ impl MlxInference {
             .weights
             .take()
             .ok_or_else(|| MlxError::WeightLoading("weights not loaded".into()))?;
+        let tq_model = self.tq_model.take();
 
-        let result = self.run_pipeline_inner(tokens, &stream, &weights);
+        let result = self.run_pipeline_inner(tokens, &stream, &weights, tq_model.as_ref());
 
         // Put them back regardless of outcome.
         self.stream = Some(stream);
         self.weights = Some(weights);
+        self.tq_model = tq_model;
 
         result
     }
@@ -120,6 +129,7 @@ impl MlxInference {
         tokens: &[u32],
         stream: &MlxStream,
         weights: &MlxWeights,
+        tq_model: Option<&MlxTurboQuantModel>,
     ) -> Result<Logits, MlxError> {
         let mc = &weights.config;
         let num_tokens = tokens.len();
@@ -136,11 +146,11 @@ impl MlxInference {
         let mut hidden = self.gather_embeddings(&weights.embedding, tokens, stream)?;
 
         // ── Per-layer transformer block ─────────────────────────
+        let use_turboquant = self.config.enable_turboquant && tq_model.is_some();
         for (layer_idx, layer) in weights.layers.iter().enumerate() {
-            // Pre-attention RMSNorm
+            // ── Lazy region A: RMSNorm + Q/K/V projections + RoPE ──
             let normed = rms_norm(&hidden, &layer.input_norm, rms_eps, stream)?;
 
-            // Q/K/V projections
             let q = self.weight_matmul(&normed, &layer.q_proj, stream)?;
             let k = self.weight_matmul(&normed, &layer.k_proj, stream)?;
             let v = self.weight_matmul(&normed, &layer.v_proj, stream)?;
@@ -189,61 +199,89 @@ impl MlxInference {
             let q = rope(&q, head_dim as i32, false, rope_theta, 1.0, offset, stream)?;
             let k = rope(&k, head_dim as i32, false, rope_theta, 1.0, offset, stream)?;
 
-            // Transpose to [batch, heads, seq, head_dim] for attention
-            // MLX transpose reverses all axes: [0,1,2,3] → [3,2,1,0]
-            // We need [0,2,1,3] which we achieve via reshapes.
-            // Actually, we reshape: [1, T, H, D] → [1, H, T, D] by swapping dims 1 and 2.
-            // Use reshape: [1*T, H, D] then reshape to [H, T, D] then [1, H, T, D].
-            let q = self.swap_dims_1_2(&q, stream)?;
-            let k = self.swap_dims_1_2(&k, stream)?;
-            let v = self.swap_dims_1_2(&v, stream)?;
+            let attn_out = if use_turboquant {
+                // ── TurboQuant path: quantized KV cache + custom attention ──
+                let tq = tq_model.unwrap();
+                let tq_cache = self
+                    .tq_cache
+                    .as_ref()
+                    .expect("tq_cache must be initialized when turboquant is enabled");
 
-            // Update KV cache by concatenating along the seq dimension
-            let (k_full, v_full) = self.update_kv_cache(layer_idx, &k, &v, stream)?;
+                // Flatten K/V from [1, T, num_kv_heads, head_dim] to
+                // [num_kv_heads × head_dim] for cache write (single token decode).
+                let k_flat = reshape(&k, &[(num_kv_heads * head_dim) as i32], stream)?;
+                let v_flat = reshape(&v, &[(num_kv_heads * head_dim) as i32], stream)?;
 
-            // GQA: expand K/V if num_heads != num_kv_heads
-            let k_for_attn = if num_groups > 1 {
-                self.expand_kv_for_gqa(&k_full, num_heads, num_kv_heads, stream)?
+                // Dispatch cache writes: K then V
+                let k_dummy = tq_cache.write_kv(layer_idx, &k_flat, true, tq, stream)?;
+                let v_dummy = tq_cache.write_kv(layer_idx, &v_flat, false, tq, stream)?;
+
+                // Per-layer eval() — materialise cache + scales before attention reads them.
+                // This is INTENTIONAL for TurboQuant: the quantized cache must be written
+                // before the attention kernel reads it in the same layer.
+                ironmill_mlx_sys::stream::eval(&[&k_dummy, &v_dummy])?;
+
+                // Flatten Q from [1, T, num_heads, head_dim] to [num_heads × head_dim]
+                let q_flat = reshape(&q, &[(num_heads * head_dim) as i32], stream)?;
+
+                // Dispatch attention kernel
+                let attn_flat = tq_cache.attend(layer_idx, &q_flat, num_heads, tq, stream)?;
+
+                // Reshape back to [T, num_heads * head_dim]
+                reshape(
+                    &attn_flat,
+                    &[num_tokens as i32, (num_heads * head_dim) as i32],
+                    stream,
+                )?
             } else {
-                k_full
+                // ── FP16 SDPA path (original) ──
+                let q = self.swap_dims_1_2(&q, stream)?;
+                let k = self.swap_dims_1_2(&k, stream)?;
+                let v = self.swap_dims_1_2(&v, stream)?;
+
+                let (k_full, v_full) = self.update_kv_cache(layer_idx, &k, &v, stream)?;
+
+                let k_for_attn = if num_groups > 1 {
+                    self.expand_kv_for_gqa(&k_full, num_heads, num_kv_heads, stream)?
+                } else {
+                    k_full
+                };
+                let v_for_attn = if num_groups > 1 {
+                    self.expand_kv_for_gqa(&v_full, num_heads, num_kv_heads, stream)?
+                } else {
+                    v_full
+                };
+
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                let attn_out = scaled_dot_product_attention(
+                    &q,
+                    &k_for_attn,
+                    &v_for_attn,
+                    scale,
+                    None,
+                    stream,
+                )?;
+
+                let attn_out = self.swap_dims_1_2(&attn_out, stream)?;
+                reshape(
+                    &attn_out,
+                    &[num_tokens as i32, (num_heads * head_dim) as i32],
+                    stream,
+                )?
             };
-            let v_for_attn = if num_groups > 1 {
-                self.expand_kv_for_gqa(&v_full, num_heads, num_kv_heads, stream)?
-            } else {
-                v_full
-            };
 
-            // Scaled dot-product attention
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            let attn_out =
-                scaled_dot_product_attention(&q, &k_for_attn, &v_for_attn, scale, None, stream)?;
-
-            // Transpose back: [1, H, T, D] → [1, T, H, D] → [T, H*D]
-            let attn_out = self.swap_dims_1_2(&attn_out, stream)?;
-            // Now [1, T, H, D] — reshape to [T, H*D]
-            let attn_out = reshape(
-                &attn_out,
-                &[num_tokens as i32, (num_heads * head_dim) as i32],
-                stream,
-            )?;
-
-            // O projection
+            // ── Lazy region B: O proj + residual + FFN ──
             let attn_proj = self.weight_matmul(&attn_out, &layer.o_proj, stream)?;
-
-            // Residual connection
             let hidden_post_attn = add(&hidden, &attn_proj, stream)?;
 
-            // Post-attention RMSNorm
             let normed_ff = rms_norm(&hidden_post_attn, &layer.post_attn_norm, rms_eps, stream)?;
 
-            // Feed-forward: gate/up → SiLU(gate) * up → down
             let gate = self.weight_matmul(&normed_ff, &layer.gate_proj, stream)?;
             let up = self.weight_matmul(&normed_ff, &layer.up_proj, stream)?;
             let gate_activated = silu(&gate, stream)?;
             let ff_mid = multiply(&gate_activated, &up, stream)?;
             let ff_out = self.weight_matmul(&ff_mid, &layer.down_proj, stream)?;
 
-            // Residual connection
             hidden = add(&hidden_post_attn, &ff_out, stream)?;
         }
 
@@ -273,7 +311,11 @@ impl MlxInference {
         let logits_f32: &[f32] = logits_arr.as_contiguous_slice()?;
         let logits = logits_f32.to_vec();
 
+        // Advance sequence position
         self.seq_pos += num_tokens;
+        if let Some(ref mut tq_cache) = self.tq_cache {
+            tq_cache.advance_by(num_tokens);
+        }
 
         Ok(logits)
     }
@@ -548,9 +590,26 @@ impl InferenceEngine for MlxInference {
 
         let num_layers = weights.config.num_hidden_layers;
 
-        // Initialize empty KV cache vectors.
+        // Initialize empty KV cache vectors (FP16 path).
         self.k_cache = vec![None; num_layers];
         self.v_cache = vec![None; num_layers];
+
+        // Initialize TurboQuant if enabled.
+        if self.config.enable_turboquant {
+            let tq_model = MlxTurboQuantModel::new(&weights.config, &self.config, &stream)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let tq_cache = MlxKvCache::new(
+                &tq_model,
+                weights.config.num_key_value_heads,
+                self.config.max_seq_len,
+                weights.config.head_dim,
+                num_layers,
+                &stream,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            self.tq_model = Some(tq_model);
+            self.tq_cache = Some(tq_cache);
+        }
 
         self.stream = Some(stream);
         self.weights = Some(weights);
@@ -586,6 +645,9 @@ impl InferenceEngine for MlxInference {
         }
         for slot in &mut self.v_cache {
             *slot = None;
+        }
+        if let Some(ref mut tq_cache) = self.tq_cache {
+            tq_cache.reset();
         }
     }
 }
