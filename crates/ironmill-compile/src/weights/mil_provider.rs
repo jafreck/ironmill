@@ -219,7 +219,6 @@ impl MilWeightProvider {
         config: ModelConfig,
         n_bits: u8,
         min_elements: usize,
-        _seed: u64,
     ) -> Result<Self, MilError> {
         use half::f16;
 

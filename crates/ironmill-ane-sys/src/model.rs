@@ -1141,12 +1141,6 @@ fn build_multi_weight_dict(weights: &[(&str, &[u8])]) -> Result<*mut c_void, Ane
     Ok(outer_dict)
 }
 
-/// Get the `hexStringIdentifier` from an `_ANEInMemoryModel` as a Rust string.
-#[allow(dead_code)]
-fn get_model_hex_id(model: *mut c_void) -> Option<String> {
-    read_nsstring_property(model, "hexStringIdentifier")
-}
-
 /// Pre-populate the model's temp directory with MIL text and weight blobs.
 fn populate_tmp_dir(hex_id: &str, mil_text: &str, weights: &[(&str, &[u8])]) {
     let tmp_dir = std::env::temp_dir().join(hex_id);

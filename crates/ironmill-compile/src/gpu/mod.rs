@@ -40,7 +40,6 @@ pub struct GpuCompileBuilder {
     input: PathBuf,
     n_bits: u8,
     min_elements: usize,
-    seed: u64,
 }
 
 impl GpuCompileBuilder {
@@ -49,7 +48,6 @@ impl GpuCompileBuilder {
             input: input.into(),
             n_bits: 4,
             min_elements: 1024,
-            seed: 42,
         }
     }
 
@@ -124,7 +122,6 @@ impl GpuCompileBuilder {
                     config,
                     self.n_bits,
                     self.min_elements,
-                    self.seed,
                 )?;
                 Ok(provider)
             }

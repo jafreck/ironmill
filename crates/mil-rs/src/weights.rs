@@ -143,11 +143,6 @@ impl<'a> WeightTensor<'a> {
     pub fn num_elements(&self) -> usize {
         self.shape.iter().product()
     }
-
-    /// Expected byte size based on shape and dtype.
-    pub fn expected_byte_size(&self) -> usize {
-        self.num_elements() * self.dtype.byte_size()
-    }
 }
 
 /// Trait abstracting over weight storage formats.

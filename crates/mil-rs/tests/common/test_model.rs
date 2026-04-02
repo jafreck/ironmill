@@ -252,18 +252,6 @@ pub fn vocab_size() -> usize {
     VOCAB_SIZE
 }
 
-/// Returns the hidden dimension used by [`create_test_program`].
-#[allow(dead_code)]
-pub fn hidden_dim() -> usize {
-    HIDDEN_DIM
-}
-
-/// Returns the number of transformer layers used by [`create_test_program`].
-#[allow(dead_code)]
-pub fn n_layers() -> usize {
-    N_LAYERS
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Build a `const` op carrying an FP32 tensor in `inputs["val"]`.
