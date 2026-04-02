@@ -114,3 +114,26 @@ pub fn async_eval(outputs: &[&crate::array::MlxArray]) -> Result<(), MlxSysError
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Metal memory management
+// ---------------------------------------------------------------------------
+
+/// Clear MLX's internal Metal buffer cache.
+///
+/// This releases pooled Metal buffers back to the system. Useful after
+/// `reset()` or after processing long sequences to prevent memory
+/// fragmentation. Safe to call at any time — MLX will re-allocate
+/// buffers as needed.
+pub fn metal_clear_cache() -> Result<(), MlxSysError> {
+    #[cfg(mlx_stub)]
+    {
+        Err(MlxSysError::MlxC("mlx-c not available (stub mode)".into()))
+    }
+
+    #[cfg(not(mlx_stub))]
+    {
+        unsafe { ffi::mlx_metal_clear_cache() };
+        Ok(())
+    }
+}

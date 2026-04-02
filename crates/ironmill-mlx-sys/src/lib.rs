@@ -190,6 +190,9 @@ pub(crate) mod ffi {
         pub fn mlx_eval(arr: mlx_array);
         pub fn mlx_async_eval(arr: mlx_array);
 
+        // Memory management
+        pub fn mlx_metal_clear_cache();
+
         // Ops
         pub fn mlx_matmul(a: mlx_array, b: mlx_array, stream: mlx_stream) -> mlx_array;
         pub fn mlx_add(a: mlx_array, b: mlx_array, stream: mlx_stream) -> mlx_array;

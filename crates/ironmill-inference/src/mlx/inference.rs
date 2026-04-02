@@ -5,6 +5,7 @@
 //! at the end materializes the logits.
 
 use std::any::Any;
+use std::time::Instant;
 
 use ironmill_mlx_sys::{
     MlxArray, MlxDtype, MlxStream, add, broadcast_to, concat, expand_dims, matmul, multiply,
@@ -77,6 +78,10 @@ pub struct MlxInference {
     tq_model: Option<MlxTurboQuantModel>,
     /// TurboQuant quantized KV cache (initialized when `enable_turboquant` is true).
     tq_cache: Option<MlxKvCache>,
+    /// Profiling: total eval() calls in the current pipeline invocation.
+    profile_eval_count: usize,
+    /// Profiling: cumulative time spent in eval() calls.
+    profile_eval_duration: std::time::Duration,
 }
 
 impl MlxInference {
@@ -92,14 +97,22 @@ impl MlxInference {
             seq_pos: 0,
             tq_model: None,
             tq_cache: None,
+            profile_eval_count: 0,
+            profile_eval_duration: std::time::Duration::ZERO,
         })
     }
 
     /// Run the transformer pipeline for a batch of tokens.
     ///
     /// This builds a lazy MLX computation graph and evaluates it with
-    /// a single `eval()` at the end.
-    fn run_pipeline(&mut self, tokens: &[u32]) -> Result<Logits, MlxError> {
+    /// a single `eval()` at the end. When `use_async_final` is `true`,
+    /// the final evaluation uses `async_eval()` to overlap with the
+    /// caller's next graph construction (used for prefill chunking).
+    fn run_pipeline(&mut self, tokens: &[u32], use_async_final: bool) -> Result<Logits, MlxError> {
+        // Reset profiling counters for this invocation.
+        self.profile_eval_count = 0;
+        self.profile_eval_duration = std::time::Duration::ZERO;
+
         // Take the stream and weights out temporarily to avoid borrow conflicts
         // between immutable references to them and mutable access to KV caches.
         let stream = self
@@ -112,12 +125,28 @@ impl MlxInference {
             .ok_or_else(|| MlxError::WeightLoading("weights not loaded".into()))?;
         let tq_model = self.tq_model.take();
 
-        let result = self.run_pipeline_inner(tokens, &stream, &weights, tq_model.as_ref());
+        let result = self.run_pipeline_inner(
+            tokens,
+            &stream,
+            &weights,
+            tq_model.as_ref(),
+            use_async_final,
+        );
 
         // Put them back regardless of outcome.
         self.stream = Some(stream);
         self.weights = Some(weights);
         self.tq_model = tq_model;
+
+        // Log profiling stats if enabled.
+        if self.config.profile {
+            eprintln!(
+                "[mlx-profile] eval calls: {}, eval time: {:.3}ms, async_final: {}",
+                self.profile_eval_count,
+                self.profile_eval_duration.as_secs_f64() * 1000.0,
+                use_async_final,
+            );
+        }
 
         result
     }
@@ -130,6 +159,7 @@ impl MlxInference {
         stream: &MlxStream,
         weights: &MlxWeights,
         tq_model: Option<&MlxTurboQuantModel>,
+        use_async_final: bool,
     ) -> Result<Logits, MlxError> {
         let mc = &weights.config;
         let num_tokens = tokens.len();
@@ -212,14 +242,25 @@ impl MlxInference {
                 let k_flat = reshape(&k, &[(num_kv_heads * head_dim) as i32], stream)?;
                 let v_flat = reshape(&v, &[(num_kv_heads * head_dim) as i32], stream)?;
 
-                // Dispatch cache writes: K then V
+                // Dispatch cache writes: K then V (lazy)
                 let k_dummy = tq_cache.write_kv(layer_idx, &k_flat, true, tq, stream)?;
                 let v_dummy = tq_cache.write_kv(layer_idx, &v_flat, false, tq, stream)?;
 
-                // Per-layer eval() — materialise cache + scales before attention reads them.
-                // This is INTENTIONAL for TurboQuant: the quantized cache must be written
-                // before the attention kernel reads it in the same layer.
+                // Materialize cache writes before attend() reads them.
+                // A previous batched-eval optimization deferred this eval,
+                // but that caused attend() to read stale/uninitialized cache
+                // data when eval_interval > 1. Per-layer eval is required
+                // for correctness. See turboquant_eval_interval doc comment.
+                let eval_start = if self.config.profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 ironmill_mlx_sys::stream::eval(&[&k_dummy, &v_dummy])?;
+                if let Some(t) = eval_start {
+                    self.profile_eval_duration += t.elapsed();
+                }
+                self.profile_eval_count += 1;
 
                 // Flatten Q from [1, T, num_heads, head_dim] to [num_heads × head_dim]
                 let q_flat = reshape(&q, &[(num_heads * head_dim) as i32], stream)?;
@@ -305,7 +346,11 @@ impl MlxInference {
         let logits_arr = self.weight_matmul(&last_hidden, &weights.lm_head, stream)?;
 
         // ── Single eval() to materialize ────────────────────────
-        ironmill_mlx_sys::stream::eval(&[&logits_arr])?;
+        if use_async_final {
+            self.profiled_async_eval(&[&logits_arr])?;
+        } else {
+            self.profiled_eval(&[&logits_arr])?;
+        }
 
         // Read logits back to CPU
         let logits_f32: &[f32] = logits_arr.as_contiguous_slice()?;
@@ -566,6 +611,38 @@ impl MlxInference {
         )?;
         Ok(result)
     }
+
+    // ── Profiled eval helpers (added by MLX-OPTIMIZE) ───────────
+
+    /// Synchronous `eval()` with optional profiling instrumentation.
+    fn profiled_eval(&mut self, outputs: &[&MlxArray]) -> Result<(), MlxError> {
+        let start = if self.config.profile {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
+        ironmill_mlx_sys::stream::eval(outputs)?;
+
+        if let Some(start) = start {
+            self.profile_eval_duration += start.elapsed();
+        }
+        self.profile_eval_count += 1;
+        Ok(())
+    }
+
+    /// Asynchronous `async_eval()` with optional profiling instrumentation.
+    ///
+    /// Only the call count is tracked — not duration — because `async_eval()`
+    /// returns immediately after dispatching work to the GPU. Any wall-clock
+    /// measurement would reflect dispatch overhead only, not actual GPU
+    /// execution time.
+    fn profiled_async_eval(&mut self, outputs: &[&MlxArray]) -> Result<(), MlxError> {
+        ironmill_mlx_sys::stream::async_eval(outputs)?;
+
+        self.profile_eval_count += 1;
+        Ok(())
+    }
 }
 
 // ── InferenceEngine implementation ──────────────────────────────
@@ -619,7 +696,8 @@ impl InferenceEngine for MlxInference {
     }
 
     fn decode_step(&mut self, token: u32) -> Result<Logits, InferenceError> {
-        self.run_pipeline(&[token]).map_err(InferenceError::from)
+        self.run_pipeline(&[token], false)
+            .map_err(InferenceError::from)
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError> {
@@ -629,10 +707,22 @@ impl InferenceEngine for MlxInference {
 
         let chunk_size = self.config.prefill_chunk_size.unwrap_or(tokens.len());
         let chunk_size = chunk_size.max(1);
+        let use_async = self.config.async_prefill && self.config.prefill_chunk_size.is_some();
 
+        let chunks: Vec<&[u32]> = tokens.chunks(chunk_size).collect();
+        let num_chunks = chunks.len();
         let mut last_logits = None;
-        for chunk in tokens.chunks(chunk_size) {
-            last_logits = Some(self.run_pipeline(chunk).map_err(InferenceError::from)?);
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_last = i + 1 == num_chunks;
+            // For non-final chunks with async_prefill, use async_eval to
+            // overlap GPU execution of this chunk with graph construction
+            // of the next. The final chunk always uses sync eval.
+            let async_final = use_async && !is_last;
+            let logits = self
+                .run_pipeline(chunk, async_final)
+                .map_err(InferenceError::from)?;
+            last_logits = Some(logits);
         }
 
         last_logits.ok_or_else(|| InferenceError::Decode("no chunks processed".into()))
@@ -648,6 +738,10 @@ impl InferenceEngine for MlxInference {
         }
         if let Some(ref mut tq_cache) = self.tq_cache {
             tq_cache.reset();
+        }
+        // Optionally release pooled Metal buffers.
+        if self.config.clear_cache_on_reset {
+            let _ = ironmill_mlx_sys::stream::metal_clear_cache();
         }
     }
 }

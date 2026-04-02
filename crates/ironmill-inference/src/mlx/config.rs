@@ -2,9 +2,9 @@
 
 /// Configuration for the MLX inference backend.
 ///
-/// Controls sequence length limits, prefill chunking, and TurboQuant
-/// quantized KV cache settings (disabled by default — activated by the
-/// MLX-TURBOQUANT task later).
+/// Controls sequence length limits, prefill chunking, TurboQuant
+/// quantized KV cache settings, and optimization knobs for eval
+/// placement, async prefill, memory management, and profiling.
 #[derive(Debug, Clone)]
 pub struct MlxConfig {
     /// Maximum sequence length for KV cache allocation.
@@ -17,6 +17,34 @@ pub struct MlxConfig {
     pub rotation_seed: u64,
     /// Number of quantization bits for TurboQuant KV cache (4 or 8).
     pub n_bits: u8,
+
+    // ── Optimization knobs (added by MLX-OPTIMIZE) ──────────────
+    /// Eval interval for the TurboQuant path (reserved — currently unused).
+    ///
+    /// This field is retained for forward-compatibility but has no effect.
+    /// The engine always calls `eval()` once per layer before `attend()` to
+    /// ensure cache writes are materialized. A previous batched-eval
+    /// optimization used this value to defer evals across multiple layers,
+    /// but that caused `attend()` to read stale/uninitialized cache data
+    /// when the interval was greater than 1.
+    pub turboquant_eval_interval: usize,
+    /// Use `async_eval()` for prefill chunk overlap.
+    ///
+    /// When `true` and `prefill_chunk_size` is set, the engine uses
+    /// `async_eval()` for all chunks except the last, overlapping graph
+    /// construction for chunk N+1 with GPU execution of chunk N.
+    pub async_prefill: bool,
+    /// Clear the Metal buffer cache on `reset()`.
+    ///
+    /// When `true`, `reset()` calls `metal_clear_cache()` to release
+    /// pooled Metal buffers back to the system.
+    pub clear_cache_on_reset: bool,
+    /// Enable profiling instrumentation.
+    ///
+    /// When `true`, the inference loop tracks per-eval timing and
+    /// eval call counts, logging them to stderr at the end of each
+    /// `run_pipeline` invocation.
+    pub profile: bool,
 }
 
 impl Default for MlxConfig {
@@ -27,6 +55,10 @@ impl Default for MlxConfig {
             enable_turboquant: false,
             rotation_seed: 42,
             n_bits: 8,
+            turboquant_eval_interval: 1,
+            async_prefill: false,
+            clear_cache_on_reset: false,
+            profile: false,
         }
     }
 }
@@ -44,6 +76,9 @@ impl MlxConfig {
             if chunk == 0 {
                 return Err("prefill_chunk_size must be > 0".into());
             }
+        }
+        if self.turboquant_eval_interval == 0 {
+            return Err("turboquant_eval_interval must be >= 1".into());
         }
         Ok(())
     }
