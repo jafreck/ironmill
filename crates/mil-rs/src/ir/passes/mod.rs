@@ -33,6 +33,8 @@ pub(crate) mod util;
 
 #[cfg(feature = "gptq")]
 pub mod gptq;
+#[cfg(feature = "gptq")]
+pub mod spinquant;
 
 pub use affine_quantize::{AffineQuantizePass, BitWidth};
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
