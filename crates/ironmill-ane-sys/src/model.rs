@@ -411,10 +411,10 @@ impl InMemoryModel {
         request: &crate::request::AneRequest,
         perf_stats_mask: u32,
     ) -> Result<crate::perf::PerformanceStats, AneSysError> {
+        let stats = crate::perf::PerformanceStats::with_hw_execution_ns(0)?;
+
         let old_mask = self.perf_stats_mask();
         self.set_perf_stats_mask(perf_stats_mask);
-
-        let stats = crate::perf::PerformanceStats::with_hw_execution_ns(0)?;
         // SAFETY: caller guarantees the request is valid; stats.as_raw() is
         // a retained _ANEPerformanceStats pointer.
         unsafe { request.set_perf_stats(stats.as_raw()) };
@@ -833,10 +833,10 @@ pub fn eval_with_stats(
     qos: u32,
     perf_stats_mask: u32,
 ) -> Result<crate::perf::PerformanceStats, AneSysError> {
+    let stats = crate::perf::PerformanceStats::with_hw_execution_ns(0)?;
+
     let old_mask = model.perf_stats_mask();
     model.set_perf_stats_mask(perf_stats_mask);
-
-    let stats = crate::perf::PerformanceStats::with_hw_execution_ns(0)?;
     let result = eval_inner(model, input_surfaces, output_surfaces, qos, stats.as_raw());
 
     model.set_perf_stats_mask(old_mask);

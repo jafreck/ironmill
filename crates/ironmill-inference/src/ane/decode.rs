@@ -15,6 +15,7 @@
 use half::f16;
 
 use super::device::AneDevice;
+use super::model::AneConfig;
 use super::turboquant::TurboQuantConfig;
 use super::turboquant::TurboQuantModel;
 use super::turboquant::mil_emitter;
@@ -814,6 +815,19 @@ impl<D: AneDevice> AneInference<D> {
         self.enable_hybrid = enable;
     }
 
+    /// Apply runtime flags from an [`AneConfig`].
+    ///
+    /// Wires `enable_profiling`, `enable_chaining`, `enable_fusion`, and
+    /// `enable_hybrid` from the config into this inference instance.
+    /// Call after [`from_bundle`](Self::from_bundle) to activate the
+    /// settings the user requested.
+    pub fn configure(&mut self, config: &AneConfig) {
+        self.enable_profiling = config.enable_profiling;
+        self.enable_chaining = config.enable_chaining;
+        self.enable_fusion = config.enable_fusion;
+        self.enable_hybrid = config.enable_hybrid;
+    }
+
     /// Attempt a hybrid ANE↔GPU decode step for a single layer.
     ///
     /// The intended pipeline:
@@ -882,69 +896,22 @@ impl<D: AneDevice> AneInference<D> {
     ///
     /// The `_ANEChainingRequest` API is undocumented — this is a best-effort
     /// implementation that may fail on some hardware or macOS versions.
-    fn try_chained_pre_attn(&mut self, hidden: &[f16], effective_layers: usize) -> Result<()> {
-        // Chained pre_attn: write input for the first layer, then chain
-        // all pre_attn evals so the ANE pipelines them without returning
-        // to the CPU between each layer's pre_attn.
+    fn try_chained_pre_attn(&mut self, _hidden: &[f16], _effective_layers: usize) -> Result<()> {
+        // Cross-layer pre_attn chaining is architecturally unsound: each
+        // layer's pre_attn input depends on the previous layer's complete
+        // output (attention + FFN + both residuals). Pre_attn programs
+        // cannot be chained across layers.
         //
-        // TODO: The ChainingRequest API requires assembling NSArray
-        // arguments with loopback indices. The exact protocol for
-        // multi-model chaining (where each layer is a different compiled
-        // model) is unclear — prepare_chaining takes a single model
-        // argument. Two possible approaches:
+        // Viable chaining targets:
+        //   - Within-layer: pre_attn → attention → post_attn for one layer
+        //   - Across-layer with full pipeline: all sub-programs for each layer
         //
-        //   1. All layers share the same pre_attn MIL program (same weights
-        //      shape), so we could compile a single program and use
-        //      procedure_index to distinguish layers. This requires the
-        //      model to have been compiled with multiple procedures.
-        //
-        //   2. Call prepare_chaining once per layer with loopback indices
-        //      that chain output→input between consecutive calls. This
-        //      is what the probe tests explore.
-        //
-        // For now, fall through to per-layer eval — the probe tests in
-        // ane_probe.rs (probes 13 & 14) will validate the API mechanics.
-
-        // Write the initial hidden state into layer 0's pre_attn input.
-        write_f16_padded(&mut self.layers[0].pre_attn.input_tensors[0], hidden)?;
-
-        // Execute pre_attn for each layer sequentially.
-        // When chaining is validated via probes, this loop will be replaced
-        // with a single ChainingRequest dispatch.
-        for layer_idx in 0..effective_layers {
-            if layer_idx > 0 {
-                // Feed previous layer's pre_attn output as this layer's input.
-                // In the chained path, this copy would be eliminated by
-                // loopback — the ANE would reuse the output surface directly.
-                let prev_out =
-                    read_f16_channels(&self.layers[layer_idx - 1].pre_attn.output_tensors[0])?;
-                write_f16_padded(
-                    &mut self.layers[layer_idx].pre_attn.input_tensors[0],
-                    &prev_out,
-                )?;
-            }
-
-            let layer = &mut self.layers[layer_idx];
-            let in_refs: Vec<&AneTensor> = layer.pre_attn.input_tensors.iter().collect();
-            let mut out_refs: Vec<&mut AneTensor> =
-                layer.pre_attn.output_tensors.iter_mut().collect();
-            ane_eval(
-                &*self.device,
-                &layer.pre_attn.program,
-                &in_refs,
-                &mut out_refs,
-                self.qos,
-                false, // no profiling in chained path
-                &mut 0,
-            )
-            .map_err(|e| {
-                AneError::Other(anyhow::anyhow!(
-                    "chained pre_attn layer {layer_idx} failed: {e}"
-                ))
-            })?;
-        }
-
-        Ok(())
+        // The chaining API probes (Probes 13 & 14 in ane_probe.rs) explore
+        // the API mechanics. Once validated, this method should be rewritten
+        // to chain within-layer programs instead.
+        Err(AneError::Other(anyhow::anyhow!(
+            "cross-layer pre_attn chaining not yet implemented"
+        )))
     }
 
     // -----------------------------------------------------------------------
@@ -1412,51 +1379,14 @@ impl<D: AneDevice> AneInference<D> {
                     );
                 }
             } else {
-                // No post_attn sub-program — use attention output directly.
-                // When fusion is enabled and a fused FFN program is available,
-                // run the FFN on the attention output. This path activates when
-                // the bundle compiler didn't produce a post_attn program (all
-                // ops fell within the attention cluster).
-                //
-                // Note: the fused FFN covers only the gate_proj + SiLU +
-                // up_proj + down_proj chain. O-proj, residual additions, and
-                // RMSNorm are handled separately (they're typically part of
-                // pre_attn or the attention sub-program). When post_attn IS
-                // present, it already fuses all of these into a single eval.
-                if self.enable_fusion {
-                    if let Some(ref mut tq) = self.turboquant {
-                        if tq.has_fused_ffn() {
-                            let mut ffn_input = AneTensor::new_with_min_alloc(
-                                attn_out_data.len(),
-                                MIN_IO_SEQ,
-                                ScalarType::Float16,
-                                tq.alloc_size(),
-                            )?;
-                            write_f16_padded(&mut ffn_input, &attn_out_data)?;
-                            if let Some(ffn_out) = tq.step_ffn(&ffn_input)? {
-                                let ffn_out_data = read_f16_channels(&ffn_out)?;
-                                // Apply residual: hidden = hidden + ffn_out.
-                                // The fused FFN only computes gate_proj + SiLU +
-                                // up_proj + down_proj; the residual connection
-                                // must be added on the CPU (the unfused post_attn
-                                // program handles this internally).
-                                hidden = hidden
-                                    .iter()
-                                    .zip(ffn_out_data.iter())
-                                    .map(|(h, f)| *h + *f)
-                                    .collect();
-                            } else {
-                                hidden = attn_out_data;
-                            }
-                        } else {
-                            hidden = attn_out_data;
-                        }
-                    } else {
-                        hidden = attn_out_data;
-                    }
-                } else {
-                    hidden = attn_out_data;
-                }
+                // TODO: Fused FFN path disabled — requires post-attention fusion
+                // (O-proj + first residual + RMSNorm) to produce correct results.
+                // The fused FFN MIL program and compile_fused_ffn() are ready, but
+                // the decode loop cannot use them until the intermediate steps
+                // between attention output and FFN input are also fused or handled
+                // on CPU. See spec Task 3, "Output proj + residual add + RMSNorm"
+                // fusion opportunity.
+                hidden = attn_out_data;
             }
             if let Some(t) = t0 {
                 d_post_attn += t.elapsed();

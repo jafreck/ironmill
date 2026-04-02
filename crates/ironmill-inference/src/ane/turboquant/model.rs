@@ -538,6 +538,12 @@ impl<D: AneDevice> TurboQuantModel<D> {
                 config.n_bits
             )));
         }
+        if config.asymmetric_kv && !config.enable_qjl {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "asymmetric K/V quantization requires QJL (enable_qjl=true) — \
+                 K uses fewer bits and relies on QJL correction to compensate"
+            )));
+        }
 
         let mil_config = MilTextConfig::default();
 
@@ -584,14 +590,13 @@ impl<D: AneDevice> TurboQuantModel<D> {
             let k_compiled = device.compile(&k_mil, &[], config.qos)?;
 
             // V cache-write: n_bits-bit codebook.
-            // Use compile_patched() to avoid consuming an ANE compile budget slot.
             let (v_levels, v_boundaries) = lloyd_max_gaussian(head_dim, v_bits);
             let (v_program, _v_weights) =
                 mil_emitter::build_single_cache_write_program(&config, &v_boundaries, &v_levels);
             let (v_mil, _) = program_to_mil_text(&v_program, &mil_config).map_err(|e| {
                 AneError::Other(anyhow::anyhow!("V cache-write MIL text failed: {e}"))
             })?;
-            let v_compiled = device.compile_patched(&k_compiled, &v_mil, &[], config.qos)?;
+            let v_compiled = device.compile(&v_mil, &[], config.qos)?;
 
             (Some(k_compiled), Some(v_compiled))
         } else {
