@@ -69,7 +69,7 @@ struct CompileArgs {
     #[arg(short, long, default_value = "all")]
     target: String,
 
-    /// Quantization mode: "none", "fp16", "int8", "mixed-fp16-int8", "awq".
+    /// Quantization mode: "none", "fp16", "int8", "mixed-fp16-int8", "awq", "d2quant".
     #[arg(short, long, default_value = "none")]
     quantize: String,
 
@@ -88,6 +88,10 @@ struct CompileArgs {
     /// PolarQuant weight quantization bit-width (2 or 4).
     #[arg(long = "polar-quantize", value_name = "BITS")]
     polar_quantize: Option<u8>,
+
+    /// Bit-width for quantization modes that accept it (e.g. d2quant: 2 or 3).
+    #[arg(long, value_name = "N")]
+    bits: Option<u8>,
 
     /// Disable fusion and optimization passes.
     #[arg(long)]
@@ -303,6 +307,7 @@ fn run() -> Result<()> {
                     quantize_config: args.quantize_config,
                     palettize: args.palettize,
                     polar_quantize: args.polar_quantize,
+                    bits: args.bits,
                     no_fusion: args.no_fusion,
                     input_shapes: args.input_shapes,
                     merge_lora,
@@ -378,6 +383,7 @@ struct CompileOpts {
     quantize_config: Option<PathBuf>,
     palettize: Option<u8>,
     polar_quantize: Option<u8>,
+    bits: Option<u8>,
     no_fusion: bool,
     input_shapes: Vec<String>,
     merge_lora: bool,
@@ -563,10 +569,16 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
                     .with_awq(channel_magnitudes, 128)
                     .context("Failed to configure AWQ quantization")?;
             }
+            "d2quant" => {
+                let bits = opts.bits.unwrap_or(2);
+                pipeline = pipeline
+                    .with_d2quant(bits, 128, 0.99)
+                    .context("Failed to configure D2Quant quantization")?;
+            }
             "none" => {}
             other => {
                 bail!(
-                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int8', 'mixed-fp16-int8', or 'awq'."
+                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int8', 'mixed-fp16-int8', 'awq', or 'd2quant'."
                 )
             }
         }
