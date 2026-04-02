@@ -668,6 +668,11 @@ inline void turboquant_quantize_group(
 //   buffer(18) d_non_padded:             uint
 //   buffer(19) outlier_n_levels:         uint
 //   buffer(20) non_outlier_n_levels:     uint
+//   buffer(21) is_k_cache:              uint (1=K, 0=V)
+//   buffer(22) outlier_qjl_matrix:      [d_outlier_padded²] float
+//   buffer(23) non_outlier_qjl_matrix:  [d_non_padded²] float
+//   buffer(24) outlier_r_norms_buf:     [num_kv_heads × max_seq_len] float
+//   buffer(25) non_outlier_r_norms_buf: [num_kv_heads × max_seq_len] float
 //
 // Dispatch: num_kv_heads threadgroups, max(d_outlier_padded, d_non_padded) threads.
 
@@ -693,6 +698,11 @@ kernel void turboquant_outlier_cache_write(
     constant uint& d_non_padded                     [[buffer(18)]],
     constant uint& outlier_n_levels                 [[buffer(19)]],
     constant uint& non_outlier_n_levels             [[buffer(20)]],
+    constant uint& is_k_cache                       [[buffer(21)]],
+    device const float* outlier_qjl_matrix          [[buffer(22)]],
+    device const float* non_outlier_qjl_matrix      [[buffer(23)]],
+    device float* outlier_r_norms_buf               [[buffer(24)]],
+    device float* non_outlier_r_norms_buf           [[buffer(25)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
@@ -729,30 +739,154 @@ kernel void turboquant_outlier_cache_write(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Rotate outlier group
+    // ── Outlier group: rotate → L2 norm → quantize → [QJL] → pack ──
     hadamard_rotate_inplace(shared_outlier, outlier_rotation_signs, d_outlier_padded, tid, tg_size);
 
-    // Quantize outlier group
-    turboquant_quantize_group(
-        shared_outlier, shared_reduce, shared_quant,
-        outlier_codebook, outlier_boundaries, outlier_n_levels,
-        outlier_cache, outlier_scale_buf,
-        d_outlier_padded, head_idx, max_seq_len, seq_pos,
-        d_outlier_padded / 2,
-        tid, tg_size);
+    // L2 norm
+    float local_sq = 0.0f;
+    for (uint d = tid; d < d_outlier_padded; d += tg_size)
+        local_sq += shared_outlier[d] * shared_outlier[d];
+    shared_reduce[tid] = local_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float o_l2 = sqrt(max(shared_reduce[0], 1e-20f));
+    if (tid == 0)
+        outlier_scale_buf[head_idx * max_seq_len + seq_pos] = o_l2;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Rotate non-outlier group
+    // Quantize
+    float o_inv = 1.0f / max(o_l2, 1e-10f);
+    uint o_nb = outlier_n_levels - 1;
+    for (uint d = tid; d < d_outlier_padded; d += tg_size) {
+        float normalized = shared_outlier[d] * o_inv;
+        uint idx = 0;
+        for (uint b = 0; b < o_nb; b++) {
+            if (normalized >= outlier_boundaries[b]) idx = b + 1;
+        }
+        shared_quant[d] = char(idx);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // QJL residual correction (K cache only)
+    if (is_k_cache == 1) {
+        float local_sq_e = 0.0f;
+        for (uint d = tid; d < d_outlier_padded; d += tg_size) {
+            float normalized = shared_outlier[d] * o_inv;
+            float dequant_val = outlier_codebook[uint(shared_quant[d])];
+            float residual = normalized - dequant_val;
+            shared_outlier[d] = residual;
+            local_sq_e += residual * residual;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        shared_reduce[tid] = local_sq_e;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float r_e = sqrt(max(shared_reduce[0], 1e-20f));
+        if (tid == 0)
+            outlier_r_norms_buf[head_idx * max_seq_len + seq_pos] = r_e;
+
+        for (uint d = tid; d < d_outlier_padded; d += tg_size) {
+            float proj = 0.0f;
+            uint row_base = d * d_outlier_padded;
+            for (uint k = 0; k < d_outlier_padded; k++) {
+                proj += outlier_qjl_matrix[row_base + k] * shared_outlier[k];
+            }
+            uchar sign_bit = (proj >= 0.0f) ? uchar(0x8) : uchar(0x0);
+            shared_quant[d] = char(uchar(shared_quant[d]) | sign_bit);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Pack INT4 nibbles
+    uint o_bpp = d_outlier_padded / 2;
+    uint o_cache_base = head_idx * max_seq_len * o_bpp + seq_pos * o_bpp;
+    for (uint d = tid * 2; d < d_outlier_padded; d += tg_size * 2) {
+        uchar lo = uchar(shared_quant[d]     & 0xF);
+        uchar hi = (d + 1 < d_outlier_padded) ? uchar(shared_quant[d + 1] & 0xF) : 0;
+        ((device uchar*)outlier_cache)[o_cache_base + d / 2] = lo | (hi << 4);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Non-outlier group: rotate → L2 norm → quantize → [QJL] → pack ──
     hadamard_rotate_inplace(shared_non_outlier, non_outlier_rotation_signs, d_non_padded, tid, tg_size);
 
-    // Quantize non-outlier group
-    turboquant_quantize_group(
-        shared_non_outlier, shared_reduce, shared_quant,
-        non_outlier_codebook, non_outlier_boundaries, non_outlier_n_levels,
-        non_outlier_cache, non_outlier_scale_buf,
-        d_non_padded, head_idx, max_seq_len, seq_pos,
-        d_non_padded / 2,
-        tid, tg_size);
+    // L2 norm
+    local_sq = 0.0f;
+    for (uint d = tid; d < d_non_padded; d += tg_size)
+        local_sq += shared_non_outlier[d] * shared_non_outlier[d];
+    shared_reduce[tid] = local_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float n_l2 = sqrt(max(shared_reduce[0], 1e-20f));
+    if (tid == 0)
+        non_outlier_scale_buf[head_idx * max_seq_len + seq_pos] = n_l2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Quantize
+    float n_inv = 1.0f / max(n_l2, 1e-10f);
+    uint n_nb = non_outlier_n_levels - 1;
+    for (uint d = tid; d < d_non_padded; d += tg_size) {
+        float normalized = shared_non_outlier[d] * n_inv;
+        uint idx = 0;
+        for (uint b = 0; b < n_nb; b++) {
+            if (normalized >= non_outlier_boundaries[b]) idx = b + 1;
+        }
+        shared_quant[d] = char(idx);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // QJL residual correction (K cache only)
+    if (is_k_cache == 1) {
+        float local_sq_e = 0.0f;
+        for (uint d = tid; d < d_non_padded; d += tg_size) {
+            float normalized = shared_non_outlier[d] * n_inv;
+            float dequant_val = non_outlier_codebook[uint(shared_quant[d])];
+            float residual = normalized - dequant_val;
+            shared_non_outlier[d] = residual;
+            local_sq_e += residual * residual;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        shared_reduce[tid] = local_sq_e;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float r_e = sqrt(max(shared_reduce[0], 1e-20f));
+        if (tid == 0)
+            non_outlier_r_norms_buf[head_idx * max_seq_len + seq_pos] = r_e;
+
+        for (uint d = tid; d < d_non_padded; d += tg_size) {
+            float proj = 0.0f;
+            uint row_base = d * d_non_padded;
+            for (uint k = 0; k < d_non_padded; k++) {
+                proj += non_outlier_qjl_matrix[row_base + k] * shared_non_outlier[k];
+            }
+            uchar sign_bit = (proj >= 0.0f) ? uchar(0x8) : uchar(0x0);
+            shared_quant[d] = char(uchar(shared_quant[d]) | sign_bit);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Pack INT4 nibbles
+    uint n_bpp = d_non_padded / 2;
+    uint n_cache_base = head_idx * max_seq_len * n_bpp + seq_pos * n_bpp;
+    for (uint d = tid * 2; d < d_non_padded; d += tg_size * 2) {
+        uchar lo = uchar(shared_quant[d]     & 0xF);
+        uchar hi = (d + 1 < d_non_padded) ? uchar(shared_quant[d + 1] & 0xF) : 0;
+        ((device uchar*)non_outlier_cache)[n_cache_base + d / 2] = lo | (hi << 4);
+    }
 }
 
 
@@ -789,6 +923,12 @@ kernel void turboquant_outlier_attention(
     constant uint& n_outlier                        [[buffer(20)]],
     constant uint& d_outlier_padded                 [[buffer(21)]],
     constant uint& d_non_padded                     [[buffer(22)]],
+    device const float* outlier_qjl_matrix          [[buffer(23)]],
+    device const float* non_outlier_qjl_matrix      [[buffer(24)]],
+    device const float* k_outlier_r_norms           [[buffer(25)]],
+    device const float* k_non_outlier_r_norms       [[buffer(26)]],
+    device const float* v_outlier_codebook          [[buffer(27)]],
+    device const float* v_non_outlier_codebook      [[buffer(28)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
@@ -796,6 +936,8 @@ kernel void turboquant_outlier_attention(
     // Shared memory budget (head_dim=256 worst case):
     //   shared_q_outlier:     256 × 4 =  1,024 B
     //   shared_q_non_outlier: 256 × 4 =  1,024 B
+    //   shared_s_q_outlier:   256 × 4 =  1,024 B
+    //   shared_s_q_non:       256 × 4 =  1,024 B
     //   outlier_kv_tile:      32 × 128 = 4,096 B (INT4 packed, aliased K/V)
     //   non_outlier_kv_tile:  32 × 128 = 4,096 B
     //   o/n_tile_scales:      2 × 32 × 4 = 256 B
@@ -804,13 +946,15 @@ kernel void turboquant_outlier_attention(
     //   output_outlier:       256 × 4 =  1,024 B
     //   output_non_outlier:   256 × 4 =  1,024 B
     //   softmax/corr:         3 × 4   =     12 B
-    //   Total: ~13.7 KB (within 32 KB limit)
+    //   Total: ~15.7 KB (within 32 KB limit)
     constexpr uint TILE = 32;
     constexpr uint MAX_DIM = 256;
     constexpr uint MAX_PACKED = 128; // MAX_DIM / 2 for INT4
 
     threadgroup float shared_q_outlier[MAX_DIM];
     threadgroup float shared_q_non_outlier[MAX_DIM];
+    threadgroup float shared_s_q_outlier[MAX_DIM];
+    threadgroup float shared_s_q_non[MAX_DIM];
     threadgroup char  outlier_kv_tile[TILE * MAX_PACKED];
     threadgroup char  non_outlier_kv_tile[TILE * MAX_PACKED];
     threadgroup float o_tile_scales[TILE];
@@ -852,6 +996,27 @@ kernel void turboquant_outlier_attention(
     hadamard_rotate_inplace(shared_q_outlier, outlier_rotation_signs, d_outlier_padded, tid, tg_size);
     hadamard_rotate_inplace(shared_q_non_outlier, non_outlier_rotation_signs, d_non_padded, tid, tg_size);
 
+    // Precompute S · q projections for QJL correction
+    for (uint out_d = tid; out_d < d_outlier_padded; out_d += tg_size) {
+        float proj = 0.0f;
+        uint row_base = out_d * d_outlier_padded;
+        for (uint k = 0; k < d_outlier_padded; k++)
+            proj += outlier_qjl_matrix[row_base + k] * shared_q_outlier[k];
+        shared_s_q_outlier[out_d] = proj;
+    }
+    for (uint out_d = tid; out_d < d_non_padded; out_d += tg_size) {
+        float proj = 0.0f;
+        uint row_base = out_d * d_non_padded;
+        for (uint k = 0; k < d_non_padded; k++)
+            proj += non_outlier_qjl_matrix[row_base + k] * shared_q_non_outlier[k];
+        shared_s_q_non[out_d] = proj;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // QJL correction coefficients: √(π/2) / d per Algorithm 2
+    float qjl_factor_o = sqrt(3.14159265f / 2.0f) / float(d_outlier_padded);
+    float qjl_factor_n = sqrt(3.14159265f / 2.0f) / float(d_non_padded);
+
     // Zero output accumulators
     for (uint d = tid; d < d_outlier_padded; d += tg_size)
         shared_output_outlier[d] = 0.0f;
@@ -888,26 +1053,31 @@ kernel void turboquant_outlier_attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute Q · K dot product for each position in tile
+        // Compute Q · K dot product with QJL correction for each position in tile
         for (uint p = 0; p < actual_tile; p++) {
             float k_o_deq = o_tile_scales[p];
             float k_n_deq = n_tile_scales[p];
 
             float partial_dot = 0.0f;
-            // Outlier K contribution
+            float partial_qjl_o = 0.0f;
+            float partial_qjl_n = 0.0f;
+
+            // Outlier K with QJL signs
             for (uint d = tid; d < d_outlier_padded; d += tg_size) {
-                float k_val = read_quantized_tile(
-                    outlier_kv_tile, p, d, d_outlier_padded, 4, k_o_deq, outlier_codebook);
-                partial_dot += shared_q_outlier[d] * k_val;
+                float2 kq = read_k_quantized_tile(
+                    outlier_kv_tile, p, d, d_outlier_padded, k_o_deq, outlier_codebook);
+                partial_dot += shared_q_outlier[d] * kq.x;
+                partial_qjl_o += shared_s_q_outlier[d] * kq.y;
             }
-            // Non-outlier K contribution
+            // Non-outlier K with QJL signs
             for (uint d = tid; d < d_non_padded; d += tg_size) {
-                float k_val = read_quantized_tile(
-                    non_outlier_kv_tile, p, d, d_non_padded, 4, k_n_deq, non_outlier_codebook);
-                partial_dot += shared_q_non_outlier[d] * k_val;
+                float2 kq = read_k_quantized_tile(
+                    non_outlier_kv_tile, p, d, d_non_padded, k_n_deq, non_outlier_codebook);
+                partial_dot += shared_q_non_outlier[d] * kq.x;
+                partial_qjl_n += shared_s_q_non[d] * kq.y;
             }
 
-            // Tree reduction
+            // Reduce base dot product
             shared_reduce[tid] = partial_dot;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint rs = 1;
@@ -917,7 +1087,34 @@ kernel void turboquant_outlier_attention(
                     shared_reduce[tid] += shared_reduce[tid + s];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            if (tid == 0) tile_scores[p] = shared_reduce[0] * scale;
+            float base_score = shared_reduce[0];
+
+            // Reduce outlier QJL dot
+            shared_reduce[tid] = partial_qjl_o;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = rs / 2; s > 0; s >>= 1) {
+                if (tid < s && (tid + s) < tg_size)
+                    shared_reduce[tid] += shared_reduce[tid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            float qjl_o = shared_reduce[0];
+
+            // Reduce non-outlier QJL dot
+            shared_reduce[tid] = partial_qjl_n;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = rs / 2; s > 0; s >>= 1) {
+                if (tid < s && (tid + s) < tg_size)
+                    shared_reduce[tid] += shared_reduce[tid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            float qjl_n = shared_reduce[0];
+
+            float corr_o = k_o_deq * k_outlier_r_norms[kv_head * max_seq_len + tile_start + p]
+                         * qjl_factor_o * qjl_o;
+            float corr_n = k_n_deq * k_non_outlier_r_norms[kv_head * max_seq_len + tile_start + p]
+                         * qjl_factor_n * qjl_n;
+
+            if (tid == 0) tile_scores[p] = (base_score + corr_o + corr_n) * scale;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
@@ -969,13 +1166,13 @@ kernel void turboquant_outlier_attention(
             float v_o_deq = o_tile_scales[p];
             for (uint d = tid; d < d_outlier_padded; d += tg_size) {
                 float v_val = read_quantized_tile(
-                    outlier_kv_tile, p, d, d_outlier_padded, 4, v_o_deq, outlier_codebook);
+                    outlier_kv_tile, p, d, d_outlier_padded, 4, v_o_deq, v_outlier_codebook);
                 shared_output_outlier[d] += w * v_val;
             }
             float v_n_deq = n_tile_scales[p];
             for (uint d = tid; d < d_non_padded; d += tg_size) {
                 float v_val = read_quantized_tile(
-                    non_outlier_kv_tile, p, d, d_non_padded, 4, v_n_deq, non_outlier_codebook);
+                    non_outlier_kv_tile, p, d, d_non_padded, 4, v_n_deq, v_non_outlier_codebook);
                 shared_output_non_outlier[d] += w * v_val;
             }
         }

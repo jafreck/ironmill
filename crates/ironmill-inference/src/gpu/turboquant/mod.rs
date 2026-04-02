@@ -59,23 +59,39 @@ pub struct OutlierState {
     pub outlier_rotation_signs: ironmill_metal_sys::MetalBuffer,
     /// Rotation signs for non-outlier group: [d_non_padded] float.
     pub non_outlier_rotation_signs: ironmill_metal_sys::MetalBuffer,
-    /// Codebook for outlier group: [outlier_n_levels] float.
+    /// V codebook for outlier group: [outlier_n_levels] float.
     pub outlier_codebook: ironmill_metal_sys::MetalBuffer,
-    /// Boundaries for outlier group: [outlier_n_levels - 1] float.
+    /// V boundaries for outlier group: [outlier_n_levels - 1] float.
     pub outlier_boundaries: ironmill_metal_sys::MetalBuffer,
-    /// Codebook for non-outlier group: [non_outlier_n_levels] float.
+    /// V codebook for non-outlier group: [non_outlier_n_levels] float.
     pub non_outlier_codebook: ironmill_metal_sys::MetalBuffer,
-    /// Boundaries for non-outlier group: [non_outlier_n_levels - 1] float.
+    /// V boundaries for non-outlier group: [non_outlier_n_levels - 1] float.
     pub non_outlier_boundaries: ironmill_metal_sys::MetalBuffer,
+    /// K codebook for outlier group: (outlier_bits-1)-bit.
+    pub k_outlier_codebook: ironmill_metal_sys::MetalBuffer,
+    /// K boundaries for outlier group.
+    pub k_outlier_boundaries: ironmill_metal_sys::MetalBuffer,
+    /// Number of K codebook levels for outlier group.
+    pub k_outlier_n_levels: u32,
+    /// K codebook for non-outlier group: (non_outlier_bits-1)-bit.
+    pub k_non_outlier_codebook: ironmill_metal_sys::MetalBuffer,
+    /// K boundaries for non-outlier group.
+    pub k_non_outlier_boundaries: ironmill_metal_sys::MetalBuffer,
+    /// Number of K codebook levels for non-outlier group.
+    pub k_non_outlier_n_levels: u32,
+    /// QJL matrix for outlier group: [d_outlier_padded²] float.
+    pub outlier_qjl_matrix: ironmill_metal_sys::MetalBuffer,
+    /// QJL matrix for non-outlier group: [d_non_padded²] float.
+    pub non_outlier_qjl_matrix: ironmill_metal_sys::MetalBuffer,
     /// Number of outlier channels.
     pub n_outlier: u32,
     /// Outlier group dimension (padded to power of 2).
     pub d_outlier_padded: u32,
     /// Non-outlier group dimension (padded to power of 2).
     pub d_non_padded: u32,
-    /// Number of codebook levels for outlier group.
+    /// Number of V codebook levels for outlier group.
     pub outlier_n_levels: u32,
-    /// Number of codebook levels for non-outlier group.
+    /// Number of V codebook levels for non-outlier group.
     pub non_outlier_n_levels: u32,
 }
 
@@ -355,7 +371,7 @@ impl GpuTurboQuantModel {
             )
             .map_err(GpuError::Metal)?;
 
-        // Independent codebooks: outlier at higher bits, non-outlier at lower bits
+        // Independent codebooks for V: outlier at higher bits, non-outlier at lower bits
         let (o_levels, o_bounds) =
             codebook::lloyd_max_gaussian(d_outlier_padded, outlier_cfg.outlier_bits);
         let outlier_n_levels = o_levels.len() as u32;
@@ -368,6 +384,30 @@ impl GpuTurboQuantModel {
         let non_outlier_codebook = create_f32_buffer(device, &n_levels_vec)?;
         let non_outlier_boundaries = create_f32_buffer(device, &n_bounds)?;
 
+        // K codebooks: (b-1)-bit MSE codebook + 1-bit QJL = b bits total
+        let (ko_levels, ko_bounds) =
+            codebook::lloyd_max_gaussian(d_outlier_padded, outlier_cfg.outlier_bits - 1);
+        let k_outlier_n_levels = ko_levels.len() as u32;
+        let k_outlier_codebook = create_f32_buffer(device, &ko_levels)?;
+        let k_outlier_boundaries = create_f32_buffer(device, &ko_bounds)?;
+
+        let (kn_levels, kn_bounds) =
+            codebook::lloyd_max_gaussian(d_non_padded, outlier_cfg.non_outlier_bits - 1);
+        let k_non_outlier_n_levels = kn_levels.len() as u32;
+        let k_non_outlier_codebook = create_f32_buffer(device, &kn_levels)?;
+        let k_non_outlier_boundaries = create_f32_buffer(device, &kn_bounds)?;
+
+        // QJL projection matrices (independent seeds)
+        let o_qjl_bytes = generate_qjl_matrix(d_outlier_padded, config.rotation_seed + 300);
+        let outlier_qjl_matrix = device
+            .create_buffer_with_data(&o_qjl_bytes, ironmill_metal_sys::StorageMode::Shared)
+            .map_err(GpuError::Metal)?;
+
+        let n_qjl_bytes = generate_qjl_matrix(d_non_padded, config.rotation_seed + 400);
+        let non_outlier_qjl_matrix = device
+            .create_buffer_with_data(&n_qjl_bytes, ironmill_metal_sys::StorageMode::Shared)
+            .map_err(GpuError::Metal)?;
+
         Ok(OutlierState {
             channel_indices,
             outlier_rotation_signs,
@@ -376,6 +416,14 @@ impl GpuTurboQuantModel {
             outlier_boundaries,
             non_outlier_codebook,
             non_outlier_boundaries,
+            k_outlier_codebook,
+            k_outlier_boundaries,
+            k_outlier_n_levels,
+            k_non_outlier_codebook,
+            k_non_outlier_boundaries,
+            k_non_outlier_n_levels,
+            outlier_qjl_matrix,
+            non_outlier_qjl_matrix,
             n_outlier: n_outlier as u32,
             d_outlier_padded: d_outlier_padded as u32,
             d_non_padded: d_non_padded as u32,

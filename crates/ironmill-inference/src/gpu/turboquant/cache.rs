@@ -49,6 +49,12 @@ pub struct GpuKvCache {
     k_non_outlier_scales: Vec<MetalBuffer>,
     v_non_outlier_scales: Vec<MetalBuffer>,
 
+    // ── QJL residual norms for outlier groups (K cache only) ──
+    /// Outlier group residual norms per layer: `[num_kv_heads × max_seq_len]` f32.
+    k_outlier_r_norms: Vec<MetalBuffer>,
+    /// Non-outlier group residual norms per layer: `[num_kv_heads × max_seq_len]` f32.
+    k_non_outlier_r_norms: Vec<MetalBuffer>,
+
     /// Current sequence position.
     seq_pos: usize,
     /// Number of KV heads.
@@ -144,6 +150,8 @@ impl GpuKvCache {
         let mut v_outlier_scales = Vec::with_capacity(config.num_layers);
         let mut k_non_outlier_scales = Vec::with_capacity(config.num_layers);
         let mut v_non_outlier_scales = Vec::with_capacity(config.num_layers);
+        let mut k_outlier_r_norms = Vec::with_capacity(config.num_layers);
+        let mut k_non_outlier_r_norms = Vec::with_capacity(config.num_layers);
 
         for _ in 0..config.num_layers {
             k_outlier_caches.push(
@@ -186,6 +194,16 @@ impl GpuKvCache {
                     .create_buffer(scale_size, StorageMode::Shared)
                     .map_err(GpuError::Metal)?,
             );
+            k_outlier_r_norms.push(
+                device
+                    .create_buffer(scale_size, StorageMode::Shared)
+                    .map_err(GpuError::Metal)?,
+            );
+            k_non_outlier_r_norms.push(
+                device
+                    .create_buffer(scale_size, StorageMode::Shared)
+                    .map_err(GpuError::Metal)?,
+            );
         }
 
         Ok(Self {
@@ -203,6 +221,8 @@ impl GpuKvCache {
             v_outlier_scales,
             k_non_outlier_scales,
             v_non_outlier_scales,
+            k_outlier_r_norms,
+            k_non_outlier_r_norms,
             seq_pos: 0,
             num_kv_heads: config.num_kv_heads,
             max_seq_len: config.max_seq_len,
@@ -251,6 +271,14 @@ impl GpuKvCache {
                 &self.k_non_outlier_scales[layer],
                 &self.v_non_outlier_scales[layer],
             ),
+        )
+    }
+
+    /// Get outlier and non-outlier QJL residual norm buffers for K cache.
+    pub fn layer_outlier_r_norms(&self, layer: usize) -> (&MetalBuffer, &MetalBuffer) {
+        (
+            &self.k_outlier_r_norms[layer],
+            &self.k_non_outlier_r_norms[layer],
         )
     }
 

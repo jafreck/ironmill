@@ -858,6 +858,7 @@ impl GpuInference {
                         kv.layer_outlier_caches(layer_idx);
                     let ((k_o_scale, v_o_scale), (k_n_scale, v_n_scale)) =
                         kv.layer_outlier_scales(layer_idx);
+                    let (k_o_r_norms, k_n_r_norms) = kv.layer_outlier_r_norms(layer_idx);
                     let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
                     let tg_size = std::cmp::max(
                         outlier.d_outlier_padded as usize,
@@ -866,34 +867,64 @@ impl GpuInference {
 
                     for t in 0..token_count {
                         let token_offset = t * kv_head_stride_bytes;
-                        for (proj_buf, o_cache, n_cache, o_scale, n_scale) in [
-                            (&bufs.k_proj, k_o_cache, k_n_cache, k_o_scale, k_n_scale),
-                            (&bufs.v_proj, v_o_cache, v_n_cache, v_o_scale, v_n_scale),
-                        ] {
-                            enc.set_pipeline(&self.pipelines.turboquant_outlier_cache_write);
-                            enc.set_buffer(proj_buf, token_offset, 0);
-                            enc.set_buffer(&outlier.channel_indices, 0, 1);
-                            enc.set_buffer(o_cache, 0, 2);
-                            enc.set_buffer(n_cache, 0, 3);
-                            enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
-                            enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
-                            enc.set_buffer(&outlier.outlier_codebook, 0, 6);
-                            enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
-                            enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
-                            enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
-                            enc.set_buffer(o_scale, 0, 10);
-                            enc.set_buffer(n_scale, 0, 11);
-                            enc.set_bytes(&nkv.to_le_bytes(), 12);
-                            enc.set_bytes(&hd.to_le_bytes(), 13);
-                            enc.set_bytes(&max_seq.to_le_bytes(), 14);
-                            enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
-                            enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
-                            enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
-                            enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
-                            enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
-                            enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
-                            enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size, 1, 1));
-                        }
+                        // K cache: (b-1)-bit codebook + QJL
+                        enc.set_pipeline(&self.pipelines.turboquant_outlier_cache_write);
+                        enc.set_buffer(&bufs.k_proj, token_offset, 0);
+                        enc.set_buffer(&outlier.channel_indices, 0, 1);
+                        enc.set_buffer(k_o_cache, 0, 2);
+                        enc.set_buffer(k_n_cache, 0, 3);
+                        enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
+                        enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
+                        enc.set_buffer(&outlier.k_outlier_codebook, 0, 6);
+                        enc.set_buffer(&outlier.k_outlier_boundaries, 0, 7);
+                        enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 8);
+                        enc.set_buffer(&outlier.k_non_outlier_boundaries, 0, 9);
+                        enc.set_buffer(k_o_scale, 0, 10);
+                        enc.set_buffer(k_n_scale, 0, 11);
+                        enc.set_bytes(&nkv.to_le_bytes(), 12);
+                        enc.set_bytes(&hd.to_le_bytes(), 13);
+                        enc.set_bytes(&max_seq.to_le_bytes(), 14);
+                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
+                        enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
+                        enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
+                        enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
+                        enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 19);
+                        enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 20);
+                        enc.set_bytes(&1u32.to_le_bytes(), 21); // is_k_cache = 1
+                        enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
+                        enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
+                        enc.set_buffer(k_o_r_norms, 0, 24);
+                        enc.set_buffer(k_n_r_norms, 0, 25);
+                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size, 1, 1));
+                        // V cache: b-bit codebook, no QJL
+                        enc.set_pipeline(&self.pipelines.turboquant_outlier_cache_write);
+                        enc.set_buffer(&bufs.v_proj, token_offset, 0);
+                        enc.set_buffer(&outlier.channel_indices, 0, 1);
+                        enc.set_buffer(v_o_cache, 0, 2);
+                        enc.set_buffer(v_n_cache, 0, 3);
+                        enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
+                        enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
+                        enc.set_buffer(&outlier.outlier_codebook, 0, 6);
+                        enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
+                        enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
+                        enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
+                        enc.set_buffer(v_o_scale, 0, 10);
+                        enc.set_buffer(v_n_scale, 0, 11);
+                        enc.set_bytes(&nkv.to_le_bytes(), 12);
+                        enc.set_bytes(&hd.to_le_bytes(), 13);
+                        enc.set_bytes(&max_seq.to_le_bytes(), 14);
+                        enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
+                        enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
+                        enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
+                        enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
+                        enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
+                        enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
+                        enc.set_bytes(&0u32.to_le_bytes(), 21); // is_k_cache = 0
+                        enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
+                        enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
+                        enc.set_buffer(k_o_r_norms, 0, 24);
+                        enc.set_buffer(k_n_r_norms, 0, 25);
+                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size, 1, 1));
                     }
 
                     let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
@@ -910,8 +941,8 @@ impl GpuInference {
                         enc.set_buffer(&outlier.channel_indices, 0, 5);
                         enc.set_buffer(&outlier.outlier_rotation_signs, 0, 6);
                         enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 7);
-                        enc.set_buffer(&outlier.outlier_codebook, 0, 8);
-                        enc.set_buffer(&outlier.non_outlier_codebook, 0, 9);
+                        enc.set_buffer(&outlier.k_outlier_codebook, 0, 8);
+                        enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 9);
                         enc.set_buffer(&bufs.attn_out, attn_out_offset, 10);
                         enc.set_buffer(k_o_scale, 0, 11);
                         enc.set_buffer(v_o_scale, 0, 12);
@@ -925,6 +956,12 @@ impl GpuInference {
                         enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 20);
                         enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 21);
                         enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 22);
+                        enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 23);
+                        enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 24);
+                        enc.set_buffer(k_o_r_norms, 0, 25);
+                        enc.set_buffer(k_n_r_norms, 0, 26);
+                        enc.set_buffer(&outlier.outlier_codebook, 0, 27);
+                        enc.set_buffer(&outlier.non_outlier_codebook, 0, 28);
                         enc.dispatch_threadgroups((nh as usize, 1, 1), (tg_size.min(1024), 1, 1));
                     }
                 } else {

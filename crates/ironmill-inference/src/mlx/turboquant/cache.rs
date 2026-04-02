@@ -120,6 +120,8 @@ impl MlxKvCache {
             let mut v_outlier_scales = Vec::with_capacity(num_layers);
             let mut k_non_outlier_scales = Vec::with_capacity(num_layers);
             let mut v_non_outlier_scales = Vec::with_capacity(num_layers);
+            let mut k_outlier_r_norms = Vec::with_capacity(num_layers);
+            let mut k_non_outlier_r_norms = Vec::with_capacity(num_layers);
 
             for _ in 0..num_layers {
                 k_outlier.push(zeros_uint8(o_cache_size.max(1), stream)?);
@@ -130,6 +132,8 @@ impl MlxKvCache {
                 v_outlier_scales.push(zeros_f32(scale_count, stream)?);
                 k_non_outlier_scales.push(zeros_f32(scale_count, stream)?);
                 v_non_outlier_scales.push(zeros_f32(scale_count, stream)?);
+                k_outlier_r_norms.push(zeros_f32(scale_count, stream)?);
+                k_non_outlier_r_norms.push(zeros_f32(scale_count, stream)?);
             }
 
             Some(MlxOutlierCache {
@@ -141,6 +145,8 @@ impl MlxKvCache {
                 v_outlier_scales,
                 k_non_outlier_scales,
                 v_non_outlier_scales,
+                k_outlier_r_norms,
+                k_non_outlier_r_norms,
             })
         } else {
             None
@@ -318,8 +324,97 @@ impl MlxKvCache {
             .ok_or_else(|| MlxError::WeightLoading("attention returned no outputs".into()))
     }
 
-    /// Dispatch the outlier cache write kernel for one layer.
-    pub fn write_kv_outlier(
+    /// Dispatch the outlier cache write kernel for one layer (K only).
+    ///
+    /// Uses K codebooks ((b-1)-bit + QJL) and writes residual norms.
+    pub fn write_k_outlier(
+        &self,
+        layer: usize,
+        kv_proj: &MlxArray,
+        model: &MlxTurboQuantModel,
+        stream: &MlxStream,
+    ) -> Result<MlxArray, MlxError> {
+        let outlier_cfg = model
+            .outlier_config
+            .as_ref()
+            .expect("outlier_config must be set for outlier cache write");
+        let outlier_cache = self
+            .outlier
+            .as_ref()
+            .expect("outlier cache must be allocated");
+        let outlier_model = model
+            .outlier_model
+            .as_ref()
+            .expect("outlier_model must be set");
+
+        let n_outlier = outlier_cfg.outlier_channels.len();
+        let d_outlier_padded = n_outlier.next_power_of_two();
+        let d_non = self.head_dim - n_outlier;
+        let d_non_padded = d_non.next_power_of_two();
+
+        let params_data: Vec<u32> = vec![
+            self.num_kv_heads as u32,
+            self.head_dim as u32,
+            self.max_seq_len as u32,
+            self.seq_pos as u32,
+            n_outlier as u32,
+            d_outlier_padded as u32,
+            d_non_padded as u32,
+            outlier_model.k_outlier_n_levels as u32,
+            outlier_model.k_non_outlier_n_levels as u32,
+            1, // is_k_cache
+        ];
+        let params_bytes: Vec<u8> = params_data.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let params_arr = MlxArray::from_data_copy(
+            &params_bytes,
+            &[params_data.len()],
+            MlxDtype::Uint32,
+            stream,
+        )?;
+
+        let inputs: Vec<&MlxArray> = vec![
+            kv_proj,                                     // 0
+            &outlier_model.channel_indices,              // 1
+            &outlier_cache.k_outlier_caches[layer],      // 2
+            &outlier_cache.k_non_outlier_caches[layer],  // 3
+            &outlier_model.outlier_rotation_signs,       // 4
+            &outlier_model.non_outlier_rotation_signs,   // 5
+            &outlier_model.k_outlier_codebook,           // 6
+            &outlier_model.k_outlier_boundaries,         // 7
+            &outlier_model.k_non_outlier_codebook,       // 8
+            &outlier_model.k_non_outlier_boundaries,     // 9
+            &outlier_cache.k_outlier_scales[layer],      // 10
+            &outlier_cache.k_non_outlier_scales[layer],  // 11
+            &outlier_model.outlier_qjl_matrix,           // 12
+            &outlier_model.non_outlier_qjl_matrix,       // 13
+            &outlier_cache.k_outlier_r_norms[layer],     // 14
+            &outlier_cache.k_non_outlier_r_norms[layer], // 15
+            &params_arr,                                 // 16
+        ];
+
+        let tg_size = d_outlier_padded.max(d_non_padded).min(256);
+
+        let result = metal_kernel(
+            "turboquant_outlier_cache_write",
+            &inputs,
+            &[],
+            super::kernels::TURBOQUANT_OUTLIER_CACHE_WRITE,
+            [self.num_kv_heads, 1, 1],
+            [tg_size, 1, 1],
+            &[&[1]],
+            &[MlxDtype::Float32],
+            stream,
+        )?;
+
+        result.into_iter().next().ok_or_else(|| {
+            MlxError::WeightLoading("outlier K cache write returned no outputs".into())
+        })
+    }
+
+    /// Dispatch the outlier cache write kernel for one layer (V only).
+    ///
+    /// Uses V codebooks (b-bit, no QJL).
+    pub fn write_v_outlier(
         &self,
         layer: usize,
         kv_proj: &MlxArray,
@@ -354,6 +449,7 @@ impl MlxKvCache {
             d_non_padded as u32,
             outlier_model.outlier_n_levels as u32,
             outlier_model.non_outlier_n_levels as u32,
+            0, // is_k_cache
         ];
         let params_bytes: Vec<u8> = params_data.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let params_arr = MlxArray::from_data_copy(
@@ -364,19 +460,23 @@ impl MlxKvCache {
         )?;
 
         let inputs: Vec<&MlxArray> = vec![
-            kv_proj,                                    // 0
-            &outlier_model.channel_indices,             // 1
-            &outlier_cache.k_outlier_caches[layer],     // 2
-            &outlier_cache.k_non_outlier_caches[layer], // 3
-            &outlier_model.outlier_rotation_signs,      // 4
-            &outlier_model.non_outlier_rotation_signs,  // 5
-            &outlier_model.outlier_codebook,            // 6
-            &outlier_model.outlier_boundaries,          // 7
-            &outlier_model.non_outlier_codebook,        // 8
-            &outlier_model.non_outlier_boundaries,      // 9
-            &outlier_cache.k_outlier_scales[layer],     // 10
-            &outlier_cache.k_non_outlier_scales[layer], // 11
-            &params_arr,                                // 12
+            kv_proj,                                     // 0
+            &outlier_model.channel_indices,              // 1
+            &outlier_cache.v_outlier_caches[layer],      // 2
+            &outlier_cache.v_non_outlier_caches[layer],  // 3
+            &outlier_model.outlier_rotation_signs,       // 4
+            &outlier_model.non_outlier_rotation_signs,   // 5
+            &outlier_model.outlier_codebook,             // 6
+            &outlier_model.outlier_boundaries,           // 7
+            &outlier_model.non_outlier_codebook,         // 8
+            &outlier_model.non_outlier_boundaries,       // 9
+            &outlier_cache.v_outlier_scales[layer],      // 10
+            &outlier_cache.v_non_outlier_scales[layer],  // 11
+            &outlier_model.outlier_qjl_matrix,           // 12
+            &outlier_model.non_outlier_qjl_matrix,       // 13
+            &outlier_cache.k_outlier_r_norms[layer],     // 14 (bound but unused)
+            &outlier_cache.k_non_outlier_r_norms[layer], // 15 (bound but unused)
+            &params_arr,                                 // 16
         ];
 
         let tg_size = d_outlier_padded.max(d_non_padded).min(256);
@@ -394,7 +494,7 @@ impl MlxKvCache {
         )?;
 
         result.into_iter().next().ok_or_else(|| {
-            MlxError::WeightLoading("outlier cache write returned no outputs".into())
+            MlxError::WeightLoading("outlier V cache write returned no outputs".into())
         })
     }
 
@@ -444,21 +544,27 @@ impl MlxKvCache {
         )?;
 
         let inputs: Vec<&MlxArray> = vec![
-            q,                                          // 0
-            &outlier_cache.k_outlier_caches[layer],     // 1
-            &outlier_cache.v_outlier_caches[layer],     // 2
-            &outlier_cache.k_non_outlier_caches[layer], // 3
-            &outlier_cache.v_non_outlier_caches[layer], // 4
-            &outlier_model.channel_indices,             // 5
-            &outlier_model.outlier_rotation_signs,      // 6
-            &outlier_model.non_outlier_rotation_signs,  // 7
-            &outlier_model.outlier_codebook,            // 8
-            &outlier_model.non_outlier_codebook,        // 9
-            &outlier_cache.k_outlier_scales[layer],     // 10
-            &outlier_cache.v_outlier_scales[layer],     // 11
-            &outlier_cache.k_non_outlier_scales[layer], // 12
-            &outlier_cache.v_non_outlier_scales[layer], // 13
-            &params_arr,                                // 14
+            q,                                           // 0
+            &outlier_cache.k_outlier_caches[layer],      // 1
+            &outlier_cache.v_outlier_caches[layer],      // 2
+            &outlier_cache.k_non_outlier_caches[layer],  // 3
+            &outlier_cache.v_non_outlier_caches[layer],  // 4
+            &outlier_model.channel_indices,              // 5
+            &outlier_model.outlier_rotation_signs,       // 6
+            &outlier_model.non_outlier_rotation_signs,   // 7
+            &outlier_model.k_outlier_codebook,           // 8: K codebook
+            &outlier_model.k_non_outlier_codebook,       // 9: K codebook
+            &outlier_cache.k_outlier_scales[layer],      // 10
+            &outlier_cache.v_outlier_scales[layer],      // 11
+            &outlier_cache.k_non_outlier_scales[layer],  // 12
+            &outlier_cache.v_non_outlier_scales[layer],  // 13
+            &outlier_model.outlier_qjl_matrix,           // 14
+            &outlier_model.non_outlier_qjl_matrix,       // 15
+            &outlier_cache.k_outlier_r_norms[layer],     // 16
+            &outlier_cache.k_non_outlier_r_norms[layer], // 17
+            &outlier_model.outlier_codebook,             // 18: V codebook
+            &outlier_model.non_outlier_codebook,         // 19: V codebook
+            &params_arr,                                 // 20
         ];
 
         let output_size = num_heads * self.head_dim;

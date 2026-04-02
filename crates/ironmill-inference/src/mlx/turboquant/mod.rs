@@ -45,17 +45,33 @@ pub struct MlxOutlierModel {
     pub outlier_rotation_signs: MlxArray,
     /// Rotation signs for non-outlier group: `[d_non_padded]` Float32.
     pub non_outlier_rotation_signs: MlxArray,
-    /// Codebook for outlier group.
+    /// V codebook for outlier group.
     pub outlier_codebook: MlxArray,
-    /// Boundaries for outlier group.
+    /// V boundaries for outlier group.
     pub outlier_boundaries: MlxArray,
-    /// Codebook for non-outlier group.
+    /// V codebook for non-outlier group.
     pub non_outlier_codebook: MlxArray,
-    /// Boundaries for non-outlier group.
+    /// V boundaries for non-outlier group.
     pub non_outlier_boundaries: MlxArray,
-    /// Number of codebook levels for outlier group.
+    /// K codebook for outlier group: (outlier_bits-1)-bit.
+    pub k_outlier_codebook: MlxArray,
+    /// K boundaries for outlier group.
+    pub k_outlier_boundaries: MlxArray,
+    /// Number of K codebook levels for outlier group.
+    pub k_outlier_n_levels: usize,
+    /// K codebook for non-outlier group: (non_outlier_bits-1)-bit.
+    pub k_non_outlier_codebook: MlxArray,
+    /// K boundaries for non-outlier group.
+    pub k_non_outlier_boundaries: MlxArray,
+    /// Number of K codebook levels for non-outlier group.
+    pub k_non_outlier_n_levels: usize,
+    /// QJL matrix for outlier group: `[d_outlier_padded²]` Float32.
+    pub outlier_qjl_matrix: MlxArray,
+    /// QJL matrix for non-outlier group: `[d_non_padded²]` Float32.
+    pub non_outlier_qjl_matrix: MlxArray,
+    /// Number of V codebook levels for outlier group.
     pub outlier_n_levels: usize,
-    /// Number of codebook levels for non-outlier group.
+    /// Number of V codebook levels for non-outlier group.
     pub non_outlier_n_levels: usize,
 }
 
@@ -69,6 +85,10 @@ pub struct MlxOutlierCache {
     pub v_outlier_scales: Vec<MlxArray>,
     pub k_non_outlier_scales: Vec<MlxArray>,
     pub v_non_outlier_scales: Vec<MlxArray>,
+    /// Outlier group K residual norms per layer.
+    pub k_outlier_r_norms: Vec<MlxArray>,
+    /// Non-outlier group K residual norms per layer.
+    pub k_non_outlier_r_norms: Vec<MlxArray>,
 }
 
 // ── MlxTurboQuantModel ──────────────────────────────────────────
@@ -264,6 +284,46 @@ impl MlxTurboQuantModel {
         let non_outlier_boundaries =
             MlxArray::from_data_copy(&n_bd_bytes, &[n_bounds.len()], MlxDtype::Float32, stream)?;
 
+        // K codebooks: (b-1)-bit MSE codebook + 1-bit QJL = b bits total
+        let (ko_levels, ko_bounds) =
+            lloyd_max_gaussian(d_outlier_padded, outlier_cfg.outlier_bits - 1);
+        let ko_cb_bytes: Vec<u8> = ko_levels.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let k_outlier_codebook =
+            MlxArray::from_data_copy(&ko_cb_bytes, &[ko_levels.len()], MlxDtype::Float32, stream)?;
+        let ko_bd_bytes: Vec<u8> = ko_bounds.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let k_outlier_boundaries =
+            MlxArray::from_data_copy(&ko_bd_bytes, &[ko_bounds.len()], MlxDtype::Float32, stream)?;
+        let k_outlier_n_levels = ko_levels.len();
+
+        let (kn_levels, kn_bounds) =
+            lloyd_max_gaussian(d_non_padded, outlier_cfg.non_outlier_bits - 1);
+        let kn_cb_bytes: Vec<u8> = kn_levels.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let k_non_outlier_codebook =
+            MlxArray::from_data_copy(&kn_cb_bytes, &[kn_levels.len()], MlxDtype::Float32, stream)?;
+        let kn_bd_bytes: Vec<u8> = kn_bounds.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let k_non_outlier_boundaries =
+            MlxArray::from_data_copy(&kn_bd_bytes, &[kn_bounds.len()], MlxDtype::Float32, stream)?;
+        let k_non_outlier_n_levels = kn_levels.len();
+
+        // QJL projection matrices (independent seeds)
+        let o_qjl = generate_qjl_matrix(d_outlier_padded, rotation_seed + 300);
+        let o_qjl_bytes: Vec<u8> = o_qjl.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let outlier_qjl_matrix = MlxArray::from_data_copy(
+            &o_qjl_bytes,
+            &[d_outlier_padded * d_outlier_padded],
+            MlxDtype::Float32,
+            stream,
+        )?;
+
+        let n_qjl = generate_qjl_matrix(d_non_padded, rotation_seed + 400);
+        let n_qjl_bytes: Vec<u8> = n_qjl.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let non_outlier_qjl_matrix = MlxArray::from_data_copy(
+            &n_qjl_bytes,
+            &[d_non_padded * d_non_padded],
+            MlxDtype::Float32,
+            stream,
+        )?;
+
         self.outlier_model = Some(MlxOutlierModel {
             channel_indices,
             outlier_rotation_signs,
@@ -272,6 +332,14 @@ impl MlxTurboQuantModel {
             outlier_boundaries,
             non_outlier_codebook,
             non_outlier_boundaries,
+            k_outlier_codebook,
+            k_outlier_boundaries,
+            k_outlier_n_levels,
+            k_non_outlier_codebook,
+            k_non_outlier_boundaries,
+            k_non_outlier_n_levels,
+            outlier_qjl_matrix,
+            non_outlier_qjl_matrix,
             outlier_n_levels: o_levels.len(),
             non_outlier_n_levels: n_levels_vec.len(),
         });
