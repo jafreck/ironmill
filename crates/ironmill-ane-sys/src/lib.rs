@@ -26,6 +26,7 @@ pub mod device;
 pub mod error;
 pub mod events;
 pub mod iosurface;
+pub mod model;
 pub(crate) mod objc;
 pub mod perf;
 pub mod process;
@@ -39,6 +40,7 @@ pub use device::{DeviceController, DeviceInfo};
 pub use error::AneSysError;
 pub use events::{SharedEvents, SharedSignalEvent, SharedWaitEvent};
 pub use iosurface::{AneBuffer, AneIOSurfaceObject};
+pub use model::{InMemoryModel, InMemoryModelDescriptor};
 pub use perf::{PerformanceStats, PerformanceStatsIOSurface, QoSMapper};
 pub use program::ProgramForEvaluation;
 pub use request::{AneRequest, ChainingRequest};
@@ -78,12 +80,30 @@ impl CompiledProgram {
         Self { model: ptr }
     }
 
+    /// Create from an [`InMemoryModel`], transferring ownership.
+    pub(crate) fn from_model(m: model::InMemoryModel) -> Self {
+        let ptr = m.as_raw();
+        objc::objc_retain(ptr);
+        // The InMemoryModel will release its reference on drop; we've taken
+        // our own retained reference for CompiledProgram.
+        Self { model: ptr }
+    }
+
     /// Get the raw model pointer.
     ///
     /// Returns the underlying `_ANEInMemoryModel` handle. The pointer is
     /// valid for the lifetime of this `CompiledProgram`.
     pub fn as_raw_ptr(&self) -> *mut c_void {
         self.model
+    }
+
+    /// View this compiled program as an [`InMemoryModel`] reference.
+    ///
+    /// The returned reference borrows the same raw pointer — no retain/release.
+    pub fn as_model(&self) -> &model::InMemoryModel {
+        // SAFETY: InMemoryModel is repr(transparent)-like (single *mut c_void
+        // field at offset 0). We alias the pointer without taking ownership.
+        unsafe { &*(std::ptr::from_ref(&self.model) as *const model::InMemoryModel) }
     }
 }
 
