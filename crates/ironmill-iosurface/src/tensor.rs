@@ -425,6 +425,163 @@ impl AneTensor {
         Ok(out)
     }
 
+    /// Read column 0 of each channel row into a caller-provided buffer,
+    /// avoiding per-call heap allocation. The buffer is resized to `channels`.
+    pub fn read_column0_f16_into(&self, out: &mut Vec<f16>) -> crate::Result<()> {
+        let channels = self.shape[1];
+        let seq_len = self.shape[3];
+
+        out.clear();
+        out.resize(channels, f16::ZERO);
+
+        if seq_len == 1 {
+            return self.read_f16_into(out);
+        }
+
+        let stride_bytes = seq_len * 2;
+
+        #[cfg(target_os = "macos")]
+        {
+            self.with_locked_base(ffi::IOSURFACE_LOCK_READ_ONLY, |base| {
+                // SAFETY: Surface is locked and base is verified non-null.
+                // Each strided read of 2 bytes at c * stride_bytes is within
+                // the allocation (channels * stride_bytes ≤ alloc_size).
+                unsafe {
+                    let src = base as *const u8;
+                    for c in 0..channels {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(c * stride_bytes),
+                            (out.as_mut_ptr() as *mut u8).add(c * 2),
+                            2,
+                        );
+                    }
+                }
+            })?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            for c in 0..channels {
+                let off = c * stride_bytes;
+                let bytes = [self.buffer[off], self.buffer[off + 1]];
+                out[c] = f16::from_le_bytes(bytes);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read all f16 elements into a caller-provided buffer, avoiding
+    /// per-call heap allocation. The buffer is resized to `num_elements()`.
+    pub fn read_f16_into(&self, out: &mut Vec<f16>) -> crate::Result<()> {
+        if self.dtype != ScalarType::Float16 {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "read_f16_into requires Float16 dtype, got {:?}",
+                self.dtype
+            )));
+        }
+        let n = self.num_elements();
+        let byte_len = n * 2;
+
+        out.clear();
+        out.resize(n, f16::ZERO);
+
+        #[cfg(target_os = "macos")]
+        {
+            self.with_locked_base(ffi::IOSURFACE_LOCK_READ_ONLY, |base| {
+                // SAFETY: Surface is locked read-only and base is verified
+                // non-null. Read length is verified ≤ alloc_size (n * 2 ≤
+                // num_elements * 2 ≤ alloc_size).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        base as *const u8,
+                        out.as_mut_ptr() as *mut u8,
+                        byte_len,
+                    );
+                }
+            })?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // SAFETY: buffer has at least byte_len bytes and out has exactly
+            // n f16 values (byte_len = n * 2). Both pointers are valid and
+            // non-overlapping.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.buffer.as_ptr(),
+                    out.as_mut_ptr() as *mut u8,
+                    byte_len,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write `values` at strided positions within a `[1, C, 1, S]` FP16 tensor,
+    /// updating one column (at `col`) of each channel row in a single locked
+    /// pass with zero heap allocations.
+    ///
+    /// `values[c]` is written to flat element index `c * stride + col` for each
+    /// channel `c`. `stride` is typically `S` (the sequence-length dimension).
+    /// This replaces the pattern of calling `write_f16_at()` per-channel which
+    /// acquires and releases the IOSurface lock on each call.
+    pub fn write_column_f16(
+        &mut self,
+        col: usize,
+        values: &[f16],
+        stride: usize,
+    ) -> crate::Result<()> {
+        let channels = values.len();
+        let last_byte = channels
+            .checked_sub(1)
+            .and_then(|c| c.checked_mul(stride))
+            .and_then(|off| off.checked_add(col))
+            .and_then(|elem| elem.checked_add(1))
+            .and_then(|elem| elem.checked_mul(2))
+            .ok_or_else(|| IOSurfaceError::CopyFailed("write_column_f16: overflow".into()))?;
+        if last_byte > self.alloc_size {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "write_column_f16: last write at byte {} exceeds allocation ({} bytes)",
+                last_byte, self.alloc_size
+            )));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.with_locked_base(0, |base| {
+                // SAFETY: Surface is locked for write and base is verified
+                // non-null. Each strided write of 2 bytes at
+                // (c * stride + col) * 2 is within the allocation
+                // (bounds checked above).
+                unsafe {
+                    let dst = base as *mut u8;
+                    for (c, val) in values.iter().enumerate() {
+                        let byte_off = (c * stride + col) * 2;
+                        std::ptr::copy_nonoverlapping(
+                            val as *const f16 as *const u8,
+                            dst.add(byte_off),
+                            2,
+                        );
+                    }
+                }
+            })?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            for (c, val) in values.iter().enumerate() {
+                let byte_off = (c * stride + col) * 2;
+                let bytes = val.to_le_bytes();
+                self.buffer[byte_off] = bytes[0];
+                self.buffer[byte_off + 1] = bytes[1];
+            }
+        }
+
+        Ok(())
+    }
+
     /// Copy column 0 from this FP16 tensor into a contiguous region of an
     /// INT8 cache tensor, converting FP16→INT8 in a single locked pass
     /// with zero intermediate allocations.

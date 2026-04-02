@@ -1331,14 +1331,17 @@ impl<D: AneDevice> AneInference<D> {
 
                 if let Some(ref map) = layer.attn_input_map {
                     // Copy Q/K/V from pre_attn outputs to fp16_attn inputs.
-                    let q_src = layer.pre_attn.output_tensors[map.q_idx].read_f16()?;
-                    attn.input_tensors[map.q_idx].write_f16(&q_src)?;
+                    layer.pre_attn.output_tensors[map.q_idx]
+                        .read_f16_into(&mut self.scratch.q_data)?;
+                    attn.input_tensors[map.q_idx].write_f16(&self.scratch.q_data)?;
 
-                    let k_src = layer.pre_attn.output_tensors[map.k_idx].read_f16()?;
-                    attn.input_tensors[map.k_idx].write_f16(&k_src)?;
+                    layer.pre_attn.output_tensors[map.k_idx]
+                        .read_f16_into(&mut self.scratch.k_data)?;
+                    attn.input_tensors[map.k_idx].write_f16(&self.scratch.k_data)?;
 
-                    let v_src = layer.pre_attn.output_tensors[map.v_idx].read_f16()?;
-                    attn.input_tensors[map.v_idx].write_f16(&v_src)?;
+                    layer.pre_attn.output_tensors[map.v_idx]
+                        .read_f16_into(&mut self.scratch.v_data)?;
+                    attn.input_tensors[map.v_idx].write_f16(&self.scratch.v_data)?;
 
                     // Fill RoPE cos/sin from CPU cache.
                     for &cos_idx in &map.rope_cos_indices {
@@ -1363,8 +1366,8 @@ impl<D: AneDevice> AneInference<D> {
                     // No input map — copy pre_attn outputs to fp16_attn inputs.
                     for (i, src) in layer.pre_attn.output_tensors.iter().enumerate() {
                         if i < attn.input_tensors.len() {
-                            let data = src.read_f16()?;
-                            attn.input_tensors[i].write_f16(&data)?;
+                            src.read_f16_into(&mut self.scratch.q_data)?;
+                            attn.input_tensors[i].write_f16(&self.scratch.q_data)?;
                         }
                     }
                 }
@@ -1471,24 +1474,15 @@ impl<D: AneDevice> AneInference<D> {
                     None
                 };
                 // Write K/V to persistent FP16 cache at current position.
-                // Batched: read full cache, update column, write back (reduces
-                // per-channel IOSurface lock/unlock cycles from ~512 to 1).
-                let k_elements = k_buf.len();
-                let v_elements = v_buf.len();
-                {
-                    let mut k_cache = caches[layer_idx].0.read_f16()?;
-                    for (c, &val) in k_buf.iter().enumerate().take(k_elements) {
-                        k_cache[c * self.max_seq_len + self.seq_pos] = val;
-                    }
-                    caches[layer_idx].0.write_f16(&k_cache)?;
-                }
-                {
-                    let mut v_cache = caches[layer_idx].1.read_f16()?;
-                    for (c, &val) in v_buf.iter().enumerate().take(v_elements) {
-                        v_cache[c * self.max_seq_len + self.seq_pos] = val;
-                    }
-                    caches[layer_idx].1.write_f16(&v_cache)?;
-                }
+                // Uses write_column_f16 for single-lock strided writes: one
+                // IOSurface lock/unlock per cache tensor instead of per-channel.
+                // Zero heap allocations.
+                caches[layer_idx]
+                    .0
+                    .write_column_f16(self.seq_pos, &k_buf, self.max_seq_len)?;
+                caches[layer_idx]
+                    .1
+                    .write_column_f16(self.seq_pos, &v_buf, self.max_seq_len)?;
 
                 // Hand-written FP16 attention: Q + K_cache + V_cache + mask → attn_output
                 if let Some(ref fp16_program) = self.fp16_attn_program {
@@ -1811,12 +1805,10 @@ fn write_f16_padded(tensor: &mut AneTensor, data: &[f16], scratch: &mut Vec<f16>
 
 /// Read C elements (one token at column 0) from an ANE tensor with shape
 /// `[1, C, 1, S]`. Inverse of `write_f16_padded`. Writes into `out` to
-/// avoid per-call heap allocation. Uses `read_column0_f16()` to read only
-/// column-0 values instead of the full C×S tensor.
+/// avoid per-call heap allocation. Uses `read_column0_f16_into()` to read
+/// directly into the output buffer with zero intermediate allocations.
 fn read_f16_channels(tensor: &AneTensor, out: &mut Vec<f16>) -> Result<()> {
-    let col0 = tensor.read_column0_f16()?;
-    out.clear();
-    out.extend_from_slice(&col0);
+    tensor.read_column0_f16_into(out)?;
     Ok(())
 }
 
