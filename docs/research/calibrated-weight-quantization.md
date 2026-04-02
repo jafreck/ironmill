@@ -573,21 +573,43 @@ quantize the optimized graph) and before backend-specific lowering.
 
 ## Key Design Decisions
 
-### 1. Calibration requires a MIL interpreter
+### 1. Calibration requires forward passes with activation capture
 
-The biggest engineering effort. Options:
+The calibration runner needs to execute the model on sample inputs and
+capture intermediate activations at each linear layer. Options:
 
 | Option | Pros | Cons |
 |--------|------|------|
-| **Minimal Rust interpreter** | Pure Rust, no deps, full control | Must implement enough ops to run LLMs |
-| **MLX backend for calibration** | Already have `ironmill-mlx-sys`, fast | Adds MLX dependency to compile path |
-| **Metal compute for calibration** | Fast, already have Metal infra | Complex, overkill for one-time calibration |
-| **Export → run externally** | Sidestep the problem | Breaks "no Python" value prop |
+| **Metal inference engine + hooks** | No external deps, already runs models, fastest | Must add activation hook API |
+| **MLX backend** | Already integrated, has autograd (needed for SpinQuant) | Requires mlx-c install |
+| **New MIL interpreter** | Pure, generic | Massive effort, reinventing a runtime |
 
-**Recommendation:** Use the MLX backend via `ironmill-mlx-sys` for calibration
-forward passes. It's already integrated, runs on Apple Silicon efficiently, and
-avoids building a full interpreter from scratch. The calibration path only needs
-forward execution — no autograd.
+**Recommendation:** Use ironmill's own Metal inference engine. It already
+runs LLM forward passes via `prefill()`. The only addition needed is an
+activation hook mechanism to tap intermediate GPU buffers:
+
+```rust
+pub trait ActivationHook {
+    fn on_linear_input(&mut self, layer: usize, name: &str, activation: &[f16]);
+}
+
+fn prefill_with_hooks(
+    &mut self,
+    tokens: &[u32],
+    hooks: &mut dyn ActivationHook,
+) -> Result<Logits, InferenceError>;
+```
+
+The Metal backend already computes these activations — they flow through
+GPU buffers between layers. Adding hooks means reading them back to CPU
+at tap points (`MTLBuffer.contents()` per layer). This is a one-time
+calibration cost, not a hot path.
+
+**Exception — SpinQuant (Phase 4):** Rotation optimization requires
+gradients (loss → rotation matrix updates). This is the one case where
+MLX's autograd capability is genuinely useful. All other methods (MinMax,
+AWQ, GPTQ, QuIP#, D2Quant) only need forward passes and can use the
+Metal engine directly.
 
 ### 2. INT4 packing format
 
@@ -616,10 +638,10 @@ User-configurable include/exclude patterns.
 | Phase | Scope | Complexity | Reuses |
 |-------|-------|------------|--------|
 | 0. INT4 MinMax | Generalize INT8 pass + INT4 packing + per-group | Low-Medium | Int8QuantizePass |
-| 1. Calibration infra | MLX-based forward runner + activation hooks | Medium | ironmill-mlx-sys |
+| 1. Calibration infra | Activation hooks on Metal inference engine | Low-Medium | MetalInference prefill |
 | 2. AWQ pass | Per-channel scaling + INT4 quantize + MIL rewrite | Medium | Phase 0 INT4 |
 | 3. GPTQ pass | Hessian + Cholesky + error compensation | High | Phase 0 INT4 |
-| 4. SpinQuant pass | Cayley rotation optimization + absorption | Medium | PolarQuant rotation.rs |
+| 4. SpinQuant pass | Cayley rotation optimization + absorption | Medium-High | PolarQuant rotation.rs, MLX autograd |
 | 5. QuIP# pass | E8 lattice codebook + Hadamard | High | PolarQuant + palettize LUT |
 | 6. D2Quant pass | Dual-scale + LayerNorm correction | Medium | Phase 0 + calibration |
 
