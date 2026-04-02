@@ -21,6 +21,7 @@
 compile_error!("ironmill-ane-sys only supports macOS");
 
 pub mod buffers_ready;
+pub mod client;
 pub mod device;
 pub mod error;
 pub mod events;
@@ -34,6 +35,7 @@ pub mod request;
 pub mod validate;
 
 pub use buffers_ready::{InputBuffersReady, OutputSetEnqueue};
+pub use client::{Client, DaemonConnection};
 pub use device::{DeviceController, DeviceInfo};
 pub use error::AneSysError;
 pub use events::{SharedEvents, SharedSignalEvent, SharedWaitEvent};
