@@ -54,8 +54,8 @@ pub struct TurboQuantConfig {
     /// Requires `n_bits >= 2` (so K gets at least 1-bit codebook).
     ///
     /// Compile budget impact: doubles cache-write programs (1 → 2 total).
-    /// The second program is compiled via `compile_patched()` which does not
-    /// consume an ANE compile budget slot.
+    /// Both K and V are compiled independently since they have different
+    /// codebook structures (different op counts in the greater/select chain).
     pub asymmetric_kv: bool,
     /// ANE QoS level for compile/load/eval.
     /// Defaults to user-interactive (33) for interactive decode.
@@ -481,8 +481,9 @@ pub struct TurboQuantModel<D: AneDevice> {
     /// Compiled V-only cache-write sub-program (asymmetric K/V).
     ///
     /// Uses `n_bits`-bit codebook. Only populated when
-    /// `config.asymmetric_kv` is true. Compiled via `compile_patched()`
-    /// to avoid consuming an ANE compile budget slot.
+    /// `config.asymmetric_kv` is true. Compiled independently (not via
+    /// `compile_patched`) because V has a different codebook chain length
+    /// than K.
     v_cache_write_program: Option<D::Program>,
     /// Compiled attention sub-program (dequant + Q-rotate + attention + output un-rotate).
     attention_program: D::Program,
@@ -554,8 +555,9 @@ impl<D: AneDevice> TurboQuantModel<D> {
         //   - K: (n_bits - 1)-bit codebook (QJL correction compensates)
         //   - V: n_bits-bit codebook (full precision, no QJL benefit)
         //
-        // Compile budget: symmetric uses 1 slot, asymmetric uses 1 slot for K +
-        // compile_patched() for V (0 budget cost). Total: still 1 compile slot.
+        // Compile budget: symmetric uses 1 slot, asymmetric uses 2 slots
+        // (K and V have different codebook chain lengths, so compile_patched
+        // cannot be used — each needs independent compilation).
         // Only compile the fused cache-write program when NOT using asymmetric
         // K/V. Asymmetric mode uses separate K and V programs below, so the
         // fused program would waste an ANE compile budget slot per layer.
