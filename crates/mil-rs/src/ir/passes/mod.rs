@@ -59,6 +59,7 @@ pub use op_fusion::{
 pub use palettize::{GroupedPalettizePass, PalettizePass};
 pub use polar_quantize::PolarQuantPass;
 pub use polar_rotation_fusion::PolarRotationFusionPass;
+pub use quip_sharp::QuipSharpPass;
 pub use shape_materialize::{AutoregressiveShapeMaterializePass, ShapeMaterializePass};
 pub use type_repropagate::TypeRepropagationPass;
 
