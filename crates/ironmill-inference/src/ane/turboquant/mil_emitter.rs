@@ -1390,7 +1390,10 @@ mod tests {
         assert!(mil.contains("tile"), "GQA attention should use tile op");
         assert!(mil.contains("gqa_reps"), "GQA should have reps constant");
         // Reps should be [1, 4, 1, 1] for 32/8 = 4x expansion
-        assert!(mil.contains("[1,4,1,1]"), "GQA reps should be [1,4,1,1]");
+        assert!(
+            mil.contains("[1,1,4,1,1]"),
+            "GQA reps should be [1,1,4,1,1]"
+        );
         // Should still have valid program structure
         assert!(mil.contains("softmax"));
         assert!(mil.contains("z_output0"));
@@ -1447,7 +1450,7 @@ mod tests {
             "FP16 GQA attention should use tile op"
         );
         assert!(mil.contains("gqa_reps"));
-        assert!(mil.contains("[1,4,1,1]"));
+        assert!(mil.contains("[1,1,4,1,1]"));
         assert!(mil.contains("softmax"));
     }
 
