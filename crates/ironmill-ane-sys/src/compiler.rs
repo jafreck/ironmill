@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::CompiledProgram;
 use crate::error::AneSysError;
 use crate::objc::{
-    CFRelease, RTLD_NOW, create_nsdata, create_nsnumber, create_nsstring, dlopen,
-    extract_nserror_description, ns_dict_set, ns_empty_dict, ns_mutable_dict, objc_getClass,
+    CFRelease, ane_framework, create_nsdata, create_nsnumber, create_nsstring,
+    extract_nserror_description, get_class, ns_dict_set, ns_empty_dict, ns_mutable_dict,
     objc_msgSend, objc_retain, responds_to_selector, sel, sel_registerName,
 };
 
@@ -42,21 +42,10 @@ pub struct AneCompiler {
 impl AneCompiler {
     /// Check whether the ANE framework is available on this system.
     pub fn is_available() -> bool {
-        // SAFETY: dlopen with a valid null-terminated path; objc_getClass with
-        // a valid null-terminated class name.
-        unsafe {
-            let handle = dlopen(
-                sel!(
-                    "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine"
-                ),
-                RTLD_NOW,
-            );
-            if handle.is_null() {
-                return false;
-            }
-            let cls = objc_getClass(sel!("_ANEInMemoryModel"));
-            !cls.is_null()
+        if ane_framework().is_err() {
+            return false;
         }
+        get_class("_ANEInMemoryModel").is_ok()
     }
 
     /// Compile a `.mlpackage` (or `.mlmodelc`) to an ANE-optimized bundle.
@@ -129,36 +118,12 @@ impl AneCompiler {
             return Err(AneSysError::InvalidInput("MIL text is empty".into()));
         }
 
-        // 1. dlopen the framework
-        // SAFETY: dlopen with a valid null-terminated path string.
-        let handle = unsafe {
-            dlopen(
-                sel!(
-                    "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine"
-                ),
-                RTLD_NOW,
-            )
-        };
-        if handle.is_null() {
-            return Err(AneSysError::FrameworkNotFound(
-                "failed to dlopen AppleNeuralEngine.framework".into(),
-            ));
-        }
+        // 1. Ensure the framework is loaded
+        ane_framework()?;
 
         // 2. Resolve required classes
-        // SAFETY: objc_getClass with valid null-terminated class names.
-        let desc_cls = unsafe { objc_getClass(sel!("_ANEInMemoryModelDescriptor")) };
-        if desc_cls.is_null() {
-            return Err(AneSysError::ClassNotFound(
-                "_ANEInMemoryModelDescriptor".into(),
-            ));
-        }
-
-        // SAFETY: objc_getClass with a valid null-terminated class name.
-        let imm_cls = unsafe { objc_getClass(sel!("_ANEInMemoryModel")) };
-        if imm_cls.is_null() {
-            return Err(AneSysError::ClassNotFound("_ANEInMemoryModel".into()));
-        }
+        let desc_cls = get_class("_ANEInMemoryModelDescriptor")?;
+        let imm_cls = get_class("_ANEInMemoryModel")?;
 
         // 3. Create NSData from MIL text
         let mil_data = create_nsdata(mil_text.as_bytes())?;
@@ -400,33 +365,10 @@ impl AneCompiler {
             )));
         }
 
-        // 2. dlopen the framework + resolve classes
-        // SAFETY: dlopen with a valid null-terminated path.
-        let handle = unsafe {
-            dlopen(
-                sel!(
-                    "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine"
-                ),
-                RTLD_NOW,
-            )
-        };
-        if handle.is_null() {
-            return Err(AneSysError::FrameworkNotFound(
-                "failed to dlopen AppleNeuralEngine.framework".into(),
-            ));
-        }
-        // SAFETY: objc_getClass with valid null-terminated class names.
-        let desc_cls = unsafe { objc_getClass(sel!("_ANEInMemoryModelDescriptor")) };
-        if desc_cls.is_null() {
-            return Err(AneSysError::ClassNotFound(
-                "_ANEInMemoryModelDescriptor".into(),
-            ));
-        }
-        // SAFETY: objc_getClass with a valid null-terminated class name.
-        let imm_cls = unsafe { objc_getClass(sel!("_ANEInMemoryModel")) };
-        if imm_cls.is_null() {
-            return Err(AneSysError::ClassNotFound("_ANEInMemoryModel".into()));
-        }
+        // 2. Ensure framework is loaded + resolve classes
+        ane_framework()?;
+        let desc_cls = get_class("_ANEInMemoryModelDescriptor")?;
+        let imm_cls = get_class("_ANEInMemoryModel")?;
 
         // 3. Create descriptor + model with new weights
         let mil_data = create_nsdata(mil_text.as_bytes())?;

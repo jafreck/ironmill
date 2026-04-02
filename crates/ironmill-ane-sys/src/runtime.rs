@@ -10,9 +10,9 @@ use std::ffi::c_void;
 
 use crate::error::AneSysError;
 use crate::objc::{
-    CFRelease, RTLD_NOW, dlopen, extract_nserror_description, ns_array_add,
-    ns_empty_dict_unchecked, ns_mutable_array, ns_number_autoreleased, objc_getClass, objc_msgSend,
-    objc_retain, sel, sel_registerName,
+    CFRelease, ane_framework, extract_nserror_description, get_class, ns_array_add,
+    ns_empty_dict_unchecked, ns_mutable_array, ns_number_autoreleased, objc_msgSend, objc_retain,
+    sel, sel_registerName,
 };
 use crate::{CompiledProgram, LoadedProgram};
 
@@ -36,57 +36,26 @@ unsafe impl Send for AneRuntime {}
 impl AneRuntime {
     /// Initialize the ANE runtime.
     ///
-    /// `dlopen`s the AppleNeuralEngine framework and resolves the
-    /// `_ANEIOSurfaceObject` and `_ANERequest` classes.
+    /// Loads the AppleNeuralEngine framework (via the shared lazy handle) and
+    /// resolves the `_ANEIOSurfaceObject` and `_ANERequest` classes.
     pub fn new() -> Result<Self, AneSysError> {
-        // SAFETY: dlopen with a valid null-terminated path.
-        let handle = unsafe {
-            dlopen(
-                sel!(
-                    "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine"
-                ),
-                RTLD_NOW,
-            )
-        };
-        if handle.is_null() {
-            return Err(AneSysError::EvalFailed {
-                status: 0,
-                context: "failed to dlopen AppleNeuralEngine.framework".into(),
-            });
-        }
+        ane_framework().map_err(|_| AneSysError::EvalFailed {
+            status: 0,
+            context: "failed to dlopen AppleNeuralEngine.framework".into(),
+        })?;
 
-        // SAFETY: objc_getClass with valid null-terminated class names.
-        let aio_cls = unsafe { objc_getClass(sel!("_ANEIOSurfaceObject")) };
-        if aio_cls.is_null() {
-            return Err(AneSysError::ClassNotFound("_ANEIOSurfaceObject".into()));
-        }
-
-        // SAFETY: objc_getClass with a valid null-terminated class name.
-        let req_cls = unsafe { objc_getClass(sel!("_ANERequest")) };
-        if req_cls.is_null() {
-            return Err(AneSysError::ClassNotFound("_ANERequest".into()));
-        }
+        let aio_cls = get_class("_ANEIOSurfaceObject")?;
+        let req_cls = get_class("_ANERequest")?;
 
         Ok(Self { aio_cls, req_cls })
     }
 
     /// Check if the ANE runtime is available on this system.
     pub fn is_available() -> bool {
-        // SAFETY: dlopen and objc_getClass with valid null-terminated strings.
-        let handle = unsafe {
-            dlopen(
-                sel!(
-                    "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine"
-                ),
-                RTLD_NOW,
-            )
-        };
-        if handle.is_null() {
+        if ane_framework().is_err() {
             return false;
         }
-        // SAFETY: objc_getClass with a valid null-terminated class name.
-        let cls = unsafe { objc_getClass(sel!("_ANEInMemoryModel")) };
-        !cls.is_null()
+        get_class("_ANEInMemoryModel").is_ok()
     }
 
     /// Load a compiled program for execution.

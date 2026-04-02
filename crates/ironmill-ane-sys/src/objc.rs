@@ -5,6 +5,7 @@
 //! those declarations and helper functions.
 
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use crate::error::AneSysError;
 
@@ -53,6 +54,52 @@ macro_rules! sel {
     };
 }
 pub(crate) use sel;
+
+// ---------------------------------------------------------------------------
+// Framework loading
+// ---------------------------------------------------------------------------
+
+/// Cached framework handle stored as `usize` because `*mut c_void` is not
+/// `Sync`.  The `OnceLock` ensures the dlopen happens exactly once.
+static FRAMEWORK: OnceLock<usize> = OnceLock::new();
+
+/// ANE framework path used by dlopen.
+const ANE_FRAMEWORK_PATH: &str =
+    "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine\0";
+
+/// Lazy framework handle — load the ANE framework once, cache in static.
+/// Replaces the inline dlopen calls scattered in compiler.rs and runtime.rs.
+pub(crate) fn ane_framework() -> Result<*mut c_void, AneSysError> {
+    let &handle = FRAMEWORK.get_or_init(|| {
+        // SAFETY: dlopen with a valid null-terminated path.
+        let h = unsafe { dlopen(ANE_FRAMEWORK_PATH.as_ptr(), RTLD_NOW) };
+        h as usize
+    });
+    let ptr = handle as *mut c_void;
+    if ptr.is_null() {
+        return Err(AneSysError::FrameworkNotFound(
+            "failed to dlopen AppleNeuralEngine.framework".into(),
+        ));
+    }
+    Ok(ptr)
+}
+
+/// Get ObjC class by name from the loaded framework, returning error if not found.
+pub(crate) fn get_class(name: &str) -> Result<*mut c_void, AneSysError> {
+    // Ensure framework is loaded first.
+    ane_framework()?;
+
+    let mut buf = Vec::with_capacity(name.len() + 1);
+    buf.extend_from_slice(name.as_bytes());
+    buf.push(0);
+
+    // SAFETY: objc_getClass with a valid null-terminated class name.
+    let cls = unsafe { objc_getClass(buf.as_ptr()) };
+    if cls.is_null() {
+        return Err(AneSysError::ClassNotFound(name.into()));
+    }
+    Ok(cls)
+}
 
 // ---------------------------------------------------------------------------
 // ObjC introspection
@@ -448,4 +495,235 @@ pub(crate) fn create_nsurl_from_path(path: &std::path::Path) -> Result<*mut c_vo
         ));
     }
     Ok(url)
+}
+
+// ---------------------------------------------------------------------------
+// NSArray (from slice)
+// ---------------------------------------------------------------------------
+
+/// Create an `NSArray` from a slice of object pointers via
+/// `+[NSArray arrayWithObjects:count:]`.
+/// Returns an autoreleased object.
+///
+/// # Safety
+///
+/// Every pointer in `objects` must be a valid, non-null ObjC object pointer.
+#[allow(dead_code)]
+pub(crate) unsafe fn create_nsarray(objects: &[*mut c_void]) -> *mut c_void {
+    // SAFETY: objc_getClass with a valid null-terminated class name.
+    let cls = unsafe { objc_getClass(sel!("NSArray")) };
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    type ArrayFn =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const *mut c_void, usize) -> *mut c_void;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let sel = unsafe { sel_registerName(sel!("arrayWithObjects:count:")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let f: ArrayFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: cls is a valid class; objects pointer and count are valid.
+    unsafe { f(cls, sel, objects.as_ptr(), objects.len()) }
+}
+
+// ---------------------------------------------------------------------------
+// NSNumber — typed constructors
+// ---------------------------------------------------------------------------
+
+/// Create an `NSNumber` from a `u32` via `+[NSNumber numberWithUnsignedInt:]`.
+/// Returns an autoreleased object.
+///
+/// # Safety
+///
+/// Must be called from a thread with an active autorelease pool (or caller
+/// must arrange to retain/release).
+#[allow(dead_code)]
+pub(crate) unsafe fn create_nsnumber_u32(val: u32) -> *mut c_void {
+    // SAFETY: objc_getClass with a valid null-terminated class name.
+    let cls = unsafe { objc_getClass(sel!("NSNumber")) };
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    type NumFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u32) -> *mut c_void;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let sel = unsafe { sel_registerName(sel!("numberWithUnsignedInt:")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let f: NumFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: cls is a valid class; val is a plain u32.
+    unsafe { f(cls, sel, val) }
+}
+
+/// Create an `NSNumber` from a `u64` via `+[NSNumber numberWithUnsignedLongLong:]`.
+/// Returns an autoreleased object.
+///
+/// # Safety
+///
+/// Must be called from a thread with an active autorelease pool (or caller
+/// must arrange to retain/release).
+#[allow(dead_code)]
+pub(crate) unsafe fn create_nsnumber_u64(val: u64) -> *mut c_void {
+    // SAFETY: objc_getClass with a valid null-terminated class name.
+    let cls = unsafe { objc_getClass(sel!("NSNumber")) };
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    type NumFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u64) -> *mut c_void;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let sel = unsafe { sel_registerName(sel!("numberWithUnsignedLongLong:")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let f: NumFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: cls is a valid class; val is a plain u64.
+    unsafe { f(cls, sel, val) }
+}
+
+/// Create an `NSNumber` from an `i64` via `+[NSNumber numberWithLongLong:]`.
+/// Returns an autoreleased object.
+///
+/// # Safety
+///
+/// Must be called from a thread with an active autorelease pool (or caller
+/// must arrange to retain/release).
+#[allow(dead_code)]
+pub(crate) unsafe fn create_nsnumber_i64(val: i64) -> *mut c_void {
+    // SAFETY: objc_getClass with a valid null-terminated class name.
+    let cls = unsafe { objc_getClass(sel!("NSNumber")) };
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    type NumFn = unsafe extern "C" fn(*mut c_void, *mut c_void, i64) -> *mut c_void;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let sel = unsafe { sel_registerName(sel!("numberWithLongLong:")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let f: NumFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: cls is a valid class; val is a plain i64.
+    unsafe { f(cls, sel, val) }
+}
+
+/// Create an `NSNumber` from a `bool` via `+[NSNumber numberWithBool:]`.
+/// Returns an autoreleased object.
+///
+/// # Safety
+///
+/// Must be called from a thread with an active autorelease pool (or caller
+/// must arrange to retain/release).
+#[allow(dead_code)]
+pub(crate) unsafe fn create_nsnumber_bool(val: bool) -> *mut c_void {
+    // SAFETY: objc_getClass with a valid null-terminated class name.
+    let cls = unsafe { objc_getClass(sel!("NSNumber")) };
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    type NumFn = unsafe extern "C" fn(*mut c_void, *mut c_void, i8) -> *mut c_void;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let sel = unsafe { sel_registerName(sel!("numberWithBool:")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let f: NumFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: cls is a valid class; val is converted to ObjC BOOL (i8).
+    unsafe { f(cls, sel, val as i8) }
+}
+
+// ---------------------------------------------------------------------------
+// NSString — read back
+// ---------------------------------------------------------------------------
+
+/// Read an NSString object pointer into a Rust String.
+/// Returns `None` if the pointer is null or the string is not valid UTF-8.
+///
+/// # Safety
+///
+/// `nsstring` must be a valid `NSString` pointer or null.
+#[allow(dead_code)]
+pub(crate) unsafe fn nsstring_to_string(nsstring: *mut c_void) -> Option<String> {
+    if nsstring.is_null() {
+        return None;
+    }
+
+    type Utf8Fn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const u8;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let utf8_sel = unsafe { sel_registerName(sel!("UTF8String")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let utf8_fn: Utf8Fn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: nsstring is a valid NSString pointer.
+    let cstr = unsafe { utf8_fn(nsstring, utf8_sel) };
+    if cstr.is_null() {
+        return None;
+    }
+
+    // SAFETY: cstr is a valid null-terminated UTF-8 string from NSString.
+    unsafe { std::ffi::CStr::from_ptr(cstr as *const i8) }
+        .to_str()
+        .ok()
+        .map(|s| s.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// NSNumber — read back
+// ---------------------------------------------------------------------------
+
+/// Read a `u64` from an `NSNumber` via `-[NSNumber unsignedLongLongValue]`.
+///
+/// # Safety
+///
+/// `nsnumber` must be a valid, non-null `NSNumber` pointer.
+#[allow(dead_code)]
+pub(crate) unsafe fn nsnumber_to_u64(nsnumber: *mut c_void) -> u64 {
+    type ValFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let sel = unsafe { sel_registerName(sel!("unsignedLongLongValue")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let f: ValFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: nsnumber is a valid NSNumber pointer.
+    unsafe { f(nsnumber, sel) }
+}
+
+/// Read a `u32` from an `NSNumber` via `-[NSNumber unsignedIntValue]`.
+///
+/// # Safety
+///
+/// `nsnumber` must be a valid, non-null `NSNumber` pointer.
+#[allow(dead_code)]
+pub(crate) unsafe fn nsnumber_to_u32(nsnumber: *mut c_void) -> u32 {
+    type ValFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let sel = unsafe { sel_registerName(sel!("unsignedIntValue")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let f: ValFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: nsnumber is a valid NSNumber pointer.
+    unsafe { f(nsnumber, sel) }
+}
+
+/// Read an `i64` from an `NSNumber` via `-[NSNumber longLongValue]`.
+///
+/// # Safety
+///
+/// `nsnumber` must be a valid, non-null `NSNumber` pointer.
+#[allow(dead_code)]
+pub(crate) unsafe fn nsnumber_to_i64(nsnumber: *mut c_void) -> i64 {
+    type ValFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let sel = unsafe { sel_registerName(sel!("longLongValue")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let f: ValFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: nsnumber is a valid NSNumber pointer.
+    unsafe { f(nsnumber, sel) }
+}
+
+/// Read a `bool` from an `NSNumber` via `-[NSNumber boolValue]`.
+///
+/// # Safety
+///
+/// `nsnumber` must be a valid, non-null `NSNumber` pointer.
+#[allow(dead_code)]
+pub(crate) unsafe fn nsnumber_to_bool(nsnumber: *mut c_void) -> bool {
+    type ValFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i8;
+    // SAFETY: sel_registerName with a valid null-terminated selector.
+    let sel = unsafe { sel_registerName(sel!("boolValue")) };
+    // SAFETY: transmute objc_msgSend to the correct signature.
+    let f: ValFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: nsnumber is a valid NSNumber pointer.
+    unsafe { f(nsnumber, sel) != 0 }
 }
