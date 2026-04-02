@@ -18,6 +18,8 @@ unsafe extern "C" {
     pub(crate) fn objc_getClass(name: *const u8) -> *mut c_void;
     pub(crate) fn sel_registerName(name: *const u8) -> *mut c_void;
     pub(crate) fn objc_msgSend(receiver: *mut c_void, sel: *mut c_void) -> *mut c_void;
+    pub(crate) fn objc_autoreleasePoolPush() -> *mut c_void;
+    pub(crate) fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
 #[link(name = "dl")]

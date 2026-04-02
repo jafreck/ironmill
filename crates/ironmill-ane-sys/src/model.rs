@@ -11,7 +11,8 @@ use crate::objc::{
     CFRelease, ane_framework, create_nsdata, create_nsnumber, create_nsstring,
     extract_nserror_description, get_class, ns_array_add, ns_dict_set, ns_empty_dict,
     ns_empty_dict_unchecked, ns_mutable_array, ns_mutable_dict, ns_number_autoreleased,
-    nsstring_to_string, objc_msgSend, objc_retain, responds_to_selector, sel, sel_registerName,
+    nsstring_to_string, objc_autoreleasePoolPop, objc_autoreleasePoolPush, objc_msgSend,
+    objc_retain, responds_to_selector, sel, sel_registerName,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,7 +29,7 @@ const ANE_COMPILE_LIMIT: usize = 119;
 static COMPILE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// QoS value used for compile/load/eval (matches Orion's constant of 21).
-const ANE_QOS: i64 = 21;
+const ANE_QOS: u32 = 21;
 
 // =========================================================================
 // InMemoryModelDescriptor
@@ -355,14 +356,14 @@ impl InMemoryModel {
     /// # Safety
     ///
     /// `request` must be a valid `_ANERequest` pointer.
-    pub unsafe fn evaluate(&self, qos: i64, request: *mut c_void) -> Result<(), AneSysError> {
+    pub unsafe fn evaluate(&self, qos: u32, request: *mut c_void) -> Result<(), AneSysError> {
         let empty_dict = ns_empty_dict()?;
         let mut error: *mut c_void = std::ptr::null_mut();
 
         type EvalFn = unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
-            i64,
+            u32,
             *mut c_void,
             *mut c_void,
             *mut *mut c_void,
@@ -643,34 +644,41 @@ pub fn compile_mil_text(
             return Err(AneSysError::InvalidInput("MIL text is empty".into()));
         }
 
-        // 1. Create descriptor
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[ane] creating descriptor from MIL text ({} bytes), {} weight(s)...",
-            mil_text.len(),
-            weights.len()
-        );
-        let desc = InMemoryModelDescriptor::from_mil_text(mil_text, weights, None)?;
+        let pool = unsafe { objc_autoreleasePoolPush() };
 
-        // 2. Create model
-        #[cfg(debug_assertions)]
-        eprintln!("[ane] descriptor created, creating in-memory model...");
-        let model = InMemoryModel::from_descriptor(&desc)?;
+        let inner = (|| -> Result<InMemoryModel, AneSysError> {
+            // 1. Create descriptor
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[ane] creating descriptor from MIL text ({} bytes), {} weight(s)...",
+                mil_text.len(),
+                weights.len()
+            );
+            let desc = InMemoryModelDescriptor::from_mil_text(mil_text, weights, None)?;
 
-        // 3. Pre-populate temp directory
-        if let Some(ref hex) = model.hex_string_identifier() {
-            populate_tmp_dir(hex, mil_text, weights);
-        }
+            // 2. Create model
+            #[cfg(debug_assertions)]
+            eprintln!("[ane] descriptor created, creating in-memory model...");
+            let model = InMemoryModel::from_descriptor(&desc)?;
 
-        // 4. Compile
-        #[cfg(debug_assertions)]
-        eprintln!("[ane] compiling with QoS={ANE_QOS}...");
-        model.compile(ANE_QOS as u32)?;
+            // 3. Pre-populate temp directory
+            if let Some(ref hex) = model.hex_string_identifier() {
+                populate_tmp_dir(hex, mil_text, weights);
+            }
 
-        // 5. Load
-        model.load(ANE_QOS as u32)?;
+            // 4. Compile
+            #[cfg(debug_assertions)]
+            eprintln!("[ane] compiling with QoS={ANE_QOS}...");
+            model.compile(ANE_QOS)?;
 
-        Ok(model)
+            // 5. Load
+            model.load(ANE_QOS)?;
+
+            Ok(model)
+        })();
+
+        unsafe { objc_autoreleasePoolPop(pool) };
+        inner
     })();
 
     if result.is_err() {
@@ -700,41 +708,48 @@ pub fn patch_weights(
         return Err(AneSysError::InvalidInput("MIL text is empty".into()));
     }
 
-    // 1. Get donor's hex ID → find its temp dir with net.plist
-    let donor_hex = donor.hex_string_identifier().ok_or_else(|| {
-        AneSysError::CompilationFailed("failed to get donor model hexStringIdentifier".into())
-    })?;
-    let donor_tmp = std::env::temp_dir().join(&donor_hex);
-    let donor_net_plist = donor_tmp.join("net.plist");
-    if !donor_net_plist.exists() {
-        return Err(AneSysError::CompilationFailed(format!(
-            "donor net.plist not found at {}",
-            donor_net_plist.display()
-        )));
-    }
+    let pool = unsafe { objc_autoreleasePoolPush() };
 
-    // 2. Create descriptor + model with new weights
-    let desc = InMemoryModelDescriptor::from_mil_text(mil_text, weights, None)?;
-    let model = InMemoryModel::from_descriptor(&desc)?;
+    let result = (|| -> Result<InMemoryModel, AneSysError> {
+        // 1. Get donor's hex ID → find its temp dir with net.plist
+        let donor_hex = donor.hex_string_identifier().ok_or_else(|| {
+            AneSysError::CompilationFailed("failed to get donor model hexStringIdentifier".into())
+        })?;
+        let donor_tmp = std::env::temp_dir().join(&donor_hex);
+        let donor_net_plist = donor_tmp.join("net.plist");
+        if !donor_net_plist.exists() {
+            return Err(AneSysError::CompilationFailed(format!(
+                "donor net.plist not found at {}",
+                donor_net_plist.display()
+            )));
+        }
 
-    // 3. Get new model's hex ID → set up its temp dir
-    let new_hex = model.hex_string_identifier().ok_or_else(|| {
-        AneSysError::CompilationFailed("failed to get new model hexStringIdentifier".into())
-    })?;
-    populate_tmp_dir(&new_hex, mil_text, weights);
+        // 2. Create descriptor + model with new weights
+        let desc = InMemoryModelDescriptor::from_mil_text(mil_text, weights, None)?;
+        let model = InMemoryModel::from_descriptor(&desc)?;
 
-    // 4. Copy donor's net.plist → new model's temp dir (the key trick)
-    let new_tmp = std::env::temp_dir().join(&new_hex);
-    let new_net_plist = new_tmp.join("net.plist");
-    std::fs::copy(&donor_net_plist, &new_net_plist)?;
+        // 3. Get new model's hex ID → set up its temp dir
+        let new_hex = model.hex_string_identifier().ok_or_else(|| {
+            AneSysError::CompilationFailed("failed to get new model hexStringIdentifier".into())
+        })?;
+        populate_tmp_dir(&new_hex, mil_text, weights);
 
-    #[cfg(debug_assertions)]
-    eprintln!("[ane] patch_weights: copied net.plist from {donor_hex} → {new_hex}");
+        // 4. Copy donor's net.plist → new model's temp dir (the key trick)
+        let new_tmp = std::env::temp_dir().join(&new_hex);
+        let new_net_plist = new_tmp.join("net.plist");
+        std::fs::copy(&donor_net_plist, &new_net_plist)?;
 
-    // 5. Load (NO compile!)
-    model.load(ANE_QOS as u32)?;
+        #[cfg(debug_assertions)]
+        eprintln!("[ane] patch_weights: copied net.plist from {donor_hex} → {new_hex}");
 
-    Ok(model)
+        // 5. Load (NO compile!)
+        model.load(ANE_QOS)?;
+
+        Ok(model)
+    })();
+
+    unsafe { objc_autoreleasePoolPop(pool) };
+    result
 }
 
 /// Evaluate a model with IOSurface pointers.
@@ -759,116 +774,162 @@ pub fn eval(
         });
     }
 
-    ane_framework()?;
-    let aio_cls = get_class("_ANEIOSurfaceObject")?;
-    let req_cls = get_class("_ANERequest")?;
-
-    // Wrap inputs
-    let in_arr = ns_mutable_array()?;
-    let in_idx = ns_mutable_array()?;
-    for (i, &surface) in input_surfaces.iter().enumerate() {
-        let wrapped = wrap_iosurface(aio_cls, surface)?;
-        ns_array_add(in_arr, wrapped);
-        ns_array_add(in_idx, ns_number_autoreleased(i as i64)?);
-    }
-
-    // Wrap outputs
-    let out_arr = ns_mutable_array()?;
-    let out_idx = ns_mutable_array()?;
-    for (i, &surface) in output_surfaces.iter().enumerate() {
-        let wrapped = wrap_iosurface(aio_cls, surface)?;
-        ns_array_add(out_arr, wrapped);
-        ns_array_add(out_idx, ns_number_autoreleased(i as i64)?);
-    }
-
-    // Build _ANERequest
-    let zero = ns_number_autoreleased(0)?;
-    type RequestFn = unsafe extern "C" fn(
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-    ) -> *mut c_void;
-    let req_sel = unsafe {
-        sel_registerName(sel!(
-            "requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:"
-        ))
-    };
-    let req_fn: RequestFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-    let request = unsafe {
-        req_fn(
-            req_cls,
-            req_sel,
-            in_arr,
-            in_idx,
-            out_arr,
-            out_idx,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            zero,
-        )
-    };
-
-    if request.is_null() {
-        unsafe {
-            CFRelease(in_arr);
-            CFRelease(in_idx);
-            CFRelease(out_arr);
-            CFRelease(out_idx);
-        }
-        return Err(AneSysError::EvalFailed {
-            status: 0,
-            context: "failed to create _ANERequest".into(),
-        });
-    }
-
-    // Evaluate
-    let empty_dict = ns_empty_dict_unchecked()?;
-    let mut error: *mut c_void = std::ptr::null_mut();
-
-    type EvalFn = unsafe extern "C" fn(
-        *mut c_void,
-        *mut c_void,
-        i64,
-        *mut c_void,
-        *mut c_void,
-        *mut *mut c_void,
-    ) -> i8;
-    let eval_sel = unsafe { sel_registerName(sel!("evaluateWithQoS:options:request:error:")) };
-    let eval_fn: EvalFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-    let ok = unsafe {
-        eval_fn(
-            model.raw, eval_sel, ANE_QOS, empty_dict, request, &mut error,
-        )
-    };
-
-    // Release temporary ObjC collections
     unsafe {
+        let pool = objc_autoreleasePoolPush();
+
+        if let Err(e) = ane_framework() {
+            objc_autoreleasePoolPop(pool);
+            return Err(e);
+        }
+
+        let aio_cls = match get_class("_ANEIOSurfaceObject") {
+            Ok(c) => c,
+            Err(e) => {
+                objc_autoreleasePoolPop(pool);
+                return Err(e);
+            }
+        };
+        let req_cls = match get_class("_ANERequest") {
+            Ok(c) => c,
+            Err(e) => {
+                objc_autoreleasePoolPop(pool);
+                return Err(e);
+            }
+        };
+
+        // Allocate retained arrays
+        let in_arr = match ns_mutable_array() {
+            Ok(a) => a,
+            Err(e) => {
+                objc_autoreleasePoolPop(pool);
+                return Err(e);
+            }
+        };
+        let in_idx = match ns_mutable_array() {
+            Ok(a) => a,
+            Err(e) => {
+                CFRelease(in_arr);
+                objc_autoreleasePoolPop(pool);
+                return Err(e);
+            }
+        };
+        let out_arr = match ns_mutable_array() {
+            Ok(a) => a,
+            Err(e) => {
+                CFRelease(in_arr);
+                CFRelease(in_idx);
+                objc_autoreleasePoolPop(pool);
+                return Err(e);
+            }
+        };
+        let out_idx = match ns_mutable_array() {
+            Ok(a) => a,
+            Err(e) => {
+                CFRelease(in_arr);
+                CFRelease(in_idx);
+                CFRelease(out_arr);
+                objc_autoreleasePoolPop(pool);
+                return Err(e);
+            }
+        };
+
+        // Use a closure so we always clean up the four arrays
+        let result = (|| -> Result<(), AneSysError> {
+            // Wrap inputs
+            for (i, &surface) in input_surfaces.iter().enumerate() {
+                let wrapped = wrap_iosurface(aio_cls, surface)?;
+                ns_array_add(in_arr, wrapped);
+                ns_array_add(in_idx, ns_number_autoreleased(i as i64)?);
+            }
+
+            // Wrap outputs
+            for (i, &surface) in output_surfaces.iter().enumerate() {
+                let wrapped = wrap_iosurface(aio_cls, surface)?;
+                ns_array_add(out_arr, wrapped);
+                ns_array_add(out_idx, ns_number_autoreleased(i as i64)?);
+            }
+
+            // Build _ANERequest
+            let zero = ns_number_autoreleased(0)?;
+            type RequestFn = unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> *mut c_void;
+            let req_sel = sel_registerName(sel!(
+                "requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:"
+            ));
+            let req_fn: RequestFn = std::mem::transmute(objc_msgSend as *const ());
+            let request = req_fn(
+                req_cls,
+                req_sel,
+                in_arr,
+                in_idx,
+                out_arr,
+                out_idx,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                zero,
+            );
+
+            if request.is_null() {
+                return Err(AneSysError::EvalFailed {
+                    status: 0,
+                    context: "failed to create _ANERequest".into(),
+                });
+            }
+
+            // Evaluate
+            let empty_dict = ns_empty_dict_unchecked()?;
+
+            let mut error: *mut c_void = std::ptr::null_mut();
+            type EvalFn = unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                *mut c_void,
+                *mut c_void,
+                *mut *mut c_void,
+            ) -> i8;
+            let eval_sel = sel_registerName(sel!("evaluateWithQoS:options:request:error:"));
+            let eval_fn: EvalFn = std::mem::transmute(objc_msgSend as *const ());
+            let ok = eval_fn(
+                model.raw, eval_sel, ANE_QOS, empty_dict, request, &mut error,
+            );
+
+            CFRelease(empty_dict);
+
+            if ok == 0 {
+                let err_msg = if !error.is_null() {
+                    extract_nserror_description(error)
+                } else {
+                    "evaluateWithQoS:options:request:error: returned NO".into()
+                };
+                return Err(AneSysError::EvalFailed {
+                    status: 1,
+                    context: err_msg,
+                });
+            }
+
+            Ok(())
+        })();
+
+        // Always release retained arrays
         CFRelease(in_arr);
         CFRelease(in_idx);
         CFRelease(out_arr);
         CFRelease(out_idx);
-        CFRelease(empty_dict);
-    }
 
-    if ok == 0 {
-        let err_msg = if !error.is_null() {
-            extract_nserror_description(error)
-        } else {
-            "evaluateWithQoS:options:request:error: returned NO".into()
-        };
-        return Err(AneSysError::EvalFailed {
-            status: 1,
-            context: err_msg,
-        });
-    }
+        objc_autoreleasePoolPop(pool);
 
-    Ok(())
+        result
+    }
 }
 
 /// Check whether the ANE is available on this system.
