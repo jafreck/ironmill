@@ -18,7 +18,7 @@ mod polarquant_bench {
     use ironmill_compile::gpu::bundle::write_gpu_bundle;
     use ironmill_compile::weights::{SafeTensorsProvider, WeightProvider};
     use ironmill_inference::InferenceEngine;
-    use ironmill_inference::gpu::{GpuConfig, GpuInference};
+    use ironmill_inference::metal::{MetalConfig, MetalInference};
 
     fn fixture_path(name: &str) -> PathBuf {
         let manifest = env!("CARGO_MANIFEST_DIR");
@@ -56,12 +56,12 @@ mod polarquant_bench {
         total
     }
 
-    /// Build a GpuInference engine from a WeightProvider and return (engine, gpu_mb, load_ms).
+    /// Build a MetalInference engine from a WeightProvider and return (engine, gpu_mb, load_ms).
     fn load_gpu_engine(
         provider: &dyn WeightProvider,
-        config: GpuConfig,
-    ) -> (GpuInference, f64, f64) {
-        let mut engine = GpuInference::new(config.clone()).expect("GpuInference::new failed");
+        config: MetalConfig,
+    ) -> (MetalInference, f64, f64) {
+        let mut engine = MetalInference::new(config.clone()).expect("MetalInference::new failed");
 
         let t0 = Instant::now();
         let gpu_before = engine.gpu_allocated_bytes();
@@ -77,7 +77,7 @@ mod polarquant_bench {
 
     /// Run decode benchmark: prefill with prompt, then decode N tokens.
     /// Returns (median_ms_per_tok, tok_per_sec).
-    fn bench_decode(engine: &mut GpuInference, decode_tokens: usize) -> (f64, f64) {
+    fn bench_decode(engine: &mut MetalInference, decode_tokens: usize) -> (f64, f64) {
         // Prefill with a short prompt.
         let prompt: Vec<u32> = vec![9707, 1879]; // "Hello world" in Qwen tokenizer
         engine.prefill(&prompt).expect("prefill failed");
@@ -112,7 +112,11 @@ mod polarquant_bench {
     }
 
     /// Compute perplexity over a dataset of token sequences.
-    fn eval_perplexity(engine: &mut GpuInference, sequences: &[Vec<u32>], max_seqs: usize) -> f64 {
+    fn eval_perplexity(
+        engine: &mut MetalInference,
+        sequences: &[Vec<u32>],
+        max_seqs: usize,
+    ) -> f64 {
         let mut total_ce = 0.0f64;
         let mut total_tokens = 0usize;
 
@@ -169,7 +173,7 @@ mod polarquant_bench {
         let model_dir = qwen_model_dir();
         skip_if_missing(&model_dir, "Qwen3-0.6B");
 
-        let config = GpuConfig::default();
+        let config = MetalConfig::default();
 
         // FP16 baseline.
         let fp16_provider =
@@ -183,7 +187,7 @@ mod polarquant_bench {
             .min_elements(1024)
             .build()
             .expect("PolarQuant compile failed");
-        let pq_config = GpuConfig {
+        let pq_config = MetalConfig {
             force_cpu_dequant: false,
             ..config
         };
@@ -211,7 +215,7 @@ mod polarquant_bench {
         let model_dir = qwen_model_dir();
         skip_if_missing(&model_dir, "Qwen3-0.6B");
 
-        let config = GpuConfig::default();
+        let config = MetalConfig::default();
         let decode_tokens = 50;
 
         // FP16 baseline.
@@ -226,7 +230,7 @@ mod polarquant_bench {
             .min_elements(1024)
             .build()
             .expect("PolarQuant compile failed");
-        let pq_config = GpuConfig {
+        let pq_config = MetalConfig {
             force_cpu_dequant: false,
             ..config
         };
@@ -254,7 +258,7 @@ mod polarquant_bench {
         let model_dir = qwen_model_dir();
         skip_if_missing(&model_dir, "Qwen3-0.6B");
 
-        let config = GpuConfig::default();
+        let config = MetalConfig::default();
         let sequences = load_dataset();
         let max_seqs = 5; // Limit for test speed.
 
@@ -336,8 +340,8 @@ mod polarquant_bench {
         let model_dir = qwen_model_dir();
         skip_if_missing(&model_dir, "Qwen3-0.6B");
 
-        let config = GpuConfig::default();
-        let pq_config = GpuConfig {
+        let config = MetalConfig::default();
+        let pq_config = MetalConfig {
             force_cpu_dequant: false,
             ..config.clone()
         };

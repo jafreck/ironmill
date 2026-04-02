@@ -1,6 +1,6 @@
 //! MLX-resident quantized KV cache for TurboQuant inference.
 //!
-//! Mirrors [`crate::gpu::turboquant::cache::GpuKvCache`] but stores all
+//! Mirrors [`crate::metal::turboquant::cache::MetalKvCache`] but stores all
 //! data as [`MlxArray`]s and dispatches cache-write / attention kernels
 //! via [`metal_kernel`].
 

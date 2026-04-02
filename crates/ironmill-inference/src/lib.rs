@@ -13,7 +13,7 @@ pub mod ane;
 pub mod coreml;
 pub mod engine;
 #[cfg(feature = "metal")]
-pub mod gpu;
+pub mod metal;
 #[cfg(feature = "mlx")]
 pub mod mlx;
 pub mod sampling;

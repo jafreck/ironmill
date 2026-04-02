@@ -14,21 +14,21 @@ use ironmill_metal_sys::{
 };
 use mil_rs::weights::{ModelConfig, WeightProvider};
 
-use super::config::GpuConfig;
-use super::error::GpuError;
+use super::config::MetalConfig;
+use super::error::MetalError;
 use super::ops;
-use super::turboquant::{GpuKvCache, GpuTurboQuantModel, OutlierConfig, TurboQuantGpuConfig};
-use super::weights::{GpuWeights, QuantizedWeight, WeightBuffer};
+use super::turboquant::{MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantMetalConfig};
+use super::weights::{MetalWeights, QuantizedWeight, WeightBuffer};
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
 
 // ── Public artifacts type for load() ────────────────────────────
 
-/// Artifacts passed to [`GpuInference::load`] via the type-erased
+/// Artifacts passed to [`MetalInference::load`] via the type-erased
 /// [`InferenceEngine`] interface.
-pub struct GpuArtifacts<'a> {
+pub struct MetalArtifacts<'a> {
     pub weights: &'a dyn WeightProvider,
-    pub config: GpuConfig,
+    pub config: MetalConfig,
 }
 
 // ── Helper structs ──────────────────────────────────────────────
@@ -49,7 +49,7 @@ impl Fp16KvCache {
         num_kv_heads: usize,
         max_seq_len: usize,
         head_dim: usize,
-    ) -> Result<Self, GpuError> {
+    ) -> Result<Self, MetalError> {
         let size_bytes = num_kv_heads * max_seq_len * head_dim * 2; // FP16
         let mut k_caches = Vec::with_capacity(num_layers);
         let mut v_caches = Vec::with_capacity(num_layers);
@@ -57,12 +57,12 @@ impl Fp16KvCache {
             k_caches.push(
                 device
                     .create_buffer(size_bytes, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             v_caches.push(
                 device
                     .create_buffer(size_bytes, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
         }
         Ok(Self {
@@ -102,7 +102,7 @@ impl IntermediateBuffers {
         device: &MetalDevice,
         max_tokens: usize,
         mc: &ModelConfig,
-    ) -> Result<Self, GpuError> {
+    ) -> Result<Self, MetalError> {
         let h = mc.hidden_size;
         let nh = mc.num_attention_heads;
         let nkv = mc.num_key_value_heads;
@@ -110,12 +110,12 @@ impl IntermediateBuffers {
         let inter = mc.intermediate_size;
         let vocab = mc.vocab_size;
 
-        let alloc = |size_elems: usize| -> Result<MetalBuffer, GpuError> {
+        let alloc = |size_elems: usize| -> Result<MetalBuffer, MetalError> {
             // FP16 = 2 bytes per element; minimum 16 bytes for Metal
             let bytes = (size_elems * 2).max(16);
             device
                 .create_buffer(bytes, StorageMode::Shared)
-                .map_err(GpuError::Metal)
+                .map_err(MetalError::Metal)
         };
 
         Ok(Self {
@@ -132,7 +132,7 @@ impl IntermediateBuffers {
             logits: alloc(max_tokens * vocab)?,
             token_ids_buf: device
                 .create_buffer((max_tokens * 4).max(16), StorageMode::Shared)
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
         })
     }
 }
@@ -182,43 +182,43 @@ struct LayerMatmuls {
     down: ProjectionMatmul,
 }
 
-// ── GpuInference ────────────────────────────────────────────────
+// ── MetalInference ────────────────────────────────────────────────
 
 /// Metal GPU inference engine.
 ///
 /// Implements the full transformer decode pipeline using Metal compute
 /// shaders for element-wise ops and MPS for matrix multiplication.
-pub struct GpuInference {
+pub struct MetalInference {
     device: MetalDevice,
     queue: ironmill_metal_sys::CommandQueue,
-    pipelines: Option<super::ops::GpuPipelines>,
-    weights: Option<GpuWeights>,
-    turboquant: Option<GpuTurboQuantModel>,
-    kv_cache: Option<GpuKvCache>,
+    pipelines: Option<super::ops::MetalPipelines>,
+    weights: Option<MetalWeights>,
+    turboquant: Option<MetalTurboQuantModel>,
+    kv_cache: Option<MetalKvCache>,
     fp16_kv_cache: Option<Fp16KvCache>,
     intermediate_buffers: Option<IntermediateBuffers>,
     rope_cos: Option<MetalBuffer>,
     rope_sin: Option<MetalBuffer>,
     /// MPS matmul cache for decode (token_count=1).
     decode_matmuls: Option<MpsMatmulCache>,
-    config: GpuConfig,
+    config: MetalConfig,
     model_config: Option<ModelConfig>,
     seq_pos: usize,
 }
 
-impl GpuInference {
+impl MetalInference {
     /// Access compiled pipelines — panics if `load()` hasn't been called yet.
-    fn pipelines(&self) -> &super::ops::GpuPipelines {
+    fn pipelines(&self) -> &super::ops::MetalPipelines {
         self.pipelines
             .as_ref()
             .expect("pipelines not compiled — call load() first")
     }
 
     /// Create a new GPU inference engine (device + queue + shader pipelines).
-    pub fn new(config: GpuConfig) -> Result<Self, GpuError> {
-        config.validate().map_err(|e| GpuError::Config(e))?;
-        let device = MetalDevice::system_default().map_err(GpuError::Metal)?;
-        let queue = device.create_command_queue().map_err(GpuError::Metal)?;
+    pub fn new(config: MetalConfig) -> Result<Self, MetalError> {
+        config.validate().map_err(|e| MetalError::Config(e))?;
+        let device = MetalDevice::system_default().map_err(MetalError::Metal)?;
+        let queue = device.create_command_queue().map_err(MetalError::Metal)?;
         // Pipelines are compiled in load() once head_dim is known.
         Ok(Self {
             device,
@@ -243,18 +243,18 @@ impl GpuInference {
     pub fn load_weights(
         &mut self,
         provider: &dyn mil_rs::weights::WeightProvider,
-        config: GpuConfig,
+        config: MetalConfig,
     ) -> Result<(), InferenceError> {
         self.config = config;
 
-        let weights = GpuWeights::load(&self.device, provider, self.config.force_cpu_dequant)
+        let weights = MetalWeights::load(&self.device, provider, self.config.force_cpu_dequant)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
         let mc = &weights.config;
         self.model_config = Some(mc.clone());
 
         // Compile Metal shader pipelines with the model's head_dim.
-        let pipelines = super::ops::GpuPipelines::compile(&self.device, mc.head_dim)
+        let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
 
@@ -286,8 +286,8 @@ impl GpuInference {
                     .iter()
                     .filter_map(|lw| {
                         if let (
-                            crate::gpu::weights::WeightBuffer::Dense { buf: k_buf, .. },
-                            crate::gpu::weights::WeightBuffer::Dense { buf: v_buf, .. },
+                            crate::metal::weights::WeightBuffer::Dense { buf: k_buf, .. },
+                            crate::metal::weights::WeightBuffer::Dense { buf: v_buf, .. },
                         ) = (&lw.k_proj, &lw.v_proj)
                         {
                             let mut k_data = vec![0u8; k_buf.length()];
@@ -318,7 +318,7 @@ impl GpuInference {
                 None
             };
 
-            let tq_config = TurboQuantGpuConfig {
+            let tq_config = TurboQuantMetalConfig {
                 n_bits: self.config.n_bits,
                 num_kv_heads: mc.num_key_value_heads,
                 head_dim: mc.head_dim,
@@ -327,9 +327,9 @@ impl GpuInference {
                 rotation_seed: self.config.rotation_seed,
                 outlier: outlier_cfg,
             };
-            let tq_model = GpuTurboQuantModel::new(&self.device, tq_config.clone())
+            let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let kv_cache = GpuKvCache::new(&self.device, &tq_config)
+            let kv_cache = MetalKvCache::new(&self.device, &tq_config)
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             self.turboquant = Some(tq_model);
             self.kv_cache = Some(kv_cache);
@@ -367,7 +367,7 @@ impl GpuInference {
         head_dim: usize,
         max_seq_len: usize,
         theta: f64,
-    ) -> Result<(MetalBuffer, MetalBuffer), GpuError> {
+    ) -> Result<(MetalBuffer, MetalBuffer), MetalError> {
         let half_dim = head_dim / 2;
         let mut cos_data = vec![0u8; max_seq_len * half_dim * 2];
         let mut sin_data = vec![0u8; max_seq_len * half_dim * 2];
@@ -386,10 +386,10 @@ impl GpuInference {
 
         let cos_buf = device
             .create_buffer_with_data(&cos_data, StorageMode::Shared)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let sin_buf = device
             .create_buffer_with_data(&sin_data, StorageMode::Shared)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         Ok((cos_buf, sin_buf))
     }
 
@@ -398,9 +398,9 @@ impl GpuInference {
     fn build_matmul_cache(
         device: &MetalDevice,
         mc: &ModelConfig,
-        weights: &GpuWeights,
+        weights: &MetalWeights,
         token_count: usize,
-    ) -> Result<MpsMatmulCache, GpuError> {
+    ) -> Result<MpsMatmulCache, MetalError> {
         let h = mc.hidden_size;
         let nh = mc.num_attention_heads;
         let nkv = mc.num_key_value_heads;
@@ -415,7 +415,7 @@ impl GpuInference {
         //   right = weight [out_features × in_features], transpose_right=true
         //   result = [token_count × out_features]
         let make_matmul =
-            |rows: usize, cols: usize, inner: usize| -> Result<MpsMatrixMultiply, GpuError> {
+            |rows: usize, cols: usize, inner: usize| -> Result<MpsMatrixMultiply, MetalError> {
                 MpsMatrixMultiply::new(
                     device, false, // transpose_left
                     true,  // transpose_right (weights are [out, in])
@@ -425,7 +425,7 @@ impl GpuInference {
                     1.0,   // alpha
                     0.0,   // beta
                 )
-                .map_err(GpuError::Metal)
+                .map_err(MetalError::Metal)
             };
 
         // Only create MPS matmul instances for Dense weights; Quantized
@@ -434,7 +434,7 @@ impl GpuInference {
                                  rows: usize,
                                  cols: usize,
                                  inner: usize|
-         -> Result<ProjectionMatmul, GpuError> {
+         -> Result<ProjectionMatmul, MetalError> {
             match wb {
                 WeightBuffer::Dense { .. } => {
                     Ok(ProjectionMatmul::Dense(make_matmul(rows, cols, inner)?))
@@ -1644,7 +1644,7 @@ fn encode_polarquant_matmul(
     input: &MetalBuffer,
     weight: &QuantizedWeight,
     output: &MetalBuffer,
-    pipelines: &super::ops::GpuPipelines,
+    pipelines: &super::ops::MetalPipelines,
     m: usize,
 ) -> Result<(), InferenceError> {
     let (n, k) = weight.shape; // (out_features, in_features)
@@ -1690,18 +1690,18 @@ fn encode_polarquant_matmul(
     Ok(())
 }
 
-impl InferenceEngine for GpuInference {
+impl InferenceEngine for MetalInference {
     fn load(&mut self, artifacts: &dyn Any) -> Result<(), InferenceError> {
         let gpu_artifacts = artifacts
-            .downcast_ref::<GpuArtifacts<'_>>()
+            .downcast_ref::<MetalArtifacts<'_>>()
             .ok_or_else(|| {
-                InferenceError::Runtime("GpuInference::load expects GpuArtifacts".into())
+                InferenceError::Runtime("MetalInference::load expects MetalArtifacts".into())
             })?;
 
         self.config = gpu_artifacts.config.clone();
 
         // Load weights into Metal buffers.
-        let weights = GpuWeights::load(
+        let weights = MetalWeights::load(
             &self.device,
             gpu_artifacts.weights,
             self.config.force_cpu_dequant,
@@ -1713,7 +1713,7 @@ impl InferenceEngine for GpuInference {
 
         // Compile Metal shader pipelines with the model's head_dim so
         // shared memory is sized exactly via #define HEAD_DIM.
-        let pipelines = super::ops::GpuPipelines::compile(&self.device, mc.head_dim)
+        let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
 
@@ -1742,7 +1742,7 @@ impl InferenceEngine for GpuInference {
 
         // Initialize KV cache.
         if self.config.enable_turboquant {
-            let tq_config = TurboQuantGpuConfig {
+            let tq_config = TurboQuantMetalConfig {
                 n_bits: self.config.n_bits,
                 num_kv_heads: mc.num_key_value_heads,
                 head_dim: mc.head_dim,
@@ -1751,9 +1751,9 @@ impl InferenceEngine for GpuInference {
                 rotation_seed: self.config.rotation_seed,
                 outlier: None,
             };
-            let tq_model = GpuTurboQuantModel::new(&self.device, tq_config.clone())
+            let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let kv_cache = GpuKvCache::new(&self.device, &tq_config)
+            let kv_cache = MetalKvCache::new(&self.device, &tq_config)
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             self.turboquant = Some(tq_model);
             self.kv_cache = Some(kv_cache);

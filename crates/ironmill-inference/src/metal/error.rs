@@ -2,9 +2,9 @@
 
 use ironmill_metal_sys::MetalSysError;
 
-/// Errors from the GPU inference backend.
+/// Errors from the Metal inference backend.
 #[derive(Debug, thiserror::Error)]
-pub enum GpuError {
+pub enum MetalError {
     /// Low-level Metal or MPS error.
     #[error("Metal error: {0}")]
     Metal(#[from] MetalSysError),
@@ -34,8 +34,8 @@ pub enum GpuError {
     Other(#[from] anyhow::Error),
 }
 
-impl From<GpuError> for crate::engine::InferenceError {
-    fn from(e: GpuError) -> Self {
+impl From<MetalError> for crate::engine::InferenceError {
+    fn from(e: MetalError) -> Self {
         crate::engine::InferenceError::Runtime(e.to_string())
     }
 }

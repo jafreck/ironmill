@@ -418,35 +418,35 @@ fn main() -> Result<()> {
         {
             use ironmill_compile::weights::SafeTensorsProvider;
             use ironmill_inference::engine::InferenceEngine;
-            use ironmill_inference::gpu::bundle::GpuBundleProvider;
-            use ironmill_inference::gpu::{GpuConfig, GpuInference};
+            use ironmill_inference::metal::bundle::MetalBundleProvider;
+            use ironmill_inference::metal::{MetalConfig, MetalInference};
 
             eprintln!("\n  Metal GPU Backend Benchmark");
             eprintln!("  {}", "─".repeat(40));
 
             // Run two configurations: FP16 baseline and TurboQuant INT4
-            let configs: Vec<(&str, GpuConfig)> = vec![
+            let configs: Vec<(&str, MetalConfig)> = vec![
                 (
                     "fp16",
-                    GpuConfig {
+                    MetalConfig {
                         enable_turboquant: false,
-                        ..GpuConfig::default()
+                        ..MetalConfig::default()
                     },
                 ),
                 (
                     "tq-int8",
-                    GpuConfig {
+                    MetalConfig {
                         enable_turboquant: true,
                         n_bits: 8,
-                        ..GpuConfig::default()
+                        ..MetalConfig::default()
                     },
                 ),
                 (
                     "tq-int4",
-                    GpuConfig {
+                    MetalConfig {
                         enable_turboquant: true,
                         n_bits: 4,
-                        ..GpuConfig::default()
+                        ..MetalConfig::default()
                     },
                 ),
             ];
@@ -462,7 +462,7 @@ fn main() -> Result<()> {
                     .map_or(false, |ext| ext == "ironml-gpu");
 
                 if is_gpu_bundle {
-                    let provider = match GpuBundleProvider::open(&model_cfg.path) {
+                    let provider = match MetalBundleProvider::open(&model_cfg.path) {
                         Ok(p) => p,
                         Err(e) => {
                             eprintln!(
@@ -478,12 +478,12 @@ fn main() -> Result<()> {
 
                     eprintln!("  Metal/{config_label}: {} (bundle)...", model_cfg.name);
 
-                    let gpu_config = GpuConfig {
+                    let gpu_config = MetalConfig {
                         enable_turboquant: false,
-                        ..GpuConfig::default()
+                        ..MetalConfig::default()
                     };
 
-                    let mut engine = match GpuInference::new(gpu_config.clone()) {
+                    let mut engine = match MetalInference::new(gpu_config.clone()) {
                         Ok(e) => e,
                         Err(e) => {
                             eprintln!("  ✗ Metal GPU init failed: {e}");
@@ -634,7 +634,7 @@ fn main() -> Result<()> {
                 for (config_name, gpu_config) in &configs {
                     eprintln!("  Metal/{config_name}: {}...", model_cfg.name);
 
-                    let mut engine = match GpuInference::new(gpu_config.clone()) {
+                    let mut engine = match MetalInference::new(gpu_config.clone()) {
                         Ok(e) => e,
                         Err(e) => {
                             eprintln!("  ✗ Metal GPU init failed: {e}");
@@ -802,7 +802,7 @@ fn main() -> Result<()> {
                     for (config_name, gpu_config) in &configs {
                         eprintln!("  Evaluating {config_name}...");
 
-                        let mut engine = GpuInference::new(gpu_config.clone())
+                        let mut engine = MetalInference::new(gpu_config.clone())
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         let gpu_before = engine.gpu_allocated_bytes();
                         engine
@@ -870,7 +870,7 @@ fn main() -> Result<()> {
                         continue;
                     }
 
-                    let provider = match GpuBundleProvider::open(&bundle_cfg.path) {
+                    let provider = match MetalBundleProvider::open(&bundle_cfg.path) {
                         Ok(p) => p,
                         Err(e) => {
                             eprintln!(
@@ -885,12 +885,12 @@ fn main() -> Result<()> {
                     let config_label = format!("PQ-INT{}", quant_info.n_bits);
                     eprintln!("  Evaluating {config_label} (bundle)...");
 
-                    let gpu_config = GpuConfig {
+                    let gpu_config = MetalConfig {
                         enable_turboquant: false,
-                        ..GpuConfig::default()
+                        ..MetalConfig::default()
                     };
 
-                    let mut engine = GpuInference::new(gpu_config.clone())
+                    let mut engine = MetalInference::new(gpu_config.clone())
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let gpu_before = engine.gpu_allocated_bytes();
                     engine

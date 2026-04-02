@@ -7,20 +7,20 @@ pub mod cache;
 pub mod codebook;
 
 pub use crate::turboquant::outlier::OutlierConfig;
-pub use cache::GpuKvCache;
+pub use cache::MetalKvCache;
 
 use ironmill_metal_sys::MetalDevice;
 
 use crate::turboquant::rotation::{generate_qjl_matrix, generate_rotation_signs};
 
-use super::error::GpuError;
+use super::error::MetalError;
 
 /// TurboQuant model state for GPU inference.
 ///
 /// Per Algorithm 2 (TurboQuant_prod), K and V caches use different codebooks:
 /// - K cache: (b-1)-bit MSE codebook + 1-bit QJL = b bits total (inner product)
 /// - V cache: b-bit MSE codebook, no QJL (MSE reconstruction)
-pub struct GpuTurboQuantModel {
+pub struct MetalTurboQuantModel {
     /// Rotation sign vector [head_dim] float (±1.0).
     pub rotation_signs: ironmill_metal_sys::MetalBuffer,
     /// Inverse quantization scale for cache write (INT8 path only).
@@ -44,7 +44,7 @@ pub struct GpuTurboQuantModel {
     /// Outlier channel state (None = standard mode).
     pub outlier: Option<OutlierState>,
     /// Config.
-    pub config: TurboQuantGpuConfig,
+    pub config: TurboQuantMetalConfig,
 }
 
 /// GPU buffers for the outlier channel strategy (Section 4.3).
@@ -96,9 +96,9 @@ pub struct OutlierState {
     pub non_outlier_n_levels: u32,
 }
 
-/// TurboQuant-specific configuration extracted from GpuConfig + model params.
+/// TurboQuant-specific configuration extracted from MetalConfig + model params.
 #[derive(Debug, Clone)]
-pub struct TurboQuantGpuConfig {
+pub struct TurboQuantMetalConfig {
     pub n_bits: u8,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -112,28 +112,28 @@ pub struct TurboQuantGpuConfig {
 fn create_f32_buffer(
     device: &MetalDevice,
     data: &[f32],
-) -> Result<ironmill_metal_sys::MetalBuffer, GpuError> {
+) -> Result<ironmill_metal_sys::MetalBuffer, MetalError> {
     let bytes: Vec<u8> = data.iter().flat_map(|&v| v.to_le_bytes()).collect();
     device
         .create_buffer_with_data(&bytes, ironmill_metal_sys::StorageMode::Shared)
-        .map_err(GpuError::Metal)
+        .map_err(MetalError::Metal)
 }
 
 fn create_u32_buffer(
     device: &MetalDevice,
     data: &[u32],
-) -> Result<ironmill_metal_sys::MetalBuffer, GpuError> {
+) -> Result<ironmill_metal_sys::MetalBuffer, MetalError> {
     let bytes: Vec<u8> = data.iter().flat_map(|&v| v.to_le_bytes()).collect();
     device
         .create_buffer_with_data(&bytes, ironmill_metal_sys::StorageMode::Shared)
-        .map_err(GpuError::Metal)
+        .map_err(MetalError::Metal)
 }
 
-impl GpuTurboQuantModel {
+impl MetalTurboQuantModel {
     /// Initialize TurboQuant with rotation signs and quantization scales.
-    pub fn new(device: &MetalDevice, config: TurboQuantGpuConfig) -> Result<Self, GpuError> {
+    pub fn new(device: &MetalDevice, config: TurboQuantMetalConfig) -> Result<Self, MetalError> {
         if !config.head_dim.is_power_of_two() {
-            return Err(GpuError::Config(
+            return Err(MetalError::Config(
                 "head_dim must be a power of two for Walsh-Hadamard butterfly".to_string(),
             ));
         }
@@ -141,7 +141,7 @@ impl GpuTurboQuantModel {
         let sign_bytes = generate_rotation_signs(config.head_dim, config.rotation_seed);
         let rotation_signs = device
             .create_buffer_with_data(&sign_bytes, ironmill_metal_sys::StorageMode::Shared)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
 
         // Per Algorithm 2 (TurboQuant_prod): K cache uses (b-1)-bit MSE
         // codebook + 1-bit QJL = b bits total. V cache uses b-bit MSE codebook.
@@ -164,7 +164,7 @@ impl GpuTurboQuantModel {
         let qjl_bytes = generate_qjl_matrix(config.head_dim, config.rotation_seed + 1);
         let qjl_matrix = device
             .create_buffer_with_data(&qjl_bytes, ironmill_metal_sys::StorageMode::Shared)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
 
         // Outlier channel state
         let outlier = if let Some(ref outlier_cfg) = config.outlier {
@@ -197,9 +197,9 @@ impl GpuTurboQuantModel {
     /// codebooks for outlier and non-outlier channel groups.
     fn init_outlier(
         device: &MetalDevice,
-        config: &TurboQuantGpuConfig,
+        config: &TurboQuantMetalConfig,
         outlier_cfg: &OutlierConfig,
-    ) -> Result<OutlierState, GpuError> {
+    ) -> Result<OutlierState, MetalError> {
         let n_outlier = outlier_cfg.outlier_channels.len();
         let n_non = config.head_dim - n_outlier;
         let d_outlier_padded = n_outlier.next_power_of_two();
@@ -229,7 +229,7 @@ impl GpuTurboQuantModel {
             generate_rotation_signs(d_outlier_padded, config.rotation_seed + 100);
         let outlier_rotation_signs = device
             .create_buffer_with_data(&outlier_sign_bytes, ironmill_metal_sys::StorageMode::Shared)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
 
         let non_outlier_sign_bytes =
             generate_rotation_signs(d_non_padded, config.rotation_seed + 200);
@@ -238,7 +238,7 @@ impl GpuTurboQuantModel {
                 &non_outlier_sign_bytes,
                 ironmill_metal_sys::StorageMode::Shared,
             )
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
 
         // Independent codebooks for V: outlier at higher bits, non-outlier at lower bits
         let (o_levels, o_bounds) =
@@ -270,12 +270,12 @@ impl GpuTurboQuantModel {
         let o_qjl_bytes = generate_qjl_matrix(d_outlier_padded, config.rotation_seed + 300);
         let outlier_qjl_matrix = device
             .create_buffer_with_data(&o_qjl_bytes, ironmill_metal_sys::StorageMode::Shared)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
 
         let n_qjl_bytes = generate_qjl_matrix(d_non_padded, config.rotation_seed + 400);
         let non_outlier_qjl_matrix = device
             .create_buffer_with_data(&n_qjl_bytes, ironmill_metal_sys::StorageMode::Shared)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
 
         Ok(OutlierState {
             channel_indices,

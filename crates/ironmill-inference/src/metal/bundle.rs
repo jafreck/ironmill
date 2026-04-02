@@ -1,6 +1,6 @@
 //! GPU bundle format (`.ironml-gpu`) reader.
 //!
-//! Provides [`GpuBundleProvider`], a [`WeightProvider`] implementation that
+//! Provides [`MetalBundleProvider`], a [`WeightProvider`] implementation that
 //! loads tensors from a pre-compiled `.ironml-gpu` bundle directory. Weight
 //! files are read from disk on each `tensor()` call and returned as owned data.
 
@@ -14,46 +14,46 @@ use ironmill_core::gpu::bundle::{
 use ironmill_core::weights::{ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
 use mil_rs::MilError;
 
-use super::error::GpuError;
+use super::error::MetalError;
 
 /// Weight provider backed by a `.ironml-gpu` bundle directory.
 ///
 /// Reads `manifest.json` at open time and loads individual weight files from
 /// disk on each [`WeightProvider::tensor`] call.
-pub struct GpuBundleProvider {
+pub struct MetalBundleProvider {
     bundle_path: PathBuf,
     manifest: GpuBundleManifest,
     config: ModelConfig,
 }
 
-impl GpuBundleProvider {
+impl MetalBundleProvider {
     /// Open a `.ironml-gpu` bundle directory.
     ///
     /// Reads and validates `manifest.json`, then prepares for on-demand
     /// weight loading.
-    pub fn open(bundle_path: impl AsRef<Path>) -> Result<Self, GpuError> {
+    pub fn open(bundle_path: impl AsRef<Path>) -> Result<Self, MetalError> {
         let bundle_path = bundle_path.as_ref().to_path_buf();
 
         let manifest_path = bundle_path.join("manifest.json");
         let manifest_json = fs::read_to_string(&manifest_path).map_err(|e| {
-            GpuError::WeightLoading(format!(
+            MetalError::WeightLoading(format!(
                 "failed to read manifest at {}: {e}",
                 manifest_path.display()
             ))
         })?;
 
         let manifest: GpuBundleManifest = serde_json::from_str(&manifest_json)
-            .map_err(|e| GpuError::WeightLoading(format!("failed to parse manifest: {e}")))?;
+            .map_err(|e| MetalError::WeightLoading(format!("failed to parse manifest: {e}")))?;
 
         if manifest.format_version != 1 {
-            return Err(GpuError::WeightLoading(format!(
+            return Err(MetalError::WeightLoading(format!(
                 "unsupported bundle format version: {}",
                 manifest.format_version
             )));
         }
 
         let config = deserialize_model_config(&manifest.model_config)
-            .map_err(|e| GpuError::Config(e.to_string()))?;
+            .map_err(|e| MetalError::Config(e.to_string()))?;
 
         Ok(Self {
             bundle_path,
@@ -74,7 +74,7 @@ impl GpuBundleProvider {
     }
 }
 
-impl WeightProvider for GpuBundleProvider {
+impl WeightProvider for MetalBundleProvider {
     fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError> {
         let desc = self.manifest.tensors.get(name).ok_or_else(|| {
             MilError::UndefinedValue(format!("tensor not found in bundle: {name}"))
@@ -289,7 +289,7 @@ mod tests {
 
         write_mock_bundle(&bundle_path);
 
-        let reader = GpuBundleProvider::open(&bundle_path).unwrap();
+        let reader = MetalBundleProvider::open(&bundle_path).unwrap();
         let tensor = reader.tensor("model.embed_tokens.weight").unwrap();
 
         assert_eq!(tensor.data.as_ref(), &[0xBB; 128]);
@@ -305,7 +305,7 @@ mod tests {
 
         write_mock_bundle(&bundle_path);
 
-        let reader = GpuBundleProvider::open(&bundle_path).unwrap();
+        let reader = MetalBundleProvider::open(&bundle_path).unwrap();
         let tensor = reader
             .tensor("model.layers.0.self_attn.q_proj.weight")
             .unwrap();
@@ -340,7 +340,7 @@ mod tests {
 
         write_mock_bundle(&bundle_path);
 
-        let reader = GpuBundleProvider::open(&bundle_path).unwrap();
+        let reader = MetalBundleProvider::open(&bundle_path).unwrap();
         let config = reader.config();
         let original = test_config();
 
@@ -357,7 +357,7 @@ mod tests {
 
         write_mock_bundle(&bundle_path);
 
-        let reader = GpuBundleProvider::open(&bundle_path).unwrap();
+        let reader = MetalBundleProvider::open(&bundle_path).unwrap();
         let mut names = reader.tensor_names();
         names.sort();
 
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn open_missing_bundle_returns_error() {
-        let result = GpuBundleProvider::open("/nonexistent/path.ironml-gpu");
+        let result = MetalBundleProvider::open("/nonexistent/path.ironml-gpu");
         assert!(result.is_err());
     }
 
@@ -383,7 +383,7 @@ mod tests {
 
         write_mock_bundle(&bundle_path);
 
-        let reader = GpuBundleProvider::open(&bundle_path).unwrap();
+        let reader = MetalBundleProvider::open(&bundle_path).unwrap();
         let result = reader.tensor("nonexistent.tensor");
         assert!(result.is_err());
     }

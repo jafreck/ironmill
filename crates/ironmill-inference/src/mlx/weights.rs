@@ -1,6 +1,6 @@
 //! Weight loading from [`WeightProvider`] into MLX arrays.
 //!
-//! Mirrors the structure of [`crate::gpu::weights`] but loads into
+//! Mirrors the structure of [`crate::metal::weights`] but loads into
 //! [`MlxArray`]s instead of Metal buffers. Quantized weights are stored
 //! as separate index/LUT/norms arrays for dispatch via custom kernels;
 //! affine-quantized weights are dequantized to dense FP16 on the CPU.

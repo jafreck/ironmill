@@ -2,10 +2,10 @@
 
 use ironmill_metal_sys::{ComputeEncoder, ComputePipeline, MetalBuffer, MetalDevice};
 
-use super::error::GpuError;
+use super::error::MetalError;
 
-/// All compiled Metal pipeline states for the GPU backend.
-pub struct GpuPipelines {
+/// All compiled Metal pipeline states for the Metal backend.
+pub struct MetalPipelines {
     pub rms_norm: ComputePipeline,
     pub silu_gate: ComputePipeline,
     pub rope: ComputePipeline,
@@ -25,12 +25,12 @@ pub struct GpuPipelines {
     pub fused_residual_rms_norm: ComputePipeline,
 }
 
-impl GpuPipelines {
+impl MetalPipelines {
     /// Compile all Metal shaders and create pipeline states.
     ///
     /// `head_dim` is injected into TurboQuant and attention shaders via
     /// `#define HEAD_DIM` so shared memory is sized exactly.
-    pub fn compile(device: &MetalDevice, head_dim: usize) -> Result<Self, GpuError> {
+    pub fn compile(device: &MetalDevice, head_dim: usize) -> Result<Self, MetalError> {
         let head_dim_header = format!(
             "#define HEAD_DIM {head_dim}\n#define HEAD_DIM_PACKED {}\n",
             head_dim / 2
@@ -52,148 +52,154 @@ impl GpuPipelines {
 
         let norm_lib = device
             .compile_shader_source(norm_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let act_lib = device
             .compile_shader_source(act_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let rope_lib = device
             .compile_shader_source(rope_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let elem_lib = device
             .compile_shader_source(elem_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let embed_lib = device
             .compile_shader_source(embed_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let tq_lib = device
             .compile_shader_source(&tq_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let attn_lib = device
             .compile_shader_source(&attn_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let qmm_lib = device
             .compile_shader_source(qmm_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let kv_scatter_lib = device
             .compile_shader_source(kv_scatter_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let matvec_lib = device
             .compile_shader_source(matvec_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
         let fused_rn_lib = device
             .compile_shader_source(fused_rn_src)
-            .map_err(GpuError::Metal)?;
+            .map_err(MetalError::Metal)?;
 
         Ok(Self {
             rms_norm: device
                 .create_compute_pipeline(
-                    &norm_lib.get_function("rms_norm").map_err(GpuError::Metal)?,
+                    &norm_lib
+                        .get_function("rms_norm")
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             silu_gate: device
                 .create_compute_pipeline(
-                    &act_lib.get_function("silu_gate").map_err(GpuError::Metal)?,
+                    &act_lib
+                        .get_function("silu_gate")
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             rope: device
-                .create_compute_pipeline(&rope_lib.get_function("rope").map_err(GpuError::Metal)?)
-                .map_err(GpuError::Metal)?,
+                .create_compute_pipeline(&rope_lib.get_function("rope").map_err(MetalError::Metal)?)
+                .map_err(MetalError::Metal)?,
             residual_add: device
                 .create_compute_pipeline(
                     &elem_lib
                         .get_function("residual_add")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             embedding_lookup: device
                 .create_compute_pipeline(
                     &embed_lib
                         .get_function("embedding_lookup")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             turboquant_cache_write: device
                 .create_compute_pipeline(
                     &tq_lib
                         .get_function("turboquant_cache_write")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             turboquant_attention: device
                 .create_compute_pipeline(
                     &tq_lib
                         .get_function("turboquant_attention")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             turboquant_outlier_cache_write: device
                 .create_compute_pipeline(
                     &tq_lib
                         .get_function("turboquant_outlier_cache_write")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             turboquant_outlier_attention: device
                 .create_compute_pipeline(
                     &tq_lib
                         .get_function("turboquant_outlier_attention")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             standard_attention: device
                 .create_compute_pipeline(
                     &attn_lib
                         .get_function("standard_attention")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             polarquant_matvec_int4: device
                 .create_compute_pipeline(
                     &qmm_lib
                         .get_function("polarquant_matvec_int4")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             polarquant_matmul_int4: device
                 .create_compute_pipeline(
                     &qmm_lib
                         .get_function("polarquant_matmul_int4")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             polarquant_matvec_int8: device
                 .create_compute_pipeline(
                     &qmm_lib
                         .get_function("polarquant_matvec_int8")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             polarquant_matmul_int8: device
                 .create_compute_pipeline(
                     &qmm_lib
                         .get_function("polarquant_matmul_int8")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             kv_scatter: device
                 .create_compute_pipeline(
                     &kv_scatter_lib
                         .get_function("kv_scatter")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             matvec: device
                 .create_compute_pipeline(
-                    &matvec_lib.get_function("matvec").map_err(GpuError::Metal)?,
+                    &matvec_lib
+                        .get_function("matvec")
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
             fused_residual_rms_norm: device
                 .create_compute_pipeline(
                     &fused_rn_lib
                         .get_function("fused_residual_rms_norm")
-                        .map_err(GpuError::Metal)?,
+                        .map_err(MetalError::Metal)?,
                 )
-                .map_err(GpuError::Metal)?,
+                .map_err(MetalError::Metal)?,
         })
     }
 }

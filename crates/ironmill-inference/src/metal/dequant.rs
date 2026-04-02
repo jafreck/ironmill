@@ -1,6 +1,6 @@
 //! CPU dequantization from quantized formats to FP16 byte arrays.
 //!
-//! Used by [`super::weights::GpuWeights::load`] to convert LUT-palettized
+//! Used by [`super::weights::MetalWeights::load`] to convert LUT-palettized
 //! and affine-quantized tensors into dense FP16 buffers before uploading
 //! to Metal.
 

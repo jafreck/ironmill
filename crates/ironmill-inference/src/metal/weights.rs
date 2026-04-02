@@ -4,7 +4,7 @@ use ironmill_metal_sys::{MetalBuffer, MetalDevice, StorageMode};
 use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightProvider};
 
 use super::dequant::{dequant_affine, dequant_lut_to_dense};
-use super::error::GpuError;
+use super::error::MetalError;
 
 /// A weight buffer that is either dense FP16 or packed quantized data.
 pub enum WeightBuffer {
@@ -60,7 +60,7 @@ pub struct QuantizedWeight {
 }
 
 /// All model weights loaded into Metal buffers, organized by layer.
-pub struct GpuWeights {
+pub struct MetalWeights {
     /// Embedding table [vocab_size × hidden_size] FP16.
     pub embedding: MetalBuffer,
     /// Per-layer weights.
@@ -101,7 +101,7 @@ pub struct LayerWeights {
     pub k_norm: Option<MetalBuffer>,
 }
 
-impl GpuWeights {
+impl MetalWeights {
     /// Load model weights from a [`WeightProvider`] into Metal buffers.
     ///
     /// Weights are loaded into shared-mode buffers for CPU→GPU transfer.
@@ -109,7 +109,7 @@ impl GpuWeights {
         device: &MetalDevice,
         provider: &dyn WeightProvider,
         force_cpu_dequant: bool,
-    ) -> Result<Self, GpuError> {
+    ) -> Result<Self, MetalError> {
         let config = provider.config().clone();
         let num_layers = config.num_hidden_layers;
 
@@ -230,14 +230,16 @@ fn pack_weight_blocked(
     original: &MetalBuffer,
     n: usize,
     k: usize,
-) -> Result<Option<MetalBuffer>, GpuError> {
+) -> Result<Option<MetalBuffer>, MetalError> {
     if n % 8 != 0 || k % 8 != 0 {
         return Ok(None);
     }
 
     let total_bytes = n * k * 2; // FP16
     let mut src = vec![0u8; total_bytes];
-    original.read_bytes(&mut src, 0).map_err(GpuError::Metal)?;
+    original
+        .read_bytes(&mut src, 0)
+        .map_err(MetalError::Metal)?;
 
     let mut dst = vec![0u8; total_bytes];
     let n_blocks = n / 8;
@@ -263,7 +265,7 @@ fn pack_weight_blocked(
 
     let buf = device
         .create_buffer_with_data(&dst, StorageMode::Shared)
-        .map_err(GpuError::Metal)?;
+        .map_err(MetalError::Metal)?;
     Ok(Some(buf))
 }
 
@@ -279,15 +281,15 @@ fn load_weight_buffer(
     provider: &dyn WeightProvider,
     name: &str,
     force_cpu_dequant: bool,
-) -> Result<WeightBuffer, GpuError> {
+) -> Result<WeightBuffer, MetalError> {
     let tensor = provider
         .tensor(name)
-        .map_err(|e| GpuError::WeightLoading(format!("{name}: {e}")))?;
+        .map_err(|e| MetalError::WeightLoading(format!("{name}: {e}")))?;
     match &tensor.quant_info {
         QuantizationInfo::None => {
             let buf = device
                 .create_buffer_with_data(&tensor.data, StorageMode::Shared)
-                .map_err(GpuError::Metal)?;
+                .map_err(MetalError::Metal)?;
             let (n, k) = dense_shape(&tensor.shape);
             let packed = pack_weight_blocked(device, &buf, n, k)?;
             Ok(WeightBuffer::Dense { buf, packed })
@@ -315,20 +317,20 @@ fn load_weight_buffer(
                 )?;
                 let buf = device
                     .create_buffer_with_data(&data, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?;
+                    .map_err(MetalError::Metal)?;
                 let (n, k) = dense_shape(original_shape);
                 let packed = pack_weight_blocked(device, &buf, n, k)?;
                 Ok(WeightBuffer::Dense { buf, packed })
             } else {
                 let indices_buf = device
                     .create_buffer_with_data(indices, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?;
+                    .map_err(MetalError::Metal)?;
                 let lut_buf = device
                     .create_buffer_with_data(lut, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?;
+                    .map_err(MetalError::Metal)?;
                 let norms_buf = device
                     .create_buffer_with_data(row_norms, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?;
+                    .map_err(MetalError::Metal)?;
                 let rows = original_shape[0];
                 let cols = if original_shape.len() > 1 {
                     original_shape[1]
@@ -362,7 +364,7 @@ fn load_weight_buffer(
             )?;
             let buf = device
                 .create_buffer_with_data(&data, StorageMode::Shared)
-                .map_err(GpuError::Metal)?;
+                .map_err(MetalError::Metal)?;
             let (n, k) = dense_shape(&tensor.shape);
             let packed = pack_weight_blocked(device, &buf, n, k)?;
             Ok(WeightBuffer::Dense { buf, packed })
@@ -378,17 +380,17 @@ fn load_dense_buffer(
     device: &MetalDevice,
     provider: &dyn WeightProvider,
     name: &str,
-) -> Result<MetalBuffer, GpuError> {
+) -> Result<MetalBuffer, MetalError> {
     let tensor = provider
         .tensor(name)
-        .map_err(|e| GpuError::WeightLoading(format!("{name}: {e}")))?;
+        .map_err(|e| MetalError::WeightLoading(format!("{name}: {e}")))?;
     let data = match &tensor.quant_info {
         QuantizationInfo::None => {
             // Zero-copy: pass borrowed data directly to Metal without
             // allocating an intermediate Vec.
             return device
                 .create_buffer_with_data(&tensor.data, StorageMode::Shared)
-                .map_err(GpuError::Metal);
+                .map_err(MetalError::Metal);
         }
         QuantizationInfo::LutToDense {
             lut,
@@ -427,5 +429,5 @@ fn load_dense_buffer(
     };
     device
         .create_buffer_with_data(&data, StorageMode::Shared)
-        .map_err(GpuError::Metal)
+        .map_err(MetalError::Metal)
 }

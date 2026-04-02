@@ -2,7 +2,7 @@
 
 /// Configuration for the Metal GPU inference backend.
 #[derive(Debug, Clone)]
-pub struct GpuConfig {
+pub struct MetalConfig {
     /// Maximum sequence length for KV cache allocation.
     pub max_seq_len: usize,
     /// Attention tile size (sequence positions per tile in threadgroup memory).
@@ -22,7 +22,7 @@ pub struct GpuConfig {
     pub force_cpu_dequant: bool,
 }
 
-impl Default for GpuConfig {
+impl Default for MetalConfig {
     fn default() -> Self {
         Self {
             max_seq_len: 2048,
@@ -36,7 +36,7 @@ impl Default for GpuConfig {
     }
 }
 
-impl GpuConfig {
+impl MetalConfig {
     /// Validate configuration. Returns an error message if invalid.
     pub fn validate(&self) -> Result<(), String> {
         if self.max_seq_len == 0 {

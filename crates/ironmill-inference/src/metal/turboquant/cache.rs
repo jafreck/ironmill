@@ -2,8 +2,8 @@
 
 use ironmill_metal_sys::{MetalBuffer, MetalDevice, StorageMode};
 
-use super::TurboQuantGpuConfig;
-use crate::gpu::error::GpuError;
+use super::TurboQuantMetalConfig;
+use crate::metal::error::MetalError;
 
 /// GPU-resident quantized KV cache for TurboQuant inference.
 ///
@@ -15,7 +15,7 @@ use crate::gpu::error::GpuError;
 /// Layout per scale buffer:
 ///   `[num_kv_heads × max_seq_len]` (1 f32 per head per position)
 #[allow(dead_code)]
-pub struct GpuKvCache {
+pub struct MetalKvCache {
     /// K cache per layer.
     k_caches: Vec<MetalBuffer>,
     /// V cache per layer.
@@ -67,11 +67,11 @@ pub struct GpuKvCache {
     n_bits: u8,
 }
 
-impl GpuKvCache {
+impl MetalKvCache {
     /// Allocate KV cache buffers for all layers.
     ///
     /// Uses shared storage mode for CPU-side inspection during development.
-    pub fn new(device: &MetalDevice, config: &TurboQuantGpuConfig) -> Result<Self, GpuError> {
+    pub fn new(device: &MetalDevice, config: &TurboQuantMetalConfig) -> Result<Self, MetalError> {
         let elements_per_pos = if config.n_bits == 4 {
             config.head_dim / 2
         } else {
@@ -97,32 +97,32 @@ impl GpuKvCache {
             k_caches.push(
                 device
                     .create_buffer(cache_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             v_caches.push(
                 device
                     .create_buffer(cache_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             k_scales.push(
                 device
                     .create_buffer(scale_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             v_scales.push(
                 device
                     .create_buffer(scale_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             k_qjl_signs.push(
                 device
                     .create_buffer(qjl_signs_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             k_r_norms.push(
                 device
                     .create_buffer(qjl_r_norm_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
         }
 
@@ -157,52 +157,52 @@ impl GpuKvCache {
             k_outlier_caches.push(
                 device
                     .create_buffer(outlier_cache_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             v_outlier_caches.push(
                 device
                     .create_buffer(outlier_cache_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             k_non_outlier_caches.push(
                 device
                     .create_buffer(non_outlier_cache_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             v_non_outlier_caches.push(
                 device
                     .create_buffer(non_outlier_cache_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             k_outlier_scales.push(
                 device
                     .create_buffer(scale_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             v_outlier_scales.push(
                 device
                     .create_buffer(scale_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             k_non_outlier_scales.push(
                 device
                     .create_buffer(scale_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             v_non_outlier_scales.push(
                 device
                     .create_buffer(scale_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             k_outlier_r_norms.push(
                 device
                     .create_buffer(scale_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
             k_non_outlier_r_norms.push(
                 device
                     .create_buffer(scale_size, StorageMode::Shared)
-                    .map_err(GpuError::Metal)?,
+                    .map_err(MetalError::Metal)?,
             );
         }
 
@@ -288,15 +288,15 @@ impl GpuKvCache {
     }
 
     /// Advance sequence position by one token.
-    pub fn advance(&mut self) -> Result<(), GpuError> {
+    pub fn advance(&mut self) -> Result<(), MetalError> {
         self.advance_by(1)
     }
 
     /// Advance by multiple positions (for prefill).
-    pub fn advance_by(&mut self, count: usize) -> Result<(), GpuError> {
+    pub fn advance_by(&mut self, count: usize) -> Result<(), MetalError> {
         let new_pos = self.seq_pos + count;
         if new_pos > self.max_seq_len {
-            return Err(GpuError::Config(format!(
+            return Err(MetalError::Config(format!(
                 "sequence position overflow: {} + {} = {} exceeds max_seq_len {}",
                 self.seq_pos, count, new_pos, self.max_seq_len,
             )));

@@ -12,6 +12,6 @@ pub mod ops;
 pub mod turboquant;
 pub mod weights;
 
-pub use config::GpuConfig;
-pub use error::GpuError;
-pub use inference::{GpuArtifacts, GpuInference};
+pub use config::MetalConfig;
+pub use error::MetalError;
+pub use inference::{MetalArtifacts, MetalInference};

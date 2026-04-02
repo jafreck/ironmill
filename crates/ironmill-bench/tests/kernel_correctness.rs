@@ -8,12 +8,12 @@
 #[ignore]
 fn polarquant_matvec_int4_correctness() {
     use half::f16;
-    use ironmill_inference::gpu::ops::GpuPipelines;
+    use ironmill_inference::metal::ops::MetalPipelines;
     use ironmill_metal_sys::{MetalDevice, StorageMode};
 
     let device = MetalDevice::system_default().expect("no Metal device");
     let queue = device.create_command_queue().expect("command queue");
-    let pipelines = GpuPipelines::compile(&device).expect("compile pipelines");
+    let pipelines = MetalPipelines::compile(&device).expect("compile pipelines");
 
     // Small test case: A=[1, 8], B=[4, 8] → C=[1, 4]
     let m = 1usize;
