@@ -9,15 +9,12 @@ use clap::{Parser, Subcommand};
 use ironmill_compile::ane::passes::ModelSplitPass;
 use ironmill_compile::ane::validate::validate_ane_compatibility;
 use ironmill_compile::ane::validate::{print_validation_report, validation_report_to_json};
-#[allow(unused_imports)]
 use ironmill_compile::convert::pipeline::{convert_pipeline, parse_pipeline_manifest};
-#[allow(unused_imports)]
 use ironmill_compile::coreml::compiler::{compile_model, is_compiler_available};
 use ironmill_compile::gpu::GpuCompileBuilder;
 use ironmill_compile::gpu::bundle::write_gpu_bundle;
 use ironmill_compile::mil::PassPipeline;
 use ironmill_compile::mil::PipelineReport;
-#[allow(unused_imports)]
 use ironmill_compile::mil::{
     ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer,
     onnx_to_program_with_config, program_to_model, program_to_multi_function_model,
@@ -59,152 +56,154 @@ enum KvQuantArg {
     TurboInt8,
 }
 
+#[derive(clap::Args)]
+struct CompileArgs {
+    /// Path to the input model (.onnx, .mlmodel, or .mlpackage).
+    input: String,
+
+    /// Path for the output .mlpackage.
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// Target compute units: "all", "cpu-only", "cpu-and-ne", "cpu-and-gpu".
+    #[arg(short, long, default_value = "all")]
+    target: String,
+
+    /// Quantization mode: "none", "fp16", "int8", "mixed-fp16-int8".
+    #[arg(short, long, default_value = "none")]
+    quantize: String,
+
+    /// Calibration data directory (for int8 quantization).
+    #[arg(long = "cal-data", value_name = "DIR")]
+    cal_data: Option<PathBuf>,
+
+    /// Path to a TOML config for mixed-precision quantization.
+    #[arg(long = "quantize-config", value_name = "PATH")]
+    quantize_config: Option<PathBuf>,
+
+    /// Weight palettization bit-width (2, 4, 6, or 8).
+    #[arg(long, value_name = "BITS")]
+    palettize: Option<u8>,
+
+    /// PolarQuant weight quantization bit-width (2 or 4).
+    #[arg(long = "polar-quantize", value_name = "BITS")]
+    polar_quantize: Option<u8>,
+
+    /// Disable fusion and optimization passes.
+    #[arg(long)]
+    no_fusion: bool,
+
+    /// Set a concrete shape for a named input (for ANE compatibility).
+    /// Format: "name:d0,d1,d2,...". May be repeated.
+    #[arg(long = "input-shape", value_name = "NAME:SHAPE")]
+    input_shapes: Vec<String>,
+
+    /// Merge LoRA adapter weights into the base model during conversion (default).
+    /// LoRA A/B weight pairs found in the ONNX initializers are automatically
+    /// detected and merged. Disable with --no-merge-lora.
+    #[arg(long = "merge-lora", default_value_t = true, action = clap::ArgAction::SetTrue)]
+    merge_lora: bool,
+
+    /// Disable automatic LoRA adapter merging.
+    #[arg(long = "no-merge-lora", conflicts_with = "merge_lora")]
+    no_merge_lora: bool,
+
+    /// Emit a separate adapter .mlpackage instead of merging LoRA weights.
+    #[arg(long = "emit-adapter")]
+    emit_adapter: bool,
+
+    /// Path to an external adapter file (e.g. .safetensors). May be repeated.
+    #[arg(long = "adapter", value_name = "PATH")]
+    adapters: Vec<PathBuf>,
+
+    /// Comma-separated list of layer names to mark as updatable for
+    /// on-device training (e.g. "dense_0,dense_1").
+    #[arg(long = "updatable-layers", value_name = "LAYERS")]
+    updatable_layers: Option<String>,
+
+    /// Learning rate for the on-device training optimizer.
+    #[arg(long, default_value = "0.001")]
+    learning_rate: f64,
+
+    /// Number of training epochs for on-device fine-tuning.
+    #[arg(long, default_value = "10")]
+    epochs: i64,
+
+    /// Loss function for on-device training: "cross-entropy" or "mse".
+    #[arg(long = "loss-function", default_value = "cross-entropy")]
+    loss_function: String,
+
+    /// Optimizer for on-device training: "sgd" or "adam".
+    #[arg(long = "optimizer", default_value = "sgd")]
+    optimizer_type: String,
+
+    /// Split the model for speculative decoding: produce a draft model
+    /// with the first N transformer layers and a full verifier model.
+    /// Outputs: <name>-draft.mlpackage and <name>-verifier.mlpackage.
+    #[arg(long = "split-draft-layers", value_name = "N")]
+    split_draft_layers: Option<usize>,
+
+    /// Detect MoE architecture and split into per-expert .mlpackage files.
+    #[arg(long = "moe-split")]
+    moe_split: bool,
+
+    /// Detect MoE architecture and bundle experts as functions in a single .mlpackage.
+    /// Uses CoreML 8+ multi-function model support.
+    #[arg(long = "moe-bundle", conflicts_with = "moe_split")]
+    moe_bundle: bool,
+
+    /// Fuse the top-K most frequently activated MoE experts into a single
+    /// dense .mlpackage, removing router overhead. Requires --cal-data
+    /// pointing to a directory containing an `expert_profile.json` file,
+    /// or a uniform profile is used when --cal-data is omitted.
+    #[arg(long = "moe-fuse-topk", value_name = "K")]
+    moe_fuse_topk: Option<usize>,
+
+    /// Path to a TOML pipeline configuration file.
+    /// When provided, overrides default pass selection and --no-fusion.
+    #[arg(long = "pipeline-config", value_name = "PATH")]
+    pipeline_config: Option<PathBuf>,
+
+    /// Annotate each operation with its preferred compute unit (ANE, GPU,
+    /// CPU, or Any) based on shape-aware ANE constraints.
+    #[arg(long = "annotate-compute-units")]
+    annotate_compute_units: bool,
+
+    /// ANE memory budget per operation (e.g. "1GB", "2GB", "512MB").
+    /// Operations exceeding this budget are split into smaller tiles.
+    /// Default: 1GB (iOS). Use 2GB for macOS.
+    #[arg(long = "ane-memory-budget", value_name = "SIZE")]
+    ane_memory_budget: Option<String>,
+
+    /// Emit ANE-optimized ops in weight-based templates (1×1 conv projections,
+    /// decomposed RMSNorm, KV-cache state, prefill/decode split).
+    #[arg(long)]
+    ane: bool,
+
+    /// Runtime backend for inference: "coreml" (default) or "ane-direct" (experimental).
+    ///
+    /// When set to "ane-direct", uses the direct ANE runtime instead of CoreML,
+    /// bypassing MLModel for potentially lower latency. Requires --features ane-direct.
+    #[arg(long, value_enum, default_value_t = RuntimeArg::CoreMl)]
+    runtime: RuntimeArg,
+
+    /// KV cache quantization strategy. Options: "none" (default), "turbo-int8".
+    #[arg(long, value_enum, default_value = "none")]
+    kv_quant: KvQuantArg,
+
+    /// Enable QJL 1-bit bias correction for TurboQuant (requires --kv-quant turbo-int8).
+    #[arg(long, default_value_t = false)]
+    kv_quant_qjl: bool,
+
+    /// Maximum sequence length for KV cache allocation (default: 2048).
+    #[arg(long, default_value_t = 2048)]
+    max_seq_len: usize,
+}
+
 #[derive(Subcommand)]
-#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Convert an ONNX model to CoreML format (.mlpackage).
-    Compile {
-        /// Path to the input model (.onnx, .mlmodel, or .mlpackage).
-        input: String,
-
-        /// Path for the output .mlpackage.
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Target compute units: "all", "cpu-only", "cpu-and-ne", "cpu-and-gpu".
-        #[arg(short, long, default_value = "all")]
-        target: String,
-
-        /// Quantization mode: "none", "fp16", "int8", "mixed-fp16-int8".
-        #[arg(short, long, default_value = "none")]
-        quantize: String,
-
-        /// Calibration data directory (for int8 quantization).
-        #[arg(long = "cal-data", value_name = "DIR")]
-        cal_data: Option<PathBuf>,
-
-        /// Path to a TOML config for mixed-precision quantization.
-        #[arg(long = "quantize-config", value_name = "PATH")]
-        quantize_config: Option<PathBuf>,
-
-        /// Weight palettization bit-width (2, 4, 6, or 8).
-        #[arg(long, value_name = "BITS")]
-        palettize: Option<u8>,
-
-        /// PolarQuant weight quantization bit-width (2 or 4).
-        #[arg(long = "polar-quantize", value_name = "BITS")]
-        polar_quantize: Option<u8>,
-
-        /// Disable fusion and optimization passes.
-        #[arg(long)]
-        no_fusion: bool,
-
-        /// Set a concrete shape for a named input (for ANE compatibility).
-        /// Format: "name:d0,d1,d2,...". May be repeated.
-        #[arg(long = "input-shape", value_name = "NAME:SHAPE")]
-        input_shapes: Vec<String>,
-
-        /// Merge LoRA adapter weights into the base model during conversion (default).
-        /// LoRA A/B weight pairs found in the ONNX initializers are automatically
-        /// detected and merged. Disable with --no-merge-lora.
-        #[arg(long = "merge-lora", default_value_t = true, action = clap::ArgAction::SetTrue)]
-        merge_lora: bool,
-
-        /// Disable automatic LoRA adapter merging.
-        #[arg(long = "no-merge-lora", conflicts_with = "merge_lora")]
-        no_merge_lora: bool,
-
-        /// Emit a separate adapter .mlpackage instead of merging LoRA weights.
-        #[arg(long = "emit-adapter")]
-        emit_adapter: bool,
-
-        /// Path to an external adapter file (e.g. .safetensors). May be repeated.
-        #[arg(long = "adapter", value_name = "PATH")]
-        adapters: Vec<PathBuf>,
-
-        /// Comma-separated list of layer names to mark as updatable for
-        /// on-device training (e.g. "dense_0,dense_1").
-        #[arg(long = "updatable-layers", value_name = "LAYERS")]
-        updatable_layers: Option<String>,
-
-        /// Learning rate for the on-device training optimizer.
-        #[arg(long, default_value = "0.001")]
-        learning_rate: f64,
-
-        /// Number of training epochs for on-device fine-tuning.
-        #[arg(long, default_value = "10")]
-        epochs: i64,
-
-        /// Loss function for on-device training: "cross-entropy" or "mse".
-        #[arg(long = "loss-function", default_value = "cross-entropy")]
-        loss_function: String,
-
-        /// Optimizer for on-device training: "sgd" or "adam".
-        #[arg(long = "optimizer", default_value = "sgd")]
-        optimizer_type: String,
-
-        /// Split the model for speculative decoding: produce a draft model
-        /// with the first N transformer layers and a full verifier model.
-        /// Outputs: <name>-draft.mlpackage and <name>-verifier.mlpackage.
-        #[arg(long = "split-draft-layers", value_name = "N")]
-        split_draft_layers: Option<usize>,
-
-        /// Detect MoE architecture and split into per-expert .mlpackage files.
-        #[arg(long = "moe-split")]
-        moe_split: bool,
-
-        /// Detect MoE architecture and bundle experts as functions in a single .mlpackage.
-        /// Uses CoreML 8+ multi-function model support.
-        #[arg(long = "moe-bundle", conflicts_with = "moe_split")]
-        moe_bundle: bool,
-
-        /// Fuse the top-K most frequently activated MoE experts into a single
-        /// dense .mlpackage, removing router overhead. Requires --cal-data
-        /// pointing to a directory containing an `expert_profile.json` file,
-        /// or a uniform profile is used when --cal-data is omitted.
-        #[arg(long = "moe-fuse-topk", value_name = "K")]
-        moe_fuse_topk: Option<usize>,
-
-        /// Path to a TOML pipeline configuration file.
-        /// When provided, overrides default pass selection and --no-fusion.
-        #[arg(long = "pipeline-config", value_name = "PATH")]
-        pipeline_config: Option<PathBuf>,
-
-        /// Annotate each operation with its preferred compute unit (ANE, GPU,
-        /// CPU, or Any) based on shape-aware ANE constraints.
-        #[arg(long = "annotate-compute-units")]
-        annotate_compute_units: bool,
-
-        /// ANE memory budget per operation (e.g. "1GB", "2GB", "512MB").
-        /// Operations exceeding this budget are split into smaller tiles.
-        /// Default: 1GB (iOS). Use 2GB for macOS.
-        #[arg(long = "ane-memory-budget", value_name = "SIZE")]
-        ane_memory_budget: Option<String>,
-
-        /// Emit ANE-optimized ops in weight-based templates (1×1 conv projections,
-        /// decomposed RMSNorm, KV-cache state, prefill/decode split).
-        #[arg(long)]
-        ane: bool,
-
-        /// Runtime backend for inference: "coreml" (default) or "ane-direct" (experimental).
-        ///
-        /// When set to "ane-direct", uses the direct ANE runtime instead of CoreML,
-        /// bypassing MLModel for potentially lower latency. Requires --features ane-direct.
-        #[arg(long, value_enum, default_value_t = RuntimeArg::CoreMl)]
-        runtime: RuntimeArg,
-
-        /// KV cache quantization strategy. Options: "none" (default), "turbo-int8".
-        #[arg(long, value_enum, default_value = "none")]
-        kv_quant: KvQuantArg,
-
-        /// Enable QJL 1-bit bias correction for TurboQuant (requires --kv-quant turbo-int8).
-        #[arg(long, default_value_t = false)]
-        kv_quant_qjl: bool,
-
-        /// Maximum sequence length for KV cache allocation (default: 2048).
-        #[arg(long, default_value_t = 2048)]
-        max_seq_len: usize,
-    },
+    Compile(Box<CompileArgs>),
 
     /// Inspect a model and show its structure.
     Inspect {
@@ -292,72 +291,43 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Compile {
-            input,
-            output,
-            target,
-            quantize,
-            cal_data,
-            quantize_config,
-            palettize,
-            polar_quantize,
-            no_fusion,
-            input_shapes,
-            merge_lora,
-            no_merge_lora,
-            emit_adapter,
-            adapters,
-            updatable_layers,
-            learning_rate,
-            epochs,
-            loss_function,
-            optimizer_type,
-            split_draft_layers,
-            moe_split,
-            moe_bundle,
-            moe_fuse_topk,
-            pipeline_config,
-            annotate_compute_units,
-            ane_memory_budget,
-            ane,
-            runtime,
-            kv_quant,
-            kv_quant_qjl,
-            max_seq_len,
-        } => cmd_compile(
-            &input,
-            CompileOpts {
-                output,
-                target,
-                quantize,
-                cal_data,
-                quantize_config,
-                palettize,
-                polar_quantize,
-                no_fusion,
-                input_shapes,
-                merge_lora: merge_lora && !no_merge_lora,
-                emit_adapter,
-                adapters,
-                updatable_layers,
-                learning_rate,
-                epochs,
-                loss_function,
-                optimizer_type,
-                split_draft_layers,
-                moe_split,
-                moe_bundle,
-                moe_fuse_topk,
-                pipeline_config,
-                annotate_compute_units,
-                ane_memory_budget,
-                ane,
-                runtime,
-                kv_quant,
-                kv_quant_qjl,
-                max_seq_len,
-            },
-        ),
+        Commands::Compile(args) => {
+            let merge_lora = args.merge_lora && !args.no_merge_lora;
+            cmd_compile(
+                &args.input,
+                CompileOpts {
+                    output: args.output,
+                    target: args.target,
+                    quantize: args.quantize,
+                    cal_data: args.cal_data,
+                    quantize_config: args.quantize_config,
+                    palettize: args.palettize,
+                    polar_quantize: args.polar_quantize,
+                    no_fusion: args.no_fusion,
+                    input_shapes: args.input_shapes,
+                    merge_lora,
+                    emit_adapter: args.emit_adapter,
+                    adapters: args.adapters,
+                    updatable_layers: args.updatable_layers,
+                    learning_rate: args.learning_rate,
+                    epochs: args.epochs,
+                    loss_function: args.loss_function,
+                    optimizer_type: args.optimizer_type,
+                    split_draft_layers: args.split_draft_layers,
+                    moe_split: args.moe_split,
+                    moe_bundle: args.moe_bundle,
+                    moe_fuse_topk: args.moe_fuse_topk,
+                    pipeline_config: args.pipeline_config,
+                    annotate_compute_units: args.annotate_compute_units,
+                    ane_memory_budget: args.ane_memory_budget,
+                    ane: args.ane,
+                    runtime: args.runtime,
+                    kv_quant: args.kv_quant,
+                    kv_quant_qjl: args.kv_quant_qjl,
+                    max_seq_len: args.max_seq_len,
+                },
+            )
+        }
         Commands::Inspect { input } => cmd_inspect(&input),
         Commands::Validate { input, format } => cmd_validate(&input, &format),
         Commands::CompilePipeline { manifest, output } => {
