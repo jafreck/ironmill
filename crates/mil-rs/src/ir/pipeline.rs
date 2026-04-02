@@ -8,13 +8,14 @@ use std::time::Instant;
 use serde::Deserialize;
 
 use super::pass::Pass;
+use super::passes::awq_quantize::AwqQuantizePass;
 use super::passes::{
-    AffineQuantizePass, AttentionFusionPass, ConstantFoldPass, ConvBatchNormFusionPass,
-    ConvBatchNormWeightFoldPass, ConvReluFusionPass, DeadCodeEliminationPass, Fp16QuantizePass,
-    GeluLinearFusionPass, GqaFusionPass, Granularity, IdentityEliminationPass, Int8QuantizePass,
-    LayerNormLinearFusionPass, LayoutOptimizationPass, LinearReluFusionPass, PalettizePass,
-    PolarQuantPass, PolarRotationFusionPass, ResidualAddFusionPass, ShapeMaterializePass,
-    TypeRepropagationPass,
+    AffineQuantizePass, AttentionFusionPass, AwqScaleFusionPass, ConstantFoldPass,
+    ConvBatchNormFusionPass, ConvBatchNormWeightFoldPass, ConvReluFusionPass,
+    DeadCodeEliminationPass, Fp16QuantizePass, GeluLinearFusionPass, GqaFusionPass, Granularity,
+    IdentityEliminationPass, Int8QuantizePass, LayerNormLinearFusionPass, LayoutOptimizationPass,
+    LinearReluFusionPass, PalettizePass, PolarQuantPass, PolarRotationFusionPass,
+    ResidualAddFusionPass, ShapeMaterializePass, TypeRepropagationPass,
 };
 use super::program::Program;
 use crate::error::{MilError, Result};
@@ -28,6 +29,7 @@ pub struct PassPipeline {
     has_fp16: bool,
     has_int8: bool,
     has_int4: bool,
+    has_awq: bool,
     has_palettize: bool,
     has_polar_quant: bool,
     has_gptq: bool,
@@ -200,6 +202,7 @@ impl std::fmt::Debug for PassPipeline {
             .field("has_fp16", &self.has_fp16)
             .field("has_int8", &self.has_int8)
             .field("has_int4", &self.has_int4)
+            .field("has_awq", &self.has_awq)
             .field("has_palettize", &self.has_palettize)
             .field("has_polar_quant", &self.has_polar_quant)
             .field("has_gptq", &self.has_gptq)
@@ -240,6 +243,7 @@ impl PassPipeline {
             has_fp16: false,
             has_int8: false,
             has_int4: false,
+            has_awq: false,
             has_palettize: false,
             has_polar_quant: false,
             has_gptq: false,
@@ -279,6 +283,7 @@ impl PassPipeline {
         let mut has_fp16 = false;
         let mut has_int8 = false;
         let mut has_int4 = false;
+        let has_awq = false;
         let mut has_palettize = false;
         let mut has_polar_quant = false;
 
@@ -375,6 +380,7 @@ impl PassPipeline {
             has_fp16,
             has_int8,
             has_int4,
+            has_awq,
             has_palettize,
             has_polar_quant,
             has_gptq: false,
@@ -415,6 +421,11 @@ impl PassPipeline {
                 "INT4 and INT8 quantization are mutually exclusive".into(),
             ));
         }
+        if self.has_awq {
+            return Err(MilError::Validation(
+                "AWQ and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
         self.has_int8 = true;
         self.passes.push(Box::new(Int8QuantizePass::new(
             cal_dir,
@@ -443,6 +454,11 @@ impl PassPipeline {
                 "palettization is mutually exclusive with int4 quantization".into(),
             ));
         }
+        if self.has_awq {
+            return Err(MilError::Validation(
+                "INT4 and AWQ quantization are mutually exclusive".into(),
+            ));
+        }
         self.has_int4 = true;
         // Insert before type-repropagation (last pass in default pipeline).
         let insert_pos = self
@@ -459,11 +475,53 @@ impl PassPipeline {
 
     /// Add AWQ (Activation-aware Weight Quantization).
     ///
-    /// Stub: calibration-data-aware quantization is not yet implemented.
-    pub fn with_awq(self, _group_size: usize) -> Result<Self> {
-        Err(MilError::Validation(
-            "AWQ requires calibration data and is not yet implemented".into(),
-        ))
+    /// Inserts `AwqQuantizePass` before type-repropagation and
+    /// `AwqScaleFusionPass` immediately after it. AWQ uses per-channel
+    /// activation magnitudes collected during calibration to protect
+    /// salient weight channels from quantization error.
+    ///
+    /// Mutually exclusive with INT4, INT8, palettization, and polar
+    /// quantization.
+    pub fn with_awq(
+        mut self,
+        channel_magnitudes: HashMap<String, Vec<f32>>,
+        group_size: usize,
+    ) -> Result<Self> {
+        if self.has_int8 {
+            return Err(MilError::Validation(
+                "AWQ and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_int4 {
+            return Err(MilError::Validation(
+                "AWQ and INT4 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_polar_quant {
+            return Err(MilError::Validation(
+                "AWQ and polar-quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_palettize {
+            return Err(MilError::Validation(
+                "AWQ and palettization are mutually exclusive".into(),
+            ));
+        }
+        self.has_awq = true;
+        // Insert AwqQuantizePass before type-repropagation.
+        let insert_pos = self
+            .passes
+            .iter()
+            .position(|p| p.name() == "type-repropagation")
+            .unwrap_or(self.passes.len());
+        self.passes.insert(
+            insert_pos,
+            Box::new(AwqQuantizePass::new(4, group_size, channel_magnitudes)),
+        );
+        // Insert AwqScaleFusionPass right after AwqQuantizePass.
+        self.passes
+            .insert(insert_pos + 1, Box::new(AwqScaleFusionPass));
+        Ok(self)
     }
 
     /// Add GPTQ weight quantization.
@@ -546,6 +604,11 @@ impl PassPipeline {
                 "INT4 quantization and palettization are mutually exclusive".into(),
             ));
         }
+        if self.has_awq {
+            return Err(MilError::Validation(
+                "AWQ and palettization are mutually exclusive".into(),
+            ));
+        }
         if self.has_polar_quant {
             return Err(MilError::Validation(
                 "polar-quantization is mutually exclusive with fp16/int8/palettization".into(),
@@ -567,9 +630,10 @@ impl PassPipeline {
     /// at the specified bit-width (2 or 4). Automatically schedules
     /// the rotation fusion pass after quantization.
     pub fn with_polar_quant(mut self, n_bits: u8) -> Result<Self> {
-        if self.has_fp16 || self.has_int8 || self.has_palettize || self.has_int4 {
+        if self.has_fp16 || self.has_int8 || self.has_palettize || self.has_int4 || self.has_awq {
             return Err(MilError::Validation(
-                "polar-quantization is mutually exclusive with fp16/int4/int8/palettization".into(),
+                "polar-quantization is mutually exclusive with fp16/int4/int8/awq/palettization"
+                    .into(),
             ));
         }
         if n_bits != 2 && n_bits != 4 {
@@ -1341,14 +1405,126 @@ name = "int4-quantize"
         assert_eq!(pipeline.pass_names(), vec!["affine-quantization"]);
     }
 
+    // ── AWQ pipeline tests ────────────────────────────────────────────
+
+    fn sample_magnitudes() -> HashMap<String, Vec<f32>> {
+        let mut m = HashMap::new();
+        m.insert("weight_0".to_string(), vec![1.0, 2.0, 3.0, 4.0]);
+        m.insert("weight_1".to_string(), vec![0.5, 1.5, 2.5, 3.5]);
+        m
+    }
+
     #[test]
-    fn awq_stub_returns_error() {
-        let result = PassPipeline::new().with_awq(128);
+    fn with_awq_builds_pipeline() {
+        let pipeline = PassPipeline::new()
+            .with_awq(sample_magnitudes(), 128)
+            .unwrap();
+        let names = pipeline.pass_names();
+        assert!(
+            names.contains(&"awq-quantization"),
+            "expected awq-quantization pass, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"awq-scale-fusion"),
+            "expected awq-scale-fusion pass, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn with_awq_inserts_before_type_repropagation() {
+        let pipeline = PassPipeline::new()
+            .with_awq(sample_magnitudes(), 128)
+            .unwrap();
+        let names = pipeline.pass_names();
+        let awq_pos = names.iter().position(|n| *n == "awq-quantization").unwrap();
+        let fusion_pos = names.iter().position(|n| *n == "awq-scale-fusion").unwrap();
+        let repr_pos = names
+            .iter()
+            .position(|n| *n == "type-repropagation")
+            .unwrap();
+        assert!(
+            awq_pos < repr_pos,
+            "awq-quantization ({awq_pos}) should come before type-repropagation ({repr_pos})"
+        );
+        assert_eq!(
+            fusion_pos,
+            awq_pos + 1,
+            "awq-scale-fusion should immediately follow awq-quantization"
+        );
+    }
+
+    #[test]
+    fn awq_and_int4_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int4(128).unwrap();
+        let result = pipeline.with_awq(sample_magnitudes(), 128);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("calibration data"),
-            "expected calibration error, got: {err}"
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn awq_and_int8_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int8(None).unwrap();
+        let result = pipeline.with_awq(sample_magnitudes(), 128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn awq_and_polar_quant_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_polar_quant(4).unwrap();
+        let result = pipeline.with_awq(sample_magnitudes(), 128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn awq_and_palettize_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_palettize(4).unwrap();
+        let result = pipeline.with_awq(sample_magnitudes(), 128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn awq_plus_fp16_is_allowed() {
+        let pipeline = PassPipeline::new()
+            .with_fp16()
+            .unwrap()
+            .with_awq(sample_magnitudes(), 128)
+            .unwrap();
+        let names = pipeline.pass_names();
+        assert!(names.contains(&"fp16-quantization"));
+        assert!(names.contains(&"awq-quantization"));
+        assert!(names.contains(&"awq-scale-fusion"));
+    }
+
+    #[test]
+    fn awq_blocks_subsequent_int4() {
+        let pipeline = PassPipeline::new()
+            .with_awq(sample_magnitudes(), 128)
+            .unwrap();
+        let result = pipeline.with_int4(128);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
         );
     }
 
