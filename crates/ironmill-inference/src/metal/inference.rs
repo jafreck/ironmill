@@ -596,217 +596,47 @@ impl MetalInference {
             let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-            // Q projection
-            match &lw.q_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.norm_out,
-                                packed_buf,
-                                &bufs.q_proj,
-                                (mc.num_attention_heads * mc.head_dim) as u32,
-                                h as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let q_weight_mat = MpsMatrix::from_buffer(
-                                buf,
-                                mc.num_attention_heads * mc.head_dim,
-                                h,
-                                row_bytes_h,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let q_result_mat = MpsMatrix::from_buffer(
-                                &bufs.q_proj,
-                                token_count,
-                                mc.num_attention_heads * mc.head_dim,
-                                row_bytes_qo,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.q.dense()
-                                .encode(&cmd_buf, &norm_mat, &q_weight_mat, &q_result_mat);
-                        }
-                    } else {
-                        let q_weight_mat = MpsMatrix::from_buffer(
-                            buf,
-                            mc.num_attention_heads * mc.head_dim,
-                            h,
-                            row_bytes_h,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let q_result_mat = MpsMatrix::from_buffer(
-                            &bufs.q_proj,
-                            token_count,
-                            mc.num_attention_heads * mc.head_dim,
-                            row_bytes_qo,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.q.dense()
-                            .encode(&cmd_buf, &norm_mat, &q_weight_mat, &q_result_mat);
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.norm_out,
-                        q,
-                        &bufs.q_proj,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-            }
-
-            // K projection
-            match &lw.k_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.norm_out,
-                                packed_buf,
-                                &bufs.k_proj,
-                                (mc.num_kv_heads() * mc.head_dim) as u32,
-                                h as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let k_weight_mat = MpsMatrix::from_buffer(
-                                buf,
-                                mc.num_kv_heads() * mc.head_dim,
-                                h,
-                                row_bytes_h,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let k_result_mat = MpsMatrix::from_buffer(
-                                &bufs.k_proj,
-                                token_count,
-                                mc.num_kv_heads() * mc.head_dim,
-                                row_bytes_kv,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.k.dense()
-                                .encode(&cmd_buf, &norm_mat, &k_weight_mat, &k_result_mat);
-                        }
-                    } else {
-                        let k_weight_mat = MpsMatrix::from_buffer(
-                            buf,
-                            mc.num_kv_heads() * mc.head_dim,
-                            h,
-                            row_bytes_h,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let k_result_mat = MpsMatrix::from_buffer(
-                            &bufs.k_proj,
-                            token_count,
-                            mc.num_kv_heads() * mc.head_dim,
-                            row_bytes_kv,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.k.dense()
-                            .encode(&cmd_buf, &norm_mat, &k_weight_mat, &k_result_mat);
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.norm_out,
-                        q,
-                        &bufs.k_proj,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
-            }
-
-            // V projection
-            match &lw.v_proj {
-                WeightBuffer::Dense { buf, packed } => {
-                    if token_count == 1 {
-                        if let Some(packed_buf) = packed {
-                            let enc = cmd_buf
-                                .compute_encoder()
-                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            ops::encode_matvec(
-                                &enc,
-                                &self.pipelines().matvec,
-                                &bufs.norm_out,
-                                packed_buf,
-                                &bufs.v_proj,
-                                (mc.num_kv_heads() * mc.head_dim) as u32,
-                                h as u32,
-                            );
-                            enc.end_encoding();
-                        } else {
-                            let v_weight_mat = MpsMatrix::from_buffer(
-                                buf,
-                                mc.num_kv_heads() * mc.head_dim,
-                                h,
-                                row_bytes_h,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            let v_result_mat = MpsMatrix::from_buffer(
-                                &bufs.v_proj,
-                                token_count,
-                                mc.num_kv_heads() * mc.head_dim,
-                                row_bytes_kv,
-                            )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                            lm.v.dense()
-                                .encode(&cmd_buf, &norm_mat, &v_weight_mat, &v_result_mat);
-                        }
-                    } else {
-                        let v_weight_mat = MpsMatrix::from_buffer(
-                            buf,
-                            mc.num_kv_heads() * mc.head_dim,
-                            h,
-                            row_bytes_h,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        let v_result_mat = MpsMatrix::from_buffer(
-                            &bufs.v_proj,
-                            token_count,
-                            mc.num_kv_heads() * mc.head_dim,
-                            row_bytes_kv,
-                        )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                        lm.v.dense()
-                            .encode(&cmd_buf, &norm_mat, &v_weight_mat, &v_result_mat);
-                    }
-                }
-                WeightBuffer::Quantized(q) => {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    encode_polarquant_matmul(
-                        &enc,
-                        &bufs.norm_out,
-                        q,
-                        &bufs.v_proj,
-                        self.pipelines(),
-                        token_count,
-                    )?;
-                    enc.end_encoding();
-                }
+            // Q / K / V projections
+            let qkv_out_features = mc.num_attention_heads * mc.head_dim;
+            let kv_out_features = mc.num_kv_heads() * mc.head_dim;
+            let pipelines = self.pipelines();
+            for (weight, output_buf, matmul, out_features, row_bytes_out) in [
+                (
+                    &lw.q_proj,
+                    &bufs.q_proj,
+                    &lm.q,
+                    qkv_out_features,
+                    row_bytes_qo,
+                ),
+                (
+                    &lw.k_proj,
+                    &bufs.k_proj,
+                    &lm.k,
+                    kv_out_features,
+                    row_bytes_kv,
+                ),
+                (
+                    &lw.v_proj,
+                    &bufs.v_proj,
+                    &lm.v,
+                    kv_out_features,
+                    row_bytes_kv,
+                ),
+            ] {
+                encode_projection(
+                    &cmd_buf,
+                    &bufs.norm_out,
+                    &norm_mat,
+                    weight,
+                    output_buf,
+                    matmul,
+                    pipelines,
+                    token_count,
+                    out_features,
+                    h,
+                    row_bytes_h,
+                    row_bytes_out,
+                )?;
             }
 
             // QK normalization (Qwen3): per-head RMSNorm on Q and K before RoPE.
@@ -1656,6 +1486,69 @@ impl ModelConfigExt for ModelConfig {
     fn num_kv_heads(&self) -> usize {
         self.num_key_value_heads
     }
+}
+
+// ── Projection dispatch helper ──────────────────────────────────
+
+/// Encode a single Q/K/V-style linear projection.
+///
+/// Handles all weight representations:
+/// - **Dense + packed (token_count == 1):** custom blocked matvec kernel.
+/// - **Dense (general):** MPS matrix multiplication.
+/// - **Quantized:** PolarQuant compute kernel.
+fn encode_projection(
+    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    input_buf: &MetalBuffer,
+    input_mat: &MpsMatrix,
+    weight: &WeightBuffer,
+    output_buf: &MetalBuffer,
+    matmul: &ProjectionMatmul,
+    pipelines: &super::ops::MetalPipelines,
+    token_count: usize,
+    out_features: usize,
+    in_features: usize,
+    row_bytes_in: usize,
+    row_bytes_out: usize,
+) -> Result<(), InferenceError> {
+    match weight {
+        WeightBuffer::Dense { buf, packed } => {
+            if token_count == 1 {
+                if let Some(packed_buf) = packed {
+                    let enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    ops::encode_matvec(
+                        &enc,
+                        &pipelines.matvec,
+                        input_buf,
+                        packed_buf,
+                        output_buf,
+                        out_features as u32,
+                        in_features as u32,
+                    );
+                    enc.end_encoding();
+                    return Ok(());
+                }
+            }
+            // MPS matmul path: multi-token, or single-token without packed buf.
+            let weight_mat = MpsMatrix::from_buffer(buf, out_features, in_features, row_bytes_in)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let result_mat =
+                MpsMatrix::from_buffer(output_buf, token_count, out_features, row_bytes_out)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            matmul
+                .dense()
+                .encode(cmd_buf, input_mat, &weight_mat, &result_mat);
+        }
+        WeightBuffer::Quantized(q) => {
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            encode_polarquant_matmul(&enc, input_buf, q, output_buf, pipelines, token_count)?;
+            enc.end_encoding();
+        }
+    }
+    Ok(())
 }
 
 // ── PolarQuant kernel dispatch ──────────────────────────────────
