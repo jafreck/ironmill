@@ -79,6 +79,19 @@ pub struct AneConfig {
     /// allocations. Falls back to unfused execution if a fused program
     /// fails to compile or exceeds ANE limits.
     pub enable_fusion: bool,
+    /// Enable experimental hybrid ANE↔GPU execution via shared events.
+    ///
+    /// When set, the decode loop attempts to coordinate ANE and Metal GPU
+    /// work using `MTLSharedEvent`-backed `SharedSignalEvent`/`SharedWaitEvent`
+    /// fences. This removes the CPU from the critical path between GPU
+    /// projections and ANE attention.
+    ///
+    /// **Requires** shared event support verified by probe 15
+    /// (`probe_shared_events`). Falls back to the standard per-layer
+    /// eval path if shared events are not available or the handoff fails.
+    ///
+    /// **Highly experimental — disabled by default.**
+    pub enable_hybrid: bool,
 }
 
 impl Default for AneConfig {
@@ -92,6 +105,7 @@ impl Default for AneConfig {
             enable_profiling: false,
             enable_chaining: false,
             enable_fusion: false,
+            enable_hybrid: false,
         }
     }
 }
@@ -522,5 +536,6 @@ mod tests {
         assert_eq!(c.qos, 33);
         assert!(!c.enable_profiling);
         assert!(!c.enable_chaining);
+        assert!(!c.enable_hybrid);
     }
 }

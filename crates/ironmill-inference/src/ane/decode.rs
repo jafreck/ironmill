@@ -104,6 +104,12 @@ pub struct AneInference<D: AneDevice> {
     /// Cache-write K/V fusion is always active (the cache-write program
     /// inherently fuses both K and V quantization into one dispatch).
     enable_fusion: bool,
+    /// Hybrid ANE↔GPU execution enabled. When `true`, the decode loop
+    /// attempts to coordinate GPU projections and ANE attention via
+    /// `MTLSharedEvent`-backed fences, removing the CPU from the
+    /// critical path. Falls back to standard per-layer eval on failure.
+    /// **Highly experimental.**
+    enable_hybrid: bool,
 }
 
 /// CPU-side weight tensor for embedding/lm_head.
@@ -755,6 +761,7 @@ impl<D: AneDevice> AneInference<D> {
             enable_profiling: false,
             enable_chaining: false,
             enable_fusion: false,
+            enable_hybrid: false,
         })
     }
 
@@ -788,6 +795,71 @@ impl<D: AneDevice> AneInference<D> {
     /// (the cache-write program inherently fuses both K and V).
     pub fn set_fusion(&mut self, enable: bool) {
         self.enable_fusion = enable;
+    }
+
+    /// Enable or disable experimental hybrid ANE↔GPU execution.
+    ///
+    /// When enabled, the decode loop attempts to use `MTLSharedEvent`-backed
+    /// fences to coordinate GPU Q/K/V projections with ANE attention,
+    /// removing the CPU from the critical synchronization path.
+    ///
+    /// **Prerequisites:**
+    /// - Shared event support must be verified by probe 15
+    ///   (`probe_shared_events` in `ironmill-ane-sys`).
+    /// - Metal GPU infrastructure must be available.
+    ///
+    /// Falls back to standard per-layer eval if shared events are
+    /// unavailable or the handoff fails. **Highly experimental.**
+    pub fn set_hybrid(&mut self, enable: bool) {
+        self.enable_hybrid = enable;
+    }
+
+    /// Attempt a hybrid ANE↔GPU decode step for a single layer.
+    ///
+    /// The intended pipeline:
+    ///   1. GPU computes Q/K/V projections → signals shared event at value N
+    ///   2. ANE waits for value N → runs attention → signals at value N+1
+    ///   3. GPU waits for value N+1 → continues with post-attention
+    ///
+    /// This eliminates the CPU from the GPU→ANE→GPU synchronization path.
+    ///
+    /// # Current status
+    ///
+    /// This is a placeholder that logs the attempt and returns `Err` to
+    /// trigger the fallback path. The actual Metal↔ANE handoff requires:
+    /// - A compiled Metal compute pipeline for Q/K/V projections
+    /// - An `MTLSharedEvent` bridged to `SharedSignalEvent`/`SharedWaitEvent`
+    /// - An `AneRequest::with_shared_events()` submission
+    ///
+    /// These components depend on probe 15 results confirming that
+    /// `MTLSharedEvent` is accepted by the ANE shared event API.
+    fn try_hybrid_layer(&mut self, _hidden: &[f16], _layer_idx: usize) -> Result<Vec<f16>> {
+        // TODO: Implement actual Metal↔ANE shared-event handoff.
+        //
+        // Sketch of the implementation:
+        //
+        //   // 1. Create or reuse MTLSharedEvent.
+        //   // let shared_event = self.hybrid_shared_event()?;
+        //
+        //   // 2. GPU: encode Q/K/V projection + signal at (seq_pos * 2).
+        //   // let signal_val = (self.seq_pos as u64) * 2;
+        //   // self.gpu_encode_qkv_projection(hidden, layer_idx, shared_event, signal_val)?;
+        //
+        //   // 3. ANE: create wait event for signal_val, signal at signal_val + 1.
+        //   // let wait = SharedWaitEvent::new(signal_val, shared_event)?;
+        //   // let signal = SharedSignalEvent::new(signal_val + 1, 0, 0, shared_event)?;
+        //   // let events = SharedEvents::new(signal_array, wait_array)?;
+        //   // let req = AneRequest::with_shared_events(..., events.as_raw())?;
+        //
+        //   // 4. GPU: encode wait for signal_val + 1, then post-attention.
+        //   // self.gpu_encode_post_attn(layer_idx, shared_event, signal_val + 1)?;
+        //
+        //   // 5. Commit both command buffers, let GPU↔ANE sync happen on-device.
+        //
+        Err(AneError::Other(anyhow::anyhow!(
+            "hybrid ANE↔GPU execution not yet implemented — \
+             requires probe 15 validation of MTLSharedEvent↔ANE interop"
+        )))
     }
 
     // -----------------------------------------------------------------------
@@ -947,6 +1019,28 @@ impl<D: AneDevice> AneInference<D> {
         };
 
         for layer_idx in 0..effective_layers {
+            // Experimental: attempt hybrid ANE↔GPU execution for this layer.
+            // When enabled, GPU computes projections and signals the ANE via
+            // a shared event fence, bypassing CPU synchronization.
+            if self.enable_hybrid {
+                match self.try_hybrid_layer(&hidden, layer_idx) {
+                    Ok(layer_out) => {
+                        hidden = layer_out;
+                        continue; // Skip the standard per-layer path.
+                    }
+                    Err(_e) => {
+                        // Fall through to standard per-layer eval.
+                        // Only log on first failure to avoid spam.
+                        if layer_idx == 0 {
+                            eprintln!(
+                                "[hybrid] ANE↔GPU handoff not available, \
+                                 falling back to standard eval"
+                            );
+                        }
+                    }
+                }
+            }
+
             // Pre-attention: norm → Q/K/V projection
             // Skip if chained pre_attn already dispatched all layers.
             if !chained_pre_attn_ok {

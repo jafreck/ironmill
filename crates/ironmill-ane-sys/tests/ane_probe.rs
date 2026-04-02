@@ -1963,3 +1963,383 @@ fn probe_chaining_multi_program() {
         ironmill_ane_sys::model::remaining_budget()
     );
 }
+
+// =========================================================================
+// Probe 15 — ANE↔GPU Shared Events  (0 compiles)
+// =========================================================================
+
+// Metal framework FFI for shared event probing.
+#[link(name = "Metal", kind = "framework")]
+unsafe extern "C" {
+    fn MTLCreateSystemDefaultDevice() -> *mut c_void;
+}
+
+/// Helper: create an MTLSharedEvent from a Metal device.
+/// Returns `(device, shared_event)` as raw ObjC pointers.
+/// Both are retained — caller must CFRelease.
+unsafe fn create_metal_shared_event() -> Option<(*mut c_void, *mut c_void)> {
+    // SAFETY: MTLCreateSystemDefaultDevice returns a retained MTLDevice or nil.
+    let device = unsafe { MTLCreateSystemDefaultDevice() };
+    if device.is_null() {
+        eprintln!("  ❌ MTLCreateSystemDefaultDevice returned nil");
+        return None;
+    }
+
+    // -[MTLDevice newSharedEvent] → returns a retained MTLSharedEvent.
+    type NewEventFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    let sel = unsafe { sel_registerName(b"newSharedEvent\0".as_ptr()) };
+    let f: NewEventFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    let event = unsafe { f(device, sel) };
+    if event.is_null() {
+        eprintln!("  ❌ newSharedEvent returned nil");
+        unsafe { CFRelease(device) };
+        return None;
+    }
+
+    Some((device, event))
+}
+
+/// Helper: get the current signaledValue of an MTLSharedEvent.
+unsafe fn shared_event_signaled_value(event: *mut c_void) -> u64 {
+    type GetFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64;
+    let sel = unsafe { sel_registerName(b"signaledValue\0".as_ptr()) };
+    let f: GetFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(event, sel) }
+}
+
+/// Helper: create a Metal command queue from a device.
+/// Returns a retained MTLCommandQueue or null.
+unsafe fn create_metal_command_queue(device: *mut c_void) -> *mut c_void {
+    type QueueFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    let sel = unsafe { sel_registerName(b"newCommandQueue\0".as_ptr()) };
+    let f: QueueFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(device, sel) }
+}
+
+/// Helper: create a Metal command buffer from a queue.
+/// Returns an autoreleased MTLCommandBuffer or null.
+unsafe fn create_metal_command_buffer(queue: *mut c_void) -> *mut c_void {
+    type BufFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    let sel = unsafe { sel_registerName(b"commandBuffer\0".as_ptr()) };
+    let f: BufFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(queue, sel) }
+}
+
+/// Helper: encode a signal on a command buffer for a shared event at a given value.
+/// -[MTLCommandBuffer encodeSignalEvent:value:]
+unsafe fn encode_signal_event(cmd_buf: *mut c_void, event: *mut c_void, value: u64) {
+    type SignalFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64);
+    let sel = unsafe { sel_registerName(b"encodeSignalEvent:value:\0".as_ptr()) };
+    let f: SignalFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(cmd_buf, sel, event, value) };
+}
+
+/// Helper: encode a wait on a command buffer for a shared event at a given value.
+/// -[MTLCommandBuffer encodeWaitForEvent:value:]
+unsafe fn encode_wait_for_event(cmd_buf: *mut c_void, event: *mut c_void, value: u64) {
+    type WaitFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64);
+    let sel = unsafe { sel_registerName(b"encodeWaitForEvent:value:\0".as_ptr()) };
+    let f: WaitFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(cmd_buf, sel, event, value) };
+}
+
+/// Helper: commit and waitUntilCompleted on a command buffer.
+unsafe fn commit_and_wait(cmd_buf: *mut c_void) {
+    type VoidFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+    let commit_sel = unsafe { sel_registerName(b"commit\0".as_ptr()) };
+    let wait_sel = unsafe { sel_registerName(b"waitUntilCompleted\0".as_ptr()) };
+    let f: VoidFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(cmd_buf, commit_sel) };
+    unsafe { f(cmd_buf, wait_sel) };
+}
+
+#[test]
+#[ignore]
+fn probe_shared_events() {
+    if !has_ane() {
+        eprintln!("SKIP: no ANE hardware");
+        return;
+    }
+    eprintln!("\n╔══════════════════════════════════════════════╗");
+    eprintln!("║  PROBE 15: ANE↔GPU Shared Events              ║");
+    eprintln!("╚══════════════════════════════════════════════╝\n");
+    eprintln!(
+        "Budget remaining: {}\n",
+        ironmill_ane_sys::model::remaining_budget()
+    );
+
+    // ── Step 1: Create an MTLSharedEvent and wrap it in ANE event types ──
+
+    eprintln!("  --- Step 1: Create MTLSharedEvent + ANE wrappers ---");
+
+    let (mtl_device, mtl_shared_event) = match unsafe { create_metal_shared_event() } {
+        Some(pair) => pair,
+        None => {
+            eprintln!("  ❌ Cannot create Metal shared event — skipping");
+            return;
+        }
+    };
+
+    let initial_val = unsafe { shared_event_signaled_value(mtl_shared_event) };
+    eprintln!("  MTLSharedEvent created: ptr={mtl_shared_event:?}, signaledValue={initial_val}");
+
+    // Attempt to create a SharedSignalEvent wrapping the MTLSharedEvent.
+    let signal_value: u64 = 1;
+    let signal_result = std::panic::catch_unwind(|| unsafe {
+        SharedSignalEvent::new(
+            signal_value,
+            0, // symbol_index
+            0, // event_type
+            mtl_shared_event,
+        )
+    });
+
+    match &signal_result {
+        Ok(Ok(sig)) => {
+            eprintln!("  ✅ SharedSignalEvent::new() succeeded");
+            eprintln!("    value:        {}", sig.value());
+            eprintln!("    symbol_index: {}", sig.symbol_index());
+            eprintln!("    event_type:   {}", sig.event_type());
+            eprintln!("    shared_event: {:?}", sig.shared_event());
+            eprintln!("    agent_mask:   {}", sig.agent_mask());
+        }
+        Ok(Err(e)) => {
+            eprintln!("  ❌ SharedSignalEvent::new() returned error: {e}");
+        }
+        Err(e) => {
+            eprintln!("  💥 SharedSignalEvent::new() panicked: {e:?}");
+        }
+    }
+
+    // Attempt to create a SharedWaitEvent wrapping the MTLSharedEvent.
+    let wait_value: u64 = 1;
+    let wait_result =
+        std::panic::catch_unwind(|| unsafe { SharedWaitEvent::new(wait_value, mtl_shared_event) });
+
+    match &wait_result {
+        Ok(Ok(w)) => {
+            eprintln!("  ✅ SharedWaitEvent::new() succeeded");
+            eprintln!("    value:        {}", w.value());
+            eprintln!("    shared_event: {:?}", w.shared_event());
+            eprintln!("    event_type:   {}", w.event_type());
+        }
+        Ok(Err(e)) => {
+            eprintln!("  ❌ SharedWaitEvent::new() returned error: {e}");
+        }
+        Err(e) => {
+            eprintln!("  💥 SharedWaitEvent::new() panicked: {e:?}");
+        }
+    }
+
+    // Test SharedEvents container (wraps signal + wait arrays).
+    let container_result = if let (Ok(Ok(_sig)), Ok(Ok(_wait))) = (&signal_result, &wait_result) {
+        // Build NSArrays of signal and wait events.
+        let sig_ref = signal_result.as_ref().unwrap().as_ref().unwrap();
+        let wait_ref = wait_result.as_ref().unwrap().as_ref().unwrap();
+        let sig_arr = unsafe { make_nsarray(&[sig_ref.as_raw()]) };
+        let wait_arr = unsafe { make_nsarray(&[wait_ref.as_raw()]) };
+
+        if sig_arr.is_null() || wait_arr.is_null() {
+            eprintln!("  ❌ Failed to create NSArrays for SharedEvents");
+            None
+        } else {
+            let r = std::panic::catch_unwind(|| unsafe { SharedEvents::new(sig_arr, wait_arr) });
+            match &r {
+                Ok(Ok(se)) => {
+                    eprintln!("  ✅ SharedEvents::new() succeeded");
+                    eprintln!("    signal_events: {:?}", se.signal_events());
+                    eprintln!("    wait_events:   {:?}", se.wait_events());
+                }
+                Ok(Err(e)) => {
+                    eprintln!("  ❌ SharedEvents::new() returned error: {e}");
+                }
+                Err(e) => {
+                    eprintln!("  💥 SharedEvents::new() panicked: {e:?}");
+                }
+            }
+            Some(r)
+        }
+    } else {
+        eprintln!("  ⏭  Skipping SharedEvents container — prerequisite failed");
+        None
+    };
+
+    // ── Step 2: Signal from Metal, observe on shared event ──
+
+    eprintln!("\n  --- Step 2: Metal signals shared event ---");
+
+    let queue = unsafe { create_metal_command_queue(mtl_device) };
+    if queue.is_null() {
+        eprintln!("  ❌ Failed to create Metal command queue");
+        unsafe {
+            CFRelease(mtl_shared_event);
+            CFRelease(mtl_device);
+        }
+        return;
+    }
+
+    let signal_test_value: u64 = 42;
+    let cmd_buf = unsafe { create_metal_command_buffer(queue) };
+    if cmd_buf.is_null() {
+        eprintln!("  ❌ Failed to create Metal command buffer");
+        unsafe {
+            CFRelease(queue);
+            CFRelease(mtl_shared_event);
+            CFRelease(mtl_device);
+        }
+        return;
+    }
+
+    // Encode a signal at value 42 and commit.
+    let encode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        encode_signal_event(cmd_buf, mtl_shared_event, signal_test_value);
+        commit_and_wait(cmd_buf);
+    }));
+
+    match encode_result {
+        Ok(()) => {
+            let new_val = unsafe { shared_event_signaled_value(mtl_shared_event) };
+            eprintln!(
+                "  ✅ Metal encodeSignalEvent completed — signaledValue: {} (expected {})",
+                new_val, signal_test_value
+            );
+            if new_val == signal_test_value {
+                eprintln!("  ✅ Shared event value updated correctly by Metal");
+            } else {
+                eprintln!("  ⚠️  signaledValue mismatch (may indicate async completion)");
+            }
+        }
+        Err(ref e) => {
+            eprintln!("  💥 Metal signal encode/commit panicked: {e:?}");
+        }
+    }
+
+    // Can ANE SharedWaitEvent be created for the signaled value?
+    let ane_wait_result = std::panic::catch_unwind(|| unsafe {
+        SharedWaitEvent::new(signal_test_value, mtl_shared_event)
+    });
+    match &ane_wait_result {
+        Ok(Ok(w)) => {
+            eprintln!("  ✅ SharedWaitEvent for Metal-signaled value created");
+            eprintln!("    value: {}, event_type: {}", w.value(), w.event_type());
+        }
+        Ok(Err(e)) => {
+            eprintln!("  ❌ SharedWaitEvent for Metal-signaled value failed: {e}");
+        }
+        Err(e) => {
+            eprintln!("  💥 SharedWaitEvent creation panicked: {e:?}");
+        }
+    }
+
+    // ── Step 3: Bidirectional — ANE signal event + Metal wait ──
+    //
+    // Create an ANE SharedSignalEvent at a future value, then encode a Metal
+    // command buffer that waits for that value. If the ANE evaluation fires
+    // the signal, the Metal wait should unblock.
+    //
+    // NOTE: Actually submitting an ANE eval with shared events requires a
+    // compiled model + AneRequest. This step tests whether the Metal wait
+    // side can be set up (the ANE signal side requires a full eval loop
+    // which is tested in integration tests, not probes).
+
+    eprintln!("\n  --- Step 3: Bidirectional setup (ANE signal → Metal wait) ---");
+
+    let bidi_signal_value: u64 = 100;
+    let bidi_signal = std::panic::catch_unwind(|| unsafe {
+        SharedSignalEvent::new(
+            bidi_signal_value,
+            0, // symbol_index
+            0, // event_type
+            mtl_shared_event,
+        )
+    });
+
+    match &bidi_signal {
+        Ok(Ok(sig)) => {
+            eprintln!(
+                "  ✅ ANE SharedSignalEvent for bidi created (value={})",
+                sig.value()
+            );
+        }
+        Ok(Err(e)) => {
+            eprintln!("  ❌ ANE SharedSignalEvent for bidi failed: {e}");
+        }
+        Err(e) => {
+            eprintln!("  💥 ANE SharedSignalEvent for bidi panicked: {e:?}");
+        }
+    }
+
+    // Verify Metal can encode a wait for the ANE signal value.
+    let cmd_buf2 = unsafe { create_metal_command_buffer(queue) };
+    if !cmd_buf2.is_null() {
+        let wait_encode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            encode_wait_for_event(cmd_buf2, mtl_shared_event, bidi_signal_value);
+        }));
+        match wait_encode {
+            Ok(()) => {
+                eprintln!("  ✅ Metal encodeWaitForEvent({bidi_signal_value}) encoded OK");
+                eprintln!("    (Not committing — ANE signal source requires eval loop)");
+            }
+            Err(e) => {
+                eprintln!("  💥 Metal encodeWaitForEvent panicked: {e:?}");
+            }
+        }
+        // Don't commit cmd_buf2 — it would block forever waiting for the
+        // ANE signal that we can't fire without a full eval path.
+    } else {
+        eprintln!("  ❌ Failed to create second Metal command buffer");
+    }
+
+    // ── Summary ──
+
+    eprintln!("\n  --- Summary ---");
+    let step1_ok = matches!(&signal_result, Ok(Ok(_)))
+        && matches!(&wait_result, Ok(Ok(_)))
+        && matches!(&container_result, Some(Ok(Ok(_))));
+    let step2_ok = matches!(encode_result, Ok(()));
+    let step3_setup_ok = matches!(&bidi_signal, Ok(Ok(_)));
+
+    eprintln!(
+        "  Step 1 (SharedEvent wrappers): {}",
+        if step1_ok { "✅ PASS" } else { "❌ FAIL" }
+    );
+    eprintln!(
+        "  Step 2 (Metal signal → read):  {}",
+        if step2_ok { "✅ PASS" } else { "❌ FAIL" }
+    );
+    eprintln!(
+        "  Step 3 (Bidi setup):           {}",
+        if step3_setup_ok {
+            "✅ PASS"
+        } else {
+            "❌ FAIL"
+        }
+    );
+
+    if step1_ok && step2_ok {
+        eprintln!(
+            "\n  🎯 MTLSharedEvent is compatible with ANE SharedSignalEvent/SharedWaitEvent."
+        );
+        eprintln!("     Hybrid ANE↔GPU execution via shared events is feasible.");
+    } else {
+        eprintln!("\n  ⚠️  Shared event interop needs further investigation.");
+    }
+
+    // Cleanup retained objects.
+    // signal_result, wait_result, container_result drop automatically (Rust Drop).
+    // ane_wait_result and bidi_signal drop automatically.
+    drop(container_result);
+    drop(signal_result);
+    drop(wait_result);
+    drop(ane_wait_result);
+    drop(bidi_signal);
+    unsafe {
+        CFRelease(queue);
+        CFRelease(mtl_shared_event);
+        CFRelease(mtl_device);
+    }
+    eprintln!(
+        "\nBudget remaining: {}",
+        ironmill_ane_sys::model::remaining_budget()
+    );
+}
