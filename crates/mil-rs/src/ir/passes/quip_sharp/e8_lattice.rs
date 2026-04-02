@@ -19,8 +19,8 @@
 //!    even count of negatives, giving 128 vectors.
 //!
 //! We add the zero vector to get 241 entries, then pad to 256 with scaled
-//! variants (shorter E8 lattice points scaled down) so that every 8-bit
-//! index is valid.
+//! E8 root variants at 0.5× and 2.0× to provide better coverage at
+//! different magnitude levels.
 //!
 //! # 4-bit feasibility note
 //!
@@ -44,82 +44,117 @@
 //! offline quantization.  If speed becomes a bottleneck, a KD-tree or
 //! lattice-decoding shortcut can reduce this to O(1) per group.
 
+use std::sync::LazyLock;
+
 /// Number of codebook entries (2-bit = 8 indices per byte gives 256 entries).
 const CODEBOOK_SIZE: usize = 256;
 
 /// Dimensionality of each codebook vector.
 const DIM: usize = 8;
 
+/// Internal storage for the lazily-initialized codebook data.
+struct E8CodebookData {
+    /// 256 codebook entries, each an 8-dimensional vector.
+    entries: [[f32; DIM]; CODEBOOK_SIZE],
+    /// Pre-computed squared norms (`dot(e, e)`) for each entry, invariant
+    /// across all nearest-neighbor queries.
+    norms_sq: [f32; CODEBOOK_SIZE],
+}
+
+/// Lazily-initialized codebook — computed once on first access.
+static CODEBOOK_DATA: LazyLock<E8CodebookData> = LazyLock::new(|| {
+    let mut entries = [[0.0f32; DIM]; CODEBOOK_SIZE];
+    let mut idx = 0;
+
+    // Entry 0: zero vector.
+    idx += 1;
+
+    // Integer orbit: permutations of (±1, ±1, 0, 0, 0, 0, 0, 0).
+    for i in 0..DIM {
+        for j in (i + 1)..DIM {
+            for &si in &[1.0f32, -1.0] {
+                for &sj in &[1.0f32, -1.0] {
+                    entries[idx][i] = si;
+                    entries[idx][j] = sj;
+                    idx += 1;
+                }
+            }
+        }
+    }
+    debug_assert_eq!(idx, 1 + 112); // 0-vector + 112 integer-orbit vectors
+
+    // Half-integer orbit: (±½)⁸ with even number of minus signs.
+    for bits in 0u32..256 {
+        if bits.count_ones() % 2 != 0 {
+            continue; // odd number of negatives → skip
+        }
+        let mut v = [0.5f32; DIM];
+        for d in 0..DIM {
+            if bits & (1 << d) != 0 {
+                v[d] = -0.5;
+            }
+        }
+        entries[idx] = v;
+        idx += 1;
+    }
+    debug_assert_eq!(idx, 241); // 0 + 112 + 128
+
+    // Pad to 256 with scaled E8 root vectors for better coverage at
+    // different magnitude levels:
+    //   - 8 entries at 0.5× scale (norm² = 0.5, for small magnitudes)
+    //   - 7 entries at 2.0× scale (norm² = 8.0, for large magnitudes)
+    for pad in 0..8 {
+        let src = entries[1 + pad];
+        for d in 0..DIM {
+            entries[idx][d] = src[d] * 0.5;
+        }
+        idx += 1;
+    }
+    for pad in 0..7 {
+        let src = entries[1 + pad];
+        for d in 0..DIM {
+            entries[idx][d] = src[d] * 2.0;
+        }
+        idx += 1;
+    }
+    debug_assert_eq!(idx, CODEBOOK_SIZE);
+
+    // Pre-compute squared norms for each entry.
+    let mut norms_sq = [0.0f32; CODEBOOK_SIZE];
+    for i in 0..CODEBOOK_SIZE {
+        norms_sq[i] = entries[i].iter().map(|&x| x * x).sum();
+    }
+
+    E8CodebookData { entries, norms_sq }
+});
+
 /// The E8 lattice codebook for 2-bit vector quantization.
 ///
 /// Each codebook entry is an 8-dimensional vector.  The first 241 entries
 /// are the 240 E8 root vectors plus the zero vector; the remaining 15 are
-/// scaled duplicates used as padding.
+/// scaled variants for better magnitude coverage.
+///
+/// The codebook data is lazily initialized on first use via [`LazyLock`]
+/// and shared across all instances — subsequent `new()` calls are free.
 pub struct E8Codebook {
-    /// 256 codebook entries, each an 8-dimensional vector.
-    entries: [[f32; DIM]; CODEBOOK_SIZE],
+    data: &'static E8CodebookData,
 }
 
 impl E8Codebook {
-    /// Generate the E8 codebook.
+    /// Create a handle to the E8 codebook.
     ///
-    /// This is fully deterministic — the codebook is defined by the
-    /// mathematical structure of the E8 lattice.
+    /// The underlying data is lazily initialized on first access and shared
+    /// across all `E8Codebook` instances.  Subsequent calls are effectively
+    /// free.
     pub fn new() -> Self {
-        let mut entries = [[0.0f32; DIM]; CODEBOOK_SIZE];
-        let mut idx = 0;
-
-        // Entry 0: zero vector.
-        idx += 1;
-
-        // Integer orbit: permutations of (±1, ±1, 0, 0, 0, 0, 0, 0).
-        for i in 0..DIM {
-            for j in (i + 1)..DIM {
-                for &si in &[1.0f32, -1.0] {
-                    for &sj in &[1.0f32, -1.0] {
-                        entries[idx][i] = si;
-                        entries[idx][j] = sj;
-                        idx += 1;
-                    }
-                }
-            }
+        Self {
+            data: &CODEBOOK_DATA,
         }
-        debug_assert_eq!(idx, 1 + 112); // 0-vector + 112 integer-orbit vectors
-
-        // Half-integer orbit: (±½)⁸ with even number of minus signs.
-        for bits in 0u32..256 {
-            if bits.count_ones() % 2 != 0 {
-                continue; // odd number of negatives → skip
-            }
-            let mut v = [0.5f32; DIM];
-            for d in 0..DIM {
-                if bits & (1 << d) != 0 {
-                    v[d] = -0.5;
-                }
-            }
-            entries[idx] = v;
-            idx += 1;
-        }
-        debug_assert_eq!(idx, 241); // 0 + 112 + 128
-
-        // Pad to 256 with scaled-down copies of the first 15 root vectors.
-        // We scale by 0.5 so they are still valid E8 lattice points (just
-        // at a smaller radius).  This ensures every u8 index is usable.
-        for pad in 0..15 {
-            let src = entries[1 + pad]; // skip zero vector
-            for d in 0..DIM {
-                entries[idx][d] = src[d] * 0.5;
-            }
-            idx += 1;
-        }
-        debug_assert_eq!(idx, CODEBOOK_SIZE);
-
-        Self { entries }
     }
 
     /// Return a reference to all codebook entries.
     pub fn entries(&self) -> &[[f32; DIM]; CODEBOOK_SIZE] {
-        &self.entries
+        &self.data.entries
     }
 
     /// Find the nearest codebook entry to `vector` (brute-force).
@@ -130,7 +165,7 @@ impl E8Codebook {
         let mut best_idx = 0u8;
         let mut best_dist = f32::MAX;
 
-        for (i, entry) in self.entries.iter().enumerate() {
+        for (i, entry) in self.data.entries.iter().enumerate() {
             let dist = squared_distance(vector, entry);
             if dist < best_dist {
                 best_dist = dist;
@@ -138,7 +173,51 @@ impl E8Codebook {
             }
         }
 
-        (best_idx, self.entries[best_idx as usize])
+        (best_idx, self.data.entries[best_idx as usize])
+    }
+
+    /// Quantize a single 8-element group with joint entry+scale optimization.
+    ///
+    /// For each codebook entry `e[i]`, the optimal scale is
+    /// `s = dot(group, e) / dot(e, e)`, and the reconstruction error is
+    /// `‖group − s·e‖²`.  Returns `(index, scale, quantized_vector)` for
+    /// the entry that minimizes this error.
+    pub fn quantize_vector(&self, group: &[f32; DIM]) -> (u8, f32, [f32; DIM]) {
+        let group_norm_sq: f32 = group.iter().map(|&x| x * x).sum();
+        if group_norm_sq < 1e-20 {
+            return (0, 0.0, [0.0; DIM]);
+        }
+
+        let mut best_idx = 0u8;
+        let mut best_scale = 0.0f32;
+        let mut best_err = f32::MAX;
+
+        for (ei, entry) in self.data.entries.iter().enumerate() {
+            let dot_ee = self.data.norms_sq[ei];
+            if dot_ee < 1e-10 {
+                continue;
+            }
+
+            let dot_ge: f32 = (0..DIM).map(|d| group[d] * entry[d]).sum();
+            let scale = dot_ge / dot_ee;
+
+            // ‖g - s·e‖² = ‖g‖² - dot(g,e)² / ‖e‖²
+            let err = group_norm_sq - dot_ge * dot_ge / dot_ee;
+
+            if err < best_err {
+                best_err = err;
+                best_idx = ei as u8;
+                best_scale = scale;
+            }
+        }
+
+        let mut quantized = [0.0f32; DIM];
+        let best_entry = &self.data.entries[best_idx as usize];
+        for d in 0..DIM {
+            quantized[d] = best_scale * best_entry[d];
+        }
+
+        (best_idx, best_scale, quantized)
     }
 
     /// Quantize a weight matrix stored in row-major order.
@@ -152,8 +231,8 @@ impl E8Codebook {
     /// - `scales[g]` is the per-group scaling factor
     ///
     /// The scaling strategy: for each 8-element group, compute
-    /// `scale = ‖group‖ / ‖nearest_codebook_entry‖`, so that
-    /// `scale * codebook_entry ≈ group`.
+    /// `scale = dot(group, e) / dot(e, e)` for the best codebook entry `e`,
+    /// so that `scale * e ≈ group`.
     pub fn quantize_matrix(&self, weights: &[f32], n_cols: usize) -> (Vec<u8>, Vec<f32>) {
         assert!(!weights.is_empty());
         assert!(n_cols > 0);
@@ -178,46 +257,9 @@ impl E8Codebook {
                     }
                 }
 
-                let group_norm = norm(&group);
-                if group_norm < 1e-10 {
-                    // Near-zero group → map to zero vector (index 0).
-                    indices.push(0u8);
-                    scales.push(0.0);
-                    continue;
-                }
-
-                // Find the codebook entry + scale that minimizes reconstruction error.
-                // For each entry e[i], optimal scale is s = dot(g, e) / dot(e, e),
-                // and reconstruction error is ||g - s*e||².
-                let mut best_idx = 0u8;
-                let mut best_scale = 0.0f32;
-                let mut best_err = f32::MAX;
-
-                for (ei, entry) in self.entries.iter().enumerate() {
-                    let dot_ge: f32 = (0..DIM).map(|d| group[d] * entry[d]).sum();
-                    let dot_ee: f32 = (0..DIM).map(|d| entry[d] * entry[d]).sum();
-
-                    if dot_ee < 1e-10 {
-                        continue;
-                    }
-
-                    let scale = dot_ge / dot_ee;
-                    let err: f32 = (0..DIM)
-                        .map(|d| {
-                            let diff = group[d] - scale * entry[d];
-                            diff * diff
-                        })
-                        .sum();
-
-                    if err < best_err {
-                        best_err = err;
-                        best_idx = ei as u8;
-                        best_scale = scale;
-                    }
-                }
-
-                indices.push(best_idx);
-                scales.push(best_scale);
+                let (idx, scale, _) = self.quantize_vector(&group);
+                indices.push(idx);
+                scales.push(scale);
             }
         }
 
@@ -239,7 +281,7 @@ impl E8Codebook {
         for row in 0..n_rows {
             for g in 0..n_groups_per_row {
                 let gi = row * n_groups_per_row + g;
-                let entry = &self.entries[indices[gi] as usize];
+                let entry = &self.data.entries[indices[gi] as usize];
                 let s = scales[gi];
 
                 for d in 0..DIM {
@@ -252,6 +294,42 @@ impl E8Codebook {
         }
 
         output
+    }
+
+    /// Compute MSE between original data and its quantized reconstruction.
+    ///
+    /// Treats `original` as a flat sequence of 8-element groups.  Handles
+    /// lengths that are not a multiple of 8 by only comparing actual
+    /// (non-padding) elements.
+    pub fn reconstruction_mse(&self, original: &[f32], indices: &[u8], scales: &[f32]) -> f32 {
+        assert_eq!(indices.len(), scales.len());
+        let n = original.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let n_groups = n.div_ceil(DIM);
+        assert_eq!(
+            indices.len(),
+            n_groups,
+            "expected {} groups for {} elements, got {}",
+            n_groups,
+            n,
+            indices.len()
+        );
+
+        let mut sum_sq_err = 0.0f32;
+        for g in 0..n_groups {
+            let entry = &self.data.entries[indices[g] as usize];
+            let s = scales[g];
+            for d in 0..DIM {
+                let orig_idx = g * DIM + d;
+                if orig_idx < n {
+                    let diff = original[orig_idx] - s * entry[d];
+                    sum_sq_err += diff * diff;
+                }
+            }
+        }
+        sum_sq_err / n as f32
     }
 }
 
@@ -270,10 +348,6 @@ fn squared_distance(a: &[f32; DIM], b: &[f32; DIM]) -> f32 {
         sum += diff * diff;
     }
     sum
-}
-
-fn norm(v: &[f32; DIM]) -> f32 {
-    squared_distance(v, &[0.0; DIM]).sqrt()
 }
 
 /// Naive scalar 2-bit quantization for comparison.
@@ -534,5 +608,172 @@ mod tests {
             quant_time * 256 / 1 // rough proportional estimate
         );
         eprintln!("Verdict: likely acceptable for offline quantization");
+    }
+
+    // ── New tests for production refinements ─────────────────────────────
+
+    #[test]
+    fn codebook_is_cached_across_instances() {
+        let cb1 = E8Codebook::new();
+        let cb2 = E8Codebook::new();
+        // Both instances share the same underlying data.
+        assert!(std::ptr::eq(cb1.entries(), cb2.entries()));
+    }
+
+    #[test]
+    fn norms_sq_precomputed_correctly() {
+        let data = &*CODEBOOK_DATA;
+        for i in 0..CODEBOOK_SIZE {
+            let expected: f32 = data.entries[i].iter().map(|&x| x * x).sum();
+            assert!(
+                (data.norms_sq[i] - expected).abs() < 1e-10,
+                "norms_sq[{i}] = {}, expected {expected}",
+                data.norms_sq[i]
+            );
+        }
+    }
+
+    #[test]
+    fn padding_entries_have_mixed_scales() {
+        let cb = E8Codebook::new();
+
+        // Entries 241..249 should be 0.5× scaled (norm² ≈ 0.5).
+        for i in 241..249 {
+            let sq: f32 = cb.entries()[i].iter().map(|&x| x * x).sum();
+            assert!(
+                (sq - 0.5).abs() < 1e-6,
+                "entry {i}: expected norm²=0.5, got {sq}"
+            );
+        }
+
+        // Entries 249..256 should be 2.0× scaled (norm² ≈ 8.0).
+        for i in 249..256 {
+            let sq: f32 = cb.entries()[i].iter().map(|&x| x * x).sum();
+            assert!(
+                (sq - 8.0).abs() < 1e-6,
+                "entry {i}: expected norm²=8.0, got {sq}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_vector_exact_codebook_entry() {
+        let cb = E8Codebook::new();
+        let scale = 2.5f32;
+        let entry = cb.entries()[10];
+        let mut group = [0.0f32; DIM];
+        for d in 0..DIM {
+            group[d] = scale * entry[d];
+        }
+
+        let (idx, s, quantized) = cb.quantize_vector(&group);
+        assert_eq!(idx, 10);
+        assert!((s - scale).abs() < 1e-5, "scale={s}, expected {scale}");
+        for d in 0..DIM {
+            assert!(
+                (quantized[d] - group[d]).abs() < 1e-5,
+                "quantized[{d}]={}, expected {}",
+                quantized[d],
+                group[d]
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_vector_zero_group() {
+        let cb = E8Codebook::new();
+        let (idx, scale, quantized) = cb.quantize_vector(&[0.0; DIM]);
+        assert_eq!(idx, 0);
+        assert_eq!(scale, 0.0);
+        assert_eq!(quantized, [0.0; DIM]);
+    }
+
+    #[test]
+    fn quantize_vector_returns_correct_tuple() {
+        let cb = E8Codebook::new();
+        let group = [0.3, -0.7, 0.1, 0.5, -0.2, 0.4, -0.6, 0.8];
+        let (idx, scale, quantized) = cb.quantize_vector(&group);
+
+        // Verify the quantized vector equals scale * codebook_entry.
+        let entry = cb.entries()[idx as usize];
+        for d in 0..DIM {
+            assert!(
+                (quantized[d] - scale * entry[d]).abs() < 1e-6,
+                "quantized[{d}]={}, expected {}",
+                quantized[d],
+                scale * entry[d]
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_vector_agrees_with_quantize_matrix() {
+        let cb = E8Codebook::new();
+        let group = [1.2, -0.3, 0.7, -1.1, 0.5, 0.0, -0.8, 0.4];
+
+        let (v_idx, v_scale, _) = cb.quantize_vector(&group);
+        let (m_indices, m_scales) = cb.quantize_matrix(&group, DIM);
+
+        assert_eq!(v_idx, m_indices[0]);
+        assert!((v_scale - m_scales[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reconstruction_mse_zero_for_exact_match() {
+        let cb = E8Codebook::new();
+        let scale = 1.5f32;
+        let entry = cb.entries()[20];
+        let original: Vec<f32> = entry.iter().map(|&x| scale * x).collect();
+
+        let (indices, scales) = cb.quantize_matrix(&original, DIM);
+        let err = cb.reconstruction_mse(&original, &indices, &scales);
+        assert!(err < 1e-10, "expected near-zero MSE, got {err}");
+    }
+
+    #[test]
+    fn reconstruction_mse_matches_manual_mse() {
+        let cb = E8Codebook::new();
+        let n = 64;
+        let weights: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.7 + 1.3).sin() * 2.0))
+            .collect();
+
+        let (indices, scales) = cb.quantize_matrix(&weights, n);
+        let recon = cb.dequantize_matrix(&indices, &scales, n);
+
+        let manual_err = mse(&weights, &recon);
+        let method_err = cb.reconstruction_mse(&weights, &indices, &scales);
+
+        assert!(
+            (manual_err - method_err).abs() < 1e-6,
+            "manual MSE={manual_err}, method MSE={method_err}"
+        );
+    }
+
+    #[test]
+    fn reconstruction_mse_non_multiple_of_8() {
+        let cb = E8Codebook::new();
+        let n: usize = 13;
+        let weights: Vec<f32> = (0..n).map(|i| i as f32 * 0.3).collect();
+
+        let n_groups = n.div_ceil(DIM);
+        // Quantize each group manually for the flat case.
+        let mut indices = Vec::new();
+        let mut scales = Vec::new();
+        for g in 0..n_groups {
+            let mut group = [0.0f32; DIM];
+            for d in 0..DIM {
+                let idx = g * DIM + d;
+                if idx < n {
+                    group[d] = weights[idx];
+                }
+            }
+            let (i, s, _) = cb.quantize_vector(&group);
+            indices.push(i);
+            scales.push(s);
+        }
+
+        let err = cb.reconstruction_mse(&weights, &indices, &scales);
+        assert!(err.is_finite(), "MSE should be finite, got {err}");
     }
 }
