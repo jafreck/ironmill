@@ -60,24 +60,39 @@ targeting Apple's Neural Engine:
 
 ### Inference Runtime
 
-ironmill-inference provides three backends for running compiled models:
+ironmill-inference provides three backends for running compiled models.
+No dependency on ironmill-compile — it loads pre-compiled bundles only.
 
-**Metal GPU backend:** runs inference on Apple Silicon GPUs via Metal compute
-shaders and MPS. Primary backend for LLM inference, supporting full
-LLaMA-style autoregressive decode:
+| | Metal GPU | CoreML | ANE-direct |
+|---|:---:|:---:|:---:|
+| LLM decode (autoregressive) | ✅ | — | ✅ |
+| Vision / general models | ✅ | ✅ | ✅ |
+| INT8 KV cache (TurboQuant) | ✅ | — | ✅ |
+| Zero-copy tensor I/O | — | — | ✅ |
+| Hardware scheduling | Manual | Apple-managed | Manual |
+| API surface | Public (Metal/MPS) | Public (CoreML) | Private (reverse-engineered) |
+| Status | **Stable** | **Stable** | **Experimental** |
+
+#### Metal GPU
+
+Primary backend for LLM inference. Runs on Apple Silicon GPUs via Metal
+compute shaders and MPS:
 
 - MPS-accelerated matrix multiplication for all linear layers
 - Custom Metal compute kernels for RMSNorm, RoPE, SiLU, attention, and residuals
 - TurboQuant INT8 KV cache with fused quantize/dequantize shaders
 - Prefill and single-step decode modes
 
-**CoreML backend:** standard CoreML runtime via `MLModel`. Works with any
-.mlmodelc compiled package. Apple manages ANE/GPU/CPU scheduling.
+#### CoreML
 
-**ANE-direct backend** *(experimental)*: bypasses CoreML entirely using
-reverse-engineered private APIs (`_ANEInMemoryModel`, `_ANECompiler`). Loads
-pre-compiled `.ironml` bundles produced by ironmill-compile, giving
-fine-grained control over:
+Standard CoreML runtime via `MLModel`. Works with any .mlmodelc compiled
+package. Apple manages ANE/GPU/CPU scheduling automatically.
+
+#### ANE-direct *(experimental)*
+
+Bypasses CoreML entirely using reverse-engineered private APIs
+(`_ANEInMemoryModel`, `_ANECompiler`). Loads pre-compiled `.ironml` bundles
+produced by ironmill-compile:
 
 - Sub-program loading/unloading from pre-compiled bundles
 - IOSurface-backed zero-copy tensor I/O
