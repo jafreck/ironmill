@@ -16,6 +16,13 @@ use crate::objc::{self, sel};
 #[link(name = "MetalPerformanceShaders", kind = "framework")]
 unsafe extern "C" {}
 
+/// MPS data-type encoding for 16-bit floating point (`MPSDataTypeFloat16`).
+///
+/// The MPS type system encodes the floating-point flag in bit 28
+/// (`0x10000000`) and the bit-width in the lower bits, giving
+/// `0x10000000 | 16 = 268435472`.
+const MPS_DATA_TYPE_FLOAT16: usize = 0x10000000 | 16;
+
 // ---------------------------------------------------------------------------
 // MpsMatrixMultiply
 // ---------------------------------------------------------------------------
@@ -203,8 +210,7 @@ impl MpsMatrix {
     ) -> Result<Self, MetalSysError> {
         // First create an MPSMatrixDescriptor.
         // +[MPSMatrixDescriptor matrixDescriptorWithRows:columns:rowBytes:dataType:]
-        // MPSDataTypeFloat16 = 0x10000000 | 16 = 268435472
-        let data_type_f16: usize = 0x10000000 | 16;
+        let data_type_f16: usize = MPS_DATA_TYPE_FLOAT16;
 
         // SAFETY: objc_getClass with a valid null-terminated class name.
         let desc_cls = unsafe { objc::objc_getClass(sel!("MPSMatrixDescriptor")) };

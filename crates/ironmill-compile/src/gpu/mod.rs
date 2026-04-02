@@ -229,6 +229,7 @@ fn derive_config_from_program(program: &Program) -> Result<ModelConfig, CompileE
     }
 
     let num_layers = max_layer.map_or(1, |m| m + 1);
+    // Fallback hidden size: 4096 matches Llama-7B / Llama-2-7B.
     let h = hidden_size.unwrap_or(4096);
     let num_heads = (h / 128).max(1);
 
@@ -240,10 +241,10 @@ fn derive_config_from_program(program: &Program) -> Result<ModelConfig, CompileE
         num_attention_heads: num_heads,
         num_key_value_heads: num_heads,
         head_dim: ModelConfig::default_head_dim(h, num_heads),
-        vocab_size: 32000,
-        max_position_embeddings: 2048,
-        rms_norm_eps: 1e-5,
-        rope_theta: 10000.0,
+        vocab_size: 32000,             // Llama-1/2 SentencePiece vocabulary size
+        max_position_embeddings: 2048, // Llama-1 context length
+        rms_norm_eps: 1e-5,            // Standard RMSNorm epsilon
+        rope_theta: 10000.0,           // Default RoPE base frequency
         tie_word_embeddings: false,
         extra: HashMap::new(),
     })

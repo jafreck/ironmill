@@ -23,6 +23,13 @@ unsafe extern "C" {
 // GpuFamily
 // ---------------------------------------------------------------------------
 
+/// `MTLGPUFamilyApple7` raw enum value (M1 generation).
+const GPU_FAMILY_APPLE_7: usize = 1007;
+/// `MTLGPUFamilyApple8` raw enum value (M2 generation).
+const GPU_FAMILY_APPLE_8: usize = 1008;
+/// `MTLGPUFamilyApple9` raw enum value (M3+ generation).
+const GPU_FAMILY_APPLE_9: usize = 1009;
+
 /// GPU family identifiers for capability queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuFamily {
@@ -38,12 +45,9 @@ impl GpuFamily {
     /// Returns the Metal `MTLGPUFamily` enum value for this family.
     fn metal_value(self) -> usize {
         match self {
-            // MTLGPUFamilyApple7 = 1007
-            GpuFamily::Apple7 => 1007,
-            // MTLGPUFamilyApple8 = 1008
-            GpuFamily::Apple8 => 1008,
-            // MTLGPUFamilyApple9 = 1009
-            GpuFamily::Apple9 => 1009,
+            GpuFamily::Apple7 => GPU_FAMILY_APPLE_7,
+            GpuFamily::Apple8 => GPU_FAMILY_APPLE_8,
+            GpuFamily::Apple9 => GPU_FAMILY_APPLE_9,
         }
     }
 }

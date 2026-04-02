@@ -24,6 +24,12 @@ use ironmill_compile::mil::{print_model_summary, print_onnx_summary};
 use ironmill_compile::templates::{TemplateOptions, weights_to_program_with_options};
 use ironmill_compile::weights::{GgufProvider, SafeTensorsProvider, WeightProvider};
 
+/// CoreML specification version used for all model serialization.
+///
+/// Version 9 corresponds to iOS 18 / macOS 15. This must match the version
+/// expected by `coremltools` and the on-device CoreML runtime.
+const COREML_SPEC_VERSION: i32 = 9;
+
 /// ironmill — Convert and optimize ML models for Apple's Neural Engine.
 ///
 /// A Rust-native alternative to Python's coremltools. Converts ONNX models
@@ -689,7 +695,7 @@ fn emit_moe_split(
     let stem = resolve_output_stem(opts.output.as_deref(), input_path);
 
     // Write shared program
-    let shared_model = program_to_model(&split_result.shared, 9)
+    let shared_model = program_to_model(&split_result.shared, COREML_SPEC_VERSION)
         .context("Failed to convert shared program to CoreML")?;
     let shared_path = format!("{stem}-shared.mlpackage");
     println!("  Writing shared layers: {shared_path}");
@@ -698,7 +704,7 @@ fn emit_moe_split(
 
     // Write per-expert programs
     for (i, expert) in split_result.experts.iter().enumerate() {
-        let expert_model = program_to_model(expert, 9)
+        let expert_model = program_to_model(expert, COREML_SPEC_VERSION)
             .with_context(|| format!("Failed to convert expert {i} to CoreML"))?;
         let expert_path = format!("{stem}-expert-{i}.mlpackage");
         println!("  Writing expert {i}: {expert_path}");
@@ -748,7 +754,7 @@ fn emit_moe_bundle(
     );
     let split_result = split_moe(program, &topology);
 
-    let bundle_model = program_to_multi_function_model(&split_result, 9)
+    let bundle_model = program_to_multi_function_model(&split_result, COREML_SPEC_VERSION)
         .context("Failed to convert MoE programs to multi-function CoreML model")?;
 
     let bundle_path = resolve_output_path(opts.output.as_deref(), input_path, "-bundle.mlpackage");
@@ -840,7 +846,7 @@ fn emit_topk_fusion(
     );
 
     let output_path = resolve_output_path(opts.output.as_deref(), input_path, "-fused.mlpackage");
-    let model = program_to_model(&fuse_result.program, 9)
+    let model = program_to_model(&fuse_result.program, COREML_SPEC_VERSION)
         .context("Failed to convert fused program to CoreML")?;
     println!("  Writing fused model: {output_path}");
     write_mlpackage(&model, &output_path)
@@ -884,7 +890,7 @@ fn emit_speculative_split(
 
     // Write draft model
     let draft_path = build_path("-draft.mlpackage");
-    let draft_model = program_to_model(&split_result.draft, 9)
+    let draft_model = program_to_model(&split_result.draft, COREML_SPEC_VERSION)
         .context("Failed to convert draft MIL IR to CoreML protobuf")?;
     println!("Writing draft model ({n_layers} layers): {draft_path}");
     write_mlpackage(&draft_model, &draft_path)
@@ -892,7 +898,7 @@ fn emit_speculative_split(
 
     // Write verifier model
     let verifier_path = build_path("-verifier.mlpackage");
-    let verifier_model = program_to_model(&split_result.verifier, 9)
+    let verifier_model = program_to_model(&split_result.verifier, COREML_SPEC_VERSION)
         .context("Failed to convert verifier MIL IR to CoreML protobuf")?;
     println!("Writing verifier model (full): {verifier_path}");
     write_mlpackage(&verifier_model, &verifier_path)
@@ -953,10 +959,11 @@ fn emit_coreml(
             "Updatable model: {} layer(s) marked for on-device training",
             layer_names.len()
         );
-        program_to_updatable_model(program, 9, &config)
+        program_to_updatable_model(program, COREML_SPEC_VERSION, &config)
             .context("Failed to convert MIL IR to updatable CoreML protobuf")?
     } else {
-        program_to_model(program, 9).context("Failed to convert MIL IR to CoreML protobuf")?
+        program_to_model(program, COREML_SPEC_VERSION)
+            .context("Failed to convert MIL IR to CoreML protobuf")?
     };
 
     let output_path = resolve_output_path(opts.output.as_deref(), input_path, ".mlpackage");

@@ -4,6 +4,20 @@ use ironmill_metal_sys::{ComputeEncoder, ComputePipeline, MetalBuffer, MetalDevi
 
 use super::error::MetalError;
 
+/// Maximum threads per threadgroup imposed by the Metal API.
+const METAL_MAX_THREADS_PER_THREADGROUP: usize = 1024;
+
+/// Default threadgroup width for 1-D element-wise dispatches.
+///
+/// 256 threads (8 SIMD-groups on Apple GPUs) strikes a good balance between
+/// occupancy and register pressure for simple per-element kernels.
+const DEFAULT_THREADGROUP_WIDTH: usize = 256;
+
+/// Number of output rows processed by each threadgroup in the custom
+/// FP16 matvec kernel. The shader is written for 8 SIMD-groups × 8 rows
+/// each, giving 64 rows per threadgroup.
+const MATVEC_ROWS_PER_THREADGROUP: usize = 64;
+
 /// All compiled Metal pipeline states for the Metal backend.
 pub struct MetalPipelines {
     pub rms_norm: ComputePipeline,
@@ -343,7 +357,7 @@ pub fn encode_rms_norm(
     encoder.set_bytes(&params.eps.to_le_bytes(), 5);
     // Cap threadgroup size to Metal's 1024-thread limit. The shader uses a
     // strided loop so it handles hidden_size > tg_size correctly.
-    let tg_size = 1024.min(params.hidden_size as usize);
+    let tg_size = METAL_MAX_THREADS_PER_THREADGROUP.min(params.hidden_size as usize);
     encoder.dispatch_threadgroups((params.token_count as usize, 1, 1), (tg_size, 1, 1));
 }
 
@@ -362,7 +376,7 @@ pub fn encode_silu_gate(
     encoder.set_buffer(output, 0, 2);
     encoder.set_bytes(&size.to_le_bytes(), 3);
     let threads = size as usize;
-    let tg_size = 256.min(threads);
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
     let tg_count = threads.div_ceil(tg_size);
     encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
 }
@@ -384,7 +398,7 @@ pub fn encode_rope(encoder: &ComputeEncoder, pipeline: &ComputePipeline, params:
             params.num_heads as usize,
             params.token_count as usize,
         ),
-        (half_dim.min(256) as usize, 1, 1),
+        ((half_dim as usize).min(DEFAULT_THREADGROUP_WIDTH), 1, 1),
     );
 }
 
@@ -403,7 +417,7 @@ pub fn encode_residual_add(
     encoder.set_buffer(output, 0, 2);
     encoder.set_bytes(&size.to_le_bytes(), 3);
     let threads = size as usize;
-    let tg_size = 256.min(threads);
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
     let tg_count = threads.div_ceil(tg_size);
     encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
 }
@@ -421,7 +435,7 @@ pub fn encode_embedding_lookup(
     encoder.set_bytes(&params.hidden_size.to_le_bytes(), 3);
     encoder.set_bytes(&params.token_count.to_le_bytes(), 4);
     encoder.set_bytes(&params.vocab_size.to_le_bytes(), 5);
-    let tg_size = 256.min(params.hidden_size as usize);
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(params.hidden_size as usize);
     encoder.dispatch_threadgroups(
         (
             (params.hidden_size as usize).div_ceil(tg_size),
@@ -483,7 +497,11 @@ pub fn encode_turboquant_attention(
     // HEAD_DIM is now exact — clamp to Metal's 1024-thread limit only.
     encoder.dispatch_threadgroups(
         (params.num_heads as usize, 1, 1),
-        ((params.head_dim as usize).min(1024), 1, 1),
+        (
+            (params.head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP),
+            1,
+            1,
+        ),
     );
 }
 
@@ -506,7 +524,11 @@ pub fn encode_standard_attention(
     // HEAD_DIM is now exact — clamp to Metal's 1024-thread limit only.
     encoder.dispatch_threadgroups(
         (params.num_heads as usize, 1, 1),
-        ((params.head_dim as usize).min(1024), 1, 1),
+        (
+            (params.head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP),
+            1,
+            1,
+        ),
     );
 }
 
@@ -524,7 +546,7 @@ pub fn encode_kv_scatter(
     encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 4);
     encoder.set_bytes(&params.head_dim.to_le_bytes(), 5);
     encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 6);
-    let tg_x = (params.head_dim as usize).min(256);
+    let tg_x = (params.head_dim as usize).min(DEFAULT_THREADGROUP_WIDTH);
     encoder.dispatch_threads(
         (
             params.head_dim as usize,
@@ -538,7 +560,8 @@ pub fn encode_kv_scatter(
 /// Encode a custom FP16 matvec: y = x · W^T for M=1 (decode).
 ///
 /// Weights must be pre-packed into blocked [N/8, K/8, 8, 8] FP16 format.
-/// Dispatch: one threadgroup per 64 output rows, 256 threads (8 simdgroups).
+/// Dispatch: one threadgroup per [`MATVEC_ROWS_PER_THREADGROUP`] output rows,
+/// [`DEFAULT_THREADGROUP_WIDTH`] threads (8 simdgroups).
 pub fn encode_matvec(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -554,9 +577,8 @@ pub fn encode_matvec(
     encoder.set_buffer(output, 0, 2);
     encoder.set_bytes(&n.to_le_bytes(), 3);
     encoder.set_bytes(&k.to_le_bytes(), 4);
-    let rows_per_tg: usize = 64;
-    let tg_count = (n as usize + rows_per_tg - 1) / rows_per_tg;
-    encoder.dispatch_threadgroups((tg_count, 1, 1), (256, 1, 1));
+    let tg_count = (n as usize + MATVEC_ROWS_PER_THREADGROUP - 1) / MATVEC_ROWS_PER_THREADGROUP;
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (DEFAULT_THREADGROUP_WIDTH, 1, 1));
 }
 
 /// Encode a fused residual-add + RMSNorm operation.
@@ -578,7 +600,7 @@ pub fn encode_fused_residual_rms_norm(
     encoder.set_bytes(&params.eps.to_le_bytes(), 5);
     encoder.set_bytes(&params.hidden_size.to_le_bytes(), 6);
     encoder.set_bytes(&params.token_count.to_le_bytes(), 7);
-    let tg_size = 1024.min(params.hidden_size as usize);
+    let tg_size = METAL_MAX_THREADS_PER_THREADGROUP.min(params.hidden_size as usize);
     encoder.dispatch_threadgroups((params.token_count as usize, 1, 1), (tg_size, 1, 1));
 }
 
@@ -609,7 +631,6 @@ pub fn encode_int4_dequantize(
     encoder.set_bytes(&weight.group_size.to_le_bytes(), 4);
     encoder.set_bytes(&total_elements.to_le_bytes(), 5);
 
-    let threads_per_tg: usize = 256;
-    let tg_count = (num_bytes + threads_per_tg - 1) / threads_per_tg;
-    encoder.dispatch_threadgroups((tg_count, 1, 1), (threads_per_tg, 1, 1));
+    let tg_count = (num_bytes + DEFAULT_THREADGROUP_WIDTH - 1) / DEFAULT_THREADGROUP_WIDTH;
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (DEFAULT_THREADGROUP_WIDTH, 1, 1));
 }
