@@ -44,6 +44,19 @@ pub mod coreml_runtime {
         ComputeUnits, ExtractedOutput, InputDescription, InputFeature, Model, MultiArrayDataType,
         OutputTensorData, PredictionInput, PredictionOutput, build_dummy_input,
     };
+
+    /// Build a [`PredictionInput`] from named f32 tensor slices.
+    ///
+    /// This is the common input-building pattern shared by framework bridge
+    /// crates (`burn-coreml`, `candle-coreml`). Each entry is
+    /// `(name, shape, data)`.
+    pub fn build_f32_input(inputs: &[(&str, &[usize], &[f32])]) -> anyhow::Result<PredictionInput> {
+        let mut pi = PredictionInput::new()?;
+        for &(name, shape, data) in inputs {
+            pi.add_multi_array(name, shape, MultiArrayDataType::Float32, data)?;
+        }
+        Ok(pi)
+    }
 }
 
 // ── ANE error type ───────────────────────────────────────────────

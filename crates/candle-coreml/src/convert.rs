@@ -1,7 +1,11 @@
 //! ONNX → CoreML conversion helpers.
 //!
-//! Wraps [`ironmill_compile::coreml::build_api::CompileBuilder`] in a candle-friendly API. Works on all
+//! Wraps [`ironmill_compile::coreml::build_api::convert`] in a candle-friendly API. Works on all
 //! platforms — no macOS or Xcode required for conversion itself.
+//!
+//! The heavy lifting is done by [`ironmill_compile::coreml::build_api::convert`];
+//! this module provides candle-flavoured option/result types on top.
+//! See also: `burn-coreml::export` for the Burn equivalent.
 //!
 //! # Example
 //!
@@ -19,7 +23,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ironmill_compile::coreml::build_api::{CompileBuilder, Quantization, TargetComputeUnit};
+use ironmill_compile::coreml::build_api::{
+    ConvertConfig, Quantization, TargetComputeUnit, convert,
+};
 
 /// Options for ONNX → CoreML conversion.
 #[derive(Debug, Clone, Default)]
@@ -69,28 +75,16 @@ pub fn convert_onnx(
     output_path: impl AsRef<Path>,
     options: ConvertOptions,
 ) -> anyhow::Result<ConvertResult> {
-    let mut builder = CompileBuilder::new(onnx_path.as_ref())
-        .output(output_path.as_ref())
-        .quantize(options.quantization);
+    let config = ConvertConfig {
+        quantization: options.quantization,
+        target: options.target,
+        input_shapes: options.input_shapes,
+        compile: options.compile,
+        palettize_bits: options.palettize_bits,
+        no_fusion: false,
+    };
 
-    if let Some(target) = options.target {
-        builder = builder.target(target);
-    }
-
-    for (name, shape) in options.input_shapes {
-        builder = builder.input_shape(name, shape);
-    }
-
-    if let Some(bits) = options.palettize_bits {
-        builder = builder.palettize(bits);
-    }
-
-    if options.compile {
-        builder = builder.compile();
-    }
-
-    let output = builder
-        .build()
+    let output = convert(onnx_path.as_ref(), output_path.as_ref(), config)
         .map_err(|e| anyhow::anyhow!("ONNX to CoreML conversion failed: {e}"))?;
 
     Ok(ConvertResult {

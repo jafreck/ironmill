@@ -297,6 +297,68 @@ impl CompileBuilder {
     }
 }
 
+// ── Convenience config for bridge crates ────────────────────────────────
+
+/// Common configuration for ONNX → CoreML conversion.
+///
+/// This struct captures the options shared by all framework bridge crates
+/// (`burn-coreml`, `candle-coreml`, etc.) and maps directly to
+/// [`CompileBuilder`] methods. Bridge crates translate their public
+/// options structs into a `ConvertConfig` and call [`convert`].
+#[derive(Debug, Clone, Default)]
+pub struct ConvertConfig {
+    /// Quantization mode (default: [`Quantization::None`]).
+    pub quantization: Quantization,
+    /// Target compute units (default: builder default, `All`).
+    pub target: Option<TargetComputeUnit>,
+    /// Fixed input shapes for ANE compatibility.
+    pub input_shapes: Vec<(String, Vec<usize>)>,
+    /// Also compile to `.mlmodelc` via `xcrun` (macOS only).
+    pub compile: bool,
+    /// Palettization bit-width (2, 4, 6, or 8).
+    pub palettize_bits: Option<u8>,
+    /// Disable optimization/fusion passes.
+    pub no_fusion: bool,
+}
+
+/// Convert an ONNX model to CoreML using [`ConvertConfig`].
+///
+/// This is the single-function entry point used by framework bridge crates.
+/// It constructs a [`CompileBuilder`], applies all options from `config`,
+/// and runs the full pipeline.
+///
+/// # Errors
+///
+/// Returns an error if the input file does not exist, is not valid ONNX,
+/// or if conversion fails.
+pub fn convert(onnx_path: &Path, output_path: &Path, config: ConvertConfig) -> Result<BuildOutput> {
+    let mut builder = CompileBuilder::new(onnx_path)
+        .output(output_path)
+        .quantize(config.quantization);
+
+    if let Some(target) = config.target {
+        builder = builder.target(target);
+    }
+
+    for (name, shape) in config.input_shapes {
+        builder = builder.input_shape(name, shape);
+    }
+
+    if let Some(bits) = config.palettize_bits {
+        builder = builder.palettize(bits);
+    }
+
+    if config.no_fusion {
+        builder = builder.no_fusion();
+    }
+
+    if config.compile {
+        builder = builder.compile();
+    }
+
+    builder.build()
+}
+
 // ── Input format detection ──────────────────────────────────────────────
 
 enum InputFormat {

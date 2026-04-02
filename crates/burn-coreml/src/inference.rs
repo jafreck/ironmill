@@ -2,12 +2,13 @@
 //!
 //! This module provides [`CoreMlInference`], a lightweight wrapper around
 //! the CoreML runtime for running exported Burn models.
+//!
+//! The input-building logic is shared with `candle-coreml::runtime` via
+//! [`ironmill_inference::coreml_runtime::build_f32_input`].
 
 use std::path::Path;
 
-use ironmill_inference::coreml_runtime::{
-    ComputeUnits, Model, MultiArrayDataType, PredictionInput,
-};
+use ironmill_inference::coreml_runtime::{ComputeUnits, Model, build_f32_input};
 
 /// A CoreML inference session for running exported models.
 ///
@@ -107,10 +108,7 @@ impl CoreMlInference {
         &self,
         inputs: &[(&str, &[usize], &[f32])],
     ) -> anyhow::Result<ironmill_inference::coreml_runtime::PredictionOutput> {
-        let mut pi = PredictionInput::new()?;
-        for &(name, shape, data) in inputs {
-            pi.add_multi_array(name, shape, MultiArrayDataType::Float32, data)?;
-        }
+        let pi = build_f32_input(inputs)?;
         self.model.predict(&pi)
     }
 }

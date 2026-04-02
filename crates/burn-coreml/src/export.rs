@@ -2,10 +2,16 @@
 //!
 //! Burn models are exported to ONNX first (using Burn's built-in recorder),
 //! then this module converts the ONNX file to a CoreML `.mlpackage`.
+//!
+//! The heavy lifting is done by [`ironmill_compile::coreml::build_api::convert`];
+//! this module provides Burn-flavoured option/result types on top.
+//! See also: `candle-coreml::convert` for the candle equivalent.
 
 use std::path::{Path, PathBuf};
 
-use ironmill_compile::coreml::build_api::{CompileBuilder, Quantization, TargetComputeUnit};
+use ironmill_compile::coreml::build_api::{
+    ConvertConfig, Quantization, TargetComputeUnit, convert,
+};
 
 /// Options for exporting to CoreML.
 #[derive(Debug, Clone, Default)]
@@ -64,31 +70,16 @@ pub fn export_to_coreml(
     output_path: impl AsRef<Path>,
     options: ExportOptions,
 ) -> anyhow::Result<ExportResult> {
-    let mut builder = CompileBuilder::new(onnx_path.as_ref()).output(output_path.as_ref());
+    let config = ConvertConfig {
+        quantization: options.quantization,
+        target: options.target,
+        input_shapes: options.input_shapes,
+        compile: options.compile,
+        palettize_bits: options.palettize_bits,
+        no_fusion: options.no_fusion,
+    };
 
-    builder = builder.quantize(options.quantization);
-
-    if let Some(target) = options.target {
-        builder = builder.target(target);
-    }
-
-    for (name, shape) in options.input_shapes {
-        builder = builder.input_shape(name, shape);
-    }
-
-    if let Some(bits) = options.palettize_bits {
-        builder = builder.palettize(bits);
-    }
-
-    if options.no_fusion {
-        builder = builder.no_fusion();
-    }
-
-    if options.compile {
-        builder = builder.compile();
-    }
-
-    let output = builder.build()?;
+    let output = convert(onnx_path.as_ref(), output_path.as_ref(), config)?;
 
     Ok(ExportResult {
         mlpackage_path: output.mlpackage,

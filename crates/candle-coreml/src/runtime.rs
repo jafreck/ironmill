@@ -1,7 +1,10 @@
 //! CoreML inference runtime (macOS only).
 //!
 //! Wraps the CoreML runtime [`Model`](ironmill_inference::coreml_runtime::Model) and returns raw f32 data + shapes that
-//! callers can convert into candle `Tensor` values:
+//! callers can convert into candle `Tensor` values.
+//!
+//! The input-building logic is shared with `burn-coreml::inference` via
+//! [`ironmill_inference::coreml_runtime::build_f32_input`].
 //!
 //! ```ignore
 //! use candle_core::{Device, Tensor};
@@ -17,7 +20,7 @@
 use std::path::Path;
 
 pub use ironmill_inference::coreml_runtime::ComputeUnits;
-use ironmill_inference::coreml_runtime::{Model, MultiArrayDataType, PredictionInput};
+use ironmill_inference::coreml_runtime::{Model, build_f32_input};
 
 /// Output tensor from CoreML inference.
 #[derive(Debug, Clone)]
@@ -100,10 +103,7 @@ impl CoreMlModel {
         &self,
         inputs: &[(&str, &[usize], &[f32])],
     ) -> anyhow::Result<Vec<OutputTensor>> {
-        let mut pred_input = PredictionInput::new()?;
-        for &(name, shape, data) in inputs {
-            pred_input.add_multi_array(name, shape, MultiArrayDataType::Float32, data)?;
-        }
+        let pred_input = build_f32_input(inputs)?;
 
         let output = self.inner.predict(&pred_input)?;
         let tensor_data = self.inner.extract_outputs(&output)?;
