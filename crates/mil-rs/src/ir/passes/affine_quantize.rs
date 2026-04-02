@@ -883,8 +883,9 @@ mod tests {
         }
 
         let data = get_quantized_data(&program);
-        assert_eq!(data.len(), 4);
-        for &b in data {
+        assert_eq!(data.len(), 2); // 4 INT4 values packed into 2 bytes
+        let unpacked = crate::ir::passes::int4_pack::unpack_int4(data, 4);
+        for &b in &unpacked {
             assert!(b <= 15);
         }
     }

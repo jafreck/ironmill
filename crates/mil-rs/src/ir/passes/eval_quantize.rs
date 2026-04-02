@@ -204,13 +204,26 @@ fn dequantize_op(op: &Operation) -> Option<Vec<f32>> {
 /// are 1-D `Tensor`), and per-group (scale/zp are `Tensor` with `group_size`
 /// attribute).
 fn dequantize_affine_op(op: &Operation) -> Option<Vec<f32>> {
-    let (quantized_data, shape) = match op.attributes.get("quantized_data") {
+    let (raw_data, shape) = match op.attributes.get("quantized_data") {
         Some(Value::Tensor {
             data,
             shape,
             dtype: ScalarType::UInt8,
         }) => (data.as_slice(), shape.as_slice()),
         _ => return None,
+    };
+
+    let bit_width = match op.attributes.get("bit_width") {
+        Some(Value::Int(b)) => *b as u8,
+        _ => 8,
+    };
+
+    // Unpack INT4 data if needed.
+    let numel: usize = shape.iter().product();
+    let quantized_data: Vec<u8> = if bit_width == 4 {
+        super::int4_pack::unpack_int4(raw_data, numel)
+    } else {
+        raw_data.to_vec()
     };
 
     let group_size = match op.attributes.get("group_size") {
