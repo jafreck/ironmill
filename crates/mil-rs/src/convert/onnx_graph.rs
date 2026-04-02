@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::convert::lora;
 use crate::convert::onnx_to_mil::convert_node;
 use crate::error::{MilError, Result};
+use crate::ir::shape_inference::{infer_concat_output, infer_conv_output, infer_pool_output};
 use crate::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 use crate::proto::onnx::{
     GraphProto, ModelProto, TensorProto, TypeProto, ValueInfoProto, tensor_shape_proto::dimension,
@@ -733,122 +734,6 @@ fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Bloc
     }
 }
 
-/// Infer conv output shape: `[N, out_channels, out_h, out_w]`.
-fn infer_conv_output(op: &Operation, type_map: &HashMap<String, TensorType>) -> Option<TensorType> {
-    let in_tt = op.inputs.get("x").and_then(|v| {
-        if let Value::Reference(n) = v {
-            type_map.get(n)
-        } else {
-            None
-        }
-    })?;
-    let w_tt = op.inputs.get("weight").and_then(|v| {
-        if let Value::Reference(n) = v {
-            type_map.get(n)
-        } else {
-            None
-        }
-    })?;
-
-    let in_shape = &in_tt.shape; // [N, C_in, H, W]
-    let w_shape = &w_tt.shape; // [C_out, C_in/groups, kH, kW]
-    if in_shape.len() != 4 || w_shape.len() != 4 {
-        return Some(in_tt.clone());
-    }
-
-    let out_channels = w_shape[0]?;
-    let in_h = in_shape[2]?;
-    let in_w = in_shape[3]?;
-    let k_h = w_shape[2]?;
-    let k_w = w_shape[3]?;
-
-    let strides = get_int_list(op, "strides").unwrap_or_else(|| vec![1, 1]);
-    let dilations = get_int_list(op, "dilations").unwrap_or_else(|| vec![1, 1]);
-    let pads = get_int_list(op, "pad").unwrap_or_else(|| vec![0, 0, 0, 0]);
-
-    let pad_top = *pads.first().unwrap_or(&0) as usize;
-    let pad_bottom = *pads.get(1).unwrap_or(&0) as usize;
-    let pad_left = *pads.get(2).unwrap_or(&0) as usize;
-    let pad_right = *pads.get(3).unwrap_or(&0) as usize;
-    let stride_h = *strides.first().unwrap_or(&1) as usize;
-    let stride_w = *strides.get(1).unwrap_or(&1) as usize;
-    let dil_h = *dilations.first().unwrap_or(&1) as usize;
-    let dil_w = *dilations.get(1).unwrap_or(&1) as usize;
-
-    // Check pad_type for "same" padding.
-    let is_same = op
-        .inputs
-        .get("pad_type")
-        .is_some_and(|v| matches!(v, Value::String(s) if s == "same"));
-
-    let (out_h, out_w) = if is_same {
-        (in_h.div_ceil(stride_h), in_w.div_ceil(stride_w))
-    } else {
-        let eff_kh = dil_h * (k_h - 1) + 1;
-        let eff_kw = dil_w * (k_w - 1) + 1;
-        (
-            (in_h + pad_top + pad_bottom).saturating_sub(eff_kh) / stride_h + 1,
-            (in_w + pad_left + pad_right).saturating_sub(eff_kw) / stride_w + 1,
-        )
-    };
-
-    Some(TensorType::new(
-        in_tt.scalar_type,
-        vec![in_shape[0].unwrap_or(1), out_channels, out_h, out_w],
-    ))
-}
-
-/// Infer pool output shape: channels preserved, spatial dims shrink.
-fn infer_pool_output(op: &Operation, type_map: &HashMap<String, TensorType>) -> Option<TensorType> {
-    let in_tt = op.inputs.get("x").and_then(|v| {
-        if let Value::Reference(n) = v {
-            type_map.get(n)
-        } else {
-            None
-        }
-    })?;
-    let in_shape = &in_tt.shape;
-    if in_shape.len() != 4 {
-        return Some(in_tt.clone());
-    }
-
-    let in_c = in_shape[1]?;
-    let in_h = in_shape[2]?;
-    let in_w = in_shape[3]?;
-
-    let is_global = op
-        .attributes
-        .get("global_pool")
-        .is_some_and(|v| matches!(v, Value::Bool(true)));
-
-    let kernels = if is_global {
-        // Global pool: kernel covers entire spatial extent → output is 1×1.
-        Some(vec![in_h as i64, in_w as i64])
-    } else {
-        get_int_list(op, "kernel_sizes")
-    }
-    .unwrap_or_else(|| vec![1, 1]);
-    let strides = get_int_list(op, "strides").unwrap_or_else(|| vec![1, 1]);
-    let pads = get_int_list(op, "pad").unwrap_or_else(|| vec![0, 0, 0, 0]);
-
-    let k_h = *kernels.first().unwrap_or(&1) as usize;
-    let k_w = *kernels.get(1).unwrap_or(&1) as usize;
-    let stride_h = *strides.first().unwrap_or(&1) as usize;
-    let stride_w = *strides.get(1).unwrap_or(&1) as usize;
-    let pad_top = *pads.first().unwrap_or(&0) as usize;
-    let pad_bottom = *pads.get(1).unwrap_or(&0) as usize;
-    let pad_left = *pads.get(2).unwrap_or(&0) as usize;
-    let pad_right = *pads.get(3).unwrap_or(&0) as usize;
-
-    let out_h = (in_h + pad_top + pad_bottom).saturating_sub(k_h) / stride_h + 1;
-    let out_w = (in_w + pad_left + pad_right).saturating_sub(k_w) / stride_w + 1;
-
-    Some(TensorType::new(
-        in_tt.scalar_type,
-        vec![in_shape[0].unwrap_or(1), in_c, out_h, out_w],
-    ))
-}
-
 /// Infer reshape/flatten output from the `shape` input constant.
 fn infer_reshape_output(
     op: &Operation,
@@ -901,73 +786,6 @@ fn infer_reshape_output(
     }
 
     Some(in_tt.clone())
-}
-
-/// Infer concat output: sum along concat axis, other dims preserved.
-fn infer_concat_output(
-    op: &Operation,
-    type_map: &HashMap<String, TensorType>,
-) -> Option<TensorType> {
-    let values = op.inputs.get("values")?;
-    let Value::List(refs) = values else {
-        return None;
-    };
-
-    let input_types: Vec<&TensorType> = refs
-        .iter()
-        .filter_map(|v| {
-            if let Value::Reference(name) = v {
-                type_map.get(name)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let first = input_types.first()?;
-    let axis = op
-        .inputs
-        .get("axis")
-        .or_else(|| op.attributes.get("axis"))
-        .and_then(|v| {
-            if let Value::Int(a) = v {
-                Some(*a as usize)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-
-    let mut out_shape: Vec<usize> = first.shape.iter().map(|d| d.unwrap_or(1)).collect();
-    if axis < out_shape.len() {
-        out_shape[axis] = input_types
-            .iter()
-            .map(|tt| tt.shape.get(axis).and_then(|d| *d).unwrap_or(0))
-            .sum();
-    }
-
-    Some(TensorType::new(first.scalar_type, out_shape))
-}
-
-/// Extract an integer list from an op input (e.g. strides, pads).
-fn get_int_list(op: &Operation, name: &str) -> Option<Vec<i64>> {
-    let val = op.inputs.get(name).or_else(|| op.attributes.get(name))?;
-    match val {
-        Value::List(items) => {
-            let ints: Vec<i64> = items
-                .iter()
-                .filter_map(|v| {
-                    if let Value::Int(i) = v {
-                        Some(*i)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if ints.is_empty() { None } else { Some(ints) }
-        }
-        _ => None,
-    }
 }
 
 /// Convert an ONNX [`TensorProto`] (initializer/weight) to a MIL `const` [`Operation`].

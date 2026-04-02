@@ -12,6 +12,7 @@ mod pass;
 pub mod passes;
 mod pipeline;
 mod program;
+pub(crate) mod shape_inference;
 mod tensor;
 mod types;
 
