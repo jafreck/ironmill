@@ -128,12 +128,31 @@ pub fn metal_kernel(
 
         // Build input vector array.
         let input_vec = unsafe { ffi::mlx_vector_array_new() };
+        if input_vec.ctx.is_null() {
+            unsafe {
+                ffi::mlx_fast_metal_kernel_free(kernel);
+                ffi::mlx_fast_metal_kernel_config_free(config);
+            }
+            return Err(MlxSysError::KernelCompile(
+                "mlx_vector_array_new returned null (input_vec)".into(),
+            ));
+        }
         for arr in inputs {
             unsafe { ffi::mlx_vector_array_append_value(input_vec, arr.raw) };
         }
 
         // Apply the kernel.
         let mut output_vec = unsafe { ffi::mlx_vector_array_new() };
+        if output_vec.ctx.is_null() {
+            unsafe {
+                ffi::mlx_fast_metal_kernel_free(kernel);
+                ffi::mlx_fast_metal_kernel_config_free(config);
+                ffi::mlx_vector_array_free(input_vec);
+            }
+            return Err(MlxSysError::KernelCompile(
+                "mlx_vector_array_new returned null (output_vec)".into(),
+            ));
+        }
         let ret = unsafe {
             ffi::mlx_fast_metal_kernel_apply(&mut output_vec, kernel, input_vec, config, stream.raw)
         };

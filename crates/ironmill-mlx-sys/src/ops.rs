@@ -248,6 +248,11 @@ pub fn concat(
     #[cfg(not(mlx_stub))]
     {
         let vec = unsafe { ffi::mlx_vector_array_new() };
+        if vec.ctx.is_null() {
+            return Err(MlxSysError::MlxC(
+                "mlx_vector_array_new returned null".into(),
+            ));
+        }
         for arr in arrays {
             unsafe { ffi::mlx_vector_array_append_value(vec, arr.raw) };
         }

@@ -50,8 +50,12 @@ impl MlxArray {
         {
             let shape_i32: Vec<i32> = shape
                 .iter()
-                .map(|&s| i32::try_from(s).unwrap_or(i32::MAX))
-                .collect();
+                .map(|&s| {
+                    i32::try_from(s).map_err(|_| {
+                        MlxSysError::Build(format!("dimension {s} exceeds i32::MAX ({})", i32::MAX))
+                    })
+                })
+                .collect::<Result<Vec<i32>, MlxSysError>>()?;
             let raw = unsafe {
                 ffi::mlx_array_new_data(
                     data.as_ptr() as *const std::ffi::c_void,
@@ -168,9 +172,9 @@ impl MlxArray {
     ///
     /// # Safety
     ///
-    /// The caller must ensure `T` matches the array's dtype and that the
-    /// array has been evaluated.
-    pub fn as_contiguous_slice<T>(&self) -> Result<&[T], MlxSysError> {
+    /// The caller must ensure that `T` matches the array's [`MlxDtype`] (e.g.
+    /// `f32` for [`MlxDtype::Float32`]) and that the array has been evaluated.
+    pub unsafe fn as_contiguous_slice<T>(&self) -> Result<&[T], MlxSysError> {
         #[cfg(mlx_stub)]
         {
             Err(MlxSysError::MlxC("mlx-c not available (stub mode)".into()))
