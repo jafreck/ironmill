@@ -14,6 +14,7 @@ pub mod constant_fold;
 pub mod dead_code;
 pub mod fp16_quantize;
 pub mod identity_elim;
+pub mod int4_pack;
 pub mod int8_quantize;
 pub mod kmeans;
 pub mod layout_optimize;
