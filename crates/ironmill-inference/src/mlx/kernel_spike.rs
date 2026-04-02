@@ -56,7 +56,8 @@ mod tests {
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
-        let out: &[f32] = result[0].as_contiguous_slice().unwrap();
+        #[allow(unsafe_code)]
+        let out: &[f32] = unsafe { result[0].as_contiguous_slice().unwrap() };
         assert_eq!(out, &[6.0, 8.0, 10.0, 12.0]);
     }
 
@@ -105,7 +106,8 @@ mod tests {
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
-        let out: &[f32] = result[0].as_contiguous_slice().unwrap();
+        #[allow(unsafe_code)]
+        let out: &[f32] = unsafe { result[0].as_contiguous_slice().unwrap() };
         for i in 0..n {
             assert!((out[i] - (i as f32 * 2.0)).abs() < 1e-6);
         }
@@ -170,7 +172,8 @@ mod tests {
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
-        let out: &[f32] = result[0].as_contiguous_slice().unwrap();
+        #[allow(unsafe_code)]
+        let out: &[f32] = unsafe { result[0].as_contiguous_slice().unwrap() };
         let expected: f32 = (0..13).map(|i| i as f32).sum();
         for &v in out.iter() {
             assert!((v - expected).abs() < 1e-4, "got {v}, expected {expected}");
@@ -241,7 +244,8 @@ mod tests {
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
-        let out: &[f32] = result[0].as_contiguous_slice().unwrap();
+        #[allow(unsafe_code)]
+        let out: &[f32] = unsafe { result[0].as_contiguous_slice().unwrap() };
         let expected: f32 = (1..=17).map(|i| i as f32).sum();
         for &v in out.iter() {
             assert!((v - expected).abs() < 1e-3, "got {v}, expected {expected}");
@@ -292,7 +296,8 @@ mod tests {
         .unwrap();
 
         eval(&[&result[0]]).unwrap();
-        let out: &[f32] = result[0].as_contiguous_slice().unwrap();
+        #[allow(unsafe_code)]
+        let out: &[f32] = unsafe { result[0].as_contiguous_slice().unwrap() };
         for head in 0..num_heads {
             for d in 0..head_dim {
                 let idx = head * head_dim + d;

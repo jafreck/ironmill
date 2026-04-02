@@ -475,7 +475,9 @@ impl MlxInference {
         }
 
         // Read logits back to CPU
-        let logits_f32: &[f32] = logits_arr.as_contiguous_slice()?;
+        // SAFETY: logits_arr is f32 dtype (produced by lm_head matmul with f32 cast)
+        #[allow(unsafe_code)]
+        let logits_f32: &[f32] = unsafe { logits_arr.as_contiguous_slice()? };
         let logits = logits_f32.to_vec();
 
         // Advance sequence position
