@@ -196,7 +196,7 @@ inline void hadamard_rotate_inplace_cw(
     uint is_k_cache   = params[6];
 
     threadgroup float shared_rotated[4096];
-    threadgroup float shared_reduce[256];
+    threadgroup float shared_reduce[512];
     threadgroup char shared_quant[4096];
 
     uint head_idx = tgid;
@@ -424,7 +424,7 @@ inline void hadamard_rotate_inplace_attn(
     uint n_bits       = params[5];
 
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 256;
+    constexpr uint MAX_DIM = 512;
 
     threadgroup float shared_q_rot[MAX_DIM];
     threadgroup float shared_s_q[MAX_DIM];
@@ -689,10 +689,10 @@ inline void hadamard_rotate_inplace_ocw(
     uint non_outlier_n_levels = params[8];
     uint is_k_cache        = params[9];
 
-    threadgroup float shared_outlier[256];
-    threadgroup float shared_non_outlier[256];
-    threadgroup float shared_reduce[256];
-    threadgroup char shared_quant[256];
+    threadgroup float shared_outlier[512];
+    threadgroup float shared_non_outlier[512];
+    threadgroup float shared_reduce[512];
+    threadgroup char shared_quant[512];
 
     uint head_idx = tgid;
     if (head_idx >= num_kv_heads) return;
@@ -985,8 +985,8 @@ inline float2 read_k_quantized_tile_oa(threadgroup const char* tile,
     uint d_non_padded     = params[7];
 
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 256;
-    constexpr uint MAX_PACKED = 128;
+    constexpr uint MAX_DIM = 512;
+    constexpr uint MAX_PACKED = MAX_DIM / 2;
 
     threadgroup float shared_q_outlier[MAX_DIM];
     threadgroup float shared_q_non_outlier[MAX_DIM];

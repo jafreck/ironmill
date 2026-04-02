@@ -174,7 +174,7 @@ kernel void turboquant_cache_write(
     uint tg_size [[threads_per_threadgroup]])
 {
     threadgroup float shared_rotated[4096];
-    threadgroup float shared_reduce[256];
+    threadgroup float shared_reduce[512];
     threadgroup char shared_quant[4096];
 
     uint head_idx = tgid;
@@ -367,18 +367,18 @@ kernel void turboquant_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory budget (head_dim=256, INT8 worst case):
-    //   shared_q_rot:  256 × 4 =  1,024 B
-    //   shared_s_q:    256 × 4 =  1,024 B
-    //   kv_tile_raw:   32 × 256 = 8,192 B (char; aliased K/V)
-    //   tile_scales:   32 × 4   =   128 B
-    //   shared_reduce: 256 × 4  = 1,024 B
-    //   tile_scores:   32 × 4   =   128 B
-    //   shared_output: 256 × 4  = 1,024 B
-    //   softmax/corr:  3 × 4    =    12 B
-    //   Total: ~12.6 KB (within 32 KB limit)
+    // Shared memory budget (head_dim=512 worst case):
+    //   shared_q_rot:  512 × 4 =  2,048 B
+    //   shared_s_q:    512 × 4 =  2,048 B
+    //   kv_tile_raw:   32 × 512 = 16,384 B (char; aliased K/V)
+    //   tile_scales:   32 × 4   =    128 B
+    //   shared_reduce: 512 × 4  =  2,048 B
+    //   tile_scores:   32 × 4   =    128 B
+    //   shared_output: 512 × 4  =  2,048 B
+    //   softmax/corr:  3 × 4    =     12 B
+    //   Total: ~24.8 KB (within 32 KB limit)
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 256;
+    constexpr uint MAX_DIM = 512;
 
     threadgroup float shared_q_rot[MAX_DIM];
     threadgroup float shared_s_q[MAX_DIM];
@@ -707,10 +707,10 @@ kernel void turboquant_outlier_cache_write(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared_outlier[256];
-    threadgroup float shared_non_outlier[256];
-    threadgroup float shared_reduce[256];
-    threadgroup char shared_quant[256];
+    threadgroup float shared_outlier[512];
+    threadgroup float shared_non_outlier[512];
+    threadgroup float shared_reduce[512];
+    threadgroup char shared_quant[512];
 
     uint head_idx = tgid;
     if (head_idx >= num_kv_heads) return;
@@ -933,23 +933,23 @@ kernel void turboquant_outlier_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory budget (head_dim=256 worst case):
-    //   shared_q_outlier:     256 × 4 =  1,024 B
-    //   shared_q_non_outlier: 256 × 4 =  1,024 B
-    //   shared_s_q_outlier:   256 × 4 =  1,024 B
-    //   shared_s_q_non:       256 × 4 =  1,024 B
-    //   outlier_kv_tile:      32 × 128 = 4,096 B (INT4 packed, aliased K/V)
-    //   non_outlier_kv_tile:  32 × 128 = 4,096 B
+    // Shared memory budget (head_dim=512 worst case):
+    //   shared_q_outlier:     512 × 4 =  2,048 B
+    //   shared_q_non_outlier: 512 × 4 =  2,048 B
+    //   shared_s_q_outlier:   512 × 4 =  2,048 B
+    //   shared_s_q_non:       512 × 4 =  2,048 B
+    //   outlier_kv_tile:      32 × 256 = 8,192 B (INT4 packed, aliased K/V)
+    //   non_outlier_kv_tile:  32 × 256 = 8,192 B
     //   o/n_tile_scales:      2 × 32 × 4 = 256 B
-    //   shared_reduce:        256 × 4 =  1,024 B
+    //   shared_reduce:        512 × 4 =  2,048 B
     //   tile_scores:          32 × 4  =    128 B
-    //   output_outlier:       256 × 4 =  1,024 B
-    //   output_non_outlier:   256 × 4 =  1,024 B
+    //   output_outlier:       512 × 4 =  2,048 B
+    //   output_non_outlier:   512 × 4 =  2,048 B
     //   softmax/corr:         3 × 4   =     12 B
-    //   Total: ~15.7 KB (within 32 KB limit)
+    //   Total: ~31.1 KB (within 32 KB limit)
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 256;
-    constexpr uint MAX_PACKED = 128; // MAX_DIM / 2 for INT4
+    constexpr uint MAX_DIM = 512;
+    constexpr uint MAX_PACKED = MAX_DIM / 2; // 256 for INT4
 
     threadgroup float shared_q_outlier[MAX_DIM];
     threadgroup float shared_q_non_outlier[MAX_DIM];

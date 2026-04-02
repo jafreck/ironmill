@@ -455,6 +455,12 @@ impl GpuInference {
         let vocab = mc.vocab_size;
         let eps = mc.rms_norm_eps as f32;
         let enable_tq = self.config.enable_turboquant && self.turboquant.is_some();
+        if enable_tq {
+            assert!(
+                hd <= 512,
+                "head_dim {hd} exceeds MAX_DIM 512 for TurboQuant kernels"
+            );
+        }
 
         // Build or reuse MPS matmul cache for this token count.
         let need_rebuild = self
@@ -895,7 +901,7 @@ impl GpuInference {
                         enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
                         enc.set_buffer(k_o_r_norms, 0, 24);
                         enc.set_buffer(k_n_r_norms, 0, 25);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size, 1, 1));
+                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(512), 1, 1));
                         // V cache: b-bit codebook, no QJL
                         enc.set_pipeline(&self.pipelines.turboquant_outlier_cache_write);
                         enc.set_buffer(&bufs.v_proj, token_offset, 0);
@@ -924,7 +930,7 @@ impl GpuInference {
                         enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
                         enc.set_buffer(k_o_r_norms, 0, 24);
                         enc.set_buffer(k_n_r_norms, 0, 25);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size, 1, 1));
+                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(512), 1, 1));
                     }
 
                     let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
@@ -992,7 +998,10 @@ impl GpuInference {
                         enc.set_buffer(k_qjl_signs, 0, 14);
                         enc.set_buffer(k_r_norms, 0, 15);
                         enc.set_bytes(&1u32.to_le_bytes(), 16);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
+                        enc.dispatch_threadgroups(
+                            (nkv as usize, 1, 1),
+                            ((hd as usize).min(512), 1, 1),
+                        );
                         // V cache write: b-bit codebook, no QJL
                         enc.set_pipeline(&self.pipelines.turboquant_cache_write);
                         enc.set_buffer(&bufs.v_proj, token_offset, 0);
@@ -1012,7 +1021,10 @@ impl GpuInference {
                         enc.set_buffer(k_qjl_signs, 0, 14);
                         enc.set_buffer(k_r_norms, 0, 15);
                         enc.set_bytes(&0u32.to_le_bytes(), 16);
-                        enc.dispatch_threadgroups((nkv as usize, 1, 1), (hd as usize, 1, 1));
+                        enc.dispatch_threadgroups(
+                            (nkv as usize, 1, 1),
+                            ((hd as usize).min(512), 1, 1),
+                        );
                     }
 
                     let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;

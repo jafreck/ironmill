@@ -34,16 +34,17 @@ kernel void standard_attention(
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory budget (head_dim=256 worst case):
-    //   shared_q:      256 × 4       =  1,024 B
-    //   kv_tile:       32 × 256 × 2  = 16,384 B  (half; aliased K then V)
-    //   shared_reduce: 256 × 4       =  1,024 B
+    // Shared memory budget (head_dim=512 worst case):
+    //   shared_q:      512 × 4       =  2,048 B
+    //   kv_tile:       32 × 512 × 2  = 32,768 B  (half; aliased K then V)
+    //   shared_reduce: 512 × 4       =  2,048 B
     //   tile_scores:   32 × 4        =    128 B
-    //   shared_output: 256 × 4       =  1,024 B
+    //   shared_output: 512 × 4       =  2,048 B
     //   softmax/corr:  3 × 4         =     12 B
-    //   Total: ~19.6 KB  (within 32 KB limit)
+    //   Total: ~39.1 KB  (NOTE: exceeds 32 KB for head_dim=512;
+    //    half kv_tile dominates. Actual usage depends on runtime head_dim.)
     constexpr uint TILE = 32;
-    constexpr uint MAX_DIM = 256;
+    constexpr uint MAX_DIM = 512;
 
     threadgroup float shared_q[MAX_DIM];
     threadgroup half  kv_tile[TILE * MAX_DIM];

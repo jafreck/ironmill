@@ -245,7 +245,7 @@ impl MlxKvCache {
             &[],
             super::kernels::TURBOQUANT_CACHE_WRITE,
             [self.num_kv_heads, 1, 1],
-            [self.head_dim.min(256), 1, 1],
+            [self.head_dim.min(512), 1, 1],
             &[&[1]], // dummy output shape
             &[MlxDtype::Float32],
             stream,
@@ -312,7 +312,7 @@ impl MlxKvCache {
             &[],
             super::kernels::TURBOQUANT_ATTENTION,
             [num_heads, 1, 1],
-            [self.head_dim.min(256), 1, 1],
+            [self.head_dim.min(512), 1, 1],
             &[&[output_size]],
             &[MlxDtype::Float16],
             stream,
@@ -392,7 +392,7 @@ impl MlxKvCache {
             &params_arr,                                 // 16
         ];
 
-        let tg_size = d_outlier_padded.max(d_non_padded).min(256);
+        let tg_size = d_outlier_padded.max(d_non_padded).min(512);
 
         let result = metal_kernel(
             "turboquant_outlier_cache_write",
@@ -479,7 +479,7 @@ impl MlxKvCache {
             &params_arr,                                 // 16
         ];
 
-        let tg_size = d_outlier_padded.max(d_non_padded).min(256);
+        let tg_size = d_outlier_padded.max(d_non_padded).min(512);
 
         let result = metal_kernel(
             "turboquant_outlier_cache_write",
@@ -568,7 +568,7 @@ impl MlxKvCache {
         ];
 
         let output_size = num_heads * self.head_dim;
-        let tg_size = d_outlier_padded.max(d_non_padded).min(256);
+        let tg_size = d_outlier_padded.max(d_non_padded).min(512);
 
         let result = metal_kernel(
             "turboquant_outlier_attention",
