@@ -63,12 +63,12 @@ targeting Apple's Neural Engine:
 Three backends for running models on Apple Silicon, each with different
 tradeoffs:
 
-| | Metal GPU | CoreML | ANE-direct |
+| | Metal GPU | CoreML | ANE Direct |
 |---|:---:|:---:|:---:|
 | Autoregressive decode | ✅ | — | ✅ |
 | Custom compute kernels | ✅ | — | ✅ |
 | INT8 KV cache (TurboQuant) | ✅ | — | ✅ |
-| Hardware scheduling | Manual | Apple-managed | Manual |
+| Hardware scheduling | ironmill | Apple | ironmill |
 | Backing tech | Metal / MPS | CoreML (CPU, GPU, ANE) | ANE private API |
 
 #### Metal GPU
@@ -88,7 +88,7 @@ Thin wrapper around Apple's CoreML runtime (`MLModel`). Loads any compiled
 Apple's runtime. Currently supports model loading and prediction dispatch —
 no LLM-specific decode loop or KV cache management.
 
-#### ANE-direct *(experimental)*
+#### ANE Direct *(experimental)*
 
 Bypasses CoreML to talk directly to the Neural Engine using
 reverse-engineered private APIs (`_ANECompiler`, `_ANEInMemoryModel`).
