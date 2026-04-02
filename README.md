@@ -60,42 +60,42 @@ targeting Apple's Neural Engine:
 
 ### Inference Runtime
 
-ironmill-inference provides three backends for running compiled models.
-No dependency on ironmill-compile — it loads pre-compiled bundles only.
+Three backends for running models on Apple Silicon, each with different
+tradeoffs:
 
 | | Metal GPU | CoreML | ANE-direct |
 |---|:---:|:---:|:---:|
-| LLM decode (autoregressive) | ✅ | — | ✅ |
-| Vision / general models | ✅ | ✅ | ✅ |
+| Autoregressive decode | ✅ | — | ✅ |
+| Custom compute kernels | ✅ | — | ✅ |
 | INT8 KV cache (TurboQuant) | ✅ | — | ✅ |
-| Zero-copy tensor I/O | — | — | ✅ |
 | Hardware scheduling | Manual | Apple-managed | Manual |
-| API surface | Public (Metal/MPS) | Public (CoreML) | Private (reverse-engineered) |
-| Status | **Stable** | **Stable** | **Experimental** |
+| API stability | Public (Metal/MPS) | Public (CoreML) | Private (reverse-engineered) |
+| Maturity | **Primary** | **Basic** | **Experimental** |
 
 #### Metal GPU
 
 Primary backend for LLM inference. Runs on Apple Silicon GPUs via Metal
 compute shaders and MPS:
 
-- MPS-accelerated matrix multiplication for all linear layers
-- Custom Metal compute kernels for RMSNorm, RoPE, SiLU, attention, and residuals
+- MPS matrix multiplication for linear layers
+- Custom Metal kernels for RMSNorm, RoPE, SiLU, attention, and residuals
 - TurboQuant INT8 KV cache with fused quantize/dequantize shaders
 - Prefill and single-step decode modes
 
 #### CoreML
 
-Standard CoreML runtime via `MLModel`. Works with any .mlmodelc compiled
-package. Apple manages ANE/GPU/CPU scheduling automatically.
+Thin wrapper around Apple's CoreML runtime (`MLModel`). Loads any compiled
+`.mlmodelc` package and delegates hardware scheduling (ANE/GPU/CPU) to
+Apple's runtime. Currently supports model loading and prediction dispatch —
+no LLM-specific decode loop or KV cache management.
 
 #### ANE-direct *(experimental)*
 
-Bypasses CoreML entirely using reverse-engineered private APIs
-(`_ANEInMemoryModel`, `_ANECompiler`). Loads pre-compiled `.ironml` bundles
-produced by ironmill-compile:
+Bypasses CoreML to talk directly to the Neural Engine using
+reverse-engineered private APIs (`_ANECompiler`, `_ANEInMemoryModel`).
+Loads pre-compiled `.ironml` bundles:
 
-- Sub-program loading/unloading from pre-compiled bundles
-- IOSurface-backed zero-copy tensor I/O
+- IOSurface-backed tensor I/O for ANE-compatible memory layout
 - [TurboQuant](docs/design/turboquant.md): INT8 KV cache compression with
   Hadamard rotation and on-ANE dequantization
 - Autoregressive decode loop with ANE-accelerated lm_head via chunked conv1×1
