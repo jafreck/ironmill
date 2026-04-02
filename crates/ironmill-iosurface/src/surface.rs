@@ -132,6 +132,16 @@ pub(crate) fn create_iosurface(alloc_size: usize) -> crate::Result<*mut c_void> 
                 &value as *const i64 as *const c_void,
             )
         };
+        if num.is_null() {
+            // Release any CFNumbers already created before returning.
+            for prev in &cf_numbers {
+                unsafe { ffi::CFRelease(*prev) };
+            }
+            unsafe { ffi::CFRelease(dict) };
+            return Err(IOSurfaceError::AllocFailed(
+                "CFNumberCreate returned null".into(),
+            ));
+        }
         unsafe { ffi::CFDictionarySetValue(dict, key, num) };
         cf_numbers.push(num);
     }

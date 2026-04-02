@@ -12,20 +12,6 @@ use mil_rs::ir::ScalarType;
 use crate::surface::ffi;
 use crate::surface::{ANE_MIN_SURFACE_BYTES, IOSurfaceError};
 
-// ── Helpers ──────────────────────────────────────────────────────
-
-fn scalar_byte_size(dtype: ScalarType) -> usize {
-    match dtype {
-        ScalarType::Float16 => 2,
-        ScalarType::Float32 => 4,
-        ScalarType::Float64 => 8,
-        ScalarType::Int8 | ScalarType::UInt8 | ScalarType::Bool => 1,
-        ScalarType::Int16 | ScalarType::UInt16 => 2,
-        ScalarType::Int32 | ScalarType::UInt32 => 4,
-        ScalarType::Int64 | ScalarType::UInt64 => 8,
-    }
-}
-
 // ── AneTensor ────────────────────────────────────────────────────
 
 /// An IOSurface-backed tensor for ANE I/O.
@@ -56,7 +42,7 @@ impl AneTensor {
         dtype: ScalarType,
         min_alloc: usize,
     ) -> crate::Result<Self> {
-        let data_size = channels * seq_len * scalar_byte_size(dtype);
+        let data_size = channels * seq_len * dtype.byte_size();
         let alloc_size = data_size.max(min_alloc).max(ANE_MIN_SURFACE_BYTES);
 
         #[cfg(target_os = "macos")]
@@ -83,6 +69,12 @@ impl AneTensor {
 
     /// Write packed f16 data into the surface.
     pub fn write_f16(&mut self, data: &[f16]) -> crate::Result<()> {
+        if self.dtype != ScalarType::Float16 {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "write_f16 requires Float16 dtype, got {:?}",
+                self.dtype
+            )));
+        }
         let expected = self.num_elements();
         if data.len() != expected {
             return Err(IOSurfaceError::CopyFailed(format!(
@@ -100,6 +92,12 @@ impl AneTensor {
 
     /// Read packed f16 data from the surface.
     pub fn read_f16(&self) -> crate::Result<Vec<f16>> {
+        if self.dtype != ScalarType::Float16 {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "read_f16 requires Float16 dtype, got {:?}",
+                self.dtype
+            )));
+        }
         let byte_len = self.num_elements() * 2;
         let bytes = self.read_bytes(byte_len)?;
         let mut out = vec![f16::ZERO; self.num_elements()];
@@ -211,6 +209,12 @@ impl AneTensor {
 
     /// Write packed f32 data (converted to f16 internally).
     pub fn write_f32(&mut self, data: &[f32]) -> crate::Result<()> {
+        if self.dtype != ScalarType::Float32 && self.dtype != ScalarType::Float16 {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "write_f32 requires Float32 or Float16 dtype, got {:?}",
+                self.dtype
+            )));
+        }
         let f16_data: Vec<f16> = data.iter().map(|&v| f16::from_f32(v)).collect();
         self.write_f16(&f16_data)
     }
@@ -242,6 +246,13 @@ impl AneTensor {
     /// `self[c * self_S + 0]`. The rest of each destination row is left
     /// unchanged (staging buffers are pre-zeroed).
     pub fn copy_column0_from(&mut self, src: &AneTensor) -> crate::Result<()> {
+        if self.dtype != src.dtype {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "copy_column0_from: dtype mismatch (dst {:?} vs src {:?})",
+                self.dtype, src.dtype
+            )));
+        }
+
         let dst_c = self.shape[1];
         let src_c = src.shape[1];
         if src_c < dst_c {
@@ -251,7 +262,7 @@ impl AneTensor {
         }
 
         let channels = dst_c;
-        let bpe = scalar_byte_size(self.dtype);
+        let bpe = self.dtype.byte_size();
         let src_s = src.shape[3];
         let dst_s = self.shape[3];
         let src_stride = src_s * bpe;
@@ -410,6 +421,19 @@ impl AneTensor {
         dst: &mut AneTensor,
         dst_byte_offset: usize,
     ) -> crate::Result<()> {
+        if self.dtype != ScalarType::Float16 {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "copy_column0_fp16_as_int8_to: src dtype must be Float16, got {:?}",
+                self.dtype
+            )));
+        }
+        if dst.dtype != ScalarType::Int8 && dst.dtype != ScalarType::UInt8 {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "copy_column0_fp16_as_int8_to: dst dtype must be Int8 or UInt8, got {:?}",
+                dst.dtype
+            )));
+        }
+
         let channels = self.shape[1];
         let src_s = self.shape[3];
         let src_stride_bytes = src_s * 2; // FP16 = 2 bytes per element
@@ -639,7 +663,7 @@ pub fn uniform_alloc_size(shapes: &[([usize; 4], ScalarType)]) -> usize {
     shapes
         .iter()
         .map(|(shape, dtype)| {
-            let data_size = shape[1] * shape[3] * scalar_byte_size(*dtype);
+            let data_size = shape[1] * shape[3] * dtype.byte_size();
             data_size.max(ANE_MIN_SURFACE_BYTES)
         })
         .max()
