@@ -5,11 +5,13 @@ use half::f16;
 /// Hook invoked during calibration forward passes to collect activation
 /// statistics without storing the raw tensors.
 pub trait ActivationHook {
-    /// Called with the input activations to each linear layer during calibration.
+    /// Called with the input activations at each capture point during calibration.
     ///
     /// * `layer` — transformer layer index (0-based).
-    /// * `name` — projection name within the layer (e.g. `"q_proj"`, `"k_proj"`,
-    ///   `"v_proj"`, `"o_proj"`, `"gate_proj"`, `"up_proj"`, `"down_proj"`).
+    /// * `name` — capture point name. The Metal calibration dispatch provides
+    ///   `"attn_norm"` (RMSNorm output feeding Q/K/V projections) and
+    ///   `"ffn_norm"` (RMSNorm output feeding gate/up/down projections).
+    ///   Other backends may provide per-projection names (e.g. `"q_proj"`).
     /// * `activation` — FP16 input tensor, flattened as `n_tokens × n_features`.
     /// * `n_features` — number of features (columns) per token. Required to
     ///   correctly reshape the flat activation slice.

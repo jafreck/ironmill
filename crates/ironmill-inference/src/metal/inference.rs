@@ -21,6 +21,7 @@ use super::error::MetalError;
 use super::ops;
 use super::turboquant::{MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantMetalConfig};
 use super::weights::{MetalWeights, QuantizedWeight, WeightBuffer};
+use crate::calibration::ActivationHook;
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
 
@@ -1582,12 +1583,19 @@ impl MetalInference {
             // norm_out is now committed and safe to read.
             {
                 let rb_start = Instant::now();
-                let mut readback = vec![0u8; norm_readback_bytes];
+                // Allocate as u16 to guarantee 2-byte alignment for f16 reinterpret.
+                let mut readback_u16 = vec![0u16; norm_readback_bytes / 2];
+                let readback = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        readback_u16.as_mut_ptr() as *mut u8,
+                        norm_readback_bytes,
+                    )
+                };
                 bufs.norm_out
-                    .read_bytes(&mut readback, 0)
+                    .read_bytes(readback, 0)
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
-                layer_callback(layer_idx, "attn_norm", &readback);
+                layer_callback(layer_idx, "attn_norm", readback);
             }
 
             // Create new command buffer for this layer's attention block.
@@ -2104,12 +2112,18 @@ impl MetalInference {
             // ── Capture ffn_norm activation (input to gate/up/down projections) ──
             {
                 let rb_start = Instant::now();
-                let mut readback = vec![0u8; norm_readback_bytes];
+                let mut readback_u16 = vec![0u16; norm_readback_bytes / 2];
+                let readback = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        readback_u16.as_mut_ptr() as *mut u8,
+                        norm_readback_bytes,
+                    )
+                };
                 bufs.norm_out
-                    .read_bytes(&mut readback, 0)
+                    .read_bytes(readback, 0)
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
-                layer_callback(layer_idx, "ffn_norm", &readback);
+                layer_callback(layer_idx, "ffn_norm", readback);
             }
 
             // ── New command buffer for FFN block ────────────────
@@ -2544,6 +2558,75 @@ impl MetalInference {
         }
         self.run_pipeline_calibration(tokens, layer_callback)
     }
+
+    /// Run the full forward pass with [`ActivationHook`] callbacks.
+    ///
+    /// Wraps [`run_pipeline_calibration`](Self::run_pipeline_calibration),
+    /// converting the raw byte readbacks to typed `&[f16]` slices and
+    /// forwarding them to the hook. `n_features` is the model's
+    /// `hidden_size` (both `attn_norm` and `ffn_norm` outputs have this
+    /// dimensionality).
+    pub fn run_pipeline_with_hooks(
+        &mut self,
+        token_ids: &[u32],
+        hooks: &mut dyn ActivationHook,
+    ) -> Result<Logits, InferenceError> {
+        let hidden_size = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .hidden_size;
+
+        self.run_pipeline_calibration(token_ids, &mut |layer, name, raw_bytes| {
+            let f16_data = bytes_as_f16(raw_bytes);
+            hooks.on_linear_input(layer, name, f16_data, hidden_size);
+        })
+    }
+
+    /// Prefill with [`ActivationHook`] callbacks — the calibration-mode
+    /// equivalent of [`prefill`](InferenceEngine::prefill).
+    ///
+    /// Processes all tokens in a single chunk (calibration sequences are
+    /// typically short) and invokes the hook for every linear-input
+    /// readback.
+    pub fn prefill_with_hooks(
+        &mut self,
+        tokens: &[u32],
+        hooks: &mut dyn ActivationHook,
+    ) -> Result<Logits, InferenceError> {
+        if tokens.is_empty() {
+            return Err(InferenceError::Decode("empty calibration tokens".into()));
+        }
+        self.run_pipeline_with_hooks(tokens, hooks)
+    }
+}
+
+// ── Byte → f16 conversion helper ───────────────────────────────
+
+/// Reinterpret a raw byte slice as `&[f16]`.
+///
+/// # Panics
+///
+/// Panics if `bytes.len()` is not a multiple of 2 or if the pointer is not
+/// 2-byte aligned. Both conditions are guaranteed for Metal buffer readbacks.
+fn bytes_as_f16(bytes: &[u8]) -> &[f16] {
+    let elem_size = std::mem::size_of::<f16>();
+    assert!(
+        bytes.len() % elem_size == 0,
+        "byte slice length {} is not a multiple of f16 size ({})",
+        bytes.len(),
+        elem_size,
+    );
+    assert!(
+        bytes.as_ptr() as usize % std::mem::align_of::<f16>() == 0,
+        "byte slice pointer is not aligned for f16",
+    );
+    // SAFETY: We have verified length and alignment. `f16` is `#[repr(transparent)]`
+    // over `u16` and has no invalid bit patterns.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::slice::from_raw_parts(bytes.as_ptr() as *const f16, bytes.len() / elem_size)
+    }
 }
 
 // ── Helpers on ModelConfig ──────────────────────────────────────
@@ -2838,6 +2921,47 @@ mod calibration_tests {
 
         // Just verify the function compiles — don't actually call it.
         let _ = _assert_method_exists;
+    }
+
+    /// Verify that run_pipeline_with_hooks and prefill_with_hooks signatures
+    /// compile and accept `&mut dyn ActivationHook`.
+    #[test]
+    fn hook_bridge_api_surface_compiles() {
+        use crate::calibration::{ActivationHook, AwqActivationStore};
+
+        fn _assert_hook_methods(engine: &mut MetalInference) {
+            let mut store = AwqActivationStore::new();
+            // These would fail at runtime (no model loaded) but prove
+            // the API surface compiles.
+            let _ = engine.run_pipeline_with_hooks(&[1, 2, 3], &mut store);
+            let _ = engine.prefill_with_hooks(&[1, 2, 3], &mut store);
+        }
+
+        let _ = _assert_hook_methods;
+    }
+
+    /// Verify that `bytes_as_f16` correctly reinterprets raw bytes.
+    #[test]
+    fn bytes_as_f16_roundtrip() {
+        let values = [f16::from_f32(1.0), f16::from_f32(-2.5), f16::from_f32(0.0)];
+        // Serialize to bytes in native byte order.
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|v| v.to_bits().to_ne_bytes())
+            .collect();
+
+        let converted = bytes_as_f16(&bytes);
+        assert_eq!(converted.len(), 3);
+        assert_eq!(converted[0], f16::from_f32(1.0));
+        assert_eq!(converted[1], f16::from_f32(-2.5));
+        assert_eq!(converted[2], f16::from_f32(0.0));
+    }
+
+    /// Verify that `bytes_as_f16` panics on an odd-length byte slice.
+    #[test]
+    #[should_panic(expected = "not a multiple of f16 size")]
+    fn bytes_as_f16_rejects_odd_length() {
+        bytes_as_f16(&[0u8; 3]);
     }
 
     /// Verify that a closure capturing mutable state works as the callback.
