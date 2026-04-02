@@ -7,6 +7,7 @@
 //! mixed-precision, model-split, op-split, op-substitute, and all `ane_*`
 //! passes) have moved to the `ironmill-compile` crate.
 
+pub mod affine_quantize;
 pub mod attention_fusion;
 pub mod beta_quantizer;
 pub mod bn_weight_fold;
@@ -31,6 +32,7 @@ pub(crate) mod util;
 #[cfg(feature = "gptq")]
 pub mod gptq;
 
+pub use affine_quantize::{AffineQuantizePass, BitWidth};
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;
 pub use constant_fold::ConstantFoldPass;
