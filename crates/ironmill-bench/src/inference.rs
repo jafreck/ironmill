@@ -19,12 +19,6 @@ pub struct InferenceResult {
 pub struct UtilizationMetrics {
     /// Time spent in model.predict() calls (the compute portion).
     pub predict_times: Vec<Duration>,
-    /// Time spent marshaling inputs before predict.
-    #[allow(dead_code)]
-    pub marshal_times: Vec<Duration>,
-    /// Time spent reading outputs after predict.
-    #[allow(dead_code)]
-    pub output_read_times: Vec<Duration>,
     /// Total iteration time (marshal + predict + output_read).
     pub total_iteration_times: Vec<Duration>,
 }
@@ -70,9 +64,6 @@ pub struct MemoryMetrics {
     pub rss_after_load: u64,
     /// Peak RSS during inference (bytes).
     pub peak_rss: u64,
-    /// RSS after inference loop (bytes).
-    #[allow(dead_code)]
-    pub rss_after_inference: u64,
     /// Model file size on disk (bytes).
     pub model_file_size: u64,
 }
@@ -81,12 +72,6 @@ impl MemoryMetrics {
     /// RSS growth during inference (peak - post-load), in MB.
     pub fn rss_growth_mb(&self) -> f64 {
         self.peak_rss.saturating_sub(self.rss_after_load) as f64 / (1024.0 * 1024.0)
-    }
-
-    /// Model load memory cost in MB.
-    #[allow(dead_code)]
-    pub fn load_cost_mb(&self) -> f64 {
-        self.rss_after_load.saturating_sub(self.rss_before_load) as f64 / (1024.0 * 1024.0)
     }
 
     /// Memory efficiency ratio: model_file_size / runtime_rss_delta.
@@ -140,34 +125,21 @@ pub fn run_inference(
 
     let mut latencies = Vec::with_capacity(iterations);
     let mut predict_times = Vec::with_capacity(iterations);
-    let mut marshal_times = Vec::with_capacity(iterations);
-    let mut output_read_times = Vec::with_capacity(iterations);
     let mut total_iteration_times = Vec::with_capacity(iterations);
     let mut peak_rss = rss_after_load;
 
     for i in 0..iterations {
         let iter_start = Instant::now();
 
-        // Marshal phase (input is already built, so this is minimal)
-        let marshal_start = Instant::now();
-        // Input is pre-built; marshal time captures the overhead of passing it
-        let marshal_time = marshal_start.elapsed();
-
         // Predict phase
         let predict_start = Instant::now();
         model.predict(&input)?;
         let predict_time = predict_start.elapsed();
 
-        // Output read phase
-        let output_start = Instant::now();
-        let output_time = output_start.elapsed();
-
         let iter_time = iter_start.elapsed();
 
         latencies.push(predict_time);
         predict_times.push(predict_time);
-        marshal_times.push(marshal_time);
-        output_read_times.push(output_time);
         total_iteration_times.push(iter_time);
 
         // Sample RSS periodically (every 100 iterations)
@@ -179,15 +151,13 @@ pub fn run_inference(
         }
     }
 
-    let rss_after_inference = current_rss();
-    if rss_after_inference > peak_rss {
-        peak_rss = rss_after_inference;
+    let rss_final = current_rss();
+    if rss_final > peak_rss {
+        peak_rss = rss_final;
     }
 
     let utilization = UtilizationMetrics {
         predict_times,
-        marshal_times,
-        output_read_times,
         total_iteration_times,
     };
 
@@ -195,7 +165,6 @@ pub fn run_inference(
         rss_before_load,
         rss_after_load,
         peak_rss,
-        rss_after_inference,
         model_file_size,
     };
 

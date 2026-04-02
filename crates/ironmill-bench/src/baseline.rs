@@ -108,61 +108,6 @@ pub fn load_baseline(name: &str) -> Result<BaselineData> {
     Ok(data)
 }
 
-/// Load the most recently modified baseline.
-#[allow(dead_code)]
-pub fn load_latest_baseline() -> Result<Option<BaselineData>> {
-    let dir = baselines_dir()?;
-    if !dir.exists() {
-        return Ok(None);
-    }
-
-    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if latest.as_ref().is_none_or(|(t, _)| modified > *t) {
-                        latest = Some((modified, path));
-                    }
-                }
-            }
-        }
-    }
-
-    match latest {
-        Some((_, path)) => {
-            let content = fs::read_to_string(&path)?;
-            let data: BaselineData = serde_json::from_str(&content)?;
-            Ok(Some(data))
-        }
-        None => Ok(None),
-    }
-}
-
-/// List all saved baselines.
-#[allow(dead_code)]
-pub fn list_baselines() -> Result<Vec<String>> {
-    let dir = baselines_dir()?;
-    if !dir.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut names = Vec::new();
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                names.push(stem.to_string());
-            }
-        }
-    }
-    names.sort();
-    Ok(names)
-}
-
 /// Compare current results against a baseline.
 pub fn compare_against_baseline(
     baseline: &BaselineData,

@@ -11,8 +11,6 @@ use ironmill_compile::mil::{Pass, Program, ScalarType, Value};
 /// Result of a quality benchmark for one (model, method) pair.
 #[derive(Debug, Clone)]
 pub struct QualityResult {
-    #[allow(dead_code)]
-    pub model_name: String,
     pub method: String,
     pub bits: u8,
     pub mse: f64,
@@ -227,7 +225,6 @@ pub fn measure_program_quality(program: &Program, method: &str, bits: u8) -> Vec
                         }
 
                         results.push(QualityResult {
-                            model_name: op.name.clone(),
                             method: method.to_string(),
                             bits,
                             mse,
@@ -244,29 +241,12 @@ pub fn measure_program_quality(program: &Program, method: &str, bits: u8) -> Vec
     results
 }
 
-/// Format quality results as a summary table string.
-#[allow(dead_code)]
-pub fn format_quality_table(results: &[QualityResult]) -> String {
-    let mut out = String::new();
-    out.push_str("| Tensor | Method | Bits | MSE | PSNR (dB) | Compression |\n");
-    out.push_str("|--------|--------|------|-----|-----------|-------------|\n");
-    for r in results {
-        out.push_str(&format!(
-            "| {} | {} | {} | {:.6} | {:.1} | {:.1}× |\n",
-            r.model_name, r.method, r.bits, r.mse, r.psnr_db, r.compression_ratio
-        ));
-    }
-    out
-}
-
 /// Aggregate quality results into a per-model summary.
 #[derive(Debug, Clone)]
 pub struct QualitySummary {
     pub model_name: String,
     pub method: String,
     pub bits: u8,
-    #[allow(dead_code)]
-    pub tensor_count: usize,
     pub avg_mse: f64,
     pub avg_psnr_db: f64,
     pub avg_compression_ratio: f64,
@@ -285,7 +265,6 @@ pub fn summarize_quality(model_name: &str, results: &[QualityResult]) -> Option<
         model_name: model_name.to_string(),
         method,
         bits,
-        tensor_count: results.len(),
         avg_mse: results.iter().map(|r| r.mse).sum::<f64>() / n,
         avg_psnr_db: results.iter().map(|r| r.psnr_db).sum::<f64>() / n,
         avg_compression_ratio: results.iter().map(|r| r.compression_ratio).sum::<f64>() / n,
