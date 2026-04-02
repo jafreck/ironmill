@@ -13,7 +13,7 @@
 //!     quantization: Quantization::Fp16,
 //!     ..Default::default()
 //! };
-//! let path = convert_onnx("model.onnx", "model.mlpackage", opts)?;
+//! let result = convert_onnx("model.onnx", "model.mlpackage", opts)?;
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
@@ -36,9 +36,19 @@ pub struct ConvertOptions {
     pub palettize_bits: Option<u8>,
 }
 
+/// Result of a successful ONNX → CoreML conversion.
+#[derive(Debug)]
+pub struct ConvertResult {
+    /// Path to the generated `.mlpackage`.
+    pub mlpackage: PathBuf,
+    /// Path to the compiled `.mlmodelc`, if compilation was requested and succeeded.
+    pub mlmodelc: Option<PathBuf>,
+}
+
 /// Convert an ONNX model to CoreML `.mlpackage` format.
 ///
-/// Returns the path to the created `.mlpackage` file.
+/// Returns a [`ConvertResult`] containing the `.mlpackage` path and, if
+/// compilation was requested via [`ConvertOptions::compile`], the `.mlmodelc` path.
 ///
 /// # Errors
 ///
@@ -50,15 +60,15 @@ pub struct ConvertOptions {
 /// ```no_run
 /// use candle_coreml::convert::{convert_onnx, ConvertOptions};
 ///
-/// let path = convert_onnx("model.onnx", "out.mlpackage", ConvertOptions::default())?;
-/// println!("wrote {}", path.display());
+/// let result = convert_onnx("model.onnx", "out.mlpackage", ConvertOptions::default())?;
+/// println!("wrote {}", result.mlpackage.display());
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn convert_onnx(
     onnx_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     options: ConvertOptions,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<ConvertResult> {
     let mut builder = CompileBuilder::new(onnx_path.as_ref())
         .output(output_path.as_ref())
         .quantize(options.quantization);
@@ -83,7 +93,10 @@ pub fn convert_onnx(
         .build()
         .map_err(|e| anyhow::anyhow!("ONNX to CoreML conversion failed: {e}"))?;
 
-    Ok(output.mlpackage)
+    Ok(ConvertResult {
+        mlpackage: output.mlpackage,
+        mlmodelc: output.mlmodelc,
+    })
 }
 
 #[cfg(test)]

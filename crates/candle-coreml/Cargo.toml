@@ -12,7 +12,6 @@ keywords = ["candle", "coreml", "apple", "machine-learning"]
 [dependencies]
 ironmill-compile = { workspace = true }
 anyhow = { workspace = true }
-half = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ironmill-inference = { path = "../ironmill-inference" }

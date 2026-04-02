@@ -140,7 +140,6 @@ name = "burn-coreml"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "half",
  "ironmill-compile",
  "ironmill-inference",
 ]
@@ -162,7 +161,6 @@ name = "candle-coreml"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "half",
  "ironmill-compile",
  "ironmill-inference",
 ]

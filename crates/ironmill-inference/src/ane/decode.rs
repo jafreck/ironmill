@@ -1203,7 +1203,7 @@ impl<D: AneDevice> AneInference<D> {
             let token_id = sample_token(&logits, temperature);
 
             // EOS detection (common EOS token IDs).
-            if is_eos_token(token_id) {
+            if is_eos_token(token_id, DEFAULT_EOS_TOKENS) {
                 break;
             }
 
@@ -1636,7 +1636,7 @@ fn cpu_lm_head_matmul(weight: &CpuWeight, hidden: &[f16]) -> Result<Vec<f32>> {
     Ok(logits)
 }
 // Sampling functions are in crate::sampling
-use crate::sampling::{is_eos_token, sample_token};
+use crate::sampling::{DEFAULT_EOS_TOKENS, is_eos_token, sample_token};
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -60,14 +60,22 @@ fn simple_random_f32() -> f32 {
     })
 }
 
-/// Check if a token ID is an end-of-sequence marker.
+/// Common EOS token IDs across popular tokenizers.
 ///
-/// Common EOS token IDs across popular tokenizers:
 /// - 2: LLaMA, Qwen
 /// - 151643: Qwen3 (tiktoken-based)
 /// - 128001: LLaMA-3
-pub fn is_eos_token(token_id: u32) -> bool {
-    matches!(token_id, 2 | 151643 | 128001)
+///
+/// TODO: These should come from `ModelArchitecture` metadata so each model
+/// declares its own EOS tokens rather than relying on a shared default.
+pub const DEFAULT_EOS_TOKENS: &[u32] = &[2, 151643, 128001];
+
+/// Check if a token ID is an end-of-sequence marker.
+///
+/// `eos_tokens` is the set of token IDs considered end-of-sequence.
+/// Use [`DEFAULT_EOS_TOKENS`] when model-specific tokens are unavailable.
+pub fn is_eos_token(token_id: u32, eos_tokens: &[u32]) -> bool {
+    eos_tokens.contains(&token_id)
 }
 
 #[cfg(test)]
@@ -87,10 +95,17 @@ mod tests {
 
     #[test]
     fn eos_detection() {
-        assert!(is_eos_token(2));
-        assert!(is_eos_token(151643));
-        assert!(is_eos_token(128001));
-        assert!(!is_eos_token(42));
+        assert!(is_eos_token(2, DEFAULT_EOS_TOKENS));
+        assert!(is_eos_token(151643, DEFAULT_EOS_TOKENS));
+        assert!(is_eos_token(128001, DEFAULT_EOS_TOKENS));
+        assert!(!is_eos_token(42, DEFAULT_EOS_TOKENS));
+    }
+
+    #[test]
+    fn eos_detection_custom_tokens() {
+        let custom = &[99, 100];
+        assert!(is_eos_token(99, custom));
+        assert!(!is_eos_token(2, custom));
     }
 
     #[test]

@@ -13,8 +13,8 @@
 //! ```no_run
 //! use candle_coreml::convert::{convert_onnx, ConvertOptions};
 //!
-//! let output = convert_onnx("model.onnx", "model.mlpackage", ConvertOptions::default())?;
-//! println!("converted to {}", output.display());
+//! let result = convert_onnx("model.onnx", "model.mlpackage", ConvertOptions::default())?;
+//! println!("converted to {}", result.mlpackage.display());
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
