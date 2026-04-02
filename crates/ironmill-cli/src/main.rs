@@ -571,6 +571,9 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
             }
             "d2quant" => {
                 let bits = opts.bits.unwrap_or(2);
+                if bits != 2 && bits != 3 {
+                    bail!("D2Quant --bits must be 2 or 3, got {bits}");
+                }
                 pipeline = pipeline
                     .with_d2quant(bits, 128, 0.99, None)
                     .context("Failed to configure D2Quant quantization")?;

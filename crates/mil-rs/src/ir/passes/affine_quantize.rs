@@ -205,12 +205,19 @@ pub fn quantize_affine(values: &[f32], qmax: f32) -> (Vec<u8>, f32, f32) {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
     for &v in values {
-        if v < min {
-            min = v;
+        if v.is_finite() {
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
         }
-        if v > max {
-            max = v;
-        }
+    }
+
+    // If no finite values were found, return zeros.
+    if !min.is_finite() || !max.is_finite() {
+        return (vec![0u8; values.len()], 1.0, 0.0);
     }
 
     let (scale, zp_float) = if (max - min).abs() < f32::EPSILON {

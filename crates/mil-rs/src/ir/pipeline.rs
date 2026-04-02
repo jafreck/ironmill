@@ -639,6 +639,11 @@ impl PassPipeline {
     ) -> Result<Self> {
         if self.has_int8 {
             return Err(MilError::Validation(
+                "GPTQ and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_int4 {
+            return Err(MilError::Validation(
                 "GPTQ and INT4 quantization are mutually exclusive".into(),
             ));
         }

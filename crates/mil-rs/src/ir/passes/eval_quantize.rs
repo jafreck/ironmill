@@ -368,19 +368,23 @@ fn dequantize_lut_op(op: &Operation) -> Option<Vec<f32>> {
         }
     };
 
-    // Unpack indices from bytes. Each byte may contain multiple indices
-    // packed from LSB to MSB.
-    let mask = (1u8 << n_bits) - 1;
-    let indices_per_byte = 8 / n_bits;
+    // Unpack indices from bytes. Uses MSB-first bit layout to match
+    // palettize.rs and polar_quantize.rs pack_indices convention.
+    let mask = (1u16 << n_bits) - 1;
     let mut unpacked = Vec::with_capacity(n_elements);
-    for &byte in indices_bytes {
-        for sub in 0..indices_per_byte {
-            if unpacked.len() >= n_elements {
-                break;
-            }
-            let idx = (byte >> (sub * n_bits)) & mask;
-            unpacked.push(idx as usize);
-        }
+    for i in 0..n_elements {
+        let bit_offset = i * n_bits;
+        let byte_pos = bit_offset / 8;
+        let bit_in_byte = bit_offset % 8;
+        let window = if byte_pos + 1 < indices_bytes.len() {
+            ((indices_bytes[byte_pos] as u16) << 8) | indices_bytes[byte_pos + 1] as u16
+        } else if byte_pos < indices_bytes.len() {
+            (indices_bytes[byte_pos] as u16) << 8
+        } else {
+            break;
+        };
+        let idx = (window >> (16 - n_bits - bit_in_byte)) & mask;
+        unpacked.push(idx as usize);
     }
 
     if unpacked.len() < n_elements {
@@ -461,16 +465,29 @@ fn dequantize_dual_scale_op(op: &Operation) -> Option<Vec<f32>> {
         return None;
     }
 
+    // Compute total element count from the outlier mask (1 bit per element).
+    let n_elements = outlier_mask_bytes.len() * 8;
+
     // Unpack quantized values from packed bytes.
-    let mask = (1u32 << bit_width) - 1;
-    let vals_per_byte = 8 / bit_width;
-    let mut quant_vals = Vec::new();
-    for &byte in quantized_bytes {
-        for sub in 0..vals_per_byte {
-            let q = ((byte as u32) >> (sub * bit_width)) & mask;
-            quant_vals.push(q as f32);
+    // 3-bit uses cross-byte packing (8 values per 3 bytes), while
+    // 2-bit and 4-bit pack evenly within bytes.
+    let quant_vals: Vec<f32> = if bit_width == 3 {
+        super::d2quant::dual_scale::unpack_3bit(quantized_bytes, n_elements)
+            .into_iter()
+            .map(|v| v as f32)
+            .collect()
+    } else {
+        let mask = (1u32 << bit_width) - 1;
+        let vals_per_byte = 8 / bit_width;
+        let mut vals = Vec::new();
+        for &byte in quantized_bytes {
+            for sub in 0..vals_per_byte {
+                let q = ((byte as u32) >> (sub * bit_width)) & mask;
+                vals.push(q as f32);
+            }
         }
-    }
+        vals
+    };
 
     // Unpack outlier mask: 1 bit per element, packed LSB-first.
     let mut outlier_flags = Vec::new();
@@ -889,10 +906,10 @@ mod tests {
     fn eval_quantize_lut_to_dense_2bit() {
         // Build a program with an original FP32 const and a quantized LUT op.
         let lut = [0.0f32, 0.5, -0.5, 1.0]; // 4 entries = 2-bit
-        // 8 elements packed into 2 bytes (4 indices per byte, 2 bits each)
-        // Indices: [0, 1, 2, 3, 0, 1, 2, 3]
-        // Byte 0: 0b_11_10_01_00 = 0xE4, Byte 1: 0b_11_10_01_00 = 0xE4
-        let packed_indices: Vec<u8> = vec![0xE4, 0xE4];
+        // 8 elements, indices: [0, 1, 2, 3, 0, 1, 2, 3]
+        // Pack using the same MSB-first convention as palettize/polar_quantize.
+        let indices: Vec<usize> = vec![0, 1, 2, 3, 0, 1, 2, 3];
+        let packed_indices = crate::ir::passes::polar_quantize::pack_indices(&indices, 2);
         let expected: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0, 0.0, 0.5, -0.5, 1.0];
 
         let original = {
@@ -960,8 +977,8 @@ mod tests {
     fn eval_quantize_lut_with_quip_sharp_scales() {
         let lut = [0.0f32, 1.0, -1.0, 2.0]; // 2-bit
         // Indices: [1, 1, 3, 3] → pre-scale values: [1.0, 1.0, 2.0, 2.0]
-        // Byte: 0b_11_11_01_01 = 0xF5
-        let packed_indices: Vec<u8> = vec![0xF5];
+        let indices: Vec<usize> = vec![1, 1, 3, 3];
+        let packed_indices = crate::ir::passes::polar_quantize::pack_indices(&indices, 2);
         // 2 groups of 2, scales: [0.5, 2.0]
         // Expected: [1.0*0.5, 1.0*0.5, 2.0*2.0, 2.0*2.0] = [0.5, 0.5, 4.0, 4.0]
         let expected = [0.5f32, 0.5, 4.0, 4.0];
