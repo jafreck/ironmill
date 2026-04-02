@@ -130,8 +130,6 @@ fn convert_graph(
     model_dir: Option<&Path>,
 ) -> Result<Function> {
     // Move initializers out of the graph to avoid a multi-GB clone.
-    // Metadata (name, dims, data_type) in each TensorProto remains intact;
-    // only the heavy byte buffers are moved via `extract_tensor_raw_data_take`.
     let mut initializers = std::mem::take(&mut graph.initializer);
 
     // 1. Collect initializer names for fast lookup.
@@ -157,8 +155,7 @@ fn convert_graph(
         }
     }
 
-    // Build a type map from ONNX value_info, graph inputs, and graph outputs
-    // so we can attach output types to every operation.
+    // Build a type map from ONNX value_info, graph inputs, and graph outputs.
     let mut onnx_type_map: HashMap<String, TensorType> = HashMap::new();
     for vi in graph
         .input
@@ -170,8 +167,8 @@ fn convert_graph(
             onnx_type_map.insert(vi.name.clone(), tt);
         }
     }
-    // Initializers also have known types.  int64 is narrowed to int32
-    // for CoreML compatibility, so update the type accordingly.
+    // Initializers also have known types — int64 is narrowed to int32
+    // for CoreML compatibility.
     for tensor in &initializers {
         if let Ok(mut dtype) = onnx_dtype_to_scalar(tensor.data_type) {
             if dtype == ScalarType::Int64 {
@@ -195,189 +192,35 @@ fn convert_graph(
         }
     }
 
-    // 4. Detect and merge LoRA adapter weights into base initializers
-    //    (only when merge_lora_weights is true).
-    //
-    //    Works directly on `init_data`, removing A/B/alpha entries and merging
-    //    into the base weight in-place. Only LoRA adapter bytes are allocated
-    //    temporarily (not all weight data).
-    let lora_names: std::collections::HashSet<String> = if merge_lora_weights {
-        let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        // Phase 1: find LoRA A tensor names.
-        let a_names: Vec<String> = init_data
-            .keys()
-            .filter(|n| n.ends_with(".lora_A.weight"))
-            .cloned()
-            .collect();
-
-        // Phase 2: for each pair, remove A/B/alpha, merge into base.
-        for a_name in &a_names {
-            let prefix = match a_name.strip_suffix(".lora_A.weight") {
-                Some(p) => p,
-                None => continue,
-            };
-            let b_name = format!("{prefix}.lora_B.weight");
-            let base_name = format!("{prefix}.weight");
-            let alpha_name = format!("{prefix}.lora_alpha");
-
-            if !init_data.contains_key(&b_name) {
-                continue;
-            }
-
-            // Remove A, B, alpha from init_data (no longer emitted as const ops).
-            let Some((a_data, a_shape, a_dtype)) = init_data.remove(a_name) else {
-                continue;
-            };
-            let Some((b_data, b_shape, b_dtype)) = init_data.remove(&b_name) else {
-                continue;
-            };
-            let alpha_entry = init_data.remove(&alpha_name);
-
-            if a_dtype != b_dtype || a_shape.len() != 2 || b_shape.len() != 2 {
-                continue;
-            }
-
-            let alpha = alpha_entry.and_then(|(data, shape, dtype)| {
-                let numel: usize = shape.iter().product();
-                if numel == 1 {
-                    lora::scalar_from_bytes(&data, dtype)
-                } else {
-                    None
-                }
-            });
-
-            if let Some((base_data, base_shape, base_dtype)) = init_data.get_mut(&base_name) {
-                match lora::merge_lora_weights(
-                    base_data,
-                    base_shape,
-                    &a_data,
-                    &[a_shape[0], a_shape[1]],
-                    &b_data,
-                    &[b_shape[0], b_shape[1]],
-                    *base_dtype,
-                    alpha,
-                ) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        warnings.push(format!("LoRA merge failed for '{base_name}': {e}"));
-                    }
-                }
-            } else {
-                warnings.push(format!(
-                    "LoRA adapter targets '{base_name}' but no matching base weight found"
-                ));
-            }
-
-            consumed.insert(a_name.clone());
-            consumed.insert(b_name);
-            consumed.insert(alpha_name);
-        }
-
-        consumed
-    } else {
-        std::collections::HashSet::new()
-    };
+    // 4. Detect and merge LoRA adapter weights into base initializers.
+    let lora_names = merge_lora_adapters(&mut init_data, warnings, merge_lora_weights);
 
     // 5. Convert initializers to const operations.
-    //    - Skip LoRA-only tensors (merged into base weights above).
-    //    - Detect pre-quantized weight formats (GPTQ/AWQ/QLoRA) and preserve
-    //      their quantization rather than emitting plain `const` ops.
     let mut block = Block::new();
     let prequant = detect_prequantized_weights(&initializer_names);
     for tensor in &initializers {
-        // Skip LoRA-only tensors — they've been merged into base weights.
         if lora_names.contains(tensor.name.as_str()) {
             continue;
         }
-        // Skip auxiliary tensors that are part of a pre-quantized group —
-        // they are folded into the primary op by `prequantized_to_op`.
         if is_prequant_auxiliary(&tensor.name, &prequant) {
             continue;
         }
-
-        if let Some(fmt) = prequant.get(tensor.name.as_str()) {
-            // Pre-quantized weights get special handling.
-            match prequantized_to_op(tensor, *fmt, &mut init_data) {
-                Ok(mut op) => {
-                    stamp_output_types(&mut op, &onnx_type_map);
-                    block.add_op(op);
-                }
-                Err(e) => {
-                    warnings.push(format!("skipping initializer '{}': {e}", tensor.name));
-                }
-            }
-        } else if let Some((data, shape, dtype)) = init_data.remove(&tensor.name) {
-            // Use merged LoRA data if available, otherwise the original data.
-            let mut actual_dtype = dtype;
-            let mut raw_bytes = data;
-            // Narrow int64 → int32 for CoreML compatibility.
-            if actual_dtype == ScalarType::Int64 {
-                raw_bytes = raw_bytes
-                    .chunks_exact(8)
-                    .flat_map(|c| {
-                        let v = i64::from_le_bytes(c.try_into().unwrap());
-                        (v as i32).to_le_bytes()
-                    })
-                    .collect();
-                actual_dtype = ScalarType::Int32;
-            }
-            let mut op = Operation::new("const", &tensor.name);
-            op = op.with_output(&tensor.name);
-            op.attributes.insert(
-                "val".into(),
-                Value::Tensor {
-                    data: raw_bytes,
-                    shape,
-                    dtype: actual_dtype,
-                },
-            );
-            stamp_output_types(&mut op, &onnx_type_map);
-            block.add_op(op);
-        } else {
-            match initializer_to_const(tensor, model_dir) {
-                Ok(mut op) => {
-                    stamp_output_types(&mut op, &onnx_type_map);
-                    block.add_op(op);
-                }
-                Err(e) => {
-                    warnings.push(format!("skipping initializer '{}': {e}", tensor.name));
-                }
-            }
-        }
+        emit_initializer(
+            tensor,
+            &prequant,
+            &mut init_data,
+            &onnx_type_map,
+            model_dir,
+            &mut block,
+            warnings,
+        );
     }
 
     // 6. Topologically sort the nodes, then convert each one.
     let sorted_nodes = topological_sort(&graph.node);
     for node_idx in &sorted_nodes {
         let node = &graph.node[*node_idx];
-        match convert_node(node) {
-            Ok(ops) => {
-                for mut op in ops {
-                    stamp_output_types(&mut op, &onnx_type_map);
-                    block.add_op(op);
-                }
-            }
-            Err(MilError::UnsupportedOp(op_type)) => {
-                warnings.push(format!("unsupported op: {op_type}"));
-                // Emit a placeholder so downstream references still resolve.
-                let mut placeholder = Operation::new("unsupported", node.name.clone());
-                placeholder
-                    .attributes
-                    .insert("original_op".into(), Value::String(op_type));
-                for out in &node.output {
-                    placeholder = placeholder.with_output(out.clone());
-                }
-                stamp_output_types(&mut placeholder, &onnx_type_map);
-                block.add_op(placeholder);
-            }
-            Err(e) => {
-                warnings.push(format!(
-                    "error converting node '{}' ({}): {e}",
-                    node.name, node.op_type
-                ));
-            }
-        }
+        emit_node_or_placeholder(node, &onnx_type_map, &mut block, warnings);
     }
 
     // 7. Set block outputs from graph outputs.
@@ -386,27 +229,223 @@ fn convert_graph(
     }
 
     // 8. Sanitize all operation/output names for CoreML compatibility.
-    //    CoreML MIL identifiers must match [A-Za-z_][A-Za-z0-9_]*.
-    //    ONNX names often contain '/', '.', ':', etc.
     sanitize_block_names(&mut block);
-
-    // Also sanitize function input names.
     for (name, _) in &mut function.inputs {
         let sanitized = sanitize_mil_name(name);
         if sanitized != *name {
-            // The block references are already updated by sanitize_block_names
-            // which includes input names in its rename map scanning.
             *name = sanitized;
         }
     }
 
     // 9. Propagate shapes for ops that still have None output_types.
-    //    Without this, shape-changing ops (conv, pool) get unknown
-    //    dimensions in the proto, which crashes the BNNS backend.
     propagate_output_types(&function.inputs, &mut block);
 
     function.body = block;
     Ok(function)
+}
+
+// ---------------------------------------------------------------------------
+// convert_graph helpers
+// ---------------------------------------------------------------------------
+
+/// Detect and merge LoRA adapter weights (A, B, alpha) into base initializers.
+///
+/// Returns the set of consumed tensor names (A/B/alpha entries that should no
+/// longer be emitted as standalone `const` ops).
+fn merge_lora_adapters(
+    init_data: &mut HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)>,
+    warnings: &mut Vec<String>,
+    enabled: bool,
+) -> HashSet<String> {
+    if !enabled {
+        return HashSet::new();
+    }
+
+    let mut consumed = HashSet::new();
+
+    let a_names: Vec<String> = init_data
+        .keys()
+        .filter(|n| n.ends_with(".lora_A.weight"))
+        .cloned()
+        .collect();
+
+    for a_name in &a_names {
+        let Some(prefix) = a_name.strip_suffix(".lora_A.weight") else {
+            continue;
+        };
+        let b_name = format!("{prefix}.lora_B.weight");
+        let base_name = format!("{prefix}.weight");
+        let alpha_name = format!("{prefix}.lora_alpha");
+
+        if !init_data.contains_key(&b_name) {
+            continue;
+        }
+
+        let Some((a_data, a_shape, a_dtype)) = init_data.remove(a_name) else {
+            continue;
+        };
+        let Some((b_data, b_shape, b_dtype)) = init_data.remove(&b_name) else {
+            continue;
+        };
+        let alpha_entry = init_data.remove(&alpha_name);
+
+        if a_dtype != b_dtype || a_shape.len() != 2 || b_shape.len() != 2 {
+            continue;
+        }
+
+        let alpha = alpha_entry.and_then(|(data, shape, dtype)| {
+            let numel: usize = shape.iter().product();
+            if numel == 1 {
+                lora::scalar_from_bytes(&data, dtype)
+            } else {
+                None
+            }
+        });
+
+        if let Some((base_data, base_shape, base_dtype)) = init_data.get_mut(&base_name) {
+            if let Err(e) = lora::merge_lora_weights(
+                base_data,
+                base_shape,
+                &a_data,
+                &[a_shape[0], a_shape[1]],
+                &b_data,
+                &[b_shape[0], b_shape[1]],
+                *base_dtype,
+                alpha,
+            ) {
+                warnings.push(format!("LoRA merge failed for '{base_name}': {e}"));
+            }
+        } else {
+            warnings.push(format!(
+                "LoRA adapter targets '{base_name}' but no matching base weight found"
+            ));
+        }
+
+        consumed.insert(a_name.clone());
+        consumed.insert(b_name);
+        consumed.insert(alpha_name);
+    }
+
+    consumed
+}
+
+/// Emit a single initializer tensor as one or more MIL operations.
+///
+/// Handles three cases:
+/// 1. Pre-quantized weight → delegated to [`emit_prequantized_initializer`].
+/// 2. Data present in `init_data` (possibly LoRA-merged) → int64-narrowed `const`.
+/// 3. Fallback → [`initializer_to_const`].
+fn emit_initializer(
+    tensor: &TensorProto,
+    prequant: &HashMap<&str, PreQuantFormat>,
+    init_data: &mut HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)>,
+    onnx_type_map: &HashMap<String, TensorType>,
+    model_dir: Option<&Path>,
+    block: &mut Block,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(fmt) = prequant.get(tensor.name.as_str()) {
+        emit_prequantized_initializer(tensor, *fmt, init_data, onnx_type_map, block, warnings);
+        return;
+    }
+
+    if let Some((data, shape, dtype)) = init_data.remove(&tensor.name) {
+        let (raw_bytes, actual_dtype) = narrow_int64(data, dtype);
+        let mut op = Operation::new("const", &tensor.name);
+        op = op.with_output(&tensor.name);
+        op.attributes.insert(
+            "val".into(),
+            Value::Tensor {
+                data: raw_bytes,
+                shape,
+                dtype: actual_dtype,
+            },
+        );
+        stamp_output_types(&mut op, onnx_type_map);
+        block.add_op(op);
+        return;
+    }
+
+    match initializer_to_const(tensor, model_dir) {
+        Ok(mut op) => {
+            stamp_output_types(&mut op, onnx_type_map);
+            block.add_op(op);
+        }
+        Err(e) => {
+            warnings.push(format!("skipping initializer '{}': {e}", tensor.name));
+        }
+    }
+}
+
+/// Emit a pre-quantized weight group (GPTQ/AWQ/QLoRA) as a single MIL op.
+fn emit_prequantized_initializer(
+    tensor: &TensorProto,
+    fmt: PreQuantFormat,
+    init_data: &mut HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)>,
+    onnx_type_map: &HashMap<String, TensorType>,
+    block: &mut Block,
+    warnings: &mut Vec<String>,
+) {
+    match prequantized_to_op(tensor, fmt, init_data) {
+        Ok(mut op) => {
+            stamp_output_types(&mut op, onnx_type_map);
+            block.add_op(op);
+        }
+        Err(e) => {
+            warnings.push(format!("skipping initializer '{}': {e}", tensor.name));
+        }
+    }
+}
+
+/// Convert a single ONNX node, or emit a placeholder if unsupported.
+fn emit_node_or_placeholder(
+    node: &crate::proto::onnx::NodeProto,
+    onnx_type_map: &HashMap<String, TensorType>,
+    block: &mut Block,
+    warnings: &mut Vec<String>,
+) {
+    match convert_node(node) {
+        Ok(ops) => {
+            for mut op in ops {
+                stamp_output_types(&mut op, onnx_type_map);
+                block.add_op(op);
+            }
+        }
+        Err(MilError::UnsupportedOp(op_type)) => {
+            warnings.push(format!("unsupported op: {op_type}"));
+            let mut placeholder = Operation::new("unsupported", node.name.clone());
+            placeholder
+                .attributes
+                .insert("original_op".into(), Value::String(op_type));
+            for out in &node.output {
+                placeholder = placeholder.with_output(out.clone());
+            }
+            stamp_output_types(&mut placeholder, onnx_type_map);
+            block.add_op(placeholder);
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "error converting node '{}' ({}): {e}",
+                node.name, node.op_type
+            ));
+        }
+    }
+}
+
+/// Narrow int64 byte buffers to int32 for CoreML compatibility.
+/// Returns the (possibly narrowed) bytes and the final scalar type.
+fn narrow_int64(data: Vec<u8>, dtype: ScalarType) -> (Vec<u8>, ScalarType) {
+    if dtype != ScalarType::Int64 {
+        return (data, dtype);
+    }
+    let narrowed = data
+        .chunks_exact(8)
+        .flat_map(|c| {
+            let v = i64::from_le_bytes(c.try_into().unwrap());
+            (v as i32).to_le_bytes()
+        })
+        .collect();
+    (narrowed, ScalarType::Int32)
 }
 
 // ---------------------------------------------------------------------------
