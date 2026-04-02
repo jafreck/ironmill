@@ -33,6 +33,7 @@ pub mod process;
 pub mod program;
 pub mod request;
 pub mod validate;
+pub mod weight;
 
 pub use buffers_ready::{InputBuffersReady, OutputSetEnqueue};
 pub use client::{Client, DaemonConnection};
@@ -49,3 +50,4 @@ pub use validate::{
     RawValidateFn, get_validate_network_supported_version, validate_mil_network_on_host_ptr,
     validate_mlir_network_on_host_ptr,
 };
+pub use weight::{ModelInstanceParameters, ProcedureData, Weight};
