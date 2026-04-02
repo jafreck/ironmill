@@ -30,6 +30,7 @@ pub struct PassPipeline {
     has_int4: bool,
     has_palettize: bool,
     has_polar_quant: bool,
+    has_gptq: bool,
 }
 
 // ── TOML configuration types ──────────────────────────────────────────
@@ -201,6 +202,7 @@ impl std::fmt::Debug for PassPipeline {
             .field("has_int4", &self.has_int4)
             .field("has_palettize", &self.has_palettize)
             .field("has_polar_quant", &self.has_polar_quant)
+            .field("has_gptq", &self.has_gptq)
             .finish()
     }
 }
@@ -240,6 +242,7 @@ impl PassPipeline {
             has_int4: false,
             has_palettize: false,
             has_polar_quant: false,
+            has_gptq: false,
         }
     }
 
@@ -374,6 +377,7 @@ impl PassPipeline {
             has_int4,
             has_palettize,
             has_polar_quant,
+            has_gptq: false,
         })
     }
 
@@ -464,10 +468,64 @@ impl PassPipeline {
 
     /// Add GPTQ weight quantization.
     ///
-    /// Stub: calibration-data-aware quantization is not yet implemented.
-    pub fn with_gptq(self, _group_size: usize) -> Result<Self> {
+    /// Uses pre-computed Hessian data from calibration to perform
+    /// optimal weight quantization via the GPTQ algorithm.
+    ///
+    /// Mutually exclusive with INT8, palettization, and polar quantization.
+    #[cfg(feature = "gptq")]
+    pub fn with_gptq(
+        mut self,
+        hessian_data: HashMap<String, (Vec<f32>, usize)>,
+        group_size: usize,
+        block_size: usize,
+        dampening: f64,
+    ) -> Result<Self> {
+        if self.has_int8 {
+            return Err(MilError::Validation(
+                "GPTQ and INT8 quantization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_palettize {
+            return Err(MilError::Validation(
+                "GPTQ and palettization are mutually exclusive".into(),
+            ));
+        }
+        if self.has_polar_quant {
+            return Err(MilError::Validation(
+                "GPTQ and polar-quantization are mutually exclusive".into(),
+            ));
+        }
+        self.has_gptq = true;
+        // Insert before type-repropagation so output types are refreshed.
+        let insert_pos = self
+            .passes
+            .iter()
+            .position(|p| p.name() == "type-repropagation")
+            .unwrap_or(self.passes.len());
+        self.passes.insert(
+            insert_pos,
+            Box::new(super::passes::gptq::GptqQuantizePass::new(
+                4,
+                group_size,
+                block_size,
+                dampening,
+                hessian_data,
+            )),
+        );
+        Ok(self)
+    }
+
+    /// Add GPTQ weight quantization (stub when `gptq` feature is disabled).
+    #[cfg(not(feature = "gptq"))]
+    pub fn with_gptq(
+        self,
+        _hessian_data: HashMap<String, (Vec<f32>, usize)>,
+        _group_size: usize,
+        _block_size: usize,
+        _dampening: f64,
+    ) -> Result<Self> {
         Err(MilError::Validation(
-            "GPTQ requires calibration data and is not yet implemented".into(),
+            "GPTQ requires the 'gptq' feature".into(),
         ))
     }
 
@@ -1295,13 +1353,79 @@ name = "int4-quantize"
     }
 
     #[test]
+    #[cfg(not(feature = "gptq"))]
     fn gptq_stub_returns_error() {
-        let result = PassPipeline::new().with_gptq(128);
+        let result = PassPipeline::new().with_gptq(HashMap::new(), 128, 128, 0.01);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("calibration data"),
-            "expected calibration error, got: {err}"
+            err.contains("gptq"),
+            "expected gptq feature error, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "gptq")]
+    fn with_gptq_builds_pipeline() {
+        let pipeline = PassPipeline::new()
+            .with_gptq(HashMap::new(), 128, 128, 0.01)
+            .unwrap();
+        let names = pipeline.pass_names();
+        assert!(
+            names.contains(&"gptq-quantization"),
+            "expected gptq-quantization in pipeline, got: {names:?}"
+        );
+        // Should be inserted before type-repropagation.
+        let gptq_pos = names
+            .iter()
+            .position(|n| *n == "gptq-quantization")
+            .unwrap();
+        let reprop_pos = names
+            .iter()
+            .position(|n| *n == "type-repropagation")
+            .unwrap();
+        assert!(
+            gptq_pos < reprop_pos,
+            "GPTQ should precede type-repropagation"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "gptq")]
+    fn gptq_and_int8_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_int8(None).unwrap();
+        let result = pipeline.with_gptq(HashMap::new(), 128, 128, 0.01);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "gptq")]
+    fn gptq_and_palettize_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_palettize(4).unwrap();
+        let result = pipeline.with_gptq(HashMap::new(), 128, 128, 0.01);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "gptq")]
+    fn gptq_and_polar_quant_mutually_exclusive() {
+        let pipeline = PassPipeline::new().with_polar_quant(4).unwrap();
+        let result = pipeline.with_gptq(HashMap::new(), 128, 128, 0.01);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
         );
     }
 }
