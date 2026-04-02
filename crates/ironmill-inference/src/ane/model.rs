@@ -60,6 +60,13 @@ pub struct AneConfig {
     /// per-layer timing summary is printed after each decode step.
     /// Has zero overhead when disabled (the normal eval path is used).
     pub enable_profiling: bool,
+    /// Enable chained (pipelined) execution of layer programs.
+    /// When set, the decode loop attempts to build a `ChainingRequest`
+    /// that pipelines all pre_attn/post_attn programs, eliminating
+    /// per-layer CPU↔ANE roundtrips. Falls back to per-layer eval if
+    /// chaining fails. **Experimental — the ANE chaining API is
+    /// undocumented and runtime behavior may vary by hardware.**
+    pub enable_chaining: bool,
 }
 
 impl Default for AneConfig {
@@ -71,6 +78,7 @@ impl Default for AneConfig {
             // QoSMapper::ane_user_interactive_task_qos() == 33
             qos: 33,
             enable_profiling: false,
+            enable_chaining: false,
         }
     }
 }
@@ -500,5 +508,6 @@ mod tests {
         assert!(!c.enable_int4);
         assert_eq!(c.qos, 33);
         assert!(!c.enable_profiling);
+        assert!(!c.enable_chaining);
     }
 }

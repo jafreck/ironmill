@@ -1463,3 +1463,503 @@ fn probe_perf_stats_bits() {
         CFRelease(output_surface);
     }
 }
+
+// =========================================================================
+// Probe 13 — Chaining: Two-program Chain  (2 compiles)
+// =========================================================================
+
+/// Create an `NSNumber` with an `i64` value (`+[NSNumber numberWithLongLong:]`).
+unsafe fn make_nsnumber_i64(value: i64) -> *mut c_void {
+    let cls = unsafe { objc_getClass(b"NSNumber\0".as_ptr()) };
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+    let sel = unsafe { sel_registerName(b"numberWithLongLong:\0".as_ptr()) };
+    type NumFn = unsafe extern "C" fn(*mut c_void, *mut c_void, i64) -> *mut c_void;
+    let f: NumFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(cls, sel, value) }
+}
+
+/// Create an `NSArray` from a slice of raw ObjC object pointers
+/// (`+[NSArray arrayWithObjects:count:]`). Returns an autoreleased object.
+unsafe fn make_nsarray(objects: &[*mut c_void]) -> *mut c_void {
+    let cls = unsafe { objc_getClass(b"NSArray\0".as_ptr()) };
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+    type ArrayFn =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const *mut c_void, usize) -> *mut c_void;
+    let sel = unsafe { sel_registerName(b"arrayWithObjects:count:\0".as_ptr()) };
+    let f: ArrayFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(cls, sel, objects.as_ptr(), objects.len()) }
+}
+
+/// Create an `NSArray` of `NSNumber` from a slice of `i64` values.
+unsafe fn make_nsnumber_array(values: &[i64]) -> *mut c_void {
+    let nums: Vec<*mut c_void> = values
+        .iter()
+        .map(|&v| unsafe { make_nsnumber_i64(v) })
+        .collect();
+    if nums.iter().any(|p| p.is_null()) {
+        return std::ptr::null_mut();
+    }
+    unsafe { make_nsarray(&nums) }
+}
+
+#[test]
+#[ignore]
+fn probe_chaining_two_program() {
+    if !has_ane() {
+        eprintln!("SKIP: no ANE hardware");
+        return;
+    }
+    eprintln!("\n╔══════════════════════════════════════════════╗");
+    eprintln!("║  PROBE 13: Chaining — Two-program Chain       ║");
+    eprintln!("╚══════════════════════════════════════════════╝\n");
+    eprintln!(
+        "Budget remaining: {}\n",
+        ironmill_ane_sys::model::remaining_budget()
+    );
+
+    // Step 1: Compile two trivial MIL programs.
+    //   prog_a: out = add(x, x)  (effectively x * 2)
+    //   prog_b: out = add(x, x)  (effectively x * 2)
+    // If chained correctly via loopback: result = (x*2)*2 = x*4
+    // (Using self-add instead of constant-add to avoid needing const tensors.)
+    let prog_a = match try_compile(
+        "chain_a (add self)",
+        &mil(
+            "        tensor<fp16, [1,4,1,4]> out = add(x=a_input0, y=a_input0)[name=string(\"out\")];",
+            "tensor<fp16, [1,4,1,4]> a_input0",
+            "out",
+        ),
+    ) {
+        Some(m) => m,
+        None => {
+            eprintln!("  Cannot compile program A — skipping chain probe");
+            return;
+        }
+    };
+
+    let prog_b = match try_compile(
+        "chain_b (add self)",
+        &mil(
+            "        tensor<fp16, [1,4,1,4]> out = add(x=a_input0, y=a_input0)[name=string(\"out\")];",
+            "tensor<fp16, [1,4,1,4]> a_input0",
+            "out",
+        ),
+    ) {
+        Some(m) => m,
+        None => {
+            eprintln!("  Cannot compile program B — skipping chain probe");
+            return;
+        }
+    };
+
+    // Step 2: Create I/O IOSurfaces.
+    let input_surface = create_probe_iosurface();
+    let output_surface = create_probe_iosurface();
+    if input_surface.is_null() || output_surface.is_null() {
+        eprintln!("  Failed to create IOSurfaces — skipping");
+        unsafe {
+            if !input_surface.is_null() {
+                CFRelease(input_surface);
+            }
+            if !output_surface.is_null() {
+                CFRelease(output_surface);
+            }
+        }
+        return;
+    }
+
+    // Step 3: Baseline — evaluate each program individually (sequential).
+    eprintln!("  --- Sequential eval (baseline) ---");
+    match ironmill_ane_sys::model::eval(
+        &prog_a,
+        &[input_surface],
+        &[output_surface],
+        ironmill_ane_sys::model::ANE_QOS,
+    ) {
+        Ok(()) => eprintln!("  ✅ prog_a eval OK"),
+        Err(e) => {
+            eprintln!("  ❌ prog_a eval failed: {e}");
+            unsafe {
+                CFRelease(input_surface);
+                CFRelease(output_surface);
+            }
+            return;
+        }
+    }
+    match ironmill_ane_sys::model::eval(
+        &prog_b,
+        &[output_surface],
+        &[output_surface],
+        ironmill_ane_sys::model::ANE_QOS,
+    ) {
+        Ok(()) => eprintln!("  ✅ prog_b eval OK (sequential)"),
+        Err(e) => eprintln!("  ❌ prog_b eval failed: {e}"),
+    }
+
+    // Step 4: Create ChainingRequest with loopback indices.
+    // loopbackInputSymbolIndex: [0] — prog_b's input symbol 0
+    // loopbackOutputSymbolIndex: [0] — prog_a's output symbol 0
+    // This tells the ANE to feed prog_a's output[0] into prog_b's input[0].
+    eprintln!("\n  --- ChainingRequest construction ---");
+    let lb_in = unsafe { make_nsnumber_array(&[0i64]) };
+    let lb_out = unsafe { make_nsnumber_array(&[0i64]) };
+    eprintln!("  lb_input_symbol_id:  {:?}", lb_in);
+    eprintln!("  lb_output_symbol_id: {:?}", lb_out);
+
+    if lb_in.is_null() || lb_out.is_null() {
+        eprintln!("  ❌ Failed to create loopback index arrays");
+        unsafe {
+            CFRelease(input_surface);
+            CFRelease(output_surface);
+        }
+        return;
+    }
+
+    // Build input/output NSArrays for the ChainingRequest.
+    let inputs_arr = unsafe { make_nsarray(&[input_surface]) };
+    let outputs_arr = unsafe { make_nsarray(&[output_surface]) };
+
+    let chain_result = std::panic::catch_unwind(|| unsafe {
+        ChainingRequest::new(
+            inputs_arr,
+            outputs_arr,
+            lb_in,
+            lb_out,
+            0,                    // procedure_index
+            std::ptr::null_mut(), // signal_events (none)
+            0,                    // transaction_handle
+            0,                    // fw_enqueue_delay
+            0,                    // memory_pool_id
+        )
+    });
+
+    let chain_req = match chain_result {
+        Ok(Ok(req)) => {
+            eprintln!("  ✅ ChainingRequest created");
+            eprintln!("     raw ptr:             {:?}", req.as_raw());
+            eprintln!("     validate:            {}", req.validate());
+            eprintln!("     input_buffer:        {:?}", req.input_buffer());
+            eprintln!("     output_sets:         {:?}", req.output_sets());
+            eprintln!(
+                "     lb_input_sym_idx:    {:?}",
+                req.loopback_input_symbol_index()
+            );
+            eprintln!(
+                "     lb_output_sym_idx:   {:?}",
+                req.loopback_output_symbol_index()
+            );
+            req
+        }
+        Ok(Err(e)) => {
+            eprintln!("  ❌ ChainingRequest::new error: {e}");
+            unsafe {
+                CFRelease(input_surface);
+                CFRelease(output_surface);
+            }
+            return;
+        }
+        Err(e) => {
+            eprintln!("  💥 ChainingRequest::new panicked: {e:?}");
+            unsafe {
+                CFRelease(input_surface);
+                CFRelease(output_surface);
+            }
+            return;
+        }
+    };
+
+    // Step 5: Get a client and attempt prepare_chaining.
+    eprintln!("\n  --- prepare_chaining ---");
+    let client = match Client::shared_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  ❌ Failed to get client: {e}");
+            unsafe {
+                CFRelease(input_surface);
+                CFRelease(output_surface);
+            }
+            return;
+        }
+    };
+
+    let mut error: *mut c_void = std::ptr::null_mut();
+    let prepare_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        client.prepare_chaining(
+            prog_a.as_raw(),
+            std::ptr::null_mut(), // options
+            chain_req.as_raw(),
+            ironmill_ane_sys::model::ANE_QOS,
+            &mut error,
+        )
+    }));
+
+    match prepare_ok {
+        Ok(true) => {
+            eprintln!("  ✅ prepare_chaining returned true");
+        }
+        Ok(false) => {
+            let err_desc = if !error.is_null() {
+                unsafe { ns_description(error) }
+            } else {
+                None
+            };
+            eprintln!(
+                "  ❌ prepare_chaining returned false — error: {}",
+                err_desc.as_deref().unwrap_or("(nil)")
+            );
+        }
+        Err(e) => {
+            eprintln!("  💥 prepare_chaining panicked: {e:?}");
+        }
+    }
+
+    // TODO: If prepare_chaining succeeds, the next step would be to
+    // evaluate the chained request and read back results. The evaluation
+    // API for chained requests is not yet clear — it may use the same
+    // eval path or require a separate dispatch mechanism.
+
+    unsafe {
+        CFRelease(input_surface);
+        CFRelease(output_surface);
+    }
+    eprintln!(
+        "\nBudget remaining: {}",
+        ironmill_ane_sys::model::remaining_budget()
+    );
+}
+
+// =========================================================================
+// Probe 14 — Chaining: Multi-program Pipeline  (4 compiles)
+// =========================================================================
+
+#[test]
+#[ignore]
+fn probe_chaining_multi_program() {
+    if !has_ane() {
+        eprintln!("SKIP: no ANE hardware");
+        return;
+    }
+    eprintln!("\n╔══════════════════════════════════════════════╗");
+    eprintln!("║  PROBE 14: Chaining — Multi-program Pipeline  ║");
+    eprintln!("╚══════════════════════════════════════════════╝\n");
+    eprintln!(
+        "Budget remaining: {}\n",
+        ironmill_ane_sys::model::remaining_budget()
+    );
+
+    // Compile 4 trivial programs that simulate a simplified layer pipeline:
+    //   Stage 0: add(x, x)       — simulates RMSNorm (x * 2)
+    //   Stage 1: add(x, x)       — simulates linear projection (x * 2)
+    //   Stage 2: add(x, x)       — simulates quantized cache write (x * 2)
+    //   Stage 3: add(x, x)       — simulates attention (x * 2)
+    // If chained: result = x * 2^4 = x * 16
+    let stage_names = [
+        "pipe_stage0 (norm)",
+        "pipe_stage1 (proj)",
+        "pipe_stage2 (cache_wr)",
+        "pipe_stage3 (attn)",
+    ];
+    let mil_body =
+        "        tensor<fp16, [1,4,1,4]> out = add(x=a_input0, y=a_input0)[name=string(\"out\")];";
+    let mil_input = "tensor<fp16, [1,4,1,4]> a_input0";
+    let mil_output = "out";
+
+    let mut programs: Vec<InMemoryModel> = Vec::new();
+    for name in &stage_names {
+        match try_compile(name, &mil(mil_body, mil_input, mil_output)) {
+            Some(m) => programs.push(m),
+            None => {
+                eprintln!("  Cannot compile {name} — skipping multi-program probe");
+                return;
+            }
+        }
+    }
+    eprintln!("  All 4 programs compiled\n");
+
+    // Create I/O IOSurfaces.
+    let input_surface = create_probe_iosurface();
+    let output_surface = create_probe_iosurface();
+    if input_surface.is_null() || output_surface.is_null() {
+        eprintln!("  Failed to create IOSurfaces — skipping");
+        unsafe {
+            if !input_surface.is_null() {
+                CFRelease(input_surface);
+            }
+            if !output_surface.is_null() {
+                CFRelease(output_surface);
+            }
+        }
+        return;
+    }
+
+    // Baseline: sequential eval of all 4 programs.
+    eprintln!("  --- Sequential eval (baseline, 4 programs) ---");
+    let t_seq = std::time::Instant::now();
+    for (i, prog) in programs.iter().enumerate() {
+        // First program reads from input_surface; subsequent from output_surface.
+        let in_surf = if i == 0 {
+            input_surface
+        } else {
+            output_surface
+        };
+        match ironmill_ane_sys::model::eval(
+            prog,
+            &[in_surf],
+            &[output_surface],
+            ironmill_ane_sys::model::ANE_QOS,
+        ) {
+            Ok(()) => eprintln!("    ✅ stage {i} eval OK"),
+            Err(e) => {
+                eprintln!("    ❌ stage {i} eval failed: {e}");
+                unsafe {
+                    CFRelease(input_surface);
+                    CFRelease(output_surface);
+                }
+                return;
+            }
+        }
+    }
+    let d_seq = t_seq.elapsed();
+    eprintln!("  Sequential total: {:.1}µs\n", d_seq.as_secs_f64() * 1e6);
+
+    // Attempt chained execution.
+    eprintln!("  --- Chained ChainingRequest (4 programs) ---");
+
+    // Build loopback arrays: chain output[0] of each program to input[0] of the next.
+    let lb_in = unsafe { make_nsnumber_array(&[0i64]) };
+    let lb_out = unsafe { make_nsnumber_array(&[0i64]) };
+    if lb_in.is_null() || lb_out.is_null() {
+        eprintln!("  ❌ Failed to create loopback arrays");
+        unsafe {
+            CFRelease(input_surface);
+            CFRelease(output_surface);
+        }
+        return;
+    }
+
+    // Create per-stage ChainingRequests.
+    let mut chain_reqs: Vec<ChainingRequest> = Vec::new();
+    for (i, _prog) in programs.iter().enumerate() {
+        // First program gets the real input; others get loopback from previous.
+        let inputs_arr = if i == 0 {
+            unsafe { make_nsarray(&[input_surface]) }
+        } else {
+            // Loopback programs don't need explicit input surfaces —
+            // the loopback indices tell the ANE to reuse the previous output.
+            // Pass the same surface as a placeholder; the loopback overrides it.
+            unsafe { make_nsarray(&[output_surface]) }
+        };
+        let outputs_arr = unsafe { make_nsarray(&[output_surface]) };
+
+        // Only intermediate programs use loopback; first program has no wait.
+        let lb_in_arg = if i > 0 { lb_in } else { std::ptr::null_mut() };
+        let lb_out_arg = if i < programs.len() - 1 {
+            lb_out
+        } else {
+            std::ptr::null_mut()
+        };
+
+        let result = std::panic::catch_unwind(|| unsafe {
+            ChainingRequest::new(
+                inputs_arr,
+                outputs_arr,
+                lb_in_arg,
+                lb_out_arg,
+                i as i64,             // procedure_index
+                std::ptr::null_mut(), // signal_events
+                0,                    // transaction_handle
+                0,                    // fw_enqueue_delay
+                0,                    // memory_pool_id
+            )
+        });
+
+        match result {
+            Ok(Ok(req)) => {
+                eprintln!(
+                    "    ✅ ChainingRequest[{i}] created  validate={}",
+                    req.validate()
+                );
+                chain_reqs.push(req);
+            }
+            Ok(Err(e)) => {
+                eprintln!("    ❌ ChainingRequest[{i}] error: {e}");
+                unsafe {
+                    CFRelease(input_surface);
+                    CFRelease(output_surface);
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("    💥 ChainingRequest[{i}] panicked: {e:?}");
+                unsafe {
+                    CFRelease(input_surface);
+                    CFRelease(output_surface);
+                }
+                return;
+            }
+        }
+    }
+
+    // Attempt prepare_chaining for each stage.
+    let client = match Client::shared_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  ❌ Failed to get client: {e}");
+            unsafe {
+                CFRelease(input_surface);
+                CFRelease(output_surface);
+            }
+            return;
+        }
+    };
+
+    eprintln!("\n  --- prepare_chaining per stage ---");
+    for (i, (prog, req)) in programs.iter().zip(chain_reqs.iter()).enumerate() {
+        let mut error: *mut c_void = std::ptr::null_mut();
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            client.prepare_chaining(
+                prog.as_raw(),
+                std::ptr::null_mut(), // options
+                req.as_raw(),
+                ironmill_ane_sys::model::ANE_QOS,
+                &mut error,
+            )
+        }));
+
+        match ok {
+            Ok(true) => eprintln!("    ✅ stage {i}: prepare_chaining OK"),
+            Ok(false) => {
+                let err_desc = if !error.is_null() {
+                    unsafe { ns_description(error) }
+                } else {
+                    None
+                };
+                eprintln!(
+                    "    ❌ stage {i}: prepare_chaining failed — {}",
+                    err_desc.as_deref().unwrap_or("(nil)")
+                );
+            }
+            Err(e) => {
+                eprintln!("    💥 stage {i}: prepare_chaining panicked: {e:?}");
+            }
+        }
+    }
+
+    // TODO: If all prepare_chaining calls succeed, dispatch the chained
+    // pipeline and compare output to the sequential baseline. The dispatch
+    // mechanism for chained requests is not yet documented — it may use
+    // evaluateDirectWithModel or a dedicated chaining eval entry point.
+
+    unsafe {
+        CFRelease(input_surface);
+        CFRelease(output_surface);
+    }
+    eprintln!(
+        "\nBudget remaining: {}",
+        ironmill_ane_sys::model::remaining_budget()
+    );
+}
