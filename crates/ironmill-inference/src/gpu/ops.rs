@@ -22,6 +22,7 @@ pub struct GpuPipelines {
     pub polarquant_matmul_int8: ComputePipeline,
     pub kv_scatter: ComputePipeline,
     pub matvec: ComputePipeline,
+    pub fused_residual_rms_norm: ComputePipeline,
 }
 
 impl GpuPipelines {
@@ -37,6 +38,7 @@ impl GpuPipelines {
         let qmm_src = include_str!("shaders/quantized_matmul.metal");
         let kv_scatter_src = include_str!("shaders/kv_scatter.metal");
         let matvec_src = include_str!("shaders/matvec.metal");
+        let fused_rn_src = include_str!("shaders/fused_residual_norm.metal");
 
         let norm_lib = device
             .compile_shader_source(norm_src)
@@ -67,6 +69,9 @@ impl GpuPipelines {
             .map_err(GpuError::Metal)?;
         let matvec_lib = device
             .compile_shader_source(matvec_src)
+            .map_err(GpuError::Metal)?;
+        let fused_rn_lib = device
+            .compile_shader_source(fused_rn_src)
             .map_err(GpuError::Metal)?;
 
         Ok(Self {
@@ -170,6 +175,13 @@ impl GpuPipelines {
             matvec: device
                 .create_compute_pipeline(
                     &matvec_lib.get_function("matvec").map_err(GpuError::Metal)?,
+                )
+                .map_err(GpuError::Metal)?,
+            fused_residual_rms_norm: device
+                .create_compute_pipeline(
+                    &fused_rn_lib
+                        .get_function("fused_residual_rms_norm")
+                        .map_err(GpuError::Metal)?,
                 )
                 .map_err(GpuError::Metal)?,
         })
@@ -469,4 +481,35 @@ pub fn encode_matvec(
     let rows_per_tg: usize = 64;
     let tg_count = (n as usize + rows_per_tg - 1) / rows_per_tg;
     encoder.dispatch_threadgroups((tg_count, 1, 1), (256, 1, 1));
+}
+
+/// Encode a fused residual-add + RMSNorm operation.
+///
+/// Computes `residual = a + b` and `normed = rms_norm(residual, weight)` in a
+/// single kernel dispatch, avoiding the intermediate global-memory round-trip
+/// that two separate dispatches would require.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_fused_residual_rms_norm(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    a: &MetalBuffer,
+    b: &MetalBuffer,
+    weight: &MetalBuffer,
+    normed_output: &MetalBuffer,
+    residual_output: &MetalBuffer,
+    eps: f32,
+    hidden_size: u32,
+    token_count: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(a, 0, 0);
+    encoder.set_buffer(b, 0, 1);
+    encoder.set_buffer(weight, 0, 2);
+    encoder.set_buffer(normed_output, 0, 3);
+    encoder.set_buffer(residual_output, 0, 4);
+    encoder.set_bytes(&eps.to_le_bytes(), 5);
+    encoder.set_bytes(&hidden_size.to_le_bytes(), 6);
+    encoder.set_bytes(&token_count.to_le_bytes(), 7);
+    let tg_size = 1024.min(hidden_size as usize);
+    encoder.dispatch_threadgroups((token_count as usize, 1, 1), (tg_size, 1, 1));
 }

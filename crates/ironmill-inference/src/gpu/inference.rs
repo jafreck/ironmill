@@ -500,43 +500,40 @@ impl GpuInference {
         }
 
         // Per-layer processing.
+        //
+        // Operator fusion: the fused_residual_rms_norm kernel combines a
+        // residual add with RMSNorm in a single dispatch, cutting per-layer
+        // kernel launches by two.  To enable the second fusion (end-of-layer
+        // residual + next layer's input norm), we hoist the very first layer's
+        // input norm out of the loop.  Subsequent layers receive their input
+        // norm as part of the previous layer's fused end-of-layer dispatch.
+
+        // Input norm for the first layer (standalone — no preceding residual to fuse).
+        {
+            let lw0 = &weights.layers[0];
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            ops::encode_rms_norm(
+                &enc,
+                &self.pipelines.rms_norm,
+                &bufs.hidden_state,
+                &lw0.input_norm,
+                &bufs.norm_out,
+                h as u32,
+                token_count as u32,
+                eps,
+            );
+            enc.end_encoding();
+        }
+
         for layer_idx in 0..mc.num_hidden_layers {
             let lw = &weights.layers[layer_idx];
             let lm = &matmuls.layer_matmuls[layer_idx];
 
-            // Copy hidden_state → residual before layernorm.
-            // We use residual_add with a zero source to copy, but actually
-            // we just need to swap buffer roles. Since we can't swap,
-            // we encode a copy via residual_add(hidden, zero) — but that's
-            // wasteful. Instead, use the pattern: norm(hidden→norm_out),
-            // then at residual add time, add hidden (original) + proj_out.
-            // So `residual` holds the pre-norm hidden state.
-            //
-            // Actually: we copy hidden → residual via a residual_add with
-            // the input as source and a zero-add. Simpler: just track that
-            // the residual IS the hidden_state buffer at this point.
-            //
-            // The approach: after norm, we still have the pre-norm hidden_state.
-            // We only overwrite hidden_state at the residual add step.
-            // So the residual connection reads from hidden_state (pre-norm value).
-
-            // Step 2: RMSNorm (input layernorm)
-            {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_rms_norm(
-                    &enc,
-                    &self.pipelines.rms_norm,
-                    &bufs.hidden_state,
-                    &lw.input_norm,
-                    &bufs.norm_out,
-                    h as u32,
-                    token_count as u32,
-                    eps,
-                );
-                enc.end_encoding();
-            }
+            // norm_out already contains the input-norm result:
+            //   • layer 0: computed by the standalone dispatch above
+            //   • layer 1+: produced by the previous layer's fused end-of-layer kernel
 
             // Steps 3-5: Q/K/V projections — dispatch by weight type.
             // Dense weights use MPS matmul (encodes directly onto cmd_buf).
@@ -1153,37 +1150,25 @@ impl GpuInference {
                 }
             }
 
-            // Step 10: Residual add — hidden = hidden_state + o_proj_out
-            // hidden_state still contains the pre-norm value (our residual).
+            // Step 10-11 (fused): Residual add + post-attention RMSNorm
+            // hidden_state still holds the pre-norm value (our skip connection).
+            // Produces both the normalized output (for MLP) and the raw residual
+            // (for the next skip connection) in a single kernel dispatch.
             {
                 let enc = cmd_buf
                     .compute_encoder()
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_residual_add(
+                ops::encode_fused_residual_rms_norm(
                     &enc,
-                    &self.pipelines.residual_add,
-                    &bufs.hidden_state,
-                    &bufs.ffn_down, // o_proj output was written here
-                    &bufs.residual,
-                    (token_count * h) as u32,
-                );
-                enc.end_encoding();
-            }
-
-            // Step 11: RMSNorm (post-attention norm)
-            {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_rms_norm(
-                    &enc,
-                    &self.pipelines.rms_norm,
-                    &bufs.residual,
-                    &lw.post_attn_norm,
-                    &bufs.norm_out,
+                    &self.pipelines.fused_residual_rms_norm,
+                    &bufs.hidden_state, // a: skip connection (pre-norm hidden)
+                    &bufs.ffn_down,     // b: o_proj output
+                    &lw.post_attn_norm, // weight: post-attention norm
+                    &bufs.norm_out,     // normed output → MLP input
+                    &bufs.residual,     // residual output → next skip connection
+                    eps,
                     h as u32,
                     token_count as u32,
-                    eps,
                 );
                 enc.end_encoding();
             }
@@ -1424,8 +1409,30 @@ impl GpuInference {
                 }
             }
 
-            // Step 16: Residual add — hidden = residual + ffn_down
-            {
+            // Step 16 (fused): Residual add + next layer's input RMSNorm
+            // For all but the last layer, fuse the post-MLP residual add with
+            // the next layer's input norm.  The last layer does a standalone
+            // residual add — the final norm lives outside the loop.
+            if layer_idx + 1 < mc.num_hidden_layers {
+                let next_lw = &weights.layers[layer_idx + 1];
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_fused_residual_rms_norm(
+                    &enc,
+                    &self.pipelines.fused_residual_rms_norm,
+                    &bufs.residual,      // a: post-attn residual
+                    &bufs.ffn_down,      // b: down_proj output
+                    &next_lw.input_norm, // weight: next layer's input norm
+                    &bufs.norm_out,      // normed output → next layer's attention
+                    &bufs.hidden_state,  // residual output → next layer's skip
+                    eps,
+                    h as u32,
+                    token_count as u32,
+                );
+                enc.end_encoding();
+            } else {
+                // Last layer: standalone residual add (final norm is separate).
                 let enc = cmd_buf
                     .compute_encoder()
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -1434,7 +1441,7 @@ impl GpuInference {
                     &self.pipelines.residual_add,
                     &bufs.residual,
                     &bufs.ffn_down,
-                    &bufs.hidden_state, // write back to hidden_state for next layer
+                    &bufs.hidden_state,
                     (token_count * h) as u32,
                 );
                 enc.end_encoding();
