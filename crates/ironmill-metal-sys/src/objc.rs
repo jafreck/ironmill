@@ -11,6 +11,8 @@ use crate::error::MetalSysError;
 // FFI declarations
 // ---------------------------------------------------------------------------
 
+// SAFETY: Standard ObjC runtime FFI declarations. These are well-defined
+// C functions from the objc dylib.
 #[link(name = "objc", kind = "dylib")]
 unsafe extern "C" {
     pub(crate) fn objc_getClass(name: *const u8) -> *mut c_void;
@@ -18,6 +20,7 @@ unsafe extern "C" {
     pub(crate) fn objc_msgSend(receiver: *mut c_void, sel: *mut c_void) -> *mut c_void;
 }
 
+// SAFETY: Standard CoreFoundation FFI declaration.
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     pub(crate) fn CFRelease(cf: *mut c_void);

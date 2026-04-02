@@ -285,8 +285,11 @@ impl AneTensor {
                     "copy_column0_from: IOSurfaceLock(src) failed (status {rc})"
                 )));
             }
+            // SAFETY: src.surface is locked read-only (lock succeeded above).
+            // IOSurfaceGetBaseAddress returns the CPU-mapped base or null.
             let src_base = unsafe { ffi::IOSurfaceGetBaseAddress(src.surface) };
             if src_base.is_null() {
+                // SAFETY: src.surface is locked; must unlock on error path.
                 unsafe {
                     ffi::IOSurfaceUnlock(
                         src.surface,
@@ -299,8 +302,11 @@ impl AneTensor {
                 ));
             }
 
+            // SAFETY: self.surface is a valid IOSurface; locking read-write
+            // for the destination copy.
             let rc = unsafe { ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut()) };
             if rc != 0 {
+                // SAFETY: src.surface is still locked read-only; unlock on error.
                 unsafe {
                     ffi::IOSurfaceUnlock(
                         src.surface,
@@ -312,8 +318,10 @@ impl AneTensor {
                     "copy_column0_from: IOSurfaceLock(dst) failed (status {rc})"
                 )));
             }
+            // SAFETY: self.surface is locked read-write (lock succeeded above).
             let dst_base = unsafe { ffi::IOSurfaceGetBaseAddress(self.surface) };
             if dst_base.is_null() {
+                // SAFETY: Both surfaces are locked; unlock both on error.
                 unsafe { ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut()) };
                 unsafe {
                     ffi::IOSurfaceUnlock(
@@ -330,6 +338,12 @@ impl AneTensor {
             let src_ptr = src_base as *const u8;
             let dst_ptr = dst_base as *mut u8;
             for c in 0..channels {
+                // SAFETY: Both surfaces are locked with verified non-null base
+                // addresses. Strided copy of `bpe` bytes per channel stays
+                // within bounds (channels * stride ≤ alloc_size for each
+                // surface). Note: stride arithmetic (c * src_stride, c *
+                // dst_stride) is unchecked — overflow is a known limitation
+                // for extremely large channel counts.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         src_ptr.add(c * src_stride),
@@ -339,6 +353,8 @@ impl AneTensor {
                 }
             }
 
+            // SAFETY: Unlock both surfaces in reverse order. self.surface was
+            // locked read-write, src.surface was locked read-only.
             unsafe { ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut()) };
             unsafe {
                 ffi::IOSurfaceUnlock(
@@ -453,6 +469,8 @@ impl AneTensor {
         #[cfg(target_os = "macos")]
         {
             // Lock src read-only.
+            // SAFETY: self.surface is a valid IOSurface from IOSurfaceCreate.
+            // IOSurfaceLock acquires CPU access; return code is checked.
             let rc = unsafe {
                 ffi::IOSurfaceLock(
                     self.surface,
@@ -465,8 +483,10 @@ impl AneTensor {
                     "copy_column0_fp16_as_int8_to: IOSurfaceLock(src) failed (status {rc})"
                 )));
             }
+            // SAFETY: self.surface is locked; get CPU-mapped base address.
             let src_base = unsafe { ffi::IOSurfaceGetBaseAddress(self.surface) };
             if src_base.is_null() {
+                // SAFETY: self.surface is locked; must unlock on error path.
                 unsafe {
                     ffi::IOSurfaceUnlock(
                         self.surface,
@@ -480,8 +500,10 @@ impl AneTensor {
             }
 
             // Lock dst read-write.
+            // SAFETY: dst.surface is a valid IOSurface.
             let rc = unsafe { ffi::IOSurfaceLock(dst.surface, 0, std::ptr::null_mut()) };
             if rc != 0 {
+                // SAFETY: self.surface is still locked; unlock on error.
                 unsafe {
                     ffi::IOSurfaceUnlock(
                         self.surface,
@@ -493,8 +515,10 @@ impl AneTensor {
                     "copy_column0_fp16_as_int8_to: IOSurfaceLock(dst) failed (status {rc})"
                 )));
             }
+            // SAFETY: dst.surface is locked read-write; get base address.
             let dst_base = unsafe { ffi::IOSurfaceGetBaseAddress(dst.surface) };
             if dst_base.is_null() {
+                // SAFETY: Both surfaces locked; unlock both on error.
                 unsafe { ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut()) };
                 unsafe {
                     ffi::IOSurfaceUnlock(
@@ -509,10 +533,17 @@ impl AneTensor {
             }
 
             let src_ptr = src_base as *const u8;
+            // SAFETY: dst_base is non-null (verified above). dst_byte_offset
+            // is bounds-checked against dst.alloc_size earlier in this method.
             let dst_ptr = unsafe { (dst_base as *mut u8).add(dst_byte_offset) };
 
             for c in 0..channels {
                 let mut fp16_bytes = [0u8; 2];
+                // SAFETY: src is locked with non-null base. Each strided read
+                // of 2 bytes at c * src_stride_bytes is within the src surface
+                // allocation. Note: c * src_stride_bytes arithmetic is
+                // unchecked — overflow is a known limitation for very large
+                // channel counts.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         src_ptr.add(c * src_stride_bytes),
@@ -522,9 +553,12 @@ impl AneTensor {
                 }
                 let val = f16::from_le_bytes(fp16_bytes);
                 // Values are already rounded/clamped to [-128, 127] by MIL program.
+                // SAFETY: dst_ptr.add(c) is within dst allocation (offset +
+                // channels ≤ alloc_size, verified above).
                 unsafe { *dst_ptr.add(c) = val.to_f32() as i8 as u8 };
             }
 
+            // SAFETY: Unlock both surfaces in reverse order.
             unsafe { ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut()) };
             unsafe {
                 ffi::IOSurfaceUnlock(

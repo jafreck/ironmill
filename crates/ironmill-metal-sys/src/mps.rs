@@ -12,6 +12,7 @@ use crate::objc::{self, sel};
 // Framework link
 // ---------------------------------------------------------------------------
 
+// SAFETY: Declares the MetalPerformanceShaders framework link for MPS class access.
 #[link(name = "MetalPerformanceShaders", kind = "framework")]
 unsafe extern "C" {}
 
@@ -52,6 +53,8 @@ impl MpsMatrixMultiply {
         device: &MetalDevice,
         config: &MpsMatrixMultiplyConfig,
     ) -> Result<Self, MetalSysError> {
+        // SAFETY: objc_getClass with a valid null-terminated class name.
+        // The MPS framework is linked above, so the class is available.
         let cls = unsafe { objc::objc_getClass(sel!("MPSMatrixMultiplication")) };
         if cls.is_null() {
             return Err(MetalSysError::Mps(
@@ -60,6 +63,8 @@ impl MpsMatrixMultiply {
         }
 
         // +alloc
+        // SAFETY: `cls` is a valid ObjC class pointer (null-checked above).
+        // "alloc" returns a +1 retained uninitialized instance.
         type AllocFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         let alloc_sel = unsafe { objc::sel_registerName(sel!("alloc")) };
         let alloc_fn: AllocFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -71,6 +76,10 @@ impl MpsMatrixMultiply {
         }
 
         // -initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:
+        // SAFETY: `obj` is a valid allocated MPSMatrixMultiplication (null-checked
+        // above). `device.as_raw_ptr()` is a valid id<MTLDevice>. The init
+        // method consumes the alloc'd object and returns a retained initialized
+        // instance or nil.
         type InitFn = unsafe extern "C" fn(
             *mut c_void, // self
             *mut c_void, // _cmd
@@ -123,6 +132,9 @@ impl MpsMatrixMultiply {
         result: &MpsMatrix,
     ) {
         // -encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:
+        // SAFETY: `self.raw` is a valid retained MPSMatrixMultiplication. All
+        // argument pointers are valid retained ObjC objects obtained from their
+        // respective safe wrappers.
         type EncodeFn = unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
@@ -153,6 +165,7 @@ impl MpsMatrixMultiply {
 impl Drop for MpsMatrixMultiply {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // SAFETY: self.raw is a retained ObjC object; null-checked above.
             unsafe { objc::CFRelease(self.raw) };
             self.raw = std::ptr::null_mut();
         }
@@ -193,6 +206,7 @@ impl MpsMatrix {
         // MPSDataTypeFloat16 = 0x10000000 | 16 = 268435472
         let data_type_f16: usize = 0x10000000 | 16;
 
+        // SAFETY: objc_getClass with a valid null-terminated class name.
         let desc_cls = unsafe { objc::objc_getClass(sel!("MPSMatrixDescriptor")) };
         if desc_cls.is_null() {
             return Err(MetalSysError::Mps(
@@ -200,6 +214,9 @@ impl MpsMatrix {
             ));
         }
 
+        // SAFETY: `desc_cls` is a valid class (null-checked above).
+        // "matrixDescriptorWithRows:columns:rowBytes:dataType:" is a class
+        // method that returns an autoreleased descriptor.
         type DescFn = unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
@@ -222,11 +239,14 @@ impl MpsMatrix {
 
         // Now create the MPSMatrix with the buffer and descriptor.
         // [[MPSMatrix alloc] initWithBuffer:descriptor:]
+        // SAFETY: objc_getClass with a valid null-terminated class name.
         let matrix_cls = unsafe { objc::objc_getClass(sel!("MPSMatrix")) };
         if matrix_cls.is_null() {
             return Err(MetalSysError::Mps("MPSMatrix class not found".into()));
         }
 
+        // SAFETY: `matrix_cls` is a valid class (null-checked above).
+        // "alloc" returns a +1 retained uninitialized instance.
         type AllocFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         let alloc_sel = unsafe { objc::sel_registerName(sel!("alloc")) };
         let alloc_fn: AllocFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -235,6 +255,10 @@ impl MpsMatrix {
             return Err(MetalSysError::Mps("MPSMatrix alloc failed".into()));
         }
 
+        // SAFETY: `obj` is a valid allocated MPSMatrix (null-checked above).
+        // `buffer.as_raw_ptr()` is a valid id<MTLBuffer> and `descriptor` is
+        // a valid MPSMatrixDescriptor. "initWithBuffer:descriptor:" returns a
+        // retained initialized instance or nil.
         type InitFn =
             unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
         let init_sel = unsafe { objc::sel_registerName(sel!("initWithBuffer:descriptor:")) };
@@ -256,6 +280,7 @@ impl MpsMatrix {
 impl Drop for MpsMatrix {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // SAFETY: self.raw is a retained ObjC object; null-checked above.
             unsafe { objc::CFRelease(self.raw) };
             self.raw = std::ptr::null_mut();
         }

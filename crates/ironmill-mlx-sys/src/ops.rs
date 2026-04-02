@@ -38,6 +38,11 @@ pub fn matmul(a: &MlxArray, b: &MlxArray, stream: &MlxStream) -> Result<MlxArray
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: mlx_array_new allocates a fresh empty handle (no invalid
+        // pointer access). The subsequent FFI calls receive valid mlx_array
+        // handles (a.raw, b.raw) owned by their MlxArray wrappers, and
+        // stream.raw is a valid mlx_stream. On success, `result` is a valid
+        // owned handle transferred to MlxArray::from_raw.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe { ffi::mlx_matmul(&mut result, a.raw, b.raw, stream.raw) };
         check_ret(ret, "matmul")?;
@@ -55,6 +60,9 @@ pub fn add(a: &MlxArray, b: &MlxArray, stream: &MlxStream) -> Result<MlxArray, M
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: All raw handles (a.raw, b.raw, stream.raw) are valid,
+        // owned by their safe wrappers. mlx_array_new returns a valid empty
+        // handle. On success, result ownership transfers to MlxArray.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe { ffi::mlx_add(&mut result, a.raw, b.raw, stream.raw) };
         check_ret(ret, "add")?;
@@ -72,6 +80,8 @@ pub fn multiply(a: &MlxArray, b: &MlxArray, stream: &MlxStream) -> Result<MlxArr
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: All raw handles (a.raw, b.raw, stream.raw) are valid,
+        // owned by their safe wrappers. Result ownership transfers on success.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe { ffi::mlx_multiply(&mut result, a.raw, b.raw, stream.raw) };
         check_ret(ret, "multiply")?;
@@ -93,6 +103,9 @@ pub fn reshape(
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: a.raw and stream.raw are valid handles. new_shape.as_ptr()
+        // and new_shape.len() describe a valid i32 slice. Result ownership
+        // transfers on success.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe {
             ffi::mlx_reshape(
@@ -118,6 +131,8 @@ pub fn transpose(a: &MlxArray, stream: &MlxStream) -> Result<MlxArray, MlxSysErr
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: a.raw and stream.raw are valid handles owned by their
+        // safe wrappers. Result ownership transfers on success.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe { ffi::mlx_transpose(&mut result, a.raw, stream.raw) };
         check_ret(ret, "transpose")?;
@@ -139,6 +154,9 @@ pub fn transpose_axes(
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: a.raw and stream.raw are valid handles. axes.as_ptr() and
+        // axes.len() describe a valid i32 slice. Result ownership transfers
+        // on success.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe {
             ffi::mlx_transpose_axes(&mut result, a.raw, axes.as_ptr(), axes.len(), stream.raw)
@@ -161,14 +179,19 @@ pub fn silu(a: &MlxArray, stream: &MlxStream) -> Result<MlxArray, MlxSysError> {
     #[cfg(not(mlx_stub))]
     {
         // silu(x) = x * sigmoid(x)
+        // SAFETY: a.raw and stream.raw are valid handles. Intermediate `sig`
+        // handle is freed on error or after use. Result ownership transfers
+        // on success via MlxArray::from_raw.
         let mut sig = unsafe { ffi::mlx_array_new() };
         let ret = unsafe { ffi::mlx_sigmoid(&mut sig, a.raw, stream.raw) };
         if ret != 0 {
+            // SAFETY: sig is a valid handle from mlx_array_new.
             unsafe { ffi::mlx_array_free(sig) };
             return Err(MlxSysError::MlxC("sigmoid failed".into()));
         }
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe { ffi::mlx_multiply(&mut result, a.raw, sig, stream.raw) };
+        // SAFETY: sig is a valid handle; freed after use regardless of success.
         unsafe { ffi::mlx_array_free(sig) };
         check_ret(ret, "silu")?;
         Ok(unsafe { MlxArray::from_raw(result) })
@@ -224,6 +247,9 @@ pub fn expand_dims(
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: a.raw and stream.raw are valid handles. axes.as_ptr() and
+        // axes.len() describe a valid i32 slice. Result ownership transfers
+        // on success.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe {
             ffi::mlx_expand_dims_axes(&mut result, a.raw, axes.as_ptr(), axes.len(), stream.raw)
@@ -247,6 +273,10 @@ pub fn concat(
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: mlx_vector_array_new returns a valid vector handle (null-
+        // checked below). Each arr.raw is a valid array handle. The vector
+        // is freed after the concatenation call. Result ownership transfers
+        // on success.
         let vec = unsafe { ffi::mlx_vector_array_new() };
         if vec.ctx.is_null() {
             return Err(MlxSysError::MlxC(
@@ -254,10 +284,12 @@ pub fn concat(
             ));
         }
         for arr in arrays {
+            // SAFETY: vec is valid (null-checked above), arr.raw is a valid handle.
             unsafe { ffi::mlx_vector_array_append_value(vec, arr.raw) };
         }
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe { ffi::mlx_concatenate_axis(&mut result, vec, axis, stream.raw) };
+        // SAFETY: vec is a valid vector handle; freed after use.
         unsafe { ffi::mlx_vector_array_free(vec) };
         check_ret(ret, "concat")?;
         Ok(unsafe { MlxArray::from_raw(result) })
@@ -278,6 +310,9 @@ pub fn broadcast_to(
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: a.raw and stream.raw are valid handles. shape.as_ptr() and
+        // shape.len() describe a valid i32 slice. Result ownership transfers
+        // on success.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe {
             ffi::mlx_broadcast_to(&mut result, a.raw, shape.as_ptr(), shape.len(), stream.raw)

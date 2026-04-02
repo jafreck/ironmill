@@ -27,11 +27,15 @@ impl ShaderLibrary {
     /// Look up a function by name in this library.
     pub fn get_function(&self, name: &str) -> Result<ShaderFunction, MetalSysError> {
         let ns_name = objc::create_nsstring(name)?;
+        // SAFETY: `self.raw` is a valid, retained id<MTLLibrary>, `ns_name`
+        // is a valid retained NSString. "newFunctionWithName:" returns a +1
+        // retained id<MTLFunction> or nil. ns_name is released after the call.
         type GetFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
         let sel = unsafe { objc::sel_registerName(sel!("newFunctionWithName:")) };
         let f: GetFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
         let raw = unsafe { f(self.raw, sel, ns_name) };
         // Release the NSString.
+        // SAFETY: ns_name is a retained NSString from create_nsstring.
         unsafe { objc::CFRelease(ns_name) };
 
         if raw.is_null() {
@@ -51,6 +55,7 @@ impl ShaderLibrary {
 impl Drop for ShaderLibrary {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // SAFETY: self.raw is a retained ObjC object; null-checked above.
             unsafe { objc::CFRelease(self.raw) };
             self.raw = std::ptr::null_mut();
         }
@@ -80,6 +85,7 @@ impl ShaderFunction {
 impl Drop for ShaderFunction {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // SAFETY: self.raw is a retained ObjC object; null-checked above.
             unsafe { objc::CFRelease(self.raw) };
             self.raw = std::ptr::null_mut();
         }

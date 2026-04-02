@@ -63,6 +63,11 @@ impl CommandQueue {
 
     /// Create a new command buffer from this queue.
     pub fn command_buffer(&self) -> Result<CommandBuffer, MetalSysError> {
+        // SAFETY: All four unsafe calls below form a single ObjC message send
+        // pattern. `self.raw` is a valid, retained id<MTLCommandQueue> (non-null
+        // enforced by `from_raw` and null-check at construction). The selector
+        // "commandBuffer" returns an autoreleased id<MTLCommandBuffer>.
+        // `transmute` casts `objc_msgSend` to the correct function signature.
         type CmdBufFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         let sel = unsafe { objc::sel_registerName(sel!("commandBuffer")) };
         let f: CmdBufFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -86,6 +91,7 @@ impl CommandQueue {
 impl Drop for CommandQueue {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // SAFETY: self.raw is a retained ObjC object; null-checked above.
             unsafe { objc::CFRelease(self.raw) };
             self.raw = std::ptr::null_mut();
         }
@@ -108,6 +114,9 @@ unsafe impl Sync for CommandBuffer {}
 impl CommandBuffer {
     /// Create a compute command encoder.
     pub fn compute_encoder(&self) -> Result<ComputeEncoder, MetalSysError> {
+        // SAFETY: `self.raw` is a valid, retained id<MTLCommandBuffer>. The
+        // selector "computeCommandEncoder" returns an autoreleased encoder.
+        // transmute casts objc_msgSend to the matching signature.
         type EncFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         let sel = unsafe { objc::sel_registerName(sel!("computeCommandEncoder")) };
         let f: EncFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -124,6 +133,8 @@ impl CommandBuffer {
 
     /// Commit the command buffer for execution.
     pub fn commit(&self) {
+        // SAFETY: `self.raw` is a valid, retained id<MTLCommandBuffer>.
+        // "commit" enqueues the buffer for GPU execution.
         type CommitFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
         let sel = unsafe { objc::sel_registerName(sel!("commit")) };
         let f: CommitFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -132,6 +143,8 @@ impl CommandBuffer {
 
     /// Block the current thread until the command buffer has completed.
     pub fn wait_until_completed(&self) {
+        // SAFETY: `self.raw` is a valid, retained id<MTLCommandBuffer>.
+        // "waitUntilCompleted" blocks until GPU execution finishes.
         type WaitFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
         let sel = unsafe { objc::sel_registerName(sel!("waitUntilCompleted")) };
         let f: WaitFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -140,6 +153,8 @@ impl CommandBuffer {
 
     /// Returns the current status of the command buffer.
     pub fn status(&self) -> CommandBufferStatus {
+        // SAFETY: `self.raw` is a valid, retained id<MTLCommandBuffer>.
+        // "status" returns an NSUInteger (MTLCommandBufferStatus enum).
         type StatusFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
         let sel = unsafe { objc::sel_registerName(sel!("status")) };
         let f: StatusFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -156,6 +171,7 @@ impl CommandBuffer {
 impl Drop for CommandBuffer {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // SAFETY: self.raw is a retained ObjC object; null-checked above.
             unsafe { objc::CFRelease(self.raw) };
             self.raw = std::ptr::null_mut();
         }
@@ -177,6 +193,9 @@ unsafe impl Send for ComputeEncoder {}
 impl ComputeEncoder {
     /// Set the compute pipeline state for subsequent dispatch calls.
     pub fn set_pipeline(&self, pipeline: &ComputePipeline) {
+        // SAFETY: `self.raw` is a valid encoder and `pipeline` is a valid
+        // retained pipeline state. "setComputePipelineState:" binds the
+        // pipeline for subsequent dispatch calls.
         type SetFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
         let sel = unsafe { objc::sel_registerName(sel!("setComputePipelineState:")) };
         let f: SetFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -185,6 +204,9 @@ impl ComputeEncoder {
 
     /// Bind a buffer at the given index with an offset.
     pub fn set_buffer(&self, buffer: &MetalBuffer, offset: usize, index: usize) {
+        // SAFETY: `self.raw` is a valid encoder and `buffer` is a valid
+        // retained Metal buffer. "setBuffer:offset:atIndex:" binds the buffer
+        // at the specified index for compute kernel access.
         type SetFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, usize, usize);
         let sel = unsafe { objc::sel_registerName(sel!("setBuffer:offset:atIndex:")) };
         let f: SetFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -193,6 +215,9 @@ impl ComputeEncoder {
 
     /// Set inline bytes at the given index.
     pub fn set_bytes(&self, data: &[u8], index: usize) {
+        // SAFETY: `self.raw` is a valid encoder. `data.as_ptr()` and
+        // `data.len()` describe a valid byte slice. "setBytes:length:atIndex:"
+        // copies the bytes into the encoder's argument table.
         type SetFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, usize);
         let sel = unsafe { objc::sel_registerName(sel!("setBytes:length:atIndex:")) };
         let f: SetFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -201,6 +226,8 @@ impl ComputeEncoder {
 
     /// Set threadgroup memory length at the given index.
     pub fn set_threadgroup_memory_length(&self, length: usize, index: usize) {
+        // SAFETY: `self.raw` is a valid encoder.
+        // "setThreadgroupMemoryLength:atIndex:" reserves threadgroup memory.
         type SetFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize);
         let sel = unsafe { objc::sel_registerName(sel!("setThreadgroupMemoryLength:atIndex:")) };
         let f: SetFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -219,6 +246,10 @@ impl ComputeEncoder {
             height: usize,
             depth: usize,
         }
+        // SAFETY: `self.raw` is a valid encoder. MtlSize is #[repr(C)] matching
+        // MTLSize layout. "dispatchThreads:threadsPerThreadgroup:" dispatches a
+        // non-uniform grid. On arm64, small structs are returned in registers
+        // so objc_msgSend (not _stret) is correct.
         type DispatchFn = unsafe extern "C" fn(*mut c_void, *mut c_void, MtlSize, MtlSize);
         let sel = unsafe { objc::sel_registerName(sel!("dispatchThreads:threadsPerThreadgroup:")) };
         let f: DispatchFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -247,6 +278,9 @@ impl ComputeEncoder {
             height: usize,
             depth: usize,
         }
+        // SAFETY: `self.raw` is a valid encoder. MtlSize is #[repr(C)] matching
+        // MTLSize layout. "dispatchThreadgroups:threadsPerThreadgroup:" dispatches
+        // the specified number of threadgroups.
         type DispatchFn = unsafe extern "C" fn(*mut c_void, *mut c_void, MtlSize, MtlSize);
         let sel =
             unsafe { objc::sel_registerName(sel!("dispatchThreadgroups:threadsPerThreadgroup:")) };
@@ -266,6 +300,8 @@ impl ComputeEncoder {
 
     /// End encoding. Must be called before committing the command buffer.
     pub fn end_encoding(&self) {
+        // SAFETY: `self.raw` is a valid encoder. "endEncoding" finalizes the
+        // encoding; no further encoding calls are valid after this.
         type EndFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
         let sel = unsafe { objc::sel_registerName(sel!("endEncoding")) };
         let f: EndFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -281,6 +317,7 @@ impl ComputeEncoder {
 impl Drop for ComputeEncoder {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // SAFETY: self.raw is a retained ObjC object; null-checked above.
             unsafe { objc::CFRelease(self.raw) };
             self.raw = std::ptr::null_mut();
         }

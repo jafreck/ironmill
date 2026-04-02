@@ -13,6 +13,7 @@ use crate::shader::{ShaderFunction, ShaderLibrary};
 // Metal framework link + MTLCreateSystemDefaultDevice
 // ---------------------------------------------------------------------------
 
+// SAFETY: These are well-known C FFI declarations from the Metal framework.
 #[link(name = "Metal", kind = "framework")]
 unsafe extern "C" {
     fn MTLCreateSystemDefaultDevice() -> *mut c_void;
@@ -78,6 +79,9 @@ impl MetalDevice {
 
     /// Returns the name of this GPU device.
     pub fn name(&self) -> String {
+        // SAFETY: `self.raw` is a valid, retained id<MTLDevice> (non-null
+        // guaranteed by system_default). "name" returns an autoreleased
+        // NSString. transmute casts objc_msgSend to the correct signature.
         type NameFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         let sel = unsafe { objc::sel_registerName(sel!("name")) };
         let f: NameFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -87,6 +91,8 @@ impl MetalDevice {
 
     /// Returns the maximum buffer length in bytes this device supports.
     pub fn max_buffer_length(&self) -> usize {
+        // SAFETY: `self.raw` is a valid id<MTLDevice>. "maxBufferLength"
+        // returns an NSUInteger property value.
         type LenFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
         let sel = unsafe { objc::sel_registerName(sel!("maxBufferLength")) };
         let f: LenFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -95,6 +101,8 @@ impl MetalDevice {
 
     /// Returns the maximum threadgroup memory length in bytes.
     pub fn max_threadgroup_memory_length(&self) -> usize {
+        // SAFETY: `self.raw` is a valid id<MTLDevice>.
+        // "maxThreadgroupMemoryLength" returns an NSUInteger property value.
         type LenFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
         let sel = unsafe { objc::sel_registerName(sel!("maxThreadgroupMemoryLength")) };
         let f: LenFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -104,6 +112,8 @@ impl MetalDevice {
     /// Returns the current total allocation size (bytes) across all Metal
     /// resources created by this device.
     pub fn current_allocated_size(&self) -> usize {
+        // SAFETY: `self.raw` is a valid id<MTLDevice>.
+        // "currentAllocatedSize" returns an NSUInteger property value.
         type LenFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
         let sel = unsafe { objc::sel_registerName(sel!("currentAllocatedSize")) };
         let f: LenFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -121,6 +131,9 @@ impl MetalDevice {
             height: usize,
             depth: usize,
         }
+        // SAFETY: `self.raw` is a valid id<MTLDevice>. MtlSize is #[repr(C)]
+        // matching MTLSize. On arm64, 3-word structs are returned in registers,
+        // so objc_msgSend (not _stret) is correct.
         type SizeFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> MtlSize;
         let sel = unsafe { objc::sel_registerName(sel!("maxThreadsPerThreadgroup")) };
         let f: SizeFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -130,6 +143,8 @@ impl MetalDevice {
 
     /// Check whether this device supports a given GPU family.
     pub fn supports_family(&self, family: GpuFamily) -> bool {
+        // SAFETY: `self.raw` is a valid id<MTLDevice>. "supportsFamily:" takes
+        // an MTLGPUFamily enum value (usize) and returns a BOOL.
         type BoolFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> bool;
         let sel = unsafe { objc::sel_registerName(sel!("supportsFamily:")) };
         let f: BoolFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -155,6 +170,9 @@ impl MetalDevice {
             ));
         }
         // -[MTLDevice newBufferWithLength:options:]
+        // SAFETY: `self.raw` is a valid id<MTLDevice>. Size is validated > 0
+        // above. "newBufferWithLength:options:" returns a +1 retained buffer
+        // or nil. transmute casts objc_msgSend to the correct signature.
         type NewBufFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void;
         let sel = unsafe { objc::sel_registerName(sel!("newBufferWithLength:options:")) };
         let f: NewBufFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -180,6 +198,10 @@ impl MetalDevice {
             ));
         }
         // -[MTLDevice newBufferWithBytes:length:options:]
+        // SAFETY: `self.raw` is a valid id<MTLDevice>. `data.as_ptr()` and
+        // `data.len()` describe a valid byte slice (non-empty, verified above).
+        // "newBufferWithBytes:length:options:" copies the data and returns a
+        // +1 retained buffer or nil.
         type NewBufFn =
             unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, usize) -> *mut c_void;
         let sel = unsafe { objc::sel_registerName(sel!("newBufferWithBytes:length:options:")) };
@@ -197,6 +219,8 @@ impl MetalDevice {
 
     /// Create a command queue for this device.
     pub fn create_command_queue(&self) -> Result<CommandQueue, MetalSysError> {
+        // SAFETY: `self.raw` is a valid id<MTLDevice>. "newCommandQueue"
+        // returns a +1 retained id<MTLCommandQueue> or nil.
         type NewQueueFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         let sel = unsafe { objc::sel_registerName(sel!("newCommandQueue")) };
         let f: NewQueueFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -215,6 +239,10 @@ impl MetalDevice {
         // Use a nil options dictionary for default compile options.
         // We pass a pointer to an error out-param.
         let mut error: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `self.raw` is a valid id<MTLDevice>, `ns_source` is a valid
+        // retained NSString. "newLibraryWithSource:options:error:" compiles
+        // MSL source and returns a +1 retained library or nil with error.
+        // The NSString is released after the call. Error is released if set.
         type NewLibFn = unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
@@ -234,11 +262,13 @@ impl MetalDevice {
             )
         };
         // Release the NSString source.
+        // SAFETY: ns_source is a retained NSString from create_nsstring.
         unsafe { objc::CFRelease(ns_source) };
 
         if raw.is_null() {
             let desc = if !error.is_null() {
                 let d = objc::extract_nserror_description(error);
+                // SAFETY: error is a non-null ObjC NSError from the out-param.
                 unsafe { objc::CFRelease(error) };
                 d
             } else {
@@ -255,6 +285,9 @@ impl MetalDevice {
         function: &ShaderFunction,
     ) -> Result<ComputePipeline, MetalSysError> {
         let mut error: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `self.raw` is a valid id<MTLDevice>, `function` is a valid
+        // retained id<MTLFunction>. "newComputePipelineStateWithFunction:error:"
+        // returns a +1 retained pipeline or nil with error.
         type NewPipeFn = unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
@@ -268,6 +301,7 @@ impl MetalDevice {
         if raw.is_null() {
             let desc = if !error.is_null() {
                 let d = objc::extract_nserror_description(error);
+                // SAFETY: error is a non-null ObjC NSError from the out-param.
                 unsafe { objc::CFRelease(error) };
                 d
             } else {

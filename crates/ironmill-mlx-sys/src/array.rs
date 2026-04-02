@@ -85,6 +85,8 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
+            // SAFETY: mlx_array_new_float is a simple C constructor that
+            // creates a scalar array. The returned handle is null-checked.
             let raw = unsafe { ffi::mlx_array_new_float(val) };
             if raw.ctx.is_null() {
                 return Err(MlxSysError::MlxC("failed to create scalar array".into()));
@@ -102,6 +104,10 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
+            // SAFETY: self.raw is a valid mlx_array handle (owned by this
+            // MlxArray). mlx_array_ndim/shape return values that remain valid
+            // for the lifetime of the handle. The slice is constructed from
+            // the shape pointer with ndim elements.
             let ndim = unsafe { ffi::mlx_array_ndim(self.raw) };
             let shape_ptr = unsafe { ffi::mlx_array_shape(self.raw) };
             if shape_ptr.is_null() || ndim == 0 {
@@ -121,6 +127,7 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
+            // SAFETY: self.raw is a valid mlx_array handle.
             let raw_dtype = unsafe { ffi::mlx_array_dtype(self.raw) };
             MlxDtype::from_raw(raw_dtype).unwrap_or(MlxDtype::Float32)
         }
@@ -135,6 +142,7 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
+            // SAFETY: self.raw is a valid mlx_array handle.
             unsafe { ffi::mlx_array_ndim(self.raw) }
         }
     }
@@ -148,6 +156,7 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
+            // SAFETY: self.raw is a valid mlx_array handle.
             unsafe { ffi::mlx_array_size(self.raw) }
         }
     }
@@ -161,6 +170,7 @@ impl MlxArray {
 
         #[cfg(not(mlx_stub))]
         {
+            // SAFETY: self.raw is a valid mlx_array handle.
             unsafe { ffi::mlx_array_itemsize(self.raw) }
         }
     }
@@ -184,6 +194,8 @@ impl MlxArray {
         {
             // Use mlx_array_data_uint8 as a generic byte pointer; caller
             // guarantees T matches the real dtype.
+            // SAFETY: self.raw is a valid, evaluated mlx_array handle. The
+            // returned pointer is valid for the array's data lifetime.
             let ptr = unsafe { ffi::mlx_array_data_uint8(self.raw) };
             if ptr.is_null() {
                 return Err(MlxSysError::MlxC(
@@ -207,6 +219,9 @@ impl Clone for MlxArray {
     fn clone(&self) -> Self {
         #[cfg(not(mlx_stub))]
         {
+            // SAFETY: mlx_array_new returns a valid empty handle.
+            // mlx_array_set copies the reference count (not data), so both
+            // new_arr and self.raw remain valid.
             let mut new_arr = unsafe { ffi::mlx_array_new() };
             unsafe { ffi::mlx_array_set(&mut new_arr, self.raw) };
             Self { raw: new_arr }
@@ -223,6 +238,7 @@ impl Drop for MlxArray {
     fn drop(&mut self) {
         #[cfg(not(mlx_stub))]
         if !self.raw.ctx.is_null() {
+            // SAFETY: self.raw is a valid mlx_array handle; null-checked above.
             unsafe { ffi::mlx_array_free(self.raw) };
             self.raw.ctx = std::ptr::null_mut();
         }

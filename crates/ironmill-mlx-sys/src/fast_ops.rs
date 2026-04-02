@@ -26,10 +26,14 @@ pub fn rms_norm(
 
     #[cfg(not(mlx_stub))]
     {
+        // SAFETY: x.raw and weight.raw are valid mlx_array handles, stream.raw
+        // is a valid mlx_stream. mlx_array_new returns a valid empty handle.
+        // On error, result is freed. On success, ownership transfers to MlxArray.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret =
             unsafe { ffi::mlx_fast_rms_norm(&mut result, x.raw, weight.raw, eps, stream.raw) };
         if ret != 0 {
+            // SAFETY: result is a valid handle from mlx_array_new.
             unsafe { ffi::mlx_array_free(result) };
             return Err(MlxSysError::MlxC("rms_norm failed".into()));
         }
@@ -63,6 +67,9 @@ pub fn rope(
         let null_freqs = ffi::mlx_array {
             ctx: std::ptr::null_mut(),
         };
+        // SAFETY: x.raw and stream.raw are valid handles. null_freqs is a
+        // sentinel null-context array signaling "no custom frequencies" to
+        // the C API. On error, result is freed.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe {
             ffi::mlx_fast_rope(
@@ -78,6 +85,7 @@ pub fn rope(
             )
         };
         if ret != 0 {
+            // SAFETY: result is a valid handle from mlx_array_new.
             unsafe { ffi::mlx_array_free(result) };
             return Err(MlxSysError::MlxC("rope failed".into()));
         }
@@ -115,6 +123,10 @@ pub fn scaled_dot_product_attention(
             None => (c"", null_arr),
         };
 
+        // SAFETY: q/k/v .raw are valid mlx_array handles. mask_mode_cstr is a
+        // valid C string. mask_arr is either a valid handle or a null-context
+        // sentinel. null_arr is a sentinel for unused sinks. stream.raw is valid.
+        // On error, result is freed.
         let mut result = unsafe { ffi::mlx_array_new() };
         let ret = unsafe {
             ffi::mlx_fast_scaled_dot_product_attention(
@@ -130,6 +142,7 @@ pub fn scaled_dot_product_attention(
             )
         };
         if ret != 0 {
+            // SAFETY: result is a valid handle from mlx_array_new.
             unsafe { ffi::mlx_array_free(result) };
             return Err(MlxSysError::MlxC(
                 "scaled_dot_product_attention failed".into(),

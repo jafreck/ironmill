@@ -58,6 +58,8 @@ impl MetalBuffer {
 
     /// Returns the length of the buffer in bytes.
     pub fn length(&self) -> usize {
+        // SAFETY: `self.raw` is a valid, retained id<MTLBuffer>.
+        // "length" returns the buffer's allocation size in bytes.
         type LenFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
         let sel = unsafe { objc::sel_registerName(sel!("length")) };
         let f: LenFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
@@ -69,6 +71,8 @@ impl MetalBuffer {
     /// Only valid for `Shared` and `Managed` storage modes. Returns a null
     /// pointer for `Private` buffers.
     pub fn contents(&self) -> *mut c_void {
+        // SAFETY: `self.raw` is a valid, retained id<MTLBuffer>. "contents"
+        // returns a CPU-accessible pointer (or null for Private buffers).
         type ContentsFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         let sel = unsafe { objc::sel_registerName(sel!("contents")) };
         let f: ContentsFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
