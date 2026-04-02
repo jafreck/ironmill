@@ -30,4 +30,40 @@ pub enum AneSysError {
     /// The per-process ANE compile budget has been exhausted.
     #[error("ANE compile budget exhausted ({count}/119 compilations)")]
     BudgetExhausted { count: usize },
+
+    /// Loading a compiled program into the ANE failed.
+    #[error("ANE load failed: {0}")]
+    LoadFailed(String),
+
+    /// Unloading a program from the ANE failed.
+    #[error("ANE unload failed: {0}")]
+    UnloadFailed(String),
+
+    /// The ANE device is not present or not reachable.
+    #[error("ANE device not available")]
+    DeviceNotAvailable,
+
+    /// Mapping an IOSurface for ANE I/O failed.
+    #[error("ANE IOSurface mapping failed: {0}")]
+    IOSurfaceMappingFailed(String),
+
+    /// A chaining (multi-segment) request failed.
+    #[error("ANE chaining request failed: {0}")]
+    ChainingFailed(String),
+
+    /// An ANE request failed validation before submission.
+    #[error("ANE request validation failed")]
+    RequestValidationFailed,
+
+    /// An ANE API call returned a null pointer unexpectedly.
+    #[error("Null pointer returned from ANE API: {context}")]
+    NullPointer { context: String },
+
+    /// Setting a session hint on the ANE failed.
+    #[error("ANE session hint failed: {0}")]
+    SessionHintFailed(String),
+
+    /// Creating an ANE program object failed.
+    #[error("ANE program creation failed: {0}")]
+    ProgramCreationFailed(String),
 }
