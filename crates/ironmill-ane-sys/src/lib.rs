@@ -32,6 +32,7 @@ pub mod perf;
 pub mod process;
 pub mod program;
 pub mod request;
+pub mod token;
 pub mod validate;
 pub mod weight;
 
@@ -46,6 +47,7 @@ pub use perf::{PerformanceStats, PerformanceStatsIOSurface, QoSMapper};
 pub use process::current_rss;
 pub use program::ProgramForEvaluation;
 pub use request::{AneRequest, ChainingRequest};
+pub use token::ModelToken;
 pub use validate::{
     RawValidateFn, get_validate_network_supported_version, validate_mil_network_on_host_ptr,
     validate_mlir_network_on_host_ptr,
