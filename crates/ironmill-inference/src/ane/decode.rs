@@ -111,6 +111,8 @@ pub struct AneInference<D: AneDevice> {
     /// critical path. Falls back to standard per-layer eval on failure.
     /// **Highly experimental.**
     enable_hybrid: bool,
+    /// Pre-allocated scratch buffers for the decode loop.
+    scratch: ScratchBuffers,
 }
 
 /// CPU-side weight tensor for embedding/lm_head.
@@ -148,6 +150,33 @@ struct AttnInputMap {
     rope_cos_indices: Vec<usize>,
     /// Indices of sin cache inputs (RoPE gathered values).
     rope_sin_indices: Vec<usize>,
+}
+
+/// Pre-allocated scratch buffers to eliminate per-token heap allocations.
+///
+/// Sized at model construction time based on max tensor dimensions.
+/// Reused across `decode()` calls via `std::mem::take` / put-back pattern.
+struct ScratchBuffers {
+    /// Scratch for `write_f16_padded()` zero-padded writes.
+    padded: Vec<f16>,
+    /// Scratch for post-attn packed residual writes.
+    packed_residual: Vec<f16>,
+    /// Pre-allocated zero buffer for cache/mask reset.
+    zeros: Vec<f16>,
+    /// Pre-allocated -inf buffer for mask reset.
+    neg_inf_mask: Vec<f16>,
+    /// Reusable hidden state / embedding buffer.
+    hidden: Vec<f16>,
+    /// Reusable attention output buffer.
+    attn_out: Vec<f16>,
+    /// Reusable Q projection buffer (FP16 cache path).
+    q_data: Vec<f16>,
+    /// Reusable K projection buffer (FP16 cache path).
+    k_data: Vec<f16>,
+    /// Reusable V projection buffer (FP16 cache path).
+    v_data: Vec<f16>,
+    /// Reusable residual read buffer (packed post-attn path).
+    residual: Vec<f16>,
 }
 
 /// A compiled sub-program with pre-allocated I/O tensors.
@@ -193,6 +222,10 @@ struct AneLmHead<D: AneDevice> {
     vocab_size: usize,
     qos: u32,
     device: Arc<D>,
+    /// Scratch for `write_f16_padded` in `forward_inner`.
+    padded_scratch: Vec<f16>,
+    /// Scratch for `read_f16_channels` chunk reads in `forward_inner`.
+    chunk_read_buf: Vec<f16>,
 }
 
 /// One chunk of the ANE lm_head — a conv1×1 with ≤16384 output channels.
@@ -294,11 +327,17 @@ impl<D: AneDevice> AneLmHead<D> {
              (max {LM_HEAD_MAX_CHUNK_CH} channels each, {patched_chunks} patched)"
         );
 
+        // Compute scratch sizes from the chunks.
+        let max_padded = hidden_size * LM_HEAD_MIN_SEQ;
+        let max_chunk_ch = chunks.iter().map(|c| c.out_channels).max().unwrap_or(0);
+
         Ok(Self {
             chunks,
             vocab_size,
             qos,
             device,
+            padded_scratch: vec![f16::ZERO; max_padded],
+            chunk_read_buf: Vec::with_capacity(max_chunk_ch),
         })
     }
 
@@ -319,10 +358,13 @@ impl<D: AneDevice> AneLmHead<D> {
         hw_ns: &mut u64,
     ) -> Result<Vec<f32>> {
         let mut logits = Vec::with_capacity(self.vocab_size);
+        // Take scratch buffers out of self to avoid borrow conflicts with self.chunks.
+        let mut padded = std::mem::take(&mut self.padded_scratch);
+        let mut chunk_buf = std::mem::take(&mut self.chunk_read_buf);
 
         for chunk in &mut self.chunks {
             // Write hidden state to input tensor (column 0, zero-padded).
-            write_f16_padded(&mut chunk.input_tensor, hidden)?;
+            write_f16_padded(&mut chunk.input_tensor, hidden, &mut padded)?;
 
             // Eval conv1×1 on ANE (program stays loaded).
             ane_eval(
@@ -336,9 +378,18 @@ impl<D: AneDevice> AneLmHead<D> {
             )?;
 
             // Read output logits from column 0 of each channel.
-            let output = read_f16_channels(&chunk.output_tensor)?;
-            logits.extend(output.iter().take(chunk.out_channels).map(|v| v.to_f32()));
+            read_f16_channels(&chunk.output_tensor, &mut chunk_buf)?;
+            logits.extend(
+                chunk_buf
+                    .iter()
+                    .take(chunk.out_channels)
+                    .map(|v| v.to_f32()),
+            );
         }
+
+        // Put scratch buffers back for reuse on next call.
+        self.padded_scratch = padded;
+        self.chunk_read_buf = chunk_buf;
 
         Ok(logits)
     }
@@ -737,6 +788,60 @@ impl<D: AneDevice> AneInference<D> {
         // compile_decode_bundle. For now, set to None.
         let qk_norm_weights: Option<Vec<(Vec<f16>, Vec<f16>)>> = None;
 
+        // Compute scratch buffer sizes from allocated tensors.
+        let mut max_padded = 0usize;
+        let mut max_out_channels = 0usize;
+        let mut max_packed_residual = 0usize;
+        for layer in &layers {
+            for t in &layer.pre_attn.input_tensors {
+                max_padded = max_padded.max(t.shape()[1] * t.shape()[3]);
+            }
+            for t in &layer.pre_attn.output_tensors {
+                max_out_channels = max_out_channels.max(t.shape()[1]);
+            }
+            if let Some(ref post) = layer.post_attn {
+                for t in &post.input_tensors {
+                    let sz = t.shape()[1] * t.shape()[3];
+                    max_padded = max_padded.max(sz);
+                    max_packed_residual = max_packed_residual.max(sz);
+                }
+                for t in &post.output_tensors {
+                    max_out_channels = max_out_channels.max(t.shape()[1]);
+                }
+            }
+            if let Some(ref attn) = layer.fp16_attn {
+                for t in &attn.input_tensors {
+                    max_padded = max_padded.max(t.shape()[1] * t.shape()[3]);
+                }
+                for t in &attn.output_tensors {
+                    max_out_channels = max_out_channels.max(t.shape()[1]);
+                }
+            }
+        }
+        // Also account for FP16 attention staging tensors.
+        if let Some(ref qs) = fp16_attn_q_staging {
+            max_padded = max_padded.max(qs.shape()[1] * qs.shape()[3]);
+        }
+        if let Some(ref os) = fp16_attn_out_staging {
+            max_out_channels = max_out_channels.max(os.shape()[1]);
+        }
+
+        let kv_cache_size = num_kv_heads * head_dim * max_seq_len;
+        let hidden_size = arch.hidden_size;
+
+        let scratch = ScratchBuffers {
+            padded: vec![f16::ZERO; max_padded],
+            packed_residual: vec![f16::ZERO; max_packed_residual],
+            zeros: vec![f16::ZERO; kv_cache_size.max(max_seq_len)],
+            neg_inf_mask: vec![f16::NEG_INFINITY; max_seq_len],
+            hidden: Vec::with_capacity(hidden_size),
+            attn_out: Vec::with_capacity(max_out_channels),
+            q_data: Vec::with_capacity(max_out_channels),
+            k_data: Vec::with_capacity(max_out_channels),
+            v_data: Vec::with_capacity(max_out_channels),
+            residual: Vec::with_capacity(max_out_channels),
+        };
+
         Ok(Self {
             embed_weight,
             layers,
@@ -763,6 +868,7 @@ impl<D: AneDevice> AneInference<D> {
             enable_chaining: false,
             enable_fusion: false,
             enable_hybrid: false,
+            scratch,
         })
     }
 
@@ -933,12 +1039,21 @@ impl<D: AneDevice> AneInference<D> {
         } else {
             None
         };
-        let embed_out = cpu_embedding_lookup(&self.embed_weight, token_id)?;
+        // Swap scratch buffers out of self for use as locals (avoids borrow
+        // conflicts with other self fields in the decode loop).
+        let mut hidden = std::mem::take(&mut self.scratch.hidden);
+        cpu_embedding_lookup(&self.embed_weight, token_id, &mut hidden)?;
         let d_embed = t0.map(|t| t.elapsed());
+
+        // Scratch buffers swapped out for the duration of decode().
+        let mut attn_out = std::mem::take(&mut self.scratch.attn_out);
+        let mut q_buf = std::mem::take(&mut self.scratch.q_data);
+        let mut k_buf = std::mem::take(&mut self.scratch.k_data);
+        let mut v_buf = std::mem::take(&mut self.scratch.v_data);
+        let mut residual_buf = std::mem::take(&mut self.scratch.residual);
 
         // 2. Per-layer: pre_attn → attention → post_attn
         let num_layers = self.layers.len();
-        let mut hidden = embed_out;
 
         // Update causal mask: unmask current position.
         // mask[seq_pos] = 0.0 (allow attention), rest stays -inf.
@@ -1017,7 +1132,11 @@ impl<D: AneDevice> AneInference<D> {
                     None
                 };
                 let layer = &mut self.layers[layer_idx];
-                write_f16_padded(&mut layer.pre_attn.input_tensors[0], &hidden)?;
+                write_f16_padded(
+                    &mut layer.pre_attn.input_tensors[0],
+                    &hidden,
+                    &mut self.scratch.padded,
+                )?;
                 {
                     let in_refs: Vec<&AneTensor> = layer.pre_attn.input_tensors.iter().collect();
                     let mut out_refs: Vec<&mut AneTensor> =
@@ -1053,8 +1172,8 @@ impl<D: AneDevice> AneInference<D> {
             // channels while K/V have num_kv_heads * head_dim (smaller for GQA models).
             let num_pre_outputs = layer.pre_attn.output_tensors.len();
 
-            // Attention (divergent path)
-            let attn_out_data = if let Some(tq) = &mut self.turboquant {
+            // Attention (divergent path) — writes into attn_out scratch buffer.
+            if let Some(tq) = &mut self.turboquant {
                 let t0 = if profiling {
                     Some(std::time::Instant::now())
                 } else {
@@ -1102,11 +1221,10 @@ impl<D: AneDevice> AneInference<D> {
                         "layer {layer_idx} turboquant attention failed: {e}"
                     ))
                 })?;
-                let result = read_f16_channels(&attn_tensor)?;
+                read_f16_channels(&attn_tensor, &mut attn_out)?;
                 if let Some(t) = t0 {
                     d_attn += t.elapsed();
                 }
-                result
             } else if let Some(ref mut attn) = layer.fp16_attn {
                 // Per-layer fp16_attn from the splitter: execute directly.
                 // Inputs match pre_attn outputs (same ANE layout, same shapes).
@@ -1131,12 +1249,20 @@ impl<D: AneDevice> AneInference<D> {
                     for &cos_idx in &map.rope_cos_indices {
                         let cos_slice = &self.rope_cos_cache[self.seq_pos * self.rope_cache_dim
                             ..(self.seq_pos + 1) * self.rope_cache_dim];
-                        write_f16_padded(&mut attn.input_tensors[cos_idx], cos_slice)?;
+                        write_f16_padded(
+                            &mut attn.input_tensors[cos_idx],
+                            cos_slice,
+                            &mut self.scratch.padded,
+                        )?;
                     }
                     for &sin_idx in &map.rope_sin_indices {
                         let sin_slice = &self.rope_sin_cache[self.seq_pos * self.rope_cache_dim
                             ..(self.seq_pos + 1) * self.rope_cache_dim];
-                        write_f16_padded(&mut attn.input_tensors[sin_idx], sin_slice)?;
+                        write_f16_padded(
+                            &mut attn.input_tensors[sin_idx],
+                            sin_slice,
+                            &mut self.scratch.padded,
+                        )?;
                     }
                 } else {
                     // No input map — copy pre_attn outputs to fp16_attn inputs.
@@ -1169,11 +1295,10 @@ impl<D: AneDevice> AneInference<D> {
                     })?;
                 }
 
-                let result = read_f16_channels(&attn.output_tensors[0])?;
+                read_f16_channels(&attn.output_tensors[0], &mut attn_out)?;
                 if let Some(t) = t0 {
                     d_attn += t.elapsed();
                 }
-                result
             } else if let Some(ref mut caches) = self.fp16_kv_caches {
                 let t0 = if profiling {
                     Some(std::time::Instant::now())
@@ -1204,27 +1329,29 @@ impl<D: AneDevice> AneInference<D> {
                 let real_kv_ch = self.num_kv_heads * self.head_dim;
                 let real_q_ch = real_kv_ch * gqa;
 
-                let mut q_data = if num_pre_outputs > 1 {
-                    read_f16_channels(&layer.pre_attn.output_tensors[1])?
+                // Read Q/K/V projections into scratch buffers.
+                if num_pre_outputs > 1 {
+                    read_f16_channels(&layer.pre_attn.output_tensors[1], &mut q_buf)?;
                 } else {
-                    read_f16_channels(&layer.pre_attn.output_tensors[0])?
-                };
-                let mut k_data = read_f16_channels(&layer.pre_attn.output_tensors[0])?;
-                let mut v_data = if num_pre_outputs > 2 {
-                    read_f16_channels(&layer.pre_attn.output_tensors[2])?
+                    read_f16_channels(&layer.pre_attn.output_tensors[0], &mut q_buf)?;
+                }
+                read_f16_channels(&layer.pre_attn.output_tensors[0], &mut k_buf)?;
+                if num_pre_outputs > 2 {
+                    read_f16_channels(&layer.pre_attn.output_tensors[2], &mut v_buf)?;
                 } else {
-                    k_data.clone()
-                };
+                    v_buf.clear();
+                    v_buf.extend_from_slice(&k_buf);
+                }
                 // Truncate to real model dimensions (undo ANE layout doubling).
-                q_data.truncate(real_q_ch);
-                k_data.truncate(real_kv_ch);
-                v_data.truncate(real_kv_ch);
+                q_buf.truncate(real_q_ch);
+                k_buf.truncate(real_kv_ch);
+                v_buf.truncate(real_kv_ch);
 
                 // Apply per-head QK normalization (Qwen3 feature).
                 if let Some(ref norms) = self.qk_norm_weights {
                     if let Some((q_norm_w, k_norm_w)) = norms.get(layer_idx) {
-                        apply_per_head_rms_norm(&mut q_data, q_norm_w, self.head_dim);
-                        apply_per_head_rms_norm(&mut k_data, k_norm_w, self.head_dim);
+                        apply_per_head_rms_norm(&mut q_buf, q_norm_w, self.head_dim);
+                        apply_per_head_rms_norm(&mut k_buf, k_norm_w, self.head_dim);
                     }
                 }
 
@@ -1236,8 +1363,8 @@ impl<D: AneDevice> AneInference<D> {
                     let cos_end = cos_start + self.rope_cache_dim;
                     let cos = &self.rope_cos_cache[cos_start..cos_end];
                     let sin = &self.rope_sin_cache[cos_start..cos_end];
-                    apply_rope_rotation(&mut q_data, cos, sin, self.head_dim);
-                    apply_rope_rotation(&mut k_data, cos, sin, self.head_dim);
+                    apply_rope_rotation(&mut q_buf, cos, sin, self.head_dim);
+                    apply_rope_rotation(&mut k_buf, cos, sin, self.head_dim);
                 }
                 if let Some(t) = t0 {
                     d_read_qkv += t.elapsed();
@@ -1249,28 +1376,31 @@ impl<D: AneDevice> AneInference<D> {
                     None
                 };
                 // Write K/V to persistent FP16 cache at current position.
-                // Cache shape is [1, channels, 1, max_seq_len] in NCHW layout.
-                // Element (c, s) is at flat index c * max_seq_len + s.
-                // Each channel gets one value at the current sequence position.
-                let k_elements = k_data.len();
-                let v_elements = v_data.len();
-                for (c, &val) in k_data.iter().enumerate().take(k_elements) {
-                    caches[layer_idx]
-                        .0
-                        .write_f16_at(c * self.max_seq_len + self.seq_pos, &[val])?;
+                // Batched: read full cache, update column, write back (reduces
+                // per-channel IOSurface lock/unlock cycles from ~512 to 1).
+                let k_elements = k_buf.len();
+                let v_elements = v_buf.len();
+                {
+                    let mut k_cache = caches[layer_idx].0.read_f16()?;
+                    for (c, &val) in k_buf.iter().enumerate().take(k_elements) {
+                        k_cache[c * self.max_seq_len + self.seq_pos] = val;
+                    }
+                    caches[layer_idx].0.write_f16(&k_cache)?;
                 }
-                for (c, &val) in v_data.iter().enumerate().take(v_elements) {
-                    caches[layer_idx]
-                        .1
-                        .write_f16_at(c * self.max_seq_len + self.seq_pos, &[val])?;
+                {
+                    let mut v_cache = caches[layer_idx].1.read_f16()?;
+                    for (c, &val) in v_buf.iter().enumerate().take(v_elements) {
+                        v_cache[c * self.max_seq_len + self.seq_pos] = val;
+                    }
+                    caches[layer_idx].1.write_f16(&v_cache)?;
                 }
 
                 // Hand-written FP16 attention: Q + K_cache + V_cache + mask → attn_output
-                let result = if let Some(ref fp16_program) = self.fp16_attn_program {
+                if let Some(ref fp16_program) = self.fp16_attn_program {
                     let q_staging = self.fp16_attn_q_staging.as_mut().unwrap();
                     let out_staging = self.fp16_attn_out_staging.as_mut().unwrap();
                     let mask = self.fp16_attn_mask.as_ref().unwrap();
-                    write_f16_padded(q_staging, &q_data)?;
+                    write_f16_padded(q_staging, &q_buf, &mut self.scratch.padded)?;
                     let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
                     ane_eval(
                         &*self.device,
@@ -1286,20 +1416,19 @@ impl<D: AneDevice> AneInference<D> {
                             "layer {layer_idx} fp16_attn eval failed: {e}"
                         ))
                     })?;
-                    read_f16_channels(out_staging)?
+                    read_f16_channels(out_staging, &mut attn_out)?;
                 } else {
-                    // No compiled attention — return Q as pass-through.
-                    q_data
-                };
+                    // No compiled attention — use Q as pass-through.
+                    std::mem::swap(&mut attn_out, &mut q_buf);
+                }
                 if let Some(t) = t0 {
                     d_attn += t.elapsed();
                 }
-                result
             } else {
                 return Err(AneError::Other(anyhow::anyhow!(
                     "no attention backend configured"
                 )));
-            };
+            }
 
             // Post-attention: O proj → residual → FFN → residual
             let t0 = if profiling {
@@ -1312,35 +1441,44 @@ impl<D: AneDevice> AneInference<D> {
                 if let Some(ref packing) = post_attn.input_packing {
                     // Packed: write all logical inputs into the single tensor.
                     if packing.offsets.len() > 1 && num_pre_outputs > 3 {
-                        let residual = read_f16_channels(&layer.pre_attn.output_tensors[3])?;
-                        // Build the packed buffer directly (can't use write_packed_inputs
-                        // because residual is a temporary we need to own).
+                        read_f16_channels(&layer.pre_attn.output_tensors[3], &mut residual_buf)?;
+                        // Build the packed buffer using scratch (avoids per-layer allocation).
                         let [_, channels, _, total_s] = post_attn.input_tensors[0].shape();
-                        let mut packed = vec![f16::ZERO; channels * total_s];
-                        let c0 = attn_out_data.len().min(channels);
+                        let packed = &mut self.scratch.packed_residual;
+                        packed.clear();
+                        packed.resize(channels * total_s, f16::ZERO);
+                        let c0 = attn_out.len().min(channels);
                         for ch in 0..c0 {
-                            packed[ch * total_s + packing.offsets[0]] = attn_out_data[ch];
+                            packed[ch * total_s + packing.offsets[0]] = attn_out[ch];
                         }
-                        let c1 = residual.len().min(channels);
+                        let c1 = residual_buf.len().min(channels);
                         for ch in 0..c1 {
-                            packed[ch * total_s + packing.offsets[1]] = residual[ch];
+                            packed[ch * total_s + packing.offsets[1]] = residual_buf[ch];
                         }
-                        post_attn.input_tensors[0].write_f16(&packed)?;
+                        post_attn.input_tensors[0].write_f16(packed)?;
                     } else {
                         super::bundle_manifest::write_packed_inputs(
                             &mut post_attn.input_tensors[0],
-                            &[&attn_out_data],
+                            &[&attn_out],
                             packing,
                         )?;
                     }
                 } else {
-                    write_f16_padded(&mut post_attn.input_tensors[0], &attn_out_data)?;
+                    write_f16_padded(
+                        &mut post_attn.input_tensors[0],
+                        &attn_out,
+                        &mut self.scratch.padded,
+                    )?;
                     // Write residual (pre-layer hidden state) to the second input.
                     // The residual flows directly from the decode loop's hidden state,
                     // not from a pre_attn output, since the 3-way split (pre_attn/
                     // attention/post_attn) doesn't pass the residual through pre_attn.
                     if post_attn.input_tensors.len() > 1 {
-                        write_f16_padded(&mut post_attn.input_tensors[1], &hidden)?;
+                        write_f16_padded(
+                            &mut post_attn.input_tensors[1],
+                            &hidden,
+                            &mut self.scratch.padded,
+                        )?;
                     }
                 }
                 {
@@ -1362,7 +1500,7 @@ impl<D: AneDevice> AneInference<D> {
                         ))
                     })?;
                 }
-                hidden = read_f16_channels(&post_attn.output_tensors[0])?;
+                read_f16_channels(&post_attn.output_tensors[0], &mut hidden)?;
 
                 // Debug: trace last few layers for explosion diagnosis
                 if self.seq_pos == 0
@@ -1386,7 +1524,7 @@ impl<D: AneDevice> AneInference<D> {
                 // between attention output and FFN input are also fused or handled
                 // on CPU. See spec Task 3, "Output proj + residual add + RMSNorm"
                 // fusion opportunity.
-                hidden = attn_out_data;
+                std::mem::swap(&mut hidden, &mut attn_out);
             }
             if let Some(t) = t0 {
                 d_post_attn += t.elapsed();
@@ -1477,6 +1615,14 @@ impl<D: AneDevice> AneInference<D> {
             );
         }
 
+        // Put scratch buffers back for reuse on next decode() call.
+        self.scratch.hidden = hidden;
+        self.scratch.attn_out = attn_out;
+        self.scratch.q_data = q_buf;
+        self.scratch.k_data = k_buf;
+        self.scratch.v_data = v_buf;
+        self.scratch.residual = residual_buf;
+
         logits
     }
 
@@ -1539,19 +1685,18 @@ impl<D: AneDevice> AneInference<D> {
         if let Some(tq) = &mut self.turboquant {
             tq.reset();
         }
-        // Re-initialize the causal mask to all -inf.
+        // Re-initialize the causal mask to all -inf (pre-allocated buffer).
         if let Some(ref mut mask) = self.fp16_attn_mask {
             let msl = self.max_seq_len;
-            let mask_data = vec![f16::NEG_INFINITY; msl];
-            let _ = mask.write_f16(&mask_data);
+            let _ = mask.write_f16(&self.scratch.neg_inf_mask[..msl]);
         }
-        // Zero the FP16 KV caches for the new sequence.
+        // Zero the FP16 KV caches using pre-allocated zero buffer.
         if let Some(ref mut caches) = self.fp16_kv_caches {
             for (k, v) in caches.iter_mut() {
                 let k_size = k.shape()[1] * k.shape()[3];
                 let v_size = v.shape()[1] * v.shape()[3];
-                let _ = k.write_f16(&vec![f16::ZERO; k_size]);
-                let _ = v.write_f16(&vec![f16::ZERO; v_size]);
+                let _ = k.write_f16(&self.scratch.zeros[..k_size]);
+                let _ = v.write_f16(&self.scratch.zeros[..v_size]);
             }
         }
     }
@@ -1633,35 +1778,32 @@ fn apply_per_head_rms_norm(data: &mut [f16], weight: &[f16], head_dim: usize) {
 /// Write `data` (C elements for one token) into an ANE tensor with shape
 /// `[1, C, 1, S]` at sequence position 0. ANE uses NCHW layout, so element
 /// `(c, s)` is at flat index `c * S + s`. The remaining S-1 columns are
-/// zero-padded.
-fn write_f16_padded(tensor: &mut AneTensor, data: &[f16]) -> Result<()> {
+/// zero-padded. Uses `scratch` to avoid per-call heap allocation.
+fn write_f16_padded(tensor: &mut AneTensor, data: &[f16], scratch: &mut Vec<f16>) -> Result<()> {
     let [_, channels, _, seq_len] = tensor.shape();
     if seq_len == 1 {
         // No padding needed — direct write.
         return Ok(tensor.write_f16(data)?);
     }
     let total = channels * seq_len;
-    let mut padded = vec![f16::ZERO; total];
+    scratch.clear();
+    scratch.resize(total, f16::ZERO);
     let c = data.len().min(channels);
     for i in 0..c {
-        padded[i * seq_len] = data[i]; // column 0 of each channel row
+        scratch[i * seq_len] = data[i]; // column 0 of each channel row
     }
-    Ok(tensor.write_f16(&padded)?)
+    Ok(tensor.write_f16(scratch)?)
 }
 
 /// Read C elements (one token at column 0) from an ANE tensor with shape
-/// `[1, C, 1, S]`. Inverse of `write_f16_padded`.
-fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
-    let [_, channels, _, seq_len] = tensor.shape();
-    if seq_len == 1 {
-        return Ok(tensor.read_f16()?);
-    }
-    let full = tensor.read_f16()?;
-    let mut out = Vec::with_capacity(channels);
-    for c in 0..channels {
-        out.push(full[c * seq_len]); // column 0 of each channel row
-    }
-    Ok(out)
+/// `[1, C, 1, S]`. Inverse of `write_f16_padded`. Writes into `out` to
+/// avoid per-call heap allocation. Uses `read_column0_f16()` to read only
+/// column-0 values instead of the full C×S tensor.
+fn read_f16_channels(tensor: &AneTensor, out: &mut Vec<f16>) -> Result<()> {
+    let col0 = tensor.read_column0_f16()?;
+    out.clear();
+    out.extend_from_slice(&col0);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1815,8 +1957,8 @@ fn cpu_rms_norm(hidden: &mut [f16], weight: &[f16]) {
 }
 
 /// CPU embedding lookup: gather row `token_id` from the weight table.
-/// Returns the row as fp16 values.
-fn cpu_embedding_lookup(weight: &CpuWeight, token_id: u32) -> Result<Vec<f16>> {
+/// Writes the row as fp16 values into `out` to avoid per-call allocation.
+fn cpu_embedding_lookup(weight: &CpuWeight, token_id: u32, out: &mut Vec<f16>) -> Result<()> {
     let [vocab_size, hidden_size] = weight.shape;
     let idx = token_id as usize;
     if idx >= vocab_size {
@@ -1838,12 +1980,13 @@ fn cpu_embedding_lookup(weight: &CpuWeight, token_id: u32) -> Result<Vec<f16>> {
     }
 
     let row_bytes = &weight.data[row_start..row_end];
-    let row: Vec<f16> = row_bytes
-        .chunks_exact(2)
-        .map(|b| f16::from_le_bytes([b[0], b[1]]))
-        .collect();
-
-    Ok(row)
+    out.clear();
+    out.extend(
+        row_bytes
+            .chunks_exact(2)
+            .map(|b| f16::from_le_bytes([b[0], b[1]])),
+    );
+    Ok(())
 }
 
 /// CPU lm_head: matmul hidden × weight^T → logits as f32.
