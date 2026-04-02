@@ -9,6 +9,7 @@
 
 pub mod affine_quantize;
 pub mod attention_fusion;
+pub mod awq_quantize;
 pub mod beta_quantizer;
 pub mod bn_weight_fold;
 pub mod constant_fold;
