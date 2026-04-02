@@ -1275,7 +1275,7 @@ fn main() -> Result<()> {
             bundle
                 .save(&bundle_path)
                 .map_err(|e| anyhow::anyhow!("save failed: {e}"))?;
-            AneInference::from_bundle(device, &bundle_path, None)
+            AneInference::from_bundle(device, &bundle_path, None, 33)
                 .map_err(|e| anyhow::anyhow!("load failed: {e}"))
         })();
 

@@ -41,7 +41,7 @@ fn compile_and_load(
         }
     };
 
-    let program = match device.compile(mil_text, &[]) {
+    let program = match device.compile(mil_text, &[], 33) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("    compile failed: {e}");
@@ -96,7 +96,7 @@ fn run_ane(
     let in_refs: Vec<&AneTensor> = in_tensors.iter().collect();
     let mut out_refs: Vec<&mut AneTensor> = out_tensors.iter_mut().collect();
 
-    match device.eval(&program, &in_refs, &mut out_refs) {
+    match device.eval(&program, &in_refs, &mut out_refs, 33) {
         Ok(()) => {}
         Err(e) => {
             eprintln!("    eval failed: {e}");
@@ -1017,7 +1017,7 @@ fn test_generated_cache_write_mil() -> (bool, bool) {
             return (true, false);
         }
     };
-    match device.compile(&mil_text, &[]) {
+    match device.compile(&mil_text, &[], 33) {
         Ok(_) => {
             println!("    ✅ generated cache-write MIL: compiles on ANE");
             (true, true)
@@ -1058,7 +1058,7 @@ fn test_generated_attention_mil() -> (bool, bool) {
             return (true, false);
         }
     };
-    match device.compile(&mil_text, &[]) {
+    match device.compile(&mil_text, &[], 33) {
         Ok(_) => {
             println!("    ✅ generated attention MIL: compiles on ANE");
             (true, true)
@@ -1091,7 +1091,7 @@ fn test_generated_qjl_mil() -> (bool, bool) {
             return (true, false);
         }
     };
-    match device.compile(&mil_text, &[]) {
+    match device.compile(&mil_text, &[], 33) {
         Ok(_) => {
             println!("    ✅ generated QJL correction MIL: compiles on ANE");
             (true, true)
@@ -1133,7 +1133,7 @@ fn test_generated_attention_gqa_mil() -> (bool, bool) {
             return (true, false);
         }
     };
-    match device.compile(&mil_text, &[]) {
+    match device.compile(&mil_text, &[], 33) {
         Ok(_) => {
             println!("    ✅ generated GQA attention MIL: compiles on ANE");
             (true, true)

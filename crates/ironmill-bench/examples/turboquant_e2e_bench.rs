@@ -58,7 +58,7 @@ fn run_model(
     let bundle_path = tmp.path().join("model.ironml");
     bundle.save(&bundle_path).expect("failed to save bundle");
 
-    let mut model = match AneInference::from_bundle(device, &bundle_path, turbo_config) {
+    let mut model = match AneInference::from_bundle(device, &bundle_path, turbo_config, 33) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("  │  ✗ Bundle load failed: {e}");

@@ -29,7 +29,7 @@ const ANE_COMPILE_LIMIT: usize = 119;
 static COMPILE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// QoS value used for compile/load/eval (matches Orion's constant of 21).
-const ANE_QOS: u32 = 21;
+pub const ANE_QOS: u32 = 21;
 
 // =========================================================================
 // InMemoryModelDescriptor
@@ -647,6 +647,7 @@ impl Drop for InMemoryModel {
 pub fn compile_mil_text(
     mil_text: &str,
     weights: &[(&str, &[u8])],
+    qos: u32,
 ) -> Result<InMemoryModel, AneSysError> {
     // 0. Budget check
     let prev = COMPILE_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -684,11 +685,11 @@ pub fn compile_mil_text(
 
             // 4. Compile
             #[cfg(debug_assertions)]
-            eprintln!("[ane] compiling with QoS={ANE_QOS}...");
-            model.compile(ANE_QOS)?;
+            eprintln!("[ane] compiling with QoS={qos}...");
+            model.compile(qos)?;
 
             // 5. Load
-            model.load(ANE_QOS)?;
+            model.load(qos)?;
 
             Ok(model)
         })();
@@ -714,6 +715,7 @@ pub fn patch_weights(
     donor: &InMemoryModel,
     mil_text: &str,
     weights: &[(&str, &[u8])],
+    qos: u32,
 ) -> Result<InMemoryModel, AneSysError> {
     if donor.raw.is_null() {
         return Err(AneSysError::InvalidInput(
@@ -759,7 +761,7 @@ pub fn patch_weights(
         eprintln!("[ane] patch_weights: copied net.plist from {donor_hex} → {new_hex}");
 
         // 5. Load (NO compile!)
-        model.load(ANE_QOS)?;
+        model.load(qos)?;
 
         Ok(model)
     })();
@@ -776,6 +778,7 @@ pub fn eval(
     model: &InMemoryModel,
     input_surfaces: &[*mut c_void],
     output_surfaces: &[*mut c_void],
+    qos: u32,
 ) -> Result<(), AneSysError> {
     if input_surfaces.is_empty() {
         return Err(AneSysError::EvalFailed {
@@ -915,9 +918,7 @@ pub fn eval(
             ) -> i8;
             let eval_sel = sel_registerName(sel!("evaluateWithQoS:options:request:error:"));
             let eval_fn: EvalFn = std::mem::transmute(objc_msgSend as *const ());
-            let ok = eval_fn(
-                model.raw, eval_sel, ANE_QOS, empty_dict, request, &mut error,
-            );
+            let ok = eval_fn(model.raw, eval_sel, qos, empty_dict, request, &mut error);
 
             CFRelease(empty_dict);
 
@@ -1132,7 +1133,7 @@ mod tests {
 
     #[test]
     fn compile_mil_text_empty_returns_error() {
-        let result = compile_mil_text("", &[]);
+        let result = compile_mil_text("", &[], ANE_QOS);
         assert!(result.is_err());
         match result.unwrap_err() {
             AneSysError::InvalidInput(msg) => {
@@ -1145,7 +1146,7 @@ mod tests {
     #[test]
     fn patch_weights_null_donor_returns_error() {
         let donor = unsafe { InMemoryModel::from_raw(std::ptr::null_mut()) };
-        let result = patch_weights(&donor, "program test {}", &[]);
+        let result = patch_weights(&donor, "program test {}", &[], ANE_QOS);
         assert!(result.is_err());
         match result.unwrap_err() {
             AneSysError::InvalidInput(msg) => {
@@ -1159,7 +1160,7 @@ mod tests {
     #[test]
     fn patch_weights_empty_text_returns_error() {
         let dummy = unsafe { InMemoryModel::from_raw(0x1 as *mut c_void) };
-        let result = patch_weights(&dummy, "", &[]);
+        let result = patch_weights(&dummy, "", &[], ANE_QOS);
         assert!(result.is_err());
         match result.unwrap_err() {
             AneSysError::InvalidInput(msg) => {
@@ -1186,7 +1187,7 @@ mod tests {
     #[test]
     fn eval_empty_inputs_returns_error() {
         let model = unsafe { InMemoryModel::from_raw(0x1 as *mut c_void) };
-        let result = eval(&model, &[], &[std::ptr::null_mut()]);
+        let result = eval(&model, &[], &[std::ptr::null_mut()], ANE_QOS);
         assert!(result.is_err());
         std::mem::forget(model);
     }
@@ -1194,7 +1195,7 @@ mod tests {
     #[test]
     fn eval_empty_outputs_returns_error() {
         let model = unsafe { InMemoryModel::from_raw(0x1 as *mut c_void) };
-        let result = eval(&model, &[std::ptr::null_mut()], &[]);
+        let result = eval(&model, &[std::ptr::null_mut()], &[], ANE_QOS);
         assert!(result.is_err());
         std::mem::forget(model);
     }

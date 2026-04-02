@@ -33,7 +33,8 @@ fn try_compile(name: &str, mil_text: &str) -> Option<InMemoryModel> {
         eprintln!("  ⏭  {name}: SKIPPED (budget exhausted)");
         return None;
     }
-    match ironmill_ane_sys::model::compile_mil_text(mil_text, &[]) {
+    match ironmill_ane_sys::model::compile_mil_text(mil_text, &[], ironmill_ane_sys::model::ANE_QOS)
+    {
         Ok(model) => {
             eprintln!("  ✅ {name}: compiled OK  (budget left: {})", budget - 1);
             Some(model)

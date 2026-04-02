@@ -21,7 +21,8 @@ pub trait AneDevice: Send + Sync {
     type Program: Send;
 
     /// Compile MIL text (with optional BLOBFILE weights) into a program.
-    fn compile(&self, mil_text: &str, weights: &[(&str, &[u8])]) -> Result<Self::Program>;
+    fn compile(&self, mil_text: &str, weights: &[(&str, &[u8])], qos: u32)
+    -> Result<Self::Program>;
 
     /// Compile using a donor program's net.plist (weight patching).
     /// Avoids consuming a compile budget slot.
@@ -30,6 +31,7 @@ pub trait AneDevice: Send + Sync {
         donor: &Self::Program,
         mil_text: &str,
         weights: &[(&str, &[u8])],
+        qos: u32,
     ) -> Result<Self::Program>;
 
     /// Evaluate a compiled program with pre-allocated I/O tensors.
@@ -38,6 +40,7 @@ pub trait AneDevice: Send + Sync {
         program: &Self::Program,
         inputs: &[&AneTensor],
         outputs: &mut [&mut AneTensor],
+        qos: u32,
     ) -> Result<()>;
 
     /// Number of programs compiled so far.
@@ -108,9 +111,14 @@ impl HardwareAneDevice {
 impl AneDevice for HardwareAneDevice {
     type Program = HardwareProgram;
 
-    fn compile(&self, mil_text: &str, weights: &[(&str, &[u8])]) -> Result<HardwareProgram> {
-        let model =
-            ironmill_ane_sys::model::compile_mil_text(mil_text, weights).map_err(map_sys_err)?;
+    fn compile(
+        &self,
+        mil_text: &str,
+        weights: &[(&str, &[u8])],
+        qos: u32,
+    ) -> Result<HardwareProgram> {
+        let model = ironmill_ane_sys::model::compile_mil_text(mil_text, weights, qos)
+            .map_err(map_sys_err)?;
         Ok(HardwareProgram { model })
     }
 
@@ -119,8 +127,9 @@ impl AneDevice for HardwareAneDevice {
         donor: &HardwareProgram,
         mil_text: &str,
         weights: &[(&str, &[u8])],
+        qos: u32,
     ) -> Result<HardwareProgram> {
-        let model = ironmill_ane_sys::model::patch_weights(&donor.model, mil_text, weights)
+        let model = ironmill_ane_sys::model::patch_weights(&donor.model, mil_text, weights, qos)
             .map_err(map_sys_err)?;
         Ok(HardwareProgram { model })
     }
@@ -130,6 +139,7 @@ impl AneDevice for HardwareAneDevice {
         program: &HardwareProgram,
         inputs: &[&AneTensor],
         outputs: &mut [&mut AneTensor],
+        qos: u32,
     ) -> Result<()> {
         if inputs.is_empty() {
             return Err(AneError::EvalFailed {
@@ -148,7 +158,7 @@ impl AneDevice for HardwareAneDevice {
         let output_ptrs: Vec<*mut std::ffi::c_void> = outputs.iter().map(|t| t.as_ptr()).collect();
 
         let _guard = self.eval_lock.lock().expect("ANE eval lock poisoned");
-        ironmill_ane_sys::model::eval(&program.model, &input_ptrs, &output_ptrs)
+        ironmill_ane_sys::model::eval(&program.model, &input_ptrs, &output_ptrs, qos)
             .map_err(map_sys_err)
     }
 
@@ -177,7 +187,12 @@ impl HardwareAneDevice {
 impl AneDevice for HardwareAneDevice {
     type Program = HardwareProgram;
 
-    fn compile(&self, _mil_text: &str, _weights: &[(&str, &[u8])]) -> Result<HardwareProgram> {
+    fn compile(
+        &self,
+        _mil_text: &str,
+        _weights: &[(&str, &[u8])],
+        _qos: u32,
+    ) -> Result<HardwareProgram> {
         Err(AneError::Other(anyhow::anyhow!(
             "ANE runtime requires macOS"
         )))
@@ -188,6 +203,7 @@ impl AneDevice for HardwareAneDevice {
         _donor: &HardwareProgram,
         _mil_text: &str,
         _weights: &[(&str, &[u8])],
+        _qos: u32,
     ) -> Result<HardwareProgram> {
         Err(AneError::Other(anyhow::anyhow!(
             "ANE runtime requires macOS"
@@ -199,6 +215,7 @@ impl AneDevice for HardwareAneDevice {
         _program: &HardwareProgram,
         _inputs: &[&AneTensor],
         _outputs: &mut [&mut AneTensor],
+        _qos: u32,
     ) -> Result<()> {
         Err(AneError::Other(anyhow::anyhow!(
             "ANE runtime requires macOS"

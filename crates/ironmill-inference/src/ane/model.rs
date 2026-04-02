@@ -52,6 +52,9 @@ pub struct AneConfig {
     pub cache_dir: Option<PathBuf>,
     /// Enable INT4 data type support (experimental).
     pub enable_int4: bool,
+    /// ANE QoS level for compile/load/eval.
+    /// Defaults to user-interactive (33) for interactive inference.
+    pub qos: u32,
 }
 
 impl Default for AneConfig {
@@ -60,6 +63,8 @@ impl Default for AneConfig {
             max_programs: 100,
             cache_dir: None,
             enable_int4: false,
+            // QoSMapper::ane_user_interactive_task_qos() == 33
+            qos: 33,
         }
     }
 }
@@ -70,6 +75,8 @@ impl Default for AneConfig {
 pub struct AneModel<D: AneDevice> {
     device: Arc<D>,
     sub_programs: Vec<LoadedSubProgram<D>>,
+    /// ANE QoS level for eval calls.
+    qos: u32,
     /// Scratch directory for compiler inputs (BLOBFILEs). Cleaned up on drop.
     _work_dir: tempfile::TempDir,
 }
@@ -92,7 +99,7 @@ impl<D: AneDevice> AneModel<D> {
     /// Reads the manifest and compiled artifacts from the bundle directory,
     /// then compiles each sub-program's MIL text on the ANE device and
     /// allocates I/O tensors. No IR passes or splitting needed.
-    pub fn from_bundle(device: Arc<D>, bundle_path: &Path, _config: AneConfig) -> Result<Self> {
+    pub fn from_bundle(device: Arc<D>, bundle_path: &Path, config: AneConfig) -> Result<Self> {
         // 1. Read and parse manifest.json
         let manifest_path = bundle_path.join("manifest.json");
         let manifest_json = std::fs::read_to_string(&manifest_path)
@@ -152,7 +159,7 @@ impl<D: AneDevice> AneModel<D> {
                 .collect();
 
             // 4d. Compile on the ANE device
-            let compiled = device.compile(&mil_text, &weight_slices)?;
+            let compiled = device.compile(&mil_text, &weight_slices, config.qos)?;
 
             // 4e. Convert manifest descriptors to TensorDescriptor
             let inputs: Vec<TensorDescriptor> = sub_manifest
@@ -206,6 +213,7 @@ impl<D: AneDevice> AneModel<D> {
         Ok(Self {
             device,
             sub_programs: loaded_subs,
+            qos: config.qos,
             _work_dir: work_dir,
         })
     }
@@ -243,7 +251,7 @@ impl<D: AneDevice> AneModel<D> {
                 let input_refs: Vec<&AneTensor> = sub.input_tensors.iter().collect();
                 let mut output_refs: Vec<&mut AneTensor> = sub.output_tensors.iter_mut().collect();
                 self.device
-                    .eval(&sub.program, &input_refs, &mut output_refs)?;
+                    .eval(&sub.program, &input_refs, &mut output_refs, self.qos)?;
             }
 
             // Wire outputs of sub-program i to inputs of sub-program i+1.
@@ -484,5 +492,6 @@ mod tests {
         assert_eq!(c.max_programs, 100);
         assert!(c.cache_dir.is_none());
         assert!(!c.enable_int4);
+        assert_eq!(c.qos, 33);
     }
 }

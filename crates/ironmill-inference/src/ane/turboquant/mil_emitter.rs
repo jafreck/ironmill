@@ -901,6 +901,7 @@ mod tests {
             num_layers: 1,
             rotation_seed: 42,
             enable_qjl: false,
+            qos: 33,
         }
     }
 
@@ -1034,6 +1035,7 @@ mod tests {
             num_layers: 1,
             rotation_seed: 42,
             enable_qjl: true,
+            qos: 33,
         };
         let (program, weights) = build_qjl_program(&small, 16);
         let mil = to_mil(&program);
@@ -1051,6 +1053,7 @@ mod tests {
             num_layers: 32,
             rotation_seed: 123,
             enable_qjl: true,
+            qos: 33,
         };
         let (program, weights) = build_qjl_program(&large, 2048);
         let mil = to_mil(&program);
@@ -1068,6 +1071,7 @@ mod tests {
             num_layers: 1,
             rotation_seed: 42,
             enable_qjl: true,
+            qos: 33,
         };
         let (program, weights) = build_qjl_program(&single, 1);
         let mil = to_mil(&program);

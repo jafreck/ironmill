@@ -66,6 +66,8 @@ pub struct AneInference<D: AneDevice> {
     fp16_attn_mask: Option<AneTensor>,
     /// Device handle.
     device: Arc<D>,
+    /// ANE QoS level for eval calls.
+    qos: u32,
     /// Current sequence position.
     seq_pos: usize,
     /// Number of KV heads (for FP16 cache management).
@@ -166,6 +168,7 @@ const LM_HEAD_MIN_SEQ: usize = 32;
 struct AneLmHead<D: AneDevice> {
     chunks: Vec<LmHeadChunk<D>>,
     vocab_size: usize,
+    qos: u32,
     device: Arc<D>,
 }
 
@@ -188,7 +191,7 @@ impl<D: AneDevice> AneLmHead<D> {
     /// MIL text (same `hidden_size` × `LM_HEAD_MAX_CHUNK_CH` conv1×1).
     /// Only the first full-size chunk is compiled; the rest reuse its
     /// compiled `net.plist` via `model::patch_weights`.
-    fn compile(device: Arc<D>, weight: &CpuWeight) -> Result<Self> {
+    fn compile(device: Arc<D>, weight: &CpuWeight, qos: u32) -> Result<Self> {
         let [vocab_size, hidden_size] = weight.shape;
 
         let num_chunks = vocab_size.div_ceil(LM_HEAD_MAX_CHUNK_CH);
@@ -217,9 +220,9 @@ impl<D: AneDevice> AneLmHead<D> {
 
             let compiled = if let Some(donor_idx) = full_chunk_donor_idx.filter(|_| is_full_size) {
                 let donor = &chunks[donor_idx].program;
-                device.compile_patched(donor, &mil_text, &[(weight_path, &chunk_data)])?
+                device.compile_patched(donor, &mil_text, &[(weight_path, &chunk_data)], qos)?
             } else {
-                device.compile(&mil_text, &[(weight_path, &chunk_data)])?
+                device.compile(&mil_text, &[(weight_path, &chunk_data)], qos)?
             };
             // DON'T unload here — patches need the donor's net.plist to exist.
             // Programs will be unloaded in AneInference::Drop.
@@ -271,6 +274,7 @@ impl<D: AneDevice> AneLmHead<D> {
         Ok(Self {
             chunks,
             vocab_size,
+            qos,
             device,
         })
     }
@@ -288,6 +292,7 @@ impl<D: AneDevice> AneLmHead<D> {
                 &chunk.program,
                 &[&chunk.input_tensor],
                 &mut [&mut chunk.output_tensor],
+                self.qos,
             )?;
 
             // Read output logits from column 0 of each channel.
@@ -345,6 +350,7 @@ impl<D: AneDevice> AneInference<D> {
         device: Arc<D>,
         bundle_path: &std::path::Path,
         turbo_config: Option<TurboQuantConfig>,
+        qos: u32,
     ) -> Result<Self> {
         use super::bundle_manifest::BundleManifest;
 
@@ -407,7 +413,7 @@ impl<D: AneDevice> AneInference<D> {
         };
 
         // 3. Compile LM head (try ANE, fall back to CPU).
-        let lm_head = match AneLmHead::compile(Arc::clone(&device), &lm_head_cpu_weight) {
+        let lm_head = match AneLmHead::compile(Arc::clone(&device), &lm_head_cpu_weight, qos) {
             Ok(ane_lm_head) => LmHead::Ane(ane_lm_head),
             Err(e) => {
                 eprintln!("warning: ANE lm_head compilation failed: {e}");
@@ -447,6 +453,7 @@ impl<D: AneDevice> AneInference<D> {
                     &weights_dir,
                     &*device,
                     pre_attn_min_output_alloc,
+                    qos,
                 )?
             } else {
                 // Layers 1+: patch weights from layer-0 donor.
@@ -457,6 +464,7 @@ impl<D: AneDevice> AneInference<D> {
                     &weights_dir,
                     &*device,
                     pre_attn_min_output_alloc,
+                    qos,
                 ) {
                     Ok(loaded) => loaded,
                     Err(e) => {
@@ -471,6 +479,7 @@ impl<D: AneDevice> AneInference<D> {
                             &weights_dir,
                             &*device,
                             pre_attn_min_output_alloc,
+                            qos,
                         )?
                     }
                 }
@@ -484,6 +493,7 @@ impl<D: AneDevice> AneInference<D> {
                         &weights_dir,
                         &*device,
                         0,
+                        qos,
                     )?)
                 } else if let Some(ref donor_post) = layers[0].post_attn {
                     match compile_sub_from_bundle_with_donor(
@@ -493,6 +503,7 @@ impl<D: AneDevice> AneInference<D> {
                         &weights_dir,
                         &*device,
                         0,
+                        qos,
                     ) {
                         Ok(loaded) => Some(loaded),
                         Err(e) => {
@@ -507,6 +518,7 @@ impl<D: AneDevice> AneInference<D> {
                                 &weights_dir,
                                 &*device,
                                 0,
+                                qos,
                             )?)
                         }
                     }
@@ -517,6 +529,7 @@ impl<D: AneDevice> AneInference<D> {
                         &weights_dir,
                         &*device,
                         0,
+                        qos,
                     )?)
                 }
             } else {
@@ -530,6 +543,7 @@ impl<D: AneDevice> AneInference<D> {
                     &weights_dir,
                     &*device,
                     0,
+                    qos,
                 ) {
                     Ok(loaded) => Some(loaded),
                     Err(e) => {
@@ -592,7 +606,7 @@ impl<D: AneDevice> AneInference<D> {
             let (mil, _) = program_to_mil_text(&attn_program, &mil_config).map_err(|e| {
                 AneError::Other(anyhow::anyhow!("FP16 attention MIL text failed: {e}"))
             })?;
-            let attn_compiled = device.compile(&mil, &[])?;
+            let attn_compiled = device.compile(&mil, &[], qos)?;
 
             let attn_alloc = uniform_alloc_size(&[
                 ([1, q_channels, 1, MIN_IO_SEQ], ScalarType::Float16),
@@ -666,6 +680,7 @@ impl<D: AneDevice> AneInference<D> {
             fp16_attn_out_staging,
             fp16_attn_mask,
             device,
+            qos,
             seq_pos: 0,
             num_kv_heads,
             head_dim,
@@ -739,7 +754,7 @@ impl<D: AneDevice> AneInference<D> {
                 let mut out_refs: Vec<&mut AneTensor> =
                     layer.pre_attn.output_tensors.iter_mut().collect();
                 self.device
-                    .eval(&layer.pre_attn.program, &in_refs, &mut out_refs)
+                    .eval(&layer.pre_attn.program, &in_refs, &mut out_refs, self.qos)
                     .map_err(|e| {
                         AneError::Other(anyhow::anyhow!(
                             "layer {layer_idx} pre_attn eval failed: {e}"
@@ -858,7 +873,7 @@ impl<D: AneDevice> AneInference<D> {
                     let mut out_refs: Vec<&mut AneTensor> =
                         attn.output_tensors.iter_mut().collect();
                     self.device
-                        .eval(&attn.program, &in_refs, &mut out_refs)
+                        .eval(&attn.program, &in_refs, &mut out_refs, self.qos)
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} fp16_attn eval failed: {e}"
@@ -974,6 +989,7 @@ impl<D: AneDevice> AneInference<D> {
                             fp16_program,
                             &[q_staging, k_cache, v_cache, mask],
                             &mut [out_staging],
+                            self.qos,
                         )
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
@@ -1042,7 +1058,7 @@ impl<D: AneDevice> AneInference<D> {
                     let mut out_refs: Vec<&mut AneTensor> =
                         post_attn.output_tensors.iter_mut().collect();
                     self.device
-                        .eval(&post_attn.program, &in_refs, &mut out_refs)
+                        .eval(&post_attn.program, &in_refs, &mut out_refs, self.qos)
                         .map_err(|e| {
                             AneError::Other(anyhow::anyhow!(
                                 "layer {layer_idx} post_attn eval failed: {e}"
@@ -1348,6 +1364,7 @@ fn compile_sub_from_bundle<D: AneDevice>(
     weights_dir: &std::path::Path,
     device: &D,
     min_output_alloc: usize,
+    qos: u32,
 ) -> Result<LoadedSubProgram<D>> {
     let mil_text = std::fs::read_to_string(programs_dir.join(format!("{}.mil", manifest.name)))
         .map_err(|e| {
@@ -1367,7 +1384,7 @@ fn compile_sub_from_bundle<D: AneDevice>(
         .map(|(path, data)| (path.as_str(), data.as_slice()))
         .collect();
 
-    let compiled = device.compile(&mil_text, &weight_slices)?;
+    let compiled = device.compile(&mil_text, &weight_slices, qos)?;
 
     allocate_io_from_manifest(manifest, compiled, min_output_alloc)
 }
@@ -1380,6 +1397,7 @@ fn compile_sub_from_bundle_with_donor<D: AneDevice>(
     weights_dir: &std::path::Path,
     device: &D,
     min_output_alloc: usize,
+    qos: u32,
 ) -> Result<LoadedSubProgram<D>> {
     let mil_text = std::fs::read_to_string(programs_dir.join(format!("{}.mil", manifest.name)))
         .map_err(|e| {
@@ -1399,7 +1417,7 @@ fn compile_sub_from_bundle_with_donor<D: AneDevice>(
         .map(|(path, data)| (path.as_str(), data.as_slice()))
         .collect();
 
-    let compiled = device.compile_patched(donor, &mil_text, &weight_slices)?;
+    let compiled = device.compile_patched(donor, &mil_text, &weight_slices, qos)?;
 
     allocate_io_from_manifest(manifest, compiled, min_output_alloc)
 }

@@ -187,7 +187,8 @@ mod tier1_logic {
     /// compile_mil_text with empty string returns InvalidInput.
     #[test]
     fn compile_empty_mil_returns_error() {
-        let result = ironmill_ane_sys::model::compile_mil_text("", &[]);
+        let result =
+            ironmill_ane_sys::model::compile_mil_text("", &[], ironmill_ane_sys::model::ANE_QOS);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -200,7 +201,12 @@ mod tier1_logic {
     #[test]
     fn eval_no_inputs_returns_error() {
         let model = unsafe { InMemoryModel::from_raw(0x1 as *mut std::ffi::c_void) };
-        let result = ironmill_ane_sys::model::eval(&model, &[], &[std::ptr::null_mut()]);
+        let result = ironmill_ane_sys::model::eval(
+            &model,
+            &[],
+            &[std::ptr::null_mut()],
+            ironmill_ane_sys::model::ANE_QOS,
+        );
         assert!(result.is_err());
         std::mem::forget(model);
     }
@@ -209,7 +215,12 @@ mod tier1_logic {
     #[test]
     fn eval_no_outputs_returns_error() {
         let model = unsafe { InMemoryModel::from_raw(0x1 as *mut std::ffi::c_void) };
-        let result = ironmill_ane_sys::model::eval(&model, &[std::ptr::null_mut()], &[]);
+        let result = ironmill_ane_sys::model::eval(
+            &model,
+            &[std::ptr::null_mut()],
+            &[],
+            ironmill_ane_sys::model::ANE_QOS,
+        );
         assert!(result.is_err());
         std::mem::forget(model);
     }
@@ -526,7 +537,11 @@ mod tier3_ane {
             return;
         }
 
-        let model = ironmill_ane_sys::model::compile_mil_text(IDENTITY_MIL, &[]);
+        let model = ironmill_ane_sys::model::compile_mil_text(
+            IDENTITY_MIL,
+            &[],
+            ironmill_ane_sys::model::ANE_QOS,
+        );
         match &model {
             Ok(m) => {
                 eprintln!("compiled OK: hex_id={:?}", m.hex_string_identifier());
@@ -554,7 +569,11 @@ mod tier3_ane {
         }
 
         // Compile
-        let model = match ironmill_ane_sys::model::compile_mil_text(IDENTITY_MIL, &[]) {
+        let model = match ironmill_ane_sys::model::compile_mil_text(
+            IDENTITY_MIL,
+            &[],
+            ironmill_ane_sys::model::ANE_QOS,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("compile failed: {e}");
@@ -581,7 +600,12 @@ mod tier3_ane {
         };
 
         // Evaluate
-        let result = ironmill_ane_sys::model::eval(&model, &[in_surface], &[out_surface]);
+        let result = ironmill_ane_sys::model::eval(
+            &model,
+            &[in_surface],
+            &[out_surface],
+            ironmill_ane_sys::model::ANE_QOS,
+        );
         match result {
             Ok(()) => eprintln!("eval succeeded!"),
             Err(e) => eprintln!("eval result: {e}"),
@@ -968,7 +992,11 @@ mod explore {
             ironmill_ane_sys::model::remaining_budget()
         );
 
-        match ironmill_ane_sys::model::compile_mil_text(IDENTITY_MIL, &[]) {
+        match ironmill_ane_sys::model::compile_mil_text(
+            IDENTITY_MIL,
+            &[],
+            ironmill_ane_sys::model::ANE_QOS,
+        ) {
             Ok(m) => {
                 eprintln!("compiled OK");
                 eprintln!(

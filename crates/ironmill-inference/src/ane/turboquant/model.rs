@@ -44,6 +44,9 @@ pub struct TurboQuantConfig {
     pub rotation_seed: u64,
     /// Enable QJL 1-bit bias correction.
     pub enable_qjl: bool,
+    /// ANE QoS level for compile/load/eval.
+    /// Defaults to user-interactive (33) for interactive decode.
+    pub qos: u32,
 }
 
 const VALID_N_BITS: &[u8] = &[1, 2, 4, 6, 8];
@@ -93,6 +96,8 @@ impl TurboQuantConfig {
             num_layers,
             rotation_seed: 42,
             enable_qjl: false,
+            // QoSMapper::ane_user_interactive_task_qos() == 33
+            qos: 33,
         })
     }
 
@@ -464,7 +469,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
         let (cw_mil, _) = program_to_mil_text(&cw_program, &mil_config)
             .map_err(|e| AneError::Other(anyhow::anyhow!("cache-write MIL text failed: {e}")))?;
         // Weights are delivered as function inputs, not BLOBFILE — pass empty weights
-        let cache_write_program = device.compile(&cw_mil, &[])?;
+        let cache_write_program = device.compile(&cw_mil, &[], config.qos)?;
 
         // --- attention sub-program ---
         let deq_scale = mil_emitter::compute_deq_scale(head_dim, config.n_bits);
@@ -482,7 +487,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
         let (attn_program, _attn_weights) = mil_emitter::build_attention_program(&attn_config);
         let (attn_mil, _) = program_to_mil_text(&attn_program, &mil_config)
             .map_err(|e| AneError::Other(anyhow::anyhow!("attention MIL text failed: {e}")))?;
-        let attention_program = device.compile(&attn_mil, &[])?;
+        let attention_program = device.compile(&attn_mil, &[], config.qos)?;
 
         // --- QJL correction sub-program (optional) ---
         let qjl_program = if config.enable_qjl {
@@ -490,7 +495,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
                 mil_emitter::build_qjl_program(&config, config.max_seq_len);
             let (qjl_mil, _) = program_to_mil_text(&qjl_program, &mil_config)
                 .map_err(|e| AneError::Other(anyhow::anyhow!("QJL MIL text failed: {e}")))?;
-            Some(device.compile(&qjl_mil, &[])?)
+            Some(device.compile(&qjl_mil, &[], config.qos)?)
         } else {
             None
         };
@@ -662,6 +667,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
             &self.cache_write_program,
             &[k_proj, v_proj, &self.rotation_tensor],
             &mut [&mut self.cw_k_output, &mut self.cw_v_output],
+            self.config.qos,
         )?;
 
         // 2. Direct IOSurface-to-IOSurface copy: cache-write output → KV cache.
@@ -704,18 +710,24 @@ impl<D: AneDevice> TurboQuantModel<D> {
                     "QJL enabled but sign cache missing for layer {layer}"
                 ))
             })?;
-            self.device
-                .eval(qjl_prog, &[q, sign_tensor], &mut [qjl_corr])?;
+            self.device.eval(
+                qjl_prog,
+                &[q, sign_tensor],
+                &mut [qjl_corr],
+                self.config.qos,
+            )?;
             self.device.eval(
                 &self.attention_program,
                 &[q, k_cache, v_cache, &self.rotation_tensor, mask, qjl_corr],
                 &mut [&mut attn_out],
+                self.config.qos,
             )?;
         } else {
             self.device.eval(
                 &self.attention_program,
                 &[q, k_cache, v_cache, &self.rotation_tensor],
                 &mut [&mut attn_out],
+                self.config.qos,
             )?;
         }
 
@@ -777,18 +789,24 @@ impl<D: AneDevice> TurboQuantModel<D> {
                     "QJL enabled but sign cache missing for layer {layer}"
                 ))
             })?;
-            self.device
-                .eval(qjl_prog, &[q, sign_tensor], &mut [qjl_corr])?;
+            self.device.eval(
+                qjl_prog,
+                &[q, sign_tensor],
+                &mut [qjl_corr],
+                self.config.qos,
+            )?;
             self.device.eval(
                 &self.attention_program,
                 &[q, k_cache, v_cache, &self.rotation_tensor, mask, qjl_corr],
                 &mut [&mut attn_out],
+                self.config.qos,
             )?;
         } else {
             self.device.eval(
                 &self.attention_program,
                 &[q, k_cache, v_cache, &self.rotation_tensor],
                 &mut [&mut attn_out],
+                self.config.qos,
             )?;
         }
 
@@ -871,6 +889,7 @@ mod tests {
             num_layers: 2,
             rotation_seed: 42,
             enable_qjl: false,
+            qos: 33,
         }
     }
 

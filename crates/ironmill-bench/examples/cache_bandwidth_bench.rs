@@ -264,6 +264,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
             &int8_program_loaded,
             &[&q_int8, &k_cache_int8, &v_cache_int8, &rot],
             &mut [&mut out_int8],
+            33,
         );
     }
     let mut int8_latencies = Vec::with_capacity(ITERATIONS);
@@ -274,6 +275,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
                 &int8_program_loaded,
                 &[&q_int8, &k_cache_int8, &v_cache_int8, &rot],
                 &mut [&mut out_int8],
+                33,
             )
             .map_err(|e| format!("INT8 eval failed: {e}"))?;
         int8_latencies.push(t.elapsed().as_micros() as f64);
@@ -287,6 +289,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
             &int8_raw_loaded,
             &[&q_int8_raw, &k_cache_int8_raw, &v_cache_int8_raw],
             &mut [&mut out_int8_raw],
+            33,
         );
     }
     let mut int8_raw_latencies = Vec::with_capacity(ITERATIONS);
@@ -297,6 +300,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
                 &int8_raw_loaded,
                 &[&q_int8_raw, &k_cache_int8_raw, &v_cache_int8_raw],
                 &mut [&mut out_int8_raw],
+                33,
             )
             .map_err(|e| format!("INT8 raw eval failed: {e}"))?;
         int8_raw_latencies.push(t.elapsed().as_micros() as f64);
@@ -310,6 +314,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
             &fp16_loaded,
             &[&q_fp16, &k_cache_fp16, &v_cache_fp16],
             &mut [&mut out_fp16],
+            33,
         );
     }
     let mut fp16_latencies = Vec::with_capacity(ITERATIONS);
@@ -320,6 +325,7 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
                 &fp16_loaded,
                 &[&q_fp16, &k_cache_fp16, &v_cache_fp16],
                 &mut [&mut out_fp16],
+                33,
             )
             .map_err(|e| format!("FP16 eval failed: {e}"))?;
         fp16_latencies.push(t.elapsed().as_micros() as f64);
