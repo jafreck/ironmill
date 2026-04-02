@@ -21,6 +21,12 @@ use crate::objc::{
 /// All methods are class methods on `_ANEDeviceInfo` — no instance is needed.
 pub struct DeviceInfo;
 
+impl std::fmt::Debug for DeviceInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceInfo").finish()
+    }
+}
+
 impl DeviceInfo {
     /// Returns `true` if ANE hardware is present on this machine.
     pub fn has_ane() -> Result<bool, AneSysError> {
@@ -212,6 +218,14 @@ pub struct DeviceController {
 
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for DeviceController {}
+
+impl std::fmt::Debug for DeviceController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceController")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
 
 impl DeviceController {
     /// Raw ObjC object pointer.

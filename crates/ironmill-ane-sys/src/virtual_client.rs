@@ -33,6 +33,14 @@ impl Default for VirtANEModel {
     }
 }
 
+impl std::fmt::Debug for VirtANEModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtANEModel")
+            .field("data_len", &self.data.len())
+            .finish()
+    }
+}
+
 /// Device information returned by `-getDeviceInfo`.
 ///
 /// Layout: `{DeviceExtendedInfo={DeviceInfo=IqqB}BII[32c][8c]}`
@@ -87,6 +95,14 @@ pub struct VirtualClient {
 
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for VirtualClient {}
+
+impl std::fmt::Debug for VirtualClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualClient")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
 
 impl VirtualClient {
     /// Raw ObjC object pointer.

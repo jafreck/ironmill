@@ -26,6 +26,15 @@ pub struct SharedEvents {
 unsafe impl Send for SharedEvents {}
 
 #[cfg(target_os = "macos")]
+impl std::fmt::Debug for SharedEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedEvents")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl SharedEvents {
     /// Create via `+[_ANESharedEvents sharedEventsWithSignalEvents:waitEvents:]`.
     ///
@@ -142,6 +151,15 @@ pub struct SharedSignalEvent {
 
 #[cfg(target_os = "macos")]
 unsafe impl Send for SharedSignalEvent {}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for SharedSignalEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedSignalEvent")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
 
 #[cfg(target_os = "macos")]
 impl SharedSignalEvent {
@@ -307,6 +325,15 @@ pub struct SharedWaitEvent {
 
 #[cfg(target_os = "macos")]
 unsafe impl Send for SharedWaitEvent {}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for SharedWaitEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedWaitEvent")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
 
 #[cfg(target_os = "macos")]
 impl SharedWaitEvent {

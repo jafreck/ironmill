@@ -26,6 +26,15 @@ pub struct InputBuffersReady {
 unsafe impl Send for InputBuffersReady {}
 
 #[cfg(target_os = "macos")]
+impl std::fmt::Debug for InputBuffersReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputBuffersReady")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl InputBuffersReady {
     /// Create via `+[_ANEInputBuffersReady inputBuffersWithProcedureIndex:inputBufferInfoIndex:inputFreeValue:executionDelay:]`.
     ///
@@ -164,6 +173,15 @@ pub struct OutputSetEnqueue {
 
 #[cfg(target_os = "macos")]
 unsafe impl Send for OutputSetEnqueue {}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for OutputSetEnqueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputSetEnqueue")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
 
 #[cfg(target_os = "macos")]
 impl OutputSetEnqueue {

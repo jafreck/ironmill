@@ -62,6 +62,15 @@ pub struct AneRequest {
 unsafe impl Send for AneRequest {}
 
 #[cfg(target_os = "macos")]
+impl std::fmt::Debug for AneRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AneRequest")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl AneRequest {
     /// Create via `+[_ANERequest requestWithInputs:inputIndices:outputs:
     /// outputIndices:weightsBuffer:perfStats:procedureIndex:]`.
@@ -531,6 +540,14 @@ pub struct ChainingRequest {
 
 #[cfg(target_os = "macos")]
 unsafe impl Send for ChainingRequest {}
+
+impl std::fmt::Debug for ChainingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainingRequest")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
 
 #[cfg(target_os = "macos")]
 impl ChainingRequest {

@@ -199,6 +199,14 @@ impl InMemoryModelDescriptor {
     }
 }
 
+impl std::fmt::Debug for InMemoryModelDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryModelDescriptor")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
 impl Drop for InMemoryModelDescriptor {
     fn drop(&mut self) {
         if !self.raw.is_null() {
@@ -610,6 +618,14 @@ impl InMemoryModel {
     /// Raw ObjC pointer to the `_ANEInMemoryModel`.
     pub fn as_raw(&self) -> *mut c_void {
         self.raw
+    }
+}
+
+impl std::fmt::Debug for InMemoryModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryModel")
+            .field("raw", &self.raw)
+            .finish()
     }
 }
 

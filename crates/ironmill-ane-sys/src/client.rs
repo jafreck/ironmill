@@ -28,6 +28,12 @@ pub struct Client {
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for Client {}
 
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client").field("raw", &self.raw).finish()
+    }
+}
+
 impl Client {
     /// Raw ObjC object pointer.
     pub fn as_raw(&self) -> *mut c_void {
@@ -558,6 +564,14 @@ pub struct DaemonConnection {
 
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for DaemonConnection {}
+
+impl std::fmt::Debug for DaemonConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonConnection")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
 
 impl DaemonConnection {
     /// Raw ObjC object pointer.

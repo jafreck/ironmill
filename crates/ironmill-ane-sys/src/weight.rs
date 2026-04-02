@@ -29,6 +29,12 @@ pub struct Weight {
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for Weight {}
 
+impl std::fmt::Debug for Weight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Weight").field("raw", &self.raw).finish()
+    }
+}
+
 impl Weight {
     /// Raw ObjC object pointer.
     pub fn as_raw(&self) -> *mut c_void {
@@ -191,6 +197,14 @@ pub struct ProcedureData {
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for ProcedureData {}
 
+impl std::fmt::Debug for ProcedureData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcedureData")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
 impl ProcedureData {
     /// Raw ObjC object pointer.
     pub fn as_raw(&self) -> *mut c_void {
@@ -266,6 +280,14 @@ pub struct ModelInstanceParameters {
 
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for ModelInstanceParameters {}
+
+impl std::fmt::Debug for ModelInstanceParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelInstanceParameters")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
 
 impl ModelInstanceParameters {
     /// Raw ObjC object pointer.

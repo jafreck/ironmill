@@ -25,6 +25,14 @@ pub struct ProgramForEvaluation {
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for ProgramForEvaluation {}
 
+impl std::fmt::Debug for ProgramForEvaluation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgramForEvaluation")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
 impl ProgramForEvaluation {
     /// Raw ObjC object pointer.
     pub fn as_raw(&self) -> *mut c_void {

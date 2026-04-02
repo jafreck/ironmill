@@ -25,6 +25,14 @@ pub struct ModelToken {
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for ModelToken {}
 
+impl std::fmt::Debug for ModelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelToken")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
 impl ModelToken {
     /// Raw ObjC object pointer.
     pub fn as_raw(&self) -> *mut c_void {

@@ -24,6 +24,14 @@ pub struct PerformanceStats {
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for PerformanceStats {}
 
+impl std::fmt::Debug for PerformanceStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PerformanceStats")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
 impl PerformanceStats {
     /// Raw ObjC object pointer.
     pub fn as_raw(&self) -> *mut c_void {
@@ -104,6 +112,14 @@ pub struct PerformanceStatsIOSurface {
 // SAFETY: The raw handle is only accessed through &self methods.
 unsafe impl Send for PerformanceStatsIOSurface {}
 
+impl std::fmt::Debug for PerformanceStatsIOSurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PerformanceStatsIOSurface")
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
 impl PerformanceStatsIOSurface {
     /// Raw ObjC object pointer.
     pub fn as_raw(&self) -> *mut c_void {
@@ -170,6 +186,12 @@ impl Drop for PerformanceStatsIOSurface {
 ///
 /// All methods are class methods on `_ANEQoSMapper` — no instance is needed.
 pub struct QoSMapper;
+
+impl std::fmt::Debug for QoSMapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QoSMapper").finish()
+    }
+}
 
 impl QoSMapper {
     /// Default task QoS value.
