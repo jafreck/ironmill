@@ -21,6 +21,7 @@ use crate::ir::types::Value;
 
 use super::replace_reference;
 use super::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
+use super::util::is_single_consumer;
 
 /// Folds BatchNorm parameters into Conv weights and bias.
 ///
@@ -75,29 +76,6 @@ fn find_const_op_index(block: &Block, output_name: &str) -> Option<usize> {
         .operations
         .iter()
         .position(|op| op.op_type == "const" && op.outputs.iter().any(|o| o == output_name))
-}
-
-/// Check whether `value_name` has exactly one consumer at `consumer_idx`.
-fn is_single_consumer(block: &Block, value_name: &str, consumer_idx: usize) -> bool {
-    for (idx, op) in block.operations.iter().enumerate() {
-        if idx == consumer_idx {
-            continue;
-        }
-        for input_val in op.inputs.values() {
-            if references_name(input_val, value_name) {
-                return false;
-            }
-        }
-    }
-    !block.outputs.contains(&value_name.to_string())
-}
-
-fn references_name(value: &Value, name: &str) -> bool {
-    match value {
-        Value::Reference(n) => n == name,
-        Value::List(items) => items.iter().any(|v| references_name(v, name)),
-        _ => false,
-    }
 }
 
 /// Extract f32 data from a const tensor.

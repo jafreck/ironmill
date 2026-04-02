@@ -10,6 +10,7 @@ use crate::ir::program::{Block, Program};
 use crate::ir::types::Value;
 
 use super::replace_reference;
+use super::util::is_single_consumer;
 
 /// Fuses Conv + BatchNorm into a single Conv with adjusted weights.
 ///
@@ -150,35 +151,6 @@ enum FusionKind {
     BatchNorm,
     /// Fuse a following linear op — sets `has_fused_linear`.
     Linear,
-}
-
-/// Check if a value name is only consumed by a single operation in the block.
-///
-/// `consumer_idx` is the index of the expected consumer; this function verifies
-/// that no *other* operation (or block output) references `value_name`.
-fn is_single_consumer(block: &Block, value_name: &str, consumer_idx: usize) -> bool {
-    for (idx, op) in block.operations.iter().enumerate() {
-        if idx == consumer_idx {
-            continue;
-        }
-        for input_val in op.inputs.values() {
-            if references_name(input_val, value_name) {
-                return false;
-            }
-        }
-    }
-    // Also check block outputs — if the value is a block output it has
-    // an external consumer and must not be fused away.
-    !block.outputs.contains(&value_name.to_string())
-}
-
-/// Returns `true` if `value` contains a [`Value::Reference`] to `name`.
-fn references_name(value: &Value, name: &str) -> bool {
-    match value {
-        Value::Reference(n) => n == name,
-        Value::List(items) => items.iter().any(|v| references_name(v, name)),
-        _ => false,
-    }
 }
 
 /// Returns `true` if the operation is tagged as a causal convolution.

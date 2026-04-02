@@ -25,6 +25,7 @@ pub mod rotation;
 pub mod shape_materialize;
 pub mod tensor_utils;
 pub mod type_repropagate;
+pub(crate) mod util;
 
 pub use attention_fusion::{AttentionFusionPass, GqaFusionPass};
 pub use bn_weight_fold::ConvBatchNormWeightFoldPass;

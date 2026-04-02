@@ -22,6 +22,7 @@ use crate::ir::types::Value;
 
 use super::replace_reference;
 use super::rotation::rotate_rows_hadamard;
+use super::util::build_consumer_map;
 
 /// Linear-family op types whose weights can be PolarQuant-rotated.
 const LINEAR_FAMILY: &[&str] = &["matmul", "linear", "conv"];
@@ -355,34 +356,6 @@ impl Pass for PolarRotationFusionPass {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Build a map from each output name to the ops that consume it.
-fn build_consumer_map(ops: &[Operation]) -> HashMap<String, Vec<(usize, String)>> {
-    let mut map: HashMap<String, Vec<(usize, String)>> = HashMap::new();
-    for (idx, op) in ops.iter().enumerate() {
-        for (key, val) in &op.inputs {
-            collect_references(val, &mut |ref_name| {
-                map.entry(ref_name.to_string())
-                    .or_default()
-                    .push((idx, key.clone()));
-            });
-        }
-    }
-    map
-}
-
-/// Recursively collect reference names from a Value.
-fn collect_references(value: &Value, cb: &mut impl FnMut(&str)) {
-    match value {
-        Value::Reference(name) => cb(name),
-        Value::List(items) => {
-            for item in items {
-                collect_references(item, cb);
-            }
-        }
-        _ => {}
-    }
-}
 
 /// Trace forward from `output_name` through a chain of element-wise ops to
 /// find the next linear-family op that consumes the result. Returns the

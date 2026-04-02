@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MilError;
+use crate::ir::passes::util::{build_consumer_index_map, collect_op_references};
 use crate::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 
 // ---------------------------------------------------------------------------
@@ -197,7 +198,7 @@ pub fn detect_moe(program: &Program) -> Option<MoeTopology> {
     }
 
     let output_map = build_output_map(ops);
-    let consumer_map = build_consumer_map(ops);
+    let consumer_map = build_consumer_index_map(ops);
 
     // Try name-based detection first (most reliable for known model formats)
     if let Some(topology) = detect_by_name(ops, &output_map, &consumer_map) {
@@ -410,7 +411,7 @@ pub fn fuse_top_k_experts(
         if keep_set.contains(&idx) || router_set.contains(&idx) {
             continue;
         }
-        let refs = collect_references(&ops[idx]);
+        let refs = collect_op_references(&ops[idx]);
         if refs.iter().any(|r| produced.contains(r)) {
             post_ops.push(idx);
         }
@@ -589,7 +590,7 @@ fn detect_by_structure(
     // Group by shared input reference
     let mut input_groups: HashMap<String, Vec<usize>> = HashMap::new();
     for &idx in &candidate_ops {
-        for ref_name in collect_references(&ops[idx]) {
+        for ref_name in collect_op_references(&ops[idx]) {
             input_groups.entry(ref_name).or_default().push(idx);
         }
     }
@@ -654,38 +655,6 @@ fn build_output_map(ops: &[Operation]) -> HashMap<String, usize> {
     map
 }
 
-/// Map each output name to the indices of ops that consume it.
-fn build_consumer_map(ops: &[Operation]) -> HashMap<String, Vec<usize>> {
-    let mut map: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, op) in ops.iter().enumerate() {
-        for ref_name in collect_references(op) {
-            map.entry(ref_name).or_default().push(i);
-        }
-    }
-    map
-}
-
-/// Collect all `Value::Reference` names from an operation's inputs.
-fn collect_references(op: &Operation) -> Vec<String> {
-    let mut refs = Vec::new();
-    for value in op.inputs.values() {
-        collect_refs_value(value, &mut refs);
-    }
-    refs
-}
-
-fn collect_refs_value(value: &Value, refs: &mut Vec<String>) {
-    match value {
-        Value::Reference(name) => refs.push(name.clone()),
-        Value::List(items) => {
-            for item in items {
-                collect_refs_value(item, refs);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Extract expert ID from an operation name.
 ///
 /// Matches patterns like `"expert_0"`, `"experts.1"`, `"expert-2"`, `"expert3"`.
@@ -720,7 +689,7 @@ fn find_router_pattern(
         if op.op_type != "softmax" {
             continue;
         }
-        for ref_name in collect_references(op) {
+        for ref_name in collect_op_references(op) {
             if let Some(&pred_idx) = output_map.get(&ref_name) {
                 let pred = &ops[pred_idx];
                 if pred.op_type == "linear" || pred.op_type == "matmul" {
@@ -739,12 +708,12 @@ fn find_router_pattern(
         if op.op_type != "topk" {
             continue;
         }
-        for ref_name in collect_references(op) {
+        for ref_name in collect_op_references(op) {
             if let Some(&softmax_idx) = output_map.get(&ref_name) {
                 if ops[softmax_idx].op_type != "softmax" {
                     continue;
                 }
-                for sr in collect_references(&ops[softmax_idx]) {
+                for sr in collect_op_references(&ops[softmax_idx]) {
                     if let Some(&gate_idx) = output_map.get(&sr) {
                         let gate = &ops[gate_idx];
                         if gate.op_type == "linear" || gate.op_type == "matmul" {
@@ -767,7 +736,7 @@ fn find_router_pattern(
 fn are_parallel(group: &[usize], ops: &[Operation], output_map: &HashMap<String, usize>) -> bool {
     let group_set: HashSet<usize> = group.iter().copied().collect();
     for &idx in group {
-        for ref_name in collect_references(&ops[idx]) {
+        for ref_name in collect_op_references(&ops[idx]) {
             if let Some(&producer) = output_map.get(&ref_name) {
                 if group_set.contains(&producer) {
                     return false;
@@ -804,7 +773,7 @@ fn trace_expert_subgraph(
             continue;
         }
 
-        let refs = collect_references(&ops[idx]);
+        let refs = collect_op_references(&ops[idx]);
         let all_from_trace = !refs.is_empty() && refs.iter().all(|r| result_outputs.contains(r));
         if !all_from_trace {
             continue;
@@ -843,7 +812,7 @@ fn compute_expert_io(
         // Inputs: references not produced within this group
         let mut inputs: Vec<String> = Vec::new();
         for &idx in group {
-            for ref_name in collect_references(&ops[idx]) {
+            for ref_name in collect_op_references(&ops[idx]) {
                 if !group_outputs.contains(&ref_name) && !inputs.contains(&ref_name) {
                     inputs.push(ref_name);
                 }
@@ -884,7 +853,7 @@ fn extract_subprogram(
     // References needed by ops in this subset but not produced within it
     let mut needed: Vec<String> = Vec::new();
     for &idx in indices {
-        for ref_name in collect_references(&ops[idx]) {
+        for ref_name in collect_op_references(&ops[idx]) {
             if !produced.contains(&ref_name) && !needed.contains(&ref_name) {
                 needed.push(ref_name);
             }

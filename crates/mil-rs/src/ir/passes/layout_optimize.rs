@@ -18,6 +18,7 @@ use crate::ir::program::{Block, Program};
 use crate::ir::types::Value;
 
 use super::replace_reference;
+use super::util::is_single_consumer;
 
 /// Cancel redundant transpose pairs in the program.
 ///
@@ -150,30 +151,6 @@ fn get_perm(op: &Operation) -> Option<Vec<usize>> {
 /// Compose two permutations: `result[i] = a[b[i]]`.
 fn compose_perms(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     b.iter().map(|&bi| a.get(bi).copied()).collect()
-}
-
-/// Check if `value_name` is consumed only by the operation at `consumer_idx`.
-fn is_single_consumer(block: &Block, value_name: &str, consumer_idx: usize) -> bool {
-    for (idx, op) in block.operations.iter().enumerate() {
-        if idx == consumer_idx {
-            continue;
-        }
-        for input_val in op.inputs.values() {
-            if references_name(input_val, value_name) {
-                return false;
-            }
-        }
-    }
-    !block.outputs.contains(&value_name.to_string())
-}
-
-/// Returns `true` if `value` contains a reference to `name`.
-fn references_name(value: &Value, name: &str) -> bool {
-    match value {
-        Value::Reference(n) => n == name,
-        Value::List(items) => items.iter().any(|v| references_name(v, name)),
-        _ => false,
-    }
 }
 
 // ---------------------------------------------------------------------------
