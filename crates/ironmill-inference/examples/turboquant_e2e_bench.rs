@@ -25,6 +25,8 @@ fn run_model(
     arch: &mil_rs::analysis::arch::ModelArch,
     turbo_config: Option<TurboQuantConfig>,
 ) -> Option<(Vec<u32>, f64)> {
+    use ironmill_compile::ane::bundle::{AneDecodeConfig, compile_decode_bundle};
+
     let is_tq = turbo_config.is_some();
     let cache_label = if is_tq { "INT8" } else { "FP16" };
     println!("  ┌─ {label} ({cache_label} KV cache) ──────────────────────────");
@@ -32,10 +34,34 @@ fn run_model(
 
     let compile_start = Instant::now();
     let device = Arc::new(HardwareAneDevice::new().expect("Failed to init ANE device"));
-    let mut model = match AneInference::compile(device, program, turbo_config) {
-        Ok(m) => m,
+
+    let config = AneDecodeConfig {
+        max_seq_len: MAX_SEQ_LEN,
+        num_heads: arch.num_heads,
+        num_kv_heads: arch.num_kv_heads,
+        head_dim: arch.head_dim,
+        rope_theta: 1_000_000.0,
+        eos_tokens: Vec::new(),
+        fuse_cache_write: turbo_config.is_some(),
+        enable_qjl: false,
+    };
+
+    let bundle = match compile_decode_bundle(program, &config) {
+        Ok(b) => b,
         Err(e) => {
             eprintln!("  │  ✗ Compilation failed: {e}");
+            println!("  └────────────────────────────────────────────────────────");
+            return None;
+        }
+    };
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let bundle_path = tmp.path().join("model.ironml");
+    bundle.save(&bundle_path).expect("failed to save bundle");
+
+    let mut model = match AneInference::from_bundle(device, &bundle_path, turbo_config) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("  │  ✗ Bundle load failed: {e}");
             println!("  └────────────────────────────────────────────────────────");
             return None;
         }

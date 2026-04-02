@@ -1029,7 +1029,7 @@ fn test_turboquant_int8_cache_pipeline() -> (bool, bool) {
 // compiles successfully on ANE (not just the hand-crafted pipeline above).
 
 fn test_generated_cache_write_mil() -> (bool, bool) {
-    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+    use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
     use ironmill_inference::ane::turboquant::TurboQuantConfig;
     use ironmill_inference::ane::turboquant::mil_emitter::build_cache_write_program;
 
@@ -1062,7 +1062,7 @@ fn test_generated_cache_write_mil() -> (bool, bool) {
 }
 
 fn test_generated_attention_mil() -> (bool, bool) {
-    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+    use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
     use ironmill_inference::ane::turboquant::mil_emitter::{
         AttentionMilConfig, build_attention_program, compute_deq_scale,
     };
@@ -1103,7 +1103,7 @@ fn test_generated_attention_mil() -> (bool, bool) {
 }
 
 fn test_generated_qjl_mil() -> (bool, bool) {
-    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+    use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
     use ironmill_inference::ane::turboquant::TurboQuantConfig;
     use ironmill_inference::ane::turboquant::mil_emitter::build_qjl_program;
 
@@ -1136,7 +1136,7 @@ fn test_generated_qjl_mil() -> (bool, bool) {
 }
 
 fn test_generated_attention_gqa_mil() -> (bool, bool) {
-    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+    use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
     use ironmill_inference::ane::turboquant::mil_emitter::{
         AttentionMilConfig, build_attention_program, compute_deq_scale,
     };

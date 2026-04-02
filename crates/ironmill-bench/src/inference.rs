@@ -223,8 +223,18 @@ pub fn run_ane_direct_inference(
         ironmill_inference::ane::HardwareAneDevice::new()
             .map_err(|e| anyhow::anyhow!("ANE device init failed: {e}"))?,
     );
-    let mut model = ironmill_inference::AneModel::compile_and_load(device, program, config)
-        .map_err(|e| anyhow::anyhow!("ANE compile failed: {e}"))?;
+    let bundle = ironmill_compile::ane::bundle::compile_model_bundle(
+        program,
+        &ironmill_compile::ane::bundle::AneCompileConfig::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("ANE compile failed: {e}"))?;
+    let tmp = tempfile::tempdir()?;
+    let bundle_path = tmp.path().join("model.ironml");
+    bundle
+        .save(&bundle_path)
+        .map_err(|e| anyhow::anyhow!("failed to save bundle: {e}"))?;
+    let mut model = ironmill_inference::AneModel::from_bundle(device, &bundle_path, config)
+        .map_err(|e| anyhow::anyhow!("ANE load failed: {e}"))?;
     let load_time = compile_start.elapsed();
 
     let desc = model.input_description();

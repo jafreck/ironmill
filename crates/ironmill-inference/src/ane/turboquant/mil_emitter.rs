@@ -3,7 +3,7 @@
 //! Builds `mil_rs::ir::Program` objects for the cache-write (quantization)
 //! and cache-read + attention (dequantization + SDPA) sub-programs that run
 //! on the Apple Neural Engine. Programs are serialized to MIL text via
-//! `ironmill_compile::ane::mil_text::program_to_mil_text`.
+//! `ironmill_core::ane::mil_text::program_to_mil_text`.
 
 use half::f16;
 use mil_rs::ir::passes::beta_quantizer::beta_optimal_levels;
@@ -847,7 +847,7 @@ pub fn build_qjl_program(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+    use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 
     /// Serialize a Program to MIL text for test assertions.
     fn to_mil(program: &Program) -> String {

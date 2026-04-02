@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use ironmill_inference::ane::turboquant::mil_emitter;
 use ironmill_inference::ane::turboquant::{AttentionMilConfig, compute_deq_scale};
 use ironmill_inference::ane::{AneDevice, HardwareAneDevice};

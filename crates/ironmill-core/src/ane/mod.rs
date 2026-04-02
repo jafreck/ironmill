@@ -1,6 +1,7 @@
 use mil_rs::ir::ScalarType;
 
 pub mod bundle;
+pub mod mil_text;
 pub mod packing;
 
 /// Describes an ANE tensor's name, shape, and element type.

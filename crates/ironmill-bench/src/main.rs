@@ -1041,7 +1041,32 @@ fn main() -> Result<()> {
         };
 
         let device = Arc::new(HardwareAneDevice::new().map_err(|e| anyhow::anyhow!("{e}"))?);
-        match AneInference::compile(device, &program, None) {
+
+        let compile_result = (|| -> anyhow::Result<AneInference<HardwareAneDevice>> {
+            let bundle = ironmill_compile::ane::bundle::compile_decode_bundle(
+                &program,
+                &ironmill_compile::ane::bundle::AneDecodeConfig {
+                    max_seq_len: 2048,
+                    num_heads: 32,
+                    num_kv_heads: 8,
+                    head_dim: 128,
+                    rope_theta: 1_000_000.0,
+                    eos_tokens: Vec::new(),
+                    fuse_cache_write: false,
+                    enable_qjl: false,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("compile failed: {e}"))?;
+            let tmp = tempfile::tempdir()?;
+            let bundle_path = tmp.path().join("model.ironml");
+            bundle
+                .save(&bundle_path)
+                .map_err(|e| anyhow::anyhow!("save failed: {e}"))?;
+            AneInference::from_bundle(device, &bundle_path, None)
+                .map_err(|e| anyhow::anyhow!("load failed: {e}"))
+        })();
+
+        match compile_result {
             Ok(mut inference) => {
                 match perplexity::evaluate_perplexity(
                     &mut inference,

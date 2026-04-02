@@ -18,9 +18,7 @@ pub mod sampling;
 pub mod types;
 
 // Re-exports for convenience.
-#[cfg(feature = "compile")]
-pub use ane::model::CompiledArtifacts;
-pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel, SubProgramArtifact};
+pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
 pub use engine::{InferenceEngine, InferenceError};
 pub use sampling::{is_eos_token, sample_token};
 pub use types::{
@@ -71,26 +69,6 @@ pub enum AneError {
 impl From<IOSurfaceError> for AneError {
     fn from(e: IOSurfaceError) -> Self {
         AneError::SurfaceError(e.to_string())
-    }
-}
-
-#[cfg(feature = "compile")]
-impl From<ironmill_compile::ane::AneCompileError> for AneError {
-    fn from(e: ironmill_compile::ane::AneCompileError) -> Self {
-        use ironmill_compile::ane::AneCompileError;
-        match e {
-            AneCompileError::CompileFailed { status, context } => {
-                AneError::CompileFailed { status, context }
-            }
-            AneCompileError::EvalFailed { status, context } => {
-                AneError::EvalFailed { status, context }
-            }
-            AneCompileError::SurfaceError(msg) => AneError::SurfaceError(msg),
-            AneCompileError::BudgetExhausted { used, limit } => {
-                AneError::BudgetExhausted { used, limit }
-            }
-            AneCompileError::Other(e) => AneError::Other(e),
-        }
     }
 }
 

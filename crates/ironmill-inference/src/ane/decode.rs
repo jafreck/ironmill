@@ -15,18 +15,12 @@
 use half::f16;
 
 use super::device::AneDevice;
-#[cfg(feature = "compile")]
 use super::turboquant::TurboQuantConfig;
 use super::turboquant::TurboQuantModel;
-#[cfg(feature = "compile")]
 use super::turboquant::mil_emitter;
-#[cfg(feature = "compile")]
 use super::turboquant::mil_emitter::MIN_IO_SEQ;
 use crate::ane::{AneError, Result};
-#[cfg(feature = "compile")]
-use ironmill_compile::ane::bundle::{AneDecodeConfig, compile_decode_bundle};
-#[cfg(feature = "compile")]
-use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use mil_rs::ir::ScalarType;
 use std::sync::Arc;
 
@@ -357,56 +351,12 @@ fn emit_lm_head_chunk_mil(hidden_size: usize, out_channels: usize) -> String {
 // ---------------------------------------------------------------------------
 
 impl<D: AneDevice> AneInference<D> {
-    /// Build from a Program. When `turbo_config` is Some, TurboQuant
-    /// replaces the FP16 attention sub-programs (they are not compiled,
-    /// saving ANE compile budget).
-    ///
-    /// Delegates to `compile_decode_bundle()` to run the full ANE decode
-    /// compilation pipeline, saves to a temporary directory, then loads
-    /// via `from_bundle()`.
-    ///
-    /// The program must be a transformer with attention-splittable layers.
-    #[cfg(feature = "compile")]
-    pub fn compile(
-        device: Arc<D>,
-        program: &mil_rs::ir::Program,
-        turbo_config: Option<TurboQuantConfig>,
-    ) -> Result<Self> {
-        let arch = mil_rs::analysis::arch::detect_model_arch(program).ok_or_else(|| {
-            AneError::Other(anyhow::anyhow!(
-                "failed to detect model architecture from program"
-            ))
-        })?;
-
-        let config = AneDecodeConfig {
-            max_seq_len: 2048,
-            num_heads: arch.num_heads,
-            num_kv_heads: arch.num_kv_heads,
-            head_dim: arch.head_dim,
-            rope_theta: 1_000_000.0,
-            eos_tokens: Vec::new(),
-            fuse_cache_write: turbo_config.is_some(),
-            enable_qjl: false,
-        };
-
-        let bundle = compile_decode_bundle(program, &config)?;
-        let tmp = tempfile::tempdir()
-            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to create work dir: {e}")))?;
-        let bundle_path = tmp.path().join("model.ironml");
-        bundle
-            .save(&bundle_path)
-            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to save bundle: {e}")))?;
-        Self::from_bundle(device, &bundle_path, turbo_config)
-    }
-
-    /// Load a pre-compiled `.ironml` decode bundle, bypassing the compile
-    /// pipeline.
+    /// Load a pre-compiled `.ironml` decode bundle.
     ///
     /// The bundle must have been created by `compile_decode_bundle()` and
     /// saved via `AneDecodeBundle::save()`. This method reads the manifest,
     /// CPU weights, and per-layer MIL programs, then compiles them on the
     /// ANE device and sets up runtime state (KV caches, etc.).
-    #[cfg(feature = "compile")]
     pub fn from_bundle(
         device: Arc<D>,
         bundle_path: &std::path::Path,
@@ -1408,7 +1358,6 @@ fn read_f16_channels(tensor: &AneTensor) -> Result<Vec<f16>> {
 /// This finds the `skip_add` variable and appends `add(skip_add, down_proj)`
 /// as the new output.
 #[allow(dead_code)]
-#[cfg(feature = "compile")]
 fn inject_ffn_residual(program: &mut mil_rs::ir::Program) {
     use mil_rs::ir::{Operation, Value};
 
@@ -1606,34 +1555,6 @@ fn allocate_io_from_manifest<D: AneDevice>(
     })
 }
 
-/// Infer the number of KV heads from pre_attn sub-program output shapes.
-#[allow(dead_code)]
-#[cfg(feature = "compile")]
-fn infer_kv_heads_from_sub(pre_attn_sps: &[&ironmill_compile::ane::split::SubProgram]) -> usize {
-    // The KV projection outputs have fewer channels than Q in GQA models.
-    // Find the minimum channel count among outputs (excluding very small ones
-    // like scalars/position IDs). This gives kv_channels = num_kv_heads * head_dim.
-    if let Some(sp) = pre_attn_sps.first() {
-        let min_channels = sp
-            .outputs
-            .iter()
-            .map(|td| td.shape[1])
-            .filter(|&c| c > 1) // skip scalars
-            .min();
-        if let Some(c) = min_channels {
-            return c;
-        }
-    }
-    1
-}
-
-/// Infer head_dim from pre_attn sub-program output shapes.
-#[allow(dead_code)]
-#[cfg(feature = "compile")]
-fn infer_head_dim_from_sub(_pre_attn_sps: &[&ironmill_compile::ane::split::SubProgram]) -> usize {
-    // Without explicit arch info, assume head_dim = 64 (common default).
-    64
-}
 /// CPU RMSNorm: normalize hidden state in-place using the given weight.
 /// RMSNorm(x) = x / sqrt(mean(x²) + eps) * weight
 fn cpu_rms_norm(hidden: &mut [f16], weight: &[f16]) {

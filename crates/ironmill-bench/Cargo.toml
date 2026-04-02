@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ironmill-compile = { workspace = true }
-ironmill-inference = { path = "../ironmill-inference", features = ["compile"] }
+ironmill-inference = { path = "../ironmill-inference" }
 ironmill-iosurface = { path = "../ironmill-iosurface", optional = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -21,6 +21,7 @@ toml = { workspace = true }
 anyhow = { workspace = true }
 statrs = { workspace = true }
 half = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ironmill-ane-sys = { workspace = true }

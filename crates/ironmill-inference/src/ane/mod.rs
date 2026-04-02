@@ -11,9 +11,7 @@ pub mod turboquant;
 
 pub use decode::AneInference;
 pub use device::{AneDevice, HardwareAneDevice, HardwareProgram};
-#[cfg(feature = "compile")]
-pub use model::CompiledArtifacts;
-pub use model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel, SubProgramArtifact};
+pub use model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
 
 // Re-export error/result from the parent module for local convenience.
 pub(crate) use super::AneError;

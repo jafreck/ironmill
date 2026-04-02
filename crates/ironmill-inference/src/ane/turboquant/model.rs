@@ -6,15 +6,13 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "compile")]
-use ironmill_compile::ane::mil_text::{MilTextConfig, program_to_mil_text};
+use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::beta_quantizer::{beta_optimal_boundaries, beta_optimal_levels};
 use mil_rs::ir::passes::rotation::{rotate_rows_hadamard, unrotate_rows_hadamard};
 
 use half::f16;
 
-#[cfg(feature = "compile")]
 use super::mil_emitter;
 use super::mil_emitter::MIN_IO_SEQ;
 use crate::ane::device::AneDevice;
@@ -471,13 +469,12 @@ pub struct TurboQuantModel<D: AneDevice> {
 }
 
 impl<D: AneDevice> TurboQuantModel<D> {
-    /// Compile and load the TurboQuant sub-programs onto the ANE.
+    /// Build and load the TurboQuant sub-programs onto the ANE.
     ///
     /// 1. Emits + compiles the cache-write MIL program.
     /// 2. Emits + compiles the attention MIL program.
     /// 3. Optionally compiles the QJL correction program.
     /// 4. Allocates the [`KvCacheManager`].
-    #[cfg(feature = "compile")]
     pub fn compile(device: Arc<D>, config: TurboQuantConfig) -> Result<Self> {
         let head_dim = config.head_dim;
 
