@@ -23,6 +23,7 @@ pub mod op_fusion;
 pub mod palettize;
 pub mod polar_quantize;
 pub mod polar_rotation_fusion;
+pub mod quip_sharp;
 pub mod rotation;
 pub mod shape_materialize;
 pub mod tensor_utils;
