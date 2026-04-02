@@ -318,48 +318,8 @@ fn compute_scaled_quantization_mse(original: &[f32], scale: f32, qmax: f32) -> f
     sum_sq / original.len() as f32
 }
 
-// ---------------------------------------------------------------------------
-// Affine quantization core (duplicated from affine_quantize to avoid coupling)
-// ---------------------------------------------------------------------------
-
-/// Quantize an f32 slice to unsigned integers using min/max affine scaling.
-///
-/// Returns `(quantized_bytes, scale, zero_point)`.
-fn quantize_affine(values: &[f32], qmax: f32) -> (Vec<u8>, f32, f32) {
-    if values.is_empty() {
-        return (Vec::new(), 1.0, 0.0);
-    }
-
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for &v in values {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-    }
-
-    let (scale, zp_float) = if (max - min).abs() < f32::EPSILON {
-        let zp = (-min).round();
-        (1.0_f32, zp)
-    } else {
-        let s = (max - min) / qmax;
-        let zp = (-min / s).round();
-        (s, zp)
-    };
-
-    let quantized: Vec<u8> = values
-        .iter()
-        .map(|&x| {
-            let q = (x / scale + zp_float).round().clamp(0.0, qmax);
-            q as u8
-        })
-        .collect();
-
-    (quantized, scale, zp_float)
-}
+use super::affine_quantize::quantize_affine;
+use super::int4_pack::pack_int4;
 
 // ---------------------------------------------------------------------------
 // Emission helpers
@@ -403,8 +363,14 @@ fn emit_per_group_with_scales(
         }
     }
 
+    let packed_data = if bits == 4 {
+        pack_int4(&all_quantized)
+    } else {
+        all_quantized
+    };
+
     let quantized_val = Value::Tensor {
-        data: all_quantized,
+        data: packed_data,
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -503,8 +469,14 @@ fn emit_fallback_per_group(
         }
     }
 
+    let packed_data = if bits == 4 {
+        pack_int4(&all_quantized)
+    } else {
+        all_quantized
+    };
+
     let quantized_val = Value::Tensor {
-        data: all_quantized,
+        data: packed_data,
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -596,10 +568,25 @@ mod tests {
 
     /// Compute MSE between original floats and dequantized reconstruction.
     fn reconstruction_mse(original: &[f32], program: &Program) -> f32 {
+        use crate::ir::passes::int4_pack::unpack_int4;
+
         let op = &program.functions["main"].body.operations[0];
-        let q_data = match op.attributes.get("quantized_data") {
+        let q_data_raw = match op.attributes.get("quantized_data") {
             Some(Value::Tensor { data, .. }) => data,
             _ => panic!("missing quantized_data"),
+        };
+
+        // Get bit_width to determine if data is packed INT4.
+        let bit_width = match op.attributes.get("bit_width") {
+            Some(Value::Int(b)) => *b as u8,
+            _ => 8,
+        };
+
+        // Unpack INT4 data if needed.
+        let q_data: Vec<u8> = if bit_width == 4 {
+            unpack_int4(q_data_raw, original.len())
+        } else {
+            q_data_raw.to_vec()
         };
 
         // Get per-group scales and zero points.

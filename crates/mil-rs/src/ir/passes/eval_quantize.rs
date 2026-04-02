@@ -870,6 +870,374 @@ mod tests {
         );
     }
 
+    // -- QuIP# (LUT) dequantization tests -----------------------------------
+
+    #[test]
+    fn eval_quantize_lut_to_dense_2bit() {
+        // Build a program with an original FP32 const and a quantized LUT op.
+        let lut = [0.0f32, 0.5, -0.5, 1.0]; // 4 entries = 2-bit
+        // 8 elements packed into 2 bytes (4 indices per byte, 2 bits each)
+        // Indices: [0, 1, 2, 3, 0, 1, 2, 3]
+        // Byte 0: 0b_11_10_01_00 = 0xE4, Byte 1: 0b_11_10_01_00 = 0xE4
+        let packed_indices: Vec<u8> = vec![0xE4, 0xE4];
+        let expected: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0, 0.0, 0.5, -0.5, 1.0];
+
+        let original = {
+            let mut p = Program::new("1.0.0");
+            let mut func = Function::new("main");
+            func.body.add_op(
+                Operation::new("const", "w_const")
+                    .with_input(
+                        "val",
+                        Value::Tensor {
+                            data: f32_bytes(&expected),
+                            shape: vec![8],
+                            dtype: ScalarType::Float32,
+                        },
+                    )
+                    .with_output("w_out"),
+            );
+            func.body.outputs.push("w_out".into());
+            p.add_function(func);
+            p
+        };
+
+        let quantized = {
+            let mut p = Program::new("1.0.0");
+            let mut func = Function::new("main");
+            let mut op = Operation::new("constexpr_lut_to_dense", "w_lut");
+            op.attributes.insert(
+                "lut".into(),
+                Value::Tensor {
+                    data: f32_bytes(&lut),
+                    shape: vec![4],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "indices".into(),
+                Value::Tensor {
+                    data: packed_indices,
+                    shape: vec![2],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+            op.attributes
+                .insert("shape".into(), Value::List(vec![Value::Int(8)]));
+            op.outputs.push("w_out".into());
+            func.body.add_op(op);
+            func.body.outputs.push("w_out".into());
+            p.add_function(func);
+            p
+        };
+
+        let metrics = QuantizationEvaluator::evaluate(&original, &quantized);
+        assert_eq!(metrics.len(), 1, "Should evaluate the LUT op");
+
+        let m = metrics.values().next().unwrap();
+        assert!(
+            m.mse < 1e-10,
+            "Perfect LUT reconstruction should have near-zero MSE, got {}",
+            m.mse
+        );
+        assert_eq!(m.n_elements, 8);
+    }
+
+    #[test]
+    fn eval_quantize_lut_with_quip_sharp_scales() {
+        let lut = [0.0f32, 1.0, -1.0, 2.0]; // 2-bit
+        // Indices: [1, 1, 3, 3] → pre-scale values: [1.0, 1.0, 2.0, 2.0]
+        // Byte: 0b_11_11_01_01 = 0xF5
+        let packed_indices: Vec<u8> = vec![0xF5];
+        // 2 groups of 2, scales: [0.5, 2.0]
+        // Expected: [1.0*0.5, 1.0*0.5, 2.0*2.0, 2.0*2.0] = [0.5, 0.5, 4.0, 4.0]
+        let expected = [0.5f32, 0.5, 4.0, 4.0];
+
+        let original = {
+            let mut p = Program::new("1.0.0");
+            let mut func = Function::new("main");
+            func.body.add_op(
+                Operation::new("const", "w_const")
+                    .with_input(
+                        "val",
+                        Value::Tensor {
+                            data: f32_bytes(&expected),
+                            shape: vec![4],
+                            dtype: ScalarType::Float32,
+                        },
+                    )
+                    .with_output("w_out"),
+            );
+            func.body.outputs.push("w_out".into());
+            p.add_function(func);
+            p
+        };
+
+        let scales = [0.5f32, 2.0];
+        let quantized = {
+            let mut p = Program::new("1.0.0");
+            let mut func = Function::new("main");
+            let mut op = Operation::new("constexpr_lut_to_dense", "w_lut");
+            op.attributes.insert(
+                "lut".into(),
+                Value::Tensor {
+                    data: f32_bytes(&lut),
+                    shape: vec![4],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "indices".into(),
+                Value::Tensor {
+                    data: packed_indices,
+                    shape: vec![1],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+            op.attributes
+                .insert("shape".into(), Value::List(vec![Value::Int(4)]));
+            op.attributes.insert(
+                "quip_sharp_scales".into(),
+                Value::Tensor {
+                    data: f32_bytes(&scales),
+                    shape: vec![2],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.outputs.push("w_out".into());
+            func.body.add_op(op);
+            func.body.outputs.push("w_out".into());
+            p.add_function(func);
+            p
+        };
+
+        let metrics = QuantizationEvaluator::evaluate(&original, &quantized);
+        assert_eq!(metrics.len(), 1);
+        let m = metrics.values().next().unwrap();
+        assert!(
+            m.mse < 1e-10,
+            "QuIP# with scales should reconstruct exactly, got MSE {}",
+            m.mse
+        );
+    }
+
+    // -- D2Quant (dual-scale) dequantization tests ----------------------------
+
+    #[test]
+    fn eval_quantize_dual_scale_dequantize() {
+        // 4 elements, group_size=4, 4-bit, all in one group.
+        // Elements: q=[2, 5, 3, 7], outlier_mask bits: [0, 1, 0, 1]
+        // Normal: scale=0.1, zero=1.0  →  (q-1)*0.1
+        // Outlier: scale=0.5, zero=2.0  →  (q-2)*0.5
+        // Expected:
+        //   elem0: normal: (2-1)*0.1 = 0.1
+        //   elem1: outlier: (5-2)*0.5 = 1.5
+        //   elem2: normal: (3-1)*0.1 = 0.2
+        //   elem3: outlier: (7-2)*0.5 = 2.5
+        let expected = [0.1f32, 1.5, 0.2, 2.5];
+
+        // Pack: 4 values in 4-bit = 2 bytes
+        // Byte 0 low nibble: q[0]=2, high nibble: q[1]=5 → 0x52
+        // Byte 1 low nibble: q[2]=3, high nibble: q[3]=7 → 0x73
+        let quantized_data: Vec<u8> = vec![0x52, 0x73];
+
+        // Outlier mask: bits [0,1,0,1] → byte 0b_0000_1010 = 0x0A
+        let outlier_mask: Vec<u8> = vec![0x0A];
+
+        let original = {
+            let mut p = Program::new("1.0.0");
+            let mut func = Function::new("main");
+            func.body.add_op(
+                Operation::new("const", "w_const")
+                    .with_input(
+                        "val",
+                        Value::Tensor {
+                            data: f32_bytes(&expected),
+                            shape: vec![4],
+                            dtype: ScalarType::Float32,
+                        },
+                    )
+                    .with_output("w_out"),
+            );
+            func.body.outputs.push("w_out".into());
+            p.add_function(func);
+            p
+        };
+
+        let quantized = {
+            let mut p = Program::new("1.0.0");
+            let mut func = Function::new("main");
+            let mut op = Operation::new("constexpr_dual_scale_dequantize", "w_d2q");
+            op.attributes.insert(
+                "quantized_data".into(),
+                Value::Tensor {
+                    data: quantized_data,
+                    shape: vec![2],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+            op.attributes.insert(
+                "normal_scale".into(),
+                Value::Tensor {
+                    data: f32_bytes(&[0.1]),
+                    shape: vec![1],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "normal_zero".into(),
+                Value::Tensor {
+                    data: f32_bytes(&[1.0]),
+                    shape: vec![1],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "outlier_scale".into(),
+                Value::Tensor {
+                    data: f32_bytes(&[0.5]),
+                    shape: vec![1],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "outlier_zero".into(),
+                Value::Tensor {
+                    data: f32_bytes(&[2.0]),
+                    shape: vec![1],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "outlier_mask".into(),
+                Value::Tensor {
+                    data: outlier_mask,
+                    shape: vec![1],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+            op.attributes.insert("group_size".into(), Value::Int(4));
+            op.attributes.insert("bit_width".into(), Value::Int(4));
+            op.outputs.push("w_out".into());
+            func.body.add_op(op);
+            func.body.outputs.push("w_out".into());
+            p.add_function(func);
+            p
+        };
+
+        let metrics = QuantizationEvaluator::evaluate(&original, &quantized);
+        assert_eq!(metrics.len(), 1, "Should evaluate the D2Quant op");
+
+        let m = metrics.values().next().unwrap();
+        assert!(
+            m.mse < 1e-6,
+            "D2Quant should reconstruct accurately, got MSE {}",
+            m.mse
+        );
+        assert_eq!(m.n_elements, 4);
+    }
+
+    #[test]
+    fn eval_quantize_dual_scale_no_outliers() {
+        // All normal elements (outlier mask = 0x00).
+        // 4 elements, group_size=4, 4-bit.
+        // q=[0, 1, 2, 3], normal scale=2.0, zero=0.0
+        // Expected: [0.0, 2.0, 4.0, 6.0]
+        let expected = [0.0f32, 2.0, 4.0, 6.0];
+        let quantized_data: Vec<u8> = vec![0x10, 0x32]; // [0,1], [2,3]
+        let outlier_mask: Vec<u8> = vec![0x00]; // no outliers
+
+        let original = {
+            let mut p = Program::new("1.0.0");
+            let mut func = Function::new("main");
+            func.body.add_op(
+                Operation::new("const", "w_const")
+                    .with_input(
+                        "val",
+                        Value::Tensor {
+                            data: f32_bytes(&expected),
+                            shape: vec![4],
+                            dtype: ScalarType::Float32,
+                        },
+                    )
+                    .with_output("w_out"),
+            );
+            func.body.outputs.push("w_out".into());
+            p.add_function(func);
+            p
+        };
+
+        let quantized = {
+            let mut p = Program::new("1.0.0");
+            let mut func = Function::new("main");
+            let mut op = Operation::new("constexpr_dual_scale_dequantize", "w_d2q");
+            op.attributes.insert(
+                "quantized_data".into(),
+                Value::Tensor {
+                    data: quantized_data,
+                    shape: vec![2],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+            op.attributes.insert(
+                "normal_scale".into(),
+                Value::Tensor {
+                    data: f32_bytes(&[2.0]),
+                    shape: vec![1],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "normal_zero".into(),
+                Value::Tensor {
+                    data: f32_bytes(&[0.0]),
+                    shape: vec![1],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "outlier_scale".into(),
+                Value::Tensor {
+                    data: f32_bytes(&[1.0]),
+                    shape: vec![1],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "outlier_zero".into(),
+                Value::Tensor {
+                    data: f32_bytes(&[0.0]),
+                    shape: vec![1],
+                    dtype: ScalarType::Float32,
+                },
+            );
+            op.attributes.insert(
+                "outlier_mask".into(),
+                Value::Tensor {
+                    data: outlier_mask,
+                    shape: vec![1],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+            op.attributes.insert("group_size".into(), Value::Int(4));
+            op.attributes.insert("bit_width".into(), Value::Int(4));
+            op.outputs.push("w_out".into());
+            func.body.add_op(op);
+            func.body.outputs.push("w_out".into());
+            p.add_function(func);
+            p
+        };
+
+        let metrics = QuantizationEvaluator::evaluate(&original, &quantized);
+        assert_eq!(metrics.len(), 1);
+        let m = metrics.values().next().unwrap();
+        assert!(
+            m.mse < 1e-10,
+            "All-normal D2Quant should reconstruct exactly, got MSE {}",
+            m.mse
+        );
+    }
+
     // -- End-to-end quality evaluation test ---------------------------------
 
     #[test]

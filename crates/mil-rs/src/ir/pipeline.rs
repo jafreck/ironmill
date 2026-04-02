@@ -50,7 +50,7 @@ pub enum SpinQuantMethod {
     /// GPTQ optimal weight quantization (requires `gptq` feature).
     #[cfg(feature = "gptq")]
     Gptq {
-        hessian_data: HashMap<String, (Vec<f32>, usize)>,
+        hessian_data: HashMap<String, (Vec<f32>, usize, usize)>,
         group_size: usize,
         block_size: usize,
         dampening: f64,
@@ -632,17 +632,12 @@ impl PassPipeline {
     #[cfg(feature = "gptq")]
     pub fn with_gptq(
         mut self,
-        hessian_data: HashMap<String, (Vec<f32>, usize)>,
+        hessian_data: HashMap<String, (Vec<f32>, usize, usize)>,
         group_size: usize,
         block_size: usize,
         dampening: f64,
     ) -> Result<Self> {
         if self.has_int8 {
-            return Err(MilError::Validation(
-                "GPTQ and INT8 quantization are mutually exclusive".into(),
-            ));
-        }
-        if self.has_int4 {
             return Err(MilError::Validation(
                 "GPTQ and INT4 quantization are mutually exclusive".into(),
             ));
@@ -701,7 +696,7 @@ impl PassPipeline {
     #[cfg(not(feature = "gptq"))]
     pub fn with_gptq(
         self,
-        _hessian_data: HashMap<String, (Vec<f32>, usize)>,
+        _hessian_data: HashMap<String, (Vec<f32>, usize, usize)>,
         _group_size: usize,
         _block_size: usize,
         _dampening: f64,

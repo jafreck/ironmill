@@ -100,7 +100,22 @@ impl Pass for D2QuantPass {
                 } = val
                 {
                     let floats = tensor_as_f32_slice(&data);
-                    let total = floats.len();
+
+                    // Partition along the last dimension per row so groups
+                    // never span row (output-channel) boundaries.
+                    let ndim = shape.len();
+                    let last_dim = if ndim > 0 {
+                        *shape.last().unwrap()
+                    } else {
+                        floats.len()
+                    };
+                    let outer_count: usize = if ndim > 1 {
+                        shape[..ndim - 1].iter().product()
+                    } else {
+                        1
+                    };
+                    let n_groups_per_row = last_dim.div_ceil(self.group_size);
+                    let total_groups = outer_count * n_groups_per_row;
 
                     // Accumulators across all groups.
                     let mut all_quantized_packed: Vec<u8> = Vec::new();
@@ -110,29 +125,30 @@ impl Pass for D2QuantPass {
                     let mut all_outlier_zero: Vec<f32> = Vec::new();
                     let mut all_mask_packed: Vec<u8> = Vec::new();
 
-                    let num_groups = total.div_ceil(self.group_size);
+                    for row in 0..outer_count {
+                        let row_start = row * last_dim;
+                        for g in 0..n_groups_per_row {
+                            let g_start = row_start + g * self.group_size;
+                            let g_end = (g_start + self.group_size).min(row_start + last_dim);
+                            let group = &floats[g_start..g_end];
 
-                    for g in 0..num_groups {
-                        let start = g * self.group_size;
-                        let end = (start + self.group_size).min(total);
-                        let group = &floats[start..end];
+                            let (quantized, params) =
+                                dual_scale_quantize(group, self.bits, self.outlier_threshold);
 
-                        let (quantized, params) =
-                            dual_scale_quantize(group, self.bits, self.outlier_threshold);
+                            // Pack quantized values.
+                            let packed = match self.bits {
+                                2 => pack_2bit(&quantized),
+                                3 => pack_3bit(&quantized),
+                                _ => unreachable!(),
+                            };
+                            all_quantized_packed.extend_from_slice(&packed);
 
-                        // Pack quantized values.
-                        let packed = match self.bits {
-                            2 => pack_2bit(&quantized),
-                            3 => pack_3bit(&quantized),
-                            _ => unreachable!(),
-                        };
-                        all_quantized_packed.extend_from_slice(&packed);
-
-                        all_normal_scale.push(params.normal_scale);
-                        all_normal_zero.push(params.normal_zero);
-                        all_outlier_scale.push(params.outlier_scale);
-                        all_outlier_zero.push(params.outlier_zero);
-                        all_mask_packed.extend_from_slice(&pack_mask(&params.outlier_mask));
+                            all_normal_scale.push(params.normal_scale);
+                            all_normal_zero.push(params.normal_zero);
+                            all_outlier_scale.push(params.outlier_scale);
+                            all_outlier_zero.push(params.outlier_zero);
+                            all_mask_packed.extend_from_slice(&pack_mask(&params.outlier_mask));
+                        }
                     }
 
                     // Rewrite the op.
@@ -159,7 +175,7 @@ impl Pass for D2QuantPass {
                         "normal_scale".to_string(),
                         Value::Tensor {
                             data: f32_bytes(&all_normal_scale),
-                            shape: vec![num_groups],
+                            shape: vec![total_groups],
                             dtype: ScalarType::Float32,
                         },
                     );
@@ -167,7 +183,7 @@ impl Pass for D2QuantPass {
                         "normal_zero".to_string(),
                         Value::Tensor {
                             data: f32_bytes(&all_normal_zero),
-                            shape: vec![num_groups],
+                            shape: vec![total_groups],
                             dtype: ScalarType::Float32,
                         },
                     );
@@ -175,7 +191,7 @@ impl Pass for D2QuantPass {
                         "outlier_scale".to_string(),
                         Value::Tensor {
                             data: f32_bytes(&all_outlier_scale),
-                            shape: vec![num_groups],
+                            shape: vec![total_groups],
                             dtype: ScalarType::Float32,
                         },
                     );
@@ -183,7 +199,7 @@ impl Pass for D2QuantPass {
                         "outlier_zero".to_string(),
                         Value::Tensor {
                             data: f32_bytes(&all_outlier_zero),
-                            shape: vec![num_groups],
+                            shape: vec![total_groups],
                             dtype: ScalarType::Float32,
                         },
                     );

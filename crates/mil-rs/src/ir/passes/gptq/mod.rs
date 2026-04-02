@@ -13,6 +13,8 @@ pub mod hessian;
 
 use std::collections::HashMap;
 
+use crate::ir::passes::int4_pack::pack_int4;
+
 use hessian::{cholesky_decompose, cholesky_inverse_row, finalize_hessian};
 
 use crate::error::Result;
@@ -42,9 +44,10 @@ pub struct GptqQuantizePass {
     /// Per-layer accumulated X^T X data.
     ///
     /// Keys are layer names (matching the `name` field of `const` ops).
-    /// Values are `(xtx_flat, n_features)` where `xtx_flat` is a row-major
-    /// `n_features × n_features` matrix.
-    pub hessian_data: HashMap<String, (Vec<f32>, usize)>,
+    /// Values are `(xtx_flat, n_features, sample_count)` where `xtx_flat` is a
+    /// row-major `n_features × n_features` matrix and `sample_count` is the
+    /// number of calibration samples used to accumulate `X^T X`.
+    pub hessian_data: HashMap<String, (Vec<f32>, usize, usize)>,
 }
 
 impl GptqQuantizePass {
@@ -54,7 +57,7 @@ impl GptqQuantizePass {
         group_size: usize,
         block_size: usize,
         dampening: f64,
-        hessian_data: HashMap<String, (Vec<f32>, usize)>,
+        hessian_data: HashMap<String, (Vec<f32>, usize, usize)>,
     ) -> Self {
         assert!(bits == 4 || bits == 8, "bits must be 4 or 8, got {bits}");
         assert!(group_size > 0, "group_size must be > 0");
@@ -85,7 +88,7 @@ impl Pass for GptqQuantizePass {
                 }
 
                 // Only process ops that have Hessian data.
-                let (xtx_orig, n_features) = match self.hessian_data.get(&op.name) {
+                let (xtx_orig, n_features, sample_count) = match self.hessian_data.get(&op.name) {
                     Some(v) => v,
                     None => continue,
                 };
@@ -145,6 +148,7 @@ impl Pass for GptqQuantizePass {
                         out_features,
                         in_features,
                         xtx_orig,
+                        *sample_count,
                         self.dampening,
                         self.block_size,
                         self.group_size,
@@ -183,15 +187,15 @@ fn gptq_quantize_weight(
     out_features: usize,
     in_features: usize,
     xtx: &[f32],
+    sample_count: usize,
     dampening: f64,
     block_size: usize,
     group_size: usize,
     qmax: f32,
 ) -> GptqResult {
     // 1. Finalize Hessian: apply scaling (2 / sample_count) and dampening.
-    //    We use sample_count = 2 so that 2/2 = 1 preserves the caller's X^T X.
     let mut h = xtx.to_vec();
-    finalize_hessian(&mut h, in_features, 2, dampening);
+    finalize_hessian(&mut h, in_features, sample_count, dampening);
 
     // 2. Cholesky decompose H → L (H = L · Lᵀ).
     let l = cholesky_decompose(&h, in_features)
@@ -329,8 +333,14 @@ fn emit_gptq_result(
     let in_features = shape[ndim - 1];
     let n_groups = in_features.div_ceil(group_size);
 
+    let quantized_data = if bits == 4 {
+        pack_int4(&result.quantized)
+    } else {
+        result.quantized.clone()
+    };
+
     let quantized_val = Value::Tensor {
-        data: result.quantized.clone(),
+        data: quantized_data,
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -546,6 +556,7 @@ mod tests {
             out_features,
             in_features,
             &xtx,
+            2,   // sample_count
             0.0, // no dampening (identity is already well-conditioned)
             128, // block_size > in_features → single block
             group_size,
@@ -618,6 +629,7 @@ mod tests {
             out_features,
             in_features,
             &xtx,
+            2,
             0.01,
             8,
             group_size,
@@ -684,6 +696,7 @@ mod tests {
             out_features,
             in_features,
             &xtx,
+            2,
             0.01,
             128,
             group_size,
@@ -726,7 +739,7 @@ mod tests {
         let xtx = identity_xtx(in_features, 1.0);
 
         let mut hessian_data = HashMap::new();
-        hessian_data.insert("weight".to_string(), (xtx, in_features));
+        hessian_data.insert("weight".to_string(), (xtx, in_features, 2));
 
         let pass = GptqQuantizePass::new(4, group_size, 128, 0.0, hessian_data);
 
@@ -739,10 +752,13 @@ mod tests {
         // Check quantized_data attribute exists with correct shape.
         match op.attributes.get("quantized_data") {
             Some(Value::Tensor { shape, dtype, data }) => {
+                use crate::ir::passes::int4_pack::unpack_int4;
                 assert_eq!(*shape, vec![out_features, in_features]);
                 assert_eq!(*dtype, ScalarType::UInt8);
-                assert_eq!(data.len(), out_features * in_features);
-                for &b in data.iter() {
+                let numel = out_features * in_features;
+                assert_eq!(data.len(), numel.div_ceil(2));
+                let unpacked = unpack_int4(data, numel);
+                for &b in unpacked.iter() {
                     assert!(b <= 15, "INT4 value {b} exceeds 15");
                 }
             }
@@ -814,6 +830,7 @@ mod tests {
             out_features,
             in_features,
             &xtx,
+            2,
             0.0,
             128,
             group_size,

@@ -204,48 +204,8 @@ fn trim_cols(data: &[f32], rows: usize, padded_cols: usize, orig_cols: usize) ->
     out
 }
 
-// ---------------------------------------------------------------------------
-// Quantization math (mirrors affine_quantize.rs)
-// ---------------------------------------------------------------------------
-
-/// Quantize an f32 slice to unsigned affine integers.
-///
-/// Returns `(quantized_bytes, scale, zero_point)`.
-fn quantize_affine(values: &[f32], qmax: f32) -> (Vec<u8>, f32, f32) {
-    if values.is_empty() {
-        return (Vec::new(), 1.0, 0.0);
-    }
-
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for &v in values {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-    }
-
-    let (scale, zp_float) = if (max - min).abs() < f32::EPSILON {
-        let zp = (-min).round();
-        (1.0_f32, zp)
-    } else {
-        let s = (max - min) / qmax;
-        let zp = (-min / s).round();
-        (s, zp)
-    };
-
-    let quantized: Vec<u8> = values
-        .iter()
-        .map(|&x| {
-            let q = (x / scale + zp_float).round().clamp(0.0, qmax);
-            q as u8
-        })
-        .collect();
-
-    (quantized, scale, zp_float)
-}
+use crate::ir::passes::affine_quantize::quantize_affine;
+use crate::ir::passes::int4_pack::pack_int4;
 
 /// Dequantize unsigned affine integers back to f32.
 fn dequantize_affine(quantized: &[u8], scale: f32, zero_point: f32) -> Vec<f32> {
@@ -325,8 +285,14 @@ fn emit_affine_quantized(
         }
     }
 
+    let packed_data = if bits == 4 {
+        pack_int4(&all_quantized)
+    } else {
+        all_quantized
+    };
+
     let quantized_val = Value::Tensor {
-        data: all_quantized,
+        data: packed_data,
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -538,9 +504,13 @@ mod tests {
         // Quantized data values should be in [0, 15] for INT4.
         match op.attributes.get("quantized_data") {
             Some(Value::Tensor { data, shape, dtype }) => {
+                use crate::ir::passes::int4_pack::unpack_int4;
                 assert_eq!(*dtype, ScalarType::UInt8);
                 assert_eq!(*shape, vec![rows, cols]);
-                for &b in data.iter() {
+                let numel = rows * cols;
+                assert_eq!(data.len(), numel.div_ceil(2));
+                let unpacked = unpack_int4(data, numel);
+                for &b in unpacked.iter() {
                     assert!(b <= 15, "INT4 value {b} exceeds 15");
                 }
             }

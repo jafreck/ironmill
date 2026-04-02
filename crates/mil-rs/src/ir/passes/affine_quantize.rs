@@ -12,6 +12,7 @@
 //!
 //! where `qmax = 2^bits - 1` (15 for INT4, 255 for INT8).
 
+use super::int4_pack::pack_int4;
 use super::tensor_utils::tensor_as_f32_slice;
 use crate::error::Result;
 use crate::ir::pass::Pass;
@@ -168,6 +169,15 @@ impl Pass for AffineQuantizePass {
                         }
                     }
 
+                    // Pack INT4 quantized data (2 values per byte).
+                    if bit_width == 4 {
+                        if let Some(Value::Tensor { data, .. }) =
+                            op.attributes.get_mut("quantized_data")
+                        {
+                            *data = pack_int4(data);
+                        }
+                    }
+
                     // Store bit_width as an attribute for downstream consumers.
                     op.attributes
                         .insert("bit_width".to_string(), Value::Int(bit_width as i64));
@@ -187,7 +197,7 @@ impl Pass for AffineQuantizePass {
 /// Returns `(quantized_bytes, scale, zero_point)`.
 /// Each quantized value is stored as a single `u8` (valid for both 4-bit and
 /// 8-bit — 4-bit values simply stay in range 0..=15).
-fn quantize_affine(values: &[f32], qmax: f32) -> (Vec<u8>, f32, f32) {
+pub fn quantize_affine(values: &[f32], qmax: f32) -> (Vec<u8>, f32, f32) {
     if values.is_empty() {
         return (Vec::new(), 1.0, 0.0);
     }
@@ -488,6 +498,8 @@ mod tests {
 
     #[test]
     fn int4_per_tensor_basic() {
+        use crate::ir::passes::int4_pack::unpack_int4;
+
         let values = [0.0_f32, 1.0, 2.0, 3.0];
         let mut program = make_program(&values, vec![4]);
 
@@ -499,14 +511,16 @@ mod tests {
         assert_eq!(op.op_type, "constexpr_affine_dequantize");
 
         let data = get_quantized_data(&program);
-        assert_eq!(data.len(), 4);
+        // 4 INT4 values packed into 2 bytes.
+        assert_eq!(data.len(), 2);
+        let unpacked = unpack_int4(data, 4);
         // min=0, max=3 → scale=3/15=0.2, zp=round(0/0.2)=0
         // q = [0, 5, 10, 15]
-        assert_eq!(data[0], 0);
-        assert_eq!(data[3], 15);
+        assert_eq!(unpacked[0], 0);
+        assert_eq!(unpacked[3], 15);
 
-        // All values should be in [0, 15].
-        for &b in data {
+        // All unpacked values should be in [0, 15].
+        for &b in &unpacked {
             assert!(b <= 15, "INT4 value {b} exceeds 15");
         }
     }
@@ -581,13 +595,15 @@ mod tests {
         let op = &program.functions["main"].body.operations[0];
         assert_eq!(op.op_type, "constexpr_affine_dequantize");
 
-        // Quantized data shape = [2, 8] (same as input).
+        // Quantized data shape = [2, 8] (same as input), packed into 8 bytes.
         match op.attributes.get("quantized_data") {
             Some(Value::Tensor { shape, dtype, data }) => {
+                use crate::ir::passes::int4_pack::unpack_int4;
                 assert_eq!(*shape, vec![2, 8]);
                 assert_eq!(*dtype, ScalarType::UInt8);
-                assert_eq!(data.len(), 16);
-                for &b in data.iter() {
+                assert_eq!(data.len(), 8);
+                let unpacked = unpack_int4(data, 16);
+                for &b in unpacked.iter() {
                     assert!(b <= 15, "INT4 value {b} exceeds 15");
                 }
             }
@@ -698,11 +714,11 @@ mod tests {
             other => panic!("expected scale Tensor, got {other:?}"),
         }
 
-        // Quantized data should have 6 elements.
+        // Quantized data should have 6 elements packed into 3 bytes.
         match op.attributes.get("quantized_data") {
             Some(Value::Tensor { data, shape, .. }) => {
                 assert_eq!(*shape, vec![1, 6]);
-                assert_eq!(data.len(), 6);
+                assert_eq!(data.len(), 3);
             }
             other => panic!("expected quantized_data Tensor, got {other:?}"),
         }
