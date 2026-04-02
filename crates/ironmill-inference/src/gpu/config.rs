@@ -39,6 +39,9 @@ impl Default for GpuConfig {
 impl GpuConfig {
     /// Validate configuration. Returns an error message if invalid.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_seq_len == 0 {
+            return Err("max_seq_len must be > 0".to_string());
+        }
         if self.n_bits != 4 && self.n_bits != 8 {
             return Err(format!("n_bits must be 4 or 8, got {}", self.n_bits));
         }

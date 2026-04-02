@@ -288,13 +288,21 @@ impl GpuKvCache {
     }
 
     /// Advance sequence position by one token.
-    pub fn advance(&mut self) {
-        self.seq_pos += 1;
+    pub fn advance(&mut self) -> Result<(), GpuError> {
+        self.advance_by(1)
     }
 
     /// Advance by multiple positions (for prefill).
-    pub fn advance_by(&mut self, count: usize) {
-        self.seq_pos += count;
+    pub fn advance_by(&mut self, count: usize) -> Result<(), GpuError> {
+        let new_pos = self.seq_pos + count;
+        if new_pos > self.max_seq_len {
+            return Err(GpuError::Config(format!(
+                "sequence position overflow: {} + {} = {} exceeds max_seq_len {}",
+                self.seq_pos, count, new_pos, self.max_seq_len,
+            )));
+        }
+        self.seq_pos = new_pos;
+        Ok(())
     }
 
     /// Current sequence length (number of cached tokens).

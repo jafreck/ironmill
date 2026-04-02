@@ -390,9 +390,11 @@ pub fn encode_turboquant_attention(
     encoder.set_buffer(k_scale_buf, 0, 12);
     encoder.set_buffer(v_scale_buf, 0, 13);
     encoder.set_buffer(codebook, 0, 14);
+    // Clamp threadgroup size to MAX_DIM=256 from turboquant.metal to
+    // prevent shared-memory out-of-bounds access.
     encoder.dispatch_threadgroups(
         (num_heads as usize, 1, 1),
-        ((head_dim as usize).min(1024), 1, 1),
+        ((head_dim as usize).min(256), 1, 1),
     );
 }
 
@@ -421,9 +423,11 @@ pub fn encode_standard_attention(
     encoder.set_bytes(&head_dim.to_le_bytes(), 6);
     encoder.set_bytes(&max_seq_len.to_le_bytes(), 7);
     encoder.set_bytes(&seq_len.to_le_bytes(), 8);
+    // Clamp threadgroup size to MAX_DIM=256 from attention.metal to
+    // prevent shared-memory out-of-bounds access.
     encoder.dispatch_threadgroups(
         (num_heads as usize, 1, 1),
-        ((head_dim as usize).min(1024), 1, 1),
+        ((head_dim as usize).min(256), 1, 1),
     );
 }
 

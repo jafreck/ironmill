@@ -1580,7 +1580,7 @@ impl GpuInference {
         self.seq_pos += token_count;
         if enable_tq {
             if let Some(kv) = self.kv_cache.as_mut() {
-                kv.advance_by(token_count);
+                kv.advance_by(token_count)?;
             }
         } else if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
             fp16_kv.seq_pos += token_count;
