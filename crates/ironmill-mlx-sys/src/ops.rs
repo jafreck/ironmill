@@ -114,6 +114,32 @@ pub fn transpose(a: &MlxArray, stream: &MlxStream) -> Result<MlxArray, MlxSysErr
     }
 }
 
+/// Transpose an array with a specific axis permutation (lazy).
+pub fn transpose_axes(
+    a: &MlxArray,
+    axes: &[i32],
+    stream: &MlxStream,
+) -> Result<MlxArray, MlxSysError> {
+    #[cfg(mlx_stub)]
+    {
+        let _ = (a, axes, stream);
+        stub_err("transpose_axes")
+    }
+
+    #[cfg(not(mlx_stub))]
+    {
+        let raw = unsafe {
+            ffi::mlx_transpose(
+                a.as_raw_ptr(),
+                axes.as_ptr(),
+                axes.len() as i32,
+                stream.as_raw_ptr(),
+            )
+        };
+        check_array(raw, "transpose_axes")
+    }
+}
+
 /// SiLU (Sigmoid Linear Unit) activation: `x * sigmoid(x)`.
 ///
 /// Implemented as `x * sigmoid(x)` using the available `mlx_sigmoid`.
@@ -192,5 +218,58 @@ pub fn expand_dims(
             )
         };
         check_array(raw, "expand_dims")
+    }
+}
+
+/// Concatenate arrays along an axis (lazy).
+pub fn concat(
+    arrays: &[&MlxArray],
+    axis: i32,
+    stream: &MlxStream,
+) -> Result<MlxArray, MlxSysError> {
+    #[cfg(mlx_stub)]
+    {
+        let _ = (arrays, axis, stream);
+        stub_err("concat")
+    }
+
+    #[cfg(not(mlx_stub))]
+    {
+        let vec = unsafe { ffi::mlx_vector_array_new() };
+        if vec.is_null() {
+            return Err(MlxSysError::MlxC("failed to create vector_array".into()));
+        }
+        for arr in arrays {
+            unsafe { ffi::mlx_vector_array_add(vec, arr.as_raw_ptr()) };
+        }
+        let raw = unsafe { ffi::mlx_concatenate(vec, axis, stream.as_raw_ptr()) };
+        unsafe { ffi::mlx_free(vec) };
+        check_array(raw, "concat")
+    }
+}
+
+/// Broadcast an array to a target shape (lazy).
+pub fn broadcast_to(
+    a: &MlxArray,
+    shape: &[i32],
+    stream: &MlxStream,
+) -> Result<MlxArray, MlxSysError> {
+    #[cfg(mlx_stub)]
+    {
+        let _ = (a, shape, stream);
+        stub_err("broadcast_to")
+    }
+
+    #[cfg(not(mlx_stub))]
+    {
+        let raw = unsafe {
+            ffi::mlx_broadcast_to(
+                a.as_raw_ptr(),
+                shape.as_ptr(),
+                shape.len() as i32,
+                stream.as_raw_ptr(),
+            )
+        };
+        check_array(raw, "broadcast_to")
     }
 }

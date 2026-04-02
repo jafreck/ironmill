@@ -26,7 +26,10 @@ pub use device::MlxDevice;
 pub use error::MlxSysError;
 pub use fast_ops::{rms_norm, rope, scaled_dot_product_attention};
 pub use metal_kernel::metal_kernel;
-pub use ops::{add, expand_dims, matmul, multiply, reshape, silu, slice, transpose};
+pub use ops::{
+    add, broadcast_to, concat, expand_dims, matmul, multiply, reshape, silu, slice, transpose,
+    transpose_axes,
+};
 pub use stream::MlxStream;
 
 // ---------------------------------------------------------------------------
@@ -198,6 +201,23 @@ pub(crate) mod ffi {
             stream: mlx_stream,
         ) -> mlx_array;
         pub fn mlx_transpose_all(a: mlx_array, stream: mlx_stream) -> mlx_array;
+        pub fn mlx_transpose(
+            a: mlx_array,
+            axes: *const i32,
+            num_axes: i32,
+            stream: mlx_stream,
+        ) -> mlx_array;
+        pub fn mlx_concatenate(
+            arrays: mlx_vector_array,
+            axis: i32,
+            stream: mlx_stream,
+        ) -> mlx_array;
+        pub fn mlx_broadcast_to(
+            a: mlx_array,
+            shape: *const i32,
+            ndim: i32,
+            stream: mlx_stream,
+        ) -> mlx_array;
         pub fn mlx_sigmoid(a: mlx_array, stream: mlx_stream) -> mlx_array;
         pub fn mlx_slice(
             a: mlx_array,
