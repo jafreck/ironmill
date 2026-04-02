@@ -497,9 +497,9 @@ dependencies = [
  "half",
  "indexmap",
  "ironmill-core",
- "ironmill-iosurface",
  "memmap2",
  "mil-rs",
+ "prost",
  "safetensors",
  "serde",
  "serde_json",
@@ -513,7 +513,6 @@ name = "ironmill-compile-ffi"
 version = "0.1.0"
 dependencies = [
  "ironmill-compile",
- "mil-rs",
 ]
 
 [[package]]
@@ -691,12 +690,10 @@ dependencies = [
  "glob-match",
  "half",
  "indexmap",
- "ironmill-compile",
  "memmap2",
  "prost",
  "prost-build",
  "rand",
- "safetensors",
  "serde",
  "serde_json",
  "statrs",

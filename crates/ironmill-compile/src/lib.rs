@@ -50,6 +50,16 @@ pub mod mil {
     // Reader / inspection
     pub use mil_rs::reader::{print_model_summary, print_onnx_summary};
 
+    // Protobuf model types
+    pub mod proto {
+        pub mod specification {
+            pub use mil_rs::proto::specification::Model;
+        }
+        pub mod onnx {
+            pub use mil_rs::proto::onnx::ModelProto;
+        }
+    }
+
     // Passes
     pub mod passes {
         pub use mil_rs::ir::passes::ConstantFoldPass;
