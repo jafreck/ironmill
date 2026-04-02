@@ -21,6 +21,7 @@ pub struct GpuPipelines {
     pub polarquant_matvec_int8: ComputePipeline,
     pub polarquant_matmul_int8: ComputePipeline,
     pub kv_scatter: ComputePipeline,
+    pub matvec: ComputePipeline,
 }
 
 impl GpuPipelines {
@@ -35,6 +36,7 @@ impl GpuPipelines {
         let attn_src = include_str!("shaders/attention.metal");
         let qmm_src = include_str!("shaders/quantized_matmul.metal");
         let kv_scatter_src = include_str!("shaders/kv_scatter.metal");
+        let matvec_src = include_str!("shaders/matvec.metal");
 
         let norm_lib = device
             .compile_shader_source(norm_src)
@@ -62,6 +64,9 @@ impl GpuPipelines {
             .map_err(GpuError::Metal)?;
         let kv_scatter_lib = device
             .compile_shader_source(kv_scatter_src)
+            .map_err(GpuError::Metal)?;
+        let matvec_lib = device
+            .compile_shader_source(matvec_src)
             .map_err(GpuError::Metal)?;
 
         Ok(Self {
@@ -160,6 +165,11 @@ impl GpuPipelines {
                     &kv_scatter_lib
                         .get_function("kv_scatter")
                         .map_err(GpuError::Metal)?,
+                )
+                .map_err(GpuError::Metal)?,
+            matvec: device
+                .create_compute_pipeline(
+                    &matvec_lib.get_function("matvec").map_err(GpuError::Metal)?,
                 )
                 .map_err(GpuError::Metal)?,
         })
@@ -429,4 +439,28 @@ pub fn encode_kv_scatter(
         ),
         (tg_x, 1, 1),
     );
+}
+
+/// Encode a custom FP16 matvec: y = x · W^T for M=1 (decode).
+///
+/// Weights must be pre-packed into blocked [N/8, K/8, 8, 8] FP16 format.
+/// Dispatch: one threadgroup per 64 output rows, 256 threads (8 simdgroups).
+pub fn encode_matvec(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    input: &MetalBuffer,
+    weight_packed: &MetalBuffer,
+    output: &MetalBuffer,
+    n: u32,
+    k: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(input, 0, 0);
+    encoder.set_buffer(weight_packed, 0, 1);
+    encoder.set_buffer(output, 0, 2);
+    encoder.set_bytes(&n.to_le_bytes(), 3);
+    encoder.set_bytes(&k.to_le_bytes(), 4);
+    let rows_per_tg: usize = 64;
+    let tg_count = (n as usize + rows_per_tg - 1) / rows_per_tg;
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (256, 1, 1));
 }

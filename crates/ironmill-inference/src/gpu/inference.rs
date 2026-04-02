@@ -249,8 +249,8 @@ impl GpuInference {
                     .iter()
                     .filter_map(|lw| {
                         if let (
-                            crate::gpu::weights::WeightBuffer::Dense(k_buf),
-                            crate::gpu::weights::WeightBuffer::Dense(v_buf),
+                            crate::gpu::weights::WeightBuffer::Dense { buf: k_buf, .. },
+                            crate::gpu::weights::WeightBuffer::Dense { buf: v_buf, .. },
                         ) = (&lw.k_proj, &lw.v_proj)
                         {
                             let mut k_data = vec![0u8; k_buf.length()];
@@ -399,7 +399,7 @@ impl GpuInference {
                             inner: usize|
          -> Result<Option<MpsMatrixMultiply>, GpuError> {
             match wb {
-                WeightBuffer::Dense(_) => Ok(Some(make_matmul(rows, cols, inner)?)),
+                WeightBuffer::Dense { .. } => Ok(Some(make_matmul(rows, cols, inner)?)),
                 WeightBuffer::Quantized(_) => Ok(None),
             }
         };
@@ -551,27 +551,66 @@ impl GpuInference {
 
             // Q projection
             match &lw.q_proj {
-                WeightBuffer::Dense(buf) => {
-                    let q_weight_mat = MpsMatrix::from_buffer(
-                        buf,
-                        mc.num_attention_heads * mc.head_dim,
-                        h,
-                        row_bytes_h,
-                    )
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let q_result_mat = MpsMatrix::from_buffer(
-                        &bufs.q_proj,
-                        token_count,
-                        mc.num_attention_heads * mc.head_dim,
-                        row_bytes_qo,
-                    )
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.q.as_ref().unwrap().encode(
-                        &cmd_buf,
-                        &norm_mat,
-                        &q_weight_mat,
-                        &q_result_mat,
-                    );
+                WeightBuffer::Dense { buf, packed } => {
+                    if token_count == 1 {
+                        if let Some(packed_buf) = packed {
+                            let enc = cmd_buf
+                                .compute_encoder()
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            ops::encode_matvec(
+                                &enc,
+                                &self.pipelines.matvec,
+                                &bufs.norm_out,
+                                packed_buf,
+                                &bufs.q_proj,
+                                (mc.num_attention_heads * mc.head_dim) as u32,
+                                h as u32,
+                            );
+                            enc.end_encoding();
+                        } else {
+                            let q_weight_mat = MpsMatrix::from_buffer(
+                                buf,
+                                mc.num_attention_heads * mc.head_dim,
+                                h,
+                                row_bytes_h,
+                            )
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            let q_result_mat = MpsMatrix::from_buffer(
+                                &bufs.q_proj,
+                                token_count,
+                                mc.num_attention_heads * mc.head_dim,
+                                row_bytes_qo,
+                            )
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            lm.q.as_ref().unwrap().encode(
+                                &cmd_buf,
+                                &norm_mat,
+                                &q_weight_mat,
+                                &q_result_mat,
+                            );
+                        }
+                    } else {
+                        let q_weight_mat = MpsMatrix::from_buffer(
+                            buf,
+                            mc.num_attention_heads * mc.head_dim,
+                            h,
+                            row_bytes_h,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        let q_result_mat = MpsMatrix::from_buffer(
+                            &bufs.q_proj,
+                            token_count,
+                            mc.num_attention_heads * mc.head_dim,
+                            row_bytes_qo,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        lm.q.as_ref().unwrap().encode(
+                            &cmd_buf,
+                            &norm_mat,
+                            &q_weight_mat,
+                            &q_result_mat,
+                        );
+                    }
                 }
                 WeightBuffer::Quantized(q) => {
                     let enc = cmd_buf
@@ -591,27 +630,66 @@ impl GpuInference {
 
             // K projection
             match &lw.k_proj {
-                WeightBuffer::Dense(buf) => {
-                    let k_weight_mat = MpsMatrix::from_buffer(
-                        buf,
-                        mc.num_kv_heads() * mc.head_dim,
-                        h,
-                        row_bytes_h,
-                    )
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let k_result_mat = MpsMatrix::from_buffer(
-                        &bufs.k_proj,
-                        token_count,
-                        mc.num_kv_heads() * mc.head_dim,
-                        row_bytes_kv,
-                    )
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.k.as_ref().unwrap().encode(
-                        &cmd_buf,
-                        &norm_mat,
-                        &k_weight_mat,
-                        &k_result_mat,
-                    );
+                WeightBuffer::Dense { buf, packed } => {
+                    if token_count == 1 {
+                        if let Some(packed_buf) = packed {
+                            let enc = cmd_buf
+                                .compute_encoder()
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            ops::encode_matvec(
+                                &enc,
+                                &self.pipelines.matvec,
+                                &bufs.norm_out,
+                                packed_buf,
+                                &bufs.k_proj,
+                                (mc.num_kv_heads() * mc.head_dim) as u32,
+                                h as u32,
+                            );
+                            enc.end_encoding();
+                        } else {
+                            let k_weight_mat = MpsMatrix::from_buffer(
+                                buf,
+                                mc.num_kv_heads() * mc.head_dim,
+                                h,
+                                row_bytes_h,
+                            )
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            let k_result_mat = MpsMatrix::from_buffer(
+                                &bufs.k_proj,
+                                token_count,
+                                mc.num_kv_heads() * mc.head_dim,
+                                row_bytes_kv,
+                            )
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            lm.k.as_ref().unwrap().encode(
+                                &cmd_buf,
+                                &norm_mat,
+                                &k_weight_mat,
+                                &k_result_mat,
+                            );
+                        }
+                    } else {
+                        let k_weight_mat = MpsMatrix::from_buffer(
+                            buf,
+                            mc.num_kv_heads() * mc.head_dim,
+                            h,
+                            row_bytes_h,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        let k_result_mat = MpsMatrix::from_buffer(
+                            &bufs.k_proj,
+                            token_count,
+                            mc.num_kv_heads() * mc.head_dim,
+                            row_bytes_kv,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        lm.k.as_ref().unwrap().encode(
+                            &cmd_buf,
+                            &norm_mat,
+                            &k_weight_mat,
+                            &k_result_mat,
+                        );
+                    }
                 }
                 WeightBuffer::Quantized(q) => {
                     let enc = cmd_buf
@@ -631,27 +709,66 @@ impl GpuInference {
 
             // V projection
             match &lw.v_proj {
-                WeightBuffer::Dense(buf) => {
-                    let v_weight_mat = MpsMatrix::from_buffer(
-                        buf,
-                        mc.num_kv_heads() * mc.head_dim,
-                        h,
-                        row_bytes_h,
-                    )
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let v_result_mat = MpsMatrix::from_buffer(
-                        &bufs.v_proj,
-                        token_count,
-                        mc.num_kv_heads() * mc.head_dim,
-                        row_bytes_kv,
-                    )
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.v.as_ref().unwrap().encode(
-                        &cmd_buf,
-                        &norm_mat,
-                        &v_weight_mat,
-                        &v_result_mat,
-                    );
+                WeightBuffer::Dense { buf, packed } => {
+                    if token_count == 1 {
+                        if let Some(packed_buf) = packed {
+                            let enc = cmd_buf
+                                .compute_encoder()
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            ops::encode_matvec(
+                                &enc,
+                                &self.pipelines.matvec,
+                                &bufs.norm_out,
+                                packed_buf,
+                                &bufs.v_proj,
+                                (mc.num_kv_heads() * mc.head_dim) as u32,
+                                h as u32,
+                            );
+                            enc.end_encoding();
+                        } else {
+                            let v_weight_mat = MpsMatrix::from_buffer(
+                                buf,
+                                mc.num_kv_heads() * mc.head_dim,
+                                h,
+                                row_bytes_h,
+                            )
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            let v_result_mat = MpsMatrix::from_buffer(
+                                &bufs.v_proj,
+                                token_count,
+                                mc.num_kv_heads() * mc.head_dim,
+                                row_bytes_kv,
+                            )
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            lm.v.as_ref().unwrap().encode(
+                                &cmd_buf,
+                                &norm_mat,
+                                &v_weight_mat,
+                                &v_result_mat,
+                            );
+                        }
+                    } else {
+                        let v_weight_mat = MpsMatrix::from_buffer(
+                            buf,
+                            mc.num_kv_heads() * mc.head_dim,
+                            h,
+                            row_bytes_h,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        let v_result_mat = MpsMatrix::from_buffer(
+                            &bufs.v_proj,
+                            token_count,
+                            mc.num_kv_heads() * mc.head_dim,
+                            row_bytes_kv,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        lm.v.as_ref().unwrap().encode(
+                            &cmd_buf,
+                            &norm_mat,
+                            &v_weight_mat,
+                            &v_result_mat,
+                        );
+                    }
                 }
                 WeightBuffer::Quantized(q) => {
                     let enc = cmd_buf
@@ -950,30 +1067,72 @@ impl GpuInference {
 
             // Step 9: Output projection
             match &lw.o_proj {
-                WeightBuffer::Dense(buf) => {
-                    let attn_mat = MpsMatrix::from_buffer(
-                        &bufs.attn_out,
-                        token_count,
-                        mc.num_attention_heads * mc.head_dim,
-                        row_bytes_qo,
-                    )
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let o_weight_mat = MpsMatrix::from_buffer(
-                        buf,
-                        h,
-                        mc.num_attention_heads * mc.head_dim,
-                        row_bytes_qo,
-                    )
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let ffn_down_mat_for_o =
-                        MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+                WeightBuffer::Dense { buf, packed } => {
+                    if token_count == 1 {
+                        if let Some(packed_buf) = packed {
+                            let enc = cmd_buf
+                                .compute_encoder()
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            ops::encode_matvec(
+                                &enc,
+                                &self.pipelines.matvec,
+                                &bufs.attn_out,
+                                packed_buf,
+                                &bufs.ffn_down,
+                                h as u32,
+                                (mc.num_attention_heads * mc.head_dim) as u32,
+                            );
+                            enc.end_encoding();
+                        } else {
+                            let attn_mat = MpsMatrix::from_buffer(
+                                &bufs.attn_out,
+                                token_count,
+                                mc.num_attention_heads * mc.head_dim,
+                                row_bytes_qo,
+                            )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.o.as_ref().unwrap().encode(
-                        &cmd_buf,
-                        &attn_mat,
-                        &o_weight_mat,
-                        &ffn_down_mat_for_o,
-                    );
+                            let o_weight_mat = MpsMatrix::from_buffer(
+                                buf,
+                                h,
+                                mc.num_attention_heads * mc.head_dim,
+                                row_bytes_qo,
+                            )
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            let ffn_down_mat_for_o =
+                                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            lm.o.as_ref().unwrap().encode(
+                                &cmd_buf,
+                                &attn_mat,
+                                &o_weight_mat,
+                                &ffn_down_mat_for_o,
+                            );
+                        }
+                    } else {
+                        let attn_mat = MpsMatrix::from_buffer(
+                            &bufs.attn_out,
+                            token_count,
+                            mc.num_attention_heads * mc.head_dim,
+                            row_bytes_qo,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        let o_weight_mat = MpsMatrix::from_buffer(
+                            buf,
+                            h,
+                            mc.num_attention_heads * mc.head_dim,
+                            row_bytes_qo,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        let ffn_down_mat_for_o =
+                            MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        lm.o.as_ref().unwrap().encode(
+                            &cmd_buf,
+                            &attn_mat,
+                            &o_weight_mat,
+                            &ffn_down_mat_for_o,
+                        );
+                    }
                 }
                 WeightBuffer::Quantized(q) => {
                     let enc = cmd_buf
@@ -1032,18 +1191,57 @@ impl GpuInference {
 
             // Gate projection
             match &lw.gate_proj {
-                WeightBuffer::Dense(buf) => {
-                    let gate_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let gate_result_mat =
-                        MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
+                WeightBuffer::Dense { buf, packed } => {
+                    if token_count == 1 {
+                        if let Some(packed_buf) = packed {
+                            let enc = cmd_buf
+                                .compute_encoder()
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            ops::encode_matvec(
+                                &enc,
+                                &self.pipelines.matvec,
+                                &bufs.norm_out,
+                                packed_buf,
+                                &bufs.ffn_gate,
+                                inter as u32,
+                                h as u32,
+                            );
+                            enc.end_encoding();
+                        } else {
+                            let gate_weight_mat =
+                                MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
+                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            let gate_result_mat = MpsMatrix::from_buffer(
+                                &bufs.ffn_gate,
+                                token_count,
+                                inter,
+                                row_bytes_inter,
+                            )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.gate.as_ref().unwrap().encode(
-                        &cmd_buf,
-                        &norm_mat2,
-                        &gate_weight_mat,
-                        &gate_result_mat,
-                    );
+                            lm.gate.as_ref().unwrap().encode(
+                                &cmd_buf,
+                                &norm_mat2,
+                                &gate_weight_mat,
+                                &gate_result_mat,
+                            );
+                        }
+                    } else {
+                        let gate_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        let gate_result_mat = MpsMatrix::from_buffer(
+                            &bufs.ffn_gate,
+                            token_count,
+                            inter,
+                            row_bytes_inter,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        lm.gate.as_ref().unwrap().encode(
+                            &cmd_buf,
+                            &norm_mat2,
+                            &gate_weight_mat,
+                            &gate_result_mat,
+                        );
+                    }
                 }
                 WeightBuffer::Quantized(q) => {
                     let enc = cmd_buf
@@ -1063,18 +1261,56 @@ impl GpuInference {
 
             // Up projection
             match &lw.up_proj {
-                WeightBuffer::Dense(buf) => {
-                    let up_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let up_result_mat =
-                        MpsMatrix::from_buffer(&bufs.ffn_up, token_count, inter, row_bytes_inter)
+                WeightBuffer::Dense { buf, packed } => {
+                    if token_count == 1 {
+                        if let Some(packed_buf) = packed {
+                            let enc = cmd_buf
+                                .compute_encoder()
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            ops::encode_matvec(
+                                &enc,
+                                &self.pipelines.matvec,
+                                &bufs.norm_out,
+                                packed_buf,
+                                &bufs.ffn_up,
+                                inter as u32,
+                                h as u32,
+                            );
+                            enc.end_encoding();
+                        } else {
+                            let up_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            let up_result_mat = MpsMatrix::from_buffer(
+                                &bufs.ffn_up,
+                                token_count,
+                                inter,
+                                row_bytes_inter,
+                            )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.up.as_ref().unwrap().encode(
-                        &cmd_buf,
-                        &norm_mat2,
-                        &up_weight_mat,
-                        &up_result_mat,
-                    );
+                            lm.up.as_ref().unwrap().encode(
+                                &cmd_buf,
+                                &norm_mat2,
+                                &up_weight_mat,
+                                &up_result_mat,
+                            );
+                        }
+                    } else {
+                        let up_weight_mat = MpsMatrix::from_buffer(buf, inter, h, row_bytes_h)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        let up_result_mat = MpsMatrix::from_buffer(
+                            &bufs.ffn_up,
+                            token_count,
+                            inter,
+                            row_bytes_inter,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        lm.up.as_ref().unwrap().encode(
+                            &cmd_buf,
+                            &norm_mat2,
+                            &up_weight_mat,
+                            &up_result_mat,
+                        );
+                    }
                 }
                 WeightBuffer::Quantized(q) => {
                     let enc = cmd_buf
@@ -1110,21 +1346,64 @@ impl GpuInference {
 
             // Step 15: Down projection
             match &lw.down_proj {
-                WeightBuffer::Dense(buf) => {
-                    let gate_out_mat =
-                        MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
+                WeightBuffer::Dense { buf, packed } => {
+                    if token_count == 1 {
+                        if let Some(packed_buf) = packed {
+                            let enc = cmd_buf
+                                .compute_encoder()
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            ops::encode_matvec(
+                                &enc,
+                                &self.pipelines.matvec,
+                                &bufs.ffn_gate,
+                                packed_buf,
+                                &bufs.ffn_down,
+                                h as u32,
+                                inter as u32,
+                            );
+                            enc.end_encoding();
+                        } else {
+                            let gate_out_mat = MpsMatrix::from_buffer(
+                                &bufs.ffn_gate,
+                                token_count,
+                                inter,
+                                row_bytes_inter,
+                            )
                             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let down_weight_mat = MpsMatrix::from_buffer(buf, h, inter, row_bytes_inter)
+                            let down_weight_mat =
+                                MpsMatrix::from_buffer(buf, h, inter, row_bytes_inter)
+                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            let down_result_mat =
+                                MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+                                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                            lm.down.as_ref().unwrap().encode(
+                                &cmd_buf,
+                                &gate_out_mat,
+                                &down_weight_mat,
+                                &down_result_mat,
+                            );
+                        }
+                    } else {
+                        let gate_out_mat = MpsMatrix::from_buffer(
+                            &bufs.ffn_gate,
+                            token_count,
+                            inter,
+                            row_bytes_inter,
+                        )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    let down_result_mat =
-                        MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                    lm.down.as_ref().unwrap().encode(
-                        &cmd_buf,
-                        &gate_out_mat,
-                        &down_weight_mat,
-                        &down_result_mat,
-                    );
+                        let down_weight_mat =
+                            MpsMatrix::from_buffer(buf, h, inter, row_bytes_inter)
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        let down_result_mat =
+                            MpsMatrix::from_buffer(&bufs.ffn_down, token_count, h, row_bytes_h)
+                                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        lm.down.as_ref().unwrap().encode(
+                            &cmd_buf,
+                            &gate_out_mat,
+                            &down_weight_mat,
+                            &down_result_mat,
+                        );
+                    }
                 }
                 WeightBuffer::Quantized(q) => {
                     let enc = cmd_buf
@@ -1180,15 +1459,49 @@ impl GpuInference {
         // Step 18: LM head matmul
         let row_bytes_h = h * 2;
         let row_bytes_vocab = vocab * 2;
-        let final_norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-        let lm_head_weight_mat = MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-        let logits_mat = MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-        matmuls
-            .lm_head
-            .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
+        if token_count == 1 {
+            if let Some(ref packed_buf) = weights.lm_head_packed {
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_matvec(
+                    &enc,
+                    &self.pipelines.matvec,
+                    &bufs.norm_out,
+                    packed_buf,
+                    &bufs.logits,
+                    vocab as u32,
+                    h as u32,
+                );
+                enc.end_encoding();
+            } else {
+                let final_norm_mat =
+                    MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                let lm_head_weight_mat =
+                    MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                let logits_mat =
+                    MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                matmuls
+                    .lm_head
+                    .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
+            }
+        } else {
+            let final_norm_mat =
+                MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let lm_head_weight_mat =
+                MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let logits_mat =
+                MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            matmuls
+                .lm_head
+                .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
+        }
 
         // Step 19: Commit and wait.
         cmd_buf.commit();
