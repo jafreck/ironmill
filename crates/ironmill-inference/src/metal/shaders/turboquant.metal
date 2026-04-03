@@ -316,19 +316,14 @@ kernel void turboquant_attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // QJL correction coefficient: √(2/π) / d
+    // QJL correction coefficient: √(2/π) / d   (Algorithm 2, variance-optimal)
     //
-    // The unbiased QJL inner-product estimator for ⟨q, r⟩ with projection
-    // matrix S having i.i.d. N(0,1) entries is:
-    //
-    //   ⟨q, r⟩ ≈ (||r|| / d) · Σ_i (S·q)_i · sign((S·r)_i)  (no extra π factor)
-    //
-    // Each term has E[X·sign(Y)] = √(2/π) · Cov(X,Y)/σ_Y, so the raw sum
-    // has expectation d·√(2/π)·⟨q,r⟩/||r||.  Multiplying by ||r||·√(2/π)/d
-    // gives an MSE-optimal scaling:  (2/π)·⟨q,r⟩.  While not perfectly
-    // unbiased, the dramatically lower variance (factor 4/π² ≈ 0.41×)
-    // yields far better attention quality than the unbiased √(π/2)/d
-    // coefficient whose high variance corrupts softmax distributions.
+    // Each sign-projection term has E[sign(S·r)_i · (S·q)_i] =
+    // √(2/π) · ⟨q,r⟩ / ||r||.  The sum of d terms has expectation
+    // d · √(2/π) · ⟨q,r⟩ / ||r||.  The paper's unbiased coefficient
+    // √(π/2)/d yields E[correction] = ⟨q,r⟩ but its higher variance
+    // corrupts softmax.  Using √(2/π)/d gives a biased (2/π)·⟨q,r⟩
+    // estimate with ~2.5× lower variance — critical for attention quality.
     float qjl_factor = (n_bits == 4) ? (sqrt(2.0f / 3.14159265f) / float(head_dim)) : 0.0f;
 
     // Zero output accumulator
