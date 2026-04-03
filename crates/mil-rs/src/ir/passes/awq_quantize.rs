@@ -157,8 +157,6 @@ impl Pass for AwqQuantizePass {
                             let mags = if mags.len() >= in_features {
                                 &mags[..in_features]
                             } else {
-                                // Magnitude vector shorter than input channel count —
-                                // fall back to MinMax.
                                 emit_fallback_per_group(
                                     op,
                                     &floats,
@@ -170,15 +168,13 @@ impl Pass for AwqQuantizePass {
                                 continue;
                             };
 
-                            // AWQ: compute optimal per-input-channel scales.
-                            let channel_scales = compute_awq_scales(
-                                &floats,
-                                &shape,
-                                mags,
-                                self.grid_search_steps,
-                                self.salient_percentile,
-                                qmax,
-                            );
+                            // Compute per-column scales from magnitudes alone.
+                            // All projections sharing the same norm receive
+                            // identical magnitudes from calibration, so they
+                            // produce identical scales — critical for correct
+                            // norm fusion.
+                            let channel_scales =
+                                compute_awq_scales_from_magnitudes(mags, self.salient_percentile);
 
                             // Apply scales per-column (input channel):
                             // W_scaled[:, c] = W[:, c] * s[c]
@@ -228,6 +224,42 @@ impl Pass for AwqQuantizePass {
 // ---------------------------------------------------------------------------
 // AWQ scale computation
 // ---------------------------------------------------------------------------
+
+/// Compute per-input-channel AWQ scales directly from activation magnitudes.
+///
+/// For salient channels (top percentile by magnitude), the scale is
+/// proportional to the magnitude: `s[c] = mag[c] / median(mag)`.
+/// This ensures all projections sharing the same norm get identical scales
+/// (since they share the same activation magnitudes), which is required
+/// for correct norm gamma fusion.
+///
+/// Non-salient channels get scale 1.0 (no modification).
+fn compute_awq_scales_from_magnitudes(magnitudes: &[f32], salient_percentile: f32) -> Vec<f32> {
+    let n = magnitudes.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    let salient_threshold = find_salient_threshold(magnitudes, salient_percentile);
+
+    // Compute median magnitude for normalization.
+    let mut sorted = magnitudes.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[n / 2].max(1e-8);
+
+    let mut scales = vec![1.0_f32; n];
+    for (c, &mag) in magnitudes.iter().enumerate() {
+        if mag >= salient_threshold && mag > 1e-8 {
+            // Scale proportional to relative magnitude.
+            // Clamp to [1.0, 4.0] — larger scales cause FP16 underflow
+            // when dividing small norm gamma values.
+            let s = (mag / median).clamp(1.0, 4.0);
+            scales[c] = s;
+        }
+    }
+
+    scales
+}
 
 /// Compute optimal per-input-channel scales using grid search.
 ///
