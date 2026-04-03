@@ -2034,6 +2034,7 @@ fn encode_kv_cache_and_attention(
         // Standard attention — loop over tokens with causal
         // masking so each token attends only to 0..seq_pos+t+1.
         let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
+        let attn_tg_size = 256_usize.max(hd as usize).min(1024);
         for t in 0..token_count {
             let q_offset = t * q_head_stride_bytes;
             let attn_out_offset = t * q_head_stride_bytes;
@@ -2048,7 +2049,7 @@ fn encode_kv_cache_and_attention(
             enc.set_bytes(&hd.to_le_bytes(), 6);
             enc.set_bytes(&max_seq.to_le_bytes(), 7);
             enc.set_bytes(&current_seq_len.to_le_bytes(), 8);
-            enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
+            enc.dispatch_threadgroups((nh as usize, 1, 1), (attn_tg_size, 1, 1));
         }
         enc.end_encoding();
     }

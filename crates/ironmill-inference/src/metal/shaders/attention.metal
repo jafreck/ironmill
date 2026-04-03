@@ -9,7 +9,11 @@ using namespace metal;
 // Loads KV cache in tiles into threadgroup SRAM to reduce global memory
 // bandwidth. Uses online softmax (per-tile) for numerical stability.
 //
-// Buffers (unchanged):
+// Uses simd_sum for QK^T dot-product reduction (zero intra-simdgroup
+// barriers) and processes multiple positions in parallel across
+// simdgroups, drastically reducing threadgroup barrier count.
+//
+// Buffers:
 //   buffer(0) q:         [num_heads × head_dim]                     half
 //   buffer(1) k_cache:   [num_kv_heads × max_seq_len × head_dim]   half
 //   buffer(2) v_cache:   [num_kv_heads × max_seq_len × head_dim]   half
@@ -22,7 +26,7 @@ using namespace metal;
 //
 // GQA: kv_head = head_idx / (num_heads / num_kv_heads)
 //
-// Dispatch: num_heads threadgroups, min(head_dim, 1024) threads per group.
+// Dispatch: num_heads threadgroups, max(256, head_dim) threads per group.
 
 kernel void standard_attention(
     device const half* q         [[buffer(0)]],
@@ -36,25 +40,22 @@ kernel void standard_attention(
     constant uint& seq_len       [[buffer(8)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint tg_size [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
 {
-    // Shared memory sized exactly to HEAD_DIM (injected at compile time).
-    //   shared_q:      HEAD_DIM × 4      B
-    //   kv_tile:       32 × HEAD_DIM × 2 B  (half; aliased K then V)
-    //   shared_reduce: HEAD_DIM × 4      B
-    //   tile_scores:   32 × 4            B
-    //   shared_output: HEAD_DIM × 4      B
-    //   softmax/corr:  3 × 4             B
     constexpr uint TILE = 32;
+    constexpr uint SIMD_SIZE = 32;
 
     threadgroup float shared_q[HEAD_DIM];
     threadgroup half  kv_tile[TILE * HEAD_DIM];
-    threadgroup float shared_reduce[HEAD_DIM];
     threadgroup float tile_scores[TILE];
     threadgroup float shared_output[HEAD_DIM];
     threadgroup float softmax_max[1];
     threadgroup float softmax_sum[1];
     threadgroup float tile_correction[1];
+
+    uint num_simdgroups = tg_size / SIMD_SIZE;
 
     uint head_idx = tgid;
     if (head_idx >= num_heads) return;
@@ -94,26 +95,20 @@ kernel void standard_attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute QK^T for every position in the tile
-        for (uint p = 0; p < actual_tile; p++) {
-            float partial_dot = 0.0f;
-            for (uint d = tid; d < head_dim; d += tg_size) {
-                partial_dot += shared_q[d] * float(kv_tile[p * head_dim + d]);
+        // QK^T: each simdgroup computes one position's dot product.
+        // simd_sum reduces within a simdgroup with zero barriers.
+        for (uint pbase = 0; pbase < actual_tile; pbase += num_simdgroups) {
+            uint p = pbase + sgid;
+            if (p < actual_tile) {
+                float dot = 0.0f;
+                for (uint d = lane; d < head_dim; d += SIMD_SIZE) {
+                    dot += shared_q[d] * float(kv_tile[p * head_dim + d]);
+                }
+                dot = simd_sum(dot);
+                if (lane == 0) tile_scores[p] = dot * scale;
             }
-
-            // Tree reduction
-            shared_reduce[tid] = partial_dot;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint rs = 1;
-            while (rs < tg_size) rs <<= 1;
-            for (uint s = rs / 2; s > 0; s >>= 1) {
-                if (tid < s && (tid + s) < tg_size)
-                    shared_reduce[tid] += shared_reduce[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (tid == 0) tile_scores[p] = shared_reduce[0] * scale;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ---- Per-tile online softmax ----
         if (tid == 0) {

@@ -13,6 +13,13 @@ const METAL_MAX_THREADS_PER_THREADGROUP: usize = 1024;
 /// occupancy and register pressure for simple per-element kernels.
 const DEFAULT_THREADGROUP_WIDTH: usize = 256;
 
+/// Minimum threadgroup width for attention kernels.
+///
+/// The attention kernel processes QK^T positions in parallel across
+/// simdgroups (one position per simdgroup). Using more threads than
+/// head_dim improves occupancy and enables more parallel positions.
+const ATTENTION_MIN_THREADGROUP_WIDTH: usize = 256;
+
 /// Number of output rows processed by each threadgroup in the custom
 /// FP16 matvec kernel. The shader is written for 8 SIMD-groups × 8 rows
 /// each, giving 64 rows per threadgroup.
@@ -466,11 +473,14 @@ pub fn encode_standard_attention(
     encoder.set_bytes(&params.head_dim.to_le_bytes(), 6);
     encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 7);
     encoder.set_bytes(&params.seq_len.to_le_bytes(), 8);
-    // HEAD_DIM is now exact — clamp to Metal's 1024-thread limit only.
+    // HEAD_DIM is now exact — use at least ATTENTION_MIN_THREADGROUP_WIDTH
+    // threads for better occupancy and parallel QK^T position processing.
     encoder.dispatch_threadgroups(
         (params.num_heads as usize, 1, 1),
         (
-            (params.head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP),
+            ATTENTION_MIN_THREADGROUP_WIDTH
+                .max(params.head_dim as usize)
+                .min(METAL_MAX_THREADS_PER_THREADGROUP),
             1,
             1,
         ),
