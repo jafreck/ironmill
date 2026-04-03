@@ -1868,7 +1868,6 @@ fn encode_kv_cache_and_attention(
                 enc.set_buffer(&tq.v_codebook_buf, 0, 15);
                 enc.set_buffer(&tq.qjl_matrix, 0, 16);
                 enc.set_buffer(k_r_norms, 0, 17);
-                enc.set_buffer(k_qjl_signs, 0, 18);
                 enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
             }
         }

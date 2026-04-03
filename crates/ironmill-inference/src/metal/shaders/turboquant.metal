@@ -41,9 +41,9 @@ inline float read_quantized(device const char* cache, uint base,
 //   buffer(9)  scale_buf:        [num_kv_heads × max_seq_len] float
 //   buffer(10) codebook:         [n_levels] float (INT4 codebook centroids)
 //   buffer(11) boundaries:       [n_levels-1] float (INT4 boundary values)
-//   buffer(12) n_levels:         uint (number of codebook levels, e.g. 16 for 4-bit)
+//   buffer(12) n_levels:         uint (number of codebook levels; K=(b-1)-bit, V=b-bit)
 //   buffer(13) qjl_matrix:       [head_dim × head_dim] float (QJL projection)
-//   buffer(14) qjl_signs_buf:    [num_kv_heads × max_seq_len × head_dim/8] uchar
+//   buffer(14) qjl_signs_buf:    UNUSED (signs packed in nibble bit 3; kept for API compat)
 //   buffer(15) r_norms_buf:      [num_kv_heads × max_seq_len] float
 //   buffer(16) is_k_cache:       uint (1 = K cache, 0 = V cache)
 //
@@ -141,11 +141,12 @@ kernel void turboquant_cache_write(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // QJL residual correction (K cache only, per Algorithm 2)
+        // Sign bit is packed into bit 3 of each nibble (like outlier path).
         if (is_k_cache == 1) {
             // Compute quantization residual in normalized space
             for (uint d = tid; d < head_dim; d += tg_size) {
                 float normalized = shared_rotated[d] * inv_norm;
-                float dequant_val = codebook[uint(shared_quant[d] & 0xF)];
+                float dequant_val = codebook[uint(shared_quant[d])];
                 shared_reduce[d] = normalized - dequant_val;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -164,24 +165,14 @@ kernel void turboquant_cache_write(
             if (tid == 0)
                 r_norms_buf[head_idx * max_seq_len + seq_pos] = r_norm;
 
-            // Project residual with QJL matrix S and store packed sign bits
-            // sign(S · r) stored as 1 bit per dimension, 8 bits per byte
-            uint signs_per_pos = head_dim / 8;
-            uint signs_base = head_idx * max_seq_len * signs_per_pos
-                            + seq_pos * signs_per_pos;
-            for (uint byte_idx = tid; byte_idx < signs_per_pos; byte_idx += tg_size) {
-                uchar packed_signs = 0;
-                for (uint bit = 0; bit < 8; bit++) {
-                    uint out_d = byte_idx * 8 + bit;
-                    if (out_d < head_dim) {
-                        float proj = 0.0f;
-                        uint row_base = out_d * head_dim;
-                        for (uint k = 0; k < head_dim; k++)
-                            proj += qjl_matrix[row_base + k] * shared_reduce[k];
-                        if (proj >= 0.0f) packed_signs |= (1u << bit);
-                    }
-                }
-                qjl_signs_buf[signs_base + byte_idx] = packed_signs;
+            // Project residual with QJL matrix S, pack sign into nibble bit 3
+            for (uint d = tid; d < head_dim; d += tg_size) {
+                float proj = 0.0f;
+                uint row_base = d * head_dim;
+                for (uint k = 0; k < head_dim; k++)
+                    proj += qjl_matrix[row_base + k] * shared_reduce[k];
+                uchar sign_bit = (proj >= 0.0f) ? uchar(0x8) : uchar(0x0);
+                shared_quant[d] = char(uchar(shared_quant[d]) | sign_bit);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -249,7 +240,6 @@ kernel void turboquant_cache_write(
 //   buffer(15) v_codebook:      V cache codebook (b-bit levels for TurboQuant_mse)
 //   buffer(16) qjl_matrix:      [head_dim × head_dim] float
 //   buffer(17) k_r_norms:       [num_kv_heads × max_seq_len] float
-//   buffer(18) k_qjl_signs:     [num_kv_heads × max_seq_len × head_dim/8] uchar
 //
 // Dispatch: num_heads threadgroups, min(head_dim, 1024) threads per group.
 
@@ -272,7 +262,6 @@ kernel void turboquant_attention(
     device const float* v_codebook      [[buffer(15)]],
     device const float* qjl_matrix      [[buffer(16)]],
     device const float* k_r_norms       [[buffer(17)]],
-    device const uchar* k_qjl_signs     [[buffer(18)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
@@ -365,12 +354,26 @@ kernel void turboquant_attention(
         for (uint p = 0; p < actual_tile; p++) {
             float k_deq = tile_scales[p];
             float partial_dot = 0.0f;
+            float partial_qjl = 0.0f;
 
-            // Both INT4 and INT8 use standard codebook dequant for K
-            for (uint d = tid; d < head_dim; d += tg_size) {
-                float k_val = read_quantized_tile(
-                    kv_tile_raw, p, d, head_dim, n_bits, k_deq, k_codebook);
-                partial_dot += shared_q_rot[d] * k_val;
+            // INT4: use read_quantized_tile_int4_qjl to extract (b-1)-bit
+            // codebook value and QJL sign from nibble simultaneously.
+            // INT8: standard codebook dequant, no QJL.
+            if (n_bits == 4) {
+                for (uint d = tid; d < head_dim; d += tg_size) {
+                    float qjl_sign;
+                    float k_val = read_quantized_tile_int4_qjl(
+                        kv_tile_raw, p, d, head_dim, k_deq,
+                        k_codebook, qjl_sign);
+                    partial_dot += shared_q_rot[d] * k_val;
+                    partial_qjl += shared_s_q[d] * qjl_sign;
+                }
+            } else {
+                for (uint d = tid; d < head_dim; d += tg_size) {
+                    float k_val = read_quantized_tile(
+                        kv_tile_raw, p, d, head_dim, n_bits, k_deq, k_codebook);
+                    partial_dot += shared_q_rot[d] * k_val;
+                }
             }
 
             // Tree reduction for base dot product
@@ -390,23 +393,7 @@ kernel void turboquant_attention(
                 uint abs_pos = tile_start + p;
                 float r_norm = k_r_norms[kv_head * max_seq_len + abs_pos];
 
-                // Compute Σ (S·Q)ᵢ · sign(S·r)ᵢ using stored sign bits
-                uint signs_per_pos = head_dim / 8;
-                uint signs_base = kv_head * max_seq_len * signs_per_pos
-                                + abs_pos * signs_per_pos;
-                float partial_agree = 0.0f;
-                for (uint byte_idx = tid; byte_idx < signs_per_pos; byte_idx += tg_size) {
-                    uchar packed_signs = k_qjl_signs[signs_base + byte_idx];
-                    for (uint bit = 0; bit < 8; bit++) {
-                        uint d = byte_idx * 8 + bit;
-                        if (d < head_dim) {
-                            float sk = ((packed_signs >> bit) & 1) ? 1.0f : -1.0f;
-                            partial_agree += sk * shared_s_q[d];
-                        }
-                    }
-                }
-
-                shared_reduce[tid] = partial_agree;
+                shared_reduce[tid] = partial_qjl;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint s = rs / 2; s > 0; s >>= 1) {
                     if (tid < s && (tid + s) < tg_size)
