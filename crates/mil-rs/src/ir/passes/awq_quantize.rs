@@ -303,16 +303,18 @@ fn find_salient_threshold(magnitudes: &[f32], percentile: f32) -> f32 {
     sorted[idx]
 }
 
-/// Compute MSE of: scale weights by 1/s, quantize, dequantize, scale back by s.
+/// Compute MSE of: scale weights UP by s, quantize, dequantize, scale back DOWN by s.
+///
+/// This matches the AWQ paper's formulation: Q(w · s) · (1/s) ≈ w.
+/// Salient channels with scale > 1 use more of the quantization range,
+/// reducing their relative quantization error.
 fn compute_scaled_quantization_mse(original: &[f32], scale: f32, qmax: f32) -> f32 {
     if original.is_empty() {
         return 0.0;
     }
 
-    let inv_scale = 1.0 / scale;
-
-    // Scale down.
-    let scaled: Vec<f32> = original.iter().map(|&w| w * inv_scale).collect();
+    // Scale UP by s (protect salient channels by giving them more range).
+    let scaled: Vec<f32> = original.iter().map(|&w| w * scale).collect();
 
     // Quantize then dequantize the scaled values.
     let (quantized, q_scale, q_zp) = quantize_affine(&scaled, qmax);
@@ -321,10 +323,11 @@ fn compute_scaled_quantization_mse(original: &[f32], scale: f32, qmax: f32) -> f
         .map(|&q| (q as f32 - q_zp) * q_scale)
         .collect();
 
-    // Scale back up and compute MSE vs. original.
+    // Scale back DOWN and compute MSE vs. original.
+    let inv_scale = 1.0 / scale;
     let mut sum_sq = 0.0_f32;
     for (i, &orig) in original.iter().enumerate() {
-        let reconstructed = dequantized[i] * scale;
+        let reconstructed = dequantized[i] * inv_scale;
         let err = orig - reconstructed;
         sum_sq += err * err;
     }

@@ -27,22 +27,23 @@ use crate::weights::{MilWeightProvider, ModelConfig, WeightProvider};
 
 /// Builder for GPU-targeted model compilation.
 ///
-/// Imports a model from disk, runs an optimization/quantization pipeline, and
-/// returns a [`MilWeightProvider`] that can feed weights to the GPU inference
-/// runtime.
+/// Imports a model from disk, runs an optimization/quantization pass pipeline,
+/// and returns a [`MilWeightProvider`] that can feed weights to the GPU
+/// inference runtime.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use ironmill_compile::gpu::GpuCompileBuilder;
-/// use mil_rs::ir::PassPipeline;
+/// use ironmill_compile::mil::PassPipeline;
 ///
-/// let provider = GpuCompileBuilder::new("model.onnx")
-///     .with_pass_pipeline(
-///         PassPipeline::new()
-///             .with_polar_quant(4)
-///             .expect("PolarQuant config"),
-///     )
+/// // INT4 affine quantization
+/// let pipeline = PassPipeline::new()
+///     .with_int4(128)
+///     .expect("INT4 config failed");
+///
+/// let provider = GpuCompileBuilder::new("model.safetensors")
+///     .with_pass_pipeline(pipeline)
 ///     .build()
 ///     .expect("GPU compile failed");
 /// ```
@@ -59,10 +60,11 @@ impl GpuCompileBuilder {
         }
     }
 
-    /// Set a pass pipeline for quantization/optimization.
+    /// Set the pass pipeline for quantization/optimization.
     ///
-    /// The caller controls what quantization is applied (PolarQuant, INT8,
-    /// AWQ, etc.). An empty pipeline produces FP16 output.
+    /// An empty pipeline (the default) produces unquantized FP16 output.
+    /// The caller controls what quantization is applied by building the
+    /// appropriate pipeline (INT4, INT8, AWQ, PolarQuant, etc.).
     pub fn with_pass_pipeline(mut self, pipeline: PassPipeline) -> Self {
         self.pipeline = pipeline;
         self
@@ -70,12 +72,11 @@ impl GpuCompileBuilder {
 
     /// Import the model, run the pass pipeline, and return a [`MilWeightProvider`].
     ///
-    /// All formats follow the same path:
     /// 1. Detect input format (ONNX / SafeTensors / GGUF)
     /// 2. Import to MIL IR [`Program`]
-    /// 3. Run the [`PassPipeline`] (may be empty for FP16 passthrough)
+    /// 3. Run the [`PassPipeline`]
     /// 4. Extract a [`MilWeightProvider`] from the optimized program
-    pub fn build(self) -> Result<MilWeightProvider, CompileError> {
+    pub fn build(mut self) -> Result<MilWeightProvider, CompileError> {
         let input = &self.input;
 
         if !input.exists() {
@@ -123,20 +124,7 @@ impl GpuCompileBuilder {
     }
 }
 
-fn load_weight_provider(
-    input: &Path,
-    format: &InputFormat,
-) -> Result<Box<dyn WeightProvider>, CompileError> {
-    match format {
-        InputFormat::SafeTensors => Ok(Box::new(crate::weights::SafeTensorsProvider::load(input)?)),
-        InputFormat::Gguf => Ok(Box::new(crate::weights::GgufProvider::load(input)?)),
-        _ => Err(CompileError::Other(
-            "load_weight_provider called with non-weight format".into(),
-        )),
-    }
-}
-
-// ── Input format detection (GPU-specific subset) ────────────────────────
+// ── Input format detection ──────────────────────────────────────────────
 
 enum InputFormat {
     Onnx,
@@ -166,6 +154,20 @@ fn detect_format(path: &Path) -> InputFormat {
 }
 
 // ── Format-specific importers ───────────────────────────────────────────
+
+/// Load a weight provider for SafeTensors or GGUF input.
+fn load_weight_provider(
+    input: &Path,
+    format: &InputFormat,
+) -> Result<Box<dyn WeightProvider>, CompileError> {
+    match format {
+        InputFormat::SafeTensors => Ok(Box::new(crate::weights::SafeTensorsProvider::load(input)?)),
+        InputFormat::Gguf => Ok(Box::new(crate::weights::GgufProvider::load(input)?)),
+        _ => Err(CompileError::Other(
+            "load_weight_provider called with non-weight format".into(),
+        )),
+    }
+}
 
 /// Import an ONNX model, returning the MIL program and a derived `ModelConfig`.
 fn import_onnx(path: &Path) -> Result<(Program, ModelConfig), CompileError> {
@@ -288,6 +290,8 @@ mod tests {
     fn builder_methods_chain() {
         let pipeline = PassPipeline::new();
         let builder = GpuCompileBuilder::new("model.onnx").with_pass_pipeline(pipeline);
+
+        // Pipeline is set (not default empty) — just verify it doesn't panic.
         assert_eq!(builder.input, PathBuf::from("model.onnx"));
     }
 
