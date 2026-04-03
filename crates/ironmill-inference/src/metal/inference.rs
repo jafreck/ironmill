@@ -656,7 +656,7 @@ impl MetalInference {
                 self.kv_cache.as_ref(),
                 self.fp16_kv_cache.as_ref(),
                 self.config.max_seq_len,
-                self.config.n_bits,
+                self.config.n_bits as usize,
                 layer_idx,
                 seq_pos,
                 token_count,
@@ -1076,7 +1076,7 @@ impl MetalInference {
                 self.kv_cache.as_ref(),
                 self.fp16_kv_cache.as_ref(),
                 self.config.max_seq_len,
-                self.config.n_bits,
+                self.config.n_bits as usize,
                 layer_idx,
                 seq_pos,
                 token_count,
@@ -1868,6 +1868,7 @@ fn encode_kv_cache_and_attention(
                 enc.set_buffer(&tq.v_codebook_buf, 0, 15);
                 enc.set_buffer(&tq.qjl_matrix, 0, 16);
                 enc.set_buffer(k_r_norms, 0, 17);
+                enc.set_buffer(k_qjl_signs, 0, 18);
                 enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
             }
         }

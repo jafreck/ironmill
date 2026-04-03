@@ -57,6 +57,24 @@ inline float read_quantized_tile_int4(threadgroup const char* tile,
     return codebook[nibble] * deq_scale;
 }
 
+/// INT4 reader for K cache with QJL sign packed in bit 3 of the nibble.
+/// The lower 3 bits are the (b-1)-bit codebook index (Algorithm 2).
+/// Returns the dequantized codebook value and writes the QJL sign (±1.0)
+/// to `qjl_sign_out`.
+inline float read_quantized_tile_int4_qjl(threadgroup const char* tile,
+                                           uint pos, uint dim, uint head_dim,
+                                           float deq_scale,
+                                           device const float* codebook,
+                                           thread float& qjl_sign_out) {
+    uint packed_stride = head_dim / 2;
+    uint byte_idx = pos * packed_stride + dim / 2;
+    uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
+    uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
+    uchar cb_index = nibble & 0x7;
+    qjl_sign_out = (nibble & 0x8) ? 1.0f : -1.0f;
+    return codebook[cb_index] * deq_scale;
+}
+
 // ── In-place Walsh-Hadamard butterfly transform ─────────────────
 //
 // Applies the randomized Hadamard rotation R = (1/√d)·D·H·D in-place

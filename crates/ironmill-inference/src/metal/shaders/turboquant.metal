@@ -111,8 +111,7 @@ kernel void turboquant_cache_write(
     float max_val = max(shared_reduce[0], 1e-10f);
 
     if (n_bits == 4) {
-        // ── TurboQuant: Rotate → L2 norm → Quantize → Pack ──
-        // Full b-bit codebook for both K and V (no QJL sign stealing).
+        // ── TurboQuant Algorithm 2: Rotate → L2 norm → Quantize → QJL → Pack ──
         float local_sq = 0.0f;
         for (uint d = tid; d < head_dim; d += tg_size)
             local_sq += shared_rotated[d] * shared_rotated[d];
@@ -141,12 +140,56 @@ kernel void turboquant_cache_write(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        // QJL residual correction (K cache only, per Algorithm 2)
+        if (is_k_cache == 1) {
+            // Compute quantization residual in normalized space
+            for (uint d = tid; d < head_dim; d += tg_size) {
+                float normalized = shared_rotated[d] * inv_norm;
+                float dequant_val = codebook[uint(shared_quant[d] & 0xF)];
+                shared_reduce[d] = normalized - dequant_val;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Compute ||residual||₂
+            float local_rsq = 0.0f;
+            for (uint d = tid; d < head_dim; d += tg_size)
+                local_rsq += shared_reduce[d] * shared_reduce[d];
+            shared_rotated[tid] = local_rsq;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tg_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_rotated[tid] += shared_rotated[tid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            float r_norm = sqrt(max(shared_rotated[0], 1e-20f));
+            if (tid == 0)
+                r_norms_buf[head_idx * max_seq_len + seq_pos] = r_norm;
+
+            // Project residual with QJL matrix S and store packed sign bits
+            // sign(S · r) stored as 1 bit per dimension, 8 bits per byte
+            uint signs_per_pos = head_dim / 8;
+            uint signs_base = head_idx * max_seq_len * signs_per_pos
+                            + seq_pos * signs_per_pos;
+            for (uint byte_idx = tid; byte_idx < signs_per_pos; byte_idx += tg_size) {
+                uchar packed_signs = 0;
+                for (uint bit = 0; bit < 8; bit++) {
+                    uint out_d = byte_idx * 8 + bit;
+                    if (out_d < head_dim) {
+                        float proj = 0.0f;
+                        uint row_base = out_d * head_dim;
+                        for (uint k = 0; k < head_dim; k++)
+                            proj += qjl_matrix[row_base + k] * shared_reduce[k];
+                        if (proj >= 0.0f) packed_signs |= (1u << bit);
+                    }
+                }
+                qjl_signs_buf[signs_base + byte_idx] = packed_signs;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
         // Pack INT4 nibbles into cache bytes
         uint packed_stride = head_dim / 2;
         uint cache_base = kv_cache_base(head_idx, max_seq_len, head_dim, 4)
                         + seq_pos * packed_stride;
-        // Note: head_dim is guaranteed power-of-two (always even) by Rust-side validation,
-        // so d+1 < head_dim always holds. Guard kept for defensive correctness.
         for (uint d = tid * 2; d < head_dim; d += tg_size * 2) {
             uchar lo = uchar(shared_quant[d]     & 0xF);
             uchar hi = (d + 1 < head_dim) ? uchar(shared_quant[d + 1] & 0xF) : 0;
@@ -206,6 +249,7 @@ kernel void turboquant_cache_write(
 //   buffer(15) v_codebook:      V cache codebook (b-bit levels for TurboQuant_mse)
 //   buffer(16) qjl_matrix:      [head_dim × head_dim] float
 //   buffer(17) k_r_norms:       [num_kv_heads × max_seq_len] float
+//   buffer(18) k_qjl_signs:     [num_kv_heads × max_seq_len × head_dim/8] uchar
 //
 // Dispatch: num_heads threadgroups, min(head_dim, 1024) threads per group.
 
@@ -228,6 +272,7 @@ kernel void turboquant_attention(
     device const float* v_codebook      [[buffer(15)]],
     device const float* qjl_matrix      [[buffer(16)]],
     device const float* k_r_norms       [[buffer(17)]],
+    device const uchar* k_qjl_signs     [[buffer(18)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
@@ -270,6 +315,21 @@ kernel void turboquant_attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     hadamard_rotate_inplace(shared_q_rot, rotation_signs, head_dim, tid, tg_size);
 
+    // Precompute S · Q_rot for QJL correction (INT4 K only)
+    if (n_bits == 4) {
+        for (uint out_d = tid; out_d < head_dim; out_d += tg_size) {
+            float proj = 0.0f;
+            uint row_base = out_d * head_dim;
+            for (uint k = 0; k < head_dim; k++)
+                proj += qjl_matrix[row_base + k] * shared_q_rot[k];
+            shared_s_q[out_d] = proj;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // QJL correction coefficient: √(π/2) / d per Algorithm 2
+    float qjl_factor = (n_bits == 4) ? (sqrt(3.14159265f / 2.0f) / float(head_dim)) : 0.0f;
+
     // Zero output accumulator
     for (uint d = tid; d < head_dim; d += tg_size) {
         shared_output[d] = 0.0f;
@@ -280,8 +340,11 @@ kernel void turboquant_attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // QJL correction coefficient: √(π/2) / d per Algorithm 2
     uint bytes_per_pos = (n_bits == 4) ? (head_dim / 2) : head_dim;
+
+    // Precompute reduction-size constant for tree reduction
+    uint rs = 1;
+    while (rs < tg_size) rs <<= 1;
 
     // ---- Step 2: Tiled flash attention ----
     for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
@@ -313,8 +376,6 @@ kernel void turboquant_attention(
             // Tree reduction for base dot product
             shared_reduce[tid] = partial_dot;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint rs = 1;
-            while (rs < tg_size) rs <<= 1;
             for (uint s = rs / 2; s > 0; s >>= 1) {
                 if (tid < s && (tid + s) < tg_size)
                     shared_reduce[tid] += shared_reduce[tid + s];
@@ -322,8 +383,41 @@ kernel void turboquant_attention(
             }
             float base_score = shared_reduce[0];
 
+            // QJL inner product correction for INT4 K cache (Algorithm 2)
+            // Correction = deq_scale * ||r|| * (√(π/2)/d) * Σ (S·Q)ᵢ · sign(S·r)ᵢ
+            float qjl_correction = 0.0f;
+            if (n_bits == 4) {
+                uint abs_pos = tile_start + p;
+                float r_norm = k_r_norms[kv_head * max_seq_len + abs_pos];
+
+                // Compute Σ (S·Q)ᵢ · sign(S·r)ᵢ using stored sign bits
+                uint signs_per_pos = head_dim / 8;
+                uint signs_base = kv_head * max_seq_len * signs_per_pos
+                                + abs_pos * signs_per_pos;
+                float partial_agree = 0.0f;
+                for (uint byte_idx = tid; byte_idx < signs_per_pos; byte_idx += tg_size) {
+                    uchar packed_signs = k_qjl_signs[signs_base + byte_idx];
+                    for (uint bit = 0; bit < 8; bit++) {
+                        uint d = byte_idx * 8 + bit;
+                        if (d < head_dim) {
+                            float sk = ((packed_signs >> bit) & 1) ? 1.0f : -1.0f;
+                            partial_agree += sk * shared_s_q[d];
+                        }
+                    }
+                }
+
+                shared_reduce[tid] = partial_agree;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = rs / 2; s > 0; s >>= 1) {
+                    if (tid < s && (tid + s) < tg_size)
+                        shared_reduce[tid] += shared_reduce[tid + s];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                qjl_correction = k_deq * r_norm * qjl_factor * shared_reduce[0];
+            }
+
             if (tid == 0)
-                tile_scores[p] = base_score * scale;
+                tile_scores[p] = (base_score + qjl_correction) * scale;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
@@ -851,6 +945,9 @@ kernel void turboquant_outlier_attention(
     uint o_base = kv_head * max_seq_len * o_bytes_per_pos;
     uint n_base = kv_head * max_seq_len * n_bytes_per_pos;
 
+    uint rs = 1;
+    while (rs < tg_size) rs <<= 1;
+
     // ---- Tiled flash attention ----
     for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
         uint tile_end = min(tile_start + TILE, seq_len);
@@ -880,24 +977,30 @@ kernel void turboquant_outlier_attention(
             float partial_qjl_o = 0.0f;
             float partial_qjl_n = 0.0f;
 
-            // Outlier K dequant
+            // Outlier K dequant with QJL sign extraction
+            // K cache stores (b-1)-bit codebook index in bits [2:0] and
+            // QJL sign in bit [3] of each nibble (Algorithm 2).
             for (uint d = tid; d < d_outlier_padded; d += tg_size) {
-                float k_val = read_quantized_tile_int4(
-                    outlier_kv_tile, p, d, d_outlier_padded, k_o_deq, outlier_codebook);
+                float qjl_sign;
+                float k_val = read_quantized_tile_int4_qjl(
+                    outlier_kv_tile, p, d, d_outlier_padded, k_o_deq,
+                    outlier_codebook, qjl_sign);
                 partial_dot += shared_q_outlier[d] * k_val;
+                partial_qjl_o += shared_s_q_outlier[d] * qjl_sign;
             }
-            // Non-outlier K dequant
+            // Non-outlier K dequant with QJL sign extraction
             for (uint d = tid; d < d_non_padded; d += tg_size) {
-                float k_val = read_quantized_tile_int4(
-                    non_outlier_kv_tile, p, d, d_non_padded, k_n_deq, non_outlier_codebook);
+                float qjl_sign;
+                float k_val = read_quantized_tile_int4_qjl(
+                    non_outlier_kv_tile, p, d, d_non_padded, k_n_deq,
+                    non_outlier_codebook, qjl_sign);
                 partial_dot += shared_q_non_outlier[d] * k_val;
+                partial_qjl_n += shared_s_q_non[d] * qjl_sign;
             }
 
             // Reduce base dot product
             shared_reduce[tid] = partial_dot;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint rs = 1;
-            while (rs < tg_size) rs <<= 1;
             for (uint s = rs / 2; s > 0; s >>= 1) {
                 if (tid < s && (tid + s) < tg_size)
                     shared_reduce[tid] += shared_reduce[tid + s];

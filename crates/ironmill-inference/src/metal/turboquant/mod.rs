@@ -143,15 +143,13 @@ impl MetalTurboQuantModel {
             .create_buffer_with_data(&sign_bytes, ironmill_metal_sys::StorageMode::Shared)
             .map_err(MetalError::Metal)?;
 
-        // Per Algorithm 2 (TurboQuant_prod): K cache uses (b-1)-bit MSE
-        // codebook + 1-bit QJL = b bits total. V cache uses b-bit MSE codebook.
-        // At INT8, QJL overhead is negligible so both use 8-bit.
-        // K codebook: use full b-bit for both K and V.
-        // The (b-1)-bit + 1-bit-QJL-sign approach (Algorithm 2) trades codebook
-        // precision for inner-product correction, but with d projections in
-        // d dimensions the estimator variance (π/(2d)) exceeds the quantization
-        // error (1/d), making the correction counterproductive. Using full b-bit
-        // for K (same as V) gives better results empirically.
+        // Per Algorithm 2 (TurboQuant_prod): both K and V use full b-bit
+        // MSE codebook. K additionally computes QJL residual correction
+        // (sign bits stored in a separate k_qjl_signs buffer, residual
+        // norms in k_r_norms). The QJL correction is applied additively
+        // during attention to produce an unbiased inner-product estimator.
+        // Note: the outlier path uses (b-1)-bit K codebook with the QJL
+        // sign packed into bit 3 of each nibble (Algorithm 2 literal).
         let (k_levels, k_bounds) = codebook::lloyd_max_gaussian(config.head_dim, config.n_bits);
         let k_n_levels = k_levels.len() as u32;
         let k_codebook_buf = create_f32_buffer(device, &k_levels)?;
