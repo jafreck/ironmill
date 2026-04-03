@@ -479,18 +479,27 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
 fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     let mut builder = GpuCompileBuilder::new(input_path);
 
-    // Reject conflicting quantization flags.
-    if opts.quantize != "none" && opts.polar_quantize.is_some() {
-        anyhow::bail!("Cannot specify both --quantize and --polar-quantize. Use only one.");
-    }
+    // Check if the quantize flag specifies a PolarQuant format (legacy path)
+    let is_polarquant = opts.quantize.starts_with("polarquant-") || opts.polar_quantize.is_some();
 
-    // Apply PolarQuant from --quantize (e.g. "polarquant-4") or --polar-quantize
-    if opts.quantize != "none" {
-        let n_bits = parse_polarquant_bits(&opts.quantize)?;
-        builder = builder.polar_quantize(n_bits);
-    } else if let Some(n_bits) = opts.polar_quantize {
-        builder = builder.polar_quantize(n_bits);
+    if is_polarquant {
+        // Legacy PolarQuant path: use the builder's built-in PolarQuant support
+        if opts.quantize != "none" && opts.polar_quantize.is_some() {
+            anyhow::bail!("Cannot specify both --quantize and --polar-quantize. Use only one.");
+        }
+
+        if opts.quantize.starts_with("polarquant-") {
+            let n_bits = parse_polarquant_bits(&opts.quantize)?;
+            builder = builder.polar_quantize(n_bits);
+        } else if let Some(n_bits) = opts.polar_quantize {
+            builder = builder.polar_quantize(n_bits);
+        }
+    } else if opts.quantize != "none" {
+        // New path: build a PassPipeline and inject it into the builder
+        let pipeline = build_pass_pipeline(opts)?;
+        builder = builder.with_pass_pipeline(pipeline);
     }
+    // When quantize == "none" and no polar_quantize: no quantization (FP16)
 
     let provider = builder.build().context("GPU compilation failed")?;
 
