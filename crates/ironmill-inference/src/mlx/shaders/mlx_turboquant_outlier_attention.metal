@@ -97,8 +97,8 @@
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float qjl_factor_o = sqrt(2.0f / 3.14159265f) / float(d_outlier_padded);
-    float qjl_factor_n = sqrt(2.0f / 3.14159265f) / float(d_non_padded);
+    float qjl_factor_o = sqrt(3.14159265f / 2.0f) / float(d_outlier_padded);
+    float qjl_factor_n = sqrt(3.14159265f / 2.0f) / float(d_non_padded);
 
     // Zero accumulators
     for (uint d = tid; d < d_outlier_padded; d += tg_size) shared_output_outlier[d] = 0.0f;
