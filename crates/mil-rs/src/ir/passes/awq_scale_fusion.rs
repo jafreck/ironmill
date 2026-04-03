@@ -50,6 +50,7 @@ impl Pass for AwqScaleFusionPass {
 }
 
 /// Norm op types whose gamma parameter can absorb AWQ channel scales.
+#[allow(dead_code)]
 const FUSEABLE_NORM_OPS: &[&str] = &["layer_norm", "rms_norm"];
 
 /// Walk a block and fuse AWQ channel scales into preceding norm ops.
@@ -57,6 +58,7 @@ const FUSEABLE_NORM_OPS: &[&str] = &["layer_norm", "rms_norm"];
 /// Multiple projections may share the same norm (e.g., Q/K/V/O share
 /// input_layernorm). We compute a merged scale per norm group (geometric
 /// mean across projections) and fuse it into the norm gamma ONCE.
+#[allow(dead_code)]
 fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
     let consumer_map = build_consumer_map(&block.operations);
 
