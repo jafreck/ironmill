@@ -226,6 +226,8 @@ kernel void turboquant_attention(
     //   shared_output: HEAD_DIM × 4     B
     //   softmax/corr:  3 × 4            B
     constexpr uint TILE = 32;
+    // Max codebook size: 2^8 = 256 entries for INT8 V, fits easily in shared mem.
+    constexpr uint MAX_CB = 256;
 
     threadgroup float shared_q_rot[HEAD_DIM];
     threadgroup float shared_s_q[HEAD_DIM];
@@ -237,6 +239,8 @@ kernel void turboquant_attention(
     threadgroup float softmax_max[1];
     threadgroup float softmax_sum[1];
     threadgroup float tile_correction[1];
+    threadgroup float shared_k_cb[MAX_CB];
+    threadgroup float shared_v_cb[MAX_CB];
 
     uint head_idx = tgid;
     if (head_idx >= num_heads) return;
@@ -246,6 +250,15 @@ kernel void turboquant_attention(
     float scale = 1.0f / sqrt(float(head_dim));
     uint q_base = head_idx * head_dim;
     uint kv_base = kv_cache_base(kv_head, max_seq_len, head_dim, n_bits);
+
+    // ---- Step 0: Preload codebooks into shared memory ----
+    uint k_cb_size = 1u << (n_bits - 1);  // (b-1)-bit K codebook
+    uint v_cb_size = 1u << n_bits;         // b-bit V codebook
+    for (uint i = tid; i < k_cb_size; i += tg_size)
+        shared_k_cb[i] = k_codebook[i];
+    for (uint i = tid; i < v_cb_size; i += tg_size)
+        shared_v_cb[i] = v_codebook[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ---- Step 1: Load Q and rotate via butterfly ----
     for (uint d = tid; d < head_dim; d += tg_size) {
@@ -306,43 +319,36 @@ kernel void turboquant_attention(
         // Compute QK^T for every position in the tile
         for (uint p = 0; p < actual_tile; p++) {
             float k_deq = tile_scales[p];
-            float partial_dot = 0.0f;
-            float partial_qjl = 0.0f;
 
-            // Unified K read: (b-1)-bit codebook + QJL sign (Algorithm 2)
-            for (uint d = tid; d < head_dim; d += tg_size) {
-                float qjl_sign;
-                float k_val = read_k_tile_qjl(
-                    kv_tile_raw, p, d, head_dim, n_bits, k_deq,
-                    k_codebook, qjl_sign);
-                partial_dot += shared_q_rot[d] * k_val;
-                partial_qjl += shared_s_q[d] * qjl_sign;
-            }
-
-            shared_reduce[tid] = partial_dot;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = rs / 2; s > 0; s >>= 1) {
-                if (tid < s && (tid + s) < tg_size)
-                    shared_reduce[tid] += shared_reduce[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            float base_score = shared_reduce[0];
-
-            // QJL inner product correction (Algorithm 2)
+            // QJL correction weight: precompute ||r|| · coefficient · scale
+            // so the QJL term can be fused into the same dot-product accumulator.
             uint abs_pos = tile_start + p;
             float r_norm = k_r_norms[kv_head * max_seq_len + abs_pos];
+            float qjl_weight = r_norm * qjl_factor * k_deq;
 
-            shared_reduce[tid] = partial_qjl;
+            // Fused K dot + QJL correction — single accumulator, single reduction.
+            //   score = Σ_d [ q_rot[d] · cb[idx] · k_deq
+            //               + s_q[d] · sign · ||r|| · c · k_deq ]
+            float partial = 0.0f;
+            for (uint d = tid; d < head_dim; d += tg_size) {
+                uchar raw = read_raw_element(kv_tile_raw, p, d, head_dim, n_bits);
+                uchar sign_mask = uchar(1) << (n_bits - 1);
+                float k_val = shared_k_cb[raw & (sign_mask - 1)] * k_deq;
+                float qjl_sign = (raw & sign_mask) ? 1.0f : -1.0f;
+                partial += shared_q_rot[d] * k_val
+                         + shared_s_q[d] * qjl_sign * qjl_weight;
+            }
+
+            shared_reduce[tid] = partial;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint s = rs / 2; s > 0; s >>= 1) {
                 if (tid < s && (tid + s) < tg_size)
                     shared_reduce[tid] += shared_reduce[tid + s];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            float qjl_correction = k_deq * r_norm * qjl_factor * shared_reduce[0];
 
             if (tid == 0)
-                tile_scores[p] = (base_score + qjl_correction) * scale;
+                tile_scores[p] = shared_reduce[0] * scale;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
@@ -387,8 +393,8 @@ kernel void turboquant_attention(
             float w = tile_scores[p];
             float v_deq = tile_scales[p];
             for (uint d = tid; d < head_dim; d += tg_size) {
-                float v_val = read_v_tile(
-                    kv_tile_raw, p, d, head_dim, n_bits, v_deq, v_codebook);
+                float v_val = shared_v_cb[read_raw_element(
+                    kv_tile_raw, p, d, head_dim, n_bits)] * v_deq;
                 shared_output[d] += w * v_val;
             }
         }
