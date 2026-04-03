@@ -19,7 +19,7 @@ kernel void residual_add(
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= size) return;
-    output[tid] = a[tid] + b[tid];
+    output[tid] = half(float(a[tid]) + float(b[tid]));
 }
 
 // Buffer copy: output[i] = input[i]

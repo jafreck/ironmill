@@ -509,6 +509,18 @@ impl MetalInference {
 
         let token_count = token_ids.len();
         let seq_pos = self.seq_pos;
+
+        // Guard: ensure tokens fit within the KV cache.
+        if seq_pos
+            .checked_add(token_count)
+            .is_none_or(|end| end > self.config.max_seq_len)
+        {
+            return Err(InferenceError::Runtime(format!(
+                "sequence position {} + token count {} exceeds max_seq_len {}",
+                seq_pos, token_count, self.config.max_seq_len,
+            )));
+        }
+
         let h = mc.hidden_size;
         let nh = mc.num_attention_heads as u32;
         let nkv = mc.num_kv_heads() as u32;
@@ -909,6 +921,18 @@ impl MetalInference {
 
         let token_count = token_ids.len();
         let seq_pos = self.seq_pos;
+
+        // Guard: ensure tokens fit within the KV cache.
+        if seq_pos
+            .checked_add(token_count)
+            .is_none_or(|end| end > self.config.max_seq_len)
+        {
+            return Err(InferenceError::Runtime(format!(
+                "sequence position {} + token count {} exceeds max_seq_len {}",
+                seq_pos, token_count, self.config.max_seq_len,
+            )));
+        }
+
         let h = mc.hidden_size;
         let nh = mc.num_attention_heads as u32;
         let nkv = mc.num_kv_heads() as u32;
@@ -1869,6 +1893,8 @@ fn encode_kv_cache_and_attention(
                 enc.set_buffer(k_n_r_norms, 0, 26);
                 enc.set_buffer(&outlier.outlier_codebook, 0, 27);
                 enc.set_buffer(&outlier.non_outlier_codebook, 0, 28);
+                enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 29);
+                enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 30);
                 enc.dispatch_threadgroups((nh as usize, 1, 1), (tg_size.min(1024), 1, 1));
             }
         } else {

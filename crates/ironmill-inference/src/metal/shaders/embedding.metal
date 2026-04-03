@@ -30,7 +30,10 @@ kernel void embedding_lookup(
     if (dim_idx >= hidden_size || token_idx >= token_count) return;
 
     uint token_id = token_ids[token_idx];
-    if (token_id >= vocab_size) return;
+    if (token_id >= vocab_size) {
+        output[token_idx * hidden_size + dim_idx] = half(0.0f);
+        return;
+    }
 
     // Copy one element from embedding_table[token_id][dim_idx]
     output[token_idx * hidden_size + dim_idx] =
