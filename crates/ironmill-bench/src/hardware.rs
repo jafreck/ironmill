@@ -27,11 +27,13 @@ pub struct HardwareInfo {
 impl HardwareInfo {
     /// Detect hardware information for the current system.
     pub fn detect() -> Self {
+        let chip = detect_chip_model();
+        let ne_cores = ne_cores_from_chip(&chip);
         Self {
-            chip: detect_chip_model(),
+            chip,
             cores_cpu: detect_cpu_cores(),
             cores_gpu: detect_gpu_cores(),
-            ne_cores: detect_ne_cores(),
+            ne_cores,
             ram_gb: detect_ram_gb(),
             macos: detect_macos_version(),
         }
@@ -90,16 +92,16 @@ fn detect_gpu_cores() -> u32 {
     0
 }
 
-/// Detect Neural Engine core count.
-fn detect_ne_cores() -> u32 {
+/// Estimate Neural Engine core count from chip model string.
+fn ne_cores_from_chip(chip: &str) -> u32 {
     // ANE core count isn't directly exposed via sysctl.
     // Use chip model to estimate: M1/M2/M3/M4 = 16 cores, A-series varies.
-    let chip = detect_chip_model().to_lowercase();
-    if chip.contains("m1")
-        || chip.contains("m2")
-        || chip.contains("m3")
-        || chip.contains("m4")
-        || chip.contains("m5")
+    let lower = chip.to_lowercase();
+    if lower.contains("m1")
+        || lower.contains("m2")
+        || lower.contains("m3")
+        || lower.contains("m4")
+        || lower.contains("m5")
     {
         16
     } else {

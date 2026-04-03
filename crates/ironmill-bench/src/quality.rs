@@ -114,13 +114,11 @@ fn reconstruct_from_lut_op(
 
 /// Run quality benchmarks on a program's const tensors.
 ///
-/// For each const op with a large enough FP32 tensor:
-/// 1. Save original weights
-/// 2. Apply quantization pass
-/// 3. Reconstruct dequantized weights from LUT + indices
-/// 4. Compute MSE and PSNR vs original
+/// Clones the program once, applies the quantization pass, then measures
+/// MSE and PSNR for each tensor against the original weights.
 pub fn measure_program_quality(program: &Program, method: &str, bits: u8) -> Vec<QualityResult> {
-    let mut results = Vec::new();
+    // Collect original weights before quantization.
+    let mut originals: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
 
     for function in program.functions.values() {
         for op in &function.body.operations {
@@ -143,99 +141,99 @@ pub fn measure_program_quality(program: &Program, method: &str, bits: u8) -> Vec
                     if numel < 1024 {
                         continue;
                     }
-
                     let original = tensor_as_f32_slice(data).to_vec();
-                    let max_val = original.iter().map(|v| v.abs()).fold(0.0f32, f32::max) as f64;
-
-                    let mut test_program = program.clone();
-                    let pass = PolarQuantPass::new(bits);
-                    if pass.run(&mut test_program).is_ok() {
-                        let original_bytes = numel * 4; // f32
-                        let compressed_bytes =
-                            (numel * bits as usize).div_ceil(8) + (1 << bits) * 2;
-
-                        // Find the quantized op by matching the original op name.
-                        let mut mse = 0.0;
-                        let mut psnr_db = 0.0;
-
-                        for qfn in test_program.functions.values() {
-                            for qop in &qfn.body.operations {
-                                if qop.op_type == "constexpr_lut_to_dense" && qop.name == op.name {
-                                    if let Some(reconstructed) = reconstruct_from_lut_op(qop, shape)
-                                    {
-                                        // Row norms are factored out, so the
-                                        // reconstructed values are the unit-norm
-                                        // quantized weights. Apply norms for MSE.
-                                        let rank = shape.len();
-                                        let (_rows, cols) = if rank >= 2 {
-                                            let c = shape[rank - 1];
-                                            let r: usize = shape[..rank - 1].iter().product();
-                                            (r, c)
-                                        } else {
-                                            (1, shape[0])
-                                        };
-
-                                        // Find corresponding norms const op.
-                                        let norms_name = format!("{}_polar_norms", op.name);
-                                        let norms = qfn
-                                            .body
-                                            .operations
-                                            .iter()
-                                            .find(|o| o.name == norms_name)
-                                            .and_then(|o| {
-                                                o.inputs
-                                                    .get("val")
-                                                    .or_else(|| o.attributes.get("val"))
-                                            });
-
-                                        let scaled: Vec<f32> = if let Some(Value::Tensor {
-                                            data: norms_data,
-                                            dtype: norms_dtype,
-                                            ..
-                                        }) = norms
-                                        {
-                                            let norms_f32: Vec<f32> = match norms_dtype {
-                                                ScalarType::Float16 => norms_data
-                                                    .chunks_exact(2)
-                                                    .map(|c| {
-                                                        f16::from_le_bytes([c[0], c[1]]).to_f32()
-                                                    })
-                                                    .collect(),
-                                                _ => tensor_as_f32_slice(norms_data).to_vec(),
-                                            };
-                                            reconstructed
-                                                .iter()
-                                                .enumerate()
-                                                .map(|(i, &v)| {
-                                                    let row = i / cols;
-                                                    let norm =
-                                                        norms_f32.get(row).copied().unwrap_or(1.0);
-                                                    v * norm
-                                                })
-                                                .collect()
-                                        } else {
-                                            reconstructed
-                                        };
-
-                                        mse = compute_mse(&original, &scaled);
-                                        psnr_db = compute_psnr(mse, max_val);
-                                    }
-                                }
-                            }
-                        }
-
-                        results.push(QualityResult {
-                            method: method.to_string(),
-                            bits,
-                            mse,
-                            psnr_db,
-                            compression_ratio: original_bytes as f64 / compressed_bytes as f64,
-                        });
-                    }
+                    originals.push((op.name.clone(), shape.clone(), original));
                 }
                 _ => continue,
             }
         }
+    }
+
+    if originals.is_empty() {
+        return Vec::new();
+    }
+
+    // Clone once, run quantization pass once.
+    let mut quantized_program = program.clone();
+    let pass = PolarQuantPass::new(bits);
+    if pass.run(&mut quantized_program).is_err() {
+        return Vec::new();
+    }
+
+    // Measure each tensor against the quantized result.
+    let mut results = Vec::new();
+
+    for (op_name, shape, original) in &originals {
+        let numel: usize = shape.iter().product();
+        let max_val = original.iter().map(|v| v.abs()).fold(0.0f32, f32::max) as f64;
+
+        let original_bytes = numel * 4; // f32
+        let compressed_bytes = (numel * bits as usize).div_ceil(8) + (1 << bits) * 2;
+
+        let mut mse = 0.0;
+        let mut psnr_db = 0.0;
+
+        for qfn in quantized_program.functions.values() {
+            for qop in &qfn.body.operations {
+                if qop.op_type == "constexpr_lut_to_dense" && qop.name == *op_name {
+                    if let Some(reconstructed) = reconstruct_from_lut_op(qop, shape) {
+                        let rank = shape.len();
+                        let (_rows, cols) = if rank >= 2 {
+                            let c = shape[rank - 1];
+                            let r: usize = shape[..rank - 1].iter().product();
+                            (r, c)
+                        } else {
+                            (1, shape[0])
+                        };
+
+                        let norms_name = format!("{}_polar_norms", op_name);
+                        let norms = qfn
+                            .body
+                            .operations
+                            .iter()
+                            .find(|o| o.name == norms_name)
+                            .and_then(|o| o.inputs.get("val").or_else(|| o.attributes.get("val")));
+
+                        let scaled: Vec<f32> = if let Some(Value::Tensor {
+                            data: norms_data,
+                            dtype: norms_dtype,
+                            ..
+                        }) = norms
+                        {
+                            let norms_f32: Vec<f32> = match norms_dtype {
+                                ScalarType::Float16 => norms_data
+                                    .chunks_exact(2)
+                                    .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+                                    .collect(),
+                                _ => tensor_as_f32_slice(norms_data).to_vec(),
+                            };
+                            reconstructed
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &v)| {
+                                    let row = i / cols;
+                                    let norm = norms_f32.get(row).copied().unwrap_or(1.0);
+                                    v * norm
+                                })
+                                .collect()
+                        } else {
+                            reconstructed
+                        };
+
+                        mse = compute_mse(original, &scaled);
+                        psnr_db = compute_psnr(mse, max_val);
+                    }
+                }
+            }
+        }
+
+        results.push(QualityResult {
+            method: method.to_string(),
+            bits,
+            mse,
+            psnr_db,
+            compression_ratio: original_bytes as f64 / compressed_bytes as f64,
+        });
     }
 
     results

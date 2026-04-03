@@ -139,8 +139,13 @@ struct Cli {
 }
 
 /// Run CoreML benchmark loop across models × optimizations × compute units.
+///
+/// When a pre-parsed `programs` map is provided, compilation uses the cached
+/// program instead of re-reading ONNX from disk.
+#[allow(clippy::too_many_arguments)]
 fn run_coreml_benchmarks(
     matrix: &config::BenchMatrix,
+    programs: &std::collections::HashMap<String, ironmill_compile::mil::Program>,
     compute_units: &[ironmill_inference::coreml_runtime::ComputeUnits],
     cache_dir: &std::path::Path,
     no_cache: bool,
@@ -149,7 +154,14 @@ fn run_coreml_benchmarks(
     report_rows: &mut Vec<ReportRow>,
 ) -> Result<()> {
     for model_cfg in &matrix.models {
-        let model_flops = compute_model_flops(model_cfg);
+        let model_flops = programs
+            .get(&model_cfg.name)
+            .and_then(|p| {
+                let f = p.total_flops();
+                if f > 0 { Some(f) } else { None }
+            })
+            .or_else(|| compute_model_flops(model_cfg));
+
         if let Some(flops) = model_flops {
             eprintln!(
                 "  Model FLOPs: {:.2}G ({:.2}M MACs)",
@@ -160,7 +172,11 @@ fn run_coreml_benchmarks(
 
         for opt_cfg in &matrix.optimizations {
             eprintln!("Compiling {} with {}...", model_cfg.name, opt_cfg.name);
-            let mlmodelc = compiler::compile_model(model_cfg, opt_cfg, cache_dir, no_cache)?;
+            let mlmodelc = if let Some(prog) = programs.get(&model_cfg.name) {
+                compiler::compile_model_from_program(prog, model_cfg, opt_cfg, cache_dir, no_cache)?
+            } else {
+                compiler::compile_model(model_cfg, opt_cfg, cache_dir, no_cache)?
+            };
 
             for &cu in compute_units {
                 eprintln!("  Running inference ({cu})...");
@@ -174,19 +190,21 @@ fn run_coreml_benchmarks(
                     None
                 };
 
+                // Load the model once and run all runs on it.
+                let (run_inference_results, _load_time) = inference::run_inference_multi_run(
+                    &mlmodelc,
+                    cu,
+                    matrix.settings.iterations,
+                    matrix.settings.warmup,
+                    matrix.settings.runs,
+                )?;
+
                 let mut run_results = Vec::new();
                 let mut last_utilization = None;
                 let mut last_memory = None;
                 let mut last_load_time = None;
 
-                for run_idx in 0..matrix.settings.runs {
-                    let result = inference::run_inference(
-                        &mlmodelc,
-                        cu,
-                        matrix.settings.iterations,
-                        matrix.settings.warmup,
-                    )?;
-
+                for (run_idx, result) in run_inference_results.into_iter().enumerate() {
                     last_load_time = Some(result.load_time.as_secs_f64() * 1000.0);
                     last_utilization = result.utilization;
                     last_memory = result.memory;
@@ -263,7 +281,12 @@ fn apply_baseline_significance(report_rows: &mut [ReportRow], baseline_name: &st
 }
 
 /// Run weight fidelity quality benchmarks for quantized optimizations.
-fn run_quality_eval(matrix: &config::BenchMatrix) {
+///
+/// Uses pre-parsed programs when available to avoid re-reading ONNX.
+fn run_quality_eval(
+    matrix: &config::BenchMatrix,
+    programs: &std::collections::HashMap<String, ironmill_compile::mil::Program>,
+) {
     eprintln!("\nRunning weight fidelity quality benchmarks...");
     let mut summaries = Vec::new();
 
@@ -280,7 +303,13 @@ fn run_quality_eval(matrix: &config::BenchMatrix) {
                 model_cfg.name, opt_cfg.name, bits
             );
 
-            match compiler::build_optimized_program(model_cfg, opt_cfg) {
+            let program_result = if let Some(prog) = programs.get(&model_cfg.name) {
+                compiler::build_optimized_program_from(prog, opt_cfg)
+            } else {
+                compiler::build_optimized_program(model_cfg, opt_cfg)
+            };
+
+            match program_result {
                 Ok(program) => {
                     let results = quality::measure_program_quality(&program, method, bits);
                     if let Some(summary) = quality::summarize_quality(&model_cfg.name, &results) {
@@ -412,9 +441,38 @@ fn main() -> Result<()> {
         !cli.perplexity || cli.ane_direct || has_metal || has_mlx || cli.quality;
     let run_coreml_bench = run_latency_bench && !compute_units.is_empty();
 
+    // ── Pre-parse ONNX models once, reuse across all benchmark phases ──
+    // This avoids redundant I/O for FLOPs computation, CoreML compilation,
+    // quality benchmarks, and ANE-direct compilation.
+    let mut parsed_programs: std::collections::HashMap<String, ironmill_compile::mil::Program> =
+        std::collections::HashMap::new();
+
+    let needs_program = run_coreml_bench || cli.quality || cli.ane_direct;
+    if needs_program {
+        for model_cfg in &matrix.models {
+            if !model_cfg.path.exists() {
+                continue;
+            }
+            let ext = model_cfg.path.extension().and_then(|e| e.to_str());
+            if ext != Some("onnx") {
+                continue;
+            }
+            eprintln!("Parsing {} (ONNX → MIL IR)...", model_cfg.name);
+            match compiler::parse_model(model_cfg) {
+                Ok(program) => {
+                    parsed_programs.insert(model_cfg.name.clone(), program);
+                }
+                Err(e) => {
+                    eprintln!("  ✗ failed to parse {}: {e}", model_cfg.name);
+                }
+            }
+        }
+    }
+
     if run_coreml_bench {
         run_coreml_benchmarks(
             &matrix,
+            &parsed_programs,
             &compute_units,
             &cache_dir,
             cli.no_cache,
@@ -441,11 +499,21 @@ fn main() -> Result<()> {
                         model_cfg.name, opt_cfg.name
                     );
 
-                    let program = match compiler::build_optimized_program(model_cfg, opt_cfg) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("  ✗ failed to build program: {e}");
-                            continue;
+                    let program = if let Some(prog) = parsed_programs.get(&model_cfg.name) {
+                        match compiler::build_optimized_program_from(prog, opt_cfg) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("  ✗ failed to build program: {e}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        match compiler::build_optimized_program(model_cfg, opt_cfg) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("  ✗ failed to build program: {e}");
+                                continue;
+                            }
                         }
                     };
 
@@ -505,6 +573,27 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── Pre-load perplexity dataset once if needed by any backend ──
+    #[allow(unused_variables)]
+    let ppl_dataset = if cli.perplexity {
+        match perplexity::PerplexityDataset::load(&cli.perplexity_dataset) {
+            Ok(ds) => {
+                eprintln!(
+                    "Perplexity dataset: {} ({} seqs × {} tokens)",
+                    ds.name, ds.num_sequences, ds.seq_len
+                );
+                Some(ds)
+            }
+            Err(e) => {
+                eprintln!("  ✗ Failed to load dataset: {e}");
+                eprintln!("  Run: python scripts/prepare-quality-dataset.py");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if has_metal {
         #[cfg(feature = "metal")]
         {
@@ -544,6 +633,11 @@ fn main() -> Result<()> {
             ];
 
             let mut gpu_ppl_results: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+
+            // Cache SafeTensorsProvider per model directory to avoid reloading
+            // weights for perplexity evaluation after latency benchmarks.
+            let mut cached_providers: std::collections::HashMap<PathBuf, SafeTensorsProvider> =
                 std::collections::HashMap::new();
 
             for model_cfg in &matrix.models {
@@ -730,7 +824,7 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                // Load weights once, reuse across configs
+                // Load weights once, reuse across configs (and perplexity if needed)
                 let model_dir = if model_cfg.path.is_dir() {
                     model_cfg.path.clone()
                 } else if let Some(parent) = model_cfg.path.parent() {
@@ -743,16 +837,21 @@ fn main() -> Result<()> {
                     continue;
                 };
 
-                let provider = match SafeTensorsProvider::load(&model_dir) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!(
-                            "  ✗ failed to load weights from {}: {e}",
-                            model_dir.display()
-                        );
-                        continue;
+                if !cached_providers.contains_key(&model_dir) {
+                    match SafeTensorsProvider::load(&model_dir) {
+                        Ok(p) => {
+                            cached_providers.insert(model_dir.clone(), p);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  ✗ failed to load weights from {}: {e}",
+                                model_dir.display()
+                            );
+                            continue;
+                        }
                     }
-                };
+                }
+                let provider = cached_providers.get(&model_dir).unwrap();
 
                 for (config_name, gpu_config) in &configs {
                     eprintln!("  Metal/{config_name}: {}...", model_cfg.name);
@@ -890,24 +989,9 @@ fn main() -> Result<()> {
             }
 
             // ── Perplexity evaluation on Metal ──
-            if cli.perplexity {
+            if let Some(dataset) = &ppl_dataset {
                 eprintln!("\n  Metal Perplexity Evaluation");
                 eprintln!("  {}", "─".repeat(40));
-
-                let dataset = match perplexity::PerplexityDataset::load(&cli.perplexity_dataset) {
-                    Ok(ds) => {
-                        eprintln!(
-                            "  Dataset: {} ({} seqs × {} tokens)",
-                            ds.name, ds.num_sequences, ds.seq_len
-                        );
-                        ds
-                    }
-                    Err(e) => {
-                        eprintln!("  ✗ Failed to load dataset: {e}");
-                        eprintln!("  Run: python scripts/prepare-quality-dataset.py");
-                        return Ok(());
-                    }
-                };
 
                 let model_cfg = matrix.models.first().unwrap();
                 let first_is_bundle = model_cfg
@@ -923,8 +1007,13 @@ fn main() -> Result<()> {
                         model_cfg.path.parent().unwrap().to_path_buf()
                     };
 
-                    let provider = SafeTensorsProvider::load(&model_dir)
-                        .map_err(|e| anyhow::anyhow!("weight load: {e}"))?;
+                    // Reuse cached provider if already loaded during latency benchmarks.
+                    if !cached_providers.contains_key(&model_dir) {
+                        let p = SafeTensorsProvider::load(&model_dir)
+                            .map_err(|e| anyhow::anyhow!("weight load: {e}"))?;
+                        cached_providers.insert(model_dir.clone(), p);
+                    }
+                    let provider = cached_providers.get(&model_dir).unwrap();
 
                     for (config_name, gpu_config) in &configs {
                         eprintln!("  Evaluating {config_name}...");
@@ -1301,104 +1390,98 @@ fn main() -> Result<()> {
     }
 
     if cli.quality {
-        run_quality_eval(&matrix);
+        run_quality_eval(&matrix, &parsed_programs);
     }
 
     // Perplexity evaluation — measure model quality via cross-entropy on text corpus
     #[cfg(feature = "ane-direct")]
     if cli.perplexity {
-        use ironmill_inference::ane::{AneInference, HardwareAneDevice};
-        use std::sync::Arc;
+        if let Some(dataset) = &ppl_dataset {
+            use ironmill_inference::ane::{AneInference, HardwareAneDevice};
+            use std::sync::Arc;
 
-        eprintln!("\nRunning perplexity evaluation...");
+            eprintln!("\nRunning ANE perplexity evaluation...");
 
-        let dataset = match perplexity::PerplexityDataset::load(&cli.perplexity_dataset) {
-            Ok(ds) => {
-                eprintln!(
-                    "  Dataset: {} ({} sequences, {} tokens each)",
-                    ds.name, ds.num_sequences, ds.seq_len
-                );
-                ds
-            }
-            Err(e) => {
-                eprintln!(
-                    "  ✗ Failed to load dataset '{}': {e}",
-                    cli.perplexity_dataset.display()
-                );
-                eprintln!("  Run: python scripts/prepare-quality-dataset.py");
-                return Ok(());
-            }
-        };
+            // Build an optimized program from the first model config
+            let model_cfg = match matrix.models.first() {
+                Some(m) => m,
+                None => {
+                    eprintln!("  ✗ No model configured. Use --model <path.onnx>");
+                    return Ok(());
+                }
+            };
+            let opt_cfg = &matrix.optimizations[0]; // baseline
 
-        // Build an optimized program from the first model config
-        let model_cfg = match matrix.models.first() {
-            Some(m) => m,
-            None => {
-                eprintln!("  ✗ No model configured. Use --model <path.onnx>");
-                return Ok(());
-            }
-        };
-        let opt_cfg = &matrix.optimizations[0]; // baseline
+            eprintln!("  Model: {} ({})", model_cfg.name, model_cfg.path.display());
+            eprintln!(
+                "  Evaluating {} sequences...",
+                cli.perplexity_sequences.min(dataset.num_sequences)
+            );
 
-        eprintln!("  Model: {} ({})", model_cfg.name, model_cfg.path.display());
-        eprintln!(
-            "  Evaluating {} sequences...",
-            cli.perplexity_sequences.min(dataset.num_sequences)
-        );
-
-        let program = match compiler::build_optimized_program(model_cfg, opt_cfg) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("  ✗ Failed to build program: {e}");
-                return Ok(());
-            }
-        };
-
-        let device = Arc::new(HardwareAneDevice::new().map_err(|e| anyhow::anyhow!("{e}"))?);
-
-        let compile_result = (|| -> anyhow::Result<AneInference<HardwareAneDevice>> {
-            let bundle = ironmill_compile::ane::bundle::compile_decode_bundle(
-                &program,
-                &ironmill_compile::ane::bundle::AneDecodeConfig {
-                    max_seq_len: 2048,
-                    num_heads: 32,
-                    num_kv_heads: 8,
-                    head_dim: 128,
-                    rope_theta: 1_000_000.0,
-                    eos_tokens: Vec::new(),
-                    fuse_cache_write: false,
-                    enable_qjl: false,
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("compile failed: {e}"))?;
-            let tmp = tempfile::tempdir()?;
-            let bundle_path = tmp.path().join("model.ironml");
-            bundle
-                .save(&bundle_path)
-                .map_err(|e| anyhow::anyhow!("save failed: {e}"))?;
-            AneInference::from_bundle(device, &bundle_path, None, 33)
-                .map_err(|e| anyhow::anyhow!("load failed: {e}"))
-        })();
-
-        match compile_result {
-            Ok(mut inference) => {
-                match perplexity::evaluate_perplexity(
-                    &mut inference,
-                    &dataset,
-                    Some(cli.perplexity_sequences),
-                ) {
-                    Ok(mut result) => {
-                        result.config_name = format!("{} ({})", model_cfg.name, opt_cfg.name);
-                        eprintln!();
-                        eprint!("{}", perplexity::format_perplexity_table(&[result]));
-                    }
+            let program = if let Some(prog) = parsed_programs.get(&model_cfg.name) {
+                match compiler::build_optimized_program_from(prog, opt_cfg) {
+                    Ok(p) => p,
                     Err(e) => {
-                        eprintln!("  ✗ Perplexity evaluation failed: {e}");
+                        eprintln!("  ✗ Failed to build program: {e}");
+                        return Ok(());
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("  ✗ Failed to compile ANE inference: {e}");
+            } else {
+                match compiler::build_optimized_program(model_cfg, opt_cfg) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("  ✗ Failed to build program: {e}");
+                        return Ok(());
+                    }
+                }
+            };
+
+            let device = Arc::new(HardwareAneDevice::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+
+            let compile_result = (|| -> anyhow::Result<AneInference<HardwareAneDevice>> {
+                let bundle = ironmill_compile::ane::bundle::compile_decode_bundle(
+                    &program,
+                    &ironmill_compile::ane::bundle::AneDecodeConfig {
+                        max_seq_len: 2048,
+                        num_heads: 32,
+                        num_kv_heads: 8,
+                        head_dim: 128,
+                        rope_theta: 1_000_000.0,
+                        eos_tokens: Vec::new(),
+                        fuse_cache_write: false,
+                        enable_qjl: false,
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("compile failed: {e}"))?;
+                let tmp = tempfile::tempdir()?;
+                let bundle_path = tmp.path().join("model.ironml");
+                bundle
+                    .save(&bundle_path)
+                    .map_err(|e| anyhow::anyhow!("save failed: {e}"))?;
+                AneInference::from_bundle(device, &bundle_path, None, 33)
+                    .map_err(|e| anyhow::anyhow!("load failed: {e}"))
+            })();
+
+            match compile_result {
+                Ok(mut inference) => {
+                    match perplexity::evaluate_perplexity(
+                        &mut inference,
+                        dataset,
+                        Some(cli.perplexity_sequences),
+                    ) {
+                        Ok(mut result) => {
+                            result.config_name = format!("{} ({})", model_cfg.name, opt_cfg.name);
+                            eprintln!();
+                            eprint!("{}", perplexity::format_perplexity_table(&[result]));
+                        }
+                        Err(e) => {
+                            eprintln!("  ✗ Perplexity evaluation failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  ✗ Failed to compile ANE inference: {e}");
+                }
             }
         }
     }

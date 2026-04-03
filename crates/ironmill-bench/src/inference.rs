@@ -98,6 +98,11 @@ fn current_rss() -> u64 {
 }
 
 /// Run inference on a compiled CoreML model and return per-iteration latencies.
+///
+/// Loads the model once and runs all iterations on it. If you need to run
+/// multiple independent "runs", call this once with the full iteration count
+/// or use [`run_inference_on_model`] to reuse an already-loaded model.
+#[allow(dead_code)]
 pub fn run_inference(
     mlmodelc_path: &Path,
     compute_units: ComputeUnits,
@@ -119,20 +124,90 @@ pub fn run_inference(
     let desc = model.input_description()?;
     let input = build_dummy_input(&desc)?;
 
-    for _ in 0..warmup {
-        model.predict(&input)?;
+    let run_result = run_inference_on_model(&model, &input, iterations, warmup)?;
+
+    let mut result = run_result;
+    result.load_time = load_time;
+    result.memory = Some(MemoryMetrics {
+        rss_before_load,
+        rss_after_load,
+        peak_rss: result
+            .memory
+            .as_ref()
+            .map_or(rss_after_load, |m| m.peak_rss),
+        model_file_size,
+    });
+
+    Ok(result)
+}
+
+/// Run multiple independent benchmark runs on the same compiled CoreML model,
+/// loading it only once.
+///
+/// Returns one [`InferenceResult`] per run. The `load_time` in each result
+/// reflects the single model load (not per-run).
+pub fn run_inference_multi_run(
+    mlmodelc_path: &Path,
+    compute_units: ComputeUnits,
+    iterations: usize,
+    warmup: usize,
+    runs: usize,
+) -> Result<(Vec<InferenceResult>, std::time::Duration)> {
+    let model_file_size = std::fs::metadata(mlmodelc_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let rss_before_load = current_rss();
+
+    let load_start = Instant::now();
+    let model = Model::load(mlmodelc_path, compute_units)?;
+    let load_time = load_start.elapsed();
+
+    let rss_after_load = current_rss();
+
+    let desc = model.input_description()?;
+    let input = build_dummy_input(&desc)?;
+
+    let mut results = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let mut run_result = run_inference_on_model(&model, &input, iterations, warmup)?;
+        run_result.load_time = load_time;
+        run_result.memory = Some(MemoryMetrics {
+            rss_before_load,
+            rss_after_load,
+            peak_rss: run_result
+                .memory
+                .as_ref()
+                .map_or(rss_after_load, |m| m.peak_rss),
+            model_file_size,
+        });
+        results.push(run_result);
     }
 
+    Ok((results, load_time))
+}
+
+/// Run inference iterations on an already-loaded model.
+fn run_inference_on_model(
+    model: &Model,
+    input: &ironmill_inference::coreml_runtime::PredictionInput,
+    iterations: usize,
+    warmup: usize,
+) -> Result<InferenceResult> {
+    for _ in 0..warmup {
+        model.predict(input)?;
+    }
+
+    let rss_baseline = current_rss();
     let mut latencies = Vec::with_capacity(iterations);
     let mut total_iteration_times = Vec::with_capacity(iterations);
-    let mut peak_rss = rss_after_load;
+    let mut peak_rss = rss_baseline;
 
     for i in 0..iterations {
         let iter_start = Instant::now();
 
-        // Predict phase
         let predict_start = Instant::now();
-        model.predict(&input)?;
+        model.predict(input)?;
         let predict_time = predict_start.elapsed();
 
         let iter_time = iter_start.elapsed();
@@ -140,7 +215,6 @@ pub fn run_inference(
         latencies.push(predict_time);
         total_iteration_times.push(iter_time);
 
-        // Sample RSS periodically (every 100 iterations)
         if i % 100 == 0 {
             let rss = current_rss();
             if rss > peak_rss {
@@ -159,18 +233,16 @@ pub fn run_inference(
         total_iteration_times,
     };
 
-    let memory = MemoryMetrics {
-        rss_before_load,
-        rss_after_load,
-        peak_rss,
-        model_file_size,
-    };
-
     Ok(InferenceResult {
         latencies,
-        load_time,
+        load_time: Duration::ZERO,
         utilization: Some(utilization),
-        memory: Some(memory),
+        memory: Some(MemoryMetrics {
+            rss_before_load: 0,
+            rss_after_load: 0,
+            peak_rss,
+            model_file_size: 0,
+        }),
     })
 }
 
