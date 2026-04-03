@@ -209,9 +209,15 @@ mod tests {
 
     #[test]
     fn cross_entropy_out_of_range() {
+        // Out-of-range target falls back to ln(vocab_size) — the cross-entropy
+        // of a uniform distribution over the vocabulary.
         let logits = vec![1.0, 2.0, 3.0];
         let ce = cross_entropy(&logits, 100);
-        assert_eq!(ce, 0.0, "Out-of-range target should return 0");
+        let expected = (logits.len() as f64).ln();
+        assert!(
+            (ce - expected).abs() < 1e-10,
+            "Out-of-range target should return ln(vocab_size), got {ce}"
+        );
     }
 
     #[test]
