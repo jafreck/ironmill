@@ -69,15 +69,13 @@ kernel void affine_matvec_int4(
         float z1 = float(zeros[scale_row + g1]);
         float w1 = (float(hi) - z1) * s1;
 
-        // AWQ compensation handled offline by norm fusion
-
         if (has_awq) {
-            w0 /= float(awq_scales[k2]);
-            w1 /= float(awq_scales[k2 + 1]);
+            acc += (float(A[k2]) / float(awq_scales[k2])) * w0;
+            acc += (float(A[k2 + 1]) / float(awq_scales[k2 + 1])) * w1;
+        } else {
+            acc += float(A[k2])     * w0;
+            acc += float(A[k2 + 1]) * w1;
         }
-
-        acc += float(A[k2])     * w0;
-        acc += float(A[k2 + 1]) * w1;
     }
 
     acc = simd_sum(acc);
@@ -123,13 +121,17 @@ kernel void affine_matmul_int4(
     float acc = 0.0f;
 
     for (uint k_base = 0; k_base < K; k_base += TILE_K) {
-        // Load A tile
+        // Load A tile (apply AWQ 1/s to activations if needed)
         for (uint i = thread_idx; i < TILE_M * TILE_K; i += total_threads) {
             uint a_row = i / TILE_K;
             uint a_col = i % TILE_K;
             uint g_row = group_id.y * TILE_M + a_row;
             uint g_col = k_base + a_col;
-            tg_a[i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+            half a_val = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+            if (has_awq && g_col < K) {
+                a_val = half(float(a_val) / float(awq_scales[g_col]));
+            }
+            tg_a[i] = a_val;
         }
 
         // Load & dequantize B tile
@@ -149,9 +151,6 @@ kernel void affine_matmul_int4(
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(nibble) - z) * s);
-                if (has_awq) {
-                    val = half(float(val) / float(awq_scales[g_k]));
-                }
             }
             tg_b[i] = val;
         }
@@ -209,8 +208,9 @@ kernel void affine_matvec_int8(
         float s = float(scales[scale_row + grp]);
         float z = float(zeros[scale_row + grp]);
         float w = (float(q) - z) * s;
-        if (has_awq) { w /= float(awq_scales[k]); }
-        acc += float(A[k]) * w;
+        float a_val = float(A[k]);
+        if (has_awq) { a_val /= float(awq_scales[k]); }
+        acc += a_val * w;
     }
 
     acc = simd_sum(acc);
@@ -255,13 +255,17 @@ kernel void affine_matmul_int8(
     float acc = 0.0f;
 
     for (uint k_base = 0; k_base < K; k_base += TILE_K) {
-        // Load A tile
+        // Load A tile (apply AWQ 1/s to activations if needed)
         for (uint i = thread_idx; i < TILE_M * TILE_K; i += total_threads) {
             uint a_row = i / TILE_K;
             uint a_col = i % TILE_K;
             uint g_row = group_id.y * TILE_M + a_row;
             uint g_col = k_base + a_col;
-            tg_a[i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+            half a_val = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+            if (has_awq && g_col < K) {
+                a_val = half(float(a_val) / float(awq_scales[g_col]));
+            }
+            tg_a[i] = a_val;
         }
 
         // Load & dequantize B tile
@@ -278,9 +282,6 @@ kernel void affine_matmul_int8(
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(q) - z) * s);
-                if (has_awq) {
-                    val = half(float(val) / float(awq_scales[g_k]));
-                }
             }
             tg_b[i] = val;
         }
