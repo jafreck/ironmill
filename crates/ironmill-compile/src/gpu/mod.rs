@@ -40,6 +40,7 @@ pub struct GpuCompileBuilder {
     input: PathBuf,
     n_bits: u8,
     min_elements: usize,
+    pipeline: Option<PassPipeline>,
 }
 
 impl GpuCompileBuilder {
@@ -48,7 +49,17 @@ impl GpuCompileBuilder {
             input: input.into(),
             n_bits: 4,
             min_elements: 1024,
+            pipeline: None,
         }
+    }
+
+    /// Set a custom pass pipeline for quantization/optimization.
+    ///
+    /// When set, this pipeline replaces the default PolarQuant passes.
+    /// The caller controls what quantization is applied (INT4, INT8, AWQ, etc.).
+    pub fn with_pass_pipeline(mut self, pipeline: PassPipeline) -> Self {
+        self.pipeline = Some(pipeline);
+        self
     }
 
     /// Set the PolarQuant bit-width (must be 2 or 4).
@@ -71,7 +82,7 @@ impl GpuCompileBuilder {
     /// 2. Import to MIL IR [`Program`]
     /// 3. Run `PassPipeline` with PolarQuant passes
     /// 4. Extract a [`MilWeightProvider`] from the quantized program
-    pub fn build(self) -> Result<MilWeightProvider, CompileError> {
+    pub fn build(mut self) -> Result<MilWeightProvider, CompileError> {
         let input = &self.input;
 
         if !input.exists() {
@@ -84,6 +95,12 @@ impl GpuCompileBuilder {
         // 1. Detect format and import to Program + ModelConfig
         let format = detect_format(input);
 
+        // If a custom pipeline is set, route everything through MIL IR.
+        if let Some(pipeline) = self.pipeline.take() {
+            return self.build_with_pipeline(input, format, pipeline);
+        }
+
+        // Legacy path: default PolarQuant behavior
         match format {
             InputFormat::Onnx => {
                 // ONNX: import → run passes → extract via MilWeightProvider.
@@ -130,6 +147,49 @@ impl GpuCompileBuilder {
                  Expected .onnx, .safetensors, .gguf, or a directory containing config.json."
             ))),
         }
+    }
+
+    /// Unified build path: import to MIL IR → run pipeline → extract provider.
+    fn build_with_pipeline(
+        &self,
+        input: &Path,
+        format: InputFormat,
+        pipeline: PassPipeline,
+    ) -> Result<MilWeightProvider, CompileError> {
+        let (mut program, config, base_provider) = match format {
+            InputFormat::Onnx => {
+                let (program, config) = import_onnx(input)?;
+                (program, config, None)
+            }
+            InputFormat::SafeTensors | InputFormat::Gguf => {
+                let base_provider: Box<dyn WeightProvider> = match format {
+                    InputFormat::SafeTensors => {
+                        Box::new(crate::weights::SafeTensorsProvider::load(input)?)
+                    }
+                    InputFormat::Gguf => Box::new(crate::weights::GgufProvider::load(input)?),
+                    _ => unreachable!(),
+                };
+                let config = base_provider.config().clone();
+                let result = crate::templates::weights_to_program(base_provider.as_ref())?;
+                (result.program, config, Some(base_provider))
+            }
+            InputFormat::Unsupported(ext) => {
+                return Err(CompileError::Other(format!(
+                    "unsupported input format '{ext}' for GPU compile. \
+                     Expected .onnx, .safetensors, .gguf, or a directory containing config.json."
+                )));
+            }
+        };
+
+        let _report = pipeline.run(&mut program)?;
+        let mut provider = MilWeightProvider::new(&program, config)?;
+
+        // Supplement any tensors the template system didn't emit
+        if let Some(base) = base_provider.as_ref() {
+            provider.supplement_from(base.as_ref())?;
+        }
+
+        Ok(provider)
     }
 }
 
@@ -281,6 +341,7 @@ mod tests {
         assert_eq!(builder.input, PathBuf::from("model.onnx"));
         assert_eq!(builder.n_bits, 4);
         assert_eq!(builder.min_elements, 1024);
+        assert!(builder.pipeline.is_none());
     }
 
     #[test]

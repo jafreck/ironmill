@@ -338,6 +338,35 @@ impl MilWeightProvider {
 
         Ok(Self { tensors, config })
     }
+
+    /// Copy any tensors from `source` that are not already present in this provider.
+    ///
+    /// Used to preserve architecture-specific weight tensors that the template
+    /// system may not emit (e.g. `q_norm`, `k_norm`). Supplemented tensors are
+    /// added without quantization since the pass pipeline only transforms
+    /// tensors emitted by the template.
+    pub fn supplement_from(&mut self, source: &dyn WeightProvider) -> Result<(), MilError> {
+        let existing: std::collections::HashSet<String> = self
+            .tensor_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        for name in source.tensor_names() {
+            if !existing.contains(name) {
+                let t = source.tensor(name)?;
+                self.tensors.insert(
+                    name.to_string(),
+                    ExtractedTensor {
+                        data: t.data.into_owned(),
+                        shape: t.shape,
+                        dtype: t.dtype,
+                        quant_info: t.quant_info,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WeightProvider for MilWeightProvider {
