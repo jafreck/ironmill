@@ -720,31 +720,23 @@ fn main() -> Result<()> {
                         for run_idx in 0..matrix.settings.runs {
                             engine.reset();
 
-                            if let Err(e) = engine.prefill(&prompt_tokens) {
+                            // Build warmup context: prefill prompt + synthetic tokens in one
+                            // batched call instead of sequential decode steps. Uses the
+                            // matmul path which is much faster than N individual decode steps.
+                            let warmup_tokens: Vec<u32> = if matrix.settings.warmup > 0 {
+                                let mut tokens = prompt_tokens.clone();
+                                tokens.resize(prompt_tokens.len() + matrix.settings.warmup, 9707);
+                                tokens
+                            } else {
+                                prompt_tokens.clone()
+                            };
+
+                            if let Err(e) = engine.prefill(&warmup_tokens) {
                                 eprintln!("  ✗ prefill failed: {e}");
                                 continue;
                             }
 
-                            let mut last_token = prompt_tokens.last().copied().unwrap_or(0);
-                            for _ in 0..matrix.settings.warmup {
-                                match engine.decode_step(last_token) {
-                                    Ok(logits) => {
-                                        last_token = logits
-                                            .iter()
-                                            .enumerate()
-                                            .max_by(|(_, a), (_, b)| {
-                                                a.partial_cmp(b)
-                                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                            })
-                                            .map(|(i, _)| i as u32)
-                                            .unwrap_or(0);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("  ✗ warmup decode failed: {e}");
-                                        break;
-                                    }
-                                }
-                            }
+                            let mut last_token = warmup_tokens.last().copied().unwrap_or(0);
 
                             let mut latencies = Vec::with_capacity(matrix.settings.iterations);
                             for _ in 0..matrix.settings.iterations {
@@ -866,7 +858,7 @@ fn main() -> Result<()> {
 
                     let load_start = std::time::Instant::now();
                     let gpu_before = engine.gpu_allocated_bytes();
-                    if let Err(e) = engine.load_weights(&provider, gpu_config.clone()) {
+                    if let Err(e) = engine.load_weights(provider, gpu_config.clone()) {
                         eprintln!("  ✗ Metal model load failed: {e}");
                         continue;
                     }
@@ -885,32 +877,22 @@ fn main() -> Result<()> {
                     for run_idx in 0..matrix.settings.runs {
                         engine.reset();
 
-                        // Prefill
-                        if let Err(e) = engine.prefill(&prompt_tokens) {
+                        // Build warmup context: prefill prompt + synthetic tokens in one
+                        // batched call instead of sequential decode steps.
+                        let warmup_tokens: Vec<u32> = if matrix.settings.warmup > 0 {
+                            let mut tokens = prompt_tokens.clone();
+                            tokens.resize(prompt_tokens.len() + matrix.settings.warmup, 9707);
+                            tokens
+                        } else {
+                            prompt_tokens.clone()
+                        };
+
+                        if let Err(e) = engine.prefill(&warmup_tokens) {
                             eprintln!("  ✗ prefill failed: {e}");
                             continue;
                         }
 
-                        // Warmup decode steps
-                        let mut last_token = prompt_tokens.last().copied().unwrap_or(0);
-                        for _ in 0..matrix.settings.warmup {
-                            match engine.decode_step(last_token) {
-                                Ok(logits) => {
-                                    last_token = logits
-                                        .iter()
-                                        .enumerate()
-                                        .max_by(|(_, a), (_, b)| {
-                                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                                        })
-                                        .map(|(i, _)| i as u32)
-                                        .unwrap_or(0);
-                                }
-                                Err(e) => {
-                                    eprintln!("  ✗ warmup decode failed: {e}");
-                                    break;
-                                }
-                            }
-                        }
+                        let mut last_token = warmup_tokens.last().copied().unwrap_or(0);
 
                         // Timed decode steps
                         let mut latencies = Vec::with_capacity(matrix.settings.iterations);
@@ -1022,7 +1004,7 @@ fn main() -> Result<()> {
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         let gpu_before = engine.gpu_allocated_bytes();
                         engine
-                            .load_weights(&provider, gpu_config.clone())
+                            .load_weights(provider, gpu_config.clone())
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         let gpu_after = engine.gpu_allocated_bytes();
                         let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
@@ -1267,7 +1249,7 @@ fn main() -> Result<()> {
                 };
 
                 let load_start = std::time::Instant::now();
-                if let Err(e) = engine.load_weights(&provider, mlx_config) {
+                if let Err(e) = engine.load_weights(provider, mlx_config) {
                     eprintln!("  ✗ MLX weight load failed: {e}");
                     continue;
                 }
@@ -1280,30 +1262,22 @@ fn main() -> Result<()> {
                 for run_idx in 0..matrix.settings.runs {
                     engine.reset();
 
-                    if let Err(e) = engine.prefill(&prompt_tokens) {
+                    // Build warmup context: prefill prompt + synthetic tokens in one
+                    // batched call instead of sequential decode steps.
+                    let warmup_tokens: Vec<u32> = if matrix.settings.warmup > 0 {
+                        let mut tokens = prompt_tokens.clone();
+                        tokens.resize(prompt_tokens.len() + matrix.settings.warmup, 9707);
+                        tokens
+                    } else {
+                        prompt_tokens.clone()
+                    };
+
+                    if let Err(e) = engine.prefill(&warmup_tokens) {
                         eprintln!("  ✗ prefill failed: {e}");
                         continue;
                     }
 
-                    let mut last_token = prompt_tokens.last().copied().unwrap_or(0);
-                    for _ in 0..matrix.settings.warmup {
-                        match engine.decode_step(last_token) {
-                            Ok(logits) => {
-                                last_token = logits
-                                    .iter()
-                                    .enumerate()
-                                    .max_by(|(_, a), (_, b)| {
-                                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                                    })
-                                    .map(|(i, _)| i as u32)
-                                    .unwrap_or(0);
-                            }
-                            Err(e) => {
-                                eprintln!("  ✗ warmup decode failed: {e}");
-                                break;
-                            }
-                        }
-                    }
+                    let mut last_token = warmup_tokens.last().copied().unwrap_or(0);
 
                     let mut latencies = Vec::with_capacity(matrix.settings.iterations);
                     for _ in 0..matrix.settings.iterations {
