@@ -48,6 +48,18 @@ pub enum TensorManifest {
         shape: Vec<usize>,
         dtype: String,
     },
+    /// Affine-quantized tensor (packed INT4/INT8 data + scales + zero points).
+    #[serde(rename = "affine_dequantize")]
+    AffineDequantize {
+        quantized_data_file: String,
+        scales_file: String,
+        zeros_file: String,
+        shape: Vec<usize>,
+        bit_width: u8,
+        group_size: usize,
+        axis: i64,
+        dtype: String,
+    },
 }
 
 // ── ScalarType string helpers ───────────────────────────────────────────

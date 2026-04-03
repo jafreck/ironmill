@@ -10,9 +10,12 @@
 //! model.ironml-gpu/
 //! ├── manifest.json
 //! └── weights/
-//!     ├── <tensor>.bin    # packed indices or dense FP16
-//!     ├── <tensor>.lut    # LUT values (raw bytes)
-//!     └── <tensor>.nrm    # row norms (raw bytes)
+//!     ├── <tensor>.bin     # packed indices or dense FP16
+//!     ├── <tensor>.lut     # LUT values (raw bytes)
+//!     ├── <tensor>.nrm     # row norms (raw bytes)
+//!     ├── <tensor>.qdata   # packed quantized data (INT4/INT8)
+//!     ├── <tensor>.scale   # per-group scales (FP16)
+//!     └── <tensor>.zeros   # per-group zero points (FP16)
 //! ```
 
 use std::collections::HashMap;
@@ -57,6 +60,7 @@ pub fn write_gpu_bundle(
 
     let mut tensors = HashMap::new();
     let mut global_n_bits: Option<u8> = None;
+    let mut methods_seen = std::collections::HashSet::new();
 
     for name in &tensor_names {
         let tensor = provider.tensor(name)?;
@@ -72,6 +76,8 @@ pub fn write_gpu_bundle(
                 row_norms,
                 ..
             } => {
+                methods_seen.insert("polarquant");
+
                 match global_n_bits {
                     None => global_n_bits = Some(*n_bits),
                     Some(prev) if prev != *n_bits => {
@@ -116,16 +122,59 @@ pub fn write_gpu_bundle(
                     },
                 );
             }
-            QuantizationInfo::AffineDequantize { .. } => {
-                // AffineDequantize tensors are stored as dense for GPU bundles.
-                let file = format!("weights/{sanitized}.bin");
-                fs::write(output_dir.join(&file), &*tensor.data)?;
+            QuantizationInfo::AffineDequantize {
+                scale,
+                zero_point,
+                axis,
+                bit_width,
+                group_size,
+                ..
+            } => {
+                let group_size = group_size.ok_or_else(|| {
+                    CompileError::Other(format!(
+                        "tensor '{name}' has per-tensor/per-channel affine quantization \
+                         (group_size=None), which is not supported in GPU bundles. \
+                         Only per-group quantization is supported."
+                    ))
+                })?;
+                let axis = axis.ok_or_else(|| {
+                    CompileError::Other(format!(
+                        "tensor '{name}' has per-tensor affine quantization \
+                         (axis=None), which is not supported in GPU bundles."
+                    ))
+                })?;
+
+                methods_seen.insert("affine");
+
+                match global_n_bits {
+                    None => global_n_bits = Some(*bit_width),
+                    Some(prev) if prev != *bit_width => {
+                        eprintln!(
+                            "Warning: tensor '{name}' has bit_width={} but global_n_bits is already {prev}",
+                            bit_width
+                        );
+                    }
+                    _ => {}
+                }
+
+                let qdata_file = format!("weights/{sanitized}.qdata");
+                let scales_file = format!("weights/{sanitized}.scale");
+                let zeros_file = format!("weights/{sanitized}.zeros");
+
+                fs::write(output_dir.join(&qdata_file), &*tensor.data)?;
+                fs::write(output_dir.join(&scales_file), scale)?;
+                fs::write(output_dir.join(&zeros_file), zero_point)?;
 
                 tensors.insert(
                     name.to_string(),
-                    TensorManifest::Dense {
-                        file,
+                    TensorManifest::AffineDequantize {
+                        quantized_data_file: qdata_file,
+                        scales_file,
+                        zeros_file,
                         shape: tensor.shape.clone(),
+                        bit_width: *bit_width,
+                        group_size,
+                        axis: axis as i64,
                         dtype: scalar_type_to_str(tensor.dtype).to_string(),
                     },
                 );
@@ -133,11 +182,17 @@ pub fn write_gpu_bundle(
         }
     }
 
+    let method = match methods_seen.len() {
+        0 => "none".to_string(),
+        1 => methods_seen.into_iter().next().unwrap().to_string(),
+        _ => "mixed".to_string(),
+    };
+
     let manifest = GpuBundleManifest {
         format_version: 1,
         model_config: serialize_model_config(config),
         quantization: QuantizationManifest {
-            method: "polarquant".to_string(),
+            method,
             n_bits: global_n_bits.unwrap_or(4),
             seed: 42,
             min_elements: 1024,
@@ -249,6 +304,25 @@ mod tests {
             },
         );
 
+        // An affine-quantized tensor (AffineDequantize)
+        tensors.insert(
+            "model.layers.0.mlp.gate_proj.weight".to_string(),
+            OwnedTensor {
+                data: vec![0xCC; 32], // packed INT4 data
+                shape: vec![2048, 2048],
+                dtype: ScalarType::UInt8,
+                quant_info: QuantizationInfo::AffineDequantize {
+                    scale: vec![0xDD; 16],
+                    zero_point: vec![0xEE; 16],
+                    scale_dtype: ScalarType::Float16,
+                    zero_point_dtype: ScalarType::Float16,
+                    axis: Some(1),
+                    bit_width: 4,
+                    group_size: Some(128),
+                },
+            },
+        );
+
         MockProvider {
             tensors,
             config: test_config(),
@@ -343,9 +417,9 @@ mod tests {
         let manifest: GpuBundleManifest = serde_json::from_str(&json).unwrap();
 
         assert_eq!(manifest.format_version, 1);
-        assert_eq!(manifest.quantization.method, "polarquant");
+        assert_eq!(manifest.quantization.method, "mixed");
         assert_eq!(manifest.quantization.n_bits, 4);
-        assert_eq!(manifest.tensors.len(), 2);
+        assert_eq!(manifest.tensors.len(), 3);
 
         // Verify the quantized tensor descriptor
         let q_desc = &manifest.tensors["model.layers.0.self_attn.q_proj.weight"];
@@ -417,6 +491,69 @@ mod tests {
             let s = scalar_type_to_str(ty);
             let restored = str_to_scalar_type(s).unwrap();
             assert_eq!(restored, ty, "round-trip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn write_affine_quantized_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("test.ironml-gpu");
+        let provider = mock_provider();
+        write_gpu_bundle(&provider, &bundle_path).unwrap();
+
+        let base = "model_layers_0_mlp_gate_proj_weight";
+        assert!(bundle_path.join(format!("weights/{base}.qdata")).exists());
+        assert!(bundle_path.join(format!("weights/{base}.scale")).exists());
+        assert!(bundle_path.join(format!("weights/{base}.zeros")).exists());
+
+        assert_eq!(
+            fs::read(bundle_path.join(format!("weights/{base}.qdata"))).unwrap(),
+            vec![0xCC; 32]
+        );
+        assert_eq!(
+            fs::read(bundle_path.join(format!("weights/{base}.scale"))).unwrap(),
+            vec![0xDD; 16]
+        );
+        assert_eq!(
+            fs::read(bundle_path.join(format!("weights/{base}.zeros"))).unwrap(),
+            vec![0xEE; 16]
+        );
+
+        // Check manifest
+        let json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
+        let manifest: GpuBundleManifest = serde_json::from_str(&json).unwrap();
+
+        let desc = &manifest.tensors["model.layers.0.mlp.gate_proj.weight"];
+        match desc {
+            TensorManifest::AffineDequantize {
+                quantized_data_file,
+                scales_file,
+                zeros_file,
+                bit_width,
+                group_size,
+                axis,
+                dtype,
+                shape,
+            } => {
+                assert_eq!(
+                    quantized_data_file,
+                    "weights/model_layers_0_mlp_gate_proj_weight.qdata"
+                );
+                assert_eq!(
+                    scales_file,
+                    "weights/model_layers_0_mlp_gate_proj_weight.scale"
+                );
+                assert_eq!(
+                    zeros_file,
+                    "weights/model_layers_0_mlp_gate_proj_weight.zeros"
+                );
+                assert_eq!(*bit_width, 4);
+                assert_eq!(*group_size, 128);
+                assert_eq!(*axis, 1);
+                assert_eq!(dtype, "uint8");
+                assert_eq!(shape, &[2048, 2048]);
+            }
+            _ => panic!("expected AffineDequantize"),
         }
     }
 
