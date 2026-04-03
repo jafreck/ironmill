@@ -295,11 +295,14 @@ impl MetalInference {
         self.decode_matmuls = None;
 
         if self.config.enable_turboquant {
-            // Outlier channel strategy (§4.3): detect high-energy channels
-            // from K/V projection weights and quantize them at higher precision.
-            // At INT4, this splits into 4-bit outlier / 3-bit non-outlier groups,
-            // each with independent (b-1)-bit K codebook + QJL sign correction.
-            let outlier_cfg: Option<OutlierConfig> = if self.config.n_bits == 4 {
+            // Algorithm selection:
+            // - b >= 4: Algorithm 1 (full b-bit codebook for K and V, no QJL).
+            //   Standard path only — outlier separation not needed.
+            // - b < 4: Algorithm 2 ((b-1)-bit K codebook + QJL). Outlier
+            //   channel strategy (§4.3) auto-detects high-energy channels
+            //   for independent quantization per group.
+            let use_qjl = self.config.n_bits < 4;
+            let outlier_cfg: Option<OutlierConfig> = if use_qjl {
                 let mut weight_data: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 for layer in 0..mc.num_hidden_layers {
                     let prefix = format!("model.layers.{layer}");
@@ -317,16 +320,13 @@ impl MetalInference {
                         .collect();
                     let out_features = mc.num_key_value_heads * mc.head_dim;
                     let n_outlier = mc.head_dim / 4;
-                    // Both groups use the target bit rate. The outlier
-                    // separation improves quality by concentrating high-energy
-                    // channels in a smaller subgroup with its own codebook.
                     Some(OutlierConfig::from_weight_norms(
                         &refs,
                         out_features,
                         mc.head_dim,
                         n_outlier,
-                        self.config.n_bits, // outlier: target rate
-                        self.config.n_bits, // non-outlier: target rate
+                        self.config.n_bits,
+                        self.config.n_bits,
                     ))
                 } else {
                     None
@@ -1902,6 +1902,7 @@ fn encode_kv_cache_and_attention(
                 enc.set_buffer(&tq.v_codebook_buf, 0, 15);
                 enc.set_buffer(&tq.qjl_matrix, 0, 16);
                 enc.set_buffer(k_r_norms, 0, 17);
+                enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 18);
                 enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
             }
         }

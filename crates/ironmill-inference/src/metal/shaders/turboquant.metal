@@ -111,7 +111,12 @@ kernel void turboquant_cache_write(
     float max_val = max(shared_reduce[0], 1e-10f);
 
     if (n_bits == 4) {
-        // ── TurboQuant Algorithm 2: Rotate → L2 norm → Quantize → QJL → Pack ──
+        // ── TurboQuant INT4: Rotate → L2 norm → Quantize → [QJL] → Pack ──
+        // Algorithm selection: if K codebook uses full b-bit (n_levels == 2^b),
+        // use Algorithm 1 (MSE only). If K codebook is reduced ((b-1)-bit),
+        // use Algorithm 2 with QJL sign correction.
+        bool use_qjl = (n_levels < (1u << n_bits));
+
         float local_sq = 0.0f;
         for (uint d = tid; d < head_dim; d += tg_size)
             local_sq += shared_rotated[d] * shared_rotated[d];
@@ -140,9 +145,8 @@ kernel void turboquant_cache_write(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // QJL residual correction (K cache only, per Algorithm 2)
-        // Sign bit is packed into bit 3 of each nibble (like outlier path).
-        if (is_k_cache == 1) {
+        // QJL residual correction (K cache only, Algorithm 2, low bit widths)
+        if (use_qjl && is_k_cache == 1) {
             // Compute quantization residual in normalized space
             for (uint d = tid; d < head_dim; d += tg_size) {
                 float normalized = shared_rotated[d] * inv_norm;
@@ -236,10 +240,11 @@ kernel void turboquant_cache_write(
 //   buffer(11) n_bits:          uint (4 or 8)
 //   buffer(12) k_scale_buf:     [num_kv_heads × max_seq_len] float
 //   buffer(13) v_scale_buf:     [num_kv_heads × max_seq_len] float
-//   buffer(14) k_codebook:      K cache codebook ((b-1)-bit levels for TurboQuant_prod)
+//   buffer(14) k_codebook:      K cache codebook
 //   buffer(15) v_codebook:      V cache codebook (b-bit levels for TurboQuant_mse)
 //   buffer(16) qjl_matrix:      [head_dim × head_dim] float
 //   buffer(17) k_r_norms:       [num_kv_heads × max_seq_len] float
+//   buffer(18) k_n_levels:      uint (K codebook levels; < 2^b means Algorithm 2 / QJL active)
 //
 // Dispatch: num_heads threadgroups, min(head_dim, 1024) threads per group.
 
@@ -262,6 +267,7 @@ kernel void turboquant_attention(
     device const float* v_codebook      [[buffer(15)]],
     device const float* qjl_matrix      [[buffer(16)]],
     device const float* k_r_norms       [[buffer(17)]],
+    constant uint& k_n_levels           [[buffer(18)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
@@ -304,8 +310,11 @@ kernel void turboquant_attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     hadamard_rotate_inplace(shared_q_rot, rotation_signs, head_dim, tid, tg_size);
 
-    // Precompute S · Q_rot for QJL correction (INT4 K only)
-    if (n_bits == 4) {
+    // Algorithm selection: QJL active when K codebook is reduced ((b-1)-bit)
+    bool use_qjl = (n_bits == 4) && (k_n_levels < (1u << n_bits));
+
+    // Precompute S · Q_rot for QJL correction (only when QJL active)
+    if (use_qjl) {
         for (uint out_d = tid; out_d < head_dim; out_d += tg_size) {
             float proj = 0.0f;
             uint row_base = out_d * head_dim;
@@ -316,8 +325,8 @@ kernel void turboquant_attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // QJL correction coefficient: √(2/π) / d
-    float qjl_factor = (n_bits == 4) ? (sqrt(3.14159265f / 2.0f) / float(head_dim)) : 0.0f;
+    // QJL correction coefficient: √(π/2) / d per Algorithm 2
+    float qjl_factor = use_qjl ? (sqrt(3.14159265f / 2.0f) / float(head_dim)) : 0.0f;
 
     // Zero output accumulator
     for (uint d = tid; d < head_dim; d += tg_size) {
@@ -356,10 +365,9 @@ kernel void turboquant_attention(
             float partial_dot = 0.0f;
             float partial_qjl = 0.0f;
 
-            // INT4: use read_quantized_tile_int4_qjl to extract (b-1)-bit
-            // codebook value and QJL sign from nibble simultaneously.
-            // INT8: standard codebook dequant, no QJL.
-            if (n_bits == 4) {
+            // K dequant: Algorithm 2 (QJL) uses masked nibble reader,
+            // Algorithm 1 uses standard full-nibble reader.
+            if (use_qjl) {
                 for (uint d = tid; d < head_dim; d += tg_size) {
                     float qjl_sign;
                     float k_val = read_quantized_tile_int4_qjl(
@@ -367,6 +375,12 @@ kernel void turboquant_attention(
                         k_codebook, qjl_sign);
                     partial_dot += shared_q_rot[d] * k_val;
                     partial_qjl += shared_s_q[d] * qjl_sign;
+                }
+            } else if (n_bits == 4) {
+                for (uint d = tid; d < head_dim; d += tg_size) {
+                    float k_val = read_quantized_tile(
+                        kv_tile_raw, p, d, head_dim, 4, k_deq, k_codebook);
+                    partial_dot += shared_q_rot[d] * k_val;
                 }
             } else {
                 for (uint d = tid; d < head_dim; d += tg_size) {
@@ -386,10 +400,9 @@ kernel void turboquant_attention(
             }
             float base_score = shared_reduce[0];
 
-            // QJL inner product correction for INT4 K cache
-            // Correction = deq_scale * ||r|| * (√(2/π)/d) * Σ (S·Q)ᵢ · sign(S·r)ᵢ
+            // QJL correction (Algorithm 2 only)
             float qjl_correction = 0.0f;
-            if (n_bits == 4) {
+            if (use_qjl) {
                 uint abs_pos = tile_start + p;
                 float r_norm = k_r_norms[kv_head * max_seq_len + abs_pos];
 

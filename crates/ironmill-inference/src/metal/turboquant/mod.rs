@@ -143,15 +143,25 @@ impl MetalTurboQuantModel {
             .create_buffer_with_data(&sign_bytes, ironmill_metal_sys::StorageMode::Shared)
             .map_err(MetalError::Metal)?;
 
-        // Per Algorithm 2 (TurboQuant_prod):
-        // - K cache: (b-1)-bit MSE codebook + 1-bit QJL sign = b bits total.
-        //   The QJL sign is packed into bit 3 of each nibble.
-        // - V cache: b-bit MSE codebook, no QJL (MSE reconstruction only).
-        assert!(
-            config.n_bits >= 2,
-            "n_bits must be >= 2 for TurboQuant (need at least 1 codebook bit + 1 QJL bit)"
-        );
-        let (k_levels, k_bounds) = codebook::lloyd_max_gaussian(config.head_dim, config.n_bits - 1);
+        // Algorithm selection based on bit width:
+        // - b >= 4: Algorithm 1 (TurboQuant_mse) for both K and V. Full b-bit
+        //   codebook. At b=4 the inner product bias is only ~0.9%, negligible
+        //   compared to QJL variance through softmax.
+        // - b < 4: Algorithm 2 (TurboQuant_prod) for K, Algorithm 1 for V.
+        //   K uses (b-1)-bit codebook + 1-bit QJL sign packed in nibble bit 3.
+        //   At low bit widths the MSE bias is significant and QJL correction
+        //   is needed for accurate attention scores.
+        let use_qjl = config.n_bits < 4;
+        let k_bits = if use_qjl {
+            assert!(
+                config.n_bits >= 2,
+                "n_bits must be >= 2 for Algorithm 2 (need 1 codebook bit + 1 QJL bit)"
+            );
+            config.n_bits - 1
+        } else {
+            config.n_bits
+        };
+        let (k_levels, k_bounds) = codebook::lloyd_max_gaussian(config.head_dim, k_bits);
         let k_n_levels = k_levels.len() as u32;
         let k_codebook_buf = create_f32_buffer(device, &k_levels)?;
         let k_boundaries_buf = create_f32_buffer(device, &k_bounds)?;
@@ -254,15 +264,23 @@ impl MetalTurboQuantModel {
         let non_outlier_codebook = create_f32_buffer(device, &n_levels_vec)?;
         let non_outlier_boundaries = create_f32_buffer(device, &n_bounds)?;
 
-        // K codebooks: (b-1)-bit MSE codebook + 1-bit QJL = b bits total
-        let (ko_levels, ko_bounds) =
-            codebook::lloyd_max_gaussian(d_outlier_padded, outlier_cfg.outlier_bits - 1);
+        // K codebooks: use Algorithm 2 ((b-1)-bit + QJL) only at low bit widths
+        let ko_bits = if outlier_cfg.outlier_bits < 4 {
+            outlier_cfg.outlier_bits - 1
+        } else {
+            outlier_cfg.outlier_bits
+        };
+        let (ko_levels, ko_bounds) = codebook::lloyd_max_gaussian(d_outlier_padded, ko_bits);
         let k_outlier_n_levels = ko_levels.len() as u32;
         let k_outlier_codebook = create_f32_buffer(device, &ko_levels)?;
         let k_outlier_boundaries = create_f32_buffer(device, &ko_bounds)?;
 
-        let (kn_levels, kn_bounds) =
-            codebook::lloyd_max_gaussian(d_non_padded, outlier_cfg.non_outlier_bits - 1);
+        let kn_bits = if outlier_cfg.non_outlier_bits < 4 {
+            outlier_cfg.non_outlier_bits - 1
+        } else {
+            outlier_cfg.non_outlier_bits
+        };
+        let (kn_levels, kn_bounds) = codebook::lloyd_max_gaussian(d_non_padded, kn_bits);
         let k_non_outlier_n_levels = kn_levels.len() as u32;
         let k_non_outlier_codebook = create_f32_buffer(device, &kn_levels)?;
         let k_non_outlier_boundaries = create_f32_buffer(device, &kn_bounds)?;
