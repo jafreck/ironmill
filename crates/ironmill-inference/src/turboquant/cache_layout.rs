@@ -59,8 +59,8 @@ impl TurboQuantCacheLayout {
         n_bits: u8,
         outlier: Option<&OutlierConfig>,
     ) -> Self {
-        let elements_per_pos = if n_bits == 4 { head_dim / 2 } else { head_dim };
-        let cache_bytes = num_kv_heads * max_seq_len * elements_per_pos;
+        let bytes_per_pos = head_dim * (n_bits as usize) / 8;
+        let cache_bytes = num_kv_heads * max_seq_len * bytes_per_pos;
         let scale_count = num_kv_heads * max_seq_len;
         let qjl_signs_bytes = num_kv_heads * max_seq_len * (head_dim / 8);
 

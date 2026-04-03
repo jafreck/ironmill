@@ -17,62 +17,103 @@ using namespace metal;
 #define HEAD_DIM_PACKED (HEAD_DIM / 2)
 #endif
 
-// ── Cache addressing ────────────────────────────────────────────
+// ── Packed cache primitives ──────────────────────────────────────
+//
+// All packing-format knowledge lives here.  Call sites never branch
+// on n_bits for addressing or element access.
+
+/// Bytes consumed by one position's worth of quantized elements.
+inline uint bytes_per_pos(uint n_bits, uint head_dim) {
+    return (n_bits < 8) ? (head_dim / (8 / n_bits)) : head_dim;
+}
 
 /// Compute the byte offset for a KV head's cache region.
 inline uint kv_cache_base(uint kv_head, uint max_seq_len, uint head_dim, uint n_bits) {
-    uint bytes_per_pos = (n_bits == 4) ? (head_dim / 2) : head_dim;
-    return kv_head * max_seq_len * bytes_per_pos;
+    return kv_head * max_seq_len * bytes_per_pos(n_bits, head_dim);
 }
 
-// ── Quantized tile readers ──────────────────────────────────────
+/// Extract one raw unsigned element from a threadgroup-shared tile.
+inline uchar read_raw_element(threadgroup const char* tile,
+                              uint pos, uint dim, uint head_dim,
+                              uint n_bits) {
+    uint bpp = bytes_per_pos(n_bits, head_dim);
+    uint byte_idx = pos * bpp + dim * n_bits / 8;
+    uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
+    uint shift = (dim * n_bits) % 8;
+    uchar mask = uchar((1u << n_bits) - 1);
+    return (packed >> shift) & mask;
+}
 
-/// Read a dequantized scalar from a threadgroup-shared KV tile.
-/// Supports both INT4 (packed nibble + codebook) and INT8 layouts.
-inline float read_quantized_tile(threadgroup const char* tile,
-                                 uint pos, uint dim, uint head_dim,
-                                 uint n_bits, float deq_scale,
-                                 device const float* codebook) {
+/// Extract one raw unsigned element from device memory.
+inline uchar read_raw_device(device const char* buf, uint base,
+                             uint pos, uint dim, uint head_dim,
+                             uint n_bits) {
+    uint bpp = bytes_per_pos(n_bits, head_dim);
+    uint byte_idx = base + pos * bpp + dim * n_bits / 8;
+    uchar packed = ((device const uchar*)buf)[byte_idx];
+    uint shift = (dim * n_bits) % 8;
+    uchar mask = uchar((1u << n_bits) - 1);
+    return (packed >> shift) & mask;
+}
+
+/// Pack a tile of quantized indices from shared_quant[0..head_dim)
+/// into device cache memory.  Handles nibble and byte layouts.
+inline void write_packed_elements(threadgroup const char* shared_quant,
+                                  device char* cache,
+                                  uint cache_base,
+                                  uint head_dim, uint n_bits,
+                                  uint tid, uint tg_size) {
     if (n_bits == 4) {
-        uint packed_stride = head_dim / 2;
-        uint byte_idx = pos * packed_stride + dim / 2;
-        uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
-        uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
-        return codebook[nibble] * deq_scale;
+        for (uint d = tid * 2; d < head_dim; d += tg_size * 2) {
+            uchar lo = uchar(shared_quant[d]     & 0xF);
+            uchar hi = (d + 1 < head_dim) ? uchar(shared_quant[d + 1] & 0xF) : 0;
+            ((device uchar*)cache)[cache_base + d / 2] = lo | (hi << 4);
+        }
     } else {
-        return float(tile[pos * head_dim + dim]) * deq_scale;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            ((device uchar*)cache)[cache_base + d] = uchar(shared_quant[d]);
+        }
     }
 }
 
-/// INT4-only variant (no n_bits branch). Used by outlier kernels
-/// which always operate in INT4 mode.
+// ── Quantized tile readers (Algorithm 2 — shared INT4/INT8) ─────
+
+/// Read a V cache element: full b-bit codebook index → centroid × scale.
+inline float read_v_tile(threadgroup const char* tile,
+                         uint pos, uint dim, uint head_dim,
+                         uint n_bits, float deq_scale,
+                         device const float* codebook) {
+    return codebook[read_raw_element(tile, pos, dim, head_dim, n_bits)] * deq_scale;
+}
+
+/// Read a K cache element: (b-1)-bit codebook index + 1-bit QJL sign.
+inline float read_k_tile_qjl(threadgroup const char* tile,
+                              uint pos, uint dim, uint head_dim,
+                              uint n_bits, float deq_scale,
+                              device const float* codebook,
+                              thread float& qjl_sign_out) {
+    uchar raw = read_raw_element(tile, pos, dim, head_dim, n_bits);
+    uchar sign_mask = uchar(1) << (n_bits - 1);
+    uchar cb_index = raw & (sign_mask - 1);
+    qjl_sign_out = (raw & sign_mask) ? 1.0f : -1.0f;
+    return codebook[cb_index] * deq_scale;
+}
+
+/// INT4-only V reader. Used by outlier kernels (always INT4).
 inline float read_quantized_tile_int4(threadgroup const char* tile,
                                       uint pos, uint dim, uint head_dim,
                                       float deq_scale,
                                       device const float* codebook) {
-    uint packed_stride = head_dim / 2;
-    uint byte_idx = pos * packed_stride + dim / 2;
-    uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
-    uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
-    return codebook[nibble] * deq_scale;
+    return read_v_tile(tile, pos, dim, head_dim, 4, deq_scale, codebook);
 }
 
-/// INT4 reader for K cache with QJL sign packed in bit 3 of the nibble.
-/// The lower 3 bits are the (b-1)-bit codebook index (Algorithm 2).
-/// Returns the dequantized codebook value and writes the QJL sign (±1.0)
-/// to `qjl_sign_out`.
+/// INT4-only K reader with QJL sign. Used by outlier kernels.
 inline float read_quantized_tile_int4_qjl(threadgroup const char* tile,
                                            uint pos, uint dim, uint head_dim,
                                            float deq_scale,
                                            device const float* codebook,
                                            thread float& qjl_sign_out) {
-    uint packed_stride = head_dim / 2;
-    uint byte_idx = pos * packed_stride + dim / 2;
-    uchar packed = ((threadgroup const uchar*)tile)[byte_idx];
-    uchar nibble = (dim % 2 == 0) ? (packed & 0xF) : (packed >> 4);
-    uchar cb_index = nibble & 0x7;
-    qjl_sign_out = (nibble & 0x8) ? 1.0f : -1.0f;
-    return codebook[cb_index] * deq_scale;
+    return read_k_tile_qjl(tile, pos, dim, head_dim, 4, deq_scale, codebook, qjl_sign_out);
 }
 
 // ── In-place Walsh-Hadamard butterfly transform ─────────────────
