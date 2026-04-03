@@ -317,7 +317,7 @@ kernel void turboquant_attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // QJL correction coefficient: √(π/2) / d per Algorithm 2
-    float qjl_factor = (n_bits == 4) ? (sqrt(3.14159265f / 2.0f) / float(head_dim)) : 0.0f;
+    float qjl_factor = 0.0f; // TEMP: disabled for debugging
 
     // Zero output accumulator
     for (uint d = tid; d < head_dim; d += tg_size) {

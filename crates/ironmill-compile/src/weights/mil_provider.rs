@@ -226,6 +226,23 @@ impl MilWeightProvider {
 
         for name in source.tensor_names() {
             let tensor = source.tensor(name)?;
+
+            // Preserve tensors that are already quantized (e.g. GGUF Q4_0/Q8_0
+            // passthrough returning AffineDequantize). Don't re-quantize or
+            // strip their quant_info.
+            if !matches!(tensor.quant_info, QuantizationInfo::None) {
+                tensors.insert(
+                    name.to_string(),
+                    ExtractedTensor {
+                        data: tensor.data.into_owned(),
+                        shape: tensor.shape.clone(),
+                        dtype: tensor.dtype,
+                        quant_info: tensor.quant_info,
+                    },
+                );
+                continue;
+            }
+
             let total: usize = tensor.shape.iter().product();
             let rank = tensor.shape.len();
             let is_float = matches!(tensor.dtype, ScalarType::Float16 | ScalarType::Float32);
@@ -346,13 +363,8 @@ impl MilWeightProvider {
     /// added without quantization since the pass pipeline only transforms
     /// tensors emitted by the template.
     pub fn supplement_from(&mut self, source: &dyn WeightProvider) -> Result<(), MilError> {
-        let existing: std::collections::HashSet<String> = self
-            .tensor_names()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
         for name in source.tensor_names() {
-            if !existing.contains(name) {
+            if !self.tensors.contains_key(name) {
                 let t = source.tensor(name)?;
                 self.tensors.insert(
                     name.to_string(),
