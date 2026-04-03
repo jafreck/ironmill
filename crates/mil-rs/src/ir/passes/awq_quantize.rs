@@ -80,6 +80,11 @@ impl Pass for AwqQuantizePass {
     fn run(&self, program: &mut Program) -> Result<()> {
         let qmax = qmax(self.bits);
 
+        // Cache α per magnitude group: all projections sharing the same
+        // norm receive identical magnitudes, so they must use the same α
+        // (and thus the same scales) for correct norm-gamma fusion.
+        let mut alpha_cache: HashMap<Vec<u8>, f32> = HashMap::new();
+
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
                 if op.op_type != "const" {
@@ -168,17 +173,28 @@ impl Pass for AwqQuantizePass {
                                 continue;
                             };
 
-                            // AWQ paper Equation 5: search a single α ∈ [0,1]
-                            // such that s[c] = s_X[c]^α minimizes the
-                            // activation-weighted quantization loss (Eq. 4).
-                            let channel_scales = compute_awq_scales(
-                                &floats,
-                                &shape,
-                                mags,
-                                self.grid_search_steps,
-                                self.group_size,
-                                qmax,
-                            );
+                            // Key for magnitude group: all ops with same mags
+                            // share a norm and must use the same α.
+                            let mag_key: Vec<u8> =
+                                mags.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+                            // Search α on first encounter, reuse for group.
+                            // This ensures all projections sharing a norm use
+                            // identical scales, making norm-gamma fusion correct.
+                            let alpha = *alpha_cache.entry(mag_key).or_insert_with(|| {
+                                search_alpha(
+                                    &floats,
+                                    &shape,
+                                    mags,
+                                    self.grid_search_steps,
+                                    self.group_size,
+                                    qmax,
+                                )
+                            });
+
+                            // s[c] = s_X[c]^α (Equation 5)
+                            let channel_scales: Vec<f32> =
+                                mags.iter().map(|&m| m.max(1e-8).powf(alpha)).collect();
 
                             // Apply scales per-column (input channel):
                             // W_scaled[:, c] = W[:, c] * s[c]
@@ -240,14 +256,19 @@ impl Pass for AwqQuantizePass {
 /// The loss is evaluated using actual per-group quantization so that
 /// within-group range interactions are properly accounted for:
 ///   L(α) = Σ_{row,col} s_X[col]² · (Q(w[row,col]·s[col])/s[col] − w[row,col])²
-fn compute_awq_scales(
+/// Search for optimal α ∈ [0, 1] per AWQ paper Equation 5.
+///
+/// s = s_X^α where s_X is the per-channel activation magnitude.
+/// The loss is activation-weighted MSE (Equation 4 approximation).
+/// Returns the best α value.
+fn search_alpha(
     floats: &[f32],
     shape: &[usize],
     magnitudes: &[f32],
     grid_steps: usize,
     group_size: usize,
     qmax: f32,
-) -> Vec<f32> {
+) -> f32 {
     let out_features = shape[0];
     let in_features = *shape.last().unwrap_or(&1);
     let grid_steps = grid_steps.max(1);
@@ -265,8 +286,7 @@ fn compute_awq_scales(
             .map(|&m| m.max(1e-8).powf(alpha))
             .collect();
 
-        // Evaluate activation-weighted MSE using per-group quantization
-        // (matches the actual quantization applied to the weight matrix).
+        // Evaluate activation-weighted MSE using per-group quantization.
         let mut total_loss = 0.0_f32;
         for row in 0..out_features {
             for g in 0..n_groups {
@@ -306,10 +326,7 @@ fn compute_awq_scales(
         }
     }
 
-    magnitudes
-        .iter()
-        .map(|&m| m.max(1e-8).powf(best_alpha))
-        .collect()
+    best_alpha
 }
 
 use super::affine_quantize::quantize_affine;
