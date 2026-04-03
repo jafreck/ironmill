@@ -76,7 +76,7 @@ impl GpuCompileBuilder {
     /// 2. Import to MIL IR [`Program`]
     /// 3. Run the [`PassPipeline`]
     /// 4. Extract a [`MilWeightProvider`] from the optimized program
-    pub fn build(mut self) -> Result<MilWeightProvider, CompileError> {
+    pub fn build(self) -> Result<MilWeightProvider, CompileError> {
         let input = &self.input;
 
         if !input.exists() {

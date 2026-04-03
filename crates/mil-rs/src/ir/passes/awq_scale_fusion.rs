@@ -20,7 +20,7 @@ use super::util::build_consumer_map;
 use crate::error::Result;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
-use crate::ir::tensor::{ScalarType, TensorType};
+use crate::ir::tensor::ScalarType;
 use crate::ir::types::Value;
 
 /// Fuses AWQ per-channel scaling factors into adjacent LayerNorm weights.

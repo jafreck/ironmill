@@ -281,6 +281,7 @@ impl Pass for AwqQuantizePass {
 /// Because α is shared across all channels, every projection sharing the
 /// same norm produces the same scale vector — enabling offline norm-gamma
 /// fusion.
+#[allow(clippy::too_many_arguments)]
 fn search_alpha(
     floats: &[f32],
     shape: &[usize],
