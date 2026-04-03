@@ -15,7 +15,7 @@
 //! 2. **Explicit `mul` op** — when no fuseable norm is found, a `mul` op is
 //!    inserted on the activation path before the linear/matmul op.
 
-use super::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
+use super::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice, tensor_f16_as_f32_slice};
 use super::util::build_consumer_map;
 use crate::error::Result;
 use crate::ir::pass::Pass;
@@ -148,13 +148,20 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
         });
 
         if let Some(norm_idx) = norm_idx {
-            // Fuse: multiply gamma by channel scales.
+            // Fuse: multiply gamma/weight by channel scales.
             let norm_op = &mut block.operations[norm_idx];
             let mut fused = false;
 
-            // Look for gamma in inputs first (as a reference to a const op),
+            // Template-generated norms use "weight", ONNX-converted use "gamma".
+            let gamma_key = if norm_op.inputs.contains_key("weight") {
+                "weight"
+            } else {
+                "gamma"
+            };
+
+            // Look for gamma/weight in inputs first (as a reference to a const op),
             // then in attributes.
-            if let Some(Value::Reference(gamma_ref)) = norm_op.inputs.get("gamma").cloned() {
+            if let Some(Value::Reference(gamma_ref)) = norm_op.inputs.get(gamma_key).cloned() {
                 // gamma is provided by a const op — find and update it.
                 if let Some(gamma_op) = block
                     .operations
@@ -170,18 +177,29 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
                         data, shape, dtype, ..
                     }) = gamma_val
                     {
-                        if *dtype == ScalarType::Float32 {
-                            let mut gamma_floats = tensor_as_f32_slice(data);
+                        let gamma_floats_opt = match *dtype {
+                            ScalarType::Float32 => Some(tensor_as_f32_slice(data)),
+                            ScalarType::Float16 => Some(tensor_f16_as_f32_slice(data)),
+                            _ => None,
+                        };
+                        if let Some(mut gamma_floats) = gamma_floats_opt {
                             let n = gamma_floats.len().min(target.scales.len());
                             for (c, g) in gamma_floats.iter_mut().enumerate().take(n) {
                                 *g *= target.scales[c];
                             }
+                            // Store in original dtype to preserve compatibility.
+                            let new_data = match *dtype {
+                                ScalarType::Float16 => gamma_floats
+                                    .iter()
+                                    .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                                    .collect(),
+                                _ => f32_slice_to_bytes(&gamma_floats),
+                            };
                             let new_val = Value::Tensor {
-                                data: f32_slice_to_bytes(&gamma_floats),
+                                data: new_data,
                                 shape: shape.clone(),
                                 dtype: *dtype,
                             };
-                            // Update whichever location held the old value.
                             if gamma_op.inputs.contains_key("val") {
                                 gamma_op.inputs.insert("val".to_string(), new_val);
                             } else {
@@ -193,19 +211,30 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
                 }
             } else if let Some(Value::Tensor {
                 data, shape, dtype, ..
-            }) = norm_op.inputs.get("gamma").cloned()
+            }) = norm_op.inputs.get(gamma_key).cloned()
             {
                 // gamma stored inline as a tensor value.
-                if dtype == ScalarType::Float32 {
-                    let mut gamma_floats = tensor_as_f32_slice(&data);
+                let gamma_floats_opt = match dtype {
+                    ScalarType::Float32 => Some(tensor_as_f32_slice(&data)),
+                    ScalarType::Float16 => Some(tensor_f16_as_f32_slice(&data)),
+                    _ => None,
+                };
+                if let Some(mut gamma_floats) = gamma_floats_opt {
                     let n = gamma_floats.len().min(target.scales.len());
                     for (c, g) in gamma_floats.iter_mut().enumerate().take(n) {
                         *g *= target.scales[c];
                     }
+                    let new_data = match dtype {
+                        ScalarType::Float16 => gamma_floats
+                            .iter()
+                            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                            .collect(),
+                        _ => f32_slice_to_bytes(&gamma_floats),
+                    };
                     norm_op.inputs.insert(
-                        "gamma".to_string(),
+                        gamma_key.to_string(),
                         Value::Tensor {
-                            data: f32_slice_to_bytes(&gamma_floats),
+                            data: new_data,
                             shape,
                             dtype,
                         },

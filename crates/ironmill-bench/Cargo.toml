@@ -51,3 +51,8 @@ required-features = ["ane-direct"]
 name = "cache_bandwidth_bench"
 path = "examples/cache_bandwidth_bench.rs"
 required-features = ["ane-direct"]
+
+[[example]]
+name = "awq_calibrate"
+path = "examples/awq_calibrate.rs"
+required-features = ["metal"]

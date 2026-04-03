@@ -69,15 +69,15 @@ struct Cli {
     model: Vec<PathBuf>,
 
     /// Iterations per measurement
-    #[arg(short, long, default_value = "200")]
+    #[arg(short, long, default_value = "1")]
     iterations: usize,
 
     /// Warmup iterations
-    #[arg(short, long, default_value = "20")]
+    #[arg(short, long, default_value = "0")]
     warmup: usize,
 
     /// Number of full runs
-    #[arg(short, long, default_value = "3")]
+    #[arg(short, long, default_value = "1")]
     runs: usize,
 
     /// Backends to benchmark. May be specified multiple times.

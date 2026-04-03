@@ -650,9 +650,9 @@ mod tests {
                 },
             ],
             settings: Settings {
-                iterations: 200,
-                warmup: 20,
-                runs: 3,
+                iterations: 1,
+                warmup: 0,
+                runs: 1,
                 backends: vec!["all".to_string()],
             },
         }

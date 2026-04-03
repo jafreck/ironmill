@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use super::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
+use super::tensor_utils::{tensor_as_f32_slice, tensor_f16_as_f32_slice};
 use crate::error::Result;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
@@ -86,24 +86,40 @@ impl Pass for AwqQuantizePass {
                     continue;
                 }
 
-                // Locate the FP32 tensor value (may be in inputs or attributes).
-                let in_inputs = matches!(
-                    op.inputs.get("val"),
-                    Some(Value::Tensor {
-                        dtype: ScalarType::Float32,
-                        ..
-                    })
-                );
-                let in_attrs = !in_inputs
-                    && matches!(
-                        op.attributes.get("val"),
+                // Locate a float tensor value (FP32 or FP16) in inputs or attributes.
+                let is_float = |v: Option<&Value>| {
+                    matches!(
+                        v,
                         Some(Value::Tensor {
-                            dtype: ScalarType::Float32,
+                            dtype: ScalarType::Float32 | ScalarType::Float16,
                             ..
                         })
-                    );
+                    )
+                };
+
+                let in_inputs = is_float(op.inputs.get("val"));
+                let in_attrs = !in_inputs && is_float(op.attributes.get("val"));
 
                 if !in_inputs && !in_attrs {
+                    continue;
+                }
+
+                // Check eligibility before removing the value.
+                let (numel, rank) = {
+                    let val = if in_inputs {
+                        op.inputs.get("val").unwrap()
+                    } else {
+                        op.attributes.get("val").unwrap()
+                    };
+                    if let Value::Tensor { shape, .. } = val {
+                        (shape.iter().product::<usize>(), shape.len())
+                    } else {
+                        continue;
+                    }
+                };
+
+                // Skip small tensors and 1D tensors (norms, biases).
+                if numel < 1024 || rank < 2 {
                     continue;
                 }
 
@@ -113,13 +129,12 @@ impl Pass for AwqQuantizePass {
                     op.attributes.remove("val").unwrap()
                 };
 
-                if let Value::Tensor {
-                    data,
-                    shape,
-                    dtype: _,
-                } = val
-                {
-                    let floats = tensor_as_f32_slice(&data);
+                if let Value::Tensor { data, shape, dtype } = val {
+                    let floats = match dtype {
+                        ScalarType::Float32 => tensor_as_f32_slice(&data),
+                        ScalarType::Float16 => tensor_f16_as_f32_slice(&data),
+                        _ => unreachable!(),
+                    };
 
                     // Need at least 2-D to have channels (rows × columns).
                     if shape.len() < 2 {
@@ -325,7 +340,13 @@ use super::int4_pack::pack_int4;
 // Emission helpers
 // ---------------------------------------------------------------------------
 
-/// Emit per-group quantization with AWQ channel scales stored as attribute.
+/// Emit per-group quantization with AWQ channel scales absorbed into
+/// the per-group scale parameters.
+///
+/// Weights were divided by `s[c]` before quantization. To compensate,
+/// each per-group scale is multiplied by `s[c]` for its row, so that
+/// dequantized weights are: `(q - zp) * (scale * s[c])` = original weight.
+/// This eliminates the need for runtime activation scaling.
 fn emit_per_group_with_scales(
     op: &mut crate::ir::operation::Operation,
     scaled_floats: &[f32],
@@ -352,13 +373,22 @@ fn emit_per_group_with_scales(
 
     for row in 0..outer_count {
         let row_start = row * last_dim;
+        // AWQ compensation: multiply each group's scale by the channel scale
+        // for this row, so dequantized weights are pre-compensated.
+        let ch_scale = if row < channel_scales.len() {
+            channel_scales[row]
+        } else {
+            1.0
+        };
         for g in 0..n_groups {
             let g_start = row_start + g * group_size;
             let g_end = (g_start + group_size).min(row_start + last_dim);
             let group_slice = &scaled_floats[g_start..g_end];
             let (q, s, zp) = quantize_affine(group_slice, qmax);
             all_quantized.extend_from_slice(&q);
-            all_scales.push(s);
+            // Absorb channel scale into the quantization scale:
+            // dequant = (q - zp) * s * ch_scale = original value
+            all_scales.push(s * ch_scale);
             all_zero_points.push(zp);
         }
     }
@@ -414,17 +444,6 @@ fn emit_per_group_with_scales(
         .insert("group_size".to_string(), Value::Int(group_size as i64));
     op.attributes
         .insert("bit_width".to_string(), Value::Int(bits as i64));
-
-    // Store AWQ channel scales for downstream fusion (Phase 2 Task 2.2).
-    let num_channels = channel_scales.len();
-    op.attributes.insert(
-        "awq_channel_scales".to_string(),
-        Value::Tensor {
-            data: f32_slice_to_bytes(channel_scales),
-            shape: vec![num_channels],
-            dtype: ScalarType::Float32,
-        },
-    );
 
     let out_type = TensorType::new(ScalarType::Float32, shape.to_vec());
     if let Some(slot) = op.output_types.get_mut(0) {

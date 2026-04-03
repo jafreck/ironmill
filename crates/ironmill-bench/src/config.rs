@@ -77,24 +77,24 @@ pub struct Settings {
 }
 
 fn default_iterations() -> usize {
-    200
+    1
 }
 fn default_warmup() -> usize {
-    20
+    0
 }
 fn default_runs() -> usize {
-    3
+    1
 }
 fn default_max_seq_len() -> usize {
-    2048
+    128
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            iterations: 200,
-            warmup: 20,
-            runs: 3,
+            iterations: default_iterations(),
+            warmup: default_warmup(),
+            runs: default_runs(),
             backends: vec!["all".to_string()],
         }
     }
@@ -130,40 +130,16 @@ pub fn load_config(path: &Path) -> anyhow::Result<BenchMatrix> {
     })
 }
 
-/// Build the default benchmark matrix (matches bench-inference.sh).
+/// Build the default benchmark matrix — fast smoke-test config.
+///
+/// Uses a single small LLM (Qwen3-0.6B) with short sequence length for
+/// quick iteration. Pass `--config` with a TOML file for full-suite runs.
 pub fn default_matrix() -> BenchMatrix {
-    let models = vec![
-        ModelConfig {
-            name: "MobileNetV2".to_string(),
-            path: PathBuf::from("tests/fixtures/mobilenetv2.onnx"),
-            input_shapes: vec![],
-        },
-        ModelConfig {
-            name: "SqueezeNet".to_string(),
-            path: PathBuf::from("tests/fixtures/squeezenet1.1.onnx"),
-            input_shapes: vec![],
-        },
-        ModelConfig {
-            name: "Whisper-tiny-encoder".to_string(),
-            path: PathBuf::from("tests/fixtures/whisper-tiny-encoder.onnx"),
-            input_shapes: vec![],
-        },
-        ModelConfig {
-            name: "DistilBERT".to_string(),
-            path: PathBuf::from("tests/fixtures/distilbert.onnx"),
-            input_shapes: vec![],
-        },
-        ModelConfig {
-            name: "ViT-base".to_string(),
-            path: PathBuf::from("tests/fixtures/vit-base.onnx"),
-            input_shapes: vec![],
-        },
-        ModelConfig {
-            name: "Qwen3-0.6B".to_string(),
-            path: PathBuf::from("tests/fixtures/qwen3-0.6b.onnx"),
-            input_shapes: vec![],
-        },
-    ];
+    let models = vec![ModelConfig {
+        name: "Qwen3-0.6B".to_string(),
+        path: PathBuf::from("tests/fixtures/qwen3-0.6b.onnx"),
+        input_shapes: vec![],
+    }];
 
     let optimizations = vec![
         OptConfig {
@@ -245,7 +221,7 @@ pub fn default_matrix() -> BenchMatrix {
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::TurboInt8,
-            max_seq_len: 4096,
+            max_seq_len: default_max_seq_len(),
         },
         // TurboQuant INT8 + QJL
         OptConfig {
@@ -256,7 +232,7 @@ pub fn default_matrix() -> BenchMatrix {
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::TurboInt8Qjl,
-            max_seq_len: 4096,
+            max_seq_len: default_max_seq_len(),
         },
     ];
 
@@ -319,23 +295,18 @@ mod tests {
     #[test]
     fn test_default_matrix() {
         let m = default_matrix();
-        assert_eq!(m.models.len(), 6);
+        assert_eq!(m.models.len(), 1);
         assert_eq!(m.optimizations.len(), 9);
         assert_eq!(m.backends, vec!["all"]);
-        assert_eq!(m.settings.iterations, 200);
-        assert_eq!(m.settings.warmup, 20);
-        assert_eq!(m.settings.runs, 3);
+        assert_eq!(m.settings.iterations, 1);
+        assert_eq!(m.settings.warmup, 0);
+        assert_eq!(m.settings.runs, 1);
     }
 
     #[test]
     fn test_default_matrix_model_names() {
         let m = default_matrix();
-        assert_eq!(m.models[0].name, "MobileNetV2");
-        assert_eq!(m.models[1].name, "SqueezeNet");
-        assert_eq!(m.models[2].name, "Whisper-tiny-encoder");
-        assert_eq!(m.models[3].name, "DistilBERT");
-        assert_eq!(m.models[4].name, "ViT-base");
-        assert_eq!(m.models[5].name, "Qwen3-0.6B");
+        assert_eq!(m.models[0].name, "Qwen3-0.6B");
     }
 
     #[test]
@@ -485,15 +456,15 @@ no_fusion = true
 "#;
         let file: ConfigFile = toml::from_str(toml_content).unwrap();
         assert_eq!(file.optimization[0].kv_quant, KvQuantMode::None);
-        assert_eq!(file.optimization[0].max_seq_len, 2048);
+        assert_eq!(file.optimization[0].max_seq_len, 128);
     }
 
     #[test]
     fn test_settings_default() {
         let s = Settings::default();
-        assert_eq!(s.iterations, 200);
-        assert_eq!(s.warmup, 20);
-        assert_eq!(s.runs, 3);
+        assert_eq!(s.iterations, 1);
+        assert_eq!(s.warmup, 0);
+        assert_eq!(s.runs, 1);
         assert_eq!(s.backends, vec!["all"]);
     }
 }
