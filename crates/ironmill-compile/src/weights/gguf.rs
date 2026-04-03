@@ -12,6 +12,7 @@
 //!
 //! Split-shard files are auto-discovered by filename pattern.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use std::path::{Path, PathBuf};
 use half::f16;
 use memmap2::Mmap;
 
-use crate::weights::{Architecture, ModelConfig, WeightProvider, WeightTensor};
+use crate::weights::{Architecture, ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
 use mil_rs::MilError;
 use mil_rs::ir::ScalarType;
 
@@ -589,6 +590,49 @@ impl WeightProvider for GgufProvider {
             ));
         }
 
+        // Q4_0: repack blocks into separate packed-nibble and scale buffers
+        if loc.ggml_type == GgmlType::Q4_0 {
+            let mmap = &self.mmaps[loc.shard_index];
+            let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
+            let (packed_data, scales, zero_point) = repack_q4_0(raw, loc.num_elements)?;
+            return Ok(WeightTensor {
+                data: Cow::Owned(packed_data),
+                shape: loc.dimensions.clone(),
+                dtype: ScalarType::UInt8,
+                quant_info: QuantizationInfo::AffineDequantize {
+                    scale: scales,
+                    zero_point,
+                    scale_dtype: ScalarType::Float16,
+                    zero_point_dtype: ScalarType::Float16,
+                    axis: Some(1),
+                    bit_width: 4,
+                    group_size: Some(32),
+                },
+            });
+        }
+
+        // Q8_0: repack blocks into separate int8 and scale buffers
+        if loc.ggml_type == GgmlType::Q8_0 {
+            let mmap = &self.mmaps[loc.shard_index];
+            let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
+            let (quant_data, scales, zero_point) = repack_q8_0(raw, loc.num_elements)?;
+            return Ok(WeightTensor {
+                data: Cow::Owned(quant_data),
+                shape: loc.dimensions.clone(),
+                dtype: ScalarType::Int8,
+                quant_info: QuantizationInfo::AffineDequantize {
+                    scale: scales,
+                    zero_point,
+                    scale_dtype: ScalarType::Float16,
+                    zero_point_dtype: ScalarType::Float16,
+                    axis: Some(1),
+                    bit_width: 8,
+                    group_size: Some(32),
+                },
+            });
+        }
+
+        // All other types: dequantize to FP16 (existing path)
         let mmap = &self.mmaps[loc.shard_index];
         let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
         let fp16_data = dequantize_to_fp16(raw, loc.num_elements, loc.ggml_type)?;
@@ -998,6 +1042,110 @@ fn dequant_q8_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilE
 }
 
 // ---------------------------------------------------------------------------
+// Q4_0 / Q8_0 repack (quantized passthrough)
+// ---------------------------------------------------------------------------
+
+/// (quant_data, scales, zero_point) triple returned by repack helpers.
+type RepackResult = Result<(Vec<u8>, Vec<u8>, Vec<u8>), MilError>;
+
+/// Repack Q4_0 blocks: separate packed nibbles from per-block scales.
+///
+/// Q4_0 blocks interleave scale + packed data. This function separates them
+/// into contiguous buffers for the `AffineDequantize` layout.
+///
+/// Returns: (packed_nibble_data, scales_fp16, zero_point_fp16)
+fn repack_q4_0(raw: &[u8], num_elements: usize) -> RepackResult {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 18;
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let expected_bytes = num_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| MilError::Validation("GGUF: Q4_0 repack size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: Q4_0 tensor data too short for repack".into(),
+        ));
+    }
+
+    // Each block has 16 bytes of packed nibbles (32 values, 2 per byte)
+    let packed_capacity = num_blocks
+        .checked_mul(16)
+        .ok_or_else(|| MilError::Validation("GGUF: Q4_0 packed data size overflow".into()))?;
+    let scales_capacity = num_blocks
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: Q4_0 scales size overflow".into()))?;
+
+    let mut packed_data = Vec::with_capacity(packed_capacity);
+    let mut scales = Vec::with_capacity(scales_capacity);
+
+    for block_idx in 0..num_blocks {
+        let block = &raw[block_idx * BLOCK_BYTES..];
+        // 2-byte FP16 scale
+        scales.extend_from_slice(&block[0..2]);
+        // 16 bytes of packed nibbles
+        packed_data.extend_from_slice(&block[2..BLOCK_BYTES]);
+    }
+
+    // Q4_0 formula: value = d * (nibble - 8)
+    // Symmetric quantization with implicit zero_point = 8.
+    let zero_point = broadcast_fp16_constant(f16::from_f32(8.0), num_blocks);
+
+    Ok((packed_data, scales, zero_point))
+}
+
+/// Repack Q8_0 blocks: separate int8 values from per-block scales.
+///
+/// Returns: (int8_data, scales_fp16, zero_point_fp16)
+fn repack_q8_0(raw: &[u8], num_elements: usize) -> RepackResult {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 34;
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let expected_bytes = num_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| MilError::Validation("GGUF: Q8_0 repack size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: Q8_0 tensor data too short for repack".into(),
+        ));
+    }
+
+    let data_capacity = num_blocks
+        .checked_mul(32)
+        .ok_or_else(|| MilError::Validation("GGUF: Q8_0 data size overflow".into()))?;
+    let scales_capacity = num_blocks
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: Q8_0 scales size overflow".into()))?;
+
+    let mut quant_data = Vec::with_capacity(data_capacity);
+    let mut scales = Vec::with_capacity(scales_capacity);
+
+    for block_idx in 0..num_blocks {
+        let block = &raw[block_idx * BLOCK_BYTES..];
+        // 2-byte FP16 scale
+        scales.extend_from_slice(&block[0..2]);
+        // 32 bytes of int8 values
+        quant_data.extend_from_slice(&block[2..BLOCK_BYTES]);
+    }
+
+    // Q8_0 formula: value = d * int8_value (zero_point = 0)
+    let zero_point = broadcast_fp16_constant(f16::from_f32(0.0), num_blocks);
+
+    Ok((quant_data, scales, zero_point))
+}
+
+/// Create a contiguous buffer of `count` copies of an FP16 value.
+fn broadcast_fp16_constant(value: f16, count: usize) -> Vec<u8> {
+    let bytes = value.to_le_bytes();
+    let mut buf = Vec::with_capacity(count * 2);
+    for _ in 0..count {
+        buf.extend_from_slice(&bytes);
+    }
+    buf
+}
+
+// ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
 
@@ -1315,5 +1463,39 @@ mod tests {
 
         let v = MetadataValue::Array(vec![MetadataValue::UInt8(1), MetadataValue::UInt8(2)]);
         assert_eq!(v.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn repack_q4_0_separates_scales_and_data() {
+        // One Q4_0 block: 18 bytes = 2 (scale) + 16 (packed nibbles)
+        let scale_bytes = f16::from_f32(0.5).to_le_bytes();
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bytes);
+        block.extend_from_slice(&[0x98; 16]); // nibbles: low=8, high=9
+
+        let (packed, scales, zeros) = repack_q4_0(&block, 32).unwrap();
+        assert_eq!(packed.len(), 16);
+        assert_eq!(scales.len(), 2);
+        assert_eq!(zeros.len(), 2); // one FP16 value for zero_point
+        assert_eq!(&scales[..], &scale_bytes);
+        assert_eq!(&packed[..], &[0x98; 16]);
+    }
+
+    #[test]
+    fn repack_q8_0_separates_scales_and_data() {
+        // One Q8_0 block: 34 bytes = 2 (scale) + 32 (int8)
+        let scale_bytes = f16::from_f32(1.0).to_le_bytes();
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bytes);
+        block.extend_from_slice(&[42i8 as u8; 32]);
+
+        let (data, scales, zeros) = repack_q8_0(&block, 32).unwrap();
+        assert_eq!(data.len(), 32);
+        assert_eq!(scales.len(), 2);
+        assert_eq!(zeros.len(), 2);
+        assert_eq!(&scales[..], &scale_bytes);
+        // Verify zero_point is FP16(0.0)
+        let zero_fp16 = f16::from_f32(0.0).to_le_bytes();
+        assert_eq!(&zeros[..], &zero_fp16);
     }
 }
