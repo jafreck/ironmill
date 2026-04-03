@@ -590,8 +590,10 @@ impl WeightProvider for GgufProvider {
             ));
         }
 
-        // Q4_0: repack blocks into separate packed-nibble and scale buffers
-        if loc.ggml_type == GgmlType::Q4_0 {
+        // Q4_0: repack blocks into separate packed-nibble and scale buffers.
+        // Only for 2D+ tensors — 1D tensors fall through to the FP16 dequant path
+        // since per-group quantization requires an axis to group along.
+        if loc.ggml_type == GgmlType::Q4_0 && loc.dimensions.len() >= 2 {
             let mmap = &self.mmaps[loc.shard_index];
             let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
             let (packed_data, scales, zero_point) = repack_q4_0(raw, loc.num_elements)?;
@@ -611,8 +613,9 @@ impl WeightProvider for GgufProvider {
             });
         }
 
-        // Q8_0: repack blocks into separate int8 and scale buffers
-        if loc.ggml_type == GgmlType::Q8_0 {
+        // Q8_0: repack blocks into separate int8 and scale buffers.
+        // Only for 2D+ tensors — same rationale as Q4_0 above.
+        if loc.ggml_type == GgmlType::Q8_0 && loc.dimensions.len() >= 2 {
             let mmap = &self.mmaps[loc.shard_index];
             let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
             let (quant_data, scales, zero_point) = repack_q8_0(raw, loc.num_elements)?;
