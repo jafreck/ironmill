@@ -566,134 +566,159 @@ fn main() -> Result<()> {
                     };
 
                     let quant_info = &provider.manifest().quantization;
-                    let config_label = format!("PQ-INT{}", quant_info.n_bits);
-
-                    eprintln!("  Metal/{config_label}: {} (bundle)...", model_cfg.name);
-
-                    let gpu_config = MetalConfig {
-                        enable_turboquant: false,
-                        ..MetalConfig::default()
+                    let weight_label = match quant_info.method.as_str() {
+                        "polarquant" => format!("PQ-INT{}", quant_info.n_bits),
+                        "affine" => format!("Affine-INT{}", quant_info.n_bits),
+                        "none" => "FP16".to_string(),
+                        "mixed" => format!("Mixed-INT{}", quant_info.n_bits),
+                        other => other.to_string(),
                     };
 
-                    let mut engine = match MetalInference::new(gpu_config.clone()) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            eprintln!("  ✗ Metal GPU init failed: {e}");
-                            continue;
-                        }
-                    };
+                    let bundle_configs: Vec<(&str, MetalConfig)> = vec![
+                        (
+                            "fp16-kv",
+                            MetalConfig {
+                                enable_turboquant: false,
+                                ..MetalConfig::default()
+                            },
+                        ),
+                        (
+                            "tq-int4-kv",
+                            MetalConfig {
+                                enable_turboquant: true,
+                                n_bits: 4,
+                                ..MetalConfig::default()
+                            },
+                        ),
+                    ];
 
-                    let load_start = std::time::Instant::now();
-                    let gpu_before = engine.gpu_allocated_bytes();
-                    if let Err(e) = engine.load_weights(&provider, gpu_config.clone()) {
-                        eprintln!("  ✗ Metal bundle load failed: {e}");
-                        continue;
-                    }
-                    let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
-                    let gpu_after = engine.gpu_allocated_bytes();
-                    let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
-                    let gpu_growth_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
-                    eprintln!(
-                        "  ✓ loaded in {load_time_ms:.1}ms (GPU: {gpu_mb:.1} MB, model: {gpu_growth_mb:.1} MB)"
-                    );
-
-                    let prompt_tokens: Vec<u32> = vec![9707, 1879];
-
-                    let mut run_results = Vec::new();
-                    for run_idx in 0..matrix.settings.runs {
-                        engine.reset();
-
-                        if let Err(e) = engine.prefill(&prompt_tokens) {
-                            eprintln!("  ✗ prefill failed: {e}");
-                            continue;
-                        }
-
-                        let mut last_token = prompt_tokens.last().copied().unwrap_or(0);
-                        for _ in 0..matrix.settings.warmup {
-                            match engine.decode_step(last_token) {
-                                Ok(logits) => {
-                                    last_token = logits
-                                        .iter()
-                                        .enumerate()
-                                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                                        .map(|(i, _)| i as u32)
-                                        .unwrap_or(0);
-                                }
-                                Err(e) => {
-                                    eprintln!("  ✗ warmup decode failed: {e}");
-                                    break;
-                                }
-                            }
-                        }
-
-                        let mut latencies = Vec::with_capacity(matrix.settings.iterations);
-                        for _ in 0..matrix.settings.iterations {
-                            let t0 = std::time::Instant::now();
-                            match engine.decode_step(last_token) {
-                                Ok(logits) => {
-                                    let elapsed = t0.elapsed();
-                                    latencies.push(elapsed);
-                                    last_token = logits
-                                        .iter()
-                                        .enumerate()
-                                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                                        .map(|(i, _)| i as u32)
-                                        .unwrap_or(0);
-                                }
-                                Err(e) => {
-                                    eprintln!("  ✗ decode failed at iteration: {e}");
-                                    break;
-                                }
-                            }
-                        }
-
-                        if latencies.is_empty() {
-                            continue;
-                        }
-
-                        let latencies_ms: Vec<f64> =
-                            latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
-
-                        let label = format!(
-                            "{}/{}/metal-{}/run{run_idx}",
-                            model_cfg.name, "default", config_label
-                        );
-                        run_results.push(compute_stats(&label, &latencies_ms));
-                    }
-
-                    if !run_results.is_empty() {
-                        let label = format!("{}/metal-{config_label}", model_cfg.name);
-                        let mut aggregated = aggregate_runs(&label, &run_results);
-
-                        let tok_per_sec = 1000.0 / aggregated.pooled.median;
-                        aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
-                        aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
-
+                    for (kv_label, gpu_config) in &bundle_configs {
                         eprintln!(
-                            "  ✓ {config_label}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms | GPU: {gpu_mb:.1} MB",
-                            aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
+                            "  Metal/{weight_label}/{kv_label}: {} (bundle)...",
+                            model_cfg.name
                         );
 
-                        let measured_memory = MemorySummary {
-                            rss_after_load_mb: gpu_mb,
-                            peak_rss_mb: gpu_mb,
-                            rss_growth_mb: gpu_growth_mb,
-                            model_file_size_mb: 0.0,
-                            efficiency_ratio: 0.0,
+                        let mut engine = match MetalInference::new(gpu_config.clone()) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                eprintln!("  ✗ Metal GPU init failed: {e}");
+                                continue;
+                            }
                         };
 
-                        report_rows.push(ReportRow {
-                            model: model_cfg.name.clone(),
-                            optimization: "default".to_string(),
-                            backend: format!("metal-{config_label}"),
-                            kv_quant: "none".to_string(),
-                            result: aggregated,
-                            significance: None,
-                            energy: None,
-                            utilization: None,
-                            memory: Some(measured_memory),
-                            load_time_ms: Some(load_time_ms),
-                        });
+                        let load_start = std::time::Instant::now();
+                        let gpu_before = engine.gpu_allocated_bytes();
+                        if let Err(e) = engine.load_weights(&provider, gpu_config.clone()) {
+                            eprintln!("  ✗ Metal bundle load failed: {e}");
+                            continue;
+                        }
+                        let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+                        let gpu_after = engine.gpu_allocated_bytes();
+                        let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
+                        let gpu_growth_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
+                        eprintln!(
+                            "  ✓ loaded in {load_time_ms:.1}ms (GPU: {gpu_mb:.1} MB, model: {gpu_growth_mb:.1} MB)"
+                        );
+
+                        let prompt_tokens: Vec<u32> = vec![9707, 1879];
+
+                        let mut run_results = Vec::new();
+                        for run_idx in 0..matrix.settings.runs {
+                            engine.reset();
+
+                            if let Err(e) = engine.prefill(&prompt_tokens) {
+                                eprintln!("  ✗ prefill failed: {e}");
+                                continue;
+                            }
+
+                            let mut last_token = prompt_tokens.last().copied().unwrap_or(0);
+                            for _ in 0..matrix.settings.warmup {
+                                match engine.decode_step(last_token) {
+                                    Ok(logits) => {
+                                        last_token = logits
+                                            .iter()
+                                            .enumerate()
+                                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                            .map(|(i, _)| i as u32)
+                                            .unwrap_or(0);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("  ✗ warmup decode failed: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let mut latencies = Vec::with_capacity(matrix.settings.iterations);
+                            for _ in 0..matrix.settings.iterations {
+                                let t0 = std::time::Instant::now();
+                                match engine.decode_step(last_token) {
+                                    Ok(logits) => {
+                                        let elapsed = t0.elapsed();
+                                        latencies.push(elapsed);
+                                        last_token = logits
+                                            .iter()
+                                            .enumerate()
+                                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                            .map(|(i, _)| i as u32)
+                                            .unwrap_or(0);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("  ✗ decode failed at iteration: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if latencies.is_empty() {
+                                continue;
+                            }
+
+                            let latencies_ms: Vec<f64> =
+                                latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+
+                            let label = format!(
+                                "{}/metal-{weight_label}-{kv_label}/run{run_idx}",
+                                model_cfg.name
+                            );
+                            run_results.push(compute_stats(&label, &latencies_ms));
+                        }
+
+                        if !run_results.is_empty() {
+                            let label =
+                                format!("{}/metal-{weight_label}-{kv_label}", model_cfg.name);
+                            let mut aggregated = aggregate_runs(&label, &run_results);
+
+                            let tok_per_sec = 1000.0 / aggregated.pooled.median;
+                            aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
+                            aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
+
+                            eprintln!(
+                                "  ✓ {weight_label}/{kv_label}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms | GPU: {gpu_mb:.1} MB",
+                                aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
+                            );
+
+                            let measured_memory = MemorySummary {
+                                rss_after_load_mb: gpu_mb,
+                                peak_rss_mb: gpu_mb,
+                                rss_growth_mb: gpu_growth_mb,
+                                model_file_size_mb: 0.0,
+                                efficiency_ratio: 0.0,
+                            };
+
+                            report_rows.push(ReportRow {
+                                model: model_cfg.name.clone(),
+                                optimization: "default".to_string(),
+                                backend: format!("metal-{weight_label}-{kv_label}"),
+                                kv_quant: kv_label.to_string(),
+                                result: aggregated,
+                                significance: None,
+                                energy: None,
+                                utilization: None,
+                                memory: Some(measured_memory),
+                                load_time_ms: Some(load_time_ms),
+                            });
+                        }
                     }
 
                     continue;
@@ -974,66 +999,91 @@ fn main() -> Result<()> {
                     };
 
                     let quant_info = &provider.manifest().quantization;
-                    let config_label = format!("PQ-INT{}", quant_info.n_bits);
-                    eprintln!("  Evaluating {config_label} (bundle)...");
-
-                    let gpu_config = MetalConfig {
-                        enable_turboquant: false,
-                        ..MetalConfig::default()
+                    let weight_label = match quant_info.method.as_str() {
+                        "polarquant" => format!("PQ-INT{}", quant_info.n_bits),
+                        "affine" => format!("Affine-INT{}", quant_info.n_bits),
+                        "none" => "FP16".to_string(),
+                        "mixed" => format!("Mixed-INT{}", quant_info.n_bits),
+                        other => other.to_string(),
                     };
 
-                    let mut engine = MetalInference::new(gpu_config.clone())
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let gpu_before = engine.gpu_allocated_bytes();
-                    engine
-                        .load_weights(&provider, gpu_config.clone())
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let gpu_after = engine.gpu_allocated_bytes();
-                    let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
-                    let model_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
-                    eprintln!("  GPU memory: {gpu_mb:.1} MB (model: {model_mb:.1} MB)");
+                    let ppl_bundle_configs: Vec<(&str, MetalConfig)> = vec![
+                        (
+                            "fp16-kv",
+                            MetalConfig {
+                                enable_turboquant: false,
+                                ..MetalConfig::default()
+                            },
+                        ),
+                        (
+                            "tq-int4-kv",
+                            MetalConfig {
+                                enable_turboquant: true,
+                                n_bits: 4,
+                                ..MetalConfig::default()
+                            },
+                        ),
+                    ];
 
-                    let num_seqs = cli.perplexity_sequences.min(dataset.num_sequences);
-                    let mut all_losses = Vec::new();
-                    let start = std::time::Instant::now();
+                    for (kv_label, gpu_config) in &ppl_bundle_configs {
+                        let combined_label = format!("{weight_label}-{kv_label}");
+                        eprintln!("  Evaluating {combined_label} (bundle)...");
 
-                    for (seq_idx, sequence) in dataset.sequences.iter().take(num_seqs).enumerate() {
-                        engine.reset();
-                        if sequence.len() < 2 {
-                            continue;
+                        let mut engine = MetalInference::new(gpu_config.clone())
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let gpu_before = engine.gpu_allocated_bytes();
+                        engine
+                            .load_weights(&provider, gpu_config.clone())
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let gpu_after = engine.gpu_allocated_bytes();
+                        let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
+                        let model_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
+                        eprintln!("  GPU memory: {gpu_mb:.1} MB (model: {model_mb:.1} MB)");
+
+                        let num_seqs = cli.perplexity_sequences.min(dataset.num_sequences);
+                        let mut all_losses = Vec::new();
+                        let start = std::time::Instant::now();
+
+                        for (seq_idx, sequence) in
+                            dataset.sequences.iter().take(num_seqs).enumerate()
+                        {
+                            engine.reset();
+                            if sequence.len() < 2 {
+                                continue;
+                            }
+                            for pos in 0..sequence.len() - 1 {
+                                let token = sequence[pos];
+                                let target = sequence[pos + 1];
+                                let logits = engine
+                                    .decode_step(token)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let ce = perplexity::cross_entropy(&logits, target);
+                                all_losses.push(ce);
+                            }
+                            let running_ppl = perplexity::perplexity_from_losses(&all_losses);
+                            let elapsed = start.elapsed().as_secs_f64();
+                            let tok_per_sec = all_losses.len() as f64 / elapsed;
+                            eprintln!(
+                                "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
+                                seq_idx + 1,
+                                num_seqs,
+                                running_ppl,
+                                all_losses.len(),
+                                tok_per_sec,
+                            );
                         }
-                        for pos in 0..sequence.len() - 1 {
-                            let token = sequence[pos];
-                            let target = sequence[pos + 1];
-                            let logits = engine
-                                .decode_step(token)
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            let ce = perplexity::cross_entropy(&logits, target);
-                            all_losses.push(ce);
-                        }
-                        let running_ppl = perplexity::perplexity_from_losses(&all_losses);
-                        let elapsed = start.elapsed().as_secs_f64();
-                        let tok_per_sec = all_losses.len() as f64 / elapsed;
-                        eprintln!(
-                            "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
-                            seq_idx + 1,
-                            num_seqs,
-                            running_ppl,
-                            all_losses.len(),
-                            tok_per_sec,
-                        );
-                    }
 
-                    if all_losses.is_empty() {
-                        eprintln!("  ⚠ {config_label}: no valid losses computed");
-                    } else {
-                        let ppl = perplexity::perplexity_from_losses(&all_losses);
-                        let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
-                        eprintln!(
-                            "  ✓ {config_label}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
-                            ppl, avg_ce
-                        );
-                        gpu_ppl_results.insert(config_label, ppl);
+                        if all_losses.is_empty() {
+                            eprintln!("  ⚠ {combined_label}: no valid losses computed");
+                        } else {
+                            let ppl = perplexity::perplexity_from_losses(&all_losses);
+                            let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
+                            eprintln!(
+                                "  ✓ {combined_label}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
+                                ppl, avg_ce
+                            );
+                            gpu_ppl_results.insert(combined_label, ppl);
+                        }
                     }
                 }
             }
