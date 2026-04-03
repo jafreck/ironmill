@@ -39,10 +39,10 @@ impl Pass for AwqScaleFusionPass {
         "awq-scale-fusion"
     }
 
-    fn run(&self, _program: &mut Program) -> Result<()> {
-        // AWQ channel scales are now stored in the GPU bundle and applied
-        // at inference time by the Metal affine matmul kernel. No norm
-        // fusion needed.
+    fn run(&self, program: &mut Program) -> Result<()> {
+        for function in program.functions.values_mut() {
+            fuse_awq_scales(&mut function.body);
+        }
         Ok(())
     }
 }
@@ -269,6 +269,84 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
             .attributes
             .remove("awq_channel_scales");
     }
+
+    // Phase 5: for targets without a fuseable norm, insert an explicit
+    // const(1/s) + mul op on the activation path to compensate.
+    // Since weights were scaled UP by s[c], we need x' = x / s = x * (1/s).
+    let mut insertions: Vec<(usize, Vec<crate::ir::operation::Operation>)> = Vec::new();
+    let mut no_norm_dequant_indices: Vec<usize> = Vec::new();
+
+    for &target_idx in &no_norm_targets {
+        let target = &targets[target_idx];
+        let inv_scales: Vec<f32> = target.scales.iter().map(|&s| 1.0 / s).collect();
+        let n = inv_scales.len();
+
+        let scale_name = format!(
+            "{}_awq_inv_scales",
+            block.operations[target.dequant_idx].name
+        );
+        let scale_output = format!("{}_out", scale_name);
+        let mul_name = format!("{}_awq_mul", block.operations[target.linear_idx].name);
+        let mul_output = format!("{}_out", mul_name);
+
+        let scale_const = crate::ir::operation::Operation::new("const", &scale_name)
+            .with_input(
+                "val",
+                Value::Tensor {
+                    data: f32_slice_to_bytes(&inv_scales),
+                    shape: vec![n],
+                    dtype: ScalarType::Float32,
+                },
+            )
+            .with_output(&scale_output);
+
+        let original_act_ref = block.operations[target.linear_idx]
+            .inputs
+            .get(&target.activation_input_key)
+            .cloned()
+            .unwrap_or(Value::Reference("input".into()));
+
+        let mul_op = crate::ir::operation::Operation::new("mul", &mul_name)
+            .with_input("x", original_act_ref)
+            .with_input("y", Value::Reference(scale_output))
+            .with_output(&mul_output);
+
+        insertions.push((target.linear_idx, vec![scale_const, mul_op]));
+        no_norm_dequant_indices.push(target.dequant_idx);
+
+        // Update the linear op's activation input to point to the mul output.
+        block.operations[target.linear_idx].inputs.insert(
+            target.activation_input_key.clone(),
+            Value::Reference(mul_output),
+        );
+    }
+
+    // Insert new ops before their consuming linear ops (reverse order to keep
+    // indices valid).
+    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    for (insert_before, ops) in insertions {
+        for (j, op) in ops.into_iter().enumerate() {
+            block.operations.insert(insert_before + j, op);
+        }
+    }
+
+    // Remove awq_channel_scales from no-norm dequant ops.
+    // Indices may have shifted due to insertions — find by name.
+    for idx in no_norm_dequant_indices {
+        let name = targets
+            .iter()
+            .find(|t| t.dequant_idx == idx)
+            .map(|t| block.operations[t.dequant_idx].name.clone());
+        if let Some(dequant_name) = name {
+            if let Some(op) = block
+                .operations
+                .iter_mut()
+                .find(|op| op.name == dequant_name)
+            {
+                op.attributes.remove("awq_channel_scales");
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -348,8 +426,9 @@ mod tests {
     #[test]
     fn fuses_scales_into_layer_norm_gamma() {
         // gamma_const -> layer_norm -> linear <- dequant(awq_scales)
+        // AWQ: weights scaled UP by s[c], so gamma_new = gamma / s.
         let gamma_values = [1.0_f32, 2.0, 3.0, 4.0];
-        let channel_scales = [2.0_f32, 0.5, 1.0, 3.0];
+        let channel_scales = [2.0_f32, 0.5, 1.0, 4.0];
 
         let mut block = Block::new();
         block.add_op(const_op("gamma_const", "gamma_out", &gamma_values));
@@ -387,7 +466,7 @@ mod tests {
             "awq_channel_scales should be removed after fusion"
         );
 
-        // gamma_const should have been updated: gamma_new[c] = gamma_old[c] * s[c].
+        // gamma_const should have been updated: gamma_new[c] = gamma_old[c] / s[c].
         let gamma_op = ops.iter().find(|op| op.name == "gamma_const").unwrap();
         let updated_gamma = match gamma_op.inputs.get("val") {
             Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
@@ -396,7 +475,7 @@ mod tests {
         let expected: Vec<f32> = gamma_values
             .iter()
             .zip(channel_scales.iter())
-            .map(|(g, s)| g * s)
+            .map(|(g, s)| g / s)
             .collect();
         assert_eq!(updated_gamma, expected);
 
@@ -413,8 +492,9 @@ mod tests {
 
     #[test]
     fn fuses_scales_into_rms_norm_gamma() {
+        // gamma_new = gamma / s
         let gamma_values = [1.0_f32, 1.0, 1.0];
-        let channel_scales = [0.5_f32, 2.0, 1.5];
+        let channel_scales = [0.5_f32, 2.0, 0.25];
 
         let mut block = Block::new();
         block.add_op(const_op("gamma_const", "gamma_out", &gamma_values));
@@ -452,7 +532,8 @@ mod tests {
             Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
             _ => panic!("expected tensor"),
         };
-        assert_eq!(updated_gamma, vec![0.5, 2.0, 1.5]);
+        // gamma / s = [1.0/0.5, 1.0/2.0, 1.0/0.25] = [2.0, 0.5, 4.0]
+        assert_eq!(updated_gamma, vec![2.0, 0.5, 4.0]);
     }
 
     // -----------------------------------------------------------------------
@@ -462,7 +543,8 @@ mod tests {
     #[test]
     fn inserts_mul_when_no_norm_present() {
         // input -> linear <- dequant(awq_scales)
-        let channel_scales = [2.0_f32, 3.0, 4.0];
+        // Fallback: insert mul(x, 1/s) since weights were scaled UP by s.
+        let channel_scales = [2.0_f32, 4.0, 0.5];
 
         let mut block = Block::new();
         block.add_op(dequant_op_with_scales(
@@ -498,7 +580,7 @@ mod tests {
             Some(&Value::Reference("input".into()))
         );
 
-        // The mul's y input should reference a new const holding the scales.
+        // The mul's y input should reference a new const holding 1/s.
         let scale_ref = match mul_op.inputs.get("y") {
             Some(Value::Reference(name)) => name.clone(),
             _ => panic!("mul y should be a reference"),
@@ -511,7 +593,8 @@ mod tests {
             Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
             _ => panic!("scale const should have tensor val"),
         };
-        assert_eq!(scale_vals, channel_scales.to_vec());
+        let expected_inv: Vec<f32> = channel_scales.iter().map(|&s| 1.0 / s).collect();
+        assert_eq!(scale_vals, expected_inv);
 
         // The linear op's x input should now point to the mul output.
         let linear = ops.iter().find(|op| op.op_type == "linear").unwrap();
@@ -564,7 +647,7 @@ mod tests {
 
     #[test]
     fn inserts_mul_for_matmul_consumer() {
-        let channel_scales = [1.5_f32, 2.5];
+        let channel_scales = [2.0_f32, 0.5];
 
         let mut block = Block::new();
         block.add_op(dequant_op_with_scales(

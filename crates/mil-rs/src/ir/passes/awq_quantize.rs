@@ -4,11 +4,11 @@
 //! salient channels and apply optimal per-channel scaling before quantization.
 //! This preserves important weight channels more faithfully than uniform MinMax.
 //!
-//! Algorithm per linear op weight:
-//!   1. Look up activation magnitudes for the layer
-//!   2. Identify salient channels (top percentile by magnitude)
-//!   3. Grid-search per-channel scale factors to minimize quantization MSE
-//!   4. Apply scales, quantize with per-group affine, emit rewritten op
+//! Algorithm per linear op weight (Equations 4–5, Lin et al. MLSys 2024):
+//!   1. Look up per-input-channel activation magnitudes s_X for the layer
+//!   2. Grid-search a single exponent α ∈ [0, 1] to minimize the
+//!      activation-weighted quantization loss: s[c] = s_X[c]^α
+//!   3. Apply scales, quantize with per-group affine, emit rewritten op
 //!
 //! The per-channel scales are stored as an `"awq_channel_scales"` attribute
 //! on the op — Phase 2 Task 2.2 will fuse them into adjacent ops.
@@ -168,16 +168,15 @@ impl Pass for AwqQuantizePass {
                                 continue;
                             };
 
-                            // AWQ paper Algorithm 1: per-column grid search
-                            // to find optimal s[c] minimizing quantization MSE.
-                            // Each projection gets its own optimal scales — the
-                            // kernel compensates by dividing by s[c] at runtime.
+                            // AWQ paper Equation 5: search a single α ∈ [0,1]
+                            // such that s[c] = s_X[c]^α minimizes the
+                            // activation-weighted quantization loss (Eq. 4).
                             let channel_scales = compute_awq_scales(
                                 &floats,
                                 &shape,
                                 mags,
                                 self.grid_search_steps,
-                                self.salient_percentile,
+                                self.group_size,
                                 qmax,
                             );
 
@@ -229,145 +228,88 @@ impl Pass for AwqQuantizePass {
 // AWQ scale computation
 // ---------------------------------------------------------------------------
 
-/// Compute per-input-channel AWQ scales directly from activation magnitudes.
+/// Compute optimal per-input-channel scales using Equation 5 from the AWQ
+/// paper (Lin et al., MLSys 2024).
 ///
-/// For salient channels (top percentile by magnitude), the scale is
-/// proportional to the magnitude: `s[c] = mag[c] / median(mag)`.
-/// This ensures all projections sharing the same norm get identical scales
-/// (since they share the same activation magnitudes), which is required
-/// for correct norm gamma fusion.
+/// Searches a single exponent α ∈ [0, 1] such that `s[c] = s_X[c]^α`
+/// minimizes the activation-weighted quantization loss (approximation of
+/// Equation 4).  Because α is shared across all channels, every projection
+/// sharing the same norm produces the same scale vector — enabling offline
+/// norm-gamma fusion.
 ///
-/// Non-salient channels get scale 1.0 (no modification).
-fn compute_awq_scales_from_magnitudes(magnitudes: &[f32], salient_percentile: f32) -> Vec<f32> {
-    let n = magnitudes.len();
-    if n == 0 {
-        return vec![];
-    }
-
-    let salient_threshold = find_salient_threshold(magnitudes, salient_percentile);
-
-    // Compute median magnitude for normalization.
-    let mut sorted = magnitudes.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = sorted[n / 2].max(1e-8);
-
-    let mut scales = vec![1.0_f32; n];
-    for (c, &mag) in magnitudes.iter().enumerate() {
-        if mag >= salient_threshold && mag > 1e-8 {
-            // Scale proportional to relative magnitude.
-            // Clamp to [1.0, 4.0] — larger scales cause FP16 underflow
-            // when dividing small norm gamma values.
-            let s = (mag / median).clamp(1.0, 4.0);
-            scales[c] = s;
-        }
-    }
-
-    scales
-}
-
-/// Compute optimal per-input-channel scales using grid search.
-///
-/// For each salient input channel (column), searches `grid_steps` candidate
-/// scales to find the one that minimizes quantize-then-dequantize MSE for
-/// that column's weight values across all output channels (rows).
+/// The loss is evaluated using actual per-group quantization so that
+/// within-group range interactions are properly accounted for:
+///   L(α) = Σ_{row,col} s_X[col]² · (Q(w[row,col]·s[col])/s[col] − w[row,col])²
 fn compute_awq_scales(
     floats: &[f32],
     shape: &[usize],
     magnitudes: &[f32],
     grid_steps: usize,
-    salient_percentile: f32,
+    group_size: usize,
     qmax: f32,
 ) -> Vec<f32> {
     let out_features = shape[0];
     let in_features = *shape.last().unwrap_or(&1);
+    let grid_steps = grid_steps.max(1);
+    let n_groups = in_features.div_ceil(group_size);
 
-    // Determine which input channels are salient.
-    let salient_threshold = find_salient_threshold(magnitudes, salient_percentile);
+    let mut best_alpha = 0.0_f32;
+    let mut best_loss = f32::INFINITY;
 
-    let max_mag = magnitudes.iter().cloned().fold(0.0_f32, f32::max);
-    let max_scale = if max_mag > 1e-8 { max_mag } else { 1.0 };
+    for step in 0..=grid_steps {
+        let alpha = step as f32 / grid_steps as f32;
 
-    let mut scales = vec![1.0_f32; in_features];
-
-    for col in 0..in_features {
-        if col >= magnitudes.len() || magnitudes[col] < salient_threshold {
-            continue;
-        }
-
-        // Extract column values across all rows.
-        let column: Vec<f32> = (0..out_features)
-            .map(|row| floats[row * in_features + col])
+        // s[c] = s_X[c]^α  (Equation 5)
+        let scales: Vec<f32> = magnitudes
+            .iter()
+            .map(|&m| m.max(1e-8).powf(alpha))
             .collect();
 
-        let mut best_scale = 1.0_f32;
-        let mut best_mse = f32::INFINITY;
+        // Evaluate activation-weighted MSE using per-group quantization
+        // (matches the actual quantization applied to the weight matrix).
+        let mut total_loss = 0.0_f32;
+        for row in 0..out_features {
+            for g in 0..n_groups {
+                let g_start = g * group_size;
+                let g_end = (g_start + group_size).min(in_features);
 
-        let grid_steps = grid_steps.max(1);
-        for step in 0..grid_steps {
-            let t = step as f32 / (grid_steps - 1).max(1) as f32;
-            let candidate = 0.1 + t * (max_scale - 0.1);
-            if candidate <= 0.0 {
-                continue;
-            }
+                let scaled_group: Vec<f32> = (g_start..g_end)
+                    .map(|col| {
+                        let s = if col < scales.len() { scales[col] } else { 1.0 };
+                        floats[row * in_features + col] * s
+                    })
+                    .collect();
 
-            let mse = compute_scaled_quantization_mse(&column, candidate, qmax);
-            if mse < best_mse {
-                best_mse = mse;
-                best_scale = candidate;
+                let (quantized, q_scale, q_zp) = quantize_affine(&scaled_group, qmax);
+
+                for (j, col) in (g_start..g_end).enumerate() {
+                    let s = if col < scales.len() { scales[col] } else { 1.0 };
+                    let mag = if col < magnitudes.len() {
+                        magnitudes[col]
+                    } else {
+                        0.0
+                    };
+                    let importance = mag * mag;
+
+                    let dequant = (quantized[j] as f32 - q_zp) * q_scale;
+                    let reconstructed = dequant / s;
+                    let original = floats[row * in_features + col];
+                    let err = original - reconstructed;
+                    total_loss += importance * err * err;
+                }
             }
         }
 
-        scales[col] = best_scale;
+        if total_loss < best_loss {
+            best_loss = total_loss;
+            best_alpha = alpha;
+        }
     }
 
-    scales
-}
-
-/// Find the magnitude threshold above which channels are considered salient.
-///
-/// Channels with magnitude ≥ this threshold are in the top `(1 - percentile)`
-/// fraction. E.g., percentile=0.99 means the top 1% are salient.
-fn find_salient_threshold(magnitudes: &[f32], percentile: f32) -> f32 {
-    if magnitudes.is_empty() {
-        return 0.0;
-    }
-    let mut sorted: Vec<f32> = magnitudes.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Index at which salient channels begin.
-    let idx = ((percentile * sorted.len() as f32) as usize).min(sorted.len() - 1);
-    sorted[idx]
-}
-
-/// Compute MSE of: scale weights UP by s, quantize, dequantize, scale back DOWN by s.
-///
-/// This matches the AWQ paper's formulation: Q(w · s) · (1/s) ≈ w.
-/// Salient channels with scale > 1 use more of the quantization range,
-/// reducing their relative quantization error.
-fn compute_scaled_quantization_mse(original: &[f32], scale: f32, qmax: f32) -> f32 {
-    if original.is_empty() {
-        return 0.0;
-    }
-
-    // Scale UP by s (protect salient channels by giving them more range).
-    let scaled: Vec<f32> = original.iter().map(|&w| w * scale).collect();
-
-    // Quantize then dequantize the scaled values.
-    let (quantized, q_scale, q_zp) = quantize_affine(&scaled, qmax);
-    let dequantized: Vec<f32> = quantized
+    magnitudes
         .iter()
-        .map(|&q| (q as f32 - q_zp) * q_scale)
-        .collect();
-
-    // Scale back DOWN and compute MSE vs. original.
-    let inv_scale = 1.0 / scale;
-    let mut sum_sq = 0.0_f32;
-    for (i, &orig) in original.iter().enumerate() {
-        let reconstructed = dequantized[i] * inv_scale;
-        let err = orig - reconstructed;
-        sum_sq += err * err;
-    }
-    sum_sq / original.len() as f32
+        .map(|&m| m.max(1e-8).powf(best_alpha))
+        .collect()
 }
 
 use super::affine_quantize::quantize_affine;
@@ -694,11 +636,12 @@ mod tests {
 
                 for i in g_start..g_end {
                     let mut reconstructed = (q_data[i] as f32 - zp) * s;
-                    // If AWQ scales present, multiply back by channel scale.
+                    // AWQ scales are per-input-channel (column). Undo the
+                    // pre-quantization scale-up: reconstructed /= s[col].
                     if let Some(ref cs) = channel_scales {
-                        let ch = i / row_len; // which row = which output channel
-                        if ch < cs.len() {
-                            reconstructed *= cs[ch];
+                        let col = i - row * row_len; // position within the row
+                        if col < cs.len() {
+                            reconstructed /= cs[col];
                         }
                     }
                     let err = original[i] - reconstructed;
@@ -710,6 +653,84 @@ mod tests {
         sum_sq / original.len() as f32
     }
 
+    /// Like `reconstruction_mse`, but each column's error is weighted by
+    /// `magnitudes[col]²`, matching the AWQ loss (Equation 4 approximation).
+    fn weighted_reconstruction_mse(original: &[f32], program: &Program, magnitudes: &[f32]) -> f32 {
+        use crate::ir::passes::int4_pack::unpack_int4;
+
+        let op = &program.functions["main"].body.operations[0];
+        let q_data_raw = match op.attributes.get("quantized_data") {
+            Some(Value::Tensor { data, .. }) => data,
+            _ => panic!("missing quantized_data"),
+        };
+        let bit_width = match op.attributes.get("bit_width") {
+            Some(Value::Int(b)) => *b as u8,
+            _ => 8,
+        };
+        let q_data: Vec<u8> = if bit_width == 4 {
+            unpack_int4(q_data_raw, original.len())
+        } else {
+            q_data_raw.to_vec()
+        };
+        let scales = match op.attributes.get("scale") {
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Float(f)) => vec![*f as f32],
+            _ => panic!("missing scale"),
+        };
+        let zero_points = match op.attributes.get("zero_point") {
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Float(f)) => vec![*f as f32],
+            _ => panic!("missing zero_point"),
+        };
+        let group_size = match op.attributes.get("group_size") {
+            Some(Value::Int(g)) => *g as usize,
+            _ => original.len(),
+        };
+        let channel_scales = match op.attributes.get("awq_channel_scales") {
+            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(data)),
+            _ => None,
+        };
+        let (num_rows, row_len) = match op.attributes.get("quantized_data") {
+            Some(Value::Tensor { shape, .. }) if shape.len() >= 2 => {
+                let outer: usize = shape[..shape.len() - 1].iter().product();
+                let last = *shape.last().unwrap();
+                (outer, last)
+            }
+            Some(Value::Tensor { shape, .. }) => (1, shape.iter().product()),
+            _ => (1, original.len()),
+        };
+        let n_groups = row_len.div_ceil(group_size);
+
+        let mut weighted_sum = 0.0_f32;
+        for row in 0..num_rows {
+            for g in 0..n_groups {
+                let param_idx = row * n_groups + g;
+                let s = scales[param_idx];
+                let zp = zero_points[param_idx];
+                let g_start = row * row_len + g * group_size;
+                let g_end = (g_start + group_size).min(row * row_len + row_len);
+
+                for i in g_start..g_end {
+                    let col = i - row * row_len;
+                    let mut reconstructed = (q_data[i] as f32 - zp) * s;
+                    if let Some(ref cs) = channel_scales {
+                        if col < cs.len() {
+                            reconstructed /= cs[col];
+                        }
+                    }
+                    let mag = if col < magnitudes.len() {
+                        magnitudes[col]
+                    } else {
+                        0.0
+                    };
+                    let err = original[i] - reconstructed;
+                    weighted_sum += mag * mag * err * err;
+                }
+            }
+        }
+        weighted_sum / original.len() as f32
+    }
+
     // -----------------------------------------------------------------------
     // Test: AWQ produces lower MSE than MinMax on weights with varying
     // channel importance.
@@ -717,72 +738,88 @@ mod tests {
 
     #[test]
     fn awq_lower_mse_than_minmax() {
-        // 4 channels × 8 columns.  Channels 0,1 have large magnitudes,
-        // channels 2,3 have small values.  AWQ should protect channels 0,1.
-        let mut weights = vec![0.0_f32; 4 * 8];
-        // Channel 0: large dynamic range
-        for i in 0..8 {
-            weights[i] = (i as f32) * 10.0 - 35.0;
-        }
-        // Channel 1: large dynamic range, different pattern
-        for i in 0..8 {
-            weights[8 + i] = (i as f32).sin() * 20.0;
-        }
-        // Channel 2: small values
-        for i in 0..8 {
-            weights[16 + i] = (i as f32) * 0.01;
-        }
-        // Channel 3: small values
-        for i in 0..8 {
-            weights[24 + i] = (i as f32) * 0.02 - 0.05;
+        // 8 rows × 128 cols. Some input channels are important (large
+        // activation magnitudes) and carry outlier weights that benefit from
+        // more quantization range.
+        //
+        // Classic AWQ scenario: important channels carry small weights while
+        // unimportant channels carry large weights in the same quantization
+        // groups. AWQ re-distributes quantization range toward the important
+        // channels.
+        let out = 8;
+        let inp = 128;
+        let group_sz = 32;
+        let mut weights = vec![0.0_f32; out * inp];
+        for row in 0..out {
+            for col in 0..inp {
+                if col % 4 == 0 {
+                    // Important channels: small weights, high activation mag.
+                    weights[row * inp + col] = 0.1 * (row as f32 - 3.5);
+                } else {
+                    // Unimportant channels: large weights, low activation mag.
+                    weights[row * inp + col] = 50.0 * ((col as f32) / inp as f32 - 0.5);
+                }
+            }
         }
         let original = weights.clone();
 
-        // Magnitudes: channels 0,1 are far more important.
-        let magnitudes = vec![50.0, 40.0, 0.5, 0.3];
+        // Per-input-channel magnitudes.
+        let magnitudes: Vec<f32> = (0..inp)
+            .map(|c| if c % 4 == 0 { 100.0 } else { 0.1 })
+            .collect();
 
         // --- MinMax baseline ---
-        let mut minmax_prog = make_program("weight", &weights, vec![4, 8]);
-        let minmax_pass = AwqQuantizePass::new(4, 8, HashMap::new());
+        let mut minmax_prog = make_program("weight", &weights, vec![out, inp]);
+        let minmax_pass = AwqQuantizePass::new(4, group_sz, HashMap::new());
         minmax_pass.run(&mut minmax_prog).unwrap();
-        let minmax_mse = reconstruction_mse(&original, &minmax_prog);
+        let minmax_wmse = weighted_reconstruction_mse(&original, &minmax_prog, &magnitudes);
 
         // --- AWQ ---
         let mut awq_mags = HashMap::new();
-        awq_mags.insert("weight".to_string(), magnitudes);
-        let mut awq_prog = make_program("weight", &weights, vec![4, 8]);
-        let awq_pass = AwqQuantizePass::new(4, 8, awq_mags)
-            .with_grid_steps(40)
-            .with_salient_percentile(0.5);
+        awq_mags.insert("weight".to_string(), magnitudes.clone());
+        let mut awq_prog = make_program("weight", &weights, vec![out, inp]);
+        let awq_pass = AwqQuantizePass::new(4, group_sz, awq_mags).with_grid_steps(40);
         awq_pass.run(&mut awq_prog).unwrap();
-        let awq_mse = reconstruction_mse(&original, &awq_prog);
+        let awq_wmse = weighted_reconstruction_mse(&original, &awq_prog, &magnitudes);
 
+        // AWQ optimizes the activation-weighted MSE; α=0 equals MinMax,
+        // so the weighted MSE can only match or improve.
         assert!(
-            awq_mse <= minmax_mse,
-            "AWQ MSE ({awq_mse}) should be <= MinMax MSE ({minmax_mse})"
+            awq_wmse <= minmax_wmse,
+            "AWQ weighted MSE ({awq_wmse}) should be <= MinMax weighted MSE ({minmax_wmse})"
         );
     }
 
     // -----------------------------------------------------------------------
-    // Test: Salient channels get non-trivial scales.
+    // Test: Equation 5 α-search produces scales that vary with magnitude.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn salient_channels_get_nontrivial_scales() {
-        let mut weights = vec![0.0_f32; 4 * 16];
-        for i in 0..4 {
-            for j in 0..16 {
-                weights[i * 16 + j] = ((i * 16 + j) as f32) * 0.1 - 3.0;
+    fn alpha_search_produces_magnitude_dependent_scales() {
+        let out = 8;
+        let inp = 128;
+        let group_sz = 32;
+        let mut weights = vec![0.0_f32; out * inp];
+        for row in 0..out {
+            for col in 0..inp {
+                if col % 4 == 0 {
+                    weights[row * inp + col] = 0.1 * (row as f32 - 3.5);
+                } else {
+                    weights[row * inp + col] = 50.0 * ((col as f32) / inp as f32 - 0.5);
+                }
             }
         }
-        // Channels 0,1 salient; 2,3 not.
-        let magnitudes = vec![100.0, 80.0, 1.0, 0.5];
+
+        // Clear magnitude variation: every 4th channel very high, rest low.
+        let magnitudes: Vec<f32> = (0..inp)
+            .map(|c| if c % 4 == 0 { 100.0 } else { 0.5 })
+            .collect();
 
         let mut mags = HashMap::new();
         mags.insert("w".to_string(), magnitudes);
 
-        let mut prog = make_program("w", &weights, vec![4, 16]);
-        let pass = AwqQuantizePass::new(4, 16, mags).with_salient_percentile(0.5);
+        let mut prog = make_program("w", &weights, vec![out, inp]);
+        let pass = AwqQuantizePass::new(4, group_sz, mags).with_grid_steps(20);
         pass.run(&mut prog).unwrap();
 
         let op = &prog.functions["main"].body.operations[0];
@@ -791,18 +828,16 @@ mod tests {
             _ => panic!("missing awq_channel_scales"),
         };
 
-        assert_eq!(scales.len(), 4);
+        assert_eq!(scales.len(), inp);
 
-        // At least one salient channel should have a non-1.0 scale.
-        let has_nontrivial = scales[0] != 1.0 || scales[1] != 1.0;
+        // With Eq. 5 (s[c] = s_X[c]^α), high-magnitude channels should
+        // have strictly larger scales than low-magnitude channels.
+        let high_mag_scale = scales[0]; // s_X = 100.0
+        let low_mag_scale = scales[1]; // s_X = 0.5
         assert!(
-            has_nontrivial,
-            "salient channels should have non-1.0 scales: {scales:?}"
+            high_mag_scale > low_mag_scale,
+            "high-mag channel should get larger scale: {high_mag_scale} vs {low_mag_scale}"
         );
-
-        // Non-salient channels should remain at 1.0.
-        assert_eq!(scales[2], 1.0, "non-salient channel 2 should be 1.0");
-        assert_eq!(scales[3], 1.0, "non-salient channel 3 should be 1.0");
     }
 
     // -----------------------------------------------------------------------
@@ -811,34 +846,37 @@ mod tests {
 
     #[test]
     fn grid_search_improves_mse() {
-        // Construct weights where a non-unity scale clearly helps.
-        let mut weights = vec![0.0_f32; 2 * 32];
-        // Channel 0: large outlier pattern.
-        for j in 0..32 {
-            weights[j] = if j < 4 { 100.0 } else { 0.1 * j as f32 };
-        }
-        // Channel 1: uniform small.
-        for j in 0..32 {
-            weights[32 + j] = 0.01 * j as f32;
+        // Construct weights where non-uniform scaling clearly helps.
+        let out = 8;
+        let inp = 128;
+        let mut weights = vec![0.0_f32; out * inp];
+        for row in 0..out {
+            for col in 0..inp {
+                // First 8 columns have outlier values, rest are small.
+                weights[row * inp + col] = if col < 8 {
+                    100.0 - (col as f32) * 10.0
+                } else {
+                    0.1 * col as f32
+                };
+            }
         }
         let original = weights.clone();
 
-        let magnitudes = vec![90.0, 1.0];
+        // High magnitudes on the outlier columns.
+        let magnitudes: Vec<f32> = (0..inp).map(|c| if c < 8 { 90.0 } else { 1.0 }).collect();
 
-        // AWQ with grid search (all channels salient via percentile=0.0).
+        // AWQ with grid search.
         let mut mags = HashMap::new();
         mags.insert("w".to_string(), magnitudes);
 
-        let mut prog = make_program("w", &weights, vec![2, 32]);
-        let pass = AwqQuantizePass::new(4, 32, mags)
-            .with_grid_steps(50)
-            .with_salient_percentile(0.0);
+        let mut prog = make_program("w", &weights, vec![out, inp]);
+        let pass = AwqQuantizePass::new(4, inp, mags).with_grid_steps(50);
         pass.run(&mut prog).unwrap();
         let awq_mse = reconstruction_mse(&original, &prog);
 
-        // Compare with scale=1.0 everywhere (plain MinMax).
-        let mut plain_prog = make_program("w", &weights, vec![2, 32]);
-        let plain_pass = AwqQuantizePass::new(4, 32, HashMap::new());
+        // Compare with plain MinMax (no calibration data).
+        let mut plain_prog = make_program("w", &weights, vec![out, inp]);
+        let plain_pass = AwqQuantizePass::new(4, inp, HashMap::new());
         plain_pass.run(&mut plain_prog).unwrap();
         let plain_mse = reconstruction_mse(&original, &plain_prog);
 
@@ -854,11 +892,13 @@ mod tests {
 
     #[test]
     fn fallback_to_minmax_no_calibration() {
-        let values: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
-        let mut prog = make_program("weight", &values, vec![2, 8]);
+        let out = 8;
+        let inp = 128;
+        let values: Vec<f32> = (0..(out * inp)).map(|i| i as f32 * 0.5).collect();
+        let mut prog = make_program("weight", &values, vec![out, inp]);
 
         // Empty magnitudes → no calibration data.
-        let pass = AwqQuantizePass::new(4, 8, HashMap::new());
+        let pass = AwqQuantizePass::new(4, inp, HashMap::new());
         pass.run(&mut prog).unwrap();
 
         let op = &prog.functions["main"].body.operations[0];
@@ -882,14 +922,16 @@ mod tests {
 
     #[test]
     fn awq_8bit_quantization() {
-        let weights: Vec<f32> = (0..32).map(|i| (i as f32) * 0.3 - 4.0).collect();
-        let magnitudes = vec![10.0, 1.0, 0.5, 0.2];
+        let out = 8;
+        let inp = 128;
+        let weights: Vec<f32> = (0..(out * inp)).map(|i| (i as f32) * 0.3 - 4.0).collect();
+        let magnitudes: Vec<f32> = (0..inp).map(|c| if c < 32 { 10.0 } else { 0.5 }).collect();
 
         let mut mags = HashMap::new();
         mags.insert("w".to_string(), magnitudes);
 
-        let mut prog = make_program("w", &weights, vec![4, 8]);
-        let pass = AwqQuantizePass::new(8, 8, mags).with_salient_percentile(0.5);
+        let mut prog = make_program("w", &weights, vec![out, inp]);
+        let pass = AwqQuantizePass::new(8, inp, mags);
         pass.run(&mut prog).unwrap();
 
         let op = &prog.functions["main"].body.operations[0];
@@ -907,23 +949,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: 1-D tensor falls back gracefully.
+    // Test: 1-D tensor is left untouched by the pass.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn one_dim_tensor_fallback() {
-        let values = vec![1.0_f32, 2.0, 3.0, 4.0];
-        let mut prog = make_program("bias", &values, vec![4]);
+    fn one_dim_tensor_skipped() {
+        let values: Vec<f32> = (0..2048).map(|i| i as f32 * 0.01).collect();
+        let mut prog = make_program("bias", &values, vec![2048]);
 
         let mut mags = HashMap::new();
-        mags.insert("bias".to_string(), vec![5.0, 3.0, 1.0, 0.5]);
+        mags.insert("bias".to_string(), vec![5.0; 2048]);
 
-        let pass = AwqQuantizePass::new(4, 4, mags);
+        let pass = AwqQuantizePass::new(4, 128, mags);
         pass.run(&mut prog).unwrap();
 
+        // 1-D tensors (rank < 2) are skipped — op stays "const".
         let op = &prog.functions["main"].body.operations[0];
-        assert_eq!(op.op_type, "constexpr_affine_dequantize");
-        // 1-D goes through fallback, no AWQ scales.
-        assert!(op.attributes.get("awq_channel_scales").is_none());
+        assert_eq!(op.op_type, "const");
     }
 }
