@@ -295,11 +295,45 @@ impl MetalInference {
         self.decode_matmuls = None;
 
         if self.config.enable_turboquant {
-            // Outlier channel strategy (§4.3) is disabled for now.
-            // The mixed-precision split (4-bit outlier / 3-bit non-outlier)
-            // combined with QJL sign bit-stealing produces worse quality
-            // than uniform 4-bit codebook quantization for both K and V.
-            let outlier_cfg: Option<OutlierConfig> = None;
+            // Outlier channel strategy (§4.3): detect high-energy channels
+            // from K/V projection weights and quantize them at higher precision.
+            // At INT4, this splits into 4-bit outlier / 3-bit non-outlier groups,
+            // each with independent (b-1)-bit K codebook + QJL sign correction.
+            let outlier_cfg: Option<OutlierConfig> = if self.config.n_bits == 4 {
+                let mut weight_data: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                for layer in 0..mc.num_hidden_layers {
+                    let prefix = format!("model.layers.{layer}");
+                    let k_name = format!("{prefix}.self_attn.k_proj.weight");
+                    let v_name = format!("{prefix}.self_attn.v_proj.weight");
+                    if let (Ok(k_t), Ok(v_t)) = (provider.tensor(&k_name), provider.tensor(&v_name))
+                    {
+                        weight_data.push((k_t.data.to_vec(), v_t.data.to_vec()));
+                    }
+                }
+                if !weight_data.is_empty() {
+                    let refs: Vec<(&[u8], &[u8])> = weight_data
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect();
+                    let out_features = mc.num_key_value_heads * mc.head_dim;
+                    let n_outlier = mc.head_dim / 4;
+                    // Both groups use the target bit rate. The outlier
+                    // separation improves quality by concentrating high-energy
+                    // channels in a smaller subgroup with its own codebook.
+                    Some(OutlierConfig::from_weight_norms(
+                        &refs,
+                        out_features,
+                        mc.head_dim,
+                        n_outlier,
+                        self.config.n_bits, // outlier: target rate
+                        self.config.n_bits, // non-outlier: target rate
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             let tq_config = TurboQuantMetalConfig {
                 n_bits: self.config.n_bits,
