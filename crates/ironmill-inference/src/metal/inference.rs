@@ -1911,7 +1911,7 @@ fn encode_kv_cache_and_attention(
                 enc.set_buffer(&outlier.non_outlier_codebook, 0, 28);
                 enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 29);
                 enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 30);
-                enc.dispatch_threadgroups((nh as usize, 1, 1), (tg_size.min(1024), 1, 1));
+                enc.dispatch_threadgroups((nh as usize, 1, 1), (256_usize.max(tg_size).min(1024), 1, 1));
             }
         } else {
             // ── Standard TurboQuant dispatch ──
@@ -1989,7 +1989,7 @@ fn encode_kv_cache_and_attention(
                 enc.set_buffer(&tq.qjl_matrix, 0, 16);
                 enc.set_buffer(k_r_norms, 0, 17);
                 enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 18);
-                enc.dispatch_threadgroups((nh as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
+                enc.dispatch_threadgroups((nh as usize, 1, 1), (256_usize.max(hd as usize).min(1024), 1, 1));
             }
         }
         enc.end_encoding();

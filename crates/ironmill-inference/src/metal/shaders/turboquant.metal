@@ -191,7 +191,7 @@ kernel void turboquant_cache_write(
 //   buffer(16) qjl_matrix:      [head_dim × head_dim] float
 //   buffer(17) k_r_norms:       [num_kv_heads × max_seq_len] float
 //
-// Dispatch: num_heads threadgroups, min(head_dim, 1024) threads per group.
+// Dispatch: num_heads threadgroups, max(256, head_dim) threads per group.
 
 kernel void turboquant_attention(
     device const half* q                [[buffer(0)]],
@@ -214,18 +214,20 @@ kernel void turboquant_attention(
     device const float* k_r_norms       [[buffer(17)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint tg_size [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
 {
     // Shared memory sized exactly to HEAD_DIM (injected at compile time).
     //   shared_q_rot:  HEAD_DIM × 4     B
     //   shared_s_q:    HEAD_DIM × 4     B
     //   kv_tile_raw:   32 × HEAD_DIM    B (char; aliased K/V)
     //   tile_scales:   32 × 4           B
-    //   shared_reduce: HEAD_DIM × 4     B
     //   tile_scores:   32 × 4           B
     //   shared_output: HEAD_DIM × 4     B
     //   softmax/corr:  3 × 4            B
     constexpr uint TILE = 32;
+    constexpr uint SIMD_SIZE = 32;
     // Max codebook size: 2^8 = 256 entries for INT8 V, fits easily in shared mem.
     constexpr uint MAX_CB = 256;
 
@@ -233,7 +235,6 @@ kernel void turboquant_attention(
     threadgroup float shared_s_q[HEAD_DIM];
     threadgroup char  kv_tile_raw[TILE * HEAD_DIM];
     threadgroup float tile_scales[TILE];
-    threadgroup float shared_reduce[HEAD_DIM];
     threadgroup float tile_scores[TILE];
     threadgroup float shared_output[HEAD_DIM];
     threadgroup float softmax_max[1];
@@ -241,6 +242,8 @@ kernel void turboquant_attention(
     threadgroup float tile_correction[1];
     threadgroup float shared_k_cb[MAX_CB];
     threadgroup float shared_v_cb[MAX_CB];
+
+    uint num_simdgroups = tg_size / SIMD_SIZE;
 
     uint head_idx = tgid;
     if (head_idx >= num_heads) return;
@@ -297,10 +300,6 @@ kernel void turboquant_attention(
 
     uint bpp = bytes_per_pos(n_bits, head_dim);
 
-    // Precompute reduction-size constant for tree reduction
-    uint rs = 1;
-    while (rs < tg_size) rs <<= 1;
-
     // ---- Step 2: Tiled flash attention ----
     for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
         uint tile_end = min(tile_start + TILE, seq_len);
@@ -316,41 +315,32 @@ kernel void turboquant_attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute QK^T for every position in the tile
-        for (uint p = 0; p < actual_tile; p++) {
-            float k_deq = tile_scales[p];
+        // QK^T with fused QJL correction: each simdgroup processes one position.
+        // simd_sum reduces within a simdgroup with zero barriers.
+        for (uint pbase = 0; pbase < actual_tile; pbase += num_simdgroups) {
+            uint p = pbase + sgid;
+            if (p < actual_tile) {
+                float k_deq = tile_scales[p];
 
-            // QJL correction weight: precompute ||r|| · coefficient · scale
-            // so the QJL term can be fused into the same dot-product accumulator.
-            uint abs_pos = tile_start + p;
-            float r_norm = k_r_norms[kv_head * max_seq_len + abs_pos];
-            float qjl_weight = r_norm * qjl_factor * k_deq;
+                uint abs_pos = tile_start + p;
+                float r_norm = k_r_norms[kv_head * max_seq_len + abs_pos];
+                float qjl_weight = r_norm * qjl_factor * k_deq;
 
-            // Fused K dot + QJL correction — single accumulator, single reduction.
-            //   score = Σ_d [ q_rot[d] · cb[idx] · k_deq
-            //               + s_q[d] · sign · ||r|| · c · k_deq ]
-            float partial = 0.0f;
-            for (uint d = tid; d < head_dim; d += tg_size) {
-                uchar raw = read_raw_element(kv_tile_raw, p, d, head_dim, n_bits);
-                uchar sign_mask = uchar(1) << (n_bits - 1);
-                float k_val = shared_k_cb[raw & (sign_mask - 1)] * k_deq;
-                float qjl_sign = (raw & sign_mask) ? 1.0f : -1.0f;
-                partial += shared_q_rot[d] * k_val
-                         + shared_s_q[d] * qjl_sign * qjl_weight;
+                float partial = 0.0f;
+                for (uint d = lane; d < head_dim; d += SIMD_SIZE) {
+                    uchar raw = read_raw_element(kv_tile_raw, p, d, head_dim, n_bits);
+                    uchar sign_mask = uchar(1) << (n_bits - 1);
+                    float k_val = shared_k_cb[raw & (sign_mask - 1)] * k_deq;
+                    float qjl_sign = (raw & sign_mask) ? 1.0f : -1.0f;
+                    partial += shared_q_rot[d] * k_val
+                             + shared_s_q[d] * qjl_sign * qjl_weight;
+                }
+                partial = simd_sum(partial);
+                if (lane == 0)
+                    tile_scores[p] = partial * scale;
             }
-
-            shared_reduce[tid] = partial;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = rs / 2; s > 0; s >>= 1) {
-                if (tid < s && (tid + s) < tg_size)
-                    shared_reduce[tid] += shared_reduce[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-
-            if (tid == 0)
-                tile_scores[p] = shared_reduce[0] * scale;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ---- Per-tile online softmax ----
         if (tid == 0) {
@@ -743,7 +733,7 @@ kernel void turboquant_outlier_cache_write(
 //
 // Buffers mirror the cache write kernel, plus Q and output buffers.
 //
-// Dispatch: num_heads threadgroups, min(max(d_outlier_padded, d_non_padded), 1024) threads.
+// Dispatch: num_heads threadgroups, max(256, max(d_outlier_padded, d_non_padded)) threads.
 
 kernel void turboquant_outlier_attention(
     device const half* q                            [[buffer(0)]],
@@ -777,7 +767,9 @@ kernel void turboquant_outlier_attention(
     device const float* v_non_outlier_codebook      [[buffer(28)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint tg_size [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
 {
     // Shared memory sized exactly to HEAD_DIM (injected at compile time).
     //   shared_q_outlier:     HEAD_DIM × 4         B
@@ -787,12 +779,12 @@ kernel void turboquant_outlier_attention(
     //   outlier_kv_tile:      32 × HEAD_DIM_PACKED B (INT4 packed, aliased K/V)
     //   non_outlier_kv_tile:  32 × HEAD_DIM_PACKED B
     //   o/n_tile_scales:      2 × 32 × 4           B
-    //   shared_reduce:        HEAD_DIM × 4         B
     //   tile_scores:          32 × 4               B
     //   output_outlier:       HEAD_DIM × 4         B
     //   output_non_outlier:   HEAD_DIM × 4         B
     //   softmax/corr:         3 × 4                B
     constexpr uint TILE = 32;
+    constexpr uint SIMD_SIZE = 32;
 
     threadgroup float shared_q_outlier[HEAD_DIM];
     threadgroup float shared_q_non_outlier[HEAD_DIM];
@@ -802,13 +794,14 @@ kernel void turboquant_outlier_attention(
     threadgroup char  non_outlier_kv_tile[TILE * HEAD_DIM_PACKED];
     threadgroup float o_tile_scales[TILE];
     threadgroup float n_tile_scales[TILE];
-    threadgroup float shared_reduce[HEAD_DIM];
     threadgroup float tile_scores[TILE];
     threadgroup float shared_output_outlier[HEAD_DIM];
     threadgroup float shared_output_non_outlier[HEAD_DIM];
     threadgroup float softmax_max[1];
     threadgroup float softmax_sum[1];
     threadgroup float tile_correction[1];
+
+    uint num_simdgroups = tg_size / SIMD_SIZE;
 
     uint head_idx = tgid;
     if (head_idx >= num_heads) return;
@@ -876,9 +869,6 @@ kernel void turboquant_outlier_attention(
     uint o_base = kv_head * max_seq_len * o_bytes_per_pos;
     uint n_base = kv_head * max_seq_len * n_bytes_per_pos;
 
-    uint rs = 1;
-    while (rs < tg_size) rs <<= 1;
-
     // ---- Tiled flash attention ----
     for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
         uint tile_end = min(tile_start + TILE, seq_len);
@@ -899,74 +889,51 @@ kernel void turboquant_outlier_attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute Q · K dot product with QJL correction for each position in tile
-        for (uint p = 0; p < actual_tile; p++) {
-            float k_o_deq = o_tile_scales[p];
-            float k_n_deq = n_tile_scales[p];
+        // QK^T with dual-group QJL correction: each simdgroup processes one position.
+        // simd_sum reduces within a simdgroup with zero barriers.
+        for (uint pbase = 0; pbase < actual_tile; pbase += num_simdgroups) {
+            uint p = pbase + sgid;
+            if (p < actual_tile) {
+                float k_o_deq = o_tile_scales[p];
+                float k_n_deq = n_tile_scales[p];
 
-            float partial_dot = 0.0f;
-            float partial_qjl_o = 0.0f;
-            float partial_qjl_n = 0.0f;
+                float partial_dot = 0.0f;
+                float partial_qjl_o = 0.0f;
+                float partial_qjl_n = 0.0f;
 
-            // Outlier K dequant with QJL sign extraction
-            // K cache stores (b-1)-bit codebook index in bits [2:0] and
-            // QJL sign in bit [3] of each nibble (Algorithm 2).
-            for (uint d = tid; d < d_outlier_padded; d += tg_size) {
-                float qjl_sign;
-                float k_val = read_quantized_tile_int4_qjl(
-                    outlier_kv_tile, p, d, d_outlier_padded, k_o_deq,
-                    outlier_codebook, qjl_sign);
-                partial_dot += shared_q_outlier[d] * k_val;
-                partial_qjl_o += shared_s_q_outlier[d] * qjl_sign;
+                // Outlier K dequant with QJL sign extraction
+                for (uint d = lane; d < d_outlier_padded; d += SIMD_SIZE) {
+                    float qjl_sign;
+                    float k_val = read_quantized_tile_int4_qjl(
+                        outlier_kv_tile, p, d, d_outlier_padded, k_o_deq,
+                        outlier_codebook, qjl_sign);
+                    partial_dot += shared_q_outlier[d] * k_val;
+                    partial_qjl_o += shared_s_q_outlier[d] * qjl_sign;
+                }
+                // Non-outlier K dequant with QJL sign extraction
+                for (uint d = lane; d < d_non_padded; d += SIMD_SIZE) {
+                    float qjl_sign;
+                    float k_val = read_quantized_tile_int4_qjl(
+                        non_outlier_kv_tile, p, d, d_non_padded, k_n_deq,
+                        non_outlier_codebook, qjl_sign);
+                    partial_dot += shared_q_non_outlier[d] * k_val;
+                    partial_qjl_n += shared_s_q_non[d] * qjl_sign;
+                }
+
+                float base_score = simd_sum(partial_dot);
+                float qjl_o = simd_sum(partial_qjl_o);
+                float qjl_n = simd_sum(partial_qjl_n);
+
+                if (lane == 0) {
+                    float corr_o = k_o_deq * k_outlier_r_norms[kv_head * max_seq_len + tile_start + p]
+                                 * qjl_factor_o * qjl_o;
+                    float corr_n = k_n_deq * k_non_outlier_r_norms[kv_head * max_seq_len + tile_start + p]
+                                 * qjl_factor_n * qjl_n;
+                    tile_scores[p] = (base_score + corr_o + corr_n) * scale;
+                }
             }
-            // Non-outlier K dequant with QJL sign extraction
-            for (uint d = tid; d < d_non_padded; d += tg_size) {
-                float qjl_sign;
-                float k_val = read_quantized_tile_int4_qjl(
-                    non_outlier_kv_tile, p, d, d_non_padded, k_n_deq,
-                    non_outlier_codebook, qjl_sign);
-                partial_dot += shared_q_non_outlier[d] * k_val;
-                partial_qjl_n += shared_s_q_non[d] * qjl_sign;
-            }
-
-            // Reduce base dot product
-            shared_reduce[tid] = partial_dot;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = rs / 2; s > 0; s >>= 1) {
-                if (tid < s && (tid + s) < tg_size)
-                    shared_reduce[tid] += shared_reduce[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            float base_score = shared_reduce[0];
-
-            // Reduce outlier QJL dot
-            shared_reduce[tid] = partial_qjl_o;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = rs / 2; s > 0; s >>= 1) {
-                if (tid < s && (tid + s) < tg_size)
-                    shared_reduce[tid] += shared_reduce[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            float qjl_o = shared_reduce[0];
-
-            // Reduce non-outlier QJL dot
-            shared_reduce[tid] = partial_qjl_n;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = rs / 2; s > 0; s >>= 1) {
-                if (tid < s && (tid + s) < tg_size)
-                    shared_reduce[tid] += shared_reduce[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            float qjl_n = shared_reduce[0];
-
-            float corr_o = k_o_deq * k_outlier_r_norms[kv_head * max_seq_len + tile_start + p]
-                         * qjl_factor_o * qjl_o;
-            float corr_n = k_n_deq * k_non_outlier_r_norms[kv_head * max_seq_len + tile_start + p]
-                         * qjl_factor_n * qjl_n;
-
-            if (tid == 0) tile_scores[p] = (base_score + corr_o + corr_n) * scale;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ---- Per-tile online softmax ----
         if (tid == 0) {
