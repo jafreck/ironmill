@@ -13,6 +13,7 @@ use ironmill_core::gpu::bundle::{
 };
 use ironmill_core::weights::{ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
 use mil_rs::MilError;
+use mil_rs::ir::ScalarType;
 
 use super::error::MetalError;
 
@@ -121,6 +122,37 @@ impl WeightProvider for MetalBundleProvider {
                     shape: shape.clone(),
                     dtype,
                     quant_info: QuantizationInfo::None,
+                })
+            }
+            TensorManifest::AffineDequantize {
+                quantized_data_file,
+                scales_file,
+                zeros_file,
+                shape,
+                bit_width,
+                group_size,
+                axis,
+                dtype,
+            } => {
+                let quantized_data = self.read_file(quantized_data_file)?;
+                let scale = self.read_file(scales_file)?;
+                let zero_point = self.read_file(zeros_file)?;
+                let dtype =
+                    str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
+
+                Ok(WeightTensor {
+                    data: Cow::Owned(quantized_data),
+                    shape: shape.clone(),
+                    dtype,
+                    quant_info: QuantizationInfo::AffineDequantize {
+                        scale,
+                        zero_point,
+                        scale_dtype: ScalarType::Float16,
+                        zero_point_dtype: ScalarType::Float16,
+                        axis: Some(*axis as usize),
+                        bit_width: *bit_width,
+                        group_size: Some(*group_size),
+                    },
                 })
             }
         }
@@ -386,5 +418,146 @@ mod tests {
         let reader = MetalBundleProvider::open(&bundle_path).unwrap();
         let result = reader.tensor("nonexistent.tensor");
         assert!(result.is_err());
+    }
+
+    struct TestAffine {
+        quantized_data: Vec<u8>,
+        scales: Vec<u8>,
+        zeros: Vec<u8>,
+        bit_width: u8,
+        group_size: usize,
+        axis: i64,
+    }
+
+    /// Write a bundle containing an affine-quantized tensor.
+    fn write_test_bundle_with_affine(
+        bundle_path: &Path,
+        config: &ModelConfig,
+        name: &str,
+        sanitized: &str,
+        shape: Vec<usize>,
+        dtype: &str,
+        affine: &TestAffine,
+    ) {
+        let weights_dir = bundle_path.join("weights");
+        fs::create_dir_all(&weights_dir).unwrap();
+
+        fs::write(
+            weights_dir.join(format!("{sanitized}.qdata")),
+            &affine.quantized_data,
+        )
+        .unwrap();
+        fs::write(
+            weights_dir.join(format!("{sanitized}.scale")),
+            &affine.scales,
+        )
+        .unwrap();
+        fs::write(
+            weights_dir.join(format!("{sanitized}.zeros")),
+            &affine.zeros,
+        )
+        .unwrap();
+
+        let mut tensor_map = serde_json::Map::new();
+        tensor_map.insert(
+            name.to_string(),
+            serde_json::json!({
+                "format": "affine_dequantize",
+                "quantized_data_file": format!("weights/{sanitized}.qdata"),
+                "scales_file": format!("weights/{sanitized}.scale"),
+                "zeros_file": format!("weights/{sanitized}.zeros"),
+                "shape": shape,
+                "bit_width": affine.bit_width,
+                "group_size": affine.group_size,
+                "axis": affine.axis,
+                "dtype": dtype,
+            }),
+        );
+
+        let manifest = serde_json::json!({
+            "format_version": 1,
+            "model_config": {
+                "architecture": format!("{:?}", config.architecture).to_lowercase(),
+                "hidden_size": config.hidden_size,
+                "intermediate_size": config.intermediate_size,
+                "num_hidden_layers": config.num_hidden_layers,
+                "num_attention_heads": config.num_attention_heads,
+                "num_key_value_heads": config.num_key_value_heads,
+                "head_dim": config.head_dim,
+                "vocab_size": config.vocab_size,
+                "max_position_embeddings": config.max_position_embeddings,
+                "rms_norm_eps": config.rms_norm_eps,
+                "rope_theta": config.rope_theta,
+                "tie_word_embeddings": config.tie_word_embeddings,
+                "extra": config.extra,
+            },
+            "quantization": {
+                "method": "none",
+                "n_bits": 16,
+                "seed": 42,
+                "min_elements": 1024,
+            },
+            "tensors": tensor_map,
+        });
+
+        fs::write(
+            bundle_path.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn round_trip_affine_quantized_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("test.ironml-gpu");
+
+        let config = test_config();
+        write_test_bundle_with_affine(
+            &bundle_path,
+            &config,
+            "model.layers.0.mlp.gate_proj.weight",
+            "model_layers_0_mlp_gate_proj_weight",
+            vec![2048, 2048],
+            "uint8",
+            &TestAffine {
+                quantized_data: vec![0xCC; 32],
+                scales: vec![0xDD; 16],
+                zeros: vec![0xEE; 16],
+                bit_width: 4,
+                group_size: 128,
+                axis: 1,
+            },
+        );
+
+        let reader = MetalBundleProvider::open(&bundle_path).unwrap();
+        let tensor = reader
+            .tensor("model.layers.0.mlp.gate_proj.weight")
+            .unwrap();
+
+        assert_eq!(tensor.dtype, ScalarType::UInt8);
+        assert_eq!(tensor.data.as_ref(), &[0xCC; 32]);
+        assert_eq!(tensor.shape, vec![2048, 2048]);
+
+        match &tensor.quant_info {
+            QuantizationInfo::AffineDequantize {
+                scale,
+                zero_point,
+                scale_dtype,
+                zero_point_dtype,
+                axis,
+                bit_width,
+                group_size,
+            } => {
+                assert_eq!(scale, &vec![0xDD; 16]);
+                assert_eq!(zero_point, &vec![0xEE; 16]);
+                assert_eq!(*scale_dtype, ScalarType::Float16);
+                assert_eq!(*zero_point_dtype, ScalarType::Float16);
+                assert_eq!(*axis, Some(1));
+                assert_eq!(*bit_width, 4);
+                assert_eq!(*group_size, Some(128));
+            }
+            other => panic!("expected AffineDequantize, got {other:?}"),
+        }
     }
 }
