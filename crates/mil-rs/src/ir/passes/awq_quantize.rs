@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use super::tensor_utils::{tensor_as_f32_slice, tensor_f16_as_f32_slice};
+use super::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice, tensor_f16_as_f32_slice};
 use crate::error::Result;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
@@ -153,11 +153,11 @@ impl Pass for AwqQuantizePass {
 
                     match magnitudes {
                         Some(mags) if !mags.is_empty() => {
-                            let num_channels = shape[0];
-                            let mags = if mags.len() >= num_channels {
-                                &mags[..num_channels]
+                            let in_features = *shape.last().unwrap_or(&1);
+                            let mags = if mags.len() >= in_features {
+                                &mags[..in_features]
                             } else {
-                                // Magnitude vector shorter than channel count —
+                                // Magnitude vector shorter than input channel count —
                                 // fall back to MinMax.
                                 emit_fallback_per_group(
                                     op,
@@ -170,7 +170,7 @@ impl Pass for AwqQuantizePass {
                                 continue;
                             };
 
-                            // AWQ: compute optimal per-channel scales.
+                            // AWQ: compute optimal per-input-channel scales.
                             let channel_scales = compute_awq_scales(
                                 &floats,
                                 &shape,
@@ -180,20 +180,22 @@ impl Pass for AwqQuantizePass {
                                 qmax,
                             );
 
-                            // Apply scales and quantize.
-                            let channel_size: usize = shape[1..].iter().product();
+                            // Apply scales per-column (input channel):
+                            // W_scaled[:, c] = W[:, c] * s[c]
+                            // This makes salient input channels use more of the
+                            // quantization range, reducing their quantization error.
+                            let out_features = shape[0];
                             let mut scaled_weights = floats.clone();
-                            for (ch, &s) in channel_scales.iter().enumerate() {
-                                if s != 1.0 {
-                                    let start = ch * channel_size;
-                                    let end = start + channel_size;
-                                    for w in &mut scaled_weights[start..end] {
-                                        *w /= s;
+                            for row in 0..out_features {
+                                for (col, &s) in channel_scales.iter().enumerate() {
+                                    if s != 1.0 {
+                                        scaled_weights[row * in_features + col] *= s;
                                     }
                                 }
                             }
 
-                            // Per-group quantization on the scaled weights.
+                            // Quantize the up-scaled weights. The norm fusion pass
+                            // will compensate by dividing norm gamma by s[c].
                             emit_per_group_with_scales(
                                 op,
                                 &scaled_weights,
@@ -227,11 +229,11 @@ impl Pass for AwqQuantizePass {
 // AWQ scale computation
 // ---------------------------------------------------------------------------
 
-/// Compute optimal per-channel scales using grid search on salient channels.
+/// Compute optimal per-input-channel scales using grid search.
 ///
-/// For each salient channel, searches `grid_steps` candidate scales to find
-/// the one that minimizes quantize-then-dequantize MSE for that channel's
-/// weight values.
+/// For each salient input channel (column), searches `grid_steps` candidate
+/// scales to find the one that minimizes quantize-then-dequantize MSE for
+/// that column's weight values across all output channels (rows).
 fn compute_awq_scales(
     floats: &[f32],
     shape: &[usize],
@@ -240,50 +242,46 @@ fn compute_awq_scales(
     salient_percentile: f32,
     qmax: f32,
 ) -> Vec<f32> {
-    let num_channels = shape[0];
-    let channel_size: usize = shape[1..].iter().product();
+    let out_features = shape[0];
+    let in_features = *shape.last().unwrap_or(&1);
 
-    // Determine which channels are salient.
+    // Determine which input channels are salient.
     let salient_threshold = find_salient_threshold(magnitudes, salient_percentile);
 
-    // Compute a reasonable max_scale from the magnitude range.
     let max_mag = magnitudes.iter().cloned().fold(0.0_f32, f32::max);
     let max_scale = if max_mag > 1e-8 { max_mag } else { 1.0 };
 
-    let mut scales = vec![1.0_f32; num_channels];
+    let mut scales = vec![1.0_f32; in_features];
 
-    for ch in 0..num_channels {
-        if magnitudes[ch] < salient_threshold {
-            // Not salient — keep scale = 1.0.
+    for col in 0..in_features {
+        if col >= magnitudes.len() || magnitudes[col] < salient_threshold {
             continue;
         }
 
-        let start = ch * channel_size;
-        let end = start + channel_size;
-        let original = &floats[start..end];
+        // Extract column values across all rows.
+        let column: Vec<f32> = (0..out_features)
+            .map(|row| floats[row * in_features + col])
+            .collect();
 
         let mut best_scale = 1.0_f32;
         let mut best_mse = f32::INFINITY;
 
         let grid_steps = grid_steps.max(1);
         for step in 0..grid_steps {
-            // Scale candidates linearly spaced in [0.1, max_scale].
             let t = step as f32 / (grid_steps - 1).max(1) as f32;
             let candidate = 0.1 + t * (max_scale - 0.1);
-
             if candidate <= 0.0 {
                 continue;
             }
 
-            let mse = compute_scaled_quantization_mse(original, candidate, qmax);
-
+            let mse = compute_scaled_quantization_mse(&column, candidate, qmax);
             if mse < best_mse {
                 best_mse = mse;
                 best_scale = candidate;
             }
         }
 
-        scales[ch] = best_scale;
+        scales[col] = best_scale;
     }
 
     scales
@@ -340,13 +338,11 @@ use super::int4_pack::pack_int4;
 // Emission helpers
 // ---------------------------------------------------------------------------
 
-/// Emit per-group quantization with AWQ channel scales absorbed into
-/// the per-group scale parameters.
+/// Emit per-group quantization with AWQ per-column channel scales.
 ///
-/// Weights were divided by `s[c]` before quantization. To compensate,
-/// each per-group scale is multiplied by `s[c]` for its row, so that
-/// dequantized weights are: `(q - zp) * (scale * s[c])` = original weight.
-/// This eliminates the need for runtime activation scaling.
+/// Weights were scaled UP by s[c] per input column before quantization.
+/// The compensation (dividing activations by s[c]) is handled by the
+/// AwqScaleFusionPass, which absorbs 1/s[c] into the preceding norm gamma.
 fn emit_per_group_with_scales(
     op: &mut crate::ir::operation::Operation,
     scaled_floats: &[f32],
@@ -373,22 +369,13 @@ fn emit_per_group_with_scales(
 
     for row in 0..outer_count {
         let row_start = row * last_dim;
-        // AWQ compensation: multiply each group's scale by the channel scale
-        // for this row, so dequantized weights are pre-compensated.
-        let ch_scale = if row < channel_scales.len() {
-            channel_scales[row]
-        } else {
-            1.0
-        };
         for g in 0..n_groups {
             let g_start = row_start + g * group_size;
             let g_end = (g_start + group_size).min(row_start + last_dim);
             let group_slice = &scaled_floats[g_start..g_end];
             let (q, s, zp) = quantize_affine(group_slice, qmax);
             all_quantized.extend_from_slice(&q);
-            // Absorb channel scale into the quantization scale:
-            // dequant = (q - zp) * s * ch_scale = original value
-            all_scales.push(s * ch_scale);
+            all_scales.push(s);
             all_zero_points.push(zp);
         }
     }
@@ -444,6 +431,18 @@ fn emit_per_group_with_scales(
         .insert("group_size".to_string(), Value::Int(group_size as i64));
     op.attributes
         .insert("bit_width".to_string(), Value::Int(bits as i64));
+
+    // Store AWQ channel scales for downstream fusion.
+    // The fusion pass divides norm gamma by these scales to compensate.
+    let num_scales = channel_scales.len();
+    op.attributes.insert(
+        "awq_channel_scales".to_string(),
+        Value::Tensor {
+            data: f32_slice_to_bytes(channel_scales),
+            shape: vec![num_scales],
+            dtype: ScalarType::Float32,
+        },
+    );
 
     let out_type = TensorType::new(ScalarType::Float32, shape.to_vec());
     if let Some(slot) = op.output_types.get_mut(0) {

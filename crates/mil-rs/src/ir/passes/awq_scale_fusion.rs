@@ -185,7 +185,7 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
                         if let Some(mut gamma_floats) = gamma_floats_opt {
                             let n = gamma_floats.len().min(target.scales.len());
                             for (c, g) in gamma_floats.iter_mut().enumerate().take(n) {
-                                *g *= target.scales[c];
+                                *g /= target.scales[c];
                             }
                             // Store in original dtype to preserve compatibility.
                             let new_data = match *dtype {
@@ -222,7 +222,7 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
                 if let Some(mut gamma_floats) = gamma_floats_opt {
                     let n = gamma_floats.len().min(target.scales.len());
                     for (c, g) in gamma_floats.iter_mut().enumerate().take(n) {
-                        *g *= target.scales[c];
+                        *g /= target.scales[c];
                     }
                     let new_data = match dtype {
                         ScalarType::Float16 => gamma_floats
