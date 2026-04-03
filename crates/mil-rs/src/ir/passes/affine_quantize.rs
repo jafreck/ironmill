@@ -63,6 +63,9 @@ pub struct AffineQuantizePass {
     /// Per-tensor or per-channel base granularity. When `group_size` is set,
     /// this field is ignored (per-group overrides it).
     pub granularity: Granularity,
+    /// Minimum number of tensor elements to quantize. Tensors smaller than
+    /// this are left in their original precision. Default: 1024.
+    pub min_elements: usize,
 }
 
 impl AffineQuantizePass {
@@ -72,6 +75,7 @@ impl AffineQuantizePass {
             bits: BitWidth::Four,
             group_size: None,
             granularity: Granularity::PerTensor,
+            min_elements: 1024,
         }
     }
 
@@ -81,6 +85,7 @@ impl AffineQuantizePass {
             bits: BitWidth::Four,
             group_size: Some(group_size),
             granularity: Granularity::PerTensor, // ignored when group_size is set
+            min_elements: 1024,
         }
     }
 
@@ -90,6 +95,7 @@ impl AffineQuantizePass {
             bits: BitWidth::Eight,
             group_size: None,
             granularity: Granularity::PerTensor,
+            min_elements: 1024,
         }
     }
 
@@ -99,6 +105,7 @@ impl AffineQuantizePass {
             bits,
             group_size,
             granularity,
+            min_elements: 1024,
         }
     }
 }
@@ -133,6 +140,32 @@ impl Pass for AffineQuantizePass {
                 let in_attrs = !in_inputs && is_float(op.attributes.get("val"));
 
                 if !in_inputs && !in_attrs {
+                    continue;
+                }
+
+                // Check eligibility before removing the value.
+                let (numel, rank) = {
+                    let val = if in_inputs {
+                        op.inputs.get("val").unwrap()
+                    } else {
+                        op.attributes.get("val").unwrap()
+                    };
+                    if let Value::Tensor { shape, .. } = val {
+                        (shape.iter().product::<usize>(), shape.len())
+                    } else {
+                        continue;
+                    }
+                };
+
+                // Skip small tensors (norms, biases, scalars).
+                if numel < self.min_elements {
+                    continue;
+                }
+
+                // For per-group quantization (GPU bundle path), skip 1D
+                // tensors (layer norms, biases) — these are critical for
+                // model quality and too small to benefit from quantization.
+                if self.group_size.is_some() && rank < 2 {
                     continue;
                 }
 
@@ -506,9 +539,13 @@ mod tests {
         let values = [0.0_f32, 1.0, 2.0, 3.0];
         let mut program = make_program(&values, vec![4]);
 
-        AffineQuantizePass::int4_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_tensor();
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
         assert_eq!(op.op_type, "constexpr_affine_dequantize");
@@ -591,9 +628,13 @@ mod tests {
         ];
         let mut program = make_program(&values, vec![2, 8]);
 
-        AffineQuantizePass::int4_per_group(4)
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_group(4);
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
         assert_eq!(op.op_type, "constexpr_affine_dequantize");
@@ -668,9 +709,13 @@ mod tests {
         let values = [0.0_f32, 0.0, 0.0, 15.0, 0.0, 0.0, 0.0, 1.0];
         let mut program = make_program(&values, vec![1, 8]);
 
-        AffineQuantizePass::int4_per_group(4)
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_group(4);
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
         match op.attributes.get("scale") {
@@ -703,9 +748,13 @@ mod tests {
         let values = [0.0_f32, 1.0, 2.0, 3.0, 10.0, 20.0];
         let mut program = make_program(&values, vec![1, 6]);
 
-        AffineQuantizePass::int4_per_group(4)
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_group(4);
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
 
@@ -729,21 +778,20 @@ mod tests {
 
     #[test]
     fn int4_per_group_1d_tensor() {
-        // 1D tensor, group_size=2: [0, 10, 0, 5]
+        // 1D tensors should be skipped (norms/biases).
         let values = [0.0_f32, 10.0, 0.0, 5.0];
         let mut program = make_program(&values, vec![4]);
 
-        AffineQuantizePass::int4_per_group(2)
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_group(2);
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
-        match op.attributes.get("scale") {
-            Some(Value::Tensor { shape, .. }) => {
-                assert_eq!(*shape, vec![2]); // 2 groups
-            }
-            other => panic!("expected scale Tensor, got {other:?}"),
-        }
+        assert_eq!(op.op_type, "const", "1D tensors should remain as const");
     }
 
     // -----------------------------------------------------------------------
@@ -762,9 +810,13 @@ mod tests {
 
         // Run our new AffineQuantizePass in INT8 per-tensor mode.
         let mut program_new = make_program(&values, vec![5]);
-        AffineQuantizePass::int8_per_tensor()
-            .run(&mut program_new)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int8_per_tensor();
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program_new)
+        .unwrap();
 
         let op_old = &program_old.functions["main"].body.operations[0];
         let op_new = &program_new.functions["main"].body.operations[0];
@@ -823,9 +875,13 @@ mod tests {
         let values = [42.0_f32; 8];
         let mut program = make_program(&values, vec![8]);
 
-        AffineQuantizePass::int4_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_tensor();
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let data = get_quantized_data(&program);
         let first = data[0];
@@ -840,9 +896,13 @@ mod tests {
         let values = [42.0_f32; 8];
         let mut program = make_program(&values, vec![8]);
 
-        AffineQuantizePass::int8_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int8_per_tensor();
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let data = get_quantized_data(&program);
         let first = data[0];
@@ -856,9 +916,13 @@ mod tests {
         let values = [7.5_f32];
         let mut program = make_program(&values, vec![1]);
 
-        AffineQuantizePass::int4_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_tensor();
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let data = get_quantized_data(&program);
         assert_eq!(data.len(), 1);
@@ -867,20 +931,24 @@ mod tests {
 
     #[test]
     fn edge_case_group_size_larger_than_tensor() {
-        // group_size=128 but tensor only has 4 elements → single group.
+        // group_size=128 but tensor only has 4 columns → single group per row.
         let values = [1.0_f32, 2.0, 3.0, 4.0];
-        let mut program = make_program(&values, vec![4]);
+        let mut program = make_program(&values, vec![1, 4]);
 
-        AffineQuantizePass::int4_per_group(128)
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_group(128);
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
 
-        // Should have 1 group.
+        // Should have 1 group (1 row × ceil(4/128) = 1).
         match op.attributes.get("scale") {
             Some(Value::Tensor { shape, .. }) => {
-                assert_eq!(*shape, vec![1]);
+                assert_eq!(*shape, vec![1, 1]);
             }
             other => panic!("expected scale Tensor, got {other:?}"),
         }
@@ -899,9 +967,13 @@ mod tests {
         let values = [0.0_f32, 1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 40.0];
         let mut program = make_program(&values, vec![2, 4]);
 
-        AffineQuantizePass::int4_per_group(4)
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_group(4);
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
         match op.attributes.get("scale") {
@@ -926,9 +998,13 @@ mod tests {
         func.body.outputs.push("idx_out".into());
         program.add_function(func);
 
-        AffineQuantizePass::int4_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_tensor();
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
         assert_eq!(op.op_type, "const");
@@ -946,9 +1022,13 @@ mod tests {
         func.body.outputs.push("relu_out".into());
         program.add_function(func);
 
-        AffineQuantizePass::int4_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_tensor();
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
         assert_eq!(op.op_type, "relu");
@@ -1002,9 +1082,13 @@ mod tests {
             .unwrap();
 
         let mut program_new = make_program(&all_vals, vec![2, 3]);
-        AffineQuantizePass::new(BitWidth::Eight, None, Granularity::PerChannel)
-            .run(&mut program_new)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::new(BitWidth::Eight, None, Granularity::PerChannel);
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program_new)
+        .unwrap();
 
         let data_old = get_quantized_data(&program_old);
         let data_new = get_quantized_data(&program_new);
@@ -1028,9 +1112,13 @@ mod tests {
         let values = [0.0_f32, 1.0, 2.0, 3.0];
         let mut program = make_program(&values, vec![4]);
 
-        AffineQuantizePass::int4_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_tensor();
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
         assert_eq!(op.attributes.get("bit_width"), Some(&Value::Int(4)));
@@ -1043,9 +1131,13 @@ mod tests {
         let values = [0.0_f32, 1.0, 2.0, 3.0];
         let mut program = make_program(&values, vec![4]);
 
-        AffineQuantizePass::int8_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int8_per_tensor();
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
         assert_eq!(op.attributes.get("bit_width"), Some(&Value::Int(8)));
@@ -1057,9 +1149,13 @@ mod tests {
         let values = [0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
         let mut program = make_program(&values, vec![2, 4]);
 
-        AffineQuantizePass::int4_per_group(2)
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_group(2);
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         let op = &program.functions["main"].body.operations[0];
         assert_eq!(op.attributes.get("bit_width"), Some(&Value::Int(4)));
@@ -1086,9 +1182,13 @@ mod tests {
         let mut program = make_program(&values, vec![2, 4]);
         program.version = "1".to_string();
 
-        AffineQuantizePass::int4_per_group(2)
-            .run(&mut program)
-            .unwrap();
+        {
+            let mut p = AffineQuantizePass::int4_per_group(2);
+            p.min_elements = 0;
+            p
+        }
+        .run(&mut program)
+        .unwrap();
 
         // Round-trip through proto.
         let model = program_to_model(&program, 7).unwrap();
