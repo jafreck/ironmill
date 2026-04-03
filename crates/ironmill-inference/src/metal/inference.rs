@@ -20,7 +20,9 @@ use super::config::MetalConfig;
 use super::error::MetalError;
 use super::ops;
 use super::turboquant::{MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantMetalConfig};
-use super::weights::{LayerWeights, MetalWeights, QuantizedWeight, WeightBuffer};
+use super::weights::{
+    AffineQuantizedWeight, LayerWeights, MetalWeights, QuantizedWeight, WeightBuffer,
+};
 use crate::calibration::ActivationHook;
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
@@ -460,11 +462,8 @@ impl MetalInference {
                     Ok(ProjectionMatmul::Dense(make_matmul(rows, cols, inner)?))
                 }
                 WeightBuffer::Quantized(_) => Ok(ProjectionMatmul::Quantized),
-                // AffineQuantized gets a Dense matmul — the dequant kernel
-                // produces FP16 weights consumed by MPS.
-                WeightBuffer::AffineQuantized(_) => {
-                    Ok(ProjectionMatmul::Dense(make_matmul(rows, cols, inner)?))
-                }
+                // AffineQuantized uses fused compute kernels — no MPS matmul needed.
+                WeightBuffer::AffineQuantized(_) => Ok(ProjectionMatmul::Quantized),
             }
         };
 
@@ -1520,22 +1519,11 @@ fn encode_projection(
             enc.end_encoding();
         }
         WeightBuffer::AffineQuantized(aq) => {
-            // Step 1: Dequantize INT4 → FP16 via compute kernel.
             let enc = cmd_buf
                 .compute_encoder()
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            ops::encode_int4_dequantize(&enc, &pipelines.int4_dequantize, aq);
+            encode_affine_matmul(&enc, input_buf, aq, output_buf, pipelines, token_count)?;
             enc.end_encoding();
-
-            // Step 2: MPS matmul using the dequantized FP16 weight buffer.
-            let (n, k) = aq.shape;
-            let weight_mat = MpsMatrix::from_buffer(&aq.dequant_buf, n, k, k * 2)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let result_mat = MpsMatrix::from_buffer(output_buf, token_count, n, row_bytes_out)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            matmul
-                .dense()
-                .encode(cmd_buf, input_mat, &weight_mat, &result_mat);
         }
     }
     Ok(())
@@ -1589,6 +1577,62 @@ fn encode_polarquant_matmul(
         encoder.set_bytes(&(m as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 6);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 7);
+        let tile_m = 8;
+        let tile_n = 32;
+        encoder.dispatch_threadgroups(
+            ((n + tile_n - 1) / tile_n, (m + tile_m - 1) / tile_m, 1),
+            (tile_n, tile_m, 1),
+        );
+    }
+    Ok(())
+}
+
+/// Encode a fused affine quantized matmul or matvec via compute kernel.
+///
+/// Dispatches to the correct Metal kernel based on `bit_width` and token count:
+/// - m=1: matvec (one threadgroup per output row)
+/// - m>1: tiled matmul
+fn encode_affine_matmul(
+    encoder: &ironmill_metal_sys::ComputeEncoder,
+    input: &MetalBuffer,
+    weight: &AffineQuantizedWeight,
+    output: &MetalBuffer,
+    pipelines: &super::ops::MetalPipelines,
+    m: usize,
+) -> Result<(), InferenceError> {
+    let (n, k) = weight.shape;
+
+    let pipeline = match (weight.bit_width, m) {
+        (4, 1) => &pipelines.affine_matvec_int4,
+        (4, _) => &pipelines.affine_matmul_int4,
+        (8, 1) => &pipelines.affine_matvec_int8,
+        (8, _) => &pipelines.affine_matmul_int8,
+        _ => {
+            return Err(InferenceError::Runtime(format!(
+                "unsupported affine bit_width: {}",
+                weight.bit_width
+            )));
+        }
+    };
+
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(input, 0, 0);
+    encoder.set_buffer(&weight.data, 0, 1);
+    encoder.set_buffer(&weight.scales, 0, 2);
+    encoder.set_buffer(&weight.zeros, 0, 3);
+    encoder.set_buffer(output, 0, 4);
+
+    if m == 1 {
+        encoder.set_bytes(&(n as u32).to_le_bytes(), 5);
+        encoder.set_bytes(&(k as u32).to_le_bytes(), 6);
+        encoder.set_bytes(&weight.group_size.to_le_bytes(), 7);
+        let threads_per_group = 32;
+        encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
+    } else {
+        encoder.set_bytes(&(m as u32).to_le_bytes(), 5);
+        encoder.set_bytes(&(n as u32).to_le_bytes(), 6);
+        encoder.set_bytes(&(k as u32).to_le_bytes(), 7);
+        encoder.set_bytes(&weight.group_size.to_le_bytes(), 8);
         let tile_m = 8;
         let tile_n = 32;
         encoder.dispatch_threadgroups(

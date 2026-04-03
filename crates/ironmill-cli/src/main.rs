@@ -483,6 +483,8 @@ fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     }
 
     // Build the pipeline — handles all quantization methods uniformly.
+    // GPU bundles require per-group quantization, so INT8 uses per-group
+    // (group_size=128) instead of per-channel.
     let pipeline = if opts.quantize.starts_with("polarquant-") {
         let n_bits = parse_polarquant_bits(&opts.quantize)?;
         PassPipeline::new()
@@ -492,6 +494,20 @@ fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         PassPipeline::new()
             .with_polar_quant(bits)
             .context("Failed to configure PolarQuant")?
+    } else if opts.quantize == "int8" {
+        // GPU bundles require per-group quantization. Use INT8 per-group
+        // (group_size=128) instead of per-channel.
+        let mut pipeline = PassPipeline::new();
+        if opts.no_fusion {
+            pipeline = pipeline.without_fusion();
+        }
+        let pass = ironmill_compile::mil::AffineQuantizePass::new(
+            ironmill_compile::mil::BitWidth::Eight,
+            Some(128),
+            ironmill_compile::mil::Granularity::PerTensor,
+        );
+        pipeline.add_pass(Box::new(pass));
+        pipeline
     } else if opts.quantize != "none" {
         build_pass_pipeline(opts)?
     } else {

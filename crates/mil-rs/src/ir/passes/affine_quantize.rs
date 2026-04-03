@@ -13,7 +13,7 @@
 //! where `qmax = 2^bits - 1` (15 for INT4, 255 for INT8).
 
 use super::int4_pack::pack_int4;
-use super::tensor_utils::tensor_as_f32_slice;
+use super::tensor_utils::{tensor_as_f32_slice, tensor_f16_as_f32_slice};
 use crate::error::Result;
 use crate::ir::pass::Pass;
 use crate::ir::passes::int8_quantize::Granularity;
@@ -118,22 +118,19 @@ impl Pass for AffineQuantizePass {
                     continue;
                 }
 
-                // Locate the FP32 tensor value (may be in inputs or attributes).
-                let in_inputs = matches!(
-                    op.inputs.get("val"),
-                    Some(Value::Tensor {
-                        dtype: ScalarType::Float32,
-                        ..
-                    })
-                );
-                let in_attrs = !in_inputs
-                    && matches!(
-                        op.attributes.get("val"),
+                // Locate a float tensor value (FP32 or FP16) in inputs or attributes.
+                let is_float = |v: Option<&Value>| {
+                    matches!(
+                        v,
                         Some(Value::Tensor {
-                            dtype: ScalarType::Float32,
+                            dtype: ScalarType::Float32 | ScalarType::Float16,
                             ..
                         })
-                    );
+                    )
+                };
+
+                let in_inputs = is_float(op.inputs.get("val"));
+                let in_attrs = !in_inputs && is_float(op.attributes.get("val"));
 
                 if !in_inputs && !in_attrs {
                     continue;
@@ -145,13 +142,12 @@ impl Pass for AffineQuantizePass {
                     op.attributes.remove("val").unwrap()
                 };
 
-                if let Value::Tensor {
-                    data,
-                    shape,
-                    dtype: _,
-                } = val
-                {
-                    let floats = tensor_as_f32_slice(&data);
+                if let Value::Tensor { data, shape, dtype } = val {
+                    let floats = match dtype {
+                        ScalarType::Float32 => tensor_as_f32_slice(&data),
+                        ScalarType::Float16 => tensor_f16_as_f32_slice(&data),
+                        _ => unreachable!(),
+                    };
 
                     if let Some(group_size) = self.group_size {
                         // --- Per-group quantization ---

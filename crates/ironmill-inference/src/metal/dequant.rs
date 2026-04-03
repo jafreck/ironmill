@@ -88,8 +88,12 @@ pub fn dequant_lut_to_dense(
 
 /// Dequantize an affine-quantized tensor to FP16 bytes.
 ///
-/// Applies `(quantized - zero_point) * scale` element-wise. Each byte
-/// of `quantized_data` is treated as a signed `i8` value.
+/// Applies `(quantized - zero_point) * scale` element-wise.
+/// For INT8 (`bit_width=8`), each byte is one element.
+/// For INT4 (`bit_width=4`), elements are packed 2 per byte (low nibble first).
+///
+/// When `group_size` is `Some(gs)`, scales/zeros are per-group along the last
+/// axis: there are `ceil(K / gs)` groups per row.
 pub fn dequant_affine(
     quantized_data: &[u8],
     scale: &[u8],
@@ -98,37 +102,78 @@ pub fn dequant_affine(
     zero_point_dtype: ScalarType,
     axis: Option<usize>,
     shape: &[usize],
+    bit_width: u8,
+    group_size: Option<usize>,
 ) -> anyhow::Result<Vec<u8>> {
     let total_elements: usize = shape.iter().product();
     let scale_elem_size = scale_dtype.byte_size();
     let zp_elem_size = zero_point_dtype.byte_size();
 
+    // Helper: extract the i-th quantized value, handling INT4 packing.
+    // Both INT4 and INT8 values are unsigned (0..qmax range).
+    let read_q = |i: usize| -> f32 {
+        if bit_width == 4 {
+            let byte = quantized_data[i / 2];
+            if i % 2 == 0 {
+                (byte & 0x0F) as f32
+            } else {
+                ((byte >> 4) & 0x0F) as f32
+            }
+        } else {
+            quantized_data[i] as f32
+        }
+    };
+
     let mut output = Vec::with_capacity(total_elements * 2);
 
-    match axis {
-        Some(ax) => {
-            // Per-axis: scale and zero_point have one entry per slice along `ax`.
-            let stride: usize = shape[ax + 1..].iter().product();
-            let axis_size = shape[ax];
+    if let Some(gs) = group_size {
+        // Per-group: scales/zeros have one entry per group of `gs` elements
+        // along the last axis. Layout: [N, num_groups] where num_groups = ceil(K/gs).
+        let k = *shape.last().unwrap_or(&1);
+        let n: usize = shape[..shape.len().saturating_sub(1)]
+            .iter()
+            .product::<usize>()
+            .max(1);
+        let num_groups = (k + gs - 1) / gs;
 
-            for i in 0..total_elements {
-                let axis_idx = (i / stride) % axis_size;
-                let s = read_typed_f32(scale, axis_idx * scale_elem_size, scale_dtype)?;
-                let z = read_typed_f32(zero_point, axis_idx * zp_elem_size, zero_point_dtype)?;
-                let q = quantized_data[i] as i8 as f32;
+        for row in 0..n {
+            for col in 0..k {
+                let group_idx = col / gs;
+                let param_idx = row * num_groups + group_idx;
+                let s = read_typed_f32(scale, param_idx * scale_elem_size, scale_dtype)?;
+                let z = read_typed_f32(zero_point, param_idx * zp_elem_size, zero_point_dtype)?;
+                let elem_idx = row * k + col;
+                let q = read_q(elem_idx);
                 let result = f16::from_f32((q - z) * s);
                 output.extend_from_slice(&result.to_le_bytes());
             }
         }
-        None => {
-            // Per-tensor: single scale and zero_point.
-            let s = read_typed_f32(scale, 0, scale_dtype)?;
-            let z = read_typed_f32(zero_point, 0, zero_point_dtype)?;
+    } else {
+        match axis {
+            Some(ax) => {
+                // Per-axis: scale and zero_point have one entry per slice along `ax`.
+                let stride: usize = shape[ax + 1..].iter().product();
+                let axis_size = shape[ax];
 
-            for i in 0..total_elements {
-                let q = quantized_data[i] as i8 as f32;
-                let result = f16::from_f32((q - z) * s);
-                output.extend_from_slice(&result.to_le_bytes());
+                for i in 0..total_elements {
+                    let axis_idx = (i / stride) % axis_size;
+                    let s = read_typed_f32(scale, axis_idx * scale_elem_size, scale_dtype)?;
+                    let z = read_typed_f32(zero_point, axis_idx * zp_elem_size, zero_point_dtype)?;
+                    let q = read_q(i);
+                    let result = f16::from_f32((q - z) * s);
+                    output.extend_from_slice(&result.to_le_bytes());
+                }
+            }
+            None => {
+                // Per-tensor: single scale and zero_point.
+                let s = read_typed_f32(scale, 0, scale_dtype)?;
+                let z = read_typed_f32(zero_point, 0, zero_point_dtype)?;
+
+                for i in 0..total_elements {
+                    let q = read_q(i);
+                    let result = f16::from_f32((q - z) * s);
+                    output.extend_from_slice(&result.to_le_bytes());
+                }
             }
         }
     }
@@ -327,8 +372,8 @@ mod tests {
 
     #[test]
     fn dequant_affine_per_tensor_int8() {
-        // 4 INT8 values: [-2, -1, 0, 1] stored as i8 → u8.
-        let quantized: Vec<u8> = vec![(-2i8) as u8, (-1i8) as u8, 0u8, 1u8];
+        // 4 unsigned INT8 values: [0, 1, 128, 255] stored as u8.
+        let quantized: Vec<u8> = vec![0u8, 1u8, 128u8, 255u8];
         let shape = vec![2, 2];
 
         // Per-tensor: scale = 0.5, zero_point = 0.0 (FP32).
@@ -343,16 +388,18 @@ mod tests {
             ScalarType::Float32,
             None,
             &shape,
+            8,
+            None,
         )
         .unwrap();
 
         assert_eq!(output.len(), 4 * 2);
 
-        // Expected: (q - 0) * 0.5 → [-1.0, -0.5, 0.0, 0.5]
-        assert!((read_f16(&output, 0) - (-1.0)).abs() < 1e-3);
-        assert!((read_f16(&output, 1) - (-0.5)).abs() < 1e-3);
-        assert!((read_f16(&output, 2) - 0.0).abs() < 1e-3);
-        assert!((read_f16(&output, 3) - 0.5).abs() < 1e-3);
+        // Expected: (q - 0) * 0.5 → [0.0, 0.5, 64.0, 127.5]
+        assert!((read_f16(&output, 0) - 0.0).abs() < 1e-3);
+        assert!((read_f16(&output, 1) - 0.5).abs() < 1e-3);
+        assert!((read_f16(&output, 2) - 64.0).abs() < 1e-1);
+        assert!((read_f16(&output, 3) - 127.5).abs() < 1.0);
     }
 
     #[test]
@@ -379,6 +426,8 @@ mod tests {
             ScalarType::Float16,
             Some(0),
             &shape,
+            8,
+            None,
         )
         .unwrap();
 
@@ -398,7 +447,8 @@ mod tests {
     #[test]
     fn dequant_affine_with_nonzero_zero_point() {
         // Verify zero_point offset works correctly.
-        let quantized: Vec<u8> = vec![128u8]; // 128 as u8, but interpreted as i8 = -128
+        // u8 value 128 with unsigned interpretation → 128.0
+        let quantized: Vec<u8> = vec![128u8];
         let shape = vec![1];
 
         let scale = 1.0f32.to_le_bytes().to_vec();
@@ -412,12 +462,12 @@ mod tests {
             ScalarType::Float32,
             None,
             &shape,
+            8,
+            None,
         )
         .unwrap();
-
-        // i8 interpretation: 128u8 = -128i8
-        // (-128 - 0) * 1.0 = -128.0
-        assert!((read_f16(&output, 0) - (-128.0)).abs() < 1.0);
+        // (128 - 0) * 1.0 = 128.0
+        assert!((read_f16(&output, 0) - 128.0).abs() < 1.0);
     }
 
     // ── convert_params_to_f16 ────────────────────────────────────

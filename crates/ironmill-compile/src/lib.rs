@@ -68,4 +68,8 @@ pub mod mil {
         pub use mil_rs::ir::passes::PolarQuantPass;
         pub use mil_rs::ir::passes::tensor_utils;
     }
+
+    // Quantization passes (used by GPU compilation path)
+    pub use mil_rs::ir::Granularity;
+    pub use mil_rs::ir::passes::{AffineQuantizePass, BitWidth};
 }

@@ -169,6 +169,8 @@ impl CpuDequant for MlxDequantOps {
         zero_point_dtype: ScalarType,
         axis: Option<usize>,
         shape: &[usize],
+        _bit_width: u8,
+        _group_size: Option<usize>,
     ) -> anyhow::Result<Vec<u8>> {
         dequant_affine_to_fp16(
             data,

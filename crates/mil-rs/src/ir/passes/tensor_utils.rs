@@ -26,6 +26,21 @@ pub fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
     data.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+/// Decode raw little-endian FP16 tensor bytes into a `Vec<f32>`.
+///
+/// # Panics
+///
+/// Panics if `data.len()` is not a multiple of 2.
+pub fn tensor_f16_as_f32_slice(data: &[u8]) -> Vec<f32> {
+    assert!(
+        data.len() % 2 == 0,
+        "tensor data length must be a multiple of 2 for f16 reinterpretation"
+    );
+    data.chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

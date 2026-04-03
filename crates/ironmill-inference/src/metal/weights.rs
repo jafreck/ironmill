@@ -67,11 +67,11 @@ pub struct QuantizedWeight {
     pub shape: (usize, usize),
 }
 
-/// INT4 affine-quantized weight stored as packed bytes with per-group
-/// scales and zero points on GPU. Dequantized to FP16 at dispatch time
-/// via the `int4_dequantize` Metal compute kernel.
+/// Affine-quantized weight (INT4 or INT8) stored as packed bytes with
+/// per-group scales and zero points on GPU. Dequantized inline during
+/// matmul via fused Metal compute kernels.
 pub struct AffineQuantizedWeight {
-    /// Packed INT4 data: 2 values per byte, low nibble first.
+    /// Packed quantized data: INT4 = 2 values per byte, INT8 = 1 value per byte.
     pub data: MetalBuffer,
     /// Per-group FP16 scales.
     pub scales: MetalBuffer,
@@ -79,11 +79,10 @@ pub struct AffineQuantizedWeight {
     pub zeros: MetalBuffer,
     /// Number of elements sharing one scale/zero pair.
     pub group_size: u32,
+    /// Quantization bit width (4 or 8).
+    pub bit_width: u8,
     /// `(out_features, in_features)` — logical element dimensions.
     pub shape: (usize, usize),
-    /// Pre-allocated FP16 output buffer for dequantized weights.
-    /// Size: `out_features * in_features * 2` bytes.
-    pub dequant_buf: MetalBuffer,
 }
 
 /// Weights for a single transformer layer (type alias over shared layout).
@@ -250,6 +249,8 @@ impl CpuDequant for MetalDequantOps {
         zero_point_dtype: ScalarType,
         axis: Option<usize>,
         shape: &[usize],
+        bit_width: u8,
+        group_size: Option<usize>,
     ) -> anyhow::Result<Vec<u8>> {
         super::dequant::dequant_affine(
             data,
@@ -259,6 +260,8 @@ impl CpuDequant for MetalDequantOps {
             zero_point_dtype,
             axis,
             shape,
+            bit_width,
+            group_size,
         )
     }
 }
@@ -349,9 +352,9 @@ fn load_weight_buffer(
             bit_width,
             group_size,
         } => {
-            // INT4 with per-group quantization: keep packed on GPU and
-            // dequantize at inference time via the int4_dequantize kernel.
-            if *bit_width == 4 && !force_cpu_dequant {
+            // INT4/INT8 with per-group quantization: keep packed on GPU and
+            // dequantize inline during matmul via fused affine kernels.
+            if (*bit_width == 4 || *bit_width == 8) && !force_cpu_dequant {
                 let (n, k) = dense_shape(&tensor.shape);
                 let total_elements = n * k;
                 let gs = group_size.unwrap_or(total_elements);
@@ -383,23 +386,17 @@ fn load_weight_buffer(
                     .create_buffer_with_data(&zeros_f16, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;
 
-                // Pre-allocate the FP16 output buffer for dequantized weights.
-                let dequant_bytes = total_elements * 2; // FP16 = 2 bytes
-                let dequant_buf = device
-                    .create_buffer(dequant_bytes, StorageMode::Shared)
-                    .map_err(MetalError::Metal)?;
-
                 return Ok(WeightBuffer::AffineQuantized(AffineQuantizedWeight {
                     data: data_buf,
                     scales: scales_buf,
                     zeros: zeros_buf,
                     group_size: gs as u32,
+                    bit_width: *bit_width,
                     shape: (n, k),
-                    dequant_buf,
                 }));
             }
 
-            // INT8 or forced CPU dequant: fall back to CPU dequantization.
+            // Forced CPU dequant fallback.
             let data = dequant_affine(
                 &tensor.data,
                 scale,
@@ -408,6 +405,8 @@ fn load_weight_buffer(
                 *zero_point_dtype,
                 *axis,
                 &tensor.shape,
+                *bit_width,
+                *group_size,
             )?;
             let buf = device
                 .create_buffer_with_data(&data, StorageMode::Shared)

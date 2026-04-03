@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use half::f16;
+
 use crate::error::CompileError;
 use crate::weights::{QuantizationInfo, WeightProvider};
 
@@ -128,56 +130,85 @@ pub fn write_gpu_bundle(
                 axis,
                 bit_width,
                 group_size,
-                ..
+                scale_dtype,
+                zero_point_dtype,
             } => {
-                let group_size = group_size.ok_or_else(|| {
-                    CompileError::Other(format!(
-                        "tensor '{name}' has per-tensor/per-channel affine quantization \
-                         (group_size=None), which is not supported in GPU bundles. \
-                         Only per-group quantization is supported."
-                    ))
-                })?;
-                let axis = axis.ok_or_else(|| {
-                    CompileError::Other(format!(
-                        "tensor '{name}' has per-tensor affine quantization \
-                         (axis=None), which is not supported in GPU bundles."
-                    ))
-                })?;
+                // Per-tensor/per-channel quantization (group_size=None) is not
+                // supported in the GPU bundle format. Dequantize these tensors
+                // back to FP16 and store them as Dense. These are typically
+                // small tensors (RoPE tables, norm weights) where the size
+                // impact is negligible.
+                if group_size.is_none() || axis.is_none() {
+                    let fp16_data = affine_dequantize_to_fp16(
+                        &tensor.data,
+                        scale,
+                        zero_point,
+                        *scale_dtype,
+                        *zero_point_dtype,
+                        *axis,
+                        *bit_width,
+                        &tensor.shape,
+                    )?;
+                    eprintln!(
+                        "Note: tensor '{name}' has per-channel INT{bit_width} quantization; \
+                         storing as FP16 in GPU bundle."
+                    );
 
-                methods_seen.insert("affine");
+                    let file = format!("weights/{sanitized}.bin");
+                    fs::write(output_dir.join(&file), &fp16_data)?;
 
-                match global_n_bits {
-                    None => global_n_bits = Some(*bit_width),
-                    Some(prev) if prev != *bit_width => {
-                        eprintln!(
-                            "Warning: tensor '{name}' has bit_width={} but global_n_bits is already {prev}",
-                            bit_width
-                        );
+                    tensors.insert(
+                        name.to_string(),
+                        TensorManifest::Dense {
+                            file,
+                            shape: tensor.shape.clone(),
+                            dtype: "float16".to_string(),
+                        },
+                    );
+                } else {
+                    let group_size = group_size.unwrap();
+                    let axis = axis.unwrap();
+
+                    methods_seen.insert("affine");
+
+                    match global_n_bits {
+                        None => global_n_bits = Some(*bit_width),
+                        Some(prev) if prev != *bit_width => {
+                            eprintln!(
+                                "Warning: tensor '{name}' has bit_width={} but global_n_bits is already {prev}",
+                                bit_width
+                            );
+                        }
+                        _ => {}
                     }
-                    _ => {}
+
+                    let qdata_file = format!("weights/{sanitized}.qdata");
+                    let scales_file = format!("weights/{sanitized}.scale");
+                    let zeros_file = format!("weights/{sanitized}.zeros");
+
+                    fs::write(output_dir.join(&qdata_file), &*tensor.data)?;
+
+                    // Convert scales and zeros to FP16 for the GPU bundle
+                    // (the bundle reader assumes FP16 for these parameters).
+                    let scales_fp16 = convert_params_to_fp16(scale, *scale_dtype);
+                    let zeros_fp16 = convert_params_to_fp16(zero_point, *zero_point_dtype);
+                    fs::write(output_dir.join(&scales_file), &scales_fp16)?;
+                    fs::write(output_dir.join(&zeros_file), &zeros_fp16)?;
+
+                    tensors.insert(
+                        name.to_string(),
+                        TensorManifest::AffineDequantize {
+                            quantized_data_file: qdata_file,
+                            scales_file,
+                            zeros_file,
+                            shape: tensor.shape.clone(),
+                            bit_width: *bit_width,
+                            group_size,
+                            axis: axis as i64,
+                            dtype: scalar_type_to_str(tensor.dtype).to_string(),
+                        },
+                    );
                 }
-
-                let qdata_file = format!("weights/{sanitized}.qdata");
-                let scales_file = format!("weights/{sanitized}.scale");
-                let zeros_file = format!("weights/{sanitized}.zeros");
-
-                fs::write(output_dir.join(&qdata_file), &*tensor.data)?;
-                fs::write(output_dir.join(&scales_file), scale)?;
-                fs::write(output_dir.join(&zeros_file), zero_point)?;
-
-                tensors.insert(
-                    name.to_string(),
-                    TensorManifest::AffineDequantize {
-                        quantized_data_file: qdata_file,
-                        scales_file,
-                        zeros_file,
-                        shape: tensor.shape.clone(),
-                        bit_width: *bit_width,
-                        group_size,
-                        axis: axis as i64,
-                        dtype: scalar_type_to_str(tensor.dtype).to_string(),
-                    },
-                );
             }
         }
     }
@@ -205,6 +236,122 @@ pub fn write_gpu_bundle(
     fs::write(output_dir.join("manifest.json"), json)?;
 
     Ok(())
+}
+
+// ── Parameter dtype conversion helper ────────────────────────────────
+
+/// Convert quantization parameters (scales or zeros) to FP16 bytes.
+///
+/// The GPU bundle format stores scales/zeros as FP16. This converts
+/// from the source dtype (typically Float32 from the quantize pass).
+fn convert_params_to_fp16(data: &[u8], dtype: mil_rs::ir::ScalarType) -> Vec<u8> {
+    use mil_rs::ir::ScalarType;
+
+    match dtype {
+        ScalarType::Float16 => data.to_vec(),
+        ScalarType::Float32 => data
+            .chunks_exact(4)
+            .flat_map(|c| {
+                let val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                f16::from_f32(val).to_le_bytes()
+            })
+            .collect(),
+        ScalarType::UInt8 => data
+            .iter()
+            .flat_map(|&b| f16::from_f32(b as f32).to_le_bytes())
+            .collect(),
+        _ => data.to_vec(),
+    }
+}
+
+// ── Affine dequantization helper ────────────────────────────────────────
+
+/// Dequantize per-tensor/per-channel INT8 data back to FP16.
+///
+/// Used when writing GPU bundles for tensors that have per-channel
+/// quantization (group_size=None), which the bundle format does not support.
+/// These are typically small tensors (RoPE tables, norm weights).
+#[allow(clippy::too_many_arguments)]
+fn affine_dequantize_to_fp16(
+    quantized_data: &[u8],
+    scale_bytes: &[u8],
+    zero_point_bytes: &[u8],
+    scale_dtype: mil_rs::ir::ScalarType,
+    zero_point_dtype: mil_rs::ir::ScalarType,
+    axis: Option<usize>,
+    bit_width: u8,
+    shape: &[usize],
+) -> Result<Vec<u8>, CompileError> {
+    use mil_rs::ir::ScalarType;
+
+    if bit_width != 8 {
+        return Err(CompileError::Other(format!(
+            "affine dequantize to FP16: only INT8 is supported, got {bit_width}-bit"
+        )));
+    }
+
+    let num_elements: usize = shape.iter().product();
+
+    // Read scales as f32
+    let scales: Vec<f32> = match scale_dtype {
+        ScalarType::Float16 => scale_bytes
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        ScalarType::Float32 => scale_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        _ => {
+            return Err(CompileError::Other(format!(
+                "unsupported scale dtype: {scale_dtype:?}"
+            )));
+        }
+    };
+
+    // Read zero points as f32
+    let zeros: Vec<f32> = match zero_point_dtype {
+        ScalarType::UInt8 => zero_point_bytes.iter().map(|&b| b as f32).collect(),
+        ScalarType::Float16 => zero_point_bytes
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        ScalarType::Float32 => zero_point_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        ScalarType::Int8 => zero_point_bytes.iter().map(|&b| b as i8 as f32).collect(),
+        _ => {
+            return Err(CompileError::Other(format!(
+                "unsupported zero_point dtype: {zero_point_dtype:?}"
+            )));
+        }
+    };
+
+    let axis = axis.unwrap_or(0);
+
+    // Compute stride along the quantization axis
+    let stride: usize = shape[axis + 1..].iter().product();
+    let dim_size = shape[axis];
+
+    if scales.len() != dim_size || zeros.len() != dim_size {
+        return Err(CompileError::Other(format!(
+            "scale/zero_point length ({}/{}) doesn't match axis dimension ({dim_size})",
+            scales.len(),
+            zeros.len()
+        )));
+    }
+
+    let mut fp16_out = Vec::with_capacity(num_elements * 2);
+    for (i, &q_byte) in quantized_data.iter().enumerate().take(num_elements) {
+        let channel_idx = (i / stride) % dim_size;
+        let q_val = q_byte as f32;
+        let dequantized = (q_val - zeros[channel_idx]) * scales[channel_idx];
+        let h = f16::from_f32(dequantized);
+        fp16_out.extend_from_slice(&h.to_le_bytes());
+    }
+
+    Ok(fp16_out)
 }
 
 #[cfg(test)]

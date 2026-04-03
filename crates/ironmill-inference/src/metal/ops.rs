@@ -34,6 +34,10 @@ pub struct MetalPipelines {
     pub polarquant_matmul_int4: ComputePipeline,
     pub polarquant_matvec_int8: ComputePipeline,
     pub polarquant_matmul_int8: ComputePipeline,
+    pub affine_matvec_int4: ComputePipeline,
+    pub affine_matmul_int4: ComputePipeline,
+    pub affine_matvec_int8: ComputePipeline,
+    pub affine_matmul_int8: ComputePipeline,
     pub kv_scatter: ComputePipeline,
     pub matvec: ComputePipeline,
     pub fused_residual_rms_norm: ComputePipeline,
@@ -66,6 +70,7 @@ impl MetalPipelines {
         let matvec_src = include_str!("shaders/matvec.metal");
         let fused_rn_src = include_str!("shaders/fused_residual_norm.metal");
         let int4_dequant_src = include_str!("shaders/int4_dequant.metal");
+        let affine_mm_src = include_str!("shaders/affine_matmul.metal");
 
         let norm_lib = device
             .compile_shader_source(norm_src)
@@ -102,6 +107,9 @@ impl MetalPipelines {
             .map_err(MetalError::Metal)?;
         let int4_dequant_lib = device
             .compile_shader_source(int4_dequant_src)
+            .map_err(MetalError::Metal)?;
+        let affine_mm_lib = device
+            .compile_shader_source(affine_mm_src)
             .map_err(MetalError::Metal)?;
 
         Ok(Self {
@@ -196,6 +204,34 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &qmm_lib
                         .get_function("polarquant_matmul_int8")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            affine_matvec_int4: device
+                .create_compute_pipeline(
+                    &affine_mm_lib
+                        .get_function("affine_matvec_int4")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            affine_matmul_int4: device
+                .create_compute_pipeline(
+                    &affine_mm_lib
+                        .get_function("affine_matmul_int4")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            affine_matvec_int8: device
+                .create_compute_pipeline(
+                    &affine_mm_lib
+                        .get_function("affine_matvec_int8")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            affine_matmul_int8: device
+                .create_compute_pipeline(
+                    &affine_mm_lib
+                        .get_function("affine_matmul_int8")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -602,35 +638,4 @@ pub fn encode_fused_residual_rms_norm(
     encoder.set_bytes(&params.token_count.to_le_bytes(), 7);
     let tg_size = METAL_MAX_THREADS_PER_THREADGROUP.min(params.hidden_size as usize);
     encoder.dispatch_threadgroups((params.token_count as usize, 1, 1), (tg_size, 1, 1));
-}
-
-// ── INT4 affine dequantization ──────────────────────────────────
-
-/// Encode an INT4 affine dequantization pass.
-///
-/// Unpacks 2 INT4 values from each byte and applies per-group affine
-/// dequantization: `output[i] = (quantized[i] - zero) * scale`.
-///
-/// The output buffer is filled with FP16 values and can be consumed
-/// directly by MPS matmul.
-///
-/// Dispatch: one thread per packed byte → `ceil(total_elements / 2)` threads.
-pub fn encode_int4_dequantize(
-    encoder: &ComputeEncoder,
-    pipeline: &ComputePipeline,
-    weight: &super::weights::AffineQuantizedWeight,
-) {
-    let total_elements = (weight.shape.0 * weight.shape.1) as u32;
-    let num_bytes = ((total_elements + 1) / 2) as usize;
-
-    encoder.set_pipeline(pipeline);
-    encoder.set_buffer(&weight.data, 0, 0);
-    encoder.set_buffer(&weight.scales, 0, 1);
-    encoder.set_buffer(&weight.zeros, 0, 2);
-    encoder.set_buffer(&weight.dequant_buf, 0, 3);
-    encoder.set_bytes(&weight.group_size.to_le_bytes(), 4);
-    encoder.set_bytes(&total_elements.to_le_bytes(), 5);
-
-    let tg_count = (num_bytes + DEFAULT_THREADGROUP_WIDTH - 1) / DEFAULT_THREADGROUP_WIDTH;
-    encoder.dispatch_threadgroups((tg_count, 1, 1), (DEFAULT_THREADGROUP_WIDTH, 1, 1));
 }

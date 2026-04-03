@@ -192,6 +192,8 @@ pub trait CpuDequant {
         zero_point_dtype: ScalarType,
         axis: Option<usize>,
         shape: &[usize],
+        bit_width: u8,
+        group_size: Option<usize>,
     ) -> anyhow::Result<Vec<u8>>;
 }
 
@@ -242,7 +244,8 @@ pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
             scale_dtype,
             zero_point_dtype,
             axis,
-            ..
+            bit_width,
+            group_size,
         } => {
             let data = D::dequant_affine(
                 &tensor.data,
@@ -252,6 +255,8 @@ pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
                 *zero_point_dtype,
                 *axis,
                 &tensor.shape,
+                *bit_width,
+                *group_size,
             )?;
             Ok(DenseData {
                 bytes: Cow::Owned(data),

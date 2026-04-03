@@ -638,7 +638,10 @@ fn main() -> Result<()> {
                                         last_token = logits
                                             .iter()
                                             .enumerate()
-                                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                            .max_by(|(_, a), (_, b)| {
+                                                a.partial_cmp(b)
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                            })
                                             .map(|(i, _)| i as u32)
                                             .unwrap_or(0);
                                     }
@@ -659,7 +662,10 @@ fn main() -> Result<()> {
                                         last_token = logits
                                             .iter()
                                             .enumerate()
-                                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                            .max_by(|(_, a), (_, b)| {
+                                                a.partial_cmp(b)
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                            })
                                             .map(|(i, _)| i as u32)
                                             .unwrap_or(0);
                                     }
@@ -794,7 +800,9 @@ fn main() -> Result<()> {
                                     last_token = logits
                                         .iter()
                                         .enumerate()
-                                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                        .max_by(|(_, a), (_, b)| {
+                                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                        })
                                         .map(|(i, _)| i as u32)
                                         .unwrap_or(0);
                                 }
@@ -816,7 +824,9 @@ fn main() -> Result<()> {
                                     last_token = logits
                                         .iter()
                                         .enumerate()
-                                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                        .max_by(|(_, a), (_, b)| {
+                                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                        })
                                         .map(|(i, _)| i as u32)
                                         .unwrap_or(0);
                                 }
@@ -1193,7 +1203,9 @@ fn main() -> Result<()> {
                                 last_token = logits
                                     .iter()
                                     .enumerate()
-                                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                    .max_by(|(_, a), (_, b)| {
+                                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                    })
                                     .map(|(i, _)| i as u32)
                                     .unwrap_or(0);
                             }
@@ -1214,7 +1226,9 @@ fn main() -> Result<()> {
                                 last_token = logits
                                     .iter()
                                     .enumerate()
-                                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                    .max_by(|(_, a), (_, b)| {
+                                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                    })
                                     .map(|(i, _)| i as u32)
                                     .unwrap_or(0);
                             }
