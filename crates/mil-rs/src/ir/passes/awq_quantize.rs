@@ -298,24 +298,35 @@ fn search_alpha(
     let n_groups = in_features.div_ceil(group_size);
 
     // Validate activations: must have the right shape [tokens, in_features].
-    let use_exact = activations.is_some()
-        && token_count > 0
-        && activations.unwrap().len() == token_count * in_features;
+    let n_tokens = if token_count > 0 && activations.len() == token_count * in_features {
+        // Subsample tokens for performance: use up to 8 evenly-spaced tokens.
+        // The full matmul is O(out × in × tokens × α_steps) which is too slow
+        // for large models. 8 tokens captures the activation distribution well.
+        token_count.min(8)
+    } else {
+        return 0.0;
+    };
+
+    // Build subsampled activation matrix (stride to pick evenly-spaced tokens).
+    let stride = if token_count > n_tokens {
+        token_count / n_tokens
+    } else {
+        1
+    };
+    let sub_activations: Vec<f32> = (0..n_tokens)
+        .flat_map(|i| {
+            let t = i * stride;
+            (0..in_features).map(move |c| activations[t * in_features + c])
+        })
+        .collect();
 
     // Pre-compute W · X^T = [out_features, tokens] for the reference output.
-    // X is stored as [tokens, in_features] row-major.
-    let (ref_output, n_tokens) = if use_exact {
-        let act = activations.unwrap();
-        let n_tokens = token_count;
-        // W [out, in] × X^T [in, tokens] → [out, tokens]
-        let mut wx = vec![0.0f32; out_features * n_tokens];
-        for row in 0..out_features {
-            for t in 0..n_tokens {
-                let mut dot = 0.0f32;
-                for c in 0..in_features {
-                    dot += floats[row * in_features + c] * act[t * in_features + c];
-                }
-                wx[row * n_tokens + t] = dot;
+    let mut ref_output = vec![0.0f32; out_features * n_tokens];
+    for row in 0..out_features {
+        for t in 0..n_tokens {
+            let mut dot = 0.0f32;
+            for c in 0..in_features {
+                dot += floats[row * in_features + c] * sub_activations[t * in_features + c];
             }
         }
         (Some(wx), n_tokens)
@@ -362,15 +373,13 @@ fn search_alpha(
 
         let total_loss = if use_exact {
             // Exact loss: L(s) = ||W_dq · X^T − W · X^T||²
-            // = Σ_{row, token} (Σ_c (W_dq[row,c] - W[row,c]) · X[token,c])²
-            let act = activations.unwrap();
-            let ref_out = ref_output.as_ref().unwrap();
             let mut loss = 0.0f32;
             for row in 0..out_features {
                 for t in 0..n_tokens {
                     let mut dq_dot = 0.0f32;
                     for c in 0..in_features {
-                        dq_dot += w_dq[row * in_features + c] * act[t * in_features + c];
+                        dq_dot +=
+                            w_dq[row * in_features + c] * sub_activations[t * in_features + c];
                     }
                     let err = dq_dot - ref_out[row * n_tokens + t];
                     loss += err * err;

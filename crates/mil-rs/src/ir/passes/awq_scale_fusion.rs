@@ -39,10 +39,12 @@ impl Pass for AwqScaleFusionPass {
         "awq-scale-fusion"
     }
 
-    fn run(&self, program: &mut Program) -> Result<()> {
-        for function in program.functions.values_mut() {
-            fuse_awq_scales(&mut function.body);
-        }
+    fn run(&self, _program: &mut Program) -> Result<()> {
+        // AWQ compensation is handled by the Metal affine matmul kernel
+        // (divides by awq_scales[col] during dequant). Norm fusion is
+        // disabled because it corrupts gamma when multiple projections
+        // share a norm — even with identical scales, FP16 precision loss
+        // in the gamma modification compounds across layers.
         Ok(())
     }
 }

@@ -8,9 +8,9 @@ using namespace metal;
 // during the dot-product:  w = (quantized - zero) * scale
 //
 // AWQ compensation (s^{-1}) is now fused into the preceding LayerNorm
-// gamma offline by the awq-scale-fusion pass; the kernel buffers
-// (awq_scales, has_awq) are retained for backward compatibility but
-// are no longer applied at runtime.
+// When AWQ scales are present (has_awq=1), the dequantized weight is
+// divided by the per-column AWQ scale to compensate for activation-aware
+// weight scaling:  w = (quantized - zero) * scale / awq_scale[col]
 //
 // Two paths per bit-width:
 //   - matvec (M=1): one threadgroup per output row, SIMD reduction
@@ -70,6 +70,11 @@ kernel void affine_matvec_int4(
         float w1 = (float(hi) - z1) * s1;
 
         // AWQ compensation handled offline by norm fusion
+
+        if (has_awq) {
+            w0 /= float(awq_scales[k2]);
+            w1 /= float(awq_scales[k2 + 1]);
+        }
 
         acc += float(A[k2])     * w0;
         acc += float(A[k2 + 1]) * w1;
@@ -144,7 +149,9 @@ kernel void affine_matmul_int4(
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(nibble) - z) * s);
-                // AWQ compensation handled offline by norm fusion
+                if (has_awq) {
+                    val = half(float(val) / float(awq_scales[g_k]));
+                }
             }
             tg_b[i] = val;
         }
@@ -202,7 +209,7 @@ kernel void affine_matvec_int8(
         float s = float(scales[scale_row + grp]);
         float z = float(zeros[scale_row + grp]);
         float w = (float(q) - z) * s;
-        // AWQ compensation handled offline by norm fusion
+        if (has_awq) { w /= float(awq_scales[k]); }
         acc += float(A[k]) * w;
     }
 
@@ -271,7 +278,9 @@ kernel void affine_matmul_int8(
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(q) - z) * s);
-                // AWQ compensation handled offline by norm fusion
+                if (has_awq) {
+                    val = half(float(val) / float(awq_scales[g_k]));
+                }
             }
             tg_b[i] = val;
         }
