@@ -83,6 +83,10 @@ pub struct AffineQuantizedWeight {
     pub bit_width: u8,
     /// `(out_features, in_features)` — logical element dimensions.
     pub shape: (usize, usize),
+    /// Optional AWQ per-column channel scales [in_features] as FP16.
+    /// When present, the kernel divides dequantized weights by these
+    /// scales to compensate for activation-aware weight scaling.
+    pub awq_scales: Option<MetalBuffer>,
 }
 
 /// Weights for a single transformer layer (type alias over shared layout).
@@ -351,6 +355,7 @@ fn load_weight_buffer(
             axis,
             bit_width,
             group_size,
+            awq_scales,
         } => {
             // INT4/INT8 with per-group quantization: keep packed on GPU and
             // dequantize inline during matmul via fused affine kernels.
@@ -386,6 +391,17 @@ fn load_weight_buffer(
                     .create_buffer_with_data(&zeros_f16, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;
 
+                // Upload AWQ per-column scales if present.
+                let awq_buf = if let Some(awq_data) = awq_scales {
+                    Some(
+                        device
+                            .create_buffer_with_data(awq_data, StorageMode::Shared)
+                            .map_err(MetalError::Metal)?,
+                    )
+                } else {
+                    None
+                };
+
                 return Ok(WeightBuffer::AffineQuantized(AffineQuantizedWeight {
                     data: data_buf,
                     scales: scales_buf,
@@ -393,6 +409,7 @@ fn load_weight_buffer(
                     group_size: gs as u32,
                     bit_width: *bit_width,
                     shape: (n, k),
+                    awq_scales: awq_buf,
                 }));
             }
 

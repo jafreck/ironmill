@@ -168,18 +168,21 @@ impl Pass for AwqQuantizePass {
                                 continue;
                             };
 
-                            // Compute per-column scales from magnitudes alone.
-                            // All projections sharing the same norm receive
-                            // identical magnitudes from calibration, so they
-                            // produce identical scales — critical for correct
-                            // norm fusion.
-                            let channel_scales =
-                                compute_awq_scales_from_magnitudes(mags, self.salient_percentile);
+                            // AWQ paper Algorithm 1: per-column grid search
+                            // to find optimal s[c] minimizing quantization MSE.
+                            // Each projection gets its own optimal scales — the
+                            // kernel compensates by dividing by s[c] at runtime.
+                            let channel_scales = compute_awq_scales(
+                                &floats,
+                                &shape,
+                                mags,
+                                self.grid_search_steps,
+                                self.salient_percentile,
+                                qmax,
+                            );
 
                             // Apply scales per-column (input channel):
                             // W_scaled[:, c] = W[:, c] * s[c]
-                            // This makes salient input channels use more of the
-                            // quantization range, reducing their quantization error.
                             let out_features = shape[0];
                             let mut scaled_weights = floats.clone();
                             for row in 0..out_features {
@@ -190,8 +193,9 @@ impl Pass for AwqQuantizePass {
                                 }
                             }
 
-                            // Quantize the up-scaled weights. The norm fusion pass
-                            // will compensate by dividing norm gamma by s[c].
+                            // Quantize the up-scaled weights. AWQ channel scales
+                            // are stored on the op and written to the GPU bundle.
+                            // The Metal kernel divides by s[c] during dequant.
                             emit_per_group_with_scales(
                                 op,
                                 &scaled_weights,

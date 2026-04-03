@@ -132,6 +132,7 @@ pub fn write_gpu_bundle(
                 group_size,
                 scale_dtype,
                 zero_point_dtype,
+                awq_scales,
             } => {
                 // Per-tensor/per-channel quantization (group_size=None) is not
                 // supported in the GPU bundle format. Dequantize these tensors
@@ -195,6 +196,14 @@ pub fn write_gpu_bundle(
                     fs::write(output_dir.join(&scales_file), &scales_fp16)?;
                     fs::write(output_dir.join(&zeros_file), &zeros_fp16)?;
 
+                    let awq_scales_file = if let Some(awq) = awq_scales {
+                        let awq_file = format!("weights/{sanitized}.awq");
+                        fs::write(output_dir.join(&awq_file), awq)?;
+                        Some(awq_file)
+                    } else {
+                        None
+                    };
+
                     tensors.insert(
                         name.to_string(),
                         TensorManifest::AffineDequantize {
@@ -206,6 +215,7 @@ pub fn write_gpu_bundle(
                             group_size,
                             axis: axis as i64,
                             dtype: scalar_type_to_str(tensor.dtype).to_string(),
+                            awq_scales_file,
                         },
                     );
                 }
@@ -466,6 +476,7 @@ mod tests {
                     axis: Some(1),
                     bit_width: 4,
                     group_size: Some(128),
+                    awq_scales: None,
                 },
             },
         );
@@ -681,6 +692,7 @@ mod tests {
                 axis,
                 dtype,
                 shape,
+                ..
             } => {
                 assert_eq!(
                     quantized_data_file,

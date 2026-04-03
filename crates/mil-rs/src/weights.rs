@@ -104,6 +104,10 @@ pub enum QuantizationInfo {
         /// Per-group size along the quantization axis. `None` means
         /// per-tensor or per-channel granularity.
         group_size: Option<usize>,
+        /// Optional AWQ per-column channel scales. When present, the
+        /// dequantized weight is divided by these scales to compensate
+        /// for activation-aware weight scaling.
+        awq_scales: Option<Vec<u8>>,
     },
 }
 

@@ -609,6 +609,7 @@ impl WeightProvider for GgufProvider {
                     axis: Some(1),
                     bit_width: 4,
                     group_size: Some(32),
+                    awq_scales: None,
                 },
             });
         }
@@ -631,6 +632,7 @@ impl WeightProvider for GgufProvider {
                     axis: Some(1),
                     bit_width: 8,
                     group_size: Some(32),
+                    awq_scales: None,
                 },
             });
         }

@@ -7,6 +7,10 @@ using namespace metal;
 // Weights stay packed in GPU memory; affine dequantization happens inline
 // during the dot-product:  w = (quantized - zero) * scale
 //
+// When AWQ scales are present (has_awq=1), the dequantized weight is
+// divided by the per-column AWQ scale to compensate for activation-aware
+// weight scaling:  w = (quantized - zero) * scale / awq_scale[col]
+//
 // Two paths per bit-width:
 //   - matvec (M=1): one threadgroup per output row, SIMD reduction
 //   - matmul (M>1): tiled GEMM with threadgroup-shared tiles
@@ -33,6 +37,8 @@ kernel void affine_matvec_int4(
     constant uint &N                [[buffer(5)]],
     constant uint &K                [[buffer(6)]],
     constant uint &group_size       [[buffer(7)]],
+    device const half *awq_scales   [[buffer(8)]],   // [K] or empty
+    constant uint &has_awq          [[buffer(9)]],
     uint tid  [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -62,6 +68,11 @@ kernel void affine_matvec_int4(
         float z1 = float(zeros[scale_row + g1]);
         float w1 = (float(hi) - z1) * s1;
 
+        if (has_awq) {
+            w0 /= float(awq_scales[k2]);
+            w1 /= float(awq_scales[k2 + 1]);
+        }
+
         acc += float(A[k2])     * w0;
         acc += float(A[k2 + 1]) * w1;
     }
@@ -88,6 +99,8 @@ kernel void affine_matmul_int4(
     constant uint &N                [[buffer(6)]],
     constant uint &K                [[buffer(7)]],
     constant uint &group_size       [[buffer(8)]],
+    device const half *awq_scales   [[buffer(9)]],
+    constant uint &has_awq          [[buffer(10)]],
     uint2 group_id [[threadgroup_position_in_grid]],
     uint2 local_id [[thread_position_in_threadgroup]])
 {
@@ -133,6 +146,9 @@ kernel void affine_matmul_int4(
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(nibble) - z) * s);
+                if (has_awq) {
+                    val = half(float(val) / float(awq_scales[g_k]));
+                }
             }
             tg_b[i] = val;
         }
@@ -171,6 +187,8 @@ kernel void affine_matvec_int8(
     constant uint &N                [[buffer(5)]],
     constant uint &K                [[buffer(6)]],
     constant uint &group_size       [[buffer(7)]],
+    device const half *awq_scales   [[buffer(8)]],
+    constant uint &has_awq          [[buffer(9)]],
     uint tid  [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -188,6 +206,7 @@ kernel void affine_matvec_int8(
         float s = float(scales[scale_row + grp]);
         float z = float(zeros[scale_row + grp]);
         float w = (float(q) - z) * s;
+        if (has_awq) { w /= float(awq_scales[k]); }
         acc += float(A[k]) * w;
     }
 
@@ -213,6 +232,8 @@ kernel void affine_matmul_int8(
     constant uint &N                [[buffer(6)]],
     constant uint &K                [[buffer(7)]],
     constant uint &group_size       [[buffer(8)]],
+    device const half *awq_scales   [[buffer(9)]],
+    constant uint &has_awq          [[buffer(10)]],
     uint2 group_id [[threadgroup_position_in_grid]],
     uint2 local_id [[thread_position_in_threadgroup]])
 {
@@ -254,6 +275,9 @@ kernel void affine_matmul_int8(
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(q) - z) * s);
+                if (has_awq) {
+                    val = half(float(val) / float(awq_scales[g_k]));
+                }
             }
             tg_b[i] = val;
         }

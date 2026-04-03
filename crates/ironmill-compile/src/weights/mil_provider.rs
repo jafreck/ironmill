@@ -154,6 +154,24 @@ impl MilWeightProvider {
                         _ => None,
                     };
 
+                    let awq_scales = match op.attributes.get("awq_channel_scales") {
+                        Some(Value::Tensor {
+                            data,
+                            dtype: ScalarType::Float32,
+                            ..
+                        }) => {
+                            let fp16_bytes: Vec<u8> = data
+                                .chunks_exact(4)
+                                .flat_map(|c| {
+                                    let val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                                    half::f16::from_f32(val).to_le_bytes()
+                                })
+                                .collect();
+                            Some(fp16_bytes)
+                        }
+                        _ => None,
+                    };
+
                     let extracted = ExtractedTensor {
                         data: quantized_data,
                         shape: quantized_shape,
@@ -166,6 +184,7 @@ impl MilWeightProvider {
                             axis,
                             bit_width,
                             group_size,
+                            awq_scales,
                         },
                     };
                     tensors.insert(name, extracted);

@@ -59,6 +59,11 @@ pub enum TensorManifest {
         group_size: usize,
         axis: i64,
         dtype: String,
+        /// Optional per-column AWQ channel scales file. When present, the
+        /// dequantized weight is divided by these scales to compensate for
+        /// activation-aware weight scaling applied during quantization.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        awq_scales_file: Option<String>,
     },
 }
 

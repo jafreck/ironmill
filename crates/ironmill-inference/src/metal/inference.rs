@@ -1650,6 +1650,15 @@ fn encode_affine_matmul(
         encoder.set_bytes(&(n as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 6);
         encoder.set_bytes(&weight.group_size.to_le_bytes(), 7);
+        // AWQ scales: buffer 8 = scales data, buffer 9 = has_awq flag
+        let has_awq: u32 = if weight.awq_scales.is_some() { 1 } else { 0 };
+        if let Some(ref awq_buf) = weight.awq_scales {
+            encoder.set_buffer(awq_buf, 0, 8);
+        } else {
+            // Bind the data buffer as a dummy (won't be read when has_awq=0).
+            encoder.set_buffer(&weight.data, 0, 8);
+        }
+        encoder.set_bytes(&has_awq.to_le_bytes(), 9);
         let threads_per_group = 32;
         encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
     } else {
@@ -1657,6 +1666,13 @@ fn encode_affine_matmul(
         encoder.set_bytes(&(n as u32).to_le_bytes(), 6);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 7);
         encoder.set_bytes(&weight.group_size.to_le_bytes(), 8);
+        let has_awq: u32 = if weight.awq_scales.is_some() { 1 } else { 0 };
+        if let Some(ref awq_buf) = weight.awq_scales {
+            encoder.set_buffer(awq_buf, 0, 9);
+        } else {
+            encoder.set_buffer(&weight.data, 0, 9);
+        }
+        encoder.set_bytes(&has_awq.to_le_bytes(), 10);
         let tile_m = 8;
         let tile_n = 32;
         encoder.dispatch_threadgroups(

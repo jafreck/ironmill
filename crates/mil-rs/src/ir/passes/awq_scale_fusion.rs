@@ -39,10 +39,10 @@ impl Pass for AwqScaleFusionPass {
         "awq-scale-fusion"
     }
 
-    fn run(&self, program: &mut Program) -> Result<()> {
-        for function in program.functions.values_mut() {
-            fuse_awq_scales(&mut function.body);
-        }
+    fn run(&self, _program: &mut Program) -> Result<()> {
+        // AWQ channel scales are now stored in the GPU bundle and applied
+        // at inference time by the Metal affine matmul kernel. No norm
+        // fusion needed.
         Ok(())
     }
 }

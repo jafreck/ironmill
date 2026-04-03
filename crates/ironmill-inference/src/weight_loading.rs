@@ -246,6 +246,7 @@ pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
             axis,
             bit_width,
             group_size,
+            ..
         } => {
             let data = D::dequant_affine(
                 &tensor.data,

@@ -133,10 +133,15 @@ impl WeightProvider for MetalBundleProvider {
                 group_size,
                 axis,
                 dtype,
+                awq_scales_file,
             } => {
                 let quantized_data = self.read_file(quantized_data_file)?;
                 let scale = self.read_file(scales_file)?;
                 let zero_point = self.read_file(zeros_file)?;
+                let awq_scales = match awq_scales_file {
+                    Some(f) => Some(self.read_file(f)?),
+                    None => None,
+                };
                 let dtype =
                     str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
 
@@ -152,6 +157,7 @@ impl WeightProvider for MetalBundleProvider {
                         axis: Some(*axis as usize),
                         bit_width: *bit_width,
                         group_size: Some(*group_size),
+                        awq_scales,
                     },
                 })
             }
@@ -548,6 +554,7 @@ mod tests {
                 axis,
                 bit_width,
                 group_size,
+                ..
             } => {
                 assert_eq!(scale, &vec![0xDD; 16]);
                 assert_eq!(zero_point, &vec![0xEE; 16]);
