@@ -26,7 +26,9 @@ use crate::ir::types::Value;
 ///
 /// Requires pre-computed per-channel activation magnitudes (mean |x|) obtained
 /// from calibration. The `channel_magnitudes` map is keyed by the operation
-/// name of the const weight.
+/// name of the const weight. Optionally accepts raw calibration activations
+/// to compute the paper's exact loss (Equation 4) instead of the mag²-weighted
+/// MSE approximation.
 pub struct AwqQuantizePass {
     /// Quantization bit width (4 or 8).
     pub bits: u8,
@@ -34,6 +36,10 @@ pub struct AwqQuantizePass {
     pub group_size: usize,
     /// Per-channel activation magnitudes: op name → `Vec<f32>` of mean |x|.
     pub channel_magnitudes: HashMap<String, Vec<f32>>,
+    /// Raw calibration activations: op name → flattened `[tokens, features]`.
+    pub calibration_activations: HashMap<String, Vec<f32>>,
+    /// Number of tokens in each calibration activation snapshot.
+    pub calibration_token_count: usize,
     /// Number of candidate scale values to evaluate in grid search (default 20).
     pub grid_search_steps: usize,
     /// Fraction of channels (by magnitude rank) considered salient (default 0.99
@@ -49,9 +55,22 @@ impl AwqQuantizePass {
             bits,
             group_size,
             channel_magnitudes,
+            calibration_activations: HashMap::new(),
+            calibration_token_count: 0,
             grid_search_steps: 20,
             salient_percentile: 0.99,
         }
+    }
+
+    /// Set raw calibration activations and token count for exact loss computation.
+    pub fn with_calibration_activations(
+        mut self,
+        activations: HashMap<String, Vec<f32>>,
+        token_count: usize,
+    ) -> Self {
+        self.calibration_activations = activations;
+        self.calibration_token_count = token_count;
+        self
     }
 
     /// Override the grid search step count.
@@ -178,6 +197,10 @@ impl Pass for AwqQuantizePass {
                             let mag_key: Vec<u8> =
                                 mags.iter().flat_map(|v| v.to_le_bytes()).collect();
 
+                            // Look up raw calibration activations for this op.
+                            let cal_act = self.calibration_activations.get(&op.name);
+                            let cal_tokens = self.calibration_token_count;
+
                             // Search α on first encounter, reuse for group.
                             // This ensures all projections sharing a norm use
                             // identical scales, making norm-gamma fusion correct.
@@ -189,6 +212,8 @@ impl Pass for AwqQuantizePass {
                                     self.grid_search_steps,
                                     self.group_size,
                                     qmax,
+                                    cal_act.map(|a| a.as_slice()),
+                                    cal_tokens,
                                 )
                             });
 
@@ -248,19 +273,14 @@ impl Pass for AwqQuantizePass {
 /// paper (Lin et al., MLSys 2024).
 ///
 /// Searches a single exponent α ∈ [0, 1] such that `s[c] = s_X[c]^α`
-/// minimizes the activation-weighted quantization loss (approximation of
-/// Equation 4).  Because α is shared across all channels, every projection
-/// sharing the same norm produces the same scale vector — enabling offline
-/// norm-gamma fusion.
+/// minimizes the quantization loss. When raw calibration activations are
+/// available, uses the paper's exact loss (Equation 4):
+///   L(s) = ||Q(W · diag(s)) · diag(s)^{-1} · X − W · X||²
+/// Otherwise falls back to the mag²-weighted MSE approximation.
 ///
-/// The loss is evaluated using actual per-group quantization so that
-/// within-group range interactions are properly accounted for:
-///   L(α) = Σ_{row,col} s_X[col]² · (Q(w[row,col]·s[col])/s[col] − w[row,col])²
-/// Search for optimal α ∈ [0, 1] per AWQ paper Equation 5.
-///
-/// s = s_X^α where s_X is the per-channel activation magnitude.
-/// The loss is activation-weighted MSE (Equation 4 approximation).
-/// Returns the best α value.
+/// Because α is shared across all channels, every projection sharing the
+/// same norm produces the same scale vector — enabling offline norm-gamma
+/// fusion.
 fn search_alpha(
     floats: &[f32],
     shape: &[usize],
@@ -268,11 +288,39 @@ fn search_alpha(
     grid_steps: usize,
     group_size: usize,
     qmax: f32,
+    activations: Option<&[f32]>,
+    token_count: usize,
 ) -> f32 {
     let out_features = shape[0];
     let in_features = *shape.last().unwrap_or(&1);
     let grid_steps = grid_steps.max(1);
     let n_groups = in_features.div_ceil(group_size);
+
+    // Validate activations: must have the right shape [tokens, in_features].
+    let use_exact = activations.is_some()
+        && token_count > 0
+        && activations.unwrap().len() == token_count * in_features;
+
+    // Pre-compute W · X^T = [out_features, tokens] for the reference output.
+    // X is stored as [tokens, in_features] row-major.
+    let (ref_output, n_tokens) = if use_exact {
+        let act = activations.unwrap();
+        let n_tokens = token_count;
+        // W [out, in] × X^T [in, tokens] → [out, tokens]
+        let mut wx = vec![0.0f32; out_features * n_tokens];
+        for row in 0..out_features {
+            for t in 0..n_tokens {
+                let mut dot = 0.0f32;
+                for c in 0..in_features {
+                    dot += floats[row * in_features + c] * act[t * in_features + c];
+                }
+                wx[row * n_tokens + t] = dot;
+            }
+        }
+        (Some(wx), n_tokens)
+    } else {
+        (None, 0)
+    };
 
     let mut best_alpha = 0.0_f32;
     let mut best_loss = f32::INFINITY;
@@ -286,8 +334,9 @@ fn search_alpha(
             .map(|&m| m.max(1e-8).powf(alpha))
             .collect();
 
-        // Evaluate activation-weighted MSE using per-group quantization.
-        let mut total_loss = 0.0_f32;
+        // Build W_dq: quantize W·diag(s), then dequant and divide by s.
+        // W_dq[row, col] = dequant(Q(W[row,col]*s[col])) / s[col]
+        let mut w_dq = vec![0.0f32; out_features * in_features];
         for row in 0..out_features {
             for g in 0..n_groups {
                 let g_start = g * group_size;
@@ -304,21 +353,46 @@ fn search_alpha(
 
                 for (j, col) in (g_start..g_end).enumerate() {
                     let s = if col < scales.len() { scales[col] } else { 1.0 };
+                    let dequant = (quantized[j] as f32 - q_zp) * q_scale;
+                    w_dq[row * in_features + col] = dequant / s;
+                }
+            }
+        }
+
+        let total_loss = if use_exact {
+            // Exact loss: L(s) = ||W_dq · X^T − W · X^T||²
+            // = Σ_{row, token} (Σ_c (W_dq[row,c] - W[row,c]) · X[token,c])²
+            let act = activations.unwrap();
+            let ref_out = ref_output.as_ref().unwrap();
+            let mut loss = 0.0f32;
+            for row in 0..out_features {
+                for t in 0..n_tokens {
+                    let mut dq_dot = 0.0f32;
+                    for c in 0..in_features {
+                        dq_dot += w_dq[row * in_features + c] * act[t * in_features + c];
+                    }
+                    let err = dq_dot - ref_out[row * n_tokens + t];
+                    loss += err * err;
+                }
+            }
+            loss
+        } else {
+            // Fallback: mag²-weighted MSE approximation.
+            let mut loss = 0.0f32;
+            for row in 0..out_features {
+                for col in 0..in_features {
                     let mag = if col < magnitudes.len() {
                         magnitudes[col]
                     } else {
                         0.0
                     };
                     let importance = mag * mag;
-
-                    let dequant = (quantized[j] as f32 - q_zp) * q_scale;
-                    let reconstructed = dequant / s;
-                    let original = floats[row * in_features + col];
-                    let err = original - reconstructed;
-                    total_loss += importance * err * err;
+                    let err = floats[row * in_features + col] - w_dq[row * in_features + col];
+                    loss += importance * err * err;
                 }
             }
-        }
+            loss
+        };
 
         if total_loss < best_loss {
             best_loss = total_loss;

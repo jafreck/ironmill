@@ -74,17 +74,25 @@ impl ChannelMagnitudes {
 /// Activation store for AWQ-style quantisation.
 ///
 /// Accumulates per-channel magnitude statistics for each linear projection
-/// in each transformer layer. Memory cost is O(n_features) per projection.
+/// in each transformer layer. Memory cost is O(n_features) per projection
+/// plus one raw activation snapshot per capture point.
 #[derive(Debug, Clone)]
 pub struct AwqActivationStore {
     /// Maps `"layer_{i}_{name}"` → per-channel magnitude statistics.
     pub magnitudes: HashMap<String, ChannelMagnitudes>,
+    /// Raw activation snapshots: key → list of flattened `[n_tokens × n_features]` tensors.
+    /// Only the first snapshot per key is kept to bound memory usage.
+    pub activations: HashMap<String, Vec<Vec<f32>>>,
+    /// Maximum number of activation snapshots to keep per key (default 1).
+    pub max_snapshots_per_key: usize,
 }
 
 impl AwqActivationStore {
     pub fn new() -> Self {
         Self {
             magnitudes: HashMap::new(),
+            activations: HashMap::new(),
+            max_snapshots_per_key: 1,
         }
     }
 }
@@ -131,6 +139,27 @@ impl AwqActivationStore {
         }
         result
     }
+
+    /// Convert raw activations to the format expected by `AwqQuantizePass`.
+    ///
+    /// Uses the same norm→projection mapping as `to_channel_magnitudes`:
+    /// each norm key is duplicated across all projections it feeds.
+    /// Returns only the first captured activation snapshot per weight op.
+    pub fn to_activations(
+        &self,
+        weight_names: &[(String, usize, &str)],
+    ) -> HashMap<String, Vec<f32>> {
+        let mut result = HashMap::new();
+        for (name, layer_idx, group) in weight_names {
+            let store_key = format!("layer_{}_{}_norm", layer_idx, group);
+            if let Some(snapshots) = self.activations.get(&store_key) {
+                if let Some(first) = snapshots.first() {
+                    result.insert(name.clone(), first.clone());
+                }
+            }
+        }
+        result
+    }
 }
 
 impl ActivationHook for AwqActivationStore {
@@ -141,7 +170,7 @@ impl ActivationHook for AwqActivationStore {
         let key = store_key(layer, name);
         let mag = self
             .magnitudes
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| ChannelMagnitudes::new(n_features));
         debug_assert_eq!(
             mag.mean_abs.len(),
@@ -149,6 +178,13 @@ impl ActivationHook for AwqActivationStore {
             "n_features changed between calls"
         );
         mag.update(activation, n_features);
+
+        // Capture raw activation snapshot (bounded by max_snapshots_per_key).
+        let snapshots = self.activations.entry(key).or_default();
+        if snapshots.len() < self.max_snapshots_per_key {
+            let f32_data: Vec<f32> = activation.iter().map(|v| v.to_f32()).collect();
+            snapshots.push(f32_data);
+        }
     }
 }
 

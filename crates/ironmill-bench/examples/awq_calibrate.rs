@@ -56,11 +56,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let magnitudes = store.to_channel_magnitudes(&weight_names);
     eprintln!("Collected magnitudes for {} projections", magnitudes.len());
 
+    let activations = store.to_activations(&weight_names);
+    let activation_token_count = activations
+        .values()
+        .next()
+        .map(|a| {
+            let n_features = magnitudes.values().next().map(|m| m.len()).unwrap_or(1);
+            if n_features > 0 {
+                a.len() / n_features
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
+    eprintln!(
+        "Collected activations for {} projections ({} tokens)",
+        activations.len(),
+        activation_token_count
+    );
+
     std::fs::create_dir_all(output_dir)?;
     let out_path = std::path::Path::new(output_dir).join("awq_magnitudes.json");
     let json = serde_json::to_string_pretty(&magnitudes)?;
     std::fs::write(&out_path, json)?;
-    eprintln!("Saved to {}", out_path.display());
+    eprintln!("Saved magnitudes to {}", out_path.display());
+
+    if !activations.is_empty() {
+        let act_path = std::path::Path::new(output_dir).join("awq_activations.json");
+        let act_json = serde_json::to_string(&activations)?;
+        std::fs::write(&act_path, act_json)?;
+        eprintln!("Saved activations to {}", act_path.display());
+
+        let tc_path = std::path::Path::new(output_dir).join("awq_token_count.json");
+        let tc_json = serde_json::to_string_pretty(&activation_token_count)?;
+        std::fs::write(&tc_path, tc_json)?;
+        eprintln!("Saved token count to {}", tc_path.display());
+    }
 
     Ok(())
 }

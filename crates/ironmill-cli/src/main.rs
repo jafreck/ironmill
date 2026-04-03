@@ -574,8 +574,34 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
                             mag_path.display()
                         )
                     })?;
+
+                // Optionally load raw calibration activations for exact loss.
+                let act_path = cal_dir.join("awq_activations.json");
+                let tc_path = cal_dir.join("awq_token_count.json");
+                let (cal_activations, cal_token_count) = if act_path.exists() && tc_path.exists() {
+                    let act_json = std::fs::read_to_string(&act_path).with_context(|| {
+                        format!("Failed to read AWQ activations from {}", act_path.display())
+                    })?;
+                    let activations: HashMap<String, Vec<f32>> = serde_json::from_str(&act_json)
+                        .with_context(|| {
+                            format!(
+                                "Failed to parse AWQ activations from {}",
+                                act_path.display()
+                            )
+                        })?;
+                    let tc_json = std::fs::read_to_string(&tc_path).with_context(|| {
+                        format!("Failed to read AWQ token count from {}", tc_path.display())
+                    })?;
+                    let token_count: usize = serde_json::from_str(&tc_json).with_context(|| {
+                        format!("Failed to parse AWQ token count from {}", tc_path.display())
+                    })?;
+                    (activations, token_count)
+                } else {
+                    (HashMap::new(), 0)
+                };
+
                 pipeline = pipeline
-                    .with_awq(channel_magnitudes, 128)
+                    .with_awq(channel_magnitudes, 128, cal_activations, cal_token_count)
                     .context("Failed to configure AWQ quantization")?;
             }
             "int4" => {

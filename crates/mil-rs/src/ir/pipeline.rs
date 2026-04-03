@@ -559,12 +559,18 @@ impl PassPipeline {
     /// activation magnitudes collected during calibration to protect
     /// salient weight channels from quantization error.
     ///
+    /// When `calibration_activations` is non-empty, the pass uses the
+    /// paper's exact loss function (Equation 4) instead of the mag²-weighted
+    /// MSE approximation.
+    ///
     /// Mutually exclusive with INT4, INT8, palettization, and polar
     /// quantization.
     pub fn with_awq(
         mut self,
         channel_magnitudes: HashMap<String, Vec<f32>>,
         group_size: usize,
+        calibration_activations: HashMap<String, Vec<f32>>,
+        calibration_token_count: usize,
     ) -> Result<Self> {
         if self.has_int8 {
             return Err(MilError::Validation(
@@ -615,7 +621,10 @@ impl PassPipeline {
             .unwrap_or(self.passes.len());
         self.passes.insert(
             insert_pos,
-            Box::new(AwqQuantizePass::new(4, group_size, channel_magnitudes)),
+            Box::new(
+                AwqQuantizePass::new(4, group_size, channel_magnitudes)
+                    .with_calibration_activations(calibration_activations, calibration_token_count),
+            ),
         );
         // Insert AwqScaleFusionPass right after AwqQuantizePass.
         self.passes
@@ -1791,7 +1800,7 @@ name = "int4-quantize"
     #[test]
     fn with_awq_builds_pipeline() {
         let pipeline = PassPipeline::new()
-            .with_awq(sample_magnitudes(), 128)
+            .with_awq(sample_magnitudes(), 128, HashMap::new(), 0)
             .unwrap();
         let names = pipeline.pass_names();
         assert!(
@@ -1807,7 +1816,7 @@ name = "int4-quantize"
     #[test]
     fn with_awq_inserts_before_type_repropagation() {
         let pipeline = PassPipeline::new()
-            .with_awq(sample_magnitudes(), 128)
+            .with_awq(sample_magnitudes(), 128, HashMap::new(), 0)
             .unwrap();
         let names = pipeline.pass_names();
         let awq_pos = names.iter().position(|n| *n == "awq-quantization").unwrap();
@@ -1830,7 +1839,7 @@ name = "int4-quantize"
     #[test]
     fn awq_and_int4_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_int4(128).unwrap();
-        let result = pipeline.with_awq(sample_magnitudes(), 128);
+        let result = pipeline.with_awq(sample_magnitudes(), 128, HashMap::new(), 0);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1842,7 +1851,7 @@ name = "int4-quantize"
     #[test]
     fn awq_and_int8_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_int8(None).unwrap();
-        let result = pipeline.with_awq(sample_magnitudes(), 128);
+        let result = pipeline.with_awq(sample_magnitudes(), 128, HashMap::new(), 0);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1854,7 +1863,7 @@ name = "int4-quantize"
     #[test]
     fn awq_and_polar_quant_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_polar_quant(4).unwrap();
-        let result = pipeline.with_awq(sample_magnitudes(), 128);
+        let result = pipeline.with_awq(sample_magnitudes(), 128, HashMap::new(), 0);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1866,7 +1875,7 @@ name = "int4-quantize"
     #[test]
     fn awq_and_palettize_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_palettize(4).unwrap();
-        let result = pipeline.with_awq(sample_magnitudes(), 128);
+        let result = pipeline.with_awq(sample_magnitudes(), 128, HashMap::new(), 0);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1880,7 +1889,7 @@ name = "int4-quantize"
         let pipeline = PassPipeline::new()
             .with_fp16()
             .unwrap()
-            .with_awq(sample_magnitudes(), 128)
+            .with_awq(sample_magnitudes(), 128, HashMap::new(), 0)
             .unwrap();
         let names = pipeline.pass_names();
         assert!(names.contains(&"fp16-quantization"));
@@ -1891,7 +1900,7 @@ name = "int4-quantize"
     #[test]
     fn awq_blocks_subsequent_int4() {
         let pipeline = PassPipeline::new()
-            .with_awq(sample_magnitudes(), 128)
+            .with_awq(sample_magnitudes(), 128, HashMap::new(), 0)
             .unwrap();
         let result = pipeline.with_int4(128);
         assert!(result.is_err());
@@ -2033,7 +2042,7 @@ name = "int4-quantize"
     #[test]
     fn quip_sharp_and_awq_mutually_exclusive() {
         let pipeline = PassPipeline::new()
-            .with_awq(sample_magnitudes(), 128)
+            .with_awq(sample_magnitudes(), 128, HashMap::new(), 0)
             .unwrap();
         let result = pipeline.with_quip_sharp(2, 42);
         assert!(result.is_err());
@@ -2150,7 +2159,7 @@ name = "int4-quantize"
     #[test]
     fn d2quant_and_awq_mutually_exclusive() {
         let pipeline = PassPipeline::new()
-            .with_awq(sample_magnitudes(), 128)
+            .with_awq(sample_magnitudes(), 128, HashMap::new(), 0)
             .unwrap();
         let result = pipeline.with_d2quant(2, 128, 0.99, None);
         assert!(result.is_err());
@@ -2178,7 +2187,7 @@ name = "int4-quantize"
         let pipeline = PassPipeline::new()
             .with_d2quant(2, 128, 0.99, None)
             .unwrap();
-        let result = pipeline.with_awq(sample_magnitudes(), 128);
+        let result = pipeline.with_awq(sample_magnitudes(), 128, HashMap::new(), 0);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2252,7 +2261,7 @@ name = "int4-quantize"
     #[test]
     fn spinquant_and_awq_mutually_exclusive() {
         let pipeline = PassPipeline::new()
-            .with_awq(sample_magnitudes(), 128)
+            .with_awq(sample_magnitudes(), 128, HashMap::new(), 0)
             .unwrap();
         let config = SpinQuantConfig {
             rotation_epochs: 100,
