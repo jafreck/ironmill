@@ -1,9 +1,9 @@
+#include <metal_stdlib>
+using namespace metal;
+
 #ifndef HEAD_DIM
 #define HEAD_DIM 128
 #endif
-
-#include <metal_stdlib>
-using namespace metal;
 
 // Tiled flash attention — standard FP16 (no quantization, no rotation).
 // Loads KV cache in tiles into threadgroup SRAM to reduce global memory
@@ -110,25 +110,27 @@ kernel void standard_attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- Per-tile online softmax ----
-        if (tid == 0) {
-            float tm = -INFINITY;
-            for (uint p = 0; p < actual_tile; p++)
-                tm = max(tm, tile_scores[p]);
+        // ---- Per-tile online softmax (parallel via simd ops) ----
+        // TILE=32 matches SIMD_SIZE=32, so the first simdgroup can process
+        // all tile positions in parallel — one lane per position.
+        if (sgid == 0) {
+            float my_score = (lane < actual_tile) ? tile_scores[lane] : -INFINITY;
+            float tm = simd_max(my_score);
 
             float old_max = softmax_max[0];
             float new_max = max(old_max, tm);
             float corr = exp(old_max - new_max);
 
-            tile_correction[0] = corr;
-            softmax_max[0] = new_max;
-            softmax_sum[0] = softmax_sum[0] * corr;
-
-            for (uint p = 0; p < actual_tile; p++) {
-                float w = exp(tile_scores[p] - new_max);
-                tile_scores[p] = w;
-                softmax_sum[0] += w;
+            if (lane == 0) {
+                tile_correction[0] = corr;
+                softmax_max[0] = new_max;
+                softmax_sum[0] = softmax_sum[0] * corr;
             }
+
+            float w = (lane < actual_tile) ? exp(my_score - new_max) : 0.0f;
+            if (lane < actual_tile) tile_scores[lane] = w;
+            float tile_sum = simd_sum(w);
+            if (lane == 0) softmax_sum[0] += tile_sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

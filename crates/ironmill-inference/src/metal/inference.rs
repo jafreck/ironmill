@@ -100,6 +100,9 @@ struct IntermediateBuffers {
     norm_out: MetalBuffer,
     logits: MetalBuffer,
     token_ids_buf: MetalBuffer,
+    /// Second token IDs buffer for prefill pipelining — allows encoding
+    /// the next chunk while the previous command buffer is still executing.
+    token_ids_buf_b: MetalBuffer,
 }
 
 impl IntermediateBuffers {
@@ -115,8 +118,17 @@ impl IntermediateBuffers {
         let inter = mc.intermediate_size;
         let vocab = mc.vocab_size;
 
-        let alloc = |size_elems: usize| -> Result<MetalBuffer, MetalError> {
-            // FP16 = 2 bytes per element; minimum 16 bytes for Metal
+        let alloc_private = |size_elems: usize| -> Result<MetalBuffer, MetalError> {
+            // GPU-only buffers use Private storage for ~10-15% bandwidth
+            // improvement — no CPU coherency overhead.
+            let bytes = (size_elems * 2).max(16);
+            device
+                .create_buffer(bytes, StorageMode::Private)
+                .map_err(MetalError::Metal)
+        };
+
+        let alloc_shared = |size_elems: usize| -> Result<MetalBuffer, MetalError> {
+            // Buffers that need CPU read/write use Shared storage.
             let bytes = (size_elems * 2).max(16);
             device
                 .create_buffer(bytes, StorageMode::Shared)
@@ -124,18 +136,21 @@ impl IntermediateBuffers {
         };
 
         Ok(Self {
-            hidden_state: alloc(max_tokens * h)?,
-            attn_out: alloc(max_tokens * nh * hd)?,
-            q_proj: alloc(max_tokens * nh * hd)?,
-            k_proj: alloc(max_tokens * nkv * hd)?,
-            v_proj: alloc(max_tokens * nkv * hd)?,
-            ffn_gate: alloc(max_tokens * inter)?,
-            ffn_up: alloc(max_tokens * inter)?,
-            ffn_down: alloc(max_tokens * h)?,
-            residual: alloc(max_tokens * h)?,
-            norm_out: alloc(max_tokens * h)?,
-            logits: alloc(max_tokens * vocab)?,
+            hidden_state: alloc_private(max_tokens * h)?,
+            attn_out: alloc_private(max_tokens * nh * hd)?,
+            q_proj: alloc_private(max_tokens * nh * hd)?,
+            k_proj: alloc_private(max_tokens * nkv * hd)?,
+            v_proj: alloc_private(max_tokens * nkv * hd)?,
+            ffn_gate: alloc_private(max_tokens * inter)?,
+            ffn_up: alloc_private(max_tokens * inter)?,
+            ffn_down: alloc_private(max_tokens * h)?,
+            residual: alloc_private(max_tokens * h)?,
+            norm_out: alloc_shared(max_tokens * h)?, // CPU reads in calibration
+            logits: alloc_shared(max_tokens * vocab)?, // CPU reads logits
             token_ids_buf: device
+                .create_buffer((max_tokens * 4).max(16), StorageMode::Shared) // CPU writes token IDs
+                .map_err(MetalError::Metal)?,
+            token_ids_buf_b: device
                 .create_buffer((max_tokens * 4).max(16), StorageMode::Shared)
                 .map_err(MetalError::Metal)?,
         })
@@ -495,6 +510,21 @@ impl MetalInference {
     /// Run the transformer decode pipeline for `token_count` tokens.
     /// Returns logits for the last token position.
     fn run_pipeline(&mut self, token_ids: &[u32]) -> Result<Logits, InferenceError> {
+        self.run_pipeline_inner(token_ids, false)
+    }
+
+    /// Run the pipeline without reading logits — used for non-last prefill
+    /// chunks where logits are immediately discarded.
+    fn run_pipeline_no_logits(&mut self, token_ids: &[u32]) -> Result<(), InferenceError> {
+        self.run_pipeline_inner(token_ids, true)?;
+        Ok(())
+    }
+
+    fn run_pipeline_inner(
+        &mut self,
+        token_ids: &[u32],
+        skip_logits: bool,
+    ) -> Result<Logits, InferenceError> {
         let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
         let mc = self
             .model_config
@@ -854,21 +884,27 @@ impl MetalInference {
         }
 
         // Step 20: Read logits for the last token position → Vec<f32>.
-        let last_token_offset = (token_count - 1) * vocab * 2; // FP16 offset in bytes
-        let logits_byte_count = vocab * 2;
-        self.logits_fp16_buf.resize(logits_byte_count, 0);
-        bufs.logits
-            .read_bytes(&mut self.logits_fp16_buf, last_token_offset)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        // When skip_logits is set (non-last prefill chunks), skip the
+        // expensive GPU readback + f16→f32 conversion since the logits
+        // are immediately discarded.
+        let logits: Vec<f32> = if skip_logits {
+            Vec::new()
+        } else {
+            let last_token_offset = (token_count - 1) * vocab * 2; // FP16 offset in bytes
+            let logits_byte_count = vocab * 2;
+            self.logits_fp16_buf.resize(logits_byte_count, 0);
+            bufs.logits
+                .read_bytes(&mut self.logits_fp16_buf, last_token_offset)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-        let logits: Vec<f32> = self
-            .logits_fp16_buf
-            .chunks_exact(2)
-            .map(|chunk| {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                f16::from_bits(bits).to_f32()
-            })
-            .collect();
+            self.logits_fp16_buf
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    f16::from_bits(bits).to_f32()
+                })
+                .collect()
+        };
 
         // Advance sequence position.
         self.seq_pos += token_count;
@@ -1806,197 +1842,191 @@ fn encode_kv_cache_and_attention(
             let ((k_o_scale, v_o_scale), (k_n_scale, v_n_scale)) =
                 kv.layer_outlier_scales(layer_idx);
             let (k_o_r_norms, k_n_r_norms) = kv.layer_outlier_r_norms(layer_idx);
-            let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
             let tg_size = std::cmp::max(
                 outlier.d_outlier_padded as usize,
                 outlier.d_non_padded as usize,
             );
 
-            for t in 0..token_count {
-                let token_offset = t * kv_head_stride_bytes;
-                // K cache: (b-1)-bit codebook + QJL
-                enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
-                enc.set_buffer(&bufs.k_proj, token_offset, 0);
-                enc.set_buffer(&outlier.channel_indices, 0, 1);
-                enc.set_buffer(k_o_cache, 0, 2);
-                enc.set_buffer(k_n_cache, 0, 3);
-                enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
-                enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
-                enc.set_buffer(&outlier.k_outlier_codebook, 0, 6);
-                enc.set_buffer(&outlier.k_outlier_boundaries, 0, 7);
-                enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 8);
-                enc.set_buffer(&outlier.k_non_outlier_boundaries, 0, 9);
-                enc.set_buffer(k_o_scale, 0, 10);
-                enc.set_buffer(k_n_scale, 0, 11);
-                enc.set_bytes(&nkv.to_le_bytes(), 12);
-                enc.set_bytes(&hd.to_le_bytes(), 13);
-                enc.set_bytes(&max_seq.to_le_bytes(), 14);
-                enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
-                enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
-                enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
-                enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
-                enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 19);
-                enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 20);
-                enc.set_bytes(&1u32.to_le_bytes(), 21); // is_k_cache = 1
-                enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
-                enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
-                enc.set_buffer(k_o_r_norms, 0, 24);
-                enc.set_buffer(k_n_r_norms, 0, 25);
-                enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
-                // V cache: b-bit codebook, no QJL
-                enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
-                enc.set_buffer(&bufs.v_proj, token_offset, 0);
-                enc.set_buffer(&outlier.channel_indices, 0, 1);
-                enc.set_buffer(v_o_cache, 0, 2);
-                enc.set_buffer(v_n_cache, 0, 3);
-                enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
-                enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
-                enc.set_buffer(&outlier.outlier_codebook, 0, 6);
-                enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
-                enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
-                enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
-                enc.set_buffer(v_o_scale, 0, 10);
-                enc.set_buffer(v_n_scale, 0, 11);
-                enc.set_bytes(&nkv.to_le_bytes(), 12);
-                enc.set_bytes(&hd.to_le_bytes(), 13);
-                enc.set_bytes(&max_seq.to_le_bytes(), 14);
-                enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 15);
-                enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
-                enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
-                enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
-                enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
-                enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
-                enc.set_bytes(&0u32.to_le_bytes(), 21); // is_k_cache = 0
-                enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
-                enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
-                enc.set_buffer(k_o_r_norms, 0, 24);
-                enc.set_buffer(k_n_r_norms, 0, 25);
-                enc.dispatch_threadgroups((nkv as usize, 1, 1), (tg_size.min(1024), 1, 1));
-            }
+            let base_seq = seq_pos as u32;
 
-            let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
-            for t in 0..token_count {
-                let q_offset = t * q_head_stride_bytes;
-                let attn_out_offset = t * q_head_stride_bytes;
-                let current_seq_len = (seq_pos + t + 1) as u32;
-                enc.set_pipeline(&pipelines.turboquant_outlier_attention);
-                enc.set_buffer(&bufs.q_proj, q_offset, 0);
-                enc.set_buffer(k_o_cache, 0, 1);
-                enc.set_buffer(v_o_cache, 0, 2);
-                enc.set_buffer(k_n_cache, 0, 3);
-                enc.set_buffer(v_n_cache, 0, 4);
-                enc.set_buffer(&outlier.channel_indices, 0, 5);
-                enc.set_buffer(&outlier.outlier_rotation_signs, 0, 6);
-                enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 7);
-                enc.set_buffer(&outlier.k_outlier_codebook, 0, 8);
-                enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 9);
-                enc.set_buffer(&bufs.attn_out, attn_out_offset, 10);
-                enc.set_buffer(k_o_scale, 0, 11);
-                enc.set_buffer(v_o_scale, 0, 12);
-                enc.set_buffer(k_n_scale, 0, 13);
-                enc.set_buffer(v_n_scale, 0, 14);
-                enc.set_bytes(&nh.to_le_bytes(), 15);
-                enc.set_bytes(&nkv.to_le_bytes(), 16);
-                enc.set_bytes(&hd.to_le_bytes(), 17);
-                enc.set_bytes(&max_seq.to_le_bytes(), 18);
-                enc.set_bytes(&current_seq_len.to_le_bytes(), 19);
-                enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 20);
-                enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 21);
-                enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 22);
-                enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 23);
-                enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 24);
-                enc.set_buffer(k_o_r_norms, 0, 25);
-                enc.set_buffer(k_n_r_norms, 0, 26);
-                enc.set_buffer(&outlier.outlier_codebook, 0, 27);
-                enc.set_buffer(&outlier.non_outlier_codebook, 0, 28);
-                enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 29);
-                enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 30);
-                enc.dispatch_threadgroups(
-                    (nh as usize, 1, 1),
-                    (256_usize.max(tg_size).min(1024), 1, 1),
-                );
-            }
+            // K cache: (b-1)-bit codebook + QJL — batched over all tokens
+            enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
+            enc.set_buffer(&bufs.k_proj, 0, 0);
+            enc.set_buffer(&outlier.channel_indices, 0, 1);
+            enc.set_buffer(k_o_cache, 0, 2);
+            enc.set_buffer(k_n_cache, 0, 3);
+            enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
+            enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
+            enc.set_buffer(&outlier.k_outlier_codebook, 0, 6);
+            enc.set_buffer(&outlier.k_outlier_boundaries, 0, 7);
+            enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 8);
+            enc.set_buffer(&outlier.k_non_outlier_boundaries, 0, 9);
+            enc.set_buffer(k_o_scale, 0, 10);
+            enc.set_buffer(k_n_scale, 0, 11);
+            enc.set_bytes(&nkv.to_le_bytes(), 12);
+            enc.set_bytes(&hd.to_le_bytes(), 13);
+            enc.set_bytes(&max_seq.to_le_bytes(), 14);
+            enc.set_bytes(&base_seq.to_le_bytes(), 15);
+            enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
+            enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
+            enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
+            enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 19);
+            enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 20);
+            enc.set_bytes(&1u32.to_le_bytes(), 21); // is_k_cache = 1
+            enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
+            enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
+            enc.set_buffer(k_o_r_norms, 0, 24);
+            enc.set_buffer(k_n_r_norms, 0, 25);
+            enc.dispatch_threadgroups((nkv as usize, token_count, 1), (tg_size.min(1024), 1, 1));
+
+            // V cache: b-bit codebook, no QJL — batched over all tokens
+            enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
+            enc.set_buffer(&bufs.v_proj, 0, 0);
+            enc.set_buffer(&outlier.channel_indices, 0, 1);
+            enc.set_buffer(v_o_cache, 0, 2);
+            enc.set_buffer(v_n_cache, 0, 3);
+            enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
+            enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
+            enc.set_buffer(&outlier.outlier_codebook, 0, 6);
+            enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
+            enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
+            enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
+            enc.set_buffer(v_o_scale, 0, 10);
+            enc.set_buffer(v_n_scale, 0, 11);
+            enc.set_bytes(&nkv.to_le_bytes(), 12);
+            enc.set_bytes(&hd.to_le_bytes(), 13);
+            enc.set_bytes(&max_seq.to_le_bytes(), 14);
+            enc.set_bytes(&base_seq.to_le_bytes(), 15);
+            enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
+            enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
+            enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
+            enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
+            enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
+            enc.set_bytes(&0u32.to_le_bytes(), 21); // is_k_cache = 0
+            enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
+            enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
+            enc.set_buffer(k_o_r_norms, 0, 24);
+            enc.set_buffer(k_n_r_norms, 0, 25);
+            enc.dispatch_threadgroups((nkv as usize, token_count, 1), (tg_size.min(1024), 1, 1));
+
+            // Outlier attention — batched over all tokens
+            enc.set_pipeline(&pipelines.turboquant_outlier_attention);
+            enc.set_buffer(&bufs.q_proj, 0, 0);
+            enc.set_buffer(k_o_cache, 0, 1);
+            enc.set_buffer(v_o_cache, 0, 2);
+            enc.set_buffer(k_n_cache, 0, 3);
+            enc.set_buffer(v_n_cache, 0, 4);
+            enc.set_buffer(&outlier.channel_indices, 0, 5);
+            enc.set_buffer(&outlier.outlier_rotation_signs, 0, 6);
+            enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 7);
+            enc.set_buffer(&outlier.k_outlier_codebook, 0, 8);
+            enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 9);
+            enc.set_buffer(&bufs.attn_out, 0, 10);
+            enc.set_buffer(k_o_scale, 0, 11);
+            enc.set_buffer(v_o_scale, 0, 12);
+            enc.set_buffer(k_n_scale, 0, 13);
+            enc.set_buffer(v_n_scale, 0, 14);
+            enc.set_bytes(&nh.to_le_bytes(), 15);
+            enc.set_bytes(&nkv.to_le_bytes(), 16);
+            enc.set_bytes(&hd.to_le_bytes(), 17);
+            enc.set_bytes(&max_seq.to_le_bytes(), 18);
+            enc.set_bytes(&base_seq.to_le_bytes(), 19);
+            enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 20);
+            enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 21);
+            enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 22);
+            enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 23);
+            enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 24);
+            enc.set_buffer(k_o_r_norms, 0, 25);
+            enc.set_buffer(k_n_r_norms, 0, 26);
+            enc.set_buffer(&outlier.outlier_codebook, 0, 27);
+            enc.set_buffer(&outlier.non_outlier_codebook, 0, 28);
+            enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 29);
+            enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 30);
+            enc.dispatch_threadgroups(
+                (nh as usize, token_count, 1),
+                (256_usize.max(tg_size).min(1024), 1, 1),
+            );
         } else {
             // ── Standard TurboQuant dispatch ──
             let (k_cache, v_cache) = kv.layer_caches(layer_idx);
             let (k_scale, v_scale) = kv.layer_scales(layer_idx);
             let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
 
-            let kv_head_stride_bytes = (nkv as usize) * (hd as usize) * 2;
-            for t in 0..token_count {
-                let token_offset = t * kv_head_stride_bytes;
-                // K cache write: (b-1)-bit codebook + QJL
-                enc.set_pipeline(&pipelines.turboquant_cache_write);
-                enc.set_buffer(&bufs.k_proj, token_offset, 0);
-                enc.set_buffer(&tq.rotation_signs, 0, 1);
-                enc.set_buffer(k_cache, 0, 2);
-                enc.set_bytes(&nkv.to_le_bytes(), 3);
-                enc.set_bytes(&hd.to_le_bytes(), 4);
-                enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
-                enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-                enc.set_bytes(&n_bits.to_le_bytes(), 8);
-                enc.set_buffer(k_scale, 0, 9);
-                enc.set_buffer(&tq.k_codebook_buf, 0, 10);
-                enc.set_buffer(&tq.k_boundaries_buf, 0, 11);
-                enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 12);
-                enc.set_buffer(&tq.qjl_matrix, 0, 13);
-                enc.set_buffer(k_qjl_signs, 0, 14);
-                enc.set_buffer(k_r_norms, 0, 15);
-                enc.set_bytes(&1u32.to_le_bytes(), 16);
-                enc.dispatch_threadgroups((nkv as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
-                // V cache write: b-bit codebook, no QJL
-                enc.set_pipeline(&pipelines.turboquant_cache_write);
-                enc.set_buffer(&bufs.v_proj, token_offset, 0);
-                enc.set_buffer(&tq.rotation_signs, 0, 1);
-                enc.set_buffer(v_cache, 0, 2);
-                enc.set_bytes(&nkv.to_le_bytes(), 3);
-                enc.set_bytes(&hd.to_le_bytes(), 4);
-                enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                enc.set_bytes(&((seq_pos + t) as u32).to_le_bytes(), 6);
-                enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-                enc.set_bytes(&n_bits.to_le_bytes(), 8);
-                enc.set_buffer(v_scale, 0, 9);
-                enc.set_buffer(&tq.v_codebook_buf, 0, 10);
-                enc.set_buffer(&tq.v_boundaries_buf, 0, 11);
-                enc.set_bytes(&tq.v_n_levels.to_le_bytes(), 12);
-                enc.set_buffer(&tq.qjl_matrix, 0, 13);
-                enc.set_buffer(k_qjl_signs, 0, 14);
-                enc.set_buffer(k_r_norms, 0, 15);
-                enc.set_bytes(&0u32.to_le_bytes(), 16);
-                enc.dispatch_threadgroups((nkv as usize, 1, 1), ((hd as usize).min(1024), 1, 1));
-            }
+            let base_seq = seq_pos as u32;
 
-            let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
-            for t in 0..token_count {
-                let q_offset = t * q_head_stride_bytes;
-                let attn_out_offset = t * q_head_stride_bytes;
-                let current_seq_len = (seq_pos + t + 1) as u32;
-                enc.set_pipeline(&pipelines.turboquant_attention);
-                enc.set_buffer(&bufs.q_proj, q_offset, 0);
-                enc.set_buffer(k_cache, 0, 1);
-                enc.set_buffer(v_cache, 0, 2);
-                enc.set_buffer(&tq.rotation_signs, 0, 3);
-                enc.set_buffer(&bufs.attn_out, attn_out_offset, 4);
-                enc.set_bytes(&nh.to_le_bytes(), 5);
-                enc.set_bytes(&nkv.to_le_bytes(), 6);
-                enc.set_bytes(&hd.to_le_bytes(), 7);
-                enc.set_bytes(&max_seq.to_le_bytes(), 8);
-                enc.set_bytes(&current_seq_len.to_le_bytes(), 9);
-                enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
-                enc.set_bytes(&n_bits.to_le_bytes(), 11);
-                enc.set_buffer(k_scale, 0, 12);
-                enc.set_buffer(v_scale, 0, 13);
-                enc.set_buffer(&tq.k_codebook_buf, 0, 14);
-                enc.set_buffer(&tq.v_codebook_buf, 0, 15);
-                enc.set_buffer(&tq.qjl_matrix, 0, 16);
-                enc.set_buffer(k_r_norms, 0, 17);
-                enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 18);
-                enc.dispatch_threadgroups(
-                    (nh as usize, 1, 1),
-                    (256_usize.max(hd as usize).min(1024), 1, 1),
-                );
-            }
+            // K cache write — batched over all tokens
+            enc.set_pipeline(&pipelines.turboquant_cache_write);
+            enc.set_buffer(&bufs.k_proj, 0, 0);
+            enc.set_buffer(&tq.rotation_signs, 0, 1);
+            enc.set_buffer(k_cache, 0, 2);
+            enc.set_bytes(&nkv.to_le_bytes(), 3);
+            enc.set_bytes(&hd.to_le_bytes(), 4);
+            enc.set_bytes(&max_seq.to_le_bytes(), 5);
+            enc.set_bytes(&base_seq.to_le_bytes(), 6);
+            enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+            enc.set_bytes(&n_bits.to_le_bytes(), 8);
+            enc.set_buffer(k_scale, 0, 9);
+            enc.set_buffer(&tq.k_codebook_buf, 0, 10);
+            enc.set_buffer(&tq.k_boundaries_buf, 0, 11);
+            enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 12);
+            enc.set_buffer(&tq.qjl_matrix, 0, 13);
+            enc.set_buffer(k_qjl_signs, 0, 14);
+            enc.set_buffer(k_r_norms, 0, 15);
+            enc.set_bytes(&1u32.to_le_bytes(), 16);
+            enc.dispatch_threadgroups(
+                (nkv as usize, token_count, 1),
+                ((hd as usize).min(1024), 1, 1),
+            );
+
+            // V cache write — batched over all tokens
+            enc.set_pipeline(&pipelines.turboquant_cache_write);
+            enc.set_buffer(&bufs.v_proj, 0, 0);
+            enc.set_buffer(&tq.rotation_signs, 0, 1);
+            enc.set_buffer(v_cache, 0, 2);
+            enc.set_bytes(&nkv.to_le_bytes(), 3);
+            enc.set_bytes(&hd.to_le_bytes(), 4);
+            enc.set_bytes(&max_seq.to_le_bytes(), 5);
+            enc.set_bytes(&base_seq.to_le_bytes(), 6);
+            enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+            enc.set_bytes(&n_bits.to_le_bytes(), 8);
+            enc.set_buffer(v_scale, 0, 9);
+            enc.set_buffer(&tq.v_codebook_buf, 0, 10);
+            enc.set_buffer(&tq.v_boundaries_buf, 0, 11);
+            enc.set_bytes(&tq.v_n_levels.to_le_bytes(), 12);
+            enc.set_buffer(&tq.qjl_matrix, 0, 13);
+            enc.set_buffer(k_qjl_signs, 0, 14);
+            enc.set_buffer(k_r_norms, 0, 15);
+            enc.set_bytes(&0u32.to_le_bytes(), 16);
+            enc.dispatch_threadgroups(
+                (nkv as usize, token_count, 1),
+                ((hd as usize).min(1024), 1, 1),
+            );
+
+            // TurboQuant attention — batched over all tokens
+            enc.set_pipeline(&pipelines.turboquant_attention);
+            enc.set_buffer(&bufs.q_proj, 0, 0);
+            enc.set_buffer(k_cache, 0, 1);
+            enc.set_buffer(v_cache, 0, 2);
+            enc.set_buffer(&tq.rotation_signs, 0, 3);
+            enc.set_buffer(&bufs.attn_out, 0, 4);
+            enc.set_bytes(&nh.to_le_bytes(), 5);
+            enc.set_bytes(&nkv.to_le_bytes(), 6);
+            enc.set_bytes(&hd.to_le_bytes(), 7);
+            enc.set_bytes(&max_seq.to_le_bytes(), 8);
+            enc.set_bytes(&base_seq.to_le_bytes(), 9);
+            enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
+            enc.set_bytes(&n_bits.to_le_bytes(), 11);
+            enc.set_buffer(k_scale, 0, 12);
+            enc.set_buffer(v_scale, 0, 13);
+            enc.set_buffer(&tq.k_codebook_buf, 0, 14);
+            enc.set_buffer(&tq.v_codebook_buf, 0, 15);
+            enc.set_buffer(&tq.qjl_matrix, 0, 16);
+            enc.set_buffer(k_r_norms, 0, 17);
+            enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 18);
+            enc.dispatch_threadgroups(
+                (nh as usize, token_count, 1),
+                (256_usize.max(hd as usize).min(1024), 1, 1),
+            );
         }
         enc.end_encoding();
     } else {
@@ -2298,12 +2328,16 @@ impl InferenceEngine for MetalInference {
         let chunk_size = self.config.prefill_chunk_size.unwrap_or(tokens.len());
         let chunk_size = chunk_size.max(1);
 
-        let mut last_logits = None;
-        for chunk in tokens.chunks(chunk_size) {
-            last_logits = Some(self.run_pipeline(chunk)?);
+        let chunks: Vec<&[u32]> = tokens.chunks(chunk_size).collect();
+        let n_chunks = chunks.len();
+
+        // For multi-chunk prefill, skip the expensive logits readback + f16→f32
+        // conversion on non-last chunks (the logits are immediately discarded).
+        for chunk in &chunks[..n_chunks - 1] {
+            self.run_pipeline_no_logits(chunk)?;
         }
 
-        last_logits.ok_or_else(|| InferenceError::Decode("no chunks processed".into()))
+        self.run_pipeline(chunks[n_chunks - 1])
     }
 
     fn reset(&mut self) {

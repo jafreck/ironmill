@@ -47,7 +47,7 @@ inline float read_v_device(device const char* cache, uint base,
 //   INT8: [num_kv_heads × max_seq_len × head_dim]       1 byte per element
 //   INT4: [num_kv_heads × max_seq_len × head_dim/2]     2 elements packed per byte
 //
-// Dispatch: num_kv_heads threadgroups, head_dim threads per group.
+// Dispatch: (num_kv_heads, token_count, 1) threadgroups, head_dim threads per group.
 
 kernel void turboquant_cache_write(
     device const half* kv_proj          [[buffer(0)]],
@@ -56,7 +56,7 @@ kernel void turboquant_cache_write(
     constant uint& num_kv_heads         [[buffer(3)]],
     constant uint& head_dim             [[buffer(4)]],
     constant uint& max_seq_len          [[buffer(5)]],
-    constant uint& seq_pos              [[buffer(6)]],
+    constant uint& base_seq_pos         [[buffer(6)]],
     constant float& inv_scale           [[buffer(7)]],  // UNUSED — kept for API compat
     constant uint& n_bits               [[buffer(8)]],
     device float* scale_buf             [[buffer(9)]],
@@ -67,19 +67,23 @@ kernel void turboquant_cache_write(
     device uchar* qjl_signs_buf         [[buffer(14)]],
     device float* r_norms_buf           [[buffer(15)]],
     constant uint& is_k_cache           [[buffer(16)]],
-    uint tid  [[thread_position_in_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint3 tid_3  [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tg_size_3 [[threads_per_threadgroup]])
 {
+    uint tid = tid_3.x;
+    uint tg_size = tg_size_3.x;
     threadgroup float shared_rotated[HEAD_DIM];
     threadgroup float shared_reduce[HEAD_DIM];
     threadgroup char shared_quant[HEAD_DIM];
 
-    uint head_idx = tgid;
+    uint head_idx = tgid.x;
+    uint token_idx = tgid.y;
     if (head_idx >= num_kv_heads) return;
+    uint seq_pos = base_seq_pos + token_idx;
 
     // Step 1: Load input into shared memory as float
-    uint input_base = head_idx * head_dim;
+    uint input_base = (token_idx * num_kv_heads + head_idx) * head_dim;
     for (uint i = tid; i < head_dim; i += tg_size) {
         shared_rotated[i] = float(kv_proj[input_base + i]);
     }
@@ -191,7 +195,7 @@ kernel void turboquant_cache_write(
 //   buffer(16) qjl_matrix:      [head_dim × head_dim] float
 //   buffer(17) k_r_norms:       [num_kv_heads × max_seq_len] float
 //
-// Dispatch: num_heads threadgroups, max(256, head_dim) threads per group.
+// Dispatch: (num_heads, token_count, 1) threadgroups, max(256, head_dim) threads per group.
 
 kernel void turboquant_attention(
     device const half* q                [[buffer(0)]],
@@ -203,7 +207,7 @@ kernel void turboquant_attention(
     constant uint& num_kv_heads         [[buffer(6)]],
     constant uint& head_dim             [[buffer(7)]],
     constant uint& max_seq_len          [[buffer(8)]],
-    constant uint& seq_len              [[buffer(9)]],
+    constant uint& base_seq_pos         [[buffer(9)]],
     constant float& deq_scale           [[buffer(10)]],
     constant uint& n_bits               [[buffer(11)]],
     device const float* k_scale_buf     [[buffer(12)]],
@@ -212,12 +216,14 @@ kernel void turboquant_attention(
     device const float* v_codebook      [[buffer(15)]],
     device const float* qjl_matrix      [[buffer(16)]],
     device const float* k_r_norms       [[buffer(17)]],
-    uint tid  [[thread_position_in_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]],
+    uint3 tid_3  [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tg_size_3 [[threads_per_threadgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
+    uint tid = tid_3.x;
+    uint tg_size = tg_size_3.x;
     // Shared memory sized exactly to HEAD_DIM (injected at compile time).
     //   shared_q_rot:  HEAD_DIM × 4     B
     //   shared_s_q:    HEAD_DIM × 4     B
@@ -245,13 +251,15 @@ kernel void turboquant_attention(
 
     uint num_simdgroups = tg_size / SIMD_SIZE;
 
-    uint head_idx = tgid;
+    uint head_idx = tgid.x;
+    uint token_idx = tgid.y;
     if (head_idx >= num_heads) return;
+    uint seq_len = base_seq_pos + token_idx + 1;
 
     uint heads_per_group = num_heads / num_kv_heads;
     uint kv_head = head_idx / heads_per_group;
     float scale = 1.0f / sqrt(float(head_dim));
-    uint q_base = head_idx * head_dim;
+    uint q_base = (token_idx * num_heads + head_idx) * head_dim;
     uint kv_base = kv_cache_base(kv_head, max_seq_len, head_dim, n_bits);
 
     // ---- Step 0: Preload codebooks into shared memory ----
@@ -342,25 +350,25 @@ kernel void turboquant_attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- Per-tile online softmax ----
-        if (tid == 0) {
-            float tm = -INFINITY;
-            for (uint p = 0; p < actual_tile; p++)
-                tm = max(tm, tile_scores[p]);
+        // ---- Per-tile online softmax (parallel via simd ops) ----
+        if (sgid == 0) {
+            float my_score = (lane < actual_tile) ? tile_scores[lane] : -INFINITY;
+            float tm = simd_max(my_score);
 
             float old_max = softmax_max[0];
             float new_max = max(old_max, tm);
             float corr = exp(old_max - new_max);
 
-            tile_correction[0] = corr;
-            softmax_max[0] = new_max;
-            softmax_sum[0] = softmax_sum[0] * corr;
-
-            for (uint p = 0; p < actual_tile; p++) {
-                float w = exp(tile_scores[p] - new_max);
-                tile_scores[p] = w;
-                softmax_sum[0] += w;
+            if (lane == 0) {
+                tile_correction[0] = corr;
+                softmax_max[0] = new_max;
+                softmax_sum[0] = softmax_sum[0] * corr;
             }
+
+            float w = (lane < actual_tile) ? exp(my_score - new_max) : 0.0f;
+            if (lane < actual_tile) tile_scores[lane] = w;
+            float tile_sum = simd_sum(w);
+            if (lane == 0) softmax_sum[0] += tile_sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -401,7 +409,7 @@ kernel void turboquant_attention(
     // ---- Step 4: Un-rotate via butterfly (self-inverse) ----
     hadamard_rotate_inplace(shared_output, rotation_signs, head_dim, tid, tg_size);
 
-    uint out_base = head_idx * head_dim;
+    uint out_base = (token_idx * num_heads + head_idx) * head_dim;
     for (uint d = tid; d < head_dim; d += tg_size) {
         output[out_base + d] = half(shared_output[d]);
     }
@@ -510,7 +518,7 @@ inline void turboquant_quantize_group(
 //   buffer(24) outlier_r_norms_buf:     [num_kv_heads × max_seq_len] float
 //   buffer(25) non_outlier_r_norms_buf: [num_kv_heads × max_seq_len] float
 //
-// Dispatch: num_kv_heads threadgroups, max(d_outlier_padded, d_non_padded) threads.
+// Dispatch: (num_kv_heads, token_count, 1) threadgroups, max(d_outlier_padded, d_non_padded) threads.
 
 kernel void turboquant_outlier_cache_write(
     device const half* kv_proj                      [[buffer(0)]],
@@ -528,7 +536,7 @@ kernel void turboquant_outlier_cache_write(
     constant uint& num_kv_heads                     [[buffer(12)]],
     constant uint& head_dim                         [[buffer(13)]],
     constant uint& max_seq_len                      [[buffer(14)]],
-    constant uint& seq_pos                          [[buffer(15)]],
+    constant uint& base_seq_pos                     [[buffer(15)]],
     constant uint& n_outlier                        [[buffer(16)]],
     constant uint& d_outlier_padded                 [[buffer(17)]],
     constant uint& d_non_padded                     [[buffer(18)]],
@@ -539,20 +547,24 @@ kernel void turboquant_outlier_cache_write(
     device const float* non_outlier_qjl_matrix      [[buffer(23)]],
     device float* outlier_r_norms_buf               [[buffer(24)]],
     device float* non_outlier_r_norms_buf           [[buffer(25)]],
-    uint tid  [[thread_position_in_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint3 tid_3  [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tg_size_3 [[threads_per_threadgroup]])
 {
+    uint tid = tid_3.x;
+    uint tg_size = tg_size_3.x;
     threadgroup float shared_outlier[HEAD_DIM];
     threadgroup float shared_non_outlier[HEAD_DIM];
     threadgroup float shared_reduce[HEAD_DIM];
     threadgroup char shared_quant[HEAD_DIM];
 
-    uint head_idx = tgid;
+    uint head_idx = tgid.x;
+    uint token_idx = tgid.y;
     if (head_idx >= num_kv_heads) return;
+    uint seq_pos = base_seq_pos + token_idx;
 
     uint n_non = head_dim - n_outlier;
-    uint input_base = head_idx * head_dim;
+    uint input_base = (token_idx * num_kv_heads + head_idx) * head_dim;
 
     // Extract outlier channels (zero-pad to d_outlier_padded)
     for (uint i = tid; i < d_outlier_padded; i += tg_size) {
@@ -733,7 +745,7 @@ kernel void turboquant_outlier_cache_write(
 //
 // Buffers mirror the cache write kernel, plus Q and output buffers.
 //
-// Dispatch: num_heads threadgroups, max(256, max(d_outlier_padded, d_non_padded)) threads.
+// Dispatch: (num_heads, token_count, 1) threadgroups, max(256, max(d_outlier_padded, d_non_padded)) threads.
 
 kernel void turboquant_outlier_attention(
     device const half* q                            [[buffer(0)]],
@@ -755,7 +767,7 @@ kernel void turboquant_outlier_attention(
     constant uint& num_kv_heads                     [[buffer(16)]],
     constant uint& head_dim                         [[buffer(17)]],
     constant uint& max_seq_len                      [[buffer(18)]],
-    constant uint& seq_len                          [[buffer(19)]],
+    constant uint& base_seq_pos                     [[buffer(19)]],
     constant uint& n_outlier                        [[buffer(20)]],
     constant uint& d_outlier_padded                 [[buffer(21)]],
     constant uint& d_non_padded                     [[buffer(22)]],
@@ -765,12 +777,14 @@ kernel void turboquant_outlier_attention(
     device const float* k_non_outlier_r_norms       [[buffer(26)]],
     device const float* v_outlier_codebook          [[buffer(27)]],
     device const float* v_non_outlier_codebook      [[buffer(28)]],
-    uint tid  [[thread_position_in_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]],
+    uint3 tid_3  [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tg_size_3 [[threads_per_threadgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
+    uint tid = tid_3.x;
+    uint tg_size = tg_size_3.x;
     // Shared memory sized exactly to HEAD_DIM (injected at compile time).
     //   shared_q_outlier:     HEAD_DIM × 4         B
     //   shared_q_non_outlier: HEAD_DIM × 4         B
@@ -803,13 +817,15 @@ kernel void turboquant_outlier_attention(
 
     uint num_simdgroups = tg_size / SIMD_SIZE;
 
-    uint head_idx = tgid;
+    uint head_idx = tgid.x;
+    uint token_idx = tgid.y;
     if (head_idx >= num_heads) return;
+    uint seq_len = base_seq_pos + token_idx + 1;
 
     uint heads_per_group = num_heads / num_kv_heads;
     uint kv_head = head_idx / heads_per_group;
     float scale = 1.0f / sqrt(float(head_dim));
-    uint q_base = head_idx * head_dim;
+    uint q_base = (token_idx * num_heads + head_idx) * head_dim;
     uint n_non = head_dim - n_outlier;
 
     // ---- Load and rotate Q for both groups ----
@@ -935,25 +951,25 @@ kernel void turboquant_outlier_attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- Per-tile online softmax ----
-        if (tid == 0) {
-            float tm = -INFINITY;
-            for (uint p = 0; p < actual_tile; p++)
-                tm = max(tm, tile_scores[p]);
+        // ---- Per-tile online softmax (parallel via simd ops) ----
+        if (sgid == 0) {
+            float my_score = (lane < actual_tile) ? tile_scores[lane] : -INFINITY;
+            float tm = simd_max(my_score);
 
             float old_max = softmax_max[0];
             float new_max = max(old_max, tm);
             float corr = exp(old_max - new_max);
 
-            tile_correction[0] = corr;
-            softmax_max[0] = new_max;
-            softmax_sum[0] = softmax_sum[0] * corr;
-
-            for (uint p = 0; p < actual_tile; p++) {
-                float w = exp(tile_scores[p] - new_max);
-                tile_scores[p] = w;
-                softmax_sum[0] += w;
+            if (lane == 0) {
+                tile_correction[0] = corr;
+                softmax_max[0] = new_max;
+                softmax_sum[0] = softmax_sum[0] * corr;
             }
+
+            float w = (lane < actual_tile) ? exp(my_score - new_max) : 0.0f;
+            if (lane < actual_tile) tile_scores[lane] = w;
+            float tile_sum = simd_sum(w);
+            if (lane == 0) softmax_sum[0] += tile_sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1009,7 +1025,7 @@ kernel void turboquant_outlier_attention(
     hadamard_rotate_inplace(shared_output_non_outlier, non_outlier_rotation_signs, d_non_padded, tid, tg_size);
 
     // ---- Scatter back to original channel positions ----
-    uint out_base = head_idx * head_dim;
+    uint out_base = (token_idx * num_heads + head_idx) * head_dim;
     for (uint i = tid; i < n_outlier; i += tg_size) {
         uint dst_idx = channel_indices[i];
         output[out_base + dst_idx] = half(shared_output_outlier[i]);

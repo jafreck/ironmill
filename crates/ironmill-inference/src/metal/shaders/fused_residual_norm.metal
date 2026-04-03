@@ -35,9 +35,8 @@ kernel void fused_residual_rms_norm(
     uint tgid   [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    // Shared memory for parallel reduction of sum-of-squares.
-    // Max 4096 elements (16 KB for float) fits in 32 KB threadgroup budget.
-    threadgroup float shared_sum[4096];
+    // Shared memory for cross-simdgroup reduction (max 32 simdgroups = 1024 threads).
+    threadgroup float sg_partial[32];
 
     uint token_idx = tgid;
     if (token_idx >= token_count) return;
@@ -51,25 +50,24 @@ kernel void fused_residual_rms_norm(
         residual_output[base + i] = half(val);
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
 
+    // Step 2: Two-level reduction — simd_sum within each simdgroup (zero
+    // barriers), then a short cross-simdgroup reduce (≤32 iterations).
+    float simd_total = simd_sum(local_sum);
+    uint sg_idx = tid / 32;
+    if (tid % 32 == 0) sg_partial[sg_idx] = simd_total;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 2: Parallel reduction to compute total sum-of-squares
-    uint reduce_size = 1;
-    while (reduce_size < tg_size) reduce_size <<= 1;
-
-    for (uint stride = reduce_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride && (tid + stride) < tg_size) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint num_sg = (tg_size + 31) / 32;
+        float total = 0.0f;
+        for (uint i = 0; i < num_sg; i++) total += sg_partial[i];
+        sg_partial[0] = total;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Step 3: Compute 1/rms from the reduced sum
-    float rms_inv = rsqrt(shared_sum[0] / float(hidden_size) + eps);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms_inv = rsqrt(sg_partial[0] / float(hidden_size) + eps);
 
     // Step 4: Normalize and scale — recompute residual in float to avoid
     // precision loss from the half round-trip through residual_output.

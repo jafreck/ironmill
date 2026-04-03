@@ -162,6 +162,78 @@ impl CommandBuffer {
         CommandBufferStatus::from_raw(raw_status)
     }
 
+    /// Register a block to be called when the command buffer has completed.
+    ///
+    /// The handler is called on an unspecified dispatch queue. The `sender`
+    /// argument to `closure` is the raw command buffer pointer.
+    ///
+    /// Uses the ObjC block ABI to create a stack block that invokes the
+    /// Rust closure, then copies it to the heap via `_Block_copy`.
+    pub fn add_completed_handler<F>(&self, closure: F)
+    where
+        F: Fn() + Send + 'static,
+    {
+        // Layout of an ObjC stack block that captures a boxed Fn closure.
+        #[repr(C)]
+        struct BlockLiteral {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: unsafe extern "C" fn(*mut BlockLiteral, *mut c_void),
+            descriptor: *const BlockDescriptor,
+            closure: *mut dyn Fn(),
+        }
+
+        #[repr(C)]
+        struct BlockDescriptor {
+            reserved: u64,
+            size: u64,
+        }
+
+        static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+            reserved: 0,
+            size: std::mem::size_of::<BlockLiteral>() as u64,
+        };
+
+        unsafe extern "C" fn invoke_block(block: *mut BlockLiteral, _cmd_buf: *mut c_void) {
+            // SAFETY: `block.closure` is a valid leaked Box<dyn Fn()>.
+            let closure = unsafe { &*(*block).closure };
+            closure();
+        }
+
+        // SAFETY: We create a heap block via _Block_copy so it survives
+        // past this stack frame. The closure is leaked into a raw pointer
+        // and never freed (the handler runs exactly once per command buffer).
+        #[link(name = "System")]
+        unsafe extern "C" {
+            static _NSConcreteStackBlock: *const c_void;
+            fn _Block_copy(block: *const c_void) -> *mut c_void;
+        }
+
+        let boxed: Box<dyn Fn()> = Box::new(closure);
+        let raw_closure = Box::into_raw(boxed);
+
+        let stack_block = BlockLiteral {
+            isa: std::ptr::addr_of!(_NSConcreteStackBlock) as *const c_void,
+            flags: 1 << 25, // BLOCK_HAS_COPY_DISPOSE not needed for simple case
+            reserved: 0,
+            invoke: invoke_block,
+            descriptor: &DESCRIPTOR,
+            closure: raw_closure,
+        };
+
+        // Copy to heap so Metal can call it asynchronously.
+        let heap_block =
+            unsafe { _Block_copy(&stack_block as *const BlockLiteral as *const c_void) };
+
+        // SAFETY: `self.raw` is a valid command buffer. `heap_block` is
+        // a valid heap-allocated ObjC block.
+        type AddHandlerFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+        let sel = unsafe { objc::sel_registerName(sel!("addCompletedHandler:")) };
+        let f: AddHandlerFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        unsafe { f(self.raw, sel, heap_block) };
+    }
+
     /// Returns the raw `id<MTLCommandBuffer>` pointer.
     pub fn as_raw_ptr(&self) -> *mut c_void {
         self.raw

@@ -55,7 +55,7 @@ impl MetalPipelines {
     /// Compile all Metal shaders and create pipeline states.
     ///
     /// `head_dim` is injected into TurboQuant and attention shaders via
-    /// `#define HEAD_DIM` so shared memory is sized exactly.
+    /// `#define HEAD_DIM` so shared memory is sized exactly at compile time.
     pub fn compile(device: &MetalDevice, head_dim: usize) -> Result<Self, MetalError> {
         let head_dim_header = format!(
             "#define HEAD_DIM {head_dim}\n#define HEAD_DIM_PACKED {}\n",
