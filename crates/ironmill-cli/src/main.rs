@@ -475,33 +475,33 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
     }
 }
 
-/// GPU compilation path: builds a PolarQuant provider and writes a `.ironml-gpu` bundle.
+/// GPU compilation path: builds a pass pipeline and writes a `.ironml-gpu` bundle.
 fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
-    let mut builder = GpuCompileBuilder::new(input_path);
-
-    // Check if the quantize flag specifies a PolarQuant format (legacy path)
-    let is_polarquant = opts.quantize.starts_with("polarquant-") || opts.polar_quantize.is_some();
-
-    if is_polarquant {
-        // Legacy PolarQuant path: use the builder's built-in PolarQuant support
-        if opts.quantize != "none" && opts.polar_quantize.is_some() {
-            anyhow::bail!("Cannot specify both --quantize and --polar-quantize. Use only one.");
-        }
-
-        if opts.quantize.starts_with("polarquant-") {
-            let n_bits = parse_polarquant_bits(&opts.quantize)?;
-            builder = builder.polar_quantize(n_bits);
-        } else if let Some(n_bits) = opts.polar_quantize {
-            builder = builder.polar_quantize(n_bits);
-        }
-    } else if opts.quantize != "none" {
-        // New path: build a PassPipeline and inject it into the builder
-        let pipeline = build_pass_pipeline(opts)?;
-        builder = builder.with_pass_pipeline(pipeline);
+    // Reject conflicting quantization flags.
+    if opts.quantize != "none" && opts.polar_quantize.is_some() {
+        anyhow::bail!("Cannot specify both --quantize and --polar-quantize. Use only one.");
     }
-    // When quantize == "none" and no polar_quantize: no quantization (FP16)
 
-    let provider = builder.build().context("GPU compilation failed")?;
+    // Build the pipeline — handles all quantization methods uniformly.
+    let pipeline = if opts.quantize.starts_with("polarquant-") {
+        let n_bits = parse_polarquant_bits(&opts.quantize)?;
+        PassPipeline::new()
+            .with_polar_quant(n_bits)
+            .context("Failed to configure PolarQuant")?
+    } else if let Some(bits) = opts.polar_quantize {
+        PassPipeline::new()
+            .with_polar_quant(bits)
+            .context("Failed to configure PolarQuant")?
+    } else if opts.quantize != "none" {
+        build_pass_pipeline(opts)?
+    } else {
+        PassPipeline::new()
+    };
+
+    let provider = GpuCompileBuilder::new(input_path)
+        .with_pass_pipeline(pipeline)
+        .build()
+        .context("GPU compilation failed")?;
 
     let output = opts
         .output

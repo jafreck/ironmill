@@ -183,8 +183,11 @@ mod polarquant_bench {
 
         // PolarQuant-4.
         let pq_provider = GpuCompileBuilder::new(model_dir.clone())
-            .polar_quantize(4)
-            .min_elements(1024)
+            .with_pass_pipeline(
+                ironmill_compile::mil::PassPipeline::new()
+                    .with_polar_quant(4)
+                    .expect("PolarQuant config"),
+            )
             .build()
             .expect("PolarQuant compile failed");
         let pq_config = MetalConfig {
@@ -226,8 +229,11 @@ mod polarquant_bench {
 
         // PolarQuant-4.
         let pq_provider = GpuCompileBuilder::new(model_dir.clone())
-            .polar_quantize(4)
-            .min_elements(1024)
+            .with_pass_pipeline(
+                ironmill_compile::mil::PassPipeline::new()
+                    .with_polar_quant(4)
+                    .expect("PolarQuant config"),
+            )
             .build()
             .expect("PolarQuant compile failed");
         let pq_config = MetalConfig {
@@ -270,8 +276,11 @@ mod polarquant_bench {
 
         // PolarQuant-4 perplexity.
         let pq_provider = GpuCompileBuilder::new(model_dir.clone())
-            .polar_quantize(4)
-            .min_elements(1024)
+            .with_pass_pipeline(
+                ironmill_compile::mil::PassPipeline::new()
+                    .with_polar_quant(4)
+                    .expect("PolarQuant config"),
+            )
             .build()
             .expect("PolarQuant compile failed");
         let (mut engine_pq, _, _) = load_gpu_engine(&pq_provider, config);
@@ -306,8 +315,11 @@ mod polarquant_bench {
 
         // Compile PolarQuant-4 bundle.
         let pq_provider = GpuCompileBuilder::new(model_dir.clone())
-            .polar_quantize(4)
-            .min_elements(1024)
+            .with_pass_pipeline(
+                ironmill_compile::mil::PassPipeline::new()
+                    .with_polar_quant(4)
+                    .expect("PolarQuant config"),
+            )
             .build()
             .expect("PolarQuant compile failed");
 
@@ -361,8 +373,11 @@ mod polarquant_bench {
 
         // ── PolarQuant-4 (CPU dequant for correctness) ───────────
         let pq_provider = GpuCompileBuilder::new(model_dir.clone())
-            .polar_quantize(4)
-            .min_elements(1024)
+            .with_pass_pipeline(
+                ironmill_compile::mil::PassPipeline::new()
+                    .with_polar_quant(4)
+                    .expect("PolarQuant config"),
+            )
             .build()
             .expect("PolarQuant compile failed");
         let (mut engine_pq, pq_gpu_mb, _) = load_gpu_engine(&pq_provider, pq_config);

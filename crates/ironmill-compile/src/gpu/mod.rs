@@ -1,18 +1,24 @@
-//! GPU-targeted compilation: PolarQuant passes → [`MilWeightProvider`].
+//! GPU-targeted compilation: import → optimize → [`MilWeightProvider`].
 //!
-//! This module provides [`GpuCompileBuilder`], a builder that imports a model,
-//! runs PolarQuant quantization passes, and produces a [`MilWeightProvider`]
-//! suitable for loading via `GpuWeights::load()`.
+//! This module provides [`GpuCompileBuilder`], a builder that imports a model
+//! from any supported format, runs an optimization/quantization [`PassPipeline`],
+//! and produces a [`MilWeightProvider`] suitable for writing to a `.ironml-gpu`
+//! bundle.
 //!
-//! Phase 1 — no bundle serialization; the provider is returned in-memory.
+//! All input formats (ONNX, SafeTensors, GGUF) follow the same pipeline:
+//!
+//! ```text
+//! Input → MIL IR Program → PassPipeline → MilWeightProvider
+//! ```
+//!
+//! Format-specific logic is limited to the initial import step. The pipeline
+//! is format-agnostic — the caller decides what quantization to apply.
 
 pub mod bundle;
 
 use std::path::{Path, PathBuf};
 
 use mil_rs::convert::{ConversionConfig, onnx_to_program_with_config};
-use mil_rs::ir::passes::PolarQuantPass;
-use mil_rs::ir::passes::TypeRepropagationPass;
 use mil_rs::ir::{PassPipeline, Program};
 use mil_rs::reader::read_onnx;
 
@@ -21,68 +27,55 @@ use crate::weights::{MilWeightProvider, ModelConfig, WeightProvider};
 
 /// Builder for GPU-targeted model compilation.
 ///
-/// Imports a model from disk, runs PolarQuant quantization passes on it, and
-/// returns a [`MilWeightProvider`] that can feed quantized weights to the GPU
-/// inference runtime.
+/// Imports a model from disk, runs an optimization/quantization pipeline, and
+/// returns a [`MilWeightProvider`] that can feed weights to the GPU inference
+/// runtime.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use ironmill_compile::gpu::GpuCompileBuilder;
+/// use mil_rs::ir::PassPipeline;
 ///
 /// let provider = GpuCompileBuilder::new("model.onnx")
-///     .polar_quantize(4)
-///     .min_elements(2048)
+///     .with_pass_pipeline(
+///         PassPipeline::new()
+///             .with_polar_quant(4)
+///             .expect("PolarQuant config"),
+///     )
 ///     .build()
 ///     .expect("GPU compile failed");
 /// ```
 pub struct GpuCompileBuilder {
     input: PathBuf,
-    n_bits: u8,
-    min_elements: usize,
-    pipeline: Option<PassPipeline>,
+    pipeline: PassPipeline,
 }
 
 impl GpuCompileBuilder {
     pub fn new(input: impl Into<PathBuf>) -> Self {
         Self {
             input: input.into(),
-            n_bits: 4,
-            min_elements: 1024,
-            pipeline: None,
+            pipeline: PassPipeline::new(),
         }
     }
 
-    /// Set a custom pass pipeline for quantization/optimization.
+    /// Set a pass pipeline for quantization/optimization.
     ///
-    /// When set, this pipeline replaces the default PolarQuant passes.
-    /// The caller controls what quantization is applied (INT4, INT8, AWQ, etc.).
+    /// The caller controls what quantization is applied (PolarQuant, INT8,
+    /// AWQ, etc.). An empty pipeline produces FP16 output.
     pub fn with_pass_pipeline(mut self, pipeline: PassPipeline) -> Self {
-        self.pipeline = Some(pipeline);
+        self.pipeline = pipeline;
         self
     }
 
-    /// Set the PolarQuant bit-width (must be 2 or 4).
-    pub fn polar_quantize(mut self, n_bits: u8) -> Self {
-        self.n_bits = n_bits;
-        self
-    }
-
-    /// Set the minimum number of tensor elements required for quantization.
+    /// Import the model, run the pass pipeline, and return a [`MilWeightProvider`].
     ///
-    /// Tensors with fewer elements than this threshold are left unquantized.
-    pub fn min_elements(mut self, min: usize) -> Self {
-        self.min_elements = min;
-        self
-    }
-
-    /// Run import + PolarQuant passes and return a [`MilWeightProvider`].
-    ///
+    /// All formats follow the same path:
     /// 1. Detect input format (ONNX / SafeTensors / GGUF)
     /// 2. Import to MIL IR [`Program`]
-    /// 3. Run `PassPipeline` with PolarQuant passes
-    /// 4. Extract a [`MilWeightProvider`] from the quantized program
-    pub fn build(mut self) -> Result<MilWeightProvider, CompileError> {
+    /// 3. Run the [`PassPipeline`] (may be empty for FP16 passthrough)
+    /// 4. Extract a [`MilWeightProvider`] from the optimized program
+    pub fn build(self) -> Result<MilWeightProvider, CompileError> {
         let input = &self.input;
 
         if !input.exists() {
@@ -92,86 +85,19 @@ impl GpuCompileBuilder {
             )));
         }
 
-        // 1. Detect format and import to Program + ModelConfig
         let format = detect_format(input);
 
-        // If a custom pipeline is set, route everything through MIL IR.
-        if let Some(pipeline) = self.pipeline.take() {
-            return self.build_with_pipeline(input, format, pipeline);
-        }
-
-        // Legacy path: default PolarQuant behavior
-        match format {
-            InputFormat::Onnx => {
-                // ONNX: import → run passes → extract via MilWeightProvider.
-                let (mut program, config) = import_onnx(input)?;
-
-                let mut pipeline = PassPipeline::new();
-                let mut pq_pass = PolarQuantPass::new(self.n_bits);
-                pq_pass.min_elements = self.min_elements;
-                pipeline.add_pass(Box::new(pq_pass));
-                pipeline.add_pass(Box::new(TypeRepropagationPass));
-                let _report = pipeline.run(&mut program)?;
-
-                let provider = MilWeightProvider::new(&program, config)?;
-                Ok(provider)
-            }
-            InputFormat::SafeTensors | InputFormat::Gguf => {
-                // SafeTensors/GGUF: load the provider directly and quantize
-                // weight tensors in-memory. This avoids the template system
-                // which is designed for CoreML/ANE and omits architecture-
-                // specific tensors (q_norm, k_norm, etc.).
-                let base_provider: Box<dyn WeightProvider> = match format {
-                    InputFormat::SafeTensors => {
-                        Box::new(crate::weights::SafeTensorsProvider::load(input)?)
-                    }
-                    InputFormat::Gguf => Box::new(crate::weights::GgufProvider::load(input)?),
-                    _ => {
-                        return Err(CompileError::Other(
-                            "unexpected input format in SafeTensors/GGUF branch".into(),
-                        ));
-                    }
-                };
-                let config = base_provider.config().clone();
-
-                let provider = MilWeightProvider::from_weight_provider(
-                    base_provider.as_ref(),
-                    config,
-                    self.n_bits,
-                    self.min_elements,
-                )?;
-                Ok(provider)
-            }
-            InputFormat::Unsupported(ext) => Err(CompileError::Other(format!(
-                "unsupported input format '{ext}' for GPU compile. \
-                 Expected .onnx, .safetensors, .gguf, or a directory containing config.json."
-            ))),
-        }
-    }
-
-    /// Unified build path: import to MIL IR → run pipeline → extract provider.
-    fn build_with_pipeline(
-        &self,
-        input: &Path,
-        format: InputFormat,
-        pipeline: PassPipeline,
-    ) -> Result<MilWeightProvider, CompileError> {
+        // Import to MIL IR — format-specific, but produces a uniform Program.
         let (mut program, config, base_provider) = match format {
             InputFormat::Onnx => {
                 let (program, config) = import_onnx(input)?;
                 (program, config, None)
             }
             InputFormat::SafeTensors | InputFormat::Gguf => {
-                let base_provider: Box<dyn WeightProvider> = match format {
-                    InputFormat::SafeTensors => {
-                        Box::new(crate::weights::SafeTensorsProvider::load(input)?)
-                    }
-                    InputFormat::Gguf => Box::new(crate::weights::GgufProvider::load(input)?),
-                    _ => unreachable!(),
-                };
-                let config = base_provider.config().clone();
-                let result = crate::templates::weights_to_program(base_provider.as_ref())?;
-                (result.program, config, Some(base_provider))
+                let provider = load_weight_provider(input, &format)?;
+                let config = provider.config().clone();
+                let result = crate::templates::weights_to_program(provider.as_ref())?;
+                (result.program, config, Some(provider))
             }
             InputFormat::Unsupported(ext) => {
                 return Err(CompileError::Other(format!(
@@ -181,15 +107,32 @@ impl GpuCompileBuilder {
             }
         };
 
-        let _report = pipeline.run(&mut program)?;
+        // Run the pass pipeline (may be empty for FP16 passthrough).
+        let _report = self.pipeline.run(&mut program)?;
+
+        // Extract weights from the optimized program.
         let mut provider = MilWeightProvider::new(&program, config)?;
 
-        // Supplement any tensors the template system didn't emit
+        // For SafeTensors/GGUF: supplement any architecture-specific tensors
+        // that the template system didn't emit (e.g. q_norm, k_norm).
         if let Some(base) = base_provider.as_ref() {
             provider.supplement_from(base.as_ref())?;
         }
 
         Ok(provider)
+    }
+}
+
+fn load_weight_provider(
+    input: &Path,
+    format: &InputFormat,
+) -> Result<Box<dyn WeightProvider>, CompileError> {
+    match format {
+        InputFormat::SafeTensors => Ok(Box::new(crate::weights::SafeTensorsProvider::load(input)?)),
+        InputFormat::Gguf => Ok(Box::new(crate::weights::GgufProvider::load(input)?)),
+        _ => Err(CompileError::Other(
+            "load_weight_provider called with non-weight format".into(),
+        )),
     }
 }
 
@@ -339,19 +282,13 @@ mod tests {
     fn new_has_correct_defaults() {
         let builder = GpuCompileBuilder::new("model.onnx");
         assert_eq!(builder.input, PathBuf::from("model.onnx"));
-        assert_eq!(builder.n_bits, 4);
-        assert_eq!(builder.min_elements, 1024);
-        assert!(builder.pipeline.is_none());
     }
 
     #[test]
     fn builder_methods_chain() {
-        let builder = GpuCompileBuilder::new("model.onnx")
-            .polar_quantize(2)
-            .min_elements(2048);
-
-        assert_eq!(builder.n_bits, 2);
-        assert_eq!(builder.min_elements, 2048);
+        let pipeline = PassPipeline::new();
+        let builder = GpuCompileBuilder::new("model.onnx").with_pass_pipeline(pipeline);
+        assert_eq!(builder.input, PathBuf::from("model.onnx"));
     }
 
     #[test]
