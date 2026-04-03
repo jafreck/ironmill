@@ -58,9 +58,10 @@ kernel void standard_attention(
 
     uint head_idx = tgid;
     if (head_idx >= num_heads) return;
+    if (head_dim != HEAD_DIM) return;
 
     uint heads_per_group = num_heads / num_kv_heads;
-    uint kv_head = head_idx / heads_per_group;
+    uint kv_head = (num_kv_heads < num_heads) ? head_idx / heads_per_group : head_idx;
 
     float scale = 1.0f / sqrt(float(head_dim));
 

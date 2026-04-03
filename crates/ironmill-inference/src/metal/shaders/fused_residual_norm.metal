@@ -71,9 +71,10 @@ kernel void fused_residual_rms_norm(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 4: Normalize and scale — read residual back from global output
+    // Step 4: Normalize and scale — recompute residual in float to avoid
+    // precision loss from the half round-trip through residual_output.
     for (uint i = tid; i < hidden_size; i += tg_size) {
-        float val = float(residual_output[base + i]);
+        float val = float(a[base + i]) + float(b[base + i]);
         normed_output[base + i] = half(val * rms_inv * float(weight[i]));
     }
 }

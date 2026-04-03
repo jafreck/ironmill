@@ -35,13 +35,13 @@ kernel void int4_dequantize(
     uint group_lo = elem_idx / group_size;
     half scale_lo = scales[group_lo];
     half zero_lo = zeros[group_lo];
-    output[elem_idx] = (half(lo) - zero_lo) * scale_lo;
+    output[elem_idx] = half((float(lo) - float(zero_lo)) * float(scale_lo));
 
     // High nibble → element at elem_idx + 1
     if (elem_idx + 1 < total_elements) {
         uint group_hi = (elem_idx + 1) / group_size;
         half scale_hi = scales[group_hi];
         half zero_hi = zeros[group_hi];
-        output[elem_idx + 1] = (half(hi) - zero_hi) * scale_hi;
+        output[elem_idx + 1] = half((float(hi) - float(zero_hi)) * float(scale_hi));
     }
 }

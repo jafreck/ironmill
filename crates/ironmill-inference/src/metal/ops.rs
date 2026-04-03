@@ -300,42 +300,6 @@ pub struct EmbeddingLookupParams<'a> {
     pub vocab_size: u32,
 }
 
-/// Parameters for [`encode_turboquant_cache_write`].
-pub struct TurboquantCacheWriteParams<'a> {
-    pub kv_proj: &'a MetalBuffer,
-    pub rotation_signs: &'a MetalBuffer,
-    pub cache: &'a MetalBuffer,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
-    pub max_seq_len: u32,
-    pub seq_pos: u32,
-    pub inv_scale: f32,
-    pub n_bits: u32,
-    pub scale_buf: &'a MetalBuffer,
-    pub codebook: &'a MetalBuffer,
-    pub boundaries: &'a MetalBuffer,
-    pub n_levels: u32,
-}
-
-/// Parameters for [`encode_turboquant_attention`].
-pub struct TurboquantAttentionParams<'a> {
-    pub q: &'a MetalBuffer,
-    pub k_cache: &'a MetalBuffer,
-    pub v_cache: &'a MetalBuffer,
-    pub rotation_signs: &'a MetalBuffer,
-    pub output: &'a MetalBuffer,
-    pub num_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
-    pub max_seq_len: u32,
-    pub seq_len: u32,
-    pub deq_scale: f32,
-    pub n_bits: u32,
-    pub k_scale_buf: &'a MetalBuffer,
-    pub v_scale_buf: &'a MetalBuffer,
-    pub codebook: &'a MetalBuffer,
-}
-
 /// Parameters for [`encode_standard_attention`].
 pub struct StandardAttentionParams<'a> {
     pub q: &'a MetalBuffer,
@@ -419,6 +383,10 @@ pub fn encode_silu_gate(
 
 /// Encode RoPE application.
 pub fn encode_rope(encoder: &ComputeEncoder, pipeline: &ComputePipeline, params: &RopeParams<'_>) {
+    debug_assert!(
+        params.token_count == 0 || params.seq_offset.checked_add(params.token_count).is_some(),
+        "rope: seq_offset + token_count overflows u32"
+    );
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(params.qk, 0, 0);
     encoder.set_buffer(params.cos_cache, 0, 1);
@@ -479,65 +447,6 @@ pub fn encode_embedding_lookup(
             1,
         ),
         (tg_size, 1, 1),
-    );
-}
-
-/// Encode TurboQuant cache write.
-pub fn encode_turboquant_cache_write(
-    encoder: &ComputeEncoder,
-    pipeline: &ComputePipeline,
-    params: &TurboquantCacheWriteParams<'_>,
-) {
-    encoder.set_pipeline(pipeline);
-    encoder.set_buffer(params.kv_proj, 0, 0);
-    encoder.set_buffer(params.rotation_signs, 0, 1);
-    encoder.set_buffer(params.cache, 0, 2);
-    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 3);
-    encoder.set_bytes(&params.head_dim.to_le_bytes(), 4);
-    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 5);
-    encoder.set_bytes(&params.seq_pos.to_le_bytes(), 6);
-    encoder.set_bytes(&params.inv_scale.to_le_bytes(), 7);
-    encoder.set_bytes(&params.n_bits.to_le_bytes(), 8);
-    encoder.set_buffer(params.scale_buf, 0, 9);
-    encoder.set_buffer(params.codebook, 0, 10);
-    encoder.set_buffer(params.boundaries, 0, 11);
-    encoder.set_bytes(&params.n_levels.to_le_bytes(), 12);
-    encoder.dispatch_threadgroups(
-        (params.num_kv_heads as usize, 1, 1),
-        (params.head_dim as usize, 1, 1),
-    );
-}
-
-/// Encode TurboQuant attention.
-pub fn encode_turboquant_attention(
-    encoder: &ComputeEncoder,
-    pipeline: &ComputePipeline,
-    params: &TurboquantAttentionParams<'_>,
-) {
-    encoder.set_pipeline(pipeline);
-    encoder.set_buffer(params.q, 0, 0);
-    encoder.set_buffer(params.k_cache, 0, 1);
-    encoder.set_buffer(params.v_cache, 0, 2);
-    encoder.set_buffer(params.rotation_signs, 0, 3);
-    encoder.set_buffer(params.output, 0, 4);
-    encoder.set_bytes(&params.num_heads.to_le_bytes(), 5);
-    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 6);
-    encoder.set_bytes(&params.head_dim.to_le_bytes(), 7);
-    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 8);
-    encoder.set_bytes(&params.seq_len.to_le_bytes(), 9);
-    encoder.set_bytes(&params.deq_scale.to_le_bytes(), 10);
-    encoder.set_bytes(&params.n_bits.to_le_bytes(), 11);
-    encoder.set_buffer(params.k_scale_buf, 0, 12);
-    encoder.set_buffer(params.v_scale_buf, 0, 13);
-    encoder.set_buffer(params.codebook, 0, 14);
-    // HEAD_DIM is now exact — clamp to Metal's 1024-thread limit only.
-    encoder.dispatch_threadgroups(
-        (params.num_heads as usize, 1, 1),
-        (
-            (params.head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP),
-            1,
-            1,
-        ),
     );
 }
 

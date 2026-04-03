@@ -211,6 +211,15 @@ impl MetalTurboQuantModel {
         config: &TurboQuantMetalConfig,
         outlier_cfg: &OutlierConfig,
     ) -> Result<OutlierState, MetalError> {
+        assert!(
+            outlier_cfg.outlier_bits >= 2,
+            "outlier_bits must be >= 2 (K cache uses b-1 bits when b < 4, minimum 1-bit codebook)"
+        );
+        assert!(
+            outlier_cfg.non_outlier_bits >= 2,
+            "non_outlier_bits must be >= 2 (K cache uses b-1 bits when b < 4, minimum 1-bit codebook)"
+        );
+
         let n_outlier = outlier_cfg.outlier_channels.len();
         let n_non = config.head_dim - n_outlier;
         let d_outlier_padded = n_outlier.next_power_of_two();
