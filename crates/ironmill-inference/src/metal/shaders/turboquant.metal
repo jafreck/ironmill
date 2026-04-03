@@ -316,8 +316,8 @@ kernel void turboquant_attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // QJL correction coefficient: √(π/2) / d per Algorithm 2
-    float qjl_factor = 0.0f; // TEMP: disabled for debugging
+    // QJL correction coefficient: √(2/π) / d
+    float qjl_factor = (n_bits == 4) ? (sqrt(2.0f / 3.14159265f) / float(head_dim)) : 0.0f;
 
     // Zero output accumulator
     for (uint d = tid; d < head_dim; d += tg_size) {
@@ -386,8 +386,8 @@ kernel void turboquant_attention(
             }
             float base_score = shared_reduce[0];
 
-            // QJL inner product correction for INT4 K cache (Algorithm 2)
-            // Correction = deq_scale * ||r|| * (√(π/2)/d) * Σ (S·Q)ᵢ · sign(S·r)ᵢ
+            // QJL inner product correction for INT4 K cache
+            // Correction = deq_scale * ||r|| * (√(2/π)/d) * Σ (S·Q)ᵢ · sign(S·r)ᵢ
             float qjl_correction = 0.0f;
             if (n_bits == 4) {
                 uint abs_pos = tile_start + p;
@@ -912,9 +912,9 @@ kernel void turboquant_outlier_attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // QJL correction coefficients: √(π/2) / d per Algorithm 2
-    float qjl_factor_o = sqrt(3.14159265f / 2.0f) / float(d_outlier_padded);
-    float qjl_factor_n = sqrt(3.14159265f / 2.0f) / float(d_non_padded);
+    // QJL correction coefficients: √(2/π) / d
+    float qjl_factor_o = sqrt(2.0f / 3.14159265f) / float(d_outlier_padded);
+    float qjl_factor_n = sqrt(2.0f / 3.14159265f) / float(d_non_padded);
 
     // Zero output accumulators
     for (uint d = tid; d < d_outlier_padded; d += tg_size)
