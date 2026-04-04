@@ -13,10 +13,13 @@ pub mod calibration;
 pub mod engine;
 pub mod generate;
 pub mod grammar;
+pub mod jit;
+
 pub mod memory;
 pub mod model_info;
 pub mod sampling;
 pub mod serving;
+pub mod shader_cache;
 pub mod speculative;
 pub mod turboquant;
 pub mod types;
