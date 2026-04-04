@@ -56,11 +56,7 @@ impl InferenceError {
 ///
 /// Provides a backend-agnostic interface for loading models, running
 /// prefill, and stepping through decode iterations.
-pub trait InferenceEngine {
-    /// Load model artifacts. The concrete type of `artifacts` depends
-    /// on the backend.
-    fn load(&mut self, artifacts: &dyn std::any::Any) -> Result<(), InferenceError>;
-
+pub trait InferenceEngine: Send {
     /// Prefill: process all prompt tokens, populating the KV cache.
     /// Returns logits for the last prompt token.
     fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError>;

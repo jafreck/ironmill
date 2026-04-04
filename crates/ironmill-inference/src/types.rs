@@ -109,7 +109,10 @@ pub trait RuntimeModel {
     fn input_description(&self) -> Vec<InputFeatureDesc>;
 
     /// Run inference on the given inputs and return the outputs.
-    fn predict(&self, inputs: &[RuntimeTensor]) -> anyhow::Result<Vec<RuntimeTensor>>;
+    fn predict(
+        &self,
+        inputs: &[RuntimeTensor],
+    ) -> Result<Vec<RuntimeTensor>, crate::engine::InferenceError>;
 }
 
 /// A backend that can compile an IR program into a runnable model.
@@ -125,7 +128,10 @@ pub trait RuntimeBackend: Send + Sync {
     ///
     /// The `model_path` may be a `.mlpackage`, `.mlmodelc`, or other format
     /// depending on the backend.
-    fn load(&self, model_path: &std::path::Path) -> anyhow::Result<Box<dyn RuntimeModel>>;
+    fn load(
+        &self,
+        model_path: &std::path::Path,
+    ) -> Result<Box<dyn RuntimeModel>, crate::engine::InferenceError>;
 }
 
 /// Build dummy input tensors from input descriptions (for benchmarking).

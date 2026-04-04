@@ -498,11 +498,14 @@ impl RuntimeModel for AneRuntimeModel {
             .collect()
     }
 
-    fn predict(&self, _inputs: &[RuntimeTensor]) -> anyhow::Result<Vec<RuntimeTensor>> {
+    fn predict(
+        &self,
+        _inputs: &[RuntimeTensor],
+    ) -> std::result::Result<Vec<RuntimeTensor>, crate::engine::InferenceError> {
         // TODO: ANE RuntimeModel::predict is not yet implemented
-        Err(anyhow::anyhow!(
+        Err(crate::engine::InferenceError::runtime(
             "ANE predict through RuntimeModel is not yet implemented — \
-             use AneModel::from_bundle() and AneModel::predict() directly for ANE inference"
+             use AneModel::from_bundle() and AneModel::predict() directly for ANE inference",
         ))
     }
 }
@@ -517,10 +520,13 @@ impl RuntimeBackend for AneDirectBackend {
         "ane-direct"
     }
 
-    fn load(&self, _model_path: &std::path::Path) -> anyhow::Result<Box<dyn RuntimeModel>> {
-        Err(anyhow::anyhow!(
+    fn load(
+        &self,
+        _model_path: &std::path::Path,
+    ) -> std::result::Result<Box<dyn RuntimeModel>, crate::engine::InferenceError> {
+        Err(crate::engine::InferenceError::runtime(
             "ANE direct backend requires a pre-compiled bundle. \
-             Use AneModel::from_bundle() directly."
+             Use AneModel::from_bundle() directly.",
         ))
     }
 }

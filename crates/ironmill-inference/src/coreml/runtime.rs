@@ -39,8 +39,12 @@ impl RuntimeModel for CoremlRuntimeModel {
             .collect()
     }
 
-    fn predict(&self, inputs: &[RuntimeTensor]) -> anyhow::Result<Vec<RuntimeTensor>> {
-        let mut pi = PredictionInput::new()?;
+    fn predict(
+        &self,
+        inputs: &[RuntimeTensor],
+    ) -> Result<Vec<RuntimeTensor>, crate::engine::InferenceError> {
+        let mut pi =
+            PredictionInput::new().map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
         for t in inputs {
             let data_f32: Vec<f32> = match t.dtype {
                 ElementType::Float32 => t
@@ -49,16 +53,20 @@ impl RuntimeModel for CoremlRuntimeModel {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
                 other => {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::engine::InferenceError::runtime(format!(
                         "unsupported input dtype {:?} for CoreML prediction — only Float32 is supported",
                         other
-                    ));
+                    )));
                 }
             };
-            pi.add_multi_array(&t.name, &t.shape, MultiArrayDataType::Float32, &data_f32)?;
+            pi.add_multi_array(&t.name, &t.shape, MultiArrayDataType::Float32, &data_f32)
+                .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
         }
         // Run prediction — output features not yet extracted as RuntimeTensor.
-        let _output = self.model.predict(&pi)?;
+        let _output = self
+            .model
+            .predict(&pi)
+            .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
         // TODO: extract prediction outputs — currently returns empty
         Ok(vec![])
     }
@@ -80,8 +88,12 @@ impl RuntimeBackend for CoremlBackend {
         "coreml"
     }
 
-    fn load(&self, model_path: &std::path::Path) -> anyhow::Result<Box<dyn RuntimeModel>> {
-        let model = Model::load(model_path, self.compute_units)?;
+    fn load(
+        &self,
+        model_path: &std::path::Path,
+    ) -> Result<Box<dyn RuntimeModel>, crate::engine::InferenceError> {
+        let model = Model::load(model_path, self.compute_units)
+            .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
         Ok(Box::new(CoremlRuntimeModel { model }))
     }
 }

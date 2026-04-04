@@ -4,7 +4,6 @@
 //! built-in operations with lazy evaluation. A single `eval()` call
 //! at the end materializes the logits.
 
-use std::any::Any;
 use std::time::Instant;
 
 use ironmill_mlx_sys::{
@@ -29,8 +28,7 @@ const POLARQUANT_SOURCE: &str = include_str!("shaders/mlx_polarquant.metal");
 
 // ── Public artifacts type for load() ────────────────────────────
 
-/// Artifacts passed to [`MlxInference::load`] via the type-erased
-/// [`InferenceEngine`] interface.
+/// Artifacts passed to [`MlxInference::load`].
 pub struct MlxArtifacts<'a> {
     /// Weight provider supplying named tensors.
     pub weights: &'a dyn WeightProvider,
@@ -86,8 +84,8 @@ impl MlxInference {
         })
     }
 
-    /// Load weights from a provider (convenience method that avoids
-    /// the `&dyn Any` lifetime constraints of `InferenceEngine::load`).
+    /// Load weights from a provider (convenience wrapper around the
+    /// weight-loading pipeline).
     pub fn load_weights(
         &mut self,
         weights: &dyn WeightProvider,
@@ -689,26 +687,20 @@ impl MlxInference {
         self.profile_eval_count += 1;
         Ok(())
     }
-}
 
-// ── InferenceEngine implementation ──────────────────────────────
-
-impl InferenceEngine for MlxInference {
-    fn load(&mut self, artifacts: &dyn Any) -> Result<(), InferenceError> {
-        let mlx_artifacts = artifacts
-            .downcast_ref::<MlxArtifacts<'_>>()
-            .ok_or_else(|| {
-                InferenceError::runtime("MlxInference::load expects MlxArtifacts".into())
-            })?;
-
-        self.config = mlx_artifacts.config.clone();
+    /// Load model artifacts into this engine.
+    ///
+    /// This is a typed method on the backend struct rather than on the
+    /// [`InferenceEngine`] trait, keeping the trait object-safe (§4.3).
+    pub fn load(&mut self, artifacts: &MlxArtifacts<'_>) -> Result<(), InferenceError> {
+        self.config = artifacts.config.clone();
 
         // Initialize MLX stream.
         let stream = MlxStream::default_gpu()
             .map_err(|e| InferenceError::runtime(format!("failed to create MLX stream: {e}")))?;
 
         // Load weights into MLX arrays.
-        let weights = MlxWeights::load(mlx_artifacts.weights, &stream)
+        let weights = MlxWeights::load(artifacts.weights, &stream)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let num_layers = weights.config.num_hidden_layers;
@@ -741,7 +733,11 @@ impl InferenceEngine for MlxInference {
 
         Ok(())
     }
+}
 
+// ── InferenceEngine implementation ──────────────────────────────
+
+impl InferenceEngine for MlxInference {
     fn decode_step(&mut self, token: u32) -> Result<Logits, InferenceError> {
         self.run_pipeline(&[token], false)
             .map_err(InferenceError::from)

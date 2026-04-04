@@ -319,7 +319,6 @@ mod tests {
     use crate::model_info::ModelInfo;
     use crate::types::Logits;
     use mil_rs::weights::Architecture;
-    use std::any::Any;
 
     fn mock_stream_model_info(vocab_size: usize) -> ModelInfo {
         ModelInfo {
@@ -360,10 +359,6 @@ mod tests {
     }
 
     impl InferenceEngine for MockStreamEngine {
-        fn load(&mut self, _artifacts: &dyn Any) -> Result<(), InferenceError> {
-            Ok(())
-        }
-
         fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError> {
             self.pos += tokens.len();
             let mut logits = vec![0.0f32; self.vocab_size];

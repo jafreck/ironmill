@@ -537,10 +537,6 @@ mod tests {
     }
 
     impl InferenceEngine for MockGenEngine {
-        fn load(&mut self, _artifacts: &dyn std::any::Any) -> Result<(), InferenceError> {
-            Ok(())
-        }
-
         fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError> {
             self.pos += tokens.len();
             let mut logits = vec![0.0f32; self.vocab_size];
@@ -599,9 +595,6 @@ mod tests {
             info: ModelInfo,
         }
         impl InferenceEngine for EosEngine {
-            fn load(&mut self, _: &dyn std::any::Any) -> Result<(), InferenceError> {
-                Ok(())
-            }
             fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError> {
                 self.pos += tokens.len();
                 let mut logits = vec![0.0f32; 10];
