@@ -270,9 +270,8 @@ fn top_k_fusion_keeps_only_selected_experts() {
     freqs.insert("1".to_string(), 0.3);
     freqs.insert("2".to_string(), 0.15);
     freqs.insert("3".to_string(), 0.05);
-    let profile = ExpertFrequencyProfile {
-        expert_frequencies: freqs,
-    };
+    let mut profile = ExpertFrequencyProfile::uniform(4);
+    profile.expert_frequencies = freqs;
 
     let result = fuse_top_k_experts(&program, 2, &profile)
         .expect("fuse_top_k should succeed")

@@ -6,7 +6,7 @@
 mod common;
 
 use ironmill_compile::ane::passes::{CodebookOptimizationPass, ModelSplitPass, OpSplittingPass};
-use ironmill_compile::convert::pipeline::parse_pipeline_manifest;
+use ironmill_compile::convert::pipeline::{StageQuantize, parse_pipeline_manifest};
 use mil_rs::ir::passes::{Fp16QuantizePass, Int8QuantizePass};
 use mil_rs::{
     Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorData, TensorType, Value,
@@ -48,11 +48,11 @@ depends_on = ["middle"]
     assert_eq!(manifest.pipeline.name, "three-stage");
     assert_eq!(manifest.stages.len(), 3);
     assert_eq!(manifest.stages[0].name, "encoder");
-    assert_eq!(manifest.stages[0].quantize, "fp16");
+    assert_eq!(manifest.stages[0].quantize, StageQuantize::Fp16);
     assert_eq!(manifest.stages[1].name, "middle");
     assert_eq!(manifest.stages[1].depends_on, vec!["encoder"]);
     assert_eq!(manifest.stages[2].name, "decoder");
-    assert_eq!(manifest.stages[2].quantize, "int8");
+    assert_eq!(manifest.stages[2].quantize, StageQuantize::Int8);
     assert_eq!(manifest.stages[2].depends_on, vec!["middle"]);
 
     // Topological order is implicitly validated by parse+validate_manifest
@@ -92,8 +92,8 @@ depends_on = ["feature_extractor"]
     assert!(manifest.stages[0].depends_on.is_empty());
     assert_eq!(manifest.stages[1].name, "classifier");
     assert_eq!(manifest.stages[1].depends_on, vec!["feature_extractor"]);
-    assert_eq!(manifest.stages[0].quantize, "fp16");
-    assert_eq!(manifest.stages[1].quantize, "none");
+    assert_eq!(manifest.stages[0].quantize, StageQuantize::Fp16);
+    assert_eq!(manifest.stages[1].quantize, StageQuantize::None);
 
     // Verify the manifest has the correct structure for building an output
     // manifest with stage names, I/O, and dependency edges. Format it to

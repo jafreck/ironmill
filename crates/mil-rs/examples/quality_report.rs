@@ -32,10 +32,8 @@ fn main() -> anyhow::Result<()> {
     println!("Model: {model_name}\n");
 
     let (mut onnx_model, model_dir) = read_onnx_with_dir(input)?;
-    let conversion_config = ConversionConfig {
-        model_dir: Some(model_dir),
-        ..Default::default()
-    };
+    let mut conversion_config = ConversionConfig::default();
+    conversion_config.model_dir = Some(model_dir);
 
     // Each combo: (label, baseline pipeline builder, optimized pipeline builder).
     // The baseline uses the default always-on passes so that graph structure

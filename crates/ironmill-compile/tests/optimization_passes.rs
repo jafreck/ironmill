@@ -1737,11 +1737,9 @@ fn polar_quant_skips_non_float32() {
 fn polar_quant_deterministic_with_seed() {
     let run_with_seed = |seed: u64| -> TensorData {
         let mut program = make_program_with_const(vec![8, 128]);
-        let pass = PolarQuantPass {
-            n_bits: 4,
-            seed,
-            min_elements: 1024,
-        };
+        let mut pass = PolarQuantPass::new(4);
+        pass.seed = seed;
+        pass.min_elements = 1024;
         pass.run(&mut program).unwrap();
         let ops = &program.functions["main"].body.operations;
         match ops[0].attributes.get("indices") {
@@ -1794,11 +1792,9 @@ fn polar_quant_different_seeds_differ() {
         );
         block.outputs.push("weight_0_out".into());
 
-        let pass = PolarQuantPass {
-            n_bits: 4,
-            seed,
-            min_elements: 1024,
-        };
+        let mut pass = PolarQuantPass::new(4);
+        pass.seed = seed;
+        pass.min_elements = 1024;
         pass.run(&mut program).unwrap();
         let ops = &program.functions["main"].body.operations;
         match ops[0].attributes.get("indices") {

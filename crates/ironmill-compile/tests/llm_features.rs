@@ -260,15 +260,15 @@ fn lora_merge_weight_math() {
     let alpha = 1.0_f64;
     let rank = 2_usize;
 
-    let adapter = LoraAdapter {
-        base_name: "test.weight".to_string(),
-        a_data: f32_slice_to_bytes(&a_vals),
-        a_shape: [rank, 3],
-        b_data: f32_slice_to_bytes(&b_vals),
-        b_shape: [4, rank],
-        dtype: ScalarType::Float32,
-        alpha: Some(alpha),
-    };
+    let adapter = LoraAdapter::new(
+        "test.weight".to_string(),
+        f32_slice_to_bytes(&a_vals),
+        [rank, 3],
+        f32_slice_to_bytes(&b_vals),
+        [4, rank],
+        ScalarType::Float32,
+        Some(alpha),
+    );
 
     merge_lora(&mut base_data, &[4, 3], ScalarType::Float32, &adapter).unwrap();
 
@@ -305,15 +305,15 @@ fn lora_merge_rank_mismatch_returns_error() {
     let b_vals = vec![0.0f32; 5 * 2];
     let mut base_data = vec![0u8; 5 * 4 * 4]; // 5×4 base
 
-    let adapter = LoraAdapter {
-        base_name: "mismatch.weight".to_string(),
-        a_data: f32_slice_to_bytes(&a_vals),
-        a_shape: [3, 4],
-        b_data: f32_slice_to_bytes(&b_vals),
-        b_shape: [5, 2],
-        dtype: ScalarType::Float32,
-        alpha: Some(1.0),
-    };
+    let adapter = LoraAdapter::new(
+        "mismatch.weight".to_string(),
+        f32_slice_to_bytes(&a_vals),
+        [3, 4],
+        f32_slice_to_bytes(&b_vals),
+        [5, 2],
+        ScalarType::Float32,
+        Some(1.0),
+    );
 
     let result = merge_lora(&mut base_data, &[5, 4], ScalarType::Float32, &adapter);
     assert!(result.is_err(), "rank mismatch should return Err");
@@ -376,13 +376,12 @@ fn updatable_model_has_training_inputs() {
     func.body.outputs.push("layer_1_out".into());
     program.add_function(func);
 
-    let config = UpdatableModelConfig {
-        updatable_layers: vec!["layer_0".to_string(), "layer_1".to_string()],
-        learning_rate: 0.01,
-        epochs: 5,
-        loss_function: LossFunction::CategoricalCrossEntropy,
-        optimizer: UpdateOptimizer::Sgd,
-    };
+    let mut config = UpdatableModelConfig::default();
+    config.updatable_layers = vec!["layer_0".to_string(), "layer_1".to_string()];
+    config.learning_rate = 0.01;
+    config.epochs = 5;
+    config.loss_function = LossFunction::CategoricalCrossEntropy;
+    config.optimizer = UpdateOptimizer::Sgd;
 
     let model = program_to_updatable_model(&program, common::SPEC_VERSION, &config).unwrap();
 
@@ -410,13 +409,12 @@ fn updatable_model_loss_references_output_tensor() {
     func.body.outputs.push("dense_out".into());
     program.add_function(func);
 
-    let config = UpdatableModelConfig {
-        updatable_layers: vec!["dense_0".to_string()],
-        learning_rate: 0.001,
-        epochs: 10,
-        loss_function: LossFunction::CategoricalCrossEntropy,
-        optimizer: UpdateOptimizer::Sgd,
-    };
+    let mut config = UpdatableModelConfig::default();
+    config.updatable_layers = vec!["dense_0".to_string()];
+    config.learning_rate = 0.001;
+    config.epochs = 10;
+    config.loss_function = LossFunction::CategoricalCrossEntropy;
+    config.optimizer = UpdateOptimizer::Sgd;
 
     let model = program_to_updatable_model(&program, common::SPEC_VERSION, &config).unwrap();
 
