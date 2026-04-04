@@ -4,7 +4,9 @@ using namespace metal;
 // GELU activation with element-wise multiply:
 //   output[i] = gelu(gate[i]) * input_slice[i]
 //
-// Uses the fast approximation: gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+// Uses the fast approximation: gelu(x) ≈ x * sigmoid(1.702 * x)
+// This avoids the tanh approximation which can produce NaN with certain
+// Metal GPU hardware due to intermediate overflow in x^3 computation.
 //
 // Buffers:
 //   buffer(0) gate:   [size]  half  (contiguous, token_count × ple_hidden)
@@ -37,11 +39,13 @@ kernel void gelu_gate(
     float g = float(gate[tid]);
     float inp = float(input[token * input_stride + input_offset + elem]);
 
-    // GELU approximation
-    const float kSqrt2OverPi = 0.7978845608f; // sqrt(2/π)
+    // GELU approximation: gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    // Clamp intermediate to avoid tanh overflow.
     float cube = g * g * g;
+    const float kSqrt2OverPi = 0.7978845608f;
     float inner = kSqrt2OverPi * (g + 0.044715f * cube);
-    float gelu_g = 0.5f * g * (1.0f + tanh(inner));
+    inner = clamp(inner, -10.0f, 10.0f); // prevent tanh overflow
+    float gelu_g = 0.5f * g * (1.0f + precise::tanh(inner));
 
     output[tid] = half(gelu_g * inp);
 }
