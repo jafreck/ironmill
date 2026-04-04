@@ -46,7 +46,7 @@ kernel void standard_attention(
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
-    constexpr uint TILE = 32;
+    constexpr uint TILE = (HEAD_DIM >= 512) ? 16 : 32;
     constexpr uint SIMD_SIZE = 32;
 
     threadgroup float shared_q[HEAD_DIM];
@@ -216,7 +216,7 @@ kernel void prefill_attention(
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
-    constexpr uint TILE = 32;
+    constexpr uint TILE = (HEAD_DIM >= 512) ? 16 : 32;
     constexpr uint SIMD_SIZE = 32;
 
     uint tid = tid_3d.x;
@@ -357,8 +357,8 @@ kernel void prefill_attention(
 // Grid: (num_heads, ceil(token_count / Q_CHUNK), 1) threadgroups.
 // Threadgroup: (max(256, HEAD_DIM), 1, 1) threads.
 
-constant constexpr uint FA2_Q_CHUNK = (HEAD_DIM >= 256) ? 8 : 32;
-constant constexpr uint FA2_KV_TILE = (HEAD_DIM >= 256) ? 16 : 32;
+constant constexpr uint FA2_Q_CHUNK = (HEAD_DIM >= 512) ? 4 : (HEAD_DIM >= 256) ? 8 : 32;
+constant constexpr uint FA2_KV_TILE = (HEAD_DIM >= 512) ? 8 : (HEAD_DIM >= 256) ? 16 : 32;
 
 kernel void prefill_attention_fa2(
     device const half* q         [[buffer(0)]],
