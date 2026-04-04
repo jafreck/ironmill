@@ -27,6 +27,11 @@ pub type RopeCacheData = (Vec<f16>, Vec<f16>, usize);
 ///
 /// Returns `(cos_values, sin_values, values_per_position)` where each
 /// value array is flat `[num_positions * values_per_position]` in fp16.
+///
+/// # Panics
+///
+/// Panics if any tensor data is `TensorData::External` (not materialized).
+/// Callers must ensure all tensors are materialized.
 pub fn extract_rope_caches(program: &Program) -> Option<RopeCacheData> {
     let func = program.main()?;
 
@@ -128,6 +133,10 @@ pub fn precompute_rope_cache(head_dim: usize, max_pos: usize, theta: f32) -> Rop
 /// Qwen3 models apply per-head RMSNorm to Q and K after projection.
 /// Returns `Some(Vec<(q_norm, k_norm)>)` indexed by layer, or `None`
 /// if the model doesn't use QK normalization.
+///
+/// # Panics
+///
+/// Panics if any tensor data is `TensorData::External` (not materialized).
 pub fn extract_qk_norm_weights(program: &Program) -> Option<Vec<(Vec<f16>, Vec<f16>)>> {
     let func = program.main()?;
 
@@ -540,6 +549,10 @@ pub struct CpuWeight {
 /// Walks the sub-program's ops looking for `const` ops with tensor values.
 /// Returns the largest one (embedding table or lm_head weight), converted
 /// to fp16 if needed.
+///
+/// # Panics
+///
+/// Panics if any tensor data is `TensorData::External` (not materialized).
 pub fn extract_cpu_weight(sub: &SubProgram, _label: &str) -> Option<CpuWeight> {
     let func = sub.program.main()?;
     let mut best: Option<(usize, Vec<u8>, [usize; 2], ScalarType)> = None;
@@ -580,6 +593,10 @@ pub fn extract_cpu_weight(sub: &SubProgram, _label: &str) -> Option<CpuWeight> {
 
 /// Extract a 1D weight (e.g., RMSNorm gamma) from a sub-program.
 /// Finds the smallest 1D const tensor whose name contains `hint`.
+///
+/// # Panics
+///
+/// Panics if any tensor data is `TensorData::External` (not materialized).
 pub fn extract_1d_weight(sub: &SubProgram, hint: &str) -> Option<Vec<f16>> {
     let func = sub.program.main()?;
 
@@ -616,6 +633,10 @@ pub fn extract_1d_weight(sub: &SubProgram, hint: &str) -> Option<Vec<f16>> {
 
 /// Convert Float32 const ops to Float16, materialize dynamic shapes,
 /// and decompose unsupported ops for ANE compatibility.
+///
+/// # Panics
+///
+/// Panics if any tensor data is `TensorData::External` (not materialized).
 pub fn convert_f32_consts_to_f16(program: &mut Program) {
     for func in program.functions.values_mut() {
         // First pass: decompose unsupported ops.
@@ -692,6 +713,10 @@ pub fn convert_f32_consts_to_f16(program: &mut Program) {
 
 /// Pad the S dimension (dim 3) to at least `min_seq` across function
 /// inputs, op output types, and reshape shape constants.
+///
+/// # Panics
+///
+/// Panics if any tensor data is `TensorData::External` (not materialized).
 pub fn apply_min_seq_padding(program: &mut Program, min_seq: usize) {
     for func in program.functions.values_mut() {
         for (_, ty) in &mut func.inputs {

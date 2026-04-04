@@ -136,6 +136,12 @@ pub struct AneDecodeConfig {
 /// splitting, weight extraction, MIL text emission) but does NOT call
 /// `device.compile()`. The resulting bundle contains MIL text + weight
 /// blobs ready for ANE device compilation at load time.
+///
+/// # Panics
+///
+/// Panics if any tensor data is `TensorData::External` (not materialized).
+/// Callers must ensure all tensors are materialized before invoking this
+/// function (e.g. via `program.materialize_all()`).
 pub fn compile_decode_bundle(
     program: &mil_rs::ir::Program,
     config: &AneDecodeConfig,
@@ -603,6 +609,12 @@ fn build_layer_bundles(
 ///
 /// Runs per-sub-program passes (f32→f16 conversion, layout fixups,
 /// padding, variable naming) before emission.
+///
+/// # Panics
+///
+/// Panics if any tensor data is `TensorData::External` (not materialized).
+/// The caller ([`compile_decode_bundle`] / [`compile_model_bundle`]) must
+/// ensure all tensors are materialized before invoking this function.
 fn emit_sub_program_bundle(
     sub: &SubProgram,
     mil_config: &MilTextConfig,
@@ -713,6 +725,12 @@ pub struct AneCompileConfig {
 ///
 /// The returned bundle can be saved to disk with [`AneModelBundle::save()`]
 /// and loaded by the inference engine without any compile-crate dependency.
+///
+/// # Panics
+///
+/// Panics if any tensor data is `TensorData::External` (not materialized).
+/// Callers must ensure all tensors are materialized before invoking this
+/// function (e.g. via `program.materialize_all()`).
 pub fn compile_model_bundle(
     program: &Program,
     config: &AneCompileConfig,
