@@ -53,6 +53,62 @@ enum RuntimeArg {
     AneDirect,
 }
 
+/// Quantization mode for `--quantize`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum QuantizeArg {
+    /// No quantization.
+    #[default]
+    None,
+    /// FP16 quantization (weights and activations).
+    Fp16,
+    /// INT8 symmetric quantization.
+    Int8,
+    /// Mixed FP16/INT8 precision (predefined layer assignment).
+    MixedFp16Int8,
+    /// Activation-aware weight quantization (INT4, requires --cal-data).
+    Awq,
+    /// INT4 group quantization (group size 128).
+    Int4,
+    /// GPTQ optimal weight quantization (requires --cal-data).
+    Gptq,
+    /// D2Quant extreme low-bit (2-3 bit) quantization.
+    D2quant,
+}
+
+/// Target compute units for `--target`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum TargetArg {
+    /// All available compute units on this platform.
+    #[default]
+    All,
+    /// CPU only.
+    CpuOnly,
+    /// CPU and GPU (Metal on macOS).
+    CpuAndGpu,
+    /// CPU and Neural Engine (macOS only).
+    CpuAndNe,
+    /// GPU-only Metal backend (macOS only).
+    Gpu,
+}
+
+/// Loss function for on-device training.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, Default)]
+pub enum LossFunctionArg {
+    #[default]
+    CrossEntropy,
+    Mse,
+}
+
+/// Optimizer for on-device training.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, Default)]
+pub enum OptimizerArg {
+    #[default]
+    Sgd,
+    Adam,
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
 enum KvQuantArg {
     /// No KV cache quantization (default)
@@ -72,13 +128,13 @@ struct CompileArgs {
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Target compute units: "all", "cpu-only", "cpu-and-ne", "cpu-and-gpu".
-    #[arg(short, long, default_value = "all")]
-    target: String,
+    /// Target compute units.
+    #[arg(short, long, value_enum, default_value_t = TargetArg::All)]
+    target: TargetArg,
 
-    /// Quantization mode: "none", "fp16", "int4", "int8", "mixed-fp16-int8", "awq", "gptq", "d2quant".
-    #[arg(short, long, default_value = "none")]
-    quantize: String,
+    /// Quantization mode.
+    #[arg(short, long, value_enum, default_value_t = QuantizeArg::None)]
+    quantize: QuantizeArg,
 
     /// Calibration data directory (for int8, AWQ, or GPTQ quantization).
     #[arg(long = "cal-data", value_name = "DIR")]
@@ -114,22 +170,16 @@ struct CompileArgs {
     #[arg(long = "input-shape", value_name = "NAME:SHAPE")]
     input_shapes: Vec<String>,
 
-    /// Merge LoRA adapter weights into the base model during conversion (default).
-    /// LoRA A/B weight pairs found in the ONNX initializers are automatically
-    /// detected and merged. Disable with --no-merge-lora.
-    #[arg(long = "merge-lora", default_value_t = true, action = clap::ArgAction::SetTrue)]
-    merge_lora: bool,
-
     /// Disable automatic LoRA adapter merging.
-    #[arg(long = "no-merge-lora", conflicts_with = "merge_lora")]
+    #[arg(long = "no-merge-lora")]
     no_merge_lora: bool,
 
     /// Emit a separate adapter .mlpackage instead of merging LoRA weights.
-    #[arg(long = "emit-adapter")]
+    #[arg(long = "emit-adapter", hide = true)]
     emit_adapter: bool,
 
     /// Path to an external adapter file (e.g. .safetensors). May be repeated.
-    #[arg(long = "adapter", value_name = "PATH")]
+    #[arg(long = "adapter", hide = true, value_name = "PATH")]
     adapters: Vec<PathBuf>,
 
     /// Comma-separated list of layer names to mark as updatable for
@@ -145,13 +195,13 @@ struct CompileArgs {
     #[arg(long, default_value = "10")]
     epochs: i64,
 
-    /// Loss function for on-device training: "cross-entropy" or "mse".
-    #[arg(long = "loss-function", default_value = "cross-entropy")]
-    loss_function: String,
+    /// Loss function for on-device training.
+    #[arg(long = "loss-function", value_enum, default_value_t = LossFunctionArg::CrossEntropy)]
+    loss_function: LossFunctionArg,
 
-    /// Optimizer for on-device training: "sgd" or "adam".
-    #[arg(long = "optimizer", default_value = "sgd")]
-    optimizer_type: String,
+    /// Optimizer for on-device training.
+    #[arg(long = "optimizer", value_enum, default_value_t = OptimizerArg::Sgd)]
+    optimizer_type: OptimizerArg,
 
     /// Split the model for speculative decoding: produce a draft model
     /// with the first N transformer layers and a full verifier model.
@@ -308,7 +358,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Compile(args) => {
-            let merge_lora = args.merge_lora && !args.no_merge_lora;
+            let merge_lora = !args.no_merge_lora;
             cmd_compile(
                 &args.input,
                 CompileOpts {
@@ -375,23 +425,10 @@ fn parse_input_shape(s: &str) -> Result<(String, Vec<usize>)> {
     Ok((name.to_string(), dims))
 }
 
-/// Parse a `--quantize` value like `"polarquant-4"` into the bit-width (e.g. 4).
-fn parse_polarquant_bits(s: &str) -> Result<u8> {
-    let bits_str = s.strip_prefix("polarquant-").ok_or_else(|| {
-        anyhow::anyhow!(
-            "invalid GPU quantization format: expected 'polarquant-N' (e.g. 'polarquant-4'), got '{s}'"
-        )
-    })?;
-    let bits: u8 = bits_str
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid bit-width '{bits_str}' in quantization '{s}'"))?;
-    Ok(bits)
-}
-
 struct CompileOpts {
     output: Option<String>,
-    target: String,
-    quantize: String,
+    target: TargetArg,
+    quantize: QuantizeArg,
     cal_data: Option<PathBuf>,
     quantize_config: Option<PathBuf>,
     palettize: Option<u8>,
@@ -406,8 +443,8 @@ struct CompileOpts {
     updatable_layers: Option<String>,
     learning_rate: f64,
     epochs: i64,
-    loss_function: String,
-    optimizer_type: String,
+    loss_function: LossFunctionArg,
+    optimizer_type: OptimizerArg,
     split_draft_layers: Option<usize>,
     moe_split: bool,
     moe_bundle: bool,
@@ -432,13 +469,13 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
         bail!("--max-seq-len must be at least 1");
     }
 
-    if opts.target == "gpu" {
+    if opts.target == TargetArg::Gpu {
         return compile_for_gpu(input_path, &opts);
     }
 
-    if opts.target != "all" && opts.target != "cpu-and-ne" {
-        println!(
-            "Note: --target '{}' will be fully supported in Phase 3. Proceeding with default target.",
+    if !matches!(opts.target, TargetArg::All | TargetArg::CpuAndNe) {
+        eprintln!(
+            "Note: --target '{:?}' will be fully supported in Phase 3. Proceeding with default target.",
             opts.target
         );
     }
@@ -451,7 +488,7 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
         bail!("--kv-quant-qjl requires --kv-quant turbo-int8");
     }
     if opts.kv_quant == KvQuantArg::TurboInt8 {
-        println!(
+        eprintln!(
             "TurboQuant: INT8 KV cache (max_seq_len={}{})",
             opts.max_seq_len,
             if opts.kv_quant_qjl {
@@ -467,7 +504,7 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
         InputFormat::SafeTensors | InputFormat::Gguf => compile_from_weights(input_path, &opts),
         InputFormat::CoreMl(ext) => {
             if opts.moe_split || opts.moe_bundle || opts.moe_fuse_topk.is_some() {
-                println!(
+                eprintln!(
                     "Note: --moe-split/--moe-bundle/--moe-fuse-topk is only supported for ONNX input. Ignoring."
                 );
             }
@@ -493,10 +530,10 @@ fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // ── Regular (MIL IR) path ───────────────────────────────────────
     // Reject conflicting quantization flags.
-    if opts.quantize != "none" && opts.polar_quantize.is_some() {
+    if opts.quantize != QuantizeArg::None && opts.polar_quantize.is_some() {
         anyhow::bail!("Cannot specify both --quantize and --polar-quantize. Use only one.");
     }
-    if opts.quip_sharp && opts.quantize != "none" {
+    if opts.quip_sharp && opts.quantize != QuantizeArg::None {
         anyhow::bail!("Cannot specify both --quantize and --quip-sharp. Use only one.");
     }
     if opts.quip_sharp && opts.polar_quantize.is_some() {
@@ -504,14 +541,7 @@ fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     }
 
     // Build the pipeline — handles all quantization methods uniformly.
-    let pipeline = if opts.quantize.starts_with("polarquant-") {
-        let n_bits = parse_polarquant_bits(&opts.quantize)?;
-        PassPipeline::new()
-            .with_polar_quant(n_bits)
-            .context("Failed to configure PolarQuant")?
-    } else {
-        build_pass_pipeline(opts)?
-    };
+    let pipeline = build_pass_pipeline(opts)?;
 
     let provider = GpuCompileBuilder::new(input_path)
         .with_pass_pipeline(pipeline)
@@ -519,7 +549,7 @@ fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         .context("GPU compilation failed")?;
 
     write_gpu_bundle(&provider, &output).context("Failed to write GPU bundle")?;
-    println!("Wrote GPU bundle to {}", output.display());
+    eprintln!("Wrote GPU bundle to {}", output.display());
     Ok(())
 }
 
@@ -553,24 +583,24 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
             .context("Failed to configure mixed-precision from config file")?;
         pipeline.add_pass(Box::new(pass));
     } else {
-        match opts.quantize.as_str() {
-            "fp16" => {
+        match opts.quantize {
+            QuantizeArg::Fp16 => {
                 pipeline = pipeline
                     .with_fp16()
                     .context("Failed to configure FP16 quantization")?;
             }
-            "int8" => {
+            QuantizeArg::Int8 => {
                 pipeline = pipeline
                     .with_int8(opts.cal_data.clone())
                     .context("Failed to configure INT8 quantization")?;
             }
-            "mixed-fp16-int8" => {
+            QuantizeArg::MixedFp16Int8 => {
                 let config =
                     ironmill_compile::ane::passes::MixedPrecisionConfig::preset_fp16_int8();
                 let pass = ironmill_compile::ane::passes::MixedPrecisionPass::new(config);
                 pipeline.add_pass(Box::new(pass));
             }
-            "awq" => {
+            QuantizeArg::Awq => {
                 let cal_dir = opts
                     .cal_data
                     .as_ref()
@@ -619,13 +649,13 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
                     .with_awq(channel_magnitudes, 128, cal_activations, cal_token_count)
                     .context("Failed to configure AWQ quantization")?;
             }
-            "int4" => {
+            QuantizeArg::Int4 => {
                 let group_size = 128; // industry standard
                 pipeline = pipeline
                     .with_int4(group_size)
                     .context("Failed to configure INT4 quantization")?;
             }
-            "gptq" => {
+            QuantizeArg::Gptq => {
                 let cal_dir = opts
                     .cal_data
                     .as_ref()
@@ -649,7 +679,7 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
                     .with_gptq(hessian_data, bits, 128, 128, 0.01)
                     .context("Failed to configure GPTQ quantization")?;
             }
-            "d2quant" => {
+            QuantizeArg::D2quant => {
                 let bits = opts.bits.unwrap_or(2);
                 if bits != 2 && bits != 3 {
                     bail!("D2Quant --bits must be 2 or 3, got {bits}");
@@ -658,12 +688,7 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
                     .with_d2quant(bits, 128, 0.99, None)
                     .context("Failed to configure D2Quant quantization")?;
             }
-            "none" => {}
-            other => {
-                bail!(
-                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int4', 'int8', 'mixed-fp16-int8', 'awq', 'gptq', or 'd2quant'."
-                )
-            }
+            QuantizeArg::None => {}
         }
     }
 
@@ -708,7 +733,7 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
         pipeline.add_pass(Box::new(
             ironmill_compile::ane::passes::OpSplittingPass::new(budget),
         ));
-        println!("  ANE memory budget: {budget_str} ({budget} bytes)");
+        eprintln!("  ANE memory budget: {budget_str} ({budget} bytes)");
     }
 
     Ok(pipeline)
@@ -753,7 +778,7 @@ fn write_coreml_package(
 ) -> Result<()> {
     let model = program_to_model(program, COREML_SPEC_VERSION)
         .with_context(|| format!("Failed to convert {label} to CoreML"))?;
-    println!("  Writing {label}: {output_path}");
+    eprintln!("  Writing {label}: {output_path}");
     write_mlpackage(&model, output_path)
         .with_context(|| format!("Failed to write {output_path}"))?;
     Ok(())
@@ -775,14 +800,14 @@ fn emit_moe_split(
     let topology = match detect_moe(program) {
         Some(t) => t,
         None => {
-            println!(
+            eprintln!(
                 "Note: --moe-split specified but no MoE pattern detected. Producing single output."
             );
             return Ok(false);
         }
     };
 
-    println!(
+    eprintln!(
         "MoE architecture detected: {} experts",
         topology.expert_count
     );
@@ -803,10 +828,10 @@ fn emit_moe_split(
         .context("Failed to serialize MoE manifest")?;
     std::fs::write(&manifest_path, &manifest_json)
         .with_context(|| format!("Failed to write {manifest_path}"))?;
-    println!("  Wrote manifest: {manifest_path}");
+    eprintln!("  Wrote manifest: {manifest_path}");
 
-    println!();
-    println!("MoE split complete.");
+    eprintln!();
+    eprintln!("MoE split complete.");
     Ok(true)
 }
 
@@ -826,14 +851,14 @@ fn emit_moe_bundle(
     let topology = match detect_moe(program) {
         Some(t) => t,
         None => {
-            println!(
+            eprintln!(
                 "Note: --moe-bundle specified but no MoE pattern detected. Producing single output."
             );
             return Ok(false);
         }
     };
 
-    println!(
+    eprintln!(
         "MoE architecture detected: {} experts",
         topology.expert_count
     );
@@ -843,7 +868,7 @@ fn emit_moe_bundle(
         .context("Failed to convert MoE programs to multi-function CoreML model")?;
 
     let bundle_path = resolve_output_path(opts.output.as_deref(), input_path, "-bundle.mlpackage");
-    println!(
+    eprintln!(
         "  Writing multi-function bundle ({} experts): {bundle_path}",
         topology.expert_count
     );
@@ -861,12 +886,12 @@ fn emit_moe_bundle(
         .context("Failed to serialize MoE manifest")?;
     std::fs::write(&manifest_path, &manifest_json)
         .with_context(|| format!("Failed to write {manifest_path}"))?;
-    println!("  Wrote manifest: {manifest_path}");
+    eprintln!("  Wrote manifest: {manifest_path}");
 
     compile_output(&bundle_path);
 
-    println!();
-    println!("MoE bundle complete.");
+    eprintln!();
+    eprintln!("MoE bundle complete.");
     Ok(true)
 }
 
@@ -893,7 +918,7 @@ fn emit_topk_fusion(
             ExpertFrequencyProfile::from_json(&json)
                 .with_context(|| format!("Failed to parse {}", profile_path.display()))?
         } else {
-            println!(
+            eprintln!(
                 "  Note: {} not found, using uniform profile.",
                 profile_path.display()
             );
@@ -903,7 +928,7 @@ fn emit_topk_fusion(
             ExpertFrequencyProfile::uniform(expert_count)
         }
     } else {
-        println!("  Note: --cal-data not provided, using uniform profile.");
+        eprintln!("  Note: --cal-data not provided, using uniform profile.");
         let expert_count = ironmill_compile::convert::moe::detect_moe(program)
             .map(|t| t.expert_count)
             .unwrap_or(k);
@@ -913,18 +938,18 @@ fn emit_topk_fusion(
     let fuse_result = match fuse_top_k_experts(program, k, &profile)? {
         Some(r) => r,
         None => {
-            println!(
+            eprintln!(
                 "Note: --moe-fuse-topk specified but no MoE pattern detected. Producing single output."
             );
             return Ok(false);
         }
     };
 
-    println!(
+    eprintln!(
         "MoE top-{k} fusion: kept experts {:?}, discarded {:?}",
         fuse_result.kept_expert_indices, fuse_result.discarded_expert_indices
     );
-    println!(
+    eprintln!(
         "  Fused program: {} ops (was {} ops)",
         count_ops(&fuse_result.program),
         count_ops(program)
@@ -934,8 +959,8 @@ fn emit_topk_fusion(
     write_coreml_package(&fuse_result.program, &output_path, "fused model")?;
     compile_output(&output_path);
 
-    println!();
-    println!("MoE top-{k} fusion complete.");
+    eprintln!();
+    eprintln!("MoE top-{k} fusion complete.");
     Ok(true)
 }
 
@@ -1011,18 +1036,13 @@ fn emit_coreml(
             opts.learning_rate
         );
 
-        let loss_fn = match opts.loss_function.as_str() {
-            "mse" | "mean-squared-error" => LossFunction::MeanSquaredError,
-            "categorical-cross-entropy" => LossFunction::CategoricalCrossEntropy,
-            other => bail!(
-                "unknown loss function: '{}'. Valid: mse, mean-squared-error, categorical-cross-entropy",
-                other
-            ),
+        let loss_fn = match opts.loss_function {
+            LossFunctionArg::CrossEntropy => LossFunction::CategoricalCrossEntropy,
+            LossFunctionArg::Mse => LossFunction::MeanSquaredError,
         };
-        let opt = match opts.optimizer_type.as_str() {
-            "adam" => UpdateOptimizer::Adam,
-            "sgd" => UpdateOptimizer::Sgd,
-            other => bail!("unknown optimizer: '{}'. Valid: adam, sgd", other),
+        let opt = match opts.optimizer_type {
+            OptimizerArg::Adam => UpdateOptimizer::Adam,
+            OptimizerArg::Sgd => UpdateOptimizer::Sgd,
         };
 
         let mut config = UpdatableModelConfig::default();
@@ -1032,7 +1052,7 @@ fn emit_coreml(
         config.loss_function = loss_fn;
         config.optimizer = opt;
 
-        println!(
+        eprintln!(
             "Updatable model: {} layer(s) marked for on-device training",
             layer_names.len()
         );
@@ -1044,7 +1064,7 @@ fn emit_coreml(
     };
 
     let output_path = resolve_output_path(opts.output.as_deref(), input_path, ".mlpackage");
-    println!("Writing CoreML package: {output_path}");
+    eprintln!("Writing CoreML package: {output_path}");
     write_mlpackage(&model, &output_path)
         .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
@@ -1064,7 +1084,7 @@ fn emit_ane_direct(
 
         let output_dir = resolve_output_path(opts.output.as_deref(), input_path, ".ironml");
 
-        println!("Compiling for ANE direct runtime → {output_dir}");
+        eprintln!("Compiling for ANE direct runtime → {output_dir}");
 
         let config = AneCompileConfig::default();
         let bundle = compile_model_bundle(program, &config)
@@ -1075,7 +1095,7 @@ fn emit_ane_direct(
             .save(output_path)
             .context("Failed to save .ironml bundle")?;
 
-        println!(
+        eprintln!(
             "  ✓ {} sub-program(s) written to {output_dir}",
             bundle.sub_programs.len(),
         );
@@ -1100,7 +1120,7 @@ fn compile_and_emit(
     // Build and run the pass pipeline.
     let pipeline = build_pass_pipeline(opts)?;
 
-    println!("Running optimization passes...");
+    eprintln!("Running optimization passes...");
     let report = pipeline
         .run(program)
         .context("Optimization pipeline failed")?;
@@ -1136,18 +1156,18 @@ fn compile_and_emit(
 
     // Print warnings
     if !warnings.is_empty() {
-        println!();
-        println!("Warnings:");
+        eprintln!();
+        eprintln!("Warnings:");
         let unsupported: Vec<&str> = warnings.iter().map(|w| w.as_str()).collect();
-        println!(
+        eprintln!(
             "  {} unsupported op(s) skipped: {:?}",
             unsupported.len(),
             unsupported
         );
     }
 
-    println!();
-    println!("Conversion complete.");
+    eprintln!();
+    eprintln!("Conversion complete.");
     Ok(())
 }
 
@@ -1157,36 +1177,36 @@ fn print_pipeline_report(report: &PipelineReport) {
         if result.ops_after < result.ops_before {
             let diff = result.ops_before - result.ops_after;
             let label = if diff == 1 { "op" } else { "ops" };
-            println!(
+            eprintln!(
                 "  {}: removed {diff} {label} ({:.2?})",
                 result.name, result.elapsed
             );
         } else if result.ops_after > result.ops_before {
             let diff = result.ops_after - result.ops_before;
             let label = if diff == 1 { "op" } else { "ops" };
-            println!(
+            eprintln!(
                 "  {}: added {diff} {label} ({:.2?})",
                 result.name, result.elapsed
             );
         } else {
-            println!("  {}: no changes ({:.2?})", result.name, result.elapsed);
+            eprintln!("  {}: no changes ({:.2?})", result.name, result.elapsed);
         }
     }
-    println!("  Total pipeline time: {:.2?}", report.total_elapsed());
-    println!();
+    eprintln!("  Total pipeline time: {:.2?}", report.total_elapsed());
+    eprintln!();
 }
 
 fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     let input_display = input_path.display();
 
     // 1. Read ONNX model
-    println!("Reading ONNX model: {input_display}");
+    eprintln!("Reading ONNX model: {input_display}");
     let mut onnx_model = read_onnx(input_path)
         .with_context(|| format!("Failed to read ONNX model: {input_display}"))?;
     print_onnx_summary(&onnx_model);
 
     if opts.merge_lora {
-        println!("  LoRA merge: enabled (use --no-merge-lora to disable)");
+        eprintln!("  LoRA merge: enabled (use --no-merge-lora to disable)");
     }
     if opts.emit_adapter {
         bail!(
@@ -1199,10 +1219,10 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
             opts.adapters.len()
         );
     }
-    println!();
+    eprintln!();
 
     // 2. Convert to MIL IR
-    println!("Converting to CoreML MIL IR...");
+    eprintln!("Converting to CoreML MIL IR...");
     let mut config = ConversionConfig::default();
     config.merge_lora = opts.merge_lora;
     config.model_dir = input_path.parent().map(|p| p.to_path_buf());
@@ -1210,12 +1230,12 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         .context("Failed to convert ONNX model to MIL IR")?;
     let mut program = result.program;
     let warnings = result.warnings;
-    println!(
+    eprintln!(
         "  Converted: {} functions, {} ops",
         program.functions.len(),
         count_ops(&program)
     );
-    println!();
+    eprintln!();
 
     // 3. Run shared pipeline + output
     compile_and_emit(&mut program, input_path, opts, warnings)
@@ -1232,7 +1252,7 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 1. Load weight provider (wrapped in Arc for program attachment)
     let provider: Arc<dyn WeightProvider + Send + Sync> = if is_gguf {
-        println!("Loading GGUF model: {input_display}");
+        eprintln!("Loading GGUF model: {input_display}");
         let p = GgufProvider::load(input_path)
             .with_context(|| format!("Failed to load GGUF model: {input_display}"))?;
         Arc::new(p)
@@ -1248,23 +1268,23 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
                 })?
                 .to_path_buf()
         };
-        println!("Loading SafeTensors model: {}", model_dir.display());
+        eprintln!("Loading SafeTensors model: {}", model_dir.display());
         let p = SafeTensorsProvider::load(&model_dir).with_context(|| {
             format!("Failed to load SafeTensors model: {}", model_dir.display())
         })?;
         Arc::new(p)
     };
 
-    println!("  Architecture: {}", provider.config().architecture);
-    println!("  Parameters: {} tensors", provider.tensor_names().len());
-    println!();
+    eprintln!("  Architecture: {}", provider.config().architecture);
+    eprintln!("  Parameters: {} tensors", provider.tensor_names().len());
+    eprintln!();
 
     // 2. Build MIL program from architecture template
     let ane_mode = opts.ane || matches!(opts.runtime, RuntimeArg::AneDirect);
     let mut template_opts = TemplateOptions::default();
     template_opts.ane = ane_mode;
 
-    println!(
+    eprintln!(
         "Building MIL program from {} template...",
         provider.config().architecture
     );
@@ -1276,12 +1296,12 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     // Attach provider for lazy tensor resolution by passes and spill-after-quantize.
     program.set_weight_provider(provider);
 
-    println!(
+    eprintln!(
         "  Built: {} functions, {} ops",
         program.functions.len(),
         count_ops(&program)
     );
-    println!();
+    eprintln!();
 
     // 3. Run shared pipeline + output
     compile_and_emit(&mut program, input_path, opts, warnings)
@@ -1295,34 +1315,30 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 /// don't prevent the output file from being usable.
 fn compile_output(output_path: &str) {
     if is_compiler_available() {
-        println!("Compiling with xcrun coremlcompiler...");
+        eprintln!("Compiling with xcrun coremlcompiler...");
         let output_dir = Path::new(output_path).parent().unwrap_or(Path::new("."));
-        match compile_model(output_path, output_dir) {
-            Ok(compiled) => println!("Done: {}", compiled.display()),
-            Err(e) => {
-                eprintln!("Warning: xcrun coremlcompiler failed: {e}");
-                eprintln!("  The .mlpackage was written successfully and may still be usable.");
-            }
-        }
+        let compiled = compile_model(output_path, output_dir)
+            .with_context(|| format!("xcrun coremlcompiler failed for {output_path}"))?;
+        eprintln!("Done: {}", compiled.display());
     } else {
-        println!("Note: xcrun coremlcompiler not found — skipping compilation step.");
-        println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
+        eprintln!("Note: xcrun coremlcompiler not found — skipping compilation step.");
+        eprintln!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
     }
 }
 
 fn compile_coreml(input_path: &Path, ext: &str) -> Result<()> {
     let input_display = input_path.display();
-    println!("Input is already CoreML format (.{ext}): {input_display}");
+    eprintln!("Input is already CoreML format (.{ext}): {input_display}");
 
     if !is_compiler_available() {
         bail!("xcrun coremlcompiler is not available. Install Xcode to compile CoreML models.");
     }
 
     let output_dir = input_path.parent().unwrap_or(Path::new("."));
-    println!("Compiling with xcrun coremlcompiler...");
+    eprintln!("Compiling with xcrun coremlcompiler...");
     let compiled = compile_model(input_path, output_dir)
         .with_context(|| format!("Failed to compile {input_display}"))?;
-    println!("Done: {}", compiled.display());
+    eprintln!("Done: {}", compiled.display());
 
     Ok(())
 }
@@ -1376,8 +1392,8 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
     let is_text = format == "text";
 
     if is_text {
-        println!("Validating: {input}");
-        println!();
+        eprintln!("Validating: {input}");
+        eprintln!();
     }
 
     let report = match ext.as_str() {
@@ -1385,8 +1401,8 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
             let mut onnx_model = read_onnx(input_path)
                 .with_context(|| format!("Failed to read ONNX model: {input}"))?;
             if is_text {
-                println!("✓ ONNX model parsed successfully");
-                println!("  Converting to MIL IR...");
+                eprintln!("✓ ONNX model parsed successfully");
+                eprintln!("  Converting to MIL IR...");
             }
 
             let result = onnx_to_program_with_config(&mut onnx_model, &ConversionConfig::default())
@@ -1394,21 +1410,21 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
 
             if is_text {
                 let op_count = count_ops(&result.program);
-                println!(
+                eprintln!(
                     "✓ Converted: {} functions, {} ops",
                     result.program.functions.len(),
                     op_count
                 );
 
                 if !result.warnings.is_empty() {
-                    println!(
+                    eprintln!(
                         "⚠ {} unsupported op(s) during conversion: {:?}",
                         result.warnings.len(),
                         result.warnings
                     );
                 }
 
-                println!();
+                eprintln!();
             }
 
             validate_ane_compatibility(&result.program)
@@ -1417,21 +1433,21 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
             let model = read_mlmodel(input_path)
                 .with_context(|| format!("Failed to read mlmodel: {input}"))?;
             if is_text {
-                println!("✓ CoreML model (.mlmodel) parsed successfully");
+                eprintln!("✓ CoreML model (.mlmodel) parsed successfully");
             }
 
             match ironmill_compile::mil::model_to_program(&model) {
                 Ok(program) => {
                     if is_text {
-                        println!();
+                        eprintln!();
                     }
                     validate_ane_compatibility(&program)
                 }
                 Err(e) => {
                     if is_text {
-                        println!();
-                        println!("Note: Could not convert to MIL IR for ANE analysis: {e}");
-                        println!("  ANE validation requires an ML Program model (spec v7+).");
+                        eprintln!();
+                        eprintln!("Note: Could not convert to MIL IR for ANE analysis: {e}");
+                        eprintln!("  ANE validation requires an ML Program model (spec v7+).");
                     }
                     return Ok(());
                 }
@@ -1441,21 +1457,21 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
             let model = read_mlpackage(input_path)
                 .with_context(|| format!("Failed to read mlpackage: {input}"))?;
             if is_text {
-                println!("✓ CoreML package (.mlpackage) parsed successfully");
+                eprintln!("✓ CoreML package (.mlpackage) parsed successfully");
             }
 
             match ironmill_compile::mil::model_to_program(&model) {
                 Ok(program) => {
                     if is_text {
-                        println!();
+                        eprintln!();
                     }
                     validate_ane_compatibility(&program)
                 }
                 Err(e) => {
                     if is_text {
-                        println!();
-                        println!("Note: Could not convert to MIL IR for ANE analysis: {e}");
-                        println!("  ANE validation requires an ML Program model (spec v7+).");
+                        eprintln!();
+                        eprintln!("Note: Could not convert to MIL IR for ANE analysis: {e}");
+                        eprintln!("  ANE validation requires an ML Program model (spec v7+).");
                     }
                     return Ok(());
                 }
@@ -1483,14 +1499,14 @@ fn cmd_compile_pipeline(manifest_path: &str, output: Option<&str>) -> Result<()>
         bail!("Pipeline manifest not found: {manifest_path}");
     }
 
-    println!("Reading pipeline manifest: {manifest_path}");
+    eprintln!("Reading pipeline manifest: {manifest_path}");
     let toml_str = std::fs::read_to_string(manifest_file)
         .with_context(|| format!("Failed to read manifest: {manifest_path}"))?;
 
     let manifest =
         parse_pipeline_manifest(&toml_str).context("Failed to parse pipeline manifest")?;
 
-    println!(
+    eprintln!(
         "Pipeline '{}': {} stage(s)",
         manifest.pipeline.name,
         manifest.stages.len()
@@ -1507,12 +1523,12 @@ fn cmd_compile_pipeline(manifest_path: &str, output: Option<&str>) -> Result<()>
             .or(stage.safetensors.as_deref())
             .or(stage.gguf.as_deref())
             .unwrap_or("unknown");
-        println!(
+        eprintln!(
             "  - {} [{}] quantize={}{deps}",
             stage.name, source, stage.quantize
         );
     }
-    println!();
+    eprintln!();
 
     let base_dir = manifest_file
         .parent()
@@ -1526,7 +1542,7 @@ fn cmd_compile_pipeline(manifest_path: &str, output: Option<&str>) -> Result<()>
     // Print per-stage warnings.
     for (stage_name, warnings) in &result.stage_warnings {
         if !warnings.is_empty() {
-            println!(
+            eprintln!(
                 "Warnings for stage '{stage_name}': {} unsupported op(s): {:?}",
                 warnings.len(),
                 warnings
@@ -1534,11 +1550,11 @@ fn cmd_compile_pipeline(manifest_path: &str, output: Option<&str>) -> Result<()>
         }
     }
 
-    println!(
+    eprintln!(
         "Pipeline manifest written: {}",
         output_dir.join("pipeline.json").display()
     );
-    println!(
+    eprintln!(
         "Pipeline conversion complete: {} stage(s) converted.",
         result.manifest.stages.len()
     );
@@ -1561,11 +1577,11 @@ fn cmd_pipeline_report(input: &str, config_a: &Path, config_b: &Path) -> Result<
         bail!("pipeline-report currently only supports ONNX models, got '.{ext}'");
     }
 
-    println!("Reading ONNX model: {input}");
+    eprintln!("Reading ONNX model: {input}");
     let mut onnx_model =
         read_onnx(input_path).with_context(|| format!("Failed to read ONNX model: {input}"))?;
 
-    println!("Converting to MIL IR...");
+    eprintln!("Converting to MIL IR...");
     let result_a =
         onnx_to_program_with_config(&mut onnx_model.clone(), &ConversionConfig::default())
             .context("Failed to convert ONNX model")?;
@@ -1574,28 +1590,28 @@ fn cmd_pipeline_report(input: &str, config_a: &Path, config_b: &Path) -> Result<
     let mut program_a = result_a.program;
     let mut program_b = result_b.program;
 
-    println!("Loading config A: {}", config_a.display());
+    eprintln!("Loading config A: {}", config_a.display());
     let pipeline_a = PassPipeline::with_config(config_a)
         .with_context(|| format!("Failed to load config A: {}", config_a.display()))?;
-    println!("  Passes: {:?}", pipeline_a.pass_names());
+    eprintln!("  Passes: {:?}", pipeline_a.pass_names());
 
-    println!("Loading config B: {}", config_b.display());
+    eprintln!("Loading config B: {}", config_b.display());
     let pipeline_b = PassPipeline::with_config(config_b)
         .with_context(|| format!("Failed to load config B: {}", config_b.display()))?;
-    println!("  Passes: {:?}", pipeline_b.pass_names());
-    println!();
+    eprintln!("  Passes: {:?}", pipeline_b.pass_names());
+    eprintln!();
 
-    println!("Running pipeline A...");
+    eprintln!("Running pipeline A...");
     let report_a = pipeline_a
         .run(&mut program_a)
         .context("Pipeline A failed")?;
 
-    println!("Running pipeline B...");
+    eprintln!("Running pipeline B...");
     let report_b = pipeline_b
         .run(&mut program_b)
         .context("Pipeline B failed")?;
 
-    println!();
+    eprintln!();
     println!("{}", PipelineReport::compare(&report_a, &report_b));
 
     Ok(())
