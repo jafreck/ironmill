@@ -414,28 +414,24 @@ impl MilWeightProvider {
         Ok(Self { tensors, config })
     }
 
-    /// Copy any tensors from `source` that are not already present in this provider.
+    /// Inject supplementary tensors that were not part of the MIL program.
     ///
-    /// Used to preserve architecture-specific weight tensors that the template
-    /// system may not emit (e.g. `q_norm`, `k_norm`). Supplemented tensors are
-    /// added without quantization since the pass pipeline only transforms
-    /// tensors emitted by the template.
-    pub fn supplement_from(&mut self, source: &dyn WeightProvider) -> Result<(), MilError> {
-        for name in source.tensor_names() {
-            if !self.tensors.contains_key(name) {
-                let t = source.tensor(name)?;
-                self.tensors.insert(
-                    name.to_string(),
-                    ExtractedTensor {
-                        data: t.data.into_owned(),
-                        shape: t.shape,
-                        dtype: t.dtype,
-                        quant_info: t.quant_info,
-                    },
-                );
-            }
+    /// These are typically architecture-specific tensors (e.g. `q_norm`, `k_norm`)
+    /// that the template system didn't emit as const ops but are needed at
+    /// bundle-writing time. This allows the source weight provider (with its mmap)
+    /// to be dropped before `MilWeightProvider` is constructed.
+    pub fn apply_supplements(
+        &mut self,
+        supplements: HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)>,
+    ) {
+        for (name, (data, shape, dtype)) in supplements {
+            self.tensors.entry(name).or_insert(ExtractedTensor {
+                data,
+                shape,
+                dtype,
+                quant_info: QuantizationInfo::None,
+            });
         }
-        Ok(())
     }
 }
 

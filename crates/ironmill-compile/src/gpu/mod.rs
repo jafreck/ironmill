@@ -16,8 +16,11 @@
 
 pub mod bundle;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use mil_rs::ScalarType;
+use mil_rs::Value;
 use mil_rs::convert::{ConversionConfig, onnx_to_program_with_config};
 use mil_rs::ir::{PassPipeline, Program};
 use mil_rs::reader::read_onnx;
@@ -89,16 +92,20 @@ impl GpuCompileBuilder {
         let format = detect_format(input);
 
         // Import to MIL IR — format-specific, but produces a uniform Program.
-        let (mut program, config, base_provider) = match format {
+        // For SafeTensors/GGUF, collect supplement tensors and drop the source
+        // provider before building MilWeightProvider to release mmap pages.
+        let (mut program, config, supplement_tensors) = match format {
             InputFormat::Onnx => {
                 let (program, config) = import_onnx(input)?;
-                (program, config, None)
+                (program, config, HashMap::new())
             }
             InputFormat::SafeTensors | InputFormat::Gguf => {
                 let provider = load_weight_provider(input, &format)?;
                 let config = provider.config().clone();
                 let result = crate::templates::weights_to_program(provider.as_ref())?;
-                (result.program, config, Some(provider))
+                let supplements = collect_supplement_tensors(provider.as_ref(), &result.program);
+                // provider is dropped here at end of match arm, releasing mmap pages
+                (result.program, config, supplements)
             }
             InputFormat::Unsupported(ext) => {
                 return Err(CompileError::Other(format!(
@@ -114,11 +121,9 @@ impl GpuCompileBuilder {
         // Extract weights from the optimized program.
         let mut provider = MilWeightProvider::new(&mut program, config)?;
 
-        // For SafeTensors/GGUF: supplement any architecture-specific tensors
-        // that the template system didn't emit (e.g. q_norm, k_norm).
-        if let Some(base) = base_provider.as_ref() {
-            provider.supplement_from(base.as_ref())?;
-        }
+        // Inject any architecture-specific tensors that the template system
+        // didn't emit (e.g. q_norm, k_norm).
+        provider.apply_supplements(supplement_tensors);
 
         Ok(provider)
     }
@@ -167,6 +172,48 @@ fn load_weight_provider(
             "load_weight_provider called with non-weight format".into(),
         )),
     }
+}
+
+/// Collect tensors from the source provider that are NOT emitted into the MIL
+/// program (e.g., `q_norm`, `k_norm` weight tensors used by some architectures
+/// but referenced only at bundle-writing time, not as MIL const ops).
+///
+/// Returns a map of name → (bytes, shape, dtype) for later injection into the
+/// `MilWeightProvider` via [`MilWeightProvider::apply_supplements`].
+fn collect_supplement_tensors(
+    provider: &dyn WeightProvider,
+    program: &Program,
+) -> HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)> {
+    // Build a set of tensor names that appear as const/constexpr ops in the program.
+    let mut program_tensor_names: HashSet<String> = HashSet::new();
+    for function in program.functions.values() {
+        for op in &function.body.operations {
+            if op.op_type == "const" || op.op_type.starts_with("constexpr_") {
+                // Recover the HF-style name: prefer onnx_name, fall back to output name.
+                let name = op
+                    .attributes
+                    .get("onnx_name")
+                    .and_then(|v| match v {
+                        Value::String(s) if !s.is_empty() => Some(s.clone()),
+                        _ => None,
+                    })
+                    .or_else(|| op.outputs.first().cloned());
+                if let Some(n) = name {
+                    program_tensor_names.insert(n);
+                }
+            }
+        }
+    }
+
+    provider
+        .tensor_names()
+        .iter()
+        .filter(|name| !program_tensor_names.contains(**name))
+        .filter_map(|name| {
+            let t = provider.tensor(name).ok()?;
+            Some((name.to_string(), (t.data.into_owned(), t.shape, t.dtype)))
+        })
+        .collect()
 }
 
 /// Import an ONNX model, returning the MIL program and a derived `ModelConfig`.
