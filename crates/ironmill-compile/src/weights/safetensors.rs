@@ -105,6 +105,31 @@ impl SafeTensorsProvider {
         }
 
         // --- Build tensor index (pre-parse metadata to avoid re-deserializing) ---
+        //
+        // Gemma 4 multimodal checkpoints nest text decoder weights under
+        // `model.language_model.*`. Since ironmill only handles the text
+        // decoder, strip that prefix so templates can use the standard
+        // `model.layers.*` / `model.embed_tokens.*` naming.
+        let is_multimodal_wrapper = config.extra.contains_key("_multimodal_prefix") || {
+            // Detect by checking if any tensor starts with "model.language_model."
+            // We peek at the first shard to decide.
+            let first_st = SafeTensors::deserialize(&mmaps[0]).map_err(|e| {
+                MilError::Validation(format!(
+                    "failed to parse safetensors shard {}: {e}",
+                    shard_paths[0].display()
+                ))
+            })?;
+            first_st
+                .names()
+                .iter()
+                .any(|n| n.starts_with("model.language_model."))
+        };
+        let prefix_strip = if is_multimodal_wrapper {
+            Some("model.language_model.")
+        } else {
+            None
+        };
+
         let mut tensor_index = HashMap::new();
         for (shard_idx, mmap) in mmaps.iter().enumerate() {
             let st = SafeTensors::deserialize(mmap).map_err(|e| {
@@ -121,8 +146,18 @@ impl SafeTensorsProvider {
                 let st_dtype = view.dtype();
                 let needs_bf16 = st_dtype == safetensors::Dtype::BF16;
                 let dtype = safetensors_dtype_to_scalar(st_dtype)?;
+                // Remap multimodal prefix: "model.language_model.X" → "model.X"
+                let key = if let Some(pfx) = prefix_strip {
+                    if let Some(rest) = name.strip_prefix(pfx) {
+                        format!("model.{rest}")
+                    } else {
+                        name
+                    }
+                } else {
+                    name
+                };
                 tensor_index.insert(
-                    name,
+                    key,
                     TensorLocation {
                         shard_index: shard_idx,
                         data_start,
