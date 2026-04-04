@@ -3,9 +3,44 @@
 > **Branch**: `api-spec`
 > **Date**: 2026-04-04
 > **Status**: 13 commits, 134 files changed, +4231/−3173 lines
+> **Full spec**: `docs/design/api-specification.md` — exact type signatures,
+> trait definitions, and usage examples for every item below
 
 This document tracks what was implemented, what remains, and what needs
 fixing before the `api-spec` branch can be merged.
+
+## Codebase Context
+
+**Crate layout** (all under `crates/`):
+
+| Crate | Role | Key source files |
+|---|---|---|
+| `mil-rs` | IR, passes, weights, shared types | `src/ir/operation.rs` (ComputeUnit), `src/weights.rs` (ModelConfig), `src/error.rs` (MilError) |
+| `ironmill-compile` | Model compilation | `src/compile_target.rs`, `src/lib.rs` (re-exports), `src/ane/passes/` |
+| `ironmill-inference` | Runtime engine | `src/types.rs` (ElementType), `src/engine.rs` (InferenceEngine trait), `src/generate.rs`, `src/metal/inference.rs`, `src/serving/sequence.rs`, `src/memory.rs`, `src/model_info.rs`, `src/jit.rs`, `src/shader_cache.rs` |
+| `ironmill-core` | High-level API | `src/model.rs`, `src/chat.rs`, `src/tokenizer.rs`, `src/device.rs`, `src/gen_params.rs`, `src/text_output.rs`, `src/error.rs` |
+| `ironmill-cli` | CLI binary | `src/main.rs` (single file) |
+
+**Conventions**:
+- `ironmill-inference` has `#![deny(unsafe_code)]`
+- All public enums carry `#[non_exhaustive]`; structs use builder pattern
+  (`ModelConfig::new(arch).with_hidden_size(n)`)
+- `InferenceEngine` trait is object-safe (no `load()`, no associated types);
+  each backend has its own typed `load()` inherent method
+- Pre-commit hook runs `cargo fmt` + `cargo clippy`; use `--no-verify`
+  for commits when clippy has pre-existing warnings from `warn(missing_docs)`
+- `ironmill-core` does NOT depend on `ironmill-inference` yet — wiring
+  that dependency is needed for `Model::stream()`, `Model::chat()`, etc.
+
+**Verification commands** (per-task commands in each section below):
+```bash
+cargo check --workspace                          # full build
+cargo test -p mil-rs --lib                        # mil-rs unit tests
+cargo test -p ironmill-compile --lib              # compile unit tests
+cargo test -p ironmill-inference --lib            # inference unit tests (264 pass, 0 fail on this branch)
+cargo test -p ironmill-core --lib                 # core unit tests
+cargo test --workspace 2>&1 | grep "error\["     # integration test errors
+```
 
 ---
 
@@ -65,26 +100,49 @@ integration test crates. Tests construct structs with struct-literal
 syntax that `#[non_exhaustive]` now blocks from outside the defining
 crate. Fix by adding constructors/builders or updating test helpers.
 
+**Files**: `tests/` dirs in `mil-rs`, `ironmill-compile`, any workspace
+integration test crate. Find all errors with:
+`cargo test --workspace 2>&1 | grep "error\[E0"`
+
+**Verify**: `cargo test --workspace 2>&1 | grep "error\[" | wc -l` → 0
+
 ### C2: 31 mil-rs lib test failures
 
 `eval_quantize` assertion mismatches, `pipeline spinquant` validation
-rejects valid configs, `reader/writer` I/O tests broken. These are
-pre-existing in some cases but must be triaged — some may be regressions
-from the `ModelConfig` builder changes or `#[non_exhaustive]` additions.
+rejects valid configs, `reader/writer` I/O tests broken. Root causes:
+`ModelConfig::new()` defaults all numeric fields to 0, which differs from
+what tests expect; `#[non_exhaustive]` may block struct literal construction
+even within the crate if test modules are structured as separate files.
+
+**Files**: `crates/mil-rs/src/` — test modules inline in source files and
+`crates/mil-rs/tests/`
+
+**Verify**: `cargo test -p mil-rs --lib` → 0 failures (currently 477 pass, 31 fail)
 
 ### C3: 7 ironmill-compile lib test failures
 
-SafeTensors config validation tests fail, template warning tests broken.
-Likely caused by `ModelConfig::new()` default values or
-`TemplateOptions` changes.
+SafeTensors config validation tests fail (`missing required field
+'intermediate_size' in config.json`), template warning tests broken.
+`ModelConfig::new()` defaults cause validation to reject configs that
+previously had non-zero defaults.
+
+**Files**: `crates/ironmill-compile/src/weights/safetensors.rs` (test module),
+`crates/ironmill-compile/src/templates/` (gemma, llama, qwen test modules)
+
+**Verify**: `cargo test -p ironmill-compile --lib` → 0 failures (currently 306 pass, 7 fail)
 
 ### C4: macOS sys crates are non-optional dependencies
 
 `ironmill-ane-sys`, `ironmill-iosurface`, `ironmill-coreml-sys` are
-still unconditional deps in `Cargo.toml`. The feature-gated module
-structure (§6.2) is in place, but the actual crate dependencies need
-`optional = true` and wiring into the feature flags for true
-cross-platform builds.
+still unconditional deps in `crates/ironmill-inference/Cargo.toml`. The
+feature-gated module structure (§6.2) is in place, but the actual crate
+dependencies need `optional = true` and wiring into the feature flags
+(`ane = ["dep:ironmill-ane-sys", "dep:ironmill-iosurface"]`,
+`coreml = ["dep:ironmill-coreml-sys"]`) for true cross-platform builds.
+
+**Files**: `crates/ironmill-inference/Cargo.toml`
+
+**Verify**: `cargo check -p ironmill-inference --no-default-features` compiles
 
 ---
 
@@ -92,33 +150,33 @@ cross-platform builds.
 
 ### High Priority
 
-| Spec Section | Item | Notes |
-|---|---|---|
-| §4.14 | `BatchRunner`, `SequenceHandle`, `BatchRunnerConfig`, `SchedulingPolicy` | Entirely missing. Large feature — managed batch inference loop. |
-| §4.11 | `AsyncTokenStream`, `generate_async::spawn()` | Feature-gated behind `async` feature with `tokio` dependency. |
-| §4.1 | `ElementType::BFloat16`, `ElementType::Int8` | Common dtypes needed for real-world usage. |
-| §4.1 | `SequenceStatus::Waiting` | Missing variant. |
-| §2.1 | `ComputeUnit::Cuda` | Trivial to add; needed for extensibility story. |
+| Spec Section | Item | Files | Verify | Notes |
+|---|---|---|---|---|
+| §4.14 | `BatchRunner`, `SequenceHandle`, `BatchRunnerConfig`, `SchedulingPolicy` | New file: `crates/ironmill-inference/src/batch_runner.rs`, update `src/lib.rs` | `cargo check -p ironmill-inference` | Large feature — managed batch inference loop. Composes existing `BatchScheduler` from `src/serving/`. Stub with `todo!()` bodies, signatures must match spec §4.14. |
+| §4.11 | `AsyncTokenStream`, `generate_async::spawn()` | `crates/ironmill-inference/src/generate.rs` (add `#[cfg(feature = "async")]` module), `Cargo.toml` (add `async = ["dep:tokio"]` feature + `tokio` optional dep) | `cargo check -p ironmill-inference --features async` | See spec §4.11 "Async Streaming" for exact types. |
+| §4.1 | `ElementType::BFloat16`, `ElementType::Int8` | `crates/ironmill-inference/src/types.rs` | `cargo check --workspace` | Add variants to existing `#[non_exhaustive]` enum. Update any exhaustive match arms. |
+| §4.1 | `SequenceStatus::Waiting` | `crates/ironmill-inference/src/serving/sequence.rs` | `cargo check -p ironmill-inference` | Add variant. Currently has `Prefilling`, `Decoding`, `Completed`. |
+| §2.1 | `ComputeUnit::Cuda` | `crates/mil-rs/src/ir/operation.rs` | `cargo check --workspace` | Add variant. Currently has `Ane`, `Gpu`, `Cpu`, `Any`. |
 
 ### Medium Priority
 
-| Spec Section | Item | Notes |
-|---|---|---|
-| §10 | `Model::from_compiled()`, `Model::stream()`, `Model::chat()` | Requires wiring `ironmill-inference` as a dependency of `ironmill-core`. |
-| §10 | `ChatSessionBuilder`, `ChatSession::say_stream()` | Builder pattern for chat + streaming response. |
-| §10 | `Model::engine()`, `Model::tokenizer()`, `Model::info()` | Accessor methods for underlying components. |
-| §11 | `MetalInference::load_jit()` | JIT loading integration point on MetalInference. |
-| §5.7 | `--lenient` flag on validate command | Validation currently exits `Ok(())` on failure instead of non-zero. |
-| §9.2 | `HfTokenizer` implementation | Requires `tokenizers` crate dependency. |
-| §12.1 | Move `QuantLevel`, `KvQuantLevel`, `MemoryEstimator`, `ModelInfo` to `mil-rs` | Currently in `ironmill-inference`; spec says shared types belong in `mil-rs`. |
+| Spec Section | Item | Files | Verify | Notes |
+|---|---|---|---|---|
+| §10 | `Model::from_compiled()`, `Model::stream()`, `Model::chat()` | `crates/ironmill-core/src/model.rs` | `cargo check -p ironmill-core` | Currently only has `from_pretrained()` and `generate()`. `stream()` and `chat()` require adding `ironmill-inference` as a dep in `crates/ironmill-core/Cargo.toml`. Stub with `todo!()` if dep not wired. |
+| §10 | `ChatSessionBuilder`, `ChatSession::say_stream()` | `crates/ironmill-core/src/chat.rs` | `cargo check -p ironmill-core` | Currently has `ChatSession::new/send/history/reset`. Add builder pattern and streaming response per spec §10.5. |
+| §10 | `Model::engine()`, `Model::tokenizer()`, `Model::info()` | `crates/ironmill-core/src/model.rs` | `cargo check -p ironmill-core` | Accessor methods. Requires `ironmill-inference` dep for `InferenceEngine` type. |
+| §11 | `MetalInference::load_jit()` | `crates/ironmill-inference/src/metal/inference.rs` | `cargo check -p ironmill-inference` | Signature: `pub fn load_jit(config: MetalConfig, provider: &dyn WeightProvider, transforms: &TransformPipeline) -> Result<Self, InferenceError>`. Stub with `todo!()`. |
+| §5.7 | `--lenient` flag on validate command | `crates/ironmill-cli/src/main.rs` | `cargo check -p ironmill-cli` | Validation currently exits `Ok(())` on failure instead of non-zero. |
+| §9.2 | `HfTokenizer` implementation | `crates/ironmill-core/src/tokenizer.rs`, `crates/ironmill-core/Cargo.toml` | `cargo check -p ironmill-core` | Placeholder exists. Add `tokenizers` crate as optional dep behind `hf-tokenizer` feature (feature flag already exists). Implement `Tokenizer` trait. |
+| §12.1 | Move `QuantLevel`, `KvQuantLevel`, `MemoryEstimator`, `ModelInfo` to `mil-rs` | From: `crates/ironmill-inference/src/memory.rs`, `src/model_info.rs`. To: `crates/mil-rs/src/` | `cargo check --workspace` | Keep re-exports in `ironmill-inference` for backward compatibility. |
 
 ### Low Priority
 
-| Spec Section | Item | Notes |
-|---|---|---|
-| §8.2 | `MetalInference::load(config, &artifacts)` one-step constructor | Still uses two-step `new()` + `load()`. Update migration guide or implement. |
-| §3.6 | Remove `proto::specification::Model` and `tensor_utils` re-exports | Currently kept with TODO comments; used by `ironmill-compile-ffi`. |
-| §6.1 | `#![warn(missing_docs)]` on `ironmill-core` | Present on the other three library crates but missing from ironmill-core. |
+| Spec Section | Item | Files | Verify | Notes |
+|---|---|---|---|---|
+| §8.2 | `MetalInference::load(config, &artifacts)` one-step constructor | `crates/ironmill-inference/src/metal/inference.rs` | `cargo check -p ironmill-inference` | Current API is two-step `new()` + `load()`. Add convenience constructor. |
+| §3.6 | Remove `proto::specification::Model` and `tensor_utils` re-exports | `crates/ironmill-compile/src/lib.rs` (lines with TODO comments) | `cargo check --workspace` | Used by `ironmill-compile-ffi`; verify FFI crate still compiles. |
+| §6.1 | `#![warn(missing_docs)]` on `ironmill-core` | `crates/ironmill-core/src/lib.rs` | `cargo check -p ironmill-core` | Present on the other three library crates but missing from ironmill-core. |
 
 ---
 
