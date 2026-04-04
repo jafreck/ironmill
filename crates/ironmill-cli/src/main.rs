@@ -285,6 +285,10 @@ enum Commands {
         /// Output format: "text" (default) or "json".
         #[arg(long, default_value = "text")]
         format: String,
+
+        /// Continue validation even if full analysis is not possible.
+        #[arg(long)]
+        lenient: bool,
     },
 
     /// Convert a multi-ONNX pipeline to coordinated .mlpackage outputs.
@@ -397,7 +401,11 @@ fn run() -> Result<()> {
             )
         }
         Commands::Inspect { input } => cmd_inspect(&input),
-        Commands::Validate { input, format } => cmd_validate(&input, &format),
+        Commands::Validate {
+            input,
+            format,
+            lenient,
+        } => cmd_validate(&input, &format, lenient),
         Commands::CompilePipeline { manifest, output } => {
             cmd_compile_pipeline(&manifest, output.as_deref())
         }
@@ -1377,7 +1385,7 @@ fn cmd_inspect(input: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_validate(input: &str, format: &str) -> Result<()> {
+fn cmd_validate(input: &str, format: &str, lenient: bool) -> Result<()> {
     let input_path = Path::new(input);
     if !input_path.exists() {
         bail!("Input file not found: {input}");
@@ -1444,12 +1452,18 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
                     validate_ane_compatibility(&program)
                 }
                 Err(e) => {
-                    if is_text {
+                    if lenient {
                         eprintln!();
                         eprintln!("Note: Could not convert to MIL IR for ANE analysis: {e}");
                         eprintln!("  ANE validation requires an ML Program model (spec v7+).");
+                        return Ok(());
+                    } else {
+                        eprintln!();
+                        eprintln!("Error: Could not convert to MIL IR for ANE analysis: {e}");
+                        eprintln!("  ANE validation requires an ML Program model (spec v7+).");
+                        eprintln!("  Use --lenient to continue despite this failure.");
+                        std::process::exit(1);
                     }
-                    return Ok(());
                 }
             }
         }
@@ -1468,12 +1482,18 @@ fn cmd_validate(input: &str, format: &str) -> Result<()> {
                     validate_ane_compatibility(&program)
                 }
                 Err(e) => {
-                    if is_text {
+                    if lenient {
                         eprintln!();
                         eprintln!("Note: Could not convert to MIL IR for ANE analysis: {e}");
                         eprintln!("  ANE validation requires an ML Program model (spec v7+).");
+                        return Ok(());
+                    } else {
+                        eprintln!();
+                        eprintln!("Error: Could not convert to MIL IR for ANE analysis: {e}");
+                        eprintln!("  ANE validation requires an ML Program model (spec v7+).");
+                        eprintln!("  Use --lenient to continue despite this failure.");
+                        std::process::exit(1);
                     }
-                    return Ok(());
                 }
             }
         }
