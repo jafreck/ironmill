@@ -431,14 +431,16 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
 
 When `ctx.layer_type == Some("full_attention")`, the attention block uses different
 dimensions. Since `LayerContext` now carries the effective values, `emit_attention_core`
-reads `ctx.effective_head_dim` and `ctx.effective_num_kv_heads` instead of
-`config.head_dim` and `config.num_key_value_heads`. The RoPE tables are already
-correct via `ctx.rope_cos`/`ctx.rope_sin`. No separate `AttentionParams` struct
-is needed — `LayerContext` is the single source of per-layer config.
+reads `ctx.effective_head_dim`, `ctx.effective_num_attention_heads`, and
+`ctx.effective_num_kv_heads` instead of `config.head_dim`, `config.num_attention_heads`,
+and `config.num_key_value_heads`. The RoPE tables are already correct via
+`ctx.rope_cos`/`ctx.rope_sin`. No separate `AttentionParams` struct is needed —
+`LayerContext` is the single source of per-layer config.
 
-Note: `emit_attention_core` currently reads `config.head_dim` (at `shared.rs:589-623`)
-and `config.num_key_value_heads` for Q/K/V reshape operations. These reads must be
-replaced with `ctx.effective_head_dim` and `ctx.effective_num_kv_heads`. The weight
+Note: `emit_attention_core` currently reads `config.head_dim` (at `shared.rs:589-623`),
+`config.num_attention_heads`, and `config.num_key_value_heads` for Q/K/V reshape
+operations. These reads must be replaced with `ctx.effective_head_dim`,
+`ctx.effective_num_attention_heads`, and `ctx.effective_num_kv_heads`. The weight
 tensor shapes from the provider are already correct per-layer, so only the reshape
 and RoPE dimensions need the override.
 
@@ -477,7 +479,7 @@ once the GGUF key format is standardized by llama.cpp.
 
 - `crates/ironmill-compile/src/templates/llama.rs` — Update `LayerContext`
   construction to add new fields with defaults:
-  `layer_type: None, effective_head_dim: config.head_dim, effective_num_kv_heads: config.num_key_value_heads`
+  `layer_type: None, effective_head_dim: config.head_dim, effective_num_attention_heads: config.num_attention_heads, effective_num_kv_heads: config.num_key_value_heads`
 - `crates/ironmill-compile/src/templates/qwen.rs` — Same `LayerContext` default
   field additions as llama.rs.
 
@@ -508,6 +510,22 @@ if config.extra.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(fals
 
 The HF config includes `"use_double_wide_mlp": false`. When `true`, this doubles
 the MLP intermediate size (using `2 * intermediate_size` for the gate/up projection).
+
+### `hidden_activation` Variant
+
+The config specifies `"hidden_activation": "gelu_pytorch_tanh"`, which is the
+GELU approximation `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))`.
+The existing `emit_mlp_gelu` helper (`shared.rs:839`) must be validated to
+confirm it uses this tanh approximation, not the exact GELU
+(`x * Φ(x)` via `erf`). If it uses exact GELU, update it or add a variant.
+
+### Logit Softcapping
+
+Gemma 3 supported `attn_logit_softcapping` and `final_logit_softcapping`. The
+existing Gemma template (`gemma.rs`) does not currently apply softcapping.
+Validate against the Gemma 4 config whether these fields are present:
+- If absent or `null`: no action needed.
+- If present with non-null values: add softcapping support in Phase 1.
 
 **Important**: The actual E2B checkpoint may use `use_double_wide_mlp: true`. This
 must be checked against the real config before implementation begins:
@@ -558,7 +576,21 @@ embedding added to the hidden state before each layer.
 - `crates/ironmill-compile/src/templates/gemma.rs` — Add PLE emission in the
   layer loop when `hidden_size_per_layer_input > 0`.
 - `crates/ironmill-compile/src/templates/shared.rs` — Add `emit_per_layer_embedding`
-  helper.
+  and `emit_gather` helpers. `emit_gather` is a new function (does not exist yet)
+  that emits a MIL `gather` op to index an embedding table by token IDs.
+
+**`input_ids` availability in the layer loop:**
+
+PLE requires access to the original `input_ids` at every layer for the gather
+operation. Currently, `input_ids` is consumed by the initial `emit_embedding` call
+and is not referenced again. To make it available throughout the layer loop:
+
+1. In `build_program`, the `input_ids` block argument name (returned by
+   `block.add_argument(...)`) must be preserved as a variable and passed into
+   the PLE helper.
+2. At inference time, the `input_ids_buf` Metal buffer is already available in
+   `run_pipeline_inner()` for the entire forward pass — no additional threading
+   is needed on the inference side.
 
 **Compile-time emission:**
 
@@ -569,11 +601,27 @@ In the layer loop of `build_program`, before the transformer layer:
 let ple_hidden_size = config.extra.get("hidden_size_per_layer_input")
     .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 if ple_hidden_size > 0 {
-    hidden = emit_per_layer_embedding(block, provider, layer_idx, &hidden, ple_hidden_size)?;
+    hidden = emit_per_layer_embedding(block, provider, layer_idx, &hidden, &input_ids_name, ple_hidden_size)?;
 }
 ```
 
 ```rust
+/// Emit a MIL `gather` operation to index into an embedding table.
+///
+/// Loads the embedding weight from the provider and gathers rows
+/// corresponding to the given indices tensor.
+pub(super) fn emit_gather(
+    block: &mut Block,
+    provider: &dyn WeightProvider,
+    weight_prefix: &str,
+    indices: &str,
+    out_name: &str,
+) -> Result<String, MilError> {
+    let table = emit_const(block, provider, &format!("{weight_prefix}.weight"), out_name)?;
+    let gathered = block.add_op("gather", &format!("{out_name}_gather"), &[&table, indices]);
+    Ok(gathered)
+}
+
 /// Emit a per-layer embedding lookup + projection + residual add.
 ///
 /// Looks up `input_ids` in a per-layer embedding table, projects to hidden_size,
@@ -583,12 +631,13 @@ pub(super) fn emit_per_layer_embedding(
     provider: &dyn WeightProvider,
     layer_idx: usize,
     hidden: &str,
+    input_ids_name: &str,
     ple_hidden_size: usize,
 ) -> Result<String, MilError> {
     let prefix = format!("model.layers.{layer_idx}");
     // 1. Gather from per-layer embedding table using input_ids
     let embed = emit_gather(block, provider, &format!("{prefix}.per_layer_input"),
-                            "input_ids", &format!("l{layer_idx}_ple_embed"))?;
+                            input_ids_name, &format!("l{layer_idx}_ple_embed"))?;
     // 2. Project from ple_hidden_size to hidden_size
     let proj = emit_linear(block, provider, &format!("{prefix}.per_layer_proj"),
                            &embed, &format!("l{layer_idx}_ple_proj"), &mut vec![])?;
@@ -616,17 +665,19 @@ When `attention_k_eq_v` is true, the key projection output is reused as the
 value projection. This saves one linear projection per layer.
 
 **Files to modify (compile):**
-- `crates/ironmill-compile/src/templates/shared.rs` — In `emit_attention_core`,
+- `crates/ironmill-compile/src/templates/shared.rs` — In `emit_attention`
+  (not `emit_attention_core`, which receives pre-projected Q/K/V tensor names),
   when `attention_k_eq_v` is set, skip the V linear projection and alias K
   output as V:
 
 ```rust
-let v = if config.extra.get("attention_k_eq_v")
+// In emit_attention (shared.rs:538), before calling emit_attention_core:
+let v = if ctx.config.extra.get("attention_k_eq_v")
     .and_then(|v| v.as_bool()).unwrap_or(false) {
     k.clone() // Reuse K projection output as V
 } else {
-    emit_linear(block, provider, &format!("{prefix}.v_proj"),
-                input, &format!("l{layer_idx}_v_proj"), warnings)?
+    emit_linear(block, ctx.provider, &format!("{prefix}.v_proj"),
+                input, &format!("l{}_v_proj", ctx.layer_idx), warnings)?
 };
 ```
 
@@ -640,6 +691,12 @@ let v = if config.extra.get("attention_k_eq_v")
 When `num_kv_shared_layers > 0`, consecutive decoder layers share the same KV
 projections. Layer `i` reuses KV from layer `i - (i % num_kv_shared_layers)`.
 
+> **Validation required**: Confirm this grouping logic against HuggingFace's
+> `modeling_gemma4.py`. Some implementations use
+> `(layer_idx // num_kv_shared_layers) * num_kv_shared_layers` as the anchor,
+> which has subtly different behavior at boundaries. The anchor detection formula
+> below assumes layer 0 is always an anchor and groups are `[0,1], [2,3], ...`.
+
 **Files to modify (compile):**
 - `crates/ironmill-compile/src/templates/gemma.rs` — Track KV projection outputs
   across layers and reuse when sharing is active. Only emit K/V projections for
@@ -651,7 +708,7 @@ let num_kv_shared = config.extra.get("num_kv_shared_layers")
 
 // In layer loop:
 let is_kv_anchor = num_kv_shared == 0 || (layer_idx % num_kv_shared == 0);
-// Pass is_kv_anchor to LayerContext; emit_attention_core skips K/V
+// Pass is_kv_anchor to LayerContext; emit_attention skips K/V
 // projections and references the anchor layer's outputs when !is_kv_anchor.
 ```
 
@@ -684,9 +741,13 @@ all layers. Gemma 4 global layers may use different values.
 /// Per-layer attention configuration for models with heterogeneous layers.
 pub struct LayerAttentionConfig {
     pub head_dim: usize,
+    pub num_attention_heads: usize,
     pub num_kv_heads: usize,
     pub window_size: usize,
     pub is_global: bool,
+    /// Index into the compiled RoPE frequency tables.
+    /// 0 = sliding (default), 1 = global (if different from sliding).
+    pub rope_table_index: usize,
 }
 ```
 
@@ -697,13 +758,29 @@ for layer_idx in 0..mc.num_hidden_layers {
     let layer_cfg = &layer_configs[layer_idx];
     // Use layer_cfg.head_dim, layer_cfg.num_kv_heads for attention dispatch
     // Use layer_cfg.window_size for KV cache window
+    // Use layer_cfg.rope_table_index to select correct RoPE cos/sin buffers
     ...
 }
 ```
 
 3. Populate `layer_configs` from `ModelConfig` at model load time, using
-   `layer_types()`, `global_head_dim()`, `num_global_key_value_heads()`,
-   and `sliding_window()`.
+   `layer_types()`, `global_head_dim()`, `num_global_attention_heads()`,
+   `num_global_key_value_heads()`, and `sliding_window()`.
+
+#### Per-Layer RoPE at Inference Time
+
+The inference engine must apply the correct RoPE frequency tables per layer. The
+compile stage emits separate cos/sin constant tensors for sliding vs global RoPE.
+At inference, the engine must:
+
+1. Load both sets of RoPE tables (sliding and global) into Metal buffers at
+   model init time.
+2. In the layer loop, use `layer_cfg.rope_table_index` to select the correct
+   cos/sin buffers when encoding the RoPE application.
+3. For partial rotation (global layers with `partial_rotary_factor < 1.0`),
+   the RoPE shader must apply rotation to only the first `rotary_dim` dimensions
+   and pass the remaining dimensions through unchanged. This may require a
+   shader variant or an additional `rotary_dim` parameter in `LayerAttentionConfig`.
 
 #### KV Cache Allocation
 
@@ -809,8 +886,12 @@ fn rope_parameters_extraction() {
         "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0}
     }));
     let rp = config.rope_parameters().unwrap();
-    assert_eq!(rp["sliding_attention"], (10000.0, 1.0));
-    assert_eq!(rp["full_attention"], (1000000.0, 0.25));
+    let sliding = &rp["sliding_attention"];
+    assert_eq!(sliding.theta, 10000.0);
+    assert_eq!(sliding.partial_rotary_factor, 1.0);
+    let global = &rp["full_attention"];
+    assert_eq!(global.theta, 1000000.0);
+    assert_eq!(global.partial_rotary_factor, 0.25);
 }
 ```
 
@@ -828,7 +909,9 @@ fn build_program_gemma4_with_layer_types() {
         "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0}
     }));
     config.num_hidden_layers = 2;
-    let provider = StubProvider::new(config).with_llama_weights();
+    let provider = StubProvider::new(config)
+        .with_gemma_weights()
+        .with_global_attention_weights(512, 4); // global_head_dim=512, global_kv_heads=4
     let result = build_program(&provider).expect("Gemma 4 build should succeed");
     assert_eq!(result.program.functions.len(), 1);
 }
@@ -1029,6 +1112,12 @@ selected experts) via a scatter/gather kernel. This reduces compute from
 `O(num_experts)` to `O(top_k)` per token but requires a new Metal kernel for
 dynamic expert routing.
 
+> **Performance note**: Dense evaluation is a significant compute multiplier.
+> For 26B with e.g. 64 experts and `top_k=4`, dense evaluation runs 16× more
+> expert FFN compute than necessary. Sparse dispatch is critical for usable
+> inference latency and should be prioritized as a fast follow-up after initial
+> correctness validation.
+
 ---
 
 ## TurboQuant Follow-Up (Future)
@@ -1061,5 +1150,7 @@ To fully support TurboQuant with heterogeneous attention layers:
 | `partial_rotary_factor` interacts unexpectedly with GQA | Incorrect attention output | Cross-reference HF transformers `modeling_gemma4.py` implementation |
 | MoE routing requires dynamic shapes in MIL IR | IR emission fails | Phase 3 can use dense (all-experts) evaluation to avoid dynamic shapes |
 | `vocab_size=262144` exceeds typical sizes | Metal buffer allocation failures or OOM during inference for the embedding table (`[262144, hidden_size]`) | Validate max buffer size against Metal device limits; test on target hardware |
+| PLE per-layer embeddings consume ~3.8 GB for E2B | OOM on memory-constrained devices (30 layers × `[262144, 256]` × FP16 ≈ 3.8 GB for PLE tables alone, on top of model weights) | Validate total memory budget on target hardware; consider FP16→INT8 PLE quantization if needed |
 | GGUF format lacks Gemma 4 metadata keys | Silent miscompilation with wrong RoPE | Phase 1 adds an explicit error for Gemma 4 via GGUF; follow-up adds proper extraction |
 | Prefill masking differs per layer type | Incorrect attention for sliding vs global layers during prefill | Emit `layer_types` as program attribute; runtime constructs per-layer masks |
+| `hidden_activation` variant mismatch | Subtly incorrect MLP output (exact GELU vs tanh-approximated GELU) | Validate `emit_mlp_gelu` uses the `gelu_pytorch_tanh` approximation |

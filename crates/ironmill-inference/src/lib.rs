@@ -23,6 +23,7 @@ pub mod metal;
 pub mod mlx;
 pub mod sampling;
 pub mod serving;
+pub mod speculative;
 pub mod turboquant;
 pub mod types;
 #[cfg(any(feature = "metal", feature = "mlx"))]
@@ -40,6 +41,9 @@ pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 pub use mlx::{MlxArtifacts, MlxConfig, MlxInference};
 pub use sampling::{
     DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, apply_token_mask, is_eos_token, sample_token,
+};
+pub use speculative::{
+    DraftCandidate, DraftHead, SpecConfig, SpeculativeEngine, speculative_decode,
 };
 pub use types::{
     ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor, build_dummy_inputs,

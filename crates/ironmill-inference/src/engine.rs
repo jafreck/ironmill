@@ -212,3 +212,18 @@ impl<'a, E: InferenceEngine> ConstrainedDecoder<'a, E> {
         &self.grammar_state
     }
 }
+
+// ── Speculative decoding free function ───────────────────────────
+
+/// Run one speculative decode round (free function, not on the trait).
+///
+/// Delegates to [`crate::speculative::speculative_decode`]. This is a
+/// convenience re-export so callers can access speculative decoding from
+/// `engine.rs` without importing the `speculative` module directly.
+pub fn speculative_decode<E: InferenceEngine>(
+    spec_engine: &mut crate::speculative::SpeculativeEngine<E>,
+    last_token: u32,
+    last_hidden: &[f32],
+) -> Result<Vec<u32>, InferenceError> {
+    crate::speculative::speculative_decode(spec_engine, last_token, last_hidden)
+}
