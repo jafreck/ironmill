@@ -35,6 +35,7 @@ pub(crate) struct CompiledRule {
 }
 
 /// Pre-computed masks for context-independent token classes.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TokenClass {
     /// Tokens consisting entirely of decimal digits.

@@ -363,7 +363,9 @@ impl MetalInference {
 
     /// Create a new GPU inference engine (device + queue + shader pipelines).
     pub fn new(config: MetalConfig) -> Result<Self, MetalError> {
-        config.validate().map_err(|e| MetalError::Config(e))?;
+        config
+            .validate()
+            .map_err(|e| MetalError::Config(e.to_string()))?;
         let device = MetalDevice::system_default().map_err(MetalError::Metal)?;
         let queue = device.create_command_queue().map_err(MetalError::Metal)?;
         // Pipelines are compiled in load() once head_dim is known.
@@ -400,7 +402,7 @@ impl MetalInference {
         self.config = config;
 
         let mut weights = MetalWeights::load(&self.device, provider, self.config.force_cpu_dequant)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
@@ -410,11 +412,11 @@ impl MetalInference {
 
         // Compile Metal shader pipelines with the model's head_dim.
         let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
 
         let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.intermediate_buffers = Some(bufs);
 
         let (cos, sin) = Self::build_rope_cache(
@@ -423,12 +425,12 @@ impl MetalInference {
             self.config.max_seq_len,
             mc.rope_theta,
         )
-        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.rope_cos = Some(cos);
         self.rope_sin = Some(sin);
 
         let decode_cache_t1 = Self::build_matmul_cache(&self.device, &mc, &weights, 1)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
 
@@ -444,8 +446,7 @@ impl MetalInference {
             let cla = super::config::ClaConfig {
                 anchor_layers: anchors.clone(),
             };
-            cla.validate(mc.num_hidden_layers)
-                .map_err(|e| InferenceError::Runtime(format!("CLA config invalid: {e}")))?;
+            cla.validate(mc.num_hidden_layers)?;
         }
         // Back-fill cla_config so is_anchor checks during inference see the
         // metadata-derived anchors, not the absent user config.
@@ -463,7 +464,7 @@ impl MetalInference {
             // Perform weight absorption: fuse W_uk into Q and W_uv into O
             // at load time so inference works directly on compressed latents.
             absorb_mla_weights(&self.device, &mut weights, mla, mc.hidden_size, provider)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
             // Create MLA compressed KV cache.
             let mla_cache = MlaKvCache::new(
@@ -472,7 +473,7 @@ impl MetalInference {
                 mc.num_hidden_layers,
                 self.config.max_seq_len,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.mla_kv_cache = Some(mla_cache);
         } else {
             self.mla_kv_cache = None;
@@ -549,9 +550,9 @@ impl MetalInference {
                 window_sizes: layer_window_sizes.clone(),
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let kv_cache = MetalKvCache::new(&self.device, &tq_config)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.turboquant = Some(tq_model);
             self.kv_cache = Some(kv_cache);
             self.fp16_kv_cache = None;
@@ -565,7 +566,7 @@ impl MetalInference {
                 cla_anchors.clone(),
                 &layer_window_sizes,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.fp16_kv_cache = Some(fp16_kv);
             self.turboquant = None;
             self.kv_cache = None;
@@ -725,7 +726,7 @@ impl MetalInference {
         let mut fp16_buf = vec![0u8; total_bytes];
         bufs.logits
             .read_bytes(&mut fp16_buf, 0)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let all_logits: Vec<Logits> = (0..n)
             .map(|t| {
@@ -770,7 +771,7 @@ impl MetalInference {
             .as_mut()
             .ok_or(InferenceError::NotLoaded)?
             .ensure_capacity(&self.device, token_ids.len(), &mc)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let bufs = self
             .intermediate_buffers
@@ -787,7 +788,7 @@ impl MetalInference {
             .checked_add(token_count)
             .is_none_or(|end| end > self.config.max_seq_len)
         {
-            return Err(InferenceError::Runtime(format!(
+            return Err(InferenceError::runtime(format!(
                 "sequence position {} + token count {} exceeds max_seq_len {}",
                 seq_pos, token_count, self.config.max_seq_len,
             )));
@@ -815,12 +816,12 @@ impl MetalInference {
                 .is_none_or(|c| c.token_count != token_count);
             if need_rebuild {
                 let cache = Self::build_matmul_cache(&self.device, &mc, weights, token_count)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 self.decode_matmuls = Some(cache);
             }
             self.decode_matmuls
                 .as_ref()
-                .ok_or_else(|| InferenceError::Runtime("decode_matmuls not populated".into()))?
+                .ok_or_else(|| InferenceError::runtime("decode_matmuls not populated".into()))?
         };
 
         // Write token IDs to GPU buffer (reuse persistent buffer).
@@ -829,16 +830,16 @@ impl MetalInference {
             .extend(token_ids.iter().flat_map(|t| t.to_le_bytes()));
         bufs.token_ids_buf
             .write_bytes(&self.token_bytes_buf, 0)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         // Create command buffer and single shared compute encoder.
         let cmd_buf = self
             .queue
             .command_buffer()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         let enc = cmd_buf
             .compute_encoder()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         // Step 0: Fused embedding lookup + first-layer RMSNorm.
         // Writes both hidden_state (raw embedding for residual) and
@@ -883,7 +884,7 @@ impl MetalInference {
             let row_bytes_kv = (mc.num_kv_heads() * mc.head_dim) * 2;
 
             let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
             // Q / K / V projections
             let qkv_out_features = mc.num_attention_heads * mc.head_dim;
@@ -981,7 +982,7 @@ impl MetalInference {
                 mc.num_attention_heads * mc.head_dim,
                 row_bytes_qo,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             encode_projection(
                 &enc,
                 &bufs.attn_out,
@@ -1081,13 +1082,13 @@ impl MetalInference {
             enc.end_encoding();
             let final_norm_mat =
                 MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let lm_head_weight_mat =
                 MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let logits_mat =
                 MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
             matmuls
                 .lm_head
                 .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
@@ -1115,7 +1116,7 @@ impl MetalInference {
             self.logits_fp16_buf.resize(logits_byte_count, 0);
             bufs.logits
                 .read_bytes(&mut self.logits_fp16_buf, last_token_offset)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
             self.logits_fp16_buf
                 .chunks_exact(2)
@@ -1138,7 +1139,7 @@ impl MetalInference {
         if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
             mla_kv
                 .advance_by(token_count)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
         }
 
         Ok(logits)
@@ -1179,7 +1180,7 @@ impl MetalInference {
             .as_mut()
             .ok_or(InferenceError::NotLoaded)?
             .ensure_capacity(&self.device, token_ids.len(), &mc)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let bufs = self
             .intermediate_buffers
@@ -1196,7 +1197,7 @@ impl MetalInference {
             .checked_add(token_count)
             .is_none_or(|end| end > self.config.max_seq_len)
         {
-            return Err(InferenceError::Runtime(format!(
+            return Err(InferenceError::runtime(format!(
                 "sequence position {} + token count {} exceeds max_seq_len {}",
                 seq_pos, token_count, self.config.max_seq_len,
             )));
@@ -1218,19 +1219,19 @@ impl MetalInference {
             .is_none_or(|c| c.token_count != token_count);
         if need_rebuild {
             let cache = Self::build_matmul_cache(&self.device, &mc, weights, token_count)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.decode_matmuls = Some(cache);
         }
         let matmuls = self
             .decode_matmuls
             .as_ref()
-            .ok_or_else(|| InferenceError::Runtime("decode_matmuls not populated".into()))?;
+            .ok_or_else(|| InferenceError::runtime("decode_matmuls not populated".into()))?;
 
         // Write token IDs to GPU buffer.
         let token_bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
         bufs.token_ids_buf
             .write_bytes(&token_bytes, 0)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         // Reusable readback buffer for norm_out: token_count × hidden_size × 2 bytes (FP16).
         let norm_readback_bytes = token_count * h * 2;
@@ -1243,11 +1244,11 @@ impl MetalInference {
         let cmd_buf = self
             .queue
             .command_buffer()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         {
             let enc = cmd_buf
                 .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             ops::encode_embedding_lookup(
                 &enc,
                 &self.pipelines()?.embedding_lookup,
@@ -1268,7 +1269,7 @@ impl MetalInference {
             let lw0 = &weights.layers[0];
             let enc = cmd_buf
                 .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
                 &self.pipelines()?.rms_norm,
@@ -1315,7 +1316,7 @@ impl MetalInference {
                 };
                 bufs.norm_out
                     .read_bytes(readback, 0)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
                 layer_callback(layer_idx, "attn_norm", readback);
             }
@@ -1324,10 +1325,10 @@ impl MetalInference {
             let cmd_buf = self
                 .queue
                 .command_buffer()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let enc = cmd_buf
                 .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
 
             // Steps 3-5: Q/K/V projections
@@ -1336,7 +1337,7 @@ impl MetalInference {
             let row_bytes_kv = (mc.num_kv_heads() * mc.head_dim) * 2;
 
             let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
             let qkv_out_features = mc.num_attention_heads * mc.head_dim;
             let kv_out_features = mc.num_kv_heads() * mc.head_dim;
@@ -1433,7 +1434,7 @@ impl MetalInference {
                 mc.num_attention_heads * mc.head_dim,
                 row_bytes_qo,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             encode_projection(
                 &enc,
                 &bufs.attn_out,
@@ -1491,7 +1492,7 @@ impl MetalInference {
                 };
                 bufs.norm_out
                     .read_bytes(readback, 0)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
                 layer_callback(layer_idx, "ffn_norm", readback);
             }
@@ -1500,10 +1501,10 @@ impl MetalInference {
             let cmd_buf = self
                 .queue
                 .command_buffer()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let enc = cmd_buf
                 .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
 
             // Steps 12-15: FFN block (gate + up + SiLU + down)
@@ -1537,13 +1538,13 @@ impl MetalInference {
         let cmd_buf = self
             .queue
             .command_buffer()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         // Step 17: Final RMSNorm
         {
             let enc = cmd_buf
                 .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
                 &self.pipelines()?.rms_norm,
@@ -1567,7 +1568,7 @@ impl MetalInference {
         if let Some(ref packed_buf) = weights.lm_head_packed {
             let enc = cmd_buf
                 .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
             let lm_kind = LinearKernelKind::for_token_count(token_count);
             let pipeline = pipelines.dense_linear_pipeline(lm_kind);
@@ -1598,13 +1599,13 @@ impl MetalInference {
             // MPS fallback — only reached when packed weights are absent.
             let final_norm_mat =
                 MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let lm_head_weight_mat =
                 MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let logits_mat =
                 MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
             matmuls
                 .lm_head
                 .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
@@ -1628,7 +1629,7 @@ impl MetalInference {
         let mut logits_fp16 = vec![0u8; logits_byte_count];
         bufs.logits
             .read_bytes(&mut logits_fp16, last_token_offset)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let logits: Vec<f32> = logits_fp16
             .chunks_exact(2)
@@ -1663,7 +1664,7 @@ impl MetalInference {
         if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
             mla_kv
                 .advance_by(token_count)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
         }
 
         Ok(logits)
@@ -1870,7 +1871,7 @@ fn encode_polarquant_projection(
 
     let pipeline = pipelines
         .polarquant_pipeline(weight.n_bits, kind)
-        .ok_or_else(|| InferenceError::Runtime(format!("unsupported n_bits: {}", weight.n_bits)))?;
+        .ok_or_else(|| InferenceError::runtime(format!("unsupported n_bits: {}", weight.n_bits)))?;
 
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(input, 0, 0);
@@ -1921,7 +1922,7 @@ fn encode_affine_projection(
     let pipeline = pipelines
         .affine_pipeline(weight.bit_width, kind)
         .ok_or_else(|| {
-            InferenceError::Runtime(format!(
+            InferenceError::runtime(format!(
                 "unsupported affine bit_width: {}",
                 weight.bit_width
             ))
@@ -2097,10 +2098,10 @@ fn encode_kv_cache_and_attention(
 
     if enable_tq {
         let tq = turboquant.ok_or_else(|| {
-            InferenceError::Runtime("turboquant must be initialized when enable_tq is true".into())
+            InferenceError::runtime("turboquant must be initialized when enable_tq is true".into())
         })?;
         let kv = kv_cache.ok_or_else(|| {
-            InferenceError::Runtime("kv_cache must be initialized when enable_tq is true".into())
+            InferenceError::runtime("kv_cache must be initialized when enable_tq is true".into())
         })?;
 
         if let Some(ref outlier) = tq.outlier {
@@ -2314,7 +2315,7 @@ fn encode_kv_cache_and_attention(
     } else {
         // FP16 KV cache path — scatter projections into cache on GPU.
         let fp16_kv = fp16_kv_cache.ok_or_else(|| {
-            InferenceError::Runtime(
+            InferenceError::runtime(
                 "fp16_kv_cache must be initialized for FP16 KV cache path".into(),
             )
         })?;
@@ -2393,7 +2394,7 @@ fn encode_ffn_block(
     let row_bytes_inter = inter * 2;
 
     let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
     // Gate projection
     encode_projection(
@@ -2443,7 +2444,7 @@ fn encode_ffn_block(
 
     // Down projection
     let gate_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
-        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        .map_err(|e| InferenceError::runtime(e.to_string()))?;
     encode_projection(
         enc,
         &bufs.ffn_gate,
@@ -2637,7 +2638,7 @@ impl InferenceEngine for MetalInference {
         let gpu_artifacts = artifacts
             .downcast_ref::<MetalArtifacts<'_>>()
             .ok_or_else(|| {
-                InferenceError::Runtime("MetalInference::load expects MetalArtifacts".into())
+                InferenceError::runtime("MetalInference::load expects MetalArtifacts".into())
             })?;
 
         self.config = gpu_artifacts.config.clone();
@@ -2648,7 +2649,7 @@ impl InferenceEngine for MetalInference {
             gpu_artifacts.weights,
             self.config.force_cpu_dequant,
         )
-        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
@@ -2659,13 +2660,13 @@ impl InferenceEngine for MetalInference {
         // Compile Metal shader pipelines with the model's head_dim so
         // shared memory is sized exactly via #define HEAD_DIM.
         let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
 
         // Allocate intermediate buffers (start at 1 token; run_pipeline_inner
         // grows them on demand for larger prefill batches).
         let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.intermediate_buffers = Some(bufs);
 
         // Build RoPE cos/sin caches.
@@ -2675,13 +2676,13 @@ impl InferenceEngine for MetalInference {
             self.config.max_seq_len,
             mc.rope_theta,
         )
-        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.rope_cos = Some(cos);
         self.rope_sin = Some(sin);
 
         // Build MPS matmul cache for single-token decode.
         let decode_cache_t1 = Self::build_matmul_cache(&self.device, &mc, &weights, 1)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
 
@@ -2696,8 +2697,7 @@ impl InferenceEngine for MetalInference {
             let cla = super::config::ClaConfig {
                 anchor_layers: anchors.clone(),
             };
-            cla.validate(mc.num_hidden_layers)
-                .map_err(|e| InferenceError::Runtime(format!("CLA config invalid: {e}")))?;
+            cla.validate(mc.num_hidden_layers)?;
         }
         // Back-fill cla_config so is_anchor checks during inference see the
         // metadata-derived anchors, not the absent user config.
@@ -2719,7 +2719,7 @@ impl InferenceEngine for MetalInference {
                 mc.hidden_size,
                 gpu_artifacts.weights,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
             let mla_cache = MlaKvCache::new(
                 &self.device,
@@ -2727,7 +2727,7 @@ impl InferenceEngine for MetalInference {
                 mc.num_hidden_layers,
                 self.config.max_seq_len,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.mla_kv_cache = Some(mla_cache);
         } else {
             self.mla_kv_cache = None;
@@ -2763,9 +2763,9 @@ impl InferenceEngine for MetalInference {
                 window_sizes: layer_window_sizes.clone(),
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let kv_cache = MetalKvCache::new(&self.device, &tq_config)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.turboquant = Some(tq_model);
             self.kv_cache = Some(kv_cache);
             self.fp16_kv_cache = None;
@@ -2779,7 +2779,7 @@ impl InferenceEngine for MetalInference {
                 cla_anchors.clone(),
                 &layer_window_sizes,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.fp16_kv_cache = Some(fp16_kv);
             self.turboquant = None;
             self.kv_cache = None;

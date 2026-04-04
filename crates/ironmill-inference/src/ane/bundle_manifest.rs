@@ -23,6 +23,7 @@ pub struct BundleManifest {
     pub decode: Option<DecodeManifest>,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BundleModelType {

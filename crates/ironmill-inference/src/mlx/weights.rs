@@ -19,6 +19,7 @@ use crate::weight_loading::{
 
 /// A weight buffer that is either dense FP16 or packed quantized data
 /// (PolarQuant LUT indices + norms).
+#[non_exhaustive]
 pub enum MlxWeightBuffer {
     /// Dense FP16 weight array.
     Dense(MlxArray),

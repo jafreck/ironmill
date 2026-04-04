@@ -5,6 +5,7 @@
 //! remaining channels use fewer bits.
 
 /// Outlier channel configuration for mixed-precision quantization.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OutlierConfig {
     /// Indices of outlier channels in the original KV dimension space.

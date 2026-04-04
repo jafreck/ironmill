@@ -65,7 +65,9 @@ pub struct MlxInference {
 impl MlxInference {
     /// Create a new MLX inference engine with the given configuration.
     pub fn new(config: MlxConfig) -> Result<Self, MlxError> {
-        config.validate().map_err(MlxError::Config)?;
+        config
+            .validate()
+            .map_err(|e| MlxError::Config(e.to_string()))?;
         Ok(Self {
             stream: None,
             weights: None,
@@ -691,18 +693,18 @@ impl InferenceEngine for MlxInference {
         let mlx_artifacts = artifacts
             .downcast_ref::<MlxArtifacts<'_>>()
             .ok_or_else(|| {
-                InferenceError::Runtime("MlxInference::load expects MlxArtifacts".into())
+                InferenceError::runtime("MlxInference::load expects MlxArtifacts".into())
             })?;
 
         self.config = mlx_artifacts.config.clone();
 
         // Initialize MLX stream.
         let stream = MlxStream::default_gpu()
-            .map_err(|e| InferenceError::Runtime(format!("failed to create MLX stream: {e}")))?;
+            .map_err(|e| InferenceError::runtime(format!("failed to create MLX stream: {e}")))?;
 
         // Load weights into MLX arrays.
         let weights = MlxWeights::load(mlx_artifacts.weights, &stream)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let num_layers = weights.config.num_hidden_layers;
 
@@ -713,7 +715,7 @@ impl InferenceEngine for MlxInference {
         // Initialize TurboQuant if enabled.
         if self.config.enable_turboquant {
             let tq_model = MlxTurboQuantModel::new(&weights.config, &self.config, &stream)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let tq_cache = MlxKvCache::new(
                 &tq_model,
                 weights.config.num_key_value_heads,
@@ -722,7 +724,7 @@ impl InferenceEngine for MlxInference {
                 num_layers,
                 &stream,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.tq_model = Some(tq_model);
             self.tq_cache = Some(tq_cache);
         }

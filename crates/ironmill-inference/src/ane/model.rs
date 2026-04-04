@@ -42,6 +42,7 @@ pub type Result<T> = std::result::Result<T, AneError>;
 // ── Configuration ─────────────────────────────────────────────────
 
 /// Configuration for the ANE runtime backend.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct AneConfig {
     /// Maximum number of compiled programs to cache in memory.

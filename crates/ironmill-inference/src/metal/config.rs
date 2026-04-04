@@ -5,6 +5,7 @@
 /// When configured, only anchor layers maintain their own KV cache buffers.
 /// Non-anchor layers reuse the KV cache of the nearest preceding anchor,
 /// reducing KV memory by up to 2×.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ClaConfig {
     /// Which layers are "anchor" layers that store their own KV cache.
@@ -20,31 +21,35 @@ impl ClaConfig {
     }
 
     /// Validate the CLA configuration against the model's layer count.
-    pub fn validate(&self, num_layers: usize) -> Result<(), String> {
+    pub fn validate(&self, num_layers: usize) -> Result<(), crate::engine::InferenceError> {
         if self.anchor_layers.is_empty() {
-            return Err("anchor_layers must not be empty".to_string());
+            return Err(crate::engine::InferenceError::runtime(
+                "anchor_layers must not be empty",
+            ));
         }
         // Must be sorted and deduplicated.
         for w in self.anchor_layers.windows(2) {
             if w[0] >= w[1] {
-                return Err(format!(
+                return Err(crate::engine::InferenceError::runtime(format!(
                     "anchor_layers must be sorted and unique, found {} before {}",
                     w[0], w[1]
-                ));
+                )));
             }
         }
         // All indices must be valid layer indices.
         if let Some(&last) = self.anchor_layers.last() {
             if last >= num_layers {
-                return Err(format!(
+                return Err(crate::engine::InferenceError::runtime(format!(
                     "anchor layer index {} >= num_layers {}",
                     last, num_layers
-                ));
+                )));
             }
         }
         // Layer 0 must be an anchor (first layer has no preceding anchor).
         if self.anchor_layers[0] != 0 {
-            return Err("layer 0 must be an anchor layer".to_string());
+            return Err(crate::engine::InferenceError::runtime(
+                "layer 0 must be an anchor layer",
+            ));
         }
         Ok(())
     }
@@ -55,6 +60,7 @@ impl ClaConfig {
 /// When configured, layers below `max_window_layers` use sliding window
 /// attention with a bounded KV cache (ring buffer of `window_size` entries),
 /// while layers at or above `max_window_layers` use full attention.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SlidingWindowConfig {
     /// Number of recent tokens each SWA layer attends to (e.g. 4096).
@@ -65,6 +71,7 @@ pub struct SlidingWindowConfig {
 }
 
 /// Configuration for the Metal GPU inference backend.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct MetalConfig {
     /// Maximum sequence length for KV cache allocation.
@@ -120,17 +127,66 @@ impl Default for MetalConfig {
 }
 
 impl MetalConfig {
-    /// Validate configuration. Returns an error message if invalid.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Create a new `MetalConfig` with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the maximum sequence length.
+    pub fn with_max_seq_len(mut self, max_seq_len: usize) -> Self {
+        self.max_seq_len = max_seq_len;
+        self
+    }
+
+    /// Enable TurboQuant KV cache compression with the given bit-width.
+    pub fn with_turboquant(mut self, bits: u8) -> Self {
+        self.enable_turboquant = true;
+        self.n_bits = bits;
+        self
+    }
+
+    /// Enable or disable FlashAttention-2 style prefill.
+    pub fn with_fa2_prefill(mut self, enable: bool) -> Self {
+        self.use_fa2_prefill = enable;
+        self
+    }
+
+    /// Set the Cross-Layer Attention configuration.
+    pub fn with_cla(mut self, cla_config: ClaConfig) -> Self {
+        self.cla_config = Some(cla_config);
+        self
+    }
+
+    /// Set the sliding window attention configuration.
+    pub fn with_sliding_window(mut self, sliding_window: SlidingWindowConfig) -> Self {
+        self.sliding_window = Some(sliding_window);
+        self
+    }
+
+    /// Set the prefill chunk size.
+    pub fn with_prefill_chunks(mut self, chunk_size: usize) -> Self {
+        self.prefill_chunk_size = Some(chunk_size);
+        self
+    }
+
+    /// Validate configuration.
+    pub fn validate(&self) -> Result<(), crate::engine::InferenceError> {
         if self.max_seq_len == 0 {
-            return Err("max_seq_len must be > 0".to_string());
+            return Err(crate::engine::InferenceError::runtime(
+                "max_seq_len must be > 0",
+            ));
         }
         if self.n_bits != 4 && self.n_bits != 8 {
-            return Err(format!("n_bits must be 4 or 8, got {}", self.n_bits));
+            return Err(crate::engine::InferenceError::runtime(format!(
+                "n_bits must be 4 or 8, got {}",
+                self.n_bits
+            )));
         }
         if let Some(ref sw) = self.sliding_window {
             if sw.window_size == 0 {
-                return Err("sliding_window.window_size must be > 0".to_string());
+                return Err(crate::engine::InferenceError::runtime(
+                    "sliding_window.window_size must be > 0",
+                ));
             }
         }
         Ok(())

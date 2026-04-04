@@ -26,6 +26,7 @@ use super::error::MlxError;
 pub type MlxOutlierConfig = OutlierConfig;
 
 /// QJL random projection configuration.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct MlxQjlConfig {
     /// Random projection matrix seed (independent from rotation seed).

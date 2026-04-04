@@ -28,6 +28,7 @@ const MATVEC_ROWS_PER_THREADGROUP: usize = 64;
 /// Whether to dispatch a linear projection as a memory-bandwidth-optimized
 /// matvec (single-token decode) or a compute-optimized batched matmul
 /// (multi-token prefill).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinearKernelKind {
     /// Single-token decode: use matvec kernels optimized for memory bandwidth

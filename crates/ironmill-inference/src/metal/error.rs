@@ -3,6 +3,7 @@
 use ironmill_metal_sys::MetalSysError;
 
 /// Errors from the Metal inference backend.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum MetalError {
     /// Low-level Metal or MPS error.
@@ -36,6 +37,6 @@ pub enum MetalError {
 
 impl From<MetalError> for crate::engine::InferenceError {
     fn from(e: MetalError) -> Self {
-        crate::engine::InferenceError::Runtime(e.to_string())
+        crate::engine::InferenceError::Runtime(Box::new(e))
     }
 }

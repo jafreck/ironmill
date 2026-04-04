@@ -5,6 +5,7 @@ use ironmill_mlx_sys::MlxSysError;
 use crate::engine::InferenceError;
 
 /// Errors from the MLX inference backend.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum MlxError {
     /// Low-level MLX FFI error.
@@ -26,6 +27,6 @@ pub enum MlxError {
 
 impl From<MlxError> for InferenceError {
     fn from(e: MlxError) -> Self {
-        InferenceError::Runtime(e.to_string())
+        InferenceError::Runtime(Box::new(e))
     }
 }

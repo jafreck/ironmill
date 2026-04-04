@@ -5,6 +5,7 @@
 /// Controls sequence length limits, prefill chunking, TurboQuant
 /// quantized KV cache settings, and optimization knobs for eval
 /// placement, async prefill, memory management, and profiling.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct MlxConfig {
     /// Maximum sequence length for KV cache allocation.
@@ -64,21 +65,30 @@ impl Default for MlxConfig {
 }
 
 impl MlxConfig {
-    /// Validate configuration. Returns an error message if invalid.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Validate configuration.
+    pub fn validate(&self) -> Result<(), crate::engine::InferenceError> {
         if self.max_seq_len == 0 {
-            return Err("max_seq_len must be > 0".into());
+            return Err(crate::engine::InferenceError::runtime(
+                "max_seq_len must be > 0",
+            ));
         }
         if self.n_bits != 4 && self.n_bits != 8 {
-            return Err(format!("n_bits must be 4 or 8, got {}", self.n_bits));
+            return Err(crate::engine::InferenceError::runtime(format!(
+                "n_bits must be 4 or 8, got {}",
+                self.n_bits
+            )));
         }
         if let Some(chunk) = self.prefill_chunk_size {
             if chunk == 0 {
-                return Err("prefill_chunk_size must be > 0".into());
+                return Err(crate::engine::InferenceError::runtime(
+                    "prefill_chunk_size must be > 0",
+                ));
             }
         }
         if self.turboquant_eval_interval == 0 {
-            return Err("turboquant_eval_interval must be >= 1".into());
+            return Err(crate::engine::InferenceError::runtime(
+                "turboquant_eval_interval must be >= 1",
+            ));
         }
         Ok(())
     }

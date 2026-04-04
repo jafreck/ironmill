@@ -35,17 +35,17 @@ pub fn load_spec_bundle(path: &Path) -> Result<DraftHead, InferenceError> {
     let weights_path = path.join("weights.bin");
 
     let manifest_data = std::fs::read_to_string(&manifest_path).map_err(|e| {
-        InferenceError::Runtime(format!(
+        InferenceError::runtime(format!(
             "failed to read spec bundle manifest at {}: {e}",
             manifest_path.display()
         ))
     })?;
 
     let manifest: SpecManifest = serde_json::from_str(&manifest_data)
-        .map_err(|e| InferenceError::Runtime(format!("invalid spec bundle manifest: {e}")))?;
+        .map_err(|e| InferenceError::runtime(format!("invalid spec bundle manifest: {e}")))?;
 
     let weight_bytes = std::fs::read(&weights_path).map_err(|e| {
-        InferenceError::Runtime(format!(
+        InferenceError::runtime(format!(
             "failed to read spec bundle weights at {}: {e}",
             weights_path.display()
         ))
@@ -54,7 +54,7 @@ pub fn load_spec_bundle(path: &Path) -> Result<DraftHead, InferenceError> {
     let elements_per_layer = manifest.hidden_dim * manifest.vocab_size;
     let expected_bytes = manifest.num_layers * elements_per_layer * 2; // f16 = 2 bytes
     if weight_bytes.len() != expected_bytes {
-        return Err(InferenceError::Runtime(format!(
+        return Err(InferenceError::runtime(format!(
             "spec bundle weight size mismatch: expected {expected_bytes} bytes, got {}",
             weight_bytes.len()
         )));

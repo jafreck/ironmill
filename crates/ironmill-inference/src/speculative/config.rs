@@ -4,6 +4,7 @@
 ///
 /// Controls the tree search depth, branching factor, and acceptance
 /// threshold used by the [`SpeculativeEngine`](super::SpeculativeEngine).
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SpecConfig {
     /// Maximum tokens the draft head may propose per speculation round.
@@ -30,6 +31,7 @@ impl Default for SpecConfig {
 /// TurboSpec dynamically tunes [`SpecConfig`] parameters (depth, width,
 /// acceptance threshold) based on observed acceptance rates, using an
 /// exponential moving average (EMA) to smooth noisy per-round signals.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TurboSpecConfig {
     /// Starting speculation depth.

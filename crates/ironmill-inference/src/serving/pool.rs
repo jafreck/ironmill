@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use crate::engine::{InferenceError, SequenceId};
 
 /// A contiguous sub-allocation within the KV cache pool.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct KvAllocation {
     /// Byte offset into the backing buffer.

@@ -24,6 +24,7 @@ use crate::engine::{InferenceEngine, InferenceError};
 // ── Configuration ───────────────────────────────────────────────
 
 /// Configuration for speculative streaming.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct StreamingConfig {
     /// Number of speculative streams (positions predicted ahead).

@@ -24,6 +24,7 @@ use ironmill_iosurface::AneTensor;
 /// Controls runtime KV cache quantization using rotation + Lloyd-Max
 /// codebook quantization. Storage format is INT8 (1 byte/element);
 /// `n_bits` controls the number of distinct quantization levels.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct TurboQuantConfig {
     /// Number of quantization bits (1, 2, 4, 6, or 8).

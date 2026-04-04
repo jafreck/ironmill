@@ -11,6 +11,7 @@ use crate::weight_loading::{
 };
 
 /// A weight buffer that is either dense FP16 or packed quantized data.
+#[non_exhaustive]
 pub enum WeightBuffer {
     /// Dense FP16 buffer for MPS matmul, with an optional pre-packed blocked
     /// buffer for the custom matvec kernel (decode path, M=1).

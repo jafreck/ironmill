@@ -121,6 +121,7 @@ pub fn apply_token_mask(logits: &mut [f32], mask: &TokenMask) {
 // ---------------------------------------------------------------------------
 
 /// Sampler configuration.
+#[non_exhaustive]
 pub struct SamplerConfig {
     /// Temperature for logit scaling. 0.0 = greedy (argmax).
     pub temperature: f32,
@@ -143,8 +144,8 @@ pub struct SamplerConfig {
 impl Default for SamplerConfig {
     fn default() -> Self {
         SamplerConfig {
-            temperature: 0.7,
-            min_p: 0.05,
+            temperature: 1.0,
+            min_p: 0.0,
             top_k: 0,
             top_p: 1.0,
             repeat_penalty: 1.0,
@@ -152,6 +153,53 @@ impl Default for SamplerConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
         }
+    }
+}
+
+impl SamplerConfig {
+    /// Create a greedy sampler (temperature = 0, all filtering disabled).
+    pub fn greedy() -> Self {
+        SamplerConfig {
+            temperature: 0.0,
+            min_p: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+            repeat_window: 64,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+        }
+    }
+
+    /// Set the temperature.
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    /// Set the top-p (nucleus) filtering threshold.
+    pub fn with_top_p(mut self, top_p: f32) -> Self {
+        self.top_p = top_p;
+        self
+    }
+
+    /// Set the top-k filtering count.
+    pub fn with_top_k(mut self, top_k: usize) -> Self {
+        self.top_k = top_k;
+        self
+    }
+
+    /// Set the min-p threshold.
+    pub fn with_min_p(mut self, min_p: f32) -> Self {
+        self.min_p = min_p;
+        self
+    }
+
+    /// Set the repetition penalty and window size.
+    pub fn with_repeat_penalty(mut self, penalty: f32, window: usize) -> Self {
+        self.repeat_penalty = penalty;
+        self.repeat_window = window;
+        self
     }
 }
 
@@ -459,8 +507,8 @@ mod tests {
     #[test]
     fn sampler_config_defaults() {
         let c = SamplerConfig::default();
-        assert_eq!(c.temperature, 0.7);
-        assert_eq!(c.min_p, 0.05);
+        assert_eq!(c.temperature, 1.0);
+        assert_eq!(c.min_p, 0.0);
         assert_eq!(c.top_k, 0);
         assert_eq!(c.top_p, 1.0);
         assert_eq!(c.repeat_penalty, 1.0);

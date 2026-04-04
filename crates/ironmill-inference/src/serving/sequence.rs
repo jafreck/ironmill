@@ -4,6 +4,7 @@ use crate::engine::SequenceId;
 use crate::serving::pool::KvAllocation;
 
 /// Lifecycle status of an inference sequence.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceStatus {
     /// Prompt tokens are being ingested into the KV cache.
@@ -15,6 +16,7 @@ pub enum SequenceStatus {
 }
 
 /// State of a single inference sequence within the batch scheduler.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SequenceState {
     /// Unique identifier for this sequence.

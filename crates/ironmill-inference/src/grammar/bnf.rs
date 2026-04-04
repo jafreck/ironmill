@@ -22,6 +22,7 @@ use std::fmt;
 // ── AST types ────────────────────────────────────────────────────
 
 /// A grammar element (AST node).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Element {
     /// Literal string, e.g. `"true"`.
@@ -62,6 +63,7 @@ pub struct Grammar {
 // ── Errors ───────────────────────────────────────────────────────
 
 /// Errors that can occur during grammar parsing.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrammarError {
     /// No rules found in the input.

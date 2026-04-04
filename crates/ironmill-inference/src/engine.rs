@@ -10,11 +10,12 @@ use crate::types::Logits;
 pub type SequenceId = u64;
 
 /// Errors from the inference engine.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum InferenceError {
     /// Runtime error (compilation, loading, execution).
     #[error("runtime error: {0}")]
-    Runtime(String),
+    Runtime(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// Decode step error.
     #[error("decode error: {0}")]
@@ -39,6 +40,14 @@ pub enum InferenceError {
     /// A generic error from an underlying operation.
     #[error("{0}")]
     Other(#[from] anyhow::Error),
+}
+
+impl InferenceError {
+    /// Create a runtime error from any displayable message.
+    pub fn runtime(msg: impl Into<String>) -> Self {
+        let s: String = msg.into();
+        InferenceError::Runtime(s.into())
+    }
 }
 
 /// Autoregressive inference engine.

@@ -81,6 +81,7 @@ pub mod coreml_runtime {
 use ironmill_iosurface::IOSurfaceError;
 
 /// Errors from the ANE runtime backend.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum AneError {
     /// ANE compilation failed with a status code.

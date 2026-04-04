@@ -11,6 +11,7 @@ use std::fmt;
 // ---------------------------------------------------------------------------
 
 /// Element data type for runtime tensors.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementType {
     Float32,
@@ -46,6 +47,7 @@ impl ElementType {
 ///
 /// This is a simple owned buffer — backends convert to/from their native
 /// tensor representations (e.g. `MLMultiArray`, IOSurface-backed buffers).
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RuntimeTensor {
     /// Feature name (matches model input/output descriptions).
@@ -82,6 +84,7 @@ impl RuntimeTensor {
 // ---------------------------------------------------------------------------
 
 /// Description of a single model input feature.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InputFeatureDesc {
     /// Feature name.
