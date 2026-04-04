@@ -41,6 +41,10 @@ pub struct LoadedLayer<D, W> {
     pub q_norm: Option<D>,
     /// Optional K normalization weight `[head_dim]` (Qwen3 QK norm).
     pub k_norm: Option<D>,
+    // TODO: MoE expert weights (when enable_moe is true):
+    // pub router_weight: Option<W>,
+    // pub expert_weights: Vec<ExpertWeights>,  // num_experts entries
+    // Adding actual fields requires updating weight loading in WeightVisitor.
 }
 
 /// Core model weights returned by [`load_model_weights`].

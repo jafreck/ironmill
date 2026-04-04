@@ -418,6 +418,13 @@ impl MetalInference {
         self.model_info = Some(ModelInfo::from_config(&mc));
         self.gemma4_config = Gemma4Config::from_model_config(&mc);
 
+        if let Some(ref g4) = self.gemma4_config {
+            if g4.num_experts > 0 {
+                // MoE expert weights are loaded into the IR but GPU dispatch
+                // is not yet implemented. The model will run without MoE contribution.
+            }
+        }
+
         // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
         self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);
 
@@ -1058,6 +1065,24 @@ impl MetalInference {
             encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, inter, token_count)?;
             enc.memory_barrier_buffers();
 
+            // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
+            // with MoE expert outputs. Currently a no-op placeholder — MoE dispatch
+            // requires new Metal kernels for router softmax + expert combine.
+            if let Some(ref g4) = self.gemma4_config {
+                let lc = &g4.layer_configs[layer_idx];
+                if lc.enable_moe && g4.num_experts > 0 {
+                    // TODO: Implement MoE inference dispatch:
+                    // 1. Router: linear(hidden → num_experts) + softmax
+                    // 2. Dense eval: run all expert FFNs (gate+up+gelu+down each)
+                    // 3. Weighted combine: top-k selection + weighted sum
+                    // 4. Add to dense MLP output
+                    //
+                    // For now, the dense MLP output alone is used. MoE experts
+                    // are compiled into the IR but not dispatched at inference.
+                    // This produces correct structure but missing MoE contribution.
+                }
+            }
+
             // Step 16: Residual add + next layer's input norm (or standalone for last layer)
             let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
                 Some(&weights.layers[layer_idx + 1].input_norm)
@@ -1566,6 +1591,24 @@ impl MetalInference {
             // Steps 12-15: FFN block (gate + up + SiLU + down)
             encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, inter, token_count)?;
             enc.memory_barrier_buffers();
+
+            // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
+            // with MoE expert outputs. Currently a no-op placeholder — MoE dispatch
+            // requires new Metal kernels for router softmax + expert combine.
+            if let Some(ref g4) = self.gemma4_config {
+                let lc = &g4.layer_configs[layer_idx];
+                if lc.enable_moe && g4.num_experts > 0 {
+                    // TODO: Implement MoE inference dispatch:
+                    // 1. Router: linear(hidden → num_experts) + softmax
+                    // 2. Dense eval: run all expert FFNs (gate+up+gelu+down each)
+                    // 3. Weighted combine: top-k selection + weighted sum
+                    // 4. Add to dense MLP output
+                    //
+                    // For now, the dense MLP output alone is used. MoE experts
+                    // are compiled into the IR but not dispatched at inference.
+                    // This produces correct structure but missing MoE contribution.
+                }
+            }
 
             // Step 16: Residual add + next layer's input norm (or standalone for last layer)
             let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
@@ -2867,6 +2910,13 @@ impl InferenceEngine for MetalInference {
         let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
         self.gemma4_config = Gemma4Config::from_model_config(&mc);
+
+        if let Some(ref g4) = self.gemma4_config {
+            if g4.num_experts > 0 {
+                // MoE expert weights are loaded into the IR but GPU dispatch
+                // is not yet implemented. The model will run without MoE contribution.
+            }
+        }
 
         // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
         self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);
