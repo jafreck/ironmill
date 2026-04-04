@@ -18,6 +18,7 @@ use super::error::MlxError;
 use super::turboquant::{MlxKvCache, MlxTurboQuantModel};
 use super::weights::{MlxWeightBuffer, MlxWeights};
 use crate::engine::{InferenceEngine, InferenceError};
+use crate::model_info::ModelInfo;
 use crate::types::Logits;
 
 // ── PolarQuant kernel source ────────────────────────────────────
@@ -60,6 +61,8 @@ pub struct MlxInference {
     profile_eval_count: usize,
     /// Profiling: cumulative time spent in eval() calls.
     profile_eval_duration: std::time::Duration,
+    /// Cached model info, populated during `load()`.
+    model_info: Option<ModelInfo>,
 }
 
 impl MlxInference {
@@ -79,6 +82,7 @@ impl MlxInference {
             tq_cache: None,
             profile_eval_count: 0,
             profile_eval_duration: std::time::Duration::ZERO,
+            model_info: None,
         })
     }
 
@@ -113,6 +117,7 @@ impl MlxInference {
         }
 
         self.stream = Some(stream);
+        self.model_info = Some(ModelInfo::from_config(&loaded.config));
         self.weights = Some(loaded);
         self.seq_pos = 0;
 
@@ -730,6 +735,7 @@ impl InferenceEngine for MlxInference {
         }
 
         self.stream = Some(stream);
+        self.model_info = Some(ModelInfo::from_config(&weights.config));
         self.weights = Some(weights);
         self.seq_pos = 0;
 
@@ -806,5 +812,11 @@ impl InferenceEngine for MlxInference {
         if let Some(ref mut tq_cache) = self.tq_cache {
             tq_cache.truncate_to(pos);
         }
+    }
+
+    fn model_info(&self) -> &ModelInfo {
+        self.model_info
+            .as_ref()
+            .expect("model_info() called before load()")
     }
 }

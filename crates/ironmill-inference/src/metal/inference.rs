@@ -27,6 +27,7 @@ use super::weights::{
 };
 use crate::calibration::ActivationHook;
 use crate::engine::{InferenceEngine, InferenceError};
+use crate::model_info::ModelInfo;
 use crate::types::Logits;
 
 // ── Matmul tile dimensions — must match Metal shader constants ──
@@ -353,6 +354,8 @@ pub struct MetalInference {
     /// Pre-allocated buffer for serializing token IDs to GPU.
     token_bytes_buf: Vec<u8>,
     seq_pos: usize,
+    /// Cached model info, populated during `load()`.
+    model_info: Option<ModelInfo>,
 }
 
 impl MetalInference {
@@ -389,6 +392,7 @@ impl MetalInference {
             logits_fp16_buf: Vec::new(),
             token_bytes_buf: Vec::new(),
             seq_pos: 0,
+            model_info: None,
         })
     }
 
@@ -406,6 +410,7 @@ impl MetalInference {
 
         let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
+        self.model_info = Some(ModelInfo::from_config(&mc));
 
         // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
         self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);
@@ -2653,6 +2658,7 @@ impl InferenceEngine for MetalInference {
 
         let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
+        self.model_info = Some(ModelInfo::from_config(&mc));
 
         // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
         self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);
@@ -2858,6 +2864,12 @@ impl InferenceEngine for MetalInference {
         if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
             mla_kv.truncate_to(pos);
         }
+    }
+
+    fn model_info(&self) -> &ModelInfo {
+        self.model_info
+            .as_ref()
+            .expect("model_info() called before load()")
     }
 }
 

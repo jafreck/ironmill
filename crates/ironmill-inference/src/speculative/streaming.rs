@@ -316,8 +316,28 @@ fn softmax_max(logits: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_info::ModelInfo;
     use crate::types::Logits;
+    use mil_rs::weights::Architecture;
     use std::any::Any;
+
+    fn mock_stream_model_info(vocab_size: usize) -> ModelInfo {
+        ModelInfo {
+            architecture: Architecture::Llama,
+            num_layers: 1,
+            hidden_size: 64,
+            vocab_size,
+            max_context_len: 2048,
+            weight_quantization: String::from("fp16"),
+            eos_tokens: vec![2],
+            param_count_m: 1.0,
+            uses_gqa: false,
+            uses_mla: false,
+            head_dim: 64,
+            num_attention_heads: 1,
+            num_kv_heads: 1,
+        }
+    }
 
     /// Minimal mock engine for testing speculative streaming.
     struct MockStreamEngine {
@@ -325,6 +345,7 @@ mod tests {
         vocab_size: usize,
         /// Fixed token the engine always picks as most likely.
         favored_token: u32,
+        model_info: ModelInfo,
     }
 
     impl MockStreamEngine {
@@ -333,6 +354,7 @@ mod tests {
                 pos: 0,
                 vocab_size,
                 favored_token,
+                model_info: mock_stream_model_info(vocab_size),
             }
         }
     }
@@ -371,6 +393,10 @@ mod tests {
         fn truncate_to(&mut self, pos: usize) {
             assert!(pos <= self.pos);
             self.pos = pos;
+        }
+
+        fn model_info(&self) -> &ModelInfo {
+            &self.model_info
         }
     }
 

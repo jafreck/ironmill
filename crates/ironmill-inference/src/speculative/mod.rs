@@ -318,19 +318,44 @@ pub fn speculative_decode<E: InferenceEngine>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_info::ModelInfo;
     use crate::sampling::SamplerConfig;
     use crate::types::Logits;
+    use mil_rs::weights::Architecture;
     use std::any::Any;
+
+    fn mock_model_info(vocab_size: usize) -> ModelInfo {
+        ModelInfo {
+            architecture: Architecture::Llama,
+            num_layers: 1,
+            hidden_size: 64,
+            vocab_size,
+            max_context_len: 2048,
+            weight_quantization: String::from("fp16"),
+            eos_tokens: vec![2],
+            param_count_m: 1.0,
+            uses_gqa: false,
+            uses_mla: false,
+            head_dim: 64,
+            num_attention_heads: 1,
+            num_kv_heads: 1,
+        }
+    }
 
     /// Minimal mock engine for testing speculative decoding.
     struct MockEngine {
         pos: usize,
         vocab_size: usize,
+        model_info: ModelInfo,
     }
 
     impl MockEngine {
         fn new(vocab_size: usize) -> Self {
-            Self { pos: 0, vocab_size }
+            Self {
+                pos: 0,
+                vocab_size,
+                model_info: mock_model_info(vocab_size),
+            }
         }
     }
 
@@ -369,6 +394,10 @@ mod tests {
         fn truncate_to(&mut self, pos: usize) {
             assert!(pos <= self.pos);
             self.pos = pos;
+        }
+
+        fn model_info(&self) -> &ModelInfo {
+            &self.model_info
         }
     }
 

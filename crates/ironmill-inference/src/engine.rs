@@ -4,6 +4,8 @@
 //! inference across backends (ANE direct, CoreML, etc.).
 
 use crate::cache::{KvCacheSlice, KvLayerSlice, PrefixCache};
+use crate::memory::MemoryUsage;
+use crate::model_info::ModelInfo;
 use crate::types::Logits;
 
 /// Unique identifier for a sequence in batch inference.
@@ -74,6 +76,19 @@ pub trait InferenceEngine {
 
     /// Truncate KV cache to the given position, discarding tokens after `pos`.
     fn truncate_to(&mut self, pos: usize);
+
+    /// Maximum sequence length this engine supports.
+    fn max_seq_len(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Model info for this loaded engine (see §4.13).
+    fn model_info(&self) -> &ModelInfo;
+
+    /// Current memory usage. Returns `None` if the backend doesn't track memory.
+    fn memory_usage(&self) -> Option<MemoryUsage> {
+        None
+    }
 }
 
 /// Batch inference engine for concurrent sequence processing.

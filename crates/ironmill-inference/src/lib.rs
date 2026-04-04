@@ -16,11 +16,14 @@ pub mod coreml;
 #[cfg(any(feature = "metal", feature = "mlx"))]
 mod dequant;
 pub mod engine;
+pub mod generate;
 pub mod grammar;
+pub mod memory;
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(feature = "mlx")]
 pub mod mlx;
+pub mod model_info;
 pub mod sampling;
 pub mod serving;
 pub mod speculative;
@@ -36,9 +39,15 @@ pub use engine::{
     BatchInferenceEngine, ConstrainedDecoder, InferenceEngine, InferenceError, SequenceId,
     prefill_with_cache,
 };
+pub use generate::{
+    CancellationToken, FinishReason, GenerateError, GenerateEvent, GenerateRequest, GenerateResult,
+    TokenStream, generate, generate_with_callback,
+};
 pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
+pub use memory::{KvQuantLevel, MemoryEstimator, MemoryUsage, QuantLevel};
 #[cfg(feature = "mlx")]
 pub use mlx::{MlxArtifacts, MlxConfig, MlxInference};
+pub use model_info::ModelInfo;
 pub use sampling::{
     DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, apply_token_mask, is_eos_token, sample_token,
 };

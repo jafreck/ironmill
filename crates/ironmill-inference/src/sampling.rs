@@ -122,6 +122,7 @@ pub fn apply_token_mask(logits: &mut [f32], mask: &TokenMask) {
 
 /// Sampler configuration.
 #[non_exhaustive]
+#[derive(Debug, Clone)]
 pub struct SamplerConfig {
     /// Temperature for logit scaling. 0.0 = greedy (argmax).
     pub temperature: f32,
