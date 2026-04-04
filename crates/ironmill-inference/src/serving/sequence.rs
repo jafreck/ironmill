@@ -7,6 +7,8 @@ use crate::serving::pool::KvAllocation;
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceStatus {
+    /// Sequence is queued and waiting for scheduling.
+    Waiting,
     /// Prompt tokens are being ingested into the KV cache.
     Prefilling,
     /// Autoregressive token generation is in progress.

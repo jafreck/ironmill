@@ -18,6 +18,8 @@ pub enum ComputeUnit {
     Ane,
     /// GPU — fallback for ops the ANE can't handle efficiently.
     Gpu,
+    /// CUDA GPU — for NVIDIA hardware.
+    Cuda,
     /// CPU — general fallback.
     Cpu,
     /// Let the runtime decide (no preference).
@@ -29,6 +31,7 @@ impl fmt::Display for ComputeUnit {
         match self {
             ComputeUnit::Ane => write!(f, "ane"),
             ComputeUnit::Gpu => write!(f, "gpu"),
+            ComputeUnit::Cuda => write!(f, "cuda"),
             ComputeUnit::Cpu => write!(f, "cpu"),
             ComputeUnit::Any => write!(f, "any"),
         }
@@ -42,6 +45,7 @@ impl FromStr for ComputeUnit {
         match s {
             "ane" => Ok(ComputeUnit::Ane),
             "gpu" => Ok(ComputeUnit::Gpu),
+            "cuda" => Ok(ComputeUnit::Cuda),
             "cpu" => Ok(ComputeUnit::Cpu),
             "any" => Ok(ComputeUnit::Any),
             other => Err(format!("unknown compute unit: {other}")),

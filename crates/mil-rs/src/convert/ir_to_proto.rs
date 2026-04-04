@@ -992,6 +992,7 @@ fn convert_operation(
         let cu_str = match cu {
             ComputeUnit::Ane => "ane",
             ComputeUnit::Gpu => "gpu",
+            ComputeUnit::Cuda => "cuda",
             ComputeUnit::Cpu => "cpu",
             ComputeUnit::Any => "any",
         };

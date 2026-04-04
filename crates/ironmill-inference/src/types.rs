@@ -16,7 +16,9 @@ use std::fmt;
 pub enum ElementType {
     Float32,
     Float16,
+    BFloat16,
     Int32,
+    Int8,
     Float64,
 }
 
@@ -25,7 +27,9 @@ impl fmt::Display for ElementType {
         match self {
             Self::Float32 => write!(f, "float32"),
             Self::Float16 => write!(f, "float16"),
+            Self::BFloat16 => write!(f, "bfloat16"),
             Self::Int32 => write!(f, "int32"),
+            Self::Int8 => write!(f, "int8"),
             Self::Float64 => write!(f, "float64"),
         }
     }
@@ -37,7 +41,9 @@ impl ElementType {
         match self {
             Self::Float32 => 4,
             Self::Float16 => 2,
+            Self::BFloat16 => 2,
             Self::Int32 => 4,
+            Self::Int8 => 1,
             Self::Float64 => 8,
         }
     }
