@@ -334,6 +334,9 @@ pub struct MetalInference {
     intermediate_buffers: Option<IntermediateBuffers>,
     rope_cos: Option<MetalBuffer>,
     rope_sin: Option<MetalBuffer>,
+    /// RoPE tables for global (full_attention) layers with different theta.
+    global_rope_cos: Option<MetalBuffer>,
+    global_rope_sin: Option<MetalBuffer>,
     /// MPS matmul cache for prefill (variable token_count > 1).
     decode_matmuls: Option<MpsMatmulCache>,
     /// MPS matmul cache for single-token decode (token_count=1), preserved
@@ -387,6 +390,8 @@ impl MetalInference {
             intermediate_buffers: None,
             rope_cos: None,
             rope_sin: None,
+            global_rope_cos: None,
+            global_rope_sin: None,
             decode_matmuls: None,
             decode_matmuls_t1: None,
             config,
@@ -451,6 +456,26 @@ impl MetalInference {
         .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.rope_cos = Some(cos);
         self.rope_sin = Some(sin);
+
+        // Build global-layer RoPE tables if Gemma 4 uses a different theta.
+        if let Some(ref g4) = self.gemma4_config {
+            if let Some(rp) = mc.rope_parameters() {
+                if let Some(global_cfg) = rp.get("full_attention") {
+                    let global_hd = g4.global_head_dim;
+                    if global_hd != mc.head_dim || global_cfg.theta != mc.rope_theta {
+                        let (gc, gs) = Self::build_rope_cache(
+                            &self.device,
+                            global_hd,
+                            self.config.max_seq_len,
+                            global_cfg.theta,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        self.global_rope_cos = Some(gc);
+                        self.global_rope_sin = Some(gs);
+                    }
+                }
+            }
+        }
 
         let decode_cache_t1 = Self::build_matmul_cache(&self.device, &mc, &weights, 1)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -925,15 +950,15 @@ impl MetalInference {
             // Steps 3-5: Q/K/V projections — dispatch by weight type.
             // These are independent (all read norm_out, write to different buffers).
             let row_bytes_h = h * 2; // FP16
-            let row_bytes_qo = (mc.num_attention_heads * mc.head_dim) * 2;
-            let row_bytes_kv = (mc.num_kv_heads() * mc.head_dim) * 2;
+            let row_bytes_qo = (mc.num_attention_heads * layer_hd as usize) * 2;
+            let row_bytes_kv = (layer_nkv as usize * layer_hd as usize) * 2;
 
             let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
             // Q / K / V projections
-            let qkv_out_features = mc.num_attention_heads * mc.head_dim;
-            let kv_out_features = mc.num_kv_heads() * mc.head_dim;
+            let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
+            let kv_out_features = layer_nkv as usize * layer_hd as usize;
             for (weight, output_buf, matmul, out_features, row_bytes_out) in [
                 (
                     &lw.q_proj,
@@ -975,17 +1000,31 @@ impl MetalInference {
             enc.memory_barrier_buffers();
 
             // Step 6: QK normalization (Qwen3) + RoPE
+            // Select per-layer RoPE tables for Gemma 4 global layers.
+            let (layer_rope_cos, layer_rope_sin) = if let Some(ref g4) = self.gemma4_config {
+                let lc = &g4.layer_configs[layer_idx];
+                if lc.is_global {
+                    (
+                        self.global_rope_cos.as_ref().unwrap_or(rope_cos),
+                        self.global_rope_sin.as_ref().unwrap_or(rope_sin),
+                    )
+                } else {
+                    (rope_cos, rope_sin)
+                }
+            } else {
+                (rope_cos, rope_sin)
+            };
             encode_qk_norm_and_rope(
                 &enc,
                 pipelines,
                 bufs,
                 lw.q_norm.as_ref(),
                 lw.k_norm.as_ref(),
-                rope_cos,
-                rope_sin,
+                layer_rope_cos,
+                layer_rope_sin,
                 nh,
-                nkv,
-                hd,
+                layer_nkv,
+                layer_hd,
                 seq_pos,
                 token_count,
                 eps,
@@ -1021,10 +1060,11 @@ impl MetalInference {
             enc.memory_barrier_buffers();
 
             // Step 9: Output projection
+            let attn_out_features = mc.num_attention_heads * layer_hd as usize;
             let attn_mat = MpsMatrix::from_buffer(
                 &bufs.attn_out,
                 token_count,
-                mc.num_attention_heads * mc.head_dim,
+                attn_out_features,
                 row_bytes_qo,
             )
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -1038,7 +1078,7 @@ impl MetalInference {
                 pipelines,
                 token_count,
                 h,
-                mc.num_attention_heads * mc.head_dim,
+                attn_out_features,
                 row_bytes_qo,
                 row_bytes_h,
             )?;
@@ -1158,12 +1198,21 @@ impl MetalInference {
         }
 
         // Gemma 4: final logit softcapping (softcap * tanh(logits / softcap)).
-        // TODO: dispatch a Metal kernel for element-wise softcapping on the
-        // logits buffer before commit. For now, the config is plumbed through
-        // and the actual kernel dispatch will be added in a follow-up.
         if let Some(ref g4) = self.gemma4_config {
-            if let Some(_softcap) = g4.final_logit_softcapping {
-                // Requires a new Metal kernel or a sequence of element-wise ops.
+            if let Some(softcap) = g4.final_logit_softcapping {
+                let pipelines = self.pipelines()?;
+                let sc_enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                let count = (token_count * vocab) as u32;
+                ops::encode_fused_softcap(
+                    &sc_enc,
+                    &pipelines.fused_softcap,
+                    &bufs.logits,
+                    softcap,
+                    count,
+                );
+                sc_enc.end_encoding();
             }
         }
 
@@ -1375,7 +1424,7 @@ impl MetalInference {
             let lm = &matmuls.layer_matmuls[layer_idx];
 
             // Gemma 4: use per-layer config if available.
-            let (_layer_hd, _layer_nkv, layer_window) = if let Some(ref g4) = self.gemma4_config {
+            let (layer_hd, layer_nkv, layer_window) = if let Some(ref g4) = self.gemma4_config {
                 let lc = &g4.layer_configs[layer_idx];
                 (lc.head_dim as u32, lc.num_kv_heads as u32, lc.window_size)
             } else {
@@ -1414,14 +1463,14 @@ impl MetalInference {
 
             // Steps 3-5: Q/K/V projections
             let row_bytes_h = h * 2;
-            let row_bytes_qo = (mc.num_attention_heads * mc.head_dim) * 2;
-            let row_bytes_kv = (mc.num_kv_heads() * mc.head_dim) * 2;
+            let row_bytes_qo = (mc.num_attention_heads * layer_hd as usize) * 2;
+            let row_bytes_kv = (layer_nkv as usize * layer_hd as usize) * 2;
 
             let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
-            let qkv_out_features = mc.num_attention_heads * mc.head_dim;
-            let kv_out_features = mc.num_kv_heads() * mc.head_dim;
+            let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
+            let kv_out_features = layer_nkv as usize * layer_hd as usize;
             for (weight, output_buf, matmul, out_features, row_bytes_out) in [
                 (
                     &lw.q_proj,
@@ -1463,17 +1512,30 @@ impl MetalInference {
             enc.memory_barrier_buffers();
 
             // Step 6: QK normalization (Qwen3) + RoPE
+            let (layer_rope_cos, layer_rope_sin) = if let Some(ref g4) = self.gemma4_config {
+                let lc = &g4.layer_configs[layer_idx];
+                if lc.is_global {
+                    (
+                        self.global_rope_cos.as_ref().unwrap_or(rope_cos),
+                        self.global_rope_sin.as_ref().unwrap_or(rope_sin),
+                    )
+                } else {
+                    (rope_cos, rope_sin)
+                }
+            } else {
+                (rope_cos, rope_sin)
+            };
             encode_qk_norm_and_rope(
                 &enc,
                 pipelines,
                 bufs,
                 lw.q_norm.as_ref(),
                 lw.k_norm.as_ref(),
-                rope_cos,
-                rope_sin,
+                layer_rope_cos,
+                layer_rope_sin,
                 nh,
-                nkv,
-                hd,
+                layer_nkv,
+                layer_hd,
                 seq_pos,
                 token_count,
                 eps,
@@ -1499,8 +1561,8 @@ impl MetalInference {
                 seq_pos,
                 token_count,
                 nh,
-                nkv,
-                hd,
+                layer_nkv,
+                layer_hd,
                 enable_tq,
                 self.config.use_fa2_prefill,
                 is_anchor,
@@ -1509,10 +1571,11 @@ impl MetalInference {
             enc.memory_barrier_buffers();
 
             // Step 9: Output projection
+            let attn_out_features = mc.num_attention_heads * layer_hd as usize;
             let attn_mat = MpsMatrix::from_buffer(
                 &bufs.attn_out,
                 token_count,
-                mc.num_attention_heads * mc.head_dim,
+                attn_out_features,
                 row_bytes_qo,
             )
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -1526,7 +1589,7 @@ impl MetalInference {
                 pipelines,
                 token_count,
                 h,
-                mc.num_attention_heads * mc.head_dim,
+                attn_out_features,
                 row_bytes_qo,
                 row_bytes_h,
             )?;
@@ -2943,6 +3006,26 @@ impl InferenceEngine for MetalInference {
         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.rope_cos = Some(cos);
         self.rope_sin = Some(sin);
+
+        // Build global-layer RoPE tables if Gemma 4 uses a different theta.
+        if let Some(ref g4) = self.gemma4_config {
+            if let Some(rp) = mc.rope_parameters() {
+                if let Some(global_cfg) = rp.get("full_attention") {
+                    let global_hd = g4.global_head_dim;
+                    if global_hd != mc.head_dim || global_cfg.theta != mc.rope_theta {
+                        let (gc, gs) = Self::build_rope_cache(
+                            &self.device,
+                            global_hd,
+                            self.config.max_seq_len,
+                            global_cfg.theta,
+                        )
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        self.global_rope_cos = Some(gc);
+                        self.global_rope_sin = Some(gs);
+                    }
+                }
+            }
+        }
 
         // Build MPS matmul cache for single-token decode.
         let decode_cache_t1 = Self::build_matmul_cache(&self.device, &mc, &weights, 1)

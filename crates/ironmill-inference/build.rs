@@ -40,6 +40,7 @@ fn main() {
         "int4_dequant",
         "affine_matmul",
         "quip_sharp",
+        "fused_softcap",
     ];
 
     for name in &independent {

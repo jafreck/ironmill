@@ -121,6 +121,7 @@ pub struct MetalPipelines {
     pub quip_sharp_matvec: ComputePipeline,
     /// QuIP# matmul kernel.
     pub quip_sharp_matmul: ComputePipeline,
+    pub fused_softcap: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -197,6 +198,12 @@ impl MetalPipelines {
             .load_library_from_data(include_bytes!(concat!(
                 env!("OUT_DIR"),
                 "/quip_sharp.metallib"
+            )))
+            .map_err(MetalError::Metal)?;
+        let fused_softcap_lib = device
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/fused_softcap.metallib"
             )))
             .map_err(MetalError::Metal)?;
         let affine_mm_lib = device
@@ -413,6 +420,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &quip_sharp_lib
                         .get_function("quip_sharp_matmul")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            fused_softcap: device
+                .create_compute_pipeline(
+                    &fused_softcap_lib
+                        .get_function("fused_softcap")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -1051,4 +1065,22 @@ pub fn encode_fused_residual_rms_norm(
     encoder.set_bytes(&params.token_count.to_le_bytes(), 7);
     let tg_size = METAL_MAX_THREADS_PER_THREADGROUP.min(params.hidden_size as usize);
     encoder.dispatch_threadgroups((params.token_count as usize, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode fused logit softcapping: `data[i] = softcap * tanh(data[i] / softcap)`.
+pub fn encode_fused_softcap(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    data: &MetalBuffer,
+    softcap: f32,
+    count: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(data, 0, 0);
+    encoder.set_bytes(&softcap.to_le_bytes(), 1);
+    encoder.set_bytes(&count.to_le_bytes(), 2);
+    let threads = count as usize;
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
+    let tg_count = threads.div_ceil(tg_size);
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
 }
