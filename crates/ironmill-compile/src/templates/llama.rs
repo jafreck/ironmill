@@ -1106,21 +1106,22 @@ mod tests {
     }
 
     #[test]
-    fn build_program_warns_on_missing_weights() {
+    fn build_program_errors_on_missing_weights() {
         let config = tiny_llama_config();
         // Provide no tensors — everything will be missing.
         let provider = StubProvider::new(config);
         let opts = TemplateOptions::default();
 
-        let result = build_program(&provider, &opts)
-            .expect("build_program should still succeed structurally");
+        let result = build_program(&provider, &opts);
         assert!(
-            !result.warnings.is_empty(),
-            "should have warnings for missing weights"
+            result.is_err(),
+            "build_program should fail when required weights are missing"
         );
-        // The program should still be structurally valid.
-        let main = result.program.main().unwrap();
-        assert!(!main.body.operations.is_empty());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing required weight"),
+            "error should mention missing weight, got: {err}"
+        );
     }
 
     #[test]
