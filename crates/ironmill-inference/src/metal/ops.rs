@@ -125,6 +125,7 @@ pub struct MetalPipelines {
     pub ple_gelu_gate: ComputePipeline,
     pub ple_add_scale: ComputePipeline,
     pub scale_buffer: ComputePipeline,
+    pub copy_buffer: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -457,6 +458,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &elem_lib
                         .get_function("scale_buffer")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            copy_buffer: device
+                .create_compute_pipeline(
+                    &elem_lib
+                        .get_function("copy_buffer")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -881,6 +889,24 @@ pub fn encode_scale_buffer(
     encoder.set_buffer(scalar, 0, 1);
     encoder.set_bytes(&count.to_le_bytes(), 2);
     let threads = count as usize;
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
+    let tg_count = threads.div_ceil(tg_size);
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode buffer copy: `dst[i] = src[i]`.
+pub fn encode_copy_buffer(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    src: &MetalBuffer,
+    dst: &MetalBuffer,
+    size: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(src, 0, 0);
+    encoder.set_buffer(dst, 0, 1);
+    encoder.set_bytes(&size.to_le_bytes(), 2);
+    let threads = size as usize;
     let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
     let tg_count = threads.div_ceil(tg_size);
     encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));

@@ -458,6 +458,24 @@ fn emit_gemma4_transformer_layer(
         warnings,
     )?;
 
+    // Gemma 4: separate pre-feedforward layernorm (replaces post_attn_norm for FFN input)
+    let ffn_input = {
+        let pre_ffn_name = format!("{prefix}.pre_feedforward_layernorm.weight");
+        if ctx.provider.has_tensor(&pre_ffn_name) {
+            emit_rms_norm(
+                block,
+                ctx.provider,
+                ctx.config,
+                &format!("{prefix}.pre_feedforward_layernorm"),
+                &post_attn,
+                &format!("l{layer_idx}_pre_ffn_norm"),
+                warnings,
+            )?
+        } else {
+            normed_mlp.clone()
+        }
+    };
+
     // 5. MLP with GELU activation
     // Double-wide MLP: the weight tensors already have the correct shape,
     // so emit_mlp_gelu loads whatever shape the provider has.
@@ -466,9 +484,27 @@ fn emit_gemma4_transformer_layer(
         ctx.provider,
         ctx.config,
         layer_idx,
-        &normed_mlp,
+        &ffn_input,
         warnings,
     )?;
+
+    // Gemma 4: post-feedforward layernorm on MLP output
+    let normed_mlp_out = {
+        let post_ffn_name = format!("{prefix}.post_feedforward_layernorm.weight");
+        if ctx.provider.has_tensor(&post_ffn_name) {
+            emit_rms_norm(
+                block,
+                ctx.provider,
+                ctx.config,
+                &format!("{prefix}.post_feedforward_layernorm"),
+                &mlp_out,
+                &format!("l{layer_idx}_post_ffn_norm"),
+                warnings,
+            )?
+        } else {
+            mlp_out.clone()
+        }
+    };
 
     // 6. MoE block (parallel with dense MLP, outputs are summed) or standard residual
     let ffn_output = if enable_moe && num_experts > 0 {
@@ -477,7 +513,7 @@ fn emit_gemma4_transformer_layer(
             block,
             ctx.provider,
             layer_idx,
-            &normed_mlp,
+            &ffn_input,
             num_experts,
             top_k_experts,
             warnings,
@@ -486,12 +522,12 @@ fn emit_gemma4_transformer_layer(
         // Sum dense MLP + MoE outputs
         emit_residual_add(
             block,
-            &mlp_out,
+            &normed_mlp_out,
             &moe_out,
             &format!("l{layer_idx}_moe_combined"),
         )
     } else {
-        mlp_out
+        normed_mlp_out
     };
 
     // Apply layer_scalar if present (Gemma 4: scales FFN output before residual add)

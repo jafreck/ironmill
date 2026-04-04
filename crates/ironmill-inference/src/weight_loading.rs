@@ -41,6 +41,10 @@ pub struct LoadedLayer<D, W> {
     pub q_norm: Option<D>,
     /// Optional K normalization weight `[head_dim]` (Qwen3 QK norm).
     pub k_norm: Option<D>,
+    /// Pre-FFN RMSNorm weight (Gemma 4 `pre_feedforward_layernorm`).
+    pub pre_ffn_norm: Option<D>,
+    /// Post-FFN RMSNorm weight (Gemma 4 `post_feedforward_layernorm`).
+    pub post_ffn_norm: Option<D>,
     // TODO: MoE expert weights (when enable_moe is true):
     // pub router_weight: Option<W>,
     // pub expert_weights: Vec<ExpertWeights>,  // num_experts entries
@@ -146,6 +150,22 @@ pub fn load_model_weights<V: WeightVisitor>(
                 Some(visitor.load_dense(provider, &k_norm_name)?)
             } else {
                 None
+            },
+            pre_ffn_norm: {
+                let name = format!("{prefix}.pre_feedforward_layernorm.weight");
+                if provider.has_tensor(&name) {
+                    Some(visitor.load_dense(provider, &name)?)
+                } else {
+                    None
+                }
+            },
+            post_ffn_norm: {
+                let name = format!("{prefix}.post_feedforward_layernorm.weight");
+                if provider.has_tensor(&name) {
+                    Some(visitor.load_dense(provider, &name)?)
+                } else {
+                    None
+                }
             },
             ple_gate: {
                 let name = format!("{prefix}.per_layer_input_gate.weight");

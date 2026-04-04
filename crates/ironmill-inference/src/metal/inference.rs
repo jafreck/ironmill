@@ -1249,9 +1249,51 @@ impl MetalInference {
             );
             enc.memory_barrier_buffers();
 
+            // Gemma 4: replace post_attn_norm with pre_feedforward_layernorm for FFN input
+            if let Some(ref pre_ffn) = lw.pre_ffn_norm {
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.residual,
+                        weight: pre_ffn,
+                        output: &bufs.norm_out,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+                enc.memory_barrier_buffers();
+            }
+
             // Steps 12-15: FFN block (gate + up + SiLU + down)
             encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, inter, token_count)?;
             enc.memory_barrier_buffers();
+
+            // Gemma 4: apply post-feedforward layernorm to MLP output
+            if let Some(ref post_ffn) = lw.post_ffn_norm {
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.ffn_down,
+                        weight: post_ffn,
+                        output: &bufs.ffn_gate,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+                enc.memory_barrier_buffers();
+                ops::encode_copy_buffer(
+                    &enc,
+                    &pipelines.copy_buffer,
+                    &bufs.ffn_gate,
+                    &bufs.ffn_down,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+            }
 
             // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
             // with MoE expert outputs. Currently a no-op placeholder — MoE dispatch
@@ -2018,6 +2060,24 @@ impl MetalInference {
                     token_count: token_count as u32,
                 },
             );
+
+            // Gemma 4: replace post_attn_norm with pre_feedforward_layernorm for FFN input
+            if let Some(ref pre_ffn) = lw.pre_ffn_norm {
+                enc.memory_barrier_buffers();
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.residual,
+                        weight: pre_ffn,
+                        output: &bufs.norm_out,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+            }
+
             enc.end_encoding();
 
             // ── Mid-layer commit: attention block done, norm_out has FFN input ──
@@ -2062,6 +2122,31 @@ impl MetalInference {
             // Steps 12-15: FFN block (gate + up + SiLU + down)
             encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, inter, token_count)?;
             enc.memory_barrier_buffers();
+
+            // Gemma 4: apply post-feedforward layernorm to MLP output
+            if let Some(ref post_ffn) = lw.post_ffn_norm {
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.ffn_down,
+                        weight: post_ffn,
+                        output: &bufs.ffn_gate,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+                enc.memory_barrier_buffers();
+                ops::encode_copy_buffer(
+                    &enc,
+                    &pipelines.copy_buffer,
+                    &bufs.ffn_gate,
+                    &bufs.ffn_down,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+            }
 
             // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
             // with MoE expert outputs. Currently a no-op placeholder — MoE dispatch
