@@ -82,3 +82,142 @@ kernel void matvec(
         }
     }
 }
+
+// ============================================================================
+// Custom FP16 matrix-matrix product using simdgroup matrix hardware.
+//
+// Computes C[M, N] = A[M, K] × W[N, K]^T for M>1 (prefill path).
+// Weights must be pre-packed into blocked [N/8, K/8, 8, 8] FP16 format.
+//
+// Uses double-buffered threadgroup memory and simdgroup_matrix 8×8 tiles.
+// 8 simdgroups each handle 8 rows of M, iterating over N in blocks of 8.
+//
+// Dispatch: ((M+63)/64, (N+63)/64, 1) threadgroups, (256, 1, 1) threads.
+// ============================================================================
+
+constant constexpr uint TM_TILE        = 64;   // output rows per threadgroup
+constant constexpr uint TN_TILE        = 64;   // output cols per threadgroup
+constant constexpr uint MATMUL_K_TILE  = 8;    // K-step (simdgroup dimension)
+constant constexpr uint N_SIMDGROUPS   = 8;
+constant constexpr uint THREADS_PER_TG = N_SIMDGROUPS * 32;  // 256
+constant constexpr uint TN_BLOCKS      = TN_TILE / 8;        // 8
+constant constexpr uint TN_STRIDE      = TN_TILE + 1;        // 65, bank-conflict-free
+
+kernel void matmul(
+    device const half* A          [[buffer(0)]],   // [M, K] activations
+    device const half* w_packed   [[buffer(1)]],   // [N/8, K/8, 8, 8] blocked weights
+    device half* C                [[buffer(2)]],   // [M, N] output
+    constant uint& M              [[buffer(3)]],
+    constant uint& N              [[buffer(4)]],
+    constant uint& K              [[buffer(5)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]])
+{
+    uint tg_m = group_id.x * TM_TILE;   // M from x (fast-varying)
+    uint tg_n = group_id.y * TN_TILE;   // N from y
+
+    uint k_blocks = K / MATMUL_K_TILE;
+
+    // Accumulators: each simdgroup handles 8 rows of M × all TN_BLOCKS columns.
+    simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
+    for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
+
+    threadgroup half tg_a[2][TM_TILE * MATMUL_K_TILE];     // [64×8] activations
+    threadgroup half tg_bt[2][MATMUL_K_TILE * TN_STRIDE];  // [8×65] weights transposed
+
+    // ---- Prologue: load first K-tile into buffer 0 ----
+    {
+        uint k_base = 0;
+        // Load A tile
+        for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
+            uint m = i / MATMUL_K_TILE;
+            uint k = i % MATMUL_K_TILE;
+            uint g_row = tg_m + m;
+            uint g_col = k_base + k;
+            tg_a[0][i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+        }
+        // Load B tile (transposed from blocked format)
+        for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
+            uint n = i / MATMUL_K_TILE;
+            uint k = i % MATMUL_K_TILE;
+            uint g_n = tg_n + n;
+            half val = half(0);
+            if (g_n < N) {
+                uint n_block = g_n / 8;
+                uint n_local = g_n % 8;
+                uint w_offset = (n_block * k_blocks + 0) * 64 + n_local * 8 + k;
+                val = w_packed[w_offset];
+            }
+            tg_bt[0][k * TN_STRIDE + n] = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Main double-buffered loop ----
+    for (uint kb = 0; kb < k_blocks; kb++) {
+        uint cur = kb & 1;
+        uint nxt = 1 - cur;
+
+        // Prefetch next K-tile into the alternate buffer.
+        uint next_kb = kb + 1;
+        if (next_kb < k_blocks) {
+            uint k_base = next_kb * MATMUL_K_TILE;
+            for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
+                uint m = i / MATMUL_K_TILE;
+                uint k = i % MATMUL_K_TILE;
+                uint g_row = tg_m + m;
+                uint g_col = k_base + k;
+                tg_a[nxt][i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+            }
+            for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
+                uint n = i / MATMUL_K_TILE;
+                uint k = i % MATMUL_K_TILE;
+                uint g_n = tg_n + n;
+                half val = half(0);
+                if (g_n < N) {
+                    uint n_block = g_n / 8;
+                    uint n_local = g_n % 8;
+                    uint w_offset = (n_block * k_blocks + next_kb) * 64 + n_local * 8 + k;
+                    val = w_packed[w_offset];
+                }
+                tg_bt[nxt][k * TN_STRIDE + n] = val;
+            }
+        }
+
+        // Compute: each simdgroup loads its 8-row slice of A and iterates
+        // over all TN_BLOCKS columns of B.
+        simdgroup_matrix<half, 8, 8> a_mat;
+        simdgroup_load(a_mat, tg_a[cur] + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
+
+        for (uint j = 0; j < TN_BLOCKS; j++) {
+            simdgroup_matrix<half, 8, 8> bt_mat;
+            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, TN_STRIDE);
+            simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- Store results ----
+    threadgroup float tg_out[N_SIMDGROUPS * 8 * 8];
+
+    for (uint j = 0; j < TN_BLOCKS; j++) {
+        simdgroup_store(acc[j], tg_out + sgid * 64, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = tid; i < TM_TILE * 8; i += THREADS_PER_TG) {
+            uint local_m = i / 8;
+            uint local_n = i % 8;
+            uint out_row = tg_m + local_m;
+            uint out_col = tg_n + j * 8 + local_n;
+            if (out_row < M && out_col < N) {
+                uint sg = local_m / 8;
+                uint sg_row = local_m % 8;
+                C[out_row * N + out_col] = half(tg_out[sg * 64 + sg_row * 8 + local_n]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}

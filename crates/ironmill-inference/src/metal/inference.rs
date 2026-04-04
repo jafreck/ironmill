@@ -1610,11 +1610,11 @@ fn encode_projection(
 ) -> Result<(), InferenceError> {
     match weight {
         WeightBuffer::Dense { buf, packed } => {
-            if token_count == 1 {
-                if let Some(packed_buf) = packed {
-                    let enc = cmd_buf
-                        .compute_encoder()
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            if let Some(packed_buf) = packed {
+                let enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                if token_count == 1 {
                     ops::encode_matvec(
                         &enc,
                         &pipelines.matvec,
@@ -1624,11 +1624,22 @@ fn encode_projection(
                         out_features as u32,
                         in_features as u32,
                     );
-                    enc.end_encoding();
-                    return Ok(());
+                } else {
+                    ops::encode_matmul(
+                        &enc,
+                        &pipelines.matmul,
+                        input_buf,
+                        packed_buf,
+                        output_buf,
+                        token_count as u32,
+                        out_features as u32,
+                        in_features as u32,
+                    );
                 }
+                enc.end_encoding();
+                return Ok(());
             }
-            // MPS matmul path: multi-token, or single-token without packed buf.
+            // Fallback to MPS when no packed weights (N or K not multiple of 8).
             let weight_mat = MpsMatrix::from_buffer(buf, out_features, in_features, row_bytes_in)
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let result_mat =

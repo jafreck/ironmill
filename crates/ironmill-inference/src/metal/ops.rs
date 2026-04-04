@@ -48,6 +48,7 @@ pub struct MetalPipelines {
     pub affine_matmul_int8: ComputePipeline,
     pub kv_scatter: ComputePipeline,
     pub matvec: ComputePipeline,
+    pub matmul: ComputePipeline,
     pub fused_residual_rms_norm: ComputePipeline,
     pub int4_dequantize: ComputePipeline,
 }
@@ -267,6 +268,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &matvec_lib
                         .get_function("matvec")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            matmul: device
+                .create_compute_pipeline(
+                    &matvec_lib
+                        .get_function("matmul")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -661,6 +669,37 @@ pub fn encode_matvec(
     encoder.set_bytes(&k.to_le_bytes(), 4);
     let tg_count = (n as usize + MATVEC_ROWS_PER_THREADGROUP - 1) / MATVEC_ROWS_PER_THREADGROUP;
     encoder.dispatch_threadgroups((tg_count, 1, 1), (DEFAULT_THREADGROUP_WIDTH, 1, 1));
+}
+
+/// Encode a custom FP16 matmul: C = A · W^T for M>1 (prefill).
+///
+/// Weights must be pre-packed into blocked [N/8, K/8, 8, 8] FP16 format.
+/// Dispatch: 2-D grid of threadgroups tiling M and N in 64-element blocks,
+/// [`DEFAULT_THREADGROUP_WIDTH`] threads (8 simdgroups).
+pub fn encode_matmul(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    input: &MetalBuffer,
+    weight_packed: &MetalBuffer,
+    output: &MetalBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+) {
+    const TM_TILE: usize = 64;
+    const TN_TILE: usize = 64;
+
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(input, 0, 0);
+    encoder.set_buffer(weight_packed, 0, 1);
+    encoder.set_buffer(output, 0, 2);
+    encoder.set_bytes(&m.to_le_bytes(), 3);
+    encoder.set_bytes(&n.to_le_bytes(), 4);
+    encoder.set_bytes(&k.to_le_bytes(), 5);
+
+    let tg_m = (m as usize + TM_TILE - 1) / TM_TILE;
+    let tg_n = (n as usize + TN_TILE - 1) / TN_TILE;
+    encoder.dispatch_threadgroups((tg_m, tg_n, 1), (DEFAULT_THREADGROUP_WIDTH, 1, 1));
 }
 
 /// Encode a fused residual-add + RMSNorm operation.
