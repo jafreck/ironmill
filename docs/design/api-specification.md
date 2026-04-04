@@ -16,6 +16,10 @@
 6. [Cross-Cutting Concerns](#6-cross-cutting-concerns)
 7. [Usage Examples](#7-usage-examples)
 8. [Migration Guide](#8-migration-guide)
+9. [Tokenizer Abstraction](#9-tokenizer-abstraction)
+10. [ironmill-core: High-Level API](#10-ironmill-core-high-level-api)
+11. [JIT Compilation](#11-jit-compilation)
+12. [Open Design Questions](#12-open-design-questions)
 
 ---
 
@@ -72,6 +76,82 @@ future CUDA/Vulkan) are isolated behind feature flags and `#[cfg]` gates.
 - Adding a new hardware backend (e.g., CUDA) must not require modifying
   any existing backend module — only adding a new feature-gated module
   and extending `#[non_exhaustive]` enums.
+
+### 1.7 Inference Architecture — Two Paths
+
+SafeTensors, GGUF, and ONNX files are **weight storage formats** — they
+contain raw tensor data (matrices, vectors) with no computation logic. They
+are not executable. Running inference requires pairing those weights with an
+execution engine that knows what operations to perform (matmul, RoPE,
+softmax, etc.).
+
+Ironmill provides two fundamentally different execution paths:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Path 1: Direct GPU (Metal today, CUDA tomorrow)                     │
+│                                                                     │
+│   SafeTensors ──→ WeightProvider ──→ GPU buffers ──→ Hand-written   │
+│                        │                              Metal shaders │
+│                        ↓                                            │
+│                  (optional: quantization                             │
+│                   passes on weight data)                             │
+│                                                                     │
+│   • No compilation step. No MIL IR. No CoreML.                      │
+│   • Weights are loaded directly into Metal buffers.                  │
+│   • Shaders are pre-compiled (metallib) or JIT-compiled.            │
+│   • Time-to-first-token: seconds (weight loading only).             │
+│   • This is MetalInference / CudaInference.                        │
+├─────────────────────────────────────────────────────────────────────┤
+│ Path 2: CoreML / ANE (Apple Neural Engine)                          │
+│                                                                     │
+│   SafeTensors ──→ MIL IR ──→ .mlpackage ──→ coremlcompiler         │
+│                  (computation    (serialized     ──→ .mlmodelc      │
+│                   graph)          protobuf)       (compiled for     │
+│                                                    CPU/GPU/ANE)     │
+│                                                                     │
+│   • Requires a computation graph (MIL IR) because CoreML needs to   │
+│     know the full graph topology to optimize for ANE/GPU/CPU.       │
+│   • Compilation is slow (30s–minutes) but produces a distributable  │
+│     artifact that Apple's runtime can execute on any Apple device.   │
+│   • Required for ANE inference — the Neural Engine only runs        │
+│     CoreML-compiled models.                                         │
+│   • This is CoremlBackend / AneInference.                           │
+├─────────────────────────────────────────────────────────────────────┤
+│ Path 3: JIT (proposed — see §11)                                    │
+│                                                                     │
+│   SafeTensors ──→ WeightProvider ──→ GPU buffers ──→ JIT-compiled   │
+│                        │                              Metal shaders │
+│                        ↓                                            │
+│                  (quantization applied                               │
+│                   directly to tensors,                               │
+│                   no MIL IR needed)                                  │
+│                                                                     │
+│   • Like Path 1 but with on-the-fly shader specialization.          │
+│   • Quantization transforms operate on raw tensors, not MIL IR.     │
+│   • Compiled shader pipelines are cached to disk.                   │
+│   • Fastest iteration speed: change config → re-run immediately.    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why does the current GPU path touch MIL IR at all?**
+
+`GpuCompileBuilder` currently routes through MIL IR because the quantization
+passes (`PassPipeline`) operate on MIL `Program` graphs. This is a historical
+artifact — weight quantization (INT4, AWQ, PolarQuant) transforms individual
+tensors and does not require a computation graph. The JIT path (§11) proposes
+`TensorTransform` passes that operate directly on `WeightProvider` data,
+eliminating the MIL IR dependency for GPU inference entirely.
+
+**Which path should users choose?**
+
+| Use case | Path | Why |
+|----------|------|-----|
+| GPU inference (dev/prod) | Direct GPU or JIT | Fastest. No compile step. |
+| ANE inference | CoreML/ANE | ANE requires CoreML models. |
+| Distributing a compiled model | CoreML | Produces .mlmodelc that runs anywhere on Apple. |
+| Experimenting with quantization | JIT | No recompile on config changes. |
+| Maximum decode throughput | Direct GPU (Metal) | Hand-tuned Metal shaders. |
 
 ---
 
@@ -576,6 +656,110 @@ pub mod convert {
 }
 ```
 
+### 3.7 CompileTarget — Backend-Agnostic Compilation
+
+The current compilation API is tightly coupled to CoreML (MIL IR →
+mlpackage → mlmodelc). For Metal direct inference and future CUDA support,
+compilation means something completely different. `CompileTarget` abstracts
+over these backends:
+
+```rust
+/// A compilation target that transforms weights for a specific runtime.
+///
+/// Implementations handle the full pipeline from source weights to a
+/// runtime-ready artifact. The artifact type varies by target:
+/// - Metal direct → `.ironml-gpu` bundle (quantized weight tensors)
+/// - CoreML → `.mlmodelc` (compiled CoreML model)
+/// - CUDA → `.ironml-cuda` bundle (future)
+pub trait CompileTarget {
+    /// Name of this compilation target (for logging/diagnostics).
+    fn name(&self) -> &str;
+
+    /// Compile a model from source weights to a runtime-ready artifact.
+    ///
+    /// `progress` is called with status updates during compilation. Pass
+    /// `&NullProgress` to suppress output.
+    fn compile(
+        &self,
+        source: &dyn WeightProvider,
+        config: &CompileConfig,
+        progress: &dyn ProgressSink,
+    ) -> Result<CompileOutput, CompileError>;
+
+    /// Estimate the output artifact size without performing compilation.
+    fn estimate_size(
+        &self,
+        source: &dyn WeightProvider,
+        config: &CompileConfig,
+    ) -> Result<usize, CompileError> {
+        // Default: weight memory estimate
+        Ok(MemoryEstimator::weight_memory(source.config(), config.quant_level()))
+    }
+}
+
+/// Compilation configuration shared across all targets.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct CompileConfig {
+    /// Output directory or file path.
+    pub output: PathBuf,
+    /// Quantization pass pipeline.
+    pub pipeline: PassPipeline,
+    /// Target compute unit hint.
+    pub compute_unit: ComputeUnit,
+}
+
+/// Output of a compilation step.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct CompileOutput {
+    /// Path to the compiled artifact.
+    pub artifact: PathBuf,
+    /// Pipeline report (passes run, timing, size changes).
+    pub report: PipelineReport,
+    /// Warnings generated during compilation.
+    pub warnings: Vec<String>,
+}
+```
+
+Built-in targets:
+
+```rust
+/// Metal direct compilation: weights → quantized tensors → .ironml-gpu bundle.
+///
+/// No MIL IR or CoreML involved. Quantization passes operate directly on
+/// weight tensors via `TensorTransform` (see §11 JIT).
+pub struct MetalCompileTarget;
+
+impl CompileTarget for MetalCompileTarget {
+    fn name(&self) -> &str { "metal-direct" }
+    fn compile(&self, source: &dyn WeightProvider, config: &CompileConfig,
+               progress: &dyn ProgressSink) -> Result<CompileOutput, CompileError> {
+        // 1. Apply quantization transforms to weight tensors
+        // 2. Write .ironml-gpu bundle (weights + config.json + metadata)
+        // No MIL IR. No coremlcompiler.
+        todo!()
+    }
+}
+
+/// CoreML compilation: weights → MIL IR → mlpackage → mlmodelc.
+///
+/// Required for ANE inference and CoreML distribution.
+pub struct CoremlCompileTarget;
+
+impl CompileTarget for CoremlCompileTarget {
+    fn name(&self) -> &str { "coreml" }
+    fn compile(&self, source: &dyn WeightProvider, config: &CompileConfig,
+               progress: &dyn ProgressSink) -> Result<CompileOutput, CompileError> {
+        // 1. Convert to MIL IR via weights_to_program()
+        // 2. Run PassPipeline on the MIL Program
+        // 3. Serialize to mlpackage
+        // 4. Run coremlcompiler → mlmodelc
+        todo!()
+    }
+}
+```
+
 ---
 
 ## 4. ironmill-inference
@@ -653,19 +837,31 @@ impl From<MetalError> for InferenceError {
 //   }
 ```
 
-### 4.3 InferenceEngine — Type-Safe Loading
+### 4.3 InferenceEngine — Two-Tier Design
 
-Replace `&dyn Any` with an associated type:
+The `InferenceEngine` trait must serve two audiences:
+
+1. **Generic callers** (application code that knows its backend at compile time)
+   want type-safe `load()` with compile-time artifact checking.
+2. **Dynamic callers** (the high-level `Model` API, batch schedulers, tests)
+   need `dyn`-dispatched engines where the backend is chosen at runtime.
+
+Trying to serve both with a single trait (associated types for one, object
+safety for the other) creates an irreconcilable tension. The solution is
+**two traits**: a low-level object-safe `InferenceEngine` for the runtime,
+and type-safe `load()` as a **separate method on each backend struct**.
 
 ```rust
-/// Autoregressive inference engine.
-pub trait InferenceEngine {
-    /// Artifacts required to load a model (e.g. weights + config).
-    type Artifacts;
-
-    /// Load model artifacts.
-    fn load(&mut self, artifacts: &Self::Artifacts) -> Result<(), InferenceError>;
-
+/// Core inference engine trait — object-safe, used everywhere.
+///
+/// This trait covers the hot path (prefill/decode) and is the primary
+/// interface consumed by `TokenStream`, `BatchRunner`, `Model`, etc.
+/// It is intentionally object-safe so it can be used as `dyn InferenceEngine`.
+///
+/// Loading is NOT part of this trait — each backend has its own typed
+/// `load()` method because artifact types differ. Once loaded, all
+/// backends present the same interface.
+pub trait InferenceEngine: Send {
     /// Prefill: process all prompt tokens, populating the KV cache.
     fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError>;
 
@@ -683,49 +879,71 @@ pub trait InferenceEngine {
 
     /// Maximum sequence length this engine supports.
     fn max_seq_len(&self) -> usize { usize::MAX }
-}
 
-// Backend implementations:
-impl InferenceEngine for MetalInference {
-    type Artifacts = MetalArtifacts<'_>;
-    // ...
-}
-
-impl InferenceEngine for MlxInference {
-    type Artifacts = MlxArtifacts<'_>;
-    // ...
+    /// Model info for this loaded engine (see §4.13).
+    fn model_info(&self) -> &ModelInfo;
 }
 ```
 
-**Note**: This removes `dyn InferenceEngine` support (can't have associated
-types with dynamic dispatch without boxing). If dynamic dispatch is needed,
-provide a `DynInferenceEngine` wrapper:
+Each backend provides its own typed loading:
 
 ```rust
-/// Type-erased inference engine for dynamic dispatch.
-pub struct DynInferenceEngine {
-    inner: Box<dyn InferenceEngineObj>,
+impl MetalInference {
+    /// Load model from Metal-specific artifacts.
+    /// Type-safe: compile-time guarantee that you pass MetalArtifacts.
+    pub fn load(config: MetalConfig, artifacts: &MetalArtifacts<'_>)
+        -> Result<Self, InferenceError> { /* ... */ }
 }
 
-trait InferenceEngineObj {
-    fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError>;
-    fn decode_step(&mut self, token: u32) -> Result<Logits, InferenceError>;
-    fn reset(&mut self);
-    fn seq_pos(&self) -> usize;
-    fn truncate_to(&mut self, pos: usize);
-    fn max_seq_len(&self) -> usize;
+impl MlxInference {
+    pub fn load(config: MlxConfig, artifacts: &MlxArtifacts<'_>)
+        -> Result<Self, InferenceError> { /* ... */ }
 }
 
-impl<E: InferenceEngine> InferenceEngineObj for E { /* delegate */ }
-
-impl DynInferenceEngine {
-    pub fn new<E: InferenceEngine + 'static>(engine: E) -> Self { /* ... */ }
-    pub fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError> { /* ... */ }
-    pub fn decode_step(&mut self, token: u32) -> Result<Logits, InferenceError> { /* ... */ }
-    pub fn reset(&mut self) { /* ... */ }
-    pub fn seq_pos(&self) -> usize { /* ... */ }
-    pub fn truncate_to(&mut self, pos: usize) { /* ... */ }
+impl AneInference<D: AneDevice> {
+    pub fn load(config: AneConfig, bundle_path: &Path, device: D)
+        -> Result<Self, InferenceError> { /* ... */ }
 }
+```
+
+**Why `Send` on the trait?** All backends hold GPU/accelerator state that
+is `Send` (can be moved to another thread) but NOT `Sync` (can't be shared).
+The `Send` bound enables the async adapter and thread-per-engine patterns.
+
+**Dynamic dispatch works naturally:**
+
+```rust
+// Runtime backend selection
+fn create_engine(device: Device, path: &Path) -> Result<Box<dyn InferenceEngine>, InferenceError> {
+    match device {
+        Device::Metal => {
+            let artifacts = MetalBundleProvider::open(path)?;
+            let engine = MetalInference::load(MetalConfig::default(), &artifacts)?;
+            Ok(Box::new(engine))
+        }
+        Device::Ane => {
+            let device = HardwareAneDevice::new()?;
+            let engine = AneInference::load(AneConfig::default(), path, device)?;
+            Ok(Box::new(engine))
+        }
+        // ...
+    }
+}
+
+// TokenStream, generate(), etc. all take &mut dyn InferenceEngine
+let mut engine: Box<dyn InferenceEngine> = create_engine(Device::Metal, path)?;
+let stream = TokenStream::new(&mut *engine, request, &cancel);
+```
+
+**Migration from old `load(&dyn Any)` pattern:**
+
+```rust
+// BEFORE (runtime type check, panics on mismatch):
+let mut engine = MetalInference::new(config)?;
+engine.load(&artifacts as &dyn std::any::Any)?;
+
+// AFTER (compile-time type check, no possible mismatch):
+let engine = MetalInference::load(config, &artifacts)?;
 ```
 
 ### 4.4 RuntimeModel / RuntimeBackend — Typed Errors
@@ -781,19 +999,25 @@ impl RuntimeBackend for AneDirectBackend {
 }
 ```
 
-Implement `InferenceEngine` for `AneInference`:
+Typed loading on the struct (not the trait — see §4.3):
+
+```rust
+impl<D: AneDevice> AneInference<D> {
+    /// Load from an ANE decode bundle. Type-safe: compile-time guarantee
+    /// that you pass the correct artifact type.
+    pub fn load(config: AneConfig, bundle_path: &Path, device: D)
+        -> Result<Self, InferenceError>
+    {
+        AneInference::from_bundle(bundle_path, device, &config)
+            .map_err(|e| InferenceError::Runtime(Box::new(e)))
+    }
+}
+```
+
+Implement the object-safe `InferenceEngine` trait (no `load`, no associated types):
 
 ```rust
 impl<D: AneDevice> InferenceEngine for AneInference<D> {
-    type Artifacts = AneDecodeArtifacts;
-
-    fn load(&mut self, artifacts: &AneDecodeArtifacts) -> Result<(), InferenceError> {
-        // Load from decode bundle path
-        *self = AneInference::from_bundle(&artifacts.bundle_path, /* ... */)
-            .map_err(|e| InferenceError::Runtime(Box::new(e)))?;
-        Ok(())
-    }
-
     fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError> {
         self.prefill(tokens)
             .map_err(|e| InferenceError::Runtime(Box::new(e)))
@@ -807,6 +1031,7 @@ impl<D: AneDevice> InferenceEngine for AneInference<D> {
     fn reset(&mut self) { self.reset(); }
     fn seq_pos(&self) -> usize { self.seq_pos() }
     fn truncate_to(&mut self, pos: usize) { self.truncate_to(pos); }
+    fn model_info(&self) -> &ModelInfo { &self.model_info }
 }
 ```
 
@@ -1092,9 +1317,17 @@ impl GenerateRequest {
             prompt_tokens,
             sampler: SamplerConfig::default(),
             max_tokens: 256,
-            stop_tokens: DEFAULT_EOS_TOKENS.to_vec(),
+            stop_tokens: Vec::new(), // empty = use model's EOS tokens from ModelInfo
             grammar: None,
         }
+    }
+
+    /// Explicitly set stop tokens. If empty (the default), the generation
+    /// loop consults [`ModelInfo::eos_tokens()`] from the engine. This
+    /// ensures model-specific EOS tokens (e.g. Llama's `[2]`, Qwen's
+    /// `[151643, 151645]`) are used automatically without hardcoding.
+    pub fn with_stop_tokens(mut self, tokens: Vec<u32>) -> Self {
+        self.stop_tokens = tokens; self
     }
 
     pub fn with_sampler(mut self, config: SamplerConfig) -> Self {
@@ -1103,10 +1336,6 @@ impl GenerateRequest {
 
     pub fn with_max_tokens(mut self, n: usize) -> Self {
         self.max_tokens = n; self
-    }
-
-    pub fn with_stop_tokens(mut self, tokens: Vec<u32>) -> Self {
-        self.stop_tokens = tokens; self
     }
 
     pub fn with_grammar(mut self, grammar: Arc<CompiledGrammar>) -> Self {
@@ -1122,6 +1351,16 @@ impl GenerateRequest {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum GenerateEvent {
+    /// Prompt processing (prefill) has completed.
+    ///
+    /// Emitted once, before the first `Token` event. Useful for progress
+    /// reporting on long prompts — callers know prefill is happening.
+    PromptProcessed {
+        /// Number of prompt tokens processed.
+        prompt_tokens: usize,
+        /// Wall-clock time for the prefill step.
+        elapsed: Duration,
+    },
     /// A new token was generated.
     Token {
         /// The sampled token ID.
@@ -1226,7 +1465,9 @@ pub struct TokenStream<'a> {
     position: usize,
     prefilled: bool,
     finished: bool,
+    pending_finish: Option<FinishReason>,
     logits: Logits,
+    effective_stop_tokens: Vec<u32>,
 }
 
 impl<'a> TokenStream<'a> {
@@ -1261,13 +1502,37 @@ impl Iterator for TokenStream<'_> {
     type Item = Result<GenerateEvent, InferenceError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished { return None; }
+        if self.finished {
+            // Emit deferred Finished event (e.g., after max_tokens final Token).
+            if let Some(reason) = self.pending_finish.take() {
+                return Some(Ok(GenerateEvent::Finished {
+                    reason,
+                    tokens_generated: self.position,
+                    prompt_tokens: self.request.prompt_tokens.len(),
+                }));
+            }
+            return None;
+        }
 
         // ── Prefill on first call ──
         if !self.prefilled {
             self.prefilled = true;
+            let start = std::time::Instant::now();
             match self.engine.prefill(&self.request.prompt_tokens) {
-                Ok(logits) => self.logits = logits,
+                Ok(logits) => {
+                    self.logits = logits;
+                    // Resolve stop tokens: use explicit list, or fall back to model's EOS.
+                    if self.request.stop_tokens.is_empty() {
+                        self.effective_stop_tokens = self.engine
+                            .model_info().eos_tokens.clone();
+                    } else {
+                        self.effective_stop_tokens = self.request.stop_tokens.clone();
+                    }
+                    return Some(Ok(GenerateEvent::PromptProcessed {
+                        prompt_tokens: self.request.prompt_tokens.len(),
+                        elapsed: start.elapsed(),
+                    }));
+                }
                 Err(e) => {
                     self.finished = true;
                     return Some(Err(e));
@@ -1310,7 +1575,7 @@ impl Iterator for TokenStream<'_> {
         }
 
         // ── Check stop conditions ──
-        if self.request.stop_tokens.contains(&token) {
+        if self.effective_stop_tokens.contains(&token) {
             self.finished = true;
             return Some(Ok(GenerateEvent::Finished {
                 reason: FinishReason::Stop,
@@ -1323,12 +1588,12 @@ impl Iterator for TokenStream<'_> {
 
         if self.position >= self.request.max_tokens {
             self.finished = true;
+            // Emit the final token. The *next* call to next() will
+            // emit Finished { reason: MaxTokens } (see top of fn).
+            self.pending_finish = Some(FinishReason::MaxTokens);
             return Some(Ok(GenerateEvent::Token {
                 token, logprob, position: self.position - 1,
             }));
-            // Caller will see no more items after this.
-            // (A follow-up Finished event is not emitted to avoid double-yield;
-            // the iterator ending signals completion.)
         }
 
         // ── Decode next ──
@@ -1387,8 +1652,10 @@ pub fn generate_with_callback(
     for event in stream {
         let event = event?;
         match &event {
+            GenerateEvent::PromptProcessed { .. } => {}
             GenerateEvent::Token { token, .. } => tokens.push(*token),
             GenerateEvent::Finished { reason, .. } => finish_reason = *reason,
+            _ => {} // forward-compatible with future variants
         }
         if on_event(event) == ControlFlow::Break(()) {
             finish_reason = FinishReason::Cancelled;
@@ -1451,6 +1718,55 @@ pub struct GenerateResult {
     pub finish_reason: FinishReason,
     /// Number of prompt tokens processed.
     pub prompt_tokens: usize,
+}
+```
+
+#### Partial Error Recovery
+
+When `decode_step` fails mid-generation (e.g., GPU OOM at token 450 of 512),
+the tokens generated so far are valuable. `GenerateError` preserves them:
+
+```rust
+/// Generation error with partial results.
+#[derive(Debug)]
+pub struct GenerateError {
+    /// The underlying inference error.
+    pub source: InferenceError,
+    /// Tokens generated before the error occurred.
+    /// Empty if the error happened during prefill.
+    pub partial_tokens: Vec<u32>,
+    /// Number of prompt tokens processed (0 if prefill failed).
+    pub prompt_tokens: usize,
+}
+
+impl std::fmt::Display for GenerateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "generation failed after {} tokens: {}", self.partial_tokens.len(), self.source)
+    }
+}
+
+impl std::error::Error for GenerateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+```
+
+The `generate()` and `generate_with_callback()` functions return
+`Result<GenerateResult, GenerateError>` instead of
+`Result<GenerateResult, InferenceError>`, so callers can recover partial
+output:
+
+```rust
+match generate(&mut engine, &request) {
+    Ok(result) => println!("Done: {} tokens", result.tokens.len()),
+    Err(e) => {
+        eprintln!("Failed: {}", e.source);
+        if !e.partial_tokens.is_empty() {
+            eprintln!("Recovered {} tokens", e.partial_tokens.len());
+            // Use partial_tokens instead of discarding all work
+        }
+    }
 }
 ```
 
@@ -1558,6 +1874,231 @@ For multi-threaded serving, the recommended patterns are:
   contention is acceptable.
 - **The async adapter** (`generate_async::spawn`) — moves the engine into a
   dedicated blocking thread and communicates via channels.
+
+### 4.12 Memory Management
+
+GPU memory is the primary constraint for on-device LLM inference. The API
+must surface memory information so callers can make informed decisions about
+model loading, sequence lengths, and batch sizes — catching OOM before it
+happens, not after.
+
+```rust
+/// Memory information for a loaded engine.
+///
+/// Returned by [`InferenceEngine::memory_info()`]. All sizes in bytes.
+/// Uses `u64` instead of `usize` to correctly represent sizes > 4 GB
+/// on 32-bit targets.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct MemoryUsage {
+    /// Total GPU memory consumed by model weights.
+    pub weight_memory: u64,
+    /// Current KV cache memory usage.
+    pub kv_cache_memory: u64,
+    /// Peak KV cache memory (maximum across all sequences).
+    pub kv_cache_peak: u64,
+    /// Estimated memory for temporary compute buffers (activations, etc.).
+    pub scratch_memory: u64,
+}
+
+/// Memory estimation utilities (no engine required).
+///
+/// These are static methods that estimate memory requirements from config
+/// alone, before loading. Useful for deciding whether a model will fit.
+pub struct MemoryEstimator;
+
+impl MemoryEstimator {
+    /// Estimate total weight memory for a model config + quantization level.
+    ///
+    /// ```rust
+    /// let est = MemoryEstimator::weight_memory(&config, QuantLevel::Int4);
+    /// if est > available_gpu_memory() {
+    ///     eprintln!("Model requires {:.1} GB, only {:.1} GB available",
+    ///         est as f64 / 1e9, available_gpu_memory() as f64 / 1e9);
+    /// }
+    /// ```
+    pub fn weight_memory(config: &ModelConfig, quant: QuantLevel) -> u64 { /* ... */ }
+
+    /// Estimate KV cache memory for a given sequence length and batch size.
+    pub fn kv_cache_memory(
+        config: &ModelConfig,
+        seq_len: usize,
+        batch_size: usize,
+        kv_quant: Option<KvQuantLevel>,
+    ) -> u64 { /* ... */ }
+
+    /// Estimate maximum sequence length that fits in the given memory budget.
+    pub fn max_seq_len_for_budget(
+        config: &ModelConfig,
+        budget_bytes: u64,
+        batch_size: usize,
+    ) -> usize { /* ... */ }
+}
+
+/// Quantization level for memory estimation.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub enum QuantLevel { Fp16, Int8, Int4, Int2 }
+
+/// KV cache quantization level.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub enum KvQuantLevel { None, Int8, TurboInt4, TurboInt8 }
+```
+
+Add to `InferenceEngine`:
+
+```rust
+pub trait InferenceEngine: Send {
+    // ... existing methods ...
+
+    /// Current memory usage. Returns `None` if the backend doesn't track memory.
+    fn memory_usage(&self) -> Option<MemoryUsage> { None }
+}
+```
+
+### 4.13 Model Capabilities
+
+After loading a model, callers need to query its properties without
+inspecting the original config files. `ModelInfo` provides a uniform
+view across all backends:
+
+```rust
+/// Runtime information about a loaded model.
+///
+/// Populated during engine loading from `ModelConfig` and weight metadata.
+/// Available via [`InferenceEngine::model_info()`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    /// Model architecture (Llama, Qwen, Gemma, etc.).
+    pub architecture: Architecture,
+    /// Number of transformer layers.
+    pub num_layers: usize,
+    /// Hidden dimension size.
+    pub hidden_size: usize,
+    /// Vocabulary size.
+    pub vocab_size: usize,
+    /// Maximum context length supported by the model.
+    pub max_context_len: usize,
+    /// Quantization applied to weights.
+    pub weight_quantization: String,
+    /// EOS token IDs for this model.
+    ///
+    /// Sourced from the model's `generation_config.json` or `tokenizer_config.json`.
+    /// Used by [`TokenStream`] when no explicit stop tokens are provided.
+    pub eos_tokens: Vec<u32>,
+    /// Number of parameters (approximate, in millions).
+    pub param_count_m: f32,
+    /// Whether the model uses grouped-query attention (num_kv_heads < num_heads).
+    pub uses_gqa: bool,
+    /// Whether the model uses multi-latent attention (DeepSeek-style).
+    pub uses_mla: bool,
+    /// Head dimension.
+    pub head_dim: usize,
+    /// Number of attention heads.
+    pub num_attention_heads: usize,
+    /// Number of KV heads (may differ from attention heads in GQA).
+    pub num_kv_heads: usize,
+}
+
+impl ModelInfo {
+    /// Create from a ModelConfig, populating all fields.
+    pub fn from_config(config: &ModelConfig) -> Self { /* ... */ }
+}
+```
+
+### 4.14 Batch Runner
+
+The current batch inference API (§7.9) requires manual orchestration of
+`BatchScheduler` + engine. `BatchRunner` composes them into a managed loop:
+
+```rust
+/// Managed batch inference loop.
+///
+/// Owns a `BatchScheduler` and drives an `InferenceEngine` in a
+/// continuous-batching loop. Handles sequence lifecycle, scheduling,
+/// and output collection.
+///
+/// ```rust
+/// let mut runner = BatchRunner::new(engine, BatchRunnerConfig::default());
+///
+/// // Submit requests (non-blocking — they queue internally)
+/// let handle1 = runner.submit(GenerateRequest::new(tokens1))?;
+/// let handle2 = runner.submit(GenerateRequest::new(tokens2))?;
+///
+/// // Drive the loop (call from your event loop or dedicated thread)
+/// while runner.has_pending() {
+///     let events = runner.step()?;
+///     for (handle, event) in events {
+///         match event {
+///             GenerateEvent::Token { token, .. } => { /* stream to client */ }
+///             GenerateEvent::Finished { .. } => { /* notify client */ }
+///             _ => {}
+///         }
+///     }
+/// }
+/// ```
+pub struct BatchRunner {
+    engine: Box<dyn BatchInferenceEngine>,
+    scheduler: BatchScheduler,
+    config: BatchRunnerConfig,
+    sequences: HashMap<SequenceHandle, SequenceState>,
+}
+
+/// Handle to a submitted generation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SequenceHandle(u64);
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct BatchRunnerConfig {
+    /// Maximum KV cache pool size in bytes.
+    pub kv_pool_size: usize,
+    /// Maximum number of concurrent sequences.
+    pub max_batch_size: usize,
+    /// Scheduling policy.
+    pub policy: SchedulingPolicy,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulingPolicy {
+    /// First-come, first-served.
+    Fcfs,
+    /// Shortest sequence first (minimize latency for short prompts).
+    ShortestFirst,
+}
+
+impl Default for BatchRunnerConfig {
+    fn default() -> Self {
+        Self {
+            kv_pool_size: 1024 * 1024 * 1024, // 1 GB
+            max_batch_size: 8,
+            policy: SchedulingPolicy::Fcfs,
+        }
+    }
+}
+
+impl BatchRunner {
+    pub fn new(engine: Box<dyn BatchInferenceEngine>, config: BatchRunnerConfig) -> Self { /* ... */ }
+
+    /// Submit a new generation request. Returns a handle for tracking.
+    pub fn submit(&mut self, request: GenerateRequest) -> Result<SequenceHandle, InferenceError> { /* ... */ }
+
+    /// Run one step of the batch loop: select batch, prefill/decode, sample, emit events.
+    pub fn step(&mut self) -> Result<Vec<(SequenceHandle, GenerateEvent)>, InferenceError> { /* ... */ }
+
+    /// Cancel a specific sequence.
+    pub fn cancel(&mut self, handle: SequenceHandle) { /* ... */ }
+
+    /// Whether any sequences are still pending or in-progress.
+    pub fn has_pending(&self) -> bool { /* ... */ }
+
+    /// Number of active sequences.
+    pub fn active_count(&self) -> usize { /* ... */ }
+}
+```
 
 ---
 
@@ -1958,15 +2499,20 @@ pub struct CudaArtifacts<'a> {
     pub config: &'a CudaConfig,
 }
 
-impl InferenceEngine for CudaInference {
-    type Artifacts = CudaArtifacts<'_>;
+impl CudaInference {
+    /// Load model from CUDA-specific artifacts.
+    /// Type-safe: compile-time guarantee you pass CudaArtifacts.
+    pub fn load(config: CudaConfig, artifacts: &CudaArtifacts<'_>)
+        -> Result<Self, InferenceError> { /* ... */ }
+}
 
-    fn load(&mut self, artifacts: &CudaArtifacts<'_>) -> Result<(), InferenceError> { /* ... */ }
+impl InferenceEngine for CudaInference {
     fn prefill(&mut self, tokens: &[u32]) -> Result<Logits, InferenceError> { /* ... */ }
     fn decode_step(&mut self, token: u32) -> Result<Logits, InferenceError> { /* ... */ }
     fn reset(&mut self) { /* ... */ }
     fn seq_pos(&self) -> usize { /* ... */ }
     fn truncate_to(&mut self, pos: usize) { /* ... */ }
+    fn model_info(&self) -> &ModelInfo { /* ... */ }
 }
 ```
 
@@ -1995,6 +2541,76 @@ ironmill-cli
 Users should never need to depend on `mil-rs` directly for normal usage.
 `ironmill-compile` re-exports the relevant IR types, and
 `ironmill-inference` re-exports the relevant weight types.
+
+### 6.4 Progress & Telemetry
+
+All long-running operations (compilation, weight loading, prefill) must
+support progress callbacks. This enables progress bars, logging, metrics,
+and user-facing status updates without baking any specific UI into the core.
+
+```rust
+/// Sink for progress updates during long-running operations.
+///
+/// Implement this trait to receive progress events. The default
+/// implementation is a no-op (silent).
+///
+/// ```rust
+/// struct StderrProgress;
+/// impl ProgressSink for StderrProgress {
+///     fn on_stage(&self, name: &str) {
+///         eprintln!("  → {name}...");
+///     }
+///     fn on_progress(&self, current: usize, total: usize, message: &str) {
+///         eprintln!("  [{current}/{total}] {message}");
+///     }
+/// }
+/// ```
+pub trait ProgressSink: Send + Sync {
+    /// A new named stage has started (e.g., "loading weights", "quantizing").
+    fn on_stage(&self, _name: &str) {}
+
+    /// Progress within the current stage.
+    fn on_progress(&self, _current: usize, _total: usize, _message: &str) {}
+
+    /// A stage has completed.
+    fn on_stage_complete(&self, _name: &str, _elapsed: Duration) {}
+
+    /// A non-fatal warning.
+    fn on_warning(&self, _message: &str) {}
+}
+
+/// No-op progress sink (the default when none is provided).
+pub struct NullProgress;
+impl ProgressSink for NullProgress {}
+```
+
+Integration points:
+
+```rust
+// CompileTarget::compile() takes &dyn ProgressSink (see §3.7)
+
+// Model loading (see §10)
+impl Model {
+    pub fn from_pretrained(path: impl AsRef<Path>) -> ModelBuilder {
+        ModelBuilder { progress: Box::new(NullProgress), /* ... */ }
+    }
+}
+
+impl ModelBuilder {
+    pub fn with_progress(mut self, sink: impl ProgressSink + 'static) -> Self {
+        self.progress = Box::new(sink); self
+    }
+}
+
+// Engine loading
+impl MetalInference {
+    pub fn load_with_progress(
+        config: MetalConfig,
+        artifacts: &MetalArtifacts<'_>,
+        progress: &dyn ProgressSink,
+    ) -> Result<Self, InferenceError> { /* ... */ }
+}
+```
 
 ---
 
@@ -2460,6 +3076,137 @@ println!("Output: {}", detokenize_all(&result.tokens));
 println!("Finish reason: {:?}", result.finish_reason);
 ```
 
+### 7.17 High-Level API — Minimal Example
+
+```rust
+use ironmill_core::{Model, GenParams};
+
+let mut model = Model::from_pretrained("./Qwen3-0.6B/")
+    .build()?;
+
+let output = model.generate("What is Rust?", GenParams::default())?;
+println!("{}", output.text);
+```
+
+### 7.18 High-Level API — Streaming
+
+```rust
+use ironmill_core::{Model, GenParams};
+
+let mut model = Model::from_pretrained("./Qwen3-0.6B/")
+    .device(Device::Metal)
+    .max_seq_len(8192)
+    .build()?;
+
+for chunk in model.stream("Explain monads simply", GenParams::default())? {
+    let chunk = chunk?;
+    print!("{}", chunk.text);
+    if chunk.finished {
+        println!("\n[done: {:?}]", chunk.finish_reason.unwrap());
+    }
+}
+```
+
+### 7.19 Chat Session
+
+```rust
+use ironmill_core::{Model, GenParams};
+
+let mut model = Model::from_pretrained("./Llama-3.2-3B/")
+    .build()?;
+
+let mut chat = model.chat()
+    .system("You are a helpful, concise assistant.")
+    .params(GenParams::default().with_temperature(0.8))
+    .build();
+
+let r1 = chat.say("What's the capital of France?")?;
+println!("Assistant: {}", r1.text);
+
+let r2 = chat.say("What about Germany?")?;
+println!("Assistant: {}", r2.text);
+
+// Context is maintained — the model knows we're talking about capitals
+println!("History: {} turns", chat.history().len());
+```
+
+### 7.20 JIT Loading (No Compile Step)
+
+```rust
+use ironmill_inference::{
+    metal::{MetalInference, MetalConfig},
+};
+use ironmill_compile::weights::SafeTensorsProvider;
+use ironmill_core::jit::TransformPipeline;
+
+// Load weights + apply INT4 quantization directly — no MIL IR
+let provider = SafeTensorsProvider::load("./Qwen3-0.6B/")?;
+let transforms = TransformPipeline::new().with_int4(128);
+let config = MetalConfig::new().with_max_seq_len(4096);
+
+let mut engine = MetalInference::load_jit(config, &provider, &transforms)?;
+
+// Ready to run inference immediately
+let logits = engine.prefill(&[1, 15043, 29892])?;
+```
+
+### 7.21 Progress Tracking
+
+```rust
+use ironmill_core::{Model, GenParams};
+use ironmill_inference::ProgressSink;
+use std::time::Duration;
+
+struct CliProgress;
+impl ProgressSink for CliProgress {
+    fn on_stage(&self, name: &str) {
+        eprintln!("⏳ {name}...");
+    }
+    fn on_progress(&self, current: usize, total: usize, msg: &str) {
+        eprintln!("  [{current}/{total}] {msg}");
+    }
+    fn on_stage_complete(&self, name: &str, elapsed: Duration) {
+        eprintln!("  ✓ {name} ({elapsed:.1?})");
+    }
+}
+
+let mut model = Model::from_pretrained("./Qwen3-0.6B/")
+    .with_progress(CliProgress)
+    .build()?;
+// Output:
+// ⏳ detecting model format...
+//   ✓ detecting model format (1.2ms)
+// ⏳ loading weights...
+//   [0/291] model.embed_tokens.weight
+//   [291/291] lm_head.weight
+//   ✓ loading weights (2.1s)
+// ⏳ allocating KV cache...
+//   ✓ allocating KV cache (45ms)
+```
+
+### 7.22 Memory Estimation
+
+```rust
+use ironmill_inference::{MemoryEstimator, QuantLevel, KvQuantLevel};
+use ironmill_compile::weights::SafeTensorsProvider;
+
+let provider = SafeTensorsProvider::load("./Llama-3.2-3B/")?;
+let config = provider.config();
+
+// Check if model fits before loading
+let weight_mem = MemoryEstimator::weight_memory(config, QuantLevel::Int4);
+let kv_mem = MemoryEstimator::kv_cache_memory(config, 4096, 1, None);
+let total = weight_mem + kv_mem;
+
+println!("Weight memory:  {:.1} GB", weight_mem as f64 / 1e9);
+println!("KV cache (4K):  {:.1} GB", kv_mem as f64 / 1e9);
+println!("Total estimate: {:.1} GB", total as f64 / 1e9);
+
+// Find max sequence length for a 4 GB budget
+let max_len = MemoryEstimator::max_seq_len_for_budget(config, 4_000_000_000, 1);
+println!("Max seq len in 4 GB: {max_len}");
+```
+
 ---
 
 ## 8. Migration Guide
@@ -2501,13 +3248,30 @@ let config = ModelConfig::new(Architecture::Llama)
 
 ### 8.2 For Consumers of ironmill-inference
 
-**InferenceEngine::load** — no more `&dyn Any`:
+**InferenceEngine::load** — loading is now a method on each backend, not on the trait:
 ```rust
 // BEFORE:
+let mut engine = MetalInference::new(config)?;
 engine.load(&artifacts as &dyn std::any::Any)?;
 
 // AFTER:
-engine.load(&artifacts)?;  // type-checked at compile time
+let engine = MetalInference::load(config, &artifacts)?;
+// Type-safe: compile-time guarantee you pass MetalArtifacts.
+// Returns a ready-to-use engine (no two-step init).
+```
+
+**InferenceEngine trait** — `load()` is removed from the trait. The trait is
+now object-safe (`dyn InferenceEngine` works). `model_info()` is added:
+```rust
+// BEFORE:
+let engine: Box<dyn InferenceEngine> = /* impossible with associated types */;
+
+// AFTER:
+let engine: Box<dyn InferenceEngine> = Box::new(
+    MetalInference::load(config, &artifacts)?
+);
+let info = engine.model_info();
+println!("Architecture: {:?}", info.architecture);
 ```
 
 **Error handling** — `InferenceError::Runtime` now boxes the source:
@@ -2520,11 +3284,59 @@ if let InferenceError::Runtime(msg) = &err {
 // AFTER:
 if let InferenceError::Runtime(source) = &err {
     eprintln!("Runtime error: {source}");
-    // Optional: downcast to specific backend error
     if let Some(metal_err) = source.downcast_ref::<MetalError>() {
         eprintln!("Metal details: {metal_err:?}");
     }
 }
+```
+
+**GenerateEvent** — new `PromptProcessed` variant:
+```rust
+// BEFORE:
+for event in stream {
+    match event? {
+        GenerateEvent::Token { .. } => { /* ... */ }
+        GenerateEvent::Finished { .. } => break,
+    }
+}
+
+// AFTER:
+for event in stream {
+    match event? {
+        GenerateEvent::PromptProcessed { prompt_tokens, elapsed } => {
+            eprintln!("Prefill: {prompt_tokens} tokens in {elapsed:.1?}");
+        }
+        GenerateEvent::Token { .. } => { /* ... */ }
+        GenerateEvent::Finished { .. } => break,
+    }
+}
+```
+
+**Stop tokens** — now model-aware by default:
+```rust
+// BEFORE:
+let request = GenerateRequest::new(tokens)
+    .with_stop_tokens(vec![2]);  // had to know the model's EOS
+
+// AFTER:
+let request = GenerateRequest::new(tokens);
+// Stop tokens are automatically pulled from ModelInfo::eos_tokens
+// Only specify explicitly if you need to override the model's default.
+```
+
+**High-level API** (new, optional):
+```rust
+// BEFORE: ~25 lines to set up inference
+let provider = SafeTensorsProvider::load("./model/")?;
+let config = MetalConfig::new().with_max_seq_len(4096);
+let mut engine = MetalInference::new(config)?;
+engine.load(&artifacts)?;
+let tokens = tokenize(&prompt);
+// ... sampling loop ...
+
+// AFTER: 2 lines
+let mut model = Model::from_pretrained("./model/").build()?;
+let output = model.generate("Hello!", GenParams::default())?;
 ```
 
 **MetalConfig** — struct literal still works, but builder is preferred:
@@ -2555,3 +3367,1099 @@ let config = MetalConfig::new().with_max_seq_len(4096);
   will see cleaner output.
 - Compiler failures are now hard errors (exit 1) instead of warnings.
   Add `|| true` to scripts that tolerated this.
+
+---
+
+## 9. Tokenizer Abstraction
+
+The core inference API operates entirely on `Vec<u32>` token IDs. This is
+correct for the low-level engine interface — tokenization is model-specific
+and orthogonal to GPU dispatch. However, every practical consumer must pair
+the engine with a tokenizer, and the current API provides no help with this.
+
+### 9.1 Tokenizer Trait
+
+```rust
+/// Text ↔ token ID conversion.
+///
+/// This trait abstracts over tokenizer implementations (SentencePiece,
+/// BPE, Unigram, etc.) so that the high-level API can tokenize/detokenize
+/// without depending on a specific tokenizer library.
+pub trait Tokenizer: Send + Sync {
+    /// Encode text into token IDs.
+    fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError>;
+
+    /// Decode token IDs back to text.
+    fn decode(&self, tokens: &[u32]) -> Result<String, TokenizerError>;
+
+    /// Decode a single token to its text representation.
+    /// Returns empty string for special tokens.
+    fn decode_token(&self, token: u32) -> Result<String, TokenizerError> {
+        self.decode(&[token])
+    }
+
+    /// Vocabulary size.
+    fn vocab_size(&self) -> usize;
+
+    /// EOS token IDs for this tokenizer/model.
+    fn eos_tokens(&self) -> &[u32];
+
+    /// BOS token ID, if the model uses one.
+    fn bos_token(&self) -> Option<u32> { None }
+
+    /// Apply the model's chat template to a conversation.
+    /// Returns the formatted prompt string ready for encoding.
+    fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String, TokenizerError> {
+        // Default: concatenate messages with role prefixes.
+        // Override for model-specific templates (Llama, Qwen, Gemma each differ).
+        let mut prompt = String::new();
+        for msg in messages {
+            prompt.push_str(&format!("<|{}|>\n{}\n", msg.role, msg.content));
+        }
+        Ok(prompt)
+    }
+}
+
+/// A message in a conversation.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    /// Role: "system", "user", "assistant", "tool".
+    pub role: String,
+    /// Message content.
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self { role: "system".into(), content: content.into() }
+    }
+    pub fn user(content: impl Into<String>) -> Self {
+        Self { role: "user".into(), content: content.into() }
+    }
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: "assistant".into(), content: content.into() }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum TokenizerError {
+    #[error("tokenizer not loaded: {0}")]
+    NotLoaded(String),
+    #[error("encoding error: {0}")]
+    Encode(String),
+    #[error("decoding error: {0}")]
+    Decode(String),
+    #[error("chat template error: {0}")]
+    Template(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+```
+
+### 9.2 HuggingFace Tokenizer Adapter
+
+The primary implementation wraps the `tokenizers` crate (HuggingFace's Rust
+tokenizer library), which supports all common tokenizer types:
+
+```rust
+/// HuggingFace tokenizers adapter.
+///
+/// Loads `tokenizer.json` from a model directory. Supports SentencePiece,
+/// BPE, Unigram, and WordPiece tokenizers.
+///
+/// ```rust
+/// let tokenizer = HfTokenizer::from_model_dir("./Qwen3-0.6B/")?;
+/// let tokens = tokenizer.encode("Hello, world!")?;
+/// let text = tokenizer.decode(&tokens)?;
+/// ```
+pub struct HfTokenizer {
+    inner: tokenizers::Tokenizer,
+    eos_tokens: Vec<u32>,
+    bos_token: Option<u32>,
+    chat_template: Option<String>,
+}
+
+impl HfTokenizer {
+    /// Load from a model directory containing `tokenizer.json`.
+    ///
+    /// Also reads `tokenizer_config.json` for EOS/BOS tokens and
+    /// `generation_config.json` for chat template, if present.
+    pub fn from_model_dir(path: impl AsRef<Path>) -> Result<Self, TokenizerError> { /* ... */ }
+
+    /// Load from an explicit `tokenizer.json` path.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TokenizerError> { /* ... */ }
+}
+
+impl Tokenizer for HfTokenizer {
+    fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
+        self.inner.encode(text, false)
+            .map(|enc| enc.get_ids().to_vec())
+            .map_err(|e| TokenizerError::Encode(e.to_string()))
+    }
+
+    fn decode(&self, tokens: &[u32]) -> Result<String, TokenizerError> {
+        self.inner.decode(tokens, true)
+            .map_err(|e| TokenizerError::Decode(e.to_string()))
+    }
+
+    fn vocab_size(&self) -> usize { self.inner.get_vocab_size(false) }
+    fn eos_tokens(&self) -> &[u32] { &self.eos_tokens }
+    fn bos_token(&self) -> Option<u32> { self.bos_token }
+
+    fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String, TokenizerError> {
+        if let Some(template) = &self.chat_template {
+            // Render Jinja2-style template (subset supported)
+            render_chat_template(template, messages)
+        } else {
+            // Fallback to default implementation
+            let mut prompt = String::new();
+            for msg in messages {
+                prompt.push_str(&format!("<|{}|>\n{}\n", msg.role, msg.content));
+            }
+            Ok(prompt)
+        }
+    }
+}
+```
+
+### 9.3 Dependency Isolation
+
+The `tokenizers` crate is a heavy dependency (regex, unicode, serde). It
+lives behind a feature flag:
+
+```toml
+[features]
+default = ["tokenizer"]
+tokenizer = ["dep:tokenizers"]
+```
+
+Users who want a different tokenizer implementation (e.g., `sentencepiece`,
+a C++ binding, or a custom one) can disable the default feature and provide
+their own `Tokenizer` impl.
+
+---
+
+## 10. ironmill-core: High-Level API
+
+`ironmill-core` is the top-level entry point for users who want to run
+inference without manually wiring weight providers, compilation targets,
+engine backends, and tokenizers. It composes all the lower-level crates
+into a single `Model` abstraction.
+
+**Design principle**: the high-level API should make the common case trivial
+and the advanced case possible. Users who need fine-grained control drop down
+to the `ironmill-inference` / `ironmill-compile` APIs directly.
+
+### 10.1 Device
+
+```rust
+/// Target compute device for inference.
+///
+/// Determines which backend the `Model` uses. `Auto` inspects the
+/// current platform and selects the best available device.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Device {
+    /// Automatically select the best device for this platform.
+    /// macOS: Metal GPU. Linux: CUDA (if available), else CPU.
+    #[default]
+    Auto,
+    /// Metal GPU (macOS only).
+    Metal,
+    /// Apple Neural Engine via CoreML (macOS only).
+    Ane,
+    /// CoreML runtime (CPU/GPU/ANE per CoreML's scheduler).
+    CoreMl,
+    /// NVIDIA GPU via CUDA (Linux/Windows).
+    Cuda,
+    /// CPU-only inference.
+    Cpu,
+}
+```
+
+### 10.2 Model — The Top-Level Abstraction
+
+```rust
+/// A loaded, ready-to-use language model.
+///
+/// `Model` owns everything needed for inference: the engine, tokenizer,
+/// model info, and (optionally) the weight provider. It provides the
+/// simplest possible interface for text generation.
+///
+/// # Quick Start
+///
+/// ```rust
+/// use ironmill_core::{Model, GenParams};
+///
+/// let model = Model::from_pretrained("./Qwen3-0.6B/")?.build()?;
+///
+/// // Non-streaming
+/// let output = model.generate("What is Rust?", GenParams::default())?;
+/// println!("{}", output.text);
+///
+/// // Streaming
+/// for chunk in model.stream("What is Rust?", GenParams::default())? {
+///     print!("{}", chunk?.text);
+/// }
+/// ```
+pub struct Model {
+    engine: Box<dyn InferenceEngine>,
+    tokenizer: Box<dyn Tokenizer>,
+    info: ModelInfo,
+}
+
+impl Model {
+    /// Start building a model from a pretrained model directory.
+    ///
+    /// The directory should contain:
+    /// - Weight files (SafeTensors, GGUF)
+    /// - `config.json` (model architecture)
+    /// - `tokenizer.json` (tokenizer definition)
+    /// - Optionally: `generation_config.json`, `tokenizer_config.json`
+    ///
+    /// The builder auto-detects architecture, selects the appropriate backend,
+    /// and loads weights. No compilation step for the GPU-direct path.
+    pub fn from_pretrained(path: impl AsRef<Path>) -> ModelBuilder {
+        ModelBuilder::new(path.as_ref().to_path_buf(), ModelSource::Pretrained)
+    }
+
+    /// Load from a pre-compiled artifact (.ironml-gpu, .mlmodelc, etc.).
+    ///
+    /// Skips weight loading and compilation — the artifact is already
+    /// in the target format. Still needs a tokenizer (from the original
+    /// model directory or provided explicitly).
+    pub fn from_compiled(path: impl AsRef<Path>) -> ModelBuilder {
+        ModelBuilder::new(path.as_ref().to_path_buf(), ModelSource::Compiled)
+    }
+
+    /// Generate text (non-streaming). Returns the complete output.
+    ///
+    /// ```rust
+    /// let output = model.generate("Explain monads", GenParams::default())?;
+    /// println!("{}", output.text);
+    /// println!("Generated {} tokens in {:?}", output.token_count, output.elapsed);
+    /// ```
+    pub fn generate(&mut self, prompt: &str, params: GenParams) -> Result<TextOutput, ModelError> {
+        let tokens = self.tokenizer.encode(prompt)?;
+        let request = params.to_generate_request(tokens, &self.info);
+        let result = generate(&mut *self.engine, &request)?;
+        let text = self.tokenizer.decode(&result.tokens)?;
+        Ok(TextOutput {
+            text,
+            tokens: result.tokens,
+            token_count: result.tokens.len(),
+            prompt_token_count: result.prompt_tokens,
+            finish_reason: result.finish_reason,
+            elapsed: Duration::default(), // filled by timing wrapper
+        })
+    }
+
+    /// Generate text with streaming output.
+    ///
+    /// Returns an iterator of text chunks. Each chunk contains one or
+    /// more decoded tokens.
+    pub fn stream<'a>(
+        &'a mut self,
+        prompt: &str,
+        params: GenParams,
+    ) -> Result<TextStream<'a>, ModelError> {
+        let tokens = self.tokenizer.encode(prompt)?;
+        let request = params.to_generate_request(tokens, &self.info);
+        Ok(TextStream::new(&mut *self.engine, &self.tokenizer, request))
+    }
+
+    /// Start or continue a chat session.
+    ///
+    /// ```rust
+    /// let mut chat = model.chat()
+    ///     .system("You are a helpful assistant.")
+    ///     .build();
+    ///
+    /// let response = chat.say("Hello!")?;
+    /// println!("{}", response.text);
+    ///
+    /// let response = chat.say("Tell me more")?;
+    /// println!("{}", response.text);
+    /// ```
+    pub fn chat(&mut self) -> ChatSessionBuilder<'_> {
+        ChatSessionBuilder::new(self)
+    }
+
+    /// Access the underlying engine for low-level operations.
+    pub fn engine(&self) -> &dyn InferenceEngine { &*self.engine }
+    pub fn engine_mut(&mut self) -> &mut dyn InferenceEngine { &mut *self.engine }
+
+    /// Access the tokenizer.
+    pub fn tokenizer(&self) -> &dyn Tokenizer { &*self.tokenizer }
+
+    /// Model information.
+    pub fn info(&self) -> &ModelInfo { &self.info }
+}
+
+/// Generation parameters for the high-level API.
+///
+/// Simpler than `GenerateRequest` — no token IDs, no grammar.
+/// Intentionally omits repetition penalties (`repeat_penalty`,
+/// `frequency_penalty`, `presence_penalty`) for simplicity. Users who
+/// need those should drop down to `GenerateRequest` + `SamplerConfig`.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct GenParams {
+    pub temperature: f32,
+    pub max_tokens: usize,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub min_p: f32,
+}
+
+impl Default for GenParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.7,
+            max_tokens: 512,
+            top_p: 0.9,
+            top_k: 0,
+            min_p: 0.0,
+        }
+    }
+}
+
+impl GenParams {
+    pub fn greedy() -> Self { Self { temperature: 0.0, ..Default::default() } }
+
+    pub fn with_temperature(mut self, t: f32) -> Self { self.temperature = t; self }
+    pub fn with_max_tokens(mut self, n: usize) -> Self { self.max_tokens = n; self }
+    pub fn with_top_p(mut self, p: f32) -> Self { self.top_p = p; self }
+
+    /// Convert to the low-level `GenerateRequest`.
+    fn to_generate_request(&self, tokens: Vec<u32>, info: &ModelInfo) -> GenerateRequest {
+        GenerateRequest::new(tokens)
+            .with_sampler(
+                SamplerConfig::default()
+                    .with_temperature(self.temperature)
+                    .with_top_p(self.top_p)
+                    .with_top_k(self.top_k)
+                    .with_min_p(self.min_p)
+            )
+            .with_max_tokens(self.max_tokens)
+            .with_stop_tokens(info.eos_tokens.clone())
+    }
+}
+
+/// Output from non-streaming generation.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct TextOutput {
+    /// Generated text (decoded tokens).
+    pub text: String,
+    /// Raw token IDs.
+    pub tokens: Vec<u32>,
+    /// Number of generated tokens.
+    pub token_count: usize,
+    /// Number of prompt tokens.
+    pub prompt_token_count: usize,
+    /// Why generation stopped.
+    pub finish_reason: FinishReason,
+    /// Wall-clock generation time.
+    pub elapsed: Duration,
+}
+```
+
+### 10.3 ModelBuilder — Configuration & Loading
+
+```rust
+/// Builder for constructing a [`Model`].
+///
+/// Handles auto-detection of model format, architecture, and backend.
+/// Supports explicit overrides for every auto-detected parameter.
+pub struct ModelBuilder {
+    path: PathBuf,
+    source: ModelSource,
+    device: Device,
+    quantize: Option<QuantLevel>,
+    max_seq_len: usize,
+    tokenizer_path: Option<PathBuf>,
+    progress: Box<dyn ProgressSink>,
+}
+
+enum ModelSource { Pretrained, Compiled }
+
+impl ModelBuilder {
+    fn new(path: PathBuf, source: ModelSource) -> Self {
+        Self {
+            path,
+            source,
+            device: Device::Auto,
+            quantize: None,
+            max_seq_len: 4096,
+            tokenizer_path: None,
+            progress: Box::new(NullProgress),
+        }
+    }
+
+    /// Target device for inference.
+    pub fn device(mut self, device: Device) -> Self { self.device = device; self }
+
+    /// Apply weight quantization during loading.
+    /// Only used for `from_pretrained()` — compiled artifacts are already quantized.
+    pub fn quantize(mut self, level: QuantLevel) -> Self {
+        self.quantize = Some(level); self
+    }
+
+    /// Maximum sequence length (context window).
+    pub fn max_seq_len(mut self, len: usize) -> Self { self.max_seq_len = len; self }
+
+    /// Explicit tokenizer path (overrides auto-detection from model dir).
+    pub fn tokenizer(mut self, path: impl AsRef<Path>) -> Self {
+        self.tokenizer_path = Some(path.as_ref().to_path_buf()); self
+    }
+
+    /// Progress callback for loading status.
+    pub fn with_progress(mut self, sink: impl ProgressSink + 'static) -> Self {
+        self.progress = Box::new(sink); self
+    }
+
+    /// Build the model: detect format, load weights, create engine, load tokenizer.
+    ///
+    /// For `from_pretrained()` with `Device::Metal`:
+    /// 1. Detect model format (SafeTensors/GGUF) and architecture
+    /// 2. Load weights into WeightProvider
+    /// 3. Apply quantization (if requested) directly to weight tensors
+    /// 4. Create MetalInference engine + load weights into GPU
+    /// 5. Load tokenizer from model directory
+    ///
+    /// No MIL IR. No CoreML. No compilation step.
+    pub fn build(self) -> Result<Model, ModelError> {
+        let device = self.resolve_device();
+        self.progress.on_stage("detecting model format");
+        let format = detect_model_format(&self.path)?;
+
+        match self.source {
+            ModelSource::Pretrained => self.build_from_pretrained(device, format),
+            ModelSource::Compiled => self.build_from_compiled(device),
+        }
+    }
+
+    fn resolve_device(&self) -> Device {
+        match self.device {
+            Device::Auto => {
+                #[cfg(target_os = "macos")]
+                { Device::Metal }
+                #[cfg(not(target_os = "macos"))]
+                { Device::Cpu }
+            }
+            other => other,
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    #[error("inference error: {0}")]
+    Inference(#[from] InferenceError),
+    #[error("compile error: {0}")]
+    Compile(#[from] CompileError),
+    #[error("tokenizer error: {0}")]
+    Tokenizer(#[from] TokenizerError),
+    #[error("model not found: {0}")]
+    NotFound(PathBuf),
+    #[error("unsupported device {0:?} on this platform")]
+    UnsupportedDevice(Device),
+    #[error("{0}")]
+    Other(String),
+}
+```
+
+### 10.4 TextStream — Streaming with Detokenization
+
+```rust
+/// Streaming text output from generation.
+///
+/// Wraps [`TokenStream`] and detokenizes each token as it arrives.
+/// Handles the complexity of multi-byte characters spanning token
+/// boundaries.
+pub struct TextStream<'a> {
+    inner: TokenStream<'a>,
+    tokenizer: &'a dyn Tokenizer,
+    cancel: CancellationToken,
+}
+
+/// A chunk of streamed text.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct TextChunk {
+    /// Decoded text for this chunk.
+    pub text: String,
+    /// Raw token ID.
+    pub token: u32,
+    /// Position in the generated sequence.
+    pub position: usize,
+    /// Whether this is the final chunk.
+    pub finished: bool,
+    /// Finish reason (only set on the final chunk).
+    pub finish_reason: Option<FinishReason>,
+}
+
+impl Iterator for TextStream<'_> {
+    type Item = Result<TextChunk, ModelError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                Ok(GenerateEvent::PromptProcessed { .. }) => continue,
+                Ok(GenerateEvent::Token { token, position, .. }) => {
+                    let text = match self.tokenizer.decode_token(token) {
+                        Ok(t) => t,
+                        Err(e) => return Some(Err(e.into())),
+                    };
+                    return Some(Ok(TextChunk {
+                        text, token, position, finished: false, finish_reason: None,
+                    }));
+                }
+                Ok(GenerateEvent::Finished { reason, tokens_generated, .. }) => {
+                    return Some(Ok(TextChunk {
+                        text: String::new(),
+                        token: 0,
+                        position: tokens_generated,
+                        finished: true,
+                        finish_reason: Some(reason),
+                    }));
+                }
+                Err(e) => return Some(Err(e.into())),
+            }
+        }
+    }
+}
+```
+
+### 10.5 ChatSession — Multi-Turn Conversations
+
+```rust
+/// Multi-turn conversation manager.
+///
+/// Tracks conversation history, applies chat templates, and manages
+/// the token budget (truncating old turns when the context window fills).
+///
+/// ```rust
+/// let mut chat = model.chat()
+///     .system("You are a concise assistant.")
+///     .max_context_tokens(4096)
+///     .build();
+///
+/// let r1 = chat.say("What is 2+2?")?;
+/// println!("Assistant: {}", r1.text);
+///
+/// let r2 = chat.say("And 3+3?")?;
+/// println!("Assistant: {}", r2.text);
+///
+/// // Streaming
+/// for chunk in chat.say_stream("Explain gravity")? {
+///     print!("{}", chunk?.text);
+/// }
+///
+/// // Access history
+/// println!("Turns so far: {}", chat.history().len());
+/// ```
+pub struct ChatSession<'a> {
+    model: &'a mut Model,
+    history: Vec<ChatMessage>,
+    system_prompt: Option<String>,
+    params: GenParams,
+    max_context_tokens: usize,
+}
+
+pub struct ChatSessionBuilder<'a> {
+    model: &'a mut Model,
+    system_prompt: Option<String>,
+    params: GenParams,
+    max_context_tokens: usize,
+}
+
+impl<'a> ChatSessionBuilder<'a> {
+    fn new(model: &'a mut Model) -> Self {
+        let max_ctx = model.info().max_context_len;
+        Self {
+            model,
+            system_prompt: None,
+            params: GenParams::default(),
+            max_context_tokens: max_ctx,
+        }
+    }
+
+    pub fn system(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into()); self
+    }
+
+    pub fn params(mut self, params: GenParams) -> Self {
+        self.params = params; self
+    }
+
+    pub fn max_context_tokens(mut self, n: usize) -> Self {
+        self.max_context_tokens = n; self
+    }
+
+    pub fn build(self) -> ChatSession<'a> {
+        let mut history = Vec::new();
+        if let Some(sys) = self.system_prompt {
+            history.push(ChatMessage::system(sys));
+        }
+        ChatSession {
+            model: self.model,
+            history,
+            system_prompt: None,
+            params: self.params,
+            max_context_tokens: self.max_context_tokens,
+        }
+    }
+}
+
+impl ChatSession<'_> {
+    /// Send a message and get a response (non-streaming).
+    pub fn say(&mut self, message: &str) -> Result<TextOutput, ModelError> {
+        self.history.push(ChatMessage::user(message));
+
+        // Truncate history if we exceed the context window
+        let mut prompt = self.model.tokenizer().apply_chat_template(&self.history)?;
+        let mut tokens = self.model.tokenizer().encode(&prompt)?;
+        while tokens.len() > self.max_context_tokens && self.history.len() > 2 {
+            // Remove oldest non-system message
+            let remove_idx = if self.history[0].role == "system" { 1 } else { 0 };
+            self.history.remove(remove_idx);
+            // Re-encode with trimmed history
+            prompt = self.model.tokenizer().apply_chat_template(&self.history)?;
+            tokens = self.model.tokenizer().encode(&prompt)?;
+        }
+
+        self.model.engine_mut().reset();
+        let output = self.model.generate(&prompt, self.params.clone())?;
+
+        self.history.push(ChatMessage::assistant(&output.text));
+        Ok(output)
+    }
+
+    /// Send a message and stream the response.
+    ///
+    /// The returned `StreamingChatResponse` must be consumed. When the
+    /// stream completes (or is dropped), the assistant's response is
+    /// automatically appended to conversation history.
+    pub fn say_stream<'a>(&'a mut self, message: &str) -> Result<StreamingChatResponse<'a>, ModelError> {
+        self.history.push(ChatMessage::user(message));
+        let prompt = self.model.tokenizer().apply_chat_template(&self.history)?;
+        self.model.engine_mut().reset();
+        let stream = self.model.stream(&prompt, self.params.clone())?;
+        Ok(StreamingChatResponse {
+            stream,
+            history: &mut self.history,
+            collected_tokens: Vec::new(),
+            tokenizer: self.model.tokenizer(),
+        })
+    }
+
+    /// Access conversation history.
+    pub fn history(&self) -> &[ChatMessage] { &self.history }
+
+    /// Clear conversation history (keeps system prompt).
+    pub fn clear(&mut self) {
+        let system = self.history.iter()
+            .find(|m| m.role == "system")
+            .cloned();
+        self.history.clear();
+        if let Some(s) = system {
+            self.history.push(s);
+        }
+        self.model.engine_mut().reset();
+    }
+}
+
+/// Streaming chat response that commits the assistant turn to history
+/// when the stream completes or is dropped.
+pub struct StreamingChatResponse<'a> {
+    stream: TextStream<'a>,
+    history: &'a mut Vec<ChatMessage>,
+    collected_tokens: Vec<u32>,
+    tokenizer: &'a dyn Tokenizer,
+}
+
+impl Iterator for StreamingChatResponse<'_> {
+    type Item = Result<TextChunk, ModelError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let chunk = self.stream.next()?;
+        if let Ok(ref c) = chunk {
+            if !c.finished {
+                self.collected_tokens.push(c.token);
+            }
+        }
+        chunk
+    }
+}
+
+impl Drop for StreamingChatResponse<'_> {
+    fn drop(&mut self) {
+        // Commit the assistant's response to history
+        if !self.collected_tokens.is_empty() {
+            if let Ok(text) = self.tokenizer.decode(&self.collected_tokens) {
+                self.history.push(ChatMessage::assistant(text));
+            }
+        }
+    }
+}
+```
+
+### 10.6 Crate Structure
+
+```
+ironmill-core/
+├── Cargo.toml
+├── src/
+│   ├── lib.rs          ← Model, Device, GenParams, TextOutput
+│   ├── builder.rs      ← ModelBuilder, auto-detection logic
+│   ├── chat.rs         ← ChatSession, ChatSessionBuilder
+│   ├── stream.rs       ← TextStream, TextChunk
+│   ├── tokenizer.rs    ← Tokenizer trait, HfTokenizer
+│   └── error.rs        ← ModelError, TokenizerError
+```
+
+Dependencies:
+
+```toml
+[dependencies]
+ironmill-inference = { path = "../ironmill-inference" }
+ironmill-compile = { path = "../ironmill-compile", optional = true }
+tokenizers = { version = "0.20", optional = true }
+
+[features]
+default = ["tokenizer", "compile"]
+tokenizer = ["dep:tokenizers"]
+compile = ["dep:ironmill-compile"]  # enables from_pretrained() with compilation
+```
+
+When `compile` is disabled, only `Model::from_compiled()` is available.
+When `tokenizer` is disabled, users must provide their own `Tokenizer` impl.
+
+---
+
+## 11. JIT Compilation
+
+### 11.1 Motivation
+
+The current Metal inference path still routes through MIL IR (via
+`GpuCompileBuilder`) even though the Metal backend never uses the MIL
+computation graph — it only uses the quantized weight tensors. MIL IR is
+an unnecessary intermediary when quantization can be applied directly to
+weight data.
+
+JIT compilation eliminates this indirection:
+
+```
+AOT (current):  SafeTensors → MIL IR Program → PassPipeline → MilWeightProvider → MetalInference
+JIT (proposed): SafeTensors → WeightProvider → TensorTransforms → MetalInference
+```
+
+| | AOT (current) | JIT (proposed) |
+|---|---|---|
+| **Indirection** | Weights converted to MIL ops, then back to tensors | Direct tensor access |
+| **Time-to-first-token** | Slow (build MIL graph, run passes, extract) | Fast (load + transform + go) |
+| **Quantization target** | MIL `Operation` nodes | Raw weight tensors |
+| **Disk artifacts** | `.ironml-gpu` bundle | None required (optional cache) |
+| **Graph optimizations** | Available (op fusion, layout) | Not needed (hand-written shaders) |
+| **CoreML compatibility** | Yes (can also produce .mlpackage) | No (Metal/CUDA only) |
+
+### 11.2 TensorTransform — Direct Weight Quantization
+
+`TensorTransform` replaces `Pass` for the JIT path. It operates on
+individual weight tensors, not MIL program graphs:
+
+```rust
+/// A transform applied directly to weight tensors during loading.
+///
+/// Unlike [`Pass`] (which operates on a MIL `Program` graph),
+/// `TensorTransform` operates on raw tensor data. This avoids the
+/// overhead of converting weights to/from MIL IR representation.
+pub trait TensorTransform: Send + Sync {
+    /// Name of this transform (for logging).
+    fn name(&self) -> &str;
+
+    /// Transform a single weight tensor in-place.
+    ///
+    /// The transform receives the tensor name (e.g. "model.layers.0.self_attn.q_proj.weight"),
+    /// the tensor data, and the model config. It can modify the data, change the
+    /// dtype, or reshape — returning the transformed tensor.
+    ///
+    /// Return `None` to leave the tensor unchanged.
+    fn transform(
+        &self,
+        name: &str,
+        tensor: WeightTensor<'_>,
+        config: &ModelConfig,
+    ) -> Result<Option<TransformedTensor>, TransformError>;
+}
+
+/// Result of a tensor transform.
+pub struct TransformedTensor {
+    pub data: Vec<u8>,
+    pub shape: Vec<usize>,
+    pub dtype: ScalarType,
+    /// Quantization metadata (for the engine to select the right kernel).
+    pub quant_info: QuantizationInfo,
+}
+
+/// Pipeline of tensor transforms, applied during weight loading.
+pub struct TransformPipeline {
+    transforms: Vec<Box<dyn TensorTransform>>,
+}
+
+impl TransformPipeline {
+    pub fn new() -> Self { Self { transforms: Vec::new() } }
+
+    pub fn with_int4(mut self, group_size: usize) -> Self {
+        self.transforms.push(Box::new(Int4AffineTransform { group_size }));
+        self
+    }
+
+    pub fn with_fp16(mut self) -> Self {
+        self.transforms.push(Box::new(Fp16CastTransform));
+        self
+    }
+
+    pub fn with_polar_quant(mut self, bits: u8) -> Self {
+        self.transforms.push(Box::new(PolarQuantTransform { bits }));
+        self
+    }
+
+    /// Apply all transforms to a weight provider, yielding transformed tensors.
+    ///
+    /// This is the core JIT path: weights are loaded from disk, transformed
+    /// (quantized/cast), and yielded one at a time for the engine to upload
+    /// to GPU memory. No intermediate MIL IR is created.
+    pub fn apply<'a>(
+        &'a self,
+        provider: &'a dyn WeightProvider,
+        progress: &'a dyn ProgressSink,
+    ) -> TransformIterator<'a> { /* ... */ }
+}
+```
+
+### 11.3 JIT Engine Loading
+
+The JIT path integrates with `MetalInference` via a new loading method:
+
+```rust
+impl MetalInference {
+    /// Load model using the JIT path: weights are loaded, transformed, and
+    /// uploaded to GPU in a single streaming pass.
+    ///
+    /// ```rust
+    /// let provider = SafeTensorsProvider::load("./Qwen3-0.6B/")?;
+    /// let transforms = TransformPipeline::new().with_fp16();
+    /// let config = MetalConfig::new().with_max_seq_len(4096);
+    ///
+    /// let engine = MetalInference::load_jit(config, &provider, &transforms)?;
+    /// // Ready to run inference — no compile step, no .ironml-gpu bundle.
+    /// ```
+    pub fn load_jit(
+        config: MetalConfig,
+        provider: &dyn WeightProvider,
+        transforms: &TransformPipeline,
+    ) -> Result<Self, InferenceError> {
+        // 1. Create Metal device + command queue
+        // 2. For each weight tensor:
+        //    a. Apply transforms (quantize/cast)
+        //    b. Upload to Metal buffer
+        // 3. Allocate KV cache buffers
+        // 4. Compile/load Metal shader pipelines (cached on disk)
+        todo!()
+    }
+}
+```
+
+### 11.4 Shader Caching
+
+JIT-compiled Metal shader pipelines are cached to avoid recompilation on
+subsequent runs. The cache key includes:
+
+- Model architecture + dimensions (hidden_size, num_layers, etc.)
+- Quantization configuration
+- Metal device capabilities (GPU family, feature set)
+- Shader source hash
+
+```rust
+/// Persistent shader pipeline cache.
+///
+/// Stores compiled Metal pipeline state objects to disk, keyed by
+/// a hash of the shader source + specialization constants.
+pub struct ShaderCache {
+    cache_dir: PathBuf,
+}
+
+impl ShaderCache {
+    /// Open or create a shader cache at the given directory.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self, std::io::Error> { /* ... */ }
+
+    /// Default cache location: `~/.cache/ironmill/shaders/`
+    pub fn default_location() -> Result<Self, std::io::Error> { /* ... */ }
+
+    /// Look up a cached pipeline binary.
+    pub fn get(&self, key: &ShaderCacheKey) -> Option<Vec<u8>> { /* ... */ }
+
+    /// Store a compiled pipeline binary.
+    pub fn put(&self, key: &ShaderCacheKey, binary: &[u8]) -> Result<(), std::io::Error> { /* ... */ }
+}
+```
+
+### 11.5 When to Use JIT vs AOT
+
+```
+                    ┌──────────────────────────────────────────────────────┐
+                    │              Which path should I use?                │
+                    └──────────────────┬───────────────────────────────────┘
+                                       │
+                              ┌────────▼────────┐
+                              │  Need ANE?       │
+                              └────┬────────┬────┘
+                                   │ yes    │ no
+                              ┌────▼────┐   │
+                              │ CoreML  │   │
+                              │ (AOT)   │   │
+                              └─────────┘   │
+                                       ┌────▼────────────┐
+                                       │ Need to ship a   │
+                                       │ compiled model?   │
+                                       └──┬──────────┬────┘
+                                          │ yes      │ no
+                                     ┌────▼────┐     │
+                                     │ AOT     │     │
+                                     │ (.ironml│     │
+                                     │  -gpu)  │     │
+                                     └─────────┘     │
+                                                ┌────▼────┐
+                                                │ JIT     │
+                                                │ (direct)│
+                                                └─────────┘
+```
+
+- **JIT**: Development, experimentation, rapid iteration, one-off runs.
+  The high-level `Model::from_pretrained()` API uses JIT by default.
+- **AOT**: Production deployment, distributing models to end users,
+  reproducible builds. Use `ironmill compile` CLI or `CompileTarget` API.
+- **CoreML AOT**: ANE inference, on-device training, integration with
+  Apple's ML ecosystem.
+
+---
+
+## 12. Open Design Questions
+
+### 12.1 Shared Type Placement
+
+`QuantLevel`, `KvQuantLevel`, `MemoryEstimator`, `ModelInfo`, and
+`Architecture` are currently proposed in `ironmill-inference`, but
+`CompileTarget::estimate_size()` (in `ironmill-compile`) also needs them.
+Placing them in `ironmill-inference` creates a dependency from compile →
+inference, which inverts the intended graph.
+
+**Recommendation**: move these shared types into `mil-rs` as the
+foundation crate. Both `ironmill-compile` and `ironmill-inference` already
+depend on it. This keeps the dependency graph clean:
+
+```
+mil-rs (shared types: Architecture, QuantLevel, ModelInfo, MemoryEstimator)
+  ↑                  ↑
+ironmill-compile   ironmill-inference
+  ↑                  ↑
+  └──── ironmill-core ────┘
+```
+
+### 12.2 Tokenizer Crate Placement
+
+The `Tokenizer` trait and `HfTokenizer` are proposed inside `ironmill-core`,
+but calibration-based quantization (AWQ, GPTQ) in `ironmill-compile` also
+needs tokenization to process calibration data. Putting the trait in
+`ironmill-core` would force `ironmill-compile` to depend on `ironmill-core`
+(inverted dependency).
+
+**Options**:
+1. **Standalone `ironmill-tokenizer` crate** — trait + HfTokenizer adapter.
+   Both `ironmill-core` and `ironmill-compile` depend on it.
+2. **Trait in `mil-rs`, adapter in `ironmill-core`** — lighter touch, but
+   adds tokenization concerns to the IR crate.
+3. **Accept the duplication** — `ironmill-compile` takes `&[u32]` calibration
+   tokens directly, leaving tokenization to the caller.
+
+### 12.3 Partial Recovery from TokenStream
+
+When `decode_step()` fails mid-generation, `TokenStream` returns
+`Some(Err(e))` then `None`. The tokens generated before the error are lost
+unless the caller tracked them manually. The `generate()` /
+`generate_with_callback()` wrappers use `GenerateError` with
+`partial_tokens`, but raw `TokenStream` users have no recovery path.
+
+**Recommendation**: add a method for partial recovery:
+
+```rust
+impl<'a> TokenStream<'a> {
+    /// Tokens generated so far (useful for recovery after an error).
+    pub fn tokens_so_far(&self) -> &[u32] { &self.generated_tokens }
+}
+```
+
+### 12.4 Device Discovery
+
+`Device::Auto` resolution logic is baked into `ModelBuilder`. There's no
+way for users to enumerate available devices (e.g., for a config UI or
+to validate CLI flags before loading).
+
+**Recommendation**:
+
+```rust
+impl Device {
+    /// Return all devices available on this platform.
+    ///
+    /// ```rust
+    /// let devices = Device::available();
+    /// // On macOS: [Metal, Ane, CoreMl, Cpu]
+    /// // On Linux with CUDA: [Cuda, Cpu]
+    /// // On Linux without CUDA: [Cpu]
+    /// ```
+    pub fn available() -> Vec<Device> { /* ... */ }
+}
+```
+
+### 12.5 Compiled Artifact Versioning
+
+`Model::from_compiled()` doesn't specify how `.ironml-gpu` bundles are
+validated for compatibility. A model compiled with INT4 quantization on
+ironmill v0.3 should produce a clear error when loaded by ironmill v0.5
+if the format changed.
+
+**Recommendation**: include a `metadata.json` (or magic bytes + header)
+in every compiled bundle with:
+- `ironmill_version`: semver of the producing build
+- `format_version`: integer, incremented on breaking format changes
+- `architecture`, `quantization`, `compile_config` for diagnostics
+
+### 12.6 Future Extension Points
+
+These are out of scope for v1 but the API should not preclude them:
+
+- **`Model::from_hub("Qwen/Qwen3-0.6B")`** — HuggingFace Hub download.
+  `ModelBuilder` already has the right shape; this is a new constructor
+  that downloads to a cache dir and delegates to `from_pretrained()`.
+
+- **C API for inference** — the existing `docs/C_API.md` covers `mil-rs`
+  FFI. The new `InferenceEngine`, `TokenStream`, and `generate()` APIs
+  need equivalent C bindings for Swift/C++ embedding. Design them as
+  opaque handles (`IronmillEngine *`, `IronmillTokenStream *`) following
+  the same `*_free()` / `mil_last_error()` pattern.
+
+- **OpenAI-compatible data types** — for production serving, types like
+  `ChatCompletionRequest`, `ChatCompletionChunk`, `Usage` are table
+  stakes. The `BatchRunner` + async streaming provides the plumbing;
+  a thin `ironmill-openai` crate could map `GenerateEvent` →
+  SSE-compatible `ChatCompletionChunk`.
+
+- **ShaderCache eviction** — the current `ShaderCache` has `get`/`put`
+  but no size limits. Add `max_size_bytes` and LRU eviction to prevent
+  unbounded growth across model configurations.
