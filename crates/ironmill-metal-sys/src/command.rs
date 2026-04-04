@@ -372,12 +372,22 @@ impl ComputeEncoder {
 
     /// End encoding. Must be called before committing the command buffer.
     pub fn end_encoding(&self) {
-        // SAFETY: `self.raw` is a valid encoder. "endEncoding" finalizes the
-        // encoding; no further encoding calls are valid after this.
         type EndFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
         let sel = unsafe { objc::sel_registerName(sel!("endEncoding")) };
         let f: EndFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
         unsafe { f(self.raw, sel) };
+    }
+
+    /// Insert a memory barrier for buffer writes.
+    ///
+    /// Ensures all prior dispatches' buffer writes are visible to
+    /// subsequent dispatches within the same compute encoder.
+    pub fn memory_barrier_buffers(&self) {
+        // MTLBarrierScope::Buffers = 1
+        type BarrierFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize);
+        let sel = unsafe { objc::sel_registerName(sel!("memoryBarrierWithScope:")) };
+        let f: BarrierFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        unsafe { f(self.raw, sel, 1) };
     }
 
     /// Returns the raw encoder pointer.

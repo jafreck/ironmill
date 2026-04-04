@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use half::f16;
 use ironmill_metal_sys::{
-    CommandBufferStatus, MetalBuffer, MetalDevice, MpsMatrix, MpsMatrixMultiply,
+    CommandBufferStatus, ComputeEncoder, MetalBuffer, MetalDevice, MpsMatrix, MpsMatrixMultiply,
     MpsMatrixMultiplyConfig, StorageMode,
 };
 use mil_rs::weights::{ModelConfig, WeightProvider};
@@ -661,10 +661,13 @@ impl MetalInference {
             .write_bytes(&self.token_bytes_buf, 0)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-        // Create command buffer.
+        // Create command buffer and single shared compute encoder.
         let cmd_buf = self
             .queue
             .command_buffer()
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        let enc = cmd_buf
+            .compute_encoder()
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
         // Step 0: Fused embedding lookup + first-layer RMSNorm.
@@ -672,9 +675,6 @@ impl MetalInference {
         // norm_out (normalized for first layer's projections).
         {
             let lw0 = &weights.layers[0];
-            let enc = cmd_buf
-                .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
             enc.set_pipeline(&pipelines.fused_embedding_norm);
             enc.set_buffer(&bufs.token_ids_buf, 0, 0);
@@ -688,8 +688,8 @@ impl MetalInference {
             enc.set_bytes(&eps.to_le_bytes(), 8);
             let tg_size = (h as usize).min(1024);
             enc.dispatch_threadgroups((token_count, 1, 1), (tg_size, 1, 1));
-            enc.end_encoding();
         }
+        enc.memory_barrier_buffers();
 
         // Per-layer processing.
         //
@@ -707,6 +707,7 @@ impl MetalInference {
             //   • layer 1+: produced by the previous layer's fused end-of-layer kernel
 
             // Steps 3-5: Q/K/V projections — dispatch by weight type.
+            // These are independent (all read norm_out, write to different buffers).
             let row_bytes_h = h * 2; // FP16
             let row_bytes_qo = (mc.num_attention_heads * mc.head_dim) * 2;
             let row_bytes_kv = (mc.num_kv_heads() * mc.head_dim) * 2;
@@ -741,7 +742,7 @@ impl MetalInference {
                 ),
             ] {
                 encode_projection(
-                    &cmd_buf,
+                    &enc,
                     &bufs.norm_out,
                     &norm_mat,
                     weight,
@@ -755,10 +756,11 @@ impl MetalInference {
                     row_bytes_out,
                 )?;
             }
+            enc.memory_barrier_buffers();
 
             // Step 6: QK normalization (Qwen3) + RoPE
             encode_qk_norm_and_rope(
-                &cmd_buf,
+                &enc,
                 pipelines,
                 bufs,
                 lw.q_norm.as_ref(),
@@ -772,10 +774,11 @@ impl MetalInference {
                 token_count,
                 eps,
             )?;
+            enc.memory_barrier_buffers();
 
             // Steps 7-8: KV cache write + attention
             encode_kv_cache_and_attention(
-                &cmd_buf,
+                &enc,
                 pipelines,
                 bufs,
                 self.turboquant.as_ref(),
@@ -792,6 +795,7 @@ impl MetalInference {
                 enable_tq,
                 self.config.use_fa2_prefill,
             )?;
+            enc.memory_barrier_buffers();
 
             // Step 9: Output projection
             let attn_mat = MpsMatrix::from_buffer(
@@ -802,7 +806,7 @@ impl MetalInference {
             )
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             encode_projection(
-                &cmd_buf,
+                &enc,
                 &bufs.attn_out,
                 &attn_mat,
                 &lw.o_proj,
@@ -815,31 +819,28 @@ impl MetalInference {
                 row_bytes_qo,
                 row_bytes_h,
             )?;
+            enc.memory_barrier_buffers();
 
             // Step 10-11 (fused): Residual add + post-attention RMSNorm
-            {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_fused_residual_rms_norm(
-                    &enc,
-                    &pipelines.fused_residual_rms_norm,
-                    &ops::FusedResidualRmsNormParams {
-                        a: &bufs.hidden_state,           // a: skip connection (pre-norm hidden)
-                        b: &bufs.ffn_down,               // b: o_proj output
-                        weight: &lw.post_attn_norm,      // weight: post-attention norm
-                        normed_output: &bufs.norm_out,   // normed output → MLP input
-                        residual_output: &bufs.residual, // residual output → next skip connection
-                        eps,
-                        hidden_size: h as u32,
-                        token_count: token_count as u32,
-                    },
-                );
-                enc.end_encoding();
-            }
+            ops::encode_fused_residual_rms_norm(
+                &enc,
+                &pipelines.fused_residual_rms_norm,
+                &ops::FusedResidualRmsNormParams {
+                    a: &bufs.hidden_state,           // a: skip connection (pre-norm hidden)
+                    b: &bufs.ffn_down,               // b: o_proj output
+                    weight: &lw.post_attn_norm,      // weight: post-attention norm
+                    normed_output: &bufs.norm_out,   // normed output → MLP input
+                    residual_output: &bufs.residual, // residual output → next skip connection
+                    eps,
+                    hidden_size: h as u32,
+                    token_count: token_count as u32,
+                },
+            );
+            enc.memory_barrier_buffers();
 
             // Steps 12-15: FFN block (gate + up + SiLU + down)
-            encode_ffn_block(&cmd_buf, pipelines, bufs, lw, lm, h, inter, token_count)?;
+            encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, inter, token_count)?;
+            enc.memory_barrier_buffers();
 
             // Step 16: Residual add + next layer's input norm (or standalone for last layer)
             let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
@@ -847,70 +848,58 @@ impl MetalInference {
             } else {
                 None
             };
-            encode_end_of_layer_residual(
-                &cmd_buf,
-                pipelines,
-                bufs,
-                next_norm,
-                h,
-                token_count,
-                eps,
-            )?;
+            encode_end_of_layer_residual(&enc, pipelines, bufs, next_norm, h, token_count, eps)?;
+            enc.memory_barrier_buffers();
         }
 
         // Step 17: Final RMSNorm
-        {
-            let enc = cmd_buf
-                .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            ops::encode_rms_norm(
-                &enc,
-                &self.pipelines()?.rms_norm,
-                &ops::RmsNormParams {
-                    input: &bufs.hidden_state,
-                    weight: &weights.final_norm,
-                    output: &bufs.norm_out,
-                    hidden_size: h as u32,
-                    token_count: token_count as u32,
-                    eps,
-                },
-            );
-            enc.end_encoding();
-        }
+        ops::encode_rms_norm(
+            &enc,
+            &self.pipelines()?.rms_norm,
+            &ops::RmsNormParams {
+                input: &bufs.hidden_state,
+                weight: &weights.final_norm,
+                output: &bufs.norm_out,
+                hidden_size: h as u32,
+                token_count: token_count as u32,
+                eps,
+            },
+        );
+        enc.memory_barrier_buffers();
 
         // Step 18: LM head matmul
+        // Prefer custom matvec/matmul when packed weights exist; fall back
+        // to MPS only when there is no packed buffer.
         let row_bytes_h = h * 2;
         let row_bytes_vocab = vocab * 2;
-        if token_count == 1 {
-            if let Some(ref packed_buf) = weights.lm_head_packed {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        if let Some(ref packed_buf) = weights.lm_head_packed {
+            let pipelines = self.pipelines()?;
+            if token_count == 1 {
                 ops::encode_matvec(
                     &enc,
-                    &self.pipelines()?.matvec,
+                    &pipelines.matvec,
                     &bufs.norm_out,
                     packed_buf,
                     &bufs.logits,
                     vocab as u32,
                     h as u32,
                 );
-                enc.end_encoding();
             } else {
-                let final_norm_mat =
-                    MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                let lm_head_weight_mat =
-                    MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                let logits_mat =
-                    MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                matmuls
-                    .lm_head
-                    .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
+                ops::encode_matmul(
+                    &enc,
+                    &pipelines.matmul,
+                    &bufs.norm_out,
+                    packed_buf,
+                    &bufs.logits,
+                    token_count as u32,
+                    vocab as u32,
+                    h as u32,
+                );
             }
+            enc.end_encoding();
         } else {
+            // MPS fallback — end shared encoder so MPS can create its own.
+            enc.end_encoding();
             let final_norm_mat =
                 MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -1144,6 +1133,9 @@ impl MetalInference {
                 .queue
                 .command_buffer()
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
 
             // Steps 3-5: Q/K/V projections
@@ -1180,7 +1172,7 @@ impl MetalInference {
                 ),
             ] {
                 encode_projection(
-                    &cmd_buf,
+                    &enc,
                     &bufs.norm_out,
                     &norm_mat,
                     weight,
@@ -1194,10 +1186,11 @@ impl MetalInference {
                     row_bytes_out,
                 )?;
             }
+            enc.memory_barrier_buffers();
 
             // Step 6: QK normalization (Qwen3) + RoPE
             encode_qk_norm_and_rope(
-                &cmd_buf,
+                &enc,
                 pipelines,
                 bufs,
                 lw.q_norm.as_ref(),
@@ -1211,10 +1204,11 @@ impl MetalInference {
                 token_count,
                 eps,
             )?;
+            enc.memory_barrier_buffers();
 
             // Steps 7-8: KV cache write + attention
             encode_kv_cache_and_attention(
-                &cmd_buf,
+                &enc,
                 pipelines,
                 bufs,
                 self.turboquant.as_ref(),
@@ -1231,6 +1225,7 @@ impl MetalInference {
                 enable_tq,
                 self.config.use_fa2_prefill,
             )?;
+            enc.memory_barrier_buffers();
 
             // Step 9: Output projection
             let attn_mat = MpsMatrix::from_buffer(
@@ -1241,7 +1236,7 @@ impl MetalInference {
             )
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             encode_projection(
-                &cmd_buf,
+                &enc,
                 &bufs.attn_out,
                 &attn_mat,
                 &lw.o_proj,
@@ -1254,28 +1249,24 @@ impl MetalInference {
                 row_bytes_qo,
                 row_bytes_h,
             )?;
+            enc.memory_barrier_buffers();
 
             // Step 10-11 (fused): Residual add + post-attention RMSNorm
-            {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                ops::encode_fused_residual_rms_norm(
-                    &enc,
-                    &pipelines.fused_residual_rms_norm,
-                    &ops::FusedResidualRmsNormParams {
-                        a: &bufs.hidden_state,
-                        b: &bufs.ffn_down,
-                        weight: &lw.post_attn_norm,
-                        normed_output: &bufs.norm_out,
-                        residual_output: &bufs.residual,
-                        eps,
-                        hidden_size: h as u32,
-                        token_count: token_count as u32,
-                    },
-                );
-                enc.end_encoding();
-            }
+            ops::encode_fused_residual_rms_norm(
+                &enc,
+                &pipelines.fused_residual_rms_norm,
+                &ops::FusedResidualRmsNormParams {
+                    a: &bufs.hidden_state,
+                    b: &bufs.ffn_down,
+                    weight: &lw.post_attn_norm,
+                    normed_output: &bufs.norm_out,
+                    residual_output: &bufs.residual,
+                    eps,
+                    hidden_size: h as u32,
+                    token_count: token_count as u32,
+                },
+            );
+            enc.end_encoding();
 
             // ── Mid-layer commit: attention block done, norm_out has FFN input ──
             let t0 = Instant::now();
@@ -1311,10 +1302,14 @@ impl MetalInference {
                 .queue
                 .command_buffer()
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
 
             // Steps 12-15: FFN block (gate + up + SiLU + down)
-            encode_ffn_block(&cmd_buf, pipelines, bufs, lw, lm, h, inter, token_count)?;
+            encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, inter, token_count)?;
+            enc.memory_barrier_buffers();
 
             // Step 16: Residual add + next layer's input norm (or standalone for last layer)
             let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
@@ -1322,15 +1317,8 @@ impl MetalInference {
             } else {
                 None
             };
-            encode_end_of_layer_residual(
-                &cmd_buf,
-                pipelines,
-                bufs,
-                next_norm,
-                h,
-                token_count,
-                eps,
-            )?;
+            encode_end_of_layer_residual(&enc, pipelines, bufs, next_norm, h, token_count, eps)?;
+            enc.end_encoding();
 
             // ── End-of-layer commit ─────────────────────────────
             // This makes norm_out readable for the next iteration's attn_norm capture
@@ -1373,38 +1361,40 @@ impl MetalInference {
         }
 
         // Step 18: LM head matmul
+        // Prefer custom matvec/matmul when packed weights exist; fall back
+        // to MPS only when there is no packed buffer.
         let row_bytes_h = h * 2;
         let row_bytes_vocab = vocab * 2;
-        if token_count == 1 {
-            if let Some(ref packed_buf) = weights.lm_head_packed {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        if let Some(ref packed_buf) = weights.lm_head_packed {
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            let pipelines = self.pipelines()?;
+            if token_count == 1 {
                 ops::encode_matvec(
                     &enc,
-                    &self.pipelines()?.matvec,
+                    &pipelines.matvec,
                     &bufs.norm_out,
                     packed_buf,
                     &bufs.logits,
                     vocab as u32,
                     h as u32,
                 );
-                enc.end_encoding();
             } else {
-                let final_norm_mat =
-                    MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                let lm_head_weight_mat =
-                    MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                let logits_mat =
-                    MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-                matmuls
-                    .lm_head
-                    .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
+                ops::encode_matmul(
+                    &enc,
+                    &pipelines.matmul,
+                    &bufs.norm_out,
+                    packed_buf,
+                    &bufs.logits,
+                    token_count as u32,
+                    vocab as u32,
+                    h as u32,
+                );
             }
+            enc.end_encoding();
         } else {
+            // MPS fallback — only reached when packed weights are absent.
             let final_norm_mat =
                 MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -1581,28 +1571,25 @@ impl ModelConfigExt for ModelConfig {
 /// - **Dense (general):** MPS matrix multiplication.
 /// - **Quantized:** PolarQuant compute kernel.
 fn encode_projection(
-    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    enc: &ComputeEncoder,
     input_buf: &MetalBuffer,
-    input_mat: &MpsMatrix,
+    _input_mat: &MpsMatrix,
     weight: &WeightBuffer,
     output_buf: &MetalBuffer,
-    matmul: &ProjectionMatmul,
+    _matmul: &ProjectionMatmul,
     pipelines: &super::ops::MetalPipelines,
     token_count: usize,
     out_features: usize,
     in_features: usize,
-    row_bytes_in: usize,
-    row_bytes_out: usize,
+    _row_bytes_in: usize,
+    _row_bytes_out: usize,
 ) -> Result<(), InferenceError> {
     match weight {
-        WeightBuffer::Dense { buf, packed } => {
+        WeightBuffer::Dense { buf: _, packed } => {
             if let Some(packed_buf) = packed {
-                let enc = cmd_buf
-                    .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 if token_count == 1 {
                     ops::encode_matvec(
-                        &enc,
+                        enc,
                         &pipelines.matvec,
                         input_buf,
                         packed_buf,
@@ -1612,7 +1599,7 @@ fn encode_projection(
                     );
                 } else {
                     ops::encode_matmul(
-                        &enc,
+                        enc,
                         &pipelines.matmul,
                         input_buf,
                         packed_buf,
@@ -1622,32 +1609,15 @@ fn encode_projection(
                         in_features as u32,
                     );
                 }
-                enc.end_encoding();
                 return Ok(());
             }
-            // Fallback to MPS when no packed weights (N or K not multiple of 8).
-            let weight_mat = MpsMatrix::from_buffer(buf, out_features, in_features, row_bytes_in)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let result_mat =
-                MpsMatrix::from_buffer(output_buf, token_count, out_features, row_bytes_out)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            matmul
-                .dense()
-                .encode(cmd_buf, input_mat, &weight_mat, &result_mat);
+            panic!("MPS dense fallback not supported in single-encoder mode");
         }
         WeightBuffer::Quantized(q) => {
-            let enc = cmd_buf
-                .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            encode_polarquant_matmul(&enc, input_buf, q, output_buf, pipelines, token_count)?;
-            enc.end_encoding();
+            encode_polarquant_matmul(enc, input_buf, q, output_buf, pipelines, token_count)?;
         }
         WeightBuffer::AffineQuantized(aq) => {
-            let enc = cmd_buf
-                .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            encode_affine_matmul(&enc, input_buf, aq, output_buf, pipelines, token_count)?;
-            enc.end_encoding();
+            encode_affine_matmul(enc, input_buf, aq, output_buf, pipelines, token_count)?;
         }
     }
     Ok(())
@@ -1795,7 +1765,7 @@ fn encode_affine_matmul(
 /// normalizes and rotates each head in one pass. Otherwise falls back
 /// to standalone RoPE dispatches.
 fn encode_qk_norm_and_rope(
-    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
     bufs: &IntermediateBuffers,
     q_norm: Option<&MetalBuffer>,
@@ -1811,9 +1781,6 @@ fn encode_qk_norm_and_rope(
 ) -> Result<(), InferenceError> {
     if let (Some(q_norm_w), Some(k_norm_w)) = (q_norm, k_norm) {
         // Fused path: one dispatch does RMSNorm + RoPE for both Q and K.
-        let enc = cmd_buf
-            .compute_encoder()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         enc.set_pipeline(&pipelines.fused_qk_norm_rope);
         enc.set_buffer(&bufs.q_proj, 0, 0);
         enc.set_buffer(&bufs.k_proj, 0, 1);
@@ -1829,14 +1796,10 @@ fn encode_qk_norm_and_rope(
         enc.set_bytes(&eps.to_le_bytes(), 11);
         let tg_size = (hd as usize).min(1024);
         enc.dispatch_threadgroups(((nh + nkv) as usize, token_count, 1), (tg_size, 1, 1));
-        enc.end_encoding();
     } else {
         // No QK-norm — just RoPE.
-        let enc = cmd_buf
-            .compute_encoder()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         ops::encode_rope(
-            &enc,
+            enc,
             &pipelines.rope,
             &ops::RopeParams {
                 qk: &bufs.q_proj,
@@ -1849,7 +1812,7 @@ fn encode_qk_norm_and_rope(
             },
         );
         ops::encode_rope(
-            &enc,
+            enc,
             &pipelines.rope,
             &ops::RopeParams {
                 qk: &bufs.k_proj,
@@ -1861,7 +1824,6 @@ fn encode_qk_norm_and_rope(
                 token_count: token_count as u32,
             },
         );
-        enc.end_encoding();
     }
 
     Ok(())
@@ -1871,7 +1833,7 @@ fn encode_qk_norm_and_rope(
 ///
 /// Handles TurboQuant (outlier and standard) and FP16 KV cache paths.
 fn encode_kv_cache_and_attention(
-    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
     bufs: &IntermediateBuffers,
     turboquant: Option<&MetalTurboQuantModel>,
@@ -1898,10 +1860,6 @@ fn encode_kv_cache_and_attention(
         let kv = kv_cache.ok_or_else(|| {
             InferenceError::Runtime("kv_cache must be initialized when enable_tq is true".into())
         })?;
-
-        let enc = cmd_buf
-            .compute_encoder()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
         if let Some(ref outlier) = tq.outlier {
             // ── Outlier channel strategy dispatch ──
@@ -2096,7 +2054,6 @@ fn encode_kv_cache_and_attention(
                 (256_usize.max(hd as usize).min(1024), 1, 1),
             );
         }
-        enc.end_encoding();
     } else {
         // FP16 KV cache path — scatter projections into cache on GPU.
         let fp16_kv = fp16_kv_cache.ok_or_else(|| {
@@ -2106,13 +2063,9 @@ fn encode_kv_cache_and_attention(
         })?;
         let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
 
-        let enc = cmd_buf
-            .compute_encoder()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-
         // Scatter K and V projections into their caches entirely on GPU.
         ops::encode_kv_scatter(
-            &enc,
+            enc,
             &pipelines.kv_scatter,
             &ops::KvScatterParams {
                 proj: &bufs.k_proj,
@@ -2125,7 +2078,7 @@ fn encode_kv_cache_and_attention(
             },
         );
         ops::encode_kv_scatter(
-            &enc,
+            enc,
             &pipelines.kv_scatter,
             &ops::KvScatterParams {
                 proj: &bufs.v_proj,
@@ -2178,7 +2131,6 @@ fn encode_kv_cache_and_attention(
             enc.set_bytes(&current_seq_len.to_le_bytes(), 8);
             enc.dispatch_threadgroups((nh as usize, 1, 1), (attn_tg_size, 1, 1));
         }
-        enc.end_encoding();
     }
 
     Ok(())
@@ -2186,7 +2138,7 @@ fn encode_kv_cache_and_attention(
 
 /// Encode the FFN block: gate + up projections, SiLU activation, and down projection.
 fn encode_ffn_block(
-    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
     bufs: &IntermediateBuffers,
     lw: &LayerWeights,
@@ -2203,7 +2155,7 @@ fn encode_ffn_block(
 
     // Gate projection
     encode_projection(
-        cmd_buf,
+        enc,
         &bufs.norm_out,
         &norm_mat,
         &lw.gate_proj,
@@ -2219,7 +2171,7 @@ fn encode_ffn_block(
 
     // Up projection
     encode_projection(
-        cmd_buf,
+        enc,
         &bufs.norm_out,
         &norm_mat,
         &lw.up_proj,
@@ -2233,27 +2185,25 @@ fn encode_ffn_block(
         row_bytes_inter,
     )?;
 
+    enc.memory_barrier_buffers();
+
     // SiLU gate
-    {
-        let enc = cmd_buf
-            .compute_encoder()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-        ops::encode_silu_gate(
-            &enc,
-            &pipelines.silu_gate,
-            &bufs.ffn_gate,
-            &bufs.ffn_up,
-            &bufs.ffn_gate, // in-place output into gate buffer
-            (token_count * inter) as u32,
-        );
-        enc.end_encoding();
-    }
+    ops::encode_silu_gate(
+        enc,
+        &pipelines.silu_gate,
+        &bufs.ffn_gate,
+        &bufs.ffn_up,
+        &bufs.ffn_gate, // in-place output into gate buffer
+        (token_count * inter) as u32,
+    );
+
+    enc.memory_barrier_buffers();
 
     // Down projection
     let gate_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
     encode_projection(
-        cmd_buf,
+        enc,
         &bufs.ffn_gate,
         &gate_mat,
         &lw.down_proj,
@@ -2272,7 +2222,7 @@ fn encode_ffn_block(
 
 /// Encode end-of-layer residual: fused with next layer's norm, or standalone for the last layer.
 fn encode_end_of_layer_residual(
-    cmd_buf: &ironmill_metal_sys::CommandBuffer,
+    enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
     bufs: &IntermediateBuffers,
     next_input_norm: Option<&MetalBuffer>,
@@ -2281,11 +2231,8 @@ fn encode_end_of_layer_residual(
     eps: f32,
 ) -> Result<(), InferenceError> {
     if let Some(norm_weight) = next_input_norm {
-        let enc = cmd_buf
-            .compute_encoder()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         ops::encode_fused_residual_rms_norm(
-            &enc,
+            enc,
             &pipelines.fused_residual_rms_norm,
             &ops::FusedResidualRmsNormParams {
                 a: &bufs.residual,
@@ -2298,20 +2245,15 @@ fn encode_end_of_layer_residual(
                 token_count: token_count as u32,
             },
         );
-        enc.end_encoding();
     } else {
-        let enc = cmd_buf
-            .compute_encoder()
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         ops::encode_residual_add(
-            &enc,
+            enc,
             &pipelines.residual_add,
             &bufs.residual,
             &bufs.ffn_down,
             &bufs.hidden_state,
             (token_count * h) as u32,
         );
-        enc.end_encoding();
     }
     Ok(())
 }
