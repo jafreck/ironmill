@@ -13,7 +13,6 @@ use ironmill_compile::convert::pipeline::{convert_pipeline, parse_pipeline_manif
 use ironmill_compile::coreml::compiler::{compile_model, is_compiler_available};
 use ironmill_compile::gpu::GpuCompileBuilder;
 use ironmill_compile::gpu::bundle::write_gpu_bundle;
-use ironmill_compile::gpu::streaming::{QuantMethod, StreamingGpuBundleBuilder};
 use ironmill_compile::mil::PassPipeline;
 use ironmill_compile::mil::PipelineReport;
 use ironmill_compile::mil::{
@@ -214,12 +213,6 @@ struct CompileArgs {
     /// Maximum sequence length for KV cache allocation (default: 2048).
     #[arg(long, default_value_t = 2048)]
     max_seq_len: usize,
-
-    /// Use the streaming GPU bundle builder, which processes one tensor at a
-    /// time to minimize peak memory (~1 GB). Only supports SafeTensors and
-    /// GGUF input; ONNX requires the regular path.
-    #[arg(long)]
-    streaming: bool,
 }
 
 #[derive(Subcommand)]
@@ -349,7 +342,6 @@ fn run() -> Result<()> {
                     kv_quant: args.kv_quant,
                     kv_quant_qjl: args.kv_quant_qjl,
                     max_seq_len: args.max_seq_len,
-                    streaming: args.streaming,
                 },
             )
         }
@@ -427,7 +419,6 @@ struct CompileOpts {
     kv_quant: KvQuantArg,
     kv_quant_qjl: bool,
     max_seq_len: usize,
-    streaming: bool,
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -498,39 +489,6 @@ fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| input_path.with_extension("ironml-gpu"));
-
-    // ── Streaming path ──────────────────────────────────────────────
-    if opts.streaming {
-        let quant_method = match opts.quantize.as_str() {
-            "int4" => Some(QuantMethod::Affine {
-                n_bits: 4,
-                group_size: 128,
-            }),
-            "int8" => Some(QuantMethod::Affine {
-                n_bits: 8,
-                group_size: 128,
-            }),
-            "fp16" => Some(QuantMethod::Fp16),
-            "none" => None,
-            other => {
-                bail!(
-                    "Streaming GPU build supports 'none', 'fp16', 'int4', 'int8' quantization, \
-                     got '{other}'. For other methods use the regular (non-streaming) path."
-                );
-            }
-        };
-
-        let mut builder = StreamingGpuBundleBuilder::new(input_path);
-        if let Some(method) = quant_method {
-            builder = builder.with_quantization(method);
-        }
-
-        builder
-            .build(&output)
-            .context("Streaming GPU compilation failed")?;
-        println!("Wrote GPU bundle (streaming) to {}", output.display());
-        return Ok(());
-    }
 
     // ── Regular (MIL IR) path ───────────────────────────────────────
     // Reject conflicting quantization flags.
