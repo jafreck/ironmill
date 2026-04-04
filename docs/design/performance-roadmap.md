@@ -182,7 +182,9 @@ Eliminates the need for a separate draft model by integrating speculated token p
 
 Prefill is compute-bound (large batch matmuls) while decode is memory-bandwidth-bound (single-token matvecs). MLX exploits this by routing prefill to the Neural Engine (which has dedicated matrix units) and decode to the GPU (which has maximum memory bandwidth). On Apple Silicon with unified memory, there's no data copy cost for this split.
 
-ironmill could detect the phase transition and select the optimal compute unit dynamically, or pipeline prefill chunks on ANE while the GPU handles ongoing decode for a different sequence.
+ironmill has an experimental ANE inference client (`ane-direct`), but it should not be a hard dependency for the Metal inference path. The preferred approach is to route through MLX's scheduling layer (which handles ANE/GPU dispatch internally) rather than the low-level ANE-direct path. If MLX integration is not available, the Metal GPU path should handle both phases — the optimization becomes selecting the right kernel (batched matmul for prefill, matvec for decode) rather than switching compute units.
+
+This is a "nice to have" behind MLX integration, not a requirement for the Metal pipeline.
 
 ### 12. Structured generation (grammar/JSON-constrained sampling)
 
