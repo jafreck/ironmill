@@ -6,6 +6,8 @@
 
 #![deny(unsafe_code)]
 
+/// Backend-agnostic compilation trait and supporting types.
+pub mod compile_target;
 /// Compilation error types.
 pub mod error;
 
@@ -34,6 +36,9 @@ pub mod mil {
         PipelineReport, Program, ScalarType, TensorType, Value,
     };
 
+    // Error
+    pub use mil_rs::MilError;
+
     // Model I/O
     pub use mil_rs::{
         model_to_program, onnx_to_program, program_to_model, program_to_multi_function_model,
@@ -50,7 +55,8 @@ pub mod mil {
     // Reader / inspection
     pub use mil_rs::reader::{print_model_summary, print_onnx_summary};
 
-    // Protobuf model types
+    // Protobuf model types — kept for backward compatibility with ironmill-compile-ffi.
+    // TODO(§3.6): deprecate and remove once downstream crates import from mil-rs directly.
     pub mod proto {
         pub mod specification {
             pub use mil_rs::proto::specification::Model;
@@ -66,10 +72,24 @@ pub mod mil {
         pub use mil_rs::ir::passes::DeadCodeEliminationPass;
         pub use mil_rs::ir::passes::IdentityEliminationPass;
         pub use mil_rs::ir::passes::PolarQuantPass;
+
+        // TODO(§3.6): deprecate and remove — used by ironmill-bench quality module.
         pub use mil_rs::ir::passes::tensor_utils;
     }
 
     // Quantization passes (used by GPU compilation path)
     pub use mil_rs::ir::Granularity;
     pub use mil_rs::ir::passes::{AffineQuantizePass, BitWidth};
+
+    // LoRA and MoE conversion helpers (§3.6)
+    pub mod convert {
+        pub use mil_rs::convert::lora::{
+            LoraAdapter, LoraWeights, detect_lora_adapters, lora_initializer_names, merge_lora,
+            merge_lora_weights,
+        };
+        pub use mil_rs::convert::moe::{
+            ExpertDescriptor, ExpertFrequencyProfile, MoeFuseResult, MoeManifest, MoeSplitResult,
+            MoeTopology, Stage, detect_moe, fuse_top_k_experts, split_moe,
+        };
+    }
 }
