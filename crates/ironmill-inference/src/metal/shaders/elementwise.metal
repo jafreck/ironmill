@@ -22,6 +22,25 @@ kernel void residual_add(
     output[tid] = half(float(a[tid]) + float(b[tid]));
 }
 
+// In-place scalar multiply: data[i] *= scalar[0]
+//
+// Buffers:
+//   buffer(0) data:   [size]  half  (read/write)
+//   buffer(1) scalar: [1]     half
+//   buffer(2) size:   uint
+//
+// Dispatch: one thread per element.
+
+kernel void scale_buffer(
+    device half* data            [[buffer(0)]],
+    device const half* scalar    [[buffer(1)]],
+    constant uint& size          [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= size) return;
+    data[tid] = half(float(data[tid]) * float(scalar[0]));
+}
+
 // Buffer copy: output[i] = input[i]
 //
 // Buffers:

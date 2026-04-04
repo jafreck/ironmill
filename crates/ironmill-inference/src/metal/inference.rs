@@ -1293,6 +1293,17 @@ impl MetalInference {
                 let pipelines = self.pipelines()?;
 
                 // 1. Standalone FFN residual add: hidden_state = residual + ffn_down
+                // Apply layer_scalar to ffn_down before the residual add.
+                if let Some(ref scalar) = lw.layer_scalar {
+                    ops::encode_scale_buffer(
+                        &enc,
+                        &pipelines.scale_buffer,
+                        &bufs.ffn_down,
+                        scalar,
+                        (token_count * h) as u32,
+                    );
+                    enc.memory_barrier_buffers();
+                }
                 ops::encode_residual_add(
                     &enc,
                     &pipelines.residual_add,
@@ -1400,6 +1411,17 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
             } else {
                 // Step 16: Residual add + next layer's input norm (or standalone for last layer)
+                // Apply layer_scalar to ffn_down before the residual add.
+                if let Some(ref scalar) = lw.layer_scalar {
+                    ops::encode_scale_buffer(
+                        &enc,
+                        &pipelines.scale_buffer,
+                        &bufs.ffn_down,
+                        scalar,
+                        (token_count * h) as u32,
+                    );
+                    enc.memory_barrier_buffers();
+                }
                 let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
                     Some(&weights.layers[layer_idx + 1].input_norm)
                 } else {
@@ -2077,6 +2099,17 @@ impl MetalInference {
                 let ple_buf = bufs.ple_per_layer_input.as_ref().unwrap();
                 let ple_scratch = bufs.ple_scratch.as_ref().unwrap();
 
+                // Apply layer_scalar to ffn_down before the residual add.
+                if let Some(ref scalar) = lw.layer_scalar {
+                    ops::encode_scale_buffer(
+                        &enc,
+                        &pipelines.scale_buffer,
+                        &bufs.ffn_down,
+                        scalar,
+                        (token_count * h) as u32,
+                    );
+                    enc.memory_barrier_buffers();
+                }
                 ops::encode_residual_add(
                     &enc,
                     &pipelines.residual_add,
@@ -2177,6 +2210,17 @@ impl MetalInference {
                 }
             } else {
                 // Step 16: Residual add + next layer's input norm (or standalone for last layer)
+                // Apply layer_scalar to ffn_down before the residual add.
+                if let Some(ref scalar) = lw.layer_scalar {
+                    ops::encode_scale_buffer(
+                        &enc,
+                        &pipelines.scale_buffer,
+                        &bufs.ffn_down,
+                        scalar,
+                        (token_count * h) as u32,
+                    );
+                    enc.memory_barrier_buffers();
+                }
                 let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
                     Some(&weights.layers[layer_idx + 1].input_norm)
                 } else {

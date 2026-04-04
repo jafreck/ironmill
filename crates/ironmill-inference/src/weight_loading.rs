@@ -51,6 +51,8 @@ pub struct LoadedLayer<D, W> {
     pub ple_projection: Option<W>,
     /// PLE post-norm weight `[hidden_size]` (Gemma 4).
     pub ple_post_norm: Option<D>,
+    /// Per-layer output scalar (Gemma 4 `layer_scalar`).
+    pub layer_scalar: Option<D>,
 }
 
 /// Core model weights returned by [`load_model_weights`].
@@ -163,6 +165,14 @@ pub fn load_model_weights<V: WeightVisitor>(
             },
             ple_post_norm: {
                 let name = format!("{prefix}.post_per_layer_input_norm.weight");
+                if provider.has_tensor(&name) {
+                    Some(visitor.load_dense(provider, &name)?)
+                } else {
+                    None
+                }
+            },
+            layer_scalar: {
+                let name = format!("{prefix}.layer_scalar");
                 if provider.has_tensor(&name) {
                     Some(visitor.load_dense(provider, &name)?)
                 } else {

@@ -25,7 +25,7 @@ use super::moe;
 use super::shared::{
     LayerContext, emit_attention, emit_embedding, emit_gather, emit_linear, emit_lm_head,
     emit_mlp_gelu, emit_residual_add, emit_rms_norm, emit_rope_tables,
-    emit_rope_tables_with_params,
+    emit_rope_tables_with_params, emit_weight_const,
 };
 
 /// Build a complete MIL [`Program`] for a Gemma-family model.
@@ -471,7 +471,7 @@ fn emit_gemma4_transformer_layer(
     )?;
 
     // 6. MoE block (parallel with dense MLP, outputs are summed) or standard residual
-    let post_mlp = if enable_moe && num_experts > 0 {
+    let ffn_output = if enable_moe && num_experts > 0 {
         // 5b. MoE output from the same normed input
         let moe_out = moe::emit_moe_block(
             block,
@@ -484,24 +484,41 @@ fn emit_gemma4_transformer_layer(
         )?;
 
         // Sum dense MLP + MoE outputs
-        let combined = emit_residual_add(
+        emit_residual_add(
             block,
             &mlp_out,
             &moe_out,
             &format!("l{layer_idx}_moe_combined"),
-        );
-
-        // Residual add with post-attention state
-        emit_residual_add(
-            block,
-            &post_attn,
-            &combined,
-            &format!("l{layer_idx}_output"),
         )
     } else {
-        // Standard: residual add with MLP output only
-        emit_residual_add(block, &post_attn, &mlp_out, &format!("l{layer_idx}_output"))
+        mlp_out
     };
+
+    // Apply layer_scalar if present (Gemma 4: scales FFN output before residual add)
+    let scaled_ffn = {
+        let scalar_name = format!("{prefix}.layer_scalar");
+        if ctx.provider.has_tensor(&scalar_name) {
+            let scalar_const = format!("l{layer_idx}_layer_scalar");
+            emit_weight_const(block, ctx.provider, &scalar_name, &scalar_const, warnings)?;
+
+            let out_name = format!("l{layer_idx}_scaled_ffn");
+            let op = Operation::new("mul", format!("l{layer_idx}_layer_scalar_op"))
+                .with_input("x", Value::Reference(ffn_output))
+                .with_input("y", Value::Reference(scalar_const))
+                .with_output(&out_name);
+            block.add_op(op);
+            out_name
+        } else {
+            ffn_output
+        }
+    };
+
+    let post_mlp = emit_residual_add(
+        block,
+        &post_attn,
+        &scaled_ffn,
+        &format!("l{layer_idx}_output"),
+    );
 
     // 7. Per-Layer Embedding (PLE) — applied AFTER the FFN block
     let layer_out = if let Some(ple_slice) = ple_input {
