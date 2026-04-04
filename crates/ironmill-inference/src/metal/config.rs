@@ -50,6 +50,20 @@ impl ClaConfig {
     }
 }
 
+/// Sliding window attention configuration.
+///
+/// When configured, layers below `max_window_layers` use sliding window
+/// attention with a bounded KV cache (ring buffer of `window_size` entries),
+/// while layers at or above `max_window_layers` use full attention.
+#[derive(Debug, Clone)]
+pub struct SlidingWindowConfig {
+    /// Number of recent tokens each SWA layer attends to (e.g. 4096).
+    pub window_size: usize,
+    /// Layers `0..max_window_layers` use sliding window attention;
+    /// layers `max_window_layers..num_layers` use full attention.
+    pub max_window_layers: usize,
+}
+
 /// Configuration for the Metal GPU inference backend.
 #[derive(Debug, Clone)]
 pub struct MetalConfig {
@@ -82,6 +96,8 @@ pub struct MetalConfig {
     pub fused_sdpa_tile_bc: Option<usize>,
     /// Cross-Layer Attention config. None = all layers are anchors (standard behavior).
     pub cla_config: Option<ClaConfig>,
+    /// Sliding window attention config. None = full attention for all layers.
+    pub sliding_window: Option<SlidingWindowConfig>,
 }
 
 impl Default for MetalConfig {
@@ -98,6 +114,7 @@ impl Default for MetalConfig {
             fused_sdpa_tile_br: None,
             fused_sdpa_tile_bc: None,
             cla_config: None,
+            sliding_window: None,
         }
     }
 }
@@ -111,6 +128,33 @@ impl MetalConfig {
         if self.n_bits != 4 && self.n_bits != 8 {
             return Err(format!("n_bits must be 4 or 8, got {}", self.n_bits));
         }
+        if let Some(ref sw) = self.sliding_window {
+            if sw.window_size == 0 {
+                return Err("sliding_window.window_size must be > 0".to_string());
+            }
+        }
         Ok(())
+    }
+
+    /// Compute the effective max_seq_len for a given layer, accounting for
+    /// sliding window attention. SWA layers use `window_size` as their
+    /// buffer stride; full-attention layers use the global `max_seq_len`.
+    pub fn effective_max_seq_len(&self, layer: usize) -> usize {
+        if let Some(ref sw) = self.sliding_window {
+            if layer < sw.max_window_layers {
+                return sw.window_size;
+            }
+        }
+        self.max_seq_len
+    }
+
+    /// Returns the sliding window size for a layer, or 0 for full attention.
+    pub fn layer_window_size(&self, layer: usize) -> usize {
+        if let Some(ref sw) = self.sliding_window {
+            if layer < sw.max_window_layers {
+                return sw.window_size;
+            }
+        }
+        0
     }
 }

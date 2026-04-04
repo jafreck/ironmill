@@ -23,6 +23,7 @@ using namespace metal;
 //   buffer(6) head_dim:     uint
 //   buffer(7) max_seq_len:  uint
 //   buffer(8) seq_len:      uint  (number of valid positions in cache)
+//   buffer(9) window_size:  uint  (0 = full attention, >0 = sliding window)
 //
 // GQA: kv_head = head_idx / (num_heads / num_kv_heads)
 //
@@ -38,6 +39,7 @@ kernel void standard_attention(
     constant uint& head_dim      [[buffer(6)]],
     constant uint& max_seq_len   [[buffer(7)]],
     constant uint& seq_len       [[buffer(8)]],
+    constant uint& window_size   [[buffer(9)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]],
@@ -80,8 +82,11 @@ kernel void standard_attention(
 
     uint kv_base = kv_head * max_seq_len * head_dim;
 
+    // Sliding window: skip KV positions outside the window.
+    uint kv_start = (window_size > 0 && seq_len > window_size) ? (seq_len - window_size) : 0;
+
     // ---- Tiled flash attention ----
-    for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
+    for (uint tile_start = kv_start; tile_start < seq_len; tile_start += TILE) {
         uint tile_end = min(tile_start + TILE, seq_len);
         uint actual_tile = tile_end - tile_start;
 
@@ -188,6 +193,7 @@ kernel void standard_attention(
 //   buffer(7) max_seq_len:  uint
 //   buffer(8) seq_offset:   uint  (KV positions before this prefill batch)
 //   buffer(9) token_count:  uint
+//   buffer(10) window_size: uint  (0 = full attention, >0 = sliding window)
 //
 // Dispatch: (num_heads, token_count, 1) threadgroups,
 //           (max(256, head_dim), 1, 1) threads per group.
@@ -203,6 +209,7 @@ kernel void prefill_attention(
     constant uint& max_seq_len   [[buffer(7)]],
     constant uint& seq_offset    [[buffer(8)]],
     constant uint& token_count   [[buffer(9)]],
+    constant uint& window_size   [[buffer(10)]],
     uint3 tid_3d  [[thread_position_in_threadgroup]],
     uint3 tgid_3d [[threadgroup_position_in_grid]],
     uint3 tg_size_3d [[threads_per_threadgroup]],
@@ -233,6 +240,13 @@ kernel void prefill_attention(
     // Causal mask: this query attends to positions 0..causal_len.
     uint causal_len = seq_offset + token_idx + 1;
 
+    // Ring buffer: causal_len cannot exceed the physical buffer size.
+    if (window_size > 0 && causal_len > max_seq_len)
+        causal_len = max_seq_len;
+
+    // Sliding window: clamp KV start so we only attend to recent positions.
+    uint kv_start = (window_size > 0 && causal_len > window_size) ? (causal_len - window_size) : 0;
+
     uint heads_per_group = num_heads / num_kv_heads;
     uint kv_head = (num_kv_heads < num_heads) ? head_idx / heads_per_group : head_idx;
 
@@ -253,7 +267,7 @@ kernel void prefill_attention(
     uint kv_base = kv_head * max_seq_len * head_dim;
 
     // ---- Tiled flash attention with causal masking ----
-    for (uint tile_start = 0; tile_start < causal_len; tile_start += TILE) {
+    for (uint tile_start = kv_start; tile_start < causal_len; tile_start += TILE) {
         uint tile_end = min(tile_start + TILE, causal_len);
         uint actual_tile = tile_end - tile_start;
 
@@ -357,6 +371,7 @@ kernel void prefill_attention_fa2(
     constant uint& max_seq_len   [[buffer(7)]],
     constant uint& seq_offset    [[buffer(8)]],
     constant uint& token_count   [[buffer(9)]],
+    constant uint& window_size   [[buffer(10)]],
     uint3 tid_3d  [[thread_position_in_threadgroup]],
     uint3 tgid_3d [[threadgroup_position_in_grid]],
     uint3 tg_size_3d [[threads_per_threadgroup]],
@@ -399,11 +414,23 @@ kernel void prefill_attention_fa2(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint max_causal = seq_offset + q_end;
+    // Ring buffer: max_causal cannot exceed the physical buffer size.
+    if (window_size > 0 && max_causal > max_seq_len)
+        max_causal = max_seq_len;
+    // Sliding window: earliest KV position any query in this chunk can see.
+    uint fa2_kv_begin = 0;
+    if (window_size > 0) {
+        // Earliest query's window start: the first query in the chunk has
+        // the smallest causal len, so the latest kv_start. But we want the
+        // global minimum kv_start across all queries in the chunk.
+        uint earliest_causal = seq_offset + q_start + 1;
+        fa2_kv_begin = (earliest_causal > window_size) ? (earliest_causal - window_size) : 0;
+    }
     uint kv_base = kv_head * max_seq_len * HEAD_DIM;
 
-    for (uint kv_start = 0; kv_start < max_causal; kv_start += FA2_KV_TILE) {
-        uint kv_end_pos = min(kv_start + FA2_KV_TILE, max_causal);
-        uint actual_kv = kv_end_pos - kv_start;
+    for (uint kv_iter = fa2_kv_begin; kv_iter < max_causal; kv_iter += FA2_KV_TILE) {
+        uint kv_end_pos = min(kv_iter + FA2_KV_TILE, max_causal);
+        uint actual_kv = kv_end_pos - kv_iter;
 
         // Load K tile
         uint k_elems = actual_kv * HEAD_DIM;
@@ -411,7 +438,7 @@ kernel void prefill_attention_fa2(
             uint p = i / HEAD_DIM;
             uint d = i % HEAD_DIM;
             kv_tile[p * HEAD_DIM + d] =
-                k_cache[kv_base + (kv_start + p) * HEAD_DIM + d];
+                k_cache[kv_base + (kv_iter + p) * HEAD_DIM + d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -421,11 +448,15 @@ kernel void prefill_attention_fa2(
             if (qi < actual_q) {
                 uint q_global = q_start + qi;
                 uint causal_len = seq_offset + q_global + 1;
+                if (window_size > 0 && causal_len > max_seq_len)
+                    causal_len = max_seq_len;
+                // Sliding window: earliest KV position this query can attend to.
+                uint q_kv_start = (window_size > 0 && causal_len > window_size) ? (causal_len - window_size) : 0;
                 uint q_base_addr = (q_global * num_heads + head_idx) * HEAD_DIM;
 
                 for (uint p = 0; p < actual_kv; p++) {
-                    uint kv_pos = kv_start + p;
-                    if (kv_pos >= causal_len) {
+                    uint kv_pos = kv_iter + p;
+                    if (kv_pos >= causal_len || kv_pos < q_kv_start) {
                         if (lane == 0) all_scores[qi * FA2_KV_TILE + p] = -INFINITY;
                     } else {
                         float dot = 0.0f;
@@ -472,7 +503,7 @@ kernel void prefill_attention_fa2(
             uint p = i / HEAD_DIM;
             uint d = i % HEAD_DIM;
             kv_tile[p * HEAD_DIM + d] =
-                v_cache[kv_base + (kv_start + p) * HEAD_DIM + d];
+                v_cache[kv_base + (kv_iter + p) * HEAD_DIM + d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

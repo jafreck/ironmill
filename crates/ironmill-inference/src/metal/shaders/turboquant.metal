@@ -80,7 +80,7 @@ kernel void turboquant_cache_write(
     uint head_idx = tgid.x;
     uint token_idx = tgid.y;
     if (head_idx >= num_kv_heads) return;
-    uint seq_pos = base_seq_pos + token_idx;
+    uint seq_pos = (base_seq_pos + token_idx) % max_seq_len;
 
     // Step 1: Load input into shared memory as float
     uint input_base = (token_idx * num_kv_heads + head_idx) * head_dim;
@@ -561,7 +561,7 @@ kernel void turboquant_outlier_cache_write(
     uint head_idx = tgid.x;
     uint token_idx = tgid.y;
     if (head_idx >= num_kv_heads) return;
-    uint seq_pos = base_seq_pos + token_idx;
+    uint seq_pos = (base_seq_pos + token_idx) % max_seq_len;
 
     uint n_non = head_dim - n_outlier;
     uint input_base = (token_idx * num_kv_heads + head_idx) * head_dim;

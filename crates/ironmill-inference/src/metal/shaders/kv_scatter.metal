@@ -33,6 +33,10 @@ kernel void kv_scatter(
     if (t >= token_count || head >= num_kv_heads || d >= head_dim) return;
 
     uint src_idx = (t * num_kv_heads + head) * head_dim + d;
-    uint dst_idx = (head * max_seq_len + (seq_pos + t)) * head_dim + d;
+    // Ring buffer: wrap write position for sliding window layers where
+    // max_seq_len == window_size. For full-attention layers seq_pos + t
+    // never reaches max_seq_len, so the modulo is a no-op.
+    uint write_pos = (seq_pos + t) % max_seq_len;
+    uint dst_idx = (head * max_seq_len + write_pos) * head_dim + d;
     cache[dst_idx] = proj[src_idx];
 }

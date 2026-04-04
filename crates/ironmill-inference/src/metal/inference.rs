@@ -46,13 +46,17 @@ pub struct MetalArtifacts<'a> {
 
 /// FP16 KV cache (when TurboQuant is disabled).
 struct Fp16KvCache {
-    /// K caches per buffer slot: `[num_kv_heads × max_seq × head_dim]` FP16.
+    /// K caches per buffer slot: `[num_kv_heads × effective_max_seq × head_dim]` FP16.
     k_caches: Vec<MetalBuffer>,
     /// V caches per buffer slot.
     v_caches: Vec<MetalBuffer>,
     seq_pos: usize,
+    /// Global max sequence length (for full-attention layers).
+    max_seq_len: usize,
     /// CLA anchor layers. When set, only anchor layers have physical buffers.
     anchor_layers: Option<Vec<usize>>,
+    /// Per-buffer sliding window sizes. `0` = full attention for that buffer.
+    window_sizes: Vec<usize>,
 }
 
 impl Fp16KvCache {
@@ -63,16 +67,31 @@ impl Fp16KvCache {
         max_seq_len: usize,
         head_dim: usize,
         anchor_layers: Option<Vec<usize>>,
+        layer_window_sizes: &[usize],
     ) -> Result<Self, MetalError> {
         let num_buffers = if let Some(ref anchors) = anchor_layers {
             anchors.len()
         } else {
             num_layers
         };
-        let size_bytes = num_kv_heads * max_seq_len * head_dim * 2; // FP16
+
+        let per_buffer_window: Vec<usize> = (0..num_buffers)
+            .map(|buf_idx| {
+                let layer = if let Some(ref anchors) = anchor_layers {
+                    anchors[buf_idx]
+                } else {
+                    buf_idx
+                };
+                layer_window_sizes.get(layer).copied().unwrap_or(0)
+            })
+            .collect();
+
         let mut k_caches = Vec::with_capacity(num_buffers);
         let mut v_caches = Vec::with_capacity(num_buffers);
-        for _ in 0..num_buffers {
+        for buf_idx in 0..num_buffers {
+            let ws = per_buffer_window[buf_idx];
+            let effective_seq = if ws > 0 { ws } else { max_seq_len };
+            let size_bytes = num_kv_heads * effective_seq * head_dim * 2; // FP16
             k_caches.push(
                 device
                     .create_buffer(size_bytes, StorageMode::Shared)
@@ -88,7 +107,9 @@ impl Fp16KvCache {
             k_caches,
             v_caches,
             seq_pos: 0,
+            max_seq_len,
             anchor_layers,
+            window_sizes: per_buffer_window,
         })
     }
 
@@ -114,6 +135,41 @@ impl Fp16KvCache {
     fn layer_caches(&self, layer: usize) -> (&MetalBuffer, &MetalBuffer) {
         let idx = self.kv_buffer_for_layer(layer);
         (&self.k_caches[idx], &self.v_caches[idx])
+    }
+
+    /// Write position for ring buffer. For SWA layers, wraps at window_size.
+    fn ring_pos(&self, layer: usize) -> usize {
+        let idx = self.kv_buffer_for_layer(layer);
+        let ws = self.window_sizes.get(idx).copied().unwrap_or(0);
+        if ws > 0 {
+            self.seq_pos % ws
+        } else {
+            self.seq_pos
+        }
+    }
+
+    /// Effective max_seq_len for a layer's buffer.
+    fn effective_max_seq_len(&self, layer: usize) -> usize {
+        let idx = self.kv_buffer_for_layer(layer);
+        let ws = self.window_sizes.get(idx).copied().unwrap_or(0);
+        if ws > 0 { ws } else { self.max_seq_len }
+    }
+
+    /// Effective seq_len for attention (capped at window_size for SWA layers).
+    fn effective_seq_len(&self, layer: usize, total_tokens: usize) -> usize {
+        let idx = self.kv_buffer_for_layer(layer);
+        let ws = self.window_sizes.get(idx).copied().unwrap_or(0);
+        if ws > 0 {
+            total_tokens.min(ws)
+        } else {
+            total_tokens
+        }
+    }
+
+    /// Window size for a layer. 0 = full attention.
+    fn window_size_for_layer(&self, layer: usize) -> usize {
+        let idx = self.kv_buffer_for_layer(layer);
+        self.window_sizes.get(idx).copied().unwrap_or(0)
     }
 
     fn reset(&mut self) {
@@ -422,6 +478,23 @@ impl MetalInference {
         }
         self.mla_config = mla_cfg;
 
+        // Resolve sliding window config: explicit config takes priority,
+        // then fall back to model metadata (sliding_window + max_window_layers).
+        if self.config.sliding_window.is_none() {
+            if let Some(ws) = mc.sliding_window() {
+                let mwl = mc.max_window_layers().unwrap_or(mc.num_hidden_layers);
+                self.config.sliding_window = Some(super::config::SlidingWindowConfig {
+                    window_size: ws,
+                    max_window_layers: mwl,
+                });
+            }
+        }
+
+        // Build per-layer window sizes for buffer allocation.
+        let layer_window_sizes: Vec<usize> = (0..mc.num_hidden_layers)
+            .map(|l| self.config.layer_window_size(l))
+            .collect();
+
         if self.config.enable_turboquant {
             // Algorithm selection:
             // - b >= 4: Algorithm 1 (full b-bit codebook for K and V, no QJL).
@@ -472,6 +545,7 @@ impl MetalInference {
                 rotation_seed: self.config.rotation_seed,
                 outlier: outlier_cfg,
                 anchor_layers: cla_anchors.clone(),
+                window_sizes: layer_window_sizes.clone(),
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -488,6 +562,7 @@ impl MetalInference {
                 self.config.max_seq_len,
                 mc.head_dim,
                 cla_anchors.clone(),
+                &layer_window_sizes,
             )
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             self.fp16_kv_cache = Some(fp16_kv);
@@ -894,6 +969,7 @@ impl MetalInference {
                 enable_tq,
                 self.config.use_fa2_prefill,
                 is_anchor,
+                self.config.layer_window_size(layer_idx),
             )?;
             enc.memory_barrier_buffers();
 
@@ -1343,6 +1419,7 @@ impl MetalInference {
                 enable_tq,
                 self.config.use_fa2_prefill,
                 is_anchor,
+                self.config.layer_window_size(layer_idx),
             )?;
             enc.memory_barrier_buffers();
 
@@ -1974,12 +2051,33 @@ fn encode_kv_cache_and_attention(
     enable_tq: bool,
     use_fa2: bool,
     is_anchor: bool,
+    window_size: usize,
 ) -> Result<(), InferenceError> {
-    let max_seq = max_seq_len as u32;
+    // For SWA layers, use window_size as the buffer stride and ring-buffer
+    // write position. For full-attention layers, use the global max_seq_len.
+    let effective_max = if window_size > 0 {
+        window_size
+    } else {
+        max_seq_len
+    };
+    let ring_seq_pos = if window_size > 0 {
+        seq_pos % window_size
+    } else {
+        seq_pos
+    };
+    // For attention: how many valid cache entries exist before the current batch.
+    let attn_seq_pos = if window_size > 0 {
+        let total = seq_pos + token_count;
+        let effective = total.min(window_size);
+        // Clamp so base_seq + token_count never exceeds the physical buffer.
+        effective
+            .saturating_sub(token_count)
+            .min(effective_max.saturating_sub(token_count))
+    } else {
+        seq_pos
+    };
+    let max_seq = effective_max as u32;
     let n_bits = n_bits as u32;
-    // `use_fa2` is unused: fused SDPA replaces the old standard_attention /
-    // prefill_attention / prefill_attention_fa2 paths for FP16 attention.
-    // Those pipelines are kept in MetalPipelines for potential fallback.
     let _ = use_fa2;
 
     if enable_tq {
@@ -2002,7 +2100,8 @@ fn encode_kv_cache_and_attention(
                 outlier.d_non_padded as usize,
             );
 
-            let base_seq = seq_pos as u32;
+            let cache_write_pos = ring_seq_pos as u32;
+            let attn_base_seq = attn_seq_pos as u32;
 
             // CLA: only anchor layers write to the KV cache.
             if is_anchor {
@@ -2023,7 +2122,7 @@ fn encode_kv_cache_and_attention(
                 enc.set_bytes(&nkv.to_le_bytes(), 12);
                 enc.set_bytes(&hd.to_le_bytes(), 13);
                 enc.set_bytes(&max_seq.to_le_bytes(), 14);
-                enc.set_bytes(&base_seq.to_le_bytes(), 15);
+                enc.set_bytes(&cache_write_pos.to_le_bytes(), 15);
                 enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
                 enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
                 enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
@@ -2056,7 +2155,7 @@ fn encode_kv_cache_and_attention(
                 enc.set_bytes(&nkv.to_le_bytes(), 12);
                 enc.set_bytes(&hd.to_le_bytes(), 13);
                 enc.set_bytes(&max_seq.to_le_bytes(), 14);
-                enc.set_bytes(&base_seq.to_le_bytes(), 15);
+                enc.set_bytes(&cache_write_pos.to_le_bytes(), 15);
                 enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
                 enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
                 enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
@@ -2094,7 +2193,7 @@ fn encode_kv_cache_and_attention(
             enc.set_bytes(&nkv.to_le_bytes(), 16);
             enc.set_bytes(&hd.to_le_bytes(), 17);
             enc.set_bytes(&max_seq.to_le_bytes(), 18);
-            enc.set_bytes(&base_seq.to_le_bytes(), 19);
+            enc.set_bytes(&attn_base_seq.to_le_bytes(), 19);
             enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 20);
             enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 21);
             enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 22);
@@ -2116,7 +2215,8 @@ fn encode_kv_cache_and_attention(
             let (k_scale, v_scale) = kv.layer_scales(layer_idx);
             let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
 
-            let base_seq = seq_pos as u32;
+            let cache_write_pos = ring_seq_pos as u32;
+            let attn_base_seq = attn_seq_pos as u32;
 
             // CLA: only anchor layers write to the KV cache.
             if is_anchor {
@@ -2128,7 +2228,7 @@ fn encode_kv_cache_and_attention(
                 enc.set_bytes(&nkv.to_le_bytes(), 3);
                 enc.set_bytes(&hd.to_le_bytes(), 4);
                 enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                enc.set_bytes(&base_seq.to_le_bytes(), 6);
+                enc.set_bytes(&cache_write_pos.to_le_bytes(), 6);
                 enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                 enc.set_bytes(&n_bits.to_le_bytes(), 8);
                 enc.set_buffer(k_scale, 0, 9);
@@ -2152,7 +2252,7 @@ fn encode_kv_cache_and_attention(
                 enc.set_bytes(&nkv.to_le_bytes(), 3);
                 enc.set_bytes(&hd.to_le_bytes(), 4);
                 enc.set_bytes(&max_seq.to_le_bytes(), 5);
-                enc.set_bytes(&base_seq.to_le_bytes(), 6);
+                enc.set_bytes(&cache_write_pos.to_le_bytes(), 6);
                 enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                 enc.set_bytes(&n_bits.to_le_bytes(), 8);
                 enc.set_buffer(v_scale, 0, 9);
@@ -2181,7 +2281,7 @@ fn encode_kv_cache_and_attention(
             enc.set_bytes(&nkv.to_le_bytes(), 6);
             enc.set_bytes(&hd.to_le_bytes(), 7);
             enc.set_bytes(&max_seq.to_le_bytes(), 8);
-            enc.set_bytes(&base_seq.to_le_bytes(), 9);
+            enc.set_bytes(&attn_base_seq.to_le_bytes(), 9);
             enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
             enc.set_bytes(&n_bits.to_le_bytes(), 11);
             enc.set_buffer(k_scale, 0, 12);
@@ -2208,13 +2308,14 @@ fn encode_kv_cache_and_attention(
         // CLA: only anchor layers write to the KV cache.
         if is_anchor {
             // Scatter K and V projections into their caches entirely on GPU.
+            // Ring buffer: kv_scatter.metal handles modular write via % max_seq_len.
             ops::encode_kv_scatter(
                 enc,
                 &pipelines.kv_scatter,
                 &ops::KvScatterParams {
                     proj: &bufs.k_proj,
                     cache: k_cache,
-                    seq_pos: seq_pos as u32,
+                    seq_pos: ring_seq_pos as u32,
                     token_count: token_count as u32,
                     num_kv_heads: nkv,
                     head_dim: hd,
@@ -2227,7 +2328,7 @@ fn encode_kv_cache_and_attention(
                 &ops::KvScatterParams {
                     proj: &bufs.v_proj,
                     cache: v_cache,
-                    seq_pos: seq_pos as u32,
+                    seq_pos: ring_seq_pos as u32,
                     token_count: token_count as u32,
                     num_kv_heads: nkv,
                     head_dim: hd,
@@ -2238,7 +2339,7 @@ fn encode_kv_cache_and_attention(
 
         // FP16 attention — use fused SDPA for both prefill and decode.
         // The kernel reads directly from the KV cache (contiguous layout).
-        let total_seq_len = (seq_pos + token_count) as u32;
+        let total_seq_len = (attn_seq_pos + token_count) as u32;
         ops::encode_fused_sdpa(
             enc,
             &pipelines.fused_sdpa,
@@ -2618,6 +2719,21 @@ impl InferenceEngine for MetalInference {
         }
         self.mla_config = mla_cfg;
 
+        // Resolve sliding window config from model metadata.
+        if self.config.sliding_window.is_none() {
+            if let Some(ws) = mc.sliding_window() {
+                let mwl = mc.max_window_layers().unwrap_or(mc.num_hidden_layers);
+                self.config.sliding_window = Some(super::config::SlidingWindowConfig {
+                    window_size: ws,
+                    max_window_layers: mwl,
+                });
+            }
+        }
+
+        let layer_window_sizes: Vec<usize> = (0..mc.num_hidden_layers)
+            .map(|l| self.config.layer_window_size(l))
+            .collect();
+
         // Initialize KV cache.
         if self.config.enable_turboquant {
             let tq_config = TurboQuantMetalConfig {
@@ -2629,6 +2745,7 @@ impl InferenceEngine for MetalInference {
                 rotation_seed: self.config.rotation_seed,
                 outlier: None,
                 anchor_layers: cla_anchors.clone(),
+                window_sizes: layer_window_sizes.clone(),
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -2645,6 +2762,7 @@ impl InferenceEngine for MetalInference {
                 self.config.max_seq_len,
                 mc.head_dim,
                 cla_anchors.clone(),
+                &layer_window_sizes,
             )
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             self.fp16_kv_cache = Some(fp16_kv);
@@ -2670,6 +2788,21 @@ impl InferenceEngine for MetalInference {
         // unless the caller explicitly set a chunk size.
         let chunk_size = self.config.prefill_chunk_size.unwrap_or(tokens.len());
         let chunk_size = chunk_size.max(1);
+
+        // SWA: prefill chunks must not exceed the smallest window_size so
+        // that ring-buffer writes and attention reads stay in bounds.
+        let chunk_size = if let Some(ref mc) = self.model_config {
+            let min_ws = (0..mc.num_hidden_layers)
+                .map(|l| self.config.layer_window_size(l))
+                .filter(|&ws| ws > 0)
+                .min();
+            match min_ws {
+                Some(ws) => chunk_size.min(ws),
+                None => chunk_size,
+            }
+        } else {
+            chunk_size
+        };
 
         let chunks: Vec<&[u32]> = tokens.chunks(chunk_size).collect();
         let n_chunks = chunks.len();

@@ -66,12 +66,18 @@ pub struct MetalKvCache {
     /// CLA anchor layers. When set, only anchor layers have physical buffers.
     /// The Vec index maps buffer index → layer index.
     anchor_layers: Option<Vec<usize>>,
+    /// Per-buffer sliding window sizes. `0` = full attention for that buffer.
+    /// When a buffer has `window_size > 0`, it is allocated with `window_size`
+    /// slots instead of `max_seq_len` and uses ring-buffer write semantics.
+    window_sizes: Vec<usize>,
 }
 
 impl MetalKvCache {
     /// Allocate KV cache buffers for all layers (or only anchor layers when CLA is configured).
     ///
     /// Uses shared storage mode for CPU-side inspection during development.
+    /// When `config.window_sizes` is non-empty, SWA layers allocate smaller
+    /// ring buffers bounded by their window size.
     pub fn new(device: &MetalDevice, config: &TurboQuantMetalConfig) -> Result<Self, MetalError> {
         let num_buffers = if let Some(ref anchors) = config.anchor_layers {
             anchors.len()
@@ -79,19 +85,18 @@ impl MetalKvCache {
             config.num_layers
         };
 
-        let layout = TurboQuantCacheLayout::new(
-            config.num_kv_heads,
-            config.head_dim,
-            config.max_seq_len,
-            config.num_layers,
-            config.n_bits,
-            config.outlier.as_ref(),
-        );
-
-        let cache_size = layout.cache_bytes;
-        let scale_size = layout.scale_bytes();
-        let qjl_signs_size = layout.qjl_signs_bytes;
-        let qjl_r_norm_size = scale_size;
+        // Compute per-buffer window sizes. Buffer index maps to layer via
+        // anchor_layers (CLA) or identity.
+        let per_buffer_window: Vec<usize> = (0..num_buffers)
+            .map(|buf_idx| {
+                let layer = if let Some(ref anchors) = config.anchor_layers {
+                    anchors[buf_idx]
+                } else {
+                    buf_idx
+                };
+                config.window_sizes.get(layer).copied().unwrap_or(0)
+            })
+            .collect();
 
         let mut k_caches = Vec::with_capacity(num_buffers);
         let mut v_caches = Vec::with_capacity(num_buffers);
@@ -100,7 +105,23 @@ impl MetalKvCache {
         let mut k_qjl_signs = Vec::with_capacity(num_buffers);
         let mut k_r_norms = Vec::with_capacity(num_buffers);
 
-        for _ in 0..num_buffers {
+        for buf_idx in 0..num_buffers {
+            let ws = per_buffer_window[buf_idx];
+            let effective_seq = if ws > 0 { ws } else { config.max_seq_len };
+            let layout = TurboQuantCacheLayout::new(
+                config.num_kv_heads,
+                config.head_dim,
+                effective_seq,
+                config.num_layers,
+                config.n_bits,
+                config.outlier.as_ref(),
+            );
+
+            let cache_size = layout.cache_bytes;
+            let scale_size = layout.scale_bytes();
+            let qjl_signs_size = layout.qjl_signs_bytes;
+            let qjl_r_norm_size = scale_size;
+
             k_caches.push(
                 device
                     .create_buffer(cache_size, StorageMode::Shared)
@@ -135,12 +156,6 @@ impl MetalKvCache {
 
         // Outlier cache buffers (allocated even when not used — zero-sized
         // buffers are fine and simplify dispatch).
-        let (outlier_cache_size, non_outlier_cache_size) = if let Some(ref ol) = layout.outlier {
-            (ol.outlier_cache_bytes, ol.non_outlier_cache_bytes)
-        } else {
-            (1, 1) // minimal allocation when not used
-        };
-
         let mut k_outlier_caches = Vec::with_capacity(num_buffers);
         let mut v_outlier_caches = Vec::with_capacity(num_buffers);
         let mut k_non_outlier_caches = Vec::with_capacity(num_buffers);
@@ -152,7 +167,25 @@ impl MetalKvCache {
         let mut k_outlier_r_norms = Vec::with_capacity(num_buffers);
         let mut k_non_outlier_r_norms = Vec::with_capacity(num_buffers);
 
-        for _ in 0..num_buffers {
+        for buf_idx in 0..num_buffers {
+            let ws = per_buffer_window[buf_idx];
+            let effective_seq = if ws > 0 { ws } else { config.max_seq_len };
+            let layout = TurboQuantCacheLayout::new(
+                config.num_kv_heads,
+                config.head_dim,
+                effective_seq,
+                config.num_layers,
+                config.n_bits,
+                config.outlier.as_ref(),
+            );
+            let scale_size = layout.scale_bytes();
+            let (outlier_cache_size, non_outlier_cache_size) = if let Some(ref ol) = layout.outlier
+            {
+                (ol.outlier_cache_bytes, ol.non_outlier_cache_bytes)
+            } else {
+                (1, 1)
+            };
+
             k_outlier_caches.push(
                 device
                     .create_buffer(outlier_cache_size, StorageMode::Shared)
@@ -225,6 +258,7 @@ impl MetalKvCache {
             seq_pos: 0,
             max_seq_len: config.max_seq_len,
             anchor_layers: config.anchor_layers.clone(),
+            window_sizes: per_buffer_window,
         })
     }
 
@@ -252,6 +286,44 @@ impl MetalKvCache {
             Some(ref anchors) => anchors.binary_search(&layer).is_ok(),
             None => true,
         }
+    }
+
+    /// Write position for ring buffer. For SWA layers, wraps at window_size.
+    /// For full-attention layers, returns seq_pos unchanged.
+    pub fn ring_pos(&self, layer: usize) -> usize {
+        let idx = self.kv_buffer_for_layer(layer);
+        let ws = self.window_sizes.get(idx).copied().unwrap_or(0);
+        if ws > 0 {
+            self.seq_pos % ws
+        } else {
+            self.seq_pos
+        }
+    }
+
+    /// Effective max_seq_len for a layer's buffer. SWA layers use window_size
+    /// as the buffer stride; full-attention layers use the global max_seq_len.
+    pub fn effective_max_seq_len(&self, layer: usize) -> usize {
+        let idx = self.kv_buffer_for_layer(layer);
+        let ws = self.window_sizes.get(idx).copied().unwrap_or(0);
+        if ws > 0 { ws } else { self.max_seq_len }
+    }
+
+    /// Effective seq_len for attention. For SWA layers, capped at window_size.
+    /// For full-attention layers, returns the actual cached token count.
+    pub fn effective_seq_len(&self, layer: usize, total_tokens: usize) -> usize {
+        let idx = self.kv_buffer_for_layer(layer);
+        let ws = self.window_sizes.get(idx).copied().unwrap_or(0);
+        if ws > 0 {
+            total_tokens.min(ws)
+        } else {
+            total_tokens
+        }
+    }
+
+    /// Window size for a layer. 0 = full attention.
+    pub fn window_size_for_layer(&self, layer: usize) -> usize {
+        let idx = self.kv_buffer_for_layer(layer);
+        self.window_sizes.get(idx).copied().unwrap_or(0)
     }
 
     /// Number of physical buffer slots allocated.

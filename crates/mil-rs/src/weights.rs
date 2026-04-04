@@ -106,6 +106,24 @@ impl ModelConfig {
             v_head_dim,
         })
     }
+
+    /// Extract sliding window size from HuggingFace config metadata.
+    ///
+    /// Looks for `"sliding_window"` in `extra`. Returns `None` if absent or null.
+    pub fn sliding_window(&self) -> Option<usize> {
+        let val = self.extra.get("sliding_window")?;
+        val.as_u64().map(|n| n as usize)
+    }
+
+    /// Extract max_window_layers from HuggingFace config metadata.
+    ///
+    /// Layers `0..max_window_layers` use sliding window attention.
+    /// Returns `None` if absent. Defaults should be handled by the caller
+    /// (e.g. fall back to `num_hidden_layers` if absent but `sliding_window` is set).
+    pub fn max_window_layers(&self) -> Option<usize> {
+        let val = self.extra.get("max_window_layers")?;
+        val.as_u64().map(|n| n as usize)
+    }
 }
 
 /// Multi-Head Latent Attention (MLA) configuration.

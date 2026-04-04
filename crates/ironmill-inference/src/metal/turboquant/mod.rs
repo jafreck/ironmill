@@ -109,6 +109,10 @@ pub struct TurboQuantMetalConfig {
     pub outlier: Option<OutlierConfig>,
     /// CLA anchor layers. None = all layers are anchors (standard behavior).
     pub anchor_layers: Option<Vec<usize>>,
+    /// Per-layer sliding window sizes. `0` = full attention.
+    /// When non-empty, SWA layers allocate smaller ring buffers.
+    /// Length must equal `num_layers` (or be empty for no SWA).
+    pub window_sizes: Vec<usize>,
 }
 
 fn create_f32_buffer(

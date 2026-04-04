@@ -282,6 +282,11 @@ pub(super) fn emit_rotary_embedding_partial(
 
 **Add per-layer attention config to `LayerContext`:**
 
+`emit_attention_core` reads `config.head_dim`, `config.num_attention_heads`, and
+`config.num_key_value_heads` directly to reshape Q/K/V projections. Since global
+layers may use different dimensions, `LayerContext` must carry per-layer effective
+values so `emit_attention_core` can use them instead of the global config.
+
 ```rust
 pub(super) struct LayerContext<'a> {
     pub provider: &'a dyn WeightProvider,
@@ -292,15 +297,25 @@ pub(super) struct LayerContext<'a> {
     /// Per-layer attention type for Gemma 4 ("sliding_attention" or "full_attention").
     /// None for non-Gemma-4 models.
     pub layer_type: Option<&'a str>,
-    /// Override RoPE tables for this specific layer type.
-    /// None means use the default rope_cos/rope_sin.
-    pub rope_cos_override: Option<&'a str>,
-    pub rope_sin_override: Option<&'a str>,
+    /// Effective head dimension for this layer's attention.
+    /// Global layers may use `global_head_dim` (e.g. 512) instead of `head_dim` (e.g. 256).
+    pub effective_head_dim: usize,
+    /// Effective number of KV heads for this layer's attention.
+    /// Global layers may use `num_global_key_value_heads`.
+    pub effective_num_kv_heads: usize,
 }
 ```
 
 This is a backwards-compatible extension — existing templates set `layer_type: None`
-and `rope_cos_override: None`.
+and `effective_head_dim: config.head_dim`, `effective_num_kv_heads: config.num_key_value_heads`.
+
+**Update `emit_attention_core` to use `LayerContext` overrides:**
+
+`emit_attention_core` currently reads `config.head_dim` and `config.num_key_value_heads`
+directly for Q/K/V reshape. Update it to read `ctx.effective_head_dim` and
+`ctx.effective_num_kv_heads` instead. The weight tensors loaded from the provider
+already have the correct shapes per layer, so only the reshape dimensions need
+overriding.
 
 #### 4. `crates/ironmill-compile/src/templates/gemma.rs`
 
@@ -341,15 +356,29 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
         let lt = layer_types.as_ref().map(|lts| lts[layer_idx].as_str());
         let is_global = lt == Some("full_attention");
 
+        // Select effective per-layer dimensions and RoPE tables
+        let (eff_cos, eff_sin) = if is_global {
+            (global_cos.as_deref().unwrap_or(&default_cos),
+             global_sin.as_deref().unwrap_or(&default_sin))
+        } else {
+            (default_cos.as_str(), default_sin.as_str())
+        };
+        let eff_head_dim = if is_global { config.global_head_dim() } else { config.head_dim };
+        let eff_num_kv_heads = if is_global {
+            config.num_global_key_value_heads()
+        } else {
+            config.num_key_value_heads
+        };
+
         let ctx = LayerContext {
             provider,
             config: &config,
             layer_idx,
-            rope_cos: &default_cos,
-            rope_sin: &default_sin,
+            rope_cos: eff_cos,
+            rope_sin: eff_sin,
             layer_type: lt,
-            rope_cos_override: if is_global { global_cos.as_deref() } else { None },
-            rope_sin_override: if is_global { global_sin.as_deref() } else { None },
+            effective_head_dim: eff_head_dim,
+            effective_num_kv_heads: eff_num_kv_heads,
         };
         hidden = emit_gemma_transformer_layer(block, &ctx, &hidden, &mut warnings)?;
     }
