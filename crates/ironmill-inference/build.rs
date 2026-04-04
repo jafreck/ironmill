@@ -55,6 +55,7 @@ fn main() {
     let attn_src = std::fs::read_to_string(shader_dir.join("attention.metal")).unwrap();
     let fused_qk_src =
         std::fs::read_to_string(shader_dir.join("fused_qk_norm_rope.metal")).unwrap();
+    let sdpa_src = std::fs::read_to_string(shader_dir.join("fused_sdpa.metal")).unwrap();
 
     for &hd in HEAD_DIMS {
         let defines = [
@@ -72,6 +73,15 @@ fn main() {
         compile_shader(
             &attn_tmp,
             &out_dir.join(format!("attention_hd{hd}.metallib")),
+            &[],
+        );
+
+        // Fused SDPA
+        let sdpa_tmp = out_dir.join(format!("_sdpa_hd{hd}.metal"));
+        std::fs::write(&sdpa_tmp, format!("{header}{sdpa_src}")).unwrap();
+        compile_shader(
+            &sdpa_tmp,
+            &out_dir.join(format!("fused_sdpa_hd{hd}.metallib")),
             &[],
         );
 

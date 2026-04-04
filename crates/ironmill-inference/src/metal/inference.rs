@@ -1938,6 +1938,10 @@ fn encode_kv_cache_and_attention(
 ) -> Result<(), InferenceError> {
     let max_seq = max_seq_len as u32;
     let n_bits = n_bits as u32;
+    // `use_fa2` is unused: fused SDPA replaces the old standard_attention /
+    // prefill_attention / prefill_attention_fa2 paths for FP16 attention.
+    // Those pipelines are kept in MetalPipelines for potential fallback.
+    let _ = use_fa2;
 
     if enable_tq {
         let tq = turboquant.ok_or_else(|| {
@@ -2193,47 +2197,27 @@ fn encode_kv_cache_and_attention(
             );
         } // end is_anchor
 
-        // Standard attention — use batched prefill kernel for multi-token,
-        // single-dispatch decode kernel for single-token.
-        // (always runs, reading from the anchor's KV buffer)
-        let attn_tg_size = 256_usize.max(hd as usize).min(1024);
-        if token_count > 1 {
-            // Both kernels share the same buffer layout and parameters.
-            enc.set_buffer(&bufs.q_proj, 0, 0);
-            enc.set_buffer(k_cache, 0, 1);
-            enc.set_buffer(v_cache, 0, 2);
-            enc.set_buffer(&bufs.attn_out, 0, 3);
-            enc.set_bytes(&nh.to_le_bytes(), 4);
-            enc.set_bytes(&nkv.to_le_bytes(), 5);
-            enc.set_bytes(&hd.to_le_bytes(), 6);
-            enc.set_bytes(&max_seq.to_le_bytes(), 7);
-            enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 8);
-            enc.set_bytes(&(token_count as u32).to_le_bytes(), 9);
-
-            if use_fa2 {
-                enc.set_pipeline(&pipelines.prefill_attention_fa2);
-                enc.dispatch_threadgroups(
-                    (nh as usize, (token_count + 31) / 32, 1),
-                    (attn_tg_size, 1, 1),
-                );
-            } else {
-                enc.set_pipeline(&pipelines.prefill_attention);
-                enc.dispatch_threadgroups((nh as usize, token_count, 1), (attn_tg_size, 1, 1));
-            }
-        } else {
-            let current_seq_len = (seq_pos + 1) as u32;
-            enc.set_pipeline(&pipelines.standard_attention);
-            enc.set_buffer(&bufs.q_proj, 0, 0);
-            enc.set_buffer(k_cache, 0, 1);
-            enc.set_buffer(v_cache, 0, 2);
-            enc.set_buffer(&bufs.attn_out, 0, 3);
-            enc.set_bytes(&nh.to_le_bytes(), 4);
-            enc.set_bytes(&nkv.to_le_bytes(), 5);
-            enc.set_bytes(&hd.to_le_bytes(), 6);
-            enc.set_bytes(&max_seq.to_le_bytes(), 7);
-            enc.set_bytes(&current_seq_len.to_le_bytes(), 8);
-            enc.dispatch_threadgroups((nh as usize, 1, 1), (attn_tg_size, 1, 1));
-        }
+        // FP16 attention — use fused SDPA for both prefill and decode.
+        // The kernel reads directly from the KV cache (contiguous layout).
+        let total_seq_len = (seq_pos + token_count) as u32;
+        ops::encode_fused_sdpa(
+            enc,
+            &pipelines.fused_sdpa,
+            &ops::FusedSdpaParams {
+                q: &bufs.q_proj,
+                k: k_cache,
+                v: v_cache,
+                output: &bufs.attn_out,
+                seq_len: total_seq_len,
+                token_count: token_count as u32,
+                head_dim: hd,
+                num_q_heads: nh,
+                num_kv_heads: nkv,
+                scale: 1.0 / (hd as f32).sqrt(),
+                max_seq_len: max_seq,
+            },
+            None,
+        );
     }
 
     Ok(())

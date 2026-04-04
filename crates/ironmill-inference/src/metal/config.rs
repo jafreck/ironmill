@@ -75,6 +75,11 @@ pub struct MetalConfig {
     /// reuse. Beneficial for large models (7B+) and long sequences; may
     /// be slower for small models where KV tiles fit in L1 cache.
     pub use_fa2_prefill: bool,
+    /// Tile size for the fused SDPA kernel (Br: Q block size).
+    /// None = auto-select based on head_dim.
+    pub fused_sdpa_tile_br: Option<usize>,
+    /// Tile size for KV blocks (Bc). None = auto.
+    pub fused_sdpa_tile_bc: Option<usize>,
     /// Cross-Layer Attention config. None = all layers are anchors (standard behavior).
     pub cla_config: Option<ClaConfig>,
 }
@@ -90,6 +95,8 @@ impl Default for MetalConfig {
             n_bits: 8,
             force_cpu_dequant: false,
             use_fa2_prefill: false,
+            fused_sdpa_tile_br: None,
+            fused_sdpa_tile_bc: None,
             cla_config: None,
         }
     }

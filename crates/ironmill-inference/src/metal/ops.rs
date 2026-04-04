@@ -54,6 +54,7 @@ pub struct MetalPipelines {
     pub fused_qk_norm_rope: ComputePipeline,
     pub fused_embedding_norm: ComputePipeline,
     pub int4_dequantize: ComputePipeline,
+    pub fused_sdpa: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -134,7 +135,7 @@ impl MetalPipelines {
             .map_err(MetalError::Metal)?;
 
         // ── HEAD_DIM-dependent shaders (precompiled or fallback) ─
-        let (attn_lib, tq_lib) = Self::load_head_dim_shaders(device, head_dim)?;
+        let (attn_lib, tq_lib, sdpa_lib) = Self::load_head_dim_shaders(device, head_dim)?;
 
         Ok(Self {
             rms_norm: device
@@ -322,10 +323,17 @@ impl MetalPipelines {
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
+            fused_sdpa: device
+                .create_compute_pipeline(
+                    &sdpa_lib
+                        .get_function("fused_sdpa")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
         })
     }
 
-    /// Load attention and turboquant shaders for a specific HEAD_DIM.
+    /// Load attention, turboquant, and fused SDPA shaders for a specific HEAD_DIM.
     ///
     /// Uses precompiled `.metallib` for common values (64, 80, 128, 256);
     /// falls back to runtime source compilation for uncommon dimensions.
@@ -334,6 +342,7 @@ impl MetalPipelines {
         head_dim: usize,
     ) -> Result<
         (
+            ironmill_metal_sys::ShaderLibrary,
             ironmill_metal_sys::ShaderLibrary,
             ironmill_metal_sys::ShaderLibrary,
         ),
@@ -347,12 +356,17 @@ impl MetalPipelines {
             (tq $hd:literal) => {
                 include_bytes!(concat!(env!("OUT_DIR"), "/turboquant_hd", $hd, ".metallib"))
             };
+            (sdpa $hd:literal) => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/fused_sdpa_hd", $hd, ".metallib"))
+            };
         }
 
         let try_precompiled = |attn_data: &[u8],
-                               tq_data: &[u8]|
+                               tq_data: &[u8],
+                               sdpa_data: &[u8]|
          -> Result<
             (
+                ironmill_metal_sys::ShaderLibrary,
                 ironmill_metal_sys::ShaderLibrary,
                 ironmill_metal_sys::ShaderLibrary,
             ),
@@ -364,14 +378,33 @@ impl MetalPipelines {
             let tq = device
                 .load_library_from_data(tq_data)
                 .map_err(MetalError::Metal)?;
-            Ok((attn, tq))
+            let sdpa = device
+                .load_library_from_data(sdpa_data)
+                .map_err(MetalError::Metal)?;
+            Ok((attn, tq, sdpa))
         };
 
         match head_dim {
-            64 => try_precompiled(precompiled!(attn "64"), precompiled!(tq "64")),
-            80 => try_precompiled(precompiled!(attn "80"), precompiled!(tq "80")),
-            128 => try_precompiled(precompiled!(attn "128"), precompiled!(tq "128")),
-            256 => try_precompiled(precompiled!(attn "256"), precompiled!(tq "256")),
+            64 => try_precompiled(
+                precompiled!(attn "64"),
+                precompiled!(tq "64"),
+                precompiled!(sdpa "64"),
+            ),
+            80 => try_precompiled(
+                precompiled!(attn "80"),
+                precompiled!(tq "80"),
+                precompiled!(sdpa "80"),
+            ),
+            128 => try_precompiled(
+                precompiled!(attn "128"),
+                precompiled!(tq "128"),
+                precompiled!(sdpa "128"),
+            ),
+            256 => try_precompiled(
+                precompiled!(attn "256"),
+                precompiled!(tq "256"),
+                precompiled!(sdpa "256"),
+            ),
             _ => {
                 // Uncommon head_dim — fall back to runtime source compilation.
                 let header = format!(
@@ -383,6 +416,8 @@ impl MetalPipelines {
                 let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
                 let tq_src_raw = include_str!("shaders/turboquant.metal");
                 let tq_src = format!("{header}{tq_helpers}\n{tq_src_raw}");
+                let sdpa_src_raw = include_str!("shaders/fused_sdpa.metal");
+                let sdpa_src = format!("{header}{sdpa_src_raw}");
 
                 let attn = device
                     .compile_shader_source(&attn_src)
@@ -390,7 +425,10 @@ impl MetalPipelines {
                 let tq = device
                     .compile_shader_source(&tq_src)
                     .map_err(MetalError::Metal)?;
-                Ok((attn, tq))
+                let sdpa = device
+                    .compile_shader_source(&sdpa_src)
+                    .map_err(MetalError::Metal)?;
+                Ok((attn, tq, sdpa))
             }
         }
     }
@@ -454,6 +492,21 @@ pub struct PrefillAttentionParams<'a> {
     pub max_seq_len: u32,
     pub seq_offset: u32,
     pub token_count: u32,
+}
+
+/// Parameters for [`encode_fused_sdpa`].
+pub struct FusedSdpaParams<'a> {
+    pub q: &'a MetalBuffer,
+    pub k: &'a MetalBuffer,
+    pub v: &'a MetalBuffer,
+    pub output: &'a MetalBuffer,
+    pub seq_len: u32,
+    pub token_count: u32,
+    pub head_dim: u32,
+    pub num_q_heads: u32,
+    pub num_kv_heads: u32,
+    pub scale: f32,
+    pub max_seq_len: u32,
 }
 
 /// Parameters for [`encode_kv_scatter`].
@@ -650,6 +703,48 @@ pub fn encode_prefill_attention(
             1,
         ),
     );
+}
+
+/// Default Q-block tile size (Br) for fused SDPA.
+const FUSED_SDPA_DEFAULT_BR: usize = 32;
+
+/// Encode fused scaled dot-product attention.
+///
+/// Handles both prefill (token_count > 1) and decode (token_count == 1).
+/// Dispatches one threadgroup per (kv_head_group, q_block), with one
+/// simdgroup per Q head within each group.
+pub fn encode_fused_sdpa(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    params: &FusedSdpaParams<'_>,
+    tile_br: Option<usize>,
+) {
+    let br = tile_br.unwrap_or(FUSED_SDPA_DEFAULT_BR);
+    let heads_per_group = (params.num_q_heads / params.num_kv_heads) as usize;
+
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(params.q, 0, 0);
+    encoder.set_buffer(params.k, 0, 1);
+    encoder.set_buffer(params.v, 0, 2);
+    encoder.set_buffer(params.output, 0, 3);
+    encoder.set_bytes(&params.seq_len.to_le_bytes(), 4);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 5);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 6);
+    encoder.set_bytes(&params.num_q_heads.to_le_bytes(), 7);
+    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 8);
+    encoder.set_bytes(&params.scale.to_le_bytes(), 9);
+    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 10);
+
+    let num_kv_groups = params.num_kv_heads as usize;
+    let q_blocks = (params.token_count as usize).div_ceil(br);
+    // One simdgroup (32 threads) per Q head in the group.
+    assert!(
+        heads_per_group <= 32,
+        "fused SDPA: GQA ratio {heads_per_group}:1 exceeds max 32 simdgroups per threadgroup"
+    );
+    let threads_per_tg = (heads_per_group * 32).min(METAL_MAX_THREADS_PER_THREADGROUP);
+
+    encoder.dispatch_threadgroups((num_kv_groups, q_blocks, 1), (threads_per_tg, 1, 1));
 }
 
 /// Encode KV scatter — copy projections into FP16 KV cache on GPU.
