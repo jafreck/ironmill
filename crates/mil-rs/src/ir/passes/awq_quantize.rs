@@ -8,7 +8,8 @@
 //!   1. Look up per-input-channel activation magnitudes s_X for the layer
 //!   2. Grid-search a single exponent α ∈ [0, 1] to minimize the
 //!      activation-weighted quantization loss: s[c] = s_X[c]^α
-//!   3. Apply scales, quantize with per-group affine, emit rewritten op
+//!   3. Apply per-group weight clipping to minimize quantization MSE
+//!   4. Apply scales, quantize with per-group affine, emit rewritten op
 //!
 //! The per-channel scales are stored as an `"awq_channel_scales"` attribute
 //! on the op — Phase 2 Task 2.2 will fuse them into adjacent ops.
@@ -289,13 +290,14 @@ impl Pass for AwqQuantizePass {
             }
 
             // ----------------------------------------------------------
-            // Phase 3: Apply the group's best α scales and quantize.
+            // Phase 3: Apply the group's best α scales, clip, and quantize.
+            // Paper Section 3.2: scale → clip → quantize.
             // ----------------------------------------------------------
             for eop in &eligible {
                 let alpha = group_best_alpha[&eop.mag_key];
                 let in_features = eop.in_features;
                 let mags = &self.channel_magnitudes[&eop.op_name][..in_features];
-                let channel_scales = normalize_scales(mags, alpha);
+                let channel_scales = compute_scales(mags, alpha);
 
                 let out_features = eop.shape[0];
                 let mut scaled_weights = eop.floats.clone();
@@ -304,6 +306,44 @@ impl Pass for AwqQuantizePass {
                         if s != 1.0 {
                             scaled_weights[row * in_features + col] *= s;
                         }
+                    }
+                }
+
+                // Weight clipping: search for optimal per-group max_val and clip.
+                if let Some(cal_act) = self.calibration_activations.get(&eop.op_name) {
+                    let token_count = self.calibration_token_count;
+                    if token_count > 0 && cal_act.len() == token_count * in_features {
+                        let n_tokens = token_count.min(128);
+                        let stride = if token_count > n_tokens {
+                            token_count / n_tokens
+                        } else {
+                            1
+                        };
+                        let sub_act: Vec<f32> = (0..n_tokens)
+                            .flat_map(|ti| {
+                                let t = ti * stride;
+                                (0..in_features).map(move |c| cal_act[t * in_features + c])
+                            })
+                            .collect();
+
+                        let clip_maxvals = search_clip_ranges(
+                            &scaled_weights,
+                            out_features,
+                            in_features,
+                            self.group_size,
+                            qmax,
+                            &sub_act,
+                            n_tokens,
+                            20,  // clip_grid
+                            0.5, // max_shrink
+                        );
+                        apply_clip(
+                            &mut scaled_weights,
+                            out_features,
+                            in_features,
+                            self.group_size,
+                            &clip_maxvals,
+                        );
                     }
                 }
 
@@ -340,17 +380,128 @@ impl Pass for AwqQuantizePass {
 // AWQ scale computation
 // ---------------------------------------------------------------------------
 
-/// Geometric-mean-normalized scales from magnitudes and alpha exponent.
-/// Matches the reference: `scales / sqrt(max(scales) * min(scales))`.
-fn normalize_scales(magnitudes: &[f32], alpha: f32) -> Vec<f32> {
-    let scales: Vec<f32> = magnitudes
+/// Per-channel scaling factors from activation magnitudes and alpha exponent.
+/// Paper Equation 5: s = s_X^α  (Lin et al., MLSys 2024).
+fn compute_scales(magnitudes: &[f32], alpha: f32) -> Vec<f32> {
+    magnitudes
         .iter()
         .map(|&m| m.max(1e-4).powf(alpha))
-        .collect();
-    let max_s = scales.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let min_s = scales.iter().cloned().fold(f32::INFINITY, f32::min);
-    let norm = (max_s * min_s).sqrt().max(1e-8);
-    scales.iter().map(|&s| s / norm).collect()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Weight clipping (paper Section 3.2: "We further apply weight clipping
+// to minimize the MSE error of quantization")
+// ---------------------------------------------------------------------------
+
+/// Search for the optimal per-group clipping range on (already-scaled) weights.
+///
+/// For each (row, group), searches for a `max_val` that minimizes
+///   `|| (act * Q(clamp(w, -max_val, max_val))) - (act * w) ||²`
+/// over the calibration tokens.
+///
+/// Returns a flat array of optimal `max_val` per (row, group).
+#[allow(clippy::too_many_arguments)]
+fn search_clip_ranges(
+    scaled_weights: &[f32],
+    out_features: usize,
+    in_features: usize,
+    group_size: usize,
+    qmax: f32,
+    sub_activations: &[f32],
+    n_tokens: usize,
+    clip_grid: usize,
+    max_shrink: f32,
+) -> Vec<f32> {
+    let n_groups = in_features.div_ceil(group_size);
+    let mut clip_maxvals = vec![f32::INFINITY; out_features * n_groups];
+
+    for row in 0..out_features {
+        for g in 0..n_groups {
+            let g_start = g * group_size;
+            let g_end = (g_start + group_size).min(in_features);
+            let gsize = g_end - g_start;
+
+            // Original (unclipped) group weights.
+            let w_group: Vec<f32> = (g_start..g_end)
+                .map(|c| scaled_weights[row * in_features + c])
+                .collect();
+
+            // Per-group abs max.
+            let org_max = w_group.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+            if org_max < 1e-8 {
+                clip_maxvals[row * n_groups + g] = org_max;
+                continue;
+            }
+
+            // Compute original (unquantized) group output per token.
+            let org_out: Vec<f32> = (0..n_tokens)
+                .map(|t| {
+                    (0..gsize)
+                        .map(|j| w_group[j] * sub_activations[t * in_features + g_start + j])
+                        .sum::<f32>()
+                })
+                .collect();
+
+            let mut best_err = f32::INFINITY;
+            let mut best_max = org_max;
+
+            let n_steps = (max_shrink * clip_grid as f32) as usize;
+            for step in 0..n_steps {
+                let max_val = org_max * (1.0 - step as f32 / clip_grid as f32);
+                let clipped: Vec<f32> = w_group
+                    .iter()
+                    .map(|&w| w.clamp(-max_val, max_val))
+                    .collect();
+                let (quantized, q_scale, q_zp) = quantize_affine(&clipped, qmax);
+
+                let mut err = 0.0f32;
+                for t in 0..n_tokens {
+                    let q_out: f32 = (0..gsize)
+                        .map(|j| {
+                            let dq = (quantized[j] as f32 - q_zp) * q_scale;
+                            dq * sub_activations[t * in_features + g_start + j]
+                        })
+                        .sum();
+                    let diff = q_out - org_out[t];
+                    err += diff * diff;
+                }
+
+                if err < best_err {
+                    best_err = err;
+                    best_max = max_val;
+                }
+            }
+
+            clip_maxvals[row * n_groups + g] = best_max;
+        }
+    }
+
+    clip_maxvals
+}
+
+/// Apply per-group clipping to a weight matrix in-place.
+fn apply_clip(
+    weights: &mut [f32],
+    out_features: usize,
+    in_features: usize,
+    group_size: usize,
+    clip_maxvals: &[f32],
+) {
+    let n_groups = in_features.div_ceil(group_size);
+    for row in 0..out_features {
+        for g in 0..n_groups {
+            let max_val = clip_maxvals[row * n_groups + g];
+            if max_val < f32::INFINITY {
+                let g_start = g * group_size;
+                let g_end = (g_start + group_size).min(in_features);
+                for c in g_start..g_end {
+                    let idx = row * in_features + c;
+                    weights[idx] = weights[idx].clamp(-max_val, max_val);
+                }
+            }
+        }
+    }
 }
 
 /// Pre-computed data for one projection in a magnitude group.
@@ -389,7 +540,7 @@ fn search_alpha_group(
 
     for step in 0..=grid_steps {
         let alpha = step as f32 / grid_steps as f32;
-        let scales = normalize_scales(magnitudes, alpha);
+        let scales = compute_scales(magnitudes, alpha);
 
         let mut total_loss = 0.0f32;
 
@@ -696,6 +847,22 @@ mod tests {
         program
     }
 
+    /// Generate synthetic calibration activations consistent with the given
+    /// magnitudes. Each token has activations whose channel magnitudes
+    /// roughly match the provided `magnitudes` vector.
+    fn make_calibration_activations(magnitudes: &[f32], n_tokens: usize) -> (Vec<f32>, usize) {
+        let in_features = magnitudes.len();
+        let mut activations = vec![0.0f32; n_tokens * in_features];
+        for t in 0..n_tokens {
+            for c in 0..in_features {
+                // Simple pattern: alternate signs, scale by magnitude.
+                let sign = if (t + c) % 2 == 0 { 1.0 } else { -1.0 };
+                activations[t * in_features + c] = sign * magnitudes[c];
+            }
+        }
+        (activations, n_tokens)
+    }
+
     /// Compute MSE between original floats and dequantized reconstruction.
     fn reconstruction_mse(original: &[f32], program: &Program) -> f32 {
         use crate::ir::passes::int4_pack::unpack_int4;
@@ -872,11 +1039,6 @@ mod tests {
         // 8 rows × 128 cols. Some input channels are important (large
         // activation magnitudes) and carry outlier weights that benefit from
         // more quantization range.
-        //
-        // Classic AWQ scenario: important channels carry small weights while
-        // unimportant channels carry large weights in the same quantization
-        // groups. AWQ re-distributes quantization range toward the important
-        // channels.
         let out = 8;
         let inp = 128;
         let group_sz = 32;
@@ -884,20 +1046,18 @@ mod tests {
         for row in 0..out {
             for col in 0..inp {
                 if col % 4 == 0 {
-                    // Important channels: small weights, high activation mag.
                     weights[row * inp + col] = 0.1 * (row as f32 - 3.5);
                 } else {
-                    // Unimportant channels: large weights, low activation mag.
                     weights[row * inp + col] = 50.0 * ((col as f32) / inp as f32 - 0.5);
                 }
             }
         }
         let original = weights.clone();
 
-        // Per-input-channel magnitudes.
         let magnitudes: Vec<f32> = (0..inp)
             .map(|c| if c % 4 == 0 { 100.0 } else { 0.1 })
             .collect();
+        let (cal_act, n_tokens) = make_calibration_activations(&magnitudes, 32);
 
         // --- MinMax baseline ---
         let mut minmax_prog = make_program("weight", &weights, vec![out, inp]);
@@ -905,11 +1065,15 @@ mod tests {
         minmax_pass.run(&mut minmax_prog).unwrap();
         let minmax_wmse = weighted_reconstruction_mse(&original, &minmax_prog, &magnitudes);
 
-        // --- AWQ ---
+        // --- AWQ (with calibration activations) ---
         let mut awq_mags = HashMap::new();
         awq_mags.insert("weight".to_string(), magnitudes.clone());
+        let mut awq_cal = HashMap::new();
+        awq_cal.insert("weight".to_string(), cal_act);
         let mut awq_prog = make_program("weight", &weights, vec![out, inp]);
-        let awq_pass = AwqQuantizePass::new(4, group_sz, awq_mags).with_grid_steps(40);
+        let awq_pass = AwqQuantizePass::new(4, group_sz, awq_mags)
+            .with_calibration_activations(awq_cal, n_tokens)
+            .with_grid_steps(40);
         awq_pass.run(&mut awq_prog).unwrap();
         let awq_wmse = weighted_reconstruction_mse(&original, &awq_prog, &magnitudes);
 
@@ -941,16 +1105,20 @@ mod tests {
             }
         }
 
-        // Clear magnitude variation: every 4th channel very high, rest low.
         let magnitudes: Vec<f32> = (0..inp)
             .map(|c| if c % 4 == 0 { 100.0 } else { 0.5 })
             .collect();
+        let (cal_act, n_tokens) = make_calibration_activations(&magnitudes, 32);
 
         let mut mags = HashMap::new();
         mags.insert("w".to_string(), magnitudes);
+        let mut cal = HashMap::new();
+        cal.insert("w".to_string(), cal_act);
 
         let mut prog = make_program("w", &weights, vec![out, inp]);
-        let pass = AwqQuantizePass::new(4, group_sz, mags).with_grid_steps(20);
+        let pass = AwqQuantizePass::new(4, group_sz, mags)
+            .with_calibration_activations(cal, n_tokens)
+            .with_grid_steps(20);
         pass.run(&mut prog).unwrap();
 
         let op = &prog.functions["main"].body.operations[0];
@@ -977,43 +1145,56 @@ mod tests {
 
     #[test]
     fn grid_search_improves_mse() {
-        // Construct weights where non-uniform scaling clearly helps.
+        // AWQ-friendly scenario: high-activation channels have moderate
+        // weights mixed with large-weight non-salient channels. AWQ
+        // scales up the salient channels to give them more quantization
+        // resolution.
         let out = 8;
         let inp = 128;
+        let group_sz = 32;
         let mut weights = vec![0.0_f32; out * inp];
         for row in 0..out {
             for col in 0..inp {
-                // First 8 columns have outlier values, rest are small.
-                weights[row * inp + col] = if col < 8 {
-                    100.0 - (col as f32) * 10.0
+                if col % 8 == 0 {
+                    // Salient channels: small weights, high activations.
+                    weights[row * inp + col] = 0.2 * (row as f32 - 3.5);
                 } else {
-                    0.1 * col as f32
-                };
+                    // Non-salient: large weights dominate the group range.
+                    weights[row * inp + col] = 40.0 * ((col as f32) / inp as f32 - 0.5);
+                }
             }
         }
         let original = weights.clone();
 
-        // High magnitudes on the outlier columns.
-        let magnitudes: Vec<f32> = (0..inp).map(|c| if c < 8 { 90.0 } else { 1.0 }).collect();
+        let magnitudes: Vec<f32> = (0..inp)
+            .map(|c| if c % 8 == 0 { 80.0 } else { 0.5 })
+            .collect();
+        let (cal_act, n_tokens) = make_calibration_activations(&magnitudes, 32);
 
-        // AWQ with grid search.
+        // AWQ with grid search + calibration activations.
         let mut mags = HashMap::new();
-        mags.insert("w".to_string(), magnitudes);
+        mags.insert("w".to_string(), magnitudes.clone());
+        let mut cal = HashMap::new();
+        cal.insert("w".to_string(), cal_act);
 
         let mut prog = make_program("w", &weights, vec![out, inp]);
-        let pass = AwqQuantizePass::new(4, inp, mags).with_grid_steps(50);
+        let pass = AwqQuantizePass::new(4, group_sz, mags)
+            .with_calibration_activations(cal, n_tokens)
+            .with_grid_steps(50);
         pass.run(&mut prog).unwrap();
-        let awq_mse = reconstruction_mse(&original, &prog);
+        let awq_wmse = weighted_reconstruction_mse(&original, &prog, &magnitudes);
 
         // Compare with plain MinMax (no calibration data).
         let mut plain_prog = make_program("w", &weights, vec![out, inp]);
-        let plain_pass = AwqQuantizePass::new(4, inp, HashMap::new());
+        let plain_pass = AwqQuantizePass::new(4, group_sz, HashMap::new());
         plain_pass.run(&mut plain_prog).unwrap();
-        let plain_mse = reconstruction_mse(&original, &plain_prog);
+        let plain_wmse = weighted_reconstruction_mse(&original, &plain_prog, &magnitudes);
 
+        // AWQ optimizes activation-weighted output MSE (Eq. 4); α=0
+        // matches MinMax, so the weighted MSE can only match or improve.
         assert!(
-            awq_mse <= plain_mse,
-            "Grid-searched AWQ MSE ({awq_mse}) should be <= plain MSE ({plain_mse})"
+            awq_wmse <= plain_wmse,
+            "AWQ weighted MSE ({awq_wmse}) should be <= plain weighted MSE ({plain_wmse})"
         );
     }
 
@@ -1057,12 +1238,15 @@ mod tests {
         let inp = 128;
         let weights: Vec<f32> = (0..(out * inp)).map(|i| (i as f32) * 0.3 - 4.0).collect();
         let magnitudes: Vec<f32> = (0..inp).map(|c| if c < 32 { 10.0 } else { 0.5 }).collect();
+        let (cal_act, n_tokens) = make_calibration_activations(&magnitudes, 32);
 
         let mut mags = HashMap::new();
         mags.insert("w".to_string(), magnitudes);
+        let mut cal = HashMap::new();
+        cal.insert("w".to_string(), cal_act);
 
         let mut prog = make_program("w", &weights, vec![out, inp]);
-        let pass = AwqQuantizePass::new(8, inp, mags);
+        let pass = AwqQuantizePass::new(8, inp, mags).with_calibration_activations(cal, n_tokens);
         pass.run(&mut prog).unwrap();
 
         let op = &prog.functions["main"].body.operations[0];
