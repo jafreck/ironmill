@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Shared types for the ironmill workspace.
 //!
 //! This crate provides bundle manifest schemas, weight provider traits,
