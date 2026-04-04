@@ -357,7 +357,12 @@ pub fn merge_lora_weights(
                 scale as f32,
             );
         }
-        _ => unreachable!(),
+        other => {
+            return Err(MilError::TypeMismatch {
+                expected: "Float32 or Float16".into(),
+                actual: format!("{other:?}"),
+            });
+        }
     }
 
     Ok(())

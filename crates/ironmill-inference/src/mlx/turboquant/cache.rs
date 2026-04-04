@@ -220,9 +220,15 @@ impl MlxKvCache {
         let qjl = model
             .qjl_matrix
             .as_ref()
-            .expect("qjl_matrix must be set for TurboQuant");
-        let qjl_signs = &self.k_qjl_signs.as_ref().unwrap()[layer];
-        let r_norms = &self.k_r_norms.as_ref().unwrap()[layer];
+            .ok_or_else(|| MlxError::Config("qjl_matrix must be set for TurboQuant".into()))?;
+        let qjl_signs = &self
+            .k_qjl_signs
+            .as_ref()
+            .ok_or_else(|| MlxError::Config("k_qjl_signs not initialized".into()))?[layer];
+        let r_norms = &self
+            .k_r_norms
+            .as_ref()
+            .ok_or_else(|| MlxError::Config("k_r_norms not initialized".into()))?[layer];
 
         let (codebook_arr, boundaries_arr) = if is_k_cache {
             (&model.k_codebook_arr, &model.k_boundaries_arr)
@@ -301,8 +307,11 @@ impl MlxKvCache {
         let qjl = model
             .qjl_matrix
             .as_ref()
-            .expect("qjl_matrix must be set for TurboQuant");
-        let r_norms = &self.k_r_norms.as_ref().unwrap()[layer];
+            .ok_or_else(|| MlxError::Config("qjl_matrix must be set for TurboQuant".into()))?;
+        let r_norms = &self
+            .k_r_norms
+            .as_ref()
+            .ok_or_else(|| MlxError::Config("k_r_norms not initialized".into()))?[layer];
 
         let inputs: Vec<&MlxArray> = vec![
             q,                     // 0
@@ -353,18 +362,17 @@ impl MlxKvCache {
         model: &MlxTurboQuantModel,
         stream: &MlxStream,
     ) -> Result<MlxArray, MlxError> {
-        let outlier_cfg = model
-            .outlier_config
-            .as_ref()
-            .expect("outlier_config must be set for outlier cache write");
+        let outlier_cfg = model.outlier_config.as_ref().ok_or_else(|| {
+            MlxError::Config("outlier_config must be set for outlier cache write".into())
+        })?;
         let outlier_cache = self
             .outlier
             .as_ref()
-            .expect("outlier cache must be allocated");
+            .ok_or_else(|| MlxError::Config("outlier cache must be allocated".into()))?;
         let outlier_model = model
             .outlier_model
             .as_ref()
-            .expect("outlier_model must be set");
+            .ok_or_else(|| MlxError::Config("outlier_model must be set".into()))?;
 
         let n_outlier = outlier_cfg.outlier_channels.len();
         let d_outlier_padded = n_outlier.next_power_of_two();
@@ -449,18 +457,17 @@ impl MlxKvCache {
         model: &MlxTurboQuantModel,
         stream: &MlxStream,
     ) -> Result<MlxArray, MlxError> {
-        let outlier_cfg = model
-            .outlier_config
-            .as_ref()
-            .expect("outlier_config must be set for outlier cache write");
+        let outlier_cfg = model.outlier_config.as_ref().ok_or_else(|| {
+            MlxError::Config("outlier_config must be set for outlier cache write".into())
+        })?;
         let outlier_cache = self
             .outlier
             .as_ref()
-            .expect("outlier cache must be allocated");
+            .ok_or_else(|| MlxError::Config("outlier cache must be allocated".into()))?;
         let outlier_model = model
             .outlier_model
             .as_ref()
-            .expect("outlier_model must be set");
+            .ok_or_else(|| MlxError::Config("outlier_model must be set".into()))?;
 
         let n_outlier = outlier_cfg.outlier_channels.len();
         let d_outlier_padded = n_outlier.next_power_of_two();
@@ -547,15 +554,15 @@ impl MlxKvCache {
         let outlier_cfg = model
             .outlier_config
             .as_ref()
-            .expect("outlier_config must be set");
+            .ok_or_else(|| MlxError::Config("outlier_config must be set".into()))?;
         let outlier_cache = self
             .outlier
             .as_ref()
-            .expect("outlier cache must be allocated");
+            .ok_or_else(|| MlxError::Config("outlier cache must be allocated".into()))?;
         let outlier_model = model
             .outlier_model
             .as_ref()
-            .expect("outlier_model must be set");
+            .ok_or_else(|| MlxError::Config("outlier_model must be set".into()))?;
 
         let n_outlier = outlier_cfg.outlier_channels.len();
         let d_outlier_padded = n_outlier.next_power_of_two();

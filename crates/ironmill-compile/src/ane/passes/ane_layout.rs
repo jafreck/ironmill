@@ -247,7 +247,12 @@ fn reshape_tensor_type(ty: &mut TensorType) {
         return;
     }
 
-    let static_shape: Vec<usize> = ty.shape.iter().map(|d| d.unwrap()).collect();
+    // is_static() guarantees all dims are Some.
+    let static_shape: Vec<usize> = ty
+        .shape
+        .iter()
+        .map(|d| d.expect("is_static checked"))
+        .collect();
     let new = to_ane_shape_static(&static_shape);
     ty.shape = new.into_iter().map(Some).collect();
 }

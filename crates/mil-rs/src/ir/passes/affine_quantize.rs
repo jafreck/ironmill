@@ -14,7 +14,7 @@
 
 use super::int4_pack::pack_int4;
 use super::tensor_utils::{tensor_as_f32_slice, tensor_f16_as_f32_slice};
-use crate::error::Result;
+use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::passes::int8_quantize::Granularity;
 use crate::ir::program::Program;
@@ -146,9 +146,13 @@ impl Pass for AffineQuantizePass {
                 // Check eligibility before removing the value.
                 let (numel, rank) = {
                     let val = if in_inputs {
-                        op.inputs.get("val").unwrap()
+                        op.inputs
+                            .get("val")
+                            .ok_or_else(|| MilError::Validation("missing val in inputs".into()))?
                     } else {
-                        op.attributes.get("val").unwrap()
+                        op.attributes.get("val").ok_or_else(|| {
+                            MilError::Validation("missing val in attributes".into())
+                        })?
                     };
                     if let Value::Tensor { shape, .. } = val {
                         (shape.iter().product::<usize>(), shape.len())
@@ -170,16 +174,25 @@ impl Pass for AffineQuantizePass {
                 }
 
                 let val = if in_inputs {
-                    op.inputs.remove("val").unwrap()
+                    op.inputs
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in inputs".into()))?
                 } else {
-                    op.attributes.remove("val").unwrap()
+                    op.attributes
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in attributes".into()))?
                 };
 
                 if let Value::Tensor { data, shape, dtype } = val {
                     let floats = match dtype {
                         ScalarType::Float32 => tensor_as_f32_slice(&data),
                         ScalarType::Float16 => tensor_f16_as_f32_slice(&data),
-                        _ => unreachable!(),
+                        other => {
+                            return Err(MilError::TypeMismatch {
+                                expected: "Float32 or Float16".into(),
+                                actual: format!("{other:?}"),
+                            });
+                        }
                     };
 
                     if let Some(group_size) = self.group_size {

@@ -104,7 +104,12 @@ impl Pass for PalettizePass {
                         let f = match dtype {
                             ScalarType::Float32 => tensor_as_f32_slice(data),
                             ScalarType::Float16 => fp16_bytes_to_f32(data)?,
-                            _ => unreachable!(),
+                            other => {
+                                return Err(MilError::TypeMismatch {
+                                    expected: "Float32 or Float16".into(),
+                                    actual: format!("{other:?}"),
+                                });
+                            }
                         };
                         (f, shape.clone(), *dtype)
                     }
@@ -194,7 +199,12 @@ impl Pass for GroupedPalettizePass {
                         let f = match dtype {
                             ScalarType::Float32 => tensor_as_f32_slice(data),
                             ScalarType::Float16 => fp16_bytes_to_f32(data)?,
-                            _ => unreachable!(),
+                            other => {
+                                return Err(MilError::TypeMismatch {
+                                    expected: "Float32 or Float16".into(),
+                                    actual: format!("{other:?}"),
+                                });
+                            }
                         };
                         (f, shape.clone(), *dtype)
                     }

@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 
 use super::tensor_utils::tensor_as_f32_slice;
-use crate::error::Result;
+use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
@@ -96,9 +96,13 @@ impl Pass for Int8QuantizePass {
                 }
 
                 let val = if in_inputs {
-                    op.inputs.remove("val").unwrap()
+                    op.inputs
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in inputs".into()))?
                 } else {
-                    op.attributes.remove("val").unwrap()
+                    op.attributes
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in attributes".into()))?
                 };
 
                 if let Value::Tensor {

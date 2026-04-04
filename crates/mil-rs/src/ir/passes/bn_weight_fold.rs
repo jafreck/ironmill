@@ -184,10 +184,18 @@ fn apply_fold(block: &mut Block, conv_idx: usize, bn_idx: usize) -> bool {
         })
         .unwrap_or(1e-5);
 
-    let mean_ref = resolve_ref(&block.operations[bn_idx], "mean").unwrap();
-    let var_ref = resolve_ref(&block.operations[bn_idx], "variance").unwrap();
-    let gamma_ref = resolve_ref(&block.operations[bn_idx], "gamma").unwrap();
-    let beta_ref = resolve_ref(&block.operations[bn_idx], "beta").unwrap();
+    let Some(mean_ref) = resolve_ref(&block.operations[bn_idx], "mean") else {
+        return false;
+    };
+    let Some(var_ref) = resolve_ref(&block.operations[bn_idx], "variance") else {
+        return false;
+    };
+    let Some(gamma_ref) = resolve_ref(&block.operations[bn_idx], "gamma") else {
+        return false;
+    };
+    let Some(beta_ref) = resolve_ref(&block.operations[bn_idx], "beta") else {
+        return false;
+    };
 
     let mean = extract_f32_data(block, &mean_ref);
     let variance = extract_f32_data(block, &var_ref);
@@ -200,7 +208,9 @@ fn apply_fold(block: &mut Block, conv_idx: usize, bn_idx: usize) -> bool {
         return false;
     }
 
-    let weight_ref = resolve_ref(&block.operations[conv_idx], "weight").unwrap();
+    let Some(weight_ref) = resolve_ref(&block.operations[conv_idx], "weight") else {
+        return false;
+    };
     let (weight_data, weight_shape) = extract_f32_data_and_shape(block, &weight_ref);
 
     // Weight shape[0] must match c_out.
@@ -247,7 +257,9 @@ fn apply_fold(block: &mut Block, conv_idx: usize, bn_idx: usize) -> bool {
     // ---- Phase 3: mutate the block ----
 
     // Update weight const op.
-    let weight_const_idx = find_const_op_index(block, &weight_ref).unwrap();
+    let Some(weight_const_idx) = find_const_op_index(block, &weight_ref) else {
+        return false;
+    };
     update_const_tensor(
         block,
         weight_const_idx,
@@ -261,7 +273,9 @@ fn apply_fold(block: &mut Block, conv_idx: usize, bn_idx: usize) -> bool {
 
     match &bias_ref {
         Some(name) => {
-            let bias_const_idx = find_const_op_index(block, name).unwrap();
+            let Some(bias_const_idx) = find_const_op_index(block, name) else {
+                return false;
+            };
             update_const_tensor(
                 block,
                 bias_const_idx,

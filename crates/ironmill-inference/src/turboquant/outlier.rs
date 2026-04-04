@@ -71,7 +71,7 @@ impl OutlierConfig {
 
         // Select top n_outlier channels by energy
         let mut indexed: Vec<(usize, f64)> = channel_energy.into_iter().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut outlier_channels: Vec<usize> =
             indexed[..n_outlier].iter().map(|(i, _)| *i).collect();
         outlier_channels.sort(); // keep in ascending order for index buffer

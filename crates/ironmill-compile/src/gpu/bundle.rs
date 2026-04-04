@@ -168,8 +168,12 @@ pub fn write_gpu_bundle(
                         },
                     );
                 } else {
-                    let group_size = group_size.unwrap();
-                    let axis = axis.unwrap();
+                    let group_size = group_size.ok_or_else(|| {
+                        CompileError::Other(format!("tensor '{name}': missing group_size"))
+                    })?;
+                    let axis = axis.ok_or_else(|| {
+                        CompileError::Other(format!("tensor '{name}': missing axis"))
+                    })?;
 
                     methods_seen.insert("affine");
 
@@ -226,7 +230,12 @@ pub fn write_gpu_bundle(
 
     let method = match methods_seen.len() {
         0 => "none".to_string(),
-        1 => methods_seen.into_iter().next().unwrap().to_string(),
+        // length checked above
+        1 => methods_seen
+            .into_iter()
+            .next()
+            .expect("len is 1")
+            .to_string(),
         _ => "mixed".to_string(),
     };
 

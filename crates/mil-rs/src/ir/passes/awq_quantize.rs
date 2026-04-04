@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use super::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice, tensor_f16_as_f32_slice};
-use crate::error::Result;
+use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
@@ -140,9 +140,13 @@ impl Pass for AwqQuantizePass {
 
                 let (numel, rank) = {
                     let val = if in_inputs {
-                        op.inputs.get("val").unwrap()
+                        op.inputs
+                            .get("val")
+                            .ok_or_else(|| MilError::Validation("missing val in inputs".into()))?
                     } else {
-                        op.attributes.get("val").unwrap()
+                        op.attributes.get("val").ok_or_else(|| {
+                            MilError::Validation("missing val in attributes".into())
+                        })?
                     };
                     if let Value::Tensor { shape, .. } = val {
                         (shape.iter().product::<usize>(), shape.len())
@@ -156,16 +160,25 @@ impl Pass for AwqQuantizePass {
                 }
 
                 let val = if in_inputs {
-                    op.inputs.remove("val").unwrap()
+                    op.inputs
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in inputs".into()))?
                 } else {
-                    op.attributes.remove("val").unwrap()
+                    op.attributes
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in attributes".into()))?
                 };
 
                 if let Value::Tensor { data, shape, dtype } = val {
                     let floats = match dtype {
                         ScalarType::Float32 => tensor_as_f32_slice(&data),
                         ScalarType::Float16 => tensor_f16_as_f32_slice(&data),
-                        _ => unreachable!(),
+                        other => {
+                            return Err(MilError::TypeMismatch {
+                                expected: "Float32 or Float16".into(),
+                                actual: format!("{other:?}"),
+                            });
+                        }
                     };
 
                     if shape.len() < 2 {

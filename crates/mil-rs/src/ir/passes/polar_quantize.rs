@@ -222,6 +222,7 @@ fn compute_quantization(info: &EligibleTensor, n_bits: u8, seed: u64) -> Option<
     let packed = pack_indices(&all_indices, n_bits);
 
     let mut padded_shape = info.shape.clone();
+    // Safety: shape cloned from tensor, guaranteed non-empty.
     *padded_shape.last_mut().unwrap() = padded_cols;
 
     Some(QuantizedTensor {
@@ -310,6 +311,7 @@ fn build_norm_mul_ops(
     };
 
     let mut norms_shape = quant.padded_shape.clone();
+    // Safety: shape cloned from tensor, guaranteed non-empty.
     *norms_shape.last_mut().unwrap() = 1;
 
     let mut norms_op = Operation::new("const", format!("{}_polar_norms", info.op_name))

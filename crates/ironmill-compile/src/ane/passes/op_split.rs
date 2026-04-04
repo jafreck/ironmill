@@ -675,13 +675,10 @@ pub fn split_attention_heads(
         };
 
         let base_name = &op.name;
-        let head_dim = resolve_head_dim(&op, n_heads, type_map);
-
-        if head_dim.is_none() {
+        let Some(head_dim) = resolve_head_dim(&op, n_heads, type_map) else {
             idx += 1;
             continue;
-        }
-        let head_dim = head_dim.unwrap();
+        };
         if head_dim == 0 {
             idx += 1;
             continue;

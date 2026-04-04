@@ -75,7 +75,7 @@ fn detect_num_layers(ops: &[Operation]) -> Option<usize> {
     }
 
     // Layer count = max layer number + 1 (0-indexed).
-    Some(layer_numbers.iter().last().unwrap() + 1)
+    Some(layer_numbers.iter().last()? + 1)
 }
 
 /// Extract a layer number from an operation name.

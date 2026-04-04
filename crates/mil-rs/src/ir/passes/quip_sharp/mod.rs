@@ -196,6 +196,7 @@ fn compute_quantization(info: &EligibleTensor, seed: u64) -> Option<QuantizedE8T
     let (indices, scales) = codebook.quantize_matrix(&padded_data, padded_cols);
 
     let mut padded_shape = info.shape.clone();
+    // Safety: shape cloned from tensor, guaranteed non-empty.
     *padded_shape.last_mut().unwrap() = padded_cols;
 
     Some(QuantizedE8Tensor {
@@ -310,6 +311,7 @@ fn build_norm_mul_ops(
     };
 
     let mut norms_shape = quant.padded_shape.clone();
+    // Safety: shape cloned from tensor, guaranteed non-empty.
     *norms_shape.last_mut().unwrap() = 1;
 
     let mut norms_op = Operation::new("const", format!("{}_quip_norms", info.op_name))

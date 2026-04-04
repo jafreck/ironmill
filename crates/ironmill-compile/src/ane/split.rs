@@ -226,7 +226,11 @@ fn classify_ops(operations: &[Operation]) -> Vec<(String, Vec<Operation>)> {
         .filter_map(|n| n.map(|v| (v, ())))
         .collect();
 
-    let last_layer = *unique_layers.keys().last().unwrap();
+    // has_layers check above guarantees at least one entry.
+    let last_layer = *unique_layers
+        .keys()
+        .last()
+        .expect("has_layers guarantees non-empty");
 
     // Find the index of the last op that belongs to the last layer number.
     let mut groups: Vec<(String, Vec<Operation>)> = Vec::new();
@@ -437,7 +441,7 @@ fn find_projection_matmuls(ops: &[Operation], graph: &OpGraph) -> Vec<usize> {
     for (_, mut indices) in groups {
         if indices.len() >= 2 {
             indices.sort();
-            if best.is_none() || indices[0] < best.as_ref().unwrap()[0] {
+            if best.as_ref().is_none_or(|b| indices[0] < b[0]) {
                 best = Some(indices);
             }
         }
@@ -960,7 +964,11 @@ fn enforce_weight_limit(sub_programs: Vec<SubProgram>, config: &SplitConfig) -> 
     let mut result: Vec<SubProgram> = Vec::new();
 
     for sp in sub_programs {
-        let ops = &sp.program.main().unwrap().body.operations;
+        let Some(main_fn) = sp.program.main() else {
+            result.push(sp);
+            continue;
+        };
+        let ops = &main_fn.body.operations;
         let total = weight_data_size(ops);
 
         if total <= config.max_weight_size || ops.len() <= 1 {

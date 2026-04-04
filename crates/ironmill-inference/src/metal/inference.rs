@@ -234,11 +234,9 @@ pub struct MetalInference {
 }
 
 impl MetalInference {
-    /// Access compiled pipelines — panics if `load()` hasn't been called yet.
-    fn pipelines(&self) -> &super::ops::MetalPipelines {
-        self.pipelines
-            .as_ref()
-            .expect("pipelines not compiled — call load() first")
+    /// Access compiled pipelines — returns `NotLoaded` if `load()` hasn't been called yet.
+    fn pipelines(&self) -> Result<&super::ops::MetalPipelines, InferenceError> {
+        self.pipelines.as_ref().ok_or(InferenceError::NotLoaded)
     }
 
     /// Create a new GPU inference engine (device + queue + shader pipelines).
@@ -578,7 +576,7 @@ impl MetalInference {
             }
             self.decode_matmuls
                 .as_ref()
-                .expect("decode_matmuls must be populated")
+                .ok_or_else(|| InferenceError::Runtime("decode_matmuls not populated".into()))?
         };
 
         // Write token IDs to GPU buffer (reuse persistent buffer).
@@ -603,7 +601,7 @@ impl MetalInference {
 
             ops::encode_embedding_lookup(
                 &enc,
-                &self.pipelines().embedding_lookup,
+                &self.pipelines()?.embedding_lookup,
                 &ops::EmbeddingLookupParams {
                     token_ids: &bufs.token_ids_buf,
                     embedding_table: &weights.embedding,
@@ -633,7 +631,7 @@ impl MetalInference {
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
-                &self.pipelines().rms_norm,
+                &self.pipelines()?.rms_norm,
                 &ops::RmsNormParams {
                     input: &bufs.hidden_state,
                     weight: &lw0.input_norm,
@@ -649,7 +647,7 @@ impl MetalInference {
         for layer_idx in 0..mc.num_hidden_layers {
             let lw = &weights.layers[layer_idx];
             let lm = &matmuls.layer_matmuls[layer_idx];
-            let pipelines = self.pipelines();
+            let pipelines = self.pipelines()?;
 
             // norm_out already contains the input-norm result:
             //   • layer 0: computed by the standalone dispatch above
@@ -813,7 +811,7 @@ impl MetalInference {
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
-                &self.pipelines().rms_norm,
+                &self.pipelines()?.rms_norm,
                 &ops::RmsNormParams {
                     input: &bufs.hidden_state,
                     weight: &weights.final_norm,
@@ -836,7 +834,7 @@ impl MetalInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_matvec(
                     &enc,
-                    &self.pipelines().matvec,
+                    &self.pipelines()?.matvec,
                     &bufs.norm_out,
                     packed_buf,
                     &bufs.logits,
@@ -991,7 +989,7 @@ impl MetalInference {
         let matmuls = self
             .decode_matmuls
             .as_ref()
-            .expect("decode_matmuls must be populated");
+            .ok_or_else(|| InferenceError::Runtime("decode_matmuls not populated".into()))?;
 
         // Write token IDs to GPU buffer.
         let token_bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
@@ -1017,7 +1015,7 @@ impl MetalInference {
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             ops::encode_embedding_lookup(
                 &enc,
-                &self.pipelines().embedding_lookup,
+                &self.pipelines()?.embedding_lookup,
                 &ops::EmbeddingLookupParams {
                     token_ids: &bufs.token_ids_buf,
                     embedding_table: &weights.embedding,
@@ -1038,7 +1036,7 @@ impl MetalInference {
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
-                &self.pipelines().rms_norm,
+                &self.pipelines()?.rms_norm,
                 &ops::RmsNormParams {
                     input: &bufs.hidden_state,
                     weight: &lw0.input_norm,
@@ -1092,7 +1090,7 @@ impl MetalInference {
                 .queue
                 .command_buffer()
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let pipelines = self.pipelines();
+            let pipelines = self.pipelines()?;
 
             // Steps 3-5: Q/K/V projections
             let row_bytes_h = h * 2;
@@ -1258,7 +1256,7 @@ impl MetalInference {
                 .queue
                 .command_buffer()
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            let pipelines = self.pipelines();
+            let pipelines = self.pipelines()?;
 
             // Steps 12-15: FFN block (gate + up + SiLU + down)
             encode_ffn_block(&cmd_buf, pipelines, bufs, lw, lm, h, inter, token_count)?;
@@ -1306,7 +1304,7 @@ impl MetalInference {
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
-                &self.pipelines().rms_norm,
+                &self.pipelines()?.rms_norm,
                 &ops::RmsNormParams {
                     input: &bufs.hidden_state,
                     weight: &weights.final_norm,
@@ -1329,7 +1327,7 @@ impl MetalInference {
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 ops::encode_matvec(
                     &enc,
-                    &self.pipelines().matvec,
+                    &self.pipelines()?.matvec,
                     &bufs.norm_out,
                     packed_buf,
                     &bufs.logits,
@@ -1828,8 +1826,12 @@ fn encode_kv_cache_and_attention(
     let n_bits = n_bits as u32;
 
     if enable_tq {
-        let tq = turboquant.expect("turboquant must be initialized when enable_tq is true");
-        let kv = kv_cache.expect("kv_cache must be initialized when enable_tq is true");
+        let tq = turboquant.ok_or_else(|| {
+            InferenceError::Runtime("turboquant must be initialized when enable_tq is true".into())
+        })?;
+        let kv = kv_cache.ok_or_else(|| {
+            InferenceError::Runtime("kv_cache must be initialized when enable_tq is true".into())
+        })?;
 
         let enc = cmd_buf
             .compute_encoder()
@@ -2031,8 +2033,11 @@ fn encode_kv_cache_and_attention(
         enc.end_encoding();
     } else {
         // FP16 KV cache path — scatter projections into cache on GPU.
-        let fp16_kv =
-            fp16_kv_cache.expect("fp16_kv_cache must be initialized for FP16 KV cache path");
+        let fp16_kv = fp16_kv_cache.ok_or_else(|| {
+            InferenceError::Runtime(
+                "fp16_kv_cache must be initialized for FP16 KV cache path".into(),
+            )
+        })?;
         let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
 
         let enc = cmd_buf

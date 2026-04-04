@@ -1486,9 +1486,15 @@ impl<D: AneDevice> AneInference<D> {
 
                 // Hand-written FP16 attention: Q + K_cache + V_cache + mask → attn_output
                 if let Some(ref fp16_program) = self.fp16_attn_program {
-                    let q_staging = self.fp16_attn_q_staging.as_mut().unwrap();
-                    let out_staging = self.fp16_attn_out_staging.as_mut().unwrap();
-                    let mask = self.fp16_attn_mask.as_ref().unwrap();
+                    let q_staging = self.fp16_attn_q_staging.as_mut().ok_or_else(|| {
+                        AneError::Other(anyhow::anyhow!("fp16_attn_q_staging not initialized"))
+                    })?;
+                    let out_staging = self.fp16_attn_out_staging.as_mut().ok_or_else(|| {
+                        AneError::Other(anyhow::anyhow!("fp16_attn_out_staging not initialized"))
+                    })?;
+                    let mask = self.fp16_attn_mask.as_ref().ok_or_else(|| {
+                        AneError::Other(anyhow::anyhow!("fp16_attn_mask not initialized"))
+                    })?;
                     write_f16_padded(q_staging, &q_buf, &mut self.scratch.padded)?;
                     let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
                     ane_eval(
@@ -1581,7 +1587,7 @@ impl<D: AneDevice> AneInference<D> {
                 let argmax = l
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, _)| i)
                     .unwrap_or(0);
                 eprintln!(
@@ -1596,15 +1602,15 @@ impl<D: AneDevice> AneInference<D> {
         let d_lm_head = t0.map(|t| t.elapsed());
 
         if profiling {
-            let total = t_total.unwrap().elapsed();
+            let total = t_total.map(|t| t.elapsed()).unwrap_or_default();
             eprintln!(
                 "[profile] decode token 0: embed={:.2}ms pre_attn={:.1}ms read_qkv={:.1}ms attn={:.1}ms post_attn={:.1}ms lm_head={:.1}ms total={:.1}ms",
-                d_embed.unwrap().as_secs_f64() * 1000.0,
+                d_embed.unwrap_or_default().as_secs_f64() * 1000.0,
                 d_pre_attn.as_secs_f64() * 1000.0,
                 d_read_qkv.as_secs_f64() * 1000.0,
                 d_attn.as_secs_f64() * 1000.0,
                 d_post_attn.as_secs_f64() * 1000.0,
-                d_lm_head.unwrap().as_secs_f64() * 1000.0,
+                d_lm_head.unwrap_or_default().as_secs_f64() * 1000.0,
                 total.as_secs_f64() * 1000.0,
             );
         }
@@ -1841,8 +1847,16 @@ fn compile_sub_from_bundle<D: AneDevice>(
             ))
         })?;
 
-    let weight_blob =
-        std::fs::read(weights_dir.join(format!("{}.bin", manifest.name))).unwrap_or_default();
+    let weight_blob = match std::fs::read(weights_dir.join(format!("{}.bin", manifest.name))) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "failed to read weights for {}: {e}",
+                manifest.name
+            )));
+        }
+    };
 
     let weight_entries =
         super::bundle_manifest::extract_weight_entries_from_bundle(&mil_text, &weight_blob);
@@ -1874,8 +1888,16 @@ fn compile_sub_from_bundle_with_donor<D: AneDevice>(
             ))
         })?;
 
-    let weight_blob =
-        std::fs::read(weights_dir.join(format!("{}.bin", manifest.name))).unwrap_or_default();
+    let weight_blob = match std::fs::read(weights_dir.join(format!("{}.bin", manifest.name))) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "failed to read weights for {}: {e}",
+                manifest.name
+            )));
+        }
+    };
 
     let weight_entries =
         super::bundle_manifest::extract_weight_entries_from_bundle(&mil_text, &weight_blob);

@@ -9,7 +9,7 @@ pub mod dac;
 pub mod dual_scale;
 
 use super::tensor_utils::tensor_as_f32_slice;
-use crate::error::Result;
+use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
@@ -88,9 +88,13 @@ impl Pass for D2QuantPass {
                 }
 
                 let val = if in_inputs {
-                    op.inputs.remove("val").unwrap()
+                    op.inputs
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in inputs".into()))?
                 } else {
-                    op.attributes.remove("val").unwrap()
+                    op.attributes
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in attributes".into()))?
                 };
 
                 if let Value::Tensor {
@@ -105,7 +109,9 @@ impl Pass for D2QuantPass {
                     // never span row (output-channel) boundaries.
                     let ndim = shape.len();
                     let last_dim = if ndim > 0 {
-                        *shape.last().unwrap()
+                        *shape
+                            .last()
+                            .ok_or_else(|| MilError::Validation("empty shape".into()))?
                     } else {
                         floats.len()
                     };
@@ -139,7 +145,11 @@ impl Pass for D2QuantPass {
                             let packed = match self.bits {
                                 2 => pack_2bit(&quantized),
                                 3 => pack_3bit(&quantized),
-                                _ => unreachable!(),
+                                other => {
+                                    return Err(MilError::Validation(format!(
+                                        "unsupported bit width: {other}"
+                                    )));
+                                }
                             };
                             all_quantized_packed.extend_from_slice(&packed);
 

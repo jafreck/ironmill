@@ -12,7 +12,7 @@ pub mod cayley;
 
 pub use cayley::{CayleyOptimizer, CayleyRotation};
 
-use crate::error::Result;
+use crate::error::{MilError, Result};
 use crate::ir::operation::Operation;
 use crate::ir::pass::Pass;
 use crate::ir::passes::rotation::pad_to_power_of_two;
@@ -80,7 +80,10 @@ impl Pass for SpinQuantPass {
                     continue;
                 }
 
-                let cols = *info.shape.last().unwrap();
+                let cols = *info
+                    .shape
+                    .last()
+                    .ok_or_else(|| MilError::Validation("empty shape".into()))?;
                 let rows: usize = info.shape[..info.shape.len() - 1].iter().product();
 
                 // Pad last dimension to a power of two for the rotation.

@@ -17,7 +17,7 @@ use crate::ir::passes::int4_pack::pack_int4;
 
 use hessian::{cholesky_decompose, cholesky_inverse_factor, finalize_hessian};
 
-use crate::error::Result;
+use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::passes::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
 use crate::ir::program::Program;
@@ -115,9 +115,13 @@ impl Pass for GptqQuantizePass {
                 }
 
                 let val = if in_inputs {
-                    op.inputs.remove("val").unwrap()
+                    op.inputs
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in inputs".into()))?
                 } else {
-                    op.attributes.remove("val").unwrap()
+                    op.attributes
+                        .remove("val")
+                        .ok_or_else(|| MilError::Validation("missing val in attributes".into()))?
                 };
 
                 if let Value::Tensor {
@@ -133,7 +137,9 @@ impl Pass for GptqQuantizePass {
                         shape.len() >= 2,
                         "GPTQ expects at least 2-D weight, got shape {shape:?}"
                     );
-                    let in_features = *shape.last().unwrap();
+                    let in_features = *shape
+                        .last()
+                        .ok_or_else(|| MilError::Validation("empty shape".into()))?;
                     let out_features: usize = shape[..shape.len() - 1].iter().product();
 
                     assert_eq!(

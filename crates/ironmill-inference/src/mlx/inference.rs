@@ -246,11 +246,14 @@ impl MlxInference {
 
             let attn_out = if use_turboquant {
                 // ── TurboQuant path: quantized KV cache + custom attention ──
-                let tq = tq_model.unwrap();
-                let tq_cache = self
-                    .tq_cache
-                    .as_ref()
-                    .expect("tq_cache must be initialized when turboquant is enabled");
+                let tq = tq_model.ok_or_else(|| {
+                    MlxError::Config("turboquant model required but not provided".into())
+                })?;
+                let tq_cache = self.tq_cache.as_ref().ok_or_else(|| {
+                    MlxError::Config(
+                        "tq_cache must be initialized when turboquant is enabled".into(),
+                    )
+                })?;
 
                 // Flatten K/V from [1, T, num_kv_heads, head_dim] to
                 // [num_kv_heads × head_dim] for cache write (single token decode).

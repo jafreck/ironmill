@@ -46,8 +46,16 @@ fn substitute_in_block(block: &mut Block) {
         // Both sigmoid and silu are eval-verified on ANE; fusion reduces 2 ops → 1.
         if op.op_type == "mul" {
             if let Some((silu_op, sigmoid_idx)) = try_fuse_silu(block, i) {
-                let original_output = op.outputs.first().cloned().unwrap();
-                let silu_output = silu_op.outputs.first().cloned().unwrap();
+                let original_output = op
+                    .outputs
+                    .first()
+                    .cloned()
+                    .expect("mul op must have output");
+                let silu_output = silu_op
+                    .outputs
+                    .first()
+                    .cloned()
+                    .expect("silu op must have output");
 
                 // Remove the mul op first.
                 block.operations.remove(i);
@@ -77,8 +85,18 @@ fn substitute_in_block(block: &mut Block) {
         // real_div is only compile-verified on ANE; pow(-0.5) is eval-verified.
         if op.op_type == "real_div" {
             if let Some(new_ops) = try_substitute_rsqrt(block, i) {
-                let original_output = op.outputs.first().cloned().unwrap();
-                let last_output = new_ops.last().unwrap().outputs.first().cloned().unwrap();
+                let original_output = op
+                    .outputs
+                    .first()
+                    .cloned()
+                    .expect("real_div op must have output");
+                let last_output = new_ops
+                    .last()
+                    .expect("new_ops is non-empty")
+                    .outputs
+                    .first()
+                    .cloned()
+                    .expect("replacement op must have output");
                 // Find the sqrt op that feeds this real_div.
                 let sqrt_idx = find_sqrt_feeding_real_div(block, i);
 

@@ -610,12 +610,12 @@ fn emit_sub_program_bundle(
     convert_f32_consts_to_f16(&mut program);
     prune_unreferenced_inputs(&mut program);
 
-    let _ = AneLayoutPass.run(&mut program);
+    AneLayoutPass.run(&mut program)?;
     apply_min_seq_padding(&mut program, 32);
-    let _ = TypeRepropagationPass.run(&mut program);
+    TypeRepropagationPass.run(&mut program)?;
 
     // Rename variables to ANE-friendly names.
-    let _ = AneVariableNamingPass.run(&mut program);
+    AneVariableNamingPass.run(&mut program)?;
 
     let (mil_text, weight_entries) = program_to_mil_text(&program, mil_config)
         .map_err(|e| anyhow::anyhow!("MIL text emission failed for {}: {e}", sub.name))?;
