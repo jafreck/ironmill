@@ -6,7 +6,7 @@
 
 use crate::weights::{ModelConfig, WeightProvider};
 use mil_rs::MilError;
-use mil_rs::ir::{Block, Operation, ScalarType, Value};
+use mil_rs::ir::{Block, Operation, ScalarType, TensorData, Value};
 
 /// Immutable context shared across layer-level template emission.
 ///
@@ -24,6 +24,9 @@ pub(super) struct LayerContext<'a> {
 // Weight / constant emission
 // ---------------------------------------------------------------------------
 
+/// Tensors smaller than this are stored inline to avoid indirection overhead.
+const INLINE_THRESHOLD_BYTES: usize = 4096;
+
 /// Emit a weight tensor as a `const` op in the block.
 ///
 /// If the weight is missing, a placeholder const is emitted and a warning
@@ -37,11 +40,18 @@ pub(super) fn emit_weight_const(
 ) -> Result<(), MilError> {
     match provider.tensor(weight_name) {
         Ok(tensor) => {
+            let data = if tensor.data.len() <= INLINE_THRESHOLD_BYTES {
+                // Small tensors (norms, biases): inline to avoid indirection.
+                TensorData::inline(tensor.data.into_owned())
+            } else {
+                // Large tensors (projections, embeddings): defer loading.
+                TensorData::external(weight_name.to_string(), tensor.data.len())
+            };
             let op = Operation::new("const", const_name)
                 .with_attr(
                     "val",
                     Value::Tensor {
-                        data: mil_rs::ir::TensorData::Inline(tensor.data.into_owned()),
+                        data,
                         shape: tensor.shape.clone(),
                         dtype: tensor.dtype,
                     },
@@ -212,7 +222,7 @@ pub(super) fn emit_rope_tables(block: &mut Block, config: &ModelConfig) -> (Stri
         .with_attr(
             "val",
             Value::Tensor {
-                data: mil_rs::ir::TensorData::Inline(cos_bytes),
+                data: TensorData::inline(cos_bytes),
                 shape: vec![max_pos, half_dim],
                 dtype: ScalarType::Float32,
             },
@@ -224,7 +234,7 @@ pub(super) fn emit_rope_tables(block: &mut Block, config: &ModelConfig) -> (Stri
         .with_attr(
             "val",
             Value::Tensor {
-                data: mil_rs::ir::TensorData::Inline(sin_bytes),
+                data: TensorData::inline(sin_bytes),
                 shape: vec![max_pos, half_dim],
                 dtype: ScalarType::Float32,
             },
