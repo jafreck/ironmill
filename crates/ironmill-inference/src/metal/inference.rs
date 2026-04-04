@@ -976,8 +976,8 @@ impl MetalInference {
                     Some(ple_embed),
                     Some(ple_proj),
                     Some(ple_norm),
-                    Some(ref ple_buf),
-                    Some(ref ple_scratch),
+                    Some(ple_buf),
+                    Some(_ple_scratch),
                 ) = (
                     &weights.ple_embed_tokens,
                     &weights.ple_model_projection,
@@ -1698,8 +1698,8 @@ impl MetalInference {
                         Some(ple_embed),
                         Some(ple_proj),
                         Some(ple_norm),
-                        Some(ref ple_buf),
-                        Some(ref ple_scratch_unused),
+                        Some(ple_buf),
+                        Some(_ple_scratch_unused),
                     ) = (
                         &weights.ple_embed_tokens,
                         &weights.ple_model_projection,
@@ -1707,7 +1707,7 @@ impl MetalInference {
                         &bufs.ple_per_layer_input,
                         &bufs.ple_scratch,
                     ) {
-                        let _ = ple_scratch_unused;
+                        // ple_scratch_unused available but not used here
                         let ple_total = mc.num_hidden_layers * ple_h;
                         let pipelines = self.pipelines()?;
 
