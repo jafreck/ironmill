@@ -173,20 +173,29 @@ MLA projects keys and values into a shared low-dimensional latent space, storing
 
 Eliminates the need for a separate draft model by integrating speculated token planning within the target model using multi-stream attention heads. Each forward pass produces both the "correct" next token and speculative future tokens. Ideal for edge/resource-constrained deployment where loading a separate draft model is impractical.
 
-### 11. Cross-layer KV cache compression (CLA + TurboQuant)
+### 11. Prefill/decode phase separation
 
-**Status:** TurboQuant per-vector quantization exists; cross-layer sharing not implemented
-**Expected impact:** 2× additional KV cache memory reduction (stacks with TurboQuant)
-**Complexity:** Medium (requires model support or fine-tuning)
-**SOTA reference:** CLA (NeurIPS 2024), FusedKV (ICLR 2026)
+**Status:** Not implemented
+**Expected impact:** 1.5–2× prefill throughput on M-series chips
+**Complexity:** Medium
+**SOTA reference:** MLX phase-optimized scheduling (Apple, 2025)
 
-ironmill already has SOTA per-vector KV compression via TurboQuant (codebook quantization + QJL 1-bit error correction). What's missing is reducing *how many vectors* are stored. CLA and MLA are orthogonal to TurboQuant — they cut the number of cache entries, TurboQuant compresses what remains. The two compose multiplicatively.
+Prefill is compute-bound (large batch matmuls) while decode is memory-bandwidth-bound (single-token matvecs). MLX exploits this by routing prefill to the Neural Engine (which has dedicated matrix units) and decode to the GPU (which has maximum memory bandwidth). On Apple Silicon with unified memory, there's no data copy cost for this split.
 
-**Cross-Layer Attention (CLA):** Subsequent layers reuse KV caches from "anchor" layers instead of storing their own. Reduces KV memory by 2× beyond GQA with negligible quality loss. FusedKV (ICLR 2026) extends this with learnable cross-layer fusion.
+ironmill could detect the phase transition and select the optimal compute unit dynamically, or pipeline prefill chunks on ANE while the GPU handles ongoing decode for a different sequence.
 
-ironmill's role: detect CLA-enabled models and share cache buffers between layers, then apply TurboQuant to the shared buffers.
+### 12. Structured generation (grammar/JSON-constrained sampling)
 
-### 12. TurboSpec adaptive speculation
+**Status:** Not implemented
+**Expected impact:** Required for agent and tool-use applications
+**Complexity:** Medium
+**SOTA reference:** Outlines/XGrammar (2025), llama.cpp GBNF grammars
+
+Constrained generation forces model output to conform to a schema (JSON, XML, function signatures) by masking invalid tokens at each decode step. The SOTA approach (XGrammar) precomputes token validity masks from a context-free grammar, making per-step masking O(1) amortized.
+
+Essential for tool-use agents, structured data extraction, and API response formatting. Composes with all sampling strategies (min-p, temperature, etc.) as an additional logit mask applied before sampling.
+
+### 13. TurboSpec adaptive speculation
 
 **Status:** Not implemented
 **Expected impact:** +20–50% over static speculative decoding
@@ -208,13 +217,15 @@ Near-term (immediate impact):
 Medium-term (production readiness):
   ├── #2  EAGLE-3 / P-EAGLE speculative decoding
   ├── #4  RadixAttention prompt caching
-  └── #6  Sliding window attention
+  ├── #6  Sliding window attention
+  └── #12 Structured generation (JSON/grammar)
 
 Long-term (serving + architectural):
   ├── #7  Continuous batching + vAttention
   ├── #8  Cross-layer KV sharing (CLA)
   ├── #9  MLA support
-  └── #10-12 Advanced optimizations
+  ├── #11 Prefill/decode phase separation
+  └── #10,13 Speculative Streaming, TurboSpec
 ```
 
 ## References
@@ -228,6 +239,7 @@ Long-term (serving + architectural):
 - vAttention: https://arxiv.org/abs/2405.04437
 - CLA: https://arxiv.org/abs/2405.12981
 - FusedKV: https://openreview.net/forum?id=4pivvEJiCl
-- XQuant: https://github.com/brinenick511/XQuant
 - TurboSpec: https://www2.eecs.berkeley.edu/Pubs/TechRpts/2025/EECS-2025-224.html
 - Speculative Streaming: https://openreview.net/forum?id=jt8wI3ZzXG
+- XGrammar: https://github.com/mlc-ai/xgrammar
+- MLX phase scheduling: https://yage.ai/share/mlx-apple-silicon-en-20260331.html
