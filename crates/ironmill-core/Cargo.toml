@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+hf-tokenizer = []
+
 [dependencies]
 mil-rs = { workspace = true }
 serde = { workspace = true }

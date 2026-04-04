@@ -6,4 +6,7 @@
 
 pub mod ane;
 pub mod gpu;
+pub mod tokenizer;
 pub mod weights;
+
+pub use tokenizer::{ChatMessage, Tokenizer, TokenizerError};
