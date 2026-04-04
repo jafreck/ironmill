@@ -452,6 +452,7 @@ impl MetalInference {
             mc.head_dim,
             self.config.max_seq_len,
             mc.rope_theta,
+            1.0,
         )
         .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.rope_cos = Some(cos);
@@ -462,12 +463,16 @@ impl MetalInference {
             if let Some(rp) = mc.rope_parameters() {
                 if let Some(global_cfg) = rp.get("full_attention") {
                     let global_hd = g4.global_head_dim;
-                    if global_hd != mc.head_dim || global_cfg.theta != mc.rope_theta {
+                    if global_hd != mc.head_dim
+                        || global_cfg.theta != mc.rope_theta
+                        || global_cfg.partial_rotary_factor != 1.0
+                    {
                         let (gc, gs) = Self::build_rope_cache(
                             &self.device,
                             global_hd,
                             self.config.max_seq_len,
                             global_cfg.theta,
+                            global_cfg.partial_rotary_factor,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                         self.global_rope_cos = Some(gc);
@@ -653,20 +658,31 @@ impl MetalInference {
         head_dim: usize,
         max_seq_len: usize,
         theta: f64,
+        partial_rotary_factor: f64,
     ) -> Result<(MetalBuffer, MetalBuffer), MetalError> {
         let half_dim = head_dim / 2;
+        let rotary_dim = ((head_dim as f64 * partial_rotary_factor) as usize / 2) * 2;
+        let rotary_half = rotary_dim / 2;
         let mut cos_data = vec![0u8; max_seq_len * half_dim * 2];
         let mut sin_data = vec![0u8; max_seq_len * half_dim * 2];
 
         for pos in 0..max_seq_len {
             for i in 0..half_dim {
-                let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
-                let angle = pos as f64 * freq;
-                let c = f16::from_f64(angle.cos());
-                let s = f16::from_f64(angle.sin());
                 let offset = (pos * half_dim + i) * 2;
-                cos_data[offset..offset + 2].copy_from_slice(&c.to_le_bytes());
-                sin_data[offset..offset + 2].copy_from_slice(&s.to_le_bytes());
+                if i < rotary_half {
+                    let freq = 1.0 / theta.powf(2.0 * i as f64 / rotary_dim as f64);
+                    let angle = pos as f64 * freq;
+                    let c = f16::from_f64(angle.cos());
+                    let s = f16::from_f64(angle.sin());
+                    cos_data[offset..offset + 2].copy_from_slice(&c.to_le_bytes());
+                    sin_data[offset..offset + 2].copy_from_slice(&s.to_le_bytes());
+                } else {
+                    // Non-rotated dimensions: identity (cos=1, sin=0)
+                    let c = f16::from_f64(1.0);
+                    let s = f16::from_f64(0.0);
+                    cos_data[offset..offset + 2].copy_from_slice(&c.to_le_bytes());
+                    sin_data[offset..offset + 2].copy_from_slice(&s.to_le_bytes());
+                }
             }
         }
 
@@ -3002,6 +3018,7 @@ impl InferenceEngine for MetalInference {
             mc.head_dim,
             self.config.max_seq_len,
             mc.rope_theta,
+            1.0,
         )
         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.rope_cos = Some(cos);
@@ -3012,12 +3029,16 @@ impl InferenceEngine for MetalInference {
             if let Some(rp) = mc.rope_parameters() {
                 if let Some(global_cfg) = rp.get("full_attention") {
                     let global_hd = g4.global_head_dim;
-                    if global_hd != mc.head_dim || global_cfg.theta != mc.rope_theta {
+                    if global_hd != mc.head_dim
+                        || global_cfg.theta != mc.rope_theta
+                        || global_cfg.partial_rotary_factor != 1.0
+                    {
                         let (gc, gs) = Self::build_rope_cache(
                             &self.device,
                             global_hd,
                             self.config.max_seq_len,
                             global_cfg.theta,
+                            global_cfg.partial_rotary_factor,
                         )
                         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                         self.global_rope_cos = Some(gc);
