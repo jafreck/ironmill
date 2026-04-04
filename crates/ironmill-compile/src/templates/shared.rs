@@ -18,6 +18,15 @@ pub(super) struct LayerContext<'a> {
     pub layer_idx: usize,
     pub rope_cos: &'a str,
     pub rope_sin: &'a str,
+    /// Per-layer attention type for Gemma 4 ("sliding_attention" or "full_attention").
+    /// None for non-Gemma-4 models.
+    pub layer_type: Option<&'a str>,
+    /// Effective head dimension for this layer's attention.
+    /// Global layers may use `global_head_dim` instead of `head_dim`.
+    pub effective_head_dim: usize,
+    /// Effective number of KV heads for this layer's attention.
+    /// Global layers may use `num_global_key_value_heads`.
+    pub effective_num_kv_heads: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +114,34 @@ pub(super) fn emit_linear(
     block.add_op(op);
 
     Ok(out_name)
+}
+
+/// Emit a MIL `gather` operation to index into an embedding table.
+#[allow(dead_code)]
+pub(super) fn emit_gather(
+    block: &mut Block,
+    provider: &dyn WeightProvider,
+    weight_name: &str,
+    indices: &str,
+    out_name: &str,
+    warnings: &mut Vec<String>,
+) -> Result<String, MilError> {
+    let const_name = format!("{out_name}_table");
+    emit_weight_const(
+        block,
+        provider,
+        &format!("{weight_name}.weight"),
+        &const_name,
+        warnings,
+    )?;
+    let gathered_name = format!("{out_name}_gathered");
+    let op = Operation::new("gather", format!("{out_name}_gather_op"))
+        .with_input("x", Value::Reference(const_name))
+        .with_input("indices", Value::Reference(indices.to_string()))
+        .with_attr("axis", Value::Int(0))
+        .with_output(&gathered_name);
+    block.add_op(op);
+    Ok(gathered_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -245,12 +282,76 @@ pub(super) fn emit_rope_tables(block: &mut Block, config: &ModelConfig) -> (Stri
     (cos_name, sin_name)
 }
 
+/// Precompute cos/sin frequency tables with explicit parameters.
+/// Supports partial rotation: only the first `rotary_dim` dimensions are rotated.
+/// Returns `(cos_table_name, sin_table_name)`.
+#[allow(dead_code)]
+pub(super) fn emit_rope_tables_with_params(
+    block: &mut Block,
+    head_dim: usize,
+    max_pos: usize,
+    theta: f64,
+    partial_rotary_factor: f64,
+    name_prefix: &str,
+) -> (String, String) {
+    let rotary_dim = ((head_dim as f64 * partial_rotary_factor) as usize / 2) * 2;
+    let half_dim = head_dim / 2;
+    let rotary_half = rotary_dim / 2;
+
+    let mut cos_bytes = Vec::with_capacity(max_pos * half_dim * 4);
+    let mut sin_bytes = Vec::with_capacity(max_pos * half_dim * 4);
+
+    for t in 0..max_pos {
+        for i in 0..half_dim {
+            if i < rotary_half {
+                let freq = 1.0 / theta.powf(2.0 * i as f64 / rotary_dim as f64);
+                let angle = t as f64 * freq;
+                cos_bytes.extend_from_slice(&(angle.cos() as f32).to_le_bytes());
+                sin_bytes.extend_from_slice(&(angle.sin() as f32).to_le_bytes());
+            } else {
+                // Non-rotated dimensions: identity (cos=1, sin=0)
+                cos_bytes.extend_from_slice(&1.0f32.to_le_bytes());
+                sin_bytes.extend_from_slice(&0.0f32.to_le_bytes());
+            }
+        }
+    }
+
+    let cos_name = format!("{name_prefix}_cos_table");
+    let sin_name = format!("{name_prefix}_sin_table");
+
+    let cos_op = Operation::new("const", &cos_name)
+        .with_attr(
+            "val",
+            Value::Tensor {
+                data: cos_bytes,
+                shape: vec![max_pos, half_dim],
+                dtype: ScalarType::Float32,
+            },
+        )
+        .with_output(&cos_name);
+    block.add_op(cos_op);
+
+    let sin_op = Operation::new("const", &sin_name)
+        .with_attr(
+            "val",
+            Value::Tensor {
+                data: sin_bytes,
+                shape: vec![max_pos, half_dim],
+                dtype: ScalarType::Float32,
+            },
+        )
+        .with_output(&sin_name);
+    block.add_op(sin_op);
+
+    (cos_name, sin_name)
+}
+
 /// Apply rotary position embeddings to Q and K tensors.
 /// Both inputs have shape `[batch, heads, seq, head_dim]`.
 /// Returns `(q_roped, k_roped)` with the same shapes.
 pub(super) fn emit_rotary_embedding(
     block: &mut Block,
-    config: &ModelConfig,
+    head_dim: usize,
     q_name: &str,
     k_name: &str,
     layer_idx: usize,
@@ -258,7 +359,7 @@ pub(super) fn emit_rotary_embedding(
     sin_table: &str,
 ) -> (String, String) {
     let prefix = format!("l{layer_idx}_rope");
-    let half_dim = config.head_dim / 2;
+    let half_dim = head_dim / 2;
 
     // Gather cos/sin using position_ids
     let cos_gathered = {
@@ -570,14 +671,27 @@ pub(super) fn emit_attention(
         &format!("l{}_k_proj", ctx.layer_idx),
         warnings,
     )?;
-    let v = emit_linear(
-        block,
-        ctx.provider,
-        &format!("{prefix}.v_proj"),
-        input,
-        &format!("l{}_v_proj", ctx.layer_idx),
-        warnings,
-    )?;
+
+    // K=V sharing: when enabled and on a global layer, reuse K as V
+    let use_k_eq_v = ctx
+        .config
+        .extra
+        .get("attention_k_eq_v")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && ctx.layer_type == Some("full_attention");
+    let v = if use_k_eq_v {
+        k.clone()
+    } else {
+        emit_linear(
+            block,
+            ctx.provider,
+            &format!("{prefix}.v_proj"),
+            input,
+            &format!("l{}_v_proj", ctx.layer_idx),
+            warnings,
+        )?
+    };
 
     emit_attention_core(block, ctx, &prefix, &q, &k, &v, warnings)
 }
@@ -605,7 +719,7 @@ pub(super) fn emit_attention_core(
             -1,
             -1,
             config.num_attention_heads as i64,
-            config.head_dim as i64,
+            ctx.effective_head_dim as i64,
         ],
     );
 
@@ -616,8 +730,8 @@ pub(super) fn emit_attention_core(
         &[
             -1,
             -1,
-            config.num_key_value_heads as i64,
-            config.head_dim as i64,
+            ctx.effective_num_kv_heads as i64,
+            ctx.effective_head_dim as i64,
         ],
     );
 
@@ -628,8 +742,8 @@ pub(super) fn emit_attention_core(
         &[
             -1,
             -1,
-            config.num_key_value_heads as i64,
-            config.head_dim as i64,
+            ctx.effective_num_kv_heads as i64,
+            ctx.effective_head_dim as i64,
         ],
     );
 
@@ -656,7 +770,7 @@ pub(super) fn emit_attention_core(
     // Apply RoPE to Q and K
     let (q_roped, k_roped) = emit_rotary_embedding(
         block,
-        config,
+        ctx.effective_head_dim,
         &q_t,
         &k_t,
         layer_idx,
@@ -665,14 +779,14 @@ pub(super) fn emit_attention_core(
     );
 
     // GQA: expand K and V heads when using grouped query attention
-    let (k_expanded, v_expanded) = if config.num_attention_heads != config.num_key_value_heads {
-        if config.num_attention_heads % config.num_key_value_heads != 0 {
+    let (k_expanded, v_expanded) = if config.num_attention_heads != ctx.effective_num_kv_heads {
+        if config.num_attention_heads % ctx.effective_num_kv_heads != 0 {
             return Err(MilError::Validation(format!(
                 "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
-                config.num_attention_heads, config.num_key_value_heads
+                config.num_attention_heads, ctx.effective_num_kv_heads
             )));
         }
-        let n_rep = config.num_attention_heads / config.num_key_value_heads;
+        let n_rep = config.num_attention_heads / ctx.effective_num_kv_heads;
         let k_exp = emit_gqa_expand(block, &k_roped, n_rep, config, layer_idx, "k");
         let v_exp = emit_gqa_expand(block, &v_t, n_rep, config, layer_idx, "v");
         (k_exp, v_exp)
@@ -701,7 +815,7 @@ pub(super) fn emit_attention_core(
 
     // Scale by 1/sqrt(head_dim)
     let scale = {
-        let scale_val = 1.0 / (config.head_dim as f64).sqrt();
+        let scale_val = 1.0 / (ctx.effective_head_dim as f64).sqrt();
         let scale_const = format!("l{layer_idx}_attn_scale_const");
         let op = Operation::new("const", &scale_const)
             .with_attr("val", Value::Float(scale_val))

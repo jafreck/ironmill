@@ -145,6 +145,9 @@ fn build_function(
             layer_idx,
             rope_cos: &rope_cos,
             rope_sin: &rope_sin,
+            layer_type: None,
+            effective_head_dim: config.head_dim,
+            effective_num_kv_heads: config.num_key_value_heads,
         };
         hidden = emit_transformer_layer(block, &ctx, &hidden, warnings, ane)?;
     }
@@ -363,7 +366,7 @@ fn emit_attention(
     // Apply RoPE to Q and K
     let (q_roped, k_roped) = emit_rotary_embedding(
         block,
-        config,
+        config.head_dim,
         &q_t,
         &k_t,
         layer_idx,
