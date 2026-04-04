@@ -1,6 +1,6 @@
 # Specification: Lazy Tensor Storage for Large Model Compilation
 
-**Status:** Draft  
+**Status:** Implemented  
 **Crates affected:** `mil-rs`, `ironmill-compile`, `ironmill-core`, `ironmill-inference`
 
 ## 1. Problem
@@ -660,7 +660,7 @@ and dropped one at a time.
 **Peak memory:** ~1 GB + protobuf overhead for inline ONNX. ~1 GB for
 external-data ONNX (identical to SafeTensors).
 
-### 7.3 GPU Bundle Path — SafeTensors/GGUF via IR (Phase B)
+### 7.3 GPU Bundle Path — SafeTensors/GGUF via IR (Phase B, with spill-after-quantize)
 
 ```
 SafeTensors (mmap) ─── Arc<WeightProvider> ───┐
@@ -672,17 +672,28 @@ SafeTensors (mmap) ─── Arc<WeightProvider> ───┐
                 │
                 ▼
         PassPipeline.run()      ← each quant pass materializes one tensor at a time
-                │                  original FP16 data replaced with smaller INT4/INT8
+                │                  quantized data replaces original
+                │                  spill_inline_tensors() writes to temp dir after each pass
+                │                  quantized Inline data → External (file-backed)
                 ▼
-        MilWeightProvider::new(&mut program)  ← destructive take (no clone)
+        MilWeightProvider::new(&mut program)  ← resolves from spill dir + provider
                 │
                 ▼
         write_gpu_bundle()      ← writes per-tensor files to disk
 ```
 
-**Peak memory: ~36 GB** for 70B INT4. This path is needed when the pass
-pipeline does work that the streaming path can't replicate (e.g., graph-level
-AWQ scale fusion, rotation fusion, or composing multiple pass types).
+**Peak memory: ~1 GB** (one unquantized tensor + quantized output). Quantized
+tensors are spilled to a temp directory between passes via
+`Program::spill_inline_tensors()`, keeping only metadata in the IR. The
+`make_resolver()` utility checks the spill directory first, then falls back to
+the weight provider. This achieves streaming-like memory efficiency while
+retaining full pass pipeline capabilities (AWQ fusion, rotation fusion,
+composed quantization).
+
+> **Note:** The original Phase A design included a `StreamingGpuBundleBuilder`
+> that bypassed the IR entirely. This was removed in favor of
+> spill-after-quantize, which achieves the same memory profile without
+> sacrificing graph-level pass capabilities.
 
 ### 7.4 ANE Bundle Path (smaller models, full materialization acceptable)
 
@@ -824,7 +835,12 @@ pub fn build(self) -> Result<MilWeightProvider, CompileError> {
 | MilWeightProvider clones all data | +140 GB |
 | **Peak** | **~280 GB** |
 
-### 10.2 After — Streaming GPU Bundle (Phase A, Task A1)
+### 10.2 ~~After — Streaming GPU Bundle (Phase A, Task A1)~~ → Replaced
+
+> **Note:** The streaming GPU bundle builder was replaced by
+> spill-after-quantize in the IR path (§10.4), which achieves the same
+> ~1 GB peak memory while retaining graph-level pass capabilities.
+> The analysis below is preserved for historical reference.
 
 All input formats achieve ~1 GB peak memory. Every quantization method
 (Affine INT4/INT8, PolarQuant, SpinQuant, D2Quant, QuIP#, FP16, Palettize,
@@ -856,16 +872,25 @@ data.
 | Source provider dropped before extraction | −0 (mmap released) |
 | **Peak** | **~140 GB** |
 
-### 10.4 Lazy + Destructive Extraction via IR (Phase B, same model, INT4)
+### 10.4 Lazy + Spill-After-Quantize via IR (Phase B, same model, INT4)
 
 | Stage | Memory |
 |-------|--------|
 | mmap'd SafeTensors shards | ~0 (kernel-managed) |
 | Template emission creates External refs | ~10 MB (metadata) |
 | Quantization: one FP16 tensor materialized at a time | ~1 GB (largest tensor) |
-| Quantized data replaces original (INT4 = 4× smaller) | grows to ~35 GB |
-| MilWeightProvider takes ownership (no clone) | ~35 GB |
-| **Peak** | **~36 GB** |
+| Spill-after-quantize writes quantized data to temp dir | ~0 (immediately evicted) |
+| MilWeightProvider resolves from spill dir + provider | ~1 GB (one tensor at a time) |
+| **Peak** | **~1 GB** |
+
+> **Note:** The original design estimated ~36 GB peak for this path because
+> quantized tensors accumulated inline in the IR. With spill-after-quantize,
+> `PassPipeline::run()` calls `program.spill_inline_tensors(4096)` after each
+> pass, evicting large tensors to a temp directory. The resolver
+> (`make_resolver`) checks the spill directory first, then falls back to the
+> weight provider. This reduces peak memory to ~1 GB — the same as the
+> original streaming path — while retaining full graph-level pass
+> capabilities.
 
 ## 11. Implementation Plan
 
@@ -879,118 +904,25 @@ the existing pass pipeline and non-GPU paths.
 
 These tasks are independent and can be parallelized.
 
-#### Task A1: Streaming GPU Bundle Builder
+#### ~~Task A1: Streaming GPU Bundle Builder~~ → Replaced by Spill-After-Quantize
 
-**Crate:** `ironmill-compile`  
-**New file:** `gpu/streaming.rs`  
-**Depends on:** nothing
+**Status:** Removed. The streaming builder was replaced by
+`Program::spill_inline_tensors()` in the pass pipeline, which achieves the
+same ~1 GB peak memory without bypassing the IR. See Phase B tasks below.
 
-Build a `StreamingGpuBundleBuilder` that bypasses the MIL IR entirely. It
-takes a weight source + quantization config, iterates tensors one at a time,
-quantizes using the existing standalone math functions, writes to the bundle,
-and drops:
+The spill-after-quantize mechanism:
+- After each pass in `PassPipeline::run()`, large inline tensors (≥ 4096 bytes)
+  are written to a `tempfile::TempDir` and replaced with `TensorData::External`
+  references.
+- The `make_resolver()` utility (used by all 12 quantization passes) checks
+  the spill directory first, then falls back to the weight provider.
+- `MilWeightProvider::new()` resolves spilled tensors from disk during
+  extraction.
+- The temp directory is auto-cleaned when the `Program` is dropped.
 
-```rust
-// crates/ironmill-compile/src/gpu/streaming.rs
-
-pub struct StreamingGpuBundleBuilder { ... }
-
-impl StreamingGpuBundleBuilder {
-    pub fn new(input: impl Into<PathBuf>) -> Self;
-    pub fn with_quantization(self, method: QuantMethod) -> Self;
-    pub fn build(self, output_dir: impl AsRef<Path>) -> Result<(), CompileError>;
-}
-```
-
-The quantization math is already factored into public standalone functions:
-- `quantize_affine(values, qmax)` (`affine_quantize.rs:242`)
-- `compute_quantization(info, n_bits, seed)` (`polar_quantize.rs:167`)
-- `pack_int4(values)` (`int4_pack.rs:20`)
-- `pack_indices(indices, n_bits)` (`polar_quantize.rs:384`)
-- `pad_to_power_of_two(data, rows, cols)` (`rotation.rs:57`)
-
-The streaming builder calls these directly on `WeightProvider` tensor data.
-Each tensor is loaded from the mmap, quantized, written to disk, and dropped.
-Only one tensor lives in memory at a time.
-
-**Subtasks:**
-- Define `QuantMethod` enum (Affine4/Affine8, PolarQuant, SpinQuant, AWQ,
-  GPTQ, etc.) with the configuration each method needs (group_size, n_bits,
-  seed, etc.). AWQ and GPTQ carry pre-computed calibration data
-  (`channel_magnitudes: HashMap` and `hessian_data: HashMap` respectively)
-  — these are small per-layer statistics, not weight data, so they do not
-  affect peak memory.
-- Implement the per-tensor quantization dispatch that calls the right
-  standalone function based on `QuantMethod`
-- Implement eligibility logic (min_elements, rank ≥ 2, skip norms/biases)
-  extracted from the existing pass implementations
-- Reuse `write_gpu_bundle`'s per-tensor file writing and manifest generation
-  from `gpu/bundle.rs`
-- Implement `OnnxInitializerProvider` — wraps an ONNX `ModelProto` (parsed
-  with zero-copy `Bytes`-backed `raw_data`) and implements `WeightProvider`
-  by serving initializers one at a time. For external-data ONNX, reads
-  directly from sidecar files. For inline ONNX, slices zero-copy from the
-  mmap-backed `Bytes` buffer. Derive `ModelConfig` from ONNX graph metadata
-  (reuse `derive_config_from_program()` logic from `gpu/mod.rs:200-256`,
-  adapted to work on raw ONNX metadata).
-- Add `prost-build` config in `mil-rs/build.rs` to generate
-  `TensorProto.raw_data` as `prost::bytes::Bytes` instead of `Vec<u8>`.
-  Update `extract_tensor_raw_data()` / `extract_tensor_raw_data_take()` in
-  `onnx_graph.rs` for the new `Bytes` type.
-- Wire into CLI as a `--streaming` flag or automatic fallback
-
-**Peak memory:** ~1 GB (one unquantized tensor + quantized output).
-
-**Supported input formats:** SafeTensors, GGUF, and ONNX.
-
-SafeTensors and GGUF are served by existing `WeightProvider` implementations
-that provide mmap-backed, per-tensor access.
-
-ONNX is also streamable because the ONNX protobuf separates **initializers**
-(weight tensors) from **nodes** (computation ops). The streaming builder only
-needs the initializers — it doesn't need the computation graph. The current
-`onnx_to_program()` path already extracts initializers into a
-`HashMap<String, (Vec<u8>, Vec<usize>, ScalarType)>` at `onnx_graph.rs:186-194`
-before touching the graph structure. The streaming builder can:
-
-1. Parse the ONNX protobuf to extract initializer metadata (names, shapes,
-   dtypes, data locations) without loading all tensor bytes at once.
-2. For each initializer: load its bytes (from `raw_data`, typed fields, or
-   external sidecar files), quantize, write to bundle, drop.
-3. For ONNX models with external data (`data_location == 1`), this is
-   essentially the same as SafeTensors — weights are in separate files with
-   `(offset, length)` descriptors.
-
-**Zero-copy ONNX via `prost` `Bytes` type:**
-
-The ONNX file is already mmap'd in `read_onnx()` (`reader/onnx.rs:34`), but
-`prost::Message::decode()` eagerly copies every `bytes raw_data` field into an
-owned `Vec<u8>`. This is the source of the memory blow-up for inline ONNX.
-
-`prost` supports generating `bytes` proto fields as `prost::bytes::Bytes`
-instead of `Vec<u8>`. `Bytes` is a reference-counted, zero-copy-sliceable
-type. When the decode source is a `Bytes` backed by the mmap, `raw_data`
-fields become zero-copy slices — no per-tensor allocation.
-
-This requires a one-line `prost-build` config change:
-
-```rust
-// build.rs
-config.bytes(&[".onnx.TensorProto.raw_data"]);
-```
-
-After this, `TensorProto.raw_data` is `Bytes` rather than `Vec<u8>`. Decoding
-from an mmap-backed `Bytes` buffer produces zero-copy slices into the mmap.
-The `OnnxInitializerProvider` can then serve individual tensors from this
-backing without any per-tensor allocation until quantization actually needs
-the data. Memory footprint for ONNX parse becomes O(metadata + mmap pages
-touched by the OS), identical to SafeTensors.
-
-The implementation adds an `OnnxInitializerProvider` that wraps the parsed
-ONNX `ModelProto` (with zero-copy `Bytes` backing) and implements
-`WeightProvider`, serving one initializer at a time. `ModelConfig` is derived
-from ONNX graph metadata (reuse `derive_config_from_program()` logic from
-`gpu/mod.rs:200-256`, adapted to work on raw ONNX metadata).
+This approach retains full graph-level pass capabilities (AWQ fusion, rotation
+fusion, composed quantization) while achieving streaming-like memory
+efficiency.
 
 #### Task A2: `MilWeightProvider` Destructive Extraction
 
@@ -1057,18 +989,10 @@ mil_provider.apply_supplements(supplement_tensors);
 **Impact:** Releases the mmap file handles and associated kernel page cache
 pressure before the MilWeightProvider allocation.
 
-#### Task A4: Testing for Phase A
+#### ~~Task A4: Testing for Phase A~~ → Superseded
 
-**Depends on:** Tasks A1-A3
-
-- Unit tests for `StreamingGpuBundleBuilder`:
-  - Round-trip: streaming bundle matches eager bundle for a small test model
-  - Each `QuantMethod` produces correct quantized output
-  - Manifest is valid
-- Verify `MilWeightProvider` destructive extraction doesn't regress:
-  - `cargo test -p ironmill-compile --lib`
-  - `cargo test -p ironmill-inference`
-- Benchmark: compare peak RSS for streaming vs eager on a 7B model
+Testing for the spill-after-quantize mechanism is covered in Task B7.
+The `MilWeightProvider` destructive extraction tests remain valid.
 
 ### Phase B: Lazy `TensorData` in MIL IR (Optional Follow-Up)
 
@@ -1174,8 +1098,9 @@ fully solves.
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| Streaming quantization diverges from pass-based quantization | Medium | High | Round-trip test: streaming bundle must match eager bundle bit-for-bit. Both call the same `quantize_affine()`/`compute_quantization()` functions. |
-| Eligibility logic duplicated between passes and streaming builder | Medium | Medium | Extract eligibility checks (min_elements, rank ≥ 2, skip norms) into shared functions callable by both. |
+| ~~Streaming quantization diverges from pass-based quantization~~ | — | — | ~~Removed: streaming builder replaced by spill-after-quantize.~~ |
+| ~~Eligibility logic duplicated between passes and streaming builder~~ | — | — | ~~Removed: no separate streaming builder.~~ |
+| Spill directory I/O bottleneck on slow storage | Low | Medium | Spill goes to OS temp dir (typically SSD/tmpfs). Threshold of 4096 bytes avoids spilling small tensors. Sequential I/O is fast. |
 | `MilWeightProvider` destructive extraction breaks callers that re-read the program | Low | Medium | Audit all call sites; `MilWeightProvider::new()` is the last step before bundle writing — the program isn't reused after. |
 | Phase B `Send + Sync` bound on `WeightProvider` breaks a downstream implementor | Low | High | All known implementors use `Send + Sync` types. Verify at compile time. |
 | Phase B missed usage site panics at runtime | Medium | Medium | `into_bytes()` on External panics with clear message. The census covers all ~60 known sites. |
