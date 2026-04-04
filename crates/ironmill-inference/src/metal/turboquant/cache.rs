@@ -297,4 +297,11 @@ impl MetalKvCache {
     pub fn reset(&mut self) {
         self.seq_pos = 0;
     }
+
+    /// Truncate cache to `pos` tokens. Does not deallocate — just moves
+    /// the write pointer back. Subsequent writes overwrite old data.
+    pub fn truncate_to(&mut self, pos: usize) {
+        assert!(pos <= self.seq_pos);
+        self.seq_pos = pos;
+    }
 }

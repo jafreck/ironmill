@@ -783,4 +783,26 @@ impl InferenceEngine for MlxInference {
             let _ = ironmill_mlx_sys::stream::metal_clear_cache();
         }
     }
+
+    fn seq_pos(&self) -> usize {
+        self.seq_pos
+    }
+
+    fn truncate_to(&mut self, pos: usize) {
+        assert!(pos <= self.seq_pos);
+        self.seq_pos = pos;
+        // FP16 MLX caches are built by concatenation and cannot be sliced
+        // in-place. Clear them unconditionally so that a subsequent prefill
+        // rebuilds them from scratch. The TurboQuant cache (pre-allocated
+        // buffers with a write pointer) handles partial truncation natively.
+        for slot in &mut self.k_cache {
+            *slot = None;
+        }
+        for slot in &mut self.v_cache {
+            *slot = None;
+        }
+        if let Some(ref mut tq_cache) = self.tq_cache {
+            tq_cache.truncate_to(pos);
+        }
+    }
 }

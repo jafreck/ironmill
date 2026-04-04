@@ -89,6 +89,15 @@ impl Fp16KvCache {
     fn reset(&mut self) {
         self.seq_pos = 0;
     }
+
+    fn seq_pos(&self) -> usize {
+        self.seq_pos
+    }
+
+    fn truncate_to(&mut self, pos: usize) {
+        assert!(pos <= self.seq_pos);
+        self.seq_pos = pos;
+    }
 }
 
 /// Reusable intermediate activation buffers.
@@ -2387,6 +2396,21 @@ impl InferenceEngine for MetalInference {
         }
         if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
             fp16_kv.reset();
+        }
+    }
+
+    fn seq_pos(&self) -> usize {
+        self.seq_pos
+    }
+
+    fn truncate_to(&mut self, pos: usize) {
+        assert!(pos <= self.seq_pos);
+        self.seq_pos = pos;
+        if let Some(kv) = self.kv_cache.as_mut() {
+            kv.truncate_to(pos);
+        }
+        if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
+            fp16_kv.truncate_to(pos);
         }
     }
 }

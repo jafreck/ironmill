@@ -47,4 +47,10 @@ pub trait InferenceEngine {
 
     /// Reset all state for a new conversation.
     fn reset(&mut self);
+
+    /// Current sequence position (number of tokens in KV cache).
+    fn seq_pos(&self) -> usize;
+
+    /// Truncate KV cache to the given position, discarding tokens after `pos`.
+    fn truncate_to(&mut self, pos: usize);
 }
