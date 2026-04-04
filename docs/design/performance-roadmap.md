@@ -20,7 +20,7 @@ Reference comparison (HuggingFace transformers, CPU FP32, same hardware):
 
 ---
 
-## Tier 1 — Critical performance gaps
+## Attention & compute
 
 ### 1. Fused SDPA with simdgroup matrix tiling
 
@@ -79,7 +79,7 @@ All of this is CPU-side logit post-processing — no kernel changes needed.
 
 ---
 
-## Tier 2 — Important for production use
+## Caching & memory
 
 ### 4. RadixAttention prompt caching
 
@@ -120,7 +120,7 @@ Qwen3 and Mistral use sliding window attention (W=4096 or similar). The attentio
 
 ---
 
-## Tier 3 — Serving infrastructure
+## Serving & architecture
 
 ### 7. Continuous batching with vAttention-style memory
 
@@ -162,7 +162,7 @@ MLA projects keys and values into a shared low-dimensional latent space, storing
 
 ---
 
-## Tier 4 — Advanced optimizations
+## Speculation & advanced
 
 ### 10. Speculative Streaming (no auxiliary model)
 
@@ -210,24 +210,35 @@ Closed-loop feedback system that dynamically tunes speculation depth, draft tree
 
 ## Implementation order
 
+All items will be implemented. Ordering reflects hard dependencies only — items at the same level can be parallelized across agents.
+
 ```
-Near-term (immediate impact):
+Independent (no dependencies, can start immediately):
   ├── #3  Min-p sampling + full sampler chain
   ├── #5  KV cache reuse across turns
-  └── #1  Fused SDPA kernel (ADR-0001)
-
-Medium-term (production readiness):
-  ├── #2  EAGLE-3 / P-EAGLE speculative decoding
-  ├── #4  RadixAttention prompt caching
+  ├── #1  Fused SDPA kernel (ADR-0001)
   ├── #6  Sliding window attention
+  ├── #9  MLA support
   └── #12 Structured generation (JSON/grammar)
 
-Long-term (serving + architectural):
-  ├── #7  Continuous batching + vAttention
-  ├── #8  Cross-layer KV sharing (CLA)
-  ├── #9  MLA support
-  ├── #11 Prefill/decode phase separation
-  └── #10,13 Speculative Streaming, TurboSpec
+Depends on #1 (Fused SDPA):
+  └── #11 Prefill/decode phase separation
+
+Depends on #5 (KV cache reuse):
+  └── #4  RadixAttention prompt caching
+
+Depends on #3 (sampling) + #5 (KV reuse):
+  └── #2  EAGLE-3 / P-EAGLE speculative decoding
+
+Depends on #2 (speculative decoding):
+  ├── #10 Speculative Streaming
+  └── #13 TurboSpec adaptive speculation
+
+Depends on #1 (Fused SDPA) + #5 (KV reuse):
+  └── #7  Continuous batching + vAttention
+
+Depends on #9 (MLA):
+  └── #8  Cross-layer KV sharing (CLA)
 ```
 
 ## References
