@@ -35,6 +35,13 @@ pub struct MilWeightProvider {
 impl MilWeightProvider {
     /// Build a provider by walking the main function of `program`.
     pub fn new(program: &mut Program, config: ModelConfig) -> Result<Self, MilError> {
+        // Materialize any remaining External tensor references (original weight
+        // data *and* spilled inter-pass data) before extraction.  This ensures
+        // the closure below never encounters an unresolved External ref.
+        if program.has_weight_provider() {
+            program.materialize_all()?;
+        }
+
         // Clone the weight provider so we can resolve External tensors during extraction.
         let wp = program.weight_provider();
         let resolve = |data: &mut TensorData| -> Result<(), MilError> {
