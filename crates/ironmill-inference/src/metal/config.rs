@@ -20,6 +20,11 @@ pub struct MetalConfig {
     /// creating Metal buffers (Phase 1 load-time dequant). When false,
     /// keep quantized weights packed in VRAM and use custom kernels.
     pub force_cpu_dequant: bool,
+    /// Use FlashAttention-2 style multi-query prefill attention kernel.
+    /// Groups multiple query tokens per threadgroup for better KV tile
+    /// reuse. Beneficial for large models (7B+) and long sequences; may
+    /// be slower for small models where KV tiles fit in L1 cache.
+    pub use_fa2_prefill: bool,
 }
 
 impl Default for MetalConfig {
@@ -32,6 +37,7 @@ impl Default for MetalConfig {
             rotation_seed: 42,
             n_bits: 8,
             force_cpu_dequant: false,
+            use_fa2_prefill: false,
         }
     }
 }

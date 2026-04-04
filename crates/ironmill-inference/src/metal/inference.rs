@@ -785,6 +785,7 @@ impl MetalInference {
                 nkv,
                 hd,
                 enable_tq,
+                self.config.use_fa2_prefill,
             )?;
 
             // Step 9: Output projection
@@ -1223,6 +1224,7 @@ impl MetalInference {
                 nkv,
                 hd,
                 enable_tq,
+                self.config.use_fa2_prefill,
             )?;
 
             // Step 9: Output projection
@@ -1875,6 +1877,7 @@ fn encode_kv_cache_and_attention(
     nkv: u32,
     hd: u32,
     enable_tq: bool,
+    use_fa2: bool,
 ) -> Result<(), InferenceError> {
     let max_seq = max_seq_len as u32;
     let n_bits = n_bits as u32;
@@ -2130,7 +2133,7 @@ fn encode_kv_cache_and_attention(
         // single-dispatch decode kernel for single-token.
         let attn_tg_size = 256_usize.max(hd as usize).min(1024);
         if token_count > 1 {
-            enc.set_pipeline(&pipelines.prefill_attention);
+            // Both kernels share the same buffer layout and parameters.
             enc.set_buffer(&bufs.q_proj, 0, 0);
             enc.set_buffer(k_cache, 0, 1);
             enc.set_buffer(v_cache, 0, 2);
@@ -2141,7 +2144,17 @@ fn encode_kv_cache_and_attention(
             enc.set_bytes(&max_seq.to_le_bytes(), 7);
             enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 8);
             enc.set_bytes(&(token_count as u32).to_le_bytes(), 9);
-            enc.dispatch_threadgroups((nh as usize, token_count, 1), (attn_tg_size, 1, 1));
+
+            if use_fa2 {
+                enc.set_pipeline(&pipelines.prefill_attention_fa2);
+                enc.dispatch_threadgroups(
+                    (nh as usize, (token_count + 31) / 32, 1),
+                    (attn_tg_size, 1, 1),
+                );
+            } else {
+                enc.set_pipeline(&pipelines.prefill_attention);
+                enc.dispatch_threadgroups((nh as usize, token_count, 1), (attn_tg_size, 1, 1));
+            }
         } else {
             let current_seq_len = (seq_pos + 1) as u32;
             enc.set_pipeline(&pipelines.standard_attention);

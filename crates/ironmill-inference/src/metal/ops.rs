@@ -38,6 +38,7 @@ pub struct MetalPipelines {
     pub turboquant_outlier_attention: ComputePipeline,
     pub standard_attention: ComputePipeline,
     pub prefill_attention: ComputePipeline,
+    pub prefill_attention_fa2: ComputePipeline,
     pub polarquant_matvec_int4: ComputePipeline,
     pub polarquant_matmul_int4: ComputePipeline,
     pub polarquant_matvec_int8: ComputePipeline,
@@ -206,6 +207,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &attn_lib
                         .get_function("prefill_attention")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            prefill_attention_fa2: device
+                .create_compute_pipeline(
+                    &attn_lib
+                        .get_function("prefill_attention_fa2")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
