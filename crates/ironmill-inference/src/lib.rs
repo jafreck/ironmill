@@ -52,6 +52,8 @@ pub use generate::{
     CancellationToken, FinishReason, GenerateError, GenerateEvent, GenerateRequest, GenerateResult,
     TokenStream, generate, generate_with_callback,
 };
+#[cfg(feature = "async")]
+pub use generate::generate_async;
 pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 pub use memory::{KvQuantLevel, MemoryEstimator, MemoryUsage, QuantLevel};
 #[cfg(all(feature = "mlx", target_os = "macos"))]

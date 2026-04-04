@@ -497,6 +497,55 @@ pub fn generate_with_callback(
     })
 }
 
+#[cfg(feature = "async")]
+pub mod generate_async {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// Async streaming token generator.
+    ///
+    /// Created via [`spawn()`]. Runs the synchronous engine on a
+    /// blocking thread and streams events through a channel.
+    pub struct AsyncTokenStream {
+        receiver: mpsc::Receiver<Result<GenerateEvent, InferenceError>>,
+        cancel: CancellationToken,
+    }
+
+    impl AsyncTokenStream {
+        /// Cancel the generation.
+        pub fn cancel(&self) {
+            self.cancel.cancel();
+        }
+
+        /// Receive the next event, or `None` if the stream is finished.
+        pub async fn next(&mut self) -> Option<Result<GenerateEvent, InferenceError>> {
+            self.receiver.recv().await
+        }
+    }
+
+    /// Spawn a generation task on a blocking thread and return an async stream.
+    pub fn spawn(
+        mut engine: Box<dyn InferenceEngine + Send>,
+        request: GenerateRequest,
+        buffer: usize,
+    ) -> AsyncTokenStream {
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let (tx, rx) = mpsc::channel(buffer);
+
+        tokio::task::spawn_blocking(move || {
+            let stream = TokenStream::new(&mut *engine, request, &cancel_clone);
+            for event in stream {
+                if tx.blocking_send(event).is_err() {
+                    break;
+                }
+            }
+        });
+
+        AsyncTokenStream { receiver: rx, cancel }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

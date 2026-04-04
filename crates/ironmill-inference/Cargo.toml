@@ -30,6 +30,12 @@ metal = ["dep:ironmill-metal-sys"]
 mlx = ["dep:ironmill-mlx-sys"]
 ane = ["dep:ironmill-ane-sys", "dep:ironmill-iosurface"]
 coreml = ["dep:ironmill-coreml-sys"]
+async = ["dep:tokio"]
+
+[dependencies.tokio]
+version = "1"
+features = ["sync", "rt"]
+optional = true
 
 [[example]]
 name = "ane_op_eval"
