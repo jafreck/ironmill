@@ -1133,6 +1133,48 @@ impl StubProvider {
         self
     }
 
+    /// Add Per-Layer Embedding (PLE) weights for Gemma 4.
+    pub fn with_ple_weights(mut self, ple_hidden_size: usize, ple_vocab_size: usize) -> Self {
+        let h = self.config.hidden_size;
+        let num_layers = self.config.num_hidden_layers;
+        // Model-level PLE weights
+        self = self.with_tensor(
+            "model.embed_tokens_per_layer.weight",
+            &[ple_vocab_size, num_layers * ple_hidden_size],
+            ScalarType::Float16,
+        );
+        self = self.with_tensor(
+            "model.per_layer_model_projection.weight",
+            &[num_layers * ple_hidden_size, h],
+            ScalarType::Float16,
+        );
+        self = self.with_tensor(
+            "model.per_layer_projection_norm.weight",
+            &[ple_hidden_size],
+            ScalarType::Float16,
+        );
+        // Per-layer PLE weights
+        for l in 0..num_layers {
+            let p = format!("model.layers.{l}");
+            self = self.with_tensor(
+                &format!("{p}.per_layer_input_gate.weight"),
+                &[ple_hidden_size, h],
+                ScalarType::Float16,
+            );
+            self = self.with_tensor(
+                &format!("{p}.per_layer_projection.weight"),
+                &[h, ple_hidden_size],
+                ScalarType::Float16,
+            );
+            self = self.with_tensor(
+                &format!("{p}.post_per_layer_input_norm.weight"),
+                &[h],
+                ScalarType::Float16,
+            );
+        }
+        self
+    }
+
     /// Add attention bias tensors for all layers (Qwen-style).
     pub fn with_attention_biases(mut self) -> Self {
         let _h = self.config.hidden_size;

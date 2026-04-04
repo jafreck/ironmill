@@ -1094,4 +1094,125 @@ mod tests {
         let result = build_program(&provider).expect("heterogeneous head_dim build should succeed");
         assert_eq!(result.program.functions.len(), 1);
     }
+
+    #[test]
+    #[ignore] // Requires E2B checkpoint download: set GEMMA4_E2B_PATH
+    fn gemma4_e2b_compilation() {
+        use crate::weights::safetensors::SafeTensorsProvider;
+        use std::path::Path;
+
+        let model_path = std::env::var("GEMMA4_E2B_PATH")
+            .expect("Set GEMMA4_E2B_PATH to Gemma 4 E2B checkpoint directory");
+        let provider = SafeTensorsProvider::load(Path::new(&model_path))
+            .expect("E2B checkpoint loading should succeed");
+        let result = build_program(&provider).expect("E2B compilation should succeed");
+        assert_eq!(result.program.functions.len(), 1);
+        let main = result.program.main().unwrap();
+        assert!(!main.body.operations.is_empty());
+        // Verify no unexpected warnings
+        for w in &result.warnings {
+            eprintln!("  warning: {w}");
+        }
+    }
+
+    #[test]
+    fn build_program_gemma4_with_ple() {
+        let mut config = tiny_gemma_config();
+        config
+            .extra
+            .insert("hidden_size_per_layer_input".into(), serde_json::json!(8));
+        config
+            .extra
+            .insert("vocab_size_per_layer_input".into(), serde_json::json!(256));
+        config.num_hidden_layers = 2;
+        let provider = StubProvider::new(config)
+            .with_llama_weights()
+            .with_ple_weights(8, 256);
+        let result = build_program(&provider).expect("Gemma 4 PLE build should succeed");
+        assert_eq!(result.program.functions.len(), 1);
+        // Verify PLE ops were emitted
+        let main = result.program.main().unwrap();
+        let ple_ops: Vec<_> = main
+            .body
+            .operations
+            .iter()
+            .filter(|op| op.name.contains("ple_"))
+            .collect();
+        assert!(!ple_ops.is_empty(), "PLE build should emit PLE ops");
+    }
+
+    #[test]
+    fn build_program_gemma4_with_kv_sharing() {
+        let mut config = tiny_gemma_config();
+        config
+            .extra
+            .insert("attention_k_eq_v".into(), serde_json::json!(true));
+        config.extra.insert(
+            "layer_types".into(),
+            serde_json::json!(["sliding_attention", "full_attention"]),
+        );
+        config.extra.insert(
+            "rope_parameters".into(),
+            serde_json::json!({
+                "sliding_attention": {"rope_theta": 10000.0},
+                "full_attention": {"rope_theta": 1000000.0}
+            }),
+        );
+        config.num_hidden_layers = 2;
+        let provider = StubProvider::new(config).with_llama_weights();
+        let result = build_program(&provider).expect("Gemma 4 K=V build should succeed");
+        // K=V sharing: global layer (layer 1) should NOT emit v_proj ops
+        let main = result.program.main().unwrap();
+        let l1_v_proj_ops: Vec<_> = main
+            .body
+            .operations
+            .iter()
+            .filter(|op| op.name.contains("l1_v_proj"))
+            .collect();
+        assert!(
+            l1_v_proj_ops.is_empty(),
+            "K=V sharing should skip V projection on full_attention layers"
+        );
+        // But sliding layer (layer 0) SHOULD have v_proj
+        let l0_v_proj_ops: Vec<_> = main
+            .body
+            .operations
+            .iter()
+            .filter(|op| op.name.contains("l0_v_proj"))
+            .collect();
+        assert!(
+            !l0_v_proj_ops.is_empty(),
+            "sliding_attention layers should still emit V projection"
+        );
+    }
+
+    #[test]
+    fn build_program_gemma4_with_kv_shared_layers() {
+        let mut config = tiny_gemma_config();
+        // 4 layers, last 2 are KV-shared
+        config
+            .extra
+            .insert("num_kv_shared_layers".into(), serde_json::json!(2));
+        config.extra.insert(
+            "layer_types".into(),
+            serde_json::json!([
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ]),
+        );
+        config.extra.insert(
+            "rope_parameters".into(),
+            serde_json::json!({
+                "sliding_attention": {"rope_theta": 10000.0},
+                "full_attention": {"rope_theta": 1000000.0}
+            }),
+        );
+        config.num_hidden_layers = 4;
+        let provider = StubProvider::new(config).with_llama_weights();
+        let result =
+            build_program(&provider).expect("Gemma 4 KV shared layers build should succeed");
+        assert_eq!(result.program.functions.len(), 1);
+    }
 }
