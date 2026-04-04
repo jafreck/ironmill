@@ -55,6 +55,8 @@ pub struct MetalPipelines {
     pub fused_embedding_norm: ComputePipeline,
     pub int4_dequantize: ComputePipeline,
     pub fused_sdpa: ComputePipeline,
+    pub quip_sharp_matvec: ComputePipeline,
+    pub quip_sharp_matmul: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -125,6 +127,12 @@ impl MetalPipelines {
             .load_library_from_data(include_bytes!(concat!(
                 env!("OUT_DIR"),
                 "/int4_dequant.metallib"
+            )))
+            .map_err(MetalError::Metal)?;
+        let quip_sharp_lib = device
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/quip_sharp.metallib"
             )))
             .map_err(MetalError::Metal)?;
         let affine_mm_lib = device
@@ -327,6 +335,20 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &sdpa_lib
                         .get_function("fused_sdpa")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            quip_sharp_matvec: device
+                .create_compute_pipeline(
+                    &quip_sharp_lib
+                        .get_function("quip_sharp_matvec")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            quip_sharp_matmul: device
+                .create_compute_pipeline(
+                    &quip_sharp_lib
+                        .get_function("quip_sharp_matmul")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,

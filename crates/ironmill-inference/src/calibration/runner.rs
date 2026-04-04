@@ -9,6 +9,91 @@ use super::dataset::CalibrationDataset;
 use super::gptq_store::GptqActivationStore;
 use super::hook::ActivationHook;
 
+/// Hessian accumulator for QuIP# LDLQ rounding at a single capture point.
+///
+/// Computes H ≈ X^T X / n where X is the [n_tokens × n_features] matrix
+/// of input activations collected during calibration.
+pub struct QuipHessianAccumulator {
+    /// Accumulated X^T X matrix, stored as a flat [n_features × n_features] array.
+    pub xtx: Vec<f64>,
+    /// Number of features (columns per token).
+    pub n_features: usize,
+    /// Total number of token samples accumulated.
+    pub sample_count: usize,
+}
+
+impl QuipHessianAccumulator {
+    pub fn new(n_features: usize) -> Self {
+        Self {
+            xtx: vec![0.0; n_features * n_features],
+            n_features,
+            sample_count: 0,
+        }
+    }
+
+    /// Finalize the Hessian: returns H = X^T X / n as a flat f32 vector.
+    pub fn finalize(&self) -> Vec<f32> {
+        let n = self.sample_count.max(1) as f64;
+        self.xtx.iter().map(|&v| (v / n) as f32).collect()
+    }
+}
+
+/// Activation hook that collects Hessian statistics (X^T X) for QuIP#
+/// LDLQ rounding.
+pub struct HessianHook {
+    /// Per-capture-point Hessian accumulators, keyed by `"layer_{i}_{name}"`.
+    pub accumulators: std::collections::HashMap<String, QuipHessianAccumulator>,
+}
+
+impl HessianHook {
+    pub fn new() -> Self {
+        Self {
+            accumulators: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for HessianHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActivationHook for HessianHook {
+    fn on_linear_input(
+        &mut self,
+        layer: usize,
+        name: &str,
+        activation: &[half::f16],
+        n_features: usize,
+    ) {
+        let key = super::hook::store_key(layer, name);
+        let acc = self
+            .accumulators
+            .entry(key)
+            .or_insert_with(|| QuipHessianAccumulator::new(n_features));
+
+        let n_tokens = activation.len() / n_features;
+        acc.sample_count += n_tokens;
+
+        // Accumulate X^T X: for each token row, add outer product.
+        for t in 0..n_tokens {
+            let row_start = t * n_features;
+            for i in 0..n_features {
+                let xi = activation[row_start + i].to_f64();
+                for j in i..n_features {
+                    let xj = activation[row_start + j].to_f64();
+                    let product = xi * xj;
+                    acc.xtx[i * n_features + j] += product;
+                    if i != j {
+                        acc.xtx[j * n_features + i] += product;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Trait for inference engines that support calibration-mode forward passes.
 ///
 /// Implemented by backends such as `MetalInference` and mock engines for
@@ -68,6 +153,20 @@ impl CalibrationRunner {
         let mut store = GptqActivationStore::new();
         self.run_calibration(engine, dataset, &mut store)?;
         Ok(store)
+    }
+
+    /// Run calibration and collect Hessian statistics for QuIP# LDLQ rounding.
+    ///
+    /// Returns a [`HessianHook`] containing per-layer Hessian accumulators.
+    /// Generic over the engine so tests can supply a mock.
+    pub fn collect_hessian_stats<E: CalibratingEngine>(
+        &self,
+        engine: &mut E,
+        dataset: &CalibrationDataset,
+    ) -> Result<HessianHook, Box<dyn std::error::Error>> {
+        let mut hook = HessianHook::new();
+        self.run_calibration(engine, dataset, &mut hook)?;
+        Ok(hook)
     }
 
     /// Shared calibration loop: iterate batches, run each sequence, report

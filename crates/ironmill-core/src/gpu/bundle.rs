@@ -40,6 +40,11 @@ pub enum TensorManifest {
         shape: Vec<usize>,
         n_bits: u8,
         dtype: String,
+        /// Optional QuIP# Hadamard rotation seed. When present, the tensor
+        /// uses E8 lattice vector quantization and requires the QuIP# dequant
+        /// path instead of the PolarQuant path.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quip_sharp_seed: Option<u32>,
     },
     /// Dense (unquantized) tensor stored as raw bytes.
     #[serde(rename = "dense")]

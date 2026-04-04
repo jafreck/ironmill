@@ -95,6 +95,11 @@ struct CompileArgs {
     #[arg(long = "polar-quantize", value_name = "BITS")]
     polar_quantize: Option<u8>,
 
+    /// QuIP# (E8 lattice) 2-bit weight quantization. Requires --cal-data
+    /// pointing to a directory for Hessian-guided calibration.
+    #[arg(long = "quip-sharp")]
+    quip_sharp: bool,
+
     /// Bit-width for quantization modes that accept it (e.g. d2quant: 2 or 3).
     #[arg(long, value_name = "N")]
     bits: Option<u8>,
@@ -313,6 +318,7 @@ fn run() -> Result<()> {
                     quantize_config: args.quantize_config,
                     palettize: args.palettize,
                     polar_quantize: args.polar_quantize,
+                    quip_sharp: args.quip_sharp,
                     bits: args.bits,
                     no_fusion: args.no_fusion,
                     input_shapes: args.input_shapes,
@@ -389,6 +395,7 @@ struct CompileOpts {
     quantize_config: Option<PathBuf>,
     palettize: Option<u8>,
     polar_quantize: Option<u8>,
+    quip_sharp: bool,
     bits: Option<u8>,
     no_fusion: bool,
     input_shapes: Vec<String>,
@@ -480,6 +487,12 @@ fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     // Reject conflicting quantization flags.
     if opts.quantize != "none" && opts.polar_quantize.is_some() {
         anyhow::bail!("Cannot specify both --quantize and --polar-quantize. Use only one.");
+    }
+    if opts.quip_sharp && opts.quantize != "none" {
+        anyhow::bail!("Cannot specify both --quantize and --quip-sharp. Use only one.");
+    }
+    if opts.quip_sharp && opts.polar_quantize.is_some() {
+        anyhow::bail!("Cannot specify both --polar-quantize and --quip-sharp. Use only one.");
     }
 
     // Build the pipeline — handles all quantization methods uniformly.
@@ -664,6 +677,19 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
         pipeline = pipeline
             .with_polar_quant(bits)
             .context("Failed to configure PolarQuant")?;
+    }
+
+    // Add QuIP# (E8 lattice 2-bit quantization)
+    if opts.quip_sharp {
+        if opts.cal_data.is_none() {
+            bail!(
+                "--quip-sharp requires --cal-data pointing to a calibration data directory \
+                 for Hessian-guided rounding"
+            );
+        }
+        pipeline = pipeline
+            .with_quip_sharp(2, 42)
+            .context("Failed to configure QuIP# quantization")?;
     }
 
     // Add compute unit annotations (should run last, after all transforms).

@@ -10,7 +10,85 @@ use mil_rs::ir::ScalarType;
 
 use crate::dequant::{read_typed_f32, unpack_indices};
 
+// ── E8 codebook constants ────────────────────────────────────────
+
+/// Number of entries in the E8 lattice codebook.
+const E8_CODEBOOK_SIZE: usize = 256;
+
+/// Dimension of each E8 codebook entry (elements per group).
+const E8_GROUP_DIM: usize = 8;
+
 // ── Public API ───────────────────────────────────────────────────
+
+/// Dequantize a QuIP#-encoded tensor (E8 codebook) to FP16 bytes.
+///
+/// Each u8 index selects one of 256 entries from the E8 codebook (8 elements
+/// each). After reconstruction, applies inverse Hadamard rotation using
+/// `quip_sharp_seed` and rescales by per-row norms.
+pub fn dequant_quip_sharp(
+    indices: &[u8],
+    lut: &[u8],
+    lut_dtype: ScalarType,
+    original_shape: &[usize],
+    row_norms: &[u8],
+    norms_dtype: ScalarType,
+    seed: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let total_elements: usize = original_shape.iter().product();
+    let cols = *original_shape
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("shape must be non-empty"))?;
+    let rows = if cols == 0 { 0 } else { total_elements / cols };
+
+    // QuIP# operates on padded (power-of-2) columns.
+    let padded_cols = cols.next_power_of_two();
+    let groups_per_row = padded_cols / E8_GROUP_DIM;
+    let entry_size = lut_dtype.byte_size();
+    let norm_size = norms_dtype.byte_size();
+
+    // Read the E8 codebook into f32.
+    let mut codebook = vec![[0.0f32; E8_GROUP_DIM]; E8_CODEBOOK_SIZE];
+    for (i, entry) in codebook.iter_mut().enumerate() {
+        for (j, val) in entry.iter_mut().enumerate() {
+            let offset = (i * E8_GROUP_DIM + j) * entry_size;
+            *val = read_typed_f32(lut, offset, lut_dtype)?;
+        }
+    }
+
+    // Reconstruct the padded weight matrix from codebook indices.
+    let work_total = rows * padded_cols;
+    let mut f32_values = vec![0.0f32; work_total];
+    for r in 0..rows {
+        for g in 0..groups_per_row {
+            let idx_pos = r * groups_per_row + g;
+            if idx_pos >= indices.len() {
+                break;
+            }
+            let cb_idx = indices[idx_pos] as usize;
+            let entry = &codebook[cb_idx.min(E8_CODEBOOK_SIZE - 1)];
+            let base = r * padded_cols + g * E8_GROUP_DIM;
+            for (k, &v) in entry.iter().enumerate() {
+                f32_values[base + k] = v;
+            }
+        }
+    }
+
+    // Apply inverse Hadamard rotation.
+    mil_rs::ir::passes::rotation::unrotate_rows_hadamard(&mut f32_values, rows, padded_cols, seed);
+
+    // Trim padding and apply per-row norms, convert to FP16.
+    let mut output = Vec::with_capacity(total_elements * 2);
+    for row in 0..rows {
+        let norm = read_typed_f32(row_norms, row * norm_size, norms_dtype)?;
+        for col in 0..cols {
+            let value = f32_values[row * padded_cols + col];
+            let result = f16::from_f32(value * norm);
+            output.extend_from_slice(&result.to_le_bytes());
+        }
+    }
+
+    Ok(output)
+}
 
 /// Dequantize a LUT-encoded tensor to FP16 bytes.
 ///

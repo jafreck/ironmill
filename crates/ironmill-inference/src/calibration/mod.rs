@@ -19,4 +19,4 @@ pub use awq_store::{AwqActivationStore, ChannelMagnitudes};
 pub use dataset::CalibrationDataset;
 pub use gptq_store::{GptqActivationStore, HessianAccumulator};
 pub use hook::ActivationHook;
-pub use runner::{CalibratingEngine, CalibrationRunner};
+pub use runner::{CalibratingEngine, CalibrationRunner, HessianHook, QuipHessianAccumulator};

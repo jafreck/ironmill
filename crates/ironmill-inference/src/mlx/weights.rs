@@ -209,7 +209,7 @@ fn load_weight_buffer(
             n_bits,
             row_norms,
             norms_dtype,
-            polar_quant_seed: _,
+            ..
         } => {
             // Store as separate arrays for custom kernel dispatch.
             let idx_arr =

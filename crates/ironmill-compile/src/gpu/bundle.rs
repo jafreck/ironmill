@@ -76,6 +76,7 @@ pub fn write_gpu_bundle(
                 original_shape,
                 n_bits,
                 row_norms,
+                quip_sharp_seed,
                 ..
             } => {
                 methods_seen.insert("polarquant");
@@ -108,6 +109,7 @@ pub fn write_gpu_bundle(
                         shape: original_shape.clone(),
                         n_bits: *n_bits,
                         dtype: scalar_type_to_str(*lut_dtype).to_string(),
+                        quip_sharp_seed: quip_sharp_seed.map(|s| s as u32),
                     },
                 );
             }
@@ -456,6 +458,7 @@ mod tests {
                     row_norms: vec![0x22; 16],
                     norms_dtype: ScalarType::Float16,
                     polar_quant_seed: None,
+                    quip_sharp_seed: None,
                 },
             },
         );

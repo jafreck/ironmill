@@ -149,6 +149,10 @@ pub enum QuantizationInfo {
         /// Hadamard rotation seed. When present, inverse rotation must be
         /// applied after LUT reconstruction to recover original weights.
         polar_quant_seed: Option<u64>,
+        /// QuIP# Hadamard rotation seed. When present, the tensor uses E8
+        /// lattice vector quantization and requires the E8 codebook +
+        /// inverse Hadamard for dequantization.
+        quip_sharp_seed: Option<u64>,
     },
     /// Affine quantization: (quantized - zero_point) * scale.
     /// Produced by `constexpr_affine_dequantize` in MIL IR.

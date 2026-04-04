@@ -304,18 +304,33 @@ fn load_weight_buffer(
             row_norms,
             norms_dtype,
             polar_quant_seed,
+            quip_sharp_seed,
         } => {
-            if force_cpu_dequant {
-                let data = dequant_lut_to_dense(
-                    indices,
-                    lut,
-                    *lut_dtype,
-                    original_shape,
-                    *n_bits,
-                    row_norms,
-                    *norms_dtype,
-                    *polar_quant_seed,
-                )?;
+            // QuIP# tensors always CPU-dequant for now (GPU kernel dispatch
+            // is wired but inference.rs routing is not yet implemented).
+            if quip_sharp_seed.is_some() || force_cpu_dequant {
+                let data = if let Some(seed) = quip_sharp_seed {
+                    super::dequant::dequant_quip_sharp(
+                        indices,
+                        lut,
+                        *lut_dtype,
+                        original_shape,
+                        row_norms,
+                        *norms_dtype,
+                        *seed,
+                    )?
+                } else {
+                    dequant_lut_to_dense(
+                        indices,
+                        lut,
+                        *lut_dtype,
+                        original_shape,
+                        *n_bits,
+                        row_norms,
+                        *norms_dtype,
+                        *polar_quant_seed,
+                    )?
+                };
                 let buf = device
                     .create_buffer_with_data(&data, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;

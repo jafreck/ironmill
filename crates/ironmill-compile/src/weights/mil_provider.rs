@@ -53,13 +53,18 @@ impl MilWeightProvider {
                 Some(n) => n.as_str(),
                 None => continue,
             };
-            if !output_name.ends_with("_polar_norms") {
+            if !output_name.ends_with("_polar_norms") && !output_name.ends_with("_quip_norms") {
                 continue;
             }
             // Extract the tensor value from inputs or attributes.
             let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
             if let Some(Value::Tensor { data, dtype, .. }) = val {
-                let prefix = &output_name[..output_name.len() - "_polar_norms".len()];
+                let suffix = if output_name.ends_with("_polar_norms") {
+                    "_polar_norms"
+                } else {
+                    "_quip_norms"
+                };
+                let prefix = &output_name[..output_name.len() - suffix.len()];
                 norms_map.insert(prefix.to_string(), (data.clone(), *dtype));
             }
         }
@@ -104,6 +109,12 @@ impl MilWeightProvider {
                         _ => None,
                     };
 
+                    // Extract quip_sharp_seed for E8 lattice dequantization.
+                    let quip_sharp_seed = match op.attributes.get("quip_sharp_seed") {
+                        Some(Value::Int(v)) => Some(*v as u64),
+                        _ => None,
+                    };
+
                     // The stored data is the packed indices (the primary payload
                     // consumers will unpack during GPU dispatch).
                     let extracted = ExtractedTensor {
@@ -119,6 +130,7 @@ impl MilWeightProvider {
                             row_norms,
                             norms_dtype,
                             polar_quant_seed,
+                            quip_sharp_seed,
                         },
                     };
                     tensors.insert(name, extracted);
@@ -209,7 +221,8 @@ impl MilWeightProvider {
                 "const" => {
                     // Skip norms ops — they are already consumed above.
                     let output_name: &str = op.outputs.first().map(String::as_str).unwrap_or("");
-                    if output_name.ends_with("_polar_norms") {
+                    if output_name.ends_with("_polar_norms") || output_name.ends_with("_quip_norms")
+                    {
                         continue;
                     }
 
@@ -383,6 +396,7 @@ impl MilWeightProvider {
                         row_norms: norms_data,
                         norms_dtype: ScalarType::Float16,
                         polar_quant_seed: None,
+                        quip_sharp_seed: None,
                     },
                 },
             );

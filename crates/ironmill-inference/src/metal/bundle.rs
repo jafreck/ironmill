@@ -89,6 +89,7 @@ impl WeightProvider for MetalBundleProvider {
                 shape,
                 n_bits,
                 dtype,
+                quip_sharp_seed,
             } => {
                 let indices = self.read_file(indices_file)?;
                 let lut = self.read_file(lut_file)?;
@@ -109,6 +110,7 @@ impl WeightProvider for MetalBundleProvider {
                         row_norms,
                         norms_dtype: dtype,
                         polar_quant_seed: None, // Bundle tensors are pre-unrotated
+                        quip_sharp_seed: quip_sharp_seed.map(|s| s as u64),
                     },
                 })
             }

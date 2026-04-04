@@ -112,6 +112,7 @@ const KNOWN_PASSES: &[&str] = &[
     "int4-quantize",
     "palettization",
     "polar-quantization",
+    "quip-sharp",
     "shape-materialization",
 ];
 
@@ -163,6 +164,18 @@ fn pass_from_name(name: &str, params: &HashMap<String, toml::Value>) -> Result<B
             }
             let n_bits = n_bits_i64 as u8;
             Ok(Box::new(PalettizePass::new(n_bits)))
+        }
+        "quip-sharp" => {
+            let bits = params.get("bits").and_then(|v| v.as_integer()).unwrap_or(2) as u8;
+            let seed = params
+                .get("seed")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(42) as u64;
+            Ok(Box::new(QuipSharpPass {
+                bits,
+                seed,
+                min_elements: 256,
+            }))
         }
         "polar-quantization" => {
             let n_bits = params.get("bits").and_then(|v| v.as_integer()).unwrap_or(4) as u8;
@@ -2294,8 +2307,8 @@ name = "int4-quantize"
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("mutually exclusive"),
-            "expected mutual exclusivity error, got: {err}"
+            err.contains("mutually exclusive") || err.contains("requires the 'gptq' feature"),
+            "expected mutual exclusivity or feature-gate error, got: {err}"
         );
     }
 

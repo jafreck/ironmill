@@ -39,6 +39,7 @@ fn main() {
         "fused_embedding_norm",
         "int4_dequant",
         "affine_matmul",
+        "quip_sharp",
     ];
 
     for name in &independent {

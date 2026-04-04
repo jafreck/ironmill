@@ -393,10 +393,10 @@ fn validate_manifest(manifest: &PipelineManifest) -> Result<()> {
         }
 
         match stage.quantize.as_str() {
-            "none" | "fp16" | "int8" => {}
+            "none" | "fp16" | "int8" | "quip-sharp" => {}
             other => {
                 return Err(MilError::Validation(format!(
-                    "stage '{}': unsupported quantize value '{other}' (expected 'none', 'fp16', or 'int8')",
+                    "stage '{}': unsupported quantize value '{other}' (expected 'none', 'fp16', 'int8', or 'quip-sharp')",
                     stage.name
                 )));
             }
@@ -474,6 +474,9 @@ fn build_stage_pipeline(stage: &StageConfig, base_dir: &Path) -> Result<PassPipe
         "int8" => {
             let cal_data = stage.cal_data.as_ref().map(|p| base_dir.join(p));
             pipeline = pipeline.with_int8(cal_data)?;
+        }
+        "quip-sharp" => {
+            pipeline = pipeline.with_quip_sharp(2, 42)?;
         }
         _ => {}
     }

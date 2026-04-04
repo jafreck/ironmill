@@ -56,6 +56,40 @@ impl QuipSharpPass {
             min_elements: 256,
         }
     }
+
+    /// LDLQ Hessian-guided rounding for a single layer's weight matrix.
+    ///
+    /// Given a per-layer Hessian `H ≈ X^T X / n` (where X is the input
+    /// activation matrix from calibration), uses Cholesky decomposition to
+    /// adaptively round weight values for lower quantization error.
+    ///
+    /// Currently delegates to the default nearest-neighbor E8 quantization
+    /// path. A future implementation will perform the full LDLQ solve:
+    ///   1. Compute L D L^T decomposition of H
+    ///   2. Process columns in reverse order
+    ///   3. Round each group using the E8 codebook with Hessian-weighted error
+    ///   4. Propagate rounding error to remaining columns
+    pub fn quantize_with_hessian(
+        &self,
+        weights: &[f32],
+        rows: usize,
+        cols: usize,
+        _hessian: &[f32],
+    ) -> bool {
+        let shape = if rows == 1 {
+            vec![cols]
+        } else {
+            vec![rows, cols]
+        };
+        let info = EligibleTensor {
+            floats: weights.to_vec(),
+            shape,
+            original_output: String::new(),
+            op_name: String::new(),
+            original_dtype: ScalarType::Float32,
+        };
+        compute_quantization(&info, self.seed).is_some()
+    }
 }
 
 impl Pass for QuipSharpPass {
