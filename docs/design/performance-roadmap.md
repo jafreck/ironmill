@@ -5,7 +5,7 @@ Current baseline (Qwen3-0.6B, Metal FP16, Apple Silicon):
 | Metric | Value |
 |--------|-------|
 | Decode throughput | ~35 tok/s (single-token autoregressive) |
-| Prefill 1024 tok | 758 tok/s |
+| Prefill 1024 tok | 1287 tok/s |
 | Prefill 8192 tok | 214 tok/s |
 | PPL (1024-tok wikitext2) | 12.86 (matches HuggingFace reference) |
 
@@ -22,172 +22,174 @@ Reference comparison (HuggingFace transformers, CPU FP32, same hardware):
 
 ## Tier 1 — Critical performance gaps
 
-### 1. Fused Scaled Dot-Product Attention (SDPA)
+### 1. Fused SDPA with simdgroup matrix tiling
 
-**Status:** Proposed ([ADR-0001](adr/0001-fused-sdpa-metal-kernel.md))  
-**Expected impact:** 3–5× prefill throughput at ≥2048 tokens  
+**Status:** Proposed ([ADR-0001](../adr/0001-fused-sdpa-metal-kernel.md))
+**Expected impact:** 3–5× prefill throughput at ≥2048 tokens
 **Complexity:** High
+**SOTA reference:** FlashAttention-3 (Dao et al., NeurIPS 2024)
 
 The single largest bottleneck. The current attention kernel dispatches one threadgroup per (head, query), giving O(n²) threadgroup count with severe causal-mask load imbalance. At 8192 tokens the GPU is 73% slower than CPU.
 
-A fused SDPA kernel tiles over both Q and KV dimensions using `simdgroup_matrix_multiply_accumulate`, keeping all intermediate data (scores, softmax state, weighted-V accumulator) in SRAM. Each KV tile is loaded once from global memory and reused across all Q tokens in the block. This matches the FlashAttention-2 algorithm that PyTorch and llama.cpp use.
+FlashAttention-3 introduces warp-specialization to overlap matmul compute with async memory loads, plus interleaved block-quantized softmax. While FA3's async TMA features are CUDA/Hopper-specific, the core tiling strategy (Q blocks × KV tiles with online softmax, `simdgroup_matrix_multiply_accumulate` for both QK^T and weighted-V) maps directly to Metal's simdgroup matrix hardware.
+
+The Metal adaptation should tile over both Q and KV dimensions using 8×8 simdgroup tiles, keeping all intermediate data in SRAM. GQA-aware: multiple Q heads share KV tile loads from the same KV head group.
 
 **Target:** ≥800 tok/s at 8192 tokens (matching CPU baseline).
 
-### 2. Speculative decoding
+### 2. EAGLE-3 / P-EAGLE speculative decoding
 
-**Status:** Not implemented  
-**Expected impact:** 2–3× decode throughput  
-**Complexity:** Medium
+**Status:** Not implemented
+**Expected impact:** 3–6× decode throughput
+**Complexity:** Medium–High
+**SOTA reference:** EAGLE-3 (NeurIPS 2025), P-EAGLE (AWS/vLLM 2025)
 
-Use a small draft model (e.g., 0.1B) to propose N candidate tokens, then verify them in a single forward pass of the full model. Accepted tokens skip individual decode steps. Requires:
+EAGLE-3 is the current SOTA for speculative decoding, using multi-layer feature fusion (not just second-top-layer extrapolation like EAGLE-1) to generate richer draft trees. Pre-trained SpecBundle draft heads are available for Qwen and Llama families.
 
-- Draft model integration (load two models simultaneously)
-- Batched verification pass (prefill N candidate tokens)
-- Rejection sampling for distribution-correct generation
-- KV cache rollback for rejected tokens
+P-EAGLE extends this with parallel draft generation — all K candidate tokens produced in a single forward pass of the draft head instead of K sequential passes, eliminating the sequential bottleneck at high speculation depths.
 
-llama.cpp implements this as "speculative sampling" with configurable draft length. PyTorch has `torch.compile` + speculative decoding in torchtune.
+Implementation requires:
+- EAGLE-3 draft head (small MLP that fuses features from target model layers)
+- Tree-structured candidate generation with dynamic depth
+- Batched verification via prefill of candidate token tree
+- KV cache rollback for rejected branches
+- SpecBundle checkpoint loading for common model families
 
-**Target:** 70–100 tok/s decode for Qwen3-0.6B (vs ~35 tok/s today).
+The draft head is ~2–5% of target model parameters and runs on the same GPU. Combined with ironmill's existing TurboQuant KV cache, this should compose cleanly.
 
-### 3. Top-k / top-p / repetition penalty sampling
+**Target:** 100–200 tok/s decode for Qwen3-0.6B (vs ~35 tok/s today).
 
-**Status:** Temperature-only (greedy/temperature scaling exist, no nucleus sampling)  
-**Expected impact:** Table stakes for generation quality  
+### 3. Min-p sampling + full sampler chain
+
+**Status:** Temperature-only (no nucleus, min-p, or repetition penalty)
+**Expected impact:** Table stakes for generation quality
 **Complexity:** Low
+**SOTA reference:** Min-p (ICLR 2025, Nguyen et al.)
 
-Every production LLM interface requires at minimum: top-k filtering, nucleus (top-p) sampling, repetition penalty, and frequency penalty. These operate on the logits vector after the forward pass — no kernel changes needed, just CPU-side post-processing.
+Min-p sampling is the SOTA replacement for top-p (nucleus) sampling. Instead of a fixed cumulative probability threshold, min-p scales the cutoff dynamically: `prob(token) > min_p × prob(top_token)`. This adapts to model confidence — restrictive when confident, permissive when uncertain — giving better coherence at high temperatures than top-p.
 
-- Top-k: keep only the k highest logits, zero the rest
-- Top-p (nucleus): keep logits whose cumulative softmax probability ≤ p
-- Repetition penalty: scale down logits for tokens that appeared in context
-- Min-p: newer alternative to top-p with better tail behavior
+Full sampler chain (matching llama.cpp's `llama_sampler`):
+1. Repetition/frequency/presence penalty
+2. Temperature scaling
+3. Min-p filtering (replaces top-p as default)
+4. Top-k filtering (optional, compositional with min-p)
+5. Categorical sampling from filtered distribution
 
-**Target:** Feature-complete sampling API matching llama.cpp's `llama_sampler`.
+All of this is CPU-side logit post-processing — no kernel changes needed.
 
 ---
 
 ## Tier 2 — Important for production use
 
-### 4. Prompt caching / KV cache persistence
+### 4. RadixAttention prompt caching
 
-**Status:** Not implemented  
-**Expected impact:** Skip re-prefill for shared prompt prefixes  
+**Status:** Not implemented
+**Expected impact:** Eliminate re-prefill for shared prompt prefixes
 **Complexity:** Medium
+**SOTA reference:** RadixAttention (SGLang, LMSYS 2024)
 
-For multi-turn chat, the system prompt + conversation history is re-prefilled on every turn. With KV cache persistence:
+RadixAttention (from SGLang) caches computed KV activations in a radix tree (Patricia trie). When a new request shares any prompt prefix with a cached entry, only the new tokens need computation. This gives up to 5× throughput improvement on workloads with ≥60% prefix overlap (chatbots, RAG, tool-augmented agents).
 
-- Cache the KV state after prefilling a prompt prefix
-- On subsequent turns, restore the cached state and only prefill new tokens
-- Hash-based cache key (prompt token sequence → cached KV state)
+This is strictly better than naive "save/restore KV cache" because:
+- Multiple divergent continuations share the common prefix cache
+- Cache-aware scheduling maximizes hit rates
+- Eviction is LRU per radix node, not per sequence
 
-llama.cpp implements this as "prompt caching" with `llama_kv_cache_seq_cp`. This is especially impactful for long system prompts (1K+ tokens).
-
-**Target:** Zero re-prefill cost for unchanged prompt prefixes.
+For ironmill's local single-user case, a simplified version (linear prefix matching without the full radix tree) would capture most of the benefit for multi-turn chat.
 
 ### 5. KV cache reuse across turns
 
-**Status:** Not implemented (engine.reset() clears all state)  
-**Expected impact:** Eliminate redundant computation in multi-turn chat  
+**Status:** Not implemented (engine.reset() clears all state)
+**Expected impact:** Eliminate redundant computation in multi-turn chat
 **Complexity:** Low–Medium
 
 Currently `MetalInference::reset()` clears the entire KV cache. For multi-turn chat, the engine should:
-
 - Track which KV cache positions correspond to which conversation turns
-- On a new user message, keep existing KV entries and only prefill the new tokens
+- On a new user message, keep existing KV entries and only prefill new tokens
 - Support cache truncation (remove old turns when context window is full)
 
-This is simpler than full prompt caching — it just means not discarding valid KV state between calls.
+This is a prerequisite for RadixAttention and a standalone win for chat UX.
 
-### 6. Sliding window attention
+### 6. Sliding window attention with ring-buffer KV cache
 
-**Status:** Partial (config field exists, mask not enforced in Metal kernels)  
-**Expected impact:** Enables infinite-length generation with bounded memory  
+**Status:** Partial (config field parsed, not enforced in Metal kernels)
+**Expected impact:** Bounded memory for infinite-length generation
 **Complexity:** Medium
 
-Qwen3 and Mistral use sliding window attention where each token attends to at most W preceding tokens (e.g., W=4096). This bounds KV cache memory to W entries regardless of generation length.
-
-The `config.json` field `sliding_window` is already parsed but the Metal attention kernels don't enforce the window — they attend to all positions up to the causal mask. Implementing this requires:
-
-- Modifying the attention kernel's causal mask to `max(0, pos - W) .. pos`
-- Ring-buffer KV cache that overwrites old entries
-- Per-layer window selection (Qwen3 `max_window_layers` controls which layers use sliding vs full attention)
+Qwen3 and Mistral use sliding window attention (W=4096 or similar). The attention kernel should clamp the causal mask to `max(0, pos - W)..pos` and the KV cache should use a ring buffer that overwrites old entries. Qwen3's `max_window_layers` controls which layers use sliding vs full attention.
 
 ---
 
-## Tier 3 — Serving and scale
+## Tier 3 — Serving infrastructure
 
-### 7. Continuous batching
+### 7. Continuous batching with vAttention-style memory
 
-**Status:** Not implemented  
-**Expected impact:** N× throughput for concurrent requests  
+**Status:** Not implemented
+**Expected impact:** N× throughput for concurrent requests
 **Complexity:** High
+**SOTA reference:** vAttention (Microsoft, ASPLOS 2025)
 
-Process multiple independent sequences simultaneously, dynamically adding/removing sequences as they complete. The matmul batch dimension absorbs multiple sequences with negligible overhead since GPU ALUs are underutilized on single-sequence inference.
+vAttention improves on PagedAttention by maintaining virtual contiguity of KV cache memory while enabling dynamic physical allocation. This means standard attention kernels (like our fused SDPA) work without modification — no page table indirection in the kernel. Memory is allocated on-demand but appears contiguous to the GPU.
 
-Requires:
-- Multi-sequence KV cache management
-- Dynamic batch assembly (different sequences at different positions)
-- Request queue with preemption
-- Paged attention or pre-allocated per-sequence cache slots
+On Metal/Apple Silicon, the equivalent would be using Metal's virtual memory APIs (if available) or a simpler pool allocator with contiguous sub-allocations per sequence. The key insight: avoid rewriting attention kernels for paging.
 
-This is the core of vLLM and llama.cpp's server mode. Critical for any production serving deployment but less important for local single-user inference.
+Continuous batching dynamically adds/removes sequences as they complete, maximizing GPU utilization. Combined with vAttention-style allocation, this enables production serving on Apple Silicon.
 
-### 8. Paged attention
+### 8. Cross-layer KV cache sharing (CLA)
 
-**Status:** Not implemented  
-**Expected impact:** Eliminates KV cache memory fragmentation  
-**Complexity:** High
+**Status:** Not implemented
+**Expected impact:** 2× KV cache memory reduction
+**Complexity:** Medium (requires model support or fine-tuning)
+**SOTA reference:** CLA (NeurIPS 2024), FusedKV (ICLR 2026)
 
-Allocate KV cache in fixed-size pages (e.g., 16 tokens per page) instead of contiguous pre-allocated blocks. Benefits:
+Cross-Layer Attention shares KV caches between adjacent layers — subsequent layers reuse the KV cache from "anchor" layers instead of storing their own. This reduces KV memory by 2× or more beyond GQA, with negligible quality loss.
 
-- No wasted memory from pre-allocating max_seq_len per sequence
-- Dynamic memory sharing across batched sequences
-- Enables longer contexts without OOM
-- Foundation for continuous batching
+FusedKV (ICLR 2026) extends this by learnably fusing informative K/V from bottom and middle layers, achieving better quality-memory trade-offs than simple sharing.
 
-The attention kernel reads KV data through a page table (indirect lookup). This adds one level of indirection but eliminates the memory waste of contiguous allocation.
+This requires model architecture support (the model must be trained or fine-tuned with CLA). ironmill's role is to detect CLA-enabled models and share cache buffers between layers accordingly.
 
-### 9. Tensor parallelism
+### 9. Multi-Head Latent Attention (MLA) support
 
-**Status:** Not implemented  
-**Expected impact:** Run larger models by splitting across GPU cores  
-**Complexity:** High
-
-Apple Silicon has unified memory but multiple GPU core clusters. Tensor parallelism splits large matmuls across cores with all-reduce synchronization. More relevant for M2 Ultra / M3 Ultra with 2 GPU dies, or future multi-chip configurations.
-
-Not a priority for single-die Apple Silicon where the GPU is already a single device.
-
-### 10. CPU offloading
-
-**Status:** Not implemented  
-**Expected impact:** Fit models larger than GPU VRAM  
+**Status:** Not implemented
+**Expected impact:** 5–10× KV cache compression vs MHA
 **Complexity:** Medium
+**SOTA reference:** DeepSeek-V2/V3 MLA architecture
 
-Keep some layers on CPU (using Accelerate BLAS) while critical layers run on GPU. llama.cpp supports this with `--n-gpu-layers`. On Apple Silicon with unified memory, the "offloading" is mainly about which compute unit runs each layer — data doesn't need physical transfer.
+MLA projects keys and values into a shared low-dimensional latent space, storing only the compressed latent per token. During attention, the latent is up-projected on-the-fly. Used by DeepSeek-V2/V3 models. ironmill would need:
+- Detect MLA config in model metadata
+- Store compressed latent KV cache instead of full K/V
+- On-the-fly up-projection in the attention kernel
 
 ---
 
-## Tier 4 — Quality and efficiency
+## Tier 4 — Advanced optimizations
 
-### 11. Activation-aware quantization improvements
+### 10. Speculative Streaming (no auxiliary model)
 
-**Status:** Partial (AWQ, GPTQ exist at compile time)  
-**Expected impact:** Better quality per bit  
-**Complexity:** Medium
-
-- **SmoothQuant:** Migrate quantization difficulty from activations to weights using per-channel scaling. Improves INT8 quality significantly.
-- **GGUF IQ (importance-aware quantization):** Non-uniform quantization that assigns more bits to important weights. llama.cpp's IQ2/IQ3 formats achieve better quality than uniform INT4.
-- **Runtime dynamic quantization:** Quantize activations on-the-fly based on their actual distribution, rather than using fixed scales from calibration.
-
-### 12. Sparse attention patterns
-
-**Status:** Not implemented  
-**Expected impact:** Reduce attention compute for very long sequences  
+**Status:** Not implemented
+**Expected impact:** 2–3× decode throughput without draft model
 **Complexity:** High
+**SOTA reference:** Speculative Streaming (OpenReview 2025)
 
-For sequences >8K tokens, full attention becomes prohibitive even with fused SDPA. Sparse patterns (local + stride, BigBird, Longformer) reduce attention from O(n²) to O(n√n) or O(n·log(n)). Most modern long-context models don't use these (they rely on RoPE scaling + full attention), so this is lower priority unless targeting 100K+ context.
+Eliminates the need for a separate draft model by integrating speculated token planning within the target model using multi-stream attention heads. Each forward pass produces both the "correct" next token and speculative future tokens. Ideal for edge/resource-constrained deployment where loading a separate draft model is impractical.
+
+### 11. Activation-aware quantization (XQuant)
+
+**Status:** Partial (AWQ, GPTQ exist at compile time)
+**Expected impact:** Better quality per bit at ultra-low precision
+**Complexity:** Medium
+**SOTA reference:** XQuant (EMNLP 2025)
+
+XQuant achieves ultra-low-bit KV cache quantization (2–4 bit) with cross-layer compression, using data-free calibration. This composes with ironmill's existing TurboQuant — XQuant could replace or supplement the codebook-based quantization with learned cross-layer compression for even better quality/memory trade-offs.
+
+### 12. TurboSpec adaptive speculation
+
+**Status:** Not implemented
+**Expected impact:** +20–50% over static speculative decoding
+**Complexity:** Medium
+**SOTA reference:** TurboSpec (Berkeley 2025)
+
+Closed-loop feedback system that dynamically tunes speculation depth, draft tree width, and acceptance thresholds at runtime based on observed acceptance rates. Maximizes "goodput" (accepted tokens per second) rather than raw proposals. Would be implemented as a runtime controller wrapping the EAGLE-3 draft head.
 
 ---
 
@@ -195,17 +197,33 @@ For sequences >8K tokens, full attention becomes prohibitive even with fused SDP
 
 ```
 Near-term (immediate impact):
-  ├── #3  Top-k/top-p sampling (low effort, table stakes)
-  ├── #5  KV cache reuse across turns (low effort, big UX win)
-  └── #1  Fused SDPA kernel (high effort, fixes scaling wall)
+  ├── #3  Min-p sampling + full sampler chain
+  ├── #5  KV cache reuse across turns
+  └── #1  Fused SDPA kernel (ADR-0001)
 
 Medium-term (production readiness):
-  ├── #2  Speculative decoding (2–3× decode speed)
-  ├── #4  Prompt caching
+  ├── #2  EAGLE-3 / P-EAGLE speculative decoding
+  ├── #4  RadixAttention prompt caching
   └── #6  Sliding window attention
 
-Long-term (serving infrastructure):
-  ├── #7  Continuous batching
-  ├── #8  Paged attention
-  └── #9  Tensor parallelism
+Long-term (serving + architectural):
+  ├── #7  Continuous batching + vAttention
+  ├── #8  Cross-layer KV sharing (CLA)
+  ├── #9  MLA support
+  └── #10-12 Advanced optimizations
 ```
+
+## References
+
+- FlashAttention-3: https://arxiv.org/abs/2407.08608
+- EAGLE-3: https://github.com/SafeAILab/EAGLE
+- P-EAGLE: https://vllm.ai/blog/p-eagle
+- SpecBundle: https://www.lmsys.org/blog/2025-12-23-spec-bundle-phase-1/
+- Min-p sampling: https://arxiv.org/abs/2407.01082
+- RadixAttention: https://www.lmsys.org/blog/2024-01-17-sglang/
+- vAttention: https://arxiv.org/abs/2405.04437
+- CLA: https://arxiv.org/abs/2405.12981
+- FusedKV: https://openreview.net/forum?id=4pivvEJiCl
+- XQuant: https://github.com/brinenick511/XQuant
+- TurboSpec: https://www2.eecs.berkeley.edu/Pubs/TechRpts/2025/EECS-2025-224.html
+- Speculative Streaming: https://openreview.net/forum?id=jt8wI3ZzXG
