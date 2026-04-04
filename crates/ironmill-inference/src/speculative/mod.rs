@@ -20,6 +20,7 @@ pub mod config;
 pub mod draft_head;
 pub mod specbundle;
 pub mod tree;
+pub mod turbospec;
 
 use std::path::Path;
 
@@ -27,9 +28,10 @@ use crate::engine::{InferenceEngine, InferenceError};
 use crate::sampling::Sampler;
 use crate::types::Logits;
 
-pub use config::SpecConfig;
+pub use config::{SpecConfig, TurboSpecConfig};
 pub use draft_head::DraftHead;
 pub use tree::{CandidateTree, DraftCandidate};
+pub use turbospec::TurboSpecController;
 
 /// Speculative decoding engine wrapping a target [`InferenceEngine`].
 ///
@@ -42,6 +44,7 @@ pub struct SpeculativeEngine<E: InferenceEngine> {
     draft_head: Option<DraftHead>,
     config: SpecConfig,
     sampler: Sampler,
+    turbospec: Option<TurboSpecController>,
 }
 
 impl<E: InferenceEngine> SpeculativeEngine<E> {
@@ -52,7 +55,14 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
             draft_head: None,
             config,
             sampler,
+            turbospec: None,
         }
+    }
+
+    /// Enable TurboSpec adaptive speculation control.
+    pub fn with_turbospec(mut self, config: TurboSpecConfig) -> Self {
+        self.turbospec = Some(TurboSpecController::new(config));
+        self
     }
 
     /// Load a draft head from a SpecBundle checkpoint directory.
@@ -71,6 +81,11 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
         last_token: u32,
         last_hidden: &[f32],
     ) -> Result<Vec<u32>, InferenceError> {
+        // Apply TurboSpec-tuned config before drafting.
+        if let Some(ref ts) = self.turbospec {
+            self.config = ts.current_config();
+        }
+
         let draft_head = match &self.draft_head {
             Some(h) => h,
             None => {
@@ -111,6 +126,11 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
             .iter()
             .map(|&i| tree.candidates[i].token_id)
             .collect();
+
+        // 5b. Feed results to TurboSpec controller.
+        if let Some(ref mut ts) = self.turbospec {
+            ts.observe(tree.candidates.len(), accepted_tokens.len());
+        }
 
         // 6. Sample correction token from adjusted distribution.
         //    decode_step(token) returns logits predicting what comes *after*
@@ -167,6 +187,11 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
     /// Check whether a draft head is loaded.
     pub fn has_draft_head(&self) -> bool {
         self.draft_head.is_some()
+    }
+
+    /// Access the TurboSpec controller, if enabled.
+    pub fn turbospec(&self) -> Option<&TurboSpecController> {
+        self.turbospec.as_ref()
     }
 
     /// Prefill candidate tokens through the target model, collecting
@@ -483,5 +508,73 @@ mod tests {
         }];
         let probs = compute_target_log_probs(&logits, &candidates);
         assert_eq!(probs[0], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn turbospec_builder_enables_controller() {
+        let engine = MockEngine::new(10);
+        let config = SpecConfig::default();
+        let sampler = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            ..SamplerConfig::default()
+        });
+
+        let spec = SpeculativeEngine::new(engine, config, sampler)
+            .with_turbospec(TurboSpecConfig::default());
+        assert!(spec.turbospec().is_some());
+    }
+
+    #[test]
+    fn turbospec_integration_with_draft_head() {
+        let engine = MockEngine::new(8);
+        let config = SpecConfig {
+            max_draft_depth: 2,
+            tree_width: 2,
+            acceptance_threshold: 0.01,
+        };
+        let sampler = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            ..SamplerConfig::default()
+        });
+
+        let mut spec =
+            SpeculativeEngine::new(engine, config, sampler).with_turbospec(TurboSpecConfig {
+                initial_depth: 2,
+                min_depth: 1,
+                max_depth: 8,
+                ema_alpha: 0.5,
+                depth_up_threshold: 0.8,
+                depth_down_threshold: 0.4,
+            });
+
+        let hidden_dim = 4;
+        let vocab_size = 8;
+        let weights = vec![half::f16::from_f32(0.1); hidden_dim * vocab_size];
+        let head = DraftHead::new(vec![weights], hidden_dim, vocab_size);
+        spec.draft_head = Some(head);
+
+        let hidden = vec![1.0f32; hidden_dim];
+        // Run several speculation rounds.
+        for _ in 0..10 {
+            let _tokens = spec.speculative_step(0, &hidden).unwrap();
+            // Reset engine position for next round.
+            spec.engine_mut().reset();
+        }
+
+        let ts = spec.turbospec().unwrap();
+        assert!(ts.total_proposed() > 0, "should have observed proposals");
+    }
+
+    #[test]
+    fn turbospec_not_enabled_by_default() {
+        let engine = MockEngine::new(10);
+        let config = SpecConfig::default();
+        let sampler = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            ..SamplerConfig::default()
+        });
+
+        let spec = SpeculativeEngine::new(engine, config, sampler);
+        assert!(spec.turbospec().is_none());
     }
 }
