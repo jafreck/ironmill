@@ -916,6 +916,232 @@ impl TurboSpecController {
 
 ---
 
+## Task 14 — QuIP# end-to-end weight quantization
+
+**Goal:** Wire the existing QuIP# mil-rs pass (Hadamard rotation + E8 lattice
+quantization) through the full compile → bundle → Metal inference pipeline,
+enabling 2-bit weight quantization with near-lossless quality.
+
+The core algorithm is already implemented: `QuipSharpPass` performs randomized
+Hadamard incoherence processing, quantizes weight vectors to 8-bit E8 lattice
+indices, extracts per-row norms, and rewrites ops to `constexpr_lut_to_dense`.
+The current pass uses nearest-neighbor E8 search without Hessian guidance.
+To match paper-quality results, the pass must be upgraded with Hessian-guided
+LDLQ (Lattice-based Data-Less Quantization) adaptive rounding.
+
+### Calibration requirements
+
+QuIP# requires a calibration dataset to estimate per-layer Hessians — the same
+pattern as AWQ and GPTQ. The Hessians capture second-order sensitivity
+(how much each weight perturbation affects layer output) and guide the adaptive
+rounding step in LDLQ.
+
+**Calibration data:** A few hundred to a few thousand text samples (e.g.,
+wikitext2 or a representative corpus). Reuse the existing `CalibrationRunner`
+infrastructure from the AWQ/GPTQ calibration pipeline.
+
+**Hessian estimation:** Per-layer, computed via forward pass on calibration data.
+For each linear layer, the Hessian is approximated as H ≈ X^T X / n where X is
+the matrix of input activations across calibration samples. This is the same
+approximation used by GPTQ. Extend the existing `HessianStore` (or add a new
+activation hook) to collect these per-layer Hessians during the calibration run.
+
+**LDLQ rounding:** Instead of nearest-neighbor E8 codebook lookup, LDLQ uses
+the Cholesky decomposition of the layer Hessian to perform adaptive rounding
+that accounts for inter-weight correlations. Weights are quantized column by
+column (like GPTQ), with the rounding error for each column propagated to
+subsequent columns via the Hessian. This is the step that makes QuIP# achieve
+<1 PPL loss at 2-bit — without it, naive E8 nearest-neighbor gives substantially
+worse results.
+
+**Calibration is mandatory.** `--quip-sharp` without `--calibration-data` is a
+compile error. Without Hessian-guided rounding, 2-bit E8 quantization produces
+unacceptably high PPL — shipping that path would give users a false impression
+of QuIP# quality.
+
+### Files to modify
+
+```
+crates/mil-rs/src/ir/passes/quip_sharp/mod.rs       — add LDLQ rounding path that accepts per-layer Hessian
+crates/mil-rs/src/ir/pipeline.rs                    — add quip_sharp to KNOWN_PASSES / pass_from_name()
+crates/ironmill-cli/src/main.rs                     — add --quip-sharp CLI flag; require --calibration-data
+crates/ironmill-compile/src/convert/pipeline.rs     — add quip_sharp to TOML pipeline stage
+crates/ironmill-compile/src/gpu/bundle.rs           — write QuIP# bundle metadata (method: "quip_sharp", seed)
+crates/ironmill-core/src/gpu/bundle.rs              — add quip_sharp_seed field to LutToDense manifest
+crates/ironmill-inference/src/metal/bundle.rs       — read quip_sharp_seed from bundle manifest
+crates/ironmill-inference/src/metal/dequant.rs      — dispatch to QuIP# dequant when quip_sharp_seed is present
+crates/ironmill-inference/src/metal/ops.rs          — add pipeline for quip_sharp_matvec / quip_sharp_matmul
+crates/ironmill-inference/src/metal/inference.rs    — select QuIP# kernel for QuIP#-quantized layers
+crates/ironmill-compile/src/weights/mil_provider.rs — read quip_sharp_seed from mil model metadata
+crates/ironmill-inference/src/calibration/runner.rs — extend CalibrationRunner with HessianHook for QuIP#
+```
+
+### Files to create
+
+```
+crates/ironmill-inference/src/metal/shaders/quip_sharp.metal
+```
+
+### Bundle metadata changes
+
+The `LutToDense` manifest variant gains an optional `quip_sharp_seed` field:
+
+```json
+{
+  "format": "lut_to_dense",
+  "n_bits": 8,
+  "method": "quip_sharp",
+  "quip_sharp_seed": 42,
+  "files": {
+    "indices": "layer.attn.q_proj.bin",
+    "lut": "layer.attn.q_proj.lut",
+    "norms": "layer.attn.q_proj.nrm"
+  }
+}
+```
+
+The `method` field distinguishes QuIP# from PolarQuant bundles. The seed is
+required for reconstructing the deterministic Hadamard rotation matrix at
+inference time.
+
+### Metal kernel signature
+
+```metal
+// E8 codebook in constant memory (256 entries × 8 half values = 4 KB)
+constant half e8_codebook[256][8] = { /* embedded at compile time */ };
+
+kernel void quip_sharp_matvec(
+    device const uint8_t* indices     [[buffer(0)]],  // [rows × cols/8] E8 lattice indices
+    device const half*    norms       [[buffer(1)]],  // [rows] per-row norm factors
+    device const half*    x           [[buffer(2)]],  // [cols] input vector
+    device half*          y           [[buffer(3)]],  // [rows] output vector
+    constant uint&        rows        [[buffer(4)]],
+    constant uint&        cols        [[buffer(5)]],
+    constant uint&        seed        [[buffer(6)]],  // Hadamard rotation seed
+    uint tid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+);
+```
+
+### Dequant logic (per row)
+
+```
+1. Load E8 indices for the row (cols/8 indices, each selecting one of 256 E8 vectors)
+2. Look up codebook vectors: w_quantized[i*8..(i+1)*8] = e8_codebook[index[i]]
+3. Apply inverse randomized Hadamard transform: w_rotated = H_seed^{-1} · w_quantized
+   - Fast Walsh–Hadamard transform (log2(cols) stages, in-register)
+   - Randomized: multiply by diagonal sign matrix derived from seed before/after WHT
+4. Multiply by per-row norm: w_final = norm[row] · w_rotated
+5. Dot product with input vector x
+```
+
+For the matvec kernel, steps 3–5 are fused: the Hadamard-rotated input vector
+is precomputed once (H_seed · x), then each row is a simple dot product of
+codebook-reconstructed values with the rotated input, scaled by the row norm.
+This avoids per-row inverse Hadamard transforms entirely.
+
+### Fused matvec optimization
+
+The key insight: instead of dequantizing W and computing W·x, compute
+W_q · (H·x) · norms, where W_q is the quantized (codebook-reconstructed)
+weight and H·x is the Hadamard-rotated input. The Hadamard rotation of x is
+O(n log n) and done once per layer, amortized across all rows.
+
+```
+1. Precompute x_rot = H_seed · x  (one WHT of the input vector, O(n log n))
+2. For each row:
+   a. Accumulate dot product of E8 codebook vectors with corresponding
+      8-element chunks of x_rot
+   b. Scale by row norm
+```
+
+This makes the inner loop a pure codebook-lookup + dot-product — the same
+pattern as PolarQuant matvec but with the E8 codebook and 8-element vector
+granularity.
+
+### Matmul kernel
+
+```metal
+kernel void quip_sharp_matmul(
+    device const uint8_t* indices     [[buffer(0)]],  // [rows × cols/8]
+    device const half*    norms       [[buffer(1)]],  // [rows]
+    device const half*    X           [[buffer(2)]],  // [batch × cols]
+    device half*          Y           [[buffer(3)]],  // [batch × rows]
+    constant uint&        rows        [[buffer(4)]],
+    constant uint&        cols        [[buffer(5)]],
+    constant uint&        batch       [[buffer(6)]],
+    constant uint&        seed        [[buffer(7)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  simd_lane [[thread_index_in_simdgroup]],
+    uint  simd_id   [[simdgroup_index_in_threadgroup]]
+);
+```
+
+Tiles over (row_block, batch_block) using simdgroup operations. Each
+threadgroup precomputes the Hadamard rotation of its X tile columns once,
+then performs codebook-lookup dot products across row tiles.
+
+### CLI integration
+
+```
+ironmill compile --quip-sharp --calibration-data wikitext2.json model.safetensors -o model.gpu
+ironmill compile --quip-sharp --calibration-data wikitext2.json --quip-sharp-seed 42 model.safetensors -o model.gpu
+```
+
+`--calibration-data` is required when `--quip-sharp` is specified. Omitting it
+is a compile error. Default seed: 0 (deterministic). The seed must match
+between compile and inference (stored in bundle manifest).
+
+### TOML pipeline config
+
+```toml
+[quantize]
+method = "quip_sharp"
+seed = 42
+calibration_data = "wikitext2.json"  # required
+```
+
+Added to `pass_from_name()` in pipeline.rs alongside existing methods.
+
+### CPU fallback dequant
+
+Update `crates/ironmill-inference/src/metal/dequant.rs` to handle
+`quip_sharp_seed`:
+
+```rust
+if let Some(seed) = quip_sharp_seed {
+    // 1. Reconstruct from LUT indices using E8 codebook
+    // 2. Apply inverse randomized Hadamard (using seed)
+    // 3. Multiply by row norms
+} else {
+    // Existing PolarQuant path
+}
+```
+
+### Acceptance criteria
+
+- `cargo test -p mil-rs -- quip_sharp` passes (existing + new round-trip tests).
+- `cargo test -p ironmill-inference` passes (no regression).
+- PPL on wikitext2 1024-tok with QuIP# 2-bit Qwen3-0.6B ≤ 14.0
+  (within ~1.14 of FP16 baseline 12.86).
+- Bundle size for Qwen3-0.6B is ≤ 110 MB (vs ~1.2 GB FP16, ~6× reduction;
+  2-bit weights + codebook + norms overhead).
+- Decode throughput ≥ 30 tok/s (≥85% of FP16 baseline; memory-bandwidth
+  savings from smaller weights should partially offset dequant compute cost).
+- `ironmill compile --quip-sharp --calibration-data data.json` produces a
+  valid `.gpu` bundle that loads and runs inference correctly.
+- CLI rejects `--quip-sharp` without `--calibration-data` with a clear error.
+- Round-trip test: quantize → bundle → load → dequant → compare against
+  mil-rs dequant reference with max error < 1e-3.
+- Hessian estimation completes in < 5 minutes for Qwen3-0.6B on a single
+  Apple Silicon GPU with 512 calibration samples.
+
+### Dependencies
+
+- None (independent — all prerequisite algorithmic code exists in mil-rs).
+
+---
+
 ## Dependency graph
 
 ```
@@ -926,7 +1152,8 @@ Independent (can start immediately):
   ├── Task 6   Sliding window attention
   ├── Task 8   Cross-layer KV sharing (CLA)
   ├── Task 9   MLA support
-  └── Task 12  Structured generation (JSON/grammar)
+  ├── Task 12  Structured generation (JSON/grammar)
+  └── Task 14  QuIP# end-to-end weight quantization
 
 Task 1 (Fused SDPA) ──→ Task 11  Prefill/decode phase separation
                     └──→ Task 7   Continuous batching + vAttention (also needs Task 5)

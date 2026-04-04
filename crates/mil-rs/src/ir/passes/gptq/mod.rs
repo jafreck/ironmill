@@ -19,7 +19,9 @@ use hessian::{cholesky_decompose, cholesky_inverse_factor, finalize_hessian};
 
 use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
-use crate::ir::passes::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
+use crate::ir::passes::tensor_utils::{
+    f32_slice_to_bytes, tensor_as_f32_slice, tensor_f16_as_f32_slice,
+};
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
 use crate::ir::types::Value;
@@ -31,7 +33,8 @@ use crate::ir::types::Value;
 /// weight matrix with per-group scales and zero points.  The op is then
 /// rewritten to `constexpr_affine_dequantize`.
 ///
-/// Weights whose names are **not** in `hessian_data` are left unchanged.
+/// All quantizable weight ops must have Hessian data — missing entries are
+/// an error. Calibration data is mandatory for GPTQ.
 pub struct GptqQuantizePass {
     /// Quantization bit width (4 or 8).
     pub bits: u8,
@@ -78,6 +81,15 @@ impl Pass for GptqQuantizePass {
     }
 
     fn run(&self, program: &mut Program) -> Result<()> {
+        if self.hessian_data.is_empty() {
+            return Err(MilError::Validation(
+                "GPTQ: hessian_data is empty. Calibration data is required — \
+                 run the calibration pipeline to collect per-layer Hessians \
+                 before applying the GPTQ pass."
+                    .into(),
+            ));
+        }
+
         let qmax = (1u32 << self.bits) - 1;
         let qmax_f = qmax as f32;
 
@@ -107,22 +119,19 @@ impl Pass for GptqQuantizePass {
                     None => continue,
                 };
 
-                // Locate the FP32 tensor value (may be in inputs or attributes).
-                let in_inputs = matches!(
-                    op.inputs.get("val"),
-                    Some(Value::Tensor {
-                        dtype: ScalarType::Float32,
-                        ..
-                    })
-                );
-                let in_attrs = !in_inputs
-                    && matches!(
-                        op.attributes.get("val"),
+                // Locate the tensor value (FP32 or FP16).
+                let is_float = |v: Option<&Value>| {
+                    matches!(
+                        v,
                         Some(Value::Tensor {
-                            dtype: ScalarType::Float32,
+                            dtype: ScalarType::Float32 | ScalarType::Float16,
                             ..
                         })
-                    );
+                    )
+                };
+
+                let in_inputs = is_float(op.inputs.get("val"));
+                let in_attrs = !in_inputs && is_float(op.attributes.get("val"));
 
                 if !in_inputs && !in_attrs {
                     continue;
@@ -138,13 +147,17 @@ impl Pass for GptqQuantizePass {
                         .ok_or_else(|| MilError::Validation("missing val in attributes".into()))?
                 };
 
-                if let Value::Tensor {
-                    data,
-                    shape,
-                    dtype: _,
-                } = val
-                {
-                    let floats = tensor_as_f32_slice(&data);
+                if let Value::Tensor { data, shape, dtype } = val {
+                    let floats = match dtype {
+                        ScalarType::Float32 => tensor_as_f32_slice(&data),
+                        ScalarType::Float16 => tensor_f16_as_f32_slice(&data),
+                        other => {
+                            return Err(MilError::TypeMismatch {
+                                expected: "Float32 or Float16".into(),
+                                actual: format!("{other:?}"),
+                            });
+                        }
+                    };
 
                     // W shape: [out_features, in_features].
                     assert!(
@@ -889,5 +902,119 @@ mod tests {
             err < 0.1,
             "8-bit GPTQ should have very low reconstruction error, got {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: Pass looks up Hessian data by onnx_name attribute
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gptq_pass_matches_by_onnx_name() {
+        let out_features = 4;
+        let in_features = 8;
+        let group_size = 4;
+
+        let w: Vec<f32> = (0..out_features * in_features)
+            .map(|i| i as f32 * 0.3 - 2.0)
+            .collect();
+
+        let xtx = identity_xtx(in_features, 1.0);
+
+        // Key the Hessian data with the HF-style name (onnx_name),
+        // NOT the MIL const name.
+        let mut hessian_data = HashMap::new();
+        hessian_data.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            (xtx, in_features, 2),
+        );
+
+        let pass = GptqQuantizePass::new(4, group_size, 128, 0.0, hessian_data);
+
+        // Create a program where op.name is the MIL name ("l0_q_proj_weight")
+        // but onnx_name is the HF name.
+        let tensor_val = Value::Tensor {
+            data: f32_bytes(&w),
+            shape: vec![out_features, in_features],
+            dtype: ScalarType::Float32,
+        };
+        let mut program = Program::new("1.0.0");
+        let mut func = Function::new("main");
+        let op = Operation::new("const", "l0_q_proj_weight")
+            .with_input("val", tensor_val)
+            .with_attr(
+                "onnx_name",
+                Value::String("model.layers.0.self_attn.q_proj.weight".into()),
+            )
+            .with_output("w_out");
+        func.body.add_op(op);
+        func.body.outputs.push("w_out".into());
+        program.add_function(func);
+
+        pass.run(&mut program).unwrap();
+
+        let op = &program.functions["main"].body.operations[0];
+        assert_eq!(
+            op.op_type, "constexpr_affine_dequantize",
+            "GPTQ pass should match by onnx_name when op.name doesn't match"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: Pass handles FP16 weight tensors (SafeTensors path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gptq_pass_handles_fp16_weights() {
+        let out_features = 4;
+        let in_features = 8;
+        let group_size = 4;
+
+        let w: Vec<f32> = (0..out_features * in_features)
+            .map(|i| i as f32 * 0.3 - 2.0)
+            .collect();
+
+        let xtx = identity_xtx(in_features, 1.0);
+
+        let mut hessian_data = HashMap::new();
+        hessian_data.insert("fp16_weight".to_string(), (xtx, in_features, 2));
+
+        let pass = GptqQuantizePass::new(4, group_size, 128, 0.0, hessian_data);
+
+        // Encode weights as FP16 bytes (like SafeTensors provides).
+        let fp16_bytes: Vec<u8> = w
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let tensor_val = Value::Tensor {
+            data: fp16_bytes,
+            shape: vec![out_features, in_features],
+            dtype: ScalarType::Float16,
+        };
+        let mut program = Program::new("1.0.0");
+        let mut func = Function::new("main");
+        func.body
+            .add_op(const_tensor_op("fp16_weight", "w_out", tensor_val));
+        func.body.outputs.push("w_out".into());
+        program.add_function(func);
+
+        pass.run(&mut program).unwrap();
+
+        let op = &program.functions["main"].body.operations[0];
+        assert_eq!(
+            op.op_type, "constexpr_affine_dequantize",
+            "GPTQ pass should handle FP16 weight tensors"
+        );
+
+        // Verify quantized output is well-formed.
+        match op.attributes.get("quantized_data") {
+            Some(Value::Tensor { shape, dtype, data }) => {
+                assert_eq!(*shape, vec![out_features, in_features]);
+                assert_eq!(*dtype, ScalarType::UInt8);
+                let numel = out_features * in_features;
+                assert_eq!(data.len(), numel.div_ceil(2)); // INT4 packed
+            }
+            other => panic!("expected quantized_data Tensor, got {other:?}"),
+        }
     }
 }

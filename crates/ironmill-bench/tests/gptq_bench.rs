@@ -85,7 +85,7 @@ mod gptq_bench {
             last_token = logits
                 .iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0);
         }
@@ -155,23 +155,27 @@ mod gptq_bench {
     /// Build the key map from MIL const-op weight names to calibration store keys.
     ///
     /// The Metal calibration dispatch captures activations at two hook points per
-    /// layer: `"attn_norm"` (RMSNorm output feeding Q/K/V/O projections) and
-    /// `"ffn_norm"` (RMSNorm output feeding gate/up/down projections). The store
+    /// layer: `"attn_norm"` (RMSNorm output feeding Q/K/V projections) and
+    /// `"ffn_norm"` (RMSNorm output feeding gate/up projections). The store
     /// keys follow the pattern `"layer_{i}_{name}"`.
     ///
-    /// The MIL const-op names from SafeTensors import follow HuggingFace naming:
-    /// `"model.layers.{i}.self_attn.{proj}.weight"` and
-    /// `"model.layers.{i}.mlp.{proj}.weight"`.
+    /// `o_proj` and `down_proj` are excluded because their input activations
+    /// come from intermediate computations (attention output / SiLU·gate),
+    /// not from the norm outputs that the calibration hooks capture.
     fn build_gptq_key_map(n_layers: usize) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for i in 0..n_layers {
-            for proj in &["q_proj", "k_proj", "v_proj", "o_proj"] {
+            // attn_norm feeds Q/K/V (all have in_features == hidden_size).
+            // o_proj has in_features == num_heads*head_dim which may differ.
+            for proj in &["q_proj", "k_proj", "v_proj"] {
                 map.insert(
                     format!("model.layers.{i}.self_attn.{proj}.weight"),
                     format!("layer_{i}_attn_norm"),
                 );
             }
-            for proj in &["gate_proj", "up_proj", "down_proj"] {
+            // ffn_norm feeds gate/up (both have in_features == hidden_size).
+            // down_proj has in_features == intermediate_size.
+            for proj in &["gate_proj", "up_proj"] {
                 map.insert(
                     format!("model.layers.{i}.mlp.{proj}.weight"),
                     format!("layer_{i}_ffn_norm"),

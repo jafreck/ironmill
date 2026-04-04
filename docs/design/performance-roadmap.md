@@ -165,6 +165,34 @@ ironmill would need:
 
 ---
 
+## Weight quantization
+
+### 14. QuIP# end-to-end weight quantization
+
+**Status:** Partial (mil-rs pass + E8 codebook + Hadamard rotation implemented; not wired through bundle/Metal/CLI)
+**Expected impact:** 2-bit weights with <1 PPL loss on 70B-class models; ~8× memory reduction vs FP16
+**Complexity:** Medium (most algorithmic work done; remaining work is plumbing + Metal kernel)
+**SOTA reference:** QuIP# (ICML 2024, Tseng et al.); E8 lattice codebooks + randomized Hadamard incoherence
+
+QuIP# achieves near-lossless 2-bit weight quantization via three key components: (1) randomized Hadamard transforms that decorrelate weight matrices, making quantization error uniform across dimensions, (2) E8 lattice vector codebooks that exploit optimal 8D sphere packing for hardware-friendly LUT-based dequantization, and (3) Hessian-guided adaptive rounding (LDLQ) that uses per-layer second-order sensitivity information to minimize output perturbation.
+
+QuIP# requires a **calibration dataset** (a few hundred to a few thousand samples) to estimate per-layer Hessians via forward/backward passes. These Hessians guide the adaptive rounding step — telling the quantizer which weight directions are most sensitive to perturbation. This is the same calibration pattern used by AWQ (channel magnitudes) and GPTQ (Hessian diagonal), and can reuse ironmill's existing `CalibrationRunner` infrastructure and `--calibration-data` CLI flag. Calibration data is mandatory — `--quip-sharp` without `--calibration-data` is a compile error.
+
+ironmill already has the core algorithmic pieces in mil-rs: `QuipSharpPass` performs Hadamard rotation + E8 quantization + norm extraction and rewrites ops to `constexpr_lut_to_dense`. The E8 codebook (256-entry, 8-bit index) with nearest-neighbor search is fully implemented and tested. The current pass does **not** use Hessian data — adding LDLQ rounding with Hessian input is required to match paper-quality results.
+
+What's missing is the end-to-end pipeline:
+- Hessian estimation during calibration (mandatory) and LDLQ adaptive rounding in the quantization pass
+- Bundle metadata doesn't distinguish QuIP# from PolarQuant (`quip_sharp_seed` vs `polar_quant_seed` mismatch)
+- No Metal dequant kernel for QuIP#-style LUT + inverse Hadamard + norm rescale
+- No CLI flag or TOML pipeline entry
+- CPU dequant path keys off `polar_quant_seed`, not `quip_sharp_seed`
+
+The Metal kernel maps naturally to the existing PolarQuant shader pattern: LUT lookup per 8-element vector, inverse Hadamard transform (fast Walsh–Hadamard in registers), multiply by row norms. The E8 codebook (256 × 8 half values = 4 KB) fits comfortably in Metal constant memory.
+
+**Target:** Qwen3-0.6B at 2-bit QuIP# with PPL ≤ 14.0 (within 1.14 of FP16 baseline 12.86).
+
+---
+
 ## Speculation & advanced
 
 ### 10. Speculative Streaming (no auxiliary model)
@@ -223,7 +251,8 @@ Independent (no dependencies, can start immediately):
   ├── #6  Sliding window attention
   ├── #8  Cross-layer KV sharing (CLA)
   ├── #9  MLA support
-  └── #12 Structured generation (JSON/grammar)
+  ├── #12 Structured generation (JSON/grammar)
+  └── #14 QuIP# end-to-end weight quantization
 
 Depends on #1 (Fused SDPA):
   └── #11 Prefill/decode phase separation
@@ -261,3 +290,5 @@ Depends on #1 (Fused SDPA) + #5 (KV reuse):
 - Speculative Streaming: https://openreview.net/forum?id=jt8wI3ZzXG
 - XGrammar: https://arxiv.org/abs/2411.15100
 - MLX phase scheduling: https://yage.ai/share/mlx-apple-silicon-en-20260331.html
+- QuIP#: https://arxiv.org/abs/2402.04396
+- QuIP# code: https://github.com/Cornell-RelaxML/quip-sharp

@@ -172,6 +172,15 @@ impl Pass for AwqQuantizePass {
     }
 
     fn run(&self, program: &mut Program) -> Result<()> {
+        if self.channel_magnitudes.is_empty() {
+            return Err(MilError::Validation(
+                "AWQ: channel_magnitudes is empty. Calibration data is required — \
+                 run the calibration pipeline to collect per-channel activation \
+                 magnitudes before applying the AWQ pass."
+                    .into(),
+            ));
+        }
+
         let qmax = qmax(self.bits);
 
         for function in program.functions.values_mut() {
@@ -444,17 +453,23 @@ impl Pass for AwqQuantizePass {
             }
 
             // ----------------------------------------------------------
-            // Phase 4: MinMax fallback for ops without calibration.
+            // Phase 4: Error on ops without calibration data.
+            // Calibration is mandatory — silent MinMax fallback would
+            // produce quantized weights with no activation-aware scaling,
+            // giving users a false impression of AWQ quality.
             // ----------------------------------------------------------
-            for (idx, floats, shape) in &fallback_ops {
-                emit_fallback_per_group(
-                    &mut function.body.operations[*idx],
-                    floats,
-                    shape,
-                    self.group_size,
-                    qmax,
-                    self.bits,
-                );
+            if !fallback_ops.is_empty() {
+                let names: Vec<&str> = fallback_ops
+                    .iter()
+                    .map(|(idx, _, _)| function.body.operations[*idx].name.as_str())
+                    .collect();
+                return Err(MilError::Validation(format!(
+                    "AWQ: {} ops missing calibration data (channel magnitudes or activations). \
+                     Calibration data is required for all quantizable ops. \
+                     Missing ops: {:?}",
+                    fallback_ops.len(),
+                    names,
+                )));
             }
         }
         Ok(())
@@ -839,101 +854,6 @@ fn emit_per_group_with_scales(
     }
 }
 
-/// Fallback: standard per-group MinMax quantization (no AWQ scaling).
-fn emit_fallback_per_group(
-    op: &mut crate::ir::operation::Operation,
-    floats: &[f32],
-    shape: &[usize],
-    group_size: usize,
-    qmax: f32,
-    bits: u8,
-) {
-    let ndim = shape.len();
-    let last_dim = if ndim > 0 { shape[ndim - 1] } else { 1 };
-    let outer_count: usize = if ndim > 1 {
-        shape[..ndim - 1].iter().product()
-    } else {
-        1
-    };
-    let n_groups = last_dim.div_ceil(group_size);
-
-    let mut all_quantized = Vec::with_capacity(floats.len());
-    let mut all_scales = Vec::with_capacity(outer_count * n_groups);
-    let mut all_zero_points = Vec::with_capacity(outer_count * n_groups);
-
-    for row in 0..outer_count {
-        let row_start = row * last_dim;
-        for g in 0..n_groups {
-            let g_start = row_start + g * group_size;
-            let g_end = (g_start + group_size).min(row_start + last_dim);
-            let group_slice = &floats[g_start..g_end];
-            let (q, s, zp) = quantize_affine(group_slice, qmax);
-            all_quantized.extend_from_slice(&q);
-            all_scales.push(s);
-            all_zero_points.push(zp);
-        }
-    }
-
-    let packed_data = if bits == 4 {
-        pack_int4(&all_quantized)
-    } else {
-        all_quantized
-    };
-
-    let quantized_val = Value::Tensor {
-        data: packed_data,
-        shape: shape.to_vec(),
-        dtype: ScalarType::UInt8,
-    };
-
-    let mut param_shape = shape.to_vec();
-    if let Some(last) = param_shape.last_mut() {
-        *last = n_groups;
-    }
-
-    let scale_bytes: Vec<u8> = all_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let zp_bytes: Vec<u8> = all_zero_points
-        .iter()
-        .flat_map(|z| z.to_le_bytes())
-        .collect();
-
-    let axis = if ndim > 0 { (ndim - 1) as i64 } else { 0 };
-
-    op.op_type = "constexpr_affine_dequantize".to_string();
-    op.inputs.remove("val");
-    op.attributes.remove("val");
-    op.attributes
-        .insert("quantized_data".to_string(), quantized_val);
-    op.attributes.insert(
-        "scale".to_string(),
-        Value::Tensor {
-            data: scale_bytes,
-            shape: param_shape.clone(),
-            dtype: ScalarType::Float32,
-        },
-    );
-    op.attributes.insert(
-        "zero_point".to_string(),
-        Value::Tensor {
-            data: zp_bytes,
-            shape: param_shape,
-            dtype: ScalarType::Float32,
-        },
-    );
-    op.attributes.insert("axis".to_string(), Value::Int(axis));
-    op.attributes
-        .insert("group_size".to_string(), Value::Int(group_size as i64));
-    op.attributes
-        .insert("bit_width".to_string(), Value::Int(bits as i64));
-
-    let out_type = TensorType::new(ScalarType::Float32, shape.to_vec());
-    if let Some(slot) = op.output_types.get_mut(0) {
-        *slot = Some(out_type);
-    } else {
-        op.output_types.push(Some(out_type));
-    }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1153,6 +1073,41 @@ mod tests {
         weighted_sum / original.len() as f32
     }
 
+    /// Compute weighted MSE of direct MinMax INT4 quantization (no AWQ scaling).
+    fn minmax_weighted_mse(
+        original: &[f32],
+        num_rows: usize,
+        row_len: usize,
+        group_size: usize,
+        magnitudes: &[f32],
+    ) -> f32 {
+        let qmax = 15.0_f32; // INT4
+        let n_groups = row_len.div_ceil(group_size);
+        let mut weighted_sum = 0.0_f32;
+
+        for row in 0..num_rows {
+            for g in 0..n_groups {
+                let g_start = row * row_len + g * group_size;
+                let g_end = (g_start + group_size).min(row * row_len + row_len);
+                let group_slice = &original[g_start..g_end];
+
+                let (q, s, zp) = quantize_affine(group_slice, qmax);
+                for (j, &qv) in q.iter().enumerate() {
+                    let reconstructed = (qv as f32 - zp) * s;
+                    let col = g * group_size + j;
+                    let mag = if col < magnitudes.len() {
+                        magnitudes[col]
+                    } else {
+                        1.0
+                    };
+                    let err = group_slice[j] - reconstructed;
+                    weighted_sum += mag * mag * err * err;
+                }
+            }
+        }
+        weighted_sum / original.len() as f32
+    }
+
     // -----------------------------------------------------------------------
     // Test: AWQ produces lower MSE than MinMax on weights with varying
     // channel importance.
@@ -1183,11 +1138,8 @@ mod tests {
             .collect();
         let (cal_act, n_tokens) = make_calibration_activations(&magnitudes, 32);
 
-        // --- MinMax baseline ---
-        let mut minmax_prog = make_program("weight", &weights, vec![out, inp]);
-        let minmax_pass = AwqQuantizePass::new(4, group_sz, HashMap::new());
-        minmax_pass.run(&mut minmax_prog).unwrap();
-        let minmax_wmse = weighted_reconstruction_mse(&original, &minmax_prog, &magnitudes);
+        // --- MinMax baseline (direct computation, no AWQ pass) ---
+        let minmax_wmse = minmax_weighted_mse(&original, out, inp, group_sz, &magnitudes);
 
         // --- AWQ (with calibration activations) ---
         let mut awq_mags = HashMap::new();
@@ -1308,11 +1260,8 @@ mod tests {
         pass.run(&mut prog).unwrap();
         let awq_wmse = weighted_reconstruction_mse(&original, &prog, &magnitudes);
 
-        // Compare with plain MinMax (no calibration data).
-        let mut plain_prog = make_program("w", &weights, vec![out, inp]);
-        let plain_pass = AwqQuantizePass::new(4, group_sz, HashMap::new());
-        plain_pass.run(&mut plain_prog).unwrap();
-        let plain_wmse = weighted_reconstruction_mse(&original, &plain_prog, &magnitudes);
+        // Compare with plain MinMax (direct computation, no AWQ pass).
+        let plain_wmse = minmax_weighted_mse(&original, out, inp, group_sz, &magnitudes);
 
         // AWQ optimizes activation-weighted output MSE (Eq. 4); α=0
         // matches MinMax, so the weighted MSE can only match or improve.
@@ -1323,33 +1272,28 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: Fallback to MinMax when no calibration data.
+    // Test: AWQ rejects empty calibration data.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn fallback_to_minmax_no_calibration() {
+    fn rejects_empty_calibration_data() {
         let out = 8;
         let inp = 128;
         let values: Vec<f32> = (0..(out * inp)).map(|i| i as f32 * 0.5).collect();
         let mut prog = make_program("weight", &values, vec![out, inp]);
 
-        // Empty magnitudes → no calibration data.
+        // Empty magnitudes → no calibration data → must error.
         let pass = AwqQuantizePass::new(4, inp, HashMap::new());
-        pass.run(&mut prog).unwrap();
-
-        let op = &prog.functions["main"].body.operations[0];
-        assert_eq!(op.op_type, "constexpr_affine_dequantize");
-
-        // Should NOT have awq_channel_scales (fallback path).
+        let result = pass.run(&mut prog);
         assert!(
-            op.attributes.get("awq_channel_scales").is_none(),
-            "fallback should not produce awq_channel_scales"
+            result.is_err(),
+            "AWQ with empty calibration data should fail"
         );
-
-        // Should still have quantized data.
-        assert!(op.attributes.get("quantized_data").is_some());
-        assert!(op.attributes.get("scale").is_some());
-        assert!(op.attributes.get("zero_point").is_some());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("channel_magnitudes is empty"),
+            "error should mention empty calibration: {err_msg}"
+        );
     }
 
     // -----------------------------------------------------------------------

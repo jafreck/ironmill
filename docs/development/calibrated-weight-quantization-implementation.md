@@ -403,7 +403,7 @@ Options (decide during implementation):
 - Add `with_awq(self, activation_stats: AwqActivationStore, group_size: usize)`
   builder method to `PassPipeline`.
 - CLI flag: `--quantize awq` (triggers calibration run + AWQ pass).
-- Optional: `--calibration-data <path>` to specify dataset.
+- `--calibration-data <path>` is required; omitting it is a compile error.
 - Register `"awq-quantize"` in `pass_from_name()` for TOML config.
 
 **Acceptance criteria:**
@@ -489,7 +489,8 @@ Algorithm per linear op:
 #### Task 3.3 — Pipeline integration
 
 - Add `with_gptq(...)` to `PassPipeline` (gated behind `#[cfg(feature = "gptq")]`).
-- CLI flag: `--quantize gptq`.
+- CLI flag: `--quantize gptq`. `--calibration-data` is required; omitting it
+  is a compile error.
 - TOML config: `quantize = "gptq"`.
 - Perplexity evaluation gate.
 
