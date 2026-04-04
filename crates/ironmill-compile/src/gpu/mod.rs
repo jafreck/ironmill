@@ -112,7 +112,7 @@ impl GpuCompileBuilder {
         let _report = self.pipeline.run(&mut program)?;
 
         // Extract weights from the optimized program.
-        let mut provider = MilWeightProvider::new(&program, config)?;
+        let mut provider = MilWeightProvider::new(&mut program, config)?;
 
         // For SafeTensors/GGUF: supplement any architecture-specific tensors
         // that the template system didn't emit (e.g. q_norm, k_norm).

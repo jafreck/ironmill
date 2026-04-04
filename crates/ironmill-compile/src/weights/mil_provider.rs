@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::mem;
 
 use mil_rs::{MilError, Operation, Program, ScalarType, Value};
 
@@ -33,19 +34,19 @@ pub struct MilWeightProvider {
 
 impl MilWeightProvider {
     /// Build a provider by walking the main function of `program`.
-    pub fn new(program: &Program, config: ModelConfig) -> Result<Self, MilError> {
+    pub fn new(program: &mut Program, config: ModelConfig) -> Result<Self, MilError> {
         let function = program
-            .main()
+            .main_mut()
             .ok_or_else(|| MilError::Validation("program has no main function".into()))?;
 
-        let ops = &function.body.operations;
+        let ops = &mut function.body.operations;
 
         // Pre-collect norms data keyed by the original output name prefix so we
         // can associate them with the corresponding constexpr_lut_to_dense op.
         // Norms ops are named `{original_output}_polar_norms` with a matching
         // output name.
         let mut norms_map: HashMap<String, (Vec<u8>, ScalarType)> = HashMap::new();
-        for op in ops {
+        for op in ops.iter_mut() {
             if op.op_type != "const" {
                 continue;
             }
@@ -57,7 +58,10 @@ impl MilWeightProvider {
                 continue;
             }
             // Extract the tensor value from inputs or attributes.
-            let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+            let val = op
+                .inputs
+                .get_mut("val")
+                .or_else(|| op.attributes.get_mut("val"));
             if let Some(Value::Tensor { data, dtype, .. }) = val {
                 let suffix = if output_name.ends_with("_polar_norms") {
                     "_polar_norms"
@@ -65,13 +69,13 @@ impl MilWeightProvider {
                     "_quip_norms"
                 };
                 let prefix = &output_name[..output_name.len() - suffix.len()];
-                norms_map.insert(prefix.to_string(), (data.clone(), *dtype));
+                norms_map.insert(prefix.to_string(), (mem::take(data), *dtype));
             }
         }
 
         let mut tensors = HashMap::new();
 
-        for op in ops {
+        for op in ops.iter_mut() {
             match op.op_type.as_str() {
                 "constexpr_lut_to_dense" => {
                     let name = tensor_name_for_op(op);
@@ -80,10 +84,10 @@ impl MilWeightProvider {
                         None => continue,
                     };
 
-                    let (lut_data, lut_dtype) = extract_tensor_attr(&op.attributes, "lut")?;
+                    let (lut_data, lut_dtype) = extract_tensor_attr(&mut op.attributes, "lut")?;
                     let (indices_data, indices_dtype) =
-                        extract_tensor_attr(&op.attributes, "indices")?;
-                    let (shape_bytes, _) = extract_tensor_attr(&op.attributes, "shape")?;
+                        extract_tensor_attr(&mut op.attributes, "indices")?;
+                    let (shape_bytes, _) = extract_tensor_attr(&mut op.attributes, "shape")?;
 
                     let original_shape = u32_bytes_to_usize_vec(&shape_bytes);
 
@@ -99,8 +103,7 @@ impl MilWeightProvider {
                     // Look up the corresponding row norms.
                     let output_name: &str = op.outputs.first().map(String::as_str).unwrap_or("");
                     let (row_norms, norms_dtype) = norms_map
-                        .get(output_name)
-                        .cloned()
+                        .remove(output_name)
                         .unwrap_or_else(|| (Vec::new(), lut_dtype));
 
                     // Extract polar_quant_seed for Hadamard rotation.
@@ -144,11 +147,14 @@ impl MilWeightProvider {
                     };
 
                     let (quantized_data, quantized_dtype) =
-                        extract_tensor_attr(&op.attributes, "quantized_data")?;
-                    let quantized_shape = extract_tensor_shape(&op.attributes, "quantized_data")?;
+                        extract_tensor_attr(&mut op.attributes, "quantized_data")?;
+                    let quantized_shape =
+                        extract_tensor_shape(&mut op.attributes, "quantized_data")?;
 
-                    let (scale_data, scale_dtype) = extract_scale_or_zp(&op.attributes, "scale")?;
-                    let (zp_data, zp_dtype) = extract_scale_or_zp(&op.attributes, "zero_point")?;
+                    let (scale_data, scale_dtype) =
+                        extract_scale_or_zp(&mut op.attributes, "scale")?;
+                    let (zp_data, zp_dtype) =
+                        extract_scale_or_zp(&mut op.attributes, "zero_point")?;
 
                     let axis = match op.attributes.get("axis") {
                         Some(Value::Int(v)) => Some(*v as usize),
@@ -232,7 +238,10 @@ impl MilWeightProvider {
                         None => continue,
                     };
 
-                    let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
+                    let val = op
+                        .inputs
+                        .get_mut("val")
+                        .or_else(|| op.attributes.get_mut("val"));
                     let val = match val {
                         Some(v) => v,
                         None => continue,
@@ -240,8 +249,8 @@ impl MilWeightProvider {
 
                     if let Value::Tensor { data, shape, dtype } = val {
                         let extracted = ExtractedTensor {
-                            data: data.clone(),
-                            shape: shape.clone(),
+                            data: mem::take(data),
+                            shape: mem::take(shape),
                             dtype: *dtype,
                             quant_info: QuantizationInfo::None,
                         };
@@ -471,11 +480,11 @@ fn tensor_name_for_op(op: &Operation) -> Option<String> {
 
 /// Extract a `Value::Tensor` attribute, returning its raw bytes and dtype.
 fn extract_tensor_attr(
-    attrs: &HashMap<String, Value>,
+    attrs: &mut HashMap<String, Value>,
     key: &str,
 ) -> Result<(Vec<u8>, ScalarType), MilError> {
-    match attrs.get(key) {
-        Some(Value::Tensor { data, dtype, .. }) => Ok((data.clone(), *dtype)),
+    match attrs.get_mut(key) {
+        Some(Value::Tensor { data, dtype, .. }) => Ok((mem::take(data), *dtype)),
         _ => Err(MilError::UndefinedValue(format!(
             "missing or invalid tensor attribute '{key}'"
         ))),
@@ -483,9 +492,12 @@ fn extract_tensor_attr(
 }
 
 /// Extract the shape from a `Value::Tensor` attribute.
-fn extract_tensor_shape(attrs: &HashMap<String, Value>, key: &str) -> Result<Vec<usize>, MilError> {
-    match attrs.get(key) {
-        Some(Value::Tensor { shape, .. }) => Ok(shape.clone()),
+fn extract_tensor_shape(
+    attrs: &mut HashMap<String, Value>,
+    key: &str,
+) -> Result<Vec<usize>, MilError> {
+    match attrs.get_mut(key) {
+        Some(Value::Tensor { shape, .. }) => Ok(mem::take(shape)),
         _ => Err(MilError::UndefinedValue(format!(
             "missing or invalid tensor attribute '{key}'"
         ))),
@@ -495,11 +507,11 @@ fn extract_tensor_shape(attrs: &HashMap<String, Value>, key: &str) -> Result<Vec
 /// Extract scale or zero_point which may be a `Value::Float` (per-tensor) or
 /// `Value::Tensor` (per-channel).
 fn extract_scale_or_zp(
-    attrs: &HashMap<String, Value>,
+    attrs: &mut HashMap<String, Value>,
     key: &str,
 ) -> Result<(Vec<u8>, ScalarType), MilError> {
-    match attrs.get(key) {
-        Some(Value::Tensor { data, dtype, .. }) => Ok((data.clone(), *dtype)),
+    match attrs.get_mut(key) {
+        Some(Value::Tensor { data, dtype, .. }) => Ok((mem::take(data), *dtype)),
         Some(Value::Float(v)) => {
             let bytes = (*v as f32).to_le_bytes().to_vec();
             Ok((bytes, ScalarType::Float32))
@@ -565,7 +577,7 @@ mod tests {
         let mut program = Program::new("1.0.0");
         program.add_function(func);
 
-        let provider = MilWeightProvider::new(&program, dummy_config()).unwrap();
+        let provider = MilWeightProvider::new(&mut program, dummy_config()).unwrap();
         assert!(provider.has_tensor("model.layers.0.weight"));
         let t = provider.tensor("model.layers.0.weight").unwrap();
         assert_eq!(t.shape, vec![2, 2]);
@@ -607,7 +619,7 @@ mod tests {
         let mut program = Program::new("1.0.0");
         program.add_function(func);
 
-        let provider = MilWeightProvider::new(&program, dummy_config()).unwrap();
+        let provider = MilWeightProvider::new(&mut program, dummy_config()).unwrap();
         let t = provider.tensor("model.layers.0.q_proj.weight").unwrap();
         assert_eq!(t.shape, vec![2, 3]);
         assert!(matches!(
@@ -681,7 +693,7 @@ mod tests {
         let mut program = Program::new("1.0.0");
         program.add_function(func);
 
-        let provider = MilWeightProvider::new(&program, dummy_config()).unwrap();
+        let provider = MilWeightProvider::new(&mut program, dummy_config()).unwrap();
         let t = provider.tensor("model.embed.weight").unwrap();
         assert_eq!(t.shape, vec![4, 8]);
         match &t.quant_info {
@@ -705,7 +717,7 @@ mod tests {
         let mut program = Program::new("1.0.0");
         program.add_function(func);
 
-        let provider = MilWeightProvider::new(&program, dummy_config()).unwrap();
+        let provider = MilWeightProvider::new(&mut program, dummy_config()).unwrap();
         assert!(provider.tensor("nonexistent").is_err());
     }
 
@@ -729,7 +741,7 @@ mod tests {
         let mut program = Program::new("1.0.0");
         program.add_function(func);
 
-        let provider = MilWeightProvider::new(&program, dummy_config()).unwrap();
+        let provider = MilWeightProvider::new(&mut program, dummy_config()).unwrap();
         assert!(provider.has_tensor("some_const_out"));
     }
 }

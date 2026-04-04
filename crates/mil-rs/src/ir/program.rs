@@ -42,6 +42,15 @@ impl Program {
             .or_else(|| self.functions.values().next())
     }
 
+    /// Return a mutable reference to the "main" function.
+    pub fn main_mut(&mut self) -> Option<&mut Function> {
+        if self.functions.contains_key("main") {
+            self.functions.get_mut("main")
+        } else {
+            self.functions.values_mut().next()
+        }
+    }
+
     /// Set a program-level attribute.
     pub fn set_attribute(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.attributes.insert(key.into(), value.into());
