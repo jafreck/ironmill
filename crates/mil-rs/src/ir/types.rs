@@ -167,3 +167,118 @@ impl Value {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::MilError;
+
+    #[test]
+    fn test_inline_basic() {
+        let data = TensorData::inline(vec![1, 2, 3, 4]);
+        assert!(data.is_inline());
+        assert!(!data.is_external());
+        assert_eq!(data.byte_len(), 4);
+        assert_eq!(data.as_bytes(), Some(&[1, 2, 3, 4][..]));
+    }
+
+    #[test]
+    fn test_external_basic() {
+        let data = TensorData::external("layer.0.weight".to_string(), 1024);
+        assert!(!data.is_inline());
+        assert!(data.is_external());
+        assert_eq!(data.byte_len(), 1024);
+        assert_eq!(data.as_bytes(), None);
+    }
+
+    #[test]
+    fn test_into_bytes_inline() {
+        let data = TensorData::inline(vec![10, 20, 30]);
+        assert_eq!(data.into_bytes(), vec![10, 20, 30]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot into_bytes()")]
+    fn test_into_bytes_external_panics() {
+        let data = TensorData::external("key".to_string(), 100);
+        data.into_bytes();
+    }
+
+    #[test]
+    fn test_resolve_with_inline() {
+        let data = TensorData::inline(vec![1, 2, 3]);
+        let result = data.resolve_with(|_| panic!("should not be called"));
+        assert_eq!(result.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_resolve_with_external() {
+        let data = TensorData::external("my.tensor".to_string(), 3);
+        let result = data.resolve_with(|key| {
+            assert_eq!(key, "my.tensor");
+            Ok(vec![4, 5, 6])
+        });
+        assert_eq!(result.unwrap(), vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn test_materialize_with_inline_noop() {
+        let mut data = TensorData::inline(vec![1, 2]);
+        data.materialize_with(|_| panic!("should not be called"))
+            .unwrap();
+        assert_eq!(data.as_bytes(), Some(&[1, 2][..]));
+    }
+
+    #[test]
+    fn test_materialize_with_external() {
+        let mut data = TensorData::external("key".to_string(), 2);
+        data.materialize_with(|key| {
+            assert_eq!(key, "key");
+            Ok(vec![7, 8])
+        })
+        .unwrap();
+        assert!(data.is_inline());
+        assert_eq!(data.as_bytes(), Some(&[7, 8][..]));
+    }
+
+    #[test]
+    fn test_materialize_with_error() {
+        let mut data = TensorData::external("bad".to_string(), 0);
+        let result = data.materialize_with(|_| Err(MilError::Validation("not found".into())));
+        assert!(result.is_err());
+        // Data remains External after failed materialization
+        assert!(data.is_external());
+    }
+
+    #[test]
+    fn test_from_vec() {
+        let data: TensorData = vec![1, 2, 3].into();
+        assert!(data.is_inline());
+        assert_eq!(data.byte_len(), 3);
+    }
+
+    #[test]
+    fn test_as_bytes_mut() {
+        let mut data = TensorData::inline(vec![1, 2, 3]);
+        if let Some(bytes) = data.as_bytes_mut() {
+            bytes[0] = 99;
+        }
+        assert_eq!(data.as_bytes(), Some(&[99, 2, 3][..]));
+
+        let mut ext = TensorData::external("k".to_string(), 10);
+        assert!(ext.as_bytes_mut().is_none());
+    }
+
+    #[test]
+    fn test_value_tensor_constructor() {
+        let val = Value::tensor(vec![1, 2], vec![2], ScalarType::UInt8);
+        match val {
+            Value::Tensor { data, shape, dtype } => {
+                assert!(data.is_inline());
+                assert_eq!(shape, vec![2]);
+                assert_eq!(dtype, ScalarType::UInt8);
+            }
+            _ => panic!("expected Value::Tensor"),
+        }
+    }
+}

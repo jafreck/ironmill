@@ -225,6 +225,138 @@ impl Default for Block {
 mod tests {
     use super::*;
     use crate::ir::tensor::ScalarType;
+    use crate::ir::types::TensorData;
+    use crate::weights::{Architecture, ModelConfig, WeightProvider, WeightTensor};
+    use std::borrow::Cow;
+
+    /// Minimal mock weight provider for testing `materialize_all`.
+    struct StubProvider {
+        config: ModelConfig,
+    }
+
+    impl StubProvider {
+        fn new() -> Self {
+            Self {
+                config: ModelConfig {
+                    architecture: Architecture::Llama,
+                    hidden_size: 64,
+                    intermediate_size: 128,
+                    num_hidden_layers: 1,
+                    num_attention_heads: 4,
+                    num_key_value_heads: 4,
+                    head_dim: 16,
+                    vocab_size: 32,
+                    max_position_embeddings: 128,
+                    rms_norm_eps: 1e-5,
+                    rope_theta: 10000.0,
+                    tie_word_embeddings: false,
+                    extra: Default::default(),
+                },
+            }
+        }
+    }
+
+    impl WeightProvider for StubProvider {
+        fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError> {
+            // Return deterministic data based on the key
+            match name {
+                "weight_a" => Ok(WeightTensor {
+                    data: Cow::Owned(vec![10, 20, 30, 40]),
+                    shape: vec![2, 2],
+                    dtype: ScalarType::UInt8,
+                    quant_info: crate::weights::QuantizationInfo::None,
+                }),
+                "weight_b" => Ok(WeightTensor {
+                    data: Cow::Owned(vec![50, 60]),
+                    shape: vec![2],
+                    dtype: ScalarType::UInt8,
+                    quant_info: crate::weights::QuantizationInfo::None,
+                }),
+                _ => Err(MilError::Validation(format!("unknown tensor: {name}"))),
+            }
+        }
+
+        fn tensor_names(&self) -> Vec<&str> {
+            vec!["weight_a", "weight_b"]
+        }
+
+        fn config(&self) -> &ModelConfig {
+            &self.config
+        }
+    }
+
+    #[test]
+    fn test_materialize_all() {
+        let mut program = Program::new("1.0");
+
+        // Build a function with two ops containing External tensors
+        let mut func = Function::new("main");
+        let op_a = Operation::new("const", "const_a")
+            .with_output("a_out")
+            .with_input(
+                "value",
+                Value::Tensor {
+                    data: TensorData::external("weight_a".to_string(), 4),
+                    shape: vec![2, 2],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+        let op_b = Operation::new("const", "const_b")
+            .with_output("b_out")
+            .with_input(
+                "value",
+                Value::Tensor {
+                    data: TensorData::external("weight_b".to_string(), 2),
+                    shape: vec![2],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+        func.body.add_op(op_a);
+        func.body.add_op(op_b);
+        func.body.outputs = vec!["a_out".into(), "b_out".into()];
+        program.add_function(func);
+
+        // Attach stub provider and materialize
+        program.set_weight_provider(Arc::new(StubProvider::new()));
+        program
+            .materialize_all()
+            .expect("materialize should succeed");
+
+        // Verify all tensors are now Inline with correct data
+        let main = program.main().unwrap();
+        for op in &main.body.operations {
+            if let Some(Value::Tensor { data, .. }) = op.inputs.get("value") {
+                assert!(data.is_inline(), "tensor in {} should be inline", op.name);
+            }
+        }
+        let op_a = &main.body.operations[0];
+        let op_b = &main.body.operations[1];
+        if let Some(Value::Tensor { data, .. }) = op_a.inputs.get("value") {
+            assert_eq!(data.as_bytes(), Some(&[10, 20, 30, 40][..]));
+        }
+        if let Some(Value::Tensor { data, .. }) = op_b.inputs.get("value") {
+            assert_eq!(data.as_bytes(), Some(&[50, 60][..]));
+        }
+    }
+
+    #[test]
+    fn test_materialize_all_no_provider_errors() {
+        let mut program = Program::new("1.0");
+        let mut func = Function::new("main");
+        let op = Operation::new("const", "c0").with_input(
+            "value",
+            Value::Tensor {
+                data: TensorData::external("k".to_string(), 1),
+                shape: vec![1],
+                dtype: ScalarType::UInt8,
+            },
+        );
+        func.body.add_op(op);
+        program.add_function(func);
+
+        let result = program.materialize_all();
+        assert!(result.is_err(), "should fail without a weight provider");
+    }
 
     #[test]
     fn create_program_with_function() {
