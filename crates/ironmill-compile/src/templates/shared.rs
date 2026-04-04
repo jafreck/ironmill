@@ -227,6 +227,18 @@ pub(super) fn emit_transpose(
     out_name
 }
 
+/// Emit a softmax operation along the last axis.
+#[allow(dead_code)]
+pub(super) fn emit_softmax(block: &mut Block, input: &str, op_name: &str) -> String {
+    let out_name = format!("{op_name}_out");
+    let op = Operation::new("softmax", op_name)
+        .with_input("x", Value::Reference(input.into()))
+        .with_attr("axis", Value::Int(-1))
+        .with_output(&out_name);
+    block.add_op(op);
+    out_name
+}
+
 // ---------------------------------------------------------------------------
 // Rotary Position Embeddings (RoPE)
 // ---------------------------------------------------------------------------

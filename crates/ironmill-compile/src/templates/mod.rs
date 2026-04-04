@@ -7,6 +7,7 @@
 pub mod config;
 pub mod gemma;
 pub mod llama;
+pub(crate) mod moe;
 pub mod qwen;
 pub(crate) mod shared;
 
