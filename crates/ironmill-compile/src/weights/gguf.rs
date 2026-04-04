@@ -753,8 +753,21 @@ fn get_meta_f64(meta: &HashMap<String, MetadataValue>, key: &str) -> Result<f64,
 
 fn extract_model_config(meta: &HashMap<String, MetadataValue>) -> Result<ModelConfig, MilError> {
     let arch_str = get_meta_str(meta, "general.architecture")?;
-    let architecture: Architecture = arch_str.parse()?;
     let arch = arch_str.to_lowercase();
+
+    // Gemma 4 requires per-layer metadata (layer_types, rope_parameters,
+    // global_head_dim) that GGUF does not encode. Reject early with a clear
+    // message rather than silently producing a broken model.
+    if arch == "gemma4" || arch == "gemma4_text" {
+        return Err(MilError::Validation(
+            "Gemma 4 is not supported via GGUF — use SafeTensors format. \
+             GGUF lacks the per-layer attention metadata (layer_types, rope_parameters, \
+             global_head_dim) required for correct compilation."
+                .into(),
+        ));
+    }
+
+    let architecture: Architecture = arch_str.parse()?;
 
     let hidden_size = get_meta_usize(meta, &format!("{arch}.embedding_length"))?;
     let intermediate_size = get_meta_usize(meta, &format!("{arch}.feed_forward_length"))?;
@@ -1504,5 +1517,35 @@ mod tests {
         // Verify zero_point is FP16(0.0)
         let zero_fp16 = f16::from_f32(0.0).to_le_bytes();
         assert_eq!(&zeros[..], &zero_fp16);
+    }
+
+    #[test]
+    fn gemma4_gguf_rejected_with_clear_error() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            MetadataValue::Str("gemma4".into()),
+        );
+        let err = extract_model_config(&meta).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported via GGUF"),
+            "expected Gemma 4 rejection message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn gemma4_text_gguf_rejected_with_clear_error() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            MetadataValue::Str("Gemma4_Text".into()),
+        );
+        let err = extract_model_config(&meta).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported via GGUF"),
+            "expected Gemma 4 rejection message, got: {msg}"
+        );
     }
 }
