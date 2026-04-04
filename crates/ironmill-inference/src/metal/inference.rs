@@ -581,6 +581,18 @@ impl MetalInference {
         Ok(())
     }
 
+    /// Load model using the JIT path: weights are loaded, transformed, and
+    /// uploaded to GPU in a single streaming pass.
+    ///
+    /// No compilation step, no MIL IR, no `.ironml-gpu` bundle.
+    pub fn load_jit(
+        config: MetalConfig,
+        provider: &dyn mil_rs::weights::WeightProvider,
+        transforms: &crate::jit::TransformPipeline,
+    ) -> Result<Self, crate::engine::InferenceError> {
+        todo!()
+    }
+
     // ── Memory query ─────────────────────────────────────────────
 
     /// Returns the current Metal device allocation size in bytes.
