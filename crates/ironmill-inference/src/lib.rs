@@ -30,7 +30,7 @@ pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
 pub use engine::{InferenceEngine, InferenceError};
 #[cfg(feature = "mlx")]
 pub use mlx::{MlxArtifacts, MlxConfig, MlxInference};
-pub use sampling::{DEFAULT_EOS_TOKENS, is_eos_token, sample_token};
+pub use sampling::{DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, is_eos_token, sample_token};
 pub use types::{
     ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor, build_dummy_inputs,
 };
