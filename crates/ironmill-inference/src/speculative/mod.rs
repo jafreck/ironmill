@@ -19,6 +19,7 @@
 pub mod config;
 pub mod draft_head;
 pub mod specbundle;
+pub mod streaming;
 pub mod tree;
 pub mod turbospec;
 
@@ -30,6 +31,7 @@ use crate::types::Logits;
 
 pub use config::{SpecConfig, TurboSpecConfig};
 pub use draft_head::DraftHead;
+pub use streaming::{MsaHeadWeights, SpeculativeStreaming, StreamingConfig};
 pub use tree::{CandidateTree, DraftCandidate};
 pub use turbospec::TurboSpecController;
 
