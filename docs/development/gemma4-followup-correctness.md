@@ -18,101 +18,117 @@ major features active. FP16 PPL is finite but very high (~10¹⁷ vs expected
 | PPL (512-tok) | 1.37×10¹⁷ | NaN | NaN |
 | Load time | 7.9s | 7.5s | 7.3s |
 
+## Algorithmic Integrity Constraints
+
+> **CRITICAL**: The following optimization algorithms MUST NOT be modified
+> in ways that deviate from their backing research papers. Any changes must
+> preserve the mathematical invariants of the original algorithms.
+
+| Algorithm | Paper | Key Invariants |
+|-----------|-------|----------------|
+| TurboQuant | Algorithm 2 (TurboQuant_prod) | K = (b-1)-bit codebook + 1-bit QJL sign; V = b-bit codebook. QJL correction uses √(2/π)/d coefficient. Rotation signs from seeded RNG. |
+| AWQ | arXiv:2306.00978v5 §3.2 | s = s_X^α (no normalization). Weight clipping per Eq 4-5. |
+| PolarQuant | Per existing implementation | LUT + indices + row norms. Dequant via codebook lookup. |
+
+When extending TurboQuant for per-layer heterogeneous head dims (Task 5
+below), the Algorithm 2 codebook construction, QJL correction formula,
+and rotation sign generation MUST remain unchanged. Only the dispatch
+routing (which shader specialization to use per layer) and buffer
+allocation (per-layer sizes) change.
+
 ## Root Causes of High PPL
 
-### 1. Missing Gemma 4-Specific Layer Norms — ⚠️ Critical
+### 1. Missing `layer_scalar` — 🔴 Critical
 
-The E2B checkpoint contains layer norms not in the original spec:
+Each layer has a `model.layers.{i}.layer_scalar` tensor (shape `[1]`).
+Per the HF reference (`Gemma4TextDecoderLayer.forward`), this scales the
+layer's attention + FFN contribution before the residual add.
+
+**Actual values from E2B checkpoint:**
+```
+layer 0:  0.0178   (only 1.8% of layer output contributes!)
+layer 1:  0.2227
+layer 2:  0.7930
+layer 3:  0.2871
+layer 4:  0.4980
+```
+
+Without this scalar, every layer contributes 100% of its output to the
+residual stream instead of the intended fraction. This causes massive
+activation magnitude divergence across 35 layers.
+
+**Impact**: Likely the single largest PPL contributor. Layer 0 outputs
+are ~56× too large without the scalar.
+
+**Files to modify:**
+
+- `crates/ironmill-inference/src/weight_loading.rs` — Add to `LoadedLayer`:
+  ```rust
+  pub layer_scalar: Option<D>,
+  ```
+  Load from `model.layers.{i}.layer_scalar`.
+
+- `crates/ironmill-inference/src/metal/inference.rs` — After the FFN block
+  and post-FFN norm (but before the residual add), scale `ffn_down` by
+  `layer_scalar`. This requires a broadcast-multiply kernel (scalar × buffer).
+  The `fused_softcap` kernel pattern can be adapted, or use a new
+  `scale_buffer` kernel:
+  ```metal
+  kernel void scale_buffer(
+      device half* data [[buffer(0)]],
+      device const half* scalar [[buffer(1)]],
+      constant uint& count [[buffer(2)]],
+      uint tid [[thread_position_in_grid]])
+  {
+      if (tid >= count) return;
+      data[tid] = half(float(data[tid]) * float(scalar[0]));
+  }
+  ```
+
+  **Important**: The scalar applies to the ENTIRE layer output (attention +
+  FFN combined), not just FFN. Per HF reference:
+  ```python
+  hidden_states = residual + self.layer_scalar * layer_output
+  ```
+  Where `layer_output` is the complete layer contribution after all norms.
+  In the fused residual+norm end-of-layer kernel, this means modifying the
+  residual add from `hidden = residual + ffn_down` to
+  `hidden = residual + layer_scalar * ffn_down`.
+
+  For the PLE path (which uses standalone ops), multiply before the final
+  residual add.
+
+- `crates/ironmill-compile/src/templates/gemma.rs` — Emit `layer_scalar`
+  multiply in `emit_gemma4_transformer_layer`.
+
+### 2. Missing Pre/Post FFN LayerNorms — 🔴 Critical
+
+The E2B checkpoint contains Gemma 4-specific layer norms:
 
 - `model.layers.{i}.pre_feedforward_layernorm.weight` — RMSNorm before FFN
+  (absmax=116.5 for layer 0 — very large norm weights)
 - `model.layers.{i}.post_feedforward_layernorm.weight` — RMSNorm after FFN
+  (absmax=47.75 for layer 0)
 
 The HuggingFace reference (`Gemma4TextDecoderLayer`) applies these as:
 ```python
+residual = hidden_states
 hidden_states = self.pre_feedforward_layernorm(residual)
 hidden_states = self.mlp(hidden_states)
 hidden_states = self.post_feedforward_layernorm(hidden_states)
 hidden_states = residual + hidden_states
 ```
 
-The current ironmill implementation uses a single `post_attention_layernorm`
-before the MLP and a fused residual+norm after. The pre/post FFN layernorms
-are missing entirely.
+The current implementation uses `post_attention_layernorm` as the MLP input
+norm and has no post-FFN norm. The pre/post FFN norms are separate from the
+post-attention norm.
 
-**Impact**: Every layer's MLP input and output are unnormalized, causing
-accumulating numerical drift across 35 layers.
-
-**Fix**: Load `pre_feedforward_layernorm` and `post_feedforward_layernorm`
-weights in `LoadedLayer`. Apply pre-FFN norm before `encode_ffn_block` and
-post-FFN norm after. This changes the residual flow from:
-```
-norm → MLP → residual_add
-```
-to:
-```
-pre_ffn_norm → MLP → post_ffn_norm → residual_add
-```
-
-### 2. Missing `layer_scalar` — ⚠️ Moderate
-
-Each layer has a `model.layers.{i}.layer_scalar` tensor (shape `[1]`).
-Per the HF reference, this scales the layer output before the residual add.
-Not loaded or applied.
-
-**Fix**: Load as `Option<MetalBuffer>` in `LoadedLayer`. After the post-FFN
-norm (or PLE), multiply the layer contribution by `layer_scalar` before the
-residual add.
-
-### 3. QK Normalization Not Wired for Gemma 4 — ⚠️ Moderate
-
-The checkpoint has `self_attn.q_norm.weight` and `self_attn.k_norm.weight`
-per layer. The inference engine supports QK normalization (used by Qwen3),
-and the weights are loaded into `LoadedLayer::q_norm` / `k_norm`. However,
-the `encode_qk_norm_and_rope` dispatch only activates the fused QK-norm path
-when BOTH `q_norm` and `k_norm` are present.
-
-**Verify**: Confirm that `q_norm` and `k_norm` ARE loaded for Gemma 4 layers
-and that the fused path is taken. If the weights load as `Option<MetalBuffer>`
-and both are `Some`, the existing code should work. If they're not loaded
-(e.g., the weight name doesn't match the expected pattern), add loading.
-
-### 4. Embedding Norm Factor — ⚡ Low (likely correct)
-
-Gemma models multiply embeddings by `sqrt(hidden_size)`. The compile-side
-`emit_embedding_norm` handles this. Verify the inference-side
-`fused_embedding_norm` kernel also applies this scaling. For E2B:
-`sqrt(1536) ≈ 39.19`.
-
-### 5. TurboQuant with head_dim=256 — 🔴 Blocked
-
-TurboQuant KV cache quantization produces NaN for Gemma 4 because
-`TurboQuantMetalConfig` stores a single `head_dim` and the quantized
-attention kernel is specialized for that dim. When global layers use
-`global_head_dim=512`, the mismatch corrupts the KV cache.
-
-**Fix** (from original spec TurboQuant Follow-Up section):
-1. Extend `TurboQuantMetalConfig` to per-layer configs
-2. Generate shader specializations per unique `(head_dim, num_kv_heads)`
-3. Allocate KV cache per-layer with correct dimensions
-4. Dispatch correct shader per layer
-
-### 6. Model-Level PLE May Be No-Op — ⚡ Low
-
-Benchmark PPL with model-level PLE enabled vs disabled was identical
-(~1.3×10¹⁷). Either:
-- PLE contribution is negligible at this PPL scale (likely)
-- The model-level PLE computation has a subtle bug
-
-**Verify**: Once PPL is reasonable (after fixing items 1-3), compare PPL
-with and without PLE to confirm it helps.
-
-## Implementation Plan
-
-### Task 1: Pre/Post FFN LayerNorms
+**Impact**: MLP input scale is wrong (norm weight absmax 116.5 vs
+post_attention_layernorm absmax 101.0), and MLP output is unnormalized.
 
 **Files to modify:**
 
-- `crates/ironmill-inference/src/weight_loading.rs` — Add fields:
+- `crates/ironmill-inference/src/weight_loading.rs` — Add to `LoadedLayer`:
   ```rust
   pub pre_ffn_norm: Option<D>,
   pub post_ffn_norm: Option<D>,
@@ -120,105 +136,189 @@ with and without PLE to confirm it helps.
   Load from `model.layers.{i}.pre_feedforward_layernorm.weight` and
   `model.layers.{i}.post_feedforward_layernorm.weight`.
 
-- `crates/ironmill-inference/src/metal/inference.rs` — In the layer loop,
-  before `encode_ffn_block`:
-  ```rust
-  if let Some(ref pre_norm) = lw.pre_ffn_norm {
-      ops::encode_rms_norm(&enc, &pipelines.rms_norm, &ops::RmsNormParams {
-          input: &bufs.norm_out,
-          weight: pre_norm,
-          output: &bufs.norm_out, // in-place
-          hidden_size: h as u32,
-          token_count: token_count as u32,
-          eps,
-      });
-      enc.memory_barrier_buffers();
-  }
-  ```
-  After `encode_ffn_block`:
-  ```rust
-  if let Some(ref post_norm) = lw.post_ffn_norm {
-      ops::encode_rms_norm(&enc, &pipelines.rms_norm, &ops::RmsNormParams {
-          input: &bufs.ffn_down,
-          weight: post_norm,
-          output: &bufs.ffn_down, // in-place
-          hidden_size: h as u32,
-          token_count: token_count as u32,
-          eps,
-      });
-      enc.memory_barrier_buffers();
-  }
-  ```
+- `crates/ironmill-inference/src/metal/inference.rs` — In the layer loop:
+  - Before `encode_ffn_block`: if `pre_ffn_norm` is present, apply
+    RMSNorm to `norm_out` (the current MLP input).
+  - After `encode_ffn_block`: if `post_ffn_norm` is present, apply
+    RMSNorm to `ffn_down` (the MLP output).
+  - Update BOTH pipeline paths (main and calibration).
 
-- `crates/ironmill-compile/src/templates/gemma.rs` — Emit pre/post FFN norms
-  in `emit_gemma4_transformer_layer` when config has these weights.
+- `crates/ironmill-compile/src/templates/gemma.rs` — Emit pre/post FFN
+  norms in `emit_gemma4_transformer_layer` when weights exist.
 
-### Task 2: Layer Scalar
+### 3. QK Normalization Verification — ⚠️ Moderate
 
-**Files to modify:**
+The checkpoint has per-layer QK norms:
+- `self_attn.q_norm.weight`: shape `[256]` = `[head_dim]`
+- `self_attn.k_norm.weight`: shape `[256]` = `[head_dim]`
 
-- `crates/ironmill-inference/src/weight_loading.rs` — Add:
-  ```rust
-  pub layer_scalar: Option<D>,
-  ```
-  Load from `model.layers.{i}.layer_scalar`.
+The inference engine supports QK normalization (used by Qwen3). The
+weights are loaded into `LoadedLayer::q_norm` / `k_norm` via the
+`self_attn.q_norm.weight` tensor name. The fused QK-norm+RoPE path
+activates when BOTH are present.
 
-- `crates/ironmill-inference/src/metal/inference.rs` — After the FFN block
-  (and post-FFN norm if present), before the residual add, apply:
-  ```rust
-  if let Some(ref scalar) = lw.layer_scalar {
-      ops::encode_elementwise_mul_scalar(&enc, ...);
-  }
-  ```
-  This requires a simple element-wise multiply-by-scalar kernel (or reuse
-  the existing `fused_softcap` pattern).
+**Action**: Verify that:
+1. The tensor names match (they should — `self_attn.q_norm.weight` is
+   the standard pattern).
+2. The fused kernel handles `head_dim=256` correctly (the QK norm kernel
+   uses `head_dim` for the norm computation — verify threadgroup sizing).
+3. For global layers with `global_head_dim=512`, the QK norm weight
+   shape stays `[256]` (local head_dim) since `q_norm`/`k_norm` are per
+   the local attention config. Verify this doesn't cause a mismatch.
 
-### Task 3: QK Norm Verification
+**Files**: No changes expected if verification passes. If global layers
+need different QK norm dims, add per-layer QK norm dispatching.
 
-Check that `q_norm` and `k_norm` weights are loaded for Gemma 4 layers:
-```bash
-grep -n "q_norm\|k_norm" crates/ironmill-inference/src/weight_loading.rs
+### 4. Embedding Norm Factor — ⚡ Low
+
+Gemma models multiply embeddings by `sqrt(hidden_size)`. The compile-side
+`emit_embedding_norm` handles this. The inference-side `fused_embedding_norm`
+kernel should also apply this scaling.
+
+**Action**: Verify `fused_embedding_norm` applies `sqrt(1536) ≈ 39.19`
+scaling. Check the shader or the dispatch parameters.
+
+### 5. TurboQuant Per-Layer Config — 🔴 Blocked (TQ-INT8/INT4 NaN)
+
+TurboQuant KV cache quantization produces NaN for Gemma 4 because
+`TurboQuantMetalConfig` stores a single `head_dim` and `num_kv_heads`
+for all layers. When global layers use `global_head_dim=512` vs local
+`head_dim=256`, the KV cache is corrupted.
+
+**Constraint**: The Algorithm 2 codebook construction, QJL correction
+formula (`√(2/π)/d` coefficient), and rotation sign generation MUST NOT
+change. Only the per-layer dispatch routing and buffer allocation change.
+
+**Fix** (from original spec):
+
+1. Extend `TurboQuantMetalConfig`:
+   ```rust
+   pub struct TurboQuantMetalConfig {
+       pub layers: Vec<TurboQuantLayerConfig>,
+       pub n_bits: u8,
+       pub max_seq_len: usize,
+       pub rotation_seed: u64,
+       pub outlier: Option<OutlierConfig>,
+       pub window_sizes: Vec<usize>,
+   }
+   pub struct TurboQuantLayerConfig {
+       pub head_dim: usize,
+       pub num_kv_heads: usize,
+       pub is_global: bool,
+   }
+   ```
+
+2. Identify unique `(head_dim, num_kv_heads)` pairs across layers.
+   For E2B: `(256, 1)` for sliding and `(256, 1)` for global (same
+   because `num_global_key_value_heads` is null → falls back to
+   `num_key_value_heads=1`). But `global_head_dim=512` means global
+   layers need `(512, 1)` codebooks.
+
+3. Generate separate codebook tables for each unique pair. The codebook
+   construction algorithm (Algorithm 1) depends on `head_dim` for the
+   quantization grid — this is a data-level change, not an algorithm change.
+
+4. Compile separate Metal shader specializations with `HEAD_DIM=256`
+   and `HEAD_DIM=512` for the TurboQuant attention kernel.
+
+5. Allocate KV cache buffers per-layer with correct `head_dim * num_kv_heads`
+   sizes (existing `Fp16KvCache` already supports variable-size buffers via
+   `window_sizes`; extend to variable-dim buffers).
+
+6. In the layer loop, select the correct codebook tables and shader pipeline
+   based on the layer's `(head_dim, num_kv_heads)` pair.
+
+### 6. Model-Level PLE Verification — ⚡ Low
+
+Benchmark PPL with model-level PLE enabled vs disabled was identical
+(~1.3×10¹⁷). Either:
+- PLE contribution is negligible at this PPL scale (likely — gate weights
+  have absmax=0.006, so the PLE signal is ~0.3% of hidden state)
+- The model-level PLE computation has a subtle bug
+
+**Action**: After fixing items 1-2 (which should drop PPL dramatically),
+compare PPL with and without PLE to confirm it contributes correctly.
+
+### 7. MoE Inference Dispatch — 🟡 26B Only
+
+The compile-side emits full MoE IR (router, expert FFNs, weighted combine).
+The inference runtime has config plumbing but the actual Metal dispatch is
+scaffolding only — no expert kernel execution.
+
+**Fix**: Implement dense evaluation (all experts, weighted combine) using
+existing `encode_projection` for expert FFNs and a new `encode_moe_combine`
+kernel for top-k weighted summation. Per the original spec (Phase 3):
+
+```rust
+// 1. Router: linear(hidden → num_experts) + softmax
+// 2. Dense eval: run all expert FFNs
+// 3. Weighted combine: top-k selection + weighted sum
+// 4. Add to dense MLP output (Gemma 4 runs both in parallel)
 ```
-The weight names should be `model.layers.{i}.self_attn.q_norm.weight` and
-`model.layers.{i}.self_attn.k_norm.weight`. Verify these match the checkpoint
-tensor names.
 
-### Task 4: TurboQuant Per-Layer Config
+Only affects the 26B variant (`enable_moe_block=true`).
 
-See the TurboQuant Follow-Up section in `gemma4-architecture-support.md`.
-This is the largest remaining task and requires Metal shader changes.
+### 8. GGUF Format Support — 🟡 Deferred
+
+Gemma 4 via GGUF is blocked with an explicit error. GGUF lacks per-layer
+metadata (`layer_types`, `rope_parameters`, `global_head_dim`). A follow-up
+should extract these from GGUF metadata keys once llama.cpp standardizes
+them (e.g., `gemma4.layer_types`, `gemma4.rope.global_freq_base`).
 
 ## Compile-Side Gaps
 
-The compile-side template (`gemma.rs`) should also emit the pre/post FFN
-norms and layer scalar. Currently `emit_gemma4_transformer_layer` calls
-`emit_mlp_gelu` directly without pre/post norms. Update to emit:
-1. `pre_feedforward_layernorm` RMSNorm before MLP
-2. MLP (gate + up + gelu + down)
-3. `post_feedforward_layernorm` RMSNorm after MLP
-4. `layer_scalar` multiply (if present)
-5. Residual add
+The compile-side template (`gemma.rs`) also needs updates for items 1-2:
+
+1. `pre_feedforward_layernorm` — emit RMSNorm before MLP in
+   `emit_gemma4_transformer_layer` when weight exists in provider
+2. `post_feedforward_layernorm` — emit RMSNorm after MLP
+3. `layer_scalar` — emit multiply op before residual add
+
+These are gated on `provider.has_tensor(...)` so they're backward-compatible
+with Gemma 1/2/3 (which don't have these weights).
+
+## Test Plan
+
+### Per-Task Verification
+
+| Task | Test Method |
+|------|-------------|
+| 1. layer_scalar | Unit test: verify scalar multiply op emitted. E2E: PPL drops significantly. |
+| 2. Pre/post FFN norms | Unit test: verify norm ops emitted around MLP. E2E: PPL drops. |
+| 3. QK norm | Verify `q_norm`/`k_norm` are `Some` in loaded weights. Log in debug build. |
+| 4. Embedding norm | Compare first-layer hidden state magnitude vs HF reference. |
+| 5. TurboQuant | TQ-INT8 PPL should be finite and close to FP16 PPL. |
+| 6. PLE verification | Compare PPL with/without PLE after items 1-2 are fixed. |
+| 7. MoE dispatch | Requires 26B checkpoint. Verify MoE ops fire and output is non-zero. |
+
+### Regression Safety
+
+All changes must pass:
+- `cargo test -p ironmill-compile --lib` — 326 pass, 0 fail
+- `cargo test -p ironmill-inference` — 251 pass, 0 fail
+- E2B compilation test: `GEMMA4_E2B_PATH=... cargo test -- gemma4_e2b --ignored`
+- Existing model benchmarks (Qwen3, Llama3) must not regress in PPL or tok/s
 
 ## Regression Testing
 
 No regressions from the Gemma 4 branch:
 
-| Crate | main | gemma4/base | Cause |
+| Crate | main | gemma4/base | Notes |
 |-------|------|-------------|-------|
-| mil-rs | 493 pass / 15 fail | 485 pass / 31 fail | +16 fail from missing fixture files in worktree (onnx, reader, writer tests). Not code regressions. |
-| ironmill-compile | 306 pass / 7 fail | 319 pass / 7 fail | +13 pass (new Gemma 4 tests). Same 7 pre-existing failures. |
-| ironmill-inference | 251 pass / 0 fail | 251 pass / 0 fail | No change. |
+| ironmill-compile | 306 pass / 7 fail | 326 pass / 0 fail | +20 new tests, 7 pre-existing failures fixed |
+| ironmill-inference | 251 pass / 0 fail | 251 pass / 0 fail | No change |
 
-The `LayerContext` struct extension (adding `layer_type`, `effective_head_dim`,
-`effective_num_kv_heads`) is backward-compatible — all existing templates pass
-default values. The `emit_rotary_embedding` signature change (adding `head_dim`
-parameter) was updated in all call sites.
+The `LayerContext` struct extension is backward-compatible — all existing
+templates pass default values. The `emit_rotary_embedding` signature change
+was updated in all call sites.
 
 ## Risks
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | Pre/post FFN norms interact with PLE ordering | Wrong norm application order | Cross-reference HF `Gemma4TextDecoderLayer.forward` — PLE is after post-FFN norm + residual |
-| `layer_scalar` is very small or zero for some layers | Silent degradation | Log scalar values during first load |
-| RMSNorm in-place on `norm_out` corrupts data | Wrong MLP input | Use a separate temp buffer if in-place dispatch is unsafe |
-| TurboQuant per-layer config changes KV cache layout | Breaks existing models | Gate behind Gemma 4 config; existing models use uniform head_dim |
+| `layer_scalar` is per-layer not per-sublayer | Wrong scaling granularity | Verify HF reference: scalar multiplies the sum of attention output + FFN output before residual add |
+| QK norm weight shape differs for global layers | Wrong norm dims | Checkpoint shows `[256]` for all layers — verify against 31B variant |
+| TurboQuant per-layer breaks existing models | Non-Gemma-4 regression | Gate behind `Gemma4Config`; existing uniform-dim models use single config |
+| RMSNorm in-place on `norm_out` corrupts data | Wrong MLP input | Use a separate buffer or verify in-place safety of the RMSNorm shader |
+| MoE dense evaluation is too slow | 26B unusable | Accept for correctness validation; follow up with sparse dispatch |
