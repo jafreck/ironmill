@@ -50,6 +50,7 @@ fn convert_program(proto: &mil_spec::Program) -> Result<Program> {
         version,
         functions,
         attributes: std::collections::HashMap::new(),
+        weight_provider: None,
     })
 }
 

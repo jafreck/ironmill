@@ -238,7 +238,7 @@ impl<'a> WeightTensor<'a> {
 
 /// Trait abstracting over weight storage formats.
 /// Templates call this to get named weight tensors.
-pub trait WeightProvider {
+pub trait WeightProvider: Send + Sync {
     /// Get a tensor by its canonical name (e.g. "model.layers.0.self_attn.q_proj.weight").
     /// Returns a borrowed view to avoid copying multi-GB tensors.
     fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError>;

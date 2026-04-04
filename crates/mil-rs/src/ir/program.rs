@@ -1,15 +1,21 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
 use super::operation::Operation;
 use super::tensor::TensorType;
+use super::types::Value;
+use crate::error::MilError;
+use crate::weights::WeightProvider;
+
+use std::fmt;
 
 /// A complete MIL program — the top-level container for a CoreML ML Program model.
 ///
 /// A program contains one or more named functions. The "main" function is
 /// the entry point for inference.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Program {
     /// Program version (e.g., "1.0.0").
     pub version: String,
@@ -17,6 +23,23 @@ pub struct Program {
     pub functions: IndexMap<String, Function>,
     /// Program-level attributes (e.g., `autoregressive`, `max_seq_length`).
     pub attributes: HashMap<String, String>,
+
+    /// Optional weight provider for resolving `TensorData::External` references.
+    pub(crate) weight_provider: Option<Arc<dyn WeightProvider + Send + Sync>>,
+}
+
+impl fmt::Debug for Program {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Program")
+            .field("version", &self.version)
+            .field("functions", &self.functions)
+            .field("attributes", &self.attributes)
+            .field(
+                "weight_provider",
+                &self.weight_provider.as_ref().map(|_| ".."),
+            )
+            .finish()
+    }
 }
 
 impl Program {
@@ -26,6 +49,7 @@ impl Program {
             version: version.into(),
             functions: IndexMap::new(),
             attributes: HashMap::new(),
+            weight_provider: None,
         }
     }
 
@@ -64,6 +88,54 @@ impl Program {
     /// Returns `true` if this program has been tagged as autoregressive.
     pub fn is_autoregressive(&self) -> bool {
         self.has_attribute("autoregressive", "true")
+    }
+
+    /// Attach a weight provider for lazy tensor resolution.
+    pub fn set_weight_provider(&mut self, provider: Arc<dyn WeightProvider + Send + Sync>) {
+        self.weight_provider = Some(provider);
+    }
+
+    /// Resolve an external tensor key to its byte data.
+    pub fn resolve_tensor(&self, key: &str) -> Result<Vec<u8>, MilError> {
+        let provider = self.weight_provider.as_ref().ok_or_else(|| {
+            MilError::Validation(format!(
+                "no weight provider attached; cannot resolve external tensor '{key}'"
+            ))
+        })?;
+        let tensor = provider.tensor(key)?;
+        Ok(tensor.data.into_owned())
+    }
+
+    /// Returns `true` if a weight provider is attached.
+    pub fn has_weight_provider(&self) -> bool {
+        self.weight_provider.is_some()
+    }
+
+    /// Materialize all `TensorData::External` references in the program.
+    pub fn materialize_all(&mut self) -> Result<(), MilError> {
+        let provider = self
+            .weight_provider
+            .clone()
+            .ok_or_else(|| MilError::Validation("no weight provider for materialization".into()))?;
+
+        for function in self.functions.values_mut() {
+            Self::materialize_block(&mut function.body, &*provider)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_block(block: &mut Block, provider: &dyn WeightProvider) -> Result<(), MilError> {
+        for op in &mut block.operations {
+            for val in op.inputs.values_mut().chain(op.attributes.values_mut()) {
+                if let Value::Tensor { data, .. } = val {
+                    data.materialize_with(|key| {
+                        let tensor = provider.tensor(key)?;
+                        Ok(tensor.data.into_owned())
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Estimate the total floating-point operations (FLOPs) for a forward pass.
