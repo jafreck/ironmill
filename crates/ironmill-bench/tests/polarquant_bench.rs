@@ -112,6 +112,10 @@ mod polarquant_bench {
     }
 
     /// Compute perplexity over a dataset of token sequences.
+    ///
+    /// Uses batched prefill (`prefill_all_logits`) to process entire
+    /// sequences in parallel on the GPU instead of one-token-at-a-time
+    /// decode, giving orders-of-magnitude faster evaluation.
     fn eval_perplexity(
         engine: &mut MetalInference,
         sequences: &[Vec<u32>],
@@ -125,12 +129,15 @@ mod polarquant_bench {
                 continue;
             }
             engine.reset();
-            for pos in 0..sequence.len() - 1 {
-                let token = sequence[pos];
-                let target = sequence[pos + 1] as usize;
-                let logits = engine.decode_step(token).expect("decode_step failed");
+            let all_logits = engine
+                .prefill_all_logits(sequence)
+                .expect("prefill_all_logits failed");
 
-                // Cross-entropy: -log(softmax(logits)[target])
+            // logits[pos] predicts token at pos+1
+            for pos in 0..sequence.len() - 1 {
+                let target = sequence[pos + 1] as usize;
+                let logits = &all_logits[pos];
+
                 let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let sum_exp: f64 = logits.iter().map(|&x| ((x - max_logit) as f64).exp()).sum();
                 let log_softmax = (logits[target] - max_logit) as f64 - sum_exp.ln();
@@ -165,7 +172,66 @@ mod polarquant_bench {
             .collect()
     }
 
+    fn load_dataset_1024() -> Vec<Vec<u32>> {
+        let path = fixture_path("quality/wikitext2-qwen3-4b-1024.json");
+        skip_if_missing(&path, "wikitext2-qwen3-4b-1024.json");
+        let data: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        data["sequences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|seq| {
+                seq.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap() as u32)
+                    .collect()
+            })
+            .collect()
+    }
     // ── Tests ────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore] // requires Metal GPU + Qwen3-0.6B fixture + wikitext2-1024 dataset
+    fn fp16_perplexity_1024_tokens() {
+        let model_dir = qwen_model_dir();
+        skip_if_missing(&model_dir, "Qwen3-0.6B");
+
+        let sequences = load_dataset_1024();
+        let config = MetalConfig {
+            enable_turboquant: false,
+            ..MetalConfig::default()
+        };
+        let provider =
+            SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
+        let (mut engine, _, _) = load_gpu_engine(&provider, config);
+
+        let t0 = Instant::now();
+        let ppl = eval_perplexity(&mut engine, &sequences, 1);
+        let elapsed = t0.elapsed();
+        let n_tokens: usize = sequences[..1]
+            .iter()
+            .map(|s| s.len().saturating_sub(1))
+            .sum();
+        let tok_s = n_tokens as f64 / elapsed.as_secs_f64();
+
+        println!("\n╔══════════════════════════════════════════════════╗");
+        println!("║   FP16 Perplexity (1024-token sequence)          ║");
+        println!("╠══════════════════════════════════════════════════╣");
+        println!("║  PPL:    {ppl:>10.2}                                ║");
+        println!("║  tok/s:  {tok_s:>10.0}                                ║");
+        println!(
+            "║  time:   {:.2}s                                ║",
+            elapsed.as_secs_f64()
+        );
+        println!("╚══════════════════════════════════════════════════╝\n");
+
+        assert!(
+            ppl < 20.0,
+            "FP16 PPL on 1024-token sequence should be <20, got {ppl:.2}"
+        );
+    }
 
     #[test]
     #[ignore] // requires Metal GPU + Qwen3-0.6B fixture

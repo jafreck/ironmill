@@ -505,6 +505,55 @@ impl MetalInference {
 
     // ── Core decode pipeline ────────────────────────────────────
 
+    /// Prefill all tokens and return logits for **every** position.
+    ///
+    /// Unlike `prefill()` (which returns only the last position's logits),
+    /// this reads back the full `[token_count × vocab_size]` logits tensor.
+    /// Tokens are processed in chunks matching the intermediate buffer size
+    /// so arbitrarily long sequences work without OOM.
+    ///
+    /// Used for efficient perplexity evaluation.
+    pub fn prefill_all_logits(&mut self, token_ids: &[u32]) -> Result<Vec<Logits>, InferenceError> {
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
+        let vocab = mc.vocab_size;
+        let chunk_size = self.config.prefill_chunk_size.unwrap_or(512).max(1);
+
+        let mut all_logits: Vec<Logits> = Vec::with_capacity(token_ids.len());
+
+        for chunk in token_ids.chunks(chunk_size) {
+            let n = chunk.len();
+
+            // Run pipeline — skip the built-in last-token readback since
+            // we read ALL positions ourselves below.
+            self.run_pipeline_inner(chunk, true)?;
+
+            let bufs = self
+                .intermediate_buffers
+                .as_ref()
+                .ok_or(InferenceError::NotLoaded)?;
+            let total_bytes = n * vocab * 2;
+            let mut fp16_buf = vec![0u8; total_bytes];
+            bufs.logits
+                .read_bytes(&mut fp16_buf, 0)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+            for t in 0..n {
+                let offset = t * vocab * 2;
+                let logits: Logits = fp16_buf[offset..offset + vocab * 2]
+                    .chunks_exact(2)
+                    .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                    .collect();
+                all_logits.push(logits);
+            }
+        }
+
+        Ok(all_logits)
+    }
+
     /// Run the transformer decode pipeline for `token_count` tokens.
     /// Returns logits for the last token position.
     fn run_pipeline(&mut self, token_ids: &[u32]) -> Result<Logits, InferenceError> {
