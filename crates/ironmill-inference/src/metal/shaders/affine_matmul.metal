@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 // ============================================================================
@@ -20,6 +21,13 @@ using namespace metal;
 constant constexpr uint TILE_M = 8;
 constant constexpr uint TILE_N = 32;
 constant constexpr uint TILE_K = 32;
+
+// Matmul tiles (simdgroup path, M>1)
+constant constexpr uint TM_TILE = 64;
+constant constexpr uint TN_TILE = 64;
+constant constexpr uint MATMUL_K_TILE = 8;
+constant constexpr uint N_SIMDGROUPS = 8;
+constant constexpr uint TN_BLOCKS = TN_TILE / 8;
 
 // ── INT4 matvec (decode path, M=1) ──────────────────────────────
 //
@@ -87,8 +95,11 @@ kernel void affine_matvec_int4(
 
 // ── INT4 tiled GEMM (prefill path, M>1) ─────────────────────────
 //
-// Dispatch: (ceil(N/TILE_N), ceil(M/TILE_M), 1) threadgroups,
-//           (TILE_N, TILE_M, 1) threads per group.
+// Uses simdgroup_matrix_multiply_accumulate for hardware-accelerated 8×8
+// matrix multiply. 256 threads = 8 simdgroups, each handling 8 output rows.
+//
+// Dispatch: (ceil(M/TM_TILE), ceil(N/TN_TILE), 1) threadgroups,
+//           (256, 1, 1) threads per group.
 
 kernel void affine_matmul_int4(
     device const half *A            [[buffer(0)]],   // [M, K]
@@ -103,30 +114,29 @@ kernel void affine_matmul_int4(
     device const half *awq_scales   [[buffer(9)]],
     constant uint &has_awq          [[buffer(10)]],
     uint2 group_id [[threadgroup_position_in_grid]],
-    uint2 local_id [[thread_position_in_threadgroup]])
+    uint tid   [[thread_index_in_threadgroup]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]])
 {
-    uint local_row = local_id.y;
-    uint local_col = local_id.x;
-    uint row = group_id.x * TILE_M + local_row;
-    uint col = group_id.y * TILE_N + local_col;
+    uint tg_m = group_id.x * TM_TILE;
+    uint tg_n = group_id.y * TN_TILE;
 
-    threadgroup half tg_a[TILE_M * TILE_K];
-    threadgroup half tg_b[TILE_N * TILE_K];
+    threadgroup half tg_a[TM_TILE * MATMUL_K_TILE];
+    threadgroup half tg_bt[MATMUL_K_TILE * TN_TILE];
 
-    uint thread_idx   = local_row * TILE_N + local_col;
-    uint total_threads = TILE_M * TILE_N;
     uint half_K = K / 2;
     uint num_groups = (K + group_size - 1) / group_size;
 
-    float acc = 0.0f;
+    simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
+    for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
 
-    for (uint k_base = 0; k_base < K; k_base += TILE_K) {
-        // Load A tile (apply AWQ 1/s to activations if needed)
-        for (uint i = thread_idx; i < TILE_M * TILE_K; i += total_threads) {
-            uint a_row = i / TILE_K;
-            uint a_col = i % TILE_K;
-            uint g_row = group_id.x * TILE_M + a_row;
-            uint g_col = k_base + a_col;
+    for (uint k_base = 0; k_base < K; k_base += MATMUL_K_TILE) {
+        // Load A tile [TM_TILE × MATMUL_K_TILE] row-major
+        for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
+            uint m = i / MATMUL_K_TILE;
+            uint k = i % MATMUL_K_TILE;
+            uint g_row = tg_m + m;
+            uint g_col = k_base + k;
             half a_val = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
             if (has_awq && g_col < K) {
                 a_val = half(float(a_val) / float(awq_scales[g_col]));
@@ -134,12 +144,12 @@ kernel void affine_matmul_int4(
             tg_a[i] = a_val;
         }
 
-        // Load & dequantize B tile
-        for (uint i = thread_idx; i < TILE_N * TILE_K; i += total_threads) {
-            uint b_n = i / TILE_K;
-            uint b_k = i % TILE_K;
-            uint g_n = group_id.y * TILE_N + b_n;
-            uint g_k = k_base + b_k;
+        // Load & dequantize B tile, store TRANSPOSED into tg_bt
+        for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
+            uint n = i / MATMUL_K_TILE;
+            uint k = i % MATMUL_K_TILE;
+            uint g_n = tg_n + n;
+            uint g_k = k_base + k;
 
             half val = half(0);
             if (g_n < N && g_k < K) {
@@ -152,25 +162,42 @@ kernel void affine_matmul_int4(
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(nibble) - z) * s);
             }
-            tg_b[i] = val;
+            tg_bt[k * TN_TILE + n] = val;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (row < M && col < N) {
-            uint a_base = local_row * TILE_K;
-            uint b_base = local_col * TILE_K;
-            uint k_end  = min(TILE_K, K - k_base);
-            for (uint k = 0; k < k_end; k++) {
-                acc += float(tg_a[a_base + k]) * float(tg_b[b_base + k]);
-            }
+        simdgroup_matrix<half, 8, 8> a_mat;
+        simdgroup_load(a_mat, tg_a + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
+
+        for (uint j = 0; j < TN_BLOCKS; j++) {
+            simdgroup_matrix<half, 8, 8> bt_mat;
+            simdgroup_load(bt_mat, tg_bt + j * 8, TN_TILE);
+            simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (row < M && col < N) {
-        C[row * N + col] = half(acc);
+    // Store results via threadgroup memory
+    threadgroup float tg_out[N_SIMDGROUPS * 8 * 8];
+
+    for (uint j = 0; j < TN_BLOCKS; j++) {
+        simdgroup_store(acc[j], tg_out + sgid * 64, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = tid; i < TM_TILE * 8; i += 256) {
+            uint local_m = i / 8;
+            uint local_n = i % 8;
+            uint out_row = tg_m + local_m;
+            uint out_col = tg_n + j * 8 + local_n;
+            if (out_row < M && out_col < N) {
+                uint sg = local_m / 8;
+                uint sg_row = local_m % 8;
+                C[out_row * N + out_col] = half(tg_out[sg * 64 + sg_row * 8 + local_n]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -222,8 +249,11 @@ kernel void affine_matvec_int8(
 
 // ── INT8 tiled GEMM (prefill path, M>1) ─────────────────────────
 //
-// Dispatch: (ceil(N/TILE_N), ceil(M/TILE_M), 1) threadgroups,
-//           (TILE_N, TILE_M, 1) threads per group.
+// Uses simdgroup_matrix_multiply_accumulate for hardware-accelerated 8×8
+// matrix multiply. 256 threads = 8 simdgroups, each handling 8 output rows.
+//
+// Dispatch: (ceil(M/TM_TILE), ceil(N/TN_TILE), 1) threadgroups,
+//           (256, 1, 1) threads per group.
 
 kernel void affine_matmul_int8(
     device const half *A            [[buffer(0)]],   // [M, K]
@@ -238,29 +268,28 @@ kernel void affine_matmul_int8(
     device const half *awq_scales   [[buffer(9)]],
     constant uint &has_awq          [[buffer(10)]],
     uint2 group_id [[threadgroup_position_in_grid]],
-    uint2 local_id [[thread_position_in_threadgroup]])
+    uint tid   [[thread_index_in_threadgroup]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]])
 {
-    uint local_row = local_id.y;
-    uint local_col = local_id.x;
-    uint row = group_id.x * TILE_M + local_row;
-    uint col = group_id.y * TILE_N + local_col;
+    uint tg_m = group_id.x * TM_TILE;
+    uint tg_n = group_id.y * TN_TILE;
 
-    threadgroup half tg_a[TILE_M * TILE_K];
-    threadgroup half tg_b[TILE_N * TILE_K];
+    threadgroup half tg_a[TM_TILE * MATMUL_K_TILE];
+    threadgroup half tg_bt[MATMUL_K_TILE * TN_TILE];
 
-    uint thread_idx    = local_row * TILE_N + local_col;
-    uint total_threads = TILE_M * TILE_N;
     uint num_groups = (K + group_size - 1) / group_size;
 
-    float acc = 0.0f;
+    simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
+    for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
 
-    for (uint k_base = 0; k_base < K; k_base += TILE_K) {
-        // Load A tile (apply AWQ 1/s to activations if needed)
-        for (uint i = thread_idx; i < TILE_M * TILE_K; i += total_threads) {
-            uint a_row = i / TILE_K;
-            uint a_col = i % TILE_K;
-            uint g_row = group_id.x * TILE_M + a_row;
-            uint g_col = k_base + a_col;
+    for (uint k_base = 0; k_base < K; k_base += MATMUL_K_TILE) {
+        // Load A tile [TM_TILE × MATMUL_K_TILE] row-major
+        for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
+            uint m = i / MATMUL_K_TILE;
+            uint k = i % MATMUL_K_TILE;
+            uint g_row = tg_m + m;
+            uint g_col = k_base + k;
             half a_val = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
             if (has_awq && g_col < K) {
                 a_val = half(float(a_val) / float(awq_scales[g_col]));
@@ -268,12 +297,12 @@ kernel void affine_matmul_int8(
             tg_a[i] = a_val;
         }
 
-        // Load & dequantize B tile
-        for (uint i = thread_idx; i < TILE_N * TILE_K; i += total_threads) {
-            uint b_n = i / TILE_K;
-            uint b_k = i % TILE_K;
-            uint g_n = group_id.y * TILE_N + b_n;
-            uint g_k = k_base + b_k;
+        // Load & dequantize B tile, store TRANSPOSED into tg_bt
+        for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
+            uint n = i / MATMUL_K_TILE;
+            uint k = i % MATMUL_K_TILE;
+            uint g_n = tg_n + n;
+            uint g_k = k_base + k;
 
             half val = half(0);
             if (g_n < N && g_k < K) {
@@ -283,24 +312,41 @@ kernel void affine_matmul_int8(
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(q) - z) * s);
             }
-            tg_b[i] = val;
+            tg_bt[k * TN_TILE + n] = val;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (row < M && col < N) {
-            uint a_base = local_row * TILE_K;
-            uint b_base = local_col * TILE_K;
-            uint k_end  = min(TILE_K, K - k_base);
-            for (uint k = 0; k < k_end; k++) {
-                acc += float(tg_a[a_base + k]) * float(tg_b[b_base + k]);
-            }
+        simdgroup_matrix<half, 8, 8> a_mat;
+        simdgroup_load(a_mat, tg_a + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
+
+        for (uint j = 0; j < TN_BLOCKS; j++) {
+            simdgroup_matrix<half, 8, 8> bt_mat;
+            simdgroup_load(bt_mat, tg_bt + j * 8, TN_TILE);
+            simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (row < M && col < N) {
-        C[row * N + col] = half(acc);
+    // Store results via threadgroup memory
+    threadgroup float tg_out[N_SIMDGROUPS * 8 * 8];
+
+    for (uint j = 0; j < TN_BLOCKS; j++) {
+        simdgroup_store(acc[j], tg_out + sgid * 64, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = tid; i < TM_TILE * 8; i += 256) {
+            uint local_m = i / 8;
+            uint local_n = i % 8;
+            uint out_row = tg_m + local_m;
+            uint out_col = tg_n + j * 8 + local_n;
+            if (out_row < M && out_col < N) {
+                uint sg = local_m / 8;
+                uint sg_row = local_m % 8;
+                C[out_row * N + out_col] = half(tg_out[sg * 64 + sg_row * 8 + local_n]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }

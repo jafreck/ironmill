@@ -1692,15 +1692,15 @@ fn encode_polarquant_matmul(
         let threads_per_group = 32; // SIMD width
         encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
     } else {
-        // matmul: tiled
+        // matmul: simdgroup tiled (column-major dispatch)
         encoder.set_bytes(&(m as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 6);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 7);
-        let tile_m = 8;
-        let tile_n = 32;
+        let tm_tile = 64;
+        let tn_tile = 64;
         encoder.dispatch_threadgroups(
-            ((m + tile_m - 1) / tile_m, (n + tile_n - 1) / tile_n, 1),
-            (tile_n, tile_m, 1),
+            ((m + tm_tile - 1) / tm_tile, (n + tn_tile - 1) / tn_tile, 1),
+            (256, 1, 1),
         );
     }
     Ok(())
@@ -1768,11 +1768,11 @@ fn encode_affine_matmul(
             encoder.set_buffer(&weight.data, 0, 9);
         }
         encoder.set_bytes(&has_awq.to_le_bytes(), 10);
-        let tile_m = 8;
-        let tile_n = 32;
+        let tm_tile = 64;
+        let tn_tile = 64;
         encoder.dispatch_threadgroups(
-            ((m + tile_m - 1) / tile_m, (n + tile_n - 1) / tile_n, 1),
-            (tile_n, tile_m, 1),
+            ((m + tm_tile - 1) / tm_tile, (n + tn_tile - 1) / tn_tile, 1),
+            (256, 1, 1),
         );
     }
     Ok(())
