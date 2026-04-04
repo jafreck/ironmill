@@ -198,31 +198,45 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| MilError::Validation("config.json missing 'model_type'".into()))?;
 
-    let architecture = Architecture::from_str(model_type)?;
+    // Gemma 4 multimodal wrapper — drill into text_config for the text decoder.
+    let (model_type, json_root) = if model_type == "gemma4" {
+        let text_config = json.get("text_config").ok_or_else(|| {
+            MilError::Validation("gemma4 config.json missing 'text_config'".into())
+        })?;
+        let inner_type = text_config
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gemma4_text");
+        (inner_type.to_string(), text_config.clone())
+    } else {
+        (model_type.to_string(), json.clone())
+    };
 
-    let hidden_size = json_usize(&json, "hidden_size").ok_or_else(|| {
+    let architecture = Architecture::from_str(&model_type)?;
+
+    let hidden_size = json_usize(&json_root, "hidden_size").ok_or_else(|| {
         MilError::Validation("missing required field 'hidden_size' in config.json".into())
     })?;
-    let intermediate_size = json_usize(&json, "intermediate_size").ok_or_else(|| {
+    let intermediate_size = json_usize(&json_root, "intermediate_size").ok_or_else(|| {
         MilError::Validation("missing required field 'intermediate_size' in config.json".into())
     })?;
-    let num_hidden_layers = json_usize(&json, "num_hidden_layers").ok_or_else(|| {
+    let num_hidden_layers = json_usize(&json_root, "num_hidden_layers").ok_or_else(|| {
         MilError::Validation("missing required field 'num_hidden_layers' in config.json".into())
     })?;
-    let num_attention_heads = json_usize(&json, "num_attention_heads").ok_or_else(|| {
+    let num_attention_heads = json_usize(&json_root, "num_attention_heads").ok_or_else(|| {
         MilError::Validation("missing required field 'num_attention_heads' in config.json".into())
     })?;
     let num_key_value_heads =
-        json_usize(&json, "num_key_value_heads").unwrap_or(num_attention_heads);
-    let head_dim = json_usize(&json, "head_dim")
+        json_usize(&json_root, "num_key_value_heads").unwrap_or(num_attention_heads);
+    let head_dim = json_usize(&json_root, "head_dim")
         .unwrap_or_else(|| ModelConfig::default_head_dim(hidden_size, num_attention_heads));
-    let vocab_size = json_usize(&json, "vocab_size").ok_or_else(|| {
+    let vocab_size = json_usize(&json_root, "vocab_size").ok_or_else(|| {
         MilError::Validation("missing required field 'vocab_size' in config.json".into())
     })?;
-    let max_position_embeddings = json_usize(&json, "max_position_embeddings").unwrap_or(0);
-    let rms_norm_eps = json_f64(&json, "rms_norm_eps").unwrap_or(1e-6);
-    let rope_theta = json_f64(&json, "rope_theta").unwrap_or(10000.0);
-    let tie_word_embeddings = json
+    let max_position_embeddings = json_usize(&json_root, "max_position_embeddings").unwrap_or(0);
+    let rms_norm_eps = json_f64(&json_root, "rms_norm_eps").unwrap_or(1e-6);
+    let rope_theta = json_f64(&json_root, "rope_theta").unwrap_or(10000.0);
+    let tie_word_embeddings = json_root
         .get("tie_word_embeddings")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
@@ -243,7 +257,7 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
         "rope_theta",
         "tie_word_embeddings",
     ];
-    if let Some(obj) = json.as_object() {
+    if let Some(obj) = json_root.as_object() {
         for (k, v) in obj {
             if !known_keys.contains(&k.as_str()) {
                 extra.insert(k.clone(), v.clone());
@@ -844,5 +858,70 @@ mod tests {
 
         let t = provider.tensor("shard2.weight").unwrap();
         assert_eq!(t.shape, vec![2, 2]);
+    }
+
+    #[test]
+    fn test_parse_hf_config_gemma4_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 2304,
+                "intermediate_size": 9216,
+                "num_hidden_layers": 30,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10000.0,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "rope_parameters": {
+                    "sliding_attention": {"rope_theta": 10000.0},
+                    "full_attention": {"rope_theta": 1000000.0, "partial_rotary_factor": 0.25}
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        let config = parse_hf_config(&config_path).unwrap();
+        assert_eq!(config.architecture, Architecture::Gemma);
+        assert_eq!(config.hidden_size, 2304);
+        assert_eq!(config.num_hidden_layers, 30);
+        assert!(config.layer_types().is_some());
+        assert!(config.rope_parameters().is_some());
+    }
+
+    #[test]
+    fn test_parse_hf_config_gemma4_text_direct() {
+        // Test direct gemma4_text config (not wrapped in multimodal)
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+            "model_type": "gemma4_text",
+            "hidden_size": 1536,
+            "intermediate_size": 6144,
+            "num_hidden_layers": 35,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "head_dim": 256,
+            "vocab_size": 262144,
+            "max_position_embeddings": 131072,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0
+        }"#,
+        )
+        .unwrap();
+        let config = parse_hf_config(&config_path).unwrap();
+        assert_eq!(config.architecture, Architecture::Gemma);
+        assert_eq!(config.hidden_size, 1536);
+        assert_eq!(config.num_key_value_heads, 1);
     }
 }
