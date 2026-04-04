@@ -103,6 +103,8 @@ struct IntermediateBuffers {
     /// Second token IDs buffer for prefill pipelining — allows encoding
     /// the next chunk while the previous command buffer is still executing.
     token_ids_buf_b: MetalBuffer,
+    /// Current maximum token capacity of these buffers.
+    capacity: usize,
 }
 
 impl IntermediateBuffers {
@@ -153,7 +155,22 @@ impl IntermediateBuffers {
             token_ids_buf_b: device
                 .create_buffer((max_tokens * 4).max(16), StorageMode::Shared)
                 .map_err(MetalError::Metal)?,
+            capacity: max_tokens,
         })
+    }
+
+    /// Grow buffers if `needed` exceeds current capacity. No-op otherwise.
+    fn ensure_capacity(
+        &mut self,
+        device: &MetalDevice,
+        needed: usize,
+        mc: &ModelConfig,
+    ) -> Result<(), MetalError> {
+        if needed <= self.capacity {
+            return Ok(());
+        }
+        *self = Self::allocate(device, needed, mc)?;
+        Ok(())
     }
 }
 
@@ -289,8 +306,7 @@ impl MetalInference {
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
 
-        let max_prefill = self.config.prefill_chunk_size.unwrap_or(512).max(1);
-        let bufs = IntermediateBuffers::allocate(&self.device, max_prefill, mc)
+        let bufs = IntermediateBuffers::allocate(&self.device, 1, mc)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.intermediate_buffers = Some(bufs);
 
@@ -520,36 +536,31 @@ impl MetalInference {
             .ok_or(InferenceError::NotLoaded)?
             .clone();
         let vocab = mc.vocab_size;
-        let chunk_size = self.config.prefill_chunk_size.unwrap_or(512).max(1);
+        let n = token_ids.len();
 
-        let mut all_logits: Vec<Logits> = Vec::with_capacity(token_ids.len());
+        // Run full pipeline — buffers grow on demand inside run_pipeline_inner.
+        // Skip the built-in last-token readback; we read ALL positions below.
+        self.run_pipeline_inner(token_ids, true)?;
 
-        for chunk in token_ids.chunks(chunk_size) {
-            let n = chunk.len();
+        let bufs = self
+            .intermediate_buffers
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?;
+        let total_bytes = n * vocab * 2;
+        let mut fp16_buf = vec![0u8; total_bytes];
+        bufs.logits
+            .read_bytes(&mut fp16_buf, 0)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-            // Run pipeline — skip the built-in last-token readback since
-            // we read ALL positions ourselves below.
-            self.run_pipeline_inner(chunk, true)?;
-
-            let bufs = self
-                .intermediate_buffers
-                .as_ref()
-                .ok_or(InferenceError::NotLoaded)?;
-            let total_bytes = n * vocab * 2;
-            let mut fp16_buf = vec![0u8; total_bytes];
-            bufs.logits
-                .read_bytes(&mut fp16_buf, 0)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-
-            for t in 0..n {
+        let all_logits: Vec<Logits> = (0..n)
+            .map(|t| {
                 let offset = t * vocab * 2;
-                let logits: Logits = fp16_buf[offset..offset + vocab * 2]
+                fp16_buf[offset..offset + vocab * 2]
                     .chunks_exact(2)
                     .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                    .collect();
-                all_logits.push(logits);
-            }
-        }
+                    .collect()
+            })
+            .collect();
 
         Ok(all_logits)
     }
@@ -576,7 +587,16 @@ impl MetalInference {
         let mc = self
             .model_config
             .as_ref()
-            .ok_or(InferenceError::NotLoaded)?;
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
+
+        // Grow intermediate buffers on demand for larger prefill batches.
+        self.intermediate_buffers
+            .as_mut()
+            .ok_or(InferenceError::NotLoaded)?
+            .ensure_capacity(&self.device, token_ids.len(), &mc)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
         let bufs = self
             .intermediate_buffers
             .as_ref()
@@ -619,7 +639,7 @@ impl MetalInference {
                 .as_ref()
                 .is_none_or(|c| c.token_count != token_count);
             if need_rebuild {
-                let cache = Self::build_matmul_cache(&self.device, mc, weights, token_count)
+                let cache = Self::build_matmul_cache(&self.device, &mc, weights, token_count)
                     .map_err(|e| InferenceError::Runtime(e.to_string()))?;
                 self.decode_matmuls = Some(cache);
             }
@@ -2319,10 +2339,9 @@ impl InferenceEngine for MetalInference {
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
 
-        // Allocate intermediate buffers (sized for single-token decode;
-        // prefill will rebuild the matmul cache for larger token counts).
-        let max_prefill = self.config.prefill_chunk_size.unwrap_or(512).max(1);
-        let bufs = IntermediateBuffers::allocate(&self.device, max_prefill, mc)
+        // Allocate intermediate buffers (start at 1 token; run_pipeline_inner
+        // grows them on demand for larger prefill batches).
+        let bufs = IntermediateBuffers::allocate(&self.device, 1, mc)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.intermediate_buffers = Some(bufs);
 
@@ -2389,14 +2408,14 @@ impl InferenceEngine for MetalInference {
             return Err(InferenceError::Decode("empty prefill tokens".into()));
         }
 
+        // With dynamic buffer resizing, process all tokens in one shot
+        // unless the caller explicitly set a chunk size.
         let chunk_size = self.config.prefill_chunk_size.unwrap_or(tokens.len());
         let chunk_size = chunk_size.max(1);
 
         let chunks: Vec<&[u32]> = tokens.chunks(chunk_size).collect();
         let n_chunks = chunks.len();
 
-        // For multi-chunk prefill, skip the expensive logits readback + f16→f32
-        // conversion on non-last chunks (the logits are immediately discarded).
         for chunk in &chunks[..n_chunks - 1] {
             self.run_pipeline_no_logits(chunk)?;
         }
