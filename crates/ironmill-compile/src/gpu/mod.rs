@@ -18,6 +18,7 @@ pub mod bundle;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mil_rs::ScalarType;
 use mil_rs::Value;
@@ -92,20 +93,30 @@ impl GpuCompileBuilder {
         let format = detect_format(input);
 
         // Import to MIL IR — format-specific, but produces a uniform Program.
-        // For SafeTensors/GGUF, collect supplement tensors and drop the source
-        // provider before building MilWeightProvider to release mmap pages.
-        let (mut program, config, supplement_tensors) = match format {
+        // For SafeTensors/GGUF, the provider is wrapped in Arc and attached to the
+        // program so that passes can lazily resolve External tensor data on demand.
+        let (mut program, config, supplement_tensors, _base_provider) = match format {
             InputFormat::Onnx => {
                 let (program, config) = import_onnx(input)?;
-                (program, config, HashMap::new())
+                (program, config, HashMap::new(), None)
             }
             InputFormat::SafeTensors | InputFormat::Gguf => {
                 let provider = load_weight_provider(input, &format)?;
                 let config = provider.config().clone();
-                let result = crate::templates::weights_to_program(provider.as_ref())?;
-                let supplements = collect_supplement_tensors(provider.as_ref(), &result.program);
-                // provider is dropped here at end of match arm, releasing mmap pages
-                (result.program, config, supplements)
+
+                // Wrap in Arc for shared ownership between program and builder.
+                let provider_arc: Arc<dyn WeightProvider + Send + Sync> = Arc::from(provider);
+
+                // Template emission creates External refs — no weight copy for large tensors.
+                let result = crate::templates::weights_to_program(provider_arc.as_ref())?;
+                let mut program = result.program;
+
+                let supplements = collect_supplement_tensors(provider_arc.as_ref(), &program);
+
+                // Attach provider for lazy resolution by passes.
+                program.set_weight_provider(provider_arc.clone());
+
+                (program, config, supplements, Some(provider_arc))
             }
             InputFormat::Unsupported(ext) => {
                 return Err(CompileError::Other(format!(
@@ -116,9 +127,11 @@ impl GpuCompileBuilder {
         };
 
         // Run the pass pipeline (may be empty for FP16 passthrough).
+        // Quantization passes resolve External tensors on demand via weight_provider.
         let _report = self.pipeline.run(&mut program)?;
 
         // Extract weights from the optimized program.
+        // MilWeightProvider resolves any remaining External tensors during extraction.
         let mut provider = MilWeightProvider::new(&mut program, config)?;
 
         // Inject any architecture-specific tensors that the template system
@@ -164,7 +177,7 @@ fn detect_format(path: &Path) -> InputFormat {
 fn load_weight_provider(
     input: &Path,
     format: &InputFormat,
-) -> Result<Box<dyn WeightProvider>, CompileError> {
+) -> Result<Box<dyn WeightProvider + Send + Sync>, CompileError> {
     match format {
         InputFormat::SafeTensors => Ok(Box::new(crate::weights::SafeTensorsProvider::load(input)?)),
         InputFormat::Gguf => Ok(Box::new(crate::weights::GgufProvider::load(input)?)),

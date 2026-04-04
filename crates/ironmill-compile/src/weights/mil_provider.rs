@@ -35,6 +35,18 @@ pub struct MilWeightProvider {
 impl MilWeightProvider {
     /// Build a provider by walking the main function of `program`.
     pub fn new(program: &mut Program, config: ModelConfig) -> Result<Self, MilError> {
+        // Clone the weight provider so we can resolve External tensors during extraction.
+        let wp = program.weight_provider();
+        let resolve = |data: &mut TensorData| -> Result<(), MilError> {
+            data.materialize_with(|key| {
+                let p = wp.as_ref().ok_or_else(|| {
+                    MilError::Validation(format!("no weight provider for resolving tensor '{key}'"))
+                })?;
+                let tensor = p.tensor(key)?;
+                Ok(tensor.data.into_owned())
+            })
+        };
+
         let function = program
             .main_mut()
             .ok_or_else(|| MilError::Validation("program has no main function".into()))?;
@@ -69,6 +81,7 @@ impl MilWeightProvider {
                     "_quip_norms"
                 };
                 let prefix = &output_name[..output_name.len() - suffix.len()];
+                resolve(data)?;
                 norms_map.insert(
                     prefix.to_string(),
                     (
@@ -90,10 +103,12 @@ impl MilWeightProvider {
                         None => continue,
                     };
 
-                    let (lut_data, lut_dtype) = extract_tensor_attr(&mut op.attributes, "lut")?;
+                    let (lut_data, lut_dtype) =
+                        extract_tensor_attr(&mut op.attributes, "lut", &resolve)?;
                     let (indices_data, indices_dtype) =
-                        extract_tensor_attr(&mut op.attributes, "indices")?;
-                    let (shape_bytes, _) = extract_tensor_attr(&mut op.attributes, "shape")?;
+                        extract_tensor_attr(&mut op.attributes, "indices", &resolve)?;
+                    let (shape_bytes, _) =
+                        extract_tensor_attr(&mut op.attributes, "shape", &resolve)?;
 
                     let original_shape = u32_bytes_to_usize_vec(&shape_bytes);
 
@@ -153,14 +168,14 @@ impl MilWeightProvider {
                     };
 
                     let (quantized_data, quantized_dtype) =
-                        extract_tensor_attr(&mut op.attributes, "quantized_data")?;
+                        extract_tensor_attr(&mut op.attributes, "quantized_data", &resolve)?;
                     let quantized_shape =
                         extract_tensor_shape(&mut op.attributes, "quantized_data")?;
 
                     let (scale_data, scale_dtype) =
-                        extract_scale_or_zp(&mut op.attributes, "scale")?;
+                        extract_scale_or_zp(&mut op.attributes, "scale", &resolve)?;
                     let (zp_data, zp_dtype) =
-                        extract_scale_or_zp(&mut op.attributes, "zero_point")?;
+                        extract_scale_or_zp(&mut op.attributes, "zero_point", &resolve)?;
 
                     let axis = match op.attributes.get("axis") {
                         Some(Value::Int(v)) => Some(*v as usize),
@@ -258,6 +273,7 @@ impl MilWeightProvider {
                     };
 
                     if let Value::Tensor { data, shape, dtype } = val {
+                        resolve(data)?;
                         let extracted = ExtractedTensor {
                             data: mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
                             shape: mem::take(shape),
@@ -485,15 +501,20 @@ fn tensor_name_for_op(op: &Operation) -> Option<String> {
 }
 
 /// Extract a `Value::Tensor` attribute, returning its raw bytes and dtype.
+/// Resolves `TensorData::External` variants via `resolve` before extraction.
 fn extract_tensor_attr(
     attrs: &mut HashMap<String, Value>,
     key: &str,
+    resolve: &impl Fn(&mut TensorData) -> Result<(), MilError>,
 ) -> Result<(Vec<u8>, ScalarType), MilError> {
     match attrs.get_mut(key) {
-        Some(Value::Tensor { data, dtype, .. }) => Ok((
-            mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
-            *dtype,
-        )),
+        Some(Value::Tensor { data, dtype, .. }) => {
+            resolve(data)?;
+            Ok((
+                mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
+                *dtype,
+            ))
+        }
         _ => Err(MilError::UndefinedValue(format!(
             "missing or invalid tensor attribute '{key}'"
         ))),
@@ -514,16 +535,21 @@ fn extract_tensor_shape(
 }
 
 /// Extract scale or zero_point which may be a `Value::Float` (per-tensor) or
-/// `Value::Tensor` (per-channel).
+/// `Value::Tensor` (per-channel). Resolves `TensorData::External` variants
+/// via `resolve` before extraction.
 fn extract_scale_or_zp(
     attrs: &mut HashMap<String, Value>,
     key: &str,
+    resolve: &impl Fn(&mut TensorData) -> Result<(), MilError>,
 ) -> Result<(Vec<u8>, ScalarType), MilError> {
     match attrs.get_mut(key) {
-        Some(Value::Tensor { data, dtype, .. }) => Ok((
-            mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
-            *dtype,
-        )),
+        Some(Value::Tensor { data, dtype, .. }) => {
+            resolve(data)?;
+            Ok((
+                mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
+                *dtype,
+            ))
+        }
         Some(Value::Float(v)) => {
             let bytes = (*v as f32).to_le_bytes().to_vec();
             Ok((bytes, ScalarType::Float32))

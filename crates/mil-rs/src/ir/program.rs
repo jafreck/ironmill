@@ -111,6 +111,16 @@ impl Program {
         self.weight_provider.is_some()
     }
 
+    /// Clone the weight provider `Arc`, if one is attached.
+    pub fn weight_provider(&self) -> Option<Arc<dyn WeightProvider + Send + Sync>> {
+        self.weight_provider.clone()
+    }
+
+    /// Remove and return the weight provider, leaving `None` in its place.
+    pub fn take_weight_provider(&mut self) -> Option<Arc<dyn WeightProvider + Send + Sync>> {
+        self.weight_provider.take()
+    }
+
     /// Materialize all `TensorData::External` references in the program.
     pub fn materialize_all(&mut self) -> Result<(), MilError> {
         let provider = self
