@@ -62,11 +62,21 @@ impl Pass for SpinQuantPass {
 
     fn run(&self, program: &mut Program) -> Result<()> {
         let qmax = (1u32 << self.bits) as f32 - 1.0;
+        let provider = program.weight_provider.clone();
+        let resolve = super::util::make_resolver(&provider);
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
                 if op.op_type != "const" {
                     continue;
+                }
+
+                // Materialize External tensors before extracting.
+                if let Some(Value::Tensor { data, .. }) = op.inputs.get_mut("val") {
+                    data.materialize_with(|key| resolve(key))?;
+                }
+                if let Some(Value::Tensor { data, .. }) = op.attributes.get_mut("val") {
+                    data.materialize_with(|key| resolve(key))?;
                 }
 
                 let eligible = extract_eligible(op, self.min_elements);

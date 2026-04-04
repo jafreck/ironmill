@@ -81,11 +81,21 @@ impl Pass for PalettizePass {
 
     fn run(&self, program: &mut Program) -> Result<()> {
         let k = 1usize << self.n_bits; // 2^n_bits centroids
+        let provider = program.weight_provider.clone();
+        let resolve = super::util::make_resolver(&provider);
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
                 if op.op_type != "const" {
                     continue;
+                }
+
+                // Materialize External tensors before accessing byte data.
+                if let Some(Value::Tensor { data, .. }) = op.inputs.get_mut("val") {
+                    data.materialize_with(|key| resolve(key))?;
+                }
+                if let Some(Value::Tensor { data, .. }) = op.attributes.get_mut("val") {
+                    data.materialize_with(|key| resolve(key))?;
                 }
 
                 // val may live in inputs or attributes depending on the
@@ -179,11 +189,21 @@ impl Pass for GroupedPalettizePass {
 
     fn run(&self, program: &mut Program) -> Result<()> {
         let k = 1usize << self.n_bits;
+        let provider = program.weight_provider.clone();
+        let resolve = super::util::make_resolver(&provider);
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
                 if op.op_type != "const" {
                     continue;
+                }
+
+                // Materialize External tensors before accessing byte data.
+                if let Some(Value::Tensor { data, .. }) = op.inputs.get_mut("val") {
+                    data.materialize_with(|key| resolve(key))?;
+                }
+                if let Some(Value::Tensor { data, .. }) = op.attributes.get_mut("val") {
+                    data.materialize_with(|key| resolve(key))?;
                 }
 
                 let val = match op.inputs.get("val").or_else(|| op.attributes.get("val")) {

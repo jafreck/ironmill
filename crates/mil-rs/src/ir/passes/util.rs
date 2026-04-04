@@ -4,10 +4,29 @@
 //! operation list without mutating anything.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::error::MilError;
 use crate::ir::operation::Operation;
 use crate::ir::program::Block;
 use crate::ir::types::Value;
+use crate::weights::WeightProvider;
+
+/// Create a resolver closure from an optional provider Arc.
+/// Used by quantization passes to materialize External tensors.
+pub(crate) fn make_resolver(
+    provider: &Option<Arc<dyn WeightProvider + Send + Sync>>,
+) -> impl Fn(&str) -> Result<Vec<u8>, MilError> + '_ {
+    move |key: &str| {
+        let p = provider.as_ref().ok_or_else(|| {
+            MilError::Validation(format!(
+                "no weight provider attached; cannot resolve tensor '{key}'"
+            ))
+        })?;
+        let tensor = p.tensor(key)?;
+        Ok(tensor.data.into_owned())
+    }
+}
 
 /// Returns `true` if `value` contains a [`Value::Reference`] to `name`,
 /// recursing into nested [`Value::List`] variants.

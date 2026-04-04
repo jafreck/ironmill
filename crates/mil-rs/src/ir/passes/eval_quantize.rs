@@ -92,6 +92,9 @@ impl QuantizationEvaluator {
     ///
     /// Returns a map of `op_name → QuantizationMetrics`.
     ///
+    /// Both programs must have all tensors materialized (inline) before comparison.
+    /// Callers should call `program.materialize_all()` first if using lazy tensors.
+    ///
     /// The evaluator:
     /// 1. Walks the original program's const ops and collects FP32 weight data
     ///    keyed by output name.

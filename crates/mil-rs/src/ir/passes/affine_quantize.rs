@@ -118,6 +118,8 @@ impl Pass for AffineQuantizePass {
     fn run(&self, program: &mut Program) -> Result<()> {
         let qmax = self.bits.qmax();
         let bit_width = self.bits.as_u8();
+        let provider = program.weight_provider.clone();
+        let resolve = super::util::make_resolver(&provider);
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
@@ -183,7 +185,13 @@ impl Pass for AffineQuantizePass {
                         .ok_or_else(|| MilError::Validation("missing val in attributes".into()))?
                 };
 
-                if let Value::Tensor { data, shape, dtype } = val {
+                if let Value::Tensor {
+                    mut data,
+                    shape,
+                    dtype,
+                } = val
+                {
+                    data.materialize_with(|key| resolve(key))?;
                     let bytes = data.as_bytes().expect("tensor not materialized");
                     let floats = match dtype {
                         ScalarType::Float32 => tensor_as_f32_slice(bytes),

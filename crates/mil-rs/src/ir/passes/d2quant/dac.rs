@@ -47,10 +47,20 @@ impl Pass for DacPass {
     }
 
     fn run(&self, program: &mut Program) -> Result<()> {
+        let provider = program.weight_provider.clone();
+        let resolve = super::super::util::make_resolver(&provider);
+
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
                 if !CORRECTABLE_NORM_OPS.contains(&op.op_type.as_str()) {
                     continue;
+                }
+
+                // Materialize External tensors in inputs before reading params.
+                for val in op.inputs.values_mut() {
+                    if let Value::Tensor { data, .. } = val {
+                        data.materialize_with(|key| resolve(key))?;
+                    }
                 }
 
                 let fp16 = match self.fp16_stats.get(&op.name) {

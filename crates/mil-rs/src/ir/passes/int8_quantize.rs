@@ -67,6 +67,9 @@ impl Pass for Int8QuantizePass {
     }
 
     fn run(&self, program: &mut Program) -> Result<()> {
+        let provider = program.weight_provider.clone();
+        let resolve = super::util::make_resolver(&provider);
+
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
                 if op.op_type != "const" {
@@ -106,11 +109,12 @@ impl Pass for Int8QuantizePass {
                 };
 
                 if let Value::Tensor {
-                    data,
+                    mut data,
                     shape,
                     dtype: _,
                 } = val
                 {
+                    data.materialize_with(|key| resolve(key))?;
                     let floats =
                         tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"));
 

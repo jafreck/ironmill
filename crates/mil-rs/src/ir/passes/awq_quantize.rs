@@ -182,6 +182,8 @@ impl Pass for AwqQuantizePass {
         }
 
         let qmax = qmax(self.bits);
+        let provider = program.weight_provider.clone();
+        let resolve = super::util::make_resolver(&provider);
 
         for function in program.functions.values_mut() {
             // ----------------------------------------------------------
@@ -252,7 +254,13 @@ impl Pass for AwqQuantizePass {
                         .ok_or_else(|| MilError::Validation("missing val in attributes".into()))?
                 };
 
-                if let Value::Tensor { data, shape, dtype } = val {
+                if let Value::Tensor {
+                    mut data,
+                    shape,
+                    dtype,
+                } = val
+                {
+                    data.materialize_with(|key| resolve(key))?;
                     let floats = match dtype {
                         ScalarType::Float32 => {
                             tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))

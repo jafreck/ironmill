@@ -25,6 +25,9 @@ impl Pass for Fp16QuantizePass {
     }
 
     fn run(&self, program: &mut Program) -> Result<()> {
+        let provider = program.weight_provider.clone();
+        let resolve = super::util::make_resolver(&provider);
+
         for function in program.functions.values_mut() {
             // Convert function input types.
             for (_name, ty) in &mut function.inputs {
@@ -35,6 +38,18 @@ impl Pass for Fp16QuantizePass {
 
             // Convert operations in the function body.
             for op in &mut function.body.operations {
+                // Materialize External tensors before quantizing.
+                for value in op.inputs.values_mut() {
+                    if let Value::Tensor { data, .. } = value {
+                        data.materialize_with(|key| resolve(key))?;
+                    }
+                }
+                for value in op.attributes.values_mut() {
+                    if let Value::Tensor { data, .. } = value {
+                        data.materialize_with(|key| resolve(key))?;
+                    }
+                }
+
                 for value in op.inputs.values_mut() {
                     quantize_value(value)?;
                 }

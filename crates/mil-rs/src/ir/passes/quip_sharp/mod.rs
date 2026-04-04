@@ -98,11 +98,26 @@ impl Pass for QuipSharpPass {
     }
 
     fn run(&self, program: &mut Program) -> Result<()> {
+        let provider = program.weight_provider.clone();
+        let resolve = super::util::make_resolver(&provider);
+
         for function in program.functions.values_mut() {
             let mut insertions: Vec<(usize, Vec<Operation>)> = Vec::new();
             let mut replacements: Vec<(String, String)> = Vec::new();
 
             for i in 0..function.body.operations.len() {
+                // Materialize External tensors before extracting.
+                if let Some(Value::Tensor { data, .. }) =
+                    function.body.operations[i].inputs.get_mut("val")
+                {
+                    data.materialize_with(|key| resolve(key))?;
+                }
+                if let Some(Value::Tensor { data, .. }) =
+                    function.body.operations[i].attributes.get_mut("val")
+                {
+                    data.materialize_with(|key| resolve(key))?;
+                }
+
                 let eligible =
                     extract_eligible_tensor(&function.body.operations[i], self.min_elements);
                 let info = match eligible {
