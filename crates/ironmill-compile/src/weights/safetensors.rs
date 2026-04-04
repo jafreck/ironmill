@@ -608,7 +608,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
-            r#"{"model_type": "llama", "hidden_size": 4, "num_attention_heads": 2}"#,
+            r#"{"model_type": "llama", "hidden_size": 4, "intermediate_size": 16, "num_hidden_layers": 2, "num_attention_heads": 2, "vocab_size": 32000}"#,
         )
         .unwrap();
 
@@ -753,7 +753,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
-            r#"{"model_type": "llama", "hidden_size": 128, "num_attention_heads": 4}"#,
+            r#"{"model_type": "llama", "hidden_size": 128, "intermediate_size": 512, "num_hidden_layers": 2, "num_attention_heads": 4, "vocab_size": 32000}"#,
         )
         .unwrap();
 
@@ -770,7 +770,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
-            r#"{"model_type": "llama", "hidden_size": 4, "num_attention_heads": 2}"#,
+            r#"{"model_type": "llama", "hidden_size": 4, "intermediate_size": 16, "num_hidden_layers": 2, "num_attention_heads": 2, "vocab_size": 32000}"#,
         )
         .unwrap();
 
@@ -803,7 +803,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
-            r#"{"model_type": "gemma", "hidden_size": 4, "num_attention_heads": 2}"#,
+            r#"{"model_type": "gemma", "hidden_size": 4, "intermediate_size": 16, "num_hidden_layers": 2, "num_attention_heads": 2, "vocab_size": 32000}"#,
         )
         .unwrap();
 

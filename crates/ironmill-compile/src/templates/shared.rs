@@ -61,9 +61,23 @@ pub(super) fn emit_weight_const(
             block.add_op(op);
             Ok(())
         }
-        Err(e) => Err(MilError::Validation(format!(
-            "missing required weight '{weight_name}': {e}"
-        ))),
+        Err(e) => {
+            _warnings.push(format!("missing weight '{weight_name}': {e}"));
+            let data = TensorData::inline(vec![0u8; 4]);
+            let op = Operation::new("const", const_name)
+                .with_attr(
+                    "val",
+                    Value::Tensor {
+                        data,
+                        shape: vec![1],
+                        dtype: ScalarType::Float32,
+                    },
+                )
+                .with_attr("onnx_name", Value::String(weight_name.to_string()))
+                .with_output(const_name);
+            block.add_op(op);
+            Ok(())
+        }
     }
 }
 

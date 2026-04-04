@@ -730,11 +730,17 @@ mod tests {
 
     #[test]
     fn eval_quantize_per_tensor_int4() {
-        let values: Vec<f32> = (-50..50).map(|i| i as f32 * 0.1).collect();
+        let n = 2048;
+        let values: Vec<f32> = (0..n)
+            .map(|i| (i as f32 - (n as f32 / 2.0)) * 0.1)
+            .collect();
+        let original_range = (values.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            - values.iter().cloned().fold(f32::INFINITY, f32::min))
+        .abs();
         let mut program = {
             let tensor_val = Value::Tensor {
                 data: TensorData::Inline(f32_bytes(&values)),
-                shape: vec![10, 10],
+                shape: vec![32, 64],
                 dtype: ScalarType::Float32,
             };
             let mut p = Program::new("1.0.0");
@@ -765,17 +771,20 @@ mod tests {
             "INT4 per-tensor SNR should be > 15 dB, got {}",
             m.snr_db
         );
-        assert_eq!(m.n_elements, 100);
-        assert!((m.original_range - 9.9).abs() < 0.01);
+        assert_eq!(m.n_elements, n);
+        assert!((m.original_range - original_range as f64).abs() < 0.01);
     }
 
     #[test]
     fn eval_quantize_per_group_int4() {
-        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.01).collect();
+        let n = 2048;
+        let values: Vec<f32> = (0..n)
+            .map(|i| (i as f32 - (n as f32 / 2.0)) * 0.01)
+            .collect();
         let mut program = {
             let tensor_val = Value::Tensor {
                 data: TensorData::Inline(f32_bytes(&values)),
-                shape: vec![2, 32],
+                shape: vec![32, 64],
                 dtype: ScalarType::Float32,
             };
             let mut p = Program::new("1.0.0");
@@ -805,7 +814,7 @@ mod tests {
             "INT4 per-group SNR should be > 20 dB, got {}",
             m.snr_db
         );
-        assert_eq!(m.n_elements, 64);
+        assert_eq!(m.n_elements, n);
     }
 
     #[test]
@@ -877,11 +886,11 @@ mod tests {
     #[test]
     fn eval_quantize_perfect_reconstruction() {
         // All-zero tensor: quantization should be lossless.
-        let values = vec![0.0_f32; 64];
+        let values = vec![0.0_f32; 2048];
         let mut program = {
             let tensor_val = Value::Tensor {
                 data: TensorData::Inline(f32_bytes(&values)),
-                shape: vec![8, 8],
+                shape: vec![32, 64],
                 dtype: ScalarType::Float32,
             };
             let mut p = Program::new("1.0.0");

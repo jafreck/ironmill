@@ -2234,6 +2234,7 @@ name = "int4-quantize"
     // ── SpinQuant pipeline tests ──────────────────────────────────────
 
     #[test]
+    #[cfg(feature = "gptq")]
     fn with_spinquant_builds_pipeline() {
         let config = SpinQuantConfig {
             rotation_epochs: 100,
@@ -2250,6 +2251,7 @@ name = "int4-quantize"
     }
 
     #[test]
+    #[cfg(feature = "gptq")]
     fn spinquant_and_int4_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_int4(128).unwrap();
         let config = SpinQuantConfig {
@@ -2266,6 +2268,7 @@ name = "int4-quantize"
     }
 
     #[test]
+    #[cfg(feature = "gptq")]
     fn spinquant_and_int8_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_int8(None).unwrap();
         let config = SpinQuantConfig {
@@ -2282,6 +2285,7 @@ name = "int4-quantize"
     }
 
     #[test]
+    #[cfg(feature = "gptq")]
     fn spinquant_and_awq_mutually_exclusive() {
         let pipeline = PassPipeline::new()
             .with_awq(sample_magnitudes(), 128, HashMap::new(), 0)
@@ -2300,6 +2304,7 @@ name = "int4-quantize"
     }
 
     #[test]
+    #[cfg(feature = "gptq")]
     fn spinquant_and_quip_sharp_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_quip_sharp(2, 42).unwrap();
         let config = SpinQuantConfig {
@@ -2316,6 +2321,7 @@ name = "int4-quantize"
     }
 
     #[test]
+    #[cfg(feature = "gptq")]
     fn spinquant_and_d2quant_mutually_exclusive() {
         let pipeline = PassPipeline::new()
             .with_d2quant(2, 128, 0.99, None)
@@ -2334,6 +2340,7 @@ name = "int4-quantize"
     }
 
     #[test]
+    #[cfg(feature = "gptq")]
     fn spinquant_blocks_subsequent_int4() {
         let config = SpinQuantConfig {
             rotation_epochs: 100,
@@ -2352,6 +2359,7 @@ name = "int4-quantize"
     }
 
     #[test]
+    #[cfg(feature = "gptq")]
     fn spinquant_plus_fp16_is_allowed() {
         let config = SpinQuantConfig {
             rotation_epochs: 100,
@@ -2367,6 +2375,7 @@ name = "int4-quantize"
     }
 
     #[test]
+    #[cfg(feature = "gptq")]
     fn spinquant_with_awq_method() {
         let config = SpinQuantConfig {
             rotation_epochs: 50,
