@@ -128,10 +128,7 @@ impl ModelSplitPass {
 
         let mut draft_fn = Function::new(function.name.clone());
         draft_fn.inputs = function.inputs.clone();
-        draft_fn.body = Block {
-            operations: kept_ops,
-            outputs: draft_outputs,
-        };
+        draft_fn.body = Block::with_operations(kept_ops, draft_outputs);
 
         Ok(draft_fn)
     }

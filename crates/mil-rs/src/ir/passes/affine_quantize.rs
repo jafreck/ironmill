@@ -23,6 +23,7 @@ use crate::ir::types::{TensorData, Value};
 
 /// Quantization bit width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BitWidth {
     /// 4-bit unsigned (0–15).
     Four,
@@ -53,6 +54,7 @@ impl BitWidth {
 /// Quantizes FP32 const weight tensors using unsigned affine min/max scaling.
 /// Supports INT4 and INT8 bit widths, per-tensor, per-channel, and per-group
 /// granularity.
+#[non_exhaustive]
 pub struct AffineQuantizePass {
     /// Quantization bit width.
     pub bits: BitWidth,

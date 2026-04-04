@@ -11,6 +11,7 @@ use crate::ir::ScalarType;
 
 /// Supported model architectures for template-based conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Architecture {
     Llama,
     Qwen,
@@ -45,6 +46,7 @@ impl std::str::FromStr for Architecture {
 /// Architecture-agnostic model configuration extracted from
 /// config.json (SafeTensors) or GGUF metadata.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ModelConfig {
     pub architecture: Architecture,
     pub hidden_size: usize,
@@ -64,6 +66,100 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Create a new `ModelConfig` with the given architecture and sensible defaults.
+    ///
+    /// All numeric fields default to `0`, booleans to `false`, and `extra`
+    /// to an empty map. Use the `with_*()` builder methods to set fields.
+    pub fn new(architecture: Architecture) -> Self {
+        Self {
+            architecture,
+            hidden_size: 0,
+            intermediate_size: 0,
+            num_hidden_layers: 0,
+            num_attention_heads: 0,
+            num_key_value_heads: 0,
+            head_dim: 0,
+            vocab_size: 0,
+            max_position_embeddings: 0,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Set the hidden size.
+    pub fn with_hidden_size(mut self, hidden_size: usize) -> Self {
+        self.hidden_size = hidden_size;
+        self
+    }
+
+    /// Set the intermediate size.
+    pub fn with_intermediate_size(mut self, intermediate_size: usize) -> Self {
+        self.intermediate_size = intermediate_size;
+        self
+    }
+
+    /// Set the number of hidden layers.
+    pub fn with_num_hidden_layers(mut self, num_hidden_layers: usize) -> Self {
+        self.num_hidden_layers = num_hidden_layers;
+        self
+    }
+
+    /// Set the number of attention heads.
+    pub fn with_num_attention_heads(mut self, num_attention_heads: usize) -> Self {
+        self.num_attention_heads = num_attention_heads;
+        self
+    }
+
+    /// Set the number of key-value heads.
+    pub fn with_num_key_value_heads(mut self, num_key_value_heads: usize) -> Self {
+        self.num_key_value_heads = num_key_value_heads;
+        self
+    }
+
+    /// Set the head dimension.
+    pub fn with_head_dim(mut self, head_dim: usize) -> Self {
+        self.head_dim = head_dim;
+        self
+    }
+
+    /// Set the vocabulary size.
+    pub fn with_vocab_size(mut self, vocab_size: usize) -> Self {
+        self.vocab_size = vocab_size;
+        self
+    }
+
+    /// Set the maximum position embeddings.
+    pub fn with_max_position_embeddings(mut self, max_position_embeddings: usize) -> Self {
+        self.max_position_embeddings = max_position_embeddings;
+        self
+    }
+
+    /// Set the RMS norm epsilon.
+    pub fn with_rms_norm_eps(mut self, rms_norm_eps: f64) -> Self {
+        self.rms_norm_eps = rms_norm_eps;
+        self
+    }
+
+    /// Set the RoPE theta.
+    pub fn with_rope_theta(mut self, rope_theta: f64) -> Self {
+        self.rope_theta = rope_theta;
+        self
+    }
+
+    /// Set whether word embeddings are tied.
+    pub fn with_tie_word_embeddings(mut self, tie_word_embeddings: bool) -> Self {
+        self.tie_word_embeddings = tie_word_embeddings;
+        self
+    }
+
+    /// Set extra architecture-specific parameters.
+    pub fn with_extra(mut self, extra: HashMap<String, serde_json::Value>) -> Self {
+        self.extra = extra;
+        self
+    }
+
     /// Compute head_dim from hidden_size and num_attention_heads if not
     /// explicitly provided. This is the standard default for most architectures.
     pub fn default_head_dim(hidden_size: usize, num_attention_heads: usize) -> usize {
@@ -133,6 +229,7 @@ impl ModelConfig {
 /// the up-projection weights into Q and O projections, eliminating
 /// runtime decompression.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MlaConfig {
     /// Compressed KV latent dimension (e.g., 512). Corresponds to
     /// `kv_lora_rank` in the HuggingFace config.
@@ -151,6 +248,7 @@ pub struct MlaConfig {
 
 /// Describes how a weight tensor is stored in compressed form.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum QuantizationInfo {
     /// Dense storage, no quantization. Existing behavior.
     None,
@@ -202,6 +300,7 @@ pub enum QuantizationInfo {
 /// mmap access from SafeTensors while still supporting owned data
 /// from GGUF dequantization.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct WeightTensor<'a> {
     pub data: Cow<'a, [u8]>,
     pub shape: Vec<usize>,
@@ -228,6 +327,12 @@ impl<'a> WeightTensor<'a> {
             dtype,
             quant_info: QuantizationInfo::None,
         }
+    }
+
+    /// Set quantization info on this tensor (builder-style).
+    pub fn with_quant_info(mut self, quant_info: QuantizationInfo) -> Self {
+        self.quant_info = quant_info;
+        self
     }
 
     /// Total number of elements in the tensor.

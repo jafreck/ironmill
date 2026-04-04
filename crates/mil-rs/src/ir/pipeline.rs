@@ -22,10 +22,14 @@ use crate::error::{MilError, Result};
 
 /// A configured optimization pipeline.
 ///
+/// A factory function that creates a [`Pass`] from a name and TOML parameters.
+pub type PassFactory = dyn Fn(&str, &HashMap<String, toml::Value>) -> Option<Box<dyn Pass>>;
+
 /// Manages pass ordering, mutual exclusivity checks, and pass selection
 /// based on model characteristics and user flags.
 pub struct PassPipeline {
     passes: Vec<Box<dyn Pass>>,
+    pass_factories: Vec<Box<PassFactory>>,
     has_fp16: bool,
     has_int8: bool,
     has_int4: bool,
@@ -39,6 +43,7 @@ pub struct PassPipeline {
 }
 
 /// Quantization method to use after SpinQuant rotation.
+#[non_exhaustive]
 pub enum SpinQuantMethod {
     /// Simple min-max affine quantization.
     MinMax { group_size: usize },
@@ -58,6 +63,7 @@ pub enum SpinQuantMethod {
 }
 
 /// Configuration for SpinQuant learned rotation.
+#[non_exhaustive]
 pub struct SpinQuantConfig {
     /// Number of Cayley optimizer epochs for rotation learning.
     pub rotation_epochs: usize,
@@ -69,6 +75,7 @@ pub struct SpinQuantConfig {
 
 /// Top-level TOML pipeline configuration.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct PipelineConfig {
     /// Ordered list of pass configurations.
     pub passes: Vec<PassConfig>,
@@ -76,6 +83,7 @@ pub struct PipelineConfig {
 
 /// Configuration for a single pass in the pipeline.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct PassConfig {
     /// Pass name (must match one of the built-in pass names).
     pub name: String,
@@ -286,6 +294,7 @@ impl PassPipeline {
                 // newly-created ops (transposes, tiles, etc.) get concrete types.
                 Box::new(TypeRepropagationPass),
             ],
+            pass_factories: Vec::new(),
             has_fp16: false,
             has_int8: false,
             has_int4: false,
@@ -426,6 +435,7 @@ impl PassPipeline {
 
         Ok(Self {
             passes,
+            pass_factories: Vec::new(),
             has_fp16,
             has_int8,
             has_int4,
@@ -1122,6 +1132,155 @@ impl PassPipeline {
         self.passes.iter().map(|p| p.name()).collect()
     }
 
+    /// Apply a TOML configuration string to this pipeline instance.
+    ///
+    /// Unlike [`from_config_str()`](Self::from_config_str), this method operates on an
+    /// existing pipeline and can resolve pass names through registered
+    /// [`pass factories`](Self::register_pass_factory).  Built-in passes
+    /// are tried first; if the name is not recognised, factories are
+    /// consulted in registration order.
+    ///
+    /// Any passes already in the pipeline are **replaced** by those
+    /// specified in the config.
+    pub fn with_config_str(mut self, toml_str: &str) -> Result<Self> {
+        let config: PipelineConfig = toml::from_str(toml_str)
+            .map_err(|e| MilError::Validation(format!("invalid pipeline config: {e}")))?;
+
+        let mut passes: Vec<Box<dyn Pass>> = Vec::new();
+        let mut has_fp16 = false;
+        let mut has_int8 = false;
+        let mut has_int4 = false;
+        let has_awq = false;
+        let mut has_palettize = false;
+        let mut has_polar_quant = false;
+
+        for entry in &config.passes {
+            if !entry.enabled {
+                continue;
+            }
+
+            // Enforce mutual exclusivity (same rules as from_config_str).
+            match entry.name.as_str() {
+                "fp16-quantization" => {
+                    if has_int8 {
+                        return Err(MilError::Validation(
+                            "FP16 and INT8 quantization are mutually exclusive".into(),
+                        ));
+                    }
+                    if has_polar_quant {
+                        return Err(MilError::Validation(
+                            "polar-quantization is mutually exclusive with fp16/int8/palettization"
+                                .into(),
+                        ));
+                    }
+                    has_fp16 = true;
+                }
+                "int8-quantization" => {
+                    if has_fp16 {
+                        return Err(MilError::Validation(
+                            "FP16 and INT8 quantization are mutually exclusive".into(),
+                        ));
+                    }
+                    if has_palettize {
+                        return Err(MilError::Validation(
+                            "INT8 quantization and palettization are mutually exclusive".into(),
+                        ));
+                    }
+                    if has_polar_quant {
+                        return Err(MilError::Validation(
+                            "polar-quantization is mutually exclusive with fp16/int8/palettization"
+                                .into(),
+                        ));
+                    }
+                    has_int8 = true;
+                }
+                "int4-quantize" => {
+                    if has_int8 {
+                        return Err(MilError::Validation(
+                            "INT4 and INT8 quantization are mutually exclusive".into(),
+                        ));
+                    }
+                    if has_polar_quant {
+                        return Err(MilError::Validation(
+                            "polar-quantization is mutually exclusive with int4 quantization"
+                                .into(),
+                        ));
+                    }
+                    has_int4 = true;
+                }
+                "palettization" => {
+                    if has_int8 {
+                        return Err(MilError::Validation(
+                            "INT8 quantization and palettization are mutually exclusive".into(),
+                        ));
+                    }
+                    if has_polar_quant {
+                        return Err(MilError::Validation(
+                            "palettization and polar-quantization are mutually exclusive".into(),
+                        ));
+                    }
+                    has_palettize = true;
+                }
+                "polar-quantization" => {
+                    if has_fp16 || has_int8 || has_palettize {
+                        return Err(MilError::Validation(
+                            "polar-quantization is mutually exclusive with fp16/int8/palettization"
+                                .into(),
+                        ));
+                    }
+                    has_polar_quant = true;
+                }
+                _ => {}
+            }
+
+            // Try built-in passes first, then consult factories.
+            if KNOWN_PASSES.contains(&entry.name.as_str()) {
+                passes.push(pass_from_name(&entry.name, &entry.params)?);
+            } else {
+                let mut resolved = false;
+                for factory in &self.pass_factories {
+                    if let Some(pass) = factory(&entry.name, &entry.params) {
+                        passes.push(pass);
+                        resolved = true;
+                        break;
+                    }
+                }
+                if !resolved {
+                    return Err(MilError::Validation(format!(
+                        "unknown pass '{}' in pipeline config",
+                        entry.name
+                    )));
+                }
+            }
+        }
+
+        self.passes = passes;
+        self.has_fp16 = has_fp16;
+        self.has_int8 = has_int8;
+        self.has_int4 = has_int4;
+        self.has_awq = has_awq;
+        self.has_palettize = has_palettize;
+        self.has_polar_quant = has_polar_quant;
+        self.has_gptq = false;
+        self.has_quip_sharp = false;
+        self.has_d2quant = false;
+        self.has_spinquant = false;
+        Ok(self)
+    }
+
+    /// Register a custom pass factory for TOML config loading.
+    ///
+    /// When the pipeline is configured via [`with_config_str()`](Self::with_config_str)
+    /// and encounters an unknown pass name, it will consult registered
+    /// factories in order.  The first factory that returns `Some(pass)` wins.
+    ///
+    /// Note: [`from_config_str()`](Self::from_config_str) is a static
+    /// constructor and cannot access instance-level factories.  Use
+    /// `with_config_str()` when custom factories are needed.
+    pub fn register_pass_factory(&mut self, factory: Box<PassFactory>) {
+        self.pass_factories.push(factory);
+    }
+
     /// Run the full pipeline, returning a report of what each pass did.
     pub fn run(self, program: &mut Program) -> Result<PipelineReport> {
         let mut pass_results = Vec::new();
@@ -1219,6 +1378,7 @@ fn estimate_memory(program: &Program) -> u64 {
 
 /// Report from running a [`PassPipeline`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct PipelineReport {
     pub pass_results: Vec<PassResult>,
 }
@@ -1338,6 +1498,7 @@ impl PipelineReport {
 
 /// Result of a single pass execution.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct PassResult {
     pub name: String,
     pub ops_before: usize,

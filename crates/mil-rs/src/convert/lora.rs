@@ -32,6 +32,7 @@ use crate::ir::ScalarType;
 
 /// A detected LoRA adapter pair ready for merging.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LoraAdapter {
     /// The base weight name this adapter targets (e.g. `model.layer.weight`).
     pub base_name: String,
@@ -47,6 +48,29 @@ pub struct LoraAdapter {
     pub dtype: ScalarType,
     /// Scaling factor `alpha`. When `None`, defaults to `rank` (scale = 1.0).
     pub alpha: Option<f64>,
+}
+
+impl LoraAdapter {
+    /// Create a new LoRA adapter.
+    pub fn new(
+        base_name: String,
+        a_data: Vec<u8>,
+        a_shape: [usize; 2],
+        b_data: Vec<u8>,
+        b_shape: [usize; 2],
+        dtype: ScalarType,
+        alpha: Option<f64>,
+    ) -> Self {
+        Self {
+            base_name,
+            a_data,
+            a_shape,
+            b_data,
+            b_shape,
+            dtype,
+            alpha,
+        }
+    }
 }
 
 /// Scan ONNX initializer names and group LoRA A/B pairs.
@@ -243,6 +267,7 @@ pub fn lora_initializer_names(adapters: &[LoraAdapter]) -> std::collections::Has
 }
 
 /// LoRA adapter weight matrices for merging into base weights.
+#[non_exhaustive]
 pub struct LoraWeights<'a> {
     /// LoRA A matrix bytes (row-major, `[rank, in_features]`).
     pub lora_a: &'a [u8],
@@ -256,6 +281,27 @@ pub struct LoraWeights<'a> {
     pub dtype: ScalarType,
     /// Optional scaling factor. When `None`, defaults to `rank` (scale = 1.0).
     pub alpha: Option<f64>,
+}
+
+impl<'a> LoraWeights<'a> {
+    /// Create a new `LoraWeights` reference set.
+    pub fn new(
+        lora_a: &'a [u8],
+        lora_a_shape: &'a [usize],
+        lora_b: &'a [u8],
+        lora_b_shape: &'a [usize],
+        dtype: ScalarType,
+        alpha: Option<f64>,
+    ) -> Self {
+        Self {
+            lora_a,
+            lora_a_shape,
+            lora_b,
+            lora_b_shape,
+            dtype,
+            alpha,
+        }
+    }
 }
 
 /// Format-agnostic LoRA merge kernel.

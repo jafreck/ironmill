@@ -4,7 +4,6 @@
 //! quantized (and unquantized) weight tensors, exposing them by their original
 //! HF-style names via the [`WeightProvider`] trait.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem;
 
@@ -325,12 +324,8 @@ impl WeightProvider for MilWeightProvider {
             .tensors
             .get(name)
             .ok_or_else(|| MilError::UndefinedValue(name.to_string()))?;
-        Ok(WeightTensor {
-            data: Cow::Borrowed(&t.data),
-            shape: t.shape.clone(),
-            dtype: t.dtype,
-            quant_info: t.quant_info.clone(),
-        })
+        Ok(WeightTensor::borrowed(&t.data, t.shape.clone(), t.dtype)
+            .with_quant_info(t.quant_info.clone()))
     }
 
     fn tensor_names(&self) -> Vec<&str> {

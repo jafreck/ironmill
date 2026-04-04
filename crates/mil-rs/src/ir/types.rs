@@ -124,6 +124,7 @@ impl From<Vec<u8>> for TensorData {
 /// A value in the MIL IR — can be a reference to another op's output,
 /// a literal constant, or a tensor type descriptor.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Value {
     /// Reference to another operation's output by name.
     Reference(String),

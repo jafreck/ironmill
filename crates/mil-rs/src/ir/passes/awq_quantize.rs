@@ -104,6 +104,7 @@ fn matmul_a_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize
 /// name of the const weight. Optionally accepts raw calibration activations
 /// to compute the paper's exact loss (Equation 4) instead of the mag²-weighted
 /// MSE approximation.
+#[non_exhaustive]
 pub struct AwqQuantizePass {
     /// Quantization bit width (4 or 8).
     pub bits: u8,

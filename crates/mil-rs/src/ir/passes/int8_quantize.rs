@@ -24,6 +24,7 @@ use crate::ir::types::{TensorData, Value};
 
 /// Quantization granularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Granularity {
     /// One scale/zero-point pair for the entire tensor.
     PerTensor,
@@ -36,6 +37,7 @@ pub enum Granularity {
 /// When `calibration_dir` is `None` (the default), only weight-only
 /// quantization is performed: const FP32 tensors are quantized in-place
 /// using their own min/max range.
+#[non_exhaustive]
 pub struct Int8QuantizePass {
     /// Directory containing calibration input tensors. `None` for weight-only.
     pub calibration_dir: Option<PathBuf>,

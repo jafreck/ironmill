@@ -89,6 +89,7 @@ pub fn scalar_type_to_str(dtype: ScalarType) -> &'static str {
         ScalarType::UInt32 => "uint32",
         ScalarType::UInt64 => "uint64",
         ScalarType::Bool => "bool",
+        _ => panic!("unsupported scalar type: {dtype:?}"),
     }
 }
 
@@ -193,22 +194,21 @@ pub fn deserialize_model_config(value: &serde_json::Value) -> Result<ModelConfig
         .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         .unwrap_or_default();
 
-    Ok(ModelConfig {
-        architecture,
-        hidden_size: get_usize("hidden_size")?,
-        intermediate_size: get_usize("intermediate_size")?,
-        num_hidden_layers: get_usize("num_hidden_layers")?,
-        num_attention_heads: get_usize("num_attention_heads")?,
-        num_key_value_heads: get_usize("num_key_value_heads")?,
-        head_dim: get_usize("head_dim")?,
-        vocab_size: get_usize("vocab_size")?,
-        max_position_embeddings: get_usize("max_position_embeddings")?,
-        rms_norm_eps: get_f64("rms_norm_eps")?,
-        rope_theta: get_f64("rope_theta")?,
-        tie_word_embeddings: obj
-            .get("tie_word_embeddings")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        extra,
-    })
+    Ok(ModelConfig::new(architecture)
+        .with_hidden_size(get_usize("hidden_size")?)
+        .with_intermediate_size(get_usize("intermediate_size")?)
+        .with_num_hidden_layers(get_usize("num_hidden_layers")?)
+        .with_num_attention_heads(get_usize("num_attention_heads")?)
+        .with_num_key_value_heads(get_usize("num_key_value_heads")?)
+        .with_head_dim(get_usize("head_dim")?)
+        .with_vocab_size(get_usize("vocab_size")?)
+        .with_max_position_embeddings(get_usize("max_position_embeddings")?)
+        .with_rms_norm_eps(get_f64("rms_norm_eps")?)
+        .with_rope_theta(get_f64("rope_theta")?)
+        .with_tie_word_embeddings(
+            obj.get("tie_word_embeddings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+        .with_extra(extra))
 }

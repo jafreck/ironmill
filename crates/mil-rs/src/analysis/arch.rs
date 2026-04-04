@@ -10,6 +10,7 @@ use crate::ir::{Operation, Program, Value};
 
 /// Detected transformer architecture parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ModelArch {
     /// Number of transformer layers.
     pub num_layers: usize,

@@ -14,6 +14,7 @@ use crate::proto::specification::{
 
 /// Which optimizer to use for on-device training.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum UpdateOptimizer {
     /// Stochastic Gradient Descent.
     Sgd,
@@ -23,6 +24,7 @@ pub enum UpdateOptimizer {
 
 /// Which loss function to use for on-device training.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum LossFunction {
     /// Categorical cross-entropy (for classification).
     CategoricalCrossEntropy,
@@ -36,6 +38,7 @@ pub enum LossFunction {
 /// `is_updatable` flag is set and which includes an `UpdateDescription`
 /// with training inputs, an optimizer, a loss layer, and epoch count.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UpdatableModelConfig {
     /// Names of layers (operations) that should be updatable.
     pub updatable_layers: Vec<String>,

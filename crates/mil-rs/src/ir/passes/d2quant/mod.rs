@@ -22,6 +22,7 @@ use dual_scale::{dual_scale_quantize, pack_2bit, pack_3bit, pack_mask};
 /// Walks every `const` op with an FP32 tensor, processes it in groups of
 /// `group_size`, and replaces each with a `constexpr_dual_scale_dequantize`
 /// op carrying packed quantized data plus per-group dual-scale parameters.
+#[non_exhaustive]
 pub struct D2QuantPass {
     /// Bit-width: 2 or 3.
     pub bits: u8,

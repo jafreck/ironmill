@@ -39,6 +39,7 @@ const E8_CODEBOOK_SIZE: usize = 256;
 /// 2. Applies a seeded randomised Hadamard rotation.
 /// 3. Quantises using E8 lattice vector quantization (8-dim groups).
 /// 4. Replaces the op with `constexpr_lut_to_dense` + row-norm rescaling.
+#[non_exhaustive]
 pub struct QuipSharpPass {
     /// Effective bits per weight (2 for the primary E8 codebook).
     pub bits: u8,

@@ -52,6 +52,8 @@ pub mod convert;
 pub mod error;
 /// MIL Intermediate Representation — programs, functions, operations, and types.
 pub mod ir;
+/// Progress reporting for long-running operations.
+pub mod progress;
 /// Auto-generated protobuf types for CoreML and ONNX specifications.
 pub mod proto;
 /// Readers for `.mlmodel`, `.mlpackage`, and `.onnx` files.
@@ -87,6 +89,9 @@ pub use ir::{
     Block, ComputeUnit, Function, Graph, Operation, Pass, PassPipeline, PassResult, PipelineReport,
     Program, ScalarType, TensorData, TensorType, Value,
 };
+
+/// Progress sink trait for long-running operations.
+pub use progress::{NullProgress, ProgressSink};
 
 /// Estimate total FLOPs for a MIL program's forward pass.
 pub use analysis::flops::estimate_program_flops;

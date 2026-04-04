@@ -18,6 +18,7 @@ use crate::ir::types::Value;
 
 /// Per-operation quantization quality metrics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct QuantizationMetrics {
     /// Mean squared error between original and dequantized weights.
     pub mse: f64,

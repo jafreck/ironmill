@@ -235,9 +235,11 @@ pub fn replace_gather_with_inputs(program: &mut Program) {
                     .get(idx)
                     .cloned()
                     .flatten()
-                    .unwrap_or_else(|| TensorType {
-                        scalar_type: ScalarType::Float16,
-                        shape: vec![Some(1), Some(1), Some(1), Some(1)],
+                    .unwrap_or_else(|| {
+                        TensorType::with_dynamic_shape(
+                            ScalarType::Float16,
+                            vec![Some(1), Some(1), Some(1), Some(1)],
+                        )
                     });
                 replaced_outputs.push((out_name.clone(), out_type));
             }

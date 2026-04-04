@@ -69,7 +69,7 @@ pub fn build_program(
     }
 
     program.set_attribute("autoregressive", "true");
-    Ok(ConversionResult { program, warnings })
+    Ok(ConversionResult::new(program, warnings))
 }
 
 /// Controls the sequence-length handling and KV-cache behaviour of a function.

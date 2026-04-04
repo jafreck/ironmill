@@ -251,21 +251,19 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
         }
     }
 
-    Ok(ModelConfig {
-        architecture,
-        hidden_size,
-        intermediate_size,
-        num_hidden_layers,
-        num_attention_heads,
-        num_key_value_heads,
-        head_dim,
-        vocab_size,
-        max_position_embeddings,
-        rms_norm_eps,
-        rope_theta,
-        tie_word_embeddings,
-        extra,
-    })
+    Ok(ModelConfig::new(architecture)
+        .with_hidden_size(hidden_size)
+        .with_intermediate_size(intermediate_size)
+        .with_num_hidden_layers(num_hidden_layers)
+        .with_num_attention_heads(num_attention_heads)
+        .with_num_key_value_heads(num_key_value_heads)
+        .with_head_dim(head_dim)
+        .with_vocab_size(vocab_size)
+        .with_max_position_embeddings(max_position_embeddings)
+        .with_rms_norm_eps(rms_norm_eps)
+        .with_rope_theta(rope_theta)
+        .with_tie_word_embeddings(tie_word_embeddings)
+        .with_extra(extra))
 }
 
 // ---------------------------------------------------------------------------
@@ -423,15 +421,15 @@ fn detect_and_merge_lora(
             global_alpha
         };
 
-        let adapter = LoraAdapter {
-            base_name: base_name.clone(),
-            a_data: a_view.data.to_vec(),
-            a_shape: [a_view.shape[0], a_view.shape[1]],
-            b_data: b_view.data.to_vec(),
-            b_shape: [b_view.shape[0], b_view.shape[1]],
-            dtype: a_dtype,
+        let adapter = LoraAdapter::new(
+            base_name.clone(),
+            a_view.data.to_vec(),
+            [a_view.shape[0], a_view.shape[1]],
+            b_view.data.to_vec(),
+            [b_view.shape[0], b_view.shape[1]],
+            a_dtype,
             alpha,
-        };
+        );
 
         let mut base_data = base_view.data.to_vec();
         let base_shape = base_view.shape.clone();
@@ -439,14 +437,14 @@ fn detect_and_merge_lora(
         lora::merge_lora_weights(
             &mut base_data,
             &base_shape,
-            &lora::LoraWeights {
-                lora_a: &adapter.a_data,
-                lora_a_shape: &adapter.a_shape,
-                lora_b: &adapter.b_data,
-                lora_b_shape: &adapter.b_shape,
-                dtype: base_dtype,
-                alpha: adapter.alpha,
-            },
+            &lora::LoraWeights::new(
+                &adapter.a_data,
+                &adapter.a_shape,
+                &adapter.b_data,
+                &adapter.b_shape,
+                base_dtype,
+                adapter.alpha,
+            ),
         )?;
 
         merged.insert(base_name, (base_data, base_shape, base_dtype));

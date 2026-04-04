@@ -92,7 +92,7 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
         program.set_attribute("sliding_window", sw.to_string());
     }
 
-    Ok(ConversionResult { program, warnings })
+    Ok(ConversionResult::new(program, warnings))
 }
 
 // ---------------------------------------------------------------------------

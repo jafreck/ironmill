@@ -1499,10 +1499,8 @@ fn compute_model_flops(model_cfg: &ModelConfig) -> Option<u64> {
         "onnx" => {
             let (mut onnx, model_dir) =
                 ironmill_compile::mil::read_onnx_with_dir(model_cfg.path.to_str()?).ok()?;
-            let config = ironmill_compile::mil::ConversionConfig {
-                model_dir: Some(model_dir),
-                ..Default::default()
-            };
+            let mut config = ironmill_compile::mil::ConversionConfig::default();
+            config.model_dir = Some(model_dir);
             let result =
                 ironmill_compile::mil::onnx_to_program_with_config(&mut onnx, &config).ok()?;
             let flops = result.program.total_flops();

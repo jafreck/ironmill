@@ -390,6 +390,7 @@ impl<'a> MilTextEmitter<'a> {
                 );
                 format!("{type_str}([{values}])")
             }
+            _ => panic!("unsupported Value variant: {value:?}"),
         }
     }
 
@@ -521,10 +522,7 @@ impl<'a> MilTextEmitter<'a> {
             shape[normalized] = Some(1);
         }
 
-        TensorType {
-            scalar_type: input_ty.scalar_type,
-            shape,
-        }
+        TensorType::with_dynamic_shape(input_ty.scalar_type, shape)
     }
 
     /// Extract the axes values from a reduce op, resolving const references.
@@ -576,6 +574,7 @@ fn format_scalar_type(st: ScalarType, _enable_int4: bool) -> &'static str {
         ScalarType::UInt32 => "uint32",
         ScalarType::UInt64 => "uint64",
         ScalarType::Bool => "bool",
+        _ => panic!("unsupported scalar type: {st:?}"),
     }
 }
 
@@ -692,6 +691,7 @@ fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> String {
             .map(|b| i16::from_le_bytes([b[0], b[1]]).to_string())
             .collect::<Vec<_>>()
             .join(","),
+        _ => panic!("unsupported scalar type for tensor elements: {dtype:?}"),
     }
 }
 

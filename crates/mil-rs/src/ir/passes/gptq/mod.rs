@@ -35,6 +35,7 @@ use crate::ir::types::Value;
 ///
 /// All quantizable weight ops must have Hessian data — missing entries are
 /// an error. Calibration data is mandatory for GPTQ.
+#[non_exhaustive]
 pub struct GptqQuantizePass {
     /// Quantization bit width (4 or 8).
     pub bits: u8,

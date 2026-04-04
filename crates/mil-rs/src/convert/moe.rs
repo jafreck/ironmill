@@ -28,6 +28,7 @@ use crate::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Val
 
 /// Detected MoE topology within a program.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MoeTopology {
     /// Number of experts detected.
     pub expert_count: usize,
@@ -48,6 +49,7 @@ pub struct MoeTopology {
 
 /// Result of splitting a MoE program into shared + per-expert artifacts.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct MoeSplitResult {
     /// Program containing shared layers (embeddings, router, norms, LM head).
     pub shared: Program,
@@ -59,6 +61,7 @@ pub struct MoeSplitResult {
 
 /// JSON-serializable manifest describing MoE topology for runtime orchestration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MoeManifest {
     /// Number of experts.
     pub expert_count: usize,
@@ -72,6 +75,7 @@ pub struct MoeManifest {
 
 /// I/O descriptor for a single expert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ExpertDescriptor {
     /// Expert index (0-based).
     pub index: usize,
@@ -83,6 +87,7 @@ pub struct ExpertDescriptor {
 
 /// A named execution stage in the MoE pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Stage {
     /// Stage name.
     pub name: String,
@@ -111,6 +116,7 @@ pub struct Stage {
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ExpertFrequencyProfile {
     /// Maps expert name/index (as string) to activation frequency (0.0–1.0)
     /// or raw activation count.  Keys are matched against expert indices
@@ -163,6 +169,7 @@ impl ExpertFrequencyProfile {
 
 /// Result of fusing top-K experts into a single dense program.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct MoeFuseResult {
     /// The fused dense program — router and non-selected experts removed.
     pub program: Program,

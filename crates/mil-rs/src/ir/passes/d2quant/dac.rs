@@ -18,6 +18,7 @@ use crate::ir::tensor::ScalarType;
 use crate::ir::types::{TensorData, Value};
 
 /// Per-channel activation statistics for a single layer.
+#[non_exhaustive]
 pub struct ChannelStats {
     /// Per-channel mean.
     pub mean: Vec<f32>,
@@ -33,6 +34,7 @@ const CORRECTABLE_NORM_OPS: &[&str] = &["layer_norm", "rms_norm"];
 /// Walks `layer_norm` and `rms_norm` ops, and adjusts their gamma (and beta
 /// for `layer_norm`) to compensate for activation distribution shifts caused
 /// by weight quantization.
+#[non_exhaustive]
 pub struct DacPass {
     /// Per-layer activation statistics from FP16 model run.
     /// Key: layer name matching the norm op's `name` field.

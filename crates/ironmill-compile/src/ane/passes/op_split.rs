@@ -82,6 +82,7 @@ fn dtype_bytes(dtype: ScalarType) -> usize {
         ScalarType::Float32 | ScalarType::Int32 | ScalarType::UInt32 => 4,
         ScalarType::Float16 | ScalarType::Int16 | ScalarType::UInt16 => 2,
         ScalarType::Int8 | ScalarType::UInt8 | ScalarType::Bool => 1,
+        _ => panic!("unsupported scalar type: {dtype:?}"),
     }
 }
 

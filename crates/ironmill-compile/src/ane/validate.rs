@@ -452,6 +452,7 @@ fn resolve_input_dtype_bytes(
         Some(ScalarType::Float32 | ScalarType::Int32 | ScalarType::UInt32) => 4,
         Some(ScalarType::Float64 | ScalarType::Int64 | ScalarType::UInt64) => 8,
         Some(ScalarType::Int8 | ScalarType::UInt8 | ScalarType::Bool) => 1,
+        Some(_) => panic!("unsupported scalar type for byte width: {dtype:?}"),
         None => 4,
     }
 }

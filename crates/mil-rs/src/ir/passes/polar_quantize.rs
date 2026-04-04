@@ -26,6 +26,7 @@ use super::tensor_utils::tensor_as_f32_slice;
 /// 2. Applies a seeded randomised Hadamard rotation.
 /// 3. Quantises using Beta-optimal levels/boundaries.
 /// 4. Replaces the op with `constexpr_lut_to_dense` + row-norm rescaling.
+#[non_exhaustive]
 pub struct PolarQuantPass {
     /// Number of bits per quantised index.
     pub n_bits: u8,

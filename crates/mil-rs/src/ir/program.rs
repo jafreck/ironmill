@@ -17,6 +17,7 @@ use std::fmt;
 ///
 /// A program contains one or more named functions. The "main" function is
 /// the entry point for inference.
+#[non_exhaustive]
 pub struct Program {
     /// Program version (e.g., "1.0.0").
     pub version: String,
@@ -279,6 +280,7 @@ impl Program {
 /// Functions have named, typed inputs and a body ([`Block`]) that
 /// contains the computation graph.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Function {
     /// Function name.
     pub name: String,
@@ -310,6 +312,7 @@ impl Function {
 /// Blocks can be nested for control flow (e.g., `cond`, `while_loop`),
 /// though most models only use a single top-level block.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Block {
     /// Operations in topological order within this block.
     pub operations: Vec<Operation>,
@@ -323,6 +326,14 @@ impl Block {
         Self {
             operations: Vec::new(),
             outputs: Vec::new(),
+        }
+    }
+
+    /// Create a block with the given operations and outputs.
+    pub fn with_operations(operations: Vec<Operation>, outputs: Vec<String>) -> Self {
+        Self {
+            operations,
+            outputs,
         }
     }
 

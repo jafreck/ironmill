@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Errors that can occur when working with MIL IR or CoreML models.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MilError {
     /// An operation referenced a value that doesn't exist in the graph.
     #[error("undefined value: {0}")]

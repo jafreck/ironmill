@@ -150,6 +150,7 @@ impl CayleyRotation {
 /// for each, and keeps the best candidate.  The perturbation radius (`sigma`)
 /// is increased when improvements are found and decreased otherwise, loosely
 /// following the 1/5-th success rule.
+#[non_exhaustive]
 pub struct CayleyOptimizer {
     /// Maximum number of optimization iterations (default 100).
     pub max_iterations: usize,

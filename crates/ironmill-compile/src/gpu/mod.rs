@@ -235,10 +235,8 @@ fn collect_supplement_tensors(
 /// Import an ONNX model, returning the MIL program and a derived `ModelConfig`.
 fn import_onnx(path: &Path) -> Result<(Program, ModelConfig), CompileError> {
     let mut onnx_model = read_onnx(path)?;
-    let conv_config = ConversionConfig {
-        merge_lora: true,
-        model_dir: path.parent().map(|p| p.to_path_buf()),
-    };
+    let mut conv_config = ConversionConfig::default();
+    conv_config.model_dir = path.parent().map(|p| p.to_path_buf());
     let result = onnx_to_program_with_config(&mut onnx_model, &conv_config)?;
 
     // Attempt to load config.json from the same directory as the ONNX file.
@@ -301,21 +299,19 @@ fn derive_config_from_program(program: &Program) -> Result<ModelConfig, CompileE
     let h = hidden_size.unwrap_or(4096);
     let num_heads = (h / 128).max(1);
 
-    Ok(ModelConfig {
-        architecture: Architecture::Llama,
-        hidden_size: h,
-        intermediate_size: h * 4,
-        num_hidden_layers: num_layers,
-        num_attention_heads: num_heads,
-        num_key_value_heads: num_heads,
-        head_dim: ModelConfig::default_head_dim(h, num_heads),
-        vocab_size: 32000,             // Llama-1/2 SentencePiece vocabulary size
-        max_position_embeddings: 2048, // Llama-1 context length
-        rms_norm_eps: 1e-5,            // Standard RMSNorm epsilon
-        rope_theta: 10000.0,           // Default RoPE base frequency
-        tie_word_embeddings: false,
-        extra: HashMap::new(),
-    })
+    Ok(ModelConfig::new(Architecture::Llama)
+        .with_hidden_size(h)
+        .with_intermediate_size(h * 4)
+        .with_num_hidden_layers(num_layers)
+        .with_num_attention_heads(num_heads)
+        .with_num_key_value_heads(num_heads)
+        .with_head_dim(ModelConfig::default_head_dim(h, num_heads))
+        .with_vocab_size(32000)
+        .with_max_position_embeddings(2048)
+        .with_rms_norm_eps(1e-5)
+        .with_rope_theta(10000.0)
+        .with_tie_word_embeddings(false)
+        .with_extra(HashMap::new()))
 }
 
 /// Extract a layer index from an output name like "model.layers.5.self_attn..."

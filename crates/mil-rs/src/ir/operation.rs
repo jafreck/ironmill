@@ -12,6 +12,7 @@ use super::types::Value;
 /// annotations are informational hints — the runtime may override them
 /// when hardware is unavailable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ComputeUnit {
     /// Apple Neural Engine — best for supported dense ops with aligned shapes.
     Ane,
@@ -53,6 +54,7 @@ impl FromStr for ComputeUnit {
 /// Operations correspond to MIL ops (e.g., `conv`, `matmul`, `relu`, `softmax`)
 /// and map to both ONNX source ops and CoreML target ops.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Operation {
     /// The MIL operation type (e.g., "conv", "matmul", "relu").
     pub op_type: String,

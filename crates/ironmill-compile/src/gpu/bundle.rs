@@ -227,6 +227,11 @@ pub fn write_gpu_bundle(
                     );
                 }
             }
+            other => {
+                return Err(CompileError::Other(format!(
+                    "unsupported quantization info for tensor '{name}': {other:?}"
+                )));
+            }
         }
     }
 

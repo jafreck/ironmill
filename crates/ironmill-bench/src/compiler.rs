@@ -35,10 +35,8 @@ fn build_pipeline(opt: &OptConfig) -> Result<ironmill_compile::mil::PassPipeline
 /// avoid redundant parsing.
 pub fn parse_model(model: &ModelConfig) -> Result<ironmill_compile::mil::Program> {
     let (mut onnx, model_dir) = ironmill_compile::mil::read_onnx_with_dir(&model.path)?;
-    let config = ironmill_compile::mil::ConversionConfig {
-        model_dir: Some(model_dir),
-        ..Default::default()
-    };
+    let mut config = ironmill_compile::mil::ConversionConfig::default();
+    config.model_dir = Some(model_dir);
     let result = ironmill_compile::mil::onnx_to_program_with_config(&mut onnx, &config)?;
     Ok(result.program)
 }

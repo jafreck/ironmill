@@ -10,4 +10,14 @@ pub trait Pass {
 
     /// Apply the pass to the program, modifying it in place.
     fn run(&self, program: &mut Program) -> crate::error::Result<()>;
+
+    /// Optional description of what this pass does.
+    fn description(&self) -> &str {
+        ""
+    }
+
+    /// Optional list of pass names this pass depends on.
+    fn dependencies(&self) -> &[&str] {
+        &[]
+    }
 }

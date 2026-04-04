@@ -8,6 +8,7 @@
 
 /// Parameters produced by dual-scale quantization for a single group.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DualScaleParams {
     /// Affine scale for the normal (low-magnitude) partition.
     pub normal_scale: f32,

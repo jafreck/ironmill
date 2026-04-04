@@ -31,6 +31,7 @@ use crate::proto::onnx::{
 /// The result of converting an ONNX model, including the MIL [`Program`] and
 /// any warnings encountered during conversion (e.g. unsupported ops).
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ConversionResult {
     /// The converted MIL program.
     pub program: Program,
@@ -38,8 +39,16 @@ pub struct ConversionResult {
     pub warnings: Vec<String>,
 }
 
+impl ConversionResult {
+    /// Create a new conversion result.
+    pub fn new(program: Program, warnings: Vec<String>) -> Self {
+        Self { program, warnings }
+    }
+}
+
 /// Configuration for ONNX → MIL conversion.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConversionConfig {
     /// Whether to detect and merge LoRA adapter weights into the base model.
     /// Defaults to `true`.

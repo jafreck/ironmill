@@ -197,10 +197,8 @@ impl CompileBuilder {
         let mut program = match detect_format(input) {
             InputFormat::Onnx => {
                 let mut onnx_model = read_onnx(input)?;
-                let config = ConversionConfig {
-                    merge_lora: true,
-                    model_dir: input.parent().map(|p| p.to_path_buf()),
-                };
+                let mut config = ConversionConfig::default();
+                config.model_dir = input.parent().map(|p| p.to_path_buf());
                 let result = onnx_to_program_with_config(&mut onnx_model, &config)?;
                 result.program
             }

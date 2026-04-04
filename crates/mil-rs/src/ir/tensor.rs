@@ -1,6 +1,7 @@
 /// Tensor data types supported by MIL / CoreML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ScalarType {
     Float16,
     Float32,
@@ -30,6 +31,7 @@ impl ScalarType {
 
 /// A tensor type descriptor — shape + element type.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TensorType {
     /// Element data type.
     pub scalar_type: ScalarType,

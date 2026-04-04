@@ -1025,13 +1025,12 @@ fn emit_coreml(
             other => bail!("unknown optimizer: '{}'. Valid: adam, sgd", other),
         };
 
-        let config = UpdatableModelConfig {
-            updatable_layers: layer_names.clone(),
-            learning_rate: opts.learning_rate,
-            epochs: opts.epochs,
-            loss_function: loss_fn,
-            optimizer: opt,
-        };
+        let mut config = UpdatableModelConfig::default();
+        config.updatable_layers = layer_names.clone();
+        config.learning_rate = opts.learning_rate;
+        config.epochs = opts.epochs;
+        config.loss_function = loss_fn;
+        config.optimizer = opt;
 
         println!(
             "Updatable model: {} layer(s) marked for on-device training",
@@ -1204,10 +1203,9 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 2. Convert to MIL IR
     println!("Converting to CoreML MIL IR...");
-    let config = ConversionConfig {
-        merge_lora: opts.merge_lora,
-        model_dir: input_path.parent().map(|p| p.to_path_buf()),
-    };
+    let mut config = ConversionConfig::default();
+    config.merge_lora = opts.merge_lora;
+    config.model_dir = input_path.parent().map(|p| p.to_path_buf());
     let result = onnx_to_program_with_config(&mut onnx_model, &config)
         .context("Failed to convert ONNX model to MIL IR")?;
     let mut program = result.program;

@@ -29,6 +29,7 @@ use crate::ir::types::{TensorData, Value};
 ///    between the rotated weights and their INT4 affine dequantization.
 /// 3. Applies the learned rotation and quantizes the result.
 /// 4. Emits `constexpr_affine_dequantize` with the quantized weights.
+#[non_exhaustive]
 pub struct SpinQuantPass {
     /// Quantization bit width (typically 4).
     pub bits: u8,

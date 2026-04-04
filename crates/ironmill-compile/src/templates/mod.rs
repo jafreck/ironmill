@@ -42,6 +42,10 @@ pub fn weights_to_program_with_options(
         Architecture::Llama => llama::build_program(provider, options),
         Architecture::Qwen => qwen::build_program(provider),
         Architecture::Gemma => gemma::build_program(provider),
+        _ => Err(MilError::Validation(format!(
+            "unsupported architecture: {:?}",
+            provider.config().architecture
+        ))),
     }
 }
 
@@ -148,8 +152,5 @@ fn extract_component(
     }
     new_program.set_attribute("component", component);
 
-    Ok(ConversionResult {
-        program: new_program,
-        warnings: result.warnings,
-    })
+    Ok(ConversionResult::new(new_program, result.warnings))
 }

@@ -11,6 +11,7 @@ use super::types::Value;
 /// This is the central data structure that model converters build
 /// and optimization passes transform.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Graph {
     /// Unique name for this graph/function.
     pub name: String,

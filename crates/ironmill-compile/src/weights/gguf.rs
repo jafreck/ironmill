@@ -12,7 +12,6 @@
 //!
 //! Split-shard files are auto-discovered by filename pattern.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -597,22 +596,20 @@ impl WeightProvider for GgufProvider {
             let mmap = &self.mmaps[loc.shard_index];
             let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
             let (packed_data, scales, zero_point) = repack_q4_0(raw, loc.num_elements)?;
-            return Ok(WeightTensor {
-                data: Cow::Owned(packed_data),
-                shape: loc.dimensions.clone(),
-                dtype: ScalarType::UInt8,
-                quant_info: QuantizationInfo::AffineDequantize {
-                    scale: scales,
-                    zero_point,
-                    scale_dtype: ScalarType::Float16,
-                    zero_point_dtype: ScalarType::Float16,
-                    axis: Some(1),
-                    bit_width: 4,
-                    group_size: Some(32),
-                    awq_scales: None,
-                    g_idx: None,
-                },
-            });
+            return Ok(
+                WeightTensor::owned(packed_data, loc.dimensions.clone(), ScalarType::UInt8)
+                    .with_quant_info(QuantizationInfo::AffineDequantize {
+                        scale: scales,
+                        zero_point,
+                        scale_dtype: ScalarType::Float16,
+                        zero_point_dtype: ScalarType::Float16,
+                        axis: Some(1),
+                        bit_width: 4,
+                        group_size: Some(32),
+                        awq_scales: None,
+                        g_idx: None,
+                    }),
+            );
         }
 
         // Q8_0: repack blocks into separate int8 and scale buffers.
@@ -621,22 +618,20 @@ impl WeightProvider for GgufProvider {
             let mmap = &self.mmaps[loc.shard_index];
             let raw = &mmap[loc.abs_offset..loc.abs_offset + loc.byte_len];
             let (quant_data, scales, zero_point) = repack_q8_0(raw, loc.num_elements)?;
-            return Ok(WeightTensor {
-                data: Cow::Owned(quant_data),
-                shape: loc.dimensions.clone(),
-                dtype: ScalarType::Int8,
-                quant_info: QuantizationInfo::AffineDequantize {
-                    scale: scales,
-                    zero_point,
-                    scale_dtype: ScalarType::Float16,
-                    zero_point_dtype: ScalarType::Float16,
-                    axis: Some(1),
-                    bit_width: 8,
-                    group_size: Some(32),
-                    awq_scales: None,
-                    g_idx: None,
-                },
-            });
+            return Ok(
+                WeightTensor::owned(quant_data, loc.dimensions.clone(), ScalarType::Int8)
+                    .with_quant_info(QuantizationInfo::AffineDequantize {
+                        scale: scales,
+                        zero_point,
+                        scale_dtype: ScalarType::Float16,
+                        zero_point_dtype: ScalarType::Float16,
+                        axis: Some(1),
+                        bit_width: 8,
+                        group_size: Some(32),
+                        awq_scales: None,
+                        g_idx: None,
+                    }),
+            );
         }
 
         // All other types: dequantize to FP16 (existing path)
@@ -800,21 +795,19 @@ fn extract_model_config(meta: &HashMap<String, MetadataValue>) -> Result<ModelCo
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    Ok(ModelConfig {
-        architecture,
-        hidden_size,
-        intermediate_size,
-        num_hidden_layers,
-        num_attention_heads,
-        num_key_value_heads,
-        head_dim,
-        vocab_size,
-        max_position_embeddings,
-        rms_norm_eps,
-        rope_theta,
-        tie_word_embeddings,
-        extra: HashMap::new(),
-    })
+    Ok(ModelConfig::new(architecture)
+        .with_hidden_size(hidden_size)
+        .with_intermediate_size(intermediate_size)
+        .with_num_hidden_layers(num_hidden_layers)
+        .with_num_attention_heads(num_attention_heads)
+        .with_num_key_value_heads(num_key_value_heads)
+        .with_head_dim(head_dim)
+        .with_vocab_size(vocab_size)
+        .with_max_position_embeddings(max_position_embeddings)
+        .with_rms_norm_eps(rms_norm_eps)
+        .with_rope_theta(rope_theta)
+        .with_tie_word_embeddings(tie_word_embeddings)
+        .with_extra(HashMap::new()))
 }
 
 // ---------------------------------------------------------------------------
