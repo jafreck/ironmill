@@ -21,6 +21,7 @@ use mil_rs::MilError;
 use mil_rs::convert::onnx_graph::ConversionResult;
 use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 
+use super::moe;
 use super::shared::{
     LayerContext, emit_attention, emit_embedding, emit_gather, emit_linear, emit_lm_head,
     emit_mlp_gelu, emit_residual_add, emit_rms_norm, emit_rope_tables,
@@ -31,18 +32,6 @@ use super::shared::{
 pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, MilError> {
     let config = provider.config().clone();
     let mut warnings: Vec<String> = Vec::new();
-
-    // Guard against Phase 3 MoE (not yet implemented)
-    if config
-        .extra
-        .get("enable_moe_block")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return Err(MilError::Validation(
-            "Gemma 4 MoE (enable_moe_block=true) is not yet supported".into(),
-        ));
-    }
 
     let seq_len: Option<usize> = None; // dynamic
     let batch: Option<usize> = Some(1);
@@ -103,6 +92,24 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
         .extra
         .get("final_logit_softcapping")
         .and_then(|v| v.as_f64());
+
+    // MoE config
+    let enable_moe = config
+        .extra
+        .get("enable_moe_block")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let num_experts = config
+        .extra
+        .get("num_experts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let top_k_experts = config
+        .extra
+        .get("top_k_experts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
     // Build the main function with typed inputs.
     let input_ids_ty = TensorType::with_dynamic_shape(ScalarType::Int32, vec![batch, seq_len]);
     let position_ids_ty = TensorType::with_dynamic_shape(ScalarType::Int32, vec![batch, seq_len]);
@@ -284,6 +291,9 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
             kv_anchor[layer_idx],
             ple_layer_input.as_deref(),
             ple_hidden_size,
+            enable_moe,
+            num_experts,
+            top_k_experts,
             &mut warnings,
         )?;
     }
@@ -398,6 +408,7 @@ fn emit_embedding_norm(
 /// Handles standard Gemma layers and Gemma 4 extensions (KV sharing,
 /// PLE, double-wide MLP). When Gemma 4 features are not configured,
 /// behaves identically to the original Gemma layer.
+#[allow(clippy::too_many_arguments)]
 fn emit_gemma4_transformer_layer(
     block: &mut Block,
     ctx: &LayerContext<'_>,
@@ -405,6 +416,9 @@ fn emit_gemma4_transformer_layer(
     _kv_anchor: Option<usize>,
     ple_input: Option<&str>,
     _ple_hidden_size: usize,
+    enable_moe: bool,
+    num_experts: usize,
+    top_k_experts: usize,
     warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let layer_idx = ctx.layer_idx;
@@ -456,8 +470,38 @@ fn emit_gemma4_transformer_layer(
         warnings,
     )?;
 
-    // 6. Residual add
-    let post_mlp = emit_residual_add(block, &post_attn, &mlp_out, &format!("l{layer_idx}_output"));
+    // 6. MoE block (parallel with dense MLP, outputs are summed) or standard residual
+    let post_mlp = if enable_moe && num_experts > 0 {
+        // 5b. MoE output from the same normed input
+        let moe_out = moe::emit_moe_block(
+            block,
+            ctx.provider,
+            layer_idx,
+            &normed_mlp,
+            num_experts,
+            top_k_experts,
+            warnings,
+        )?;
+
+        // Sum dense MLP + MoE outputs
+        let combined = emit_residual_add(
+            block,
+            &mlp_out,
+            &moe_out,
+            &format!("l{layer_idx}_moe_combined"),
+        );
+
+        // Residual add with post-attention state
+        emit_residual_add(
+            block,
+            &post_attn,
+            &combined,
+            &format!("l{layer_idx}_output"),
+        )
+    } else {
+        // Standard: residual add with MLP output only
+        emit_residual_add(block, &post_attn, &mlp_out, &format!("l{layer_idx}_output"))
+    };
 
     // 7. Per-Layer Embedding (PLE) — applied AFTER the FFN block
     let layer_out = if let Some(ple_slice) = ple_input {
@@ -705,14 +749,68 @@ mod tests {
     }
 
     #[test]
-    fn build_program_gemma4_rejects_moe() {
+    fn build_program_gemma4_with_moe() {
         let mut config = tiny_gemma_config();
+        config.num_hidden_layers = 2;
         config
             .extra
             .insert("enable_moe_block".into(), serde_json::json!(true));
-        let provider = StubProvider::new(config).with_llama_weights();
-        let err = build_program(&provider).unwrap_err();
-        assert!(err.to_string().contains("MoE"), "should reject MoE config");
+        config
+            .extra
+            .insert("num_experts".into(), serde_json::json!(4));
+        config
+            .extra
+            .insert("top_k_experts".into(), serde_json::json!(2));
+
+        let moe_inter = 64; // moe_intermediate_size
+        let h = config.hidden_size;
+        let mut provider = StubProvider::new(config).with_llama_weights();
+        // Add MoE weights for each layer
+        for l in 0..2 {
+            let p = format!("model.layers.{l}.mlp");
+            provider =
+                provider.with_tensor(&format!("{p}.router.weight"), &[4, h], ScalarType::Float16);
+            for e in 0..4 {
+                provider = provider
+                    .with_tensor(
+                        &format!("{p}.experts.{e}.gate_proj.weight"),
+                        &[moe_inter, h],
+                        ScalarType::Float16,
+                    )
+                    .with_tensor(
+                        &format!("{p}.experts.{e}.up_proj.weight"),
+                        &[moe_inter, h],
+                        ScalarType::Float16,
+                    )
+                    .with_tensor(
+                        &format!("{p}.experts.{e}.down_proj.weight"),
+                        &[h, moe_inter],
+                        ScalarType::Float16,
+                    );
+            }
+        }
+
+        let result = build_program(&provider).expect("MoE build should succeed");
+        let main = result.program.main().unwrap();
+        // Should have MoE-related ops
+        let moe_ops: Vec<_> = main
+            .body
+            .operations
+            .iter()
+            .filter(|op| op.name.contains("moe_"))
+            .collect();
+        assert!(!moe_ops.is_empty(), "MoE build should emit MoE ops");
+        // Should also have standard MLP ops (dense + MoE in parallel)
+        let gelu_ops: Vec<_> = main
+            .body
+            .operations
+            .iter()
+            .filter(|op| op.op_type == "gelu")
+            .collect();
+        assert!(
+            !gelu_ops.is_empty(),
+            "MoE layers should still emit dense MLP gelu ops"
+        );
     }
 
     #[test]

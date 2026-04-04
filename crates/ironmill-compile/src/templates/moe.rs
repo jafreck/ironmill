@@ -23,7 +23,6 @@ use super::shared::{emit_linear, emit_softmax};
 /// evaluating all experts (acceptable for CoreML static graphs).
 ///
 /// Returns the MoE output tensor name.
-#[allow(dead_code)]
 pub(super) fn emit_moe_block(
     block: &mut Block,
     provider: &dyn WeightProvider,
