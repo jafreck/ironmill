@@ -357,8 +357,8 @@ kernel void prefill_attention(
 // Grid: (num_heads, ceil(token_count / Q_CHUNK), 1) threadgroups.
 // Threadgroup: (max(256, HEAD_DIM), 1, 1) threads.
 
-constant constexpr uint FA2_Q_CHUNK = 32;
-constant constexpr uint FA2_KV_TILE = 32;
+constant constexpr uint FA2_Q_CHUNK = (HEAD_DIM >= 256) ? 8 : 32;
+constant constexpr uint FA2_KV_TILE = (HEAD_DIM >= 256) ? 16 : 32;
 
 kernel void prefill_attention_fa2(
     device const half* q         [[buffer(0)]],

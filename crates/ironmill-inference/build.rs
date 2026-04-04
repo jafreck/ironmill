@@ -77,9 +77,14 @@ fn main() {
             &[],
         );
 
-        // Fused SDPA
+        // Fused SDPA — reduce tile sizes for large head dims to fit in 32KB threadgroup memory.
+        let sdpa_tile_defines = if hd >= 256 {
+            "#define SDPA_BR 16\n#define SDPA_BC 16\n".to_string()
+        } else {
+            String::new()
+        };
         let sdpa_tmp = out_dir.join(format!("_sdpa_hd{hd}.metal"));
-        std::fs::write(&sdpa_tmp, format!("{header}{sdpa_src}")).unwrap();
+        std::fs::write(&sdpa_tmp, format!("{header}{sdpa_tile_defines}{sdpa_src}")).unwrap();
         compile_shader(
             &sdpa_tmp,
             &out_dir.join(format!("fused_sdpa_hd{hd}.metallib")),
