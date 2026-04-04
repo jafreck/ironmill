@@ -85,6 +85,50 @@ impl ModelConfig {
         }
         Some(layers)
     }
+
+    /// Extract Multi-Head Latent Attention (MLA) configuration from metadata.
+    ///
+    /// Looks for DeepSeek-V2/V3 MLA-specific fields (`kv_lora_rank`,
+    /// `q_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim`, `v_head_dim`)
+    /// in `extra`. Returns `None` if any required field is absent.
+    pub fn mla_config(&self) -> Option<MlaConfig> {
+        let kv_latent_dim = self.extra.get("kv_lora_rank")?.as_u64()? as usize;
+        let q_latent_dim = self.extra.get("q_lora_rank")?.as_u64()? as usize;
+        let qk_nope_head_dim = self.extra.get("qk_nope_head_dim")?.as_u64()? as usize;
+        let qk_rope_head_dim = self.extra.get("qk_rope_head_dim")?.as_u64()? as usize;
+        let v_head_dim = self.extra.get("v_head_dim")?.as_u64()? as usize;
+        Some(MlaConfig {
+            kv_latent_dim,
+            q_latent_dim,
+            num_heads: self.num_attention_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+        })
+    }
+}
+
+/// Multi-Head Latent Attention (MLA) configuration.
+///
+/// Used by DeepSeek-V2/V3 models to compress the KV cache into a
+/// low-dimensional latent space. Weight absorption at load time fuses
+/// the up-projection weights into Q and O projections, eliminating
+/// runtime decompression.
+#[derive(Debug, Clone)]
+pub struct MlaConfig {
+    /// Compressed KV latent dimension (e.g., 512). Corresponds to
+    /// `kv_lora_rank` in the HuggingFace config.
+    pub kv_latent_dim: usize,
+    /// Query latent dimension. Corresponds to `q_lora_rank`.
+    pub q_latent_dim: usize,
+    /// Number of attention heads.
+    pub num_heads: usize,
+    /// Non-RoPE portion of the Q/K head dimension.
+    pub qk_nope_head_dim: usize,
+    /// RoPE-applied portion of the Q/K head dimension.
+    pub qk_rope_head_dim: usize,
+    /// Per-head value dimension.
+    pub v_head_dim: usize,
 }
 
 /// Describes how a weight tensor is stored in compressed form.

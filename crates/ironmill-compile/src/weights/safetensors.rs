@@ -228,6 +228,10 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
         .unwrap_or(false);
 
     // Collect architecture-specific extra fields.
+    // This captures all non-standard keys including MLA-specific fields
+    // from DeepSeek-V2/V3 models (kv_lora_rank, q_lora_rank,
+    // qk_nope_head_dim, qk_rope_head_dim, v_head_dim) which are consumed
+    // by ModelConfig::mla_config().
     let mut extra = HashMap::new();
     let known_keys: &[&str] = &[
         "model_type",
@@ -699,6 +703,72 @@ mod tests {
         assert!(config.tie_word_embeddings);
         // Extra field captured.
         assert!(config.extra.contains_key("use_sliding_window"));
+    }
+
+    #[test]
+    fn test_parse_hf_config_deepseek_mla() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "model_type": "llama",
+                "hidden_size": 5120,
+                "intermediate_size": 12288,
+                "num_hidden_layers": 60,
+                "num_attention_heads": 128,
+                "num_key_value_heads": 1,
+                "vocab_size": 102400,
+                "kv_lora_rank": 512,
+                "q_lora_rank": 1536,
+                "qk_nope_head_dim": 128,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 128
+            }"#,
+        )
+        .unwrap();
+
+        let config = parse_hf_config(&config_path).unwrap();
+
+        // MLA fields should be captured in extra.
+        assert!(config.extra.contains_key("kv_lora_rank"));
+        assert!(config.extra.contains_key("q_lora_rank"));
+        assert!(config.extra.contains_key("qk_nope_head_dim"));
+        assert!(config.extra.contains_key("qk_rope_head_dim"));
+        assert!(config.extra.contains_key("v_head_dim"));
+
+        // mla_config() should return a valid MlaConfig.
+        let mla = config.mla_config().expect("MLA config should be present");
+        assert_eq!(mla.kv_latent_dim, 512);
+        assert_eq!(mla.q_latent_dim, 1536);
+        assert_eq!(mla.num_heads, 128);
+        assert_eq!(mla.qk_nope_head_dim, 128);
+        assert_eq!(mla.qk_rope_head_dim, 64);
+        assert_eq!(mla.v_head_dim, 128);
+    }
+
+    #[test]
+    fn test_mla_config_absent_for_standard_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "model_type": "llama",
+                "hidden_size": 4096,
+                "intermediate_size": 11008,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "vocab_size": 32000
+            }"#,
+        )
+        .unwrap();
+
+        let config = parse_hf_config(&config_path).unwrap();
+        assert!(
+            config.mla_config().is_none(),
+            "standard model should not have MLA config"
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ use mil_rs::weights::{ModelConfig, WeightProvider};
 
 use super::config::MetalConfig;
 use super::error::MetalError;
+use super::mla::{MlaConfig, MlaKvCache};
 use super::ops;
 use super::turboquant::{MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantMetalConfig};
 use super::weights::{
@@ -286,6 +287,10 @@ pub struct MetalInference {
     decode_matmuls_t1: Option<MpsMatmulCache>,
     config: MetalConfig,
     model_config: Option<ModelConfig>,
+    /// MLA configuration (set when the model uses Multi-Head Latent Attention).
+    mla_config: Option<MlaConfig>,
+    /// MLA compressed KV cache (used instead of fp16_kv_cache for MLA models).
+    mla_kv_cache: Option<MlaKvCache>,
     /// Pre-allocated buffer for FP16 logits readback.
     logits_fp16_buf: Vec<u8>,
     /// Pre-allocated buffer for serializing token IDs to GPU.
@@ -320,6 +325,8 @@ impl MetalInference {
             decode_matmuls_t1: None,
             config,
             model_config: None,
+            mla_config: None,
+            mla_kv_cache: None,
             logits_fp16_buf: Vec::new(),
             token_bytes_buf: Vec::new(),
             seq_pos: 0,
@@ -335,10 +342,10 @@ impl MetalInference {
     ) -> Result<(), InferenceError> {
         self.config = config;
 
-        let weights = MetalWeights::load(&self.device, provider, self.config.force_cpu_dequant)
+        let mut weights = MetalWeights::load(&self.device, provider, self.config.force_cpu_dequant)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-        let mc = &weights.config;
+        let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
 
         // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
@@ -349,7 +356,7 @@ impl MetalInference {
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
 
-        let bufs = IntermediateBuffers::allocate(&self.device, 1, mc)
+        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.intermediate_buffers = Some(bufs);
 
@@ -363,7 +370,7 @@ impl MetalInference {
         self.rope_cos = Some(cos);
         self.rope_sin = Some(sin);
 
-        let decode_cache_t1 = Self::build_matmul_cache(&self.device, mc, &weights, 1)
+        let decode_cache_t1 = Self::build_matmul_cache(&self.device, &mc, &weights, 1)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
@@ -392,6 +399,28 @@ impl MetalInference {
                 });
             }
         }
+
+        // ── MLA detection and weight absorption ─────────────────
+        let mla_cfg = mc.mla_config();
+        if let Some(ref mla) = mla_cfg {
+            // Perform weight absorption: fuse W_uk into Q and W_uv into O
+            // at load time so inference works directly on compressed latents.
+            absorb_mla_weights(&self.device, &mut weights, mla, mc.hidden_size, provider)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+            // Create MLA compressed KV cache.
+            let mla_cache = MlaKvCache::new(
+                &self.device,
+                mla,
+                mc.num_hidden_layers,
+                self.config.max_seq_len,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            self.mla_kv_cache = Some(mla_cache);
+        } else {
+            self.mla_kv_cache = None;
+        }
+        self.mla_config = mla_cfg;
 
         if self.config.enable_turboquant {
             // Algorithm selection:
@@ -1027,6 +1056,11 @@ impl MetalInference {
         } else if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
             fp16_kv.seq_pos += token_count;
         }
+        if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
+            mla_kv
+                .advance_by(token_count)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        }
 
         Ok(logits)
     }
@@ -1543,6 +1577,11 @@ impl MetalInference {
             }
         } else if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
             fp16_kv.seq_pos += token_count;
+        }
+        if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
+            mla_kv
+                .advance_by(token_count)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         }
 
         Ok(logits)
@@ -2345,6 +2384,138 @@ fn encode_end_of_layer_residual(
     Ok(())
 }
 
+// ── MLA weight absorption helper ───────────────────────────────
+
+/// Absorb MLA up-projection weights into Q and O projections at load time.
+///
+/// For each transformer layer, reads W_uk and W_uv from the weight provider,
+/// reads the current Q and O weights from the Metal buffers, performs the
+/// absorption matrix multiplies, and replaces the Q and O Metal buffers with
+/// the absorbed versions.
+fn absorb_mla_weights(
+    device: &MetalDevice,
+    weights: &mut MetalWeights,
+    mla: &super::mla::MlaConfig,
+    hidden_size: usize,
+    provider: &dyn WeightProvider,
+) -> Result<(), MetalError> {
+    let num_layers = weights.layers.len();
+    let qk_dim = mla.qk_nope_head_dim + mla.qk_rope_head_dim;
+    let q_total = mla.num_heads * qk_dim * hidden_size;
+    let o_total = hidden_size * mla.num_heads * mla.v_head_dim;
+    let uk_total = mla.num_heads * mla.qk_nope_head_dim * mla.kv_latent_dim;
+    let uv_total = mla.num_heads * mla.v_head_dim * mla.kv_latent_dim;
+
+    for layer_idx in 0..num_layers {
+        let prefix = format!("model.layers.{layer_idx}");
+
+        // Load W_uk and W_uv from the provider.
+        let uk_name = format!("{prefix}.self_attn.kv_b_proj.weight");
+        let _uv_name = uk_name.clone(); // In DeepSeek, kv_b_proj contains both UK and UV
+
+        // Read current Q and O weights from Metal buffers.
+        let q_bytes = read_f16_buffer(&weights.layers[layer_idx].q_proj, q_total)?;
+        let o_bytes = read_f16_buffer(&weights.layers[layer_idx].o_proj, o_total)?;
+
+        // Convert to f16 slices.
+        let w_q: Vec<f16> = q_bytes
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let w_o: Vec<f16> = o_bytes
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        // Load up-projection weights. These may be combined in kv_b_proj;
+        // the first num_heads * qk_nope_head_dim rows are W_uk, the next
+        // num_heads * v_head_dim rows are W_uv.
+        let (w_uk, w_uv) = if provider.has_tensor(&uk_name) {
+            let tensor = provider
+                .tensor(&uk_name)
+                .map_err(|e| MetalError::WeightLoading(format!("{uk_name}: {e}")))?;
+            let all_f16: Vec<f16> = tensor
+                .data
+                .chunks_exact(2)
+                .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            // Split: first uk_total elements are W_uk, next uv_total are W_uv.
+            if all_f16.len() >= uk_total + uv_total {
+                (
+                    all_f16[..uk_total].to_vec(),
+                    all_f16[uk_total..uk_total + uv_total].to_vec(),
+                )
+            } else {
+                // Fallback: separate tensors
+                if all_f16.len() < uk_total {
+                    return Err(MetalError::WeightLoading(format!(
+                        "kv_b_proj tensor too small: expected {} elements, got {}",
+                        uk_total,
+                        all_f16.len()
+                    )));
+                }
+                let w_uk_vec = all_f16[..uk_total].to_vec();
+                let uv_tensor = provider
+                    .tensor(&format!("{prefix}.self_attn.v_b_proj.weight"))
+                    .map_err(|e| MetalError::WeightLoading(format!("v_b_proj: {e}")))?;
+                let w_uv_vec: Vec<f16> = uv_tensor
+                    .data
+                    .chunks_exact(2)
+                    .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                (w_uk_vec, w_uv_vec)
+            }
+        } else {
+            return Err(MetalError::WeightLoading(format!(
+                "MLA up-projection weight not found: {uk_name}"
+            )));
+        };
+
+        // Perform absorption.
+        let (q_absorbed, o_absorbed) = super::mla::absorb_weights(&w_q, &w_uk, &w_o, &w_uv, mla);
+
+        // Create new Metal buffers with absorbed weights.
+        let q_absorbed_bytes: Vec<u8> = q_absorbed.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let o_absorbed_bytes: Vec<u8> = o_absorbed.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let q_buf = device
+            .create_buffer_with_data(&q_absorbed_bytes, StorageMode::Shared)
+            .map_err(MetalError::Metal)?;
+        let o_buf = device
+            .create_buffer_with_data(&o_absorbed_bytes, StorageMode::Shared)
+            .map_err(MetalError::Metal)?;
+
+        // Replace the Q and O projection weights with absorbed versions.
+        weights.layers[layer_idx].q_proj = WeightBuffer::Dense {
+            buf: q_buf,
+            packed: None, // Absorption changes dimensions; re-packing can be added later.
+        };
+        weights.layers[layer_idx].o_proj = WeightBuffer::Dense {
+            buf: o_buf,
+            packed: None,
+        };
+    }
+
+    Ok(())
+}
+
+/// Read FP16 data from a WeightBuffer, returning raw bytes.
+///
+/// For Dense weights, reads directly from the underlying Metal buffer.
+/// Returns an error for quantized weights (MLA absorption requires dense
+/// weights as input).
+fn read_f16_buffer(weight: &WeightBuffer, num_elements: usize) -> Result<Vec<u8>, MetalError> {
+    let buf = weight.as_dense().map_err(|e| {
+        MetalError::WeightLoading(format!(
+            "MLA absorption requires dense weights, got quantized: {e}"
+        ))
+    })?;
+    let byte_count = num_elements * 2;
+    let mut data = vec![0u8; byte_count];
+    buf.read_bytes(&mut data, 0).map_err(MetalError::Metal)?;
+    Ok(data)
+}
+
 impl InferenceEngine for MetalInference {
     fn load(&mut self, artifacts: &dyn Any) -> Result<(), InferenceError> {
         let gpu_artifacts = artifacts
@@ -2356,14 +2527,14 @@ impl InferenceEngine for MetalInference {
         self.config = gpu_artifacts.config.clone();
 
         // Load weights into Metal buffers.
-        let weights = MetalWeights::load(
+        let mut weights = MetalWeights::load(
             &self.device,
             gpu_artifacts.weights,
             self.config.force_cpu_dequant,
         )
         .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-        let mc = &weights.config;
+        let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
 
         // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
@@ -2377,7 +2548,7 @@ impl InferenceEngine for MetalInference {
 
         // Allocate intermediate buffers (start at 1 token; run_pipeline_inner
         // grows them on demand for larger prefill batches).
-        let bufs = IntermediateBuffers::allocate(&self.device, 1, mc)
+        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.intermediate_buffers = Some(bufs);
 
@@ -2393,7 +2564,7 @@ impl InferenceEngine for MetalInference {
         self.rope_sin = Some(sin);
 
         // Build MPS matmul cache for single-token decode.
-        let decode_cache_t1 = Self::build_matmul_cache(&self.device, mc, &weights, 1)
+        let decode_cache_t1 = Self::build_matmul_cache(&self.device, &mc, &weights, 1)
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
@@ -2421,6 +2592,31 @@ impl InferenceEngine for MetalInference {
                 });
             }
         }
+
+        // ── MLA detection and weight absorption ─────────────────
+        let mla_cfg = mc.mla_config();
+        if let Some(ref mla) = mla_cfg {
+            absorb_mla_weights(
+                &self.device,
+                &mut weights,
+                mla,
+                mc.hidden_size,
+                gpu_artifacts.weights,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
+            let mla_cache = MlaKvCache::new(
+                &self.device,
+                mla,
+                mc.num_hidden_layers,
+                self.config.max_seq_len,
+            )
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            self.mla_kv_cache = Some(mla_cache);
+        } else {
+            self.mla_kv_cache = None;
+        }
+        self.mla_config = mla_cfg;
 
         // Initialize KV cache.
         if self.config.enable_turboquant {
@@ -2493,6 +2689,9 @@ impl InferenceEngine for MetalInference {
         if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
             fp16_kv.reset();
         }
+        if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
+            mla_kv.reset();
+        }
     }
 
     fn seq_pos(&self) -> usize {
@@ -2507,6 +2706,9 @@ impl InferenceEngine for MetalInference {
         }
         if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
             fp16_kv.truncate_to(pos);
+        }
+        if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
+            mla_kv.truncate_to(pos);
         }
     }
 }
