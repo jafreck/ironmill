@@ -20,6 +20,8 @@ pub struct Gemma4LayerConfig {
     pub kv_anchor: Option<usize>,
     /// Effective intermediate size for MLP (may be doubled for KV-shared layers).
     pub intermediate_size: usize,
+    /// Whether this layer uses MoE (Mixture of Experts) FFN.
+    pub enable_moe: bool,
 }
 
 /// Gemma 4 model-specific configuration, computed at model load time.
@@ -33,6 +35,12 @@ pub struct Gemma4Config {
     pub ple_hidden_size: usize,
     /// Final logit softcapping value. None = no softcapping.
     pub final_logit_softcapping: Option<f32>,
+    /// Number of MoE experts. 0 = no MoE.
+    pub num_experts: usize,
+    /// Number of top-k experts selected per token.
+    pub top_k_experts: usize,
+    /// MoE expert FFN intermediate size.
+    pub moe_intermediate_size: usize,
 }
 
 impl Gemma4Config {
@@ -70,6 +78,27 @@ impl Gemma4Config {
             .and_then(|v| v.as_f64())
             .map(|v| v as f32);
 
+        let enable_moe = mc
+            .extra
+            .get("enable_moe_block")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let num_experts = mc
+            .extra
+            .get("num_experts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let top_k_experts = mc
+            .extra
+            .get("top_k_experts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let moe_intermediate_size = mc
+            .extra
+            .get("moe_intermediate_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
         // Build per-layer configs
         let prev_types = &layer_types[..first_shared_idx];
         let mut layer_configs = Vec::with_capacity(mc.num_hidden_layers);
@@ -106,6 +135,7 @@ impl Gemma4Config {
                 rope_table_index: if is_global { 1 } else { 0 },
                 kv_anchor,
                 intermediate_size,
+                enable_moe,
             });
         }
 
@@ -114,6 +144,9 @@ impl Gemma4Config {
             global_head_dim,
             ple_hidden_size,
             final_logit_softcapping,
+            num_experts,
+            top_k_experts,
+            moe_intermediate_size,
         })
     }
 }
