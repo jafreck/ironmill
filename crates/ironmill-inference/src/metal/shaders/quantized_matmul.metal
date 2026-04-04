@@ -88,8 +88,8 @@ kernel void polarquant_matmul_int4(
     uint local_row = local_id.y;  // 0..TILE_M-1
     uint local_col = local_id.x;  // 0..TILE_N-1
 
-    uint row = group_id.y * TILE_M + local_row;
-    uint col = group_id.x * TILE_N + local_col;
+    uint row = group_id.x * TILE_M + local_row;
+    uint col = group_id.y * TILE_N + local_col;
 
     threadgroup half tg_a[TILE_M * TILE_K];
     threadgroup half tg_b[TILE_N * TILE_K];
@@ -105,7 +105,7 @@ kernel void polarquant_matmul_int4(
         for (uint i = thread_idx; i < TILE_M * TILE_K; i += total_threads) {
             uint a_row = i / TILE_K;
             uint a_col = i % TILE_K;
-            uint g_row = group_id.y * TILE_M + a_row;
+            uint g_row = group_id.x * TILE_M + a_row;
             uint g_col = k_base + a_col;
             tg_a[i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
         }
@@ -114,7 +114,7 @@ kernel void polarquant_matmul_int4(
         for (uint i = thread_idx; i < TILE_N * TILE_K; i += total_threads) {
             uint b_n = i / TILE_K;
             uint b_k = i % TILE_K;
-            uint g_n = group_id.x * TILE_N + b_n;
+            uint g_n = group_id.y * TILE_N + b_n;
             uint g_k = k_base + b_k;
 
             half val = half(0);
@@ -207,8 +207,8 @@ kernel void polarquant_matmul_int8(
     uint local_row = local_id.y;
     uint local_col = local_id.x;
 
-    uint row = group_id.y * TILE_M + local_row;
-    uint col = group_id.x * TILE_N + local_col;
+    uint row = group_id.x * TILE_M + local_row;
+    uint col = group_id.y * TILE_N + local_col;
 
     threadgroup half tg_a[TILE_M * TILE_K];
     threadgroup half tg_b[TILE_N * TILE_K];
@@ -223,7 +223,7 @@ kernel void polarquant_matmul_int8(
         for (uint i = thread_idx; i < TILE_M * TILE_K; i += total_threads) {
             uint a_row = i / TILE_K;
             uint a_col = i % TILE_K;
-            uint g_row = group_id.y * TILE_M + a_row;
+            uint g_row = group_id.x * TILE_M + a_row;
             uint g_col = k_base + a_col;
             tg_a[i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
         }
@@ -232,7 +232,7 @@ kernel void polarquant_matmul_int8(
         for (uint i = thread_idx; i < TILE_N * TILE_K; i += total_threads) {
             uint b_n = i / TILE_K;
             uint b_k = i % TILE_K;
-            uint g_n = group_id.x * TILE_N + b_n;
+            uint g_n = group_id.y * TILE_N + b_n;
             uint g_k = k_base + b_k;
 
             half val = half(0);

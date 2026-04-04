@@ -1699,7 +1699,7 @@ fn encode_polarquant_matmul(
         let tile_m = 8;
         let tile_n = 32;
         encoder.dispatch_threadgroups(
-            ((n + tile_n - 1) / tile_n, (m + tile_m - 1) / tile_m, 1),
+            ((m + tile_m - 1) / tile_m, (n + tile_n - 1) / tile_n, 1),
             (tile_n, tile_m, 1),
         );
     }
@@ -1771,7 +1771,7 @@ fn encode_affine_matmul(
         let tile_m = 8;
         let tile_n = 32;
         encoder.dispatch_threadgroups(
-            ((n + tile_n - 1) / tile_n, (m + tile_m - 1) / tile_m, 1),
+            ((m + tile_m - 1) / tile_m, (n + tile_n - 1) / tile_n, 1),
             (tile_n, tile_m, 1),
         );
     }
