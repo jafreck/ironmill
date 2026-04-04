@@ -15,6 +15,7 @@ pub mod coreml;
 #[cfg(any(feature = "metal", feature = "mlx"))]
 mod dequant;
 pub mod engine;
+pub mod grammar;
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(feature = "mlx")]
@@ -27,10 +28,13 @@ mod weight_loading;
 
 // Re-exports for convenience.
 pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
-pub use engine::{InferenceEngine, InferenceError};
+pub use engine::{ConstrainedDecoder, InferenceEngine, InferenceError};
+pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 #[cfg(feature = "mlx")]
 pub use mlx::{MlxArtifacts, MlxConfig, MlxInference};
-pub use sampling::{DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, is_eos_token, sample_token};
+pub use sampling::{
+    DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, apply_token_mask, is_eos_token, sample_token,
+};
 pub use types::{
     ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor, build_dummy_inputs,
 };

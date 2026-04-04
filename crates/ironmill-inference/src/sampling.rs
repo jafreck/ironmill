@@ -95,6 +95,28 @@ pub fn is_eos_token(token_id: u32, eos_tokens: &[u32]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Grammar mask
+// ---------------------------------------------------------------------------
+
+use crate::grammar::TokenMask;
+
+/// Apply a grammar mask to logits — set masked-out tokens to `NEG_INFINITY`.
+///
+/// This should be called **before** temperature scaling and sampling so that
+/// the sampler never selects a token forbidden by the grammar.
+///
+/// Tokens where `mask.is_allowed(i)` is `false` are clamped to
+/// [`f32::NEG_INFINITY`], effectively removing them from the softmax
+/// distribution.
+pub fn apply_token_mask(logits: &mut [f32], mask: &TokenMask) {
+    for (i, logit) in logits.iter_mut().enumerate() {
+        if !mask.is_allowed(i) {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Full sampler chain
 // ---------------------------------------------------------------------------
 
