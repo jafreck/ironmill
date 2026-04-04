@@ -453,23 +453,20 @@ impl Pass for AwqQuantizePass {
             }
 
             // ----------------------------------------------------------
-            // Phase 4: Error on ops without calibration data.
-            // Calibration is mandatory — silent MinMax fallback would
-            // produce quantized weights with no activation-aware scaling,
-            // giving users a false impression of AWQ quality.
+            // Phase 4: Restore ops without calibration data.
+            // These are large 2D tensors (e.g. embeddings) that the
+            // calibration runner didn't instrument. Leave them
+            // unquantized rather than silently applying MinMax.
             // ----------------------------------------------------------
-            if !fallback_ops.is_empty() {
-                let names: Vec<&str> = fallback_ops
-                    .iter()
-                    .map(|(idx, _, _)| function.body.operations[*idx].name.as_str())
-                    .collect();
-                return Err(MilError::Validation(format!(
-                    "AWQ: {} ops missing calibration data (channel magnitudes or activations). \
-                     Calibration data is required for all quantizable ops. \
-                     Missing ops: {:?}",
-                    fallback_ops.len(),
-                    names,
-                )));
+            for (idx, floats, shape) in fallback_ops {
+                let op = &mut function.body.operations[idx];
+                let data = f32_slice_to_bytes(&floats);
+                let val = Value::Tensor {
+                    data,
+                    shape,
+                    dtype: ScalarType::Float32,
+                };
+                op.inputs.insert("val".to_string(), val);
             }
         }
         Ok(())
@@ -1293,6 +1290,31 @@ mod tests {
         assert!(
             err_msg.contains("channel_magnitudes is empty"),
             "error should mention empty calibration: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: Ops without calibration data are left unquantized (not MinMax).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn uncalibrated_ops_left_unquantized() {
+        let out = 8;
+        let inp = 128;
+        let values: Vec<f32> = (0..(out * inp)).map(|i| i as f32 * 0.5).collect();
+        let mut prog = make_program("weight", &values, vec![out, inp]);
+
+        // Provide magnitudes for a different op name so "weight" has no data.
+        let mut mags = HashMap::new();
+        mags.insert("other_weight".to_string(), vec![1.0; inp]);
+        let pass = AwqQuantizePass::new(4, inp, mags);
+        pass.run(&mut prog).unwrap();
+
+        // "weight" should remain as a `const` op (unquantized).
+        let op = &prog.functions["main"].body.operations[0];
+        assert_eq!(
+            op.op_type, "const",
+            "op without calibration data should remain unquantized"
         );
     }
 
