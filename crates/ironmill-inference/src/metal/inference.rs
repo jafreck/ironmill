@@ -45,11 +45,13 @@ pub struct MetalArtifacts<'a> {
 
 /// FP16 KV cache (when TurboQuant is disabled).
 struct Fp16KvCache {
-    /// K caches per layer: `[num_kv_heads × max_seq × head_dim]` FP16.
+    /// K caches per buffer slot: `[num_kv_heads × max_seq × head_dim]` FP16.
     k_caches: Vec<MetalBuffer>,
-    /// V caches per layer.
+    /// V caches per buffer slot.
     v_caches: Vec<MetalBuffer>,
     seq_pos: usize,
+    /// CLA anchor layers. When set, only anchor layers have physical buffers.
+    anchor_layers: Option<Vec<usize>>,
 }
 
 impl Fp16KvCache {
@@ -59,11 +61,17 @@ impl Fp16KvCache {
         num_kv_heads: usize,
         max_seq_len: usize,
         head_dim: usize,
+        anchor_layers: Option<Vec<usize>>,
     ) -> Result<Self, MetalError> {
+        let num_buffers = if let Some(ref anchors) = anchor_layers {
+            anchors.len()
+        } else {
+            num_layers
+        };
         let size_bytes = num_kv_heads * max_seq_len * head_dim * 2; // FP16
-        let mut k_caches = Vec::with_capacity(num_layers);
-        let mut v_caches = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers {
+        let mut k_caches = Vec::with_capacity(num_buffers);
+        let mut v_caches = Vec::with_capacity(num_buffers);
+        for _ in 0..num_buffers {
             k_caches.push(
                 device
                     .create_buffer(size_bytes, StorageMode::Shared)
@@ -79,11 +87,32 @@ impl Fp16KvCache {
             k_caches,
             v_caches,
             seq_pos: 0,
+            anchor_layers,
         })
     }
 
+    /// Map a layer index to its physical buffer index.
+    fn kv_buffer_for_layer(&self, layer: usize) -> usize {
+        match self.anchor_layers {
+            Some(ref anchors) => match anchors.binary_search(&layer) {
+                Ok(idx) => idx,
+                Err(idx) => idx.saturating_sub(1),
+            },
+            None => layer,
+        }
+    }
+
+    /// Returns true if `layer` is an anchor layer (or CLA is not configured).
+    fn is_anchor_layer(&self, layer: usize) -> bool {
+        match self.anchor_layers {
+            Some(ref anchors) => anchors.binary_search(&layer).is_ok(),
+            None => true,
+        }
+    }
+
     fn layer_caches(&self, layer: usize) -> (&MetalBuffer, &MetalBuffer) {
-        (&self.k_caches[layer], &self.v_caches[layer])
+        let idx = self.kv_buffer_for_layer(layer);
+        (&self.k_caches[idx], &self.v_caches[idx])
     }
 
     fn reset(&mut self) {
@@ -339,6 +368,31 @@ impl MetalInference {
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
 
+        // Resolve CLA anchor layers: explicit config takes priority, then
+        // fall back to model metadata. Validate against num_layers.
+        let cla_anchors = self
+            .config
+            .cla_config
+            .as_ref()
+            .map(|c| c.anchor_layers.clone())
+            .or_else(|| mc.cla_anchor_layers());
+        if let Some(ref anchors) = cla_anchors {
+            let cla = super::config::ClaConfig {
+                anchor_layers: anchors.clone(),
+            };
+            cla.validate(mc.num_hidden_layers)
+                .map_err(|e| InferenceError::Runtime(format!("CLA config invalid: {e}")))?;
+        }
+        // Back-fill cla_config so is_anchor checks during inference see the
+        // metadata-derived anchors, not the absent user config.
+        if self.config.cla_config.is_none() {
+            if let Some(ref anchors) = cla_anchors {
+                self.config.cla_config = Some(super::config::ClaConfig {
+                    anchor_layers: anchors.clone(),
+                });
+            }
+        }
+
         if self.config.enable_turboquant {
             // Algorithm selection:
             // - b >= 4: Algorithm 1 (full b-bit codebook for K and V, no QJL).
@@ -388,6 +442,7 @@ impl MetalInference {
                 num_layers: mc.num_hidden_layers,
                 rotation_seed: self.config.rotation_seed,
                 outlier: outlier_cfg,
+                anchor_layers: cla_anchors.clone(),
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -403,6 +458,7 @@ impl MetalInference {
                 mc.num_key_value_heads,
                 self.config.max_seq_len,
                 mc.head_dim,
+                cla_anchors.clone(),
             )
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             self.fp16_kv_cache = Some(fp16_kv);
@@ -786,6 +842,11 @@ impl MetalInference {
             enc.memory_barrier_buffers();
 
             // Steps 7-8: KV cache write + attention
+            let is_anchor = self
+                .config
+                .cla_config
+                .as_ref()
+                .map_or(true, |cla| cla.is_anchor(layer_idx));
             encode_kv_cache_and_attention(
                 &enc,
                 pipelines,
@@ -803,6 +864,7 @@ impl MetalInference {
                 hd,
                 enable_tq,
                 self.config.use_fa2_prefill,
+                is_anchor,
             )?;
             enc.memory_barrier_buffers();
 
@@ -1224,6 +1286,11 @@ impl MetalInference {
             enc.memory_barrier_buffers();
 
             // Steps 7-8: KV cache write + attention
+            let is_anchor = self
+                .config
+                .cla_config
+                .as_ref()
+                .map_or(true, |cla| cla.is_anchor(layer_idx));
             encode_kv_cache_and_attention(
                 &enc,
                 pipelines,
@@ -1241,6 +1308,7 @@ impl MetalInference {
                 hd,
                 enable_tq,
                 self.config.use_fa2_prefill,
+                is_anchor,
             )?;
             enc.memory_barrier_buffers();
 
@@ -1866,6 +1934,7 @@ fn encode_kv_cache_and_attention(
     hd: u32,
     enable_tq: bool,
     use_fa2: bool,
+    is_anchor: bool,
 ) -> Result<(), InferenceError> {
     let max_seq = max_seq_len as u32;
     let n_bits = n_bits as u32;
@@ -1892,65 +1961,74 @@ fn encode_kv_cache_and_attention(
 
             let base_seq = seq_pos as u32;
 
-            // K cache: (b-1)-bit codebook + QJL — batched over all tokens
-            enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
-            enc.set_buffer(&bufs.k_proj, 0, 0);
-            enc.set_buffer(&outlier.channel_indices, 0, 1);
-            enc.set_buffer(k_o_cache, 0, 2);
-            enc.set_buffer(k_n_cache, 0, 3);
-            enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
-            enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
-            enc.set_buffer(&outlier.k_outlier_codebook, 0, 6);
-            enc.set_buffer(&outlier.k_outlier_boundaries, 0, 7);
-            enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 8);
-            enc.set_buffer(&outlier.k_non_outlier_boundaries, 0, 9);
-            enc.set_buffer(k_o_scale, 0, 10);
-            enc.set_buffer(k_n_scale, 0, 11);
-            enc.set_bytes(&nkv.to_le_bytes(), 12);
-            enc.set_bytes(&hd.to_le_bytes(), 13);
-            enc.set_bytes(&max_seq.to_le_bytes(), 14);
-            enc.set_bytes(&base_seq.to_le_bytes(), 15);
-            enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
-            enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
-            enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
-            enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 19);
-            enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 20);
-            enc.set_bytes(&1u32.to_le_bytes(), 21); // is_k_cache = 1
-            enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
-            enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
-            enc.set_buffer(k_o_r_norms, 0, 24);
-            enc.set_buffer(k_n_r_norms, 0, 25);
-            enc.dispatch_threadgroups((nkv as usize, token_count, 1), (tg_size.min(1024), 1, 1));
+            // CLA: only anchor layers write to the KV cache.
+            if is_anchor {
+                // K cache: (b-1)-bit codebook + QJL — batched over all tokens
+                enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
+                enc.set_buffer(&bufs.k_proj, 0, 0);
+                enc.set_buffer(&outlier.channel_indices, 0, 1);
+                enc.set_buffer(k_o_cache, 0, 2);
+                enc.set_buffer(k_n_cache, 0, 3);
+                enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
+                enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
+                enc.set_buffer(&outlier.k_outlier_codebook, 0, 6);
+                enc.set_buffer(&outlier.k_outlier_boundaries, 0, 7);
+                enc.set_buffer(&outlier.k_non_outlier_codebook, 0, 8);
+                enc.set_buffer(&outlier.k_non_outlier_boundaries, 0, 9);
+                enc.set_buffer(k_o_scale, 0, 10);
+                enc.set_buffer(k_n_scale, 0, 11);
+                enc.set_bytes(&nkv.to_le_bytes(), 12);
+                enc.set_bytes(&hd.to_le_bytes(), 13);
+                enc.set_bytes(&max_seq.to_le_bytes(), 14);
+                enc.set_bytes(&base_seq.to_le_bytes(), 15);
+                enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
+                enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
+                enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
+                enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 19);
+                enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 20);
+                enc.set_bytes(&1u32.to_le_bytes(), 21); // is_k_cache = 1
+                enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
+                enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
+                enc.set_buffer(k_o_r_norms, 0, 24);
+                enc.set_buffer(k_n_r_norms, 0, 25);
+                enc.dispatch_threadgroups(
+                    (nkv as usize, token_count, 1),
+                    (tg_size.min(1024), 1, 1),
+                );
 
-            // V cache: b-bit codebook, no QJL — batched over all tokens
-            enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
-            enc.set_buffer(&bufs.v_proj, 0, 0);
-            enc.set_buffer(&outlier.channel_indices, 0, 1);
-            enc.set_buffer(v_o_cache, 0, 2);
-            enc.set_buffer(v_n_cache, 0, 3);
-            enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
-            enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
-            enc.set_buffer(&outlier.outlier_codebook, 0, 6);
-            enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
-            enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
-            enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
-            enc.set_buffer(v_o_scale, 0, 10);
-            enc.set_buffer(v_n_scale, 0, 11);
-            enc.set_bytes(&nkv.to_le_bytes(), 12);
-            enc.set_bytes(&hd.to_le_bytes(), 13);
-            enc.set_bytes(&max_seq.to_le_bytes(), 14);
-            enc.set_bytes(&base_seq.to_le_bytes(), 15);
-            enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
-            enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
-            enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
-            enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
-            enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
-            enc.set_bytes(&0u32.to_le_bytes(), 21); // is_k_cache = 0
-            enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
-            enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
-            enc.set_buffer(k_o_r_norms, 0, 24);
-            enc.set_buffer(k_n_r_norms, 0, 25);
-            enc.dispatch_threadgroups((nkv as usize, token_count, 1), (tg_size.min(1024), 1, 1));
+                // V cache: b-bit codebook, no QJL — batched over all tokens
+                enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
+                enc.set_buffer(&bufs.v_proj, 0, 0);
+                enc.set_buffer(&outlier.channel_indices, 0, 1);
+                enc.set_buffer(v_o_cache, 0, 2);
+                enc.set_buffer(v_n_cache, 0, 3);
+                enc.set_buffer(&outlier.outlier_rotation_signs, 0, 4);
+                enc.set_buffer(&outlier.non_outlier_rotation_signs, 0, 5);
+                enc.set_buffer(&outlier.outlier_codebook, 0, 6);
+                enc.set_buffer(&outlier.outlier_boundaries, 0, 7);
+                enc.set_buffer(&outlier.non_outlier_codebook, 0, 8);
+                enc.set_buffer(&outlier.non_outlier_boundaries, 0, 9);
+                enc.set_buffer(v_o_scale, 0, 10);
+                enc.set_buffer(v_n_scale, 0, 11);
+                enc.set_bytes(&nkv.to_le_bytes(), 12);
+                enc.set_bytes(&hd.to_le_bytes(), 13);
+                enc.set_bytes(&max_seq.to_le_bytes(), 14);
+                enc.set_bytes(&base_seq.to_le_bytes(), 15);
+                enc.set_bytes(&outlier.n_outlier.to_le_bytes(), 16);
+                enc.set_bytes(&outlier.d_outlier_padded.to_le_bytes(), 17);
+                enc.set_bytes(&outlier.d_non_padded.to_le_bytes(), 18);
+                enc.set_bytes(&outlier.outlier_n_levels.to_le_bytes(), 19);
+                enc.set_bytes(&outlier.non_outlier_n_levels.to_le_bytes(), 20);
+                enc.set_bytes(&0u32.to_le_bytes(), 21); // is_k_cache = 0
+                enc.set_buffer(&outlier.outlier_qjl_matrix, 0, 22);
+                enc.set_buffer(&outlier.non_outlier_qjl_matrix, 0, 23);
+                enc.set_buffer(k_o_r_norms, 0, 24);
+                enc.set_buffer(k_n_r_norms, 0, 25);
+                enc.dispatch_threadgroups(
+                    (nkv as usize, token_count, 1),
+                    (tg_size.min(1024), 1, 1),
+                );
+            } // end is_anchor
 
             // Outlier attention — batched over all tokens
             enc.set_pipeline(&pipelines.turboquant_outlier_attention);
@@ -1997,55 +2075,59 @@ fn encode_kv_cache_and_attention(
 
             let base_seq = seq_pos as u32;
 
-            // K cache write — batched over all tokens
-            enc.set_pipeline(&pipelines.turboquant_cache_write);
-            enc.set_buffer(&bufs.k_proj, 0, 0);
-            enc.set_buffer(&tq.rotation_signs, 0, 1);
-            enc.set_buffer(k_cache, 0, 2);
-            enc.set_bytes(&nkv.to_le_bytes(), 3);
-            enc.set_bytes(&hd.to_le_bytes(), 4);
-            enc.set_bytes(&max_seq.to_le_bytes(), 5);
-            enc.set_bytes(&base_seq.to_le_bytes(), 6);
-            enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-            enc.set_bytes(&n_bits.to_le_bytes(), 8);
-            enc.set_buffer(k_scale, 0, 9);
-            enc.set_buffer(&tq.k_codebook_buf, 0, 10);
-            enc.set_buffer(&tq.k_boundaries_buf, 0, 11);
-            enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 12);
-            enc.set_buffer(&tq.qjl_matrix, 0, 13);
-            enc.set_buffer(k_qjl_signs, 0, 14);
-            enc.set_buffer(k_r_norms, 0, 15);
-            enc.set_bytes(&1u32.to_le_bytes(), 16);
-            enc.dispatch_threadgroups(
-                (nkv as usize, token_count, 1),
-                ((hd as usize).min(1024), 1, 1),
-            );
+            // CLA: only anchor layers write to the KV cache.
+            if is_anchor {
+                // K cache write — batched over all tokens
+                enc.set_pipeline(&pipelines.turboquant_cache_write);
+                enc.set_buffer(&bufs.k_proj, 0, 0);
+                enc.set_buffer(&tq.rotation_signs, 0, 1);
+                enc.set_buffer(k_cache, 0, 2);
+                enc.set_bytes(&nkv.to_le_bytes(), 3);
+                enc.set_bytes(&hd.to_le_bytes(), 4);
+                enc.set_bytes(&max_seq.to_le_bytes(), 5);
+                enc.set_bytes(&base_seq.to_le_bytes(), 6);
+                enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+                enc.set_bytes(&n_bits.to_le_bytes(), 8);
+                enc.set_buffer(k_scale, 0, 9);
+                enc.set_buffer(&tq.k_codebook_buf, 0, 10);
+                enc.set_buffer(&tq.k_boundaries_buf, 0, 11);
+                enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 12);
+                enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                enc.set_buffer(k_qjl_signs, 0, 14);
+                enc.set_buffer(k_r_norms, 0, 15);
+                enc.set_bytes(&1u32.to_le_bytes(), 16);
+                enc.dispatch_threadgroups(
+                    (nkv as usize, token_count, 1),
+                    ((hd as usize).min(1024), 1, 1),
+                );
 
-            // V cache write — batched over all tokens
-            enc.set_pipeline(&pipelines.turboquant_cache_write);
-            enc.set_buffer(&bufs.v_proj, 0, 0);
-            enc.set_buffer(&tq.rotation_signs, 0, 1);
-            enc.set_buffer(v_cache, 0, 2);
-            enc.set_bytes(&nkv.to_le_bytes(), 3);
-            enc.set_bytes(&hd.to_le_bytes(), 4);
-            enc.set_bytes(&max_seq.to_le_bytes(), 5);
-            enc.set_bytes(&base_seq.to_le_bytes(), 6);
-            enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
-            enc.set_bytes(&n_bits.to_le_bytes(), 8);
-            enc.set_buffer(v_scale, 0, 9);
-            enc.set_buffer(&tq.v_codebook_buf, 0, 10);
-            enc.set_buffer(&tq.v_boundaries_buf, 0, 11);
-            enc.set_bytes(&tq.v_n_levels.to_le_bytes(), 12);
-            enc.set_buffer(&tq.qjl_matrix, 0, 13);
-            enc.set_buffer(k_qjl_signs, 0, 14);
-            enc.set_buffer(k_r_norms, 0, 15);
-            enc.set_bytes(&0u32.to_le_bytes(), 16);
-            enc.dispatch_threadgroups(
-                (nkv as usize, token_count, 1),
-                ((hd as usize).min(1024), 1, 1),
-            );
+                // V cache write — batched over all tokens
+                enc.set_pipeline(&pipelines.turboquant_cache_write);
+                enc.set_buffer(&bufs.v_proj, 0, 0);
+                enc.set_buffer(&tq.rotation_signs, 0, 1);
+                enc.set_buffer(v_cache, 0, 2);
+                enc.set_bytes(&nkv.to_le_bytes(), 3);
+                enc.set_bytes(&hd.to_le_bytes(), 4);
+                enc.set_bytes(&max_seq.to_le_bytes(), 5);
+                enc.set_bytes(&base_seq.to_le_bytes(), 6);
+                enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
+                enc.set_bytes(&n_bits.to_le_bytes(), 8);
+                enc.set_buffer(v_scale, 0, 9);
+                enc.set_buffer(&tq.v_codebook_buf, 0, 10);
+                enc.set_buffer(&tq.v_boundaries_buf, 0, 11);
+                enc.set_bytes(&tq.v_n_levels.to_le_bytes(), 12);
+                enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                enc.set_buffer(k_qjl_signs, 0, 14);
+                enc.set_buffer(k_r_norms, 0, 15);
+                enc.set_bytes(&0u32.to_le_bytes(), 16);
+                enc.dispatch_threadgroups(
+                    (nkv as usize, token_count, 1),
+                    ((hd as usize).min(1024), 1, 1),
+                );
+            } // end is_anchor
 
             // TurboQuant attention — batched over all tokens
+            // (always runs, reading from the anchor's KV buffer)
             enc.set_pipeline(&pipelines.turboquant_attention);
             enc.set_buffer(&bufs.q_proj, 0, 0);
             enc.set_buffer(k_cache, 0, 1);
@@ -2080,36 +2162,40 @@ fn encode_kv_cache_and_attention(
         })?;
         let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
 
-        // Scatter K and V projections into their caches entirely on GPU.
-        ops::encode_kv_scatter(
-            enc,
-            &pipelines.kv_scatter,
-            &ops::KvScatterParams {
-                proj: &bufs.k_proj,
-                cache: k_cache,
-                seq_pos: seq_pos as u32,
-                token_count: token_count as u32,
-                num_kv_heads: nkv,
-                head_dim: hd,
-                max_seq_len: max_seq,
-            },
-        );
-        ops::encode_kv_scatter(
-            enc,
-            &pipelines.kv_scatter,
-            &ops::KvScatterParams {
-                proj: &bufs.v_proj,
-                cache: v_cache,
-                seq_pos: seq_pos as u32,
-                token_count: token_count as u32,
-                num_kv_heads: nkv,
-                head_dim: hd,
-                max_seq_len: max_seq,
-            },
-        );
+        // CLA: only anchor layers write to the KV cache.
+        if is_anchor {
+            // Scatter K and V projections into their caches entirely on GPU.
+            ops::encode_kv_scatter(
+                enc,
+                &pipelines.kv_scatter,
+                &ops::KvScatterParams {
+                    proj: &bufs.k_proj,
+                    cache: k_cache,
+                    seq_pos: seq_pos as u32,
+                    token_count: token_count as u32,
+                    num_kv_heads: nkv,
+                    head_dim: hd,
+                    max_seq_len: max_seq,
+                },
+            );
+            ops::encode_kv_scatter(
+                enc,
+                &pipelines.kv_scatter,
+                &ops::KvScatterParams {
+                    proj: &bufs.v_proj,
+                    cache: v_cache,
+                    seq_pos: seq_pos as u32,
+                    token_count: token_count as u32,
+                    num_kv_heads: nkv,
+                    head_dim: hd,
+                    max_seq_len: max_seq,
+                },
+            );
+        } // end is_anchor
 
         // Standard attention — use batched prefill kernel for multi-token,
         // single-dispatch decode kernel for single-token.
+        // (always runs, reading from the anchor's KV buffer)
         let attn_tg_size = 256_usize.max(hd as usize).min(1024);
         if token_count > 1 {
             // Both kernels share the same buffer layout and parameters.
@@ -2328,6 +2414,30 @@ impl InferenceEngine for MetalInference {
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
 
+        // Resolve CLA anchor layers.
+        let cla_anchors = self
+            .config
+            .cla_config
+            .as_ref()
+            .map(|c| c.anchor_layers.clone())
+            .or_else(|| mc.cla_anchor_layers());
+        if let Some(ref anchors) = cla_anchors {
+            let cla = super::config::ClaConfig {
+                anchor_layers: anchors.clone(),
+            };
+            cla.validate(mc.num_hidden_layers)
+                .map_err(|e| InferenceError::Runtime(format!("CLA config invalid: {e}")))?;
+        }
+        // Back-fill cla_config so is_anchor checks during inference see the
+        // metadata-derived anchors, not the absent user config.
+        if self.config.cla_config.is_none() {
+            if let Some(ref anchors) = cla_anchors {
+                self.config.cla_config = Some(super::config::ClaConfig {
+                    anchor_layers: anchors.clone(),
+                });
+            }
+        }
+
         // Initialize KV cache.
         if self.config.enable_turboquant {
             let tq_config = TurboQuantMetalConfig {
@@ -2338,6 +2448,7 @@ impl InferenceEngine for MetalInference {
                 num_layers: mc.num_hidden_layers,
                 rotation_seed: self.config.rotation_seed,
                 outlier: None,
+                anchor_layers: cla_anchors.clone(),
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
@@ -2353,6 +2464,7 @@ impl InferenceEngine for MetalInference {
                 mc.num_key_value_heads,
                 self.config.max_seq_len,
                 mc.head_dim,
+                cla_anchors.clone(),
             )
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             self.fp16_kv_cache = Some(fp16_kv);

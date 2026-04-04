@@ -69,6 +69,22 @@ impl ModelConfig {
     pub fn default_head_dim(hidden_size: usize, num_attention_heads: usize) -> usize {
         hidden_size / num_attention_heads
     }
+
+    /// Extract Cross-Layer Attention anchor layer indices from metadata.
+    ///
+    /// Looks for `"cla_anchor_layers"` in `extra` (a JSON array of layer indices).
+    /// Returns `None` if the key is absent or not a valid array of unsigned integers.
+    pub fn cla_anchor_layers(&self) -> Option<Vec<usize>> {
+        let val = self.extra.get("cla_anchor_layers")?;
+        let arr = val.as_array()?;
+        let layers: Option<Vec<usize>> =
+            arr.iter().map(|v| v.as_u64().map(|n| n as usize)).collect();
+        let layers = layers?;
+        if layers.is_empty() {
+            return None;
+        }
+        Some(layers)
+    }
 }
 
 /// Describes how a weight tensor is stored in compressed form.

@@ -107,6 +107,8 @@ pub struct TurboQuantMetalConfig {
     pub rotation_seed: u64,
     /// Optional outlier channel configuration.
     pub outlier: Option<OutlierConfig>,
+    /// CLA anchor layers. None = all layers are anchors (standard behavior).
+    pub anchor_layers: Option<Vec<usize>>,
 }
 
 fn create_f32_buffer(

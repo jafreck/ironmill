@@ -15,6 +15,10 @@ use crate::turboquant::cache_layout::TurboQuantCacheLayout;
 ///   INT4: `[num_kv_heads × max_seq_len × head_dim / 2]` (2 elements/byte)
 /// Layout per scale buffer:
 ///   `[num_kv_heads × max_seq_len]` (1 f32 per head per position)
+///
+/// When CLA (cross-layer attention) is configured, only anchor layers
+/// have physical buffers. Non-anchor layers share their nearest preceding
+/// anchor's buffers via [`kv_buffer_for_layer`].
 pub struct MetalKvCache {
     /// K cache per layer.
     k_caches: Vec<MetalBuffer>,
@@ -59,13 +63,22 @@ pub struct MetalKvCache {
     seq_pos: usize,
     /// Maximum sequence length.
     max_seq_len: usize,
+    /// CLA anchor layers. When set, only anchor layers have physical buffers.
+    /// The Vec index maps buffer index → layer index.
+    anchor_layers: Option<Vec<usize>>,
 }
 
 impl MetalKvCache {
-    /// Allocate KV cache buffers for all layers.
+    /// Allocate KV cache buffers for all layers (or only anchor layers when CLA is configured).
     ///
     /// Uses shared storage mode for CPU-side inspection during development.
     pub fn new(device: &MetalDevice, config: &TurboQuantMetalConfig) -> Result<Self, MetalError> {
+        let num_buffers = if let Some(ref anchors) = config.anchor_layers {
+            anchors.len()
+        } else {
+            config.num_layers
+        };
+
         let layout = TurboQuantCacheLayout::new(
             config.num_kv_heads,
             config.head_dim,
@@ -80,14 +93,14 @@ impl MetalKvCache {
         let qjl_signs_size = layout.qjl_signs_bytes;
         let qjl_r_norm_size = scale_size;
 
-        let mut k_caches = Vec::with_capacity(config.num_layers);
-        let mut v_caches = Vec::with_capacity(config.num_layers);
-        let mut k_scales = Vec::with_capacity(config.num_layers);
-        let mut v_scales = Vec::with_capacity(config.num_layers);
-        let mut k_qjl_signs = Vec::with_capacity(config.num_layers);
-        let mut k_r_norms = Vec::with_capacity(config.num_layers);
+        let mut k_caches = Vec::with_capacity(num_buffers);
+        let mut v_caches = Vec::with_capacity(num_buffers);
+        let mut k_scales = Vec::with_capacity(num_buffers);
+        let mut v_scales = Vec::with_capacity(num_buffers);
+        let mut k_qjl_signs = Vec::with_capacity(num_buffers);
+        let mut k_r_norms = Vec::with_capacity(num_buffers);
 
-        for _ in 0..config.num_layers {
+        for _ in 0..num_buffers {
             k_caches.push(
                 device
                     .create_buffer(cache_size, StorageMode::Shared)
@@ -128,18 +141,18 @@ impl MetalKvCache {
             (1, 1) // minimal allocation when not used
         };
 
-        let mut k_outlier_caches = Vec::with_capacity(config.num_layers);
-        let mut v_outlier_caches = Vec::with_capacity(config.num_layers);
-        let mut k_non_outlier_caches = Vec::with_capacity(config.num_layers);
-        let mut v_non_outlier_caches = Vec::with_capacity(config.num_layers);
-        let mut k_outlier_scales = Vec::with_capacity(config.num_layers);
-        let mut v_outlier_scales = Vec::with_capacity(config.num_layers);
-        let mut k_non_outlier_scales = Vec::with_capacity(config.num_layers);
-        let mut v_non_outlier_scales = Vec::with_capacity(config.num_layers);
-        let mut k_outlier_r_norms = Vec::with_capacity(config.num_layers);
-        let mut k_non_outlier_r_norms = Vec::with_capacity(config.num_layers);
+        let mut k_outlier_caches = Vec::with_capacity(num_buffers);
+        let mut v_outlier_caches = Vec::with_capacity(num_buffers);
+        let mut k_non_outlier_caches = Vec::with_capacity(num_buffers);
+        let mut v_non_outlier_caches = Vec::with_capacity(num_buffers);
+        let mut k_outlier_scales = Vec::with_capacity(num_buffers);
+        let mut v_outlier_scales = Vec::with_capacity(num_buffers);
+        let mut k_non_outlier_scales = Vec::with_capacity(num_buffers);
+        let mut v_non_outlier_scales = Vec::with_capacity(num_buffers);
+        let mut k_outlier_r_norms = Vec::with_capacity(num_buffers);
+        let mut k_non_outlier_r_norms = Vec::with_capacity(num_buffers);
 
-        for _ in 0..config.num_layers {
+        for _ in 0..num_buffers {
             k_outlier_caches.push(
                 device
                     .create_buffer(outlier_cache_size, StorageMode::Shared)
@@ -211,22 +224,58 @@ impl MetalKvCache {
             k_non_outlier_r_norms,
             seq_pos: 0,
             max_seq_len: config.max_seq_len,
+            anchor_layers: config.anchor_layers.clone(),
         })
     }
 
+    /// Map a layer index to its physical buffer index.
+    ///
+    /// When CLA is configured, non-anchor layers map to their nearest
+    /// preceding anchor's buffer. When CLA is not configured, returns
+    /// the layer index unchanged (identity mapping).
+    pub fn kv_buffer_for_layer(&self, layer: usize) -> usize {
+        match self.anchor_layers {
+            Some(ref anchors) => {
+                // Binary search for the largest anchor <= layer.
+                match anchors.binary_search(&layer) {
+                    Ok(idx) => idx,
+                    Err(idx) => idx.saturating_sub(1),
+                }
+            }
+            None => layer,
+        }
+    }
+
+    /// Returns true if `layer` is an anchor layer (or CLA is not configured).
+    pub fn is_anchor_layer(&self, layer: usize) -> bool {
+        match self.anchor_layers {
+            Some(ref anchors) => anchors.binary_search(&layer).is_ok(),
+            None => true,
+        }
+    }
+
+    /// Number of physical buffer slots allocated.
+    pub fn num_buffers(&self) -> usize {
+        self.k_caches.len()
+    }
+
     /// Get K and V cache buffers for a specific layer.
+    /// When CLA is configured, non-anchor layers return their anchor's buffers.
     pub fn layer_caches(&self, layer: usize) -> (&MetalBuffer, &MetalBuffer) {
-        (&self.k_caches[layer], &self.v_caches[layer])
+        let idx = self.kv_buffer_for_layer(layer);
+        (&self.k_caches[idx], &self.v_caches[idx])
     }
 
     /// Get K and V scale buffers for a specific layer.
     pub fn layer_scales(&self, layer: usize) -> (&MetalBuffer, &MetalBuffer) {
-        (&self.k_scales[layer], &self.v_scales[layer])
+        let idx = self.kv_buffer_for_layer(layer);
+        (&self.k_scales[idx], &self.v_scales[idx])
     }
 
     /// Get QJL sign and residual norm buffers for the K cache of a specific layer.
     pub fn layer_k_qjl(&self, layer: usize) -> (&MetalBuffer, &MetalBuffer) {
-        (&self.k_qjl_signs[layer], &self.k_r_norms[layer])
+        let idx = self.kv_buffer_for_layer(layer);
+        (&self.k_qjl_signs[idx], &self.k_r_norms[idx])
     }
 
     /// Get outlier and non-outlier cache buffers for a specific layer.
@@ -234,11 +283,12 @@ impl MetalKvCache {
         &self,
         layer: usize,
     ) -> ((&MetalBuffer, &MetalBuffer), (&MetalBuffer, &MetalBuffer)) {
+        let idx = self.kv_buffer_for_layer(layer);
         (
-            (&self.k_outlier_caches[layer], &self.v_outlier_caches[layer]),
+            (&self.k_outlier_caches[idx], &self.v_outlier_caches[idx]),
             (
-                &self.k_non_outlier_caches[layer],
-                &self.v_non_outlier_caches[layer],
+                &self.k_non_outlier_caches[idx],
+                &self.v_non_outlier_caches[idx],
             ),
         )
     }
@@ -248,20 +298,22 @@ impl MetalKvCache {
         &self,
         layer: usize,
     ) -> ((&MetalBuffer, &MetalBuffer), (&MetalBuffer, &MetalBuffer)) {
+        let idx = self.kv_buffer_for_layer(layer);
         (
-            (&self.k_outlier_scales[layer], &self.v_outlier_scales[layer]),
+            (&self.k_outlier_scales[idx], &self.v_outlier_scales[idx]),
             (
-                &self.k_non_outlier_scales[layer],
-                &self.v_non_outlier_scales[layer],
+                &self.k_non_outlier_scales[idx],
+                &self.v_non_outlier_scales[idx],
             ),
         )
     }
 
     /// Get outlier and non-outlier QJL residual norm buffers for K cache.
     pub fn layer_outlier_r_norms(&self, layer: usize) -> (&MetalBuffer, &MetalBuffer) {
+        let idx = self.kv_buffer_for_layer(layer);
         (
-            &self.k_outlier_r_norms[layer],
-            &self.k_non_outlier_r_norms[layer],
+            &self.k_outlier_r_norms[idx],
+            &self.k_non_outlier_r_norms[idx],
         )
     }
 
