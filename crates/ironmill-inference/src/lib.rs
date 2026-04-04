@@ -21,6 +21,7 @@ pub mod metal;
 #[cfg(feature = "mlx")]
 pub mod mlx;
 pub mod sampling;
+pub mod serving;
 pub mod turboquant;
 pub mod types;
 #[cfg(any(feature = "metal", feature = "mlx"))]
@@ -28,7 +29,9 @@ mod weight_loading;
 
 // Re-exports for convenience.
 pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
-pub use engine::{ConstrainedDecoder, InferenceEngine, InferenceError};
+pub use engine::{
+    BatchInferenceEngine, ConstrainedDecoder, InferenceEngine, InferenceError, SequenceId,
+};
 pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 #[cfg(feature = "mlx")]
 pub use mlx::{MlxArtifacts, MlxConfig, MlxInference};

@@ -5,6 +5,9 @@
 
 use crate::types::Logits;
 
+/// Unique identifier for a sequence in batch inference.
+pub type SequenceId = u64;
+
 /// Errors from the inference engine.
 #[derive(Debug, thiserror::Error)]
 pub enum InferenceError {
@@ -23,6 +26,14 @@ pub enum InferenceError {
     /// Sampling error.
     #[error("sampling error: {0}")]
     Sampling(String),
+
+    /// KV cache allocation error.
+    #[error("allocation error: {0}")]
+    Allocation(String),
+
+    /// Sequence not found.
+    #[error("sequence {0} not found")]
+    SequenceNotFound(u64),
 
     /// A generic error from an underlying operation.
     #[error("{0}")]
@@ -53,6 +64,23 @@ pub trait InferenceEngine {
 
     /// Truncate KV cache to the given position, discarding tokens after `pos`.
     fn truncate_to(&mut self, pos: usize);
+}
+
+/// Batch inference engine for concurrent sequence processing.
+///
+/// Extends [`InferenceEngine`] with the ability to manage multiple
+/// sequences simultaneously, supporting continuous batching with
+/// dynamic add/remove.
+pub trait BatchInferenceEngine: InferenceEngine {
+    /// Add a new sequence with the given prompt tokens.
+    fn add_sequence(&mut self, tokens: &[u32]) -> Result<SequenceId, InferenceError>;
+
+    /// Remove a sequence and free its resources.
+    fn remove_sequence(&mut self, id: SequenceId) -> Result<(), InferenceError>;
+
+    /// Run one decode step for all active sequences in the batch.
+    /// Returns logits for each active sequence.
+    fn batch_decode_step(&mut self) -> Result<Vec<(SequenceId, Vec<f32>)>, InferenceError>;
 }
 
 // ── Grammar-constrained decoding ─────────────────────────────────
