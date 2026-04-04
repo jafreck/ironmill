@@ -12,11 +12,11 @@ fixing before the `api-spec` branch can be merged.
 ## What Was Implemented
 
 ### Wave 0 — Foundation
-- **mil-rs API hardening** (§2.1–§2.5, §6.4) — `#[non_exhaustive]` on 49
+- **mil-rs API hardening** (§2.1–§2.5, §6.4) — `#[non_exhaustive]` on 51
   public enums/structs, `ModelConfig` builder, `Pass` trait defaults,
   `PassPipeline::register_pass_factory()`, `ProgressSink` trait
 - **ironmill-inference type hardening** (§4.1, §4.2, §4.7–§4.10) —
-  `#[non_exhaustive]` on 29 types, `InferenceError::Runtime` boxed,
+  `#[non_exhaustive]` on 39 types, `InferenceError::Runtime` boxed,
   `MetalConfig`/`SamplerConfig` builders, validation methods
 
 ### Wave 1 — Compile + Generation
@@ -25,8 +25,8 @@ fixing before the `api-spec` branch can be merged.
   `TemplateOptions` Default, `BuildOutput` hardened
 - **Generation API + ModelInfo + Memory** (§4.3, §4.11–§4.14) —
   `GenerateRequest`, `TokenStream` iterator, `CancellationToken`,
-  `generate()`, `generate_with_callback()`, `ModelInfo::from_config()`,
-  `MemoryEstimator`
+  `generate()`, `generate_with_callback()`, `GenerateError` with partial
+  token recovery, `ModelInfo::from_config()`, `MemoryEstimator`
 
 ### Wave 2 — CLI
 - **CLI improvements** (§5.1–§5.7) — `QuantizeArg`/`TargetArg` ValueEnums,
@@ -46,7 +46,8 @@ fixing before the `api-spec` branch can be merged.
   `AneDirectBackend::load`, `InferenceEngine for AneInference`,
   `CoremlRuntimeModel::predict` output extraction
 - **Platform portability** (§6.1–§6.2) — `compile_error!` removed,
-  backends feature-gated, `#![warn(missing_docs)]` on all library crates
+  backends feature-gated, `#![warn(missing_docs)]` on mil-rs,
+  ironmill-compile, ironmill-inference (not yet on ironmill-core)
 - **ironmill-core high-level API** (§10) — `Device`, `Model`,
   `ModelBuilder`, `GenParams`, `TextOutput`, `TextChunk`, `ChatSession`
 - **JIT compilation** (§11) — `TensorTransform` trait,
@@ -58,8 +59,8 @@ fixing before the `api-spec` branch can be merged.
 
 ### C1: Integration tests don't compile
 
-8 `E0639` (non-exhaustive struct construction), 6 `E0609`
-(`MoeFuseResult` field access), 6 `E0308` (type mismatches) across
+10 `E0639` (non-exhaustive struct construction), 7 `E0609`
+(`MoeFuseResult` field access), 9 `E0308` (type mismatches) across
 integration test crates. Tests construct structs with struct-literal
 syntax that `#[non_exhaustive]` now blocks from outside the defining
 crate. Fix by adding constructors/builders or updating test helpers.
@@ -117,7 +118,7 @@ cross-platform builds.
 |---|---|---|
 | §8.2 | `MetalInference::load(config, &artifacts)` one-step constructor | Still uses two-step `new()` + `load()`. Update migration guide or implement. |
 | §3.6 | Remove `proto::specification::Model` and `tensor_utils` re-exports | Currently kept with TODO comments; used by `ironmill-compile-ffi`. |
-| §4.11 | `GenerateError` return from `generate()` / `generate_with_callback()` | Currently returns `Result<_, InferenceError>`, not `Result<_, GenerateError>`. |
+| §6.1 | `#![warn(missing_docs)]` on `ironmill-core` | Present on the other three library crates but missing from ironmill-core. |
 
 ---
 
@@ -136,7 +137,6 @@ choices.
 | §4.9 `SpecConfig` | `acceptance_threshold: f64` | `f32` | Matches existing field type |
 | §10 `ChatSession` | Method named `say()` | Named `send()` | Naming preference |
 | §10 `Model::generate` | Takes `GenParams` by value | Takes `&GenParams` by ref | Avoids unnecessary clone |
-| §3.7 `CompileConfig` | Has `pipeline: PassPipeline` | Has `pipeline: Option<PassPipeline>` | `PassPipeline` isn't `Clone` |
 | §3.7 `estimate_size` | Returns `MemoryEstimator::weight_memory(...)` | Returns `Ok(0)` | `MemoryEstimator` lives in inference crate |
 
 ---
