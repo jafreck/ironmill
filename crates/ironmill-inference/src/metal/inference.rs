@@ -21,7 +21,9 @@ use super::error::MetalError;
 use super::mla::{MlaConfig, MlaKvCache};
 use super::ops;
 use super::ops::LinearKernelKind;
-use super::turboquant::{MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantMetalConfig};
+use super::turboquant::{
+    MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantLayerConfig, TurboQuantMetalConfig,
+};
 use super::weights::{
     AffineQuantizedWeight, LayerWeights, MetalWeights, QuantizedWeight, WeightBuffer,
 };
@@ -354,6 +356,10 @@ pub struct MetalInference {
     device: MetalDevice,
     queue: ironmill_metal_sys::CommandQueue,
     pipelines: Option<super::ops::MetalPipelines>,
+    /// Second pipeline set for global layers with a different HEAD_DIM (Gemma 4).
+    global_pipelines: Option<super::ops::MetalPipelines>,
+    /// The head_dim that `global_pipelines` was compiled for (0 if not set).
+    global_head_dim: usize,
     weights: Option<MetalWeights>,
     turboquant: Option<MetalTurboQuantModel>,
     kv_cache: Option<MetalKvCache>,
@@ -410,6 +416,8 @@ impl MetalInference {
             device,
             queue,
             pipelines: None,
+            global_pipelines: None,
+            global_head_dim: 0,
             weights: None,
             turboquant: None,
             kv_cache: None,
@@ -465,10 +473,17 @@ impl MetalInference {
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
 
-        // If Gemma 4 global layers use a different head_dim, a second pipeline
-        // set will be needed. For now, this is noted — kernel dispatch can be
-        // added when global-layer attention is fully wired up.
-        // TODO: compile second MetalPipelines with global_head_dim
+        // If Gemma 4 global layers use a different head_dim, compile a second
+        // pipeline set with that HEAD_DIM for correct shader dispatch.
+        if let Some(ref g4) = self.gemma4_config {
+            if g4.global_head_dim != mc.head_dim {
+                let global_pipelines =
+                    super::ops::MetalPipelines::compile(&self.device, g4.global_head_dim)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                self.global_head_dim = g4.global_head_dim;
+                self.global_pipelines = Some(global_pipelines);
+            }
+        }
 
         let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -618,6 +633,19 @@ impl MetalInference {
                 None
             };
 
+            let tq_layer_configs: Vec<TurboQuantLayerConfig> =
+                if let Some(ref g4) = self.gemma4_config {
+                    g4.layer_configs
+                        .iter()
+                        .map(|lc| TurboQuantLayerConfig {
+                            head_dim: lc.head_dim,
+                            num_kv_heads: lc.num_kv_heads,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
             let tq_config = TurboQuantMetalConfig {
                 n_bits: self.config.n_bits,
                 num_kv_heads: mc.num_key_value_heads,
@@ -628,6 +656,7 @@ impl MetalInference {
                 outlier: outlier_cfg,
                 anchor_layers: cla_anchors.clone(),
                 window_sizes: layer_window_sizes.clone(),
+                layer_configs: tq_layer_configs,
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -1076,7 +1105,7 @@ impl MetalInference {
         for layer_idx in 0..mc.num_hidden_layers {
             let lw = &weights.layers[layer_idx];
             let lm = &matmuls.layer_matmuls[layer_idx];
-            let pipelines = self.pipelines()?;
+            let default_pipelines = self.pipelines()?;
 
             // Gemma 4: use per-layer config if available.
             let (layer_hd, layer_nkv, layer_window) = if let Some(ref g4) = self.gemma4_config {
@@ -1084,6 +1113,16 @@ impl MetalInference {
                 (lc.head_dim as u32, lc.num_kv_heads as u32, lc.window_size)
             } else {
                 (hd, nkv, self.config.layer_window_size(layer_idx))
+            };
+
+            // Select the pipeline set matching this layer's HEAD_DIM.
+            let pipelines = if self.global_head_dim > 0
+                && layer_hd as usize == self.global_head_dim
+                && self.global_head_dim != mc.head_dim
+            {
+                self.global_pipelines.as_ref().unwrap_or(default_pipelines)
+            } else {
+                default_pipelines
             };
 
             // norm_out already contains the input-norm result:
@@ -1929,7 +1968,17 @@ impl MetalInference {
             let enc = cmd_buf
                 .compute_encoder()
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            let pipelines = self.pipelines()?;
+            let default_pipelines = self.pipelines()?;
+
+            // Select the pipeline set matching this layer's HEAD_DIM.
+            let pipelines = if self.global_head_dim > 0
+                && layer_hd as usize == self.global_head_dim
+                && self.global_head_dim != mc.head_dim
+            {
+                self.global_pipelines.as_ref().unwrap_or(default_pipelines)
+            } else {
+                default_pipelines
+            };
 
             // Steps 3-5: Q/K/V projections
             let row_bytes_h = h * 2;
@@ -3224,6 +3273,27 @@ fn encode_kv_cache_and_attention(
             let (k_scale, v_scale) = kv.layer_scales(layer_idx);
             let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
 
+            // Select per-layer codebooks if this layer uses a non-default head_dim.
+            let dim_cb = tq.codebooks_for_layer(layer_idx);
+            let rotation_signs = dim_cb
+                .map(|dc| &dc.rotation_signs)
+                .unwrap_or(&tq.rotation_signs);
+            let k_codebook = dim_cb
+                .map(|dc| &dc.k_codebook_buf)
+                .unwrap_or(&tq.k_codebook_buf);
+            let k_boundaries = dim_cb
+                .map(|dc| &dc.k_boundaries_buf)
+                .unwrap_or(&tq.k_boundaries_buf);
+            let k_n_levels_val = dim_cb.map(|dc| dc.k_n_levels).unwrap_or(tq.k_n_levels);
+            let v_codebook = dim_cb
+                .map(|dc| &dc.v_codebook_buf)
+                .unwrap_or(&tq.v_codebook_buf);
+            let v_boundaries = dim_cb
+                .map(|dc| &dc.v_boundaries_buf)
+                .unwrap_or(&tq.v_boundaries_buf);
+            let v_n_levels_val = dim_cb.map(|dc| dc.v_n_levels).unwrap_or(tq.v_n_levels);
+            let qjl_matrix = dim_cb.map(|dc| &dc.qjl_matrix).unwrap_or(&tq.qjl_matrix);
+
             let cache_write_pos = ring_seq_pos as u32;
             let attn_base_seq = attn_seq_pos as u32;
 
@@ -3232,7 +3302,7 @@ fn encode_kv_cache_and_attention(
                 // K cache write — batched over all tokens
                 enc.set_pipeline(&pipelines.turboquant_cache_write);
                 enc.set_buffer(&bufs.k_proj, 0, 0);
-                enc.set_buffer(&tq.rotation_signs, 0, 1);
+                enc.set_buffer(rotation_signs, 0, 1);
                 enc.set_buffer(k_cache, 0, 2);
                 enc.set_bytes(&nkv.to_le_bytes(), 3);
                 enc.set_bytes(&hd.to_le_bytes(), 4);
@@ -3241,10 +3311,10 @@ fn encode_kv_cache_and_attention(
                 enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                 enc.set_bytes(&n_bits.to_le_bytes(), 8);
                 enc.set_buffer(k_scale, 0, 9);
-                enc.set_buffer(&tq.k_codebook_buf, 0, 10);
-                enc.set_buffer(&tq.k_boundaries_buf, 0, 11);
-                enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 12);
-                enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                enc.set_buffer(k_codebook, 0, 10);
+                enc.set_buffer(k_boundaries, 0, 11);
+                enc.set_bytes(&k_n_levels_val.to_le_bytes(), 12);
+                enc.set_buffer(qjl_matrix, 0, 13);
                 enc.set_buffer(k_qjl_signs, 0, 14);
                 enc.set_buffer(k_r_norms, 0, 15);
                 enc.set_bytes(&1u32.to_le_bytes(), 16);
@@ -3256,7 +3326,7 @@ fn encode_kv_cache_and_attention(
                 // V cache write — batched over all tokens
                 enc.set_pipeline(&pipelines.turboquant_cache_write);
                 enc.set_buffer(&bufs.v_proj, 0, 0);
-                enc.set_buffer(&tq.rotation_signs, 0, 1);
+                enc.set_buffer(rotation_signs, 0, 1);
                 enc.set_buffer(v_cache, 0, 2);
                 enc.set_bytes(&nkv.to_le_bytes(), 3);
                 enc.set_bytes(&hd.to_le_bytes(), 4);
@@ -3265,10 +3335,10 @@ fn encode_kv_cache_and_attention(
                 enc.set_bytes(&tq.inv_scale.to_le_bytes(), 7);
                 enc.set_bytes(&n_bits.to_le_bytes(), 8);
                 enc.set_buffer(v_scale, 0, 9);
-                enc.set_buffer(&tq.v_codebook_buf, 0, 10);
-                enc.set_buffer(&tq.v_boundaries_buf, 0, 11);
-                enc.set_bytes(&tq.v_n_levels.to_le_bytes(), 12);
-                enc.set_buffer(&tq.qjl_matrix, 0, 13);
+                enc.set_buffer(v_codebook, 0, 10);
+                enc.set_buffer(v_boundaries, 0, 11);
+                enc.set_bytes(&v_n_levels_val.to_le_bytes(), 12);
+                enc.set_buffer(qjl_matrix, 0, 13);
                 enc.set_buffer(k_qjl_signs, 0, 14);
                 enc.set_buffer(k_r_norms, 0, 15);
                 enc.set_bytes(&0u32.to_le_bytes(), 16);
@@ -3284,7 +3354,7 @@ fn encode_kv_cache_and_attention(
             enc.set_buffer(&bufs.q_proj, 0, 0);
             enc.set_buffer(k_cache, 0, 1);
             enc.set_buffer(v_cache, 0, 2);
-            enc.set_buffer(&tq.rotation_signs, 0, 3);
+            enc.set_buffer(rotation_signs, 0, 3);
             enc.set_buffer(&bufs.attn_out, 0, 4);
             enc.set_bytes(&nh.to_le_bytes(), 5);
             enc.set_bytes(&nkv.to_le_bytes(), 6);
@@ -3295,11 +3365,11 @@ fn encode_kv_cache_and_attention(
             enc.set_bytes(&n_bits.to_le_bytes(), 11);
             enc.set_buffer(k_scale, 0, 12);
             enc.set_buffer(v_scale, 0, 13);
-            enc.set_buffer(&tq.k_codebook_buf, 0, 14);
-            enc.set_buffer(&tq.v_codebook_buf, 0, 15);
-            enc.set_buffer(&tq.qjl_matrix, 0, 16);
+            enc.set_buffer(k_codebook, 0, 14);
+            enc.set_buffer(v_codebook, 0, 15);
+            enc.set_buffer(qjl_matrix, 0, 16);
             enc.set_buffer(k_r_norms, 0, 17);
-            enc.set_bytes(&tq.k_n_levels.to_le_bytes(), 18);
+            enc.set_bytes(&k_n_levels_val.to_le_bytes(), 18);
             enc.dispatch_threadgroups(
                 (nh as usize, token_count, 1),
                 (256_usize.max(hd as usize).min(1024), 1, 1),
@@ -3777,6 +3847,19 @@ impl InferenceEngine for MetalInference {
 
         // Initialize KV cache.
         if self.config.enable_turboquant {
+            let tq_layer_configs: Vec<TurboQuantLayerConfig> =
+                if let Some(ref g4) = self.gemma4_config {
+                    g4.layer_configs
+                        .iter()
+                        .map(|lc| TurboQuantLayerConfig {
+                            head_dim: lc.head_dim,
+                            num_kv_heads: lc.num_kv_heads,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
             let tq_config = TurboQuantMetalConfig {
                 n_bits: self.config.n_bits,
                 num_kv_heads: mc.num_key_value_heads,
@@ -3787,6 +3870,7 @@ impl InferenceEngine for MetalInference {
                 outlier: None,
                 anchor_layers: cla_anchors.clone(),
                 window_sizes: layer_window_sizes.clone(),
+                layer_configs: tq_layer_configs,
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;

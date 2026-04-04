@@ -105,11 +105,27 @@ impl MetalKvCache {
         let mut k_qjl_signs = Vec::with_capacity(num_buffers);
         let mut k_r_norms = Vec::with_capacity(num_buffers);
 
-        for ws in &per_buffer_window {
-            let effective_seq = if *ws > 0 { *ws } else { config.max_seq_len };
+        for buf_idx in 0..num_buffers {
+            let ws = per_buffer_window[buf_idx];
+            let effective_seq = if ws > 0 { ws } else { config.max_seq_len };
+            let layer = if let Some(ref anchors) = config.anchor_layers {
+                anchors[buf_idx]
+            } else {
+                buf_idx
+            };
+            let layer_head_dim = config
+                .layer_configs
+                .get(layer)
+                .map(|lc| lc.head_dim)
+                .unwrap_or(config.head_dim);
+            let layer_num_kv = config
+                .layer_configs
+                .get(layer)
+                .map(|lc| lc.num_kv_heads)
+                .unwrap_or(config.num_kv_heads);
             let layout = TurboQuantCacheLayout::new(
-                config.num_kv_heads,
-                config.head_dim,
+                layer_num_kv,
+                layer_head_dim,
                 effective_seq,
                 config.num_layers,
                 config.n_bits,
@@ -166,11 +182,27 @@ impl MetalKvCache {
         let mut k_outlier_r_norms = Vec::with_capacity(num_buffers);
         let mut k_non_outlier_r_norms = Vec::with_capacity(num_buffers);
 
-        for ws in &per_buffer_window {
-            let effective_seq = if *ws > 0 { *ws } else { config.max_seq_len };
+        for buf_idx in 0..num_buffers {
+            let ws = per_buffer_window[buf_idx];
+            let effective_seq = if ws > 0 { ws } else { config.max_seq_len };
+            let layer = if let Some(ref anchors) = config.anchor_layers {
+                anchors[buf_idx]
+            } else {
+                buf_idx
+            };
+            let layer_head_dim = config
+                .layer_configs
+                .get(layer)
+                .map(|lc| lc.head_dim)
+                .unwrap_or(config.head_dim);
+            let layer_num_kv = config
+                .layer_configs
+                .get(layer)
+                .map(|lc| lc.num_kv_heads)
+                .unwrap_or(config.num_kv_heads);
             let layout = TurboQuantCacheLayout::new(
-                config.num_kv_heads,
-                config.head_dim,
+                layer_num_kv,
+                layer_head_dim,
                 effective_seq,
                 config.num_layers,
                 config.n_bits,

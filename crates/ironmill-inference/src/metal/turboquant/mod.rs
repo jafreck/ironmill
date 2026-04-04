@@ -15,6 +15,33 @@ use crate::turboquant::rotation::{generate_qjl_matrix, generate_rotation_signs};
 
 use super::error::MetalError;
 
+/// Per-dimension codebook, rotation, and QJL buffers for one unique head_dim.
+///
+/// When all layers share the same head_dim, the default codebooks on
+/// [`MetalTurboQuantModel`] are used and this struct is not needed.
+/// For heterogeneous models (e.g. Gemma 4 with sliding=256, global=512),
+/// one `DimCodebooks` is stored per unique non-default head_dim.
+pub struct DimCodebooks {
+    /// Rotation sign vector [head_dim] float (±1.0).
+    pub rotation_signs: ironmill_metal_sys::MetalBuffer,
+    /// K cache codebook: (b-1)-bit Lloyd-Max centroids.
+    pub k_codebook_buf: ironmill_metal_sys::MetalBuffer,
+    /// K cache boundaries: (b-1)-bit decision thresholds.
+    pub k_boundaries_buf: ironmill_metal_sys::MetalBuffer,
+    /// Number of K codebook levels (2^(b-1)).
+    pub k_n_levels: u32,
+    /// V cache codebook: b-bit Lloyd-Max centroids.
+    pub v_codebook_buf: ironmill_metal_sys::MetalBuffer,
+    /// V cache boundaries: b-bit decision thresholds.
+    pub v_boundaries_buf: ironmill_metal_sys::MetalBuffer,
+    /// Number of V codebook levels (2^b).
+    pub v_n_levels: u32,
+    /// QJL random projection matrix [head_dim × head_dim] float.
+    pub qjl_matrix: ironmill_metal_sys::MetalBuffer,
+    /// The head_dim these codebooks were generated for.
+    pub head_dim: usize,
+}
+
 /// TurboQuant model state for GPU inference.
 ///
 /// Per Algorithm 2 (TurboQuant_prod), K and V caches use different codebooks:
@@ -45,6 +72,9 @@ pub struct MetalTurboQuantModel {
     pub outlier: Option<OutlierState>,
     /// Config.
     pub config: TurboQuantMetalConfig,
+    /// Per-unique-head_dim codebook sets for heterogeneous models.
+    /// Empty when all layers use the default `config.head_dim`.
+    pub dim_codebooks: Vec<DimCodebooks>,
 }
 
 /// GPU buffers for the outlier channel strategy (Section 4.3).
@@ -96,6 +126,13 @@ pub struct OutlierState {
     pub non_outlier_n_levels: u32,
 }
 
+/// Per-layer TurboQuant configuration for heterogeneous head dims (e.g. Gemma 4).
+#[derive(Debug, Clone)]
+pub struct TurboQuantLayerConfig {
+    pub head_dim: usize,
+    pub num_kv_heads: usize,
+}
+
 /// TurboQuant-specific configuration extracted from MetalConfig + model params.
 #[derive(Debug, Clone)]
 pub struct TurboQuantMetalConfig {
@@ -119,6 +156,9 @@ pub struct TurboQuantMetalConfig {
     /// When non-empty, SWA layers allocate smaller ring buffers.
     /// Length must equal `num_layers` (or be empty for no SWA).
     pub window_sizes: Vec<usize>,
+    /// Per-layer configs for heterogeneous head dims (Gemma 4).
+    /// When empty, all layers use the global head_dim/num_kv_heads.
+    pub layer_configs: Vec<TurboQuantLayerConfig>,
 }
 
 fn create_f32_buffer(
@@ -186,6 +226,10 @@ impl MetalTurboQuantModel {
             None
         };
 
+        // Per-unique-head_dim codebook sets for heterogeneous models.
+        // Collect unique head_dims that differ from the default.
+        let dim_codebooks = Self::init_dim_codebooks(device, &config)?;
+
         let max_abs = 32.0_f32;
         let inv_scale = 127.0 / max_abs;
         let deq_scale = max_abs / 127.0;
@@ -203,7 +247,86 @@ impl MetalTurboQuantModel {
             qjl_matrix,
             outlier,
             config,
+            dim_codebooks,
         })
+    }
+
+    /// Build codebook sets for each unique non-default head_dim in `layer_configs`.
+    fn init_dim_codebooks(
+        device: &MetalDevice,
+        config: &TurboQuantMetalConfig,
+    ) -> Result<Vec<DimCodebooks>, MetalError> {
+        if config.layer_configs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Collect unique head_dims that differ from the default.
+        let mut unique_dims: Vec<usize> = config
+            .layer_configs
+            .iter()
+            .map(|lc| lc.head_dim)
+            .filter(|&hd| hd != config.head_dim)
+            .collect();
+        unique_dims.sort_unstable();
+        unique_dims.dedup();
+
+        let k_bits = config.n_bits - 1;
+        let mut codebooks = Vec::with_capacity(unique_dims.len());
+
+        for &hd in &unique_dims {
+            if !hd.is_power_of_two() {
+                return Err(MetalError::Config(format!(
+                    "per-layer head_dim {} must be a power of two for Walsh-Hadamard butterfly",
+                    hd
+                )));
+            }
+
+            let sign_bytes = generate_rotation_signs(hd, config.rotation_seed);
+            let rotation_signs = device
+                .create_buffer_with_data(&sign_bytes, ironmill_metal_sys::StorageMode::Shared)
+                .map_err(MetalError::Metal)?;
+
+            let (kl, kb) = codebook::lloyd_max_gaussian(hd, k_bits);
+            let k_n_levels = kl.len() as u32;
+            let k_codebook_buf = create_f32_buffer(device, &kl)?;
+            let k_boundaries_buf = create_f32_buffer(device, &kb)?;
+
+            let (vl, vb) = codebook::lloyd_max_gaussian(hd, config.n_bits);
+            let v_n_levels = vl.len() as u32;
+            let v_codebook_buf = create_f32_buffer(device, &vl)?;
+            let v_boundaries_buf = create_f32_buffer(device, &vb)?;
+
+            let qjl_bytes = generate_qjl_matrix(hd, config.rotation_seed + 1);
+            let qjl_matrix = device
+                .create_buffer_with_data(&qjl_bytes, ironmill_metal_sys::StorageMode::Shared)
+                .map_err(MetalError::Metal)?;
+
+            codebooks.push(DimCodebooks {
+                rotation_signs,
+                k_codebook_buf,
+                k_boundaries_buf,
+                k_n_levels,
+                v_codebook_buf,
+                v_boundaries_buf,
+                v_n_levels,
+                qjl_matrix,
+                head_dim: hd,
+            });
+        }
+
+        Ok(codebooks)
+    }
+
+    /// Look up the codebooks for a given layer. Returns `None` when the
+    /// default (global) codebooks should be used (layer uses `config.head_dim`).
+    pub fn codebooks_for_layer(&self, layer_idx: usize) -> Option<&DimCodebooks> {
+        let lc = self.config.layer_configs.get(layer_idx)?;
+        if lc.head_dim == self.config.head_dim {
+            return None;
+        }
+        self.dim_codebooks
+            .iter()
+            .find(|dc| dc.head_dim == lc.head_dim)
     }
 
     /// Initialize outlier channel state: independent rotation signs and
