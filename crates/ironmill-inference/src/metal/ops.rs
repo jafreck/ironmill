@@ -52,72 +52,78 @@ pub struct MetalPipelines {
 }
 
 impl MetalPipelines {
-    /// Compile all Metal shaders and create pipeline states.
+    /// Load precompiled Metal shader libraries and create pipeline states.
     ///
-    /// `head_dim` is injected into TurboQuant and attention shaders via
-    /// `#define HEAD_DIM` so shared memory is sized exactly at compile time.
+    /// HEAD_DIM-independent shaders are loaded from precompiled `.metallib`
+    /// binaries embedded at build time (~1ms). HEAD_DIM-dependent shaders
+    /// (attention, turboquant) use precompiled variants for common head
+    /// dimensions (64, 80, 128, 256) and fall back to runtime source
+    /// compilation for uncommon values.
     pub fn compile(device: &MetalDevice, head_dim: usize) -> Result<Self, MetalError> {
-        let head_dim_header = format!(
-            "#define HEAD_DIM {head_dim}\n#define HEAD_DIM_PACKED {}\n",
-            head_dim / 2
-        );
-
-        let norm_src = include_str!("shaders/normalization.metal");
-        let act_src = include_str!("shaders/activation.metal");
-        let rope_src = include_str!("shaders/rope.metal");
-        let elem_src = include_str!("shaders/elementwise.metal");
-        let embed_src = include_str!("shaders/embedding.metal");
-        let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
-        let tq_src_raw = include_str!("shaders/turboquant.metal");
-        let tq_src = format!("{head_dim_header}{tq_helpers}\n{tq_src_raw}");
-        let attn_src_raw = include_str!("shaders/attention.metal");
-        let attn_src = format!("{head_dim_header}{attn_src_raw}");
-        let qmm_src = include_str!("shaders/quantized_matmul.metal");
-        let kv_scatter_src = include_str!("shaders/kv_scatter.metal");
-        let matvec_src = include_str!("shaders/matvec.metal");
-        let fused_rn_src = include_str!("shaders/fused_residual_norm.metal");
-        let int4_dequant_src = include_str!("shaders/int4_dequant.metal");
-        let affine_mm_src = include_str!("shaders/affine_matmul.metal");
-
+        // ── HEAD_DIM-independent shaders (precompiled) ──────────
         let norm_lib = device
-            .compile_shader_source(norm_src)
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/normalization.metallib"
+            )))
             .map_err(MetalError::Metal)?;
         let act_lib = device
-            .compile_shader_source(act_src)
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/activation.metallib"
+            )))
             .map_err(MetalError::Metal)?;
         let rope_lib = device
-            .compile_shader_source(rope_src)
+            .load_library_from_data(include_bytes!(concat!(env!("OUT_DIR"), "/rope.metallib")))
             .map_err(MetalError::Metal)?;
         let elem_lib = device
-            .compile_shader_source(elem_src)
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/elementwise.metallib"
+            )))
             .map_err(MetalError::Metal)?;
         let embed_lib = device
-            .compile_shader_source(embed_src)
-            .map_err(MetalError::Metal)?;
-        let tq_lib = device
-            .compile_shader_source(&tq_src)
-            .map_err(MetalError::Metal)?;
-        let attn_lib = device
-            .compile_shader_source(&attn_src)
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/embedding.metallib"
+            )))
             .map_err(MetalError::Metal)?;
         let qmm_lib = device
-            .compile_shader_source(qmm_src)
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/quantized_matmul.metallib"
+            )))
             .map_err(MetalError::Metal)?;
         let kv_scatter_lib = device
-            .compile_shader_source(kv_scatter_src)
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/kv_scatter.metallib"
+            )))
             .map_err(MetalError::Metal)?;
         let matvec_lib = device
-            .compile_shader_source(matvec_src)
+            .load_library_from_data(include_bytes!(concat!(env!("OUT_DIR"), "/matvec.metallib")))
             .map_err(MetalError::Metal)?;
         let fused_rn_lib = device
-            .compile_shader_source(fused_rn_src)
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/fused_residual_norm.metallib"
+            )))
             .map_err(MetalError::Metal)?;
         let int4_dequant_lib = device
-            .compile_shader_source(int4_dequant_src)
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/int4_dequant.metallib"
+            )))
             .map_err(MetalError::Metal)?;
         let affine_mm_lib = device
-            .compile_shader_source(affine_mm_src)
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/affine_matmul.metallib"
+            )))
             .map_err(MetalError::Metal)?;
+
+        // ── HEAD_DIM-dependent shaders (precompiled or fallback) ─
+        let (attn_lib, tq_lib) = Self::load_head_dim_shaders(device, head_dim)?;
 
         Ok(Self {
             rms_norm: device
@@ -271,6 +277,76 @@ impl MetalPipelines {
                 )
                 .map_err(MetalError::Metal)?,
         })
+    }
+
+    /// Load attention and turboquant shaders for a specific HEAD_DIM.
+    ///
+    /// Uses precompiled `.metallib` for common values (64, 80, 128, 256);
+    /// falls back to runtime source compilation for uncommon dimensions.
+    fn load_head_dim_shaders(
+        device: &MetalDevice,
+        head_dim: usize,
+    ) -> Result<
+        (
+            ironmill_metal_sys::ShaderLibrary,
+            ironmill_metal_sys::ShaderLibrary,
+        ),
+        MetalError,
+    > {
+        // Macro to embed a precompiled metallib by head_dim.
+        macro_rules! precompiled {
+            (attn $hd:literal) => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/attention_hd", $hd, ".metallib"))
+            };
+            (tq $hd:literal) => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/turboquant_hd", $hd, ".metallib"))
+            };
+        }
+
+        let try_precompiled = |attn_data: &[u8],
+                               tq_data: &[u8]|
+         -> Result<
+            (
+                ironmill_metal_sys::ShaderLibrary,
+                ironmill_metal_sys::ShaderLibrary,
+            ),
+            MetalError,
+        > {
+            let attn = device
+                .load_library_from_data(attn_data)
+                .map_err(MetalError::Metal)?;
+            let tq = device
+                .load_library_from_data(tq_data)
+                .map_err(MetalError::Metal)?;
+            Ok((attn, tq))
+        };
+
+        match head_dim {
+            64 => try_precompiled(precompiled!(attn "64"), precompiled!(tq "64")),
+            80 => try_precompiled(precompiled!(attn "80"), precompiled!(tq "80")),
+            128 => try_precompiled(precompiled!(attn "128"), precompiled!(tq "128")),
+            256 => try_precompiled(precompiled!(attn "256"), precompiled!(tq "256")),
+            _ => {
+                // Uncommon head_dim — fall back to runtime source compilation.
+                let header = format!(
+                    "#define HEAD_DIM {head_dim}\n#define HEAD_DIM_PACKED {}\n",
+                    head_dim / 2
+                );
+                let attn_src_raw = include_str!("shaders/attention.metal");
+                let attn_src = format!("{header}{attn_src_raw}");
+                let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
+                let tq_src_raw = include_str!("shaders/turboquant.metal");
+                let tq_src = format!("{header}{tq_helpers}\n{tq_src_raw}");
+
+                let attn = device
+                    .compile_shader_source(&attn_src)
+                    .map_err(MetalError::Metal)?;
+                let tq = device
+                    .compile_shader_source(&tq_src)
+                    .map_err(MetalError::Metal)?;
+                Ok((attn, tq))
+            }
+        }
     }
 }
 

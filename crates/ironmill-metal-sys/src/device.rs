@@ -237,6 +237,93 @@ impl MetalDevice {
         Ok(CommandQueue::from_raw(raw))
     }
 
+    /// Load a precompiled Metal library from binary data (`.metallib`).
+    ///
+    /// This is much faster than [`compile_shader_source`] (~1ms vs ~100-500ms)
+    /// because the GPU binary is already compiled.
+    pub fn load_library_from_data(&self, data: &[u8]) -> Result<ShaderLibrary, MetalSysError> {
+        if data.is_empty() {
+            return Err(MetalSysError::ShaderCompilation(
+                "metallib data must not be empty".into(),
+            ));
+        }
+        // Wrap the bytes in an NSData via dispatch_data (zero-copy).
+        // SAFETY: objc_getClass + alloc/init on NSData is a standard pattern.
+        let ns_data_cls = unsafe { objc::objc_getClass(sel!("NSData")) };
+        if ns_data_cls.is_null() {
+            return Err(MetalSysError::FrameworkNotFound);
+        }
+        type AllocFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        let alloc_sel = unsafe { objc::sel_registerName(sel!("alloc")) };
+        let alloc_fn: AllocFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        let ns_data_raw = unsafe { alloc_fn(ns_data_cls, alloc_sel) };
+        if ns_data_raw.is_null() {
+            return Err(MetalSysError::ShaderCompilation(
+                "NSData alloc failed".into(),
+            ));
+        }
+        // -[NSData initWithBytes:length:]
+        type InitBytesFn =
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void;
+        let init_sel = unsafe { objc::sel_registerName(sel!("initWithBytes:length:")) };
+        let init_fn: InitBytesFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        let ns_data = unsafe { init_fn(ns_data_raw, init_sel, data.as_ptr(), data.len()) };
+        if ns_data.is_null() {
+            return Err(MetalSysError::ShaderCompilation(
+                "NSData initWithBytes failed".into(),
+            ));
+        }
+
+        // Create a dispatch_data_t from the NSData.
+        // dispatch_data_create copies/retains the bytes, so NSData can be released after.
+        #[link(name = "System")]
+        unsafe extern "C" {
+            fn dispatch_data_create(
+                buffer: *const u8,
+                size: usize,
+                queue: *const c_void,
+                destructor: *const c_void,
+            ) -> *mut c_void;
+        }
+        let dispatch_data = unsafe {
+            dispatch_data_create(
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        unsafe { objc::CFRelease(ns_data) };
+
+        // -[MTLDevice newLibraryWithData:error:]
+        let mut error: *mut c_void = std::ptr::null_mut();
+        type NewLibFn = unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut *mut c_void,
+        ) -> *mut c_void;
+        let sel = unsafe { objc::sel_registerName(sel!("newLibraryWithData:error:")) };
+        let f: NewLibFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        let raw = unsafe { f(self.raw, sel, dispatch_data, &mut error) };
+        // Release the dispatch_data.
+        unsafe { objc::CFRelease(dispatch_data) };
+
+        if raw.is_null() {
+            let desc = if !error.is_null() {
+                let d = objc::extract_nserror_description(error);
+                unsafe { objc::CFRelease(error) };
+                d
+            } else {
+                "unknown error".into()
+            };
+            return Err(MetalSysError::ShaderCompilation(format!(
+                "failed to load metallib: {desc}"
+            )));
+        }
+        Ok(ShaderLibrary::from_raw(raw))
+    }
+
     /// Compile Metal Shading Language source code into a shader library.
     pub fn compile_shader_source(&self, source: &str) -> Result<ShaderLibrary, MetalSysError> {
         let ns_source = objc::create_nsstring(source)?;
