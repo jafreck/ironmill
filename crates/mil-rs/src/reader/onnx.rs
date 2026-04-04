@@ -133,6 +133,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires test fixture files
     fn read_mnist_onnx() {
         let path = fixture_path("mnist.onnx");
         let model = read_onnx(&path).expect("failed to read mnist.onnx");
@@ -146,6 +147,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires test fixture files
     fn read_squeezenet_onnx() {
         let path = fixture_path("squeezenet1.1.onnx");
         let model = read_onnx(&path).expect("failed to read squeezenet1.1.onnx");
@@ -165,6 +167,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires test fixture files
     fn print_onnx_summary_does_not_panic() {
         let path = fixture_path("mnist.onnx");
         let model = read_onnx(&path).unwrap();

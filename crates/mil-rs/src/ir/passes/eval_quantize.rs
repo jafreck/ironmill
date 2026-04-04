@@ -757,9 +757,9 @@ mod tests {
         };
 
         let original = program.clone();
-        AffineQuantizePass::int4_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        let mut pass = AffineQuantizePass::int4_per_tensor();
+        pass.min_elements = 0;
+        pass.run(&mut program).unwrap();
 
         let metrics = QuantizationEvaluator::evaluate(&original, &program);
         assert_eq!(metrics.len(), 1);
@@ -801,9 +801,9 @@ mod tests {
         };
 
         let original = program.clone();
-        AffineQuantizePass::int4_per_group(32)
-            .run(&mut program)
-            .unwrap();
+        let mut pass = AffineQuantizePass::int4_per_group(32);
+        pass.min_elements = 0;
+        pass.run(&mut program).unwrap();
 
         let metrics = QuantizationEvaluator::evaluate(&original, &program);
         assert_eq!(metrics.len(), 1);
@@ -907,9 +907,9 @@ mod tests {
         };
 
         let original = program.clone();
-        AffineQuantizePass::int4_per_tensor()
-            .run(&mut program)
-            .unwrap();
+        let mut pass = AffineQuantizePass::int4_per_tensor();
+        pass.min_elements = 0;
+        pass.run(&mut program).unwrap();
 
         let metrics = QuantizationEvaluator::evaluate(&original, &program);
         assert_eq!(metrics.len(), 1);

@@ -2399,6 +2399,7 @@ name = "int4-quantize"
 
     // ── SpinQuant pipeline tests ──────────────────────────────────────
 
+    #[cfg(feature = "gptq")]
     #[test]
     #[cfg(feature = "gptq")]
     fn with_spinquant_builds_pipeline() {
@@ -2416,6 +2417,7 @@ name = "int4-quantize"
         );
     }
 
+    #[cfg(feature = "gptq")]
     #[test]
     #[cfg(feature = "gptq")]
     fn spinquant_and_int4_mutually_exclusive() {
@@ -2433,6 +2435,7 @@ name = "int4-quantize"
         );
     }
 
+    #[cfg(feature = "gptq")]
     #[test]
     #[cfg(feature = "gptq")]
     fn spinquant_and_int8_mutually_exclusive() {
@@ -2450,6 +2453,7 @@ name = "int4-quantize"
         );
     }
 
+    #[cfg(feature = "gptq")]
     #[test]
     #[cfg(feature = "gptq")]
     fn spinquant_and_awq_mutually_exclusive() {
@@ -2486,6 +2490,7 @@ name = "int4-quantize"
         );
     }
 
+    #[cfg(feature = "gptq")]
     #[test]
     #[cfg(feature = "gptq")]
     fn spinquant_and_d2quant_mutually_exclusive() {
@@ -2505,6 +2510,7 @@ name = "int4-quantize"
         );
     }
 
+    #[cfg(feature = "gptq")]
     #[test]
     #[cfg(feature = "gptq")]
     fn spinquant_blocks_subsequent_int4() {
@@ -2524,6 +2530,7 @@ name = "int4-quantize"
         );
     }
 
+    #[cfg(feature = "gptq")]
     #[test]
     #[cfg(feature = "gptq")]
     fn spinquant_plus_fp16_is_allowed() {
@@ -2540,6 +2547,7 @@ name = "int4-quantize"
         assert!(names.contains(&"fp16-quantization"));
     }
 
+    #[cfg(feature = "gptq")]
     #[test]
     #[cfg(feature = "gptq")]
     fn spinquant_with_awq_method() {
