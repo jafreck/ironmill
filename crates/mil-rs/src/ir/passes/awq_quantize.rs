@@ -16,12 +16,86 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use super::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice, tensor_f16_as_f32_slice};
 use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
 use crate::ir::types::Value;
+
+// ---------------------------------------------------------------------------
+// Apple Accelerate BLAS bindings for hardware-accelerated matrix math.
+// On Apple Silicon this uses the AMX coprocessor for near-GPU throughput.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod blas {
+    pub const ROW_MAJOR: i32 = 101;
+    pub const NO_TRANS: i32 = 111;
+    pub const TRANS: i32 = 112;
+
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        pub fn cblas_sgemm(
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+}
+
+/// Compute C = A × B^T using Accelerate BLAS on macOS, scalar fallback elsewhere.
+/// A: [m × k] row-major, B: [n × k] row-major, C: [m × n] row-major.
+#[allow(unsafe_code)]
+fn matmul_a_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            blas::cblas_sgemm(
+                blas::ROW_MAJOR,
+                blas::NO_TRANS,
+                blas::TRANS,
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                a.as_ptr(),
+                k as i32,
+                b.as_ptr(),
+                k as i32,
+                0.0,
+                c.as_mut_ptr(),
+                n as i32,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        for i in 0..m {
+            for j in 0..n {
+                let mut dot = 0.0f32;
+                for p in 0..k {
+                    dot += a[i * k + p] * b[j * k + p];
+                }
+                c[i * n + j] = dot;
+            }
+        }
+    }
+}
 
 /// AWQ quantization pass.
 ///
@@ -268,18 +342,16 @@ impl Pass for AwqQuantizePass {
                         })
                         .collect();
 
-                    // Pre-compute W · X^T = [out_features, n_tokens].
+                    // Pre-compute W · X^T = [out_features, n_tokens] using BLAS.
                     let mut ref_output = vec![0.0f32; out_features * n_tokens];
-                    for row in 0..out_features {
-                        for t in 0..n_tokens {
-                            let mut dot = 0.0f32;
-                            for c in 0..in_features {
-                                dot += eop.floats[row * in_features + c]
-                                    * sub_activations[t * in_features + c];
-                            }
-                            ref_output[row * n_tokens + t] = dot;
-                        }
-                    }
+                    matmul_a_bt(
+                        &eop.floats,
+                        &sub_activations,
+                        &mut ref_output,
+                        out_features,
+                        n_tokens,
+                        in_features,
+                    );
 
                     proj_data.push(GroupProjection {
                         floats: &eop.floats,
@@ -413,6 +485,8 @@ fn compute_scales(magnitudes: &[f32], alpha: f32) -> Vec<f32> {
 ///   `|| (act * Q(clamp(w, -max_val, max_val))) - (act * w) ||²`
 /// over the calibration tokens.
 ///
+/// Uses Rayon to parallelize across (row, group) pairs for near-GPU throughput.
+///
 /// Returns a flat array of optimal `max_val` per (row, group).
 #[allow(clippy::too_many_arguments)]
 fn search_clip_ranges(
@@ -427,56 +501,73 @@ fn search_clip_ranges(
     max_shrink: f32,
 ) -> Vec<f32> {
     let n_groups = in_features.div_ceil(group_size);
-    let mut clip_maxvals = vec![f32::INFINITY; out_features * n_groups];
+    let n_steps = (max_shrink * clip_grid as f32) as usize;
 
-    for row in 0..out_features {
-        for g in 0..n_groups {
+    // Parallel search over all (row, group) pairs.
+    let total_pairs = out_features * n_groups;
+    let results: Vec<f32> = (0..total_pairs)
+        .into_par_iter()
+        .map(|pair_idx| {
+            let row = pair_idx / n_groups;
+            let g = pair_idx % n_groups;
+
             let g_start = g * group_size;
             let g_end = (g_start + group_size).min(in_features);
             let gsize = g_end - g_start;
 
-            // Original (unclipped) group weights.
-            let w_group: Vec<f32> = (g_start..g_end)
-                .map(|c| scaled_weights[row * in_features + c])
-                .collect();
+            let row_base = row * in_features;
 
-            // Per-group abs max.
-            let org_max = w_group.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+            // Per-group abs max (read from weight slice directly, no allocation).
+            let mut org_max = 0.0f32;
+            for c in g_start..g_end {
+                let v = scaled_weights[row_base + c].abs();
+                if v > org_max {
+                    org_max = v;
+                }
+            }
             if org_max < 1e-8 {
-                clip_maxvals[row * n_groups + g] = org_max;
-                continue;
+                return org_max;
             }
 
             // Compute original (unquantized) group output per token.
-            let org_out: Vec<f32> = (0..n_tokens)
-                .map(|t| {
-                    (0..gsize)
-                        .map(|j| w_group[j] * sub_activations[t * in_features + g_start + j])
-                        .sum::<f32>()
-                })
-                .collect();
+            let mut org_out = vec![0.0f32; n_tokens];
+            for (t, org) in org_out.iter_mut().enumerate() {
+                let act_base = t * in_features + g_start;
+                let mut sum = 0.0f32;
+                for j in 0..gsize {
+                    sum += scaled_weights[row_base + g_start + j] * sub_activations[act_base + j];
+                }
+                *org = sum;
+            }
 
+            // Reusable buffers.
+            let mut clipped = vec![0.0f32; gsize];
             let mut best_err = f32::INFINITY;
             let mut best_max = org_max;
 
-            let n_steps = (max_shrink * clip_grid as f32) as usize;
             for step in 0..n_steps {
                 let max_val = org_max * (1.0 - step as f32 / clip_grid as f32);
-                let clipped: Vec<f32> = w_group
-                    .iter()
-                    .map(|&w| w.clamp(-max_val, max_val))
-                    .collect();
+
+                // Clamp weights into reusable buffer.
+                for j in 0..gsize {
+                    clipped[j] = scaled_weights[row_base + g_start + j].clamp(-max_val, max_val);
+                }
+
                 let (quantized, q_scale, q_zp) = quantize_affine(&clipped, qmax);
 
+                // Dequantize once into the clipped buffer (reuse it).
+                for j in 0..gsize {
+                    clipped[j] = (quantized[j] as f32 - q_zp) * q_scale;
+                }
+
                 let mut err = 0.0f32;
-                for t in 0..n_tokens {
-                    let q_out: f32 = (0..gsize)
-                        .map(|j| {
-                            let dq = (quantized[j] as f32 - q_zp) * q_scale;
-                            dq * sub_activations[t * in_features + g_start + j]
-                        })
-                        .sum();
-                    let diff = q_out - org_out[t];
+                for (t, &org) in org_out.iter().enumerate() {
+                    let act_base = t * in_features + g_start;
+                    let mut q_out = 0.0f32;
+                    for j in 0..gsize {
+                        q_out += clipped[j] * sub_activations[act_base + j];
+                    }
+                    let diff = q_out - org;
                     err += diff * diff;
                 }
 
@@ -486,11 +577,11 @@ fn search_clip_ranges(
                 }
             }
 
-            clip_maxvals[row * n_groups + g] = best_max;
-        }
-    }
+            best_max
+        })
+        .collect();
 
-    clip_maxvals
+    results
 }
 
 /// Apply per-group clipping to a weight matrix in-place.
@@ -533,6 +624,9 @@ struct GroupProjection<'a> {
 /// For each candidate α the same scale vector is applied to every projection
 /// and the per-projection losses are summed, matching the reference which
 /// evaluates all `linears2scale` projections together.
+///
+/// Uses Rayon to evaluate α candidates in parallel and Accelerate BLAS
+/// for the loss matrix multiply, giving near-GPU throughput on Apple Silicon.
 fn search_alpha_group(
     projections: &[GroupProjection],
     magnitudes: &[f32],
@@ -548,63 +642,80 @@ fn search_alpha_group(
     let in_features = magnitudes.len();
     let n_groups = in_features.div_ceil(group_size);
 
-    let mut best_alpha = 0.0_f32;
-    let mut best_loss = f32::INFINITY;
+    // Evaluate all α candidates in parallel.
+    let best = (0..=grid_steps)
+        .into_par_iter()
+        .map(|step| {
+            let alpha = step as f32 / grid_steps as f32;
+            let scales = compute_scales(magnitudes, alpha);
 
-    for step in 0..=grid_steps {
-        let alpha = step as f32 / grid_steps as f32;
-        let scales = compute_scales(magnitudes, alpha);
+            let mut total_loss = 0.0f32;
 
-        let mut total_loss = 0.0f32;
+            // Reusable buffers per thread (avoid repeated allocation).
+            let max_out = projections
+                .iter()
+                .map(|p| p.out_features)
+                .max()
+                .unwrap_or(0);
+            let mut w_dq = vec![0.0f32; max_out * in_features];
+            let max_tokens = projections.iter().map(|p| p.n_tokens).max().unwrap_or(0);
+            let mut output = vec![0.0f32; max_out * max_tokens];
+            let mut scaled_group = vec![0.0f32; group_size];
 
-        for proj in projections {
-            // Build W_dq: quantize W·diag(s), then dequant and divide by s.
-            let mut w_dq = vec![0.0f32; proj.out_features * proj.in_features];
-            for row in 0..proj.out_features {
-                for g in 0..n_groups {
-                    let g_start = g * group_size;
-                    let g_end = (g_start + group_size).min(proj.in_features);
+            for proj in projections {
+                let wdq = &mut w_dq[..proj.out_features * proj.in_features];
 
-                    let scaled_group: Vec<f32> = (g_start..g_end)
-                        .map(|col| {
-                            let s = if col < scales.len() { scales[col] } else { 1.0 };
-                            proj.floats[row * proj.in_features + col] * s
-                        })
-                        .collect();
+                // Build W_dq: quantize W·diag(s), then dequant and divide by s.
+                for row in 0..proj.out_features {
+                    for g in 0..n_groups {
+                        let g_start = g * group_size;
+                        let g_end = (g_start + group_size).min(proj.in_features);
+                        let gsize = g_end - g_start;
 
-                    let (quantized, q_scale, q_zp) = quantize_affine(&scaled_group, qmax);
+                        // Scale the group into the reusable buffer.
+                        for (j, col) in (g_start..g_end).enumerate() {
+                            scaled_group[j] =
+                                proj.floats[row * proj.in_features + col] * scales[col];
+                        }
 
-                    for (j, col) in (g_start..g_end).enumerate() {
-                        let s = if col < scales.len() { scales[col] } else { 1.0 };
-                        let dequant = (quantized[j] as f32 - q_zp) * q_scale;
-                        w_dq[row * proj.in_features + col] = dequant / s;
+                        let (quantized, q_scale, q_zp) =
+                            quantize_affine(&scaled_group[..gsize], qmax);
+
+                        for (j, col) in (g_start..g_end).enumerate() {
+                            let dequant = (quantized[j] as f32 - q_zp) * q_scale;
+                            wdq[row * proj.in_features + col] = dequant / scales[col];
+                        }
                     }
                 }
+
+                // Compute loss = ||W_dq · X^T − ref_output||² via BLAS matmul.
+                let out = &mut output[..proj.out_features * proj.n_tokens];
+                matmul_a_bt(
+                    wdq,
+                    &proj.sub_activations,
+                    out,
+                    proj.out_features,
+                    proj.n_tokens,
+                    proj.in_features,
+                );
+
+                let loss: f32 = out
+                    .iter()
+                    .zip(proj.ref_output.iter())
+                    .map(|(&a, &b)| {
+                        let e = a - b;
+                        e * e
+                    })
+                    .sum();
+                total_loss += loss;
             }
 
-            // Exact loss: L(s) = ||W_dq · X^T − W · X^T||²
-            let mut loss = 0.0f32;
-            for row in 0..proj.out_features {
-                for t in 0..proj.n_tokens {
-                    let mut dq_dot = 0.0f32;
-                    for c in 0..proj.in_features {
-                        dq_dot += w_dq[row * proj.in_features + c]
-                            * proj.sub_activations[t * proj.in_features + c];
-                    }
-                    let err = dq_dot - proj.ref_output[row * proj.n_tokens + t];
-                    loss += err * err;
-                }
-            }
-            total_loss += loss;
-        }
+            (alpha, total_loss)
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0.0, f32::INFINITY));
 
-        if total_loss < best_loss {
-            best_loss = total_loss;
-            best_alpha = alpha;
-        }
-    }
-
-    best_alpha
+    best.0
 }
 
 use super::affine_quantize::quantize_affine;
