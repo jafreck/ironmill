@@ -38,7 +38,7 @@ impl std::str::FromStr for Architecture {
         match s.to_lowercase().as_str() {
             "llama" | "llama2" | "llama3" | "codellama" | "mistral" => Ok(Architecture::Llama),
             "qwen" | "qwen2" | "qwen3" => Ok(Architecture::Qwen),
-            "gemma" | "gemma2" | "gemma3" => Ok(Architecture::Gemma),
+            "gemma" | "gemma2" | "gemma3" | "gemma4" | "gemma4_text" => Ok(Architecture::Gemma),
             _ => Err(MilError::Validation(format!(
                 "unsupported architecture: {s}"
             ))),
@@ -235,6 +235,72 @@ impl ModelConfig {
         let val = self.extra.get("max_window_layers")?;
         val.as_u64().map(|n| n as usize)
     }
+
+    /// Extract per-layer attention types from Gemma 4 config.
+    ///
+    /// Returns `None` for non-Gemma-4 models. When present, each entry
+    /// is `"sliding_attention"` or `"full_attention"`.
+    pub fn layer_types(&self) -> Option<Vec<String>> {
+        let val = self.extra.get("layer_types")?;
+        let arr = val.as_array()?;
+        let types: Option<Vec<String>> = arr.iter().map(|v| v.as_str().map(String::from)).collect();
+        types
+    }
+
+    /// Get per-layer-type RoPE parameters from Gemma 4 config.
+    ///
+    /// Returns a map from layer type name to its RoPE configuration.
+    /// `partial_rotary_factor` of 1.0 means full rotation (standard RoPE).
+    pub fn rope_parameters(&self) -> Option<HashMap<String, RopeLayerConfig>> {
+        let val = self.extra.get("rope_parameters")?;
+        let obj = val.as_object()?;
+        let mut result = HashMap::new();
+        for (key, params) in obj {
+            let theta = params
+                .get("rope_theta")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(10000.0);
+            let partial_rotary_factor = params
+                .get("partial_rotary_factor")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            result.insert(
+                key.clone(),
+                RopeLayerConfig {
+                    theta,
+                    partial_rotary_factor,
+                },
+            );
+        }
+        Some(result)
+    }
+
+    /// Get the global head dim for Gemma 4 full-attention layers.
+    /// Falls back to `self.head_dim` if not specified.
+    pub fn global_head_dim(&self) -> usize {
+        self.extra
+            .get("global_head_dim")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(self.head_dim)
+    }
+
+    /// Get the number of KV heads for global attention layers.
+    /// Falls back to `self.num_key_value_heads` if not specified.
+    pub fn num_global_key_value_heads(&self) -> usize {
+        self.extra
+            .get("num_global_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(self.num_key_value_heads)
+    }
+}
+
+/// Per-layer-type RoPE configuration for Gemma 4.
+#[derive(Debug, Clone)]
+pub struct RopeLayerConfig {
+    pub theta: f64,
+    pub partial_rotary_factor: f64,
 }
 
 /// Multi-Head Latent Attention (MLA) configuration.
@@ -388,5 +454,111 @@ pub trait WeightProvider: Send + Sync {
     /// Check whether a tensor with the given name exists.
     fn has_tensor(&self, name: &str) -> bool {
         self.tensor_names().contains(&name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config() -> ModelConfig {
+        ModelConfig {
+            architecture: Architecture::Gemma,
+            hidden_size: 1536,
+            intermediate_size: 6144,
+            num_hidden_layers: 6,
+            num_attention_heads: 8,
+            num_key_value_heads: 1,
+            head_dim: 256,
+            vocab_size: 262144,
+            max_position_embeddings: 131072,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            tie_word_embeddings: true,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn architecture_from_str_gemma4() {
+        assert_eq!(
+            "gemma4".parse::<Architecture>().unwrap(),
+            Architecture::Gemma
+        );
+        assert_eq!(
+            "gemma4_text".parse::<Architecture>().unwrap(),
+            Architecture::Gemma
+        );
+    }
+
+    #[test]
+    fn layer_types_extraction() {
+        let mut config = minimal_config();
+        config.extra.insert(
+            "layer_types".into(),
+            serde_json::json!([
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention"
+            ]),
+        );
+        let lt = config.layer_types().unwrap();
+        assert_eq!(lt.len(), 6);
+        assert_eq!(lt[5], "full_attention");
+    }
+
+    #[test]
+    fn layer_types_none_for_non_gemma4() {
+        let config = minimal_config();
+        assert!(config.layer_types().is_none());
+    }
+
+    #[test]
+    fn rope_parameters_extraction() {
+        let mut config = minimal_config();
+        config.extra.insert("rope_parameters".into(), serde_json::json!({
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+            "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0}
+        }));
+        let rp = config.rope_parameters().unwrap();
+        let sliding = &rp["sliding_attention"];
+        assert_eq!(sliding.theta, 10000.0);
+        assert_eq!(sliding.partial_rotary_factor, 1.0);
+        let global = &rp["full_attention"];
+        assert_eq!(global.theta, 1000000.0);
+        assert_eq!(global.partial_rotary_factor, 0.25);
+    }
+
+    #[test]
+    fn global_head_dim_fallback() {
+        let config = minimal_config();
+        assert_eq!(config.global_head_dim(), 256);
+    }
+
+    #[test]
+    fn global_head_dim_explicit() {
+        let mut config = minimal_config();
+        config
+            .extra
+            .insert("global_head_dim".into(), serde_json::json!(512));
+        assert_eq!(config.global_head_dim(), 512);
+    }
+
+    #[test]
+    fn num_global_kv_heads_fallback() {
+        let config = minimal_config();
+        assert_eq!(config.num_global_key_value_heads(), 1);
+    }
+
+    #[test]
+    fn num_global_kv_heads_explicit() {
+        let mut config = minimal_config();
+        config
+            .extra
+            .insert("num_global_key_value_heads".into(), serde_json::json!(4));
+        assert_eq!(config.num_global_key_value_heads(), 4);
     }
 }
