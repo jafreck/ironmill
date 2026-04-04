@@ -46,6 +46,7 @@ pub(super) fn emit_weight_const(
     provider: &dyn WeightProvider,
     weight_name: &str,
     const_name: &str,
+    warnings: &mut Vec<String>,
 ) -> Result<(), MilError> {
     match provider.tensor(weight_name) {
         Ok(tensor) => {
