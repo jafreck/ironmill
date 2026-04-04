@@ -137,18 +137,24 @@ pub struct AneDecodeConfig {
 /// `device.compile()`. The resulting bundle contains MIL text + weight
 /// blobs ready for ANE device compilation at load time.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if any tensor data is `TensorData::External` (not materialized).
-/// Callers must ensure all tensors are materialized before invoking this
-/// function (e.g. via `program.materialize_all()`).
+/// Returns an error if external tensors cannot be materialized (e.g. the
+/// weight provider is missing or a key lookup fails).
 pub fn compile_decode_bundle(
     program: &mil_rs::ir::Program,
     config: &AneDecodeConfig,
 ) -> Result<AneDecodeBundle> {
-    // 0. Extract pre-pass data from the original program.
-    let original_arch = mil_rs::analysis::arch::detect_model_arch(program);
-    let (rope_cos_cache, rope_sin_cache, _rope_cache_dim) = extract_rope_caches(program)
+    // 0. Clone and materialize all external tensors up front so that
+    //    every downstream `as_bytes()` call is guaranteed to succeed.
+    let mut program = program.clone();
+    program
+        .materialize_all()
+        .map_err(|e| anyhow::anyhow!("tensor materialization failed: {e}"))?;
+
+    // 1. Extract pre-pass data from the (now-materialized) program.
+    let original_arch = mil_rs::analysis::arch::detect_model_arch(&program);
+    let (rope_cos_cache, rope_sin_cache, _rope_cache_dim) = extract_rope_caches(&program)
         .unwrap_or_else(|| {
             precompute_rope_cache(
                 config.head_dim,
@@ -156,10 +162,9 @@ pub fn compile_decode_bundle(
                 config.rope_theta as f32,
             )
         });
-    let has_qk_norm = extract_qk_norm_weights(program).is_some();
+    let has_qk_norm = extract_qk_norm_weights(&program).is_some();
 
-    // 1. Clone and prepare program for single-token decode.
-    let mut program = program.clone();
+    // 2. Prepare program for single-token decode.
     if !program.is_autoregressive() {
         program.set_attribute("autoregressive", "true");
     }
@@ -726,17 +731,19 @@ pub struct AneCompileConfig {
 /// The returned bundle can be saved to disk with [`AneModelBundle::save()`]
 /// and loaded by the inference engine without any compile-crate dependency.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if any tensor data is `TensorData::External` (not materialized).
-/// Callers must ensure all tensors are materialized before invoking this
-/// function (e.g. via `program.materialize_all()`).
+/// Returns an error if external tensors cannot be materialized (e.g. the
+/// weight provider is missing or a key lookup fails).
 pub fn compile_model_bundle(
     program: &Program,
     config: &AneCompileConfig,
 ) -> Result<AneModelBundle> {
-    // 1. Clone and run ANE-specific passes
+    // 1. Clone, materialize external tensors, and run ANE-specific passes.
     let mut program = program.clone();
+    program
+        .materialize_all()
+        .map_err(|e| anyhow::anyhow!("tensor materialization failed: {e}"))?;
     let passes: &[(&str, &dyn Pass)] = &[
         ("OpSubstitution", &OpSubstitutionPass),
         ("AneLayout", &AneLayoutPass),

@@ -31,7 +31,8 @@ pub type RopeCacheData = (Vec<f16>, Vec<f16>, usize);
 /// # Panics
 ///
 /// Panics if any tensor data is `TensorData::External` (not materialized).
-/// Callers must ensure all tensors are materialized.
+/// Callers must ensure all tensors are materialized (e.g. via
+/// `program.materialize_all()` in `compile_decode_bundle`).
 pub fn extract_rope_caches(program: &Program) -> Option<RopeCacheData> {
     let func = program.main()?;
 
