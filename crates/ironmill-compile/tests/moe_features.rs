@@ -54,7 +54,7 @@ fn moe_detection_name_based() {
 fn moe_split_produces_shared_and_experts() {
     let program = build_moe_program(2);
     let topology = detect_moe(&program).expect("should detect MoE");
-    let split = split_moe(&program, &topology);
+    let split = split_moe(&program, &topology).unwrap();
 
     // Shared program should contain router ops.
     let shared_ops = &split.shared.main().unwrap().body.operations;
@@ -90,7 +90,7 @@ fn moe_split_produces_shared_and_experts() {
 fn moe_manifest_describes_execution_flow() {
     let program = build_moe_program(2);
     let topology = detect_moe(&program).unwrap();
-    let split = split_moe(&program, &topology);
+    let split = split_moe(&program, &topology).unwrap();
     let manifest = &split.manifest;
 
     // Should have shared + 2 expert stages.
@@ -139,7 +139,7 @@ fn moe_manifest_describes_execution_flow() {
 fn multi_function_model_has_all_functions() {
     let program = build_moe_program(2);
     let topology = detect_moe(&program).unwrap();
-    let split = split_moe(&program, &topology);
+    let split = split_moe(&program, &topology).unwrap();
 
     let model =
         program_to_multi_function_model(&split, 9).expect("multi-function model should build");
@@ -169,7 +169,7 @@ fn multi_function_model_has_all_functions() {
 fn multi_function_dedup_only_shared_consts() {
     let program = build_moe_program(2);
     let topology = detect_moe(&program).unwrap();
-    let split = split_moe(&program, &topology);
+    let split = split_moe(&program, &topology).unwrap();
 
     let model =
         program_to_multi_function_model(&split, 9).expect("multi-function model should build");

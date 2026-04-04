@@ -263,7 +263,8 @@ pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
                     *zero_point_dtype,
                     &tensor.shape,
                     *bit_width,
-                    g_idx.as_deref().unwrap(),
+                    // Safety: guarded by `if g_idx.is_some()` above.
+                    g_idx.as_deref().expect("g_idx checked above"),
                 )?
             } else {
                 D::dequant_affine(

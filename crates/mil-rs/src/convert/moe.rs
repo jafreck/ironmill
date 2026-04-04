@@ -214,8 +214,13 @@ pub fn detect_moe(program: &Program) -> Option<MoeTopology> {
 /// The `topology` should come from [`detect_moe`]. Each expert becomes its
 /// own [`Program`] with function inputs for values produced by shared layers,
 /// and function outputs consumed downstream.
-pub fn split_moe(program: &Program, topology: &MoeTopology) -> MoeSplitResult {
-    let func = program.main().expect("program must have a main function");
+pub fn split_moe(
+    program: &Program,
+    topology: &MoeTopology,
+) -> crate::error::Result<MoeSplitResult> {
+    let func = program
+        .main()
+        .ok_or_else(|| MilError::Validation("program must have a main function".into()))?;
     let ops = &func.body.operations;
     let version = &program.version;
 
@@ -251,13 +256,13 @@ pub fn split_moe(program: &Program, topology: &MoeTopology) -> MoeSplitResult {
         })
         .collect();
 
-    let manifest = build_manifest(topology, &shared, &experts);
+    let manifest = build_manifest(topology, &shared, &experts)?;
 
-    MoeSplitResult {
+    Ok(MoeSplitResult {
         shared,
         experts,
         manifest,
-    }
+    })
 }
 
 /// Fuse the top-K most frequently activated experts into a single dense program.
@@ -910,8 +915,14 @@ fn extract_subprogram(
 /// weights as its outputs.  The runtime is responsible for dispatching expert
 /// inputs based on those weights and combining expert outputs; there is no
 /// separate "combination" artifact.
-fn build_manifest(topology: &MoeTopology, shared: &Program, experts: &[Program]) -> MoeManifest {
-    let shared_func = shared.main().expect("shared program has main");
+fn build_manifest(
+    topology: &MoeTopology,
+    shared: &Program,
+    experts: &[Program],
+) -> crate::error::Result<MoeManifest> {
+    let shared_func = shared
+        .main()
+        .ok_or_else(|| MilError::Validation("shared program has no main function".into()))?;
     let shared_inputs: Vec<String> = shared_func.inputs.iter().map(|(n, _)| n.clone()).collect();
     let shared_outputs = shared_func.body.outputs.clone();
 
@@ -919,14 +930,16 @@ fn build_manifest(topology: &MoeTopology, shared: &Program, experts: &[Program])
         .iter()
         .enumerate()
         .map(|(i, prog)| {
-            let func = prog.main().expect("expert program has main");
-            ExpertDescriptor {
+            let func = prog.main().ok_or_else(|| {
+                MilError::Validation(format!("expert {i} program has no main function"))
+            })?;
+            Ok(ExpertDescriptor {
                 index: i,
                 inputs: func.inputs.iter().map(|(n, _)| n.clone()).collect(),
                 outputs: func.body.outputs.clone(),
-            }
+            })
         })
-        .collect();
+        .collect::<crate::error::Result<Vec<_>>>()?;
 
     // Stage 1: shared program (router + combination logic) runs once with
     // model inputs and produces router weights as intermediate outputs.
@@ -947,12 +960,12 @@ fn build_manifest(topology: &MoeTopology, shared: &Program, experts: &[Program])
         });
     }
 
-    MoeManifest {
+    Ok(MoeManifest {
         expert_count: topology.expert_count,
         router_output: topology.router_output.clone(),
         experts: expert_descriptors,
         stages,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,7 +1265,7 @@ mod tests {
     fn split_produces_correct_program_count() {
         let program = make_named_moe_program();
         let topo = detect_moe(&program).unwrap();
-        let result = split_moe(&program, &topo);
+        let result = split_moe(&program, &topo).unwrap();
 
         assert_eq!(result.experts.len(), 2);
         assert!(result.shared.main().is_some());
@@ -1262,7 +1275,7 @@ mod tests {
     fn split_expert_programs_have_correct_ops() {
         let program = make_named_moe_program();
         let topo = detect_moe(&program).unwrap();
-        let result = split_moe(&program, &topo);
+        let result = split_moe(&program, &topo).unwrap();
 
         for (i, expert) in result.experts.iter().enumerate() {
             let func = expert.main().expect("expert should have main");
@@ -1281,7 +1294,7 @@ mod tests {
     fn split_shared_program_excludes_experts() {
         let program = make_named_moe_program();
         let topo = detect_moe(&program).unwrap();
-        let result = split_moe(&program, &topo);
+        let result = split_moe(&program, &topo).unwrap();
 
         let shared_func = result.shared.main().unwrap();
         for op in &shared_func.body.operations {
@@ -1297,7 +1310,7 @@ mod tests {
     fn split_expert_programs_have_inputs_for_cross_partition_refs() {
         let program = make_named_moe_program();
         let topo = detect_moe(&program).unwrap();
-        let result = split_moe(&program, &topo);
+        let result = split_moe(&program, &topo).unwrap();
 
         for expert in &result.experts {
             let func = expert.main().unwrap();
@@ -1315,7 +1328,7 @@ mod tests {
     fn manifest_has_correct_structure() {
         let program = make_named_moe_program();
         let topo = detect_moe(&program).unwrap();
-        let result = split_moe(&program, &topo);
+        let result = split_moe(&program, &topo).unwrap();
 
         assert_eq!(result.manifest.expert_count, 2);
         assert_eq!(result.manifest.router_output, "gate_weights");
@@ -1328,7 +1341,7 @@ mod tests {
     fn manifest_stages_order() {
         let program = make_named_moe_program();
         let topo = detect_moe(&program).unwrap();
-        let result = split_moe(&program, &topo);
+        let result = split_moe(&program, &topo).unwrap();
 
         // shared, expert-0, expert-1 (no separate combination stage)
         assert_eq!(result.manifest.stages.len(), 3);
@@ -1343,7 +1356,7 @@ mod tests {
     fn manifest_serializes_to_json() {
         let program = make_named_moe_program();
         let topo = detect_moe(&program).unwrap();
-        let result = split_moe(&program, &topo);
+        let result = split_moe(&program, &topo).unwrap();
 
         let json = serde_json::to_string_pretty(&result.manifest).expect("should serialize");
         assert!(json.contains("\"expert_count\": 2"));

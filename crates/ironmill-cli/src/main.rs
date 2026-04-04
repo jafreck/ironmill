@@ -758,7 +758,7 @@ fn emit_moe_split(
         "MoE architecture detected: {} experts",
         topology.expert_count
     );
-    let split_result = split_moe(program, &topology);
+    let split_result = split_moe(program, &topology).context("failed to split MoE program")?;
     let stem = resolve_output_stem(opts.output.as_deref(), input_path);
 
     let shared_path = format!("{stem}-shared.mlpackage");
@@ -809,7 +809,7 @@ fn emit_moe_bundle(
         "MoE architecture detected: {} experts",
         topology.expert_count
     );
-    let split_result = split_moe(program, &topology);
+    let split_result = split_moe(program, &topology).context("failed to split MoE program")?;
 
     let bundle_model = program_to_multi_function_model(&split_result, COREML_SPEC_VERSION)
         .context("Failed to convert MoE programs to multi-function CoreML model")?;

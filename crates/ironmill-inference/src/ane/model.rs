@@ -309,7 +309,10 @@ impl<D: AneDevice> AneModel<D> {
         }
 
         // Read final outputs into fresh tensors for the caller.
-        let last = self.sub_programs.last().unwrap();
+        let last = self
+            .sub_programs
+            .last()
+            .ok_or_else(|| AneError::Other(anyhow::anyhow!("no sub-programs loaded")))?;
         let mut results = Vec::with_capacity(last.output_tensors.len());
         for tensor in &last.output_tensors {
             let data = tensor.read_f16()?;

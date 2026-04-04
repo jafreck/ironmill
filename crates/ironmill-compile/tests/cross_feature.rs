@@ -148,7 +148,7 @@ fn moe_split_plus_per_expert_quant_plus_bundle() {
     let topology = detect_moe(&program).expect("should detect MoE topology");
     assert_eq!(topology.expert_count, n_experts);
 
-    let mut split_result = split_moe(&program, &topology);
+    let mut split_result = split_moe(&program, &topology).unwrap();
     assert_eq!(split_result.experts.len(), n_experts);
 
     // Apply per-expert quantization: expert_0 is "hot" (FP16), rest are cold (4-bit).
@@ -606,7 +606,7 @@ fn parallel_moe_expert_compilation() {
     let program = build_moe_program(n_experts);
 
     let topology = detect_moe(&program).expect("should detect MoE topology");
-    let split = split_moe(&program, &topology);
+    let split = split_moe(&program, &topology).unwrap();
     assert_eq!(split.experts.len(), n_experts);
 
     // Spawn a thread per expert, each running a quantization pipeline.
