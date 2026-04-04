@@ -265,7 +265,7 @@ fn build_unpaired_unrotation(
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: TensorData::Inline(r_inv_data),
+                    data: TensorData::inline(r_inv_data),
                     shape: vec![n_padded, n_padded],
                     dtype: lut_dtype,
                 },
@@ -302,7 +302,7 @@ fn build_unpaired_unrotation(
             .with_attr(
                 "end",
                 Value::Tensor {
-                    data: TensorData::Inline(end_data),
+                    data: TensorData::inline(end_data),
                     shape: vec![2],
                     dtype: ScalarType::Int32,
                 },
@@ -310,7 +310,7 @@ fn build_unpaired_unrotation(
             .with_attr(
                 "end_mask",
                 Value::Tensor {
-                    data: TensorData::Inline(vec![1u8, 0]),
+                    data: TensorData::inline(vec![1u8, 0]),
                     shape: vec![2],
                     dtype: ScalarType::Bool,
                 },
@@ -564,7 +564,7 @@ mod tests {
             .with_attr(
                 "lut",
                 Value::Tensor {
-                    data: TensorData::Inline(lut_data),
+                    data: TensorData::inline(lut_data),
                     shape: vec![16],
                     dtype: ScalarType::Float16,
                 },
@@ -572,7 +572,7 @@ mod tests {
             .with_attr(
                 "shape",
                 Value::Tensor {
-                    data: TensorData::Inline(shape_data),
+                    data: TensorData::inline(shape_data),
                     shape: vec![2],
                     dtype: ScalarType::UInt32,
                 },
@@ -802,7 +802,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: TensorData::Inline(vec![0u8; 16]),
+                    data: TensorData::inline(vec![0u8; 16]),
                     shape: vec![4],
                     dtype: ScalarType::Float32,
                 },

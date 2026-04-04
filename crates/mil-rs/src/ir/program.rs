@@ -433,4 +433,134 @@ mod tests {
         let program = Program::new("1.0.0");
         assert!(program.attributes.is_empty());
     }
+
+    /// Build a program with External tensor refs, run Fp16QuantizePass, and
+    /// verify the output matches an identical program built with Inline tensors.
+    #[test]
+    fn external_tensor_quantize_matches_inline() {
+        use crate::ir::pass::Pass;
+        use crate::ir::passes::fp16_quantize::Fp16QuantizePass;
+
+        // 4 floats = 16 bytes of FP32 data
+        let fp32_data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        // --- Eager program (inline data) ---
+        let mut eager = Program::new("1.0");
+        let mut func_eager = Function::new("main");
+        let op = Operation::new("const", "w").with_output("w_out").with_attr(
+            "val",
+            Value::Tensor {
+                data: TensorData::inline(fp32_data.clone()),
+                shape: vec![2, 2],
+                dtype: ScalarType::Float32,
+            },
+        );
+        func_eager.body.add_op(op);
+        func_eager.body.outputs = vec!["w_out".into()];
+        eager.add_function(func_eager);
+
+        // --- Lazy program (external ref) ---
+        let mut lazy = Program::new("1.0");
+        let mut func_lazy = Function::new("main");
+        let op = Operation::new("const", "w").with_output("w_out").with_attr(
+            "val",
+            Value::Tensor {
+                data: TensorData::external("weight_fp32".to_string(), fp32_data.len()),
+                shape: vec![2, 2],
+                dtype: ScalarType::Float32,
+            },
+        );
+        func_lazy.body.add_op(op);
+        func_lazy.body.outputs = vec!["w_out".into()];
+        lazy.add_function(func_lazy);
+
+        // Provider that serves the FP32 tensor
+        struct Fp32Provider {
+            data: Vec<u8>,
+            config: ModelConfig,
+        }
+        impl WeightProvider for Fp32Provider {
+            fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError> {
+                if name == "weight_fp32" {
+                    Ok(WeightTensor {
+                        data: Cow::Borrowed(&self.data),
+                        shape: vec![2, 2],
+                        dtype: ScalarType::Float32,
+                        quant_info: crate::weights::QuantizationInfo::None,
+                    })
+                } else {
+                    Err(MilError::Validation(format!("unknown: {name}")))
+                }
+            }
+            fn tensor_names(&self) -> Vec<&str> {
+                vec!["weight_fp32"]
+            }
+            fn config(&self) -> &ModelConfig {
+                &self.config
+            }
+        }
+
+        lazy.set_weight_provider(Arc::new(Fp32Provider {
+            data: fp32_data,
+            config: ModelConfig {
+                architecture: Architecture::Llama,
+                hidden_size: 64,
+                intermediate_size: 128,
+                num_hidden_layers: 1,
+                num_attention_heads: 4,
+                num_key_value_heads: 4,
+                head_dim: 16,
+                vocab_size: 32,
+                max_position_embeddings: 128,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                tie_word_embeddings: false,
+                extra: Default::default(),
+            },
+        }));
+
+        // Run FP16 quantization on both
+        Fp16QuantizePass.run(&mut eager).expect("eager pass failed");
+        Fp16QuantizePass.run(&mut lazy).expect("lazy pass failed");
+
+        // Extract results and compare
+        let eager_op = &eager.main().unwrap().body.operations[0];
+        let lazy_op = &lazy.main().unwrap().body.operations[0];
+
+        let eager_val = eager_op.attributes.get("val").expect("eager val");
+        let lazy_val = lazy_op.attributes.get("val").expect("lazy val");
+
+        if let (
+            Value::Tensor {
+                data: eager_data,
+                shape: eager_shape,
+                dtype: eager_dtype,
+            },
+            Value::Tensor {
+                data: lazy_data,
+                shape: lazy_shape,
+                dtype: lazy_dtype,
+            },
+        ) = (eager_val, lazy_val)
+        {
+            assert_eq!(eager_dtype, lazy_dtype, "dtype mismatch");
+            assert_eq!(
+                *eager_dtype,
+                ScalarType::Float16,
+                "should be FP16 after pass"
+            );
+            assert_eq!(eager_shape, lazy_shape, "shape mismatch");
+            assert!(lazy_data.is_inline(), "lazy tensor should be materialized");
+            assert_eq!(
+                eager_data.as_bytes(),
+                lazy_data.as_bytes(),
+                "quantized bytes differ between eager and lazy paths"
+            );
+        } else {
+            panic!("expected Tensor values");
+        }
+    }
 }
