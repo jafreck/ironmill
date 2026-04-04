@@ -87,18 +87,108 @@ Loads pre-compiled `.ironml` bundles:
 ### CLI
 
 ```bash
-# Install
 cargo install --path crates/ironmill-cli
+```
 
-# Compile
-ironmill compile model.onnx                                        # basic CoreML conversion
-ironmill compile model.onnx -o output.mlpackage --quantize fp16    # FP16 quantization
-ironmill compile model.onnx --quantize int8                        # weight-only INT8
-ironmill compile model.onnx --input-shape "input:1,3,224,224"      # fixed shapes for ANE
+#### Commands
 
-# Inspect / validate
+```
+COMMANDS:
+  compile           Compile a model to CoreML, ANE, Metal, or CUDA format
+  inspect           Print model structure and metadata
+  validate          Validate model for target hardware compatibility
+  compile-pipeline  Compile a multi-stage pipeline from a TOML manifest
+  pipeline-report   Compare two pipeline configurations
+```
+
+#### `compile`
+
+Convert an ONNX, SafeTensors, GGUF, or CoreML model to an optimized output format.
+
+Key flags:
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <PATH>` | Output path (default: derived from input) |
+| `-t, --target <TARGET>` | Compute units: `all`, `cpu-only`, `cpu-and-gpu`, `cpu-and-ne`, `gpu` |
+| `-q, --quantize <MODE>` | Quantization: `none`, `fp16`, `int8`, `mixed-fp16-int8`, `awq`, `int4`, `gptq`, `d2quant` |
+| `--cal-data <DIR>` | Calibration data directory (for INT8, AWQ, or GPTQ) |
+| `--polar-quantize <BITS>` | PolarQuant weight quantization (2 or 4 bit) |
+| `--palettize <BITS>` | Weight palettization bit-width (2, 4, 6, or 8) |
+| `--quip-sharp` | QuIP# (E8 lattice) 2-bit weight quantization |
+| `--input-shape <NAME:SHAPE>` | Set concrete input shape for ANE (repeatable) |
+| `--ane` | Emit ANE-optimized ops (1×1 conv projections, decomposed RMSNorm, etc.) |
+| `--ane-memory-budget <SIZE>` | ANE memory budget per op (e.g. `1GB`, `512MB`) |
+| `--runtime <BACKEND>` | Runtime backend: `coreml` (default), `ane-direct` (experimental) |
+| `--kv-quant <MODE>` | KV cache quantization: `none`, `turbo-int8` |
+| `--pipeline-config <PATH>` | TOML pipeline configuration (overrides default passes) |
+| `--no-fusion` | Disable fusion and optimization passes |
+| `--moe-split` | Split MoE model into per-expert `.mlpackage` files |
+| `--moe-bundle` | Bundle MoE experts as functions in a single `.mlpackage` |
+| `--split-draft-layers <N>` | Split model for speculative decoding (draft + verifier) |
+| `--annotate-compute-units` | Annotate ops with preferred compute unit (ANE/GPU/CPU) |
+
+#### `inspect`
+
+Print model structure and metadata for `.onnx`, `.mlmodel`, or `.mlpackage` files.
+
+#### `validate`
+
+Check whether a model is compatible with the Apple Neural Engine.
+
+| Flag | Description |
+|------|-------------|
+| `--format <FMT>` | Output format: `text` (default) or `json` |
+
+#### `compile-pipeline`
+
+Compile a multi-ONNX pipeline from a TOML manifest into coordinated `.mlpackage` outputs.
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <DIR>` | Output directory for `.mlpackage` files and `pipeline.json` |
+
+#### `pipeline-report`
+
+Compare two pipeline configurations on a model and report metrics.
+
+| Flag | Description |
+|------|-------------|
+| `--config-a <PATH>` | Path to the first pipeline config (TOML) |
+| `--config-b <PATH>` | Path to the second pipeline config (TOML) |
+
+#### Examples
+
+```bash
+# Basic CoreML conversion
+ironmill compile model.onnx
+
+# FP16 quantization with explicit output path
+ironmill compile model.onnx -o output.mlpackage --quantize fp16
+
+# Weight-only INT8 quantization
+ironmill compile model.onnx --quantize int8
+
+# Fixed input shapes for ANE compatibility
+ironmill compile model.onnx --input-shape "input:1,3,224,224"
+
+# 4-bit PolarQuant for Metal GPU backend
+ironmill compile model.onnx --target gpu --polar-quantize 4
+
+# ANE-optimized compile with TurboQuant KV cache
+ironmill compile model.onnx --ane --kv-quant turbo-int8
+
+# Compile a multi-stage pipeline
+ironmill compile-pipeline pipeline.toml -o out/
+
+# Compare two pipeline configs
+ironmill pipeline-report model.onnx --config-a fast.toml --config-b accurate.toml
+
+# Inspect model structure
 ironmill inspect model.onnx
-ironmill validate model.onnx
+
+# Validate ANE compatibility (JSON output)
+ironmill validate model.onnx --format json
 ```
 
 ### Rust API — Compilation
@@ -289,7 +379,7 @@ flowchart TD
 | [`ironmill-iosurface`](crates/ironmill-iosurface/) | IOSurface tensor management for ANE I/O (macOS) |
 | [`ironmill-coreml-sys`](crates/ironmill-coreml-sys/) | CoreML runtime bindings via objc2 (macOS) |
 | [`ironmill-metal-sys`](crates/ironmill-metal-sys/) | Metal and MPS framework bindings (macOS) |
-| [`ironmill-cli`](crates/ironmill-cli/) | CLI: `compile`, `inspect`, `validate` |
+| [`ironmill-cli`](crates/ironmill-cli/) | CLI: `compile`, `inspect`, `validate`, `compile-pipeline`, `pipeline-report` |
 | [`ironmill-bench`](crates/ironmill-bench/) | Benchmarks: latency, power, perplexity |
 | [`candle-coreml`](crates/candle-coreml/) | [candle](https://github.com/huggingface/candle) bridge: ONNX→CoreML + runtime |
 | [`burn-coreml`](crates/burn-coreml/) | [Burn](https://github.com/tracel-ai/burn) bridge: export + inference |
