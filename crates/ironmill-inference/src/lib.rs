@@ -10,6 +10,7 @@
 compile_error!("ironmill-inference only supports macOS");
 
 pub mod ane;
+pub mod cache;
 pub mod calibration;
 pub mod coreml;
 #[cfg(any(feature = "metal", feature = "mlx"))]
@@ -29,8 +30,10 @@ mod weight_loading;
 
 // Re-exports for convenience.
 pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
+pub use cache::{KvCacheSlice, KvLayerSlice, LinearPrefixCache, LruPolicy, PrefixCache, RadixTree};
 pub use engine::{
     BatchInferenceEngine, ConstrainedDecoder, InferenceEngine, InferenceError, SequenceId,
+    prefill_with_cache,
 };
 pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 #[cfg(feature = "mlx")]

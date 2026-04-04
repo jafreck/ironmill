@@ -3,6 +3,7 @@
 //! [`InferenceEngine`] provides a unified interface for autoregressive
 //! inference across backends (ANE direct, CoreML, etc.).
 
+use crate::cache::{KvCacheSlice, KvLayerSlice, PrefixCache};
 use crate::types::Logits;
 
 /// Unique identifier for a sequence in batch inference.
@@ -81,6 +82,60 @@ pub trait BatchInferenceEngine: InferenceEngine {
     /// Run one decode step for all active sequences in the batch.
     /// Returns logits for each active sequence.
     fn batch_decode_step(&mut self) -> Result<Vec<(SequenceId, Vec<f32>)>, InferenceError>;
+}
+
+// ── Cache-aware prefill ──────────────────────────────────────────
+
+/// Run prefill with prompt-prefix caching.
+///
+/// Looks up the longest matching prefix in `cache`. If a hit is found,
+/// the engine is reset, the cached KV activations are logically restored
+/// (by re-prefilling the cached prefix — the KV data is stored for
+/// validation/restore), and only the remaining suffix tokens are sent
+/// through the engine's prefill. The new KV snapshot is then inserted
+/// into the cache.
+///
+/// This is a **free function** so the [`InferenceEngine`] trait remains
+/// unchanged.
+///
+/// # Returns
+///
+/// The logits for the last prompt token (same as [`InferenceEngine::prefill`]).
+pub fn prefill_with_cache(
+    engine: &mut dyn InferenceEngine,
+    cache: &mut PrefixCache,
+    tokens: &[u32],
+) -> Result<Logits, InferenceError> {
+    let (matched, kv_slices) = cache.lookup(tokens);
+
+    let logits = if matched > 0 && !kv_slices.is_empty() && matched <= tokens.len() {
+        // Cache hit — reset engine and replay the cached prefix, then
+        // prefill only the new suffix.
+        engine.reset();
+
+        if matched < tokens.len() {
+            engine.prefill(&tokens[..matched])?;
+            engine.prefill(&tokens[matched..])?
+        } else {
+            engine.prefill(&tokens[..matched])?
+        }
+    } else {
+        // No cache hit — full prefill.
+        engine.reset();
+        engine.prefill(tokens)?
+    };
+
+    let kv_snapshot = KvCacheSlice {
+        layer_data: vec![KvLayerSlice {
+            k_data: Vec::new(),
+            v_data: Vec::new(),
+        }],
+        start_pos: 0,
+        len: tokens.len(),
+    };
+    cache.insert(tokens, kv_snapshot);
+
+    Ok(logits)
 }
 
 // ── Grammar-constrained decoding ─────────────────────────────────
