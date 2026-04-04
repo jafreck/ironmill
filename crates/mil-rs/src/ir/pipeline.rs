@@ -637,15 +637,21 @@ impl PassPipeline {
     /// Uses pre-computed Hessian data from calibration to perform
     /// optimal weight quantization via the GPTQ algorithm.
     ///
-    /// Mutually exclusive with INT8, palettization, and polar quantization.
+    /// `bits` must be 4 or 8. Mutually exclusive with other quantization methods.
     #[cfg(feature = "gptq")]
     pub fn with_gptq(
         mut self,
         hessian_data: HashMap<String, (Vec<f32>, usize, usize)>,
+        bits: u8,
         group_size: usize,
         block_size: usize,
         dampening: f64,
     ) -> Result<Self> {
+        if bits != 4 && bits != 8 {
+            return Err(MilError::Validation(format!(
+                "GPTQ bits must be 4 or 8, got {bits}"
+            )));
+        }
         if self.has_int8 {
             return Err(MilError::Validation(
                 "GPTQ and INT8 quantization are mutually exclusive".into(),
@@ -696,7 +702,7 @@ impl PassPipeline {
         self.passes.insert(
             insert_pos,
             Box::new(super::passes::gptq::GptqQuantizePass::new(
-                4,
+                bits,
                 group_size,
                 block_size,
                 dampening,
@@ -711,6 +717,7 @@ impl PassPipeline {
     pub fn with_gptq(
         self,
         _hessian_data: HashMap<String, (Vec<f32>, usize, usize)>,
+        _bits: u8,
         _group_size: usize,
         _block_size: usize,
         _dampening: f64,
@@ -1914,7 +1921,7 @@ name = "int4-quantize"
     #[test]
     #[cfg(not(feature = "gptq"))]
     fn gptq_stub_returns_error() {
-        let result = PassPipeline::new().with_gptq(HashMap::new(), 128, 128, 0.01);
+        let result = PassPipeline::new().with_gptq(HashMap::new(), 4, 128, 128, 0.01);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1927,7 +1934,7 @@ name = "int4-quantize"
     #[cfg(feature = "gptq")]
     fn with_gptq_builds_pipeline() {
         let pipeline = PassPipeline::new()
-            .with_gptq(HashMap::new(), 128, 128, 0.01)
+            .with_gptq(HashMap::new(), 4, 128, 128, 0.01)
             .unwrap();
         let names = pipeline.pass_names();
         assert!(
@@ -1953,7 +1960,7 @@ name = "int4-quantize"
     #[cfg(feature = "gptq")]
     fn gptq_and_int8_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_int8(None).unwrap();
-        let result = pipeline.with_gptq(HashMap::new(), 128, 128, 0.01);
+        let result = pipeline.with_gptq(HashMap::new(), 4, 128, 128, 0.01);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1966,7 +1973,7 @@ name = "int4-quantize"
     #[cfg(feature = "gptq")]
     fn gptq_and_palettize_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_palettize(4).unwrap();
-        let result = pipeline.with_gptq(HashMap::new(), 128, 128, 0.01);
+        let result = pipeline.with_gptq(HashMap::new(), 4, 128, 128, 0.01);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1979,7 +1986,7 @@ name = "int4-quantize"
     #[cfg(feature = "gptq")]
     fn gptq_and_polar_quant_mutually_exclusive() {
         let pipeline = PassPipeline::new().with_polar_quant(4).unwrap();
-        let result = pipeline.with_gptq(HashMap::new(), 128, 128, 0.01);
+        let result = pipeline.with_gptq(HashMap::new(), 4, 128, 128, 0.01);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

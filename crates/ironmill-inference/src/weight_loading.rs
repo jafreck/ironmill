@@ -10,6 +10,8 @@ use std::borrow::Cow;
 use mil_rs::ir::ScalarType;
 use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
 
+use crate::dequant::dequant_affine_with_g_idx;
+
 // ── Generic layer / model structs ───────────────────────────────
 
 /// Weights for a single transformer layer, generic over backend types.
@@ -246,19 +248,37 @@ pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
             axis,
             bit_width,
             group_size,
+            g_idx,
             ..
         } => {
-            let data = D::dequant_affine(
-                &tensor.data,
-                scale,
-                zero_point,
-                *scale_dtype,
-                *zero_point_dtype,
-                *axis,
-                &tensor.shape,
-                *bit_width,
-                *group_size,
-            )?;
+            let data = if g_idx.is_some() {
+                // GPTQ act-order: use g_idx for group mapping instead of
+                // the default col/group_size. Re-dequantize with correct
+                // per-column group indices.
+                dequant_affine_with_g_idx(
+                    &tensor.data,
+                    scale,
+                    zero_point,
+                    *scale_dtype,
+                    *zero_point_dtype,
+                    &tensor.shape,
+                    *bit_width,
+                    g_idx.as_deref().unwrap(),
+                )?
+            } else {
+                D::dequant_affine(
+                    &tensor.data,
+                    scale,
+                    zero_point,
+                    *scale_dtype,
+                    *zero_point_dtype,
+                    *axis,
+                    &tensor.shape,
+                    *bit_width,
+                    *group_size,
+                )?
+            };
+
             Ok(DenseData {
                 bytes: Cow::Owned(data),
                 shape: &tensor.shape,

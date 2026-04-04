@@ -172,6 +172,21 @@ impl MilWeightProvider {
                         _ => None,
                     };
 
+                    let g_idx = match op.attributes.get("g_idx") {
+                        Some(Value::Tensor {
+                            data,
+                            dtype: ScalarType::Int32,
+                            ..
+                        }) => {
+                            let indices: Vec<u32> = data
+                                .chunks_exact(4)
+                                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+                                .collect();
+                            Some(indices)
+                        }
+                        _ => None,
+                    };
+
                     let extracted = ExtractedTensor {
                         data: quantized_data,
                         shape: quantized_shape,
@@ -185,6 +200,7 @@ impl MilWeightProvider {
                             bit_width,
                             group_size,
                             awq_scales,
+                            g_idx,
                         },
                     };
                     tensors.insert(name, extracted);

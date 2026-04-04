@@ -108,6 +108,11 @@ pub enum QuantizationInfo {
         /// dequantized weight is divided by these scales to compensate
         /// for activation-aware weight scaling.
         awq_scales: Option<Vec<u8>>,
+        /// Optional GPTQ column permutation index (act-order / desc_act).
+        /// When present, weight columns were quantized in a permuted order
+        /// and must be un-permuted during dequantization. Each entry maps
+        /// a column index to its original position.
+        g_idx: Option<Vec<u32>>,
     },
 }
 

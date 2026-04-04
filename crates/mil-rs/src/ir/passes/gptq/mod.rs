@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::ir::passes::int4_pack::pack_int4;
 
-use hessian::{cholesky_decompose, cholesky_inverse_row, finalize_hessian};
+use hessian::{cholesky_decompose, cholesky_inverse_factor, finalize_hessian};
 
 use crate::error::Result;
 use crate::ir::pass::Pass;
@@ -182,6 +182,16 @@ struct GptqResult {
 ///
 /// W is row-major `[out_features, in_features]`.
 /// Returns quantized weights with per-group scale/zero_point.
+///
+/// Follows the reference GPTQ implementation (Frantar et al., 2022):
+///   1. Compute H = (2/n)·X^TX + dampening
+///   2. Cholesky-decompose H → L
+///   3. Compute U = upper Cholesky factor of H⁻¹ (H⁻¹ = UᵀU)
+///   4. Process columns in blocks using U submatrices
+///
+/// The upper Cholesky factor U encodes the conditional/Schur-complement
+/// structure: U[i,i] is the correct denominator for the OBQ update at
+/// column i, and U[i, j>i] gives the correct propagation coefficients.
 fn gptq_quantize_weight(
     w: &[f32],
     out_features: usize,
@@ -200,7 +210,13 @@ fn gptq_quantize_weight(
     // 2. Cholesky decompose H → L (H = L · Lᵀ).
     let l = cholesky_decompose(&h, in_features)?;
 
-    // 3. Pre-compute per-group scales and zero_points from the ORIGINAL
+    // 3. Compute U = upper Cholesky factor of H⁻¹ (H⁻¹ = Uᵀ U).
+    //    This is the matrix used in the reference GPTQ implementation.
+    //    U[i,i] gives the correct conditional denominator for column i,
+    //    and U[i,j] for j>i gives the correct propagation coefficients.
+    let u = cholesky_inverse_factor(&l, in_features)?;
+
+    // 4. Pre-compute per-group scales and zero_points from the ORIGINAL
     //    weights. The quantization grid is fixed; error compensation only
     //    adjusts which grid point each value maps to.
     let n_groups = in_features.div_ceil(group_size);
@@ -233,7 +249,7 @@ fn gptq_quantize_weight(
         }
     }
 
-    // 4. Working copy of W for in-place error compensation.
+    // 5. Working copy of W for in-place error compensation.
     let mut w_mut = w.to_vec();
 
     let mut q_out = vec![0u8; out_features * in_features];
@@ -241,16 +257,15 @@ fn gptq_quantize_weight(
     // Per-row error buffer for inter-block propagation.
     let mut err_buf = vec![vec![0.0f32; block_size]; out_features];
 
-    // 5. Process columns in blocks.
+    // 6. Process columns in blocks using U submatrices.
+    //    Within each block [col, col_end), use U_block = U[col:col_end, col:col_end].
+    //    U_block[i,i] is the correct conditional denominator.
+    //    U_block[i, j>i] gives the correct intra-block propagation coefficients.
+    //    U[col:col_end, col_end:] gives the inter-block propagation coefficients.
     let mut col = 0;
     while col < in_features {
         let col_end = (col + block_size).min(in_features);
         let bsize = col_end - col;
-
-        // Pre-compute H⁻¹ rows for columns in this block.
-        let h_inv_rows: Vec<Vec<f32>> = (col..col_end)
-            .map(|c| cholesky_inverse_row(&l, in_features, c))
-            .collect::<Result<Vec<_>>>()?;
 
         // Reset error buffer for this block.
         for row_buf in err_buf.iter_mut() {
@@ -261,7 +276,8 @@ fn gptq_quantize_weight(
 
         for j in col..col_end {
             let j_local = j - col;
-            let h_inv_jj = h_inv_rows[j_local][j];
+            // Diagonal of U subblock: U[j, j].
+            let u_jj = u[j * in_features + j];
             let group_idx = j / group_size;
 
             // Quantize column j for every output row.
@@ -277,23 +293,24 @@ fn gptq_quantize_weight(
                 // Dequantize.
                 let w_hat = (q_val - zp) * scale;
 
-                // Scaled error for this column.
-                let err = if h_inv_jj.abs() > 1e-10 {
-                    (w_val - w_hat) / h_inv_jj
+                // Scaled error: divide by U[j,j] (conditional std dev).
+                let err = if u_jj.abs() > 1e-10 {
+                    (w_val - w_hat) / u_jj
                 } else {
                     0.0
                 };
                 err_buf[row][j_local] = err;
 
-                // Propagate error to remaining columns within this block.
+                // Propagate error to remaining columns within this block
+                // using U[j, k] (intra-block coefficients from Cholesky factor).
                 for k in (j + 1)..col_end {
-                    w_mut[row * in_features + k] -= err * h_inv_rows[j_local][k];
+                    w_mut[row * in_features + k] -= err * u[j * in_features + k];
                 }
             }
         }
 
         // Inter-block lazy update: propagate this block's errors to all
-        // columns beyond col_end.
+        // columns beyond col_end using U[j, k] for k >= col_end.
         if col_end < in_features {
             for row in 0..out_features {
                 for j_local in 0..bsize {
@@ -301,9 +318,9 @@ fn gptq_quantize_weight(
                     if err.abs() < 1e-15 {
                         continue;
                     }
-                    let h_row = &h_inv_rows[j_local];
+                    let j = col + j_local;
                     for k in col_end..in_features {
-                        w_mut[row * in_features + k] -= err * h_row[k];
+                        w_mut[row * in_features + k] -= err * u[j * in_features + k];
                     }
                 }
             }
@@ -560,14 +577,15 @@ mod tests {
             128, // block_size > in_features → single block
             group_size,
             qmax,
-        );
+        )
+        .unwrap();
 
         let minmax_result = minmax_quantize(&w, out_features, in_features, group_size, qmax);
 
         // With identity Hessian, GPTQ quantized values should match min/max.
         // Note: dampening=0 with finalize_hessian(sample_count=2) gives
-        //   H = (2/2)*I = I, and H_inv = I.
-        // So H_inv[j,j]=1 and H_inv[j,k]=0 for k!=j → no error propagation.
+        //   H = (2/2)*I = I, and H_inv = I, cholesky(H_inv) = I.
+        // So U[j,j]=1 and U[j,k]=0 for k!=j → no error propagation.
         assert_eq!(
             gptq_result.quantized, minmax_result.quantized,
             "GPTQ with identity Hessian should match standard quantization"
@@ -621,7 +639,7 @@ mod tests {
 
         // Finalize a copy of xtx to get the actual H used in error comparison.
         let mut h_for_eval = xtx.clone();
-        finalize_hessian(&mut h_for_eval, in_features, 2, 0.01);
+        finalize_hessian(&mut h_for_eval, in_features, 2, 0.01).unwrap();
 
         let gptq_result = gptq_quantize_weight(
             &w,
@@ -633,7 +651,8 @@ mod tests {
             8,
             group_size,
             qmax,
-        );
+        )
+        .unwrap();
 
         let minmax_result = minmax_quantize(&w, out_features, in_features, group_size, qmax);
 
@@ -700,7 +719,8 @@ mod tests {
             128,
             group_size,
             qmax,
-        );
+        )
+        .unwrap();
 
         let minmax_result = minmax_quantize(&w, out_features, in_features, group_size, qmax);
 
@@ -834,7 +854,8 @@ mod tests {
             128,
             group_size,
             qmax,
-        );
+        )
+        .unwrap();
 
         // All quantized values should be in [0, 255].
         for &q in &result.quantized {

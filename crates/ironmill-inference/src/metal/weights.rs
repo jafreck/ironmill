@@ -356,6 +356,7 @@ fn load_weight_buffer(
             bit_width,
             group_size,
             awq_scales,
+            g_idx: _,
         } => {
             // INT4/INT8 with per-group quantization: keep packed on GPU and
             // dequantize inline during matmul via fused affine kernels.

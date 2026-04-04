@@ -133,6 +133,7 @@ pub fn write_gpu_bundle(
                 scale_dtype,
                 zero_point_dtype,
                 awq_scales,
+                g_idx: _,
             } => {
                 // Per-tensor/per-channel quantization (group_size=None) is not
                 // supported in the GPU bundle format. Dequantize these tensors
@@ -477,6 +478,7 @@ mod tests {
                     bit_width: 4,
                     group_size: Some(128),
                     awq_scales: None,
+                    g_idx: None,
                 },
             },
         );

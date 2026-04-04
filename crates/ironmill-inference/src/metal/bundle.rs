@@ -158,6 +158,7 @@ impl WeightProvider for MetalBundleProvider {
                         bit_width: *bit_width,
                         group_size: Some(*group_size),
                         awq_scales,
+                        g_idx: None,
                     },
                 })
             }

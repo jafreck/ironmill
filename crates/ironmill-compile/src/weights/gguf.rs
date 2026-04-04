@@ -610,6 +610,7 @@ impl WeightProvider for GgufProvider {
                     bit_width: 4,
                     group_size: Some(32),
                     awq_scales: None,
+                    g_idx: None,
                 },
             });
         }
@@ -633,6 +634,7 @@ impl WeightProvider for GgufProvider {
                     bit_width: 8,
                     group_size: Some(32),
                     awq_scales: None,
+                    g_idx: None,
                 },
             });
         }

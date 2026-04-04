@@ -154,7 +154,7 @@ pub fn cholesky_inverse_row(l: &[f32], n: usize, row: usize) -> crate::error::Re
         x[i] = sum / l64[i * n + i];
     }
 
-    x.iter().map(|&v| v as f32).collect()
+    Ok(x.iter().map(|&v| v as f32).collect())
 }
 
 /// Compute the full inverse Hessian from the Cholesky factor.
@@ -178,6 +178,50 @@ pub fn cholesky_inverse(l: &[f32], n: usize) -> crate::error::Result<Vec<f32>> {
     for row in 0..n {
         let inv_row = cholesky_inverse_row(l, n, row)?;
         result[row * n..row * n + n].copy_from_slice(&inv_row);
+    }
+    Ok(result)
+}
+
+/// Compute the upper Cholesky factor of H⁻¹ from the lower Cholesky factor
+/// of H.
+///
+/// Given L such that H = LLᵀ, computes U (upper triangular, row-major) such
+/// that H⁻¹ = UᵀU. This is the matrix the GPTQ algorithm needs: the
+/// diagonal `U[i,i]` gives the correct conditional standard deviation for
+/// sequential column quantization, and `U[i, j]` for j > i gives the
+/// conditional regression coefficients.
+///
+/// Steps:
+///   1. Compute H⁻¹ from L via forward/backward substitution.
+///   2. Cholesky-decompose H⁻¹ → U (upper triangular).
+///
+/// # Errors
+///
+/// Returns `Err` if `l.len() != n²` or if H⁻¹ is not positive-definite.
+pub fn cholesky_inverse_factor(l: &[f32], n: usize) -> crate::error::Result<Vec<f32>> {
+    // 1. Compute the full H⁻¹.
+    let h_inv = cholesky_inverse(l, n)?;
+
+    // 2. Cholesky-decompose H⁻¹ in f64 for stability.
+    //    Compute L (lower triangular) then transpose to get U (upper triangular).
+    //    H⁻¹ = L Lᵀ = Uᵀ U where U = Lᵀ.
+    let mat = faer::Mat::<f64>::from_fn(n, n, |i, j| h_inv[i * n + j] as f64);
+
+    let cholesky = mat.cholesky(faer::Side::Lower).map_err(|e| {
+        MilError::Validation(format!(
+            "Cholesky of H⁻¹ failed: non-positive-definite minor at index {}",
+            e.non_positive_definite_minor
+        ))
+    })?;
+
+    let l_mat = cholesky.compute_l();
+
+    // U = Lᵀ (transpose to get upper triangular factor).
+    let mut result = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            result[i * n + j] = l_mat.read(j, i) as f32;
+        }
     }
     Ok(result)
 }
@@ -501,5 +545,88 @@ mod tests {
         assert!((h_inv[1] - (-0.125)).abs() < TOL, "H^-1[0,1]={}", h_inv[1]);
         assert!((h_inv[2] - (-0.125)).abs() < TOL, "H^-1[1,0]={}", h_inv[2]);
         assert!((h_inv[3] - 0.25).abs() < TOL, "H^-1[1,1]={}", h_inv[3]);
+    }
+
+    // -- cholesky_inverse_factor tests ----------------------------------------
+
+    #[test]
+    fn cholesky_inverse_factor_produces_upper_triangular() {
+        #[rustfmt::skip]
+        let h = vec![
+            4.0, 2.0, 1.0,
+            2.0, 5.0, 3.0,
+            1.0, 3.0, 6.0,
+        ];
+        let l = cholesky_decompose(&h, 3).unwrap();
+        let u = cholesky_inverse_factor(&l, 3).unwrap();
+
+        // U should be upper-triangular: lower entries are zero.
+        for i in 0..3 {
+            for j in 0..i {
+                assert!(
+                    u[i * 3 + j].abs() < TOL,
+                    "U[{i},{j}] = {} should be zero",
+                    u[i * 3 + j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cholesky_inverse_factor_reconstructs_h_inv() {
+        // Verify Uᵀ U = H⁻¹.
+        #[rustfmt::skip]
+        let h = vec![
+            4.0, 2.0, 1.0,
+            2.0, 5.0, 3.0,
+            1.0, 3.0, 6.0,
+        ];
+        let l = cholesky_decompose(&h, 3).unwrap();
+        let u = cholesky_inverse_factor(&l, 3).unwrap();
+        let h_inv = cholesky_inverse(&l, 3).unwrap();
+
+        // Compute Uᵀ U and compare with H⁻¹.
+        let ut = transpose(&u, 3);
+        let reconstructed = mat_mul(&ut, &u, 3);
+        assert_mat_approx(&reconstructed, &h_inv, 3, TOL, "Uᵀ U vs H⁻¹");
+    }
+
+    #[test]
+    fn cholesky_inverse_factor_diagonal_differs_from_h_inv() {
+        // With non-trivial off-diagonals, U[i,i] ≠ H⁻¹[i,i] for i > 0.
+        // This is the key property that makes the corrected GPTQ algorithm
+        // different from the buggy one.
+        #[rustfmt::skip]
+        let h = vec![
+            4.0, 2.0,
+            2.0, 5.0,
+        ];
+        let l = cholesky_decompose(&h, 2).unwrap();
+        let u = cholesky_inverse_factor(&l, 2).unwrap();
+        let h_inv = cholesky_inverse(&l, 2).unwrap();
+
+        // U[0,0] = sqrt(H⁻¹[0,0]) — first diagonal matches sqrt.
+        let u00 = u[0 * 2 + 0];
+        assert!(
+            (u00 - h_inv[0].sqrt()).abs() < TOL,
+            "U[0,0]={u00} should equal sqrt(H⁻¹[0,0])={}",
+            h_inv[0].sqrt()
+        );
+
+        // U[1,1] ≠ sqrt(H⁻¹[1,1]) because of the Schur complement.
+        // U[1,1] = sqrt(H⁻¹[1,1] - H⁻¹[0,1]²/H⁻¹[0,0])
+        let u11 = u[1 * 2 + 1];
+        let h_inv_11 = h_inv[3];
+        let schur = h_inv_11 - h_inv[1] * h_inv[1] / h_inv[0];
+        assert!(
+            (u11 - schur.sqrt()).abs() < TOL,
+            "U[1,1]={u11} should equal sqrt(Schur)={}",
+            schur.sqrt()
+        );
+        // Confirm they differ.
+        assert!(
+            (u11 - h_inv_11.sqrt()).abs() > 0.01,
+            "U[1,1] and sqrt(H⁻¹[1,1]) should differ for non-diagonal H"
+        );
     }
 }
