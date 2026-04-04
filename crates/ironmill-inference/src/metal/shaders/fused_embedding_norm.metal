@@ -20,6 +20,7 @@ using namespace metal;
 //   buffer(6) token_count:     uint
 //   buffer(7) vocab_size:      uint
 //   buffer(8) eps:             float
+//   buffer(9) embed_scale:     float  (sqrt(hidden_size) for Gemma, 1.0 otherwise)
 //
 // Dispatch: (token_count, 1, 1) threadgroups,
 //           (min(hidden_size, 1024), 1, 1) threads per group.
@@ -34,6 +35,7 @@ kernel void fused_embedding_norm(
     constant uint& token_count          [[buffer(6)]],
     constant uint& vocab_size           [[buffer(7)]],
     constant float& eps                 [[buffer(8)]],
+    constant float& embed_scale         [[buffer(9)]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tg_size [[threads_per_threadgroup]])
@@ -48,10 +50,10 @@ kernel void fused_embedding_norm(
     uint out_base = token_idx * hidden_size;
     bool valid = (token_id < vocab_size);
 
-    // Step 1: Load embedding row and accumulate sum-of-squares
+    // Step 1: Load embedding row, apply embed_scale, accumulate sum-of-squares
     float local_sum = 0.0f;
     for (uint i = tid; i < hidden_size; i += tg_size) {
-        float val = valid ? float(embedding_table[emb_base + i]) : 0.0f;
+        float val = valid ? float(embedding_table[emb_base + i]) * embed_scale : 0.0f;
         raw_output[out_base + i] = half(val);
         local_sum += val * val;
     }
@@ -74,7 +76,7 @@ kernel void fused_embedding_norm(
 
     // Step 3: Normalize and write
     for (uint i = tid; i < hidden_size; i += tg_size) {
-        float val = valid ? float(embedding_table[emb_base + i]) : 0.0f;
+        float val = valid ? float(embedding_table[emb_base + i]) * embed_scale : 0.0f;
         normed_output[out_base + i] = half(val * rms_inv * float(norm_weight[i]));
     }
 }

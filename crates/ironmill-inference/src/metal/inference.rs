@@ -13,7 +13,7 @@ use ironmill_metal_sys::{
     CommandBufferStatus, ComputeEncoder, MetalBuffer, MetalDevice, MpsMatrix, MpsMatrixMultiply,
     MpsMatrixMultiplyConfig, StorageMode,
 };
-use mil_rs::weights::{ModelConfig, WeightProvider};
+use mil_rs::weights::{Architecture, ModelConfig, WeightProvider};
 
 use super::config::Gemma4Config;
 use super::config::MetalConfig;
@@ -949,6 +949,12 @@ impl MetalInference {
         // Step 0: Fused embedding lookup + first-layer RMSNorm.
         // Writes both hidden_state (raw embedding for residual) and
         // norm_out (normalized for first layer's projections).
+        // Gemma models scale embeddings by sqrt(hidden_size).
+        let embed_scale: f32 = if mc.architecture == Architecture::Gemma {
+            (h as f32).sqrt()
+        } else {
+            1.0
+        };
         {
             let lw0 = &weights.layers[0];
             let pipelines = self.pipelines()?;
@@ -962,6 +968,7 @@ impl MetalInference {
             enc.set_bytes(&(token_count as u32).to_le_bytes(), 6);
             enc.set_bytes(&(vocab as u32).to_le_bytes(), 7);
             enc.set_bytes(&eps.to_le_bytes(), 8);
+            enc.set_bytes(&embed_scale.to_le_bytes(), 9);
             let tg_size = h.min(1024);
             enc.dispatch_threadgroups((token_count, 1, 1), (tg_size, 1, 1));
         }
@@ -1712,6 +1719,12 @@ impl MetalInference {
         let mut readback_time_ms = 0.0f64;
 
         // ── Phase 0: Embedding lookup ───────────────────────────
+        // Gemma models scale embeddings by sqrt(hidden_size).
+        let embed_scale: f32 = if mc.architecture == Architecture::Gemma {
+            (h as f32).sqrt()
+        } else {
+            1.0
+        };
         let cmd_buf = self
             .queue
             .command_buffer()
@@ -1732,6 +1745,25 @@ impl MetalInference {
                     vocab_size: vocab as u32,
                 },
             );
+            // Gemma embedding scaling: multiply hidden_state by sqrt(hidden_size).
+            if embed_scale != 1.0 {
+                enc.memory_barrier_buffers();
+                let scale_half = f16::from_f32(embed_scale);
+                let scale_buf = self
+                    .device
+                    .create_buffer(2, StorageMode::Shared)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                scale_buf
+                    .write_bytes(&scale_half.to_le_bytes(), 0)
+                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                ops::encode_scale_buffer(
+                    &enc,
+                    &self.pipelines()?.scale_buffer,
+                    &bufs.hidden_state,
+                    &scale_buf,
+                    (token_count * h) as u32,
+                );
+            }
             enc.end_encoding();
         }
 
