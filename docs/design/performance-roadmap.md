@@ -70,10 +70,13 @@ Min-p sampling is the SOTA replacement for top-p (nucleus) sampling. Instead of 
 
 Full sampler chain (matching llama.cpp's `llama_sampler`):
 1. Repetition/frequency/presence penalty
-2. Temperature scaling
-3. Min-p filtering (replaces top-p as default)
-4. Top-k filtering (optional, compositional with min-p)
-5. Categorical sampling from filtered distribution
+2. Top-k filtering (optional)
+3. Top-p (nucleus) filtering (optional, retained for backward compatibility)
+4. Min-p filtering (replaces top-p as default)
+5. Temperature scaling
+6. Categorical sampling from filtered distribution
+
+Truncation filters (top-k, top-p, min-p) operate on the raw logit distribution before temperature scaling. This prevents temperature from inflating low-probability tokens past the min-p threshold.
 
 All of this is CPU-side logit post-processing — no kernel changes needed.
 

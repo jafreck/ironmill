@@ -107,7 +107,7 @@ crates/ironmill-inference/src/metal/shaders/draft_head.metal  — draft head mat
 ```
 crates/ironmill-inference/src/engine.rs            — add speculative_decode() to InferenceEngine trait
 crates/ironmill-inference/src/metal/inference.rs   — implement speculative_decode(), KV cache rollback
-crates/ironmill-inference/src/metal/turboquant/cache.rs — add rollback(to_pos: usize) method
+crates/ironmill-inference/src/metal/turboquant/cache.rs — use truncate_to(pos) from Task 5 for KV cache rollback
 crates/ironmill-inference/src/lib.rs               — re-export speculative module
 ```
 
@@ -150,14 +150,25 @@ pub struct DraftCandidate {
 }
 ```
 
-### Verification loop
+### Verification loop (Leviathan et al. rejection sampling)
 
 1. Draft head produces tree of K candidates from fused target-model features.
 2. Pack candidate token IDs into a batch and prefill through the target model.
-3. Compare target model probabilities with draft probabilities at each tree node.
-4. Accept the longest prefix where target prob ≥ draft prob (standard rejection sampling).
-5. Rollback KV cache to the last accepted position.
-6. Append the first rejected token (sampled from target) as the correction token.
+3. For each draft token `x_i` along the best tree path, compare target model
+   probability `p_target(x_i)` with draft probability `p_draft(x_i)`:
+   - Sample `u ~ Uniform(0, 1)`.
+   - **Accept** if `u < p_target(x_i) / p_draft(x_i)` (i.e., with probability
+     `min(1, p_target(x_i) / p_draft(x_i))`).
+   - **Reject** otherwise — discard `x_i` and all subsequent draft tokens.
+4. Sample a **correction token** from the adjusted distribution:
+   - If rejected at position `i`: sample from
+     `normalize(max(0, p_target(x) - p_draft(x)))` for all tokens `x`.
+   - If all K tokens accepted: sample a bonus token from `p_target` directly.
+5. Rollback KV cache (via `truncate_to()` from Task 5) to the last accepted
+   position + 1 (the correction token position).
+
+This stochastic acceptance preserves the target model's output distribution
+exactly, guaranteeing mathematically lossless speculation.
 
 ### Acceptance criteria
 
@@ -227,7 +238,7 @@ impl Sampler {
     pub fn new(config: SamplerConfig) -> Self;
 
     /// Apply the full sampler chain to logits and return a sampled token ID.
-    /// Chain order: repetition penalty → temperature → min-p → top-k → sample.
+    /// Chain order: repetition penalty → top-k → top-p → min-p → temperature → sample.
     pub fn sample(&mut self, logits: &mut [f32]) -> u32;
 
     /// Reset token history (e.g., on conversation clear).
@@ -235,17 +246,25 @@ impl Sampler {
 }
 ```
 
-### Sampler chain (applied in order)
+### Sampler chain (applied in order, matching llama.cpp default)
 
 1. **Repetition/frequency/presence penalty** — scan `recent_tokens` window,
    apply multiplicative penalty for repeat, additive for frequency/presence.
-2. **Temperature scaling** — divide logits by temperature. If temperature ≤ 0,
-   short-circuit to argmax.
-3. **Min-p filtering** — compute `threshold = min_p × max(softmax(logits))`,
+2. **Top-k filtering** — if enabled, keep only top-k logits by value.
+3. **Top-p (nucleus) filtering** — if enabled, sort logits descending, compute
+   cumulative softmax probabilities, keep the smallest set of tokens whose
+   cumulative probability exceeds `top_p`.
+4. **Min-p filtering** — compute `threshold = min_p × max(softmax(logits))`,
    zero out all tokens with `softmax(logit) < threshold`.
-4. **Top-k filtering** — if enabled, keep only top-k logits by value.
-5. **Categorical sampling** — softmax the surviving logits, sample from the
+5. **Temperature scaling** — divide logits by temperature. If temperature ≤ 0,
+   short-circuit to argmax.
+6. **Categorical sampling** — softmax the surviving logits, sample from the
    resulting distribution.
+
+Note: this order matches llama.cpp's default sampler chain, where truncation
+filters (top-k, top-p, min-p) operate on the raw logit distribution before
+temperature scaling. This prevents temperature from inflating low-probability
+tokens past the min-p threshold.
 
 ### Acceptance criteria
 
@@ -442,7 +461,7 @@ generation.
 crates/ironmill-inference/src/metal/inference.rs   — clamp attention mask, select SWA layers
 crates/ironmill-inference/src/metal/shaders/fused_sdpa.metal — add window_size uniform, clamp KV range
 crates/ironmill-inference/src/metal/turboquant/cache.rs — ring buffer write logic
-crates/mil-rs/src/weights.rs                       — parse sliding_window and max_window_layers from config
+crates/ironmill-compile/src/weights/safetensors.rs    — parse sliding_window and max_window_layers from HuggingFace config
 crates/ironmill-inference/src/metal/config.rs      — add sliding_window field
 ```
 
@@ -535,18 +554,34 @@ pub trait BatchInferenceEngine: InferenceEngine {
 }
 
 /// Contiguous sub-allocator for KV cache memory.
+/// Inspired by vAttention (Patel et al. 2024), adapted for Metal where
+/// OS-level virtual memory demand paging (CUDA VMM) is unavailable.
 /// Allocates contiguous slabs from a pre-allocated Metal buffer.
 /// No page tables — attention kernels see flat contiguous memory.
 pub struct KvPool {
     backing_buffer: MetalBuffer,
     allocations: BTreeMap<SequenceId, KvAllocation>,
-    free_list: Vec<(usize, usize)>,  // (offset, length)
+    free_list: Vec<(usize, usize)>,  // (offset, length) sorted by offset
 }
 
 pub struct KvAllocation {
     offset: usize,
-    capacity: usize,  // max tokens
+    capacity: usize,  // max tokens (grows via reallocation)
     used: usize,      // current tokens
+}
+
+impl KvPool {
+    /// Grow a sequence's allocation when it exceeds capacity.
+    /// Strategy: attempt to extend in-place if adjacent free space exists.
+    /// Otherwise, allocate a new larger slab (2× capacity), copy KV data,
+    /// and free the old slab.
+    pub fn grow(&mut self, id: SequenceId) -> Result<()>;
+
+    /// Defragment: compact live allocations toward the start of the
+    /// backing buffer, coalescing free regions. Called when allocation
+    /// fails despite sufficient total free memory. Requires GPU copies
+    /// for relocated slabs.
+    pub fn defragment(&mut self, encoder: &ComputeEncoder) -> Result<()>;
 }
 ```
 
@@ -619,7 +654,7 @@ None.
 ## Task 9 — Multi-Head Latent Attention (MLA) support
 
 **Goal:** Support DeepSeek-V2/V3's MLA architecture, storing compressed latent
-KV cache and up-projecting on-the-fly during attention.
+KV cache and using weight absorption to eliminate runtime up-projection.
 
 ### Files to create
 
@@ -627,34 +662,34 @@ KV cache and up-projecting on-the-fly during attention.
 crates/ironmill-inference/src/metal/mla/
 ├── mod.rs          — MLA engine integration
 ├── cache.rs        — latent KV cache (compressed)
-└── projection.rs   — up/down projection helpers
-
-crates/ironmill-inference/src/metal/shaders/mla_attention.metal  — MLA-aware attention kernel
+└── absorption.rs   — weight absorption (fuse W_uk into W_q, W_uv into W_o)
 ```
 
 ### Files to modify
 
 ```
-crates/ironmill-inference/src/metal/inference.rs — detect MLA config, use MLA attention path
-crates/mil-rs/src/weights.rs                    — parse MLA config fields (latent_dim, etc.)
+crates/ironmill-inference/src/metal/inference.rs — detect MLA config, use absorbed attention path
+crates/ironmill-compile/src/weights/safetensors.rs — parse MLA config fields (latent_dim, etc.)
 ```
 
 ### Key types
 
 ```rust
 pub struct MlaConfig {
-    pub kv_latent_dim: usize,      // compressed latent dimension (e.g., 512)
-    pub q_latent_dim: usize,       // query latent dimension
+    pub kv_latent_dim: usize,       // compressed KV latent dimension (e.g., 512)
+    pub q_latent_dim: usize,        // query latent dimension
     pub num_heads: usize,
-    pub head_dim: usize,
-    pub rope_head_dim: usize,      // RoPE-applied portion of head_dim
+    pub qk_nope_head_dim: usize,    // non-RoPE portion of Q/K head dimension
+    pub qk_rope_head_dim: usize,    // RoPE-applied portion of Q/K head dimension
+    pub v_head_dim: usize,          // per-head value dimension (may differ from qk dims)
 }
 
 /// Compressed KV cache storing latents instead of full K/V.
+/// MLA stores a single joint KV latent (not separate K and V) plus RoPE keys.
 pub struct MlaKvCache {
-    /// Per-layer latent buffers: [max_seq_len × kv_latent_dim]
+    /// Per-layer joint KV latent buffers: [max_seq_len × kv_latent_dim]
     latent_caches: Vec<MetalBuffer>,
-    /// Per-layer RoPE key buffers: [max_seq_len × rope_head_dim]
+    /// Per-layer RoPE key buffers: [max_seq_len × qk_rope_head_dim]
     rope_k_caches: Vec<MetalBuffer>,
     seq_pos: usize,
     max_seq_len: usize,
@@ -663,19 +698,27 @@ pub struct MlaKvCache {
 
 ### Implementation notes
 
-- **Down-projection**: after computing K, V in each layer, project to latent
-  space via learned matrix `W_dkv` and store the latent.
-- **Up-projection**: during attention, project the latent back to full K, V
-  via `W_uk`, `W_uv`. With matrix absorption, these projections can be fused
-  into the Q and O projections, eliminating runtime up-projection entirely.
-- **RoPE split**: MLA splits the key into a latent-compressed part and a
-  RoPE-applied part. Only the RoPE part is stored separately.
+- **Weight absorption** (required for efficient inference): at model load time,
+  fuse the KV up-projection matrices into the Q and O weight matrices:
+  - `W_q_absorbed = W_q · W_uk^T` — query projection absorbs K up-projection.
+  - `W_o_absorbed = W_uv · W_o` — output projection absorbs V up-projection.
+  This eliminates runtime up-projection entirely. Attention operates directly
+  on the compressed latent using absorbed weights.
+- **Down-projection**: after computing the hidden state in each layer, project
+  to latent space via learned matrix `W_dkv` and store the latent.
+- **RoPE split**: MLA splits the key into a latent-compressed part (handled via
+  absorption) and a RoPE-applied part. Only the RoPE part is stored separately
+  and must be concatenated with the absorbed-Q dot latent during attention.
+- **No separate MLA attention kernel**: with absorption, standard attention
+  kernels (fused SDPA from Task 1) work directly on the absorbed Q and latent
+  K/V. The only kernel change is handling the RoPE key concatenation.
 
 ### Acceptance criteria
 
 - DeepSeek-V2-Lite (or similar small MLA model) runs end-to-end.
-- KV cache memory is `num_layers × max_seq × (kv_latent_dim + rope_head_dim) × 2`
-  instead of `num_layers × max_seq × num_heads × head_dim × 2`.
+- KV cache memory per token is `(kv_latent_dim + qk_rope_head_dim) × 2 bytes`
+  (one joint KV latent + RoPE key, in half precision) instead of
+  `num_heads × head_dim × 2 × 2 bytes` (separate full K and V per head).
 - PPL matches the HuggingFace reference for the same model.
 - Non-MLA models are unaffected.
 - `cargo test -p ironmill-inference -- mla` passes.
@@ -707,11 +750,16 @@ crates/ironmill-inference/src/speculative/mod.rs — integrate streaming path
 
 ### Implementation notes
 
-- Requires model architecture support: the model must have been trained with
-  multi-stream attention heads (extra output heads that predict tokens at
-  positions +2, +3, ..., +K).
-- The inference engine detects streaming heads in the model config and dispatches
-  them alongside the primary head.
+- Requires a model that has been **fine-tuned with multi-stream attention (MSA)**
+  (Bhendawade et al. 2024, arXiv:2402.11131). Standard attention layers are
+  replaced with MSA layers during training, using an n-gram prediction objective
+  that teaches the model to predict tokens at positions +2, +3, ..., +K
+  alongside the standard next-token prediction.
+- This is a **fundamental architecture change**, not a plug-in feature — models
+  must be specifically trained or fine-tuned with the MSA objective. A matching
+  MSA-trained checkpoint is required.
+- The inference engine detects MSA-trained heads in the model weights (additional
+  projection matrices per MSA layer) and dispatches them alongside the primary head.
 - Verification is implicit: the primary head's output at position N+1 confirms
   or rejects the speculative token produced at position N.
 
@@ -745,7 +793,7 @@ crates/ironmill-inference/src/metal/ops.rs       — add matvec pipeline variant
 ### Files to create (optional MLX path)
 
 ```
-crates/ironmill-inference/src/mlx/scheduler.rs — MLX-based ANE/GPU phase routing
+crates/ironmill-inference/src/mlx/scheduler.rs — MLX-based ANE/GPU phase routing (mlx/ dir already exists)
 ```
 
 ### Implementation notes
@@ -963,13 +1011,12 @@ of QuIP# quality.
 
 ```
 crates/mil-rs/src/ir/passes/quip_sharp/mod.rs       — add LDLQ rounding path that accepts per-layer Hessian
-crates/mil-rs/src/ir/pipeline.rs                    — add quip_sharp to KNOWN_PASSES / pass_from_name()
+crates/mil-rs/src/ir/pipeline.rs                    — add quip_sharp to KNOWN_PASSES array and pass_from_name()
 crates/ironmill-cli/src/main.rs                     — add --quip-sharp CLI flag; require --calibration-data
 crates/ironmill-compile/src/convert/pipeline.rs     — add quip_sharp to TOML pipeline stage
 crates/ironmill-compile/src/gpu/bundle.rs           — write QuIP# bundle metadata (method: "quip_sharp", seed)
 crates/ironmill-core/src/gpu/bundle.rs              — add quip_sharp_seed field to LutToDense manifest
-crates/ironmill-inference/src/metal/bundle.rs       — read quip_sharp_seed from bundle manifest
-crates/ironmill-inference/src/metal/dequant.rs      — dispatch to QuIP# dequant when quip_sharp_seed is present
+crates/ironmill-inference/src/metal/dequant.rs      — read quip_sharp_seed from manifest; dispatch to QuIP# dequant
 crates/ironmill-inference/src/metal/ops.rs          — add pipeline for quip_sharp_matvec / quip_sharp_matmul
 crates/ironmill-inference/src/metal/inference.rs    — select QuIP# kernel for QuIP#-quantized layers
 crates/ironmill-compile/src/weights/mil_provider.rs — read quip_sharp_seed from mil model metadata
@@ -1160,6 +1207,8 @@ Task 1 (Fused SDPA) ──→ Task 11  Prefill/decode phase separation
 
 Task 5 (KV reuse)  ──→ Task 4   RadixAttention prompt caching
                    └──→ Task 2   EAGLE-3 speculative decoding (also needs Task 3)
+
+Task 3 (Min-p)     ──→ Task 2   EAGLE-3 speculative decoding (also needs Task 5)
 
 Task 2 (EAGLE-3)   ──→ Task 10  Speculative Streaming
                    └──→ Task 13  TurboSpec adaptive speculation
