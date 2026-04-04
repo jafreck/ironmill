@@ -1053,6 +1053,18 @@ impl MetalInference {
                 .cla_config
                 .as_ref()
                 .is_none_or(|cla| cla.is_anchor(layer_idx));
+
+            // Gemma 4 KV shared layers: shared layers skip KV writes and
+            // read from their anchor layer's cache instead.
+            let (is_anchor, kv_cache_layer) = if let Some(ref g4) = self.gemma4_config {
+                if let Some(anchor) = g4.layer_configs[layer_idx].kv_anchor {
+                    (false, anchor)
+                } else {
+                    (is_anchor, layer_idx)
+                }
+            } else {
+                (is_anchor, layer_idx)
+            };
             encode_kv_cache_and_attention(
                 &enc,
                 pipelines,
@@ -1062,7 +1074,7 @@ impl MetalInference {
                 self.fp16_kv_cache.as_ref(),
                 self.config.max_seq_len,
                 self.config.n_bits as usize,
-                layer_idx,
+                kv_cache_layer,
                 seq_pos,
                 token_count,
                 nh,
@@ -1564,6 +1576,18 @@ impl MetalInference {
                 .cla_config
                 .as_ref()
                 .is_none_or(|cla| cla.is_anchor(layer_idx));
+
+            // Gemma 4 KV shared layers: shared layers skip KV writes and
+            // read from their anchor layer's cache instead.
+            let (is_anchor, kv_cache_layer) = if let Some(ref g4) = self.gemma4_config {
+                if let Some(anchor) = g4.layer_configs[layer_idx].kv_anchor {
+                    (false, anchor)
+                } else {
+                    (is_anchor, layer_idx)
+                }
+            } else {
+                (is_anchor, layer_idx)
+            };
             encode_kv_cache_and_attention(
                 &enc,
                 pipelines,
@@ -1573,7 +1597,7 @@ impl MetalInference {
                 self.fp16_kv_cache.as_ref(),
                 self.config.max_seq_len,
                 self.config.n_bits as usize,
-                layer_idx,
+                kv_cache_layer,
                 seq_pos,
                 token_count,
                 nh,
