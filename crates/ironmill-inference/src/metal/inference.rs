@@ -214,6 +214,16 @@ struct IntermediateBuffers {
     /// PLE scratch buffer for gate/projection intermediates `[token_count, ple_hidden_size]`.
     /// Reused across layers. None when the model has no PLE.
     ple_scratch: Option<MetalBuffer>,
+    /// MoE router logits buffer `[token_count, num_experts]`. None when no MoE.
+    moe_router_logits: Option<MetalBuffer>,
+    /// MoE expert FFN gate scratch `[token_count, moe_intermediate_size]`. None when no MoE.
+    moe_expert_gate: Option<MetalBuffer>,
+    /// MoE expert FFN up scratch `[token_count, moe_intermediate_size]`. None when no MoE.
+    moe_expert_up: Option<MetalBuffer>,
+    /// MoE expert output accumulator `[num_experts, token_count, hidden_size]`. None when no MoE.
+    moe_expert_outputs: Option<MetalBuffer>,
+    /// MoE combined output `[token_count, hidden_size]`. None when no MoE.
+    moe_combined: Option<MetalBuffer>,
     /// Current maximum token capacity of these buffers.
     capacity: usize,
 }
@@ -267,6 +277,44 @@ impl IntermediateBuffers {
             None
         };
 
+        let num_experts = mc
+            .extra
+            .get("num_experts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let moe_inter = mc
+            .extra
+            .get("moe_intermediate_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let has_moe = num_experts > 0 && moe_inter > 0;
+
+        let moe_router_logits = if has_moe {
+            Some(alloc_private(max_tokens * num_experts)?)
+        } else {
+            None
+        };
+        let moe_expert_gate = if has_moe {
+            Some(alloc_private(max_tokens * moe_inter)?)
+        } else {
+            None
+        };
+        let moe_expert_up = if has_moe {
+            Some(alloc_private(max_tokens * moe_inter)?)
+        } else {
+            None
+        };
+        let moe_expert_outputs = if has_moe {
+            Some(alloc_private(num_experts * max_tokens * h)?)
+        } else {
+            None
+        };
+        let moe_combined = if has_moe {
+            Some(alloc_private(max_tokens * h)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             hidden_state: alloc_private(max_tokens * h)?,
             attn_out: alloc_private(max_tokens * nh * hd)?,
@@ -287,6 +335,11 @@ impl IntermediateBuffers {
                 .map_err(MetalError::Metal)?,
             ple_per_layer_input,
             ple_scratch,
+            moe_router_logits,
+            moe_expert_gate,
+            moe_expert_up,
+            moe_expert_outputs,
+            moe_combined,
             capacity: max_tokens,
         })
     }
@@ -457,13 +510,6 @@ impl MetalInference {
         self.model_config = Some(mc.clone());
         self.model_info = Some(ModelInfo::from_config(&mc));
         self.gemma4_config = Gemma4Config::from_model_config(&mc);
-
-        if let Some(ref g4) = self.gemma4_config {
-            if g4.num_experts > 0 {
-                // MoE expert weights are loaded into the IR but GPU dispatch
-                // is not yet implemented. The model will run without MoE contribution.
-            }
-        }
 
         // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
         self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);
@@ -1342,20 +1388,21 @@ impl MetalInference {
             }
 
             // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
-            // with MoE expert outputs. Currently a no-op placeholder — MoE dispatch
-            // requires new Metal kernels for router softmax + expert combine.
+            // with MoE expert outputs via router → expert FFNs → weighted combine.
             if let Some(ref g4) = self.gemma4_config {
                 let lc = &g4.layer_configs[layer_idx];
-                if lc.enable_moe && g4.num_experts > 0 {
-                    // TODO: Implement MoE inference dispatch:
-                    // 1. Router: linear(hidden → num_experts) + softmax
-                    // 2. Dense eval: run all expert FFNs (gate+up+gelu+down each)
-                    // 3. Weighted combine: top-k selection + weighted sum
-                    // 4. Add to dense MLP output
-                    //
-                    // For now, the dense MLP output alone is used. MoE experts
-                    // are compiled into the IR but not dispatched at inference.
-                    // This produces correct structure but missing MoE contribution.
+                if lc.enable_moe && g4.num_experts > 0 && !lw.expert_gate_projs.is_empty() {
+                    encode_moe_block(
+                        &enc,
+                        pipelines,
+                        bufs,
+                        lw,
+                        h,
+                        g4.moe_intermediate_size,
+                        token_count,
+                        g4.num_experts,
+                        g4.top_k_experts,
+                    )?;
                 }
             }
 
@@ -2230,20 +2277,21 @@ impl MetalInference {
             }
 
             // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
-            // with MoE expert outputs. Currently a no-op placeholder — MoE dispatch
-            // requires new Metal kernels for router softmax + expert combine.
+            // with MoE expert outputs via router → expert FFNs → weighted combine.
             if let Some(ref g4) = self.gemma4_config {
                 let lc = &g4.layer_configs[layer_idx];
-                if lc.enable_moe && g4.num_experts > 0 {
-                    // TODO: Implement MoE inference dispatch:
-                    // 1. Router: linear(hidden → num_experts) + softmax
-                    // 2. Dense eval: run all expert FFNs (gate+up+gelu+down each)
-                    // 3. Weighted combine: top-k selection + weighted sum
-                    // 4. Add to dense MLP output
-                    //
-                    // For now, the dense MLP output alone is used. MoE experts
-                    // are compiled into the IR but not dispatched at inference.
-                    // This produces correct structure but missing MoE contribution.
+                if lc.enable_moe && g4.num_experts > 0 && !lw.expert_gate_projs.is_empty() {
+                    encode_moe_block(
+                        &enc,
+                        pipelines,
+                        bufs,
+                        lw,
+                        h,
+                        g4.moe_intermediate_size,
+                        token_count,
+                        g4.num_experts,
+                        g4.top_k_experts,
+                    )?;
                 }
             }
 
@@ -3525,6 +3573,203 @@ fn encode_ffn_block(
     Ok(())
 }
 
+/// Encode MoE (Mixture of Experts) dispatch: router → expert FFNs → weighted combine.
+///
+/// Dense evaluation: all experts are run and top-k selection + weighted sum is
+/// applied afterward. The MoE output is written to `bufs.moe_combined` and then
+/// added to `bufs.ffn_down` (the dense MLP output).
+fn encode_moe_block(
+    enc: &ComputeEncoder,
+    pipelines: &super::ops::MetalPipelines,
+    bufs: &IntermediateBuffers,
+    lw: &LayerWeights,
+    h: usize,
+    moe_inter: usize,
+    token_count: usize,
+    num_experts: usize,
+    top_k: usize,
+) -> Result<(), InferenceError> {
+    let router_weight = lw
+        .router_weight
+        .as_ref()
+        .ok_or_else(|| InferenceError::Runtime("MoE layer missing router weight".to_string()))?;
+    let router_logits = bufs
+        .moe_router_logits
+        .as_ref()
+        .ok_or_else(|| InferenceError::Runtime("MoE buffers not allocated".to_string()))?;
+    let expert_gate_buf = bufs.moe_expert_gate.as_ref().unwrap();
+    let expert_up_buf = bufs.moe_expert_up.as_ref().unwrap();
+    let expert_outputs = bufs.moe_expert_outputs.as_ref().unwrap();
+    let moe_combined = bufs.moe_combined.as_ref().unwrap();
+
+    let row_bytes_h = h * 2;
+    let row_bytes_moe_inter = moe_inter * 2;
+
+    // 1. Router: linear(norm_out → router_logits) [hidden_size → num_experts]
+    let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
+        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+    encode_projection(
+        enc,
+        &bufs.norm_out,
+        &norm_mat,
+        router_weight,
+        router_logits,
+        &ProjectionMatmul::Quantized,
+        pipelines,
+        token_count,
+        num_experts,
+        h,
+        row_bytes_h,
+        num_experts * 2,
+    )?;
+    enc.memory_barrier_buffers();
+
+    // 2. Softmax over router logits [token_count, num_experts]
+    ops::encode_moe_softmax(
+        enc,
+        &pipelines.moe_softmax,
+        router_logits,
+        num_experts as u32,
+        token_count as u32,
+    );
+    enc.memory_barrier_buffers();
+
+    // 3. Dense eval: run all expert FFNs
+    let expert_slice_size = token_count * h;
+    for e in 0..num_experts {
+        let e_gate = &lw.expert_gate_projs[e];
+        let e_up = &lw.expert_up_projs[e];
+        let e_down = &lw.expert_down_projs[e];
+
+        // Gate projection: norm_out → expert_gate_buf [hidden → moe_inter]
+        encode_projection(
+            enc,
+            &bufs.norm_out,
+            &norm_mat,
+            e_gate,
+            expert_gate_buf,
+            &ProjectionMatmul::Quantized,
+            pipelines,
+            token_count,
+            moe_inter,
+            h,
+            row_bytes_h,
+            row_bytes_moe_inter,
+        )?;
+
+        // Up projection: norm_out → expert_up_buf [hidden → moe_inter]
+        encode_projection(
+            enc,
+            &bufs.norm_out,
+            &norm_mat,
+            e_up,
+            expert_up_buf,
+            &ProjectionMatmul::Quantized,
+            pipelines,
+            token_count,
+            moe_inter,
+            h,
+            row_bytes_h,
+            row_bytes_moe_inter,
+        )?;
+        enc.memory_barrier_buffers();
+
+        // GELU activation on gate (in-place)
+        ops::encode_moe_gelu(
+            enc,
+            &pipelines.moe_gelu,
+            expert_gate_buf,
+            (token_count * moe_inter) as u32,
+        );
+        enc.memory_barrier_buffers();
+
+        // Element-wise multiply: gate *= up (in-place on gate)
+        ops::encode_moe_mul(
+            enc,
+            &pipelines.moe_mul,
+            expert_gate_buf,
+            expert_up_buf,
+            (token_count * moe_inter) as u32,
+        );
+        enc.memory_barrier_buffers();
+
+        // Down projection: expert_gate_buf → expert_outputs[e] [moe_inter → hidden]
+        // We write to the slice expert_outputs[e * token_count * h ..]
+        // Since encode_projection writes to the start of the output buffer,
+        // we need to use moe_combined as a temp and then copy.
+        let gate_mat =
+            MpsMatrix::from_buffer(expert_gate_buf, token_count, moe_inter, row_bytes_moe_inter)
+                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        encode_projection(
+            enc,
+            expert_gate_buf,
+            &gate_mat,
+            e_down,
+            moe_combined,
+            &ProjectionMatmul::Quantized,
+            pipelines,
+            token_count,
+            h,
+            moe_inter,
+            row_bytes_moe_inter,
+            row_bytes_h,
+        )?;
+        enc.memory_barrier_buffers();
+
+        // Copy moe_combined → expert_outputs at offset [e * token_count * h]
+        // We use a blit-style copy via the copy_buffer kernel with offset.
+        // Since our copy_buffer kernel doesn't support offsets, we'll use
+        // encode_residual_add with a zero-initialized approach. Instead,
+        // let's write directly using the Metal blit encoder... but we only
+        // have a compute encoder here.
+        //
+        // Alternative: use expert_outputs at offset e*slice as the output
+        // of the down projection directly. MetalBuffer doesn't support
+        // sub-buffer slicing in our API, so we copy.
+        //
+        // For correctness, copy element by element via the existing
+        // copy_buffer kernel. The expert_outputs buffer is laid out as
+        // [num_experts × token_count × hidden_size] and we write to
+        // the e-th slice.
+        enc.set_pipeline(&pipelines.copy_buffer);
+        enc.set_buffer(moe_combined, 0, 0);
+        enc.set_buffer(expert_outputs, e * expert_slice_size * 2, 1);
+        let copy_size = expert_slice_size as u32;
+        enc.set_bytes(&copy_size.to_le_bytes(), 2);
+        let tg_size = 256usize.min(expert_slice_size);
+        let tg_count = expert_slice_size.div_ceil(tg_size);
+        enc.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
+        enc.memory_barrier_buffers();
+    }
+
+    // 4. Weighted combine: top-k selection + weighted sum → moe_combined
+    ops::encode_moe_weighted_combine(
+        enc,
+        &pipelines.moe_weighted_combine,
+        router_logits,
+        expert_outputs,
+        moe_combined,
+        num_experts as u32,
+        top_k as u32,
+        h as u32,
+        token_count as u32,
+    );
+    enc.memory_barrier_buffers();
+
+    // 5. Add MoE output to dense MLP output: ffn_down += moe_combined
+    ops::encode_residual_add(
+        enc,
+        &pipelines.residual_add,
+        &bufs.ffn_down,
+        moe_combined,
+        &bufs.ffn_down,
+        (token_count * h) as u32,
+    );
+    enc.memory_barrier_buffers();
+
+    Ok(())
+}
+
 /// Encode end-of-layer residual: fused with next layer's norm, or standalone for the last layer.
 fn encode_end_of_layer_residual(
     enc: &ComputeEncoder,
@@ -3716,13 +3961,6 @@ impl InferenceEngine for MetalInference {
         let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
         self.gemma4_config = Gemma4Config::from_model_config(&mc);
-
-        if let Some(ref g4) = self.gemma4_config {
-            if g4.num_experts > 0 {
-                // MoE expert weights are loaded into the IR but GPU dispatch
-                // is not yet implemented. The model will run without MoE contribution.
-            }
-        }
 
         // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
         self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);

@@ -45,10 +45,14 @@ pub struct LoadedLayer<D, W> {
     pub pre_ffn_norm: Option<D>,
     /// Post-FFN RMSNorm weight (Gemma 4 `post_feedforward_layernorm`).
     pub post_ffn_norm: Option<D>,
-    // TODO: MoE expert weights (when enable_moe is true):
-    // pub router_weight: Option<W>,
-    // pub expert_weights: Vec<ExpertWeights>,  // num_experts entries
-    // Adding actual fields requires updating weight loading in WeightVisitor.
+    /// MoE router weight `[num_experts, hidden_size]`.
+    pub router_weight: Option<W>,
+    /// MoE expert gate projections `[moe_intermediate_size, hidden_size]` per expert.
+    pub expert_gate_projs: Vec<W>,
+    /// MoE expert up projections `[moe_intermediate_size, hidden_size]` per expert.
+    pub expert_up_projs: Vec<W>,
+    /// MoE expert down projections `[hidden_size, moe_intermediate_size]` per expert.
+    pub expert_down_projs: Vec<W>,
     /// PLE gate weight `[ple_hidden_size, hidden_size]` (Gemma 4).
     pub ple_gate: Option<W>,
     /// PLE projection weight `[hidden_size, ple_hidden_size]` (Gemma 4).
@@ -166,6 +170,47 @@ pub fn load_model_weights<V: WeightVisitor>(
                 } else {
                     None
                 }
+            },
+            router_weight: {
+                let name = format!("{prefix}.mlp.router.weight");
+                if provider.has_tensor(&name) {
+                    Some(visitor.load_weight(provider, &name)?)
+                } else {
+                    None
+                }
+            },
+            expert_gate_projs: {
+                let mut projs = Vec::new();
+                for e in 0.. {
+                    let name = format!("{prefix}.mlp.experts.{e}.gate_proj.weight");
+                    if !provider.has_tensor(&name) {
+                        break;
+                    }
+                    projs.push(visitor.load_weight(provider, &name)?);
+                }
+                projs
+            },
+            expert_up_projs: {
+                let mut projs = Vec::new();
+                for e in 0.. {
+                    let name = format!("{prefix}.mlp.experts.{e}.up_proj.weight");
+                    if !provider.has_tensor(&name) {
+                        break;
+                    }
+                    projs.push(visitor.load_weight(provider, &name)?);
+                }
+                projs
+            },
+            expert_down_projs: {
+                let mut projs = Vec::new();
+                for e in 0.. {
+                    let name = format!("{prefix}.mlp.experts.{e}.down_proj.weight");
+                    if !provider.has_tensor(&name) {
+                        break;
+                    }
+                    projs.push(visitor.load_weight(provider, &name)?);
+                }
+                projs
             },
             ple_gate: {
                 let name = format!("{prefix}.per_layer_input_gate.weight");

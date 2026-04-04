@@ -42,6 +42,7 @@ fn main() {
         "quip_sharp",
         "fused_softcap",
         "ple_kernels",
+        "moe",
     ];
 
     for name in &independent {
