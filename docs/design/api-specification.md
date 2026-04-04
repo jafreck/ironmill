@@ -1046,6 +1046,519 @@ impl MlxConfig {
 }
 ```
 
+### 4.11 Generation API — Streaming & Async
+
+The core inference loop (prefill → decode_step → sample → repeat) is low-level
+and requires callers to manage sampling, stopping, grammar constraints, and
+cancellation manually. The generation API provides a high-level, composable
+layer that handles all of this.
+
+#### Design goals
+
+1. **Synchronous `Iterator`** as the primary interface — no async runtime
+   dependency in the core crate.
+2. **Cancellation** via a lightweight token, not runtime-specific channels.
+3. **Grammar constraints** integrated directly — no separate wrapper needed.
+4. **Callback-based alternative** using `ControlFlow` for inline streaming
+   without allocating an iterator.
+5. **Async adapter** behind an optional feature flag for server use cases.
+
+#### GenerateRequest — Builder
+
+All generation parameters in a single request object. This replaces the
+pattern of users manually wiring sampler + stop logic + grammar.
+
+```rust
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct GenerateRequest {
+    /// Prompt token IDs.
+    pub prompt_tokens: Vec<u32>,
+    /// Sampling configuration.
+    pub sampler: SamplerConfig,
+    /// Maximum number of tokens to generate (excluding prompt).
+    pub max_tokens: usize,
+    /// Token IDs that signal end of generation.
+    pub stop_tokens: Vec<u32>,
+    /// Optional grammar constraint.
+    pub grammar: Option<Arc<CompiledGrammar>>,
+}
+
+impl GenerateRequest {
+    /// Create a new request with the given prompt tokens.
+    /// Uses default sampler, 256 max tokens, and DEFAULT_EOS_TOKENS.
+    pub fn new(prompt_tokens: Vec<u32>) -> Self {
+        Self {
+            prompt_tokens,
+            sampler: SamplerConfig::default(),
+            max_tokens: 256,
+            stop_tokens: DEFAULT_EOS_TOKENS.to_vec(),
+            grammar: None,
+        }
+    }
+
+    pub fn with_sampler(mut self, config: SamplerConfig) -> Self {
+        self.sampler = config; self
+    }
+
+    pub fn with_max_tokens(mut self, n: usize) -> Self {
+        self.max_tokens = n; self
+    }
+
+    pub fn with_stop_tokens(mut self, tokens: Vec<u32>) -> Self {
+        self.stop_tokens = tokens; self
+    }
+
+    pub fn with_grammar(mut self, grammar: Arc<CompiledGrammar>) -> Self {
+        self.grammar = Some(grammar); self
+    }
+}
+```
+
+#### GenerateEvent & FinishReason
+
+```rust
+/// Events emitted during generation.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum GenerateEvent {
+    /// A new token was generated.
+    Token {
+        /// The sampled token ID.
+        token: u32,
+        /// Log-probability of the sampled token.
+        logprob: f32,
+        /// Zero-based position within the generated output (not counting prompt).
+        position: usize,
+    },
+    /// Generation has finished.
+    Finished {
+        reason: FinishReason,
+        /// Number of tokens generated (excluding prompt).
+        tokens_generated: usize,
+        /// Number of prompt tokens processed.
+        prompt_tokens: usize,
+    },
+}
+
+/// Why generation stopped.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// A stop token (EOS) was generated.
+    Stop,
+    /// Reached the `max_tokens` limit.
+    MaxTokens,
+    /// Cancelled by the caller via [`CancellationToken`].
+    Cancelled,
+    /// Grammar reached an accepting state.
+    GrammarComplete,
+}
+```
+
+#### CancellationToken
+
+A lightweight, cloneable handle for cooperative cancellation. No async
+runtime dependency — just an `AtomicBool` behind an `Arc`.
+
+```rust
+/// Cooperative cancellation token.
+///
+/// Clone this token and share it with other threads or an async runtime.
+/// Call [`cancel()`](Self::cancel) to signal the generation loop to stop.
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self { cancelled: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// Signal cancellation. The next `TokenStream::next()` call will
+    /// yield `GenerateEvent::Finished { reason: Cancelled, .. }`.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Check whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self { Self::new() }
+}
+```
+
+#### TokenStream — Synchronous Iterator
+
+The primary streaming interface. Wraps an engine and yields
+`GenerateEvent` items. Handles prefill on first iteration, then decode
+steps until a stop condition is met.
+
+```rust
+/// Streaming token generator.
+///
+/// Created via [`TokenStream::new()`]. Implements [`Iterator`] so it
+/// works with `for` loops, `.take()`, `.map()`, `.collect()`, etc.
+///
+/// ```rust
+/// let cancel = CancellationToken::new();
+/// let stream = TokenStream::new(&mut engine, request, &cancel);
+///
+/// for event in stream {
+///     match event? {
+///         GenerateEvent::Token { token, .. } => print_token(token),
+///         GenerateEvent::Finished { reason, .. } => break,
+///     }
+/// }
+/// ```
+pub struct TokenStream<'a> {
+    engine: &'a mut dyn InferenceEngine,
+    sampler: Sampler,
+    request: GenerateRequest,
+    cancel: &'a CancellationToken,
+    grammar_state: Option<GrammarState>,
+    // internal state
+    position: usize,
+    prefilled: bool,
+    finished: bool,
+    logits: Logits,
+}
+
+impl<'a> TokenStream<'a> {
+    /// Create a new token stream.
+    ///
+    /// Prefill is deferred to the first call to `next()`, so construction
+    /// is cheap and infallible.
+    pub fn new(
+        engine: &'a mut dyn InferenceEngine,
+        request: GenerateRequest,
+        cancel: &'a CancellationToken,
+    ) -> Self {
+        let grammar_state = request.grammar.as_ref().map(|g| {
+            GrammarState::new(Arc::clone(g))
+        });
+        let sampler = Sampler::new(request.sampler.clone());
+        Self {
+            engine,
+            sampler,
+            request,
+            cancel,
+            grammar_state,
+            position: 0,
+            prefilled: false,
+            finished: false,
+            logits: Vec::new(),
+        }
+    }
+}
+
+impl Iterator for TokenStream<'_> {
+    type Item = Result<GenerateEvent, InferenceError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished { return None; }
+
+        // ── Prefill on first call ──
+        if !self.prefilled {
+            self.prefilled = true;
+            match self.engine.prefill(&self.request.prompt_tokens) {
+                Ok(logits) => self.logits = logits,
+                Err(e) => {
+                    self.finished = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+
+        // ── Check cancellation ──
+        if self.cancel.is_cancelled() {
+            self.finished = true;
+            return Some(Ok(GenerateEvent::Finished {
+                reason: FinishReason::Cancelled,
+                tokens_generated: self.position,
+                prompt_tokens: self.request.prompt_tokens.len(),
+            }));
+        }
+
+        // ── Apply grammar mask (if constrained) ──
+        if let Some(state) = &self.grammar_state {
+            let mask = state.token_mask();
+            crate::sampling::apply_token_mask(&mut self.logits, &mask);
+        }
+
+        // ── Sample ──
+        let token = self.sampler.sample(&mut self.logits);
+        let logprob = self.logits.get(token as usize)
+            .copied().unwrap_or(f32::NEG_INFINITY);
+
+        // ── Advance grammar ──
+        if let Some(state) = &mut self.grammar_state {
+            state.advance(token);
+            if state.is_complete() {
+                self.finished = true;
+                return Some(Ok(GenerateEvent::Finished {
+                    reason: FinishReason::GrammarComplete,
+                    tokens_generated: self.position + 1,
+                    prompt_tokens: self.request.prompt_tokens.len(),
+                }));
+            }
+        }
+
+        // ── Check stop conditions ──
+        if self.request.stop_tokens.contains(&token) {
+            self.finished = true;
+            return Some(Ok(GenerateEvent::Finished {
+                reason: FinishReason::Stop,
+                tokens_generated: self.position,
+                prompt_tokens: self.request.prompt_tokens.len(),
+            }));
+        }
+
+        self.position += 1;
+
+        if self.position >= self.request.max_tokens {
+            self.finished = true;
+            return Some(Ok(GenerateEvent::Token {
+                token, logprob, position: self.position - 1,
+            }));
+            // Caller will see no more items after this.
+            // (A follow-up Finished event is not emitted to avoid double-yield;
+            // the iterator ending signals completion.)
+        }
+
+        // ── Decode next ──
+        match self.engine.decode_step(token) {
+            Ok(logits) => self.logits = logits,
+            Err(e) => {
+                self.finished = true;
+                return Some(Err(e));
+            }
+        }
+
+        Some(Ok(GenerateEvent::Token {
+            token,
+            logprob,
+            position: self.position - 1,
+        }))
+    }
+}
+```
+
+#### Callback-Based Generation
+
+For callers who prefer inline processing without an iterator. Uses
+`std::ops::ControlFlow` for natural cancellation:
+
+```rust
+/// Run generation with a per-event callback.
+///
+/// The callback receives each [`GenerateEvent`] and returns:
+/// - `ControlFlow::Continue(())` to keep generating
+/// - `ControlFlow::Break(())` to cancel
+///
+/// ```rust
+/// generate_with_callback(&mut engine, &request, |event| {
+///     match &event {
+///         GenerateEvent::Token { token, .. } => {
+///             print!("{}", detokenize(*token));
+///             std::io::stdout().flush().unwrap();
+///             ControlFlow::Continue(())
+///         }
+///         GenerateEvent::Finished { .. } => ControlFlow::Break(()),
+///     }
+/// })?;
+/// ```
+pub fn generate_with_callback(
+    engine: &mut dyn InferenceEngine,
+    request: &GenerateRequest,
+    mut on_event: impl FnMut(GenerateEvent) -> ControlFlow<(), ()>,
+) -> Result<GenerateResult, InferenceError> {
+    let cancel = CancellationToken::new();
+    let stream = TokenStream::new(engine, request.clone(), &cancel);
+
+    let mut tokens = Vec::new();
+    let mut finish_reason = FinishReason::MaxTokens;
+
+    for event in stream {
+        let event = event?;
+        match &event {
+            GenerateEvent::Token { token, .. } => tokens.push(*token),
+            GenerateEvent::Finished { reason, .. } => finish_reason = *reason,
+        }
+        if on_event(event) == ControlFlow::Break(()) {
+            finish_reason = FinishReason::Cancelled;
+            break;
+        }
+    }
+
+    Ok(GenerateResult {
+        tokens,
+        finish_reason,
+        prompt_tokens: request.prompt_tokens.len(),
+    })
+}
+```
+
+#### Convenience: Collect All Tokens
+
+For non-streaming use cases where you just want the final output:
+
+```rust
+/// Run generation to completion and collect all output tokens.
+///
+/// ```rust
+/// let result = generate(&mut engine, &request)?;
+/// println!("Generated {} tokens, reason: {:?}", result.tokens.len(), result.finish_reason);
+/// ```
+pub fn generate(
+    engine: &mut dyn InferenceEngine,
+    request: &GenerateRequest,
+) -> Result<GenerateResult, InferenceError> {
+    let cancel = CancellationToken::new();
+    let stream = TokenStream::new(engine, request.clone(), &cancel);
+
+    let mut tokens = Vec::new();
+    let mut finish_reason = FinishReason::MaxTokens;
+
+    for event in stream {
+        match event? {
+            GenerateEvent::Token { token, .. } => tokens.push(token),
+            GenerateEvent::Finished { reason, .. } => {
+                finish_reason = reason;
+                break;
+            }
+        }
+    }
+
+    Ok(GenerateResult {
+        tokens,
+        finish_reason,
+        prompt_tokens: request.prompt_tokens.len(),
+    })
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct GenerateResult {
+    /// Generated token IDs (excluding prompt).
+    pub tokens: Vec<u32>,
+    /// Why generation stopped.
+    pub finish_reason: FinishReason,
+    /// Number of prompt tokens processed.
+    pub prompt_tokens: usize,
+}
+```
+
+#### Async Streaming — Feature-Gated
+
+For server and async use cases, an optional `async` feature provides
+`AsyncTokenStream`. This is **runtime-agnostic** — it uses channels
+internally and spawns the synchronous engine on a blocking thread.
+
+The async adapter lives behind a feature flag so the core crate has
+zero async runtime dependency:
+
+```toml
+# Cargo.toml
+[features]
+async = ["dep:tokio"]
+
+[dependencies.tokio]
+version = "1"
+features = ["sync", "rt"]
+optional = true
+```
+
+```rust
+#[cfg(feature = "async")]
+pub mod generate_async {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// Async streaming token generator.
+    ///
+    /// Created via [`spawn()`]. Runs the synchronous engine on a
+    /// blocking thread and streams events through a channel.
+    ///
+    /// Implements [`tokio_stream::Stream`] if `tokio-stream` is available,
+    /// otherwise use [`next()`](Self::next) directly.
+    pub struct AsyncTokenStream {
+        receiver: mpsc::Receiver<Result<GenerateEvent, InferenceError>>,
+        cancel: CancellationToken,
+    }
+
+    impl AsyncTokenStream {
+        /// Cancel the generation. The engine will stop after the current
+        /// decode step completes.
+        pub fn cancel(&self) {
+            self.cancel.cancel();
+        }
+
+        /// Receive the next event, or `None` if the stream is finished.
+        pub async fn next(&mut self) -> Option<Result<GenerateEvent, InferenceError>> {
+            self.receiver.recv().await
+        }
+    }
+
+    /// Spawn a generation task on a blocking thread and return an async stream.
+    ///
+    /// The engine is moved into the blocking thread. When the stream is dropped
+    /// or cancelled, the engine is returned via the join handle.
+    ///
+    /// ```rust
+    /// let mut stream = generate_async::spawn(engine, request, 32).await;
+    ///
+    /// while let Some(event) = stream.next().await {
+    ///     match event? {
+    ///         GenerateEvent::Token { token, .. } => {
+    ///             send_sse(token).await;
+    ///         }
+    ///         GenerateEvent::Finished { .. } => break,
+    ///     }
+    /// }
+    /// ```
+    pub fn spawn(
+        mut engine: Box<dyn InferenceEngine + Send>,
+        request: GenerateRequest,
+        buffer: usize,
+    ) -> AsyncTokenStream {
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let (tx, rx) = mpsc::channel(buffer);
+
+        tokio::task::spawn_blocking(move || {
+            let stream = TokenStream::new(&mut *engine, request, &cancel_clone);
+            for event in stream {
+                if tx.blocking_send(event).is_err() {
+                    // Receiver dropped — stop generating.
+                    break;
+                }
+            }
+        });
+
+        AsyncTokenStream { receiver: rx, cancel }
+    }
+}
+```
+
+#### Thread Safety Notes
+
+`InferenceEngine` implementations are generally `Send` but **not** `Sync`:
+they hold mutable GPU/accelerator state that cannot be shared across threads.
+
+For multi-threaded serving, the recommended patterns are:
+- **One engine per worker thread** — the `BatchScheduler` manages scheduling
+  across sequences, not across threads.
+- **`Mutex<Box<dyn InferenceEngine + Send>>`** — for simple cases where
+  contention is acceptable.
+- **The async adapter** (`generate_async::spawn`) — moves the engine into a
+  dedicated blocking thread and communicates via channels.
+
 ---
 
 ## 5. ironmill-cli
@@ -1838,6 +2351,113 @@ ironmill validate ./model.mlpackage --format json
 
 # Compare pipeline configurations
 ironmill pipeline-report ./model.onnx --config-a baseline.toml --config-b optimized.toml
+```
+
+### 7.13 Streaming Token Generation
+
+```rust
+use ironmill_inference::{
+    InferenceEngine, CancellationToken,
+    generate::{GenerateRequest, GenerateEvent, TokenStream, FinishReason},
+    sampling::SamplerConfig,
+    metal::{MetalInference, MetalConfig},
+};
+
+// Set up engine (same as §7.3)
+let config = MetalConfig::new().with_max_seq_len(4096);
+let mut engine = MetalInference::new(config)?;
+// ... load model ...
+
+// Build request
+let request = GenerateRequest::new(prompt_tokens)
+    .with_sampler(SamplerConfig::default().with_temperature(0.7).with_top_p(0.9))
+    .with_max_tokens(512)
+    .with_stop_tokens(vec![2, 151643]);
+
+// Stream tokens — cancel from another thread if needed
+let cancel = CancellationToken::new();
+let cancel_handle = cancel.clone();
+// e.g. ctrlc::set_handler(move || cancel_handle.cancel());
+
+let stream = TokenStream::new(&mut engine, request, &cancel);
+
+for event in stream {
+    match event? {
+        GenerateEvent::Token { token, .. } => {
+            print!("{}", detokenize(token));
+        }
+        GenerateEvent::Finished { reason, tokens_generated, .. } => {
+            eprintln!("\n[done: {reason:?}, {tokens_generated} tokens]");
+            break;
+        }
+    }
+}
+```
+
+### 7.14 Callback-Based Streaming
+
+```rust
+use std::ops::ControlFlow;
+use ironmill_inference::generate::{generate_with_callback, GenerateRequest, GenerateEvent};
+
+let request = GenerateRequest::new(prompt_tokens)
+    .with_max_tokens(100);
+
+let result = generate_with_callback(&mut engine, &request, |event| {
+    match &event {
+        GenerateEvent::Token { token, .. } => {
+            print!("{}", detokenize(*token));
+            std::io::stdout().flush().unwrap();
+            ControlFlow::Continue(())
+        }
+        GenerateEvent::Finished { .. } => ControlFlow::Break(()),
+    }
+})?;
+
+println!("\nGenerated {} tokens", result.tokens.len());
+```
+
+### 7.15 Async Server Streaming (SSE)
+
+```rust
+use ironmill_inference::generate::{
+    GenerateRequest, GenerateEvent,
+    generate_async,  // requires feature = "async"
+};
+
+async fn handle_completion(engine: Box<dyn InferenceEngine + Send>, prompt: Vec<u32>) {
+    let request = GenerateRequest::new(prompt)
+        .with_sampler(SamplerConfig::default().with_temperature(0.8))
+        .with_max_tokens(1024);
+
+    let mut stream = generate_async::spawn(engine, request, 32);
+
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            GenerateEvent::Token { token, .. } => {
+                send_sse_event(&format!("data: {}\n\n", detokenize(token))).await;
+            }
+            GenerateEvent::Finished { reason, .. } => {
+                send_sse_event(&format!("data: [DONE] {reason:?}\n\n")).await;
+                break;
+            }
+        }
+    }
+}
+```
+
+### 7.16 Non-Streaming (Collect All Tokens)
+
+```rust
+use ironmill_inference::generate::{generate, GenerateRequest};
+
+let request = GenerateRequest::new(prompt_tokens)
+    .with_sampler(SamplerConfig::greedy())
+    .with_max_tokens(200);
+
+let result = generate(&mut engine, &request)?;
+println!("Output: {}", detokenize_all(&result.tokens));
+println!("Finish reason: {:?}", result.finish_reason);
 ```
 
 ---
