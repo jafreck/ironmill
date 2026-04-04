@@ -19,7 +19,7 @@
 9. [Tokenizer Abstraction](#9-tokenizer-abstraction)
 10. [ironmill-core: High-Level API](#10-ironmill-core-high-level-api)
 11. [JIT Compilation](#11-jit-compilation)
-12. [Open Design Questions](#12-open-design-questions)
+12. [Design Decisions](#12-design-decisions)
 
 ---
 
@@ -719,6 +719,26 @@ pub struct CompileOutput {
     pub report: PipelineReport,
     /// Warnings generated during compilation.
     pub warnings: Vec<String>,
+    /// Metadata written into the artifact bundle (see §12.3).
+    pub metadata: ArtifactMetadata,
+}
+
+/// Metadata embedded in every compiled artifact for version checking.
+///
+/// Written as `metadata.json` at the bundle root. Loaders check
+/// `format_version` on load and reject incompatible bundles with a
+/// clear error message.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactMetadata {
+    /// Bundle format version. Incremented on breaking layout changes.
+    pub format_version: u32,
+    /// Semver of the ironmill build that produced this artifact.
+    pub ironmill_version: String,
+    /// Model architecture name.
+    pub architecture: String,
+    /// Quantization method applied.
+    pub quantization: String,
 }
 ```
 
@@ -1468,6 +1488,7 @@ pub struct TokenStream<'a> {
     pending_finish: Option<FinishReason>,
     logits: Logits,
     effective_stop_tokens: Vec<u32>,
+    generated_tokens: Vec<u32>,
 }
 
 impl<'a> TokenStream<'a> {
@@ -1493,9 +1514,19 @@ impl<'a> TokenStream<'a> {
             position: 0,
             prefilled: false,
             finished: false,
+            pending_finish: None,
             logits: Vec::new(),
+            generated_tokens: Vec::new(),
+            effective_stop_tokens: Vec::new(),
         }
     }
+
+    /// Tokens generated so far (useful for recovery after an error).
+    ///
+    /// When `decode_step()` fails mid-generation, the iterator yields
+    /// `Some(Err(e))` then `None`. Call this method after the error to
+    /// retrieve any tokens generated before the failure.
+    pub fn tokens_so_far(&self) -> &[u32] { &self.generated_tokens }
 }
 
 impl Iterator for TokenStream<'_> {
@@ -1560,6 +1591,7 @@ impl Iterator for TokenStream<'_> {
         let token = self.sampler.sample(&mut self.logits);
         let logprob = self.logits.get(token as usize)
             .copied().unwrap_or(f32::NEG_INFINITY);
+        self.generated_tokens.push(token);
 
         // ── Advance grammar ──
         if let Some(state) = &mut self.grammar_state {
@@ -1881,6 +1913,11 @@ GPU memory is the primary constraint for on-device LLM inference. The API
 must surface memory information so callers can make informed decisions about
 model loading, sequence lengths, and batch sizes — catching OOM before it
 happens, not after.
+
+The core types (`MemoryUsage`, `MemoryEstimator`, `QuantLevel`,
+`KvQuantLevel`) live in `mil-rs` so both `ironmill-compile` and
+`ironmill-inference` can use them (see §12.1). `ironmill-inference`
+re-exports them at the crate root.
 
 ```rust
 /// Memory information for a loaded engine.
@@ -2527,10 +2564,17 @@ impl InferenceEngine for CudaInference {
 
 ```
 ironmill-cli
+  └─ ironmill-core (high-level API)
+  │    ├─ ironmill-compile
+  │    ├─ ironmill-inference
+  │    └─ tokenizers (feature-gated)
+  │
   └─ ironmill-compile (compilation API)
-  │    └─ mil-rs (IR, passes, weights)
+  │    └─ mil-rs (IR, passes, weights, shared types)
+  │
   └─ ironmill-inference (runtime API)
-       ├─ mil-rs (shared weight types)
+       ├─ mil-rs (shared types: Architecture, QuantLevel, ModelInfo,
+       │          MemoryEstimator, QuantizationInfo, ModelConfig)
        ├─ ironmill-metal-sys     [feature = "metal",  macOS only]
        ├─ ironmill-ane-sys       [feature = "ane",    macOS only]
        ├─ ironmill-coreml-sys    [feature = "coreml", macOS only]
@@ -2540,7 +2584,7 @@ ironmill-cli
 
 Users should never need to depend on `mil-rs` directly for normal usage.
 `ironmill-compile` re-exports the relevant IR types, and
-`ironmill-inference` re-exports the relevant weight types.
+`ironmill-inference` re-exports the relevant weight and estimation types.
 
 ### 6.4 Progress & Telemetry
 
@@ -3539,6 +3583,14 @@ Users who want a different tokenizer implementation (e.g., `sentencepiece`,
 a C++ binding, or a custom one) can disable the default feature and provide
 their own `Tokenizer` impl.
 
+### 9.4 Compilation Boundary
+
+The `Tokenizer` trait and `HfTokenizer` live in `ironmill-core`, **not**
+in `ironmill-compile`. Calibration-based quantization passes (AWQ, GPTQ)
+accept pre-tokenized `&[Vec<u32>]` sequences — the caller is responsible
+for tokenization. This keeps `ironmill-compile` free of tokenizer
+dependencies and maintains a clean dependency graph (see §12.2).
+
 ---
 
 ## 10. ironmill-core: High-Level API
@@ -3576,6 +3628,22 @@ pub enum Device {
     Cuda,
     /// CPU-only inference.
     Cpu,
+}
+
+impl Device {
+    /// Return all devices available on this platform.
+    ///
+    /// Uses compile-time feature gates and runtime hardware probing.
+    /// `Cpu` is always available. `Auto` is always included (resolves
+    /// at load time).
+    ///
+    /// ```rust
+    /// let devices = Device::available();
+    /// // macOS:            [Auto, Metal, Ane, CoreMl, Cpu]
+    /// // Linux with CUDA:  [Auto, Cuda, Cpu]
+    /// // Linux without:    [Auto, Cpu]
+    /// ```
+    pub fn available() -> Vec<Device> { /* ... */ }
 }
 ```
 
@@ -4290,23 +4358,40 @@ subsequent runs. The cache key includes:
 /// Persistent shader pipeline cache.
 ///
 /// Stores compiled Metal pipeline state objects to disk, keyed by
-/// a hash of the shader source + specialization constants.
+/// a hash of the shader source + specialization constants. Uses LRU
+/// eviction to prevent unbounded growth across model configurations.
 pub struct ShaderCache {
     cache_dir: PathBuf,
+    max_size_bytes: u64,
 }
 
 impl ShaderCache {
     /// Open or create a shader cache at the given directory.
+    ///
+    /// Default max size is 512 MB. Use [`with_max_size()`] to override.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, std::io::Error> { /* ... */ }
 
     /// Default cache location: `~/.cache/ironmill/shaders/`
     pub fn default_location() -> Result<Self, std::io::Error> { /* ... */ }
 
+    /// Set the maximum cache size in bytes. Entries are evicted LRU
+    /// when the cache exceeds this limit.
+    pub fn with_max_size(mut self, bytes: u64) -> Self {
+        self.max_size_bytes = bytes; self
+    }
+
     /// Look up a cached pipeline binary.
     pub fn get(&self, key: &ShaderCacheKey) -> Option<Vec<u8>> { /* ... */ }
 
-    /// Store a compiled pipeline binary.
+    /// Store a compiled pipeline binary. Evicts least-recently-used
+    /// entries if the cache exceeds `max_size_bytes`.
     pub fn put(&self, key: &ShaderCacheKey, binary: &[u8]) -> Result<(), std::io::Error> { /* ... */ }
+
+    /// Remove all cached entries.
+    pub fn clear(&self) -> Result<(), std::io::Error> { /* ... */ }
+
+    /// Current total size of cached entries in bytes.
+    pub fn size(&self) -> u64 { /* ... */ }
 }
 ```
 
@@ -4350,19 +4435,15 @@ impl ShaderCache {
 
 ---
 
-## 12. Open Design Questions
+## 12. Design Decisions
 
-### 12.1 Shared Type Placement
+### 12.1 Shared Type Placement — mil-rs
 
 `QuantLevel`, `KvQuantLevel`, `MemoryEstimator`, `ModelInfo`, and
-`Architecture` are currently proposed in `ironmill-inference`, but
-`CompileTarget::estimate_size()` (in `ironmill-compile`) also needs them.
-Placing them in `ironmill-inference` creates a dependency from compile →
-inference, which inverts the intended graph.
-
-**Recommendation**: move these shared types into `mil-rs` as the
-foundation crate. Both `ironmill-compile` and `ironmill-inference` already
-depend on it. This keeps the dependency graph clean:
+`Architecture` live in `mil-rs`, not `ironmill-inference`. Both
+`ironmill-compile` (via `CompileTarget::estimate_size()`) and
+`ironmill-inference` need these types, and both already depend on
+`mil-rs`. This keeps the dependency graph clean:
 
 ```
 mil-rs (shared types: Architecture, QuantLevel, ModelInfo, MemoryEstimator)
@@ -4372,94 +4453,41 @@ ironmill-compile   ironmill-inference
   └──── ironmill-core ────┘
 ```
 
-### 12.2 Tokenizer Crate Placement
+`ironmill-inference` re-exports them at the crate root for convenience.
 
-The `Tokenizer` trait and `HfTokenizer` are proposed inside `ironmill-core`,
-but calibration-based quantization (AWQ, GPTQ) in `ironmill-compile` also
-needs tokenization to process calibration data. Putting the trait in
-`ironmill-core` would force `ironmill-compile` to depend on `ironmill-core`
-(inverted dependency).
+### 12.2 Tokenizer Boundary — Callers Tokenize
 
-**Options**:
-1. **Standalone `ironmill-tokenizer` crate** — trait + HfTokenizer adapter.
-   Both `ironmill-core` and `ironmill-compile` depend on it.
-2. **Trait in `mil-rs`, adapter in `ironmill-core`** — lighter touch, but
-   adds tokenization concerns to the IR crate.
-3. **Accept the duplication** — `ironmill-compile` takes `&[u32]` calibration
-   tokens directly, leaving tokenization to the caller.
+The `Tokenizer` trait and `HfTokenizer` live in `ironmill-core`.
+`ironmill-compile` does **not** depend on them. Calibration-based
+quantization (AWQ, GPTQ) accepts `&[Vec<u32>]` — pre-tokenized
+calibration sequences. The caller is responsible for tokenization.
 
-### 12.3 Partial Recovery from TokenStream
+This is the same boundary every compiler maintains: LLVM doesn't
+parse source code, and ironmill-compile doesn't tokenize text.
+The CLI handles tokenization when `--cal-data` points to raw text
+files, bridging the gap for end users.
 
-When `decode_step()` fails mid-generation, `TokenStream` returns
-`Some(Err(e))` then `None`. The tokens generated before the error are lost
-unless the caller tracked them manually. The `generate()` /
-`generate_with_callback()` wrappers use `GenerateError` with
-`partial_tokens`, but raw `TokenStream` users have no recovery path.
+### 12.3 Compiled Artifact Versioning
 
-**Recommendation**: add a method for partial recovery:
+Every compiled bundle (`.ironml-gpu`, `.ane-bundle`) includes a
+`metadata.json` at the bundle root:
 
-```rust
-impl<'a> TokenStream<'a> {
-    /// Tokens generated so far (useful for recovery after an error).
-    pub fn tokens_so_far(&self) -> &[u32] { &self.generated_tokens }
+```json
+{
+    "format_version": 1,
+    "ironmill_version": "0.3.0",
+    "architecture": "qwen",
+    "quantization": "int4-g128",
+    "hidden_size": 1536,
+    "num_layers": 28,
+    "compile_config": { /* ... */ }
 }
 ```
 
-### 12.4 Device Discovery
-
-`Device::Auto` resolution logic is baked into `ModelBuilder`. There's no
-way for users to enumerate available devices (e.g., for a config UI or
-to validate CLI flags before loading).
-
-**Recommendation**:
-
-```rust
-impl Device {
-    /// Return all devices available on this platform.
-    ///
-    /// ```rust
-    /// let devices = Device::available();
-    /// // On macOS: [Metal, Ane, CoreMl, Cpu]
-    /// // On Linux with CUDA: [Cuda, Cpu]
-    /// // On Linux without CUDA: [Cpu]
-    /// ```
-    pub fn available() -> Vec<Device> { /* ... */ }
-}
-```
-
-### 12.5 Compiled Artifact Versioning
-
-`Model::from_compiled()` doesn't specify how `.ironml-gpu` bundles are
-validated for compatibility. A model compiled with INT4 quantization on
-ironmill v0.3 should produce a clear error when loaded by ironmill v0.5
-if the format changed.
-
-**Recommendation**: include a `metadata.json` (or magic bytes + header)
-in every compiled bundle with:
-- `ironmill_version`: semver of the producing build
-- `format_version`: integer, incremented on breaking format changes
-- `architecture`, `quantization`, `compile_config` for diagnostics
-
-### 12.6 Future Extension Points
-
-These are out of scope for v1 but the API should not preclude them:
-
-- **`Model::from_hub("Qwen/Qwen3-0.6B")`** — HuggingFace Hub download.
-  `ModelBuilder` already has the right shape; this is a new constructor
-  that downloads to a cache dir and delegates to `from_pretrained()`.
-
-- **C API for inference** — the existing `docs/C_API.md` covers `mil-rs`
-  FFI. The new `InferenceEngine`, `TokenStream`, and `generate()` APIs
-  need equivalent C bindings for Swift/C++ embedding. Design them as
-  opaque handles (`IronmillEngine *`, `IronmillTokenStream *`) following
-  the same `*_free()` / `mil_last_error()` pattern.
-
-- **OpenAI-compatible data types** — for production serving, types like
-  `ChatCompletionRequest`, `ChatCompletionChunk`, `Usage` are table
-  stakes. The `BatchRunner` + async streaming provides the plumbing;
-  a thin `ironmill-openai` crate could map `GenerateEvent` →
-  SSE-compatible `ChatCompletionChunk`.
-
-- **ShaderCache eviction** — the current `ShaderCache` has `get`/`put`
-  but no size limits. Add `max_size_bytes` and LRU eviction to prevent
-  unbounded growth across model configurations.
+- `format_version` is an integer, incremented on any breaking change
+  to the bundle layout or weight encoding. Loaders check this first
+  and emit a clear error (e.g., "bundle format v2 requires ironmill
+  >= 0.5.0, you have 0.3.0") instead of silently loading corrupt data.
+- `ironmill_version` is informational — the semver of the build that
+  produced the bundle.
+- Remaining fields are diagnostic (logged on load, useful for debugging).
