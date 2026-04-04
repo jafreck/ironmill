@@ -27,6 +27,7 @@ constant constexpr uint TM_TILE = 64;
 constant constexpr uint TN_TILE = 64;
 constant constexpr uint MATMUL_K_TILE = 8;
 constant constexpr uint N_SIMDGROUPS = 8;
+constant constexpr uint TN_STRIDE = TN_TILE + 1;  // +1 padding to avoid threadgroup bank conflicts
 constant constexpr uint TN_BLOCKS = TN_TILE / 8;
 
 // ── INT4 matvec (decode path, M=1) ──────────────────────────────
@@ -122,11 +123,15 @@ kernel void affine_matmul_int4(
     uint tg_n = group_id.y * TN_TILE;
 
     threadgroup half tg_a[2][TM_TILE * MATMUL_K_TILE];
-    threadgroup half tg_bt[2][MATMUL_K_TILE * TN_TILE];
+    threadgroup half tg_bt[2][MATMUL_K_TILE * TN_STRIDE];
 
-    uint half_K = K / 2;
     uint num_groups = (K + group_size - 1) / group_size;
     uint num_k_steps = (K + MATMUL_K_TILE - 1) / MATMUL_K_TILE;
+
+    // Blocked layout constants for B-load
+    uint k_blocks = num_k_steps;
+    uint local_k_bytes = MATMUL_K_TILE / 2;  // 4 bytes per INT4 tile column
+    uint block_bytes = TN_TILE * local_k_bytes;
 
     simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
     for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
@@ -145,6 +150,8 @@ kernel void affine_matmul_int4(
             }
             tg_a[0][i] = a_val;
         }
+        uint block_k = k_base / MATMUL_K_TILE;
+        uint block_base = (group_id.y * k_blocks + block_k) * block_bytes;
         for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
             uint n = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
@@ -152,15 +159,15 @@ kernel void affine_matmul_int4(
             uint g_k = k_base + k;
             half val = half(0);
             if (g_n < N && g_k < K) {
-                uint byte_idx = g_n * half_K + g_k / 2;
+                uint byte_idx = block_base + n * local_k_bytes + k / 2;
                 uchar packed  = B_packed[byte_idx];
-                uchar nibble  = (g_k % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+                uchar nibble  = (k % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
                 uint grp = g_k / group_size;
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(nibble) - z) * s);
             }
-            tg_bt[0][k * TN_TILE + n] = val;
+            tg_bt[0][k * TN_STRIDE + n] = val;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -184,6 +191,8 @@ kernel void affine_matmul_int4(
                 }
                 tg_a[nxt][i] = a_val;
             }
+            uint block_k = k_base / MATMUL_K_TILE;
+            uint block_base = (group_id.y * k_blocks + block_k) * block_bytes;
             for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
                 uint n = i / MATMUL_K_TILE;
                 uint k = i % MATMUL_K_TILE;
@@ -191,15 +200,15 @@ kernel void affine_matmul_int4(
                 uint g_k = k_base + k;
                 half val = half(0);
                 if (g_n < N && g_k < K) {
-                    uint byte_idx = g_n * half_K + g_k / 2;
+                    uint byte_idx = block_base + n * local_k_bytes + k / 2;
                     uchar packed  = B_packed[byte_idx];
-                    uchar nibble  = (g_k % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+                    uchar nibble  = (k % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
                     uint grp = g_k / group_size;
                     float s = float(scales[g_n * num_groups + grp]);
                     float z = float(zeros[g_n * num_groups + grp]);
                     val = half((float(nibble) - z) * s);
                 }
-                tg_bt[nxt][k * TN_TILE + n] = val;
+                tg_bt[nxt][k * TN_STRIDE + n] = val;
             }
         }
 
@@ -208,7 +217,7 @@ kernel void affine_matmul_int4(
         simdgroup_load(a_mat, tg_a[cur] + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
         for (uint j = 0; j < TN_BLOCKS; j++) {
             simdgroup_matrix<half, 8, 8> bt_mat;
-            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, TN_TILE);
+            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, TN_STRIDE);
             simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
         }
 
@@ -312,10 +321,15 @@ kernel void affine_matmul_int8(
     uint tg_n = group_id.y * TN_TILE;
 
     threadgroup half tg_a[2][TM_TILE * MATMUL_K_TILE];
-    threadgroup half tg_bt[2][MATMUL_K_TILE * TN_TILE];
+    threadgroup half tg_bt[2][MATMUL_K_TILE * TN_STRIDE];
 
     uint num_groups = (K + group_size - 1) / group_size;
     uint num_k_steps = (K + MATMUL_K_TILE - 1) / MATMUL_K_TILE;
+
+    // Blocked layout constants for B-load
+    uint k_blocks = num_k_steps;
+    uint local_k_bytes = MATMUL_K_TILE;  // 8 bytes per INT8 tile column
+    uint block_bytes = TN_TILE * local_k_bytes;
 
     simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
     for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
@@ -334,6 +348,8 @@ kernel void affine_matmul_int8(
             }
             tg_a[0][i] = a_val;
         }
+        uint block_k = k_base / MATMUL_K_TILE;
+        uint block_base = (group_id.y * k_blocks + block_k) * block_bytes;
         for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
             uint n = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
@@ -341,13 +357,14 @@ kernel void affine_matmul_int8(
             uint g_k = k_base + k;
             half val = half(0);
             if (g_n < N && g_k < K) {
-                uchar q = B_packed[g_n * K + g_k];
+                uint byte_idx = block_base + n * local_k_bytes + k;
+                uchar q = B_packed[byte_idx];
                 uint grp = g_k / group_size;
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
                 val = half((float(q) - z) * s);
             }
-            tg_bt[0][k * TN_TILE + n] = val;
+            tg_bt[0][k * TN_STRIDE + n] = val;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -371,6 +388,8 @@ kernel void affine_matmul_int8(
                 }
                 tg_a[nxt][i] = a_val;
             }
+            uint block_k = k_base / MATMUL_K_TILE;
+            uint block_base = (group_id.y * k_blocks + block_k) * block_bytes;
             for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
                 uint n = i / MATMUL_K_TILE;
                 uint k = i % MATMUL_K_TILE;
@@ -378,13 +397,14 @@ kernel void affine_matmul_int8(
                 uint g_k = k_base + k;
                 half val = half(0);
                 if (g_n < N && g_k < K) {
-                    uchar q = B_packed[g_n * K + g_k];
+                    uint byte_idx = block_base + n * local_k_bytes + k;
+                    uchar q = B_packed[byte_idx];
                     uint grp = g_k / group_size;
                     float s = float(scales[g_n * num_groups + grp]);
                     float z = float(zeros[g_n * num_groups + grp]);
                     val = half((float(q) - z) * s);
                 }
-                tg_bt[nxt][k * TN_TILE + n] = val;
+                tg_bt[nxt][k * TN_STRIDE + n] = val;
             }
         }
 
@@ -393,7 +413,7 @@ kernel void affine_matmul_int8(
         simdgroup_load(a_mat, tg_a[cur] + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
         for (uint j = 0; j < TN_BLOCKS; j++) {
             simdgroup_matrix<half, 8, 8> bt_mat;
-            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, TN_TILE);
+            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, TN_STRIDE);
             simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
         }
 

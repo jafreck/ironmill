@@ -323,8 +323,15 @@ fn load_weight_buffer(
                 let packed = pack_weight_blocked(device, &buf, n, k)?;
                 Ok(WeightBuffer::Dense { buf, packed })
             } else {
+                let rows = original_shape[0];
+                let cols = if original_shape.len() > 1 {
+                    original_shape[1]
+                } else {
+                    1
+                };
+                let repacked = pack_quantized_blocked(indices, rows, cols, *n_bits as usize);
                 let indices_buf = device
-                    .create_buffer_with_data(indices, StorageMode::Shared)
+                    .create_buffer_with_data(&repacked, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;
                 let lut_buf = device
                     .create_buffer_with_data(lut, StorageMode::Shared)
@@ -332,12 +339,6 @@ fn load_weight_buffer(
                 let norms_buf = device
                     .create_buffer_with_data(row_norms, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;
-                let rows = original_shape[0];
-                let cols = if original_shape.len() > 1 {
-                    original_shape[1]
-                } else {
-                    1
-                };
                 Ok(WeightBuffer::Quantized(QuantizedWeight {
                     indices: indices_buf,
                     lut: lut_buf,
@@ -365,8 +366,9 @@ fn load_weight_buffer(
                 let total_elements = n * k;
                 let gs = group_size.unwrap_or(total_elements);
 
+                let repacked = pack_quantized_blocked(&tensor.data, n, k, *bit_width as usize);
                 let data_buf = device
-                    .create_buffer_with_data(&tensor.data, StorageMode::Shared)
+                    .create_buffer_with_data(&repacked, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;
 
                 // Convert scales and zeros to FP16 bytes for the GPU.
@@ -452,4 +454,49 @@ fn load_dense_buffer(
     device
         .create_buffer_with_data(&dense.bytes, StorageMode::Shared)
         .map_err(MetalError::Metal)
+}
+
+/// Repack quantized weight bytes into blocked layout for simdgroup matmul.
+///
+/// Input layout:  row-major `[N, K_bytes_per_row]`
+/// Output layout: `[N_blocks, K_blocks, TN_TILE, local_K_bytes]`
+///
+/// `N_blocks = ceil(N/64)`, `K_blocks = ceil(K/K_TILE)`
+/// For INT4: `K_bytes_per_row = K/2`, `local_K_bytes = K_TILE/2 = 4`
+/// For INT8: `K_bytes_per_row = K`,   `local_K_bytes = K_TILE = 8`
+fn pack_quantized_blocked(data: &[u8], n: usize, k: usize, bit_width: usize) -> Vec<u8> {
+    let k_tile: usize = 8;
+    let n_tile: usize = 64;
+    let n_blocks = n.div_ceil(n_tile);
+    let k_blocks = k.div_ceil(k_tile);
+
+    let elements_per_byte = 8 / bit_width; // 2 for INT4, 1 for INT8
+    let bytes_per_row = k / elements_per_byte;
+    let local_k_bytes = k_tile / elements_per_byte;
+    let block_bytes = n_tile * local_k_bytes;
+
+    let total_bytes = n_blocks * k_blocks * block_bytes;
+    let mut out = vec![0u8; total_bytes];
+
+    for nb in 0..n_blocks {
+        for kb in 0..k_blocks {
+            for n_local in 0..n_tile {
+                let g_n = nb * n_tile + n_local;
+                if g_n >= n {
+                    continue;
+                }
+                for b in 0..local_k_bytes {
+                    let src_byte = kb * local_k_bytes + b;
+                    if src_byte >= bytes_per_row {
+                        continue;
+                    }
+                    let src_offset = g_n * bytes_per_row + src_byte;
+                    let dst_offset =
+                        (nb * k_blocks + kb) * block_bytes + n_local * local_k_bytes + b;
+                    out[dst_offset] = data[src_offset];
+                }
+            }
+        }
+    }
+    out
 }
