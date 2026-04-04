@@ -662,56 +662,35 @@ impl MetalInference {
             .command_buffer()
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
 
-        // Step 0: Embedding lookup via compute encoder.
-        {
-            let enc = cmd_buf
-                .compute_encoder()
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-
-            ops::encode_embedding_lookup(
-                &enc,
-                &self.pipelines()?.embedding_lookup,
-                &ops::EmbeddingLookupParams {
-                    token_ids: &bufs.token_ids_buf,
-                    embedding_table: &weights.embedding,
-                    output: &bufs.hidden_state,
-                    hidden_size: h as u32,
-                    token_count: token_count as u32,
-                    vocab_size: vocab as u32,
-                },
-            );
-            enc.end_encoding();
-        }
-
-        // Per-layer processing.
-        //
-        // Operator fusion: the fused_residual_rms_norm kernel combines a
-        // residual add with RMSNorm in a single dispatch, cutting per-layer
-        // kernel launches by two.  To enable the second fusion (end-of-layer
-        // residual + next layer's input norm), we hoist the very first layer's
-        // input norm out of the loop.  Subsequent layers receive their input
-        // norm as part of the previous layer's fused end-of-layer dispatch.
-
-        // Input norm for the first layer (standalone — no preceding residual to fuse).
+        // Step 0: Fused embedding lookup + first-layer RMSNorm.
+        // Writes both hidden_state (raw embedding for residual) and
+        // norm_out (normalized for first layer's projections).
         {
             let lw0 = &weights.layers[0];
             let enc = cmd_buf
                 .compute_encoder()
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-            ops::encode_rms_norm(
-                &enc,
-                &self.pipelines()?.rms_norm,
-                &ops::RmsNormParams {
-                    input: &bufs.hidden_state,
-                    weight: &lw0.input_norm,
-                    output: &bufs.norm_out,
-                    hidden_size: h as u32,
-                    token_count: token_count as u32,
-                    eps,
-                },
-            );
+            let pipelines = self.pipelines()?;
+            enc.set_pipeline(&pipelines.fused_embedding_norm);
+            enc.set_buffer(&bufs.token_ids_buf, 0, 0);
+            enc.set_buffer(&weights.embedding, 0, 1);
+            enc.set_buffer(&lw0.input_norm, 0, 2);
+            enc.set_buffer(&bufs.norm_out, 0, 3);
+            enc.set_buffer(&bufs.hidden_state, 0, 4);
+            enc.set_bytes(&(h as u32).to_le_bytes(), 5);
+            enc.set_bytes(&(token_count as u32).to_le_bytes(), 6);
+            enc.set_bytes(&(vocab as u32).to_le_bytes(), 7);
+            enc.set_bytes(&eps.to_le_bytes(), 8);
+            let tg_size = (h as usize).min(1024);
+            enc.dispatch_threadgroups((token_count, 1, 1), (tg_size, 1, 1));
             enc.end_encoding();
         }
+
+        // Per-layer processing.
+        //
+        // norm_out already contains the first layer's input-norm result
+        // (from the fused embedding+norm above). Subsequent layers receive
+        // their input norm from the previous layer's fused end-of-layer dispatch.
 
         for layer_idx in 0..mc.num_hidden_layers {
             let lw = &weights.layers[layer_idx];
@@ -1800,6 +1779,10 @@ fn encode_affine_matmul(
 // ── Shared decode helpers ──────────────────────────────────────
 
 /// Encode QK normalization (Qwen3) and RoPE for Q and K projections.
+///
+/// When QK-norm weights are present, uses a single fused kernel that
+/// normalizes and rotates each head in one pass. Otherwise falls back
+/// to standalone RoPE dispatches.
 fn encode_qk_norm_and_rope(
     cmd_buf: &ironmill_metal_sys::CommandBuffer,
     pipelines: &super::ops::MetalPipelines,
@@ -1816,37 +1799,28 @@ fn encode_qk_norm_and_rope(
     eps: f32,
 ) -> Result<(), InferenceError> {
     if let (Some(q_norm_w), Some(k_norm_w)) = (q_norm, k_norm) {
+        // Fused path: one dispatch does RMSNorm + RoPE for both Q and K.
         let enc = cmd_buf
             .compute_encoder()
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;
-        ops::encode_rms_norm(
-            &enc,
-            &pipelines.rms_norm,
-            &ops::RmsNormParams {
-                input: &bufs.q_proj,
-                weight: q_norm_w,
-                output: &bufs.q_proj,
-                hidden_size: hd,
-                token_count: token_count as u32 * nh,
-                eps,
-            },
-        );
-        ops::encode_rms_norm(
-            &enc,
-            &pipelines.rms_norm,
-            &ops::RmsNormParams {
-                input: &bufs.k_proj,
-                weight: k_norm_w,
-                output: &bufs.k_proj,
-                hidden_size: hd,
-                token_count: token_count as u32 * nkv,
-                eps,
-            },
-        );
+        enc.set_pipeline(&pipelines.fused_qk_norm_rope);
+        enc.set_buffer(&bufs.q_proj, 0, 0);
+        enc.set_buffer(&bufs.k_proj, 0, 1);
+        enc.set_buffer(q_norm_w, 0, 2);
+        enc.set_buffer(k_norm_w, 0, 3);
+        enc.set_buffer(rope_cos, 0, 4);
+        enc.set_buffer(rope_sin, 0, 5);
+        enc.set_bytes(&nh.to_le_bytes(), 6);
+        enc.set_bytes(&nkv.to_le_bytes(), 7);
+        enc.set_bytes(&hd.to_le_bytes(), 8);
+        enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 9);
+        enc.set_bytes(&(token_count as u32).to_le_bytes(), 10);
+        enc.set_bytes(&eps.to_le_bytes(), 11);
+        let tg_size = (hd as usize).min(1024);
+        enc.dispatch_threadgroups(((nh + nkv) as usize, token_count, 1), (tg_size, 1, 1));
         enc.end_encoding();
-    }
-
-    {
+    } else {
+        // No QK-norm — just RoPE.
         let enc = cmd_buf
             .compute_encoder()
             .map_err(|e| InferenceError::Runtime(e.to_string()))?;

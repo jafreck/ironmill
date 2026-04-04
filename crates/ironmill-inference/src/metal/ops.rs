@@ -50,6 +50,8 @@ pub struct MetalPipelines {
     pub matvec: ComputePipeline,
     pub matmul: ComputePipeline,
     pub fused_residual_rms_norm: ComputePipeline,
+    pub fused_qk_norm_rope: ComputePipeline,
+    pub fused_embedding_norm: ComputePipeline,
     pub int4_dequantize: ComputePipeline,
 }
 
@@ -109,6 +111,12 @@ impl MetalPipelines {
             .load_library_from_data(include_bytes!(concat!(
                 env!("OUT_DIR"),
                 "/fused_residual_norm.metallib"
+            )))
+            .map_err(MetalError::Metal)?;
+        let fused_en_lib = device
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/fused_embedding_norm.metallib"
             )))
             .map_err(MetalError::Metal)?;
         let int4_dequant_lib = device
@@ -282,6 +290,20 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &fused_rn_lib
                         .get_function("fused_residual_rms_norm")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            fused_qk_norm_rope: device
+                .create_compute_pipeline(
+                    &attn_lib
+                        .get_function("fused_qk_norm_rope")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            fused_embedding_norm: device
+                .create_compute_pipeline(
+                    &fused_en_lib
+                        .get_function("fused_embedding_norm")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,

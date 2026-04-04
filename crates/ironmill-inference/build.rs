@@ -36,6 +36,7 @@ fn main() {
         "kv_scatter",
         "matvec",
         "fused_residual_norm",
+        "fused_embedding_norm",
         "int4_dequant",
         "affine_matmul",
     ];
@@ -52,6 +53,8 @@ fn main() {
         std::fs::read_to_string(helpers_dir.join("turboquant_helpers.metal")).unwrap();
     let tq_main_src = std::fs::read_to_string(shader_dir.join("turboquant.metal")).unwrap();
     let attn_src = std::fs::read_to_string(shader_dir.join("attention.metal")).unwrap();
+    let fused_qk_src =
+        std::fs::read_to_string(shader_dir.join("fused_qk_norm_rope.metal")).unwrap();
 
     for &hd in HEAD_DIMS {
         let defines = [
@@ -65,7 +68,7 @@ fn main() {
             "#define HEAD_DIM {hd}\n#define HEAD_DIM_PACKED {}\n",
             hd / 2
         );
-        std::fs::write(&attn_tmp, format!("{header}{attn_src}")).unwrap();
+        std::fs::write(&attn_tmp, format!("{header}{attn_src}\n{fused_qk_src}")).unwrap();
         compile_shader(
             &attn_tmp,
             &out_dir.join(format!("attention_hd{hd}.metallib")),
