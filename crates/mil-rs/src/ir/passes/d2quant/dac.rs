@@ -48,7 +48,8 @@ impl Pass for DacPass {
 
     fn run(&self, program: &mut Program) -> Result<()> {
         let provider = program.weight_provider.clone();
-        let resolve = super::super::util::make_resolver(&provider);
+        let spill_index = program.spill_index.clone();
+        let resolve = super::super::util::make_resolver(&provider, &spill_index);
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {

@@ -4,6 +4,7 @@
 //! operation list without mutating anything.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::MilError;
@@ -12,12 +13,20 @@ use crate::ir::program::Block;
 use crate::ir::types::Value;
 use crate::weights::WeightProvider;
 
-/// Create a resolver closure from an optional provider Arc.
+/// Create a resolver closure from an optional provider Arc and a spill index.
 /// Used by quantization passes to materialize External tensors.
-pub(crate) fn make_resolver(
-    provider: &Option<Arc<dyn WeightProvider + Send + Sync>>,
-) -> impl Fn(&str) -> Result<Vec<u8>, MilError> + '_ {
+/// Checks the spill index first (for data written between passes), then
+/// falls back to the weight provider.
+pub(crate) fn make_resolver<'a>(
+    provider: &'a Option<Arc<dyn WeightProvider + Send + Sync>>,
+    spill_index: &'a HashMap<String, PathBuf>,
+) -> impl Fn(&str) -> Result<Vec<u8>, MilError> + 'a {
     move |key: &str| {
+        // Check spill first (quantized data written between passes)
+        if let Some(path) = spill_index.get(key) {
+            return std::fs::read(path).map_err(MilError::Io);
+        }
+        // Fall back to weight provider (original weight data)
         let p = provider.as_ref().ok_or_else(|| {
             MilError::Validation(format!(
                 "no weight provider attached; cannot resolve tensor '{key}'"

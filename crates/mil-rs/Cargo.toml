@@ -24,6 +24,7 @@ statrs = { workspace = true }
 memmap2 = { workspace = true }
 faer = { version = "0.20", optional = true }
 rayon = "1.11"
+tempfile = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

@@ -82,7 +82,8 @@ impl Pass for PalettizePass {
     fn run(&self, program: &mut Program) -> Result<()> {
         let k = 1usize << self.n_bits; // 2^n_bits centroids
         let provider = program.weight_provider.clone();
-        let resolve = super::util::make_resolver(&provider);
+        let spill_index = program.spill_index.clone();
+        let resolve = super::util::make_resolver(&provider, &spill_index);
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {
@@ -190,7 +191,8 @@ impl Pass for GroupedPalettizePass {
     fn run(&self, program: &mut Program) -> Result<()> {
         let k = 1usize << self.n_bits;
         let provider = program.weight_provider.clone();
-        let resolve = super::util::make_resolver(&provider);
+        let spill_index = program.spill_index.clone();
+        let resolve = super::util::make_resolver(&provider, &spill_index);
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {

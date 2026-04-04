@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
+use tempfile::TempDir;
 
 use super::operation::Operation;
 use super::tensor::TensorType;
-use super::types::Value;
+use super::types::{TensorData, Value};
 use crate::error::MilError;
 use crate::weights::WeightProvider;
 
@@ -15,7 +17,6 @@ use std::fmt;
 ///
 /// A program contains one or more named functions. The "main" function is
 /// the entry point for inference.
-#[derive(Clone)]
 pub struct Program {
     /// Program version (e.g., "1.0.0").
     pub version: String,
@@ -26,6 +27,25 @@ pub struct Program {
 
     /// Optional weight provider for resolving `TensorData::External` references.
     pub(crate) weight_provider: Option<Arc<dyn WeightProvider + Send + Sync>>,
+
+    /// Temp directory for spilled tensor data (auto-cleaned on drop).
+    /// Not cloned — each Program gets its own spill state.
+    pub(crate) spill_dir: Option<TempDir>,
+    /// Maps spill keys to file paths for resolution.
+    pub(crate) spill_index: HashMap<String, PathBuf>,
+}
+
+impl Clone for Program {
+    fn clone(&self) -> Self {
+        Self {
+            version: self.version.clone(),
+            functions: self.functions.clone(),
+            attributes: self.attributes.clone(),
+            weight_provider: self.weight_provider.clone(),
+            spill_dir: None,
+            spill_index: HashMap::new(),
+        }
+    }
 }
 
 impl fmt::Debug for Program {
@@ -38,6 +58,8 @@ impl fmt::Debug for Program {
                 "weight_provider",
                 &self.weight_provider.as_ref().map(|_| ".."),
             )
+            .field("spill_dir", &self.spill_dir.is_some())
+            .field("spill_index_len", &self.spill_index.len())
             .finish()
     }
 }
@@ -50,6 +72,8 @@ impl Program {
             functions: IndexMap::new(),
             attributes: HashMap::new(),
             weight_provider: None,
+            spill_dir: None,
+            spill_index: HashMap::new(),
         }
     }
 
@@ -97,6 +121,11 @@ impl Program {
 
     /// Resolve an external tensor key to its byte data.
     pub fn resolve_tensor(&self, key: &str) -> Result<Vec<u8>, MilError> {
+        // Check spill directory first (quantized data written between passes)
+        if let Some(path) = self.spill_index.get(key) {
+            return std::fs::read(path).map_err(MilError::Io);
+        }
+        // Fall back to weight provider (original weight data)
         let provider = self.weight_provider.as_ref().ok_or_else(|| {
             MilError::Validation(format!(
                 "no weight provider attached; cannot resolve external tensor '{key}'"
@@ -127,21 +156,83 @@ impl Program {
             .weight_provider
             .clone()
             .ok_or_else(|| MilError::Validation("no weight provider for materialization".into()))?;
+        let spill_index = self.spill_index.clone();
 
         for function in self.functions.values_mut() {
-            Self::materialize_block(&mut function.body, &*provider)?;
+            Self::materialize_block(&mut function.body, &*provider, &spill_index)?;
         }
         Ok(())
     }
 
-    fn materialize_block(block: &mut Block, provider: &dyn WeightProvider) -> Result<(), MilError> {
+    fn materialize_block(
+        block: &mut Block,
+        provider: &dyn WeightProvider,
+        spill_index: &HashMap<String, PathBuf>,
+    ) -> Result<(), MilError> {
         for op in &mut block.operations {
             for val in op.inputs.values_mut().chain(op.attributes.values_mut()) {
                 if let Value::Tensor { data, .. } = val {
                     data.materialize_with(|key| {
+                        // Check spill first
+                        if let Some(path) = spill_index.get(key) {
+                            return std::fs::read(path).map_err(MilError::Io);
+                        }
                         let tensor = provider.tensor(key)?;
                         Ok(tensor.data.into_owned())
                     })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Spill large inline tensors to a temp directory, replacing them with
+    /// `TensorData::External` references. Called between passes to bound
+    /// peak memory to one unquantized tensor at a time.
+    ///
+    /// Tensors smaller than `min_bytes` are kept inline (scalars, norms, biases).
+    pub fn spill_inline_tensors(&mut self, min_bytes: usize) -> Result<(), MilError> {
+        // Lazily create the spill directory
+        if self.spill_dir.is_none() {
+            self.spill_dir = Some(tempfile::tempdir().map_err(|e| {
+                MilError::Validation(format!("failed to create spill directory: {e}"))
+            })?);
+        }
+        let dir = self.spill_dir.as_ref().unwrap().path().to_owned();
+        let mut counter = self.spill_index.len();
+
+        for function in self.functions.values_mut() {
+            Self::spill_block(
+                &mut function.body,
+                &dir,
+                min_bytes,
+                &mut counter,
+                &mut self.spill_index,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn spill_block(
+        block: &mut Block,
+        dir: &std::path::Path,
+        min_bytes: usize,
+        counter: &mut usize,
+        index: &mut HashMap<String, PathBuf>,
+    ) -> Result<(), MilError> {
+        for op in &mut block.operations {
+            for val in op.inputs.values_mut().chain(op.attributes.values_mut()) {
+                if let Value::Tensor { data, .. } = val {
+                    if data.is_inline() && data.byte_len() >= min_bytes {
+                        let key = format!("_spill_{counter}");
+                        *counter += 1;
+                        let path = dir.join(&key);
+                        let bytes = data.as_bytes().unwrap();
+                        std::fs::write(&path, bytes).map_err(MilError::Io)?;
+                        let byte_len = bytes.len();
+                        *data = TensorData::external(key.clone(), byte_len);
+                        index.insert(key, path);
+                    }
                 }
             }
         }
@@ -561,6 +652,92 @@ mod tests {
             );
         } else {
             panic!("expected Tensor values");
+        }
+    }
+
+    #[test]
+    fn test_spill_and_rematerialize() {
+        // Build a program with a large inline tensor
+        let mut program = Program::new("1.0");
+        let mut func = Function::new("main");
+        let big_data = vec![42u8; 8192]; // Above 4096 threshold
+        let op = Operation::new("const", "big_const")
+            .with_output("big_out")
+            .with_attr(
+                "val",
+                Value::Tensor {
+                    data: TensorData::inline(big_data.clone()),
+                    shape: vec![8192],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+        func.body.add_op(op);
+        func.body.outputs = vec!["big_out".into()];
+        program.add_function(func);
+
+        // Spill with threshold = 4096
+        program
+            .spill_inline_tensors(4096)
+            .expect("spill should succeed");
+
+        // Verify the tensor is now External
+        let main = program.main().unwrap();
+        let op = &main.body.operations[0];
+        if let Some(Value::Tensor { data, .. }) = op.attributes.get("val") {
+            assert!(data.is_external(), "should be spilled to disk");
+            assert_eq!(data.byte_len(), 8192);
+        } else {
+            panic!("expected tensor attribute");
+        }
+
+        // Attach a dummy provider and materialize
+        program.set_weight_provider(Arc::new(StubProvider::new()));
+        program
+            .materialize_all()
+            .expect("materialize should succeed");
+
+        // Verify data is back
+        let main = program.main().unwrap();
+        let op = &main.body.operations[0];
+        if let Some(Value::Tensor { data, .. }) = op.attributes.get("val") {
+            assert!(data.is_inline(), "should be materialized");
+            assert_eq!(data.as_bytes().unwrap(), &big_data[..]);
+        } else {
+            panic!("expected tensor attribute after materialize");
+        }
+    }
+
+    #[test]
+    fn test_spill_skips_small_tensors() {
+        let mut program = Program::new("1.0");
+        let mut func = Function::new("main");
+        let small_data = vec![1u8; 100]; // Below 4096 threshold
+        let op = Operation::new("const", "small_const")
+            .with_output("small_out")
+            .with_attr(
+                "val",
+                Value::Tensor {
+                    data: TensorData::inline(small_data.clone()),
+                    shape: vec![100],
+                    dtype: ScalarType::UInt8,
+                },
+            );
+        func.body.add_op(op);
+        func.body.outputs = vec!["small_out".into()];
+        program.add_function(func);
+
+        program
+            .spill_inline_tensors(4096)
+            .expect("spill should succeed");
+
+        // Small tensor should remain inline
+        let main = program.main().unwrap();
+        let op = &main.body.operations[0];
+        if let Some(Value::Tensor { data, .. }) = op.attributes.get("val") {
+            assert!(data.is_inline(), "small tensor should stay inline");
+            assert_eq!(data.as_bytes().unwrap(), &small_data[..]);
+        } else {
+            panic!("expected tensor attribute");
         }
     }
 }

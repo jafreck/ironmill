@@ -119,7 +119,8 @@ impl Pass for AffineQuantizePass {
         let qmax = self.bits.qmax();
         let bit_width = self.bits.as_u8();
         let provider = program.weight_provider.clone();
-        let resolve = super::util::make_resolver(&provider);
+        let spill_index = program.spill_index.clone();
+        let resolve = super::util::make_resolver(&provider, &spill_index);
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {

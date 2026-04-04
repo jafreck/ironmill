@@ -93,7 +93,8 @@ impl Pass for GptqQuantizePass {
         let qmax = (1u32 << self.bits) - 1;
         let qmax_f = qmax as f32;
         let provider = program.weight_provider.clone();
-        let resolve = super::util::make_resolver(&provider);
+        let spill_index = program.spill_index.clone();
+        let resolve = super::util::make_resolver(&provider, &spill_index);
 
         for function in program.functions.values_mut() {
             for op in &mut function.body.operations {

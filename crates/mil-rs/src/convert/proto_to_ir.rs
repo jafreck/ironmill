@@ -51,6 +51,8 @@ fn convert_program(proto: &mil_spec::Program) -> Result<Program> {
         functions,
         attributes: std::collections::HashMap::new(),
         weight_provider: None,
+        spill_dir: None,
+        spill_index: std::collections::HashMap::new(),
     })
 }
 

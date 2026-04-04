@@ -183,7 +183,8 @@ impl Pass for AwqQuantizePass {
 
         let qmax = qmax(self.bits);
         let provider = program.weight_provider.clone();
-        let resolve = super::util::make_resolver(&provider);
+        let spill_index = program.spill_index.clone();
+        let resolve = super::util::make_resolver(&provider, &spill_index);
 
         for function in program.functions.values_mut() {
             // ----------------------------------------------------------
