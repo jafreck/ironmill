@@ -758,4 +758,242 @@ mod tests {
         assert!(Architecture::from_str("gemma4").is_ok());
         assert!(Architecture::from_str("gemma4_text").is_ok());
     }
+
+    #[test]
+    fn build_program_gemma4_31b_dense() {
+        // 31B: no PLE, no K=V, no KV shared layers — simplest Gemma 4 variant
+        let mut config = tiny_gemma_config();
+        config.hidden_size = 128;
+        config.intermediate_size = 512;
+        config.num_attention_heads = 8;
+        config.num_key_value_heads = 4;
+        config.head_dim = 16;
+        config.num_hidden_layers = 4;
+        // Per-layer attention types (every 5th is full_attention)
+        config.extra.insert(
+            "layer_types".into(),
+            serde_json::json!([
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention"
+            ]),
+        );
+        config.extra.insert(
+            "rope_parameters".into(),
+            serde_json::json!({
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0}
+            }),
+        );
+        config
+            .extra
+            .insert("sliding_window".into(), serde_json::json!(4096));
+        // 31B does NOT use PLE, K=V, KV sharing, or double-wide MLP
+        config
+            .extra
+            .insert("hidden_size_per_layer_input".into(), serde_json::json!(0));
+        config
+            .extra
+            .insert("attention_k_eq_v".into(), serde_json::json!(false));
+        config
+            .extra
+            .insert("num_kv_shared_layers".into(), serde_json::json!(0));
+        config
+            .extra
+            .insert("use_double_wide_mlp".into(), serde_json::json!(false));
+
+        let provider = StubProvider::new(config).with_llama_weights();
+        let result = build_program(&provider).expect("31B build should succeed");
+        assert_eq!(result.program.functions.len(), 1);
+
+        // Should have per-layer attention types
+        assert!(result.program.attributes.get("layer_types").is_some());
+        // Should NOT have PLE-related ops
+        let main = result.program.main().unwrap();
+        let ple_ops: Vec<_> = main
+            .body
+            .operations
+            .iter()
+            .filter(|op| op.name.contains("ple_"))
+            .collect();
+        assert!(ple_ops.is_empty(), "31B should not emit PLE ops");
+    }
+
+    #[test]
+    fn build_program_gemma4_e4b() {
+        // E4B: same architecture as E2B — PLE, KV sharing, double-wide MLP
+        let mut config = tiny_gemma_config();
+        config.hidden_size = 128;
+        config.intermediate_size = 256;
+        config.num_attention_heads = 8;
+        config.num_key_value_heads = 1; // MQA
+        config.head_dim = 16;
+        config.num_hidden_layers = 6;
+        // Per-layer attention types
+        config.extra.insert(
+            "layer_types".into(),
+            serde_json::json!([
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention"
+            ]),
+        );
+        config.extra.insert(
+            "rope_parameters".into(),
+            serde_json::json!({
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0}
+            }),
+        );
+        config
+            .extra
+            .insert("sliding_window".into(), serde_json::json!(512));
+        // E4B uses PLE
+        config
+            .extra
+            .insert("hidden_size_per_layer_input".into(), serde_json::json!(32));
+        config
+            .extra
+            .insert("vocab_size_per_layer_input".into(), serde_json::json!(256));
+        // E4B uses KV sharing (last 4 of 6 layers)
+        config
+            .extra
+            .insert("num_kv_shared_layers".into(), serde_json::json!(4));
+        // E4B uses double-wide MLP on shared layers
+        config
+            .extra
+            .insert("use_double_wide_mlp".into(), serde_json::json!(true));
+        config
+            .extra
+            .insert("attention_k_eq_v".into(), serde_json::json!(false));
+        config
+            .extra
+            .insert("final_logit_softcapping".into(), serde_json::json!(30.0));
+
+        // Build weights with PLE model-level tensors
+        let mut provider = StubProvider::new(config).with_llama_weights();
+        // Add model-level PLE weights
+        provider = provider
+            .with_tensor(
+                "model.embed_tokens_per_layer.weight",
+                &[256, 6 * 32],
+                ScalarType::Float16,
+            )
+            .with_tensor(
+                "model.per_layer_model_projection.weight",
+                &[6 * 32, 128],
+                ScalarType::Float16,
+            )
+            .with_tensor(
+                "model.per_layer_projection_norm.weight",
+                &[32],
+                ScalarType::Float16,
+            );
+        // Add per-layer PLE weights
+        for l in 0..6 {
+            let p = format!("model.layers.{l}");
+            provider = provider
+                .with_tensor(
+                    &format!("{p}.per_layer_input_gate.weight"),
+                    &[32, 128],
+                    ScalarType::Float16,
+                )
+                .with_tensor(
+                    &format!("{p}.per_layer_projection.weight"),
+                    &[128, 32],
+                    ScalarType::Float16,
+                )
+                .with_tensor(
+                    &format!("{p}.post_per_layer_input_norm.weight"),
+                    &[128],
+                    ScalarType::Float16,
+                );
+        }
+
+        let result = build_program(&provider).expect("E4B build should succeed");
+        assert_eq!(result.program.functions.len(), 1);
+
+        let main = result.program.main().unwrap();
+        // Should have PLE ops
+        let ple_ops: Vec<_> = main
+            .body
+            .operations
+            .iter()
+            .filter(|op| op.name.contains("ple_"))
+            .collect();
+        assert!(!ple_ops.is_empty(), "E4B should emit PLE ops");
+
+        // Should have softcapping
+        let has_tanh = main.body.operations.iter().any(|op| op.op_type == "tanh");
+        assert!(has_tanh, "E4B should emit softcapping tanh");
+    }
+
+    #[test]
+    fn build_program_gemma4_no_layer_types_is_gemma3() {
+        // When no layer_types are set, it's a standard Gemma (1/2/3) — backward compat
+        let config = tiny_gemma_config();
+        let provider = StubProvider::new(config).with_llama_weights();
+        let result = build_program(&provider).expect("Gemma 3 build should succeed");
+        assert!(
+            result.program.attributes.get("layer_types").is_none(),
+            "Gemma 3 should not emit layer_types attribute"
+        );
+    }
+
+    #[test]
+    fn build_program_gemma4_global_head_dim_differs() {
+        // Test with global_head_dim != head_dim (e.g. global_head_dim=32 vs head_dim=16)
+        let mut config = tiny_gemma_config();
+        config.num_hidden_layers = 2;
+        config.extra.insert(
+            "layer_types".into(),
+            serde_json::json!(["sliding_attention", "full_attention"]),
+        );
+        config.extra.insert(
+            "rope_parameters".into(),
+            serde_json::json!({
+                "sliding_attention": {"rope_theta": 10000.0},
+                "full_attention": {"rope_theta": 1000000.0, "partial_rotary_factor": 0.5}
+            }),
+        );
+        config
+            .extra
+            .insert("global_head_dim".into(), serde_json::json!(32));
+        config
+            .extra
+            .insert("num_global_key_value_heads".into(), serde_json::json!(2));
+
+        // Need custom weights for the global layer with different head_dim
+        let mut provider = StubProvider::new(config.clone()).with_llama_weights();
+        // Override the global layer's attention weights with correct dimensions
+        let p = "model.layers.1";
+        provider = provider
+            .with_tensor(
+                &format!("{p}.self_attn.q_proj.weight"),
+                &[config.num_attention_heads * 32, config.hidden_size],
+                ScalarType::Float16,
+            )
+            .with_tensor(
+                &format!("{p}.self_attn.k_proj.weight"),
+                &[2 * 32, config.hidden_size],
+                ScalarType::Float16,
+            )
+            .with_tensor(
+                &format!("{p}.self_attn.v_proj.weight"),
+                &[2 * 32, config.hidden_size],
+                ScalarType::Float16,
+            )
+            .with_tensor(
+                &format!("{p}.self_attn.o_proj.weight"),
+                &[config.hidden_size, config.num_attention_heads * 32],
+                ScalarType::Float16,
+            );
+
+        let result = build_program(&provider).expect("heterogeneous head_dim build should succeed");
+        assert_eq!(result.program.functions.len(), 1);
+    }
 }
