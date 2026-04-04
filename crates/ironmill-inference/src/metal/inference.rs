@@ -2121,19 +2121,29 @@ fn encode_kv_cache_and_attention(
             },
         );
 
-        // Standard attention — loop over tokens with causal
-        // masking so each token attends only to 0..seq_pos+t+1.
-        let q_head_stride_bytes = (nh as usize) * (hd as usize) * 2;
+        // Standard attention — use batched prefill kernel for multi-token,
+        // single-dispatch decode kernel for single-token.
         let attn_tg_size = 256_usize.max(hd as usize).min(1024);
-        for t in 0..token_count {
-            let q_offset = t * q_head_stride_bytes;
-            let attn_out_offset = t * q_head_stride_bytes;
-            let current_seq_len = (seq_pos + t + 1) as u32;
-            enc.set_pipeline(&pipelines.standard_attention);
-            enc.set_buffer(&bufs.q_proj, q_offset, 0);
+        if token_count > 1 {
+            enc.set_pipeline(&pipelines.prefill_attention);
+            enc.set_buffer(&bufs.q_proj, 0, 0);
             enc.set_buffer(k_cache, 0, 1);
             enc.set_buffer(v_cache, 0, 2);
-            enc.set_buffer(&bufs.attn_out, attn_out_offset, 3);
+            enc.set_buffer(&bufs.attn_out, 0, 3);
+            enc.set_bytes(&nh.to_le_bytes(), 4);
+            enc.set_bytes(&nkv.to_le_bytes(), 5);
+            enc.set_bytes(&hd.to_le_bytes(), 6);
+            enc.set_bytes(&max_seq.to_le_bytes(), 7);
+            enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 8);
+            enc.set_bytes(&(token_count as u32).to_le_bytes(), 9);
+            enc.dispatch_threadgroups((nh as usize, token_count, 1), (attn_tg_size, 1, 1));
+        } else {
+            let current_seq_len = (seq_pos + 1) as u32;
+            enc.set_pipeline(&pipelines.standard_attention);
+            enc.set_buffer(&bufs.q_proj, 0, 0);
+            enc.set_buffer(k_cache, 0, 1);
+            enc.set_buffer(v_cache, 0, 2);
+            enc.set_buffer(&bufs.attn_out, 0, 3);
             enc.set_bytes(&nh.to_le_bytes(), 4);
             enc.set_bytes(&nkv.to_le_bytes(), 5);
             enc.set_bytes(&hd.to_le_bytes(), 6);

@@ -165,3 +165,166 @@ kernel void standard_attention(
         output[out_base + d] = half(shared_output[d] / denom);
     }
 }
+
+// ============================================================================
+// Prefill attention — batched across all query tokens in a single dispatch.
+//
+// Same tiled flash attention algorithm as standard_attention, but processes
+// multiple query tokens via a 2D threadgroup grid. Each threadgroup handles
+// one (head, query_token) pair with causal masking: query at position t
+// attends only to KV cache positions 0..seq_offset+t+1.
+//
+// This replaces the per-token dispatch loop in the FP16 prefill path,
+// eliminating ~token_count × num_layers kernel launch overhead.
+//
+// Buffers:
+//   buffer(0) q:           [token_count × num_heads × head_dim]     half
+//   buffer(1) k_cache:     [num_kv_heads × max_seq_len × head_dim]  half
+//   buffer(2) v_cache:     [num_kv_heads × max_seq_len × head_dim]  half
+//   buffer(3) output:      [token_count × num_heads × head_dim]     half
+//   buffer(4) num_heads:    uint
+//   buffer(5) num_kv_heads: uint
+//   buffer(6) head_dim:     uint
+//   buffer(7) max_seq_len:  uint
+//   buffer(8) seq_offset:   uint  (KV positions before this prefill batch)
+//   buffer(9) token_count:  uint
+//
+// Dispatch: (num_heads, token_count, 1) threadgroups,
+//           (max(256, head_dim), 1, 1) threads per group.
+
+kernel void prefill_attention(
+    device const half* q         [[buffer(0)]],
+    device const half* k_cache   [[buffer(1)]],
+    device const half* v_cache   [[buffer(2)]],
+    device half* output          [[buffer(3)]],
+    constant uint& num_heads     [[buffer(4)]],
+    constant uint& num_kv_heads  [[buffer(5)]],
+    constant uint& head_dim      [[buffer(6)]],
+    constant uint& max_seq_len   [[buffer(7)]],
+    constant uint& seq_offset    [[buffer(8)]],
+    constant uint& token_count   [[buffer(9)]],
+    uint3 tid_3d  [[thread_position_in_threadgroup]],
+    uint3 tgid_3d [[threadgroup_position_in_grid]],
+    uint3 tg_size_3d [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint TILE = 32;
+    constexpr uint SIMD_SIZE = 32;
+
+    uint tid = tid_3d.x;
+    uint tg_size = tg_size_3d.x;
+
+    threadgroup float shared_q[HEAD_DIM];
+    threadgroup half  kv_tile[TILE * HEAD_DIM];
+    threadgroup float tile_scores[TILE];
+    threadgroup float shared_output[HEAD_DIM];
+    threadgroup float softmax_max[1];
+    threadgroup float softmax_sum[1];
+    threadgroup float tile_correction[1];
+
+    uint num_simdgroups = tg_size / SIMD_SIZE;
+
+    uint head_idx = tgid_3d.x;
+    uint token_idx = tgid_3d.y;
+    if (head_idx >= num_heads || token_idx >= token_count) return;
+    if (head_dim != HEAD_DIM) return;
+
+    // Causal mask: this query attends to positions 0..causal_len.
+    uint causal_len = seq_offset + token_idx + 1;
+
+    uint heads_per_group = num_heads / num_kv_heads;
+    uint kv_head = (num_kv_heads < num_heads) ? head_idx / heads_per_group : head_idx;
+
+    float scale = 1.0f / sqrt(float(head_dim));
+
+    // Load Q vector for this (token, head) pair
+    uint q_base = (token_idx * num_heads + head_idx) * head_dim;
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        shared_q[d] = float(q[q_base + d]);
+        shared_output[d] = 0.0f;
+    }
+    if (tid == 0) {
+        softmax_max[0] = -INFINITY;
+        softmax_sum[0] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kv_base = kv_head * max_seq_len * head_dim;
+
+    // ---- Tiled flash attention with causal masking ----
+    for (uint tile_start = 0; tile_start < causal_len; tile_start += TILE) {
+        uint tile_end = min(tile_start + TILE, causal_len);
+        uint actual_tile = tile_end - tile_start;
+
+        uint k_elems = actual_tile * head_dim;
+        for (uint i = tid; i < k_elems; i += tg_size) {
+            uint p = i / head_dim;
+            uint d = i % head_dim;
+            kv_tile[p * head_dim + d] =
+                k_cache[kv_base + (tile_start + p) * head_dim + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint pbase = 0; pbase < actual_tile; pbase += num_simdgroups) {
+            uint p = pbase + sgid;
+            if (p < actual_tile) {
+                float dot = 0.0f;
+                for (uint d = lane; d < head_dim; d += SIMD_SIZE) {
+                    dot += shared_q[d] * float(kv_tile[p * head_dim + d]);
+                }
+                dot = simd_sum(dot);
+                if (lane == 0) tile_scores[p] = dot * scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgid == 0) {
+            float my_score = (lane < actual_tile) ? tile_scores[lane] : -INFINITY;
+            float tm = simd_max(my_score);
+
+            float old_max = softmax_max[0];
+            float new_max = max(old_max, tm);
+            float corr = exp(old_max - new_max);
+
+            if (lane == 0) {
+                tile_correction[0] = corr;
+                softmax_max[0] = new_max;
+                softmax_sum[0] = softmax_sum[0] * corr;
+            }
+
+            float w = (lane < actual_tile) ? exp(my_score - new_max) : 0.0f;
+            if (lane < actual_tile) tile_scores[lane] = w;
+            float tile_sum = simd_sum(w);
+            if (lane == 0) softmax_sum[0] += tile_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float corr = tile_correction[0];
+        for (uint d = tid; d < head_dim; d += tg_size)
+            shared_output[d] *= corr;
+
+        uint v_elems = actual_tile * head_dim;
+        for (uint i = tid; i < v_elems; i += tg_size) {
+            uint p = i / head_dim;
+            uint d = i % head_dim;
+            kv_tile[p * head_dim + d] =
+                v_cache[kv_base + (tile_start + p) * head_dim + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint p = 0; p < actual_tile; p++) {
+            float w = tile_scores[p];
+            for (uint d = tid; d < head_dim; d += tg_size)
+                shared_output[d] += w * float(kv_tile[p * head_dim + d]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Normalize and write output
+    float denom = max(softmax_sum[0], 1e-10f);
+    uint out_base = (token_idx * num_heads + head_idx) * head_dim;
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[out_base + d] = half(shared_output[d] / denom);
+    }
+}

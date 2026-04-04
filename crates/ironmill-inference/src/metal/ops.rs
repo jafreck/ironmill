@@ -37,6 +37,7 @@ pub struct MetalPipelines {
     pub turboquant_outlier_cache_write: ComputePipeline,
     pub turboquant_outlier_attention: ComputePipeline,
     pub standard_attention: ComputePipeline,
+    pub prefill_attention: ComputePipeline,
     pub polarquant_matvec_int4: ComputePipeline,
     pub polarquant_matmul_int4: ComputePipeline,
     pub polarquant_matvec_int8: ComputePipeline,
@@ -189,6 +190,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &attn_lib
                         .get_function("standard_attention")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            prefill_attention: device
+                .create_compute_pipeline(
+                    &attn_lib
+                        .get_function("prefill_attention")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -396,6 +404,20 @@ pub struct StandardAttentionParams<'a> {
     pub seq_len: u32,
 }
 
+/// Parameters for [`encode_prefill_attention`].
+pub struct PrefillAttentionParams<'a> {
+    pub q: &'a MetalBuffer,
+    pub k_cache: &'a MetalBuffer,
+    pub v_cache: &'a MetalBuffer,
+    pub output: &'a MetalBuffer,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub max_seq_len: u32,
+    pub seq_offset: u32,
+    pub token_count: u32,
+}
+
 /// Parameters for [`encode_kv_scatter`].
 pub struct KvScatterParams<'a> {
     pub proj: &'a MetalBuffer,
@@ -553,6 +575,35 @@ pub fn encode_standard_attention(
     // threads for better occupancy and parallel QK^T position processing.
     encoder.dispatch_threadgroups(
         (params.num_heads as usize, 1, 1),
+        (
+            ATTENTION_MIN_THREADGROUP_WIDTH
+                .max(params.head_dim as usize)
+                .min(METAL_MAX_THREADS_PER_THREADGROUP),
+            1,
+            1,
+        ),
+    );
+}
+
+/// Encode batched prefill attention — all query tokens in one dispatch.
+pub fn encode_prefill_attention(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    params: &PrefillAttentionParams<'_>,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(params.q, 0, 0);
+    encoder.set_buffer(params.k_cache, 0, 1);
+    encoder.set_buffer(params.v_cache, 0, 2);
+    encoder.set_buffer(params.output, 0, 3);
+    encoder.set_bytes(&params.num_heads.to_le_bytes(), 4);
+    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 5);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 6);
+    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 7);
+    encoder.set_bytes(&params.seq_offset.to_le_bytes(), 8);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 9);
+    encoder.dispatch_threadgroups(
+        (params.num_heads as usize, params.token_count as usize, 1),
         (
             ATTENTION_MIN_THREADGROUP_WIDTH
                 .max(params.head_dim as usize)
