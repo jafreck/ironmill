@@ -137,16 +137,16 @@ Continuous batching dynamically adds/removes sequences as they complete, maximiz
 
 ### 8. Cross-layer KV cache sharing (CLA)
 
-**Status:** Not implemented
-**Expected impact:** 2× KV cache memory reduction
+**Status:** Not implemented (TurboQuant handles per-vector compression; CLA handles per-layer reduction)
+**Expected impact:** 2× KV cache memory reduction (composes with TurboQuant for multiplicative savings)
 **Complexity:** Medium (requires model support or fine-tuning)
 **SOTA reference:** CLA (NeurIPS 2024), FusedKV (ICLR 2026)
 
-Cross-Layer Attention shares KV caches between adjacent layers — subsequent layers reuse the KV cache from "anchor" layers instead of storing their own. This reduces KV memory by 2× or more beyond GQA, with negligible quality loss.
+Cross-Layer Attention shares KV caches between adjacent layers — subsequent layers reuse the KV cache from "anchor" layers instead of storing their own. This is orthogonal to TurboQuant's per-vector quantization: CLA reduces the number of KV vectors stored, TurboQuant compresses each vector. Combined: a model with 28 layers using CLA (14 anchor layers) + TurboQuant INT4 would use ~3.5% of the naive FP16 KV memory.
 
-FusedKV (ICLR 2026) extends this by learnably fusing informative K/V from bottom and middle layers, achieving better quality-memory trade-offs than simple sharing.
+FusedKV (ICLR 2026) extends CLA with learnable cross-layer fusion for better quality-memory trade-offs.
 
-This requires model architecture support (the model must be trained or fine-tuned with CLA). ironmill's role is to detect CLA-enabled models and share cache buffers between layers accordingly.
+Requires model architecture support (trained with CLA). ironmill detects CLA config and shares cache buffers between layers accordingly.
 
 ### 9. Multi-Head Latent Attention (MLA) support
 
@@ -173,14 +173,18 @@ MLA projects keys and values into a shared low-dimensional latent space, storing
 
 Eliminates the need for a separate draft model by integrating speculated token planning within the target model using multi-stream attention heads. Each forward pass produces both the "correct" next token and speculative future tokens. Ideal for edge/resource-constrained deployment where loading a separate draft model is impractical.
 
-### 11. Activation-aware quantization (XQuant)
+### 11. Cross-layer KV cache compression (CLA + TurboQuant)
 
-**Status:** Partial (AWQ, GPTQ exist at compile time)
-**Expected impact:** Better quality per bit at ultra-low precision
-**Complexity:** Medium
-**SOTA reference:** XQuant (EMNLP 2025)
+**Status:** TurboQuant per-vector quantization exists; cross-layer sharing not implemented
+**Expected impact:** 2× additional KV cache memory reduction (stacks with TurboQuant)
+**Complexity:** Medium (requires model support or fine-tuning)
+**SOTA reference:** CLA (NeurIPS 2024), FusedKV (ICLR 2026)
 
-XQuant achieves ultra-low-bit KV cache quantization (2–4 bit) with cross-layer compression, using data-free calibration. This composes with ironmill's existing TurboQuant — XQuant could replace or supplement the codebook-based quantization with learned cross-layer compression for even better quality/memory trade-offs.
+ironmill already has SOTA per-vector KV compression via TurboQuant (codebook quantization + QJL 1-bit error correction). What's missing is reducing *how many vectors* are stored. CLA and MLA are orthogonal to TurboQuant — they cut the number of cache entries, TurboQuant compresses what remains. The two compose multiplicatively.
+
+**Cross-Layer Attention (CLA):** Subsequent layers reuse KV caches from "anchor" layers instead of storing their own. Reduces KV memory by 2× beyond GQA with negligible quality loss. FusedKV (ICLR 2026) extends this with learnable cross-layer fusion.
+
+ironmill's role: detect CLA-enabled models and share cache buffers between layers, then apply TurboQuant to the shared buffers.
 
 ### 12. TurboSpec adaptive speculation
 
