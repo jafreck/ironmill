@@ -19,7 +19,7 @@ use crate::ir::pass::Pass;
 use crate::ir::passes::int8_quantize::Granularity;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 /// Quantization bit width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,9 +184,10 @@ impl Pass for AffineQuantizePass {
                 };
 
                 if let Value::Tensor { data, shape, dtype } = val {
+                    let bytes = data.as_bytes().expect("tensor not materialized");
                     let floats = match dtype {
-                        ScalarType::Float32 => tensor_as_f32_slice(&data),
-                        ScalarType::Float16 => tensor_f16_as_f32_slice(&data),
+                        ScalarType::Float32 => tensor_as_f32_slice(bytes),
+                        ScalarType::Float16 => tensor_f16_as_f32_slice(bytes),
                         other => {
                             return Err(MilError::TypeMismatch {
                                 expected: "Float32 or Float16".into(),
@@ -216,7 +217,9 @@ impl Pass for AffineQuantizePass {
                         if let Some(Value::Tensor { data, .. }) =
                             op.attributes.get_mut("quantized_data")
                         {
-                            *data = pack_int4(data);
+                            let packed =
+                                pack_int4(data.as_bytes().expect("tensor not materialized"));
+                            *data = TensorData::Inline(packed);
                         }
                     }
 
@@ -306,7 +309,7 @@ fn emit_per_tensor(
     let (quantized, scale, zero_point) = quantize_affine(floats, qmax);
 
     let quantized_val = Value::Tensor {
-        data: quantized,
+        data: TensorData::Inline(quantized),
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -353,7 +356,7 @@ fn emit_per_channel(
     }
 
     let quantized_val = Value::Tensor {
-        data: all_quantized,
+        data: TensorData::Inline(all_quantized),
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -368,7 +371,7 @@ fn emit_per_channel(
     op.attributes.insert(
         "scale".to_string(),
         Value::Tensor {
-            data: scale_bytes,
+            data: TensorData::Inline(scale_bytes),
             shape: vec![num_channels],
             dtype: ScalarType::Float32,
         },
@@ -378,7 +381,7 @@ fn emit_per_channel(
     op.attributes.insert(
         "zero_point".to_string(),
         Value::Tensor {
-            data: zp_bytes,
+            data: TensorData::Inline(zp_bytes),
             shape: vec![num_channels],
             dtype: ScalarType::Float32,
         },
@@ -439,7 +442,7 @@ fn emit_per_group(
     }
 
     let quantized_val = Value::Tensor {
-        data: all_quantized,
+        data: TensorData::Inline(all_quantized),
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -466,7 +469,7 @@ fn emit_per_group(
     op.attributes.insert(
         "scale".to_string(),
         Value::Tensor {
-            data: scale_bytes,
+            data: TensorData::Inline(scale_bytes),
             shape: param_shape.clone(),
             dtype: ScalarType::Float32,
         },
@@ -474,7 +477,7 @@ fn emit_per_group(
     op.attributes.insert(
         "zero_point".to_string(),
         Value::Tensor {
-            data: zp_bytes,
+            data: TensorData::Inline(zp_bytes),
             shape: param_shape,
             dtype: ScalarType::Float32,
         },
@@ -519,7 +522,7 @@ mod tests {
     /// Build a single-const-op program for testing.
     fn make_program(values: &[f32], shape: Vec<usize>) -> Program {
         let tensor_val = Value::Tensor {
-            data: f32_bytes(values),
+            data: TensorData::Inline(f32_bytes(values)),
             shape,
             dtype: ScalarType::Float32,
         };
@@ -536,7 +539,7 @@ mod tests {
     fn get_quantized_data(program: &Program) -> &[u8] {
         let op = &program.functions["main"].body.operations[0];
         match op.attributes.get("quantized_data") {
-            Some(Value::Tensor { data, .. }) => data,
+            Some(Value::Tensor { data, .. }) => data.as_bytes().expect("tensor not materialized"),
             other => panic!("expected quantized_data Tensor, got {other:?}"),
         }
     }
@@ -656,10 +659,11 @@ mod tests {
         match op.attributes.get("quantized_data") {
             Some(Value::Tensor { shape, dtype, data }) => {
                 use crate::ir::passes::int4_pack::unpack_int4;
+                let bytes = data.as_bytes().expect("tensor not materialized");
                 assert_eq!(*shape, vec![2, 8]);
                 assert_eq!(*dtype, ScalarType::UInt8);
-                assert_eq!(data.len(), 8);
-                let unpacked = unpack_int4(data, 16);
+                assert_eq!(bytes.len(), 8);
+                let unpacked = unpack_int4(bytes, 16);
                 for &b in unpacked.iter() {
                     assert!(b <= 15, "INT4 value {b} exceeds 15");
                 }
@@ -670,11 +674,12 @@ mod tests {
         // Scale shape = [2, 2] (2 rows, 2 groups per row).
         match op.attributes.get("scale") {
             Some(Value::Tensor { shape, dtype, data }) => {
+                let bytes = data.as_bytes().expect("tensor not materialized");
                 assert_eq!(*shape, vec![2, 2]);
                 assert_eq!(*dtype, ScalarType::Float32);
-                assert_eq!(data.len(), 4 * 4); // 4 float32s
+                assert_eq!(bytes.len(), 4 * 4); // 4 float32s
 
-                let scales: Vec<f32> = data
+                let scales: Vec<f32> = bytes
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
@@ -733,8 +738,9 @@ mod tests {
         let op = &program.functions["main"].body.operations[0];
         match op.attributes.get("scale") {
             Some(Value::Tensor { data, shape, .. }) => {
+                let bytes = data.as_bytes().expect("tensor not materialized");
                 assert_eq!(*shape, vec![1, 2]);
-                let scales: Vec<f32> = data
+                let scales: Vec<f32> = bytes
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
@@ -783,7 +789,7 @@ mod tests {
         match op.attributes.get("quantized_data") {
             Some(Value::Tensor { data, shape, .. }) => {
                 assert_eq!(*shape, vec![1, 6]);
-                assert_eq!(data.len(), 3);
+                assert_eq!(data.byte_len(), 3);
             }
             other => panic!("expected quantized_data Tensor, got {other:?}"),
         }
@@ -1000,7 +1006,7 @@ mod tests {
     #[test]
     fn leaves_non_fp32_tensors_unchanged() {
         let int_val = Value::Tensor {
-            data: vec![1, 0, 0, 0],
+            data: TensorData::Inline(vec![1, 0, 0, 0]),
             shape: vec![1],
             dtype: ScalarType::Int32,
         };
@@ -1219,7 +1225,7 @@ mod tests {
         // or group_size attributes (as would exist in models saved before
         // this feature was added).
         let quantized_data = Value::Tensor {
-            data: vec![0, 128, 255, 64],
+            data: TensorData::Inline(vec![0, 128, 255, 64]),
             shape: vec![4],
             dtype: ScalarType::UInt8,
         };

@@ -1039,7 +1039,9 @@ fn infer_output_type(
                 ..
             }) = op.attributes.get("shape")
             {
-                data.chunks_exact(4)
+                data.as_bytes()
+                    .expect("tensor not materialized")
+                    .chunks_exact(4)
                     .map(|c| {
                         let d = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                         mil_spec::Dimension {
@@ -1348,6 +1350,8 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
     let tv_value = match dtype {
         ScalarType::Float32 => {
             let floats: Vec<f32> = data
+                .as_bytes()
+                .expect("tensor not materialized")
                 .chunks_exact(4)
                 .map(|c| -> Result<f32> {
                     let bytes: [u8; 4] = c.try_into().map_err(|_| {
@@ -1362,6 +1366,8 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         }
         ScalarType::Float64 => {
             let doubles: Vec<f64> = data
+                .as_bytes()
+                .expect("tensor not materialized")
                 .chunks_exact(8)
                 .map(|c| -> Result<f64> {
                     let bytes: [u8; 8] = c.try_into().map_err(|_| {
@@ -1376,6 +1382,8 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         }
         ScalarType::Int32 => {
             let ints: Vec<i32> = data
+                .as_bytes()
+                .expect("tensor not materialized")
                 .chunks_exact(4)
                 .map(|c| -> Result<i32> {
                     let bytes: [u8; 4] = c.try_into().map_err(|_| {
@@ -1390,6 +1398,8 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         }
         ScalarType::Int64 | ScalarType::UInt64 => {
             let longs: Vec<i64> = data
+                .as_bytes()
+                .expect("tensor not materialized")
                 .chunks_exact(8)
                 .map(|c| -> Result<i64> {
                     let bytes: [u8; 8] = c.try_into().map_err(|_| {
@@ -1403,7 +1413,12 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
             })
         }
         ScalarType::Bool => {
-            let bools: Vec<bool> = data.iter().map(|&b| b != 0).collect();
+            let bools: Vec<bool> = data
+                .as_bytes()
+                .expect("tensor not materialized")
+                .iter()
+                .map(|&b| b != 0)
+                .collect();
             mil_spec::tensor_value::Value::Bools(mil_spec::tensor_value::RepeatedBools {
                 values: bools,
             })
@@ -1411,7 +1426,7 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         // For types without a dedicated repeated field (fp16, int8, etc.)
         // fall back to raw bytes.
         _ => mil_spec::tensor_value::Value::Bytes(mil_spec::tensor_value::RepeatedBytes {
-            values: data.clone(),
+            values: data.as_bytes().expect("tensor not materialized").to_vec(),
         }),
     };
 
@@ -1752,6 +1767,7 @@ fn tensor_type_to_state_descriptor(name: &str, tt: &TensorType) -> FeatureDescri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TensorData;
     use crate::convert::model_to_program;
 
     #[test]
@@ -2301,7 +2317,7 @@ mod tests {
     fn round_trip_affine_dequantize_with_bit_width_and_group_size() {
         // Build a constexpr_affine_dequantize op with bit_width and group_size.
         let quantized_data = Value::Tensor {
-            data: vec![0, 5, 10, 15, 0, 5, 10, 15],
+            data: TensorData::Inline(vec![0, 5, 10, 15, 0, 5, 10, 15]),
             shape: vec![2, 4],
             dtype: ScalarType::UInt8,
         };
@@ -2319,7 +2335,7 @@ mod tests {
             .with_attr(
                 "scale",
                 Value::Tensor {
-                    data: scale_bytes,
+                    data: TensorData::Inline(scale_bytes),
                     shape: vec![2, 2],
                     dtype: ScalarType::Float32,
                 },
@@ -2327,7 +2343,7 @@ mod tests {
             .with_attr(
                 "zero_point",
                 Value::Tensor {
-                    data: zp_bytes,
+                    data: TensorData::Inline(zp_bytes),
                     shape: vec![2, 2],
                     dtype: ScalarType::Float32,
                 },
@@ -2368,7 +2384,7 @@ mod tests {
         // bit_width or group_size attributes. Should round-trip cleanly
         // and the attributes should simply be absent (callers default).
         let quantized_data = Value::Tensor {
-            data: vec![0, 128, 255, 64],
+            data: TensorData::Inline(vec![0, 128, 255, 64]),
             shape: vec![4],
             dtype: ScalarType::UInt8,
         };

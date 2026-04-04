@@ -15,7 +15,7 @@ use crate::error::Result;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::ScalarType;
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 /// Per-channel activation statistics for a single layer.
 pub struct ChannelStats {
@@ -131,7 +131,9 @@ fn read_param(inputs: &HashMap<String, Value>, key: &str) -> Option<Vec<f32>> {
             data,
             dtype: ScalarType::Float32,
             ..
-        }) => Some(tensor_as_f32_slice(data)),
+        }) => Some(tensor_as_f32_slice(
+            data.as_bytes().expect("tensor not materialized"),
+        )),
         _ => None,
     }
 }
@@ -151,12 +153,12 @@ where
 {
     if let Some(Value::Tensor { data, shape, dtype }) = inputs.get(key).cloned() {
         if dtype == ScalarType::Float32 {
-            let mut floats = tensor_as_f32_slice(&data);
+            let mut floats = tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"));
             let result = f(&mut floats);
             inputs.insert(
                 key.to_string(),
                 Value::Tensor {
-                    data: f32_slice_to_bytes(&floats),
+                    data: TensorData::Inline(f32_slice_to_bytes(&floats)),
                     shape,
                     dtype,
                 },
@@ -183,7 +185,7 @@ mod tests {
 
     fn make_tensor(values: &[f32]) -> Value {
         Value::Tensor {
-            data: f32_bytes(values),
+            data: TensorData::Inline(f32_bytes(values)),
             shape: vec![values.len()],
             dtype: ScalarType::Float32,
         }
@@ -280,11 +282,15 @@ mod tests {
         // = [-0.5, 3.0, -1.0]
 
         let actual_gamma = match op.inputs.get("gamma") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("gamma should be a tensor"),
         };
         let actual_beta = match op.inputs.get("beta") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("beta should be a tensor"),
         };
 
@@ -330,7 +336,9 @@ mod tests {
         // ratio = [sqrt(9/1), sqrt(16/4)] = [3.0, 2.0]
         // gamma_new = [3.0*3.0, 1.0*2.0] = [9.0, 2.0]
         let actual_gamma = match op.inputs.get("gamma") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("gamma should be a tensor"),
         };
         assert!((actual_gamma[0] - 9.0).abs() < 1e-6);
@@ -364,11 +372,15 @@ mod tests {
         let op = &program.functions["main"].body.operations[0];
 
         let actual_gamma = match op.inputs.get("gamma") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("gamma should be a tensor"),
         };
         let actual_beta = match op.inputs.get("beta") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("beta should be a tensor"),
         };
 
@@ -397,7 +409,9 @@ mod tests {
 
         let op = &program.functions["main"].body.operations[0];
         let actual_gamma = match op.inputs.get("gamma") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("gamma should be a tensor"),
         };
         assert_eq!(actual_gamma, gamma.to_vec(), "gamma should be unchanged");

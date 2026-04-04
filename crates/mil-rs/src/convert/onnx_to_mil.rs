@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::error::{MilError, Result};
-use crate::ir::{Operation, ScalarType, Value};
+use crate::ir::{Operation, ScalarType, TensorData, Value};
 use crate::proto::onnx::{NodeProto, TensorProto};
 
 // ---------------------------------------------------------------------------
@@ -202,7 +202,7 @@ fn int_tensor_value(values: &[i64]) -> Value {
         .flat_map(|&v| (v as i32).to_le_bytes())
         .collect();
     Value::Tensor {
-        data,
+        data: TensorData::Inline(data),
         shape: vec![values.len()],
         dtype: ScalarType::Int32,
     }
@@ -737,7 +737,7 @@ fn convert_constant(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr(
             "val",
             Value::Tensor {
-                data: raw_bytes,
+                data: TensorData::Inline(raw_bytes),
                 shape,
                 dtype,
             },

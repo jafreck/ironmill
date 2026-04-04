@@ -13,7 +13,7 @@ use crate::ir::operation::Operation;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 use super::beta_quantizer::quantize_to_index;
 use super::rotation::{pad_to_power_of_two, rotate_rows_hadamard};
@@ -137,12 +137,20 @@ fn extract_eligible_tensor(op: &Operation, min_elements: usize) -> Option<Eligib
             data,
             shape,
             dtype: dtype @ ScalarType::Float32,
-        } => (tensor_as_f32_slice(data), shape.clone(), *dtype),
+        } => (
+            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
+            shape.clone(),
+            *dtype,
+        ),
         Value::Tensor {
             data,
             shape,
             dtype: dtype @ ScalarType::Float16,
-        } => (fp16_bytes_to_f32(data), shape.clone(), *dtype),
+        } => (
+            fp16_bytes_to_f32(data.as_bytes().expect("tensor not materialized")),
+            shape.clone(),
+            *dtype,
+        ),
         _ => return None,
     };
 
@@ -250,13 +258,13 @@ fn rewrite_op_in_place(
         _ => quant.levels.iter().flat_map(|v| v.to_le_bytes()).collect(),
     };
     let lut_value = Value::Tensor {
-        data: lut_data,
+        data: TensorData::Inline(lut_data),
         shape: vec![k],
         dtype: info.original_dtype,
     };
 
     let indices_value = Value::Tensor {
-        data: quant.packed.clone(),
+        data: TensorData::Inline(quant.packed.clone()),
         shape: vec![quant.packed.len()],
         dtype: ScalarType::UInt8,
     };
@@ -267,7 +275,7 @@ fn rewrite_op_in_place(
         .flat_map(|&d| (d as u32).to_le_bytes())
         .collect();
     let shape_value = Value::Tensor {
-        data: shape_bytes,
+        data: TensorData::Inline(shape_bytes),
         shape: vec![info.shape.len()],
         dtype: ScalarType::UInt32,
     };
@@ -318,7 +326,7 @@ fn build_norm_mul_ops(
         .with_input(
             "val",
             Value::Tensor {
-                data: norms_data,
+                data: TensorData::Inline(norms_data),
                 shape: norms_shape.clone(),
                 dtype: info.original_dtype,
             },
@@ -429,7 +437,7 @@ mod tests {
     fn skips_small_tensors() {
         let weights: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![8, 8],
             dtype: ScalarType::Float32,
         };
@@ -455,7 +463,7 @@ mod tests {
         let weights: Vec<f32> = (0..numel).map(|i| (i as f32 * 0.1).sin()).collect();
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![rows, cols],
             dtype: ScalarType::Float32,
         };
@@ -514,7 +522,7 @@ mod tests {
         let weights: Vec<f32> = (0..numel).map(|i| (i as f32).cos()).collect();
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![rows, cols],
             dtype: ScalarType::Float32,
         };
@@ -585,7 +593,7 @@ mod tests {
         let weights: Vec<f32> = (0..numel).map(|i| (i as f32).cos()).collect();
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![rows, cols],
             dtype: ScalarType::Float32,
         };

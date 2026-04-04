@@ -19,7 +19,7 @@ use crate::ir::passes::rotation::pad_to_power_of_two;
 use crate::ir::passes::tensor_utils::tensor_as_f32_slice;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 /// SpinQuant weight quantization pass.
 ///
@@ -161,7 +161,10 @@ fn extract_eligible(op: &Operation, min_elements: usize) -> Option<EligibleTenso
             data,
             shape,
             dtype: ScalarType::Float32,
-        } => (tensor_as_f32_slice(data), shape.clone()),
+        } => (
+            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
+            shape.clone(),
+        ),
         _ => return None,
     };
 
@@ -295,7 +298,7 @@ fn emit_affine_quantized(
     };
 
     let quantized_val = Value::Tensor {
-        data: packed_data,
+        data: TensorData::Inline(packed_data),
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -321,7 +324,7 @@ fn emit_affine_quantized(
     op.attributes.insert(
         "scale".to_string(),
         Value::Tensor {
-            data: scale_bytes,
+            data: TensorData::Inline(scale_bytes),
             shape: param_shape.clone(),
             dtype: ScalarType::Float32,
         },
@@ -329,7 +332,7 @@ fn emit_affine_quantized(
     op.attributes.insert(
         "zero_point".to_string(),
         Value::Tensor {
-            data: zp_bytes,
+            data: TensorData::Inline(zp_bytes),
             shape: param_shape,
             dtype: ScalarType::Float32,
         },
@@ -370,7 +373,7 @@ mod tests {
 
     fn make_program(values: &[f32], shape: Vec<usize>) -> Program {
         let tensor_val = Value::Tensor {
-            data: f32_bytes(values),
+            data: TensorData::Inline(f32_bytes(values)),
             shape,
             dtype: ScalarType::Float32,
         };
@@ -511,6 +514,7 @@ mod tests {
                 assert_eq!(*dtype, ScalarType::UInt8);
                 assert_eq!(*shape, vec![rows, cols]);
                 let numel = rows * cols;
+                let data = data.as_bytes().expect("tensor not materialized");
                 assert_eq!(data.len(), numel.div_ceil(2));
                 let unpacked = unpack_int4(data, numel);
                 for &b in unpacked.iter() {

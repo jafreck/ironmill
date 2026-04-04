@@ -473,6 +473,7 @@ mod tests {
     use mil_rs::ir::Function;
     use mil_rs::ir::Operation;
     use mil_rs::ir::ScalarType;
+    use mil_rs::ir::TensorData;
     use mil_rs::ir::Value;
 
     /// Helper: create a simple op with only a type and name.
@@ -486,7 +487,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data,
+                    data: data.into(),
                     shape: vec![values.len()],
                     dtype: ScalarType::Float32,
                 },
@@ -742,7 +743,7 @@ attention = "fp64"
                 .with_input(
                     "val",
                     Value::Tensor {
-                        data: fp32_data.clone(),
+                        data: fp32_data.clone().into(),
                         shape: vec![2],
                         dtype: ScalarType::Float32,
                     },
@@ -761,7 +762,7 @@ attention = "fp64"
         assert_eq!(const_op.op_type, "const");
         if let Some(Value::Tensor { dtype, data, .. }) = const_op.inputs.get("val") {
             assert_eq!(*dtype, ScalarType::Float32);
-            assert_eq!(*data, fp32_data);
+            assert_eq!(*data, TensorData::Inline(fp32_data));
         }
     }
 

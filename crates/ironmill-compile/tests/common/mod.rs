@@ -656,7 +656,7 @@ pub fn build_const_program(shape: &[usize], dtype: ScalarType) -> Program {
             .with_attr(
                 "val",
                 Value::Tensor {
-                    data,
+                    data: data.into(),
                     shape: shape.to_vec(),
                     dtype,
                 },
@@ -758,7 +758,7 @@ pub fn make_const_op(name: &str, shape: &[usize], dtype: ScalarType) -> Operatio
         .with_attr(
             "val",
             Value::Tensor {
-                data,
+                data: data.into(),
                 shape: shape.to_vec(),
                 dtype,
             },
@@ -773,7 +773,7 @@ pub fn make_const_op_with_values(name: &str, shape: &[usize], values: &[f32]) ->
         .with_attr(
             "val",
             Value::Tensor {
-                data,
+                data: data.into(),
                 shape: shape.to_vec(),
                 dtype: ScalarType::Float32,
             },

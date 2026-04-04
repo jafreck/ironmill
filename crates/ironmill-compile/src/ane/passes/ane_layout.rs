@@ -154,7 +154,7 @@ impl Pass for AneLayoutPass {
                             op.inputs.insert(
                                 "shape".to_string(),
                                 Value::Tensor {
-                                    data,
+                                    data: mil_rs::ir::TensorData::Inline(data),
                                     shape: vec![n],
                                     dtype: mil_rs::ir::ScalarType::Int32,
                                 },
@@ -425,7 +425,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0; 16],
+                    data: vec![0; 16].into(),
                     shape: vec![4, 4],
                     dtype: ScalarType::Float32,
                 },
@@ -464,7 +464,7 @@ mod tests {
             .with_input(
                 "shape",
                 Value::Tensor {
-                    data: shape_data,
+                    data: shape_data.into(),
                     shape: vec![3],
                     dtype: ScalarType::Int32,
                 },
@@ -492,7 +492,8 @@ mod tests {
             Some(Value::Tensor { data, shape, dtype }) => {
                 assert_eq!(*dtype, ScalarType::Int32);
                 assert_eq!(shape, &vec![4]); // 1-D tensor with 4 elements
-                let values: Vec<i32> = data
+                let bytes = data.as_bytes().expect("tensor not materialized");
+                let values: Vec<i32> = bytes
                     .chunks_exact(4)
                     .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect();

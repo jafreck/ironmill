@@ -18,7 +18,7 @@ use crate::ir::operation::Operation;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::ScalarType;
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 use super::replace_reference;
 use super::rotation::rotate_rows_hadamard;
@@ -265,7 +265,7 @@ fn build_unpaired_unrotation(
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: r_inv_data,
+                    data: TensorData::Inline(r_inv_data),
                     shape: vec![n_padded, n_padded],
                     dtype: lut_dtype,
                 },
@@ -302,7 +302,7 @@ fn build_unpaired_unrotation(
             .with_attr(
                 "end",
                 Value::Tensor {
-                    data: end_data,
+                    data: TensorData::Inline(end_data),
                     shape: vec![2],
                     dtype: ScalarType::Int32,
                 },
@@ -310,7 +310,7 @@ fn build_unpaired_unrotation(
             .with_attr(
                 "end_mask",
                 Value::Tensor {
-                    data: vec![1u8, 0],
+                    data: TensorData::Inline(vec![1u8, 0]),
                     shape: vec![2],
                     dtype: ScalarType::Bool,
                 },
@@ -490,15 +490,16 @@ fn get_original_cols(op: &Operation) -> usize {
                 return 0;
             }
             let n_dims = shape[0];
-            if data.len() < n_dims * 4 {
+            if data.byte_len() < n_dims * 4 {
                 return 0;
             }
+            let bytes = data.as_bytes().expect("tensor not materialized");
             let last_offset = (n_dims - 1) * 4;
             u32::from_le_bytes([
-                data[last_offset],
-                data[last_offset + 1],
-                data[last_offset + 2],
-                data[last_offset + 3],
+                bytes[last_offset],
+                bytes[last_offset + 1],
+                bytes[last_offset + 2],
+                bytes[last_offset + 3],
             ]) as usize
         }
         _ => 0,
@@ -520,15 +521,16 @@ fn get_padded_cols(op: &Operation) -> usize {
             }
             // Last dimension from the UInt32 tensor.
             let n_dims = shape[0];
-            if data.len() < n_dims * 4 {
+            if data.byte_len() < n_dims * 4 {
                 return 0;
             }
+            let bytes = data.as_bytes().expect("tensor not materialized");
             let last_offset = (n_dims - 1) * 4;
             u32::from_le_bytes([
-                data[last_offset],
-                data[last_offset + 1],
-                data[last_offset + 2],
-                data[last_offset + 3],
+                bytes[last_offset],
+                bytes[last_offset + 1],
+                bytes[last_offset + 2],
+                bytes[last_offset + 3],
             ]) as usize
         }
         _ => return 0,
@@ -543,6 +545,7 @@ mod tests {
     use crate::ir::pass::Pass;
     use crate::ir::program::{Function, Program};
     use crate::ir::tensor::ScalarType;
+    use crate::ir::types::TensorData;
     use crate::ir::types::Value;
 
     /// Helper: create a constexpr_lut_to_dense op with polar_quant_seed.
@@ -561,7 +564,7 @@ mod tests {
             .with_attr(
                 "lut",
                 Value::Tensor {
-                    data: lut_data,
+                    data: TensorData::Inline(lut_data),
                     shape: vec![16],
                     dtype: ScalarType::Float16,
                 },
@@ -569,7 +572,7 @@ mod tests {
             .with_attr(
                 "shape",
                 Value::Tensor {
-                    data: shape_data,
+                    data: TensorData::Inline(shape_data),
                     shape: vec![2],
                     dtype: ScalarType::UInt32,
                 },
@@ -799,7 +802,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0u8; 16],
+                    data: TensorData::Inline(vec![0u8; 16]),
                     shape: vec![4],
                     dtype: ScalarType::Float32,
                 },

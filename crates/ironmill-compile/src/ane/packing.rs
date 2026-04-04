@@ -98,7 +98,7 @@ pub fn pack_inputs(sub: &mut SubProgram) -> Option<InputPacking> {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: begin_data,
+                    data: mil_rs::ir::TensorData::Inline(begin_data),
                     shape: vec![4],
                     dtype: ScalarType::Int32,
                 },
@@ -116,7 +116,7 @@ pub fn pack_inputs(sub: &mut SubProgram) -> Option<InputPacking> {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: size_data,
+                    data: mil_rs::ir::TensorData::Inline(size_data),
                     shape: vec![4],
                     dtype: ScalarType::Int32,
                 },

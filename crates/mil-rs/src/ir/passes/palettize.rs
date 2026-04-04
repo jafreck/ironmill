@@ -9,7 +9,7 @@ use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::ScalarType;
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 use super::kmeans::kmeans;
 use super::tensor_utils::tensor_as_f32_slice;
@@ -101,9 +101,10 @@ impl Pass for PalettizePass {
                         shape,
                         dtype: dtype @ (ScalarType::Float32 | ScalarType::Float16),
                     } => {
+                        let bytes = data.as_bytes().expect("tensor not materialized");
                         let f = match dtype {
-                            ScalarType::Float32 => tensor_as_f32_slice(data),
-                            ScalarType::Float16 => fp16_bytes_to_f32(data)?,
+                            ScalarType::Float32 => tensor_as_f32_slice(bytes),
+                            ScalarType::Float16 => fp16_bytes_to_f32(bytes)?,
                             other => {
                                 return Err(MilError::TypeMismatch {
                                     expected: "Float32 or Float16".into(),
@@ -130,7 +131,7 @@ impl Pass for PalettizePass {
                 };
 
                 let lut_value = Value::Tensor {
-                    data: lut_data,
+                    data: TensorData::Inline(lut_data),
                     shape: vec![k],
                     dtype: original_dtype,
                 };
@@ -141,7 +142,7 @@ impl Pass for PalettizePass {
                 // CoreML expects the indices as a 1D (rank 1) tensor of
                 // packed bytes; the output shape comes from the `shape` attr.
                 let indices_value = Value::Tensor {
-                    data: packed_indices.clone(),
+                    data: TensorData::Inline(packed_indices.clone()),
                     shape: vec![packed_indices.len()],
                     dtype: ScalarType::UInt8,
                 };
@@ -153,7 +154,7 @@ impl Pass for PalettizePass {
                     .flat_map(|&d| (d as u32).to_le_bytes())
                     .collect();
                 let shape_value = Value::Tensor {
-                    data: shape_bytes,
+                    data: TensorData::Inline(shape_bytes),
                     shape: vec![shape.len()],
                     dtype: ScalarType::UInt32,
                 };
@@ -196,9 +197,10 @@ impl Pass for GroupedPalettizePass {
                         shape,
                         dtype: dtype @ (ScalarType::Float32 | ScalarType::Float16),
                     } => {
+                        let bytes = data.as_bytes().expect("tensor not materialized");
                         let f = match dtype {
-                            ScalarType::Float32 => tensor_as_f32_slice(data),
-                            ScalarType::Float16 => fp16_bytes_to_f32(data)?,
+                            ScalarType::Float32 => tensor_as_f32_slice(bytes),
+                            ScalarType::Float16 => fp16_bytes_to_f32(bytes)?,
                             other => {
                                 return Err(MilError::TypeMismatch {
                                     expected: "Float32 or Float16".into(),
@@ -286,7 +288,7 @@ impl Pass for GroupedPalettizePass {
                 };
 
                 let lut_value = Value::Tensor {
-                    data: lut_data,
+                    data: TensorData::Inline(lut_data),
                     shape: vec![total_lut_entries],
                     dtype: original_dtype,
                 };
@@ -297,7 +299,7 @@ impl Pass for GroupedPalettizePass {
                 let packed_indices = pack_indices(&all_assignments, grouped_bits);
 
                 let indices_value = Value::Tensor {
-                    data: packed_indices.clone(),
+                    data: TensorData::Inline(packed_indices.clone()),
                     shape: vec![packed_indices.len()],
                     dtype: ScalarType::UInt8,
                 };
@@ -307,7 +309,7 @@ impl Pass for GroupedPalettizePass {
                     .flat_map(|&d| (d as u32).to_le_bytes())
                     .collect();
                 let shape_value = Value::Tensor {
-                    data: shape_bytes,
+                    data: TensorData::Inline(shape_bytes),
                     shape: vec![shape.len()],
                     dtype: ScalarType::UInt32,
                 };
@@ -346,13 +348,13 @@ fn apply_lut_transform(
         _ => centroids.iter().flat_map(|c| c.to_le_bytes()).collect(),
     };
     let lut_value = Value::Tensor {
-        data: lut_data,
+        data: TensorData::Inline(lut_data),
         shape: vec![k],
         dtype: original_dtype,
     };
     let packed_indices = pack_indices(assignments, n_bits);
     let indices_value = Value::Tensor {
-        data: packed_indices.clone(),
+        data: TensorData::Inline(packed_indices.clone()),
         shape: vec![packed_indices.len()],
         dtype: ScalarType::UInt8,
     };
@@ -361,7 +363,7 @@ fn apply_lut_transform(
         .flat_map(|&d| (d as u32).to_le_bytes())
         .collect();
     let shape_value = Value::Tensor {
-        data: shape_bytes,
+        data: TensorData::Inline(shape_bytes),
         shape: vec![shape.len()],
         dtype: ScalarType::UInt32,
     };
@@ -469,7 +471,7 @@ mod tests {
         }
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![64],
             dtype: ScalarType::Float32,
         };
@@ -500,7 +502,7 @@ mod tests {
         match op.attributes.get("indices") {
             Some(Value::Tensor { data, shape, .. }) => {
                 assert_eq!(*shape, vec![32]); // packed byte count
-                assert_eq!(data.len(), 32); // 64 × 4 bits / 8
+                assert_eq!(data.byte_len(), 32); // 64 × 4 bits / 8
             }
             other => panic!("expected indices tensor, got {other:?}"),
         }
@@ -510,7 +512,8 @@ mod tests {
             Some(Value::Tensor { data, shape, dtype }) => {
                 assert_eq!(*dtype, ScalarType::UInt32);
                 assert_eq!(*shape, vec![1]);
-                let dim = u32::from_le_bytes(data[..4].try_into().unwrap());
+                let bytes = data.as_bytes().expect("tensor not materialized");
+                let dim = u32::from_le_bytes(bytes[..4].try_into().unwrap());
                 assert_eq!(dim, 64);
             }
             other => panic!("expected shape tensor, got {other:?}"),
@@ -522,7 +525,7 @@ mod tests {
         let weights: Vec<f32> = (0..32).map(|i| (i % 4) as f32).collect();
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![32],
             dtype: ScalarType::Float32,
         };
@@ -550,7 +553,7 @@ mod tests {
         match op.attributes.get("indices") {
             Some(Value::Tensor { data, shape, .. }) => {
                 assert_eq!(*shape, vec![8]); // packed byte count
-                assert_eq!(data.len(), 8);
+                assert_eq!(data.byte_len(), 8);
             }
             other => panic!("expected indices tensor, got {other:?}"),
         }
@@ -563,7 +566,7 @@ mod tests {
         let original_size = n * 4; // FP32 = 4 bytes each
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![n],
             dtype: ScalarType::Float32,
         };
@@ -579,11 +582,11 @@ mod tests {
 
         let op = &program.functions["main"].body.operations[0];
         let lut_size = match op.attributes.get("lut") {
-            Some(Value::Tensor { data, .. }) => data.len(),
+            Some(Value::Tensor { data, .. }) => data.byte_len(),
             _ => panic!("missing lut"),
         };
         let idx_size = match op.attributes.get("indices") {
-            Some(Value::Tensor { data, .. }) => data.len(),
+            Some(Value::Tensor { data, .. }) => data.byte_len(),
             _ => panic!("missing indices"),
         };
 
@@ -615,7 +618,7 @@ mod tests {
     #[test]
     fn leaves_non_float_const_unchanged() {
         let int_val = Value::Tensor {
-            data: vec![1, 0, 0, 0],
+            data: TensorData::Inline(vec![1, 0, 0, 0]),
             shape: vec![1],
             dtype: ScalarType::Int32,
         };
@@ -641,7 +644,7 @@ mod tests {
             .collect();
 
         let tensor_val = Value::Tensor {
-            data: fp16_data,
+            data: TensorData::Inline(fp16_data),
             shape: vec![16],
             dtype: ScalarType::Float16,
         };
@@ -726,7 +729,7 @@ mod tests {
         }
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![32],
             dtype: ScalarType::Float32,
         };
@@ -756,7 +759,7 @@ mod tests {
         match op.attributes.get("indices") {
             Some(Value::Tensor { data, shape, .. }) => {
                 assert_eq!(*shape, vec![4]);
-                assert_eq!(data.len(), 4);
+                assert_eq!(data.byte_len(), 4);
             }
             other => panic!("expected indices tensor, got {other:?}"),
         }
@@ -776,7 +779,7 @@ mod tests {
             .collect();
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![64],
             dtype: ScalarType::Float32,
         };
@@ -798,8 +801,9 @@ mod tests {
             Some(Value::Tensor { data, shape, dtype }) => {
                 assert_eq!(*shape, vec![2]);
                 assert_eq!(*dtype, ScalarType::Float32);
-                let c0 = f32::from_le_bytes(data[0..4].try_into().unwrap());
-                let c1 = f32::from_le_bytes(data[4..8].try_into().unwrap());
+                let bytes = data.as_bytes().expect("tensor not materialized");
+                let c0 = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                let c1 = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
                 let (lo, hi) = if c0 < c1 { (c0, c1) } else { (c1, c0) };
                 assert!(
                     (lo - (-1.0)).abs() < 0.1,
@@ -844,7 +848,7 @@ mod tests {
         }
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![4, 8],
             dtype: ScalarType::Float32,
         };
@@ -887,7 +891,7 @@ mod tests {
         let weights: Vec<f32> = (0..16).map(|i| (i % 4) as f32).collect();
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![16],
             dtype: ScalarType::Float32,
         };
@@ -923,7 +927,7 @@ mod tests {
         }
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![3, 4],
             dtype: ScalarType::Float32,
         };
@@ -970,7 +974,7 @@ mod tests {
 
         let original = weights.clone();
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![2, 32],
             dtype: ScalarType::Float32,
         };
@@ -988,7 +992,7 @@ mod tests {
 
         // Reconstruct approximate values from LUT + indices.
         let lut_data = match op.attributes.get("lut") {
-            Some(Value::Tensor { data, .. }) => data,
+            Some(Value::Tensor { data, .. }) => data.as_bytes().expect("tensor not materialized"),
             _ => panic!("missing lut"),
         };
         let lut: Vec<f32> = lut_data
@@ -1007,7 +1011,7 @@ mod tests {
         let grouped_bits = bits_for(total_entries);
 
         let idx_data = match op.attributes.get("indices") {
-            Some(Value::Tensor { data, .. }) => data,
+            Some(Value::Tensor { data, .. }) => data.as_bytes().expect("tensor not materialized"),
             _ => panic!("missing indices"),
         };
         let unpacked = unpack_indices(idx_data, original.len(), grouped_bits);
@@ -1061,7 +1065,7 @@ mod tests {
         }
 
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![128, 4],
             dtype: ScalarType::Float32,
         };

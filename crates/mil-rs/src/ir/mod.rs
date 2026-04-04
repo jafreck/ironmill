@@ -29,4 +29,4 @@ pub use passes::{
 pub use pipeline::{PassPipeline, PassResult, PipelineConfig, PipelineReport};
 pub use program::{Block, Function, Program};
 pub use tensor::{ScalarType, TensorType};
-pub use types::Value;
+pub use types::{TensorData, Value};

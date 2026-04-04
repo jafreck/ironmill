@@ -299,6 +299,7 @@ fn detect_vocab_size(ops: &[Operation]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::TensorData;
     use crate::ir::{Block, Function, Operation, Program, Value};
 
     fn make_reshape_op(name: &str, shape_dims: &[i64]) -> Operation {
@@ -317,7 +318,7 @@ mod tests {
             .with_input(
                 "weight",
                 Value::Tensor {
-                    data: vec![0u8; weight_shape.iter().product::<usize>() * 4],
+                    data: TensorData::Inline(vec![0u8; weight_shape.iter().product::<usize>() * 4]),
                     shape: weight_shape.to_vec(),
                     dtype: crate::ir::ScalarType::Float32,
                 },
@@ -463,7 +464,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0u8; 1024 * 2048 * 4],
+                    data: TensorData::Inline(vec![0u8; 1024 * 2048 * 4]),
                     shape: vec![1024, 2048],
                     dtype: crate::ir::ScalarType::Float32,
                 },

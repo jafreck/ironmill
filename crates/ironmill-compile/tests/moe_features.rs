@@ -9,8 +9,8 @@ use mil_rs::convert::moe::{ExpertFrequencyProfile, detect_moe, fuse_top_k_expert
 use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
 use mil_rs::ir::passes::{GroupedPalettizePass, PalettizePass};
 use mil_rs::{
-    Function, Operation, Pass, PassPipeline, PipelineReport, Program, ScalarType, TensorType,
-    Value, program_to_multi_function_model,
+    Function, Operation, Pass, PassPipeline, PipelineReport, Program, ScalarType, TensorData,
+    TensorType, Value, program_to_multi_function_model,
 };
 
 use ironmill_compile::ane::passes::{
@@ -274,7 +274,9 @@ fn top_k_fusion_keeps_only_selected_experts() {
         expert_frequencies: freqs,
     };
 
-    let result = fuse_top_k_experts(&program, 2, &profile).expect("fuse_top_k should succeed");
+    let result = fuse_top_k_experts(&program, 2, &profile)
+        .expect("fuse_top_k should succeed")
+        .expect("fuse_top_k should return Some");
 
     // Should have kept experts 0 and 1 (highest frequency).
     assert_eq!(result.kept_expert_indices.len(), 2, "should keep 2 experts");
@@ -359,7 +361,7 @@ fn one_bit_palettization_produces_two_centroids() {
         let total_elements: usize = 64 * 64;
         let expected_bytes = total_elements.div_ceil(8); // 1-bit packing
         assert_eq!(
-            data.len(),
+            data.byte_len(),
             expected_bytes,
             "1-bit packed indices should use {} bytes for {} elements",
             expected_bytes,
@@ -821,7 +823,7 @@ fn moe_fuse_topk_greater_than_experts_returns_error() {
     // The implementation clamps selected to available experts,
     // so it should return Some with all experts kept.
     match result {
-        Some(fuse_result) => {
+        Ok(Some(fuse_result)) => {
             // All experts should be kept since k > expert_count.
             assert!(
                 fuse_result.kept_expert_indices.len() <= 2,
@@ -832,7 +834,7 @@ fn moe_fuse_topk_greater_than_experts_returns_error() {
                 "no experts should be discarded when k >= expert_count"
             );
         }
-        None => {
+        Ok(None) | Err(_) => {
             // If it returns None, that's also acceptable behavior.
             // The important thing is it doesn't panic.
         }
@@ -866,7 +868,9 @@ fn palettize_roundtrip_error_bounded() {
             .or_else(|| const_op.attributes.get("val"))
             .unwrap();
         match val {
-            Value::Tensor { data, .. } => tensor_as_f32_slice(data),
+            Value::Tensor { data, .. } => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("expected tensor"),
         }
     };
@@ -885,14 +889,16 @@ fn palettize_roundtrip_error_bounded() {
 
     // Extract LUT centroids.
     let lut_centroids: Vec<f32> = match lut_op.attributes.get("lut").unwrap() {
-        Value::Tensor { data, .. } => tensor_as_f32_slice(data),
+        Value::Tensor { data, .. } => {
+            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+        }
         _ => panic!("expected tensor"),
     };
     assert_eq!(lut_centroids.len(), 16, "4-bit should have 16 centroids");
 
     // Extract packed indices.
     let packed_indices = match lut_op.attributes.get("indices").unwrap() {
-        Value::Tensor { data, .. } => data.clone(),
+        Value::Tensor { data, .. } => data.as_bytes().expect("tensor not materialized").to_vec(),
         _ => panic!("expected tensor"),
     };
 
@@ -967,7 +973,7 @@ fn grouped_palettize_preserves_group_structure() {
             .with_attr(
                 "val",
                 Value::Tensor {
-                    data,
+                    data: data.into(),
                     shape: vec![128, 64],
                     dtype: ScalarType::Float32,
                 },
@@ -994,7 +1000,9 @@ fn grouped_palettize_preserves_group_structure() {
         .unwrap();
 
     let lut_values: Vec<f32> = match lut_op.attributes.get("lut").unwrap() {
-        Value::Tensor { data, .. } => tensor_as_f32_slice(data),
+        Value::Tensor { data, .. } => {
+            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+        }
         _ => panic!("expected tensor"),
     };
 

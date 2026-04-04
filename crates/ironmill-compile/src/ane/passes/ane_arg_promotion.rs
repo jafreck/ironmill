@@ -258,12 +258,18 @@ fn remap_ane_reduce_axes(value: &Value, _op: &Operation) -> Value {
         Value::Tensor { data, shape, dtype }
             if *dtype == ScalarType::Int32 && shape.iter().product::<usize>() == 1 =>
         {
-            if data.len() >= 4 {
-                let axis = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            if data.byte_len() >= 4 {
+                let data_bytes = data.as_bytes().expect("tensor not materialized");
+                let axis = i32::from_le_bytes([
+                    data_bytes[0],
+                    data_bytes[1],
+                    data_bytes[2],
+                    data_bytes[3],
+                ]);
                 if axis == -1 || axis == 3 {
                     let new_data = 1i32.to_le_bytes().to_vec();
                     return Value::Tensor {
-                        data: new_data,
+                        data: mil_rs::ir::TensorData::Inline(new_data),
                         shape: shape.clone(),
                         dtype: *dtype,
                     };
@@ -327,7 +333,7 @@ fn build_const_for_value(name: &str, value: &Value) -> Option<Operation> {
             op.inputs.insert(
                 "val".to_string(),
                 Value::Tensor {
-                    data,
+                    data: mil_rs::ir::TensorData::Inline(data),
                     shape: shape.clone(),
                     dtype: ScalarType::Int32,
                 },

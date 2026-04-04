@@ -135,9 +135,10 @@ fn get_perm(op: &Operation) -> Option<Vec<usize>> {
             dtype: super::super::tensor::ScalarType::Int32,
             ..
         } => Some({
+            let data = data.as_bytes().expect("tensor not materialized");
             let vals: Option<Vec<usize>> = data
                 .chunks_exact(4)
-                .map(|c| {
+                .map(|c: &[u8]| {
                     let v = i32::from_le_bytes(c.try_into().unwrap());
                     if v >= 0 { Some(v as usize) } else { None }
                 })
@@ -162,6 +163,7 @@ mod tests {
     use super::*;
     use crate::ir::operation::Operation;
     use crate::ir::program::Function;
+    use crate::ir::types::TensorData;
 
     fn program_with_block(block: Block) -> Program {
         let mut func = Function::new("main");
@@ -196,7 +198,7 @@ mod tests {
             .with_input(
                 "perm",
                 Value::Tensor {
-                    data: perm_data,
+                    data: TensorData::Inline(perm_data),
                     shape: vec![perm.len()],
                     dtype: ScalarType::Int32,
                 },

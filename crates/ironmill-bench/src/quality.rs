@@ -73,7 +73,9 @@ fn reconstruct_from_lut_op(
     let indices = op.attributes.get("indices")?;
 
     let (lut_data, lut_dtype) = match lut {
-        Value::Tensor { data, dtype, .. } => (data, *dtype),
+        Value::Tensor { data, dtype, .. } => {
+            (data.as_bytes().expect("tensor not materialized"), *dtype)
+        }
         _ => return None,
     };
 
@@ -87,7 +89,7 @@ fn reconstruct_from_lut_op(
     };
 
     let packed_bytes = match indices {
-        Value::Tensor { data, .. } => data,
+        Value::Tensor { data, .. } => data.as_bytes().expect("tensor not materialized"),
         _ => return None,
     };
 
@@ -141,7 +143,9 @@ pub fn measure_program_quality(program: &Program, method: &str, bits: u8) -> Vec
                     if numel < 1024 {
                         continue;
                     }
-                    let original = tensor_as_f32_slice(data).to_vec();
+                    let original =
+                        tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+                            .to_vec();
                     originals.push((op.name.clone(), shape.clone(), original));
                 }
                 _ => continue,
@@ -200,12 +204,14 @@ pub fn measure_program_quality(program: &Program, method: &str, bits: u8) -> Vec
                             ..
                         }) = norms
                         {
+                            let norms_bytes =
+                                norms_data.as_bytes().expect("tensor not materialized");
                             let norms_f32: Vec<f32> = match norms_dtype {
-                                ScalarType::Float16 => norms_data
+                                ScalarType::Float16 => norms_bytes
                                     .chunks_exact(2)
                                     .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
                                     .collect(),
-                                _ => tensor_as_f32_slice(norms_data).to_vec(),
+                                _ => tensor_as_f32_slice(norms_bytes).to_vec(),
                             };
                             reconstructed
                                 .iter()

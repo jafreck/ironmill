@@ -1201,7 +1201,7 @@ fn estimate_memory(program: &Program) -> u64 {
         for op in &func.body.operations {
             if op.op_type == "const" {
                 if let Some(super::types::Value::Tensor { data, .. }) = op.inputs.get("val") {
-                    total += data.len() as u64;
+                    total += data.byte_len() as u64;
                 }
             }
         }

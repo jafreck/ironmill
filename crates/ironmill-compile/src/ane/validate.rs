@@ -1054,7 +1054,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0; 64 * 3 * 32 * 32 * 4],
+                    data: vec![0; 64 * 3 * 32 * 32 * 4].into(),
                     shape: vec![64, 3, 32, 32],
                     dtype: ScalarType::Float32,
                 },
@@ -1087,7 +1087,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0; 64 * 3 * 3 * 3 * 4],
+                    data: vec![0; 64 * 3 * 3 * 3 * 4].into(),
                     shape: vec![64, 3, 3, 3],
                     dtype: ScalarType::Float32,
                 },
@@ -1114,7 +1114,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0; 64 * 3 * 3 * 3 * 4],
+                    data: vec![0; 64 * 3 * 3 * 3 * 4].into(),
                     shape: vec![64, 3, 3, 3],
                     dtype: ScalarType::Float32,
                 },
@@ -1217,7 +1217,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0; 64 * 3 * 3 * 3 * 4],
+                    data: vec![0; 64 * 3 * 3 * 3 * 4].into(),
                     shape: vec![64, 3, 3, 3],
                     dtype: ScalarType::Float32,
                 },
@@ -1258,7 +1258,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0; 64 * 3 * 3 * 3 * 4],
+                    data: vec![0; 64 * 3 * 3 * 3 * 4].into(),
                     shape: vec![64, 3, 3, 3],
                     dtype: ScalarType::Float32,
                 },

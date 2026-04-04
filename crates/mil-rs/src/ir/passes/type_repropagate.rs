@@ -293,6 +293,7 @@ mod tests {
     use super::*;
     use crate::ir::program::Function;
     use crate::ir::tensor::ScalarType;
+    use crate::ir::types::TensorData;
 
     fn run_pass(program: &mut Program) {
         TypeRepropagationPass.run(program).unwrap();
@@ -315,7 +316,7 @@ mod tests {
                 .with_input(
                     "perm",
                     Value::Tensor {
-                        data: perm_data,
+                        data: TensorData::Inline(perm_data),
                         shape: vec![4],
                         dtype: ScalarType::Int32,
                     },
@@ -408,7 +409,7 @@ mod tests {
                 .with_input(
                     "val",
                     Value::Tensor {
-                        data: w_data,
+                        data: TensorData::Inline(w_data),
                         shape: vec![16, 3, 3, 3],
                         dtype: ScalarType::Float32,
                     },
@@ -431,7 +432,7 @@ mod tests {
                 .with_input(
                     "pad",
                     Value::Tensor {
-                        data: pad_data,
+                        data: TensorData::Inline(pad_data),
                         shape: vec![4],
                         dtype: ScalarType::Int32,
                     },
@@ -439,7 +440,7 @@ mod tests {
                 .with_input(
                     "strides",
                     Value::Tensor {
-                        data: stride_data,
+                        data: TensorData::Inline(stride_data),
                         shape: vec![2],
                         dtype: ScalarType::Int32,
                     },
@@ -447,7 +448,7 @@ mod tests {
                 .with_input(
                     "dilations",
                     Value::Tensor {
-                        data: dil_data,
+                        data: TensorData::Inline(dil_data),
                         shape: vec![2],
                         dtype: ScalarType::Int32,
                     },

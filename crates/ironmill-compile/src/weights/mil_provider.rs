@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem;
 
-use mil_rs::{MilError, Operation, Program, ScalarType, Value};
+use mil_rs::{MilError, Operation, Program, ScalarType, TensorData, Value};
 
 use super::{ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
 
@@ -69,7 +69,13 @@ impl MilWeightProvider {
                     "_quip_norms"
                 };
                 let prefix = &output_name[..output_name.len() - suffix.len()];
-                norms_map.insert(prefix.to_string(), (mem::take(data), *dtype));
+                norms_map.insert(
+                    prefix.to_string(),
+                    (
+                        mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
+                        *dtype,
+                    ),
+                );
             }
         }
 
@@ -179,6 +185,8 @@ impl MilWeightProvider {
                             ..
                         }) => {
                             let fp16_bytes: Vec<u8> = data
+                                .as_bytes()
+                                .expect("tensor not materialized")
                                 .chunks_exact(4)
                                 .flat_map(|c| {
                                     let val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
@@ -197,6 +205,8 @@ impl MilWeightProvider {
                             ..
                         }) => {
                             let indices: Vec<u32> = data
+                                .as_bytes()
+                                .expect("tensor not materialized")
                                 .chunks_exact(4)
                                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                                 .collect();
@@ -249,7 +259,7 @@ impl MilWeightProvider {
 
                     if let Value::Tensor { data, shape, dtype } = val {
                         let extracted = ExtractedTensor {
-                            data: mem::take(data),
+                            data: mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
                             shape: mem::take(shape),
                             dtype: *dtype,
                             quant_info: QuantizationInfo::None,
@@ -480,7 +490,10 @@ fn extract_tensor_attr(
     key: &str,
 ) -> Result<(Vec<u8>, ScalarType), MilError> {
     match attrs.get_mut(key) {
-        Some(Value::Tensor { data, dtype, .. }) => Ok((mem::take(data), *dtype)),
+        Some(Value::Tensor { data, dtype, .. }) => Ok((
+            mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
+            *dtype,
+        )),
         _ => Err(MilError::UndefinedValue(format!(
             "missing or invalid tensor attribute '{key}'"
         ))),
@@ -507,7 +520,10 @@ fn extract_scale_or_zp(
     key: &str,
 ) -> Result<(Vec<u8>, ScalarType), MilError> {
     match attrs.get_mut(key) {
-        Some(Value::Tensor { data, dtype, .. }) => Ok((mem::take(data), *dtype)),
+        Some(Value::Tensor { data, dtype, .. }) => Ok((
+            mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
+            *dtype,
+        )),
         Some(Value::Float(v)) => {
             let bytes = (*v as f32).to_le_bytes().to_vec();
             Ok((bytes, ScalarType::Float32))
@@ -556,7 +572,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: data.clone(),
+                    data: data.clone().into(),
                     shape: vec![2, 2],
                     dtype: ScalarType::Float32,
                 },
@@ -591,7 +607,7 @@ mod tests {
         op.attributes.insert(
             "quantized_data".into(),
             Value::Tensor {
-                data: quantized.clone(),
+                data: quantized.clone().into(),
                 shape: vec![2, 3],
                 dtype: ScalarType::UInt8,
             },
@@ -636,7 +652,7 @@ mod tests {
         lut_op.attributes.insert(
             "lut".into(),
             Value::Tensor {
-                data: lut_data.clone(),
+                data: lut_data.clone().into(),
                 shape: vec![4],
                 dtype: ScalarType::Float32,
             },
@@ -644,7 +660,7 @@ mod tests {
         lut_op.attributes.insert(
             "indices".into(),
             Value::Tensor {
-                data: indices.clone(),
+                data: indices.clone().into(),
                 shape: vec![8],
                 dtype: ScalarType::UInt8,
             },
@@ -652,7 +668,7 @@ mod tests {
         lut_op.attributes.insert(
             "shape".into(),
             Value::Tensor {
-                data: original_shape,
+                data: original_shape.into(),
                 shape: vec![2],
                 dtype: ScalarType::UInt32,
             },
@@ -674,7 +690,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: norms_data.clone(),
+                    data: norms_data.clone().into(),
                     shape: vec![4, 1],
                     dtype: ScalarType::Float32,
                 },
@@ -724,7 +740,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: data.clone(),
+                    data: data.clone().into(),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },

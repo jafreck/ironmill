@@ -294,7 +294,10 @@ impl<'a> MilTextEmitter<'a> {
             if is_int_param {
                 // Emit inline: tensor<int32, [N]>([v1, v2, ...])
                 let type_str = self.format_tensor_type_from(shape, *dtype);
-                let values = format_tensor_elements(data, *dtype);
+                let values = format_tensor_elements(
+                    data.as_bytes().expect("tensor not materialized"),
+                    *dtype,
+                );
                 let num_elements: usize = shape.iter().product();
 
                 writeln!(
@@ -309,7 +312,7 @@ impl<'a> MilTextEmitter<'a> {
                 self.weight_entries.push(WeightBlobEntry {
                     name: op.name.clone(),
                     path: weight_path.clone(),
-                    data: data.clone(),
+                    data: data.as_bytes().expect("tensor not materialized").to_vec(),
                     offset: WEIGHT_BLOB_HEADER_BYTES,
                     dtype: *dtype,
                     shape: shape.clone(),
@@ -381,7 +384,10 @@ impl<'a> MilTextEmitter<'a> {
                 let type_str = format!("tensor<{dtype_str}, [{num_elements}]>");
 
                 // Decode the raw bytes into element values.
-                let values = format_tensor_elements(data, *dtype);
+                let values = format_tensor_elements(
+                    data.as_bytes().expect("tensor not materialized"),
+                    *dtype,
+                );
                 format!("{type_str}([{values}])")
             }
         }
@@ -545,8 +551,10 @@ impl<'a> MilTextEmitter<'a> {
                 })
                 .collect(),
             Some(Value::Tensor { data, dtype, .. }) if *dtype == ScalarType::Int32 => data
+                .as_bytes()
+                .expect("tensor not materialized")
                 .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+                .map(|c: &[u8]| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
                 .collect(),
             _ => vec![],
         }
@@ -690,7 +698,7 @@ fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mil_rs::ir::{Function, Operation};
+    use mil_rs::ir::{Function, Operation, TensorData};
 
     /// Helper: build a simple program with one function.
     fn make_program(func: Function) -> Program {
@@ -709,8 +717,14 @@ mod tests {
     /// Helper: build a const operation for a weight tensor.
     fn weight_const(name: &str, data: Vec<u8>, shape: Vec<usize>, dtype: ScalarType) -> Operation {
         let mut op = Operation::new("const", name).with_output(name);
-        op.inputs
-            .insert("val".to_string(), Value::Tensor { data, shape, dtype });
+        op.inputs.insert(
+            "val".to_string(),
+            Value::Tensor {
+                data: data.into(),
+                shape,
+                dtype,
+            },
+        );
         op
     }
 
@@ -1004,7 +1018,7 @@ mod tests {
         // Tensor values should produce inline tensor literals.
         assert_eq!(
             emitter.format_value(&Value::Tensor {
-                data: vec![1, 0, 0, 0, 1, 0, 0, 0, 128, 0, 0, 0], // [1, 1, 128] as int32
+                data: TensorData::Inline(vec![1, 0, 0, 0, 1, 0, 0, 0, 128, 0, 0, 0]), // [1, 1, 128] as int32
                 shape: vec![3],
                 dtype: ScalarType::Int32,
             }),

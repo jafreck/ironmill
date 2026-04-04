@@ -151,7 +151,7 @@ fn tensor_input_bytes(
     type_map: &HashMap<String, TensorType>,
 ) -> usize {
     match op.inputs.get(input_name) {
-        Some(Value::Tensor { data, .. }) => data.len(),
+        Some(Value::Tensor { data, .. }) => data.byte_len(),
         Some(Value::Reference(ref_name)) => {
             if let Some(tt) = type_map.get(ref_name) {
                 static_elements(&tt.shape)
@@ -914,7 +914,7 @@ mod tests {
             .with_input(
                 "y",
                 Value::Tensor {
-                    data: weight_data,
+                    data: weight_data.into(),
                     shape: vec![n, k],
                     dtype: ScalarType::Float32,
                 },
@@ -930,7 +930,7 @@ mod tests {
             .with_input(
                 "weight",
                 Value::Tensor {
-                    data: weight_data,
+                    data: weight_data.into(),
                     shape: vec![k, n],
                     dtype: ScalarType::Float32,
                 },
@@ -946,7 +946,7 @@ mod tests {
             .with_input(
                 "weight",
                 Value::Tensor {
-                    data: weight_data,
+                    data: weight_data.into(),
                     shape: vec![c_out, c_in, kh, kw],
                     dtype: ScalarType::Float32,
                 },

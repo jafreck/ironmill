@@ -20,7 +20,7 @@ use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 /// Quantization granularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,8 @@ impl Pass for Int8QuantizePass {
                     dtype: _,
                 } = val
                 {
-                    let floats = tensor_as_f32_slice(&data);
+                    let floats =
+                        tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"));
 
                     let use_per_channel = self.granularity == Granularity::PerChannel
                         && shape.len() >= 2
@@ -135,7 +136,7 @@ impl Pass for Int8QuantizePass {
                         }
 
                         let quantized_val = Value::Tensor {
-                            data: all_quantized,
+                            data: TensorData::Inline(all_quantized),
                             shape: shape.clone(),
                             dtype: ScalarType::UInt8,
                         };
@@ -151,7 +152,7 @@ impl Pass for Int8QuantizePass {
                         op.attributes.insert(
                             "scale".to_string(),
                             Value::Tensor {
-                                data: scale_bytes,
+                                data: TensorData::Inline(scale_bytes),
                                 shape: vec![num_channels],
                                 dtype: ScalarType::Float32,
                             },
@@ -162,7 +163,7 @@ impl Pass for Int8QuantizePass {
                         op.attributes.insert(
                             "zero_point".to_string(),
                             Value::Tensor {
-                                data: zp_bytes,
+                                data: TensorData::Inline(zp_bytes),
                                 shape: vec![num_channels],
                                 dtype: ScalarType::Float32,
                             },
@@ -180,7 +181,7 @@ impl Pass for Int8QuantizePass {
                         let (quantized, scale, zero_point) = quantize_f32_to_uint8(&floats);
 
                         let quantized_val = Value::Tensor {
-                            data: quantized,
+                            data: TensorData::Inline(quantized),
                             shape: shape.clone(),
                             dtype: ScalarType::UInt8,
                         };
@@ -289,7 +290,7 @@ mod tests {
     fn quantizes_fp32_const_to_uint8_with_attrs() {
         let fp32_data = f32_bytes(&[0.0, 1.0, 2.0, 3.0]);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: TensorData::Inline(fp32_data),
             shape: vec![4],
             dtype: ScalarType::Float32,
         };
@@ -309,8 +310,8 @@ mod tests {
             Some(Value::Tensor { data, shape, dtype }) => {
                 assert_eq!(*dtype, ScalarType::UInt8);
                 assert_eq!(*shape, vec![4]);
-                assert_eq!(data.len(), 4);
-                assert!(!data.is_empty());
+                assert_eq!(data.byte_len(), 4);
+                assert!(!data.as_bytes().expect("tensor not materialized").is_empty());
             }
             other => panic!("expected UInt8 Tensor, got {other:?}"),
         }
@@ -339,7 +340,7 @@ mod tests {
         let vals = [-5.0_f32, -1.0, 0.0, 2.5, 10.0];
         let fp32_data = f32_bytes(&vals);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: TensorData::Inline(fp32_data),
             shape: vec![5],
             dtype: ScalarType::Float32,
         };
@@ -354,6 +355,7 @@ mod tests {
 
         let op = &program.functions["main"].body.operations[0];
         if let Some(Value::Tensor { data, .. }) = op.attributes.get("quantized_data") {
+            let data = data.as_bytes().expect("tensor not materialized");
             assert_eq!(data.len(), 5);
             assert_eq!(data[0], 0, "min value should map to 0");
             assert_eq!(data[4], 255, "max value should map to 255");
@@ -384,7 +386,7 @@ mod tests {
         let vals = [42.0_f32; 8];
         let fp32_data = f32_bytes(&vals);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: TensorData::Inline(fp32_data),
             shape: vec![8],
             dtype: ScalarType::Float32,
         };
@@ -400,6 +402,7 @@ mod tests {
         let op = &program.functions["main"].body.operations[0];
         if let Some(Value::Tensor { data, dtype, .. }) = op.attributes.get("quantized_data") {
             assert_eq!(*dtype, ScalarType::UInt8);
+            let data = data.as_bytes().expect("tensor not materialized");
             let first = data[0];
             for &b in data {
                 assert_eq!(b, first, "all-same input should produce all-same output");
@@ -413,7 +416,7 @@ mod tests {
     fn edge_case_single_element() {
         let fp32_data = f32_bytes(&[7.5]);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: TensorData::Inline(fp32_data),
             shape: vec![1],
             dtype: ScalarType::Float32,
         };
@@ -430,7 +433,7 @@ mod tests {
         if let Some(Value::Tensor { data, dtype, shape }) = op.attributes.get("quantized_data") {
             assert_eq!(*dtype, ScalarType::UInt8);
             assert_eq!(*shape, vec![1]);
-            assert_eq!(data.len(), 1);
+            assert_eq!(data.byte_len(), 1);
         } else {
             panic!("expected Tensor");
         }
@@ -439,7 +442,7 @@ mod tests {
     #[test]
     fn leaves_non_fp32_tensors_unchanged() {
         let int_val = Value::Tensor {
-            data: vec![1, 0, 0, 0],
+            data: TensorData::Inline(vec![1, 0, 0, 0]),
             shape: vec![1],
             dtype: ScalarType::Int32,
         };
@@ -456,7 +459,7 @@ mod tests {
         match op.inputs.get("val") {
             Some(Value::Tensor { dtype, data, .. }) => {
                 assert_eq!(*dtype, ScalarType::Int32);
-                assert_eq!(data.len(), 4);
+                assert_eq!(data.byte_len(), 4);
             }
             other => panic!("expected Int32 Tensor, got {other:?}"),
         }
@@ -492,7 +495,7 @@ mod tests {
         let fp32_data = f32_bytes(&all_vals);
 
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: TensorData::Inline(fp32_data),
             shape: vec![2, 3],
             dtype: ScalarType::Float32,
         };
@@ -516,7 +519,7 @@ mod tests {
             Some(Value::Tensor { shape, dtype, data }) => {
                 assert_eq!(*shape, vec![2]);
                 assert_eq!(*dtype, ScalarType::Float32);
-                assert_eq!(data.len(), 8); // 2 floats * 4 bytes
+                assert_eq!(data.byte_len(), 8); // 2 floats * 4 bytes
             }
             other => panic!("expected per-channel scale Tensor, got {other:?}"),
         }
@@ -526,7 +529,7 @@ mod tests {
             Some(Value::Tensor { shape, dtype, data }) => {
                 assert_eq!(*shape, vec![2]);
                 assert_eq!(*dtype, ScalarType::Float32);
-                assert_eq!(data.len(), 8);
+                assert_eq!(data.byte_len(), 8);
             }
             other => panic!("expected per-channel zero_point Tensor, got {other:?}"),
         }
@@ -536,7 +539,7 @@ mod tests {
             Some(Value::Tensor { data, shape, dtype }) => {
                 assert_eq!(*dtype, ScalarType::UInt8);
                 assert_eq!(*shape, vec![2, 3]);
-                assert_eq!(data.len(), 6);
+                assert_eq!(data.byte_len(), 6);
             }
             other => panic!("expected UInt8 Tensor, got {other:?}"),
         }
@@ -547,7 +550,7 @@ mod tests {
         // 1D tensor: per-channel not applicable, should use per-tensor.
         let fp32_data = f32_bytes(&[1.0, 2.0, 3.0]);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: TensorData::Inline(fp32_data),
             shape: vec![3],
             dtype: ScalarType::Float32,
         };

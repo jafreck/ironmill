@@ -85,7 +85,7 @@ pub use error::MilError;
 
 pub use ir::{
     Block, ComputeUnit, Function, Graph, Operation, Pass, PassPipeline, PassResult, PipelineReport,
-    Program, ScalarType, TensorType, Value,
+    Program, ScalarType, TensorData, TensorType, Value,
 };
 
 /// Estimate total FLOPs for a MIL program's forward pass.

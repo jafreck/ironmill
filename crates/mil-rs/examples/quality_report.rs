@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use half::f16;
+use mil_rs::TensorData;
 use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
 use mil_rs::{
     ConversionConfig, PassPipeline, Program, ScalarType, Value, onnx_to_program_with_config,
@@ -254,14 +255,20 @@ fn collect_const_tensors(program: &Program) -> HashMap<String, Vec<f32>> {
                     dtype: ScalarType::Float32,
                     ..
                 } => {
-                    result.insert(op.name.clone(), tensor_as_f32_slice(data));
+                    result.insert(
+                        op.name.clone(),
+                        tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
+                    );
                 }
                 Value::Tensor {
                     data,
                     dtype: ScalarType::Float16,
                     ..
                 } => {
-                    result.insert(op.name.clone(), fp16_bytes_to_f32(data));
+                    result.insert(
+                        op.name.clone(),
+                        fp16_bytes_to_f32(data.as_bytes().expect("tensor not materialized")),
+                    );
                 }
                 Value::Tensor {
                     data,
@@ -278,6 +285,8 @@ fn collect_const_tensors(program: &Program) -> HashMap<String, Vec<f32>> {
                         _ => continue,
                     };
                     let dequantized: Vec<f32> = data
+                        .as_bytes()
+                        .expect("tensor not materialized")
                         .iter()
                         .map(|&q| (q as f32 - zero_point) * scale)
                         .collect();
@@ -318,6 +327,8 @@ fn reconstruct_affine_dequantize(op: &mil_rs::Operation) -> Option<Vec<f32>> {
         let zero_point = *zp as f32;
         return Some(
             qdata
+                .as_bytes()
+                .expect("tensor not materialized")
                 .iter()
                 .map(|&q| (q as f32 - zero_point) * scale)
                 .collect(),
@@ -330,7 +341,7 @@ fn reconstruct_affine_dequantize(op: &mil_rs::Operation) -> Option<Vec<f32>> {
             data,
             dtype: ScalarType::Float32,
             ..
-        }) => tensor_as_f32_slice(data),
+        }) => tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
         _ => return None,
     };
     let zero_points = match op.attributes.get("zero_point") {
@@ -338,7 +349,7 @@ fn reconstruct_affine_dequantize(op: &mil_rs::Operation) -> Option<Vec<f32>> {
             data,
             dtype: ScalarType::Float32,
             ..
-        }) => tensor_as_f32_slice(data),
+        }) => tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
         _ => return None,
     };
 
@@ -355,7 +366,12 @@ fn reconstruct_affine_dequantize(op: &mil_rs::Operation) -> Option<Vec<f32>> {
     };
 
     let mut result = Vec::with_capacity(total_elements);
-    for (ch, &q_byte) in qdata.iter().enumerate() {
+    for (ch, &q_byte) in qdata
+        .as_bytes()
+        .expect("tensor not materialized")
+        .iter()
+        .enumerate()
+    {
         let ch_idx = ch / channel_size;
         if ch_idx < num_channels {
             result.push((q_byte as f32 - zero_points[ch_idx]) * scales[ch_idx]);
@@ -376,8 +392,12 @@ fn reconstruct_palettized(op: &mil_rs::Operation) -> Option<Vec<f32>> {
 
     // Decode LUT centroids to f32.
     let centroids: Vec<f32> = match lut_dtype {
-        ScalarType::Float32 => tensor_as_f32_slice(lut_data),
-        ScalarType::Float16 => fp16_bytes_to_f32(lut_data),
+        ScalarType::Float32 => {
+            tensor_as_f32_slice(lut_data.as_bytes().expect("tensor not materialized"))
+        }
+        ScalarType::Float16 => {
+            fp16_bytes_to_f32(lut_data.as_bytes().expect("tensor not materialized"))
+        }
         _ => return None,
     };
 
@@ -395,7 +415,11 @@ fn reconstruct_palettized(op: &mil_rs::Operation) -> Option<Vec<f32>> {
         _ => return None,
     };
 
-    let assignments = unpack_indices(indices_data, n_values, n_bits);
+    let assignments = unpack_indices(
+        indices_data.as_bytes().expect("tensor not materialized"),
+        n_values,
+        n_bits,
+    );
     Some(
         assignments
             .iter()

@@ -282,6 +282,7 @@ fn output_spatial_dims(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::TensorData;
     use crate::ir::{Block, Function, Operation, Program, ScalarType, TensorType};
 
     /// Build a minimal program with the given operations in a single function.
@@ -307,7 +308,7 @@ mod tests {
         conv.inputs.insert(
             "weight".into(),
             Value::Tensor {
-                data: vec![0u8; 4 * 128 * 64 * 3 * 3],
+                data: TensorData::Inline(vec![0u8; 4 * 128 * 64 * 3 * 3]),
                 shape: vec![128, 64, 3, 3],
                 dtype: ScalarType::Float32,
             },
@@ -331,7 +332,7 @@ mod tests {
         mm.inputs.insert(
             "x".into(),
             Value::Tensor {
-                data: vec![],
+                data: TensorData::Inline(vec![]),
                 shape: vec![4, 128, 64],
                 dtype: ScalarType::Float32,
             },
@@ -339,7 +340,7 @@ mod tests {
         mm.inputs.insert(
             "y".into(),
             Value::Tensor {
-                data: vec![],
+                data: TensorData::Inline(vec![]),
                 shape: vec![4, 64, 256],
                 dtype: ScalarType::Float32,
             },
@@ -359,7 +360,7 @@ mod tests {
         linear.inputs.insert(
             "weight".into(),
             Value::Tensor {
-                data: vec![],
+                data: TensorData::Inline(vec![]),
                 shape: vec![512, 256],
                 dtype: ScalarType::Float32,
             },
@@ -367,7 +368,7 @@ mod tests {
         linear.inputs.insert(
             "x".into(),
             Value::Tensor {
-                data: vec![],
+                data: TensorData::Inline(vec![]),
                 shape: vec![8, 256],
                 dtype: ScalarType::Float32,
             },
@@ -419,7 +420,7 @@ mod tests {
         attn.inputs.insert(
             "query".into(),
             Value::Tensor {
-                data: vec![],
+                data: TensorData::Inline(vec![]),
                 shape: vec![2, 8, 128, 64],
                 dtype: ScalarType::Float32,
             },
@@ -446,7 +447,7 @@ mod tests {
         conv.inputs.insert(
             "weight".into(),
             Value::Tensor {
-                data: vec![0u8; 4 * 128 * 64 * 3 * 3],
+                data: TensorData::Inline(vec![0u8; 4 * 128 * 64 * 3 * 3]),
                 shape: vec![128, 64, 3, 3],
                 dtype: ScalarType::Float32,
             },

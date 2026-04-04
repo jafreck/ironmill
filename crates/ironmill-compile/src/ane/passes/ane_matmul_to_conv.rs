@@ -60,9 +60,11 @@ fn convert_matmul_to_conv(block: &mut Block) {
             if o.op_type == "const" && o.outputs.first().map(|s| s.as_str()) == Some(&y_ref) {
                 let val = o.inputs.get("val").or_else(|| o.attributes.get("val"));
                 match val {
-                    Some(Value::Tensor { data, shape, dtype }) => {
-                        Some((data.clone(), shape.clone(), *dtype))
-                    }
+                    Some(Value::Tensor { data, shape, dtype }) => Some((
+                        data.as_bytes().expect("tensor not materialized").to_vec(),
+                        shape.clone(),
+                        *dtype,
+                    )),
                     _ => None,
                 }
             } else {
@@ -218,7 +220,7 @@ fn build_conv_replacement(
         .with_input(
             "val",
             Value::Tensor {
-                data: params.weight_data,
+                data: mil_rs::ir::TensorData::Inline(params.weight_data),
                 shape: vec![params.cout, params.cin, 1, 1],
                 dtype: params.dtype,
             },
@@ -267,7 +269,7 @@ mod tests {
         w_op.attributes.insert(
             "val".into(),
             Value::Tensor {
-                data: weight_data,
+                data: weight_data.into(),
                 shape: vec![4, 8],
                 dtype: ScalarType::Float16,
             },
@@ -372,7 +374,7 @@ mod tests {
         w_op.attributes.insert(
             "val".into(),
             Value::Tensor {
-                data: weight_data,
+                data: weight_data.into(),
                 shape: vec![4, 8],
                 dtype: ScalarType::Float16,
             },

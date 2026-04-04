@@ -37,7 +37,14 @@ pub fn extract_rope_caches(program: &Program) -> Option<RopeCacheData> {
             let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
             if let Some(Value::Tensor { data, shape, dtype }) = tensor {
                 for out in &op.outputs {
-                    const_map.insert(out.as_str(), (data.as_slice(), shape.as_slice(), *dtype));
+                    const_map.insert(
+                        out.as_str(),
+                        (
+                            data.as_bytes().expect("tensor not materialized"),
+                            shape.as_slice(),
+                            *dtype,
+                        ),
+                    );
                 }
             }
         }
@@ -146,6 +153,7 @@ pub fn extract_qk_norm_weights(program: &Program) -> Option<Vec<(Vec<f16>, Vec<f
         let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
         if let Some(Value::Tensor { data, shape, dtype }) = tensor {
             if shape.len() == 1 {
+                let data = data.as_bytes().expect("tensor not materialized");
                 let values: Vec<f16> = if *dtype == ScalarType::Float32 {
                     data.chunks_exact(4)
                         .map(|b| f16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
@@ -540,8 +548,13 @@ pub fn extract_cpu_weight(sub: &SubProgram, _label: &str) -> Option<CpuWeight> {
         if op.op_type == "const" {
             let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
             if let Some(Value::Tensor { data, shape, dtype }) = tensor {
-                if shape.len() >= 2 && data.len() > best.as_ref().map_or(0, |b| b.0) {
-                    best = Some((data.len(), data.clone(), [shape[0], shape[1]], *dtype));
+                if shape.len() >= 2 && data.byte_len() > best.as_ref().map_or(0, |b| b.0) {
+                    best = Some((
+                        data.byte_len(),
+                        data.as_bytes().expect("tensor not materialized").to_vec(),
+                        [shape[0], shape[1]],
+                        *dtype,
+                    ));
                 }
             }
         }
@@ -581,6 +594,7 @@ pub fn extract_1d_weight(sub: &SubProgram, hint: &str) -> Option<Vec<f16>> {
         let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
         if let Some(Value::Tensor { data, shape, dtype }) = tensor {
             if shape.len() == 1 {
+                let data = data.as_bytes().expect("tensor not materialized");
                 let values: Vec<f16> = if *dtype == ScalarType::Float32 {
                     data.chunks_exact(4)
                         .map(|b| {
@@ -638,14 +652,16 @@ pub fn convert_f32_consts_to_f16(program: &mut Program) {
                 {
                     if *dtype == ScalarType::Float32 {
                         let f32_values: Vec<f32> = data
+                            .as_bytes()
+                            .expect("tensor not materialized")
                             .chunks_exact(4)
-                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .map(|b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                             .collect();
                         let f16_bytes: Vec<u8> = f32_values
                             .iter()
                             .flat_map(|&v| f16::from_f32(v).to_le_bytes())
                             .collect();
-                        *data = f16_bytes;
+                        *data = mil_rs::ir::TensorData::Inline(f16_bytes);
                         *dtype = ScalarType::Float16;
                     }
                 }
@@ -701,20 +717,22 @@ pub fn apply_min_seq_padding(program: &mut Program, min_seq: usize) {
                 if let Some(Value::Tensor { shape, data, dtype }) = op.inputs.get_mut("shape") {
                     if shape.len() == 1 && *dtype == ScalarType::Int32 {
                         let ndims = shape[0];
-                        if ndims >= 4 && data.len() >= ndims * 4 {
-                            let off = (ndims - 1) * 4;
-                            let last = i32::from_le_bytes([
-                                data[off],
-                                data[off + 1],
-                                data[off + 2],
-                                data[off + 3],
-                            ]);
-                            if last > 0 && (last as usize) < min_seq {
-                                let b = (min_seq as i32).to_le_bytes();
-                                data[off] = b[0];
-                                data[off + 1] = b[1];
-                                data[off + 2] = b[2];
-                                data[off + 3] = b[3];
+                        if let Some(data) = data.as_bytes_mut() {
+                            if ndims >= 4 && data.len() >= ndims * 4 {
+                                let off = (ndims - 1) * 4;
+                                let last = i32::from_le_bytes([
+                                    data[off],
+                                    data[off + 1],
+                                    data[off + 2],
+                                    data[off + 3],
+                                ]);
+                                if last > 0 && (last as usize) < min_seq {
+                                    let b = (min_seq as i32).to_le_bytes();
+                                    data[off] = b[0];
+                                    data[off + 1] = b[1];
+                                    data[off + 2] = b[2];
+                                    data[off + 3] = b[3];
+                                }
                             }
                         }
                     }

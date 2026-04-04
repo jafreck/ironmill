@@ -23,7 +23,7 @@ use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 // ---------------------------------------------------------------------------
 // Apple Accelerate BLAS bindings for hardware-accelerated matrix math.
@@ -254,8 +254,12 @@ impl Pass for AwqQuantizePass {
 
                 if let Value::Tensor { data, shape, dtype } = val {
                     let floats = match dtype {
-                        ScalarType::Float32 => tensor_as_f32_slice(&data),
-                        ScalarType::Float16 => tensor_f16_as_f32_slice(&data),
+                        ScalarType::Float32 => {
+                            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+                        }
+                        ScalarType::Float16 => tensor_f16_as_f32_slice(
+                            data.as_bytes().expect("tensor not materialized"),
+                        ),
                         other => {
                             return Err(MilError::TypeMismatch {
                                 expected: "Float32 or Float16".into(),
@@ -462,7 +466,7 @@ impl Pass for AwqQuantizePass {
                 let op = &mut function.body.operations[idx];
                 let data = f32_slice_to_bytes(&floats);
                 let val = Value::Tensor {
-                    data,
+                    data: TensorData::Inline(data),
                     shape,
                     dtype: ScalarType::Float32,
                 };
@@ -786,7 +790,7 @@ fn emit_per_group_with_scales(
     };
 
     let quantized_val = Value::Tensor {
-        data: packed_data,
+        data: TensorData::Inline(packed_data),
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -812,7 +816,7 @@ fn emit_per_group_with_scales(
     op.attributes.insert(
         "scale".to_string(),
         Value::Tensor {
-            data: scale_bytes,
+            data: TensorData::Inline(scale_bytes),
             shape: param_shape.clone(),
             dtype: ScalarType::Float32,
         },
@@ -820,7 +824,7 @@ fn emit_per_group_with_scales(
     op.attributes.insert(
         "zero_point".to_string(),
         Value::Tensor {
-            data: zp_bytes,
+            data: TensorData::Inline(zp_bytes),
             shape: param_shape,
             dtype: ScalarType::Float32,
         },
@@ -837,7 +841,7 @@ fn emit_per_group_with_scales(
     op.attributes.insert(
         "awq_channel_scales".to_string(),
         Value::Tensor {
-            data: f32_slice_to_bytes(channel_scales),
+            data: TensorData::Inline(f32_slice_to_bytes(channel_scales)),
             shape: vec![num_scales],
             dtype: ScalarType::Float32,
         },
@@ -876,7 +880,7 @@ mod tests {
     /// Build a single-const-op program for testing.
     fn make_program(name: &str, values: &[f32], shape: Vec<usize>) -> Program {
         let tensor_val = Value::Tensor {
-            data: f32_bytes(values),
+            data: TensorData::Inline(f32_bytes(values)),
             shape,
             dtype: ScalarType::Float32,
         };
@@ -910,7 +914,7 @@ mod tests {
 
         let op = &program.functions["main"].body.operations[0];
         let q_data_raw = match op.attributes.get("quantized_data") {
-            Some(Value::Tensor { data, .. }) => data,
+            Some(Value::Tensor { data, .. }) => data.as_bytes().expect("tensor not materialized"),
             _ => panic!("missing quantized_data"),
         };
 
@@ -929,12 +933,16 @@ mod tests {
 
         // Get per-group scales and zero points.
         let scales = match op.attributes.get("scale") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing scale"),
         };
         let zero_points = match op.attributes.get("zero_point") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing zero_point"),
         };
@@ -946,7 +954,9 @@ mod tests {
 
         // Get AWQ channel scales if present.
         let channel_scales = match op.attributes.get("awq_channel_scales") {
-            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(data)),
+            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(
+                data.as_bytes().expect("tensor not materialized"),
+            )),
             _ => None,
         };
 
@@ -999,7 +1009,7 @@ mod tests {
 
         let op = &program.functions["main"].body.operations[0];
         let q_data_raw = match op.attributes.get("quantized_data") {
-            Some(Value::Tensor { data, .. }) => data,
+            Some(Value::Tensor { data, .. }) => data.as_bytes().expect("tensor not materialized"),
             _ => panic!("missing quantized_data"),
         };
         let bit_width = match op.attributes.get("bit_width") {
@@ -1012,12 +1022,16 @@ mod tests {
             q_data_raw.to_vec()
         };
         let scales = match op.attributes.get("scale") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing scale"),
         };
         let zero_points = match op.attributes.get("zero_point") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing zero_point"),
         };
@@ -1026,7 +1040,9 @@ mod tests {
             _ => original.len(),
         };
         let channel_scales = match op.attributes.get("awq_channel_scales") {
-            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(data)),
+            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(
+                data.as_bytes().expect("tensor not materialized"),
+            )),
             _ => None,
         };
         let (num_rows, row_len) = match op.attributes.get("quantized_data") {
@@ -1196,7 +1212,9 @@ mod tests {
 
         let op = &prog.functions["main"].body.operations[0];
         let scales = match op.attributes.get("awq_channel_scales") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("missing awq_channel_scales"),
         };
 
@@ -1345,7 +1363,7 @@ mod tests {
 
         // All quantized values should be in [0, 255].
         let q_data = match op.attributes.get("quantized_data") {
-            Some(Value::Tensor { data, .. }) => data,
+            Some(Value::Tensor { data, .. }) => data.as_bytes().expect("tensor not materialized"),
             _ => panic!("missing quantized_data"),
         };
         for &b in q_data {

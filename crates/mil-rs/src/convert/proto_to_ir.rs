@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 
 use crate::error::{MilError, Result};
 use crate::ir::ScalarType;
-use crate::ir::{Block, Function, Operation, Program, TensorType, Value};
+use crate::ir::{Block, Function, Operation, Program, TensorData, TensorType, Value};
 use crate::proto::mil_spec;
 use crate::proto::specification::{Model, model};
 
@@ -284,7 +284,11 @@ fn convert_tensor_value(
                 if !shape.is_empty() {
                     let dtype = convert_data_type(tt.data_type)?;
                     let data: Vec<u8> = f.values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    return Ok(Value::Tensor { data, shape, dtype });
+                    return Ok(Value::Tensor {
+                        data: TensorData::Inline(data),
+                        shape,
+                        dtype,
+                    });
                 }
             }
             match f.values.as_slice() {
@@ -343,7 +347,7 @@ fn convert_tensor_value(
                 .collect();
 
             Ok(Value::Tensor {
-                data: b.values.clone(),
+                data: TensorData::Inline(b.values.clone()),
                 shape,
                 dtype,
             })

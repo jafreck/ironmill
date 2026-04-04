@@ -10,8 +10,8 @@ use mil_rs::ir::passes::{
     Fp16QuantizePass, Granularity, Int8QuantizePass, LayoutOptimizationPass, PolarQuantPass,
 };
 use mil_rs::{
-    ComputeUnit, Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorType, Value,
-    model_to_program, program_to_model,
+    ComputeUnit, Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorData,
+    TensorType, Value, model_to_program, program_to_model,
 };
 
 use ironmill_compile::ane::passes::{
@@ -134,7 +134,7 @@ fn validate_conv_exceeding_ane_limits() {
         .with_input(
             "val",
             Value::Tensor {
-                data: vec![0u8; 64 * 32 * 32 * 32 * 2],
+                data: vec![0u8; 64 * 32 * 32 * 32 * 2].into(),
                 shape: vec![64, 32, 32, 32],
                 dtype: ScalarType::Float16,
             },
@@ -252,7 +252,7 @@ fn validate_flops_proportional_to_shape() {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0u8; 16 * 3 * 3 * 3 * 2],
+                    data: vec![0u8; 16 * 3 * 3 * 3 * 2].into(),
                     shape: vec![16, 3, 3, 3],
                     dtype: ScalarType::Float16,
                 },
@@ -1160,7 +1160,7 @@ fn fp16_roundtrip_error_bounded() {
         if op.op_type == "const" && op.name == "weight" {
             if let Some(val) = op.attributes.get_mut("val") {
                 if let Value::Tensor { data, .. } = val {
-                    *data = f32_slice_to_bytes(&original_values);
+                    *data = f32_slice_to_bytes(&original_values).into();
                 }
             }
         }
@@ -1184,13 +1184,14 @@ fn fp16_roundtrip_error_bounded() {
     match val {
         Value::Tensor { data, dtype, .. } => {
             assert_eq!(*dtype, ScalarType::Float16);
-            let roundtripped: Vec<f32> = data
+            let bytes = data.as_bytes().expect("tensor not materialized");
+            let roundtripped: Vec<f32> = bytes
                 .chunks_exact(2)
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect();
             assert_eq!(roundtripped.len(), original_values.len());
 
-            let max_error = original_values
+            let max_error: f32 = original_values
                 .iter()
                 .zip(roundtripped.iter())
                 .map(|(a, b)| (a - b).abs())
@@ -1218,7 +1219,7 @@ fn int8_roundtrip_error_bounded() {
         if op.op_type == "const" && op.name == "weight" {
             if let Some(val) = op.attributes.get_mut("val") {
                 if let Value::Tensor { data, .. } = val {
-                    *data = f32_slice_to_bytes(&original_values);
+                    *data = f32_slice_to_bytes(&original_values).into();
                 }
             }
         }
@@ -1251,7 +1252,8 @@ fn int8_roundtrip_error_bounded() {
     };
 
     // Dequantize: x_approx = (q - zero_point) * scale
-    let dequantized: Vec<f32> = quantized
+    let q_bytes = quantized.as_bytes().expect("tensor not materialized");
+    let dequantized: Vec<f32> = q_bytes
         .iter()
         .map(|&q| (q as f32 - zero_point) * scale)
         .collect();
@@ -1261,7 +1263,7 @@ fn int8_roundtrip_error_bounded() {
         .iter()
         .map(|v| v.abs())
         .fold(0.0_f32, f32::max);
-    let max_error = original_values
+    let max_error: f32 = original_values
         .iter()
         .zip(dequantized.iter())
         .map(|(a, b)| (a - b).abs())
@@ -1329,12 +1331,13 @@ fn int8_quantize_all_zeros_tensor() {
         Value::Tensor { data, .. } => data,
         _ => panic!("expected Tensor qd"),
     };
-    let dequantized: Vec<f32> = quantized
+    let q_bytes = quantized.as_bytes().expect("tensor not materialized");
+    let dequantized: Vec<f32> = q_bytes
         .iter()
         .map(|&q| (q as f32 - zero_point) * scale)
         .collect();
 
-    let max_error = dequantized.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+    let max_error: f32 = dequantized.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
     assert!(
         max_error < 1e-5,
         "dequantized all-zeros should be near zero, max_error={max_error}"
@@ -1388,7 +1391,8 @@ fn int8_quantize_uniform_value_tensor() {
         _ => panic!("expected Tensor qd"),
     };
 
-    let dequantized: Vec<f32> = quantized
+    let q_bytes = quantized.as_bytes().expect("tensor not materialized");
+    let dequantized: Vec<f32> = q_bytes
         .iter()
         .map(|&q| (q as f32 - zero_point) * scale)
         .collect();
@@ -1398,7 +1402,7 @@ fn int8_quantize_uniform_value_tensor() {
     // error can be up to 0.5.
     for (i, &v) in dequantized.iter().enumerate() {
         assert!(
-            (v - uniform_val).abs() < 0.5,
+            (v - uniform_val).abs() < 0.5_f32,
             "dequantized[{i}] = {v}, expected ≈ {uniform_val}"
         );
     }
@@ -1428,7 +1432,7 @@ fn polar_quant_serialization_round_trip() {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: tensor_bytes,
+                    data: tensor_bytes.into(),
                     shape: vec![rows, cols],
                     dtype: ScalarType::Float32,
                 },
@@ -1517,7 +1521,7 @@ fn polar_quant_lut_shape_preserved_in_proto() {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: tensor_bytes,
+                    data: tensor_bytes.into(),
                     shape: vec![rows, cols],
                     dtype: ScalarType::Float32,
                 },
@@ -1614,7 +1618,7 @@ fn make_program_with_const(shape: Vec<usize>) -> Program {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: tensor_bytes,
+                    data: tensor_bytes.into(),
                     shape,
                     dtype: ScalarType::Float32,
                 },
@@ -1662,7 +1666,8 @@ fn polar_quant_preserves_output_shape() {
             // shape tensor records rank as its own shape
             assert_eq!(*shape, vec![original_shape.len()]);
             // decode the stored dimensions
-            let dims: Vec<u32> = data
+            let bytes = data.as_bytes().expect("tensor not materialized");
+            let dims: Vec<u32> = bytes
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
@@ -1709,7 +1714,7 @@ fn polar_quant_skips_non_float32() {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: tensor_bytes,
+                    data: tensor_bytes.into(),
                     shape,
                     dtype: ScalarType::Int32,
                 },
@@ -1730,7 +1735,7 @@ fn polar_quant_skips_non_float32() {
 
 #[test]
 fn polar_quant_deterministic_with_seed() {
-    let run_with_seed = |seed: u64| -> Vec<u8> {
+    let run_with_seed = |seed: u64| -> TensorData {
         let mut program = make_program_with_const(vec![8, 128]);
         let pass = PolarQuantPass {
             n_bits: 4,
@@ -1755,7 +1760,7 @@ fn polar_quant_deterministic_with_seed() {
 
 #[test]
 fn polar_quant_different_seeds_differ() {
-    let run_with_seed = |seed: u64| -> Vec<u8> {
+    let run_with_seed = |seed: u64| -> TensorData {
         // Use structured data so rotation produces meaningfully different results.
         let rows = 8;
         let cols = 128;
@@ -1780,7 +1785,7 @@ fn polar_quant_different_seeds_differ() {
                 .with_input(
                     "val",
                     Value::Tensor {
-                        data: tensor_bytes,
+                        data: tensor_bytes.into(),
                         shape: vec![rows, cols],
                         dtype: ScalarType::Float32,
                     },
@@ -1826,6 +1831,8 @@ fn polar_quant_handles_non_power_of_two() {
     match ops[0].attributes.get("shape") {
         Some(Value::Tensor { data, .. }) => {
             let dims: Vec<u32> = data
+                .as_bytes()
+                .expect("tensor not materialized")
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
@@ -1904,7 +1911,7 @@ fn polar_4bit_round_trip_quality() {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: tensor_bytes,
+                    data: tensor_bytes.into(),
                     shape: vec![rows, cols],
                     dtype: ScalarType::Float32,
                 },
@@ -1925,26 +1932,35 @@ fn polar_4bit_round_trip_quality() {
             data,
             dtype: ScalarType::Float16,
             ..
-        }) => data
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect(),
+        }) => {
+            let bytes = data.as_bytes().expect("tensor not materialized");
+            bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        }
         Some(Value::Tensor {
             data,
             dtype: ScalarType::Float32,
             ..
-        }) => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
+        }) => {
+            let bytes = data.as_bytes().expect("tensor not materialized");
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
         other => panic!("expected lut tensor, got {other:?}"),
     };
 
     // Extract the packed indices.
-    let (indices_data, _indices_shape) = match ops[0].attributes.get("indices") {
+    let (_indices_data_td, _indices_shape) = match ops[0].attributes.get("indices") {
         Some(Value::Tensor { data, shape, .. }) => (data.clone(), shape.clone()),
         other => panic!("expected indices tensor, got {other:?}"),
     };
+    let indices_data = _indices_data_td
+        .as_bytes()
+        .expect("tensor not materialized");
 
     // Unpack 4-bit indices (MSB-first packing).
     let n_bits: usize = 4;
@@ -1974,18 +1990,24 @@ fn polar_4bit_round_trip_quality() {
             data,
             dtype: ScalarType::Float16,
             ..
-        }) => data
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect(),
+        }) => {
+            let bytes = data.as_bytes().expect("tensor not materialized");
+            bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        }
         Some(Value::Tensor {
             data,
             dtype: ScalarType::Float32,
             ..
-        }) => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
+        }) => {
+            let bytes = data.as_bytes().expect("tensor not materialized");
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
         other => panic!("expected norms tensor, got {other:?}"),
     };
 

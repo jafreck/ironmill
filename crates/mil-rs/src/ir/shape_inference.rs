@@ -33,8 +33,10 @@ pub(crate) fn read_int_list(value: &Value) -> Option<Vec<i64>> {
             dtype: ScalarType::Int32,
             ..
         } => Some(
-            data.chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64)
+            data.as_bytes()
+                .expect("tensor not materialized")
+                .chunks_exact(4)
+                .map(|c: &[u8]| i32::from_le_bytes(c.try_into().unwrap()) as i64)
                 .collect(),
         ),
         _ => None,

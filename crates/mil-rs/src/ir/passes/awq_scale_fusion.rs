@@ -21,7 +21,7 @@ use crate::error::Result;
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::ScalarType;
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 /// Fuses AWQ per-channel scaling factors into adjacent LayerNorm weights.
 ///
@@ -85,7 +85,7 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
                 data,
                 dtype: ScalarType::Float32,
                 ..
-            } => tensor_as_f32_slice(data),
+            } => tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
             _ => continue,
         };
 
@@ -218,8 +218,12 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
                 }) = gamma_val
                 {
                     let gamma_floats_opt = match *dtype {
-                        ScalarType::Float32 => Some(tensor_as_f32_slice(data)),
-                        ScalarType::Float16 => Some(tensor_f16_as_f32_slice(data)),
+                        ScalarType::Float32 => Some(tensor_as_f32_slice(
+                            data.as_bytes().expect("tensor not materialized"),
+                        )),
+                        ScalarType::Float16 => Some(tensor_f16_as_f32_slice(
+                            data.as_bytes().expect("tensor not materialized"),
+                        )),
                         _ => None,
                     };
                     if let Some(mut gamma_floats) = gamma_floats_opt {
@@ -235,7 +239,7 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
                             _ => f32_slice_to_bytes(&gamma_floats),
                         };
                         let new_val = Value::Tensor {
-                            data: new_data,
+                            data: TensorData::Inline(new_data),
                             shape: shape.clone(),
                             dtype: *dtype,
                         };
@@ -297,7 +301,7 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: f32_slice_to_bytes(&inv_scales),
+                    data: TensorData::Inline(f32_slice_to_bytes(&inv_scales)),
                     shape: vec![n],
                     dtype: ScalarType::Float32,
                 },
@@ -374,7 +378,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: f32_bytes(values),
+                    data: TensorData::Inline(f32_bytes(values)),
                     shape: vec![values.len()],
                     dtype: ScalarType::Float32,
                 },
@@ -388,7 +392,7 @@ mod tests {
             .with_attr(
                 "quantized_data",
                 Value::Tensor {
-                    data: vec![0u8; channel_scales.len() * 4],
+                    data: TensorData::Inline(vec![0u8; channel_scales.len() * 4]),
                     shape: vec![channel_scales.len(), 4],
                     dtype: ScalarType::Float32,
                 },
@@ -401,7 +405,7 @@ mod tests {
             .with_attr(
                 "awq_channel_scales",
                 Value::Tensor {
-                    data: f32_bytes(channel_scales),
+                    data: TensorData::Inline(f32_bytes(channel_scales)),
                     shape: vec![channel_scales.len()],
                     dtype: ScalarType::Float32,
                 },
@@ -473,7 +477,9 @@ mod tests {
         // gamma_const should have been updated: gamma_new[c] = gamma_old[c] / s[c].
         let gamma_op = ops.iter().find(|op| op.name == "gamma_const").unwrap();
         let updated_gamma = match gamma_op.inputs.get("val") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("gamma_const should still have a tensor val"),
         };
         let expected: Vec<f32> = gamma_values
@@ -533,7 +539,9 @@ mod tests {
 
         let gamma_op = ops.iter().find(|op| op.name == "gamma_const").unwrap();
         let updated_gamma = match gamma_op.inputs.get("val") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("expected tensor"),
         };
         // gamma / s = [1.0/0.5, 1.0/2.0, 1.0/0.25] = [2.0, 0.5, 4.0]
@@ -594,7 +602,9 @@ mod tests {
             .find(|op| op.outputs.first().map(|s| s.as_str()) == Some(scale_ref.as_str()))
             .unwrap();
         let scale_vals = match scale_const.inputs.get("val") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => {
+                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+            }
             _ => panic!("scale const should have tensor val"),
         };
         let expected_inv: Vec<f32> = channel_scales.iter().map(|&s| 1.0 / s).collect();
@@ -621,7 +631,7 @@ mod tests {
                 .with_attr(
                     "quantized_data",
                     Value::Tensor {
-                        data: vec![0u8; 16],
+                        data: TensorData::Inline(vec![0u8; 16]),
                         shape: vec![4, 4],
                         dtype: ScalarType::Float32,
                     },

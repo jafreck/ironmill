@@ -121,7 +121,8 @@ impl QuantizationEvaluator {
                 }) = val
                 {
                     if let Some(output_name) = op.outputs.first() {
-                        let floats = tensor_as_f32_slice(data);
+                        let floats =
+                            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"));
                         original_weights.insert(output_name.clone(), floats);
                     }
                 }
@@ -209,7 +210,10 @@ fn dequantize_affine_op(op: &Operation) -> Option<Vec<f32>> {
             data,
             shape,
             dtype: ScalarType::UInt8,
-        }) => (data.as_slice(), shape.as_slice()),
+        }) => (
+            data.as_bytes().expect("tensor not materialized"),
+            shape.as_slice(),
+        ),
         _ => return None,
     };
 
@@ -300,7 +304,9 @@ fn extract_f32_params(value: Option<&Value>) -> Option<Vec<f32>> {
             data,
             dtype: ScalarType::Float32,
             ..
-        }) => Some(tensor_as_f32_slice(data)),
+        }) => Some(tensor_as_f32_slice(
+            data.as_bytes().expect("tensor not materialized"),
+        )),
         _ => None,
     }
 }
@@ -320,7 +326,7 @@ fn dequantize_lut_op(op: &Operation) -> Option<Vec<f32>> {
             data,
             dtype: ScalarType::UInt8,
             ..
-        }) => data.as_slice(),
+        }) => data.as_bytes().expect("tensor not materialized"),
         _ => return None,
     };
 
@@ -331,6 +337,8 @@ fn dequantize_lut_op(op: &Operation) -> Option<Vec<f32>> {
             dtype: ScalarType::Int32,
         }) => {
             let ints = data
+                .as_bytes()
+                .expect("tensor not materialized")
                 .chunks_exact(4)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
                 .collect::<Vec<_>>();
@@ -433,7 +441,7 @@ fn dequantize_dual_scale_op(op: &Operation) -> Option<Vec<f32>> {
             data,
             dtype: ScalarType::UInt8,
             ..
-        }) => data.as_slice(),
+        }) => data.as_bytes().expect("tensor not materialized"),
         _ => return None,
     };
 
@@ -447,7 +455,7 @@ fn dequantize_dual_scale_op(op: &Operation) -> Option<Vec<f32>> {
             data,
             dtype: ScalarType::UInt8,
             ..
-        }) => data.as_slice(),
+        }) => data.as_bytes().expect("tensor not materialized"),
         _ => return None,
     };
 
@@ -578,6 +586,7 @@ mod tests {
     use crate::ir::passes::affine_quantize::AffineQuantizePass;
     use crate::ir::program::{Block, Function};
     use crate::ir::tensor::TensorType;
+    use crate::ir::types::TensorData;
 
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -593,7 +602,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: f32_bytes(data),
+                    data: TensorData::Inline(f32_bytes(data)),
                     shape,
                     dtype: ScalarType::Float32,
                 },
@@ -721,7 +730,7 @@ mod tests {
         let values: Vec<f32> = (-50..50).map(|i| i as f32 * 0.1).collect();
         let mut program = {
             let tensor_val = Value::Tensor {
-                data: f32_bytes(&values),
+                data: TensorData::Inline(f32_bytes(&values)),
                 shape: vec![10, 10],
                 dtype: ScalarType::Float32,
             };
@@ -762,7 +771,7 @@ mod tests {
         let values: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.01).collect();
         let mut program = {
             let tensor_val = Value::Tensor {
-                data: f32_bytes(&values),
+                data: TensorData::Inline(f32_bytes(&values)),
                 shape: vec![2, 32],
                 dtype: ScalarType::Float32,
             };
@@ -808,7 +817,7 @@ mod tests {
     fn eval_quantize_skips_non_quantized_ops() {
         let values = [1.0_f32, 2.0, 3.0, 4.0];
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&values),
+            data: TensorData::Inline(f32_bytes(&values)),
             shape: vec![4],
             dtype: ScalarType::Float32,
         };
@@ -868,7 +877,7 @@ mod tests {
         let values = vec![0.0_f32; 64];
         let mut program = {
             let tensor_val = Value::Tensor {
-                data: f32_bytes(&values),
+                data: TensorData::Inline(f32_bytes(&values)),
                 shape: vec![8, 8],
                 dtype: ScalarType::Float32,
             };
@@ -920,7 +929,7 @@ mod tests {
                     .with_input(
                         "val",
                         Value::Tensor {
-                            data: f32_bytes(&expected),
+                            data: TensorData::Inline(f32_bytes(&expected)),
                             shape: vec![8],
                             dtype: ScalarType::Float32,
                         },
@@ -939,7 +948,7 @@ mod tests {
             op.attributes.insert(
                 "lut".into(),
                 Value::Tensor {
-                    data: f32_bytes(&lut),
+                    data: TensorData::Inline(f32_bytes(&lut)),
                     shape: vec![4],
                     dtype: ScalarType::Float32,
                 },
@@ -947,7 +956,7 @@ mod tests {
             op.attributes.insert(
                 "indices".into(),
                 Value::Tensor {
-                    data: packed_indices,
+                    data: TensorData::Inline(packed_indices),
                     shape: vec![2],
                     dtype: ScalarType::UInt8,
                 },
@@ -991,7 +1000,7 @@ mod tests {
                     .with_input(
                         "val",
                         Value::Tensor {
-                            data: f32_bytes(&expected),
+                            data: TensorData::Inline(f32_bytes(&expected)),
                             shape: vec![4],
                             dtype: ScalarType::Float32,
                         },
@@ -1011,7 +1020,7 @@ mod tests {
             op.attributes.insert(
                 "lut".into(),
                 Value::Tensor {
-                    data: f32_bytes(&lut),
+                    data: TensorData::Inline(f32_bytes(&lut)),
                     shape: vec![4],
                     dtype: ScalarType::Float32,
                 },
@@ -1019,7 +1028,7 @@ mod tests {
             op.attributes.insert(
                 "indices".into(),
                 Value::Tensor {
-                    data: packed_indices,
+                    data: TensorData::Inline(packed_indices),
                     shape: vec![1],
                     dtype: ScalarType::UInt8,
                 },
@@ -1029,7 +1038,7 @@ mod tests {
             op.attributes.insert(
                 "quip_sharp_scales".into(),
                 Value::Tensor {
-                    data: f32_bytes(&scales),
+                    data: TensorData::Inline(f32_bytes(&scales)),
                     shape: vec![2],
                     dtype: ScalarType::Float32,
                 },
@@ -1082,7 +1091,7 @@ mod tests {
                     .with_input(
                         "val",
                         Value::Tensor {
-                            data: f32_bytes(&expected),
+                            data: TensorData::Inline(f32_bytes(&expected)),
                             shape: vec![4],
                             dtype: ScalarType::Float32,
                         },
@@ -1101,7 +1110,7 @@ mod tests {
             op.attributes.insert(
                 "quantized_data".into(),
                 Value::Tensor {
-                    data: quantized_data,
+                    data: TensorData::Inline(quantized_data),
                     shape: vec![2],
                     dtype: ScalarType::UInt8,
                 },
@@ -1109,7 +1118,7 @@ mod tests {
             op.attributes.insert(
                 "normal_scale".into(),
                 Value::Tensor {
-                    data: f32_bytes(&[0.1]),
+                    data: TensorData::Inline(f32_bytes(&[0.1])),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },
@@ -1117,7 +1126,7 @@ mod tests {
             op.attributes.insert(
                 "normal_zero".into(),
                 Value::Tensor {
-                    data: f32_bytes(&[1.0]),
+                    data: TensorData::Inline(f32_bytes(&[1.0])),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },
@@ -1125,7 +1134,7 @@ mod tests {
             op.attributes.insert(
                 "outlier_scale".into(),
                 Value::Tensor {
-                    data: f32_bytes(&[0.5]),
+                    data: TensorData::Inline(f32_bytes(&[0.5])),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },
@@ -1133,7 +1142,7 @@ mod tests {
             op.attributes.insert(
                 "outlier_zero".into(),
                 Value::Tensor {
-                    data: f32_bytes(&[2.0]),
+                    data: TensorData::Inline(f32_bytes(&[2.0])),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },
@@ -1141,7 +1150,7 @@ mod tests {
             op.attributes.insert(
                 "outlier_mask".into(),
                 Value::Tensor {
-                    data: outlier_mask,
+                    data: TensorData::Inline(outlier_mask),
                     shape: vec![1],
                     dtype: ScalarType::UInt8,
                 },
@@ -1185,7 +1194,7 @@ mod tests {
                     .with_input(
                         "val",
                         Value::Tensor {
-                            data: f32_bytes(&expected),
+                            data: TensorData::Inline(f32_bytes(&expected)),
                             shape: vec![4],
                             dtype: ScalarType::Float32,
                         },
@@ -1204,7 +1213,7 @@ mod tests {
             op.attributes.insert(
                 "quantized_data".into(),
                 Value::Tensor {
-                    data: quantized_data,
+                    data: TensorData::Inline(quantized_data),
                     shape: vec![2],
                     dtype: ScalarType::UInt8,
                 },
@@ -1212,7 +1221,7 @@ mod tests {
             op.attributes.insert(
                 "normal_scale".into(),
                 Value::Tensor {
-                    data: f32_bytes(&[2.0]),
+                    data: TensorData::Inline(f32_bytes(&[2.0])),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },
@@ -1220,7 +1229,7 @@ mod tests {
             op.attributes.insert(
                 "normal_zero".into(),
                 Value::Tensor {
-                    data: f32_bytes(&[0.0]),
+                    data: TensorData::Inline(f32_bytes(&[0.0])),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },
@@ -1228,7 +1237,7 @@ mod tests {
             op.attributes.insert(
                 "outlier_scale".into(),
                 Value::Tensor {
-                    data: f32_bytes(&[1.0]),
+                    data: TensorData::Inline(f32_bytes(&[1.0])),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },
@@ -1236,7 +1245,7 @@ mod tests {
             op.attributes.insert(
                 "outlier_zero".into(),
                 Value::Tensor {
-                    data: f32_bytes(&[0.0]),
+                    data: TensorData::Inline(f32_bytes(&[0.0])),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },
@@ -1244,7 +1253,7 @@ mod tests {
             op.attributes.insert(
                 "outlier_mask".into(),
                 Value::Tensor {
-                    data: outlier_mask,
+                    data: TensorData::Inline(outlier_mask),
                     shape: vec![1],
                     dtype: ScalarType::UInt8,
                 },

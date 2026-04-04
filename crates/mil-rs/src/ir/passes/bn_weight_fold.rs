@@ -17,7 +17,7 @@ use crate::ir::operation::Operation;
 use crate::ir::pass::Pass;
 use crate::ir::program::{Block, Program};
 use crate::ir::tensor::ScalarType;
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 use super::replace_reference;
 use super::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice};
@@ -81,7 +81,9 @@ fn find_const_op_index(block: &Block, output_name: &str) -> Option<usize> {
 /// Extract f32 data from a const tensor.
 fn extract_f32_data(block: &Block, output_name: &str) -> Vec<f32> {
     match find_const_tensor(block, output_name) {
-        Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+        Some(Value::Tensor { data, .. }) => {
+            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+        }
         _ => vec![],
     }
 }
@@ -89,7 +91,10 @@ fn extract_f32_data(block: &Block, output_name: &str) -> Vec<f32> {
 /// Extract f32 data and shape from a const tensor.
 fn extract_f32_data_and_shape(block: &Block, output_name: &str) -> (Vec<f32>, Vec<usize>) {
     match find_const_tensor(block, output_name) {
-        Some(Value::Tensor { data, shape, .. }) => (tensor_as_f32_slice(data), shape.clone()),
+        Some(Value::Tensor { data, shape, .. }) => (
+            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
+            shape.clone(),
+        ),
         _ => (vec![], vec![]),
     }
 }
@@ -97,7 +102,7 @@ fn extract_f32_data_and_shape(block: &Block, output_name: &str) -> (Vec<f32>, Ve
 /// Overwrite the tensor data in a const op at `idx`.
 fn update_const_tensor(block: &mut Block, idx: usize, new_data: Vec<u8>, new_shape: Vec<usize>) {
     if let Some(Value::Tensor { data, shape, .. }) = block.operations[idx].inputs.get_mut("val") {
-        *data = new_data;
+        *data = TensorData::Inline(new_data);
         *shape = new_shape;
     }
 }
@@ -290,7 +295,7 @@ fn apply_fold(block: &mut Block, conv_idx: usize, bn_idx: usize) -> bool {
                 .with_input(
                     "val",
                     Value::Tensor {
-                        data: f32_slice_to_bytes(&folded_bias),
+                        data: TensorData::Inline(f32_slice_to_bytes(&folded_bias)),
                         shape: vec![c_out],
                         dtype: ScalarType::Float32,
                     },
@@ -347,7 +352,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: f32_slice_to_bytes(data),
+                    data: TensorData::Inline(f32_slice_to_bytes(data)),
                     shape,
                     dtype: ScalarType::Float32,
                 },
@@ -447,7 +452,7 @@ mod tests {
         // Find the weight const and verify folded values.
         let w_const = ops.iter().find(|op| op.name == "w_const").unwrap();
         if let Some(Value::Tensor { data, shape, .. }) = w_const.inputs.get("val") {
-            let w = tensor_as_f32_slice(data);
+            let w = tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"));
             // scale = [1.0, 2.0], W_folded = [1.0*1.0, 2.0*2.0] = [1.0, 4.0]
             assert_eq!(w, vec![1.0, 4.0]);
             assert_eq!(*shape, vec![2, 1, 1, 1]);
@@ -458,7 +463,7 @@ mod tests {
         // Find the bias const and verify folded values.
         let b_const = ops.iter().find(|op| op.name == "b_const").unwrap();
         if let Some(Value::Tensor { data, .. }) = b_const.inputs.get("val") {
-            let b = tensor_as_f32_slice(data);
+            let b = tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"));
             // b_folded = [(0.5-0.0)*1.0+0.0, (0.5-1.0)*2.0+1.0] = [0.5, 0.0]
             assert_eq!(b, vec![0.5, 0.0]);
         } else {
@@ -685,7 +690,7 @@ mod tests {
             .find(|op| op.op_type == "const" && op.outputs.iter().any(|o| o == &bias_ref))
             .unwrap();
         if let Some(Value::Tensor { data, .. }) = bias_const.inputs.get("val") {
-            let b = tensor_as_f32_slice(data);
+            let b = tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"));
             assert_eq!(b, vec![0.0, -1.0]);
         } else {
             panic!("expected tensor value in created bias const");

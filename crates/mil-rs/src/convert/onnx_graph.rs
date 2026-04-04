@@ -18,7 +18,7 @@ use crate::convert::lora;
 use crate::convert::onnx_to_mil::convert_node;
 use crate::error::{MilError, Result};
 use crate::ir::shape_inference::{infer_concat_output, infer_conv_output, infer_pool_output};
-use crate::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
+use crate::ir::{Block, Function, Operation, Program, ScalarType, TensorData, TensorType, Value};
 use crate::proto::onnx::{
     GraphProto, ModelProto, TensorProto, TypeProto, ValueInfoProto, tensor_shape_proto::dimension,
     type_proto,
@@ -356,7 +356,7 @@ fn emit_initializer(
         op.attributes.insert(
             "val".into(),
             Value::Tensor {
-                data: raw_bytes,
+                data: TensorData::Inline(raw_bytes),
                 shape,
                 dtype: actual_dtype,
             },
@@ -534,14 +534,15 @@ fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Bloc
                 }
                 let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
                 if let Some(Value::Tensor { dtype, data, .. }) = val {
-                    if *dtype == ScalarType::Int32 && data.len() % 4 == 0 {
-                        let dims: Vec<usize> = data
+                    let bytes = data.as_bytes().expect("tensor not materialized");
+                    if *dtype == ScalarType::Int32 && data.byte_len() % 4 == 0 {
+                        let dims: Vec<usize> = bytes
                             .chunks_exact(4)
                             .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64 as usize)
                             .collect();
                         const_values.insert(name.clone(), dims);
-                    } else if *dtype == ScalarType::Int64 && data.len() % 8 == 0 {
-                        let dims: Vec<usize> = data
+                    } else if *dtype == ScalarType::Int64 && data.byte_len() % 8 == 0 {
+                        let dims: Vec<usize> = bytes
                             .chunks_exact(8)
                             .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as usize)
                             .collect();
@@ -570,7 +571,7 @@ fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Bloc
                         let to_i32_tensor = |vals: &[i32]| -> Value {
                             let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                             Value::Tensor {
-                                data,
+                                data: TensorData::Inline(data),
                                 shape: vec![vals.len()],
                                 dtype: ScalarType::Int32,
                             }
@@ -678,7 +679,7 @@ fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Bloc
                 op.inputs.insert(
                     "shape".into(),
                     Value::Tensor {
-                        data,
+                        data: TensorData::Inline(data),
                         shape: vec![vals.len()],
                         dtype: ScalarType::Int32,
                     },
@@ -816,7 +817,7 @@ fn initializer_to_const(tensor: &TensorProto, model_dir: Option<&Path>) -> Resul
     op.attributes.insert(
         "val".into(),
         Value::Tensor {
-            data: raw_bytes,
+            data: TensorData::Inline(raw_bytes),
             shape: shape.clone(),
             dtype,
         },
@@ -1296,7 +1297,7 @@ fn prequantized_to_op(
     op.attributes.insert(
         "val".into(),
         Value::Tensor {
-            data: raw_bytes,
+            data: TensorData::Inline(raw_bytes),
             shape,
             dtype,
         },
@@ -1330,7 +1331,7 @@ fn prequantized_to_op(
             op.attributes.insert(
                 attr_key,
                 Value::Tensor {
-                    data: aux_data,
+                    data: TensorData::Inline(aux_data),
                     shape: aux_shape,
                     dtype: aux_dtype,
                 },

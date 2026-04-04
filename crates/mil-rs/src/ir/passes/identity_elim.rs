@@ -97,9 +97,11 @@ fn is_identity_perm(perm: &Value) -> bool {
             dtype: crate::ir::ScalarType::Int32,
             ..
         } => data
+            .as_bytes()
+            .expect("tensor not materialized")
             .chunks_exact(4)
             .enumerate()
-            .all(|(i, c)| i32::from_le_bytes(c.try_into().unwrap()) as usize == i),
+            .all(|(i, c): (usize, &[u8])| i32::from_le_bytes(c.try_into().unwrap()) as usize == i),
         _ => false,
     }
 }

@@ -124,7 +124,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0u8; 4],
+                    data: vec![0u8; 4].into(),
                     shape: vec![1],
                     dtype: ScalarType::Float32,
                 },
@@ -154,7 +154,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0u8; 64 * 32 * 32 * 32 * 2],
+                    data: vec![0u8; 64 * 32 * 32 * 32 * 2].into(),
                     shape: vec![64, 32, 32, 32],
                     dtype: ScalarType::Float16,
                 },

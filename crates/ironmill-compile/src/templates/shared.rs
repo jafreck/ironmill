@@ -41,7 +41,7 @@ pub(super) fn emit_weight_const(
                 .with_attr(
                     "val",
                     Value::Tensor {
-                        data: tensor.data.into_owned(),
+                        data: mil_rs::ir::TensorData::Inline(tensor.data.into_owned()),
                         shape: tensor.shape.clone(),
                         dtype: tensor.dtype,
                     },
@@ -212,7 +212,7 @@ pub(super) fn emit_rope_tables(block: &mut Block, config: &ModelConfig) -> (Stri
         .with_attr(
             "val",
             Value::Tensor {
-                data: cos_bytes,
+                data: mil_rs::ir::TensorData::Inline(cos_bytes),
                 shape: vec![max_pos, half_dim],
                 dtype: ScalarType::Float32,
             },
@@ -224,7 +224,7 @@ pub(super) fn emit_rope_tables(block: &mut Block, config: &ModelConfig) -> (Stri
         .with_attr(
             "val",
             Value::Tensor {
-                data: sin_bytes,
+                data: mil_rs::ir::TensorData::Inline(sin_bytes),
                 shape: vec![max_pos, half_dim],
                 dtype: ScalarType::Float32,
             },

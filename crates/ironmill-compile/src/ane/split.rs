@@ -953,7 +953,7 @@ fn weight_data_size(ops: &[Operation]) -> usize {
     ops.iter()
         .flat_map(|op| op.inputs.values().chain(op.attributes.values()))
         .map(|v| match v {
-            Value::Tensor { data, .. } => data.len(),
+            Value::Tensor { data, .. } => data.byte_len(),
             _ => 0,
         })
         .sum()
@@ -1255,7 +1255,7 @@ mod tests {
     fn split_weight_size_limit() {
         // Create ops with large tensor weights that exceed the limit.
         let big_tensor = Value::Tensor {
-            data: vec![0u8; 40 * 1024 * 1024], // 40 MB each
+            data: vec![0u8; 40 * 1024 * 1024].into(), // 40 MB each
             shape: vec![1024, 1024],
             dtype: ScalarType::Float32,
         };
@@ -1474,7 +1474,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: vec![0u8; 16],
+                    data: vec![0u8; 16].into(),
                     shape: vec![4, 4],
                     dtype: ScalarType::Float16,
                 },

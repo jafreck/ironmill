@@ -187,7 +187,9 @@ impl MixedPrecisionPass {
                 shape: _,
                 dtype,
             } if *dtype == ScalarType::Float32 => {
-                *data = fp32_to_fp16_bytes(data);
+                *data = mil_rs::ir::TensorData::Inline(fp32_to_fp16_bytes(
+                    data.as_bytes().expect("tensor not materialized"),
+                ));
                 *dtype = ScalarType::Float16;
             }
             Value::Type(ty) if ty.scalar_type == ScalarType::Float32 => {
@@ -293,11 +295,13 @@ impl Pass for MixedPrecisionPass {
                             dtype: _,
                         } = val
                         {
-                            let floats = tensor_as_f32_slice(&data);
+                            let floats = tensor_as_f32_slice(
+                                data.as_bytes().expect("tensor not materialized"),
+                            );
                             let (quantized, scale, zero_point) = quantize_f32_to_uint8(&floats);
 
                             let quantized_val = Value::Tensor {
-                                data: quantized,
+                                data: mil_rs::ir::TensorData::Inline(quantized),
                                 shape: shape.clone(),
                                 dtype: ScalarType::UInt8,
                             };
@@ -604,8 +608,12 @@ impl PerExpertQuantPass {
 
         if let Value::Tensor { data, shape, dtype } = val {
             let floats = match dtype {
-                ScalarType::Float32 => tensor_as_f32_slice(&data).to_vec(),
-                ScalarType::Float16 => fp16_bytes_to_f32(&data),
+                ScalarType::Float32 => {
+                    tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")).to_vec()
+                }
+                ScalarType::Float16 => {
+                    fp16_bytes_to_f32(data.as_bytes().expect("tensor not materialized"))
+                }
                 _ => return,
             };
 
@@ -629,7 +637,7 @@ impl PerExpertQuantPass {
             op.attributes.insert(
                 "lut".to_string(),
                 Value::Tensor {
-                    data: lut_bytes,
+                    data: mil_rs::ir::TensorData::Inline(lut_bytes),
                     shape: vec![k],
                     dtype: ScalarType::Float32,
                 },
@@ -637,7 +645,7 @@ impl PerExpertQuantPass {
             op.attributes.insert(
                 "indices".to_string(),
                 Value::Tensor {
-                    data: packed_indices,
+                    data: mil_rs::ir::TensorData::Inline(packed_indices),
                     shape: shape.clone(),
                     dtype: ScalarType::UInt8,
                 },
@@ -645,7 +653,7 @@ impl PerExpertQuantPass {
             op.attributes.insert(
                 "shape".to_string(),
                 Value::Tensor {
-                    data: shape_u32,
+                    data: mil_rs::ir::TensorData::Inline(shape_u32),
                     shape: vec![shape.len()],
                     dtype: ScalarType::UInt32,
                 },
@@ -744,10 +752,12 @@ impl Pass for PerExpertQuantPass {
                             dtype: _,
                         } = val
                         {
-                            let floats = tensor_as_f32_slice(&data);
+                            let floats = tensor_as_f32_slice(
+                                data.as_bytes().expect("tensor not materialized"),
+                            );
                             let (quantized, scale, zero_point) = quantize_f32_to_uint8(&floats);
                             let quantized_val = Value::Tensor {
-                                data: quantized,
+                                data: mil_rs::ir::TensorData::Inline(quantized),
                                 shape: shape.clone(),
                                 dtype: ScalarType::UInt8,
                             };
@@ -818,6 +828,7 @@ mod tests {
     use super::*;
     use mil_rs::ir::Function;
     use mil_rs::ir::Operation;
+    use mil_rs::ir::TensorData;
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -905,7 +916,7 @@ default = "fp16"
     fn mixed_precision_applies_fp16_to_matching_ops() {
         let fp32_data = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: fp32_data.into(),
             shape: vec![4],
             dtype: ScalarType::Float32,
         };
@@ -931,7 +942,7 @@ default = "fp16"
         match op.inputs.get("val") {
             Some(Value::Tensor { dtype, data, .. }) => {
                 assert_eq!(*dtype, ScalarType::Float16);
-                assert_eq!(data.len(), 8); // 4 elements * 2 bytes
+                assert_eq!(data.byte_len(), 8); // 4 elements * 2 bytes
             }
             other => panic!("expected FP16 Tensor, got {other:?}"),
         }
@@ -941,7 +952,7 @@ default = "fp16"
     fn mixed_precision_applies_int8_to_matching_ops() {
         let fp32_data = f32_bytes(&[0.0, 1.0, 2.0, 3.0]);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: fp32_data.into(),
             shape: vec![4],
             dtype: ScalarType::Float32,
         };
@@ -974,7 +985,7 @@ default = "fp16"
     fn mixed_precision_leaves_none_ops_unchanged() {
         let fp32_data = f32_bytes(&[1.0, 2.0]);
         let tensor_val = Value::Tensor {
-            data: fp32_data.clone(),
+            data: fp32_data.clone().into(),
             shape: vec![2],
             dtype: ScalarType::Float32,
         };
@@ -998,7 +1009,7 @@ default = "fp16"
         match op.inputs.get("val") {
             Some(Value::Tensor { dtype, data, .. }) => {
                 assert_eq!(*dtype, ScalarType::Float32);
-                assert_eq!(*data, fp32_data);
+                assert_eq!(*data, TensorData::Inline(fp32_data));
             }
             other => panic!("expected FP32 Tensor, got {other:?}"),
         }
@@ -1108,7 +1119,7 @@ default = "fp16"
     fn per_expert_pass_applies_fp16_to_hot_expert() {
         let fp32_data = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: fp32_data.into(),
             shape: vec![4],
             dtype: ScalarType::Float32,
         };
@@ -1139,7 +1150,7 @@ default = "fp16"
         match op.inputs.get("val") {
             Some(Value::Tensor { dtype, data, .. }) => {
                 assert_eq!(*dtype, ScalarType::Float16);
-                assert_eq!(data.len(), 8);
+                assert_eq!(data.byte_len(), 8);
             }
             other => panic!("expected FP16 Tensor, got {other:?}"),
         }
@@ -1149,7 +1160,7 @@ default = "fp16"
     fn per_expert_pass_applies_int8_to_medium_expert() {
         let fp32_data = f32_bytes(&[0.0, 1.0, 2.0, 3.0]);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: fp32_data.into(),
             shape: vec![4],
             dtype: ScalarType::Float32,
         };
@@ -1186,7 +1197,7 @@ default = "fp16"
     fn per_expert_pass_applies_palettize_to_cold_expert() {
         let fp32_data = f32_bytes(&[0.1, 0.5, 0.9, 1.2, 0.3, 0.7, 1.1, 0.4]);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: fp32_data.into(),
             shape: vec![8],
             dtype: ScalarType::Float32,
         };
@@ -1224,7 +1235,7 @@ default = "fp16"
     fn per_expert_pass_applies_shared_strategy() {
         let fp32_data = f32_bytes(&[1.0, 2.0]);
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: fp32_data.into(),
             shape: vec![2],
             dtype: ScalarType::Float32,
         };
@@ -1276,7 +1287,7 @@ default = "fp16"
             "embed.weight",
             "embed_out",
             Value::Tensor {
-                data: f32_bytes(&[1.0, 2.0]),
+                data: f32_bytes(&[1.0, 2.0]).into(),
                 shape: vec![2],
                 dtype: ScalarType::Float32,
             },
@@ -1286,7 +1297,7 @@ default = "fp16"
             "expert_0.weight",
             "e0_out",
             Value::Tensor {
-                data: f32_bytes(&[3.0, 4.0, 5.0, 6.0]),
+                data: f32_bytes(&[3.0, 4.0, 5.0, 6.0]).into(),
                 shape: vec![4],
                 dtype: ScalarType::Float32,
             },
@@ -1296,7 +1307,7 @@ default = "fp16"
             "expert_1.weight",
             "e1_out",
             Value::Tensor {
-                data: f32_bytes(&[0.1, 0.5, 0.9, 1.2, 0.3, 0.7, 1.1, 0.4]),
+                data: f32_bytes(&[0.1, 0.5, 0.9, 1.2, 0.3, 0.7, 1.1, 0.4]).into(),
                 shape: vec![8],
                 dtype: ScalarType::Float32,
             },

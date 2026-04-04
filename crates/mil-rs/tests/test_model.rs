@@ -7,6 +7,7 @@
 mod common;
 
 use common::test_model;
+use mil_rs::TensorData;
 use mil_rs::ir::{ScalarType, Value};
 
 // ── Program structure ───────────────────────────────────────────────────
@@ -79,7 +80,7 @@ fn test_const_ops_carry_fp32_tensor_data() {
                 );
                 let expected_bytes = shape.iter().product::<usize>() * 4;
                 assert_eq!(
-                    data.len(),
+                    data.byte_len(),
                     expected_bytes,
                     "const op '{}' data length mismatch: shape {:?}",
                     op.name,

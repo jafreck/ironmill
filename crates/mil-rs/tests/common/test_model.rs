@@ -13,6 +13,7 @@
 //!
 //! All weights are deterministic (seeded RNG) so tests are reproducible.
 
+use mil_rs::TensorData;
 use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -260,7 +261,7 @@ fn const_tensor_op(name: &str, output: &str, data: &[f32], shape: Vec<usize>) ->
         .with_input(
             "val",
             Value::Tensor {
-                data: f32_slice_to_bytes(data),
+                data: TensorData::Inline(f32_slice_to_bytes(data)),
                 shape,
                 dtype: ScalarType::Float32,
             },

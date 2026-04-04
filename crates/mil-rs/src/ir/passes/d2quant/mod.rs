@@ -13,7 +13,7 @@ use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 use dual_scale::{dual_scale_quantize, pack_2bit, pack_3bit, pack_mask};
 
@@ -103,7 +103,8 @@ impl Pass for D2QuantPass {
                     dtype: _,
                 } = val
                 {
-                    let floats = tensor_as_f32_slice(&data);
+                    let floats =
+                        tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"));
 
                     // Partition along the last dimension per row so groups
                     // never span row (output-channel) boundaries.
@@ -170,7 +171,7 @@ impl Pass for D2QuantPass {
                     op.attributes.insert(
                         "quantized_data".to_string(),
                         Value::Tensor {
-                            data: all_quantized_packed.clone(),
+                            data: TensorData::Inline(all_quantized_packed.clone()),
                             shape: vec![all_quantized_packed.len()],
                             dtype: ScalarType::UInt8,
                         },
@@ -184,7 +185,7 @@ impl Pass for D2QuantPass {
                     op.attributes.insert(
                         "normal_scale".to_string(),
                         Value::Tensor {
-                            data: f32_bytes(&all_normal_scale),
+                            data: TensorData::Inline(f32_bytes(&all_normal_scale)),
                             shape: vec![total_groups],
                             dtype: ScalarType::Float32,
                         },
@@ -192,7 +193,7 @@ impl Pass for D2QuantPass {
                     op.attributes.insert(
                         "normal_zero".to_string(),
                         Value::Tensor {
-                            data: f32_bytes(&all_normal_zero),
+                            data: TensorData::Inline(f32_bytes(&all_normal_zero)),
                             shape: vec![total_groups],
                             dtype: ScalarType::Float32,
                         },
@@ -200,7 +201,7 @@ impl Pass for D2QuantPass {
                     op.attributes.insert(
                         "outlier_scale".to_string(),
                         Value::Tensor {
-                            data: f32_bytes(&all_outlier_scale),
+                            data: TensorData::Inline(f32_bytes(&all_outlier_scale)),
                             shape: vec![total_groups],
                             dtype: ScalarType::Float32,
                         },
@@ -208,7 +209,7 @@ impl Pass for D2QuantPass {
                     op.attributes.insert(
                         "outlier_zero".to_string(),
                         Value::Tensor {
-                            data: f32_bytes(&all_outlier_zero),
+                            data: TensorData::Inline(f32_bytes(&all_outlier_zero)),
                             shape: vec![total_groups],
                             dtype: ScalarType::Float32,
                         },
@@ -218,7 +219,7 @@ impl Pass for D2QuantPass {
                     op.attributes.insert(
                         "outlier_mask".to_string(),
                         Value::Tensor {
-                            data: all_mask_packed.clone(),
+                            data: TensorData::Inline(all_mask_packed.clone()),
                             shape: vec![all_mask_packed.len()],
                             dtype: ScalarType::UInt8,
                         },
@@ -264,7 +265,7 @@ mod tests {
     fn pass_rewrites_const_to_dual_scale_dequantize() {
         let weights: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.1).collect();
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![16],
             dtype: ScalarType::Float32,
         };
@@ -323,7 +324,7 @@ mod tests {
     #[test]
     fn pass_skips_non_fp32_tensors() {
         let tensor_val = Value::Tensor {
-            data: vec![0u8; 16],
+            data: TensorData::Inline(vec![0u8; 16]),
             shape: vec![16],
             dtype: ScalarType::UInt8,
         };
@@ -344,7 +345,7 @@ mod tests {
     fn pass_handles_val_in_attributes() {
         let weights: Vec<f32> = (0..8).map(|i| i as f32 * 0.5).collect();
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![8],
             dtype: ScalarType::Float32,
         };
@@ -369,7 +370,7 @@ mod tests {
     fn output_type_is_fp32_with_original_shape() {
         let weights: Vec<f32> = vec![0.0; 24];
         let tensor_val = Value::Tensor {
-            data: f32_bytes(&weights),
+            data: TensorData::Inline(f32_bytes(&weights)),
             shape: vec![2, 3, 4],
             dtype: ScalarType::Float32,
         };

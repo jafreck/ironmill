@@ -7,7 +7,7 @@
 
 use half::f16;
 use mil_rs::ir::passes::rotation::rotate_rows_hadamard;
-use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
+use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorData, TensorType, Value};
 
 use crate::turboquant::codebook::lloyd_max_gaussian;
 
@@ -28,7 +28,7 @@ pub(crate) const MIN_IO_SEQ: usize = 32;
 /// Create an inline int32 tensor value for use as an op input (shape, axes, etc.).
 fn int32_tensor(values: &[i32]) -> Value {
     Value::Tensor {
-        data: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        data: TensorData::Inline(values.iter().flat_map(|v| v.to_le_bytes()).collect()),
         shape: vec![values.len()],
         dtype: ScalarType::Int32,
     }
@@ -1066,7 +1066,7 @@ pub fn build_fused_ffn_program(
         &mut func.body,
         "gate_weight",
         Value::Tensor {
-            data: gate_proj_weight.to_vec(),
+            data: TensorData::Inline(gate_proj_weight.to_vec()),
             shape: vec![inter, hidden, 1, 1],
             dtype: ScalarType::Float16,
         },
@@ -1076,7 +1076,7 @@ pub fn build_fused_ffn_program(
         &mut func.body,
         "up_weight",
         Value::Tensor {
-            data: up_proj_weight.to_vec(),
+            data: TensorData::Inline(up_proj_weight.to_vec()),
             shape: vec![inter, hidden, 1, 1],
             dtype: ScalarType::Float16,
         },
@@ -1086,7 +1086,7 @@ pub fn build_fused_ffn_program(
         &mut func.body,
         "down_weight",
         Value::Tensor {
-            data: down_proj_weight.to_vec(),
+            data: TensorData::Inline(down_proj_weight.to_vec()),
             shape: vec![hidden, inter, 1, 1],
             dtype: ScalarType::Float16,
         },

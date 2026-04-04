@@ -342,20 +342,22 @@ fn pad_reshape_shape_constant(op: &mut mil_rs::ir::Operation, min_seq: usize) {
     if let Some(mil_rs::ir::Value::Tensor { shape, data, dtype }) = op.inputs.get_mut("shape") {
         if shape.len() == 1 && *dtype == mil_rs::ir::ScalarType::Int32 {
             let ndims = shape[0];
-            if ndims >= 4 && data.len() >= ndims * 4 {
-                let last_offset = (ndims - 1) * 4;
-                let last_val = i32::from_le_bytes([
-                    data[last_offset],
-                    data[last_offset + 1],
-                    data[last_offset + 2],
-                    data[last_offset + 3],
-                ]);
-                if last_val > 0 && (last_val as usize) < min_seq {
-                    let b = (min_seq as i32).to_le_bytes();
-                    data[last_offset] = b[0];
-                    data[last_offset + 1] = b[1];
-                    data[last_offset + 2] = b[2];
-                    data[last_offset + 3] = b[3];
+            if let Some(data) = data.as_bytes_mut() {
+                if ndims >= 4 && data.len() >= ndims * 4 {
+                    let last_offset = (ndims - 1) * 4;
+                    let last_val = i32::from_le_bytes([
+                        data[last_offset],
+                        data[last_offset + 1],
+                        data[last_offset + 2],
+                        data[last_offset + 3],
+                    ]);
+                    if last_val > 0 && (last_val as usize) < min_seq {
+                        let b = (min_seq as i32).to_le_bytes();
+                        data[last_offset] = b[0];
+                        data[last_offset + 1] = b[1];
+                        data[last_offset + 2] = b[2];
+                        data[last_offset + 3] = b[3];
+                    }
                 }
             }
         }

@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mil_rs::ir::TensorData;
 use mil_rs::ir::{Block, Function, PassPipeline};
 use mil_rs::reader::print_model_summary;
 use mil_rs::{
@@ -153,7 +154,7 @@ fn transpose_ops_serialize_correctly() {
         .with_input(
             "perm",
             Value::Tensor {
-                data: perm_nhwc,
+                data: TensorData::Inline(perm_nhwc),
                 shape: vec![4],
                 dtype: ScalarType::Int32,
             },
@@ -165,7 +166,7 @@ fn transpose_ops_serialize_correctly() {
         .with_input(
             "perm",
             Value::Tensor {
-                data: perm_nchw,
+                data: TensorData::Inline(perm_nchw),
                 shape: vec![4],
                 dtype: ScalarType::Int32,
             },

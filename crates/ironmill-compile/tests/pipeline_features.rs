@@ -10,7 +10,9 @@ use ironmill_compile::convert::pipeline::{
     PipelineManifest, PipelineMeta, StageConfig, parse_pipeline_manifest,
 };
 use mil_rs::ir::passes::{Fp16QuantizePass, Int8QuantizePass};
-use mil_rs::{Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorType, Value};
+use mil_rs::{
+    Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorData, TensorType, Value,
+};
 
 use common::{build_transformer_program, make_const_op};
 
@@ -137,7 +139,7 @@ fn oversized_matmul_split_into_tiles() {
         .with_input(
             "y",
             Value::Tensor {
-                data: weight_data,
+                data: TensorData::Inline(weight_data),
                 shape: vec![n, k],
                 dtype: ScalarType::Float32,
             },
@@ -212,7 +214,7 @@ fn splitting_preserves_output_dimensions() {
         .with_input(
             "y",
             Value::Tensor {
-                data: weight_data,
+                data: TensorData::Inline(weight_data),
                 shape: vec![n, k],
                 dtype: ScalarType::Float32,
             },
@@ -376,7 +378,7 @@ fn rvq_pattern_fused_end_to_end() {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data,
+                    data: TensorData::Inline(data),
                     shape: vec![k, d],
                     dtype: ScalarType::Float32,
                 },

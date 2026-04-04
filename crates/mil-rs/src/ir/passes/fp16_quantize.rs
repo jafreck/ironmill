@@ -9,7 +9,7 @@ use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
-use crate::ir::types::Value;
+use crate::ir::types::{TensorData, Value};
 
 /// Convert FP32 weights and activations to FP16.
 ///
@@ -83,7 +83,9 @@ fn quantize_value(value: &mut Value) -> Result<()> {
             shape: _,
             dtype,
         } if *dtype == ScalarType::Float32 => {
-            *data = fp32_to_fp16_bytes(data)?;
+            *data = TensorData::Inline(fp32_to_fp16_bytes(
+                data.as_bytes().expect("tensor not materialized"),
+            )?);
             *dtype = ScalarType::Float16;
         }
         Value::Float(f) => {
@@ -92,7 +94,7 @@ fn quantize_value(value: &mut Value) -> Result<()> {
             // consistent with their FP16 inputs.
             let h = f16::from_f64(*f);
             *value = Value::Tensor {
-                data: h.to_le_bytes().to_vec(),
+                data: TensorData::Inline(h.to_le_bytes().to_vec()),
                 shape: vec![],
                 dtype: ScalarType::Float16,
             };
@@ -156,7 +158,7 @@ mod tests {
         assert_eq!(fp32_data.len(), 16);
 
         let tensor_val = Value::Tensor {
-            data: fp32_data,
+            data: TensorData::Inline(fp32_data),
             shape: vec![4],
             dtype: ScalarType::Float32,
         };
@@ -176,6 +178,7 @@ mod tests {
                 assert_eq!(*dtype, ScalarType::Float16);
                 assert_eq!(*shape, vec![4]);
                 // FP16 is 2 bytes per element → 8 bytes total.
+                let data = data.as_bytes().expect("tensor not materialized");
                 assert_eq!(data.len(), 8);
 
                 // Verify round-trip values.
@@ -211,7 +214,7 @@ mod tests {
     #[test]
     fn leaves_non_float_ops_unchanged() {
         let int_val = Value::Tensor {
-            data: vec![1, 0, 0, 0], // i32 = 1
+            data: TensorData::Inline(vec![1, 0, 0, 0]), // i32 = 1
             shape: vec![1],
             dtype: ScalarType::Int32,
         };
@@ -235,7 +238,7 @@ mod tests {
         match ops[0].inputs.get("val") {
             Some(Value::Tensor { dtype, data, .. }) => {
                 assert_eq!(*dtype, ScalarType::Int32);
-                assert_eq!(data.len(), 4);
+                assert_eq!(data.byte_len(), 4);
             }
             other => panic!("expected Int32 Tensor, got {other:?}"),
         }
@@ -255,7 +258,7 @@ mod tests {
         let original_data = fp16_data.clone();
 
         let tensor_val = Value::Tensor {
-            data: fp16_data,
+            data: TensorData::Inline(fp16_data),
             shape: vec![2],
             dtype: ScalarType::Float16,
         };
@@ -272,7 +275,10 @@ mod tests {
         match op.inputs.get("val") {
             Some(Value::Tensor { data, dtype, .. }) => {
                 assert_eq!(*dtype, ScalarType::Float16);
-                assert_eq!(*data, original_data);
+                assert_eq!(
+                    data.as_bytes().expect("tensor not materialized"),
+                    &original_data[..]
+                );
             }
             other => panic!("expected FP16 Tensor, got {other:?}"),
         }
@@ -331,7 +337,8 @@ mod tests {
             Some(Value::Tensor { dtype, shape, data }) => {
                 assert_eq!(*dtype, ScalarType::Float16, "epsilon should be FP16");
                 assert!(shape.is_empty(), "epsilon should be scalar (rank 0)");
-                assert_eq!(data.len(), 2, "FP16 scalar is 2 bytes");
+                assert_eq!(data.byte_len(), 2, "FP16 scalar is 2 bytes");
+                let data = data.as_bytes().expect("tensor not materialized");
                 let h = f16::from_le_bytes([data[0], data[1]]);
                 assert!(
                     (h.to_f64() - 1e-5).abs() < 1e-4,

@@ -407,7 +407,7 @@ fn stack_codebook_tensors(block: &Block, gathers: &[CodebookGather]) -> Option<V
                 } else {
                     first_dtype = Some(*dtype);
                 }
-                all_data.extend_from_slice(data);
+                all_data.extend_from_slice(data.as_bytes().expect("tensor not materialized"));
             }
             _ => return None,
         }
@@ -421,7 +421,7 @@ fn stack_codebook_tensors(block: &Block, gathers: &[CodebookGather]) -> Option<V
     stacked_shape.extend_from_slice(&inner_shape);
 
     Some(Value::Tensor {
-        data: all_data,
+        data: mil_rs::ir::TensorData::Inline(all_data),
         shape: stacked_shape,
         dtype,
     })
@@ -438,7 +438,7 @@ fn total_codebook_bytes(block: &Block, gathers: &[CodebookGather]) -> usize {
                 .get("val")
                 .or_else(|| const_op.attributes.get("val"))?;
             match val {
-                Value::Tensor { data, .. } => Some(data.len()),
+                Value::Tensor { data, .. } => Some(data.byte_len()),
                 _ => None,
             }
         })
@@ -566,7 +566,7 @@ mod tests {
             .with_input(
                 "val",
                 Value::Tensor {
-                    data: f32_bytes(values),
+                    data: f32_bytes(values).into(),
                     shape,
                     dtype: ScalarType::Float32,
                 },
