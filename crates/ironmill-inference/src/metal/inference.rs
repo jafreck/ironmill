@@ -27,6 +27,11 @@ use crate::calibration::ActivationHook;
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
 
+// ── Matmul tile dimensions — must match Metal shader constants ──
+const MATMUL_TM_TILE: usize = 64;
+const MATMUL_TN_TILE: usize = 64;
+const MATMUL_THREADS_PER_TG: usize = 256;
+
 // ── Public artifacts type for load() ────────────────────────────
 
 /// Artifacts passed to [`MetalInference::load`] via the type-erased
@@ -1696,11 +1701,13 @@ fn encode_polarquant_matmul(
         encoder.set_bytes(&(m as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 6);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 7);
-        let tm_tile = 64;
-        let tn_tile = 64;
         encoder.dispatch_threadgroups(
-            ((m + tm_tile - 1) / tm_tile, (n + tn_tile - 1) / tn_tile, 1),
-            (256, 1, 1),
+            (
+                (m + MATMUL_TM_TILE - 1) / MATMUL_TM_TILE,
+                (n + MATMUL_TN_TILE - 1) / MATMUL_TN_TILE,
+                1,
+            ),
+            (MATMUL_THREADS_PER_TG, 1, 1),
         );
     }
     Ok(())
@@ -1768,11 +1775,13 @@ fn encode_affine_matmul(
             encoder.set_buffer(&weight.data, 0, 9);
         }
         encoder.set_bytes(&has_awq.to_le_bytes(), 10);
-        let tm_tile = 64;
-        let tn_tile = 64;
         encoder.dispatch_threadgroups(
-            ((m + tm_tile - 1) / tm_tile, (n + tn_tile - 1) / tn_tile, 1),
-            (256, 1, 1),
+            (
+                (m + MATMUL_TM_TILE - 1) / MATMUL_TM_TILE,
+                (n + MATMUL_TN_TILE - 1) / MATMUL_TN_TILE,
+                1,
+            ),
+            (MATMUL_THREADS_PER_TG, 1, 1),
         );
     }
     Ok(())

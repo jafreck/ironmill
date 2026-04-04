@@ -22,13 +22,24 @@ constant constexpr uint TILE_M = 8;
 constant constexpr uint TILE_N = 32;
 constant constexpr uint TILE_K = 32;
 
-// Matmul tiles (simdgroup path, M>1)
-constant constexpr uint TM_TILE = 64;
-constant constexpr uint TN_TILE = 64;
-constant constexpr uint MATMUL_K_TILE = 8;
-constant constexpr uint N_SIMDGROUPS = 8;
-constant constexpr uint TN_STRIDE = TN_TILE + 1;  // +1 padding to avoid threadgroup bank conflicts
-constant constexpr uint TN_BLOCKS = TN_TILE / 8;
+// ── Matmul tuning parameters ──
+// N_SIMDGROUPS controls the threadgroup size: N_SIMDGROUPS * 32 threads.
+// Increasing to 16 (512 threads) doubles output rows per threadgroup but
+// increases register pressure and threadgroup memory, potentially reducing
+// occupancy (fewer concurrent threadgroups per GPU core).
+//
+// Trade-off:
+//   8 simdgroups (256 threads): lower register pressure, higher occupancy
+//  16 simdgroups (512 threads): larger tiles, better arithmetic intensity
+//
+// Profile on target hardware to determine the optimum.
+constant constexpr uint N_SIMDGROUPS   = 8;
+constant constexpr uint THREADS_PER_TG = N_SIMDGROUPS * 32;
+constant constexpr uint TM_TILE        = N_SIMDGROUPS * 8;   // 64 for 8 SG, 128 for 16 SG
+constant constexpr uint TN_TILE        = 64;
+constant constexpr uint TN_STRIDE      = TN_TILE + 1;
+constant constexpr uint MATMUL_K_TILE  = 8;
+constant constexpr uint TN_BLOCKS      = TN_TILE / 8;
 
 // ── INT4 matvec (decode path, M=1) ──────────────────────────────
 //
@@ -139,7 +150,7 @@ kernel void affine_matmul_int4(
     // Prologue: load first tile into buf[0]
     {
         uint k_base = 0;
-        for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
+        for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
             uint m = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
             uint g_row = tg_m + m;
@@ -152,7 +163,7 @@ kernel void affine_matmul_int4(
         }
         uint block_k = k_base / MATMUL_K_TILE;
         uint block_base = (group_id.y * k_blocks + block_k) * block_bytes;
-        for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
+        for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
             uint n = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
             uint g_n = tg_n + n;
@@ -180,7 +191,7 @@ kernel void affine_matmul_int4(
         // Load NEXT tile (if not the last step)
         if (t + 1 < num_k_steps) {
             uint k_base = (t + 1) * MATMUL_K_TILE;
-            for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
+            for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
                 uint m = i / MATMUL_K_TILE;
                 uint k = i % MATMUL_K_TILE;
                 uint g_row = tg_m + m;
@@ -193,7 +204,7 @@ kernel void affine_matmul_int4(
             }
             uint block_k = k_base / MATMUL_K_TILE;
             uint block_base = (group_id.y * k_blocks + block_k) * block_bytes;
-            for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
+            for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
                 uint n = i / MATMUL_K_TILE;
                 uint k = i % MATMUL_K_TILE;
                 uint g_n = tg_n + n;
@@ -231,7 +242,7 @@ kernel void affine_matmul_int4(
         simdgroup_store(acc[j], tg_out + sgid * 64, 8);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint i = tid; i < TM_TILE * 8; i += 256) {
+        for (uint i = tid; i < TM_TILE * 8; i += THREADS_PER_TG) {
             uint local_m = i / 8;
             uint local_n = i % 8;
             uint out_row = tg_m + local_m;
@@ -337,7 +348,7 @@ kernel void affine_matmul_int8(
     // Prologue: load first tile into buf[0]
     {
         uint k_base = 0;
-        for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
+        for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
             uint m = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
             uint g_row = tg_m + m;
@@ -350,7 +361,7 @@ kernel void affine_matmul_int8(
         }
         uint block_k = k_base / MATMUL_K_TILE;
         uint block_base = (group_id.y * k_blocks + block_k) * block_bytes;
-        for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
+        for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
             uint n = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
             uint g_n = tg_n + n;
@@ -377,7 +388,7 @@ kernel void affine_matmul_int8(
         // Load NEXT tile (if not the last step)
         if (t + 1 < num_k_steps) {
             uint k_base = (t + 1) * MATMUL_K_TILE;
-            for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
+            for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
                 uint m = i / MATMUL_K_TILE;
                 uint k = i % MATMUL_K_TILE;
                 uint g_row = tg_m + m;
@@ -390,7 +401,7 @@ kernel void affine_matmul_int8(
             }
             uint block_k = k_base / MATMUL_K_TILE;
             uint block_base = (group_id.y * k_blocks + block_k) * block_bytes;
-            for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
+            for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
                 uint n = i / MATMUL_K_TILE;
                 uint k = i % MATMUL_K_TILE;
                 uint g_n = tg_n + n;
@@ -427,7 +438,7 @@ kernel void affine_matmul_int8(
         simdgroup_store(acc[j], tg_out + sgid * 64, 8);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint i = tid; i < TM_TILE * 8; i += 256) {
+        for (uint i = tid; i < TM_TILE * 8; i += THREADS_PER_TG) {
             uint local_m = i / 8;
             uint local_n = i % 8;
             uint out_row = tg_m + local_m;
