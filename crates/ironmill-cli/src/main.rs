@@ -75,11 +75,11 @@ struct CompileArgs {
     #[arg(short, long, default_value = "all")]
     target: String,
 
-    /// Quantization mode: "none", "fp16", "int4", "int8", "mixed-fp16-int8", "awq", "d2quant".
+    /// Quantization mode: "none", "fp16", "int4", "int8", "mixed-fp16-int8", "awq", "gptq", "d2quant".
     #[arg(short, long, default_value = "none")]
     quantize: String,
 
-    /// Calibration data directory (for int8 or AWQ quantization).
+    /// Calibration data directory (for int8, AWQ, or GPTQ quantization).
     #[arg(long = "cal-data", value_name = "DIR")]
     cal_data: Option<PathBuf>,
 
@@ -610,6 +610,30 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
                     .with_int4(group_size)
                     .context("Failed to configure INT4 quantization")?;
             }
+            "gptq" => {
+                let cal_dir = opts
+                    .cal_data
+                    .as_ref()
+                    .context("GPTQ quantization requires --cal-data pointing to a directory containing gptq_hessians.json")?;
+                let hessian_path = cal_dir.join("gptq_hessians.json");
+                let json = std::fs::read_to_string(&hessian_path).with_context(|| {
+                    format!(
+                        "Failed to read GPTQ Hessian data from {}",
+                        hessian_path.display()
+                    )
+                })?;
+                let hessian_data: HashMap<String, (Vec<f32>, usize, usize)> =
+                    serde_json::from_str(&json).with_context(|| {
+                        format!(
+                            "Failed to parse GPTQ Hessian data from {}",
+                            hessian_path.display()
+                        )
+                    })?;
+                let bits = opts.bits.unwrap_or(4);
+                pipeline = pipeline
+                    .with_gptq(hessian_data, bits, 128, 128, 0.01)
+                    .context("Failed to configure GPTQ quantization")?;
+            }
             "d2quant" => {
                 let bits = opts.bits.unwrap_or(2);
                 if bits != 2 && bits != 3 {
@@ -622,7 +646,7 @@ fn build_pass_pipeline(opts: &CompileOpts) -> Result<PassPipeline> {
             "none" => {}
             other => {
                 bail!(
-                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int4', 'int8', 'mixed-fp16-int8', 'awq', or 'd2quant'."
+                    "Unsupported quantization mode: '{other}'. Expected 'none', 'fp16', 'int4', 'int8', 'mixed-fp16-int8', 'awq', 'gptq', or 'd2quant'."
                 )
             }
         }

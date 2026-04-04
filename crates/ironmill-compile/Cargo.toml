@@ -23,6 +23,6 @@ glob-match = { workspace = true }
 toml = { workspace = true }
 
 [features]
-
+gptq = ["mil-rs/gptq"]
 [dev-dependencies]
 prost = { workspace = true }
