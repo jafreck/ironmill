@@ -41,6 +41,7 @@ fn main() {
         "affine_matmul",
         "quip_sharp",
         "fused_softcap",
+        "ple_kernels",
     ];
 
     for name in &independent {

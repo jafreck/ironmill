@@ -45,6 +45,12 @@ pub struct LoadedLayer<D, W> {
     // pub router_weight: Option<W>,
     // pub expert_weights: Vec<ExpertWeights>,  // num_experts entries
     // Adding actual fields requires updating weight loading in WeightVisitor.
+    /// PLE gate weight `[ple_hidden_size, hidden_size]` (Gemma 4).
+    pub ple_gate: Option<W>,
+    /// PLE projection weight `[hidden_size, ple_hidden_size]` (Gemma 4).
+    pub ple_projection: Option<W>,
+    /// PLE post-norm weight `[hidden_size]` (Gemma 4).
+    pub ple_post_norm: Option<D>,
 }
 
 /// Core model weights returned by [`load_model_weights`].
@@ -60,6 +66,13 @@ pub struct LoadedModelCore<D, W> {
     pub final_norm: D,
     /// Model configuration extracted from weight metadata.
     pub config: ModelConfig,
+
+    /// PLE embedding table `[vocab_size, num_layers * ple_hidden_size]` (Gemma 4).
+    pub ple_embed_tokens: Option<D>,
+    /// PLE model projection weight `[num_layers * ple_hidden_size, hidden_size]` (Gemma 4).
+    pub ple_model_projection: Option<W>,
+    /// PLE projection norm weight `[num_layers * ple_hidden_size]` (Gemma 4).
+    pub ple_projection_norm: Option<D>,
 }
 
 // ── Visitor trait ────────────────────────────────────────────────
@@ -132,16 +145,63 @@ pub fn load_model_weights<V: WeightVisitor>(
             } else {
                 None
             },
+            ple_gate: {
+                let name = format!("{prefix}.per_layer_input_gate.weight");
+                if provider.has_tensor(&name) {
+                    Some(visitor.load_weight(provider, &name)?)
+                } else {
+                    None
+                }
+            },
+            ple_projection: {
+                let name = format!("{prefix}.per_layer_projection.weight");
+                if provider.has_tensor(&name) {
+                    Some(visitor.load_weight(provider, &name)?)
+                } else {
+                    None
+                }
+            },
+            ple_post_norm: {
+                let name = format!("{prefix}.post_per_layer_input_norm.weight");
+                if provider.has_tensor(&name) {
+                    Some(visitor.load_dense(provider, &name)?)
+                } else {
+                    None
+                }
+            },
         });
     }
 
     let final_norm = visitor.load_dense(provider, "model.norm.weight")?;
+
+    // PLE model-level weights (Gemma 4).
+    let ple_embed_name = "model.embed_tokens_per_layer.weight";
+    let ple_embed_tokens = if provider.has_tensor(ple_embed_name) {
+        Some(visitor.load_dense(provider, ple_embed_name)?)
+    } else {
+        None
+    };
+    let ple_proj_name = "model.per_layer_model_projection.weight";
+    let ple_model_projection = if provider.has_tensor(ple_proj_name) {
+        Some(visitor.load_weight(provider, ple_proj_name)?)
+    } else {
+        None
+    };
+    let ple_norm_name = "model.per_layer_projection_norm.weight";
+    let ple_projection_norm = if provider.has_tensor(ple_norm_name) {
+        Some(visitor.load_dense(provider, ple_norm_name)?)
+    } else {
+        None
+    };
 
     Ok(LoadedModelCore {
         embedding,
         layers,
         final_norm,
         config,
+        ple_embed_tokens,
+        ple_model_projection,
+        ple_projection_norm,
     })
 }
 

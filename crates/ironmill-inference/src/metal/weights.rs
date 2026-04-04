@@ -107,6 +107,13 @@ pub struct MetalWeights {
     pub lm_head_packed: Option<MetalBuffer>,
     /// Model configuration extracted from weight metadata.
     pub config: ModelConfig,
+
+    /// PLE embedding table `[vocab_size, num_layers * ple_hidden_size]` FP16 (Gemma 4).
+    pub ple_embed_tokens: Option<MetalBuffer>,
+    /// PLE model projection weight (Gemma 4).
+    pub ple_model_projection: Option<WeightBuffer>,
+    /// PLE projection norm weight (Gemma 4).
+    pub ple_projection_norm: Option<MetalBuffer>,
 }
 
 /// Backend-specific visitor that loads tensors into Metal buffers.
@@ -169,6 +176,9 @@ impl MetalWeights {
             lm_head,
             lm_head_packed,
             config,
+            ple_embed_tokens: core.ple_embed_tokens,
+            ple_model_projection: core.ple_model_projection,
+            ple_projection_norm: core.ple_projection_norm,
         })
     }
 }

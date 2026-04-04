@@ -206,6 +206,12 @@ struct IntermediateBuffers {
     /// Second token IDs buffer for prefill pipelining — allows encoding
     /// the next chunk while the previous command buffer is still executing.
     _token_ids_buf_b: MetalBuffer,
+    /// PLE per-layer input buffer `[token_count, num_layers * ple_hidden_size]`.
+    /// None when the model has no PLE.
+    ple_per_layer_input: Option<MetalBuffer>,
+    /// PLE scratch buffer for gate/projection intermediates `[token_count, ple_hidden_size]`.
+    /// Reused across layers. None when the model has no PLE.
+    ple_scratch: Option<MetalBuffer>,
     /// Current maximum token capacity of these buffers.
     capacity: usize,
 }
@@ -223,6 +229,12 @@ impl IntermediateBuffers {
         let inter = mc.intermediate_size;
         let vocab = mc.vocab_size;
 
+        let ple_hidden = mc
+            .extra
+            .get("hidden_size_per_layer_input")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
         let alloc_private = |size_elems: usize| -> Result<MetalBuffer, MetalError> {
             // GPU-only buffers use Private storage for ~10-15% bandwidth
             // improvement — no CPU coherency overhead.
@@ -238,6 +250,19 @@ impl IntermediateBuffers {
             device
                 .create_buffer(bytes, StorageMode::Shared)
                 .map_err(MetalError::Metal)
+        };
+
+        let ple_per_layer_input = if ple_hidden > 0 {
+            Some(alloc_private(
+                max_tokens * mc.num_hidden_layers * ple_hidden,
+            )?)
+        } else {
+            None
+        };
+        let ple_scratch = if ple_hidden > 0 {
+            Some(alloc_private(max_tokens * ple_hidden)?)
+        } else {
+            None
         };
 
         Ok(Self {
@@ -258,6 +283,8 @@ impl IntermediateBuffers {
             _token_ids_buf_b: device
                 .create_buffer((max_tokens * 4).max(16), StorageMode::Shared)
                 .map_err(MetalError::Metal)?,
+            ple_per_layer_input,
+            ple_scratch,
             capacity: max_tokens,
         })
     }
@@ -940,6 +967,99 @@ impl MetalInference {
         }
         enc.memory_barrier_buffers();
 
+        // PLE model-level computation: compute per-layer embeddings before the layer loop.
+        // Result lives in ple_per_layer_input for the duration of all layers.
+        if let Some(ref g4) = self.gemma4_config {
+            let ple_h = g4.ple_hidden_size;
+            if ple_h > 0 {
+                if let (
+                    Some(ple_embed),
+                    Some(ple_proj),
+                    Some(ple_norm),
+                    Some(ref ple_buf),
+                    Some(ref ple_scratch),
+                ) = (
+                    &weights.ple_embed_tokens,
+                    &weights.ple_model_projection,
+                    &weights.ple_projection_norm,
+                    &bufs.ple_per_layer_input,
+                    &bufs.ple_scratch,
+                ) {
+                    let ple_total = mc.num_hidden_layers * ple_h;
+                    let pipelines = self.pipelines()?;
+
+                    // 1. Gather from ple_embed_tokens using token_ids → ple_per_layer_input
+                    //    Shape: [tokens, num_layers * ple_hidden]
+                    ops::encode_embedding_lookup(
+                        &enc,
+                        &pipelines.embedding_lookup,
+                        &ops::EmbeddingLookupParams {
+                            token_ids: &bufs.token_ids_buf,
+                            embedding_table: ple_embed,
+                            output: ple_buf,
+                            hidden_size: ple_total as u32,
+                            token_count: token_count as u32,
+                            vocab_size: vocab as u32,
+                        },
+                    );
+
+                    // 2. Project hidden_state via ple_model_projection → ple_scratch (reused as temp)
+                    //    We need a temp buffer of size [tokens, ple_total]. ple_buf is occupied with
+                    //    the embed result, so we use ffn_down as temp (it's [tokens, h] which may be
+                    //    smaller). Instead, since ple_scratch is [tokens, ple_h], we need a larger temp.
+                    //    For the projection output we reuse ffn_gate which is [tokens, intermediate_size]
+                    //    and intermediate_size >= ple_total for all known models.
+                    let row_bytes_h = h * 2;
+                    let row_bytes_ple_total = ple_total * 2;
+                    encode_projection(
+                        &enc,
+                        &bufs.hidden_state,
+                        &MpsMatrix::from_buffer(&bufs.hidden_state, token_count, h, row_bytes_h)
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                        ple_proj,
+                        &bufs.ffn_gate, // temp output: [tokens, ple_total] fits in ffn_gate
+                        &ProjectionMatmul::Quantized, // placeholder, encode_projection selects by weight type
+                        pipelines,
+                        token_count,
+                        ple_total,
+                        h,
+                        row_bytes_h,
+                        row_bytes_ple_total,
+                    )?;
+                    enc.memory_barrier_buffers();
+
+                    // 3. RMSNorm the projection output (in ffn_gate) → write to ffn_up (temp)
+                    ops::encode_rms_norm(
+                        &enc,
+                        &pipelines.rms_norm,
+                        &ops::RmsNormParams {
+                            input: &bufs.ffn_gate,
+                            weight: ple_norm,
+                            output: &bufs.ffn_up,
+                            hidden_size: ple_total as u32,
+                            token_count: token_count as u32,
+                            eps,
+                        },
+                    );
+                    enc.memory_barrier_buffers();
+
+                    // 4+5. Add embed (ple_buf) + normed projection (ffn_up), scale by 2^(-0.5)
+                    //       → store result back in ple_per_layer_input
+                    let ple_scale: f32 = std::f32::consts::FRAC_1_SQRT_2; // 2^(-0.5) = 0.7071
+                    ops::encode_add_scale(
+                        &enc,
+                        &pipelines.ple_add_scale,
+                        ple_buf,
+                        &bufs.ffn_up,
+                        ple_buf,
+                        (token_count * ple_total) as u32,
+                        ple_scale,
+                    );
+                    enc.memory_barrier_buffers();
+                }
+            }
+        }
+
         // Per-layer processing.
         //
         // norm_out already contains the first layer's input-norm result
@@ -1151,14 +1271,151 @@ impl MetalInference {
                 }
             }
 
-            // Step 16: Residual add + next layer's input norm (or standalone for last layer)
-            let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
-                Some(&weights.layers[layer_idx + 1].input_norm)
+            // PLE per-layer: gate → GELU → multiply → project → norm → residual add.
+            // When PLE is active, we split the fused residual+norm into separate steps
+            // so PLE can be inserted between the FFN residual add and next layer's norm.
+            let has_ple = self
+                .gemma4_config
+                .as_ref()
+                .is_some_and(|g4| g4.ple_hidden_size > 0)
+                && lw.ple_gate.is_some()
+                && bufs.ple_per_layer_input.is_some();
+
+            if has_ple {
+                let g4 = self.gemma4_config.as_ref().unwrap();
+                let ple_h = g4.ple_hidden_size;
+                let ple_total = mc.num_hidden_layers * ple_h;
+                let ple_gate = lw.ple_gate.as_ref().unwrap();
+                let ple_proj = lw.ple_projection.as_ref().unwrap();
+                let ple_post_norm = lw.ple_post_norm.as_ref().unwrap();
+                let ple_buf = bufs.ple_per_layer_input.as_ref().unwrap();
+                let ple_scratch = bufs.ple_scratch.as_ref().unwrap();
+                let pipelines = self.pipelines()?;
+
+                // 1. Standalone FFN residual add: hidden_state = residual + ffn_down
+                ops::encode_residual_add(
+                    &enc,
+                    &pipelines.residual_add,
+                    &bufs.residual,
+                    &bufs.ffn_down,
+                    &bufs.hidden_state,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+
+                // 2. PLE gate: linear(hidden_state → ple_scratch) [hidden → ple_hidden]
+                let row_bytes_h = h * 2;
+                let row_bytes_ple = ple_h * 2;
+                encode_projection(
+                    &enc,
+                    &bufs.hidden_state,
+                    &MpsMatrix::from_buffer(&bufs.hidden_state, token_count, h, row_bytes_h)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                    ple_gate,
+                    ple_scratch,
+                    &ProjectionMatmul::Quantized,
+                    pipelines,
+                    token_count,
+                    ple_h,
+                    h,
+                    row_bytes_h,
+                    row_bytes_ple,
+                )?;
+                enc.memory_barrier_buffers();
+
+                // 3. GELU activation + multiply with per-layer input slice
+                ops::encode_gelu_gate(
+                    &enc,
+                    &pipelines.ple_gelu_gate,
+                    ple_scratch,
+                    ple_buf,
+                    ple_scratch, // in-place
+                    ple_h as u32,
+                    token_count as u32,
+                    ple_total as u32,           // stride: full row width
+                    (layer_idx * ple_h) as u32, // offset: this layer's slice
+                );
+                enc.memory_barrier_buffers();
+
+                // 4. Project back: linear(ple_scratch → ffn_down) [ple_hidden → hidden]
+                encode_projection(
+                    &enc,
+                    ple_scratch,
+                    &MpsMatrix::from_buffer(ple_scratch, token_count, ple_h, row_bytes_ple)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                    ple_proj,
+                    &bufs.ffn_down, // reuse ffn_down as temp
+                    &ProjectionMatmul::Quantized,
+                    pipelines,
+                    token_count,
+                    h,
+                    ple_h,
+                    row_bytes_ple,
+                    row_bytes_h,
+                )?;
+                enc.memory_barrier_buffers();
+
+                // 5. RMSNorm the projected output
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.ffn_down,
+                        weight: ple_post_norm,
+                        output: &bufs.ffn_up, // temp
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+                enc.memory_barrier_buffers();
+
+                // 6. PLE residual add: hidden_state += normed PLE output
+                ops::encode_residual_add(
+                    &enc,
+                    &pipelines.residual_add,
+                    &bufs.hidden_state,
+                    &bufs.ffn_up,
+                    &bufs.hidden_state, // in-place
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+
+                // 7. Next layer's input norm (or skip for last layer)
+                if layer_idx + 1 < mc.num_hidden_layers {
+                    let next_norm = &weights.layers[layer_idx + 1].input_norm;
+                    ops::encode_rms_norm(
+                        &enc,
+                        &pipelines.rms_norm,
+                        &ops::RmsNormParams {
+                            input: &bufs.hidden_state,
+                            weight: next_norm,
+                            output: &bufs.norm_out,
+                            hidden_size: h as u32,
+                            token_count: token_count as u32,
+                            eps,
+                        },
+                    );
+                }
+                enc.memory_barrier_buffers();
             } else {
-                None
-            };
-            encode_end_of_layer_residual(&enc, pipelines, bufs, next_norm, h, token_count, eps)?;
-            enc.memory_barrier_buffers();
+                // Step 16: Residual add + next layer's input norm (or standalone for last layer)
+                let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
+                    Some(&weights.layers[layer_idx + 1].input_norm)
+                } else {
+                    None
+                };
+                encode_end_of_layer_residual(
+                    &enc,
+                    pipelines,
+                    bufs,
+                    next_norm,
+                    h,
+                    token_count,
+                    eps,
+                )?;
+                enc.memory_barrier_buffers();
+            }
         }
 
         // Step 17: Final RMSNorm
@@ -1432,6 +1689,95 @@ impl MetalInference {
                     eps,
                 },
             );
+
+            // PLE model-level: compute per-layer embeddings.
+            if let Some(ref g4) = self.gemma4_config {
+                let ple_h = g4.ple_hidden_size;
+                if ple_h > 0 {
+                    if let (
+                        Some(ple_embed),
+                        Some(ple_proj),
+                        Some(ple_norm),
+                        Some(ref ple_buf),
+                        Some(ref ple_scratch_unused),
+                    ) = (
+                        &weights.ple_embed_tokens,
+                        &weights.ple_model_projection,
+                        &weights.ple_projection_norm,
+                        &bufs.ple_per_layer_input,
+                        &bufs.ple_scratch,
+                    ) {
+                        let _ = ple_scratch_unused;
+                        let ple_total = mc.num_hidden_layers * ple_h;
+                        let pipelines = self.pipelines()?;
+
+                        enc.memory_barrier_buffers();
+
+                        ops::encode_embedding_lookup(
+                            &enc,
+                            &pipelines.embedding_lookup,
+                            &ops::EmbeddingLookupParams {
+                                token_ids: &bufs.token_ids_buf,
+                                embedding_table: ple_embed,
+                                output: ple_buf,
+                                hidden_size: ple_total as u32,
+                                token_count: token_count as u32,
+                                vocab_size: vocab as u32,
+                            },
+                        );
+
+                        let row_bytes_h = h * 2;
+                        let row_bytes_ple_total = ple_total * 2;
+                        encode_projection(
+                            &enc,
+                            &bufs.hidden_state,
+                            &MpsMatrix::from_buffer(
+                                &bufs.hidden_state,
+                                token_count,
+                                h,
+                                row_bytes_h,
+                            )
+                            .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                            ple_proj,
+                            &bufs.ffn_gate,
+                            &ProjectionMatmul::Quantized,
+                            pipelines,
+                            token_count,
+                            ple_total,
+                            h,
+                            row_bytes_h,
+                            row_bytes_ple_total,
+                        )?;
+                        enc.memory_barrier_buffers();
+
+                        ops::encode_rms_norm(
+                            &enc,
+                            &pipelines.rms_norm,
+                            &ops::RmsNormParams {
+                                input: &bufs.ffn_gate,
+                                weight: ple_norm,
+                                output: &bufs.ffn_up,
+                                hidden_size: ple_total as u32,
+                                token_count: token_count as u32,
+                                eps,
+                            },
+                        );
+                        enc.memory_barrier_buffers();
+
+                        let ple_scale: f32 = std::f32::consts::FRAC_1_SQRT_2;
+                        ops::encode_add_scale(
+                            &enc,
+                            &pipelines.ple_add_scale,
+                            ple_buf,
+                            &bufs.ffn_up,
+                            ple_buf,
+                            (token_count * ple_total) as u32,
+                            ple_scale,
+                        );
+                    }
+                }
+            }
+
             enc.end_encoding();
         }
 
@@ -1713,13 +2059,139 @@ impl MetalInference {
                 }
             }
 
-            // Step 16: Residual add + next layer's input norm (or standalone for last layer)
-            let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
-                Some(&weights.layers[layer_idx + 1].input_norm)
+            // PLE per-layer dispatch (same logic as run_pipeline_inner).
+            let has_ple = self
+                .gemma4_config
+                .as_ref()
+                .is_some_and(|g4| g4.ple_hidden_size > 0)
+                && lw.ple_gate.is_some()
+                && bufs.ple_per_layer_input.is_some();
+
+            if has_ple {
+                let g4 = self.gemma4_config.as_ref().unwrap();
+                let ple_h = g4.ple_hidden_size;
+                let ple_total = mc.num_hidden_layers * ple_h;
+                let ple_gate = lw.ple_gate.as_ref().unwrap();
+                let ple_proj = lw.ple_projection.as_ref().unwrap();
+                let ple_post_norm = lw.ple_post_norm.as_ref().unwrap();
+                let ple_buf = bufs.ple_per_layer_input.as_ref().unwrap();
+                let ple_scratch = bufs.ple_scratch.as_ref().unwrap();
+
+                ops::encode_residual_add(
+                    &enc,
+                    &pipelines.residual_add,
+                    &bufs.residual,
+                    &bufs.ffn_down,
+                    &bufs.hidden_state,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+
+                let row_bytes_h = h * 2;
+                let row_bytes_ple = ple_h * 2;
+                encode_projection(
+                    &enc,
+                    &bufs.hidden_state,
+                    &MpsMatrix::from_buffer(&bufs.hidden_state, token_count, h, row_bytes_h)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                    ple_gate,
+                    ple_scratch,
+                    &ProjectionMatmul::Quantized,
+                    pipelines,
+                    token_count,
+                    ple_h,
+                    h,
+                    row_bytes_h,
+                    row_bytes_ple,
+                )?;
+                enc.memory_barrier_buffers();
+
+                ops::encode_gelu_gate(
+                    &enc,
+                    &pipelines.ple_gelu_gate,
+                    ple_scratch,
+                    ple_buf,
+                    ple_scratch,
+                    ple_h as u32,
+                    token_count as u32,
+                    ple_total as u32,
+                    (layer_idx * ple_h) as u32,
+                );
+                enc.memory_barrier_buffers();
+
+                encode_projection(
+                    &enc,
+                    ple_scratch,
+                    &MpsMatrix::from_buffer(ple_scratch, token_count, ple_h, row_bytes_ple)
+                        .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                    ple_proj,
+                    &bufs.ffn_down,
+                    &ProjectionMatmul::Quantized,
+                    pipelines,
+                    token_count,
+                    h,
+                    ple_h,
+                    row_bytes_ple,
+                    row_bytes_h,
+                )?;
+                enc.memory_barrier_buffers();
+
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.ffn_down,
+                        weight: ple_post_norm,
+                        output: &bufs.ffn_up,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+                enc.memory_barrier_buffers();
+
+                ops::encode_residual_add(
+                    &enc,
+                    &pipelines.residual_add,
+                    &bufs.hidden_state,
+                    &bufs.ffn_up,
+                    &bufs.hidden_state,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+
+                if layer_idx + 1 < mc.num_hidden_layers {
+                    let next_norm = &weights.layers[layer_idx + 1].input_norm;
+                    ops::encode_rms_norm(
+                        &enc,
+                        &pipelines.rms_norm,
+                        &ops::RmsNormParams {
+                            input: &bufs.hidden_state,
+                            weight: next_norm,
+                            output: &bufs.norm_out,
+                            hidden_size: h as u32,
+                            token_count: token_count as u32,
+                            eps,
+                        },
+                    );
+                }
             } else {
-                None
-            };
-            encode_end_of_layer_residual(&enc, pipelines, bufs, next_norm, h, token_count, eps)?;
+                // Step 16: Residual add + next layer's input norm (or standalone for last layer)
+                let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
+                    Some(&weights.layers[layer_idx + 1].input_norm)
+                } else {
+                    None
+                };
+                encode_end_of_layer_residual(
+                    &enc,
+                    pipelines,
+                    bufs,
+                    next_norm,
+                    h,
+                    token_count,
+                    eps,
+                )?;
+            }
             enc.end_encoding();
 
             // ── End-of-layer commit ─────────────────────────────

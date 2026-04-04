@@ -122,6 +122,8 @@ pub struct MetalPipelines {
     /// QuIP# matmul kernel.
     pub quip_sharp_matmul: ComputePipeline,
     pub fused_softcap: ComputePipeline,
+    pub ple_gelu_gate: ComputePipeline,
+    pub ple_add_scale: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -204,6 +206,12 @@ impl MetalPipelines {
             .load_library_from_data(include_bytes!(concat!(
                 env!("OUT_DIR"),
                 "/fused_softcap.metallib"
+            )))
+            .map_err(MetalError::Metal)?;
+        let ple_lib = device
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/ple_kernels.metallib"
             )))
             .map_err(MetalError::Metal)?;
         let affine_mm_lib = device
@@ -427,6 +435,20 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &fused_softcap_lib
                         .get_function("fused_softcap")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            ple_gelu_gate: device
+                .create_compute_pipeline(
+                    &ple_lib
+                        .get_function("gelu_gate")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            ple_add_scale: device
+                .create_compute_pipeline(
+                    &ple_lib
+                        .get_function("add_scale")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -1080,6 +1102,58 @@ pub fn encode_fused_softcap(
     encoder.set_bytes(&softcap.to_le_bytes(), 1);
     encoder.set_bytes(&count.to_le_bytes(), 2);
     let threads = count as usize;
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
+    let tg_count = threads.div_ceil(tg_size);
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode GELU-gated element-wise multiply with strided input access:
+///   `output[i] = gelu(gate[i]) * input_slice[token, layer_offset + elem]`.
+///
+/// The `input` buffer has row stride `input_stride` elements and each layer's
+/// slice starts at column `input_offset`.
+pub fn encode_gelu_gate(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    gate: &MetalBuffer,
+    input: &MetalBuffer,
+    output: &MetalBuffer,
+    ple_hidden: u32,
+    token_count: u32,
+    input_stride: u32,
+    input_offset: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(gate, 0, 0);
+    encoder.set_buffer(input, 0, 1);
+    encoder.set_buffer(output, 0, 2);
+    encoder.set_bytes(&ple_hidden.to_le_bytes(), 3);
+    encoder.set_bytes(&token_count.to_le_bytes(), 4);
+    encoder.set_bytes(&input_stride.to_le_bytes(), 5);
+    encoder.set_bytes(&input_offset.to_le_bytes(), 6);
+    let threads = (token_count * ple_hidden) as usize;
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
+    let tg_count = threads.div_ceil(tg_size);
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode add-and-scale: `output[i] = (a[i] + b[i]) * scale`.
+pub fn encode_add_scale(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    a: &MetalBuffer,
+    b: &MetalBuffer,
+    output: &MetalBuffer,
+    size: u32,
+    scale: f32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(a, 0, 0);
+    encoder.set_buffer(b, 0, 1);
+    encoder.set_buffer(output, 0, 2);
+    encoder.set_bytes(&size.to_le_bytes(), 3);
+    encoder.set_bytes(&scale.to_le_bytes(), 4);
+    let threads = size as usize;
     let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
     let tg_count = threads.div_ceil(tg_size);
     encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
