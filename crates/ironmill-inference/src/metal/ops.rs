@@ -607,12 +607,19 @@ impl MetalPipelines {
                     head_dim / 2
                 );
                 let attn_src_raw = include_str!("shaders/attention.metal");
-                let attn_src = format!("{header}{attn_src_raw}");
+                let fused_qk_src = include_str!("shaders/fused_qk_norm_rope.metal");
+                let attn_src = format!("{header}{attn_src_raw}\n{fused_qk_src}");
                 let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
                 let tq_src_raw = include_str!("shaders/turboquant.metal");
                 let tq_src = format!("{header}{tq_helpers}\n{tq_src_raw}");
+                // Reduce SDPA tile sizes for large head dims to fit in 32KB threadgroup memory.
+                let sdpa_tile_defines = if head_dim >= 256 {
+                    "#define SDPA_BR 16\n#define SDPA_BC 16\n"
+                } else {
+                    ""
+                };
                 let sdpa_src_raw = include_str!("shaders/fused_sdpa.metal");
-                let sdpa_src = format!("{header}{sdpa_src_raw}");
+                let sdpa_src = format!("{header}{sdpa_tile_defines}{sdpa_src_raw}");
 
                 let attn = device
                     .compile_shader_source(&attn_src)
