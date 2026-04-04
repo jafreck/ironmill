@@ -15,6 +15,7 @@
 //! is format-agnostic — the caller decides what quantization to apply.
 
 pub mod bundle;
+pub mod streaming;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
