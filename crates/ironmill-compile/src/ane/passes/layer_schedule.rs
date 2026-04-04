@@ -21,6 +21,7 @@ use crate::ane::passes::mixed_precision::{
 // ── Layer type classification ─────────────────────────────────────────
 
 /// The logical layer type assigned to a group of operations.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayerType {
     /// Convolution block (conv, optionally followed by batch_norm and/or relu).

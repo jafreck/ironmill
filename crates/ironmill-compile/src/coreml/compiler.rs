@@ -55,9 +55,9 @@ pub fn compile_model(input: impl AsRef<Path>, output_dir: impl AsRef<Path>) -> R
     }
 
     if !is_compiler_available() {
-        return Err(CompileError::CompilerNotAvailable(
-            "xcrun coremlcompiler not found. Install Xcode or Command Line Tools.".into(),
-        ));
+        return Err(CompileError::CompilerNotAvailable {
+            path: "xcrun coremlcompiler".into(),
+        });
     }
 
     std::fs::create_dir_all(output_dir)?;
@@ -69,10 +69,9 @@ pub fn compile_model(input: impl AsRef<Path>, output_dir: impl AsRef<Path>) -> R
         .output()?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CompileError::CompilerFailed(format!(
-            "coremlcompiler failed: {stderr}"
-        )));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let exit_code = output.status.code().unwrap_or(-1);
+        return Err(CompileError::CompilerFailed { exit_code, stderr });
     }
 
     // The compiled model is placed at output_dir/<stem>.mlmodelc

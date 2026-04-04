@@ -387,7 +387,6 @@ mod tests {
     use crate::weights::{ModelConfig, WeightTensor};
     use ironmill_core::gpu::bundle::{deserialize_model_config, str_to_scalar_type};
     use mil_rs::ir::ScalarType;
-    use std::borrow::Cow;
 
     /// Minimal provider for testing the bundle writer.
     struct MockProvider {
@@ -408,12 +407,8 @@ mod tests {
                 .tensors
                 .get(name)
                 .ok_or_else(|| mil_rs::MilError::UndefinedValue(name.to_string()))?;
-            Ok(WeightTensor {
-                data: Cow::Borrowed(&t.data),
-                shape: t.shape.clone(),
-                dtype: t.dtype,
-                quant_info: t.quant_info.clone(),
-            })
+            Ok(WeightTensor::borrowed(&t.data, t.shape.clone(), t.dtype)
+                .with_quant_info(t.quant_info.clone()))
         }
 
         fn tensor_names(&self) -> Vec<&str> {
@@ -427,21 +422,17 @@ mod tests {
 
     fn test_config() -> ModelConfig {
         use crate::weights::Architecture;
-        ModelConfig {
-            architecture: Architecture::Llama,
-            hidden_size: 2048,
-            intermediate_size: 5504,
-            num_hidden_layers: 2,
-            num_attention_heads: 16,
-            num_key_value_heads: 16,
-            head_dim: 128,
-            vocab_size: 32000,
-            max_position_embeddings: 2048,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
-            tie_word_embeddings: false,
-            extra: HashMap::new(),
-        }
+        ModelConfig::new(Architecture::Llama)
+            .with_hidden_size(2048)
+            .with_intermediate_size(5504)
+            .with_num_hidden_layers(2)
+            .with_num_attention_heads(16)
+            .with_num_key_value_heads(16)
+            .with_head_dim(128)
+            .with_vocab_size(32000)
+            .with_max_position_embeddings(2048)
+            .with_rms_norm_eps(1e-5)
+            .with_rope_theta(10000.0)
     }
 
     fn mock_provider() -> MockProvider {

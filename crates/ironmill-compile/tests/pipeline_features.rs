@@ -6,9 +6,7 @@
 mod common;
 
 use ironmill_compile::ane::passes::{CodebookOptimizationPass, ModelSplitPass, OpSplittingPass};
-use ironmill_compile::convert::pipeline::{
-    PipelineManifest, PipelineMeta, StageConfig, parse_pipeline_manifest,
-};
+use ironmill_compile::convert::pipeline::parse_pipeline_manifest;
 use mil_rs::ir::passes::{Fp16QuantizePass, Int8QuantizePass};
 use mil_rs::{
     Function, Operation, Pass, PassPipeline, Program, ScalarType, TensorData, TensorType, Value,
@@ -664,40 +662,24 @@ depends_on = ["A"]
     // Actually we need to test at the integration level. The validate function
     // is internal, but we can test by creating a program that would cycle.
 
-    // Direct approach: construct a PipelineManifest with a cycle and call
+    // Direct approach: parse a TOML manifest with a cycle and call
     // convert_pipeline which validates internally. Since we don't have real
     // ONNX files, validation will fail on the cycle before reading files.
-    let cyclic_manifest = PipelineManifest {
-        pipeline: PipelineMeta {
-            name: "cyclic".into(),
-        },
-        stages: vec![
-            StageConfig {
-                name: "A".into(),
-                onnx: Some("a.onnx".into()),
-                safetensors: None,
-                gguf: None,
-                component: None,
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec!["B".into()],
-            },
-            StageConfig {
-                name: "B".into(),
-                onnx: Some("b.onnx".into()),
-                safetensors: None,
-                gguf: None,
-                component: None,
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec!["A".into()],
-            },
-        ],
-    };
+    let toml = r#"
+[pipeline]
+name = "cyclic"
+
+[[stages]]
+name = "A"
+onnx = "a.onnx"
+depends_on = ["B"]
+
+[[stages]]
+name = "B"
+onnx = "b.onnx"
+depends_on = ["A"]
+"#;
+    let cyclic_manifest = parse_pipeline_manifest(toml).unwrap();
 
     let err = ironmill_compile::convert::pipeline::convert_pipeline(
         &cyclic_manifest,
@@ -715,37 +697,20 @@ depends_on = ["A"]
 #[test]
 fn pipeline_manifest_missing_dependency() {
     // Manifest referencing a nonexistent stage "C" as a dependency.
-    let manifest = PipelineManifest {
-        pipeline: PipelineMeta {
-            name: "bad-dep".into(),
-        },
-        stages: vec![
-            StageConfig {
-                name: "A".into(),
-                onnx: Some("a.onnx".into()),
-                safetensors: None,
-                gguf: None,
-                component: None,
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec![],
-            },
-            StageConfig {
-                name: "B".into(),
-                onnx: Some("b.onnx".into()),
-                safetensors: None,
-                gguf: None,
-                component: None,
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec!["C".into()],
-            },
-        ],
-    };
+    let toml = r#"
+[pipeline]
+name = "bad-dep"
+
+[[stages]]
+name = "A"
+onnx = "a.onnx"
+
+[[stages]]
+name = "B"
+onnx = "b.onnx"
+depends_on = ["C"]
+"#;
+    let manifest = parse_pipeline_manifest(toml).unwrap();
 
     let err = ironmill_compile::convert::pipeline::convert_pipeline(
         &manifest,

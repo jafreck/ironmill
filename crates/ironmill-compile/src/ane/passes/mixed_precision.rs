@@ -22,6 +22,7 @@ use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
 use mil_rs::ir::{ScalarType, TensorType};
 
 /// Per-operation quantization mode.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpPrecision {
@@ -387,6 +388,7 @@ fn quantize_f32_to_uint8(values: &[f32]) -> (Vec<u8>, f32, f32) {
 // ---------------------------------------------------------------------------
 
 /// Quantization strategy for a single expert (or layer class).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExpertQuantStrategy {

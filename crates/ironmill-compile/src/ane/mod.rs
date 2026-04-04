@@ -10,6 +10,7 @@ pub mod split;
 pub mod validate;
 
 /// Errors produced by the ANE compilation pipeline.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum AneCompileError {
     #[error("ANE compilation failed (status {status}): {context}")]

@@ -427,21 +427,17 @@ mod tests {
     use mil_rs::{Function, Operation, Program, ScalarType, TensorType, Value};
 
     fn dummy_config() -> ModelConfig {
-        ModelConfig {
-            architecture: super::super::Architecture::Llama,
-            hidden_size: 128,
-            intermediate_size: 256,
-            num_hidden_layers: 2,
-            num_attention_heads: 4,
-            num_key_value_heads: 4,
-            head_dim: 32,
-            vocab_size: 1000,
-            max_position_embeddings: 512,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
-            tie_word_embeddings: false,
-            extra: HashMap::new(),
-        }
+        ModelConfig::new(super::super::Architecture::Llama)
+            .with_hidden_size(128)
+            .with_intermediate_size(256)
+            .with_num_hidden_layers(2)
+            .with_num_attention_heads(4)
+            .with_num_key_value_heads(4)
+            .with_head_dim(32)
+            .with_vocab_size(1000)
+            .with_max_position_embeddings(512)
+            .with_rms_norm_eps(1e-5)
+            .with_rope_theta(10000.0)
     }
 
     #[test]

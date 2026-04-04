@@ -1067,19 +1067,15 @@ impl WeightProvider for StubProvider {
 #[cfg(test)]
 pub(super) fn tiny_llama_config() -> ModelConfig {
     use crate::weights::Architecture;
-    ModelConfig {
-        architecture: Architecture::Llama,
-        hidden_size: 64,
-        intermediate_size: 128,
-        num_hidden_layers: 2,
-        num_attention_heads: 4,
-        num_key_value_heads: 4,
-        head_dim: 16,
-        vocab_size: 256,
-        max_position_embeddings: 128,
-        rms_norm_eps: 1e-5,
-        rope_theta: 10000.0,
-        tie_word_embeddings: false,
-        extra: std::collections::HashMap::new(),
-    }
+    ModelConfig::new(Architecture::Llama)
+        .with_hidden_size(64)
+        .with_intermediate_size(128)
+        .with_num_hidden_layers(2)
+        .with_num_attention_heads(4)
+        .with_num_key_value_heads(4)
+        .with_head_dim(16)
+        .with_vocab_size(256)
+        .with_max_position_embeddings(128)
+        .with_rms_norm_eps(1e-5)
+        .with_rope_theta(10000.0)
 }

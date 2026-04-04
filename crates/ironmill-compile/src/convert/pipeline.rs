@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::templates::weights_to_program_component;
+use crate::templates::{ModelComponent, weights_to_program_component};
 use mil_rs::convert::onnx_graph::onnx_to_program;
 use mil_rs::error::{MilError, Result};
 use mil_rs::ir::{PassPipeline, Program};
@@ -52,7 +52,58 @@ use mil_rs::writer::write_mlpackage;
 // TOML manifest types
 // ---------------------------------------------------------------------------
 
+/// Quantization method for a pipeline stage.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StageQuantize {
+    /// No quantization — keep original precision.
+    None,
+    /// Convert to float16.
+    Fp16,
+    /// Quantize to 8-bit integers.
+    Int8,
+    /// Quantize to 4-bit integers.
+    Int4,
+    /// AWQ quantization.
+    Awq,
+    /// GPTQ quantization.
+    Gptq,
+    /// D2Quant quantization.
+    D2Quant,
+    /// Palettization.
+    Palettize,
+    /// PolarQuant quantization.
+    PolarQuant,
+    /// QuIP# quantization.
+    QuipSharp,
+}
+
+impl Default for StageQuantize {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl std::fmt::Display for StageQuantize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Fp16 => write!(f, "fp16"),
+            Self::Int8 => write!(f, "int8"),
+            Self::Int4 => write!(f, "int4"),
+            Self::Awq => write!(f, "awq"),
+            Self::Gptq => write!(f, "gptq"),
+            Self::D2Quant => write!(f, "d2quant"),
+            Self::Palettize => write!(f, "palettize"),
+            Self::PolarQuant => write!(f, "polar-quant"),
+            Self::QuipSharp => write!(f, "quip-sharp"),
+        }
+    }
+}
+
 /// Top-level pipeline manifest parsed from a TOML file.
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct PipelineManifest {
     /// Pipeline metadata.
@@ -69,6 +120,7 @@ pub struct PipelineMeta {
 }
 
 /// Configuration for a single stage in the pipeline.
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct StageConfig {
     /// Unique stage name (used as the output `.mlpackage` stem).
@@ -81,12 +133,10 @@ pub struct StageConfig {
     /// Path to a GGUF file (relative to the manifest directory).
     pub gguf: Option<String>,
     /// Which model component to extract when using `safetensors` or `gguf`.
-    /// Valid values: `"embeddings"`, `"transformer"`, `"lm_head"`.
-    /// If not specified, the full model is built.
-    pub component: Option<String>,
-    /// Quantization mode: `"none"`, `"fp16"`, or `"int8"` (default: `"none"`).
-    #[serde(default = "default_quantize")]
-    pub quantize: String,
+    pub component: Option<ModelComponent>,
+    /// Quantization method for this stage.
+    #[serde(default)]
+    pub quantize: StageQuantize,
     /// Optional calibration data directory for int8 quantization.
     pub cal_data: Option<PathBuf>,
     /// Optional palettization bit-width (2, 4, 6, or 8).
@@ -97,10 +147,6 @@ pub struct StageConfig {
     /// Names of stages this stage depends on (for topology ordering).
     #[serde(default)]
     pub depends_on: Vec<String>,
-}
-
-fn default_quantize() -> String {
-    "none".into()
 }
 
 // ---------------------------------------------------------------------------
@@ -275,13 +321,16 @@ fn convert_stage(stage: &StageConfig, base_dir: &Path) -> Result<(Program, Vec<S
             ))
         })?;
 
-        let result =
-            weights_to_program_component(&provider, stage.component.as_deref()).map_err(|e| {
-                MilError::Validation(format!(
-                    "stage '{}': SafeTensors conversion failed: {e}",
-                    stage.name
-                ))
-            })?;
+        let result = weights_to_program_component(
+            &provider,
+            stage.component.unwrap_or(ModelComponent::Full),
+        )
+        .map_err(|e| {
+            MilError::Validation(format!(
+                "stage '{}': SafeTensors conversion failed: {e}",
+                stage.name
+            ))
+        })?;
 
         Ok((result.program, result.warnings))
     } else if let Some(gguf_path) = &stage.gguf {
@@ -295,13 +344,16 @@ fn convert_stage(stage: &StageConfig, base_dir: &Path) -> Result<(Program, Vec<S
             ))
         })?;
 
-        let result =
-            weights_to_program_component(&provider, stage.component.as_deref()).map_err(|e| {
-                MilError::Validation(format!(
-                    "stage '{}': GGUF conversion failed: {e}",
-                    stage.name
-                ))
-            })?;
+        let result = weights_to_program_component(
+            &provider,
+            stage.component.unwrap_or(ModelComponent::Full),
+        )
+        .map_err(|e| {
+            MilError::Validation(format!(
+                "stage '{}': GGUF conversion failed: {e}",
+                stage.name
+            ))
+        })?;
 
         Ok((result.program, result.warnings))
     } else {
@@ -364,19 +416,6 @@ fn validate_manifest(manifest: &PipelineManifest) -> Result<()> {
             )));
         }
 
-        // Validate component values.
-        if let Some(comp) = &stage.component {
-            match comp.as_str() {
-                "embeddings" | "transformer" | "lm_head" => {}
-                other => {
-                    return Err(MilError::Validation(format!(
-                        "stage '{}': unsupported component '{other}' (expected 'embeddings', 'transformer', or 'lm_head')",
-                        stage.name
-                    )));
-                }
-            }
-        }
-
         for dep in &stage.depends_on {
             if !names.contains(dep.as_str()) {
                 return Err(MilError::Validation(format!(
@@ -392,12 +431,15 @@ fn validate_manifest(manifest: &PipelineManifest) -> Result<()> {
             }
         }
 
-        match stage.quantize.as_str() {
-            "none" | "fp16" | "int8" | "quip-sharp" => {}
-            other => {
+        match stage.quantize {
+            StageQuantize::None
+            | StageQuantize::Fp16
+            | StageQuantize::Int8
+            | StageQuantize::QuipSharp => {}
+            _ => {
                 return Err(MilError::Validation(format!(
-                    "stage '{}': unsupported quantize value '{other}' (expected 'none', 'fp16', 'int8', or 'quip-sharp')",
-                    stage.name
+                    "stage '{}': unsupported quantize value '{:?}' for pipeline conversion",
+                    stage.name, stage.quantize
                 )));
             }
         }
@@ -467,15 +509,15 @@ fn build_stage_pipeline(stage: &StageConfig, base_dir: &Path) -> Result<PassPipe
         pipeline = pipeline.without_fusion();
     }
 
-    match stage.quantize.as_str() {
-        "fp16" => {
+    match stage.quantize {
+        StageQuantize::Fp16 => {
             pipeline = pipeline.with_fp16()?;
         }
-        "int8" => {
+        StageQuantize::Int8 => {
             let cal_data = stage.cal_data.as_ref().map(|p| base_dir.join(p));
             pipeline = pipeline.with_int8(cal_data)?;
         }
-        "quip-sharp" => {
+        StageQuantize::QuipSharp => {
             pipeline = pipeline.with_quip_sharp(2, 42)?;
         }
         _ => {}
@@ -666,7 +708,7 @@ mod tests {
             safetensors: None,
             gguf: None,
             component: None,
-            quantize: "none".into(),
+            quantize: StageQuantize::None,
             cal_data: None,
             palettize: None,
             no_fusion: false,
@@ -694,9 +736,9 @@ depends_on = ["encoder"]
         assert_eq!(manifest.pipeline.name, "test-pipeline");
         assert_eq!(manifest.stages.len(), 2);
         assert_eq!(manifest.stages[0].name, "encoder");
-        assert_eq!(manifest.stages[0].quantize, "fp16");
+        assert_eq!(manifest.stages[0].quantize, StageQuantize::Fp16);
         assert_eq!(manifest.stages[1].name, "decoder");
-        assert_eq!(manifest.stages[1].quantize, "none");
+        assert_eq!(manifest.stages[1].quantize, StageQuantize::None);
         assert_eq!(manifest.stages[1].depends_on, vec!["encoder"]);
     }
 
@@ -716,7 +758,7 @@ depends_on = []
 "#;
         let manifest = parse_pipeline_manifest(toml).unwrap();
         let stage = &manifest.stages[0];
-        assert_eq!(stage.quantize, "int8");
+        assert_eq!(stage.quantize, StageQuantize::Int8);
         assert_eq!(stage.palettize, Some(4));
         assert!(stage.no_fusion);
         assert!(stage.depends_on.is_empty());
@@ -737,7 +779,7 @@ quantize = "fp16"
         let manifest = parse_pipeline_manifest(toml).unwrap();
         let stage = &manifest.stages[0];
         assert_eq!(stage.safetensors, Some("model.safetensors".into()));
-        assert_eq!(stage.component, Some("transformer".into()));
+        assert_eq!(stage.component, Some(ModelComponent::Transformer));
         assert!(stage.onnx.is_none());
         assert!(stage.gguf.is_none());
     }
@@ -756,7 +798,7 @@ component = "embeddings"
         let manifest = parse_pipeline_manifest(toml).unwrap();
         let stage = &manifest.stages[0];
         assert_eq!(stage.gguf, Some("model.gguf".into()));
-        assert_eq!(stage.component, Some("embeddings".into()));
+        assert_eq!(stage.component, Some(ModelComponent::Embeddings));
         assert!(stage.onnx.is_none());
         assert!(stage.safetensors.is_none());
     }
@@ -818,17 +860,19 @@ component = "embeddings"
     }
 
     #[test]
-    fn validate_invalid_quantize() {
-        let mut stage = onnx_stage("a", "a.onnx");
-        stage.quantize = "fp64".into();
-        let manifest = PipelineManifest {
-            pipeline: PipelineMeta {
-                name: "bad-q".into(),
-            },
-            stages: vec![stage],
-        };
-        let err = validate_manifest(&manifest).unwrap_err();
-        assert!(err.to_string().contains("unsupported quantize"));
+    fn validate_invalid_quantize_toml() {
+        // With a typed enum, invalid quantize values are caught at parse time.
+        let toml = r#"
+[pipeline]
+name = "bad-q"
+
+[[stages]]
+name = "a"
+onnx = "a.onnx"
+quantize = "fp64"
+"#;
+        let err = parse_pipeline_manifest(toml);
+        assert!(err.is_err());
     }
 
     #[test]
@@ -843,7 +887,7 @@ component = "embeddings"
                 safetensors: None,
                 gguf: None,
                 component: None,
-                quantize: "none".into(),
+                quantize: StageQuantize::None,
                 cal_data: None,
                 palettize: None,
                 no_fusion: false,
@@ -866,7 +910,7 @@ component = "embeddings"
                 safetensors: Some("a.safetensors".into()),
                 gguf: None,
                 component: None,
-                quantize: "none".into(),
+                quantize: StageQuantize::None,
                 cal_data: None,
                 palettize: None,
                 no_fusion: false,
@@ -880,7 +924,7 @@ component = "embeddings"
     #[test]
     fn validate_component_with_onnx_rejected() {
         let mut stage = onnx_stage("a", "a.onnx");
-        stage.component = Some("transformer".into());
+        stage.component = Some(ModelComponent::Transformer);
         let manifest = PipelineManifest {
             pipeline: PipelineMeta {
                 name: "bad-comp".into(),
@@ -892,26 +936,19 @@ component = "embeddings"
     }
 
     #[test]
-    fn validate_invalid_component() {
-        let manifest = PipelineManifest {
-            pipeline: PipelineMeta {
-                name: "bad-comp".into(),
-            },
-            stages: vec![StageConfig {
-                name: "a".into(),
-                onnx: None,
-                safetensors: Some("model.safetensors".into()),
-                gguf: None,
-                component: Some("invalid_component".into()),
-                quantize: "none".into(),
-                cal_data: None,
-                palettize: None,
-                no_fusion: false,
-                depends_on: vec![],
-            }],
-        };
-        let err = validate_manifest(&manifest).unwrap_err();
-        assert!(err.to_string().contains("unsupported component"));
+    fn validate_invalid_component_toml() {
+        // With a typed enum, invalid components are caught at parse time.
+        let toml = r#"
+[pipeline]
+name = "bad-comp"
+
+[[stages]]
+name = "a"
+safetensors = "model.safetensors"
+component = "invalid_component"
+"#;
+        let err = parse_pipeline_manifest(toml);
+        assert!(err.is_err());
     }
 
     #[test]
@@ -925,8 +962,8 @@ component = "embeddings"
                 onnx: None,
                 safetensors: Some("model.safetensors".into()),
                 gguf: None,
-                component: Some("transformer".into()),
-                quantize: "none".into(),
+                component: Some(ModelComponent::Transformer),
+                quantize: StageQuantize::None,
                 cal_data: None,
                 palettize: None,
                 no_fusion: false,

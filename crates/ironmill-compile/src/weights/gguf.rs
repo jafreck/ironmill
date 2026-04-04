@@ -39,6 +39,7 @@ const ALIGNMENT: usize = 32;
 // ---------------------------------------------------------------------------
 
 /// GGML quantization type tags (matches the GGUF spec).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum GgmlType {

@@ -1261,7 +1261,8 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     // 2. Build MIL program from architecture template
     let ane_mode = opts.ane || matches!(opts.runtime, RuntimeArg::AneDirect);
-    let template_opts = TemplateOptions { ane: ane_mode };
+    let mut template_opts = TemplateOptions::default();
+    template_opts.ane = ane_mode;
 
     println!(
         "Building MIL program from {} template...",

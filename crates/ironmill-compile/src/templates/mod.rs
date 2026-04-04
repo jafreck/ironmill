@@ -13,8 +13,25 @@ pub(crate) mod shared;
 use crate::weights::{Architecture, WeightProvider};
 use mil_rs::MilError;
 use mil_rs::convert::onnx_graph::ConversionResult;
+use serde::Deserialize;
 
-#[derive(Debug, Clone, Default)]
+/// Model component for targeted compilation.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelComponent {
+    /// Full model (default).
+    Full,
+    /// Embedding table only.
+    Embeddings,
+    /// Transformer layers only.
+    Transformer,
+    /// Language model head only.
+    LmHead,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
 pub struct TemplateOptions {
     /// When true, emit ANE-optimized ops:
     /// - Conv2d (1×1) instead of Linear for projections
@@ -22,6 +39,12 @@ pub struct TemplateOptions {
     /// - Static KV-cache state inputs per layer
     /// - Prefill / decode function split
     pub ane: bool,
+}
+
+impl Default for TemplateOptions {
+    fn default() -> Self {
+        Self { ane: false }
+    }
 }
 
 /// Build a MIL IR [`Program`] from a weight provider by dispatching to the
@@ -51,21 +74,18 @@ pub fn weights_to_program_with_options(
 
 /// Build a MIL IR [`Program`] for a specific component of the model.
 ///
-/// When `component` is `None`, the full model is built. When specified,
-/// only the requested component is emitted:
-/// - `"embeddings"` — token embedding layer only
-/// - `"transformer"` — transformer blocks (layers 0..N)
-/// - `"lm_head"` — final norm + language model head
+/// When `component` is [`ModelComponent::Full`], the full model is built.
+/// Otherwise, only the requested component is emitted.
 pub fn weights_to_program_component(
     provider: &dyn WeightProvider,
-    component: Option<&str>,
+    component: ModelComponent,
 ) -> Result<ConversionResult, MilError> {
     match component {
-        None => weights_to_program(provider),
-        Some(comp) => {
+        ModelComponent::Full => weights_to_program(provider),
+        _ => {
             // Build the full program, then extract the requested component.
             let full = weights_to_program(provider)?;
-            extract_component(full, comp, provider.config())
+            extract_component(full, component, provider.config())
         }
     }
 }
@@ -77,7 +97,7 @@ pub fn weights_to_program_component(
 /// For v1, we use a naming-convention heuristic to classify ops.
 fn extract_component(
     result: ConversionResult,
-    component: &str,
+    component: ModelComponent,
     config: &crate::weights::ModelConfig,
 ) -> Result<ConversionResult, MilError> {
     use mil_rs::ir::{Function, Program};
@@ -94,17 +114,19 @@ fn extract_component(
         .map(|op| {
             let name = &op.name;
             match component {
-                "embeddings" => {
+                ModelComponent::Embeddings => {
                     name.contains("embed_tokens")
                         || name == "embed_gather"
                         || name == "embed_out"
                         || name.starts_with("embed_norm")
                 }
-                "transformer" => {
+                ModelComponent::Transformer => {
                     name.starts_with("l") && !name.starts_with("lm_head")
                         || name.starts_with("rope_")
                 }
-                "lm_head" => name.starts_with("final_norm") || name.starts_with("lm_head"),
+                ModelComponent::LmHead => {
+                    name.starts_with("final_norm") || name.starts_with("lm_head")
+                }
                 _ => true,
             }
         })
@@ -119,12 +141,15 @@ fn extract_component(
 
     let mut new_func = Function::new("main");
     // Preserve inputs for embedding/transformer, outputs for lm_head/full
-    if component == "embeddings" || component == "transformer" {
+    if matches!(
+        component,
+        ModelComponent::Embeddings | ModelComponent::Transformer
+    ) {
         for (name, ty) in &func.inputs {
             new_func = new_func.with_input(name, ty.clone());
         }
     }
-    if component == "lm_head" {
+    if component == ModelComponent::LmHead {
         // lm_head takes hidden state as input (Float16, [batch, seq, hidden_size])
         use mil_rs::ir::{ScalarType, TensorType};
         let hidden_ty = TensorType::new(
@@ -150,7 +175,14 @@ fn extract_component(
     if program.is_autoregressive() {
         new_program.set_attribute("autoregressive", "true");
     }
-    new_program.set_attribute("component", component);
+
+    let component_str = match component {
+        ModelComponent::Embeddings => "embeddings",
+        ModelComponent::Transformer => "transformer",
+        ModelComponent::LmHead => "lm_head",
+        _ => "full",
+    };
+    new_program.set_attribute("component", component_str);
 
     Ok(ConversionResult::new(new_program, result.warnings))
 }

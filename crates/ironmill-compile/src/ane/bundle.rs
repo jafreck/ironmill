@@ -86,6 +86,7 @@ pub struct LayerBundle {
 }
 
 /// LM head bundle — can be ANE-chunked or CPU fallback.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum LmHeadBundle {
     /// ANE-accelerated chunked lm_head.

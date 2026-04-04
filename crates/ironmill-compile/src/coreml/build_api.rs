@@ -34,6 +34,7 @@ use mil_rs::writer::write_mlpackage;
 type Result<T> = std::result::Result<T, CompileError>;
 
 /// Quantization mode for model conversion.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Quantization {
     /// No quantization — keep original precision.
@@ -50,6 +51,7 @@ pub enum Quantization {
 /// This controls which hardware the model is eligible to run on.
 /// Unlike [`crate::ir::ComputeUnit`] (which annotates individual operations),
 /// this specifies the model-level deployment target.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TargetComputeUnit {
     /// Run on CPU only.
@@ -91,6 +93,7 @@ pub struct CompileBuilder {
 }
 
 /// Output produced by [`CompileBuilder::build`].
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct BuildOutput {
     /// Path to the generated `.mlpackage`.

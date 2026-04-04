@@ -876,10 +876,7 @@ mod tests {
             "input".into(),
             TensorType::new(ScalarType::Float32, vec![1, 3, 224, 224]),
         ));
-        func.body = Block {
-            operations: ops,
-            outputs: vec!["out".into()],
-        };
+        func.body = Block::with_operations(ops, vec!["out".into()]);
         let mut program = Program::new("1.0.0");
         program.add_function(func);
         program
@@ -933,10 +930,10 @@ mod tests {
                 vec![None, Some(3), Some(224), Some(224)],
             ),
         ));
-        func.body = Block {
-            operations: vec![Operation::new("relu", "relu_0").with_output("out")],
-            outputs: vec!["out".into()],
-        };
+        func.body = Block::with_operations(
+            vec![Operation::new("relu", "relu_0").with_output("out")],
+            vec!["out".into()],
+        );
 
         let mut program = Program::new("1.0.0");
         program.add_function(func);
@@ -991,10 +988,10 @@ mod tests {
             "big".into(),
             TensorType::new(ScalarType::Float32, vec![1, 3, 32768]),
         ));
-        func.body = Block {
-            operations: vec![Operation::new("relu", "r0").with_output("out")],
-            outputs: vec!["out".into()],
-        };
+        func.body = Block::with_operations(
+            vec![Operation::new("relu", "r0").with_output("out")],
+            vec!["out".into()],
+        );
 
         let mut program = Program::new("1.0.0");
         program.add_function(func);
@@ -1017,10 +1014,10 @@ mod tests {
             "input".into(),
             TensorType::new(ScalarType::Float64, vec![1, 10]),
         ));
-        func.body = Block {
-            operations: vec![Operation::new("relu", "r0").with_output("out")],
-            outputs: vec!["out".into()],
-        };
+        func.body = Block::with_operations(
+            vec![Operation::new("relu", "r0").with_output("out")],
+            vec!["out".into()],
+        );
 
         let mut program = Program::new("1.0.0");
         program.add_function(func);
@@ -1151,15 +1148,15 @@ mod tests {
             "input".into(),
             TensorType::new(ScalarType::Float32, vec![1, 128, 32768]),
         ));
-        func.body = Block {
-            operations: vec![
+        func.body = Block::with_operations(
+            vec![
                 Operation::new("matmul", "mm_0")
                     .with_input("x", Value::Reference("input".into()))
                     .with_input("y", Value::Reference("other".into()))
                     .with_output("out"),
             ],
-            outputs: vec!["out".into()],
-        };
+            vec!["out".into()],
+        );
 
         let mut program = Program::new("1.0.0");
         program.add_function(func);
@@ -1185,14 +1182,14 @@ mod tests {
             "input".into(),
             TensorType::new(ScalarType::Float32, vec![1, 128, 512]),
         ));
-        func.body = Block {
-            operations: vec![
+        func.body = Block::with_operations(
+            vec![
                 Operation::new("matmul", "mm_0")
                     .with_input("x", Value::Reference("input".into()))
                     .with_output("out"),
             ],
-            outputs: vec!["out".into()],
-        };
+            vec!["out".into()],
+        );
 
         let mut program = Program::new("1.0.0");
         program.add_function(func);
@@ -1291,14 +1288,14 @@ mod tests {
             "big_tensor".into(),
             TensorType::new(ScalarType::Float32, vec![1, 256, 512]),
         ));
-        func.body = Block {
-            operations: vec![
+        func.body = Block::with_operations(
+            vec![
                 Operation::new("gather", "gather_0")
                     .with_input("x", Value::Reference("big_tensor".into()))
                     .with_output("out"),
             ],
-            outputs: vec!["out".into()],
-        };
+            vec!["out".into()],
+        );
 
         let mut program = Program::new("1.0.0");
         program.add_function(func);
