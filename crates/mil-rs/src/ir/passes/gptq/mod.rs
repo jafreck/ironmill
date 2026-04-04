@@ -88,7 +88,21 @@ impl Pass for GptqQuantizePass {
                 }
 
                 // Only process ops that have Hessian data.
-                let (xtx_orig, n_features, sample_count) = match self.hessian_data.get(&op.name) {
+                // Look up by onnx_name first (canonical HF weight name), then
+                // fall back to op.name (MIL-internal const name).
+                let hessian_entry = self
+                    .hessian_data
+                    .get(
+                        op.attributes
+                            .get("onnx_name")
+                            .and_then(|v| match v {
+                                Value::String(s) if !s.is_empty() => Some(s.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or(&op.name),
+                    )
+                    .or_else(|| self.hessian_data.get(&op.name));
+                let (xtx_orig, n_features, sample_count) = match hessian_entry {
                     Some(v) => v,
                     None => continue,
                 };

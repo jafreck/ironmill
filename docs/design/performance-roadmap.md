@@ -27,13 +27,13 @@ Reference comparison (HuggingFace transformers, CPU FP32, same hardware):
 **Status:** Proposed ([ADR-0001](../adr/0001-fused-sdpa-metal-kernel.md))
 **Expected impact:** 3–5× prefill throughput at ≥2048 tokens
 **Complexity:** High
-**SOTA reference:** FlashAttention-3 (Dao et al., NeurIPS 2024)
+**SOTA reference:** FlashAttention-4 (Dao et al., arXiv 2026); FA3 (NeurIPS 2024) for Metal-applicable tiling
 
 The single largest bottleneck. The current attention kernel dispatches one threadgroup per (head, query), giving O(n²) threadgroup count with severe causal-mask load imbalance. At 8192 tokens the GPU is 73% slower than CPU.
 
-FlashAttention-3 introduces warp-specialization to overlap matmul compute with async memory loads, plus interleaved block-quantized softmax. While FA3's async TMA features are CUDA/Hopper-specific, the core tiling strategy (Q blocks × KV tiles with online softmax, `simdgroup_matrix_multiply_accumulate` for both QK^T and weighted-V) maps directly to Metal's simdgroup matrix hardware.
+FlashAttention-4 is the latest in the FA lineage, co-designing algorithm and kernel pipelining for Blackwell's asymmetric hardware scaling. Key hardware-agnostic insights from FA4: conditional rescaling (only ~10% of softmax output blocks need numerically-stabilizing rescale, reducing work vs always rescaling) and polynomial SFU-free exponential approximation. FA3's core tiling strategy (Q blocks × KV tiles with online softmax) remains the most applicable to Metal's simdgroup matrix hardware, since FA4's async TMA and 2-CTA MMA features are CUDA/Blackwell-specific.
 
-The Metal adaptation should tile over both Q and KV dimensions using 8×8 simdgroup tiles, keeping all intermediate data in SRAM. GQA-aware: multiple Q heads share KV tile loads from the same KV head group.
+The Metal adaptation should tile over both Q and KV dimensions using 8×8 simdgroup tiles, keeping all intermediate data in SRAM. GQA-aware: multiple Q heads share KV tile loads from the same KV head group. Adopt FA4's conditional rescaling to skip unnecessary numerical stabilization passes.
 
 **Target:** ≥800 tok/s at 8192 tokens (matching CPU baseline).
 
@@ -153,12 +153,15 @@ Requires model architecture support (trained with CLA). ironmill detects CLA con
 **Status:** Not implemented
 **Expected impact:** 5–10× KV cache compression vs MHA
 **Complexity:** Medium
-**SOTA reference:** DeepSeek-V2/V3 MLA architecture
+**SOTA reference:** DeepSeek-V2/V3 MLA architecture; FlashMLA (DeepSeek 2025); MHA2MLA (arXiv 2025)
 
-MLA projects keys and values into a shared low-dimensional latent space, storing only the compressed latent per token. During attention, the latent is up-projected on-the-fly. Used by DeepSeek-V2/V3 models. ironmill would need:
+MLA projects keys and values into a shared low-dimensional latent space, storing only the compressed latent per token. During attention, the latent is up-projected on-the-fly. Used by DeepSeek-V2/V3 models. FlashMLA provides optimized CUDA kernels with FP8 cache support and matrix absorption (pre-fusing projection matrices to reduce runtime ops). MHA2MLA demonstrates converting existing MHA models (Llama, Qwen) to MLA via joint low-rank SVD approximation and minimal fine-tuning, achieving 92% KV cache reduction with negligible quality loss — meaning ironmill needn't wait for natively MLA-trained models.
+
+ironmill would need:
 - Detect MLA config in model metadata
 - Store compressed latent KV cache instead of full K/V
-- On-the-fly up-projection in the attention kernel
+- On-the-fly up-projection in the attention kernel (or matrix absorption to eliminate it)
+- Metal-optimized MLA kernel analogous to FlashMLA
 
 ---
 
@@ -191,9 +194,9 @@ This is a "nice to have" behind MLX integration, not a requirement for the Metal
 **Status:** Not implemented
 **Expected impact:** Required for agent and tool-use applications
 **Complexity:** Medium
-**SOTA reference:** Outlines/XGrammar (2025), llama.cpp GBNF grammars
+**SOTA reference:** XGrammar 2 (MLSys 2025)
 
-Constrained generation forces model output to conform to a schema (JSON, XML, function signatures) by masking invalid tokens at each decode step. The SOTA approach (XGrammar) precomputes token validity masks from a context-free grammar, making per-step masking O(1) amortized.
+Constrained generation forces model output to conform to a schema (JSON, XML, function signatures) by masking invalid tokens at each decode step. XGrammar 2 is the current SOTA: it classifies tokens as context-independent (precomputed and cached) vs context-dependent (checked at runtime with a persistent pushdown automaton stack), achieving up to 100× speedup over prior approaches. JIT mask compilation reduces preprocessing from seconds to milliseconds for large grammars. TagDispatch efficiently switches grammar masks on-the-fly for multi-schema tool-calling.
 
 Essential for tool-use agents, structured data extraction, and API response formatting. Composes with all sampling strategies (min-p, temperature, etc.) as an additional logit mask applied before sampling.
 
@@ -218,6 +221,7 @@ Independent (no dependencies, can start immediately):
   ├── #5  KV cache reuse across turns
   ├── #1  Fused SDPA kernel (ADR-0001)
   ├── #6  Sliding window attention
+  ├── #8  Cross-layer KV sharing (CLA)
   ├── #9  MLA support
   └── #12 Structured generation (JSON/grammar)
 
@@ -236,13 +240,11 @@ Depends on #2 (speculative decoding):
 
 Depends on #1 (Fused SDPA) + #5 (KV reuse):
   └── #7  Continuous batching + vAttention
-
-Depends on #9 (MLA):
-  └── #8  Cross-layer KV sharing (CLA)
 ```
 
 ## References
 
+- FlashAttention-4: https://arxiv.org/abs/2603.05451
 - FlashAttention-3: https://arxiv.org/abs/2407.08608
 - EAGLE-3: https://github.com/SafeAILab/EAGLE
 - P-EAGLE: https://vllm.ai/blog/p-eagle
@@ -252,7 +254,10 @@ Depends on #9 (MLA):
 - vAttention: https://arxiv.org/abs/2405.04437
 - CLA: https://arxiv.org/abs/2405.12981
 - FusedKV: https://openreview.net/forum?id=4pivvEJiCl
+- MLA / DeepSeek-V2: https://arxiv.org/abs/2405.04434
+- FlashMLA: https://github.com/deepseek-ai/FlashMLA
+- MHA2MLA: https://arxiv.org/abs/2502.14837
 - TurboSpec: https://www2.eecs.berkeley.edu/Pubs/TechRpts/2025/EECS-2025-224.html
 - Speculative Streaming: https://openreview.net/forum?id=jt8wI3ZzXG
-- XGrammar: https://github.com/mlc-ai/xgrammar
+- XGrammar: https://arxiv.org/abs/2411.15100
 - MLX phase scheduling: https://yage.ai/share/mlx-apple-silicon-en-20260331.html

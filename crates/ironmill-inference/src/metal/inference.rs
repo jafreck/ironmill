@@ -989,6 +989,14 @@ impl MetalInference {
             .as_ref()
             .ok_or(InferenceError::NotLoaded)?
             .clone();
+
+        // Grow intermediate buffers on demand for larger calibration batches.
+        self.intermediate_buffers
+            .as_mut()
+            .ok_or(InferenceError::NotLoaded)?
+            .ensure_capacity(&self.device, token_ids.len(), &mc)
+            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+
         let bufs = self
             .intermediate_buffers
             .as_ref()

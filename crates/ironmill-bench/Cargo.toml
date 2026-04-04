@@ -36,6 +36,7 @@ default = []
 ane-direct = ["dep:ironmill-iosurface"]
 metal = ["ironmill-inference/metal"]
 mlx = ["ironmill-inference/mlx"]
+gptq = ["ironmill-compile/gptq"]
 
 [[example]]
 name = "turboquant_e2e_bench"
