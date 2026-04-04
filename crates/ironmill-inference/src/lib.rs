@@ -5,34 +5,38 @@
 //! types shared across backends.
 
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 
-#[cfg(not(target_os = "macos"))]
-compile_error!("ironmill-inference only supports macOS");
-
-pub mod ane;
+// Core — always available, any platform
 pub mod cache;
 pub mod calibration;
-pub mod coreml;
-#[cfg(any(feature = "metal", feature = "mlx"))]
-mod dequant;
 pub mod engine;
 pub mod generate;
 pub mod grammar;
 pub mod memory;
-#[cfg(feature = "metal")]
-pub mod metal;
-#[cfg(feature = "mlx")]
-pub mod mlx;
 pub mod model_info;
 pub mod sampling;
 pub mod serving;
 pub mod speculative;
 pub mod turboquant;
 pub mod types;
-#[cfg(any(feature = "metal", feature = "mlx"))]
+
+// Platform-specific backends — feature + OS gated
+#[cfg(all(feature = "ane", target_os = "macos"))]
+pub mod ane;
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+pub mod coreml;
+#[cfg(all(any(feature = "metal", feature = "mlx"), target_os = "macos"))]
+mod dequant;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+pub mod mlx;
+#[cfg(all(any(feature = "metal", feature = "mlx"), target_os = "macos"))]
 mod weight_loading;
 
 // Re-exports for convenience.
+#[cfg(all(feature = "ane", target_os = "macos"))]
 pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
 pub use cache::{KvCacheSlice, KvLayerSlice, LinearPrefixCache, LruPolicy, PrefixCache, RadixTree};
 pub use engine::{
@@ -45,7 +49,7 @@ pub use generate::{
 };
 pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 pub use memory::{KvQuantLevel, MemoryEstimator, MemoryUsage, QuantLevel};
-#[cfg(feature = "mlx")]
+#[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use mlx::{MlxArtifacts, MlxConfig, MlxInference};
 pub use model_info::ModelInfo;
 pub use sampling::{
@@ -63,6 +67,7 @@ pub use types::{
 ///
 /// User-facing crates should depend on `ironmill-inference`, not
 /// `ironmill-coreml-sys` directly.
+#[cfg(all(feature = "coreml", target_os = "macos"))]
 pub mod coreml_runtime {
     pub use ironmill_coreml_sys::{
         ComputeUnits, ExtractedOutput, InputDescription, InputFeature, Model, MultiArrayDataType,
@@ -87,9 +92,11 @@ pub mod coreml_runtime {
 // The AneError is shared across the ane submodules and needs to be
 // at the crate level since both ane::device and ane::decode use it.
 
+#[cfg(all(feature = "ane", target_os = "macos"))]
 use ironmill_iosurface::IOSurfaceError;
 
 /// Errors from the ANE runtime backend.
+#[cfg(all(feature = "ane", target_os = "macos"))]
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum AneError {
@@ -114,6 +121,7 @@ pub enum AneError {
     Other(#[from] anyhow::Error),
 }
 
+#[cfg(all(feature = "ane", target_os = "macos"))]
 impl From<IOSurfaceError> for AneError {
     fn from(e: IOSurfaceError) -> Self {
         AneError::SurfaceError(e.to_string())

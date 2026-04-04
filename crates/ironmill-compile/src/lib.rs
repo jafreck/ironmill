@@ -5,6 +5,7 @@
 //! core MIL IR but owns all backend-specific compilation logic.
 
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Backend-agnostic compilation trait and supporting types.
 pub mod compile_target;

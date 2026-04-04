@@ -43,6 +43,7 @@
 //! but cannot be converted to the MIL IR.
 
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 
 /// Analysis passes for MIL IR programs (FLOPs counting, etc.).
 pub mod analysis;

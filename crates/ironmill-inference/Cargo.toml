@@ -24,10 +24,12 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = []
+default = ["coreml", "ane"]
 int4 = []
 metal = ["dep:ironmill-metal-sys"]
 mlx = ["dep:ironmill-mlx-sys"]
+ane = []
+coreml = []
 
 [[example]]
 name = "ane_op_eval"
