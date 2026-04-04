@@ -95,31 +95,30 @@ kernel void polarquant_matmul_int4(
     uint tg_m = group_id.x * TM_TILE;
     uint tg_n = group_id.y * TN_TILE;
 
-    threadgroup half tg_a[TM_TILE * MATMUL_K_TILE];
-    threadgroup half tg_bt[MATMUL_K_TILE * TN_TILE];
+    threadgroup half tg_a[2][TM_TILE * MATMUL_K_TILE];
+    threadgroup half tg_bt[2][MATMUL_K_TILE * TN_TILE];
 
     uint half_K = K / 2;
+    uint num_k_steps = (K + MATMUL_K_TILE - 1) / MATMUL_K_TILE;
 
     simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
     for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
 
-    for (uint k_base = 0; k_base < K; k_base += MATMUL_K_TILE) {
-        // Load A tile [TM_TILE × MATMUL_K_TILE] row-major
+    // Prologue: load first tile into buf[0]
+    {
+        uint k_base = 0;
         for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
             uint m = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
             uint g_row = tg_m + m;
             uint g_col = k_base + k;
-            tg_a[i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+            tg_a[0][i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
         }
-
-        // Load & dequantize B tile, store TRANSPOSED into tg_bt
         for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
             uint n = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
             uint g_n = tg_n + n;
             uint g_k = k_base + k;
-
             half val = half(0);
             if (g_n < N && g_k < K) {
                 uint byte_idx = g_n * half_K + g_k / 2;
@@ -127,17 +126,48 @@ kernel void polarquant_matmul_int4(
                 uchar idx     = (g_k % 2 == 0) ? ((packed >> 4) & 0xF) : (packed & 0xF);
                 val = lut[idx] * norms[g_n];
             }
-            tg_bt[k * TN_TILE + n] = val;
+            tg_bt[0][k * TN_TILE + n] = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Main loop: overlap load[next] with compute[current]
+    for (uint t = 0; t < num_k_steps; t++) {
+        uint cur = t % 2;
+        uint nxt = (t + 1) % 2;
+
+        // Load NEXT tile (if not the last step)
+        if (t + 1 < num_k_steps) {
+            uint k_base = (t + 1) * MATMUL_K_TILE;
+            for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
+                uint m = i / MATMUL_K_TILE;
+                uint k = i % MATMUL_K_TILE;
+                uint g_row = tg_m + m;
+                uint g_col = k_base + k;
+                tg_a[nxt][i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+            }
+            for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
+                uint n = i / MATMUL_K_TILE;
+                uint k = i % MATMUL_K_TILE;
+                uint g_n = tg_n + n;
+                uint g_k = k_base + k;
+                half val = half(0);
+                if (g_n < N && g_k < K) {
+                    uint byte_idx = g_n * half_K + g_k / 2;
+                    uchar packed  = B_packed[byte_idx];
+                    uchar idx     = (g_k % 2 == 0) ? ((packed >> 4) & 0xF) : (packed & 0xF);
+                    val = lut[idx] * norms[g_n];
+                }
+                tg_bt[nxt][k * TN_TILE + n] = val;
+            }
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
+        // Compute on CURRENT tile
         simdgroup_matrix<half, 8, 8> a_mat;
-        simdgroup_load(a_mat, tg_a + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
-
+        simdgroup_load(a_mat, tg_a[cur] + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
         for (uint j = 0; j < TN_BLOCKS; j++) {
             simdgroup_matrix<half, 8, 8> bt_mat;
-            simdgroup_load(bt_mat, tg_bt + j * 8, TN_TILE);
+            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, TN_TILE);
             simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
         }
 
@@ -229,45 +259,74 @@ kernel void polarquant_matmul_int8(
     uint tg_m = group_id.x * TM_TILE;
     uint tg_n = group_id.y * TN_TILE;
 
-    threadgroup half tg_a[TM_TILE * MATMUL_K_TILE];
-    threadgroup half tg_bt[MATMUL_K_TILE * TN_TILE];
+    threadgroup half tg_a[2][TM_TILE * MATMUL_K_TILE];
+    threadgroup half tg_bt[2][MATMUL_K_TILE * TN_TILE];
+
+    uint num_k_steps = (K + MATMUL_K_TILE - 1) / MATMUL_K_TILE;
 
     simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
     for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
 
-    for (uint k_base = 0; k_base < K; k_base += MATMUL_K_TILE) {
-        // Load A tile [TM_TILE × MATMUL_K_TILE] row-major
+    // Prologue: load first tile into buf[0]
+    {
+        uint k_base = 0;
         for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
             uint m = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
             uint g_row = tg_m + m;
             uint g_col = k_base + k;
-            tg_a[i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+            tg_a[0][i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
         }
-
-        // Load & dequantize B tile, store TRANSPOSED into tg_bt
         for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
             uint n = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
             uint g_n = tg_n + n;
             uint g_k = k_base + k;
-
             half val = half(0);
             if (g_n < N && g_k < K) {
                 uchar idx = B_packed[g_n * K + g_k];
                 val = lut[idx] * norms[g_n];
             }
-            tg_bt[k * TN_TILE + n] = val;
+            tg_bt[0][k * TN_TILE + n] = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Main loop: overlap load[next] with compute[current]
+    for (uint t = 0; t < num_k_steps; t++) {
+        uint cur = t % 2;
+        uint nxt = (t + 1) % 2;
+
+        // Load NEXT tile (if not the last step)
+        if (t + 1 < num_k_steps) {
+            uint k_base = (t + 1) * MATMUL_K_TILE;
+            for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += 256) {
+                uint m = i / MATMUL_K_TILE;
+                uint k = i % MATMUL_K_TILE;
+                uint g_row = tg_m + m;
+                uint g_col = k_base + k;
+                tg_a[nxt][i] = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
+            }
+            for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += 256) {
+                uint n = i / MATMUL_K_TILE;
+                uint k = i % MATMUL_K_TILE;
+                uint g_n = tg_n + n;
+                uint g_k = k_base + k;
+                half val = half(0);
+                if (g_n < N && g_k < K) {
+                    uchar idx = B_packed[g_n * K + g_k];
+                    val = lut[idx] * norms[g_n];
+                }
+                tg_bt[nxt][k * TN_TILE + n] = val;
+            }
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
+        // Compute on CURRENT tile
         simdgroup_matrix<half, 8, 8> a_mat;
-        simdgroup_load(a_mat, tg_a + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
-
+        simdgroup_load(a_mat, tg_a[cur] + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
         for (uint j = 0; j < TN_BLOCKS; j++) {
             simdgroup_matrix<half, 8, 8> bt_mat;
-            simdgroup_load(bt_mat, tg_bt + j * 8, TN_TILE);
+            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, TN_TILE);
             simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
         }
 
