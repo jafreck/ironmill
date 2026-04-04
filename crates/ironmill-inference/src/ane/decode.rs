@@ -21,8 +21,12 @@ use super::turboquant::TurboQuantModel;
 use super::turboquant::mil_emitter;
 use super::turboquant::mil_emitter::MIN_IO_SEQ;
 use crate::ane::{AneError, Result};
+use crate::engine::{InferenceEngine, InferenceError};
+use crate::model_info::ModelInfo;
+use crate::types::Logits;
 use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 use mil_rs::ir::ScalarType;
+use mil_rs::weights::Architecture;
 use std::sync::Arc;
 
 use ironmill_iosurface::{AneTensor, uniform_alloc_size};
@@ -113,6 +117,8 @@ pub struct AneInference<D: AneDevice> {
     enable_hybrid: bool,
     /// Pre-allocated scratch buffers for the decode loop.
     scratch: ScratchBuffers,
+    /// Model metadata for the InferenceEngine trait.
+    model_info: ModelInfo,
 }
 
 /// CPU-side weight tensor for embedding/lm_head.
@@ -869,6 +875,21 @@ impl<D: AneDevice> AneInference<D> {
             enable_fusion: false,
             enable_hybrid: false,
             scratch,
+            model_info: ModelInfo {
+                architecture: Architecture::Llama,
+                num_layers,
+                hidden_size: arch.hidden_size,
+                vocab_size: arch.vocab_size,
+                max_context_len: arch.max_seq_len,
+                weight_quantization: String::from("fp16"),
+                eos_tokens: arch.eos_tokens.clone(),
+                param_count_m: 0.0, // not available from bundle manifest
+                uses_gqa: arch.num_kv_heads < arch.num_heads,
+                uses_mla: false,
+                head_dim: arch.head_dim,
+                num_attention_heads: arch.num_heads,
+                num_kv_heads: arch.num_kv_heads,
+            },
         })
     }
 
@@ -1728,6 +1749,50 @@ impl<D: AneDevice> AneInference<D> {
     /// Whether the lm_head runs on ANE (true) or CPU (false).
     pub fn is_ane_lm_head(&self) -> bool {
         matches!(self.lm_head, LmHead::Ane(_))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InferenceEngine implementation
+// ---------------------------------------------------------------------------
+
+impl<D: AneDevice + Send + 'static> InferenceEngine for AneInference<D> {
+    fn prefill(&mut self, tokens: &[u32]) -> std::result::Result<Logits, InferenceError> {
+        AneInference::prefill(self, tokens).map_err(|e| InferenceError::Runtime(e.into()))
+    }
+
+    fn decode_step(&mut self, token: u32) -> std::result::Result<Logits, InferenceError> {
+        self.decode(token)
+            .map_err(|e| InferenceError::Runtime(e.into()))
+    }
+
+    fn reset(&mut self) {
+        AneInference::reset(self);
+    }
+
+    fn seq_pos(&self) -> usize {
+        AneInference::seq_pos(self)
+    }
+
+    fn truncate_to(&mut self, pos: usize) {
+        assert!(pos <= self.seq_pos, "cannot truncate forward");
+        self.seq_pos = pos;
+        // FP16 KV caches are pre-allocated with max_seq_len and written
+        // positionally, so truncation only needs to reset the write pointer.
+        // The stale data beyond `pos` will be overwritten on subsequent decodes.
+        // TurboQuant caches don't support partial truncation — a full reset
+        // is required, which means a subsequent prefill must replay from scratch.
+        if let Some(ref mut tq) = self.turboquant {
+            tq.reset();
+        }
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn model_info(&self) -> &ModelInfo {
+        &self.model_info
     }
 }
 

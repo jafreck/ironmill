@@ -15,6 +15,8 @@ use crate::AneError;
 use crate::ane::bundle_manifest::{BundleManifest, BundleModelType, TensorDescriptorManifest};
 use crate::types::{ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor};
 
+use std::cell::RefCell;
+
 /// Describes an ANE tensor's name, shape, and element type.
 ///
 /// This is the inference-side equivalent of the compile-side TensorDescriptor.
@@ -481,13 +483,18 @@ fn scalar_to_element(dt: ScalarType) -> ElementType {
 }
 
 /// Wraps a loaded [`AneModel`] to implement [`RuntimeModel`].
+///
+/// Uses `RefCell` for interior mutability because `AneModel::predict`
+/// requires `&mut self` (it writes to internal staging buffers) while
+/// `RuntimeModel::predict` takes `&self`.
 pub struct AneRuntimeModel {
-    model: AneModel<HardwareAneDevice>,
+    model: RefCell<AneModel<HardwareAneDevice>>,
 }
 
 impl RuntimeModel for AneRuntimeModel {
     fn input_description(&self) -> Vec<InputFeatureDesc> {
         self.model
+            .borrow()
             .input_description()
             .iter()
             .map(|d| InputFeatureDesc {
@@ -500,20 +507,112 @@ impl RuntimeModel for AneRuntimeModel {
 
     fn predict(
         &self,
-        _inputs: &[RuntimeTensor],
+        inputs: &[RuntimeTensor],
     ) -> std::result::Result<Vec<RuntimeTensor>, crate::engine::InferenceError> {
-        // TODO: ANE RuntimeModel::predict is not yet implemented
-        Err(crate::engine::InferenceError::runtime(
-            "ANE predict through RuntimeModel is not yet implemented — \
-             use AneModel::from_bundle() and AneModel::predict() directly for ANE inference",
-        ))
+        // ANE operates on fp16 IOSurface-backed tensors with 4D shape [1, C, 1, S].
+        // Convert each RuntimeTensor (raw bytes) → AneTensor, run prediction,
+        // then convert the AneTensor outputs back to RuntimeTensor.
+
+        let ane_inputs: Vec<AneTensor> = inputs
+            .iter()
+            .map(|t| {
+                // ANE expects 4D shape [1, C, 1, S]. The RuntimeTensor shape
+                // may be [C, S] or [1, C, 1, S]. Determine C and S.
+                let (channels, seq_len) = match t.shape.len() {
+                    2 => (t.shape[0], t.shape[1]),
+                    4 => (t.shape[1], t.shape[3]),
+                    _ => {
+                        return Err(crate::engine::InferenceError::runtime(format!(
+                            "ANE requires 2D [C,S] or 4D [1,C,1,S] shape, got {:?}",
+                            t.shape
+                        )));
+                    }
+                };
+
+                // Convert raw bytes to f16 values.
+                let f16_data: Vec<half::f16> = match t.dtype {
+                    ElementType::Float16 => t
+                        .data
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
+                        .collect(),
+                    ElementType::Float32 => t
+                        .data
+                        .chunks_exact(4)
+                        .map(|c| {
+                            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                            half::f16::from_f32(v)
+                        })
+                        .collect(),
+                    other => {
+                        return Err(crate::engine::InferenceError::runtime(format!(
+                            "ANE only supports Float16/Float32 inputs, got {:?}",
+                            other
+                        )));
+                    }
+                };
+
+                let mut tensor = AneTensor::new(channels, seq_len, ScalarType::Float16)
+                    .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
+                tensor
+                    .write_f16(&f16_data)
+                    .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
+                Ok(tensor)
+            })
+            .collect::<std::result::Result<Vec<_>, crate::engine::InferenceError>>()?;
+
+        let mut model = self.model.borrow_mut();
+        let output_descs = model.output_description();
+        let ane_outputs = model
+            .predict(&ane_inputs)
+            .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
+
+        // Convert AneTensor outputs → RuntimeTensor.
+        ane_outputs
+            .iter()
+            .enumerate()
+            .map(|(i, tensor)| {
+                let f16_data = tensor
+                    .read_f16()
+                    .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
+                let raw_bytes: Vec<u8> = f16_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let shape_4d = tensor.shape();
+                let name = output_descs
+                    .get(i)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_else(|| format!("output_{i}"));
+                Ok(RuntimeTensor {
+                    name,
+                    data: raw_bytes,
+                    shape: shape_4d.to_vec(),
+                    dtype: ElementType::Float16,
+                })
+            })
+            .collect()
     }
 }
 
-/// ANE direct backend. Since ANE requires a pre-compiled bundle,
-/// this backend is a no-op placeholder that enables uniform backend selection.
-/// Use [`AneModel::from_bundle`] directly for actual ANE execution.
-pub struct AneDirectBackend;
+/// ANE direct backend that loads pre-compiled `.ironml` bundles.
+///
+/// The bundle path must point to a directory containing a `manifest.json`
+/// and compiled sub-program artifacts (as produced by the compile pipeline).
+pub struct AneDirectBackend {
+    config: AneConfig,
+}
+
+impl AneDirectBackend {
+    /// Create a new ANE direct backend with the given configuration.
+    pub fn new(config: AneConfig) -> Self {
+        Self { config }
+    }
+
+    /// Create with default configuration.
+    pub fn with_defaults() -> Self {
+        Self {
+            config: AneConfig::default(),
+        }
+    }
+}
 
 impl RuntimeBackend for AneDirectBackend {
     fn name(&self) -> &str {
@@ -522,12 +621,21 @@ impl RuntimeBackend for AneDirectBackend {
 
     fn load(
         &self,
-        _model_path: &std::path::Path,
+        model_path: &std::path::Path,
     ) -> std::result::Result<Box<dyn RuntimeModel>, crate::engine::InferenceError> {
-        Err(crate::engine::InferenceError::runtime(
-            "ANE direct backend requires a pre-compiled bundle. \
-             Use AneModel::from_bundle() directly.",
-        ))
+        let device = Arc::new(HardwareAneDevice::new().map_err(|e| {
+            crate::engine::InferenceError::runtime(format!("failed to initialize ANE device: {e}"))
+        })?);
+        let model =
+            AneModel::from_bundle(device, model_path, self.config.clone()).map_err(|e| {
+                crate::engine::InferenceError::runtime(format!(
+                    "failed to load ANE bundle from '{}': {e}",
+                    model_path.display()
+                ))
+            })?;
+        Ok(Box::new(AneRuntimeModel {
+            model: RefCell::new(model),
+        }))
     }
 }
 

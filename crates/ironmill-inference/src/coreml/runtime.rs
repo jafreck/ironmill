@@ -62,13 +62,33 @@ impl RuntimeModel for CoremlRuntimeModel {
             pi.add_multi_array(&t.name, &t.shape, MultiArrayDataType::Float32, &data_f32)
                 .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
         }
-        // Run prediction — output features not yet extracted as RuntimeTensor.
-        let _output = self
+        // Run prediction and extract output features as RuntimeTensor values.
+        let output = self
             .model
             .predict(&pi)
             .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
-        // TODO: extract prediction outputs — currently returns empty
-        Ok(vec![])
+
+        // Extract multi-array outputs from the prediction result.
+        let extracted = self
+            .model
+            .extract_outputs(&output)
+            .map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
+
+        let results = extracted
+            .into_iter()
+            .map(|out| {
+                // OutputTensorData contains f32 data; convert to raw bytes.
+                let raw_bytes: Vec<u8> = out.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                RuntimeTensor {
+                    name: out.name,
+                    data: raw_bytes,
+                    shape: out.shape,
+                    dtype: ElementType::Float32,
+                }
+            })
+            .collect();
+
+        Ok(results)
     }
 }
 
