@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 // Core — always available, any platform
+pub mod batch_runner;
 pub mod cache;
 pub mod calibration;
 pub mod engine;
@@ -39,6 +40,7 @@ pub mod mlx;
 mod weight_loading;
 
 // Re-exports for convenience.
+pub use batch_runner::{BatchRunner, BatchRunnerConfig, SchedulingPolicy, SequenceHandle};
 #[cfg(all(feature = "ane", target_os = "macos"))]
 pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
 pub use cache::{KvCacheSlice, KvLayerSlice, LinearPrefixCache, LruPolicy, PrefixCache, RadixTree};
