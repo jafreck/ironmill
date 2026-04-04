@@ -11,6 +11,7 @@ using namespace metal;
 //
 // Uses simdgroup_matrix_multiply_accumulate for hardware-accelerated 8×8
 // matrix multiply with mixed-precision (half inputs, float accumulator).
+// Loads weights transposed so the multiply contracts over K (not N).
 // Weight loads through simdgroup_matrix are coalesced by hardware.
 //
 // Each threadgroup handles ROWS_PER_TG (64) output rows.
@@ -48,21 +49,26 @@ kernel void matvec(
     simdgroup_matrix<float, 8, 8> acc(0);
 
     for (uint kb = 0; kb < n_blocks; kb++) {
-        // Load 8×8 weight tile — coalesced by simdgroup hardware.
-        // w_mat[m, k] = W[row_base + m, kb*8 + k]
-        simdgroup_matrix<half, 8, 8> w_mat;
-        simdgroup_load(w_mat, w_packed + (row_block * n_blocks + kb) * 64, 8);
+        // Load weight tile transposed: w_T[k, m] = W[row_base + m, kb*8 + k].
+        // Transpose converts the row-major 8×8 block into column-major so the
+        // multiply below contracts over the K dimension correctly.
+        simdgroup_matrix<half, 8, 8> w_T;
+        simdgroup_load(w_T, w_packed + (row_block * n_blocks + kb) * 64, 8,
+                       ulong2(0, 0), true);
 
-        // Broadcast x[kb*8..kb*8+8] to all 8 rows (stride=0).
-        // x_mat[k, n] = x[kb*8 + k] for all n.
+        // Broadcast x[kb*8..kb*8+8] as identical rows (stride=0).
+        // x_mat[r, k] = x[kb*8 + k] for all r.
         simdgroup_matrix<half, 8, 8> x_mat;
         simdgroup_load(x_mat, x + kb * TILE_K, 0);
 
-        // D[m, n] = Σ_k W[m, k] × x[k]  (identical for all columns n)
-        simdgroup_multiply_accumulate(acc, w_mat, x_mat, acc);
+        // acc[r, m] += Σ_k x_mat[r, k] × w_T[k, m]
+        //            = Σ_k x[kb*8+k] × W[row_base+m, kb*8+k]
+        // All rows of acc are identical; column m holds the partial dot
+        // product for output row (row_base + m).
+        simdgroup_multiply_accumulate(acc, x_mat, w_T, acc);
     }
 
-    // Extract column 0 from the result (all columns are identical).
+    // All rows of acc are identical. Column m = y[row_base + m].
     threadgroup float tg_result[SIMDGROUPS * 64];
     simdgroup_store(acc, tg_result + sgid * 64, 8);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -71,7 +77,7 @@ kernel void matvec(
         for (uint r = 0; r < ROWS_PER_SG; r++) {
             uint n_row = row_base + r;
             if (n_row < N) {
-                y[n_row] = half(tg_result[sgid * 64 + r * 8]);
+                y[n_row] = half(tg_result[sgid * 64 + r]);
             }
         }
     }
