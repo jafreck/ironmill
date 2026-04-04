@@ -17,3 +17,4 @@ pub use config::{ClaConfig, MetalConfig};
 pub use error::MetalError;
 pub use inference::{MetalArtifacts, MetalInference};
 pub use mla::MlaConfig;
+pub use ops::LinearKernelKind;

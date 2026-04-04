@@ -20,6 +20,7 @@ use super::config::MetalConfig;
 use super::error::MetalError;
 use super::mla::{MlaConfig, MlaKvCache};
 use super::ops;
+use super::ops::LinearKernelKind;
 use super::turboquant::{MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantMetalConfig};
 use super::weights::{
     AffineQuantizedWeight, LayerWeights, MetalWeights, QuantizedWeight, WeightBuffer,
@@ -1043,17 +1044,19 @@ impl MetalInference {
         );
         enc.memory_barrier_buffers();
 
-        // Step 18: LM head matmul
+        // Step 18: LM head — select kernel variant based on prefill/decode phase.
         // Prefer custom matvec/matmul when packed weights exist; fall back
         // to MPS only when there is no packed buffer.
         let row_bytes_h = h * 2;
         let row_bytes_vocab = vocab * 2;
         if let Some(ref packed_buf) = weights.lm_head_packed {
             let pipelines = self.pipelines()?;
-            if token_count == 1 {
+            let lm_kind = LinearKernelKind::for_token_count(token_count);
+            let pipeline = pipelines.dense_linear_pipeline(lm_kind);
+            if lm_kind.is_decode() {
                 ops::encode_matvec(
                     &enc,
-                    &pipelines.matvec,
+                    pipeline,
                     &bufs.norm_out,
                     packed_buf,
                     &bufs.logits,
@@ -1063,7 +1066,7 @@ impl MetalInference {
             } else {
                 ops::encode_matmul(
                     &enc,
-                    &pipelines.matmul,
+                    pipeline,
                     &bufs.norm_out,
                     packed_buf,
                     &bufs.logits,
@@ -1556,7 +1559,7 @@ impl MetalInference {
             enc.end_encoding();
         }
 
-        // Step 18: LM head matmul
+        // Step 18: LM head — select kernel variant based on prefill/decode phase.
         // Prefer custom matvec/matmul when packed weights exist; fall back
         // to MPS only when there is no packed buffer.
         let row_bytes_h = h * 2;
@@ -1566,10 +1569,12 @@ impl MetalInference {
                 .compute_encoder()
                 .map_err(|e| InferenceError::Runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
-            if token_count == 1 {
+            let lm_kind = LinearKernelKind::for_token_count(token_count);
+            let pipeline = pipelines.dense_linear_pipeline(lm_kind);
+            if lm_kind.is_decode() {
                 ops::encode_matvec(
                     &enc,
-                    &pipelines.matvec,
+                    pipeline,
                     &bufs.norm_out,
                     packed_buf,
                     &bufs.logits,
@@ -1579,7 +1584,7 @@ impl MetalInference {
             } else {
                 ops::encode_matmul(
                     &enc,
-                    &pipelines.matmul,
+                    pipeline,
                     &bufs.norm_out,
                     packed_buf,
                     &bufs.logits,
@@ -1767,10 +1772,12 @@ impl ModelConfigExt for ModelConfig {
 
 /// Encode a single Q/K/V-style linear projection.
 ///
-/// Handles all weight representations:
-/// - **Dense + packed (token_count == 1):** custom blocked matvec kernel.
-/// - **Dense (general):** MPS matrix multiplication.
-/// - **Quantized:** PolarQuant compute kernel.
+/// Automatically selects the optimal kernel variant based on `token_count`:
+/// - **Decode (token_count == 1):** memory-bandwidth-optimized matvec kernels.
+/// - **Prefill (token_count > 1):** compute-optimized batched matmul kernels.
+///
+/// This applies uniformly across all weight representations (Dense, PolarQuant,
+/// AffineQuantized).
 fn encode_projection(
     enc: &ComputeEncoder,
     input_buf: &MetalBuffer,
@@ -1785,13 +1792,16 @@ fn encode_projection(
     _row_bytes_in: usize,
     _row_bytes_out: usize,
 ) -> Result<(), InferenceError> {
+    let kernel_kind = LinearKernelKind::for_token_count(token_count);
+
     match weight {
         WeightBuffer::Dense { buf: _, packed } => {
             if let Some(packed_buf) = packed {
-                if token_count == 1 {
+                let pipeline = pipelines.dense_linear_pipeline(kernel_kind);
+                if kernel_kind.is_decode() {
                     ops::encode_matvec(
                         enc,
-                        &pipelines.matvec,
+                        pipeline,
                         input_buf,
                         packed_buf,
                         output_buf,
@@ -1801,7 +1811,7 @@ fn encode_projection(
                 } else {
                     ops::encode_matmul(
                         enc,
-                        &pipelines.matmul,
+                        pipeline,
                         input_buf,
                         packed_buf,
                         output_buf,
@@ -1815,10 +1825,26 @@ fn encode_projection(
             panic!("MPS dense fallback not supported in single-encoder mode");
         }
         WeightBuffer::Quantized(q) => {
-            encode_polarquant_matmul(enc, input_buf, q, output_buf, pipelines, token_count)?;
+            encode_polarquant_projection(
+                enc,
+                input_buf,
+                q,
+                output_buf,
+                pipelines,
+                kernel_kind,
+                token_count,
+            )?;
         }
         WeightBuffer::AffineQuantized(aq) => {
-            encode_affine_matmul(enc, input_buf, aq, output_buf, pipelines, token_count)?;
+            encode_affine_projection(
+                enc,
+                input_buf,
+                aq,
+                output_buf,
+                pipelines,
+                kernel_kind,
+                token_count,
+            )?;
         }
     }
     Ok(())
@@ -1826,33 +1852,25 @@ fn encode_projection(
 
 // ── PolarQuant kernel dispatch ──────────────────────────────────
 
-/// Encode a PolarQuant quantized matmul or matvec via compute kernel.
+/// Encode a PolarQuant quantized projection via compute kernel.
 ///
-/// Dispatches to the correct Metal kernel based on `n_bits` and token count:
-/// - m=1: matvec (one threadgroup per output row)
-/// - m>1: tiled matmul
-fn encode_polarquant_matmul(
+/// Dispatches to the correct Metal kernel based on `n_bits` and kernel kind:
+/// - [`LinearKernelKind::Matvec`]: matvec (one threadgroup per output row)
+/// - [`LinearKernelKind::Matmul`]: tiled matmul with `token_count` rows
+fn encode_polarquant_projection(
     encoder: &ironmill_metal_sys::ComputeEncoder,
     input: &MetalBuffer,
     weight: &QuantizedWeight,
     output: &MetalBuffer,
     pipelines: &super::ops::MetalPipelines,
-    m: usize,
+    kind: LinearKernelKind,
+    token_count: usize,
 ) -> Result<(), InferenceError> {
     let (n, k) = weight.shape; // (out_features, in_features)
 
-    let pipeline = match (weight.n_bits, m) {
-        (4, 1) => &pipelines.polarquant_matvec_int4,
-        (4, _) => &pipelines.polarquant_matmul_int4,
-        (8, 1) => &pipelines.polarquant_matvec_int8,
-        (8, _) => &pipelines.polarquant_matmul_int8,
-        _ => {
-            return Err(InferenceError::Runtime(format!(
-                "unsupported n_bits: {}",
-                weight.n_bits
-            )));
-        }
-    };
+    let pipeline = pipelines
+        .polarquant_pipeline(weight.n_bits, kind)
+        .ok_or_else(|| InferenceError::Runtime(format!("unsupported n_bits: {}", weight.n_bits)))?;
 
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(input, 0, 0);
@@ -1861,7 +1879,7 @@ fn encode_polarquant_matmul(
     encoder.set_buffer(&weight.norms, 0, 3);
     encoder.set_buffer(output, 0, 4);
 
-    if m == 1 {
+    if kind.is_decode() {
         // matvec: one threadgroup per output row
         encoder.set_bytes(&(n as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 6);
@@ -1869,12 +1887,12 @@ fn encode_polarquant_matmul(
         encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
     } else {
         // matmul: simdgroup tiled (column-major dispatch)
-        encoder.set_bytes(&(m as u32).to_le_bytes(), 5);
+        encoder.set_bytes(&(token_count as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 6);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 7);
         encoder.dispatch_threadgroups(
             (
-                (m + MATMUL_TM_TILE - 1) / MATMUL_TM_TILE,
+                (token_count + MATMUL_TM_TILE - 1) / MATMUL_TM_TILE,
                 (n + MATMUL_TN_TILE - 1) / MATMUL_TN_TILE,
                 1,
             ),
@@ -1884,33 +1902,30 @@ fn encode_polarquant_matmul(
     Ok(())
 }
 
-/// Encode a fused affine quantized matmul or matvec via compute kernel.
+/// Encode a fused affine quantized projection via compute kernel.
 ///
-/// Dispatches to the correct Metal kernel based on `bit_width` and token count:
-/// - m=1: matvec (one threadgroup per output row)
-/// - m>1: tiled matmul
-fn encode_affine_matmul(
+/// Dispatches to the correct Metal kernel based on `bit_width` and kernel kind:
+/// - [`LinearKernelKind::Matvec`]: matvec (one threadgroup per output row)
+/// - [`LinearKernelKind::Matmul`]: tiled matmul with `token_count` rows
+fn encode_affine_projection(
     encoder: &ironmill_metal_sys::ComputeEncoder,
     input: &MetalBuffer,
     weight: &AffineQuantizedWeight,
     output: &MetalBuffer,
     pipelines: &super::ops::MetalPipelines,
-    m: usize,
+    kind: LinearKernelKind,
+    token_count: usize,
 ) -> Result<(), InferenceError> {
     let (n, k) = weight.shape;
 
-    let pipeline = match (weight.bit_width, m) {
-        (4, 1) => &pipelines.affine_matvec_int4,
-        (4, _) => &pipelines.affine_matmul_int4,
-        (8, 1) => &pipelines.affine_matvec_int8,
-        (8, _) => &pipelines.affine_matmul_int8,
-        _ => {
-            return Err(InferenceError::Runtime(format!(
+    let pipeline = pipelines
+        .affine_pipeline(weight.bit_width, kind)
+        .ok_or_else(|| {
+            InferenceError::Runtime(format!(
                 "unsupported affine bit_width: {}",
                 weight.bit_width
-            )));
-        }
-    };
+            ))
+        })?;
 
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(input, 0, 0);
@@ -1919,7 +1934,7 @@ fn encode_affine_matmul(
     encoder.set_buffer(&weight.zeros, 0, 3);
     encoder.set_buffer(output, 0, 4);
 
-    if m == 1 {
+    if kind.is_decode() {
         encoder.set_bytes(&(n as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 6);
         encoder.set_bytes(&weight.group_size.to_le_bytes(), 7);
@@ -1935,7 +1950,7 @@ fn encode_affine_matmul(
         let threads_per_group = 32;
         encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
     } else {
-        encoder.set_bytes(&(m as u32).to_le_bytes(), 5);
+        encoder.set_bytes(&(token_count as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 6);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 7);
         encoder.set_bytes(&weight.group_size.to_le_bytes(), 8);
@@ -1948,7 +1963,7 @@ fn encode_affine_matmul(
         encoder.set_bytes(&has_awq.to_le_bytes(), 10);
         encoder.dispatch_threadgroups(
             (
-                (m + MATMUL_TM_TILE - 1) / MATMUL_TM_TILE,
+                (token_count + MATMUL_TM_TILE - 1) / MATMUL_TM_TILE,
                 (n + MATMUL_TN_TILE - 1) / MATMUL_TN_TILE,
                 1,
             ),

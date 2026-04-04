@@ -25,6 +25,39 @@ const ATTENTION_MIN_THREADGROUP_WIDTH: usize = 256;
 /// each, giving 64 rows per threadgroup.
 const MATVEC_ROWS_PER_THREADGROUP: usize = 64;
 
+/// Whether to dispatch a linear projection as a memory-bandwidth-optimized
+/// matvec (single-token decode) or a compute-optimized batched matmul
+/// (multi-token prefill).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearKernelKind {
+    /// Single-token decode: use matvec kernels optimized for memory bandwidth
+    /// (wider threadgroups, coalesced reads, no shared-memory tiling).
+    Matvec,
+    /// Multi-token prefill: use batched matmul kernels that tile across M and N.
+    Matmul,
+}
+
+impl LinearKernelKind {
+    /// Select the optimal kernel variant based on token count.
+    ///
+    /// - `token_count == 1` → [`Matvec`](Self::Matvec) (decode phase, memory-bound)
+    /// - `token_count > 1`  → [`Matmul`](Self::Matmul) (prefill phase, compute-bound)
+    #[inline]
+    pub fn for_token_count(token_count: usize) -> Self {
+        if token_count == 1 {
+            Self::Matvec
+        } else {
+            Self::Matmul
+        }
+    }
+
+    /// Returns `true` when this is the decode (matvec) variant.
+    #[inline]
+    pub fn is_decode(self) -> bool {
+        self == Self::Matvec
+    }
+}
+
 /// All compiled Metal pipeline states for the Metal backend.
 pub struct MetalPipelines {
     pub rms_norm: ComputePipeline,
@@ -452,6 +485,58 @@ impl MetalPipelines {
                     .map_err(MetalError::Metal)?;
                 Ok((attn, tq, sdpa))
             }
+        }
+    }
+
+    // ── Phase-aware pipeline selection ───────────────────────────
+
+    /// Select the FP16 dense linear pipeline (matvec or matmul) based on phase.
+    #[inline]
+    pub fn dense_linear_pipeline(&self, kind: LinearKernelKind) -> &ComputePipeline {
+        match kind {
+            LinearKernelKind::Matvec => &self.matvec,
+            LinearKernelKind::Matmul => &self.matmul,
+        }
+    }
+
+    /// Select the PolarQuant pipeline for a given bit-width and phase.
+    #[inline]
+    pub fn polarquant_pipeline(
+        &self,
+        n_bits: u32,
+        kind: LinearKernelKind,
+    ) -> Option<&ComputePipeline> {
+        match (n_bits, kind) {
+            (4, LinearKernelKind::Matvec) => Some(&self.polarquant_matvec_int4),
+            (4, LinearKernelKind::Matmul) => Some(&self.polarquant_matmul_int4),
+            (8, LinearKernelKind::Matvec) => Some(&self.polarquant_matvec_int8),
+            (8, LinearKernelKind::Matmul) => Some(&self.polarquant_matmul_int8),
+            _ => None,
+        }
+    }
+
+    /// Select the affine-quantized pipeline for a given bit-width and phase.
+    #[inline]
+    pub fn affine_pipeline(
+        &self,
+        bit_width: u32,
+        kind: LinearKernelKind,
+    ) -> Option<&ComputePipeline> {
+        match (bit_width, kind) {
+            (4, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int4),
+            (4, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int4),
+            (8, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int8),
+            (8, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int8),
+            _ => None,
+        }
+    }
+
+    /// Select the QuIP# pipeline for the given phase.
+    #[inline]
+    pub fn quip_sharp_pipeline(&self, kind: LinearKernelKind) -> &ComputePipeline {
+        match kind {
+            LinearKernelKind::Matvec => &self.quip_sharp_matvec,
+            LinearKernelKind::Matmul => &self.quip_sharp_matmul,
         }
     }
 }
