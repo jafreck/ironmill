@@ -1,13 +1,20 @@
 //! Gemma architecture template.
 //!
 //! Builds a MIL IR [`Program`] for the Gemma model family (Gemma, Gemma 2,
-//! Gemma 3) from weight tensors provided by a [`WeightProvider`].
+//! Gemma 3, Gemma 4) from weight tensors provided by a [`WeightProvider`].
 //!
 //! Key differences from LLaMA:
 //! - GELU activation in MLP instead of SiLU
 //! - Embedding output is normalized by multiplying by sqrt(hidden_size)
 //! - May use sliding window attention on alternating layers
 //! - Uses RMSNorm (same as LLaMA/Qwen)
+//!
+//! Gemma 4 extensions:
+//! - Per-layer attention types (sliding vs global) with different RoPE and head dims
+//! - Per-Layer Embeddings (PLE)
+//! - KV shared layers with anchor mapping
+//! - Double-wide MLP on shared layers
+//! - Final logit softcapping
 
 use crate::weights::WeightProvider;
 use mil_rs::MilError;
@@ -15,8 +22,9 @@ use mil_rs::convert::onnx_graph::ConversionResult;
 use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 
 use super::shared::{
-    LayerContext, emit_attention, emit_embedding, emit_lm_head, emit_mlp_gelu, emit_residual_add,
-    emit_rms_norm, emit_rope_tables,
+    LayerContext, emit_attention, emit_embedding, emit_gather, emit_linear, emit_lm_head,
+    emit_mlp_gelu, emit_residual_add, emit_rms_norm, emit_rope_tables,
+    emit_rope_tables_with_params,
 };
 
 /// Build a complete MIL [`Program`] for a Gemma-family model.
@@ -24,19 +32,77 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
     let config = provider.config().clone();
     let mut warnings: Vec<String> = Vec::new();
 
+    // Guard against Phase 3 MoE (not yet implemented)
+    if config
+        .extra
+        .get("enable_moe_block")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(MilError::Validation(
+            "Gemma 4 MoE (enable_moe_block=true) is not yet supported".into(),
+        ));
+    }
+
     let seq_len: Option<usize> = None; // dynamic
     let batch: Option<usize> = Some(1);
 
-    // Record sliding window configuration for the runtime.
-    // The MIL graph emits standard full-context attention; actual sliding-window
-    // masking is applied by the inference runtime using this attribute. This is
-    // intentional — the graph structure is identical, only the mask differs.
-    let sliding_window: Option<usize> = config
-        .extra
-        .get("sliding_window")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    // Check for sliding window configuration.
+    let sliding_window: Option<usize> = config.sliding_window();
 
+    if sliding_window.is_some() {
+        warnings.push(
+            "sliding_window attention on alternating layers is noted but mask handling is caller-provided"
+                .into(),
+        );
+    }
+
+    // Gemma 4: check for per-layer attention types
+    let layer_types = config.layer_types();
+    let rope_params = config.rope_parameters();
+
+    // KV shared layers: precompute anchor mapping
+    let num_kv_shared = config
+        .extra
+        .get("num_kv_shared_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let first_shared_idx = config.num_hidden_layers.saturating_sub(num_kv_shared);
+    let mut kv_anchor: Vec<Option<usize>> = vec![None; config.num_hidden_layers];
+    if num_kv_shared > 0 {
+        if let Some(ref lts) = layer_types {
+            let prev = &lts[..first_shared_idx];
+            for layer_idx in first_shared_idx..config.num_hidden_layers {
+                let lt = &lts[layer_idx];
+                kv_anchor[layer_idx] = prev.iter().rposition(|t| t == lt);
+            }
+        }
+    }
+
+    // PLE config
+    let ple_hidden_size = config
+        .extra
+        .get("hidden_size_per_layer_input")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let ple_vocab_size = config
+        .extra
+        .get("vocab_size_per_layer_input")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    // Double-wide MLP config
+    let use_double_wide_mlp = config
+        .extra
+        .get("use_double_wide_mlp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Final logit softcapping
+    let final_logit_softcapping = config
+        .extra
+        .get("final_logit_softcapping")
+        .and_then(|v| v.as_f64());
     // Build the main function with typed inputs.
     let input_ids_ty = TensorType::with_dynamic_shape(ScalarType::Int32, vec![batch, seq_len]);
     let position_ids_ty = TensorType::with_dynamic_shape(ScalarType::Int32, vec![batch, seq_len]);
@@ -56,23 +122,170 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
     // Gemma-specific: normalize embeddings by multiplying by sqrt(hidden_size).
     let embed_normed = emit_embedding_norm(block, &config, &embed_out);
 
-    // Precompute RoPE cos/sin tables.
-    let (rope_cos, rope_sin) = emit_rope_tables(block, &config);
+    // Emit RoPE tables — Gemma 4 needs separate tables per attention type
+    let (default_cos, default_sin, global_cos, global_sin) = if let Some(ref rp) = rope_params {
+        let (sc, ss) = if let Some(cfg) = rp.get("sliding_attention") {
+            emit_rope_tables_with_params(
+                block,
+                config.head_dim,
+                config.max_position_embeddings,
+                cfg.theta,
+                cfg.partial_rotary_factor,
+                "rope_sliding",
+            )
+        } else {
+            emit_rope_tables(block, &config)
+        };
+        let global_head_dim = config.global_head_dim();
+        let (gc, gs) = if let Some(cfg) = rp.get("full_attention") {
+            emit_rope_tables_with_params(
+                block,
+                global_head_dim,
+                config.max_position_embeddings,
+                cfg.theta,
+                cfg.partial_rotary_factor,
+                "rope_global",
+            )
+        } else {
+            (sc.clone(), ss.clone())
+        };
+        (sc, ss, Some(gc), Some(gs))
+    } else {
+        let (c, s) = emit_rope_tables(block, &config);
+        (c, s, None, None)
+    };
+
+    // PLE model-level computation (before layer loop)
+    let per_layer_inputs = if ple_hidden_size > 0 && ple_vocab_size > 0 {
+        // 1. Gather from embed_tokens_per_layer using input_ids
+        let ple_embed = emit_gather(
+            block,
+            provider,
+            "model.embed_tokens_per_layer",
+            "input_ids",
+            "ple_embed",
+            &mut warnings,
+        )?;
+
+        // 2. Project inputs_embeds via per_layer_model_projection
+        let ple_proj = emit_linear(
+            block,
+            provider,
+            "model.per_layer_model_projection",
+            &embed_normed,
+            "ple_proj",
+            &mut warnings,
+        )?;
+
+        // 3. Apply per_layer_projection_norm (RMSNorm)
+        let ple_proj_normed = emit_rms_norm(
+            block,
+            provider,
+            &config,
+            "model.per_layer_projection_norm",
+            &ple_proj,
+            "ple_proj_norm",
+            &mut warnings,
+        )?;
+
+        // 4. Sum: embed + proj
+        let ple_sum = emit_residual_add(block, &ple_embed, &ple_proj_normed, "ple_sum");
+
+        // 5. Scale by 2^(-0.5) = 0.7071067811865476
+        let scale_const = "ple_scale_const".to_string();
+        let op = Operation::new("const", &scale_const)
+            .with_attr("val", Value::Float(std::f64::consts::FRAC_1_SQRT_2))
+            .with_output(&scale_const);
+        block.add_op(op);
+
+        let ple_scaled = "ple_scaled".to_string();
+        let op = Operation::new("mul", "ple_scale_op")
+            .with_input("x", Value::Reference(ple_sum))
+            .with_input("y", Value::Reference(scale_const))
+            .with_output(&ple_scaled);
+        block.add_op(op);
+
+        Some(ple_scaled)
+    } else {
+        None
+    };
 
     // Transformer layers.
     let mut hidden = embed_normed;
     for layer_idx in 0..config.num_hidden_layers {
+        let lt = layer_types.as_ref().map(|lts| lts[layer_idx].as_str());
+        let is_global = lt == Some("full_attention");
+
+        // Select per-layer RoPE tables
+        let (eff_cos, eff_sin) = if is_global {
+            (
+                global_cos.as_deref().unwrap_or(&default_cos),
+                global_sin.as_deref().unwrap_or(&default_sin),
+            )
+        } else {
+            (default_cos.as_str(), default_sin.as_str())
+        };
+        let eff_head_dim = if is_global {
+            config.global_head_dim()
+        } else {
+            config.head_dim
+        };
+        let eff_num_kv_heads = if is_global {
+            config.num_global_key_value_heads()
+        } else {
+            config.num_key_value_heads
+        };
+
+        // KV shared layers: skip K/V projection for shared layers
+        let is_kv_shared = num_kv_shared > 0 && layer_idx >= first_shared_idx;
+
+        // Double-wide MLP: layers in the shared region use 2x intermediate_size
+        let _effective_intermediate = if use_double_wide_mlp && is_kv_shared {
+            config.intermediate_size * 2
+        } else {
+            config.intermediate_size
+        };
+
         let ctx = LayerContext {
             provider,
             config: &config,
             layer_idx,
-            rope_cos: &rope_cos,
-            rope_sin: &rope_sin,
-            layer_type: None,
-            effective_head_dim: config.head_dim,
-            effective_num_kv_heads: config.num_key_value_heads,
+            rope_cos: eff_cos,
+            rope_sin: eff_sin,
+            layer_type: lt,
+            effective_head_dim: eff_head_dim,
+            effective_num_kv_heads: eff_num_kv_heads,
         };
-        hidden = emit_gemma_transformer_layer(block, &ctx, &hidden, &mut warnings)?;
+
+        // Per-layer PLE input slice (if PLE is active)
+        let ple_layer_input = per_layer_inputs.as_ref().map(|pli| {
+            let slice_name = format!("ple_layer_{layer_idx}_slice");
+            let start = layer_idx * ple_hidden_size;
+            let end = start + ple_hidden_size;
+            let op = Operation::new("slice_by_index", format!("ple_layer_{layer_idx}_slice_op"))
+                .with_input("x", Value::Reference(pli.clone()))
+                .with_attr(
+                    "begin",
+                    Value::List(vec![Value::Int(0), Value::Int(0), Value::Int(start as i64)]),
+                )
+                .with_attr(
+                    "end",
+                    Value::List(vec![Value::Int(-1), Value::Int(-1), Value::Int(end as i64)]),
+                )
+                .with_output(&slice_name);
+            block.add_op(op);
+            slice_name
+        });
+
+        hidden = emit_gemma4_transformer_layer(
+            block,
+            &ctx,
+            &hidden,
+            kv_anchor[layer_idx],
+            ple_layer_input.as_deref(),
+            ple_hidden_size,
+            &mut warnings,
+        )?;
     }
 
     // Final RMSNorm.
@@ -89,7 +302,49 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
     // LM head projection.
     let logits = emit_lm_head(block, provider, &config, &normed, &mut warnings)?;
 
-    block.outputs.push(logits);
+    // Final logit softcapping: logits = softcap * tanh(logits / softcap)
+    let final_output = if let Some(softcap) = final_logit_softcapping {
+        let cap_const = "softcap_const".to_string();
+        let op = Operation::new("const", &cap_const)
+            .with_attr("val", Value::Float(softcap))
+            .with_output(&cap_const);
+        block.add_op(op);
+
+        let inv_cap_const = "inv_softcap_const".to_string();
+        let op = Operation::new("const", &inv_cap_const)
+            .with_attr("val", Value::Float(1.0 / softcap))
+            .with_output(&inv_cap_const);
+        block.add_op(op);
+
+        // logits / softcap
+        let scaled = "logits_prescale".to_string();
+        let op = Operation::new("mul", "softcap_prescale_op")
+            .with_input("x", Value::Reference(logits))
+            .with_input("y", Value::Reference(inv_cap_const))
+            .with_output(&scaled);
+        block.add_op(op);
+
+        // tanh
+        let tanh_out = "logits_tanh".to_string();
+        let op = Operation::new("tanh", "softcap_tanh_op")
+            .with_input("x", Value::Reference(scaled))
+            .with_output(&tanh_out);
+        block.add_op(op);
+
+        // * softcap
+        let capped = "logits_capped".to_string();
+        let op = Operation::new("mul", "softcap_scale_op")
+            .with_input("x", Value::Reference(tanh_out))
+            .with_input("y", Value::Reference(cap_const))
+            .with_output(&capped);
+        block.add_op(op);
+
+        capped
+    } else {
+        logits
+    };
+
+    block.outputs.push(final_output);
 
     let mut program = Program::new("1");
     program.add_function(func);
@@ -97,6 +352,12 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
 
     if let Some(sw) = sliding_window {
         program.set_attribute("sliding_window", sw.to_string());
+    }
+
+    // Emit layer_types as program attribute for inference
+    if let Some(ref lts) = layer_types {
+        let types_str = lts.join(",");
+        program.set_attribute("layer_types", types_str);
     }
 
     Ok(ConversionResult::new(program, warnings))
@@ -132,15 +393,22 @@ fn emit_embedding_norm(
 // Gemma transformer layer
 // ---------------------------------------------------------------------------
 
-/// Emit a Gemma transformer layer.
-/// Same structure as LLaMA but uses GELU activation in MLP.
-fn emit_gemma_transformer_layer(
+/// Emit a Gemma transformer layer with Gemma 4 feature support.
+///
+/// Handles standard Gemma layers and Gemma 4 extensions (KV sharing,
+/// PLE, double-wide MLP). When Gemma 4 features are not configured,
+/// behaves identically to the original Gemma layer.
+fn emit_gemma4_transformer_layer(
     block: &mut Block,
     ctx: &LayerContext<'_>,
     input: &str,
+    _kv_anchor: Option<usize>,
+    ple_input: Option<&str>,
+    _ple_hidden_size: usize,
     warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
-    let prefix = format!("model.layers.{}", ctx.layer_idx);
+    let layer_idx = ctx.layer_idx;
+    let prefix = format!("model.layers.{layer_idx}");
 
     // 1. Input RMSNorm
     let normed_attn = emit_rms_norm(
@@ -149,11 +417,12 @@ fn emit_gemma_transformer_layer(
         ctx.config,
         &format!("{prefix}.input_layernorm"),
         input,
-        &format!("l{}_input_norm", ctx.layer_idx),
+        &format!("l{layer_idx}_input_norm"),
         warnings,
     )?;
 
-    // 2. Self-attention (standard LLaMA-style, no bias)
+    // 2. Self-attention
+    // KV reuse from anchor layers is an inference-time concern, not IR-level.
     let attn_out = emit_attention(block, ctx, &normed_attn, warnings)?;
 
     // 3. Residual add
@@ -161,7 +430,7 @@ fn emit_gemma_transformer_layer(
         block,
         input,
         &attn_out,
-        &format!("l{}_post_attn_residual", ctx.layer_idx),
+        &format!("l{layer_idx}_post_attn_residual"),
     );
 
     // 4. Post-attention RMSNorm
@@ -171,27 +440,89 @@ fn emit_gemma_transformer_layer(
         ctx.config,
         &format!("{prefix}.post_attention_layernorm"),
         &post_attn,
-        &format!("l{}_post_attn_norm", ctx.layer_idx),
+        &format!("l{layer_idx}_post_attn_norm"),
         warnings,
     )?;
 
-    // 5. MLP with GELU activation (Gemma-specific)
+    // 5. MLP with GELU activation
+    // Double-wide MLP: the weight tensors already have the correct shape,
+    // so emit_mlp_gelu loads whatever shape the provider has.
     let mlp_out = emit_mlp_gelu(
         block,
         ctx.provider,
         ctx.config,
-        ctx.layer_idx,
+        layer_idx,
         &normed_mlp,
         warnings,
     )?;
 
     // 6. Residual add
-    let layer_out = emit_residual_add(
-        block,
-        &post_attn,
-        &mlp_out,
-        &format!("l{}_output", ctx.layer_idx),
-    );
+    let post_mlp = emit_residual_add(block, &post_attn, &mlp_out, &format!("l{layer_idx}_output"));
+
+    // 7. Per-Layer Embedding (PLE) — applied AFTER the FFN block
+    let layer_out = if let Some(ple_slice) = ple_input {
+        // Gate: linear [hidden_size → ple_hidden_size]
+        let gate = emit_linear(
+            block,
+            ctx.provider,
+            &format!("{prefix}.per_layer_input_gate"),
+            &post_mlp,
+            &format!("l{layer_idx}_ple_gate"),
+            warnings,
+        )?;
+
+        // Activation (gelu)
+        let gate_act = {
+            let out_name = format!("l{layer_idx}_ple_gelu");
+            let op = Operation::new("gelu", format!("l{layer_idx}_ple_gelu_op"))
+                .with_input("x", Value::Reference(gate))
+                .with_output(&out_name);
+            block.add_op(op);
+            out_name
+        };
+
+        // Element-wise multiply with per_layer_input slice
+        let gated = {
+            let out_name = format!("l{layer_idx}_ple_gated");
+            let op = Operation::new("mul", format!("l{layer_idx}_ple_mul_op"))
+                .with_input("x", Value::Reference(gate_act))
+                .with_input("y", Value::Reference(ple_slice.to_string()))
+                .with_output(&out_name);
+            block.add_op(op);
+            out_name
+        };
+
+        // Project back: linear [ple_hidden_size → hidden_size]
+        let projected = emit_linear(
+            block,
+            ctx.provider,
+            &format!("{prefix}.per_layer_projection"),
+            &gated,
+            &format!("l{layer_idx}_ple_proj"),
+            warnings,
+        )?;
+
+        // Post-PLE RMSNorm
+        let ple_normed = emit_rms_norm(
+            block,
+            ctx.provider,
+            ctx.config,
+            &format!("{prefix}.post_per_layer_input_norm"),
+            &projected,
+            &format!("l{layer_idx}_ple_norm"),
+            warnings,
+        )?;
+
+        // Residual add
+        emit_residual_add(
+            block,
+            &post_mlp,
+            &ple_normed,
+            &format!("l{layer_idx}_ple_output"),
+        )
+    } else {
+        post_mlp
+    };
 
     Ok(layer_out)
 }
@@ -371,5 +702,60 @@ mod tests {
             lm_head.inputs.get("weight"),
             Some(&Value::Reference("embed_tokens_weight".into()))
         );
+    }
+
+    #[test]
+    fn build_program_gemma4_rejects_moe() {
+        let mut config = tiny_gemma_config();
+        config
+            .extra
+            .insert("enable_moe_block".into(), serde_json::json!(true));
+        let provider = StubProvider::new(config).with_llama_weights();
+        let err = build_program(&provider).unwrap_err();
+        assert!(err.to_string().contains("MoE"), "should reject MoE config");
+    }
+
+    #[test]
+    fn build_program_gemma4_with_layer_types() {
+        let mut config = tiny_gemma_config();
+        config.extra.insert(
+            "layer_types".into(),
+            serde_json::json!(["sliding_attention", "full_attention"]),
+        );
+        config.extra.insert(
+            "rope_parameters".into(),
+            serde_json::json!({
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0}
+            }),
+        );
+        config.num_hidden_layers = 2;
+        let provider = StubProvider::new(config).with_llama_weights();
+        let result = build_program(&provider).expect("Gemma 4 build should succeed");
+        assert_eq!(result.program.functions.len(), 1);
+        assert_eq!(
+            result.program.attributes.get("layer_types"),
+            Some(&"sliding_attention,full_attention".to_string())
+        );
+    }
+
+    #[test]
+    fn build_program_gemma4_with_softcapping() {
+        let mut config = tiny_gemma_config();
+        config
+            .extra
+            .insert("final_logit_softcapping".into(), serde_json::json!(30.0));
+        let provider = StubProvider::new(config).with_llama_weights();
+        let result = build_program(&provider).expect("softcapping build should succeed");
+        let main = result.program.main().unwrap();
+        let has_tanh = main.body.operations.iter().any(|op| op.op_type == "tanh");
+        assert!(has_tanh, "softcapping should emit tanh op");
+    }
+
+    #[test]
+    fn build_program_gemma4_model_type_accepted() {
+        use std::str::FromStr;
+        assert!(Architecture::from_str("gemma4").is_ok());
+        assert!(Architecture::from_str("gemma4_text").is_ok());
     }
 }
