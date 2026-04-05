@@ -29,14 +29,14 @@ const INLINE_THRESHOLD_BYTES: usize = 4096;
 
 /// Emit a weight tensor as a `const` op in the block.
 ///
-/// If the weight is missing, a placeholder const is emitted and a warning
-/// is pushed so the graph remains structurally valid.
+/// Returns an error if the weight is missing from the provider.
+/// Large tensors (above `INLINE_THRESHOLD_BYTES`) are emitted as
+/// `TensorData::External` references for lazy resolution by passes.
 pub(super) fn emit_weight_const(
     block: &mut Block,
     provider: &dyn WeightProvider,
     weight_name: &str,
     const_name: &str,
-    _warnings: &mut Vec<String>,
 ) -> Result<(), MilError> {
     match provider.tensor(weight_name) {
         Ok(tensor) => {
@@ -79,17 +79,17 @@ pub(super) fn emit_linear(
     weight_prefix: &str,
     input: &str,
     op_prefix: &str,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let weight_name = format!("{weight_prefix}.weight");
     let weight_const = format!("{op_prefix}_weight");
-    emit_weight_const(block, provider, &weight_name, &weight_const, warnings)?;
+    emit_weight_const(block, provider, &weight_name, &weight_const)?;
 
     let bias_name = format!("{weight_prefix}.bias");
     let has_bias = provider.has_tensor(&bias_name);
     if has_bias {
         let bias_const = format!("{op_prefix}_bias");
-        emit_weight_const(block, provider, &bias_name, &bias_const, warnings)?;
+        emit_weight_const(block, provider, &bias_name, &bias_const)?;
     }
 
     let out_name = format!("{op_prefix}_out");
@@ -119,11 +119,11 @@ pub(super) fn emit_rms_norm(
     weight_prefix: &str,
     input: &str,
     op_prefix: &str,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let weight_name = format!("{weight_prefix}.weight");
     let weight_const = format!("{op_prefix}_weight");
-    emit_weight_const(block, provider, &weight_name, &weight_const, warnings)?;
+    emit_weight_const(block, provider, &weight_name, &weight_const)?;
 
     let out_name = format!("{op_prefix}_out");
     let op = Operation::new("rms_norm", format!("{op_prefix}_op"))
@@ -494,11 +494,11 @@ pub(super) fn emit_embedding(
     block: &mut Block,
     provider: &dyn WeightProvider,
     _config: &ModelConfig,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let weight_name = "model.embed_tokens.weight";
     let const_name = "embed_tokens_weight";
-    emit_weight_const(block, provider, weight_name, const_name, warnings)?;
+    emit_weight_const(block, provider, weight_name, const_name)?;
 
     let out_name = "embed_out".to_string();
     let gather = Operation::new("gather", "embed_gather")

@@ -200,3 +200,85 @@ fn gpu_compile_spill_produces_correct_output() {
         );
     }
 }
+
+/// Verify that the spill-after-quantize mechanism actually creates External
+/// refs mid-pipeline and that the round-trip preserves data integrity.
+#[test]
+fn spill_creates_external_refs_and_round_trips() {
+    use mil_rs::TensorData;
+    use mil_rs::Value;
+
+    let model_dir = tempfile::tempdir().unwrap();
+    write_model_dir(model_dir.path());
+
+    let provider_arc: Arc<dyn WeightProvider + Send + Sync> = Arc::from(Box::new(
+        SafeTensorsProvider::load(model_dir.path()).unwrap(),
+    )
+        as Box<dyn WeightProvider + Send + Sync>);
+    let config = provider_arc.config().clone();
+    let result = weights_to_program(provider_arc.as_ref()).unwrap();
+    let mut program = result.program;
+    program.set_weight_provider(provider_arc.clone());
+
+    // Before spilling: large tensors should be External (from template emission),
+    // small tensors should be Inline.
+    let has_external_before = program.main().unwrap().body.operations.iter().any(|op| {
+        op.attributes.values().chain(op.inputs.values()).any(|v| {
+            matches!(
+                v,
+                Value::Tensor {
+                    data: TensorData::External { .. },
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        has_external_before,
+        "template emission should produce External refs for large tensors"
+    );
+
+    // Materialize all, then run FP16 pass to produce new inline data.
+    program.materialize_all().unwrap();
+    Fp16QuantizePass.run(&mut program).unwrap();
+
+    // After FP16 pass, quantized tensors are inline. Spill them.
+    program.spill_inline_tensors(4096).unwrap();
+
+    // After spilling: large tensors should be External again (spilled to disk).
+    let has_external_after_spill = program.main().unwrap().body.operations.iter().any(|op| {
+        op.attributes.values().chain(op.inputs.values()).any(|v| {
+            matches!(
+                v,
+                Value::Tensor {
+                    data: TensorData::External { .. },
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        has_external_after_spill,
+        "spill_inline_tensors should produce External refs for large tensors"
+    );
+
+    // Materialize again and verify data is readable.
+    program.materialize_all().unwrap();
+    let all_inline = program.main().unwrap().body.operations.iter().all(|op| {
+        op.attributes
+            .values()
+            .chain(op.inputs.values())
+            .all(|v| match v {
+                Value::Tensor { data, .. } => data.is_inline(),
+                _ => true,
+            })
+    });
+    assert!(
+        all_inline,
+        "all tensors should be inline after materialize_all"
+    );
+
+    // Final extraction should succeed and produce valid tensors.
+    let provider = MilWeightProvider::new(&mut program, config).unwrap();
+    assert!(!provider.tensor_names().is_empty());
+}

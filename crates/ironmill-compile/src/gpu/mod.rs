@@ -222,9 +222,12 @@ fn collect_supplement_tensors(
         .tensor_names()
         .iter()
         .filter(|name| !program_tensor_names.contains(**name))
-        .filter_map(|name| {
-            let t = provider.tensor(name).ok()?;
-            Some((name.to_string(), (t.data.into_owned(), t.shape, t.dtype)))
+        .filter_map(|name| match provider.tensor(name) {
+            Ok(t) => Some((name.to_string(), (t.data.into_owned(), t.shape, t.dtype))),
+            Err(e) => {
+                eprintln!("Warning: failed to load supplement tensor '{name}': {e}");
+                None
+            }
         })
         .collect()
 }

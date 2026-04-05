@@ -26,17 +26,14 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
     let seq_len: Option<usize> = None; // dynamic
     let batch: Option<usize> = Some(1);
 
-    // Check for sliding window configuration.
+    // Record sliding window configuration for the runtime.
+    // The MIL graph emits standard full-context attention; actual sliding-window
+    // masking is applied by the inference runtime using this attribute.
     let sliding_window: Option<usize> = config
         .extra
         .get("sliding_window")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
-
-    if sliding_window.is_some() {
-        warnings
-            .push("sliding_window attention is noted but mask handling is caller-provided".into());
-    }
 
     // Build the main function with typed inputs.
     let input_ids_ty = TensorType::with_dynamic_shape(ScalarType::Int32, vec![batch, seq_len]);
@@ -300,12 +297,7 @@ mod tests {
             .with_attention_biases();
 
         let result = build_program(&provider).expect("build_program should succeed");
-        // sliding_window should be noted in warnings
-        assert!(
-            result.warnings.iter().any(|w| w.contains("sliding_window")),
-            "should have sliding_window note"
-        );
-        // sliding_window attribute should be set on program
+        // sliding_window should be recorded as a program attribute for the runtime.
         assert_eq!(
             result.program.attributes.get("sliding_window"),
             Some(&"4096".to_string())

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -862,7 +863,7 @@ fn emit_moe_bundle(
         .with_context(|| format!("Failed to write {manifest_path}"))?;
     println!("  Wrote manifest: {manifest_path}");
 
-    compile_output(&bundle_path);
+    compile_output(&bundle_path)?;
 
     println!();
     println!("MoE bundle complete.");
@@ -931,7 +932,7 @@ fn emit_topk_fusion(
 
     let output_path = resolve_output_path(opts.output.as_deref(), input_path, "-fused.mlpackage");
     write_coreml_package(&fuse_result.program, &output_path, "fused model")?;
-    compile_output(&output_path);
+    compile_output(&output_path)?;
 
     println!();
     println!("MoE top-{k} fusion complete.");
@@ -981,8 +982,8 @@ fn emit_speculative_split(
         "verifier model (full)",
     )?;
 
-    compile_output(&draft_path);
-    compile_output(&verifier_path);
+    compile_output(&draft_path)?;
+    compile_output(&verifier_path)?;
     Ok(())
 }
 
@@ -1048,7 +1049,7 @@ fn emit_coreml(
     write_mlpackage(&model, &output_path)
         .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
-    compile_output(&output_path);
+    compile_output(&output_path)?;
     Ok(())
 }
 
@@ -1106,6 +1107,15 @@ fn compile_and_emit(
         .context("Optimization pipeline failed")?;
 
     print_pipeline_report(&report);
+
+    // Materialize all External tensor refs (from lazy loading and
+    // spill-after-quantize) before emission. Serialization paths
+    // (CoreML protobuf, ANE blob packing) require inline byte data.
+    if program.has_weight_provider() {
+        program
+            .materialize_all()
+            .context("Failed to materialize external tensors before emission")?;
+    }
 
     // MoE modes return early (no warnings / "Conversion complete" footer).
     if emit_moe_split(program, input_path, opts)?
@@ -1180,11 +1190,13 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         println!("  LoRA merge: enabled (use --no-merge-lora to disable)");
     }
     if opts.emit_adapter {
-        println!("  Note: --emit-adapter is reserved for future adapter export support.");
+        bail!(
+            "--emit-adapter is not yet implemented. This flag is reserved for future adapter export support."
+        );
     }
     if !opts.adapters.is_empty() {
-        println!(
-            "  Note: --adapter is reserved for future external adapter loading ({} path(s) provided).",
+        bail!(
+            "--adapter is not yet implemented. This flag is reserved for future external adapter loading ({} path(s) provided).",
             opts.adapters.len()
         );
     }
@@ -1220,12 +1232,12 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         .and_then(|e| e.to_str())
         .is_some_and(|e| e == "gguf");
 
-    // 1. Load weight provider
-    let provider: Box<dyn WeightProvider> = if is_gguf {
+    // 1. Load weight provider (wrapped in Arc for program attachment)
+    let provider: Arc<dyn WeightProvider + Send + Sync> = if is_gguf {
         println!("Loading GGUF model: {input_display}");
         let p = GgufProvider::load(input_path)
             .with_context(|| format!("Failed to load GGUF model: {input_display}"))?;
-        Box::new(p)
+        Arc::new(p)
     } else {
         // SafeTensors — resolve model directory (accepts a .safetensors file or directory)
         let model_dir = if input_path.is_dir() {
@@ -1242,7 +1254,7 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         let p = SafeTensorsProvider::load(&model_dir).with_context(|| {
             format!("Failed to load SafeTensors model: {}", model_dir.display())
         })?;
-        Box::new(p)
+        Arc::new(p)
     };
 
     println!("  Architecture: {}", provider.config().architecture);
@@ -1261,6 +1273,10 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         .context("Failed to build MIL program from weights")?;
     let mut program = result.program;
     let warnings = result.warnings;
+
+    // Attach provider for lazy tensor resolution by passes and spill-after-quantize.
+    program.set_weight_provider(provider);
+
     println!(
         "  Built: {} functions, {} ops",
         program.functions.len(),
@@ -1273,18 +1289,18 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 }
 
 /// Compile a .mlpackage using xcrun coremlcompiler.
-fn compile_output(output_path: &str) {
+fn compile_output(output_path: &str) -> Result<()> {
     if is_compiler_available() {
         println!("Compiling with xcrun coremlcompiler...");
         let output_dir = Path::new(output_path).parent().unwrap_or(Path::new("."));
-        match compile_model(output_path, output_dir) {
-            Ok(compiled) => println!("Done: {}", compiled.display()),
-            Err(e) => println!("Warning: compilation failed: {e}"),
-        }
+        let compiled = compile_model(output_path, output_dir)
+            .with_context(|| format!("xcrun coremlcompiler failed for {output_path}"))?;
+        println!("Done: {}", compiled.display());
     } else {
         println!("Note: xcrun coremlcompiler not found — skipping compilation step.");
         println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
     }
+    Ok(())
 }
 
 fn compile_coreml(input_path: &Path, ext: &str) -> Result<()> {
