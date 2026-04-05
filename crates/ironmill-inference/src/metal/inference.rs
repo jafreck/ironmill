@@ -1166,6 +1166,9 @@ impl MetalInference {
 
                     // 1. Gather from ple_embed_tokens using token_ids → ple_per_layer_input
                     //    Shape: [tokens, num_layers * ple_hidden]
+                    //    HF scales by sqrt(hidden_size_per_layer_input) inside
+                    //    Gemma4TextScaledWordEmbedding; we apply the same scale
+                    //    after the plain lookup.
                     ops::encode_embedding_lookup(
                         &enc,
                         &pipelines.embedding_lookup,
@@ -1178,13 +1181,28 @@ impl MetalInference {
                             vocab_size: vocab as u32,
                         },
                     );
+                    enc.memory_barrier_buffers();
 
-                    // 2. Project hidden_state via ple_model_projection → ple_scratch (reused as temp)
-                    //    We need a temp buffer of size [tokens, ple_total]. ple_buf is occupied with
-                    //    the embed result, so we use ffn_down as temp (it's [tokens, h] which may be
-                    //    smaller). Instead, since ple_scratch is [tokens, ple_h], we need a larger temp.
-                    //    For the projection output we reuse ffn_gate which is [tokens, intermediate_size]
-                    //    and intermediate_size >= ple_total for all known models.
+                    // Scale PLE embeddings by sqrt(ple_hidden_size) to match HF.
+                    {
+                        let ple_embed_scale = (ple_h as f32).sqrt();
+                        let scale_half = f16::from_f32(ple_embed_scale);
+                        let scale_buf = self
+                            .device
+                            .create_buffer_with_data(&scale_half.to_le_bytes(), StorageMode::Shared)
+                            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                        ops::encode_scale_buffer(
+                            &enc,
+                            &pipelines.scale_buffer,
+                            ple_buf,
+                            &scale_buf,
+                            (token_count * ple_total) as u32,
+                        );
+                        enc.memory_barrier_buffers();
+                    }
+
+                    // 2. Project hidden_state via ple_model_projection → ffn_gate (temp)
+                    //    HF then scales by per_layer_model_projection_scale = 1/sqrt(hidden_size).
                     let row_bytes_h = h * 2;
                     let row_bytes_ple_total = ple_total * 2;
                     encode_projection(
@@ -1204,7 +1222,29 @@ impl MetalInference {
                     )?;
                     enc.memory_barrier_buffers();
 
-                    // 3. RMSNorm the projection output (in ffn_gate) → write to ffn_up (temp)
+                    // Scale projection output by 1/sqrt(hidden_size) to match HF's
+                    // per_layer_model_projection_scale.
+                    {
+                        let proj_scale = 1.0 / (h as f32).sqrt();
+                        let scale_half = f16::from_f32(proj_scale);
+                        let scale_buf = self
+                            .device
+                            .create_buffer_with_data(&scale_half.to_le_bytes(), StorageMode::Shared)
+                            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                        ops::encode_scale_buffer(
+                            &enc,
+                            &pipelines.scale_buffer,
+                            &bufs.ffn_gate,
+                            &scale_buf,
+                            (token_count * ple_total) as u32,
+                        );
+                        enc.memory_barrier_buffers();
+                    }
+
+                    // 3. RMSNorm the projection output per-layer (NOT over ple_total).
+                    //    HF reshapes to [..., num_layers, ple_h] and norms the last dim (ple_h).
+                    //    We achieve the same by treating each layer's ple_h slice as a separate
+                    //    "token" — hidden_size=ple_h, token_count=token_count*num_layers.
                     ops::encode_rms_norm(
                         &enc,
                         &pipelines.rms_norm,
@@ -1212,8 +1252,8 @@ impl MetalInference {
                             input: &bufs.ffn_gate,
                             weight: ple_norm,
                             output: &bufs.ffn_up,
-                            hidden_size: ple_total as u32,
-                            token_count: token_count as u32,
+                            hidden_size: ple_h as u32,
+                            token_count: (token_count * mc.num_hidden_layers) as u32,
                             eps,
                         },
                     );
