@@ -42,20 +42,25 @@ struct Cli {
     command: Commands,
 }
 
-/// Runtime backend for inference.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+/// Runtime backend and output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum RuntimeArg {
-    /// Use CoreML MLModel for inference (default, stable).
+    /// CoreML runtime — produces .mlpackage (default, stable).
     #[value(name = "coreml")]
     CoreMl,
-    /// Use ANE direct backend for inference (experimental).
-    #[value(name = "ane-direct")]
-    AneDirect,
+    /// Metal GPU runtime — produces .ironml-gpu bundle.
+    #[value(name = "metal")]
+    Metal,
+    /// ANE direct runtime — produces .ironml bundle (experimental).
+    #[value(name = "ane")]
+    Ane,
 }
 
 /// Quantization mode for `--quantize`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum QuantizeArg {
     /// No quantization.
     #[default]
@@ -65,205 +70,195 @@ pub enum QuantizeArg {
     /// INT8 symmetric quantization.
     Int8,
     /// Mixed FP16/INT8 precision (predefined layer assignment).
+    #[serde(rename = "mixed-fp16-int8")]
     MixedFp16Int8,
-    /// Activation-aware weight quantization (INT4, requires --cal-data).
+    /// Activation-aware weight quantization (INT4, requires cal_data).
     Awq,
     /// INT4 group quantization (group size 128).
     Int4,
-    /// GPTQ optimal weight quantization (requires --cal-data).
+    /// GPTQ optimal weight quantization (requires cal_data).
     Gptq,
     /// D2Quant extreme low-bit (2-3 bit) quantization.
     D2quant,
 }
 
-/// Target compute units for `--target`.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
-pub enum TargetArg {
-    /// All available compute units on this platform.
-    #[default]
-    All,
-    /// CPU only.
-    CpuOnly,
-    /// CPU and GPU (Metal on macOS).
-    CpuAndGpu,
-    /// CPU and Neural Engine (macOS only).
-    CpuAndNe,
-    /// GPU-only Metal backend (macOS only).
-    Gpu,
-}
-
 /// Loss function for on-device training.
-#[derive(Debug, Clone, Copy, clap::ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LossFunctionArg {
     #[default]
+    #[serde(rename = "cross-entropy")]
     CrossEntropy,
     Mse,
 }
 
 /// Optimizer for on-device training.
-#[derive(Debug, Clone, Copy, clap::ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OptimizerArg {
     #[default]
     Sgd,
     Adam,
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
-enum KvQuantArg {
-    /// No KV cache quantization (default)
-    #[value(name = "none")]
-    None,
-    /// TurboQuant INT8 KV cache compression
-    #[value(name = "turbo-int8")]
-    TurboInt8,
-}
-
 #[derive(clap::Args)]
 struct CompileArgs {
-    /// Path to the input model (.onnx, .mlmodel, or .mlpackage).
+    /// Path to the input model (.onnx, .mlmodel, .mlpackage, .safetensors,
+    /// .gguf, or a HuggingFace model directory).
     input: String,
 
-    /// Path for the output .mlpackage.
+    /// Path for the output file/directory.
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Target compute units.
-    #[arg(short, long, value_enum, default_value_t = TargetArg::All)]
-    target: TargetArg,
+    /// Runtime backend and output format: "coreml" (default), "metal", or "ane".
+    ///
+    /// "ane" implies ANE-optimized template ops (prefill/decode split, 1×1 conv
+    /// projections, decomposed RMSNorm). To use ANE-optimized ops with CoreML
+    /// output instead, set {"ane_template": true} in --config.
+    #[arg(long, value_enum, default_value_t = RuntimeArg::CoreMl)]
+    runtime: RuntimeArg,
 
-    /// Quantization mode.
-    #[arg(short, long, value_enum, default_value_t = QuantizeArg::None)]
+    /// Path to a JSON config file for compile options.
+    /// CLI flags take precedence over config file values.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    // ── Weight Quantization (mutually exclusive) ────────────────────
+    /// Weight quantization mode.
+    #[arg(short, long, value_enum, default_value_t = QuantizeArg::None, help_heading = "Weight Quantization")]
     quantize: QuantizeArg,
 
-    /// Calibration data directory (for int8, AWQ, or GPTQ quantization).
-    #[arg(long = "cal-data", value_name = "DIR")]
-    cal_data: Option<PathBuf>,
-
-    /// Path to a TOML config for mixed-precision quantization.
-    #[arg(long = "quantize-config", value_name = "PATH")]
-    quantize_config: Option<PathBuf>,
-
     /// Weight palettization bit-width (2, 4, 6, or 8).
-    #[arg(long, value_name = "BITS")]
+    #[arg(long, value_name = "BITS", help_heading = "Weight Quantization")]
     palettize: Option<u8>,
 
     /// PolarQuant weight quantization bit-width (2 or 4).
-    #[arg(long = "polar-quantize", value_name = "BITS")]
+    #[arg(
+        long = "polar-quantize",
+        value_name = "BITS",
+        help_heading = "Weight Quantization"
+    )]
     polar_quantize: Option<u8>,
 
-    /// QuIP# (E8 lattice) 2-bit weight quantization. Requires --cal-data
-    /// pointing to a directory for Hessian-guided calibration.
-    #[arg(long = "quip-sharp")]
+    /// QuIP# (E8 lattice) 2-bit weight quantization.
+    #[arg(long = "quip-sharp", help_heading = "Weight Quantization")]
     quip_sharp: bool,
 
-    /// Bit-width for quantization modes that accept it (e.g. d2quant: 2 or 3).
-    #[arg(long, value_name = "N")]
+    /// Path to a TOML config for mixed-precision quantization.
+    #[arg(
+        long = "quantize-config",
+        value_name = "PATH",
+        help_heading = "Weight Quantization"
+    )]
+    quantize_config: Option<PathBuf>,
+
+    /// Calibration data directory (for int8, AWQ, GPTQ, or QuIP#).
+    #[arg(
+        long = "cal-data",
+        value_name = "DIR",
+        help_heading = "Weight Quantization"
+    )]
+    cal_data: Option<PathBuf>,
+
+    /// Bit-width override for quantization modes that accept it (d2quant: 2-3, gptq: 2-8).
+    #[arg(long, value_name = "N", help_heading = "Weight Quantization")]
     bits: Option<u8>,
 
-    /// Disable fusion and optimization passes.
-    #[arg(long)]
-    no_fusion: bool,
-
-    /// Set a concrete shape for a named input (for ANE compatibility).
-    /// Format: "name:d0,d1,d2,...". May be repeated.
-    #[arg(long = "input-shape", value_name = "NAME:SHAPE")]
-    input_shapes: Vec<String>,
-
-    /// Disable automatic LoRA adapter merging.
-    #[arg(long = "no-merge-lora")]
-    no_merge_lora: bool,
-
-    /// Emit a separate adapter .mlpackage instead of merging LoRA weights.
-    #[arg(long = "emit-adapter", hide = true)]
-    emit_adapter: bool,
-
-    /// Path to an external adapter file (e.g. .safetensors). May be repeated.
-    #[arg(long = "adapter", hide = true, value_name = "PATH")]
-    adapters: Vec<PathBuf>,
-
-    /// Comma-separated list of layer names to mark as updatable for
-    /// on-device training (e.g. "dense_0,dense_1").
-    #[arg(long = "updatable-layers", value_name = "LAYERS")]
-    updatable_layers: Option<String>,
-
-    /// Learning rate for the on-device training optimizer.
-    #[arg(long, default_value = "0.001")]
-    learning_rate: f64,
-
-    /// Number of training epochs for on-device fine-tuning.
-    #[arg(long, default_value = "10")]
-    epochs: i64,
-
-    /// Loss function for on-device training.
-    #[arg(long = "loss-function", value_enum, default_value_t = LossFunctionArg::CrossEntropy)]
-    loss_function: LossFunctionArg,
-
-    /// Optimizer for on-device training.
-    #[arg(long = "optimizer", value_enum, default_value_t = OptimizerArg::Sgd)]
-    optimizer_type: OptimizerArg,
-
+    // ── Output Mode (mutually exclusive) ────────────────────────────
     /// Split the model for speculative decoding: produce a draft model
     /// with the first N transformer layers and a full verifier model.
-    /// Outputs: <name>-draft.mlpackage and <name>-verifier.mlpackage.
-    #[arg(long = "split-draft-layers", value_name = "N")]
+    #[arg(
+        long = "split-draft-layers",
+        value_name = "N",
+        help_heading = "Output Mode"
+    )]
     split_draft_layers: Option<usize>,
 
     /// Detect MoE architecture and split into per-expert .mlpackage files.
-    #[arg(long = "moe-split")]
+    #[arg(long = "moe-split", help_heading = "Output Mode")]
     moe_split: bool,
 
     /// Detect MoE architecture and bundle experts as functions in a single .mlpackage.
-    /// Uses CoreML 8+ multi-function model support.
-    #[arg(long = "moe-bundle", conflicts_with = "moe_split")]
+    #[arg(
+        long = "moe-bundle",
+        conflicts_with = "moe_split",
+        help_heading = "Output Mode"
+    )]
     moe_bundle: bool,
 
     /// Fuse the top-K most frequently activated MoE experts into a single
-    /// dense .mlpackage, removing router overhead. Requires --cal-data
-    /// pointing to a directory containing an `expert_profile.json` file,
-    /// or a uniform profile is used when --cal-data is omitted.
-    #[arg(long = "moe-fuse-topk", value_name = "K")]
+    /// dense .mlpackage, removing router overhead.
+    #[arg(long = "moe-fuse-topk", value_name = "K", help_heading = "Output Mode")]
     moe_fuse_topk: Option<usize>,
+
+    // ── Optimization ────────────────────────────────────────────────
+    /// Disable fusion and optimization passes.
+    #[arg(long, help_heading = "Optimization")]
+    no_fusion: bool,
 
     /// Path to a TOML pipeline configuration file.
     /// When provided, overrides default pass selection and --no-fusion.
-    #[arg(long = "pipeline-config", value_name = "PATH")]
+    #[arg(
+        long = "pipeline-config",
+        value_name = "PATH",
+        help_heading = "Optimization"
+    )]
     pipeline_config: Option<PathBuf>,
+
+    /// Set a concrete shape for a named input (for ANE compatibility).
+    /// Format: "name:d0,d1,d2,...". May be repeated.
+    #[arg(
+        long = "input-shape",
+        value_name = "NAME:SHAPE",
+        help_heading = "Optimization"
+    )]
+    input_shapes: Vec<String>,
 
     /// Annotate each operation with its preferred compute unit (ANE, GPU,
     /// CPU, or Any) based on shape-aware ANE constraints.
-    #[arg(long = "annotate-compute-units")]
+    #[arg(long = "annotate-compute-units", help_heading = "Optimization")]
     annotate_compute_units: bool,
 
     /// ANE memory budget per operation (e.g. "1GB", "2GB", "512MB").
     /// Operations exceeding this budget are split into smaller tiles.
-    /// Default: 1GB (iOS). Use 2GB for macOS.
-    #[arg(long = "ane-memory-budget", value_name = "SIZE")]
+    #[arg(
+        long = "ane-memory-budget",
+        value_name = "SIZE",
+        help_heading = "Optimization"
+    )]
     ane_memory_budget: Option<String>,
 
-    /// Emit ANE-optimized ops in weight-based templates (1×1 conv projections,
-    /// decomposed RMSNorm, KV-cache state, prefill/decode split).
-    #[arg(long)]
-    ane: bool,
+    // ── LoRA ─────────────────────────────────────────────────────────
+    /// Disable automatic LoRA adapter merging.
+    #[arg(long = "no-merge-lora", help_heading = "LoRA")]
+    no_merge_lora: bool,
 
-    /// Runtime backend for inference: "coreml" (default) or "ane-direct" (experimental).
-    ///
-    /// When set to "ane-direct", uses the direct ANE runtime instead of CoreML,
-    /// bypassing MLModel for potentially lower latency. Requires --features ane-direct.
-    #[arg(long, value_enum, default_value_t = RuntimeArg::CoreMl)]
-    runtime: RuntimeArg,
+    // ── On-Device Training ──────────────────────────────────────────
+    /// Comma-separated list of layer names to mark as updatable for
+    /// on-device training (e.g. "dense_0,dense_1").
+    #[arg(
+        long = "updatable-layers",
+        value_name = "LAYERS",
+        help_heading = "On-Device Training"
+    )]
+    updatable_layers: Option<String>,
 
-    /// KV cache quantization strategy. Options: "none" (default), "turbo-int8".
-    #[arg(long, value_enum, default_value = "none")]
-    kv_quant: KvQuantArg,
+    /// Learning rate for the on-device training optimizer.
+    #[arg(long, default_value = "0.001", help_heading = "On-Device Training")]
+    learning_rate: f64,
 
-    /// Enable QJL 1-bit bias correction for TurboQuant (requires --kv-quant turbo-int8).
-    #[arg(long, default_value_t = false)]
-    kv_quant_qjl: bool,
+    /// Number of training epochs for on-device fine-tuning.
+    #[arg(long, default_value = "10", help_heading = "On-Device Training")]
+    epochs: i64,
 
-    /// Maximum sequence length for KV cache allocation (default: 2048).
-    #[arg(long, default_value_t = 2048)]
-    max_seq_len: usize,
+    /// Loss function for on-device training.
+    #[arg(long = "loss-function", value_enum, default_value_t = LossFunctionArg::CrossEntropy, help_heading = "On-Device Training")]
+    loss_function: LossFunctionArg,
+
+    /// Optimizer for on-device training.
+    #[arg(long = "optimizer", value_enum, default_value_t = OptimizerArg::Sgd, help_heading = "On-Device Training")]
+    optimizer_type: OptimizerArg,
 }
 
 #[derive(Subcommand)]
@@ -357,46 +352,149 @@ fn detect_input_format(path: &Path) -> InputFormat {
     InputFormat::Unknown(ext_display)
 }
 
+/// JSON config file schema for advanced compile options.
+///
+/// All fields are optional; CLI flags take precedence over config values.
+/// Example:
+/// ```json
+/// {
+///     "quantize": "awq",
+///     "cal_data": "/path/to/calibration",
+///     "palettize": 4,
+///     "moe_split": true
+/// }
+/// ```
+#[derive(serde::Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct CompileConfig {
+    output: Option<String>,
+    runtime: Option<RuntimeArg>,
+    quantize: Option<QuantizeArg>,
+    /// Emit ANE-optimized template ops even when runtime is "coreml".
+    /// Automatically true when runtime is "ane".
+    ane_template: Option<bool>,
+    no_fusion: Option<bool>,
+    cal_data: Option<PathBuf>,
+    quantize_config: Option<PathBuf>,
+    palettize: Option<u8>,
+    polar_quantize: Option<u8>,
+    quip_sharp: Option<bool>,
+    bits: Option<u8>,
+    input_shapes: Option<HashMap<String, Vec<usize>>>,
+    merge_lora: Option<bool>,
+    updatable_layers: Option<Vec<String>>,
+    learning_rate: Option<f64>,
+    epochs: Option<i64>,
+    loss_function: Option<LossFunctionArg>,
+    optimizer: Option<OptimizerArg>,
+    split_draft_layers: Option<usize>,
+    moe_split: Option<bool>,
+    moe_bundle: Option<bool>,
+    moe_fuse_topk: Option<usize>,
+    pipeline_config: Option<PathBuf>,
+    annotate_compute_units: Option<bool>,
+    ane_memory_budget: Option<String>,
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Compile(args) => {
-            let merge_lora = !args.no_merge_lora;
+            // Load config file (if provided) as base, then overlay CLI args.
+            let config = if let Some(ref config_path) = args.config {
+                let json = std::fs::read_to_string(config_path).with_context(|| {
+                    format!("Failed to read config file: {}", config_path.display())
+                })?;
+                serde_json::from_str::<CompileConfig>(&json).with_context(|| {
+                    format!("Failed to parse config file: {}", config_path.display())
+                })?
+            } else {
+                CompileConfig::default()
+            };
+
+            // CLI flags override config values. Non-default CLI values win.
+            let merge_lora = if args.no_merge_lora {
+                false
+            } else {
+                config.merge_lora.unwrap_or(true)
+            };
+
+            let quantize = if args.quantize != QuantizeArg::None {
+                args.quantize
+            } else {
+                config.quantize.unwrap_or_default()
+            };
+
+            let runtime = if args.runtime != RuntimeArg::CoreMl {
+                args.runtime
+            } else {
+                config.runtime.unwrap_or(RuntimeArg::CoreMl)
+            };
+
+            // For input_shapes: merge CLI --input-shape with config.input_shapes.
+            // CLI shapes override config shapes with the same name.
+            let input_shapes = if !args.input_shapes.is_empty() {
+                args.input_shapes
+            } else if let Some(ref shapes) = config.input_shapes {
+                shapes
+                    .iter()
+                    .map(|(name, dims)| {
+                        format!(
+                            "{}:{}",
+                            name,
+                            dims.iter()
+                                .map(|d| d.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let updatable_layers = args
+                .updatable_layers
+                .or_else(|| config.updatable_layers.map(|layers| layers.join(",")));
+
             cmd_compile(
                 &args.input,
                 CompileOpts {
-                    output: args.output,
-                    target: args.target,
-                    quantize: args.quantize,
-                    cal_data: args.cal_data,
-                    quantize_config: args.quantize_config,
-                    palettize: args.palettize,
-                    polar_quantize: args.polar_quantize,
-                    quip_sharp: args.quip_sharp,
-                    bits: args.bits,
-                    no_fusion: args.no_fusion,
-                    input_shapes: args.input_shapes,
+                    output: args.output.or(config.output),
+                    quantize,
+                    cal_data: args.cal_data.or(config.cal_data),
+                    quantize_config: args.quantize_config.or(config.quantize_config),
+                    palettize: args.palettize.or(config.palettize),
+                    polar_quantize: args.polar_quantize.or(config.polar_quantize),
+                    quip_sharp: args.quip_sharp || config.quip_sharp.unwrap_or(false),
+                    bits: args.bits.or(config.bits),
+                    no_fusion: args.no_fusion || config.no_fusion.unwrap_or(false),
+                    input_shapes,
                     merge_lora,
-                    emit_adapter: args.emit_adapter,
-                    adapters: args.adapters,
-                    updatable_layers: args.updatable_layers,
-                    learning_rate: args.learning_rate,
-                    epochs: args.epochs,
+                    updatable_layers,
+                    learning_rate: if args.learning_rate != 0.001 {
+                        args.learning_rate
+                    } else {
+                        config.learning_rate.unwrap_or(0.001)
+                    },
+                    epochs: if args.epochs != 10 {
+                        args.epochs
+                    } else {
+                        config.epochs.unwrap_or(10)
+                    },
                     loss_function: args.loss_function,
                     optimizer_type: args.optimizer_type,
-                    split_draft_layers: args.split_draft_layers,
-                    moe_split: args.moe_split,
-                    moe_bundle: args.moe_bundle,
-                    moe_fuse_topk: args.moe_fuse_topk,
-                    pipeline_config: args.pipeline_config,
-                    annotate_compute_units: args.annotate_compute_units,
-                    ane_memory_budget: args.ane_memory_budget,
-                    ane: args.ane,
-                    runtime: args.runtime,
-                    kv_quant: args.kv_quant,
-                    kv_quant_qjl: args.kv_quant_qjl,
-                    max_seq_len: args.max_seq_len,
+                    split_draft_layers: args.split_draft_layers.or(config.split_draft_layers),
+                    moe_split: args.moe_split || config.moe_split.unwrap_or(false),
+                    moe_bundle: args.moe_bundle || config.moe_bundle.unwrap_or(false),
+                    moe_fuse_topk: args.moe_fuse_topk.or(config.moe_fuse_topk),
+                    pipeline_config: args.pipeline_config.or(config.pipeline_config),
+                    annotate_compute_units: args.annotate_compute_units
+                        || config.annotate_compute_units.unwrap_or(false),
+                    ane_memory_budget: args.ane_memory_budget.or(config.ane_memory_budget),
+                    ane_template: config.ane_template.unwrap_or(false),
+                    runtime,
                 },
             )
         }
@@ -435,7 +533,6 @@ fn parse_input_shape(s: &str) -> Result<(String, Vec<usize>)> {
 
 struct CompileOpts {
     output: Option<String>,
-    target: TargetArg,
     quantize: QuantizeArg,
     cal_data: Option<PathBuf>,
     quantize_config: Option<PathBuf>,
@@ -446,8 +543,6 @@ struct CompileOpts {
     no_fusion: bool,
     input_shapes: Vec<String>,
     merge_lora: bool,
-    emit_adapter: bool,
-    adapters: Vec<PathBuf>,
     updatable_layers: Option<String>,
     learning_rate: f64,
     epochs: i64,
@@ -460,11 +555,130 @@ struct CompileOpts {
     pipeline_config: Option<PathBuf>,
     annotate_compute_units: bool,
     ane_memory_budget: Option<String>,
-    ane: bool,
+    ane_template: bool,
     runtime: RuntimeArg,
-    kv_quant: KvQuantArg,
-    kv_quant_qjl: bool,
-    max_seq_len: usize,
+}
+
+/// Validate compile options for consistency.
+///
+/// Called once at the start of `cmd_compile`, before dispatching to any
+/// format-specific path. Catches conflicting or invalid flag combinations
+/// early with clear CLI-level messages.
+///
+/// NOTE: Most weight-compression conflicts (e.g. int8 + palettize) are
+/// already enforced by `PassPipeline`'s builder methods. This function
+/// only guards the cases that bypass the builder (`--quantize-config` and
+/// `--quantize mixed-fp16-int8` use `add_pass()` directly) plus
+/// target-specific and not-yet-implemented restrictions.
+fn validate_compile_opts(opts: &CompileOpts) -> Result<()> {
+    // ── quantize-config bypasses builder flag tracking ───────────────
+    if opts.quantize_config.is_some() {
+        let mut conflicts = Vec::new();
+        if opts.quantize != QuantizeArg::None {
+            conflicts.push("--quantize");
+        }
+        if opts.palettize.is_some() {
+            conflicts.push("--palettize");
+        }
+        if opts.polar_quantize.is_some() {
+            conflicts.push("--polar-quantize");
+        }
+        if opts.quip_sharp {
+            conflicts.push("--quip-sharp");
+        }
+        if !conflicts.is_empty() {
+            bail!(
+                "--quantize-config cannot be combined with other weight compression flags: {}",
+                conflicts.join(", ")
+            );
+        }
+    }
+
+    // ── mixed-fp16-int8 preset bypasses builder flag tracking ────────
+    if opts.quantize == QuantizeArg::MixedFp16Int8 {
+        let mut conflicts = Vec::new();
+        if opts.palettize.is_some() {
+            conflicts.push("--palettize");
+        }
+        if opts.polar_quantize.is_some() {
+            conflicts.push("--polar-quantize");
+        }
+        if opts.quip_sharp {
+            conflicts.push("--quip-sharp");
+        }
+        if !conflicts.is_empty() {
+            bail!(
+                "--quantize mixed-fp16-int8 cannot be combined with: {}",
+                conflicts.join(", ")
+            );
+        }
+    }
+
+    // ── Bit-width validation ────────────────────────────────────────
+    if let Some(bits) = opts.palettize {
+        if !matches!(bits, 2 | 4 | 6 | 8) {
+            bail!("--palettize must be 2, 4, 6, or 8, got {bits}");
+        }
+    }
+    if let Some(bits) = opts.polar_quantize {
+        if !matches!(bits, 2 | 4) {
+            bail!("--polar-quantize must be 2 or 4, got {bits}");
+        }
+    }
+
+    // ── --bits only valid with d2quant or gptq ──────────────────────
+    if opts.bits.is_some() && !matches!(opts.quantize, QuantizeArg::D2quant | QuantizeArg::Gptq) {
+        bail!("--bits is only valid with --quantize d2quant or --quantize gptq");
+    }
+
+    // ── Output mode: at most one ────────────────────────────────────
+    let mut output_modes: Vec<&str> = Vec::new();
+    if opts.moe_split {
+        output_modes.push("--moe-split / moe_split");
+    }
+    if opts.moe_bundle {
+        output_modes.push("--moe-bundle / moe_bundle");
+    }
+    if opts.moe_fuse_topk.is_some() {
+        output_modes.push("--moe-fuse-topk / moe_fuse_topk");
+    }
+    if opts.split_draft_layers.is_some() {
+        output_modes.push("--split-draft-layers / split_draft_layers");
+    }
+    if output_modes.len() > 1 {
+        bail!(
+            "Only one output mode may be used at a time. Got: {}",
+            output_modes.join(" + ")
+        );
+    }
+
+    // ── Metal runtime restrictions ──────────────────────────────────
+    if opts.runtime == RuntimeArg::Metal {
+        let mut unsupported = Vec::new();
+        if opts.moe_split {
+            unsupported.push("moe_split");
+        }
+        if opts.moe_bundle {
+            unsupported.push("moe_bundle");
+        }
+        if opts.moe_fuse_topk.is_some() {
+            unsupported.push("moe_fuse_topk");
+        }
+        if opts.split_draft_layers.is_some() {
+            unsupported.push("split_draft_layers");
+        }
+        if opts.updatable_layers.is_some() {
+            unsupported.push("updatable_layers");
+        }
+        if !unsupported.is_empty() {
+            bail!(
+                "The following options are not supported with --runtime metal: {}",
+                unsupported.join(", ")
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
@@ -473,45 +687,10 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
         bail!("Input file not found: {input}");
     }
 
-    if opts.max_seq_len == 0 {
-        bail!("--max-seq-len must be at least 1");
-    }
+    validate_compile_opts(&opts)?;
 
-    if opts.target == TargetArg::Gpu {
+    if opts.runtime == RuntimeArg::Metal {
         return compile_for_gpu(input_path, &opts);
-    }
-
-    if !matches!(opts.target, TargetArg::All | TargetArg::CpuAndNe) {
-        eprintln!(
-            "Warning: --target '{:?}' is accepted but not yet wired into compilation. Proceeding with default target.",
-            opts.target
-        );
-    }
-
-    // TurboQuant validation
-    if opts.kv_quant == KvQuantArg::TurboInt8 && !matches!(opts.runtime, RuntimeArg::AneDirect) {
-        bail!("--kv-quant turbo-int8 requires --runtime ane-direct");
-    }
-    if opts.kv_quant_qjl && opts.kv_quant != KvQuantArg::TurboInt8 {
-        bail!("--kv-quant-qjl requires --kv-quant turbo-int8");
-    }
-    if opts.kv_quant == KvQuantArg::TurboInt8 {
-        eprintln!(
-            "TurboQuant: INT8 KV cache (max_seq_len={}{})",
-            opts.max_seq_len,
-            if opts.kv_quant_qjl {
-                ", QJL enabled"
-            } else {
-                ""
-            }
-        );
-        eprintln!("Warning: --kv-quant is accepted but not yet wired into compilation.");
-        if opts.kv_quant_qjl {
-            eprintln!("Warning: --kv-quant-qjl is accepted but not yet wired into compilation.");
-        }
-        if opts.max_seq_len != 2048 {
-            eprintln!("Warning: --max-seq-len is accepted but not yet wired into compilation.");
-        }
     }
 
     match detect_input_format(input_path) {
@@ -543,19 +722,8 @@ fn compile_for_gpu(input_path: &Path, opts: &CompileOpts) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| input_path.with_extension("ironml-gpu"));
 
-    // ── Regular (MIL IR) path ───────────────────────────────────────
-    // Reject conflicting quantization flags.
-    if opts.quantize != QuantizeArg::None && opts.polar_quantize.is_some() {
-        anyhow::bail!("Cannot specify both --quantize and --polar-quantize. Use only one.");
-    }
-    if opts.quip_sharp && opts.quantize != QuantizeArg::None {
-        anyhow::bail!("Cannot specify both --quantize and --quip-sharp. Use only one.");
-    }
-    if opts.quip_sharp && opts.polar_quantize.is_some() {
-        anyhow::bail!("Cannot specify both --polar-quantize and --quip-sharp. Use only one.");
-    }
-
     // Build the pipeline — handles all quantization methods uniformly.
+    // (Conflict checks are in validate_compile_opts, called before dispatch.)
     let pipeline = build_pass_pipeline(opts)?;
 
     let provider = GpuCompileBuilder::new(input_path)
@@ -1165,7 +1333,8 @@ fn compile_and_emit(
     } else {
         match opts.runtime {
             RuntimeArg::CoreMl => emit_coreml(program, input_path, opts)?,
-            RuntimeArg::AneDirect => emit_ane_direct(program, input_path, opts)?,
+            RuntimeArg::Ane => emit_ane_direct(program, input_path, opts)?,
+            RuntimeArg::Metal => unreachable!("Metal dispatched via compile_for_gpu"),
         }
     }
 
@@ -1222,17 +1391,6 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 
     if opts.merge_lora {
         eprintln!("  LoRA merge: enabled (use --no-merge-lora to disable)");
-    }
-    if opts.emit_adapter {
-        bail!(
-            "LoRA adapter emission is not yet implemented. Compile the base model without --emit-adapter."
-        );
-    }
-    if !opts.adapters.is_empty() {
-        bail!(
-            "LoRA adapter loading is not yet implemented. Compile the base model without --adapter ({} path(s) provided).",
-            opts.adapters.len()
-        );
     }
     eprintln!();
 
@@ -1295,7 +1453,7 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     eprintln!();
 
     // 2. Build MIL program from architecture template
-    let ane_mode = opts.ane || matches!(opts.runtime, RuntimeArg::AneDirect);
+    let ane_mode = opts.ane_template || matches!(opts.runtime, RuntimeArg::Ane);
     let mut template_opts = TemplateOptions::default();
     template_opts.ane = ane_mode;
 
