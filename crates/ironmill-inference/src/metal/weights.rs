@@ -461,6 +461,35 @@ fn load_weight_buffer(
             let packed = pack_weight_blocked(device, &buf, n, k)?;
             Ok(WeightBuffer::Dense { buf, packed })
         }
+        QuantizationInfo::DualScaleDequantize {
+            quantized_data,
+            normal_scale,
+            normal_zero,
+            outlier_scale,
+            outlier_zero,
+            outlier_mask,
+            original_shape,
+            bit_width,
+            group_size,
+        } => {
+            let data = super::dequant::dequant_dual_scale(
+                quantized_data,
+                normal_scale,
+                normal_zero,
+                outlier_scale,
+                outlier_zero,
+                outlier_mask,
+                original_shape,
+                *bit_width,
+                *group_size,
+            )?;
+            let buf = device
+                .create_buffer_with_data(&data, StorageMode::Shared)
+                .map_err(MetalError::Metal)?;
+            let (n, k) = dense_shape(original_shape);
+            let packed = pack_weight_blocked(device, &buf, n, k)?;
+            Ok(WeightBuffer::Dense { buf, packed })
+        }
         other => Err(MetalError::WeightLoading(format!(
             "{name}: unsupported quant_info variant: {other:?}"
         ))),

@@ -453,6 +453,52 @@ pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
                 dtype: ScalarType::Float16,
             })
         }
+        QuantizationInfo::DualScaleDequantize {
+            quantized_data,
+            normal_scale,
+            normal_zero,
+            outlier_scale,
+            outlier_zero,
+            outlier_mask,
+            original_shape,
+            bit_width,
+            group_size,
+        } => {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                let data = crate::metal::dequant::dequant_dual_scale(
+                    quantized_data,
+                    normal_scale,
+                    normal_zero,
+                    outlier_scale,
+                    outlier_zero,
+                    outlier_mask,
+                    original_shape,
+                    *bit_width,
+                    *group_size,
+                )?;
+                Ok(DenseData {
+                    bytes: Cow::Owned(data),
+                    shape: original_shape,
+                    dtype: ScalarType::Float16,
+                })
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            {
+                let _ = (
+                    quantized_data,
+                    normal_scale,
+                    normal_zero,
+                    outlier_scale,
+                    outlier_zero,
+                    outlier_mask,
+                    original_shape,
+                    bit_width,
+                    group_size,
+                );
+                anyhow::bail!("D2Quant dequantization requires Metal backend");
+            }
+        }
         other => anyhow::bail!("unsupported quant_info variant: {other:?}"),
     }
 }

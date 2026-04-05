@@ -240,6 +240,59 @@ pub fn write_gpu_bundle(
                     );
                 }
             }
+            QuantizationInfo::DualScaleDequantize {
+                quantized_data,
+                normal_scale,
+                normal_zero,
+                outlier_scale,
+                outlier_zero,
+                outlier_mask,
+                original_shape,
+                bit_width,
+                group_size,
+            } => {
+                methods_seen.insert("d2quant");
+
+                match global_n_bits {
+                    None => global_n_bits = Some(*bit_width),
+                    Some(prev) if prev != *bit_width => {
+                        eprintln!(
+                            "Warning: tensor '{name}' has bit_width={} but global_n_bits is already {prev}",
+                            bit_width
+                        );
+                    }
+                    _ => {}
+                }
+
+                let qdata_file = format!("weights/{sanitized}.qdata");
+                let ns_file = format!("weights/{sanitized}.nscale");
+                let nz_file = format!("weights/{sanitized}.nzero");
+                let os_file = format!("weights/{sanitized}.oscale");
+                let oz_file = format!("weights/{sanitized}.ozero");
+                let mask_file = format!("weights/{sanitized}.mask");
+
+                fs::write(output_dir.join(&qdata_file), quantized_data)?;
+                fs::write(output_dir.join(&ns_file), normal_scale)?;
+                fs::write(output_dir.join(&nz_file), normal_zero)?;
+                fs::write(output_dir.join(&os_file), outlier_scale)?;
+                fs::write(output_dir.join(&oz_file), outlier_zero)?;
+                fs::write(output_dir.join(&mask_file), outlier_mask)?;
+
+                tensors.insert(
+                    name.to_string(),
+                    TensorManifest::DualScaleDequantize {
+                        quantized_data_file: qdata_file,
+                        normal_scale_file: ns_file,
+                        normal_zero_file: nz_file,
+                        outlier_scale_file: os_file,
+                        outlier_zero_file: oz_file,
+                        outlier_mask_file: mask_file,
+                        shape: original_shape.clone(),
+                        bit_width: *bit_width,
+                        group_size: *group_size,
+                    },
+                );
+            }
             other => {
                 return Err(CompileError::Other(format!(
                     "unsupported quantization info for tensor '{name}': {other:?}"

@@ -300,6 +300,59 @@ pub fn convert_params_to_f16(
     Ok(output)
 }
 
+/// Dequantize a D2Quant dual-scale tensor to FP16 bytes.
+///
+/// Each group has separate scale/zero for normal and outlier partitions,
+/// selected by a per-weight bit mask. The formula for each weight `i` in
+/// group `g` is:
+/// - If `outlier_mask[i]` is 1: `(quantized[i] - outlier_zero[g]) * outlier_scale[g]`
+/// - If `outlier_mask[i]` is 0: `(quantized[i] - normal_zero[g]) * normal_scale[g]`
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_dual_scale(
+    quantized_data: &[u8],
+    normal_scale: &[u8],
+    normal_zero: &[u8],
+    outlier_scale: &[u8],
+    outlier_zero: &[u8],
+    outlier_mask: &[u8],
+    original_shape: &[usize],
+    bit_width: u8,
+    group_size: usize,
+) -> anyhow::Result<Vec<u8>> {
+    use mil_rs::ir::passes::d2quant::dual_scale::{unpack_2bit, unpack_3bit};
+
+    let total_elements: usize = original_shape.iter().product();
+
+    // Unpack quantized values based on bit width.
+    let unpacked = match bit_width {
+        2 => unpack_2bit(quantized_data, total_elements),
+        3 => unpack_3bit(quantized_data, total_elements),
+        _ => bail!("unsupported D2Quant bit_width: {bit_width} (expected 2 or 3)"),
+    };
+
+    let mut output = Vec::with_capacity(total_elements * 2);
+
+    for (i, &q) in unpacked.iter().enumerate() {
+        let group = i / group_size;
+        let is_outlier = (outlier_mask[i / 8] >> (i % 8)) & 1 == 1;
+
+        let (scale_buf, zero_buf) = if is_outlier {
+            (outlier_scale, outlier_zero)
+        } else {
+            (normal_scale, normal_zero)
+        };
+
+        let s = read_typed_f32(scale_buf, group * 4, ScalarType::Float32)?;
+        let z = read_typed_f32(zero_buf, group * 4, ScalarType::Float32)?;
+
+        let val = (q as f32 - z) * s;
+        let h = f16::from_f32(val);
+        output.extend_from_slice(&h.to_le_bytes());
+    }
+
+    Ok(output)
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]

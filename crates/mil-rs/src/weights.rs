@@ -410,6 +410,29 @@ pub enum QuantizationInfo {
         /// a column index to its original position.
         g_idx: Option<Vec<u32>>,
     },
+    /// D2Quant dual-scale quantization: each weight group has separate
+    /// scale/zero for normal and outlier partitions, selected by a bit mask.
+    /// Produced by `constexpr_dual_scale_dequantize` in MIL IR.
+    DualScaleDequantize {
+        /// Packed quantized data (2-bit or 3-bit packed into bytes).
+        quantized_data: Vec<u8>,
+        /// Per-group scale for the normal (low-magnitude) partition.
+        normal_scale: Vec<u8>,
+        /// Per-group zero point for the normal partition.
+        normal_zero: Vec<u8>,
+        /// Per-group scale for the outlier (high-magnitude) partition.
+        outlier_scale: Vec<u8>,
+        /// Per-group zero point for the outlier partition.
+        outlier_zero: Vec<u8>,
+        /// Packed outlier mask (1 bit per weight).
+        outlier_mask: Vec<u8>,
+        /// Original unquantized tensor shape.
+        original_shape: Vec<usize>,
+        /// Quantization bit width (2 or 3).
+        bit_width: u8,
+        /// Number of weights per group (typically 128).
+        group_size: usize,
+    },
 }
 
 /// Borrowed view of a weight tensor. Uses `Cow` to allow zero-copy

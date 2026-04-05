@@ -168,6 +168,39 @@ impl WeightProvider for MetalBundleProvider {
                     ),
                 )
             }
+            TensorManifest::DualScaleDequantize {
+                quantized_data_file,
+                normal_scale_file,
+                normal_zero_file,
+                outlier_scale_file,
+                outlier_zero_file,
+                outlier_mask_file,
+                shape,
+                bit_width,
+                group_size,
+            } => {
+                let quantized_data = self.read_file(quantized_data_file)?;
+                let normal_scale = self.read_file(normal_scale_file)?;
+                let normal_zero = self.read_file(normal_zero_file)?;
+                let outlier_scale = self.read_file(outlier_scale_file)?;
+                let outlier_zero = self.read_file(outlier_zero_file)?;
+                let outlier_mask = self.read_file(outlier_mask_file)?;
+
+                Ok(
+                    WeightTensor::owned(Vec::new(), shape.clone(), ScalarType::UInt8)
+                        .with_quant_info(QuantizationInfo::DualScaleDequantize {
+                            quantized_data,
+                            normal_scale,
+                            normal_zero,
+                            outlier_scale,
+                            outlier_zero,
+                            outlier_mask,
+                            original_shape: shape.clone(),
+                            bit_width: *bit_width,
+                            group_size: *group_size,
+                        }),
+                )
+            }
         }
     }
 

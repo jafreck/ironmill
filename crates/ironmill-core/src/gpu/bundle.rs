@@ -104,6 +104,28 @@ pub enum TensorManifest {
         #[serde(skip_serializing_if = "Option::is_none")]
         zero_point_dtype: Option<String>,
     },
+    /// D2Quant dual-scale quantized tensor.
+    #[serde(rename = "dual_scale_dequantize")]
+    DualScaleDequantize {
+        /// Path to the packed quantized data file.
+        quantized_data_file: String,
+        /// Path to the normal-partition scale file (FP32).
+        normal_scale_file: String,
+        /// Path to the normal-partition zero point file (FP32).
+        normal_zero_file: String,
+        /// Path to the outlier-partition scale file (FP32).
+        outlier_scale_file: String,
+        /// Path to the outlier-partition zero point file (FP32).
+        outlier_zero_file: String,
+        /// Path to the packed outlier mask file.
+        outlier_mask_file: String,
+        /// Original tensor shape.
+        shape: Vec<usize>,
+        /// Quantization bit width (2 or 3).
+        bit_width: u8,
+        /// Number of weights per group.
+        group_size: usize,
+    },
 }
 
 // ── ScalarType string helpers ───────────────────────────────────────────

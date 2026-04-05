@@ -266,6 +266,62 @@ impl MilWeightProvider {
                     tensors.insert(name, extracted);
                 }
 
+                "constexpr_dual_scale_dequantize" => {
+                    let name = tensor_name_for_op(op);
+                    let name = match name {
+                        Some(n) => n,
+                        None => continue,
+                    };
+
+                    let (quantized_data, _quantized_dtype) =
+                        extract_tensor_attr(&mut op.attributes, "quantized_data", &resolve)?;
+                    let (normal_scale, _) =
+                        extract_tensor_attr(&mut op.attributes, "normal_scale", &resolve)?;
+                    let (normal_zero, _) =
+                        extract_tensor_attr(&mut op.attributes, "normal_zero", &resolve)?;
+                    let (outlier_scale, _) =
+                        extract_tensor_attr(&mut op.attributes, "outlier_scale", &resolve)?;
+                    let (outlier_zero, _) =
+                        extract_tensor_attr(&mut op.attributes, "outlier_zero", &resolve)?;
+                    let (outlier_mask, _) =
+                        extract_tensor_attr(&mut op.attributes, "outlier_mask", &resolve)?;
+
+                    let bit_width = match op.attributes.get("bit_width") {
+                        Some(Value::Int(v)) => *v as u8,
+                        _ => 3,
+                    };
+                    let group_size = match op.attributes.get("group_size") {
+                        Some(Value::Int(v)) => *v as usize,
+                        _ => 128,
+                    };
+
+                    // Recover original shape from the output type.
+                    let original_shape: Vec<usize> = op
+                        .output_types
+                        .first()
+                        .and_then(|t| t.as_ref())
+                        .map(|t| t.shape.iter().filter_map(|d| *d).collect())
+                        .unwrap_or_default();
+
+                    let extracted = ExtractedTensor {
+                        data: Vec::new(),
+                        shape: original_shape.clone(),
+                        dtype: ScalarType::UInt8,
+                        quant_info: QuantizationInfo::DualScaleDequantize {
+                            quantized_data,
+                            normal_scale,
+                            normal_zero,
+                            outlier_scale,
+                            outlier_zero,
+                            outlier_mask,
+                            original_shape,
+                            bit_width,
+                            group_size,
+                        },
+                    };
+                    tensors.insert(name, extracted);
+                }
+
                 "const" => {
                     // Skip norms ops — they are already consumed above.
                     let output_name: &str = op.outputs.first().map(String::as_str).unwrap_or("");
