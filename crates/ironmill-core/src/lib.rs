@@ -5,8 +5,10 @@
 //! model configuration types, and shared abstractions used across
 //! the ironmill stack.
 
+/// Apple Neural Engine bundle types and utilities.
 pub mod ane;
 pub mod device;
+/// GPU bundle types and quantization manifest schemas.
 pub mod gpu;
 pub mod model_info;
 pub mod tokenizer;

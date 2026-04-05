@@ -30,8 +30,9 @@ pub enum ModelComponent {
     LmHead,
 }
 
+/// Options controlling MIL template generation for a model.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TemplateOptions {
     /// When true, emit ANE-optimized ops:
     /// - Conv2d (1×1) instead of Linear for projections
@@ -39,12 +40,6 @@ pub struct TemplateOptions {
     /// - Static KV-cache state inputs per layer
     /// - Prefill / decode function split
     pub ane: bool,
-}
-
-impl Default for TemplateOptions {
-    fn default() -> Self {
-        Self { ane: false }
-    }
 }
 
 /// Build a MIL IR [`Program`] from a weight provider by dispatching to the

@@ -11,11 +11,14 @@
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
+    /// Role of the message sender (e.g., "system", "user", "assistant").
     pub role: String,
+    /// Text content of the message.
     pub content: String,
 }
 
 impl ChatMessage {
+    /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
@@ -23,6 +26,7 @@ impl ChatMessage {
         }
     }
 
+    /// Create a user message.
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
@@ -30,6 +34,7 @@ impl ChatMessage {
         }
     }
 
+    /// Create an assistant message.
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
@@ -46,15 +51,19 @@ impl ChatMessage {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum TokenizerError {
+    /// The tokenizer has not been initialized or loaded.
     #[error("tokenizer not loaded: {0}")]
     NotLoaded(String),
 
+    /// Failed to encode text into token IDs.
     #[error("encoding error: {0}")]
     Encode(String),
 
+    /// Failed to decode token IDs back into text.
     #[error("decoding error: {0}")]
     Decode(String),
 
+    /// Failed to apply or render the chat template.
     #[error("chat template error: {0}")]
     Template(String),
 
@@ -62,6 +71,7 @@ pub enum TokenizerError {
     #[error("load error: {0}")]
     Load(String),
 
+    /// An I/O error occurred while reading tokenizer files.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

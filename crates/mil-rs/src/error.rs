@@ -10,7 +10,12 @@ pub enum MilError {
 
     /// A type mismatch was detected during graph construction or validation.
     #[error("type mismatch: expected {expected}, got {actual}")]
-    TypeMismatch { expected: String, actual: String },
+    TypeMismatch {
+        /// The type that was expected.
+        expected: String,
+        /// The type that was actually encountered.
+        actual: String,
+    },
 
     /// An unsupported ONNX operation was encountered during conversion.
     #[error("unsupported operation: {0}")]

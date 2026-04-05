@@ -29,7 +29,9 @@ pub enum Element {
     Literal(String),
     /// Character class, e.g. `[0-9]` or `[^"\\]`.
     CharClass {
+        /// Inclusive character ranges in this class.
         ranges: Vec<(char, char)>,
+        /// Whether this class is negated (e.g. `[^...]`).
         negated: bool,
     },
     /// Reference to a named rule, e.g. `<value>`.
@@ -49,14 +51,18 @@ pub enum Element {
 /// A named grammar rule.
 #[derive(Debug, Clone)]
 pub struct Rule {
+    /// The rule's identifier (e.g. `"value"`).
     pub name: String,
+    /// The expression defining the rule body.
     pub expr: Element,
 }
 
 /// A complete grammar with named rules and a start symbol.
 #[derive(Debug, Clone)]
 pub struct Grammar {
+    /// All named rules in this grammar.
     pub rules: Vec<Rule>,
+    /// The rule name to start parsing from.
     pub start_rule: String,
 }
 
@@ -69,19 +75,36 @@ pub enum GrammarError {
     /// No rules found in the input.
     EmptyGrammar,
     /// Unexpected character during parsing.
-    UnexpectedChar { pos: usize, ch: char },
+    UnexpectedChar {
+        /// Byte position where the unexpected character was found.
+        pos: usize,
+        /// The unexpected character.
+        ch: char,
+    },
     /// Unexpected end of input.
     UnexpectedEnd,
     /// Unterminated string literal.
-    UnterminatedString { pos: usize },
+    UnterminatedString {
+        /// Byte position where the string literal started.
+        pos: usize,
+    },
     /// Unterminated character class.
-    UnterminatedCharClass { pos: usize },
+    UnterminatedCharClass {
+        /// Byte position where the character class started.
+        pos: usize,
+    },
     /// Unterminated group.
-    UnterminatedGroup { pos: usize },
+    UnterminatedGroup {
+        /// Byte position where the group started.
+        pos: usize,
+    },
     /// Empty alternation branch.
     EmptyBranch,
     /// Unterminated rule reference.
-    UnterminatedRuleRef { pos: usize },
+    UnterminatedRuleRef {
+        /// Byte position where the rule reference started.
+        pos: usize,
+    },
     /// Reference to an undefined rule name.
     UndefinedRule(String),
 }

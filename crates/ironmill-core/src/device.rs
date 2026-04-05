@@ -4,12 +4,18 @@
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Device {
+    /// Automatically select the best available device.
     #[default]
     Auto,
+    /// Use Metal GPU acceleration (macOS).
     Metal,
+    /// Use the Apple Neural Engine.
     Ane,
+    /// Use Core ML for inference.
     CoreMl,
+    /// Use an NVIDIA CUDA GPU.
     Cuda,
+    /// Use CPU-only inference.
     Cpu,
 }
 

@@ -43,33 +43,61 @@ const ALIGNMENT: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum GgmlType {
+    /// 32-bit IEEE 754 float.
     F32 = 0,
+    /// 16-bit IEEE 754 half-precision float.
     F16 = 1,
+    /// 4-bit quantization (round-to-nearest, group size 32).
     Q4_0 = 2,
+    /// 4-bit quantization with non-zero offset (group size 32).
     Q4_1 = 3,
+    /// 5-bit quantization (round-to-nearest, group size 32).
     Q5_0 = 6,
+    /// 5-bit quantization with non-zero offset (group size 32).
     Q5_1 = 7,
+    /// 8-bit quantization (round-to-nearest, group size 32).
     Q8_0 = 8,
+    /// 8-bit quantization with non-zero offset (group size 32).
     Q8_1 = 9,
+    /// K-quant 2-bit (super-block quantization).
     Q2K = 10,
+    /// K-quant 3-bit (super-block quantization).
     Q3K = 11,
+    /// K-quant 4-bit (super-block quantization).
     Q4K = 12,
+    /// K-quant 5-bit (super-block quantization).
     Q5K = 13,
+    /// K-quant 6-bit (super-block quantization).
     Q6K = 14,
+    /// Importance-matrix 2-bit (extra-extra-small variant).
     IQ2XXS = 16,
+    /// Importance-matrix 2-bit (extra-small variant).
     IQ2XS = 17,
+    /// Importance-matrix 3-bit (extra-extra-small variant).
     IQ3XXS = 18,
+    /// Importance-matrix 1-bit (small variant).
     IQ1S = 19,
+    /// Importance-matrix 4-bit (non-linear quantization).
     IQ4NL = 20,
+    /// Importance-matrix 3-bit (small variant).
     IQ3S = 21,
+    /// Importance-matrix 2-bit (small variant).
     IQ2S = 22,
+    /// Importance-matrix 4-bit (extra-small variant).
     IQ4XS = 23,
+    /// 8-bit signed integer.
     I8 = 24,
+    /// 16-bit signed integer.
     I16 = 25,
+    /// 32-bit signed integer.
     I32 = 26,
+    /// 64-bit signed integer.
     I64 = 27,
+    /// 64-bit IEEE 754 double-precision float.
     F64 = 28,
+    /// Importance-matrix 1-bit (medium variant).
     IQ1M = 29,
+    /// 16-bit brain float (bfloat16).
     BF16 = 30,
 }
 

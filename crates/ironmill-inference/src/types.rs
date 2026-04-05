@@ -14,11 +14,17 @@ use std::fmt;
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementType {
+    /// 32-bit IEEE 754 floating point.
     Float32,
+    /// 16-bit IEEE 754 floating point.
     Float16,
+    /// 16-bit brain floating point.
     BFloat16,
+    /// 32-bit signed integer.
     Int32,
+    /// 8-bit signed integer.
     Int8,
+    /// 64-bit IEEE 754 floating point.
     Float64,
 }
 

@@ -88,6 +88,7 @@ pub struct GptqActivationStore {
 }
 
 impl GptqActivationStore {
+    /// Create a new empty GPTQ activation store.
     pub fn new() -> Self {
         Self {
             hessians: HashMap::new(),

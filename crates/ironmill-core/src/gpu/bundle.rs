@@ -12,18 +12,26 @@ use serde::{Deserialize, Serialize};
 /// Top-level manifest stored as `manifest.json` inside the bundle.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GpuBundleManifest {
+    /// Schema version of the GPU bundle format.
     pub format_version: u32,
+    /// Serialized model configuration (architecture, dimensions, etc.).
     pub model_config: serde_json::Value,
+    /// Global quantization parameters used to produce this bundle.
     pub quantization: QuantizationManifest,
+    /// Per-tensor manifests keyed by tensor name.
     pub tensors: HashMap<String, TensorManifest>,
 }
 
 /// Global quantization parameters that produced the bundle.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QuantizationManifest {
+    /// Quantization algorithm name (e.g., "polarquant", "affine").
     pub method: String,
+    /// Bit width used for quantization.
     pub n_bits: u8,
+    /// Random seed for reproducible quantization.
     pub seed: u32,
+    /// Minimum tensor element count to qualify for quantization.
     pub min_elements: usize,
 }
 
@@ -34,11 +42,17 @@ pub enum TensorManifest {
     /// PolarQuant LUT-compressed tensor (indices + LUT + row norms).
     #[serde(rename = "lut_to_dense")]
     LutToDense {
+        /// Path to the packed index file.
         indices_file: String,
+        /// Path to the look-up table file.
         lut_file: String,
+        /// Path to the per-row normalization file.
         norms_file: String,
+        /// Original tensor shape before quantization.
         shape: Vec<usize>,
+        /// Bit width of the quantized indices.
         n_bits: u8,
+        /// Original element data type (e.g., "float16").
         dtype: String,
         /// Optional QuIP# Hadamard rotation seed. When present, the tensor
         /// uses E8 lattice vector quantization and requires the QuIP# dequant
@@ -49,20 +63,31 @@ pub enum TensorManifest {
     /// Dense (unquantized) tensor stored as raw bytes.
     #[serde(rename = "dense")]
     Dense {
+        /// Path to the raw tensor data file.
         file: String,
+        /// Tensor shape.
         shape: Vec<usize>,
+        /// Element data type (e.g., "float32").
         dtype: String,
     },
     /// Affine-quantized tensor (packed INT4/INT8 data + scales + zero points).
     #[serde(rename = "affine_dequantize")]
     AffineDequantize {
+        /// Path to the packed quantized weight data.
         quantized_data_file: String,
+        /// Path to the per-group scale factors.
         scales_file: String,
+        /// Path to the per-group zero-point values.
         zeros_file: String,
+        /// Original tensor shape before quantization.
         shape: Vec<usize>,
+        /// Quantization bit width (e.g., 4 or 8).
         bit_width: u8,
+        /// Number of elements per quantization group.
         group_size: usize,
+        /// Axis along which groups are formed.
         axis: i64,
+        /// Original element data type.
         dtype: String,
         /// Optional per-column AWQ channel scales file. When present, the
         /// dequantized weight is divided by these scales to compensate for

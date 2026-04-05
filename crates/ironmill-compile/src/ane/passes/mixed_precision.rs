@@ -399,6 +399,7 @@ pub enum ExpertQuantStrategy {
     /// N-bit palettization via k-means (2 or 4 bits).
     #[serde(rename = "palettize_4bit")]
     Palettize4Bit,
+    /// N-bit palettization via k-means (2 bits).
     #[serde(rename = "palettize_2bit")]
     Palettize2Bit,
     /// Leave unchanged.

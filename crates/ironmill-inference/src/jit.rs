@@ -27,9 +27,13 @@ pub trait TensorTransform: Send + Sync {
 /// Result of a tensor transform.
 #[non_exhaustive]
 pub struct TransformedTensor {
+    /// Raw bytes of the transformed tensor data.
     pub data: Vec<u8>,
+    /// Dimensions of the tensor.
     pub shape: Vec<usize>,
+    /// Element data type after transformation.
     pub dtype: ScalarType,
+    /// Quantization parameters applied during the transform.
     pub quant_info: QuantizationInfo,
 }
 
@@ -37,10 +41,13 @@ pub struct TransformedTensor {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum TransformError {
+    /// A transform step failed.
     #[error("transform failed: {0}")]
     Failed(String),
+    /// The tensor type or layout is not supported by this transform.
     #[error("unsupported tensor: {0}")]
     Unsupported(String),
+    /// An I/O error occurred during transformation.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -51,32 +58,38 @@ pub struct TransformPipeline {
 }
 
 impl TransformPipeline {
+    /// Create a new empty transform pipeline.
     pub fn new() -> Self {
         Self {
             transforms: Vec::new(),
         }
     }
 
+    /// Append a transform step to the pipeline.
     pub fn with_transform(mut self, transform: Box<dyn TensorTransform>) -> Self {
         self.transforms.push(transform);
         self
     }
 
+    /// Add an int4 affine quantization transform (not yet implemented).
     pub fn with_int4(self, _group_size: usize) -> Self {
         // TODO: Add Int4AffineTransform
         self
     }
 
+    /// Add a float16 cast transform (not yet implemented).
     pub fn with_fp16(self) -> Self {
         // TODO: Add Fp16CastTransform
         self
     }
 
+    /// Add a polar quantization transform (not yet implemented).
     pub fn with_polar_quant(self, _bits: u8) -> Self {
         // TODO: Add PolarQuantTransform
         self
     }
 
+    /// Return a slice of the registered transforms.
     pub fn transforms(&self) -> &[Box<dyn TensorTransform>] {
         &self.transforms
     }

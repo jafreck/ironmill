@@ -37,6 +37,7 @@ pub struct PolarQuantPass {
 }
 
 impl PolarQuantPass {
+    /// Create a new polar quantization pass with the given bit width.
     pub fn new(n_bits: u8) -> Self {
         Self {
             n_bits,

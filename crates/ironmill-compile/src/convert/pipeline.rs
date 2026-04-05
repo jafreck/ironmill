@@ -54,10 +54,11 @@ use mil_rs::writer::write_mlpackage;
 
 /// Quantization method for a pipeline stage.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StageQuantize {
     /// No quantization — keep original precision.
+    #[default]
     None,
     /// Convert to float16.
     Fp16,
@@ -77,12 +78,6 @@ pub enum StageQuantize {
     PolarQuant,
     /// QuIP# quantization.
     QuipSharp,
-}
-
-impl Default for StageQuantize {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl std::fmt::Display for StageQuantize {

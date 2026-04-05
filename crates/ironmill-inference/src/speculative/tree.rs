@@ -25,6 +25,7 @@ pub struct DraftCandidate {
 /// efficient batch prefill through the target model.
 #[derive(Debug)]
 pub struct CandidateTree {
+    /// Flat list of draft candidates with parent pointers forming the tree.
     pub candidates: Vec<DraftCandidate>,
 }
 

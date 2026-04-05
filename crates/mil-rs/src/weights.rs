@@ -13,8 +13,11 @@ use crate::ir::ScalarType;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Architecture {
+    /// Meta's LLaMA family (includes Mistral, CodeLlama).
     Llama,
+    /// Alibaba's Qwen family.
     Qwen,
+    /// Google's Gemma family.
     Gemma,
 }
 
@@ -48,17 +51,29 @@ impl std::str::FromStr for Architecture {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ModelConfig {
+    /// Model architecture family.
     pub architecture: Architecture,
+    /// Dimensionality of the hidden representations.
     pub hidden_size: usize,
+    /// Dimensionality of the feed-forward intermediate layer.
     pub intermediate_size: usize,
+    /// Number of transformer layers.
     pub num_hidden_layers: usize,
+    /// Number of query attention heads.
     pub num_attention_heads: usize,
+    /// Number of key/value attention heads (for grouped-query attention).
     pub num_key_value_heads: usize,
+    /// Dimensionality of each attention head.
     pub head_dim: usize,
+    /// Size of the token vocabulary.
     pub vocab_size: usize,
+    /// Maximum sequence length supported by the positional embeddings.
     pub max_position_embeddings: usize,
+    /// Epsilon for RMSNorm layers.
     pub rms_norm_eps: f64,
+    /// Base frequency for rotary position embeddings.
     pub rope_theta: f64,
+    /// Whether the input and output embedding weights are shared.
     pub tie_word_embeddings: bool,
     /// Architecture-specific parameters (e.g. Gemma sliding_window_size,
     /// Qwen attention bias flags). Templates access via architecture match.
@@ -255,12 +270,19 @@ pub enum QuantizationInfo {
     /// PolarQuant / palettization: LUT + packed indices + row norms.
     /// Produced by `constexpr_lut_to_dense` in MIL IR.
     LutToDense {
+        /// Raw bytes of the palette lookup table.
         lut: Vec<u8>,
+        /// Scalar type of the LUT entries.
         lut_dtype: ScalarType,
+        /// Packed index buffer referencing LUT entries.
         indices: Vec<u8>,
+        /// Original unquantized tensor shape.
         original_shape: Vec<usize>,
+        /// Number of bits per index (1, 2, 4, 6, or 8).
         n_bits: u8,
+        /// Per-row norm values used for dequantization.
         row_norms: Vec<u8>,
+        /// Scalar type of the row norm values.
         norms_dtype: ScalarType,
         /// Hadamard rotation seed. When present, inverse rotation must be
         /// applied after LUT reconstruction to recover original weights.
@@ -274,10 +296,15 @@ pub enum QuantizationInfo {
     /// Produced by `constexpr_affine_dequantize` in MIL IR.
     /// Supports INT4 and INT8 bit widths, and optional per-group granularity.
     AffineDequantize {
+        /// Raw bytes of the per-channel or per-group scale factors.
         scale: Vec<u8>,
+        /// Raw bytes of the per-channel or per-group zero points.
         zero_point: Vec<u8>,
+        /// Scalar type of the scale values.
         scale_dtype: ScalarType,
+        /// Scalar type of the zero point values.
         zero_point_dtype: ScalarType,
+        /// Axis along which quantization parameters are applied.
         axis: Option<usize>,
         /// Quantization bit width (4 or 8). Defaults to 8 for legacy models.
         bit_width: u8,
@@ -302,9 +329,13 @@ pub enum QuantizationInfo {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct WeightTensor<'a> {
+    /// Raw weight data, borrowed (mmap) or owned (dequantized).
     pub data: Cow<'a, [u8]>,
+    /// Tensor dimensions.
     pub shape: Vec<usize>,
+    /// Element data type.
     pub dtype: ScalarType,
+    /// Quantization metadata, if any.
     pub quant_info: QuantizationInfo,
 }
 

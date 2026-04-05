@@ -42,17 +42,24 @@ use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 /// Used by the "simple" compilation path (AneModel).
 #[derive(Debug)]
 pub struct AneModelBundle {
+    /// Ordered list of compiled sub-programs that compose the model.
     pub sub_programs: Vec<SubProgramBundle>,
 }
 
 /// Single ANE sub-program artifact.
 #[derive(Debug)]
 pub struct SubProgramBundle {
+    /// Sub-program name (e.g., `"layer_0"`, `"embedding"`).
     pub name: String,
+    /// Serialized MIL text representation of this sub-program.
     pub mil_text: String,
+    /// BLOBFILE weight data baked into this sub-program.
     pub weight_blob: Vec<u8>,
+    /// Input tensor descriptors consumed by this sub-program.
     pub inputs: Vec<BundleTensorDescriptor>,
+    /// Output tensor descriptors produced by this sub-program.
     pub outputs: Vec<BundleTensorDescriptor>,
+    /// Optional packing scheme applied to input tensors.
     pub input_packing: Option<BundleInputPacking>,
 }
 
@@ -65,23 +72,36 @@ use ironmill_core::ane::bundle::{
 /// Compiled autoregressive decode model.
 #[derive(Debug)]
 pub struct AneDecodeBundle {
+    /// Model architecture metadata (family, dimensions, etc.).
     pub architecture: BundleArchitecture,
+    /// Pre-computed RoPE cosine embeddings (fp16 bytes).
     pub rope_cos: Vec<u8>,
+    /// Pre-computed RoPE sine embeddings (fp16 bytes).
     pub rope_sin: Vec<u8>,
+    /// Token embedding weight table (fp16 bytes).
     pub embedding_weights: Vec<u8>,
+    /// Language model head (ANE-chunked or CPU fallback).
     pub lm_head: LmHeadBundle,
+    /// Optional final layer-norm weight (e.g., for RMSNorm before lm_head).
     pub final_norm_weight: Option<Vec<u8>>,
+    /// Per-layer compiled transformer bundles, in order.
     pub layers: Vec<LayerBundle>,
 }
 
 /// Single transformer layer artifact.
 #[derive(Debug)]
 pub struct LayerBundle {
+    /// Zero-based layer index within the model.
     pub index: usize,
+    /// Pre-attention sub-program (QKV projections + norms).
     pub pre_attn: SubProgramBundle,
+    /// Optional post-attention sub-program (output projection + FFN).
     pub post_attn: Option<SubProgramBundle>,
+    /// Optional FP16 attention sub-program for higher-precision layers.
     pub fp16_attn: Option<SubProgramBundle>,
+    /// Whether cache-write ops are fused into the pre-attention sub-program.
     pub cache_write_fused: bool,
+    /// Whether this layer is compatible with donor weight injection.
     pub donor_compatible: bool,
 }
 
@@ -91,14 +111,20 @@ pub struct LayerBundle {
 pub enum LmHeadBundle {
     /// ANE-accelerated chunked lm_head.
     Ane {
+        /// Compiled sub-program chunks that partition the vocabulary.
         chunks: Vec<SubProgramBundle>,
+        /// Total vocabulary size across all chunks.
         vocab_size: usize,
+        /// Hidden dimension of the model.
         hidden_size: usize,
     },
     /// CPU fallback: raw fp16 weight bytes `[vocab_size, hidden_size]`.
     Cpu {
+        /// Raw fp16 weight data for CPU matrix multiplication.
         weight_data: Vec<u8>,
+        /// Total vocabulary size.
         vocab_size: usize,
+        /// Hidden dimension of the model.
         hidden_size: usize,
     },
 }

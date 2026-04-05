@@ -44,23 +44,23 @@ impl Default for BatchRunnerConfig {
 
 /// Managed batch inference loop.
 pub struct BatchRunner {
-    engine: Box<dyn BatchInferenceEngine>,
-    config: BatchRunnerConfig,
-    next_handle: u64,
+    _engine: Box<dyn BatchInferenceEngine>,
+    _config: BatchRunnerConfig,
+    _next_handle: u64,
 }
 
 impl BatchRunner {
     /// Create a new batch runner with the given engine and configuration.
     pub fn new(engine: Box<dyn BatchInferenceEngine>, config: BatchRunnerConfig) -> Self {
         Self {
-            engine,
-            config,
-            next_handle: 0,
+            _engine: engine,
+            _config: config,
+            _next_handle: 0,
         }
     }
 
     /// Submit a generation request and receive a handle for tracking.
-    pub fn submit(&mut self, request: GenerateRequest) -> Result<SequenceHandle, InferenceError> {
+    pub fn submit(&mut self, _request: GenerateRequest) -> Result<SequenceHandle, InferenceError> {
         todo!()
     }
 
@@ -70,7 +70,7 @@ impl BatchRunner {
     }
 
     /// Cancel a previously submitted sequence.
-    pub fn cancel(&mut self, handle: SequenceHandle) {
+    pub fn cancel(&mut self, _handle: SequenceHandle) {
         todo!()
     }
 

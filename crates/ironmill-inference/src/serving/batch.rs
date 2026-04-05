@@ -66,7 +66,6 @@ impl InferenceBatch {
                     batch.tokens.push(vec![last]);
                 }
                 SequenceStatus::Completed | SequenceStatus::Waiting => unreachable!(),
-                _ => {}
             }
         }
 

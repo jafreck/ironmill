@@ -24,14 +24,20 @@ use serde::Deserialize;
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct CalibrationDataset {
+    /// Dataset name identifier.
     pub name: String,
+    /// Model name this dataset was tokenized for.
     pub model: String,
+    /// Vocabulary size of the tokenizer.
     pub vocab_size: usize,
+    /// Sequence length (number of tokens per sequence).
     pub seq_len: usize,
+    /// Total number of sequences in the dataset.
     pub num_sequences: usize,
     /// Optional; present in PerplexityDataset files but unused for calibration.
     #[serde(default)]
     pub eos_token_id: Option<u32>,
+    /// Pre-tokenized sequences, each containing `seq_len` token IDs.
     pub sequences: Vec<Vec<u32>>,
 }
 

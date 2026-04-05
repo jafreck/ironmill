@@ -89,9 +89,13 @@ impl MemoryEstimator {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum QuantLevel {
+    /// 16-bit floating point weights.
     Fp16,
+    /// 8-bit integer quantized weights.
     Int8,
+    /// 4-bit integer quantized weights.
     Int4,
+    /// 2-bit integer quantized weights.
     Int2,
 }
 
@@ -99,9 +103,13 @@ pub enum QuantLevel {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum KvQuantLevel {
+    /// Full-precision KV cache (no quantization).
     None,
+    /// 8-bit integer KV cache quantization.
     Int8,
+    /// Turbo mode with 4-bit integer KV cache.
     TurboInt4,
+    /// Turbo mode with 8-bit integer KV cache.
     TurboInt8,
 }
 

@@ -18,7 +18,9 @@ pub const MAX_COMPILE_BUDGET: usize = 119;
 /// program because weights are baked at compile time (constraint #7).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct ProgramKey {
+    /// Hash of the MIL text IR for this program.
     pub mil_text_hash: u64,
+    /// Hash of the weight blob baked into this program.
     pub weight_hash: u64,
 }
 

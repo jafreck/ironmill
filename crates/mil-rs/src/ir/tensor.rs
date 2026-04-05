@@ -3,17 +3,29 @@
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ScalarType {
+    /// IEEE 754 half-precision (16-bit) floating point.
     Float16,
+    /// IEEE 754 single-precision (32-bit) floating point.
     Float32,
+    /// IEEE 754 double-precision (64-bit) floating point.
     Float64,
+    /// Signed 8-bit integer.
     Int8,
+    /// Signed 16-bit integer.
     Int16,
+    /// Signed 32-bit integer.
     Int32,
+    /// Signed 64-bit integer.
     Int64,
+    /// Unsigned 8-bit integer.
     UInt8,
+    /// Unsigned 16-bit integer.
     UInt16,
+    /// Unsigned 32-bit integer.
     UInt32,
+    /// Unsigned 64-bit integer.
     UInt64,
+    /// Boolean (1 byte storage).
     Bool,
 }
 

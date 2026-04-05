@@ -1325,9 +1325,10 @@ fn compile_output(output_path: &str) {
     if is_compiler_available() {
         eprintln!("Compiling with xcrun coremlcompiler...");
         let output_dir = Path::new(output_path).parent().unwrap_or(Path::new("."));
-        let compiled = compile_model(output_path, output_dir)
-            .with_context(|| format!("xcrun coremlcompiler failed for {output_path}"))?;
-        eprintln!("Done: {}", compiled.display());
+        match compile_model(output_path, output_dir) {
+            Ok(compiled) => eprintln!("Done: {}", compiled.display()),
+            Err(e) => eprintln!("Warning: xcrun coremlcompiler failed for {output_path}: {e}"),
+        }
     } else {
         eprintln!("Note: xcrun coremlcompiler not found — skipping compilation step.");
         eprintln!("  The .mlpackage can be compiled on a Mac with Xcode installed.");

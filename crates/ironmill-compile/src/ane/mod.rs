@@ -13,12 +13,31 @@ pub mod validate;
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum AneCompileError {
+    /// ANE compilation returned a non-zero status code.
     #[error("ANE compilation failed (status {status}): {context}")]
-    CompileFailed { status: u32, context: String },
+    CompileFailed {
+        /// Non-zero status code returned by the ANE compiler.
+        status: u32,
+        /// Human-readable description of the failure.
+        context: String,
+    },
+    /// ANE program evaluation returned a non-zero status code.
     #[error("ANE evaluation failed (status {status}): {context}")]
-    EvalFailed { status: u32, context: String },
+    EvalFailed {
+        /// Non-zero status code returned by the ANE evaluator.
+        status: u32,
+        /// Human-readable description of the failure.
+        context: String,
+    },
+    /// The per-process compile budget has been exhausted.
     #[error("compile budget exhausted: used {used} of {limit}")]
-    BudgetExhausted { used: usize, limit: usize },
+    BudgetExhausted {
+        /// Number of compilations already performed.
+        used: usize,
+        /// Maximum compilations allowed per process.
+        limit: usize,
+    },
+    /// Opaque error forwarded from an underlying subsystem.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

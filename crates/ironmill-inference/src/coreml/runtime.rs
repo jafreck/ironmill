@@ -94,10 +94,12 @@ impl RuntimeModel for CoremlRuntimeModel {
 
 /// CoreML backend that loads compiled `.mlmodelc` bundles.
 pub struct CoremlBackend {
+    /// Which compute units (CPU, GPU, ANE) the backend should use.
     pub compute_units: ComputeUnits,
 }
 
 impl CoremlBackend {
+    /// Create a new CoreML backend targeting the given compute units.
     pub fn new(compute_units: ComputeUnits) -> Self {
         Self { compute_units }
     }

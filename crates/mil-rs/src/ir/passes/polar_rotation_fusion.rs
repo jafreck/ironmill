@@ -39,6 +39,7 @@ pub struct PolarRotationFusionPass {
 }
 
 impl PolarRotationFusionPass {
+    /// Create a new polar rotation fusion pass with default safe activations.
     pub fn new() -> Self {
         Self {
             safe_activations: vec!["relu".to_string(), "leaky_relu".to_string()],

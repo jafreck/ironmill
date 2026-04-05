@@ -57,6 +57,7 @@ pub struct GpuCompileBuilder {
 }
 
 impl GpuCompileBuilder {
+    /// Create a new builder targeting the given input model path.
     pub fn new(input: impl Into<PathBuf>) -> Self {
         Self {
             input: input.into(),

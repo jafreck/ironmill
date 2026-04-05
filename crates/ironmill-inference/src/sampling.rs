@@ -214,6 +214,7 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    /// Create a new sampler with the given configuration.
     pub fn new(config: SamplerConfig) -> Self {
         Self {
             config,

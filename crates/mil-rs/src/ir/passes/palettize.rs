@@ -27,6 +27,7 @@ pub struct PalettizePass {
 }
 
 impl PalettizePass {
+    /// Create a new palettize pass with the given bit width.
     pub fn new(n_bits: u8) -> Self {
         assert!(
             matches!(n_bits, 1 | 2 | 4 | 6 | 8),

@@ -23,8 +23,11 @@ use std::cell::RefCell;
 /// Having a local copy avoids requiring the compile crate at runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TensorDescriptor {
+    /// Tensor name identifier.
     pub name: String,
+    /// NCHW shape of the tensor.
     pub shape: [usize; 4],
+    /// Scalar element type.
     pub dtype: ScalarType,
 }
 

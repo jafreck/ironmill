@@ -45,7 +45,7 @@ impl ModelInfo {
     pub fn from_config(config: &ModelConfig) -> Self {
         let uses_gqa = config.num_key_value_heads < config.num_attention_heads;
         let uses_mla =
-            config.extra.get("mla_config").is_some() || config.extra.get("q_lora_rank").is_some();
+            config.extra.contains_key("mla_config") || config.extra.contains_key("q_lora_rank");
         let param_count_m = estimate_param_count(config);
         Self {
             architecture: config.architecture,

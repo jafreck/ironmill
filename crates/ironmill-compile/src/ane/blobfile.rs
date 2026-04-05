@@ -25,9 +25,13 @@ const DATA_START: usize = 128;
 /// Metadata for a weight entry in the BLOBFILE.
 #[derive(Debug, Clone)]
 pub struct BlobEntry {
+    /// Weight tensor name (e.g., `"attn.qkv_proj.weight"`).
     pub name: String,
+    /// Byte offset of this entry's data within the BLOBFILE.
     pub offset: u64,
+    /// Size of the weight data in bytes.
     pub size: u64,
+    /// Scalar element type of the weight tensor.
     pub dtype: ScalarType,
 }
 

@@ -50,6 +50,7 @@ pub struct QuipSharpPass {
 }
 
 impl QuipSharpPass {
+    /// Create a new QuIP# quantization pass with the given bit width.
     pub fn new(bits: u8) -> Self {
         Self {
             bits,

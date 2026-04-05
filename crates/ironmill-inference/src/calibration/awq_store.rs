@@ -88,6 +88,7 @@ pub struct AwqActivationStore {
 }
 
 impl AwqActivationStore {
+    /// Create a new empty activation store with default settings.
     pub fn new() -> Self {
         Self {
             magnitudes: HashMap::new(),

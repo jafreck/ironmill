@@ -442,8 +442,11 @@ pub fn inject_ffn_residual(program: &mut Program) {
 
 /// Configuration subset needed for cache-write fusion.
 pub struct CacheWriteConfig {
+    /// Number of query attention heads.
     pub num_heads: usize,
+    /// Number of key-value attention heads (may differ in GQA).
     pub num_kv_heads: usize,
+    /// Dimensionality of each attention head.
     pub head_dim: usize,
 }
 

@@ -18,6 +18,7 @@ use ironmill_core::ane::TensorDescriptor;
 /// The result of splitting a model into ANE-sized sub-programs.
 #[derive(Debug)]
 pub struct ModelSplit {
+    /// Ordered list of sub-programs produced by the split.
     pub programs: Vec<SubProgram>,
 }
 

@@ -1380,6 +1380,7 @@ fn estimate_memory(program: &Program) -> u64 {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct PipelineReport {
+    /// Results from each pass in execution order.
     pub pass_results: Vec<PassResult>,
 }
 
@@ -1500,8 +1501,11 @@ impl PipelineReport {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct PassResult {
+    /// Name of the pass that was executed.
     pub name: String,
+    /// Number of operations in the graph before this pass ran.
     pub ops_before: usize,
+    /// Number of operations in the graph after this pass ran.
     pub ops_after: usize,
     /// Estimated FLOPs before this pass ran.
     pub flops_before: u64,

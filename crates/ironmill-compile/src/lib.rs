@@ -56,18 +56,20 @@ pub mod mil {
     // Reader / inspection
     pub use mil_rs::reader::{print_model_summary, print_onnx_summary};
 
-    // Protobuf model types — kept for backward compatibility with ironmill-compile-ffi.
+    /// Protobuf model types — kept for backward compatibility with ironmill-compile-ffi.
     // TODO(§3.6): deprecate and remove once downstream crates import from mil-rs directly.
     pub mod proto {
+        /// CoreML specification protobuf types.
         pub mod specification {
             pub use mil_rs::proto::specification::Model;
         }
+        /// ONNX protobuf types.
         pub mod onnx {
             pub use mil_rs::proto::onnx::ModelProto;
         }
     }
 
-    // Passes
+    /// MIL IR optimization and quantization passes.
     pub mod passes {
         pub use mil_rs::ir::passes::ConstantFoldPass;
         pub use mil_rs::ir::passes::DeadCodeEliminationPass;
@@ -82,7 +84,7 @@ pub mod mil {
     pub use mil_rs::ir::Granularity;
     pub use mil_rs::ir::passes::{AffineQuantizePass, BitWidth};
 
-    // LoRA and MoE conversion helpers (§3.6)
+    /// LoRA and MoE conversion helpers.
     pub mod convert {
         pub use mil_rs::convert::lora::{
             LoraAdapter, LoraWeights, detect_lora_adapters, lora_initializer_names, merge_lora,

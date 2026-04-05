@@ -30,11 +30,11 @@ pub mod types;
 pub mod ane;
 #[cfg(all(feature = "coreml", target_os = "macos"))]
 pub mod coreml;
-#[cfg(all(any(feature = "metal"), target_os = "macos"))]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod dequant;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
-#[cfg(all(any(feature = "metal"), target_os = "macos"))]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod weight_loading;
 
 // Re-exports for convenience.
@@ -105,11 +105,21 @@ use ironmill_iosurface::IOSurfaceError;
 pub enum AneError {
     /// ANE compilation failed with a status code.
     #[error("ANE compilation failed (status {status:#x}): {context}")]
-    CompileFailed { status: u32, context: String },
+    CompileFailed {
+        /// The ANE status code returned by the compiler.
+        status: u32,
+        /// Human-readable description of the failure.
+        context: String,
+    },
 
     /// ANE eval failed with a status code.
     #[error("ANE eval failed (status {status:#x}): {context}")]
-    EvalFailed { status: u32, context: String },
+    EvalFailed {
+        /// The ANE status code returned during evaluation.
+        status: u32,
+        /// Human-readable description of the failure.
+        context: String,
+    },
 
     /// IOSurface creation or I/O failed.
     #[error("IOSurface error: {0}")]
@@ -117,7 +127,12 @@ pub enum AneError {
 
     /// The compile budget (~119 per process) has been exhausted.
     #[error("ANE compile budget exhausted ({used}/{limit} compilations used)")]
-    BudgetExhausted { used: usize, limit: usize },
+    BudgetExhausted {
+        /// Number of compilations already consumed.
+        used: usize,
+        /// Maximum compilations allowed per process.
+        limit: usize,
+    },
 
     /// A generic error from an underlying operation.
     #[error("{0}")]

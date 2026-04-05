@@ -23,6 +23,7 @@ pub struct QuipHessianAccumulator {
 }
 
 impl QuipHessianAccumulator {
+    /// Create a new accumulator for the given feature dimension.
     pub fn new(n_features: usize) -> Self {
         Self {
             xtx: vec![0.0; n_features * n_features],
@@ -46,6 +47,7 @@ pub struct HessianHook {
 }
 
 impl HessianHook {
+    /// Create a new empty Hessian hook.
     pub fn new() -> Self {
         Self {
             accumulators: std::collections::HashMap::new(),
@@ -122,6 +124,7 @@ pub struct CalibrationRunner {
 }
 
 impl CalibrationRunner {
+    /// Create a new runner with default settings.
     pub fn new() -> Self {
         Self {
             batch_size: 4,

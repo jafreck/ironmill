@@ -85,16 +85,19 @@ impl GenerateRequest {
         self
     }
 
+    /// Set the sampler configuration for token selection.
     pub fn with_sampler(mut self, config: SamplerConfig) -> Self {
         self.sampler = config;
         self
     }
 
+    /// Set the maximum number of tokens to generate.
     pub fn with_max_tokens(mut self, n: usize) -> Self {
         self.max_tokens = n;
         self
     }
 
+    /// Set a compiled grammar to constrain generation output.
     pub fn with_grammar(mut self, grammar: Arc<CompiledGrammar>) -> Self {
         self.grammar = Some(grammar);
         self
@@ -127,6 +130,7 @@ pub enum GenerateEvent {
     },
     /// Generation has finished.
     Finished {
+        /// The reason generation stopped.
         reason: FinishReason,
         /// Number of tokens generated (excluding prompt).
         tokens_generated: usize,
@@ -161,6 +165,7 @@ pub struct CancellationToken {
 }
 
 impl CancellationToken {
+    /// Create a new cancellation token in the non-cancelled state.
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
