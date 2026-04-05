@@ -604,10 +604,7 @@ impl MetalInference {
                             global_hd,
                             self.config.max_seq_len,
                             global_cfg.theta,
-                            // Gemma4 proportional RoPE: partial_rotary_factor is for
-                            // NTK frequency scaling, not dimension reduction.
-                            // All head dimensions are rotated.
-                            1.0,
+                            global_cfg.partial_rotary_factor,
                         )
                         .map_err(|e| InferenceError::runtime(e.to_string()))?;
                         self.global_rope_cos = Some(gc);
@@ -846,7 +843,10 @@ impl MetalInference {
             for i in 0..half_dim {
                 let offset = (pos * half_dim + i) * 2;
                 if i < rotary_half {
-                    let freq = 1.0 / theta.powf(2.0 * i as f64 / rotary_dim as f64);
+                    // Proportional RoPE: frequency denominator is always head_dim,
+                    // even when partial_rotary_factor < 1.0 reduces the number of
+                    // rotated dimensions. HF: 1/base^(2i/head_dim)
+                    let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
                     let angle = pos as f64 * freq;
                     let c = f16::from_f64(angle.cos());
                     let s = f16::from_f64(angle.sin());
@@ -3010,7 +3010,7 @@ impl MetalInference {
                             global_hd,
                             self.config.max_seq_len,
                             global_cfg.theta,
-                            1.0,
+                            global_cfg.partial_rotary_factor,
                         )
                         .map_err(|e| InferenceError::runtime(e.to_string()))?;
                         self.global_rope_cos = Some(gc);
