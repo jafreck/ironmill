@@ -483,7 +483,7 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
 
     if !matches!(opts.target, TargetArg::All | TargetArg::CpuAndNe) {
         eprintln!(
-            "Note: --target '{:?}' will be fully supported in Phase 3. Proceeding with default target.",
+            "Warning: --target '{:?}' is accepted but not yet wired into compilation. Proceeding with default target.",
             opts.target
         );
     }
@@ -505,6 +505,13 @@ fn cmd_compile(input: &str, opts: CompileOpts) -> Result<()> {
                 ""
             }
         );
+        eprintln!("Warning: --kv-quant is accepted but not yet wired into compilation.");
+        if opts.kv_quant_qjl {
+            eprintln!("Warning: --kv-quant-qjl is accepted but not yet wired into compilation.");
+        }
+        if opts.max_seq_len != 2048 {
+            eprintln!("Warning: --max-seq-len is accepted but not yet wired into compilation.");
+        }
     }
 
     match detect_input_format(input_path) {
@@ -1218,12 +1225,12 @@ fn compile_from_onnx(input_path: &Path, opts: &CompileOpts) -> Result<()> {
     }
     if opts.emit_adapter {
         bail!(
-            "--emit-adapter is not yet implemented. This flag is reserved for future adapter export support."
+            "LoRA adapter emission is not yet implemented. Compile the base model without --emit-adapter."
         );
     }
     if !opts.adapters.is_empty() {
         bail!(
-            "--adapter is not yet implemented. This flag is reserved for future external adapter loading ({} path(s) provided).",
+            "LoRA adapter loading is not yet implemented. Compile the base model without --adapter ({} path(s) provided).",
             opts.adapters.len()
         );
     }
