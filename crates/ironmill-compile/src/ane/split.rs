@@ -218,6 +218,11 @@ fn classify_ops(operations: &[Operation]) -> Vec<(String, Vec<Operation>)> {
 
     if !has_layers {
         // Fallback: single group with all ops.
+        eprintln!(
+            "Warning: ANE split: no layer-numbering pattern found in operation names. \
+             Falling back to legacy single 'main' group. This may produce suboptimal \
+             ANE splitting for models that don't follow the 'layerN' naming convention."
+        );
         return vec![("main".to_string(), operations.to_vec())];
     }
 

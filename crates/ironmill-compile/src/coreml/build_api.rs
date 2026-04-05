@@ -264,10 +264,20 @@ impl CompileBuilder {
         // 3. Run the pipeline
         let report = pipeline.run(&mut program)?;
 
-        // 4. Convert to Model proto (spec version 7 as default)
+        // 4. Apply target compute unit preference as model metadata.
+        // CoreML stores this as a string in the model description's metadata.
+        let compute_unit_str = match self.target {
+            TargetComputeUnit::CpuOnly => "cpuOnly",
+            TargetComputeUnit::CpuAndGpu => "cpuAndGPU",
+            TargetComputeUnit::CpuAndNeuralEngine => "cpuAndNeuralEngine",
+            TargetComputeUnit::All => "all",
+        };
+        program.set_attribute("compute_units", compute_unit_str);
+
+        // 5. Convert to Model proto (spec version 7 as default)
         let model = program_to_model(&program, 7)?;
 
-        // 5. Determine output path
+        // 6. Determine output path
         let output_path = self.output.unwrap_or_else(|| default_output_path(input));
 
         // 6. Write .mlpackage

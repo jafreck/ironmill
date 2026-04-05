@@ -94,6 +94,15 @@ pub enum TensorManifest {
         /// activation-aware weight scaling applied during quantization.
         #[serde(skip_serializing_if = "Option::is_none")]
         awq_scales_file: Option<String>,
+        /// Optional group-index mapping file for GPTQ-style reordering.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        g_idx_file: Option<String>,
+        /// Data type of the scale parameters (e.g., "float16", "float32").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scale_dtype: Option<String>,
+        /// Data type of the zero-point parameters (e.g., "float16", "float32").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        zero_point_dtype: Option<String>,
     },
 }
 

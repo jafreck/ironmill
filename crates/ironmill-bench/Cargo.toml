@@ -13,8 +13,8 @@ path = "src/main.rs"
 [dependencies]
 ironmill-compile = { workspace = true }
 ironmill-core = { workspace = true }
-ironmill-inference = { path = "../ironmill-inference" }
-ironmill-iosurface = { path = "../ironmill-iosurface", optional = true }
+ironmill-inference = { workspace = true }
+ironmill-iosurface = { workspace = true, optional = true }
 mil-rs = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -29,7 +29,7 @@ tempfile = { workspace = true }
 ironmill-ane-sys = { workspace = true }
 
 [dev-dependencies]
-ironmill-metal-sys = { path = "../ironmill-metal-sys" }
+ironmill-metal-sys = { workspace = true }
 
 [features]
 default = []

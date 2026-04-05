@@ -2,19 +2,12 @@
 // because the unsafety boundary is at the C ↔ Rust FFI boundary, not at each
 // individual function.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(deprecated)]
 
 //! C-compatible FFI API for `mil-rs`.
 //!
 //! This module exposes the core model conversion pipeline to C, Swift, C++,
 //! Go, and any other language that can call `extern "C"` functions.
-//!
-//! # Feature gate
-//!
-//! This module is only available when the `c-api` Cargo feature is enabled:
-//!
-//! ```bash
-//! cargo build -p mil-rs --features c-api
-//! ```
 //!
 //! # Error handling
 //!

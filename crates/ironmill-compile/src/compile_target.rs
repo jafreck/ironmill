@@ -101,7 +101,9 @@ impl CompileTarget for MetalCompileTarget {
         _progress: &dyn ProgressSink,
     ) -> Result<CompileOutput, CompileError> {
         Err(CompileError::Other(
-            "MetalCompileTarget not yet implemented".into(),
+            "MetalCompileTarget is not yet implemented. \
+             Use GpuCompileTarget for GPU bundle output."
+                .into(),
         ))
     }
 }
@@ -121,7 +123,9 @@ impl CompileTarget for CoremlCompileTarget {
         _progress: &dyn ProgressSink,
     ) -> Result<CompileOutput, CompileError> {
         Err(CompileError::Other(
-            "CoremlCompileTarget not yet implemented".into(),
+            "CoremlCompileTarget is not yet implemented. \
+             Use the coreml::build_api::CompileBuilder for CoreML compilation."
+                .into(),
         ))
     }
 }

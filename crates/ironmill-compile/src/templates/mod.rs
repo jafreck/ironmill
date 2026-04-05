@@ -58,8 +58,26 @@ pub fn weights_to_program_with_options(
 ) -> Result<ConversionResult, MilError> {
     match provider.config().architecture {
         Architecture::Llama => llama::build_program(provider, options),
-        Architecture::Qwen => qwen::build_program(provider),
-        Architecture::Gemma => gemma::build_program(provider),
+        Architecture::Qwen => {
+            if options.ane {
+                return Err(MilError::Validation(
+                    "ANE lowering is not yet supported for Qwen. \
+                     Only LLaMA models support ANE compilation."
+                        .into(),
+                ));
+            }
+            qwen::build_program(provider)
+        }
+        Architecture::Gemma => {
+            if options.ane {
+                return Err(MilError::Validation(
+                    "ANE lowering is not yet supported for Gemma. \
+                     Only LLaMA models support ANE compilation."
+                        .into(),
+                ));
+            }
+            gemma::build_program(provider)
+        }
         _ => Err(MilError::Validation(format!(
             "unsupported architecture: {:?}",
             provider.config().architecture
@@ -127,6 +145,18 @@ fn extract_component(
         })
         .collect();
 
+    // Warn about heuristic decisions that may break dataflow.
+    if component == ModelComponent::Transformer {
+        let has_embed_out = ops.iter().any(|op| op.name == "embed_out");
+        if has_embed_out {
+            eprintln!(
+                "Warning: extract_component(Transformer): dropping 'embed_out' op. \
+                 The Transformer component will not include the embedding output projection. \
+                 This may break dataflow if downstream components depend on it."
+            );
+        }
+    }
+
     let filtered_ops: Vec<_> = ops
         .iter()
         .zip(keep.iter())
@@ -145,7 +175,15 @@ fn extract_component(
         }
     }
     if component == ModelComponent::LmHead {
-        // lm_head takes hidden state as input (Float16, [batch, seq, hidden_size])
+        // Note: LmHead fabricates a fixed hidden-state input with shape
+        // [1, max_position_embeddings, hidden_size]. This is a heuristic;
+        // the actual hidden-state shape depends on the transformer output
+        // and may differ for non-standard sequence lengths.
+        eprintln!(
+            "Warning: extract_component(LmHead): fabricating hidden-state input with fixed shape \
+             [1, {}, {}]. Actual shape may differ at runtime.",
+            config.max_position_embeddings, config.hidden_size
+        );
         use mil_rs::ir::{ScalarType, TensorType};
         let hidden_ty = TensorType::new(
             ScalarType::Float16,

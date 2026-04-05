@@ -32,6 +32,18 @@ pub enum CompileError {
         stderr: String,
     },
 
+    /// The requested quantization format is not supported.
+    #[error("unsupported quantization: {0}")]
+    UnsupportedQuantization(String),
+
+    /// The model architecture is not supported.
+    #[error("unsupported architecture: {0}")]
+    UnsupportedArchitecture(String),
+
+    /// An error occurred while loading or processing weight tensors.
+    #[error("weight load error: {0}")]
+    WeightLoadError(String),
+
     /// A generic compilation error.
     #[error("{0}")]
     Other(String),

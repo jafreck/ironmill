@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use ironmill_compile::coreml::compiler::compile_model;
+#[allow(deprecated)]
 use ironmill_compile::mil::passes::{
     ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass,
 };

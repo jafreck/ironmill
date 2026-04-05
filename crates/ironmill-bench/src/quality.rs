@@ -4,7 +4,9 @@
 //! enabling automated tracking of weight fidelity impact from optimizations.
 
 use half::f16;
+#[allow(deprecated)]
 use ironmill_compile::mil::passes::PolarQuantPass;
+#[allow(deprecated)]
 use ironmill_compile::mil::passes::tensor_utils::tensor_as_f32_slice;
 use ironmill_compile::mil::{Pass, Program, ScalarType, Value};
 

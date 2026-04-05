@@ -921,10 +921,14 @@ fn dequantize_to_fp16(
         GgmlType::F16 => dequant_f16_passthrough(raw, num_elements),
         GgmlType::BF16 => dequant_bf16_to_fp16(raw, num_elements),
         GgmlType::Q4_0 => dequant_q4_0_to_fp16(raw, num_elements),
+        GgmlType::Q4_1 => dequant_q4_1_to_fp16(raw, num_elements),
+        GgmlType::Q5_0 => dequant_q5_0_to_fp16(raw, num_elements),
+        GgmlType::Q5_1 => dequant_q5_1_to_fp16(raw, num_elements),
+        GgmlType::Q6K => dequant_q6_k_to_fp16(raw, num_elements),
         GgmlType::Q8_0 => dequant_q8_0_to_fp16(raw, num_elements),
         other => Err(MilError::Validation(format!(
             "GGUF: dequantization not yet implemented for {other:?}. \
-             Supported types: F32, F16, BF16, Q4_0, Q8_0"
+             Supported types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q6_K, Q8_0"
         ))),
     }
 }
@@ -1078,6 +1082,239 @@ fn dequant_q8_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilE
             let h = f16::from_f32(val);
             out.extend_from_slice(&h.to_le_bytes());
         }
+    }
+
+    Ok(out)
+}
+
+/// Q4_1 → FP16: each block is 32 values.
+///
+/// Block layout (20 bytes):
+///   - 2 bytes: f16 scale factor (`d`)
+///   - 2 bytes: f16 minimum value (`m`)
+///   - 16 bytes: 32 × 4-bit unsigned nibbles packed 2-per-byte (low nibble first)
+///
+/// Dequantization: `value = d * nibble + m`
+fn dequant_q4_1_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 20;
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let expected_bytes = num_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| MilError::Validation("GGUF: Q4_1 dequant size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: Q4_1 tensor data too short".into(),
+        ));
+    }
+
+    let out_capacity = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: Q4_1 dequant output size overflow".into()))?;
+    let mut out = Vec::with_capacity(out_capacity);
+
+    for block_idx in 0..num_blocks {
+        let block = &raw[block_idx * BLOCK_BYTES..];
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let quant_data = &block[4..BLOCK_BYTES];
+
+        for &byte in quant_data.iter().take(16) {
+            let lo = (byte & 0x0F) as f32;
+            let hi = ((byte >> 4) & 0x0F) as f32;
+
+            let v_lo = f16::from_f32(d * lo + m);
+            let v_hi = f16::from_f32(d * hi + m);
+            out.extend_from_slice(&v_lo.to_le_bytes());
+            out.extend_from_slice(&v_hi.to_le_bytes());
+        }
+    }
+
+    Ok(out)
+}
+
+/// Q5_0 → FP16: each block is 32 values.
+///
+/// Block layout (22 bytes):
+///   - 2 bytes: f16 scale factor (`d`)
+///   - 4 bytes: 32 high bits (one per element, packed into 32-bit integer)
+///   - 16 bytes: 32 × 4-bit low nibbles packed 2-per-byte (low nibble first)
+///
+/// Dequantization: `value = d * (((high_bit << 4) | low_nibble) - 16)`
+fn dequant_q5_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 22;
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let expected_bytes = num_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| MilError::Validation("GGUF: Q5_0 dequant size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: Q5_0 tensor data too short".into(),
+        ));
+    }
+
+    let out_capacity = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: Q5_0 dequant output size overflow".into()))?;
+    let mut out = Vec::with_capacity(out_capacity);
+
+    for block_idx in 0..num_blocks {
+        let block = &raw[block_idx * BLOCK_BYTES..];
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let quant_data = &block[6..BLOCK_BYTES];
+
+        for j in 0..16 {
+            let byte = quant_data[j];
+            let lo_nibble = (byte & 0x0F) as i32;
+            let hi_nibble = ((byte >> 4) & 0x0F) as i32;
+
+            let lo_high = ((qh >> j) & 1) as i32;
+            let hi_high = ((qh >> (j + 16)) & 1) as i32;
+
+            let lo_val = d * ((lo_nibble | (lo_high << 4)) - 16) as f32;
+            let hi_val = d * ((hi_nibble | (hi_high << 4)) - 16) as f32;
+
+            out.extend_from_slice(&f16::from_f32(lo_val).to_le_bytes());
+            out.extend_from_slice(&f16::from_f32(hi_val).to_le_bytes());
+        }
+    }
+
+    Ok(out)
+}
+
+/// Q5_1 → FP16: each block is 32 values.
+///
+/// Block layout (24 bytes):
+///   - 2 bytes: f16 scale factor (`d`)
+///   - 2 bytes: f16 minimum value (`m`)
+///   - 4 bytes: 32 high bits packed into a u32
+///   - 16 bytes: 32 × 4-bit low nibbles packed 2-per-byte (low nibble first)
+///
+/// Dequantization: `value = d * ((high_bit << 4) | low_nibble) + m`
+fn dequant_q5_1_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 24;
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let expected_bytes = num_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| MilError::Validation("GGUF: Q5_1 dequant size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: Q5_1 tensor data too short".into(),
+        ));
+    }
+
+    let out_capacity = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: Q5_1 dequant output size overflow".into()))?;
+    let mut out = Vec::with_capacity(out_capacity);
+
+    for block_idx in 0..num_blocks {
+        let block = &raw[block_idx * BLOCK_BYTES..];
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let m = f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let quant_data = &block[8..BLOCK_BYTES];
+
+        for j in 0..16 {
+            let byte = quant_data[j];
+            let lo_nibble = (byte & 0x0F) as i32;
+            let hi_nibble = ((byte >> 4) & 0x0F) as i32;
+
+            let lo_high = ((qh >> j) & 1) as i32;
+            let hi_high = ((qh >> (j + 16)) & 1) as i32;
+
+            let lo_val = d * (lo_nibble | (lo_high << 4)) as f32 + m;
+            let hi_val = d * (hi_nibble | (hi_high << 4)) as f32 + m;
+
+            out.extend_from_slice(&f16::from_f32(lo_val).to_le_bytes());
+            out.extend_from_slice(&f16::from_f32(hi_val).to_le_bytes());
+        }
+    }
+
+    Ok(out)
+}
+
+/// Q6_K → FP16: K-quant 6-bit (256 elements per super-block, 210 bytes/block).
+///
+/// Super-block layout (210 bytes):
+///   - 128 bytes: packed 6-bit quantized values (ql, lower 4 bits)
+///   - 64 bytes:  packed high 2-bit values (qh)
+///   - 16 bytes:  per-sub-block scales (int8, 16 sub-blocks of 16 elements)
+///   - 2 bytes:   f16 super-block scale factor (`d`)
+///
+/// Dequantization: `value = d * scale_i * (q - 32)`
+fn dequant_q6_k_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let expected_bytes = num_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| MilError::Validation("GGUF: Q6_K dequant size overflow".into()))?;
+    if raw.len() < expected_bytes {
+        return Err(MilError::Validation(
+            "GGUF: Q6_K tensor data too short".into(),
+        ));
+    }
+
+    let out_capacity = num_elements
+        .checked_mul(2)
+        .ok_or_else(|| MilError::Validation("GGUF: Q6_K dequant output size overflow".into()))?;
+    let mut out = Vec::with_capacity(out_capacity);
+
+    for block_idx in 0..num_blocks {
+        let block = &raw[block_idx * BLOCK_BYTES..];
+        let ql = &block[0..128]; // lower 4 bits
+        let qh = &block[128..192]; // upper 2 bits
+        let scales = &block[192..208]; // 16 int8 scales
+        let d = f16::from_le_bytes([block[208], block[209]]).to_f32();
+
+        let mut fp16_buf = vec![0u8; BLOCK_SIZE * 2];
+
+        for h in 0..2u32 {
+            for l in 0..32u32 {
+                let q1 = (ql[(h * 64 + l) as usize] & 0x0F) as i32
+                    | ((((qh[(h * 32 + l) as usize] >> 0) & 3) as i32) << 4);
+                let q2 = (ql[(h * 64 + l + 32) as usize] & 0x0F) as i32
+                    | ((((qh[(h * 32 + l) as usize] >> 2) & 3) as i32) << 4);
+                let q3 = ((ql[(h * 64 + l) as usize] >> 4) & 0x0F) as i32
+                    | ((((qh[(h * 32 + l) as usize] >> 4) & 3) as i32) << 4);
+                let q4 = ((ql[(h * 64 + l + 32) as usize] >> 4) & 0x0F) as i32
+                    | ((((qh[(h * 32 + l) as usize] >> 6) & 3) as i32) << 4);
+
+                let sc1 = scales[(h * 8 + l / 16) as usize] as i8;
+                let sc2 = scales[(h * 8 + l / 16 + 2) as usize] as i8;
+                let sc3 = scales[(h * 8 + l / 16 + 4) as usize] as i8;
+                let sc4 = scales[(h * 8 + l / 16 + 6) as usize] as i8;
+
+                let idx1 = (h * 128 + l) as usize;
+                let idx2 = (h * 128 + l + 32) as usize;
+                let idx3 = (h * 128 + l + 64) as usize;
+                let idx4 = (h * 128 + l + 96) as usize;
+
+                let v1 = d * (sc1 as f32) * (q1 - 32) as f32;
+                let v2 = d * (sc2 as f32) * (q2 - 32) as f32;
+                let v3 = d * (sc3 as f32) * (q3 - 32) as f32;
+                let v4 = d * (sc4 as f32) * (q4 - 32) as f32;
+
+                let base = idx1 * 2;
+                fp16_buf[base..base + 2].copy_from_slice(&f16::from_f32(v1).to_le_bytes());
+                let base = idx2 * 2;
+                fp16_buf[base..base + 2].copy_from_slice(&f16::from_f32(v2).to_le_bytes());
+                let base = idx3 * 2;
+                fp16_buf[base..base + 2].copy_from_slice(&f16::from_f32(v3).to_le_bytes());
+                let base = idx4 * 2;
+                fp16_buf[base..base + 2].copy_from_slice(&f16::from_f32(v4).to_le_bytes());
+            }
+        }
+
+        out.extend_from_slice(&fp16_buf);
     }
 
     Ok(out)

@@ -135,7 +135,7 @@ pub fn write_gpu_bundle(
                 scale_dtype,
                 zero_point_dtype,
                 awq_scales,
-                g_idx: _,
+                g_idx,
             } => {
                 // Per-tensor/per-channel quantization (group_size=None) is not
                 // supported in the GPU bundle format. Dequantize these tensors
@@ -196,17 +196,25 @@ pub fn write_gpu_bundle(
 
                     fs::write(output_dir.join(&qdata_file), &*tensor.data)?;
 
-                    // Convert scales and zeros to FP16 for the GPU bundle
-                    // (the bundle reader assumes FP16 for these parameters).
-                    let scales_fp16 = convert_params_to_fp16(scale, *scale_dtype);
-                    let zeros_fp16 = convert_params_to_fp16(zero_point, *zero_point_dtype);
-                    fs::write(output_dir.join(&scales_file), &scales_fp16)?;
-                    fs::write(output_dir.join(&zeros_file), &zeros_fp16)?;
+                    // Write scales and zeros in their original dtype to preserve
+                    // quantization metadata fidelity.
+                    fs::write(output_dir.join(&scales_file), scale)?;
+                    fs::write(output_dir.join(&zeros_file), zero_point)?;
 
                     let awq_scales_file = if let Some(awq) = awq_scales {
                         let awq_file = format!("weights/{sanitized}.awq");
                         fs::write(output_dir.join(&awq_file), awq)?;
                         Some(awq_file)
+                    } else {
+                        None
+                    };
+
+                    let g_idx_file = if let Some(indices) = g_idx {
+                        let gidx_file = format!("weights/{sanitized}.gidx");
+                        let gidx_bytes: Vec<u8> =
+                            indices.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                        fs::write(output_dir.join(&gidx_file), &gidx_bytes)?;
+                        Some(gidx_file)
                     } else {
                         None
                     };
@@ -223,6 +231,11 @@ pub fn write_gpu_bundle(
                             axis: axis as i64,
                             dtype: scalar_type_to_str(tensor.dtype).to_string(),
                             awq_scales_file,
+                            g_idx_file,
+                            scale_dtype: Some(scalar_type_to_str(*scale_dtype).to_string()),
+                            zero_point_dtype: Some(
+                                scalar_type_to_str(*zero_point_dtype).to_string(),
+                            ),
                         },
                     );
                 }
@@ -263,32 +276,6 @@ pub fn write_gpu_bundle(
     fs::write(output_dir.join("manifest.json"), json)?;
 
     Ok(())
-}
-
-// ── Parameter dtype conversion helper ────────────────────────────────
-
-/// Convert quantization parameters (scales or zeros) to FP16 bytes.
-///
-/// The GPU bundle format stores scales/zeros as FP16. This converts
-/// from the source dtype (typically Float32 from the quantize pass).
-fn convert_params_to_fp16(data: &[u8], dtype: mil_rs::ir::ScalarType) -> Vec<u8> {
-    use mil_rs::ir::ScalarType;
-
-    match dtype {
-        ScalarType::Float16 => data.to_vec(),
-        ScalarType::Float32 => data
-            .chunks_exact(4)
-            .flat_map(|c| {
-                let val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                f16::from_f32(val).to_le_bytes()
-            })
-            .collect(),
-        ScalarType::UInt8 => data
-            .iter()
-            .flat_map(|&b| f16::from_f32(b as f32).to_le_bytes())
-            .collect(),
-        _ => data.to_vec(),
-    }
 }
 
 // ── Affine dequantization helper ────────────────────────────────────────

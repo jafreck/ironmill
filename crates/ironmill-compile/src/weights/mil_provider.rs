@@ -191,7 +191,14 @@ impl MilWeightProvider {
                     // Default bit_width=8 for backward compat with legacy INT8 models.
                     let bit_width = match op.attributes.get("bit_width") {
                         Some(Value::Int(v)) => *v as u8,
-                        _ => 8,
+                        _ => {
+                            eprintln!(
+                                "Warning: legacy INT8 defaulting: tensor has no explicit bit_width \
+                                 attribute, defaulting to 8. This behavior is deprecated; \
+                                 quantized models should specify bit_width explicitly."
+                            );
+                            8
+                        }
                     };
 
                     let group_size = match op.attributes.get("group_size") {
@@ -205,9 +212,12 @@ impl MilWeightProvider {
                             dtype: ScalarType::Float32,
                             ..
                         }) => {
-                            let fp16_bytes: Vec<u8> = data
-                                .as_bytes()
-                                .expect("tensor not materialized")
+                            let raw = data.as_bytes().ok_or_else(|| {
+                                MilError::Validation(
+                                    "awq_channel_scales tensor not materialized".into(),
+                                )
+                            })?;
+                            let fp16_bytes: Vec<u8> = raw
                                 .chunks_exact(4)
                                 .flat_map(|c| {
                                     let val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
@@ -225,9 +235,10 @@ impl MilWeightProvider {
                             dtype: ScalarType::Int32,
                             ..
                         }) => {
-                            let indices: Vec<u32> = data
-                                .as_bytes()
-                                .expect("tensor not materialized")
+                            let raw = data.as_bytes().ok_or_else(|| {
+                                MilError::Validation("g_idx tensor not materialized".into())
+                            })?;
+                            let indices: Vec<u32> = raw
                                 .chunks_exact(4)
                                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                                 .collect();

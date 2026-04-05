@@ -431,10 +431,45 @@ fn validate_manifest(manifest: &PipelineManifest) -> Result<()> {
             | StageQuantize::Fp16
             | StageQuantize::Int8
             | StageQuantize::QuipSharp => {}
-            _ => {
+            StageQuantize::Int4 => {
                 return Err(MilError::Validation(format!(
-                    "stage '{}': unsupported quantize value '{:?}' for pipeline conversion",
-                    stage.name, stage.quantize
+                    "stage '{}': Int4 quantization is not yet supported for pipeline conversion. \
+                     Use Fp16 or Int8 instead.",
+                    stage.name
+                )));
+            }
+            StageQuantize::Awq => {
+                return Err(MilError::Validation(format!(
+                    "stage '{}': AWQ quantization is not yet supported for pipeline conversion. \
+                     Pre-quantized AWQ weights can be loaded via SafeTensors.",
+                    stage.name
+                )));
+            }
+            StageQuantize::Gptq => {
+                return Err(MilError::Validation(format!(
+                    "stage '{}': GPTQ quantization is not yet supported for pipeline conversion. \
+                     Pre-quantized GPTQ weights can be loaded via SafeTensors.",
+                    stage.name
+                )));
+            }
+            StageQuantize::D2Quant => {
+                return Err(MilError::Validation(format!(
+                    "stage '{}': D2Quant quantization is not yet supported for pipeline conversion.",
+                    stage.name
+                )));
+            }
+            StageQuantize::Palettize => {
+                return Err(MilError::Validation(format!(
+                    "stage '{}': Palettize quantization is not yet supported for pipeline conversion. \
+                     Use the `palettize` field with a bit-width instead.",
+                    stage.name
+                )));
+            }
+            StageQuantize::PolarQuant => {
+                return Err(MilError::Validation(format!(
+                    "stage '{}': PolarQuant quantization is not yet supported for pipeline conversion. \
+                     Use the GPU compilation path with PolarQuantPass instead.",
+                    stage.name
                 )));
             }
         }
@@ -506,6 +541,13 @@ fn build_stage_pipeline(stage: &StageConfig, base_dir: &Path) -> Result<PassPipe
 
     match stage.quantize {
         StageQuantize::Fp16 => {
+            if stage.cal_data.is_some() {
+                eprintln!(
+                    "Warning: stage '{}': calibration data is ignored for Fp16 quantization \
+                     (only used for Int8).",
+                    stage.name
+                );
+            }
             pipeline = pipeline.with_fp16()?;
         }
         StageQuantize::Int8 => {
@@ -513,9 +555,28 @@ fn build_stage_pipeline(stage: &StageConfig, base_dir: &Path) -> Result<PassPipe
             pipeline = pipeline.with_int8(cal_data)?;
         }
         StageQuantize::QuipSharp => {
+            if stage.cal_data.is_some() {
+                eprintln!(
+                    "Warning: stage '{}': calibration data is ignored for QuipSharp quantization \
+                     (only used for Int8).",
+                    stage.name
+                );
+            }
+            // QuIP# lattice parameters: codebook_bits=2, seed=42.
+            // These are hardcoded because the QuIP# pass currently only
+            // supports the E8P lattice (2-bit codebook) and uses seed=42
+            // for deterministic codebook generation.
             pipeline = pipeline.with_quip_sharp(2, 42)?;
         }
-        _ => {}
+        _ => {
+            if stage.cal_data.is_some() {
+                eprintln!(
+                    "Warning: stage '{}': calibration data is ignored for {:?} quantization \
+                     (only used for Int8).",
+                    stage.name, stage.quantize
+                );
+            }
+        }
     }
 
     if let Some(bits) = stage.palettize {

@@ -440,7 +440,7 @@ fn resolve_input_dtype_bytes(
     op: &Operation,
     input_name: &str,
     type_map: &HashMap<String, TensorType>,
-) -> usize {
+) -> Result<usize, String> {
     let dtype = match op.inputs.get(input_name) {
         Some(Value::Reference(name)) => type_map.get(name).map(|t| t.scalar_type),
         Some(Value::Tensor { dtype, .. }) => Some(*dtype),
@@ -448,12 +448,12 @@ fn resolve_input_dtype_bytes(
     };
 
     match dtype {
-        Some(ScalarType::Float16 | ScalarType::Int16 | ScalarType::UInt16) => 2,
-        Some(ScalarType::Float32 | ScalarType::Int32 | ScalarType::UInt32) => 4,
-        Some(ScalarType::Float64 | ScalarType::Int64 | ScalarType::UInt64) => 8,
-        Some(ScalarType::Int8 | ScalarType::UInt8 | ScalarType::Bool) => 1,
-        Some(_) => panic!("unsupported scalar type for byte width: {dtype:?}"),
-        None => 4,
+        Some(ScalarType::Float16 | ScalarType::Int16 | ScalarType::UInt16) => Ok(2),
+        Some(ScalarType::Float32 | ScalarType::Int32 | ScalarType::UInt32) => Ok(4),
+        Some(ScalarType::Float64 | ScalarType::Int64 | ScalarType::UInt64) => Ok(8),
+        Some(ScalarType::Int8 | ScalarType::UInt8 | ScalarType::Bool) => Ok(1),
+        Some(other) => Err(format!("unsupported scalar type for byte width: {other:?}")),
+        None => Ok(4),
     }
 }
 
@@ -593,7 +593,13 @@ fn check_alignment_constraints(
     let input_shape = resolve_input_shape(op, "x", type_map);
     if let Some(ref shape) = input_shape {
         if let Some(&Some(innermost)) = shape.last() {
-            let elem_bytes = resolve_input_dtype_bytes(op, "x", type_map);
+            let elem_bytes = match resolve_input_dtype_bytes(op, "x", type_map) {
+                Ok(b) => b,
+                Err(msg) => {
+                    annotations.push(format!("cannot determine byte alignment: {msg}"));
+                    return (None, annotations);
+                }
+            };
             let stride_bytes = innermost * elem_bytes;
             if stride_bytes % ANE_BYTE_ALIGNMENT != 0 {
                 annotations.push(format!(

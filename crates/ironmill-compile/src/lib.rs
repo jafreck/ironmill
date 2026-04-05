@@ -58,6 +58,10 @@ pub mod mil {
 
     /// Protobuf model types — kept for backward compatibility with ironmill-compile-ffi.
     // TODO(§3.6): deprecate and remove once downstream crates import from mil-rs directly.
+    #[deprecated(
+        since = "0.2.0",
+        note = "import protobuf types from `mil_rs::proto` directly instead of `ironmill_compile::mil::proto`"
+    )]
     pub mod proto {
         /// CoreML specification protobuf types.
         pub mod specification {
@@ -70,6 +74,10 @@ pub mod mil {
     }
 
     /// MIL IR optimization and quantization passes.
+    #[deprecated(
+        since = "0.2.0",
+        note = "import passes from `mil_rs::ir::passes` directly instead of `ironmill_compile::mil::passes`"
+    )]
     pub mod passes {
         pub use mil_rs::ir::passes::ConstantFoldPass;
         pub use mil_rs::ir::passes::DeadCodeEliminationPass;
@@ -77,6 +85,10 @@ pub mod mil {
         pub use mil_rs::ir::passes::PolarQuantPass;
 
         // TODO(§3.6): deprecate and remove — used by ironmill-bench quality module.
+        #[deprecated(
+            since = "0.2.0",
+            note = "import `tensor_utils` from `mil_rs::ir::passes` directly"
+        )]
         pub use mil_rs::ir::passes::tensor_utils;
     }
 
