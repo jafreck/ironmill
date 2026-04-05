@@ -16,86 +16,12 @@
 
 use std::collections::HashMap;
 
-use rayon::prelude::*;
-
 use super::tensor_utils::{f32_slice_to_bytes, tensor_as_f32_slice, tensor_f16_as_f32_slice};
 use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
 use crate::ir::tensor::{ScalarType, TensorType};
 use crate::ir::types::{TensorData, Value};
-
-// ---------------------------------------------------------------------------
-// Apple Accelerate BLAS bindings for hardware-accelerated matrix math.
-// On Apple Silicon this uses the AMX coprocessor for near-GPU throughput.
-// ---------------------------------------------------------------------------
-
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-mod blas {
-    pub const ROW_MAJOR: i32 = 101;
-    pub const NO_TRANS: i32 = 111;
-    pub const TRANS: i32 = 112;
-
-    #[link(name = "Accelerate", kind = "framework")]
-    unsafe extern "C" {
-        pub fn cblas_sgemm(
-            order: i32,
-            trans_a: i32,
-            trans_b: i32,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            a: *const f32,
-            lda: i32,
-            b: *const f32,
-            ldb: i32,
-            beta: f32,
-            c: *mut f32,
-            ldc: i32,
-        );
-    }
-}
-
-/// Compute C = A × B^T using Accelerate BLAS on macOS, scalar fallback elsewhere.
-/// A: [m × k] row-major, B: [n × k] row-major, C: [m × n] row-major.
-#[allow(unsafe_code)]
-fn matmul_a_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe {
-            blas::cblas_sgemm(
-                blas::ROW_MAJOR,
-                blas::NO_TRANS,
-                blas::TRANS,
-                m as i32,
-                n as i32,
-                k as i32,
-                1.0,
-                a.as_ptr(),
-                k as i32,
-                b.as_ptr(),
-                k as i32,
-                0.0,
-                c.as_mut_ptr(),
-                n as i32,
-            );
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        for i in 0..m {
-            for j in 0..n {
-                let mut dot = 0.0f32;
-                for p in 0..k {
-                    dot += a[i * k + p] * b[j * k + p];
-                }
-                c[i * n + j] = dot;
-            }
-        }
-    }
-}
 
 /// AWQ quantization pass.
 ///
@@ -104,7 +30,6 @@ fn matmul_a_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize
 /// name of the const weight. Optionally accepts raw calibration activations
 /// to compute the paper's exact loss (Equation 4) instead of the mag²-weighted
 /// MSE approximation.
-#[non_exhaustive]
 pub struct AwqQuantizePass {
     /// Quantization bit width (4 or 8).
     pub bits: u8,
@@ -173,19 +98,7 @@ impl Pass for AwqQuantizePass {
     }
 
     fn run(&self, program: &mut Program) -> Result<()> {
-        if self.channel_magnitudes.is_empty() {
-            return Err(MilError::Validation(
-                "AWQ: channel_magnitudes is empty. Calibration data is required — \
-                 run the calibration pipeline to collect per-channel activation \
-                 magnitudes before applying the AWQ pass."
-                    .into(),
-            ));
-        }
-
         let qmax = qmax(self.bits);
-        let provider = program.weight_provider.clone();
-        let spill_index = program.spill_index.clone();
-        let resolve = super::util::make_resolver(&provider, &spill_index);
 
         for function in program.functions.values_mut() {
             // ----------------------------------------------------------
@@ -256,20 +169,10 @@ impl Pass for AwqQuantizePass {
                         .ok_or_else(|| MilError::Validation("missing val in attributes".into()))?
                 };
 
-                if let Value::Tensor {
-                    mut data,
-                    shape,
-                    dtype,
-                } = val
-                {
-                    data.materialize_with(|key| resolve(key))?;
+                if let Value::Tensor { data, shape, dtype } = val {
                     let floats = match dtype {
-                        ScalarType::Float32 => {
-                            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
-                        }
-                        ScalarType::Float16 => tensor_f16_as_f32_slice(
-                            data.as_bytes().expect("tensor not materialized"),
-                        ),
+                        ScalarType::Float32 => tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
+                        ScalarType::Float16 => tensor_f16_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
                         other => {
                             return Err(MilError::TypeMismatch {
                                 expected: "Float32 or Float16".into(),
@@ -327,9 +230,17 @@ impl Pass for AwqQuantizePass {
                 group_map.entry(eop.mag_key.clone()).or_default().push(i);
             }
 
+            eprintln!(
+                "[awq] {} eligible ops, {} fallback ops, {} groups",
+                eligible.len(),
+                fallback_ops.len(),
+                group_map.len()
+            );
+
             let mut group_best_alpha: HashMap<Vec<u8>, f32> = HashMap::new();
 
-            for (mag_key, indices) in &group_map {
+            for (group_idx, (mag_key, indices)) in group_map.iter().enumerate() {
+                let t0 = std::time::Instant::now();
                 let first = &eligible[indices[0]];
                 let in_features = first.in_features;
                 let mags = &self.channel_magnitudes[&first.op_name][..in_features];
@@ -348,7 +259,7 @@ impl Pass for AwqQuantizePass {
 
                     let n_tokens = if token_count > 0 && cal_act.len() == token_count * in_features
                     {
-                        token_count.min(128)
+                        token_count.min(32)
                     } else {
                         continue;
                     };
@@ -365,16 +276,18 @@ impl Pass for AwqQuantizePass {
                         })
                         .collect();
 
-                    // Pre-compute W · X^T = [out_features, n_tokens] using BLAS.
+                    // Pre-compute W · X^T = [out_features, n_tokens].
                     let mut ref_output = vec![0.0f32; out_features * n_tokens];
-                    matmul_a_bt(
-                        &eop.floats,
-                        &sub_activations,
-                        &mut ref_output,
-                        out_features,
-                        n_tokens,
-                        in_features,
-                    );
+                    for row in 0..out_features {
+                        for t in 0..n_tokens {
+                            let mut dot = 0.0f32;
+                            for c in 0..in_features {
+                                dot += eop.floats[row * in_features + c]
+                                    * sub_activations[t * in_features + c];
+                            }
+                            ref_output[row * n_tokens + t] = dot;
+                        }
+                    }
 
                     proj_data.push(GroupProjection {
                         floats: &eop.floats,
@@ -395,13 +308,22 @@ impl Pass for AwqQuantizePass {
                 );
 
                 group_best_alpha.insert(mag_key.clone(), best_alpha);
+                eprintln!(
+                    "[awq] group {}/{}: α={:.2}, {} projections, {:.1}ms",
+                    group_idx + 1,
+                    group_map.len(),
+                    best_alpha,
+                    indices.len(),
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                );
             }
 
             // ----------------------------------------------------------
             // Phase 3: Apply the group's best α scales, clip, and quantize.
             // Paper Section 3.2: scale → clip → quantize.
             // ----------------------------------------------------------
-            for eop in &eligible {
+            for (eop_idx, eop) in eligible.iter().enumerate() {
+                let t0 = std::time::Instant::now();
                 let alpha = group_best_alpha[&eop.mag_key];
                 let in_features = eop.in_features;
                 let mags = &self.channel_magnitudes[&eop.op_name][..in_features];
@@ -421,27 +343,14 @@ impl Pass for AwqQuantizePass {
                 if let Some(cal_act) = self.calibration_activations.get(&eop.op_name) {
                     let token_count = self.calibration_token_count;
                     if token_count > 0 && cal_act.len() == token_count * in_features {
-                        let n_tokens = token_count.min(128);
-                        let stride = if token_count > n_tokens {
-                            token_count / n_tokens
-                        } else {
-                            1
-                        };
-                        let sub_act: Vec<f32> = (0..n_tokens)
-                            .flat_map(|ti| {
-                                let t = ti * stride;
-                                (0..in_features).map(move |c| cal_act[t * in_features + c])
-                            })
-                            .collect();
-
                         let clip_maxvals = search_clip_ranges(
                             &scaled_weights,
                             out_features,
                             in_features,
                             self.group_size,
                             qmax,
-                            &sub_act,
-                            n_tokens,
+                            cal_act,
+                            token_count,
                             20,  // clip_grid
                             0.5, // max_shrink
                         );
@@ -464,23 +373,28 @@ impl Pass for AwqQuantizePass {
                     &channel_scales,
                     self.bits,
                 );
+                eprintln!(
+                    "[awq] phase3 {}/{}: {}x{}, {:.1}ms",
+                    eop_idx + 1,
+                    eligible.len(),
+                    eop.shape[0],
+                    in_features,
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                );
             }
 
             // ----------------------------------------------------------
-            // Phase 4: Restore ops without calibration data.
-            // These are large 2D tensors (e.g. embeddings) that the
-            // calibration runner didn't instrument. Leave them
-            // unquantized rather than silently applying MinMax.
+            // Phase 4: MinMax fallback for ops without calibration.
             // ----------------------------------------------------------
-            for (idx, floats, shape) in fallback_ops {
-                let op = &mut function.body.operations[idx];
-                let data = f32_slice_to_bytes(&floats);
-                let val = Value::Tensor {
-                    data: TensorData::Inline(data),
+            for (idx, floats, shape) in &fallback_ops {
+                emit_fallback_per_group(
+                    &mut function.body.operations[*idx],
+                    floats,
                     shape,
-                    dtype: ScalarType::Float32,
-                };
-                op.inputs.insert("val".to_string(), val);
+                    self.group_size,
+                    qmax,
+                    self.bits,
+                );
             }
         }
         Ok(())
@@ -507,11 +421,13 @@ fn compute_scales(magnitudes: &[f32], alpha: f32) -> Vec<f32> {
 
 /// Search for the optimal per-group clipping range on (already-scaled) weights.
 ///
-/// For each (row, group), searches for a `max_val` that minimizes
-///   `|| (act * Q(clamp(w, -max_val, max_val))) - (act * w) ||²`
-/// over the calibration tokens.
+/// Matches the reference `auto_clip_layer`: for each (row, group), finds the
+/// `max_val` that minimizes activation-weighted quantization error.
+/// Uses pre-allocated buffers and inlined quantization to avoid inner-loop
+/// allocations (the hot loop runs ~millions of iterations).
 ///
-/// Uses Rayon to parallelize across (row, group) pairs for near-GPU throughput.
+/// TODO: move to Metal compute shader for GPU-accelerated clipping search
+/// (matching the reference which uses PyTorch GPU tensor ops).
 ///
 /// Returns a flat array of optimal `max_val` per (row, group).
 #[allow(clippy::too_many_arguments)]
@@ -527,73 +443,92 @@ fn search_clip_ranges(
     max_shrink: f32,
 ) -> Vec<f32> {
     let n_groups = in_features.div_ceil(group_size);
-    let n_steps = (max_shrink * clip_grid as f32) as usize;
+    let mut clip_maxvals = vec![f32::INFINITY; out_features * n_groups];
 
-    // Parallel search over all (row, group) pairs.
-    let total_pairs = out_features * n_groups;
-    let results: Vec<f32> = (0..total_pairs)
-        .into_par_iter()
-        .map(|pair_idx| {
-            let row = pair_idx / n_groups;
-            let g = pair_idx % n_groups;
+    // Pre-allocate reusable buffers (avoids millions of inner-loop allocations).
+    let mut clipped = vec![0.0f32; group_size];
+    let mut quantized = vec![0u8; group_size];
 
-            let g_start = g * group_size;
-            let g_end = (g_start + group_size).min(in_features);
-            let gsize = g_end - g_start;
+    // Sub-sample tokens.
+    let n_sample = n_tokens.min(4);
+    let stride = if n_tokens > n_sample {
+        n_tokens / n_sample
+    } else {
+        1
+    };
 
-            let row_base = row * in_features;
+    for g in 0..n_groups {
+        let g_start = g * group_size;
+        let g_end = (g_start + group_size).min(in_features);
+        let gsize = g_end - g_start;
 
-            // Per-group abs max (read from weight slice directly, no allocation).
-            let mut org_max = 0.0f32;
-            for c in g_start..g_end {
-                let v = scaled_weights[row_base + c].abs();
-                if v > org_max {
-                    org_max = v;
-                }
-            }
+        // Pre-compute sub-sampled activations for this group: [n_sample, gsize].
+        let act_g: Vec<f32> = (0..n_sample)
+            .flat_map(|si| {
+                let t = si * stride;
+                (0..gsize).map(move |j| sub_activations[t * in_features + g_start + j])
+            })
+            .collect();
+
+        for row in 0..out_features {
+            let w_base = row * in_features + g_start;
+            let w_slice = &scaled_weights[w_base..w_base + gsize];
+
+            let org_max = w_slice.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
             if org_max < 1e-8 {
-                return org_max;
+                clip_maxvals[row * n_groups + g] = org_max;
+                continue;
             }
 
-            // Compute original (unquantized) group output per token.
-            let mut org_out = vec![0.0f32; n_tokens];
-            for (t, org) in org_out.iter_mut().enumerate() {
-                let act_base = t * in_features + g_start;
-                let mut sum = 0.0f32;
+            // Reference output per sample token (stack array, n_sample <= 16).
+            let mut org_out = [0.0f32; 16];
+            for si in 0..n_sample {
+                let mut dot = 0.0f32;
+                let ab = si * gsize;
                 for j in 0..gsize {
-                    sum += scaled_weights[row_base + g_start + j] * sub_activations[act_base + j];
+                    dot += w_slice[j] * act_g[ab + j];
                 }
-                *org = sum;
+                org_out[si] = dot;
             }
 
-            // Reusable buffers.
-            let mut clipped = vec![0.0f32; gsize];
             let mut best_err = f32::INFINITY;
             let mut best_max = org_max;
 
+            let n_steps = (max_shrink * clip_grid as f32) as usize;
             for step in 0..n_steps {
                 let max_val = org_max * (1.0 - step as f32 / clip_grid as f32);
 
-                // Clamp weights into reusable buffer.
+                // Clip weights into pre-allocated buffer.
                 for j in 0..gsize {
-                    clipped[j] = scaled_weights[row_base + g_start + j].clamp(-max_val, max_val);
+                    clipped[j] = w_slice[j].clamp(-max_val, max_val);
                 }
 
-                let (quantized, q_scale, q_zp) = quantize_affine(&clipped, qmax);
-
-                // Dequantize once into the clipped buffer (reuse it).
+                // Inline affine quantization (no alloc).
+                let mut wmin = f32::INFINITY;
+                let mut wmax = f32::NEG_INFINITY;
                 for j in 0..gsize {
-                    clipped[j] = (quantized[j] as f32 - q_zp) * q_scale;
-                }
-
-                let mut err = 0.0f32;
-                for (t, &org) in org_out.iter().enumerate() {
-                    let act_base = t * in_features + g_start;
-                    let mut q_out = 0.0f32;
-                    for j in 0..gsize {
-                        q_out += clipped[j] * sub_activations[act_base + j];
+                    if clipped[j] < wmin {
+                        wmin = clipped[j];
                     }
-                    let diff = q_out - org;
+                    if clipped[j] > wmax {
+                        wmax = clipped[j];
+                    }
+                }
+                let scale = ((wmax - wmin) / qmax).max(1e-10);
+                let zp = (-wmin / scale).round();
+                for j in 0..gsize {
+                    quantized[j] = (clipped[j] / scale + zp).round().clamp(0.0, qmax) as u8;
+                }
+
+                // Compute error against reference.
+                let mut err = 0.0f32;
+                for si in 0..n_sample {
+                    let mut q_out = 0.0f32;
+                    let ab = si * gsize;
+                    for j in 0..gsize {
+                        q_out += (quantized[j] as f32 - zp) * scale * act_g[ab + j];
+                    }
+                    let diff = q_out - org_out[si];
                     err += diff * diff;
                 }
 
@@ -603,11 +538,11 @@ fn search_clip_ranges(
                 }
             }
 
-            best_max
-        })
-        .collect();
+            clip_maxvals[row * n_groups + g] = best_max;
+        }
+    }
 
-    results
+    clip_maxvals
 }
 
 /// Apply per-group clipping to a weight matrix in-place.
@@ -650,9 +585,6 @@ struct GroupProjection<'a> {
 /// For each candidate α the same scale vector is applied to every projection
 /// and the per-projection losses are summed, matching the reference which
 /// evaluates all `linears2scale` projections together.
-///
-/// Uses Rayon to evaluate α candidates in parallel and Accelerate BLAS
-/// for the loss matrix multiply, giving near-GPU throughput on Apple Silicon.
 fn search_alpha_group(
     projections: &[GroupProjection],
     magnitudes: &[f32],
@@ -668,80 +600,63 @@ fn search_alpha_group(
     let in_features = magnitudes.len();
     let n_groups = in_features.div_ceil(group_size);
 
-    // Evaluate all α candidates in parallel.
-    let best = (0..=grid_steps)
-        .into_par_iter()
-        .map(|step| {
-            let alpha = step as f32 / grid_steps as f32;
-            let scales = compute_scales(magnitudes, alpha);
+    let mut best_alpha = 0.0_f32;
+    let mut best_loss = f32::INFINITY;
 
-            let mut total_loss = 0.0f32;
+    for step in 0..=grid_steps {
+        let alpha = step as f32 / grid_steps as f32;
+        let scales = compute_scales(magnitudes, alpha);
 
-            // Reusable buffers per thread (avoid repeated allocation).
-            let max_out = projections
-                .iter()
-                .map(|p| p.out_features)
-                .max()
-                .unwrap_or(0);
-            let mut w_dq = vec![0.0f32; max_out * in_features];
-            let max_tokens = projections.iter().map(|p| p.n_tokens).max().unwrap_or(0);
-            let mut output = vec![0.0f32; max_out * max_tokens];
-            let mut scaled_group = vec![0.0f32; group_size];
+        let mut total_loss = 0.0f32;
 
-            for proj in projections {
-                let wdq = &mut w_dq[..proj.out_features * proj.in_features];
+        for proj in projections {
+            // Build W_dq: quantize W·diag(s), then dequant and divide by s.
+            let mut w_dq = vec![0.0f32; proj.out_features * proj.in_features];
+            for row in 0..proj.out_features {
+                for g in 0..n_groups {
+                    let g_start = g * group_size;
+                    let g_end = (g_start + group_size).min(proj.in_features);
 
-                // Build W_dq: quantize W·diag(s), then dequant and divide by s.
-                for row in 0..proj.out_features {
-                    for g in 0..n_groups {
-                        let g_start = g * group_size;
-                        let g_end = (g_start + group_size).min(proj.in_features);
-                        let gsize = g_end - g_start;
+                    let scaled_group: Vec<f32> = (g_start..g_end)
+                        .map(|col| {
+                            let s = if col < scales.len() { scales[col] } else { 1.0 };
+                            proj.floats[row * proj.in_features + col] * s
+                        })
+                        .collect();
 
-                        // Scale the group into the reusable buffer.
-                        for (j, col) in (g_start..g_end).enumerate() {
-                            scaled_group[j] =
-                                proj.floats[row * proj.in_features + col] * scales[col];
-                        }
+                    let (quantized, q_scale, q_zp) = quantize_affine(&scaled_group, qmax);
 
-                        let (quantized, q_scale, q_zp) =
-                            quantize_affine(&scaled_group[..gsize], qmax);
-
-                        for (j, col) in (g_start..g_end).enumerate() {
-                            let dequant = (quantized[j] as f32 - q_zp) * q_scale;
-                            wdq[row * proj.in_features + col] = dequant / scales[col];
-                        }
+                    for (j, col) in (g_start..g_end).enumerate() {
+                        let s = if col < scales.len() { scales[col] } else { 1.0 };
+                        let dequant = (quantized[j] as f32 - q_zp) * q_scale;
+                        w_dq[row * proj.in_features + col] = dequant / s;
                     }
                 }
-
-                // Compute loss = ||W_dq · X^T − ref_output||² via BLAS matmul.
-                let out = &mut output[..proj.out_features * proj.n_tokens];
-                matmul_a_bt(
-                    wdq,
-                    &proj.sub_activations,
-                    out,
-                    proj.out_features,
-                    proj.n_tokens,
-                    proj.in_features,
-                );
-
-                let loss: f32 = out
-                    .iter()
-                    .zip(proj.ref_output.iter())
-                    .map(|(&a, &b)| {
-                        let e = a - b;
-                        e * e
-                    })
-                    .sum();
-                total_loss += loss;
             }
 
-            (alpha, total_loss)
-        })
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or((0.0, f32::INFINITY));
+            // Exact loss: L(s) = ||W_dq · X^T − W · X^T||²
+            let mut loss = 0.0f32;
+            for row in 0..proj.out_features {
+                for t in 0..proj.n_tokens {
+                    let mut dq_dot = 0.0f32;
+                    for c in 0..proj.in_features {
+                        dq_dot += w_dq[row * proj.in_features + c]
+                            * proj.sub_activations[t * proj.in_features + c];
+                    }
+                    let err = dq_dot - proj.ref_output[row * proj.n_tokens + t];
+                    loss += err * err;
+                }
+            }
+            total_loss += loss;
+        }
 
-    best.0
+        if total_loss < best_loss {
+            best_loss = total_loss;
+            best_alpha = alpha;
+        }
+    }
+
+    best_alpha
 }
 
 use super::affine_quantize::quantize_affine;
@@ -800,7 +715,7 @@ fn emit_per_group_with_scales(
     };
 
     let quantized_val = Value::Tensor {
-        data: TensorData::Inline(packed_data),
+        data: TensorData::inline(packed_data),
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -826,7 +741,7 @@ fn emit_per_group_with_scales(
     op.attributes.insert(
         "scale".to_string(),
         Value::Tensor {
-            data: TensorData::Inline(scale_bytes),
+            data: TensorData::inline(scale_bytes),
             shape: param_shape.clone(),
             dtype: ScalarType::Float32,
         },
@@ -834,7 +749,7 @@ fn emit_per_group_with_scales(
     op.attributes.insert(
         "zero_point".to_string(),
         Value::Tensor {
-            data: TensorData::Inline(zp_bytes),
+            data: TensorData::inline(zp_bytes),
             shape: param_shape,
             dtype: ScalarType::Float32,
         },
@@ -851,11 +766,106 @@ fn emit_per_group_with_scales(
     op.attributes.insert(
         "awq_channel_scales".to_string(),
         Value::Tensor {
-            data: TensorData::Inline(f32_slice_to_bytes(channel_scales)),
+            data: TensorData::inline(f32_slice_to_bytes(channel_scales)),
             shape: vec![num_scales],
             dtype: ScalarType::Float32,
         },
     );
+
+    let out_type = TensorType::new(ScalarType::Float32, shape.to_vec());
+    if let Some(slot) = op.output_types.get_mut(0) {
+        *slot = Some(out_type);
+    } else {
+        op.output_types.push(Some(out_type));
+    }
+}
+
+/// Fallback: standard per-group MinMax quantization (no AWQ scaling).
+fn emit_fallback_per_group(
+    op: &mut crate::ir::operation::Operation,
+    floats: &[f32],
+    shape: &[usize],
+    group_size: usize,
+    qmax: f32,
+    bits: u8,
+) {
+    let ndim = shape.len();
+    let last_dim = if ndim > 0 { shape[ndim - 1] } else { 1 };
+    let outer_count: usize = if ndim > 1 {
+        shape[..ndim - 1].iter().product()
+    } else {
+        1
+    };
+    let n_groups = last_dim.div_ceil(group_size);
+
+    let mut all_quantized = Vec::with_capacity(floats.len());
+    let mut all_scales = Vec::with_capacity(outer_count * n_groups);
+    let mut all_zero_points = Vec::with_capacity(outer_count * n_groups);
+
+    for row in 0..outer_count {
+        let row_start = row * last_dim;
+        for g in 0..n_groups {
+            let g_start = row_start + g * group_size;
+            let g_end = (g_start + group_size).min(row_start + last_dim);
+            let group_slice = &floats[g_start..g_end];
+            let (q, s, zp) = quantize_affine(group_slice, qmax);
+            all_quantized.extend_from_slice(&q);
+            all_scales.push(s);
+            all_zero_points.push(zp);
+        }
+    }
+
+    let packed_data = if bits == 4 {
+        pack_int4(&all_quantized)
+    } else {
+        all_quantized
+    };
+
+    let quantized_val = Value::Tensor {
+        data: TensorData::inline(packed_data),
+        shape: shape.to_vec(),
+        dtype: ScalarType::UInt8,
+    };
+
+    let mut param_shape = shape.to_vec();
+    if let Some(last) = param_shape.last_mut() {
+        *last = n_groups;
+    }
+
+    let scale_bytes: Vec<u8> = all_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let zp_bytes: Vec<u8> = all_zero_points
+        .iter()
+        .flat_map(|z| z.to_le_bytes())
+        .collect();
+
+    let axis = if ndim > 0 { (ndim - 1) as i64 } else { 0 };
+
+    op.op_type = "constexpr_affine_dequantize".to_string();
+    op.inputs.remove("val");
+    op.attributes.remove("val");
+    op.attributes
+        .insert("quantized_data".to_string(), quantized_val);
+    op.attributes.insert(
+        "scale".to_string(),
+        Value::Tensor {
+            data: TensorData::inline(scale_bytes),
+            shape: param_shape.clone(),
+            dtype: ScalarType::Float32,
+        },
+    );
+    op.attributes.insert(
+        "zero_point".to_string(),
+        Value::Tensor {
+            data: TensorData::inline(zp_bytes),
+            shape: param_shape,
+            dtype: ScalarType::Float32,
+        },
+    );
+    op.attributes.insert("axis".to_string(), Value::Int(axis));
+    op.attributes
+        .insert("group_size".to_string(), Value::Int(group_size as i64));
+    op.attributes
+        .insert("bit_width".to_string(), Value::Int(bits as i64));
 
     let out_type = TensorType::new(ScalarType::Float32, shape.to_vec());
     if let Some(slot) = op.output_types.get_mut(0) {
@@ -890,7 +900,7 @@ mod tests {
     /// Build a single-const-op program for testing.
     fn make_program(name: &str, values: &[f32], shape: Vec<usize>) -> Program {
         let tensor_val = Value::Tensor {
-            data: TensorData::Inline(f32_bytes(values)),
+            data: TensorData::inline(f32_bytes(values)),
             shape,
             dtype: ScalarType::Float32,
         };
@@ -924,7 +934,7 @@ mod tests {
 
         let op = &program.functions["main"].body.operations[0];
         let q_data_raw = match op.attributes.get("quantized_data") {
-            Some(Value::Tensor { data, .. }) => data.as_bytes().expect("tensor not materialized"),
+            Some(Value::Tensor { data, .. }) => data,
             _ => panic!("missing quantized_data"),
         };
 
@@ -943,16 +953,12 @@ mod tests {
 
         // Get per-group scales and zero points.
         let scales = match op.attributes.get("scale") {
-            Some(Value::Tensor { data, .. }) => {
-                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
-            }
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing scale"),
         };
         let zero_points = match op.attributes.get("zero_point") {
-            Some(Value::Tensor { data, .. }) => {
-                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
-            }
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing zero_point"),
         };
@@ -964,9 +970,7 @@ mod tests {
 
         // Get AWQ channel scales if present.
         let channel_scales = match op.attributes.get("awq_channel_scales") {
-            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(
-                data.as_bytes().expect("tensor not materialized"),
-            )),
+            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(data)),
             _ => None,
         };
 
@@ -1019,7 +1023,7 @@ mod tests {
 
         let op = &program.functions["main"].body.operations[0];
         let q_data_raw = match op.attributes.get("quantized_data") {
-            Some(Value::Tensor { data, .. }) => data.as_bytes().expect("tensor not materialized"),
+            Some(Value::Tensor { data, .. }) => data,
             _ => panic!("missing quantized_data"),
         };
         let bit_width = match op.attributes.get("bit_width") {
@@ -1032,16 +1036,12 @@ mod tests {
             q_data_raw.to_vec()
         };
         let scales = match op.attributes.get("scale") {
-            Some(Value::Tensor { data, .. }) => {
-                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
-            }
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing scale"),
         };
         let zero_points = match op.attributes.get("zero_point") {
-            Some(Value::Tensor { data, .. }) => {
-                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
-            }
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing zero_point"),
         };
@@ -1050,9 +1050,7 @@ mod tests {
             _ => original.len(),
         };
         let channel_scales = match op.attributes.get("awq_channel_scales") {
-            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(
-                data.as_bytes().expect("tensor not materialized"),
-            )),
+            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(data)),
             _ => None,
         };
         let (num_rows, row_len) = match op.attributes.get("quantized_data") {
@@ -1096,41 +1094,6 @@ mod tests {
         weighted_sum / original.len() as f32
     }
 
-    /// Compute weighted MSE of direct MinMax INT4 quantization (no AWQ scaling).
-    fn minmax_weighted_mse(
-        original: &[f32],
-        num_rows: usize,
-        row_len: usize,
-        group_size: usize,
-        magnitudes: &[f32],
-    ) -> f32 {
-        let qmax = 15.0_f32; // INT4
-        let n_groups = row_len.div_ceil(group_size);
-        let mut weighted_sum = 0.0_f32;
-
-        for row in 0..num_rows {
-            for g in 0..n_groups {
-                let g_start = row * row_len + g * group_size;
-                let g_end = (g_start + group_size).min(row * row_len + row_len);
-                let group_slice = &original[g_start..g_end];
-
-                let (q, s, zp) = quantize_affine(group_slice, qmax);
-                for (j, &qv) in q.iter().enumerate() {
-                    let reconstructed = (qv as f32 - zp) * s;
-                    let col = g * group_size + j;
-                    let mag = if col < magnitudes.len() {
-                        magnitudes[col]
-                    } else {
-                        1.0
-                    };
-                    let err = group_slice[j] - reconstructed;
-                    weighted_sum += mag * mag * err * err;
-                }
-            }
-        }
-        weighted_sum / original.len() as f32
-    }
-
     // -----------------------------------------------------------------------
     // Test: AWQ produces lower MSE than MinMax on weights with varying
     // channel importance.
@@ -1161,8 +1124,11 @@ mod tests {
             .collect();
         let (cal_act, n_tokens) = make_calibration_activations(&magnitudes, 32);
 
-        // --- MinMax baseline (direct computation, no AWQ pass) ---
-        let minmax_wmse = minmax_weighted_mse(&original, out, inp, group_sz, &magnitudes);
+        // --- MinMax baseline ---
+        let mut minmax_prog = make_program("weight", &weights, vec![out, inp]);
+        let minmax_pass = AwqQuantizePass::new(4, group_sz, HashMap::new());
+        minmax_pass.run(&mut minmax_prog).unwrap();
+        let minmax_wmse = weighted_reconstruction_mse(&original, &minmax_prog, &magnitudes);
 
         // --- AWQ (with calibration activations) ---
         let mut awq_mags = HashMap::new();
@@ -1222,9 +1188,7 @@ mod tests {
 
         let op = &prog.functions["main"].body.operations[0];
         let scales = match op.attributes.get("awq_channel_scales") {
-            Some(Value::Tensor { data, .. }) => {
-                tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
-            }
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
             _ => panic!("missing awq_channel_scales"),
         };
 
@@ -1285,8 +1249,11 @@ mod tests {
         pass.run(&mut prog).unwrap();
         let awq_wmse = weighted_reconstruction_mse(&original, &prog, &magnitudes);
 
-        // Compare with plain MinMax (direct computation, no AWQ pass).
-        let plain_wmse = minmax_weighted_mse(&original, out, inp, group_sz, &magnitudes);
+        // Compare with plain MinMax (no calibration data).
+        let mut plain_prog = make_program("w", &weights, vec![out, inp]);
+        let plain_pass = AwqQuantizePass::new(4, group_sz, HashMap::new());
+        plain_pass.run(&mut plain_prog).unwrap();
+        let plain_wmse = weighted_reconstruction_mse(&original, &plain_prog, &magnitudes);
 
         // AWQ optimizes activation-weighted output MSE (Eq. 4); α=0
         // matches MinMax, so the weighted MSE can only match or improve.
@@ -1297,53 +1264,33 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: AWQ rejects empty calibration data.
+    // Test: Fallback to MinMax when no calibration data.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn rejects_empty_calibration_data() {
+    fn fallback_to_minmax_no_calibration() {
         let out = 8;
         let inp = 128;
         let values: Vec<f32> = (0..(out * inp)).map(|i| i as f32 * 0.5).collect();
         let mut prog = make_program("weight", &values, vec![out, inp]);
 
-        // Empty magnitudes → no calibration data → must error.
+        // Empty magnitudes → no calibration data.
         let pass = AwqQuantizePass::new(4, inp, HashMap::new());
-        let result = pass.run(&mut prog);
-        assert!(
-            result.is_err(),
-            "AWQ with empty calibration data should fail"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("channel_magnitudes is empty"),
-            "error should mention empty calibration: {err_msg}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Test: Ops without calibration data are left unquantized (not MinMax).
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn uncalibrated_ops_left_unquantized() {
-        let out = 8;
-        let inp = 128;
-        let values: Vec<f32> = (0..(out * inp)).map(|i| i as f32 * 0.5).collect();
-        let mut prog = make_program("weight", &values, vec![out, inp]);
-
-        // Provide magnitudes for a different op name so "weight" has no data.
-        let mut mags = HashMap::new();
-        mags.insert("other_weight".to_string(), vec![1.0; inp]);
-        let pass = AwqQuantizePass::new(4, inp, mags);
         pass.run(&mut prog).unwrap();
 
-        // "weight" should remain as a `const` op (unquantized).
         let op = &prog.functions["main"].body.operations[0];
-        assert_eq!(
-            op.op_type, "const",
-            "op without calibration data should remain unquantized"
+        assert_eq!(op.op_type, "constexpr_affine_dequantize");
+
+        // Should NOT have awq_channel_scales (fallback path).
+        assert!(
+            op.attributes.get("awq_channel_scales").is_none(),
+            "fallback should not produce awq_channel_scales"
         );
+
+        // Should still have quantized data.
+        assert!(op.attributes.get("quantized_data").is_some());
+        assert!(op.attributes.get("scale").is_some());
+        assert!(op.attributes.get("zero_point").is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -1373,7 +1320,7 @@ mod tests {
 
         // All quantized values should be in [0, 255].
         let q_data = match op.attributes.get("quantized_data") {
-            Some(Value::Tensor { data, .. }) => data.as_bytes().expect("tensor not materialized"),
+            Some(Value::Tensor { data, .. }) => data,
             _ => panic!("missing quantized_data"),
         };
         for &b in q_data {

@@ -111,6 +111,7 @@ pub extern "C" fn mil_read_onnx(path: *const c_char) -> *mut MilModel {
 /// Read a `.mlmodel` file and return an opaque [`MilModel`] handle.
 ///
 /// Returns null on error; call [`mil_last_error`] for the message.
+#[deprecated(note = "Use mlpackage format instead")]
 #[unsafe(no_mangle)]
 pub extern "C" fn mil_read_mlmodel(path: *const c_char) -> *mut MilModel {
     let Some(path_str) = cstr_to_str(path) else {
@@ -230,6 +231,7 @@ pub extern "C" fn mil_program_free(program: *mut MilProgram) {
 ///
 /// Returns `0` on success, `-1` on error. The model must be a CoreML model
 /// (not ONNX). Call [`mil_last_error`] for the message on failure.
+#[deprecated(note = "Use mlpackage format instead")]
 #[unsafe(no_mangle)]
 pub extern "C" fn mil_write_mlmodel(model: *const MilModel, path: *const c_char) -> i32 {
     if model.is_null() {

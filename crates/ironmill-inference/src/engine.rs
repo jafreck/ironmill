@@ -1,7 +1,7 @@
 //! Inference engine trait and shared logic.
 //!
 //! [`InferenceEngine`] provides a unified interface for autoregressive
-//! inference across backends (ANE direct, CoreML, etc.).
+//! inference across backends (Metal, ANE direct, CoreML).
 
 use crate::cache::{KvCacheSlice, KvLayerSlice, PrefixCache};
 use crate::memory::MemoryUsage;

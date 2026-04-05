@@ -1,4 +1,4 @@
-//! Inference engine for ironmill (ANE + CoreML backends).
+//! Inference engine for ironmill (Metal, ANE, and CoreML backends).
 //!
 //! This crate consolidates all inference-related code: autoregressive
 //! decode loops, KV cache management, token sampling, and the runtime

@@ -20,8 +20,8 @@ ironmill compiles ML models into optimized bundles and runs them on Apple
 Silicon hardware. It supports multiple input formats (ONNX, SafeTensors,
 GGUF, CoreML), applies optimization and quantization passes via an
 intermediate representation ([MIL](https://apple.github.io/coremltools/docs-guides/source/mil-program.html)),
-and produces artifacts for three inference backends: GPU (Metal/MPS), CoreML, and
-an experimental direct-ANE backend built on reverse-engineered private APIs.
+and produces artifacts for three inference backends: Metal (GPU/MPS), CoreML,
+and an experimental direct-ANE backend built on reverse-engineered private APIs.
 
 ## Features
 
@@ -94,7 +94,7 @@ cargo install --path crates/ironmill-cli
 
 ```
 COMMANDS:
-  compile           Compile a model to CoreML, ANE, Metal, or CUDA format
+  compile           Compile a model to CoreML, ANE, or Metal format
   inspect           Print model structure and metadata
   validate          Validate model for target hardware compatibility
   compile-pipeline  Compile a multi-stage pipeline from a TOML manifest
