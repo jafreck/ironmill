@@ -319,21 +319,27 @@ mod tests {
 
     #[test]
     fn build_program_errors_on_missing_weights() {
-        let config = tiny_qwen_config();
+        let config = tiny_llama_config();
+        // Provide no tensors — everything will be missing.
         let provider = StubProvider::new(config);
-
         let result = build_program(&provider);
+        // Missing weights produce warnings (not errors) so templates can handle
+        // optional weights for architectures like Gemma 4.
         assert!(
-            result.is_err(),
-            "build_program should fail when required weights are missing"
+            result.is_ok(),
+            "build_program should succeed with warnings for missing weights"
         );
-        let err = result.unwrap_err().to_string();
+        let cr = result.unwrap();
         assert!(
-            err.contains("missing required weight"),
-            "error should mention missing weight, got: {err}"
+            !cr.warnings.is_empty(),
+            "should have warnings about missing weights"
+        );
+        assert!(
+            cr.warnings.iter().any(|w| w.contains("missing weight")),
+            "warnings should mention missing weight, got: {:?}",
+            cr.warnings
         );
     }
-
     #[test]
     fn build_program_with_gqa() {
         let mut config = tiny_qwen_config();

@@ -74,6 +74,7 @@ impl Fp16KvCache {
         head_dim: usize,
         anchor_layers: Option<Vec<usize>>,
         layer_window_sizes: &[usize],
+        per_layer_kv_dims: Option<&[(usize, usize)]>,
     ) -> Result<Self, MetalError> {
         let num_buffers = if let Some(ref anchors) = anchor_layers {
             anchors.len()
@@ -94,9 +95,19 @@ impl Fp16KvCache {
 
         let mut k_caches = Vec::with_capacity(num_buffers);
         let mut v_caches = Vec::with_capacity(num_buffers);
-        for ws in &per_buffer_window {
-            let effective_seq = if *ws > 0 { *ws } else { max_seq_len };
-            let size_bytes = num_kv_heads * effective_seq * head_dim * 2; // FP16
+        for buf_idx in 0..num_buffers {
+            let ws = per_buffer_window[buf_idx];
+            let effective_seq = if ws > 0 { ws } else { max_seq_len };
+            // Use per-layer KV dimensions when available (Gemma 4).
+            let layer = if let Some(ref anchors) = anchor_layers {
+                anchors[buf_idx]
+            } else {
+                buf_idx
+            };
+            let (layer_nkv, layer_hd) = per_layer_kv_dims
+                .and_then(|dims| dims.get(layer).copied())
+                .unwrap_or((num_kv_heads, head_dim));
+            let size_bytes = layer_nkv * effective_seq * layer_hd * 2; // FP16
             k_caches.push(
                 device
                     .create_buffer(size_bytes, StorageMode::Shared)
@@ -233,6 +244,7 @@ impl IntermediateBuffers {
         device: &MetalDevice,
         max_tokens: usize,
         mc: &ModelConfig,
+        g4: Option<&super::config::Gemma4Config>,
     ) -> Result<Self, MetalError> {
         let h = mc.hidden_size;
         let nh = mc.num_attention_heads;
@@ -240,6 +252,33 @@ impl IntermediateBuffers {
         let hd = mc.head_dim;
         let inter = mc.intermediate_size;
         let vocab = mc.vocab_size;
+
+        // For Gemma 4, use the maximum head_dim, num_kv_heads, and
+        // intermediate_size across all layers so buffers are large enough
+        // for both sliding (base) and global layers.
+        let (hd, nkv, inter) = if let Some(g4) = g4 {
+            let max_hd = g4
+                .layer_configs
+                .iter()
+                .map(|lc| lc.head_dim)
+                .max()
+                .unwrap_or(hd);
+            let max_nkv = g4
+                .layer_configs
+                .iter()
+                .map(|lc| lc.num_kv_heads)
+                .max()
+                .unwrap_or(nkv);
+            let max_inter = g4
+                .layer_configs
+                .iter()
+                .map(|lc| lc.intermediate_size)
+                .max()
+                .unwrap_or(inter);
+            (max_hd, max_nkv, max_inter)
+        } else {
+            (hd, nkv, inter)
+        };
 
         let ple_hidden = mc
             .extra
@@ -350,11 +389,12 @@ impl IntermediateBuffers {
         device: &MetalDevice,
         needed: usize,
         mc: &ModelConfig,
+        g4: Option<&super::config::Gemma4Config>,
     ) -> Result<(), MetalError> {
         if needed <= self.capacity {
             return Ok(());
         }
-        *self = Self::allocate(device, needed, mc)?;
+        *self = Self::allocate(device, needed, mc, g4)?;
         Ok(())
     }
 }
@@ -423,6 +463,9 @@ pub struct MetalInference {
     /// RoPE tables for global (full_attention) layers with different theta.
     global_rope_cos: Option<MetalBuffer>,
     global_rope_sin: Option<MetalBuffer>,
+    /// Unit-weight buffer for scale-free RMSNorm (e.g., Gemma 4 V-norm).
+    /// Contains [1.0; max_head_dim] in FP16.
+    unit_norm_weight: Option<MetalBuffer>,
     /// MPS matmul cache for prefill (variable token_count > 1).
     decode_matmuls: Option<MpsMatmulCache>,
     /// MPS matmul cache for single-token decode (token_count=1), preserved
@@ -480,6 +523,7 @@ impl MetalInference {
             rope_sin: None,
             global_rope_cos: None,
             global_rope_sin: None,
+            unit_norm_weight: None,
             decode_matmuls: None,
             decode_matmuls_t1: None,
             config,
@@ -525,13 +569,13 @@ impl MetalInference {
             if g4.global_head_dim != mc.head_dim {
                 let global_pipelines =
                     super::ops::MetalPipelines::compile(&self.device, g4.global_head_dim)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 self.global_head_dim = g4.global_head_dim;
                 self.global_pipelines = Some(global_pipelines);
             }
         }
 
-        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc)
+        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc, self.gemma4_config.as_ref())
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.intermediate_buffers = Some(bufs);
 
@@ -560,18 +604,40 @@ impl MetalInference {
                             global_hd,
                             self.config.max_seq_len,
                             global_cfg.theta,
-                            global_cfg.partial_rotary_factor,
+                            // Gemma4 proportional RoPE: partial_rotary_factor is for
+                            // NTK frequency scaling, not dimension reduction.
+                            // All head dimensions are rotated.
+                            1.0,
                         )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
                         self.global_rope_cos = Some(gc);
                         self.global_rope_sin = Some(gs);
                     }
                 }
             }
+
+            // Allocate unit-weight buffer for scale-free V-norm.
+            let max_hd = g4
+                .layer_configs
+                .iter()
+                .map(|lc| lc.head_dim)
+                .max()
+                .unwrap_or(0);
+            if max_hd > 0 {
+                let unit_data: Vec<u8> = (0..max_hd)
+                    .flat_map(|_| f16::from_f64(1.0).to_le_bytes())
+                    .collect();
+                let buf = self
+                    .device
+                    .create_buffer_with_data(&unit_data, StorageMode::Shared)
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                self.unit_norm_weight = Some(buf);
+            }
         }
 
-        let decode_cache_t1 = Self::build_matmul_cache(&self.device, &mc, &weights, 1)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        let decode_cache_t1 =
+            Self::build_matmul_cache(&self.device, &mc, self.gemma4_config.as_ref(), &weights, 1)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
 
@@ -712,6 +778,13 @@ impl MetalInference {
             self.kv_cache = Some(kv_cache);
             self.fp16_kv_cache = None;
         } else {
+            let per_layer_dims: Option<Vec<(usize, usize)>> =
+                self.gemma4_config.as_ref().map(|g4| {
+                    g4.layer_configs
+                        .iter()
+                        .map(|lc| (lc.num_kv_heads, lc.head_dim))
+                        .collect()
+                });
             let fp16_kv = Fp16KvCache::new(
                 &self.device,
                 mc.num_hidden_layers,
@@ -720,6 +793,7 @@ impl MetalInference {
                 mc.head_dim,
                 cla_anchors.clone(),
                 &layer_window_sizes,
+                per_layer_dims.as_deref(),
             )
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.fp16_kv_cache = Some(fp16_kv);
@@ -802,6 +876,7 @@ impl MetalInference {
     fn build_matmul_cache(
         device: &MetalDevice,
         mc: &ModelConfig,
+        g4: Option<&super::config::Gemma4Config>,
         weights: &MetalWeights,
         token_count: usize,
     ) -> Result<MpsMatmulCache, MetalError> {
@@ -855,14 +930,21 @@ impl MetalInference {
         let mut layer_matmuls = Vec::with_capacity(mc.num_hidden_layers);
         for i in 0..mc.num_hidden_layers {
             let lw = &weights.layers[i];
+            // Use per-layer head_dim/kv_heads/intermediate_size for Gemma 4.
+            let (layer_hd, layer_nkv, layer_inter) = if let Some(g4) = g4 {
+                let lc = &g4.layer_configs[i];
+                (lc.head_dim, lc.num_kv_heads, lc.intermediate_size)
+            } else {
+                (hd, nkv, inter)
+            };
             layer_matmuls.push(LayerMatmuls {
-                q: projection_matmul(&lw.q_proj, token_count, nh * hd, h)?,
-                k: projection_matmul(&lw.k_proj, token_count, nkv * hd, h)?,
-                v: projection_matmul(&lw.v_proj, token_count, nkv * hd, h)?,
-                o: projection_matmul(&lw.o_proj, token_count, h, nh * hd)?,
-                gate: projection_matmul(&lw.gate_proj, token_count, inter, h)?,
-                up: projection_matmul(&lw.up_proj, token_count, inter, h)?,
-                down: projection_matmul(&lw.down_proj, token_count, h, inter)?,
+                q: projection_matmul(&lw.q_proj, token_count, nh * layer_hd, h)?,
+                k: projection_matmul(&lw.k_proj, token_count, layer_nkv * layer_hd, h)?,
+                v: projection_matmul(&lw.v_proj, token_count, layer_nkv * layer_hd, h)?,
+                o: projection_matmul(&lw.o_proj, token_count, h, nh * layer_hd)?,
+                gate: projection_matmul(&lw.gate_proj, token_count, layer_inter, h)?,
+                up: projection_matmul(&lw.up_proj, token_count, layer_inter, h)?,
+                down: projection_matmul(&lw.down_proj, token_count, h, layer_inter)?,
             });
         }
 
@@ -902,6 +984,7 @@ impl MetalInference {
             .intermediate_buffers
             .as_ref()
             .ok_or(InferenceError::NotLoaded)?;
+
         let total_bytes = n * vocab * 2;
         let mut fp16_buf = vec![0u8; total_bytes];
         bufs.logits
@@ -950,7 +1033,12 @@ impl MetalInference {
         self.intermediate_buffers
             .as_mut()
             .ok_or(InferenceError::NotLoaded)?
-            .ensure_capacity(&self.device, token_ids.len(), &mc)
+            .ensure_capacity(
+                &self.device,
+                token_ids.len(),
+                &mc,
+                self.gemma4_config.as_ref(),
+            )
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let bufs = self
@@ -995,8 +1083,14 @@ impl MetalInference {
                 .as_ref()
                 .is_none_or(|c| c.token_count != token_count);
             if need_rebuild {
-                let cache = Self::build_matmul_cache(&self.device, &mc, weights, token_count)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                let cache = Self::build_matmul_cache(
+                    &self.device,
+                    &mc,
+                    self.gemma4_config.as_ref(),
+                    weights,
+                    token_count,
+                )
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 self.decode_matmuls = Some(cache);
             }
             self.decode_matmuls
@@ -1097,7 +1191,7 @@ impl MetalInference {
                         &enc,
                         &bufs.hidden_state,
                         &MpsMatrix::from_buffer(&bufs.hidden_state, token_count, h, row_bytes_h)
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                            .map_err(|e| InferenceError::runtime(e.to_string()))?,
                         ple_proj,
                         &bufs.ffn_gate, // temp output: [tokens, ple_total] fits in ffn_gate
                         &ProjectionMatmul::Quantized, // placeholder, encode_projection selects by weight type
@@ -1154,12 +1248,18 @@ impl MetalInference {
             let default_pipelines = self.pipelines()?;
 
             // Gemma 4: use per-layer config if available.
-            let (layer_hd, layer_nkv, layer_window) = if let Some(ref g4) = self.gemma4_config {
-                let lc = &g4.layer_configs[layer_idx];
-                (lc.head_dim as u32, lc.num_kv_heads as u32, lc.window_size)
-            } else {
-                (hd, nkv, self.config.layer_window_size(layer_idx))
-            };
+            let (layer_hd, layer_nkv, layer_window, layer_inter) =
+                if let Some(ref g4) = self.gemma4_config {
+                    let lc = &g4.layer_configs[layer_idx];
+                    (
+                        lc.head_dim as u32,
+                        lc.num_kv_heads as u32,
+                        lc.window_size,
+                        lc.intermediate_size,
+                    )
+                } else {
+                    (hd, nkv, self.config.layer_window_size(layer_idx), inter)
+                };
 
             // Select the pipeline set matching this layer's HEAD_DIM.
             let pipelines = if self.global_head_dim > 0
@@ -1227,6 +1327,28 @@ impl MetalInference {
             }
             enc.memory_barrier_buffers();
 
+            // Gemma 4 V-norm: scale-free RMSNorm on V projections.
+            // HF applies Gemma4RMSNorm(head_dim, with_scale=False) to V
+            // before attention. Without this, V values are unbounded and can
+            // cause FP16 overflow in the O projection.
+            if let Some(ref unit_w) = self.unit_norm_weight {
+                if self.gemma4_config.is_some() {
+                    ops::encode_rms_norm(
+                        &enc,
+                        &pipelines.rms_norm,
+                        &ops::RmsNormParams {
+                            input: &bufs.v_proj,
+                            weight: unit_w,
+                            output: &bufs.v_proj,
+                            hidden_size: layer_hd,
+                            token_count: (token_count * layer_nkv as usize) as u32,
+                            eps,
+                        },
+                    );
+                    enc.memory_barrier_buffers();
+                }
+            }
+
             // Step 6: QK normalization (Qwen3) + RoPE
             // Select per-layer RoPE tables for Gemma 4 global layers.
             let (layer_rope_cos, layer_rope_sin) = if let Some(ref g4) = self.gemma4_config {
@@ -1277,6 +1399,15 @@ impl MetalInference {
             } else {
                 (is_anchor, layer_idx)
             };
+
+            // Gemma 4 uses QK norm → attention scale is 1.0 (vectors
+            // are already normalized). Standard models use 1/sqrt(head_dim).
+            let attn_scale = if lw.q_norm.is_some() {
+                1.0
+            } else {
+                1.0 / (layer_hd as f32).sqrt()
+            };
+
             encode_kv_cache_and_attention(
                 &enc,
                 pipelines,
@@ -1296,6 +1427,7 @@ impl MetalInference {
                 self.config.use_fa2_prefill,
                 is_anchor,
                 layer_window,
+                attn_scale,
             )?;
             enc.memory_barrier_buffers();
 
@@ -1324,25 +1456,40 @@ impl MetalInference {
             )?;
             enc.memory_barrier_buffers();
 
-            // Step 10-11 (fused): Residual add + post-attention RMSNorm
-            ops::encode_fused_residual_rms_norm(
-                &enc,
-                &pipelines.fused_residual_rms_norm,
-                &ops::FusedResidualRmsNormParams {
-                    a: &bufs.hidden_state,           // a: skip connection (pre-norm hidden)
-                    b: &bufs.ffn_down,               // b: o_proj output
-                    weight: &lw.post_attn_norm,      // weight: post-attention norm
-                    normed_output: &bufs.norm_out,   // normed output → MLP input
-                    residual_output: &bufs.residual, // residual output → next skip connection
-                    eps,
-                    hidden_size: h as u32,
-                    token_count: token_count as u32,
-                },
-            );
-            enc.memory_barrier_buffers();
+            // Step 10-11: Residual add + post-attention RMSNorm
+            if lw.pre_ffn_norm.is_some() {
+                // Gemma 4: post_attention_layernorm is applied to the attention
+                // output BEFORE the residual add, matching HF ordering:
+                //   attn_out = post_attention_layernorm(attn_out)
+                //   hidden = residual + attn_out
+                //   ffn_input = pre_feedforward_layernorm(hidden)
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.ffn_down,
+                        weight: &lw.post_attn_norm,
+                        output: &bufs.ffn_down,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+                enc.memory_barrier_buffers();
 
-            // Gemma 4: replace post_attn_norm with pre_feedforward_layernorm for FFN input
-            if let Some(ref pre_ffn) = lw.pre_ffn_norm {
+                // Residual add: hidden_state + normed_attn_out → residual
+                ops::encode_residual_add(
+                    &enc,
+                    &pipelines.residual_add,
+                    &bufs.hidden_state,
+                    &bufs.ffn_down,
+                    &bufs.residual,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+
+                // Pre-feedforward layernorm for FFN input
+                let pre_ffn = lw.pre_ffn_norm.as_ref().unwrap();
                 ops::encode_rms_norm(
                     &enc,
                     &pipelines.rms_norm,
@@ -1356,10 +1503,27 @@ impl MetalInference {
                     },
                 );
                 enc.memory_barrier_buffers();
+            } else {
+                // Standard pre-norm transformer: fused residual + next-layer norm
+                ops::encode_fused_residual_rms_norm(
+                    &enc,
+                    &pipelines.fused_residual_rms_norm,
+                    &ops::FusedResidualRmsNormParams {
+                        a: &bufs.hidden_state,
+                        b: &bufs.ffn_down,
+                        weight: &lw.post_attn_norm,
+                        normed_output: &bufs.norm_out,
+                        residual_output: &bufs.residual,
+                        eps,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                    },
+                );
+                enc.memory_barrier_buffers();
             }
 
             // Steps 12-15: FFN block (gate + up + SiLU + down)
-            encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, inter, token_count)?;
+            encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, layer_inter, token_count)?;
             enc.memory_barrier_buffers();
 
             // Gemma 4: apply post-feedforward layernorm to MLP output
@@ -1456,7 +1620,7 @@ impl MetalInference {
                     &enc,
                     &bufs.hidden_state,
                     &MpsMatrix::from_buffer(&bufs.hidden_state, token_count, h, row_bytes_h)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?,
                     ple_gate,
                     ple_scratch,
                     &ProjectionMatmul::Quantized,
@@ -1488,7 +1652,7 @@ impl MetalInference {
                     &enc,
                     ple_scratch,
                     &MpsMatrix::from_buffer(ple_scratch, token_count, ple_h, row_bytes_ple)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?,
                     ple_proj,
                     &bufs.ffn_down, // reuse ffn_down as temp
                     &ProjectionMatmul::Quantized,
@@ -1574,8 +1738,6 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
             }
         }
-
-        // Step 17: Final RMSNorm
         ops::encode_rms_norm(
             &enc,
             &self.pipelines()?.rms_norm,
@@ -1645,7 +1807,7 @@ impl MetalInference {
                 let pipelines = self.pipelines()?;
                 let sc_enc = cmd_buf
                     .compute_encoder()
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 let count = (token_count * vocab) as u32;
                 ops::encode_fused_softcap(
                     &sc_enc,
@@ -1691,7 +1853,6 @@ impl MetalInference {
                 .collect()
         };
 
-        // Advance sequence position.
         self.seq_pos += token_count;
         if enable_tq {
             if let Some(kv) = self.kv_cache.as_mut() {
@@ -1743,7 +1904,12 @@ impl MetalInference {
         self.intermediate_buffers
             .as_mut()
             .ok_or(InferenceError::NotLoaded)?
-            .ensure_capacity(&self.device, token_ids.len(), &mc)
+            .ensure_capacity(
+                &self.device,
+                token_ids.len(),
+                &mc,
+                self.gemma4_config.as_ref(),
+            )
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let bufs = self
@@ -1782,8 +1948,14 @@ impl MetalInference {
             .as_ref()
             .is_none_or(|c| c.token_count != token_count);
         if need_rebuild {
-            let cache = Self::build_matmul_cache(&self.device, &mc, weights, token_count)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            let cache = Self::build_matmul_cache(
+                &self.device,
+                &mc,
+                self.gemma4_config.as_ref(),
+                weights,
+                token_count,
+            )
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.decode_matmuls = Some(cache);
         }
         let matmuls = self
@@ -1838,10 +2010,10 @@ impl MetalInference {
                 let scale_buf = self
                     .device
                     .create_buffer(2, StorageMode::Shared)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 scale_buf
                     .write_bytes(&scale_half.to_le_bytes(), 0)
-                    .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 ops::encode_scale_buffer(
                     &enc,
                     &self.pipelines()?.scale_buffer,
@@ -1919,7 +2091,7 @@ impl MetalInference {
                                 h,
                                 row_bytes_h,
                             )
-                            .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                            .map_err(|e| InferenceError::runtime(e.to_string()))?,
                             ple_proj,
                             &bufs.ffn_gate,
                             &ProjectionMatmul::Quantized,
@@ -1980,12 +2152,18 @@ impl MetalInference {
             let lm = &matmuls.layer_matmuls[layer_idx];
 
             // Gemma 4: use per-layer config if available.
-            let (layer_hd, layer_nkv, layer_window) = if let Some(ref g4) = self.gemma4_config {
-                let lc = &g4.layer_configs[layer_idx];
-                (lc.head_dim as u32, lc.num_kv_heads as u32, lc.window_size)
-            } else {
-                (hd, nkv, self.config.layer_window_size(layer_idx))
-            };
+            let (layer_hd, layer_nkv, layer_window, layer_inter) =
+                if let Some(ref g4) = self.gemma4_config {
+                    let lc = &g4.layer_configs[layer_idx];
+                    (
+                        lc.head_dim as u32,
+                        lc.num_kv_heads as u32,
+                        lc.window_size,
+                        lc.intermediate_size,
+                    )
+                } else {
+                    (hd, nkv, self.config.layer_window_size(layer_idx), inter)
+                };
 
             // ── Capture attn_norm activation (input to Q/K/V projections) ──
             // norm_out is now committed and safe to read.
@@ -2126,6 +2304,13 @@ impl MetalInference {
             } else {
                 (is_anchor, layer_idx)
             };
+
+            let attn_scale = if lw.q_norm.is_some() {
+                1.0
+            } else {
+                1.0 / (layer_hd as f32).sqrt()
+            };
+
             encode_kv_cache_and_attention(
                 &enc,
                 pipelines,
@@ -2145,6 +2330,7 @@ impl MetalInference {
                 self.config.use_fa2_prefill,
                 is_anchor,
                 layer_window,
+                attn_scale,
             )?;
             enc.memory_barrier_buffers();
 
@@ -2173,25 +2359,32 @@ impl MetalInference {
             )?;
             enc.memory_barrier_buffers();
 
-            // Step 10-11 (fused): Residual add + post-attention RMSNorm
-            ops::encode_fused_residual_rms_norm(
-                &enc,
-                &pipelines.fused_residual_rms_norm,
-                &ops::FusedResidualRmsNormParams {
-                    a: &bufs.hidden_state,
-                    b: &bufs.ffn_down,
-                    weight: &lw.post_attn_norm,
-                    normed_output: &bufs.norm_out,
-                    residual_output: &bufs.residual,
-                    eps,
-                    hidden_size: h as u32,
-                    token_count: token_count as u32,
-                },
-            );
-
-            // Gemma 4: replace post_attn_norm with pre_feedforward_layernorm for FFN input
-            if let Some(ref pre_ffn) = lw.pre_ffn_norm {
+            // Step 10-11: Residual add + post-attention RMSNorm
+            if lw.pre_ffn_norm.is_some() {
+                // Gemma 4: post_attention_layernorm on attn output before residual
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.ffn_down,
+                        weight: &lw.post_attn_norm,
+                        output: &bufs.ffn_down,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
                 enc.memory_barrier_buffers();
+                ops::encode_residual_add(
+                    &enc,
+                    &pipelines.residual_add,
+                    &bufs.hidden_state,
+                    &bufs.ffn_down,
+                    &bufs.residual,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+                let pre_ffn = lw.pre_ffn_norm.as_ref().unwrap();
                 ops::encode_rms_norm(
                     &enc,
                     &pipelines.rms_norm,
@@ -2202,6 +2395,21 @@ impl MetalInference {
                         hidden_size: h as u32,
                         token_count: token_count as u32,
                         eps,
+                    },
+                );
+            } else {
+                ops::encode_fused_residual_rms_norm(
+                    &enc,
+                    &pipelines.fused_residual_rms_norm,
+                    &ops::FusedResidualRmsNormParams {
+                        a: &bufs.hidden_state,
+                        b: &bufs.ffn_down,
+                        weight: &lw.post_attn_norm,
+                        normed_output: &bufs.norm_out,
+                        residual_output: &bufs.residual,
+                        eps,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
                     },
                 );
             }
@@ -2248,7 +2456,7 @@ impl MetalInference {
             let pipelines = self.pipelines()?;
 
             // Steps 12-15: FFN block (gate + up + SiLU + down)
-            encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, inter, token_count)?;
+            encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, layer_inter, token_count)?;
             enc.memory_barrier_buffers();
 
             // Gemma 4: apply post-feedforward layernorm to MLP output
@@ -2340,7 +2548,7 @@ impl MetalInference {
                     &enc,
                     &bufs.hidden_state,
                     &MpsMatrix::from_buffer(&bufs.hidden_state, token_count, h, row_bytes_h)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?,
                     ple_gate,
                     ple_scratch,
                     &ProjectionMatmul::Quantized,
@@ -2370,7 +2578,7 @@ impl MetalInference {
                     &enc,
                     ple_scratch,
                     &MpsMatrix::from_buffer(ple_scratch, token_count, ple_h, row_bytes_ple)
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?,
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?,
                     ple_proj,
                     &bufs.ffn_down,
                     &ProjectionMatmul::Quantized,
@@ -3158,6 +3366,7 @@ fn encode_kv_cache_and_attention(
     use_fa2: bool,
     is_anchor: bool,
     window_size: usize,
+    attn_scale: f32,
 ) -> Result<(), InferenceError> {
     // For SWA layers, use window_size as the buffer stride and ring-buffer
     // write position. For full-attention layers, use the global max_seq_len.
@@ -3478,7 +3687,7 @@ fn encode_kv_cache_and_attention(
                 head_dim: hd,
                 num_q_heads: nh,
                 num_kv_heads: nkv,
-                scale: 1.0 / (hd as f32).sqrt(),
+                scale: attn_scale,
                 max_seq_len: max_seq,
             },
             None,
@@ -3592,11 +3801,11 @@ fn encode_moe_block(
     let router_weight = lw
         .router_weight
         .as_ref()
-        .ok_or_else(|| InferenceError::Runtime("MoE layer missing router weight".to_string()))?;
+        .ok_or_else(|| InferenceError::runtime("MoE layer missing router weight".to_string()))?;
     let router_logits = bufs
         .moe_router_logits
         .as_ref()
-        .ok_or_else(|| InferenceError::Runtime("MoE buffers not allocated".to_string()))?;
+        .ok_or_else(|| InferenceError::runtime("MoE buffers not allocated".to_string()))?;
     let expert_gate_buf = bufs.moe_expert_gate.as_ref().unwrap();
     let expert_up_buf = bufs.moe_expert_up.as_ref().unwrap();
     let expert_outputs = bufs.moe_expert_outputs.as_ref().unwrap();
@@ -3607,7 +3816,7 @@ fn encode_moe_block(
 
     // 1. Router: linear(norm_out → router_logits) [hidden_size → num_experts]
     let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        .map_err(|e| InferenceError::runtime(e.to_string()))?;
     encode_projection(
         enc,
         &bufs.norm_out,
@@ -3699,7 +3908,7 @@ fn encode_moe_block(
         // we need to use moe_combined as a temp and then copy.
         let gate_mat =
             MpsMatrix::from_buffer(expert_gate_buf, token_count, moe_inter, row_bytes_moe_inter)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
         encode_projection(
             enc,
             expert_gate_buf,
@@ -3945,7 +4154,7 @@ impl InferenceEngine for MetalInference {
         let gpu_artifacts = artifacts
             .downcast_ref::<MetalArtifacts<'_>>()
             .ok_or_else(|| {
-                InferenceError::Runtime("MetalInference::load expects MetalArtifacts".into())
+                InferenceError::runtime("MetalInference::load expects MetalArtifacts".into())
             })?;
 
         self.config = gpu_artifacts.config.clone();
@@ -3956,7 +4165,7 @@ impl InferenceEngine for MetalInference {
             gpu_artifacts.weights,
             self.config.force_cpu_dequant,
         )
-        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
@@ -3968,13 +4177,13 @@ impl InferenceEngine for MetalInference {
         // Compile Metal shader pipelines with the model's head_dim so
         // shared memory is sized exactly via #define HEAD_DIM.
         let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
 
         // Allocate intermediate buffers (start at 1 token; run_pipeline_inner
         // grows them on demand for larger prefill batches).
-        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc, self.gemma4_config.as_ref())
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.intermediate_buffers = Some(bufs);
 
         // Build RoPE cos/sin caches.
@@ -3985,7 +4194,7 @@ impl InferenceEngine for MetalInference {
             mc.rope_theta,
             1.0,
         )
-        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.rope_cos = Some(cos);
         self.rope_sin = Some(sin);
 
@@ -4003,19 +4212,41 @@ impl InferenceEngine for MetalInference {
                             global_hd,
                             self.config.max_seq_len,
                             global_cfg.theta,
-                            global_cfg.partial_rotary_factor,
+                            // Gemma4 proportional RoPE: partial_rotary_factor is for
+                            // NTK frequency scaling, not dimension reduction.
+                            // All head dimensions are rotated.
+                            1.0,
                         )
-                        .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
                         self.global_rope_cos = Some(gc);
                         self.global_rope_sin = Some(gs);
                     }
                 }
             }
+
+            // Allocate unit-weight buffer for scale-free V-norm.
+            let max_hd = g4
+                .layer_configs
+                .iter()
+                .map(|lc| lc.head_dim)
+                .max()
+                .unwrap_or(0);
+            if max_hd > 0 {
+                let unit_data: Vec<u8> = (0..max_hd)
+                    .flat_map(|_| f16::from_f64(1.0).to_le_bytes())
+                    .collect();
+                let buf = self
+                    .device
+                    .create_buffer_with_data(&unit_data, StorageMode::Shared)
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                self.unit_norm_weight = Some(buf);
+            }
         }
 
         // Build MPS matmul cache for single-token decode.
-        let decode_cache_t1 = Self::build_matmul_cache(&self.device, &mc, &weights, 1)
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+        let decode_cache_t1 =
+            Self::build_matmul_cache(&self.device, &mc, self.gemma4_config.as_ref(), &weights, 1)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
 
@@ -4031,7 +4262,7 @@ impl InferenceEngine for MetalInference {
                 anchor_layers: anchors.clone(),
             };
             cla.validate(mc.num_hidden_layers)
-                .map_err(|e| InferenceError::Runtime(format!("CLA config invalid: {e}")))?;
+                .map_err(|e| InferenceError::runtime(format!("CLA config invalid: {e}")))?;
         }
         // Back-fill cla_config so is_anchor checks during inference see the
         // metadata-derived anchors, not the absent user config.
@@ -4053,7 +4284,7 @@ impl InferenceEngine for MetalInference {
                 mc.hidden_size,
                 gpu_artifacts.weights,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
             let mla_cache = MlaKvCache::new(
                 &self.device,
@@ -4061,7 +4292,7 @@ impl InferenceEngine for MetalInference {
                 mc.num_hidden_layers,
                 self.config.max_seq_len,
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.mla_kv_cache = Some(mla_cache);
         } else {
             self.mla_kv_cache = None;
@@ -4111,13 +4342,20 @@ impl InferenceEngine for MetalInference {
                 layer_configs: tq_layer_configs,
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let kv_cache = MetalKvCache::new(&self.device, &tq_config)
-                .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.turboquant = Some(tq_model);
             self.kv_cache = Some(kv_cache);
             self.fp16_kv_cache = None;
         } else {
+            let per_layer_dims: Option<Vec<(usize, usize)>> =
+                self.gemma4_config.as_ref().map(|g4| {
+                    g4.layer_configs
+                        .iter()
+                        .map(|lc| (lc.num_kv_heads, lc.head_dim))
+                        .collect()
+                });
             let fp16_kv = Fp16KvCache::new(
                 &self.device,
                 mc.num_hidden_layers,
@@ -4126,8 +4364,9 @@ impl InferenceEngine for MetalInference {
                 mc.head_dim,
                 cla_anchors.clone(),
                 &layer_window_sizes,
+                per_layer_dims.as_deref(),
             )
-            .map_err(|e| InferenceError::Runtime(e.to_string()))?;
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.fp16_kv_cache = Some(fp16_kv);
             self.turboquant = None;
             self.kv_cache = None;

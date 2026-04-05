@@ -685,12 +685,12 @@ fn emit_projection_ane(
     weight_prefix: &str,
     input: &str,
     op_prefix: &str,
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     // Load weight [out_features, in_features]
     let weight_name = format!("{weight_prefix}.weight");
     let weight_const = format!("{op_prefix}_weight");
-    emit_weight_const(block, provider, &weight_name, &weight_const)?;
+    emit_weight_const(block, provider, &weight_name, &weight_const, warnings)?;
 
     // Reshape weight: [out, in] → [out, in, 1, 1]
     let weight_4d = emit_reshape(
@@ -705,7 +705,7 @@ fn emit_projection_ane(
     let has_bias = provider.has_tensor(&bias_name);
     if has_bias {
         let bias_const = format!("{op_prefix}_bias");
-        emit_weight_const(block, provider, &bias_name, &bias_const)?;
+        emit_weight_const(block, provider, &bias_name, &bias_const, warnings)?;
     }
 
     // Transpose input: [batch, seq, hidden] → [batch, hidden, seq]
@@ -805,12 +805,12 @@ fn emit_rms_norm_ane(
     weight_prefix: &str,
     input: &str,
     op_prefix: &str,
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     // Load RMSNorm weight (gamma)
     let weight_name = format!("{weight_prefix}.weight");
     let weight_const = format!("{op_prefix}_weight");
-    emit_weight_const(block, provider, &weight_name, &weight_const)?;
+    emit_weight_const(block, provider, &weight_name, &weight_const, warnings)?;
 
     // neg_x = x * −1
     let neg_const = format!("{op_prefix}_neg_const");
@@ -1116,14 +1116,21 @@ mod tests {
         let opts = TemplateOptions::default();
 
         let result = build_program(&provider, &opts);
+        // Missing weights produce warnings (not errors) so templates can handle
+        // optional weights for architectures like Gemma 4.
         assert!(
-            result.is_err(),
-            "build_program should fail when required weights are missing"
+            result.is_ok(),
+            "build_program should succeed with warnings for missing weights"
         );
-        let err = result.unwrap_err().to_string();
+        let cr = result.unwrap();
         assert!(
-            err.contains("missing required weight"),
-            "error should mention missing weight, got: {err}"
+            !cr.warnings.is_empty(),
+            "should have warnings about missing weights"
+        );
+        assert!(
+            cr.warnings.iter().any(|w| w.contains("missing weight")),
+            "warnings should mention missing weight, got: {:?}",
+            cr.warnings
         );
     }
 

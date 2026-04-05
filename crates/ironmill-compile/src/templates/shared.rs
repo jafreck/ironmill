@@ -103,17 +103,17 @@ pub(super) fn emit_linear(
     weight_prefix: &str,
     input: &str,
     op_prefix: &str,
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let weight_name = format!("{weight_prefix}.weight");
     let weight_const = format!("{op_prefix}_weight");
-    emit_weight_const(block, provider, &weight_name, &weight_const)?;
+    emit_weight_const(block, provider, &weight_name, &weight_const, warnings)?;
 
     let bias_name = format!("{weight_prefix}.bias");
     let has_bias = provider.has_tensor(&bias_name);
     if has_bias {
         let bias_const = format!("{op_prefix}_bias");
-        emit_weight_const(block, provider, &bias_name, &bias_const)?;
+        emit_weight_const(block, provider, &bias_name, &bias_const, warnings)?;
     }
 
     let out_name = format!("{op_prefix}_out");
@@ -171,11 +171,11 @@ pub(super) fn emit_rms_norm(
     weight_prefix: &str,
     input: &str,
     op_prefix: &str,
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let weight_name = format!("{weight_prefix}.weight");
     let weight_const = format!("{op_prefix}_weight");
-    emit_weight_const(block, provider, &weight_name, &weight_const)?;
+    emit_weight_const(block, provider, &weight_name, &weight_const, warnings)?;
 
     let out_name = format!("{op_prefix}_out");
     let op = Operation::new("rms_norm", format!("{op_prefix}_op"))
@@ -622,11 +622,11 @@ pub(super) fn emit_embedding(
     block: &mut Block,
     provider: &dyn WeightProvider,
     _config: &ModelConfig,
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let weight_name = "model.embed_tokens.weight";
     let const_name = "embed_tokens_weight";
-    emit_weight_const(block, provider, weight_name, const_name)?;
+    emit_weight_const(block, provider, weight_name, const_name, warnings)?;
 
     let out_name = "embed_out".to_string();
     let gather = Operation::new("gather", "embed_gather")
