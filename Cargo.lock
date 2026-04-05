@@ -1009,6 +1009,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ironmill-compile",
+ "serde",
  "serde_json",
  "tempfile",
  "toml",

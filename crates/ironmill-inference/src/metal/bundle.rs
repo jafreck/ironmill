@@ -268,21 +268,15 @@ mod tests {
 
     fn test_config() -> ModelConfig {
         use ironmill_core::weights::Architecture;
-        ModelConfig {
-            architecture: Architecture::Llama,
-            hidden_size: 2048,
-            intermediate_size: 5504,
-            num_hidden_layers: 2,
-            num_attention_heads: 16,
-            num_key_value_heads: 16,
-            head_dim: 128,
-            vocab_size: 32000,
-            max_position_embeddings: 2048,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
-            tie_word_embeddings: false,
-            extra: HashMap::new(),
-        }
+        ModelConfig::new(Architecture::Llama)
+            .with_hidden_size(2048)
+            .with_intermediate_size(5504)
+            .with_num_hidden_layers(2)
+            .with_num_attention_heads(16)
+            .with_num_key_value_heads(16)
+            .with_head_dim(128)
+            .with_vocab_size(32000)
+            .with_max_position_embeddings(2048)
     }
 
     fn write_mock_bundle(bundle_path: &Path) {

@@ -331,7 +331,10 @@ pub(super) fn emit_rope_tables_with_params(
     for t in 0..max_pos {
         for i in 0..half_dim {
             if i < rotary_half {
-                let freq = 1.0 / theta.powf(2.0 * i as f64 / rotary_dim as f64);
+                // Proportional RoPE: frequency denominator is always head_dim,
+                // even when partial_rotary_factor < 1.0 reduces the number of
+                // rotated dimensions. Matches inference and HF: 1/base^(2i/head_dim).
+                let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
                 let angle = t as f64 * freq;
                 cos_bytes.extend_from_slice(&(angle.cos() as f32).to_le_bytes());
                 sin_bytes.extend_from_slice(&(angle.sin() as f32).to_le_bytes());
@@ -1020,6 +1023,7 @@ pub(super) fn emit_mlp_gelu(
         let out_name = format!("l{layer_idx}_gate_gelu");
         let op = Operation::new("gelu", format!("l{layer_idx}_gelu_op"))
             .with_input("x", Value::Reference(gate))
+            .with_attr("mode", Value::String("TANH_APPROXIMATION".to_string()))
             .with_output(&out_name);
         block.add_op(op);
         out_name

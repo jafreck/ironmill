@@ -129,7 +129,9 @@ pub struct OutlierState {
 /// Per-layer TurboQuant configuration for heterogeneous head dims (e.g. Gemma 4).
 #[derive(Debug, Clone)]
 pub struct TurboQuantLayerConfig {
+    /// Per-head dimension for this layer's KV cache.
     pub head_dim: usize,
+    /// Number of key-value heads for this layer.
     pub num_kv_heads: usize,
 }
 

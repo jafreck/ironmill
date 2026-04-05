@@ -582,7 +582,7 @@ mod tests {
         assert!(src.contains("buffer(5)"));
         assert!(src.contains("thread_position_in_grid"));
         // Verify dequantization formula
-        assert!(src.contains("(half(lo) - zero_lo) * scale_lo"));
-        assert!(src.contains("(half(hi) - zero_hi) * scale_hi"));
+        assert!(src.contains("(float(lo) - float(zero_lo)) * float(scale_lo)"));
+        assert!(src.contains("(float(hi) - float(zero_hi)) * float(scale_hi)"));
     }
 }

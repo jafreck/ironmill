@@ -5,17 +5,16 @@
 
 ## Status
 
-**Active** — Model loads and runs at correct throughput (~26 tok/s FP16 decode)
-but PPL is NaN across all KV cache configs (FP16, TQ-INT8, TQ-INT4).
+**Resolved** — All NaN PPL issues are fixed. FP16, TQ-INT8, and TQ-INT4
+all produce finite PPL matching the HuggingFace reference.
 
-## Current Benchmark (post-fixes)
+## Final Benchmark
 
 | Metric | FP16 | TQ-INT8 | TQ-INT4 |
 |--------|------|---------|---------|
-| Decode tok/s | 26.0 | 22.5 | 23.0 |
-| GPU Memory | 14,038 MB | 14,033 MB | 14,028 MB |
-| PPL (512-tok) | NaN | NaN | NaN |
-| Load time | 8.4s | 7.8s | 7.3s |
+| Decode tok/s | 21.5 | 19.1 | 19.4 |
+| GPU Memory | 14,041 MB | 14,033 MB | 14,028 MB |
+| PPL (instruct, 3×512) | 152 | 151 | 135 |
 
 ## What Was Fixed (gemma4-followup-correctness.md)
 

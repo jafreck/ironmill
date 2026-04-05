@@ -143,14 +143,7 @@ mod tests {
     #[test]
     fn absorb_weights_small() {
         // Config: 2 heads, nope=2, rope=1, kv_latent=3, v_dim=2
-        let config = MlaConfig {
-            kv_latent_dim: 3,
-            q_latent_dim: 0, // unused in absorption
-            num_heads: 2,
-            qk_nope_head_dim: 2,
-            qk_rope_head_dim: 1,
-            v_head_dim: 2,
-        };
+        let config = MlaConfig::new(3, 0, 2, 2, 1, 2);
 
         let hidden_size = 4;
         let qk_dim = 3; // nope + rope
@@ -227,14 +220,7 @@ mod tests {
         // 1 head, nope=2, rope=0, kv_lat=2, v_dim=2
         // When kv_lat == nope and W_uk is identity, the absorbed Q should
         // equal the original Q nope portion.
-        let config = MlaConfig {
-            kv_latent_dim: 2,
-            q_latent_dim: 0,
-            num_heads: 1,
-            qk_nope_head_dim: 2,
-            qk_rope_head_dim: 0,
-            v_head_dim: 2,
-        };
+        let config = MlaConfig::new(2, 0, 1, 2, 0, 2);
 
         let hidden_size = 3;
 

@@ -66,6 +66,7 @@ struct Fp16KvCache {
 }
 
 impl Fp16KvCache {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: &MetalDevice,
         num_layers: usize,
@@ -1497,7 +1498,7 @@ impl MetalInference {
             enc.memory_barrier_buffers();
 
             // Step 10-11: Residual add + post-attention RMSNorm
-            if lw.pre_ffn_norm.is_some() {
+            if let Some(pre_ffn) = &lw.pre_ffn_norm {
                 // Gemma 4: post_attention_layernorm is applied to the attention
                 // output BEFORE the residual add, matching HF ordering:
                 //   attn_out = post_attention_layernorm(attn_out)
@@ -1529,7 +1530,6 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
 
                 // Pre-feedforward layernorm for FFN input
-                let pre_ffn = lw.pre_ffn_norm.as_ref().unwrap();
                 ops::encode_rms_norm(
                     &enc,
                     &pipelines.rms_norm,
@@ -1765,7 +1765,7 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
             } else {
                 // Step 16: Residual add + layer_scalar + next layer's input norm.
-                if lw.layer_scalar.is_some() {
+                if let Some(scalar) = &lw.layer_scalar {
                     // Can't use fused residual+norm: need to insert layer_scalar
                     // between the residual add and the next-layer norm.
                     // HF: hidden_states = residual + hidden_states; hidden_states *= layer_scalar
@@ -1782,7 +1782,7 @@ impl MetalInference {
                         &enc,
                         &pipelines.scale_buffer,
                         &bufs.hidden_state,
-                        lw.layer_scalar.as_ref().unwrap(),
+                        scalar,
                         (token_count * h) as u32,
                     );
                     enc.memory_barrier_buffers();
@@ -2443,7 +2443,7 @@ impl MetalInference {
             enc.memory_barrier_buffers();
 
             // Step 10-11: Residual add + post-attention RMSNorm
-            if lw.pre_ffn_norm.is_some() {
+            if let Some(pre_ffn) = &lw.pre_ffn_norm {
                 // Gemma 4: post_attention_layernorm on attn output before residual
                 ops::encode_rms_norm(
                     &enc,
@@ -2467,7 +2467,6 @@ impl MetalInference {
                     (token_count * h) as u32,
                 );
                 enc.memory_barrier_buffers();
-                let pre_ffn = lw.pre_ffn_norm.as_ref().unwrap();
                 ops::encode_rms_norm(
                     &enc,
                     &pipelines.rms_norm,
@@ -2729,7 +2728,7 @@ impl MetalInference {
                 }
             } else {
                 // Step 16: Residual add + layer_scalar + next layer's input norm.
-                if lw.layer_scalar.is_some() {
+                if let Some(scalar) = &lw.layer_scalar {
                     ops::encode_residual_add(
                         &enc,
                         &pipelines.residual_add,
@@ -2743,7 +2742,7 @@ impl MetalInference {
                         &enc,
                         &pipelines.scale_buffer,
                         &bufs.hidden_state,
-                        lw.layer_scalar.as_ref().unwrap(),
+                        scalar,
                         (token_count * h) as u32,
                     );
                     enc.memory_barrier_buffers();
@@ -3983,6 +3982,7 @@ fn encode_ffn_block(
 /// Dense evaluation: all experts are run and top-k selection + weighted sum is
 /// applied afterward. The MoE output is written to `bufs.moe_combined` and then
 /// added to `bufs.ffn_down` (the dense MLP output).
+#[allow(clippy::too_many_arguments)]
 fn encode_moe_block(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,

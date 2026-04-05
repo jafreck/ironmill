@@ -11,7 +11,8 @@ use std::process::Command;
 ///   80  — Llama 3
 ///   128 — LLaMA 2, Qwen 2/3, Mistral, Gemma
 ///   256 — large models with wide attention
-const HEAD_DIMS: &[usize] = &[64, 80, 128, 256];
+///   512 — Gemma 4 global attention layers
+const HEAD_DIMS: &[usize] = &[64, 80, 128, 256, 512];
 
 fn main() {
     // Only precompile when targeting macOS with the metal feature.

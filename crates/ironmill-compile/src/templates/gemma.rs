@@ -163,6 +163,9 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
     };
 
     // PLE model-level computation (before layer loop)
+    // HF: per_layer_input = embed_tokens_per_layer(ids) * sqrt(ple_h)
+    //      model_level = per_layer_model_projection(embeds) * (1/sqrt(hidden_size))
+    //      per_layer_input = per_layer_projection_norm(per_layer_input + model_level)
     let per_layer_inputs = if ple_hidden_size > 0 && ple_vocab_size > 0 {
         // 1. Gather from embed_tokens_per_layer using input_ids
         let ple_embed = emit_gather(
@@ -174,7 +177,22 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
             &mut warnings,
         )?;
 
-        // 2. Project inputs_embeds via per_layer_model_projection
+        // 2. Scale embed by sqrt(ple_hidden_size)
+        let embed_scale_val = (ple_hidden_size as f64).sqrt();
+        let embed_scale_name = "ple_embed_scale".to_string();
+        let op = Operation::new("const", &embed_scale_name)
+            .with_attr("val", Value::Float(embed_scale_val))
+            .with_output(&embed_scale_name);
+        block.add_op(op);
+
+        let ple_embed_scaled = "ple_embed_scaled".to_string();
+        let op = Operation::new("mul", "ple_embed_scale_op")
+            .with_input("x", Value::Reference(ple_embed))
+            .with_input("y", Value::Reference(embed_scale_name))
+            .with_output(&ple_embed_scaled);
+        block.add_op(op);
+
+        // 3. Project inputs_embeds via per_layer_model_projection
         let ple_proj = emit_linear(
             block,
             provider,
@@ -184,35 +202,36 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
             &mut warnings,
         )?;
 
-        // 3. Apply per_layer_projection_norm (RMSNorm)
-        let ple_proj_normed = emit_rms_norm(
+        // 4. Scale projection by 1/sqrt(hidden_size)
+        let proj_scale_val = 1.0 / (config.hidden_size as f64).sqrt();
+        let proj_scale_name = "ple_proj_scale".to_string();
+        let op = Operation::new("const", &proj_scale_name)
+            .with_attr("val", Value::Float(proj_scale_val))
+            .with_output(&proj_scale_name);
+        block.add_op(op);
+
+        let ple_proj_scaled = "ple_proj_scaled".to_string();
+        let op = Operation::new("mul", "ple_proj_scale_op")
+            .with_input("x", Value::Reference(ple_proj))
+            .with_input("y", Value::Reference(proj_scale_name))
+            .with_output(&ple_proj_scaled);
+        block.add_op(op);
+
+        // 5. Sum scaled embed + scaled proj
+        let ple_sum = emit_residual_add(block, &ple_embed_scaled, &ple_proj_scaled, "ple_sum");
+
+        // 6. Apply per_layer_projection_norm (RMSNorm on the sum)
+        let ple_normed = emit_rms_norm(
             block,
             provider,
             &config,
             "model.per_layer_projection_norm",
-            &ple_proj,
+            &ple_sum,
             "ple_proj_norm",
             &mut warnings,
         )?;
 
-        // 4. Sum: embed + proj
-        let ple_sum = emit_residual_add(block, &ple_embed, &ple_proj_normed, "ple_sum");
-
-        // 5. Scale by 2^(-0.5) = 0.7071067811865476
-        let scale_const = "ple_scale_const".to_string();
-        let op = Operation::new("const", &scale_const)
-            .with_attr("val", Value::Float(std::f64::consts::FRAC_1_SQRT_2))
-            .with_output(&scale_const);
-        block.add_op(op);
-
-        let ple_scaled = "ple_scaled".to_string();
-        let op = Operation::new("mul", "ple_scale_op")
-            .with_input("x", Value::Reference(ple_sum))
-            .with_input("y", Value::Reference(scale_const))
-            .with_output(&ple_scaled);
-        block.add_op(op);
-
-        Some(ple_scaled)
+        Some(ple_normed)
     } else {
         None
     };
@@ -439,26 +458,28 @@ fn emit_gemma4_transformer_layer(
     // KV reuse from anchor layers is an inference-time concern, not IR-level.
     let attn_out = emit_attention(block, ctx, &normed_attn, warnings)?;
 
-    // 3. Residual add
-    let post_attn = emit_residual_add(
-        block,
-        input,
-        &attn_out,
-        &format!("l{layer_idx}_post_attn_residual"),
-    );
-
-    // 4. Post-attention RMSNorm
-    let normed_mlp = emit_rms_norm(
+    // 3. Post-attention RMSNorm (applied to attn output BEFORE residual add).
+    // This matches HF Gemma2/4: hidden = post_attention_layernorm(attn_output),
+    // then hidden = residual + hidden.
+    let normed_attn_out = emit_rms_norm(
         block,
         ctx.provider,
         ctx.config,
         &format!("{prefix}.post_attention_layernorm"),
-        &post_attn,
+        &attn_out,
         &format!("l{layer_idx}_post_attn_norm"),
         warnings,
     )?;
 
-    // Gemma 4: separate pre-feedforward layernorm (replaces post_attn_norm for FFN input)
+    // 4. Residual add (after norm)
+    let post_attn = emit_residual_add(
+        block,
+        input,
+        &normed_attn_out,
+        &format!("l{layer_idx}_post_attn_residual"),
+    );
+
+    // Gemma 4: separate pre-feedforward layernorm on residual sum
     let ffn_input = {
         let pre_ffn_name = format!("{prefix}.pre_feedforward_layernorm.weight");
         if ctx.provider.has_tensor(&pre_ffn_name) {
@@ -472,7 +493,8 @@ fn emit_gemma4_transformer_layer(
                 warnings,
             )?
         } else {
-            normed_mlp.clone()
+            // Gemma 2/3: no separate pre-FFN norm, use residual sum directly
+            post_attn.clone()
         }
     };
 
@@ -488,26 +510,8 @@ fn emit_gemma4_transformer_layer(
         warnings,
     )?;
 
-    // Gemma 4: post-feedforward layernorm on MLP output
-    let normed_mlp_out = {
-        let post_ffn_name = format!("{prefix}.post_feedforward_layernorm.weight");
-        if ctx.provider.has_tensor(&post_ffn_name) {
-            emit_rms_norm(
-                block,
-                ctx.provider,
-                ctx.config,
-                &format!("{prefix}.post_feedforward_layernorm"),
-                &mlp_out,
-                &format!("l{layer_idx}_post_ffn_norm"),
-                warnings,
-            )?
-        } else {
-            mlp_out.clone()
-        }
-    };
-
     // 6. MoE block (parallel with dense MLP, outputs are summed) or standard residual
-    let ffn_output = if enable_moe && num_experts > 0 {
+    let ffn_combined = if enable_moe && num_experts > 0 {
         // 5b. MoE output from the same normed input
         let moe_out = moe::emit_moe_block(
             block,
@@ -519,45 +523,46 @@ fn emit_gemma4_transformer_layer(
             warnings,
         )?;
 
-        // Sum dense MLP + MoE outputs
+        // Sum dense MLP + MoE outputs (before post-FFN norm, matching HF)
         emit_residual_add(
             block,
-            &normed_mlp_out,
+            &mlp_out,
             &moe_out,
             &format!("l{layer_idx}_moe_combined"),
         )
     } else {
-        normed_mlp_out
+        mlp_out
     };
 
-    // Apply layer_scalar if present (Gemma 4: scales FFN output before residual add)
-    let scaled_ffn = {
-        let scalar_name = format!("{prefix}.layer_scalar");
-        if ctx.provider.has_tensor(&scalar_name) {
-            let scalar_const = format!("l{layer_idx}_layer_scalar");
-            emit_weight_const(block, ctx.provider, &scalar_name, &scalar_const, warnings)?;
-
-            let out_name = format!("l{layer_idx}_scaled_ffn");
-            let op = Operation::new("mul", format!("l{layer_idx}_layer_scalar_op"))
-                .with_input("x", Value::Reference(ffn_output))
-                .with_input("y", Value::Reference(scalar_const))
-                .with_output(&out_name);
-            block.add_op(op);
-            out_name
+    // Gemma 4: post-feedforward layernorm on combined MLP+MoE output.
+    // HF applies this AFTER MoE combine, not before.
+    let normed_ffn_out = {
+        let post_ffn_name = format!("{prefix}.post_feedforward_layernorm.weight");
+        if ctx.provider.has_tensor(&post_ffn_name) {
+            emit_rms_norm(
+                block,
+                ctx.provider,
+                ctx.config,
+                &format!("{prefix}.post_feedforward_layernorm"),
+                &ffn_combined,
+                &format!("l{layer_idx}_post_ffn_norm"),
+                warnings,
+            )?
         } else {
-            ffn_output
+            ffn_combined
         }
     };
 
+    // FFN residual add: hidden = residual + normed_ffn_output
     let post_mlp = emit_residual_add(
         block,
         &post_attn,
-        &scaled_ffn,
+        &normed_ffn_out,
         &format!("l{layer_idx}_output"),
     );
 
     // 7. Per-Layer Embedding (PLE) — applied AFTER the FFN block
-    let layer_out = if let Some(ple_slice) = ple_input {
+    let after_ple = if let Some(ple_slice) = ple_input {
         // Gate: linear [hidden_size → ple_hidden_size]
         let gate = emit_linear(
             block,
@@ -573,6 +578,7 @@ fn emit_gemma4_transformer_layer(
             let out_name = format!("l{layer_idx}_ple_gelu");
             let op = Operation::new("gelu", format!("l{layer_idx}_ple_gelu_op"))
                 .with_input("x", Value::Reference(gate))
+                .with_attr("mode", Value::String("TANH_APPROXIMATION".to_string()))
                 .with_output(&out_name);
             block.add_op(op);
             out_name
@@ -619,6 +625,26 @@ fn emit_gemma4_transformer_layer(
         )
     } else {
         post_mlp
+    };
+
+    // Apply layer_scalar AFTER all residual adds (including PLE).
+    // HF: hidden_states *= self.layer_scalar (last op in decoder layer).
+    let layer_out = {
+        let scalar_name = format!("{prefix}.layer_scalar");
+        if ctx.provider.has_tensor(&scalar_name) {
+            let scalar_const = format!("l{layer_idx}_layer_scalar");
+            emit_weight_const(block, ctx.provider, &scalar_name, &scalar_const, warnings)?;
+
+            let out_name = format!("l{layer_idx}_scaled_output");
+            let op = Operation::new("mul", format!("l{layer_idx}_layer_scalar_op"))
+                .with_input("x", Value::Reference(after_ple))
+                .with_input("y", Value::Reference(scalar_const))
+                .with_output(&out_name);
+            block.add_op(op);
+            out_name
+        } else {
+            after_ple
+        }
     };
 
     Ok(layer_out)

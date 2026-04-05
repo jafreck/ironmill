@@ -123,14 +123,23 @@ pub struct MetalPipelines {
     pub quip_sharp_matvec: ComputePipeline,
     /// QuIP# matmul kernel.
     pub quip_sharp_matmul: ComputePipeline,
+    /// Fused softcapping kernel.
     pub fused_softcap: ComputePipeline,
+    /// PLE GELU-gated activation kernel.
     pub ple_gelu_gate: ComputePipeline,
+    /// PLE add-and-scale kernel.
     pub ple_add_scale: ComputePipeline,
+    /// Element-wise buffer scaling kernel.
     pub scale_buffer: ComputePipeline,
+    /// Buffer copy kernel.
     pub copy_buffer: ComputePipeline,
+    /// MoE router softmax kernel.
     pub moe_softmax: ComputePipeline,
+    /// MoE expert GELU activation kernel.
     pub moe_gelu: ComputePipeline,
+    /// MoE element-wise multiply kernel.
     pub moe_mul: ComputePipeline,
+    /// MoE weighted expert combination kernel.
     pub moe_weighted_combine: ComputePipeline,
 }
 
@@ -608,6 +617,11 @@ impl MetalPipelines {
                 precompiled!(attn "256"),
                 precompiled!(tq "256"),
                 precompiled!(sdpa "256"),
+            ),
+            512 => try_precompiled(
+                precompiled!(attn "512"),
+                precompiled!(tq "512"),
+                precompiled!(sdpa "512"),
             ),
             _ => {
                 // Uncommon head_dim — fall back to runtime source compilation.
@@ -1237,6 +1251,7 @@ pub fn encode_fused_softcap(
 ///
 /// The `input` buffer has row stride `input_stride` elements and each layer's
 /// slice starts at column `input_offset`.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_gelu_gate(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -1337,6 +1352,7 @@ pub fn encode_moe_mul(
 }
 
 /// Encode MoE top-k weighted combine of expert outputs.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_moe_weighted_combine(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,

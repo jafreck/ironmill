@@ -299,7 +299,9 @@ impl ModelConfig {
 /// Per-layer-type RoPE configuration for Gemma 4.
 #[derive(Debug, Clone)]
 pub struct RopeLayerConfig {
+    /// Base frequency for rotary position embeddings.
     pub theta: f64,
+    /// Fraction of head dimensions that receive rotation (1.0 = all).
     pub partial_rotary_factor: f64,
 }
 
@@ -325,6 +327,27 @@ pub struct MlaConfig {
     pub qk_rope_head_dim: usize,
     /// Per-head value dimension.
     pub v_head_dim: usize,
+}
+
+impl MlaConfig {
+    /// Create a new MLA configuration.
+    pub fn new(
+        kv_latent_dim: usize,
+        q_latent_dim: usize,
+        num_heads: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        v_head_dim: usize,
+    ) -> Self {
+        Self {
+            kv_latent_dim,
+            q_latent_dim,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+        }
+    }
 }
 
 /// Describes how a weight tensor is stored in compressed form.
