@@ -207,7 +207,10 @@ impl AneTensor {
         Ok(out)
     }
 
-    /// Write packed f32 data (converted to f16 internally).
+    /// Write packed f32 data.
+    ///
+    /// For `Float32` tensors the values are written directly.
+    /// For `Float16` tensors the values are converted to f16 first.
     pub fn write_f32(&mut self, data: &[f32]) -> crate::Result<()> {
         if self.dtype != ScalarType::Float32 && self.dtype != ScalarType::Float16 {
             return Err(IOSurfaceError::CopyFailed(format!(
@@ -215,8 +218,54 @@ impl AneTensor {
                 self.dtype
             )));
         }
-        let f16_data: Vec<f16> = data.iter().map(|&v| f16::from_f32(v)).collect();
-        self.write_f16(&f16_data)
+        let expected = self.num_elements();
+        if data.len() != expected {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "expected {} f32 elements, got {}",
+                expected,
+                data.len()
+            )));
+        }
+        match self.dtype {
+            ScalarType::Float32 => {
+                let byte_len = data.len() * 4;
+                // SAFETY: `data` is a valid f32 slice; reinterpreting as bytes
+                // is sound because we only read within the slice bounds.
+                let src =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+                self.write_bytes(src)
+            }
+            ScalarType::Float16 => {
+                let f16_data: Vec<f16> = data.iter().map(|&v| f16::from_f32(v)).collect();
+                let byte_len = f16_data.len() * 2;
+                // SAFETY: `f16_data` is a valid f16 slice; reinterpreting as
+                // bytes is sound.
+                let src =
+                    unsafe { std::slice::from_raw_parts(f16_data.as_ptr() as *const u8, byte_len) };
+                self.write_bytes(src)
+            }
+            _ => unreachable!(), // guarded by the dtype check above
+        }
+    }
+
+    /// Read packed f32 data from a Float32 surface.
+    pub fn read_f32(&self) -> crate::Result<Vec<f32>> {
+        if self.dtype != ScalarType::Float32 {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "read_f32 requires Float32 dtype, got {:?}",
+                self.dtype
+            )));
+        }
+        let byte_len = self.num_elements() * 4;
+        let bytes = self.read_bytes(byte_len)?;
+        let mut out = vec![0.0f32; self.num_elements()];
+        // SAFETY: `bytes` has exactly `byte_len` bytes and `out` has exactly
+        // `num_elements` f32 values (byte_len = num_elements * 4). Both
+        // pointers are valid and non-overlapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, byte_len);
+        }
+        Ok(out)
     }
 
     /// Tensor shape `[1, C, 1, S]`.
@@ -899,13 +948,29 @@ mod tests {
     }
 
     #[test]
-    fn tensor_packed_write_read_f32() {
+    fn tensor_packed_write_read_f32_as_f16() {
         let mut t = AneTensor::new(2, 4, ScalarType::Float16).unwrap();
         let data: Vec<f32> = (0..8).map(|i| i as f32 * 0.5).collect();
         t.write_f32(&data).unwrap();
         let out = t.read_f16().unwrap();
         let expected: Vec<f16> = data.iter().map(|&v| f16::from_f32(v)).collect();
         assert_eq!(expected, out);
+    }
+
+    #[test]
+    fn tensor_packed_write_read_f32() {
+        let mut t = AneTensor::new(2, 4, ScalarType::Float32).unwrap();
+        let data: Vec<f32> = (0..8).map(|i| i as f32 * 0.5).collect();
+        t.write_f32(&data).unwrap();
+        let out = t.read_f32().unwrap();
+        assert_eq!(data, out);
+    }
+
+    #[test]
+    fn tensor_write_f32_rejects_wrong_dtype() {
+        let mut t = AneTensor::new(2, 4, ScalarType::Int8).unwrap();
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        assert!(t.write_f32(&data).is_err());
     }
 
     #[test]
