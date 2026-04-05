@@ -83,7 +83,7 @@ pub fn build_program(provider: &dyn WeightProvider) -> Result<ConversionResult, 
 
     block.outputs.push(logits);
 
-    let mut program = Program::new("1.0.0");
+    let mut program = Program::new("1");
     program.add_function(func);
     program.set_attribute("autoregressive", "true");
 

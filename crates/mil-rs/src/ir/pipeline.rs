@@ -1135,7 +1135,12 @@ impl PassPipeline {
             let elapsed = start.elapsed();
 
             // Spill large inline tensors to disk between passes to bound peak memory.
-            program.spill_inline_tensors(4096)?;
+            // Only spill when a weight provider is attached — the resolver needs it
+            // to materialize spilled data in subsequent passes. Programs built without
+            // a provider (e.g. manual construction, ONNX import) keep data inline.
+            if program.has_weight_provider() {
+                program.spill_inline_tensors(4096)?;
+            }
 
             let ops_after = count_ops(program);
             let flops_after = estimate_flops(program);

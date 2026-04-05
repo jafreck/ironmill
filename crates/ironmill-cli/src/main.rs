@@ -863,7 +863,7 @@ fn emit_moe_bundle(
         .with_context(|| format!("Failed to write {manifest_path}"))?;
     println!("  Wrote manifest: {manifest_path}");
 
-    compile_output(&bundle_path)?;
+    compile_output(&bundle_path);
 
     println!();
     println!("MoE bundle complete.");
@@ -932,7 +932,7 @@ fn emit_topk_fusion(
 
     let output_path = resolve_output_path(opts.output.as_deref(), input_path, "-fused.mlpackage");
     write_coreml_package(&fuse_result.program, &output_path, "fused model")?;
-    compile_output(&output_path)?;
+    compile_output(&output_path);
 
     println!();
     println!("MoE top-{k} fusion complete.");
@@ -982,8 +982,8 @@ fn emit_speculative_split(
         "verifier model (full)",
     )?;
 
-    compile_output(&draft_path)?;
-    compile_output(&verifier_path)?;
+    compile_output(&draft_path);
+    compile_output(&verifier_path);
     Ok(())
 }
 
@@ -1049,7 +1049,7 @@ fn emit_coreml(
     write_mlpackage(&model, &output_path)
         .with_context(|| format!("Failed to write mlpackage: {output_path}"))?;
 
-    compile_output(&output_path)?;
+    compile_output(&output_path);
     Ok(())
 }
 
@@ -1289,18 +1289,26 @@ fn compile_from_weights(input_path: &Path, opts: &CompileOpts) -> Result<()> {
 }
 
 /// Compile a .mlpackage using xcrun coremlcompiler.
-fn compile_output(output_path: &str) -> Result<()> {
+///
+/// This is a convenience step — the .mlpackage is already complete on disk.
+/// coremlcompiler failures are logged as warnings since they may indicate
+/// model issues that the on-device runtime would also encounter, but they
+/// don't prevent the output file from being usable.
+fn compile_output(output_path: &str) {
     if is_compiler_available() {
         println!("Compiling with xcrun coremlcompiler...");
         let output_dir = Path::new(output_path).parent().unwrap_or(Path::new("."));
-        let compiled = compile_model(output_path, output_dir)
-            .with_context(|| format!("xcrun coremlcompiler failed for {output_path}"))?;
-        println!("Done: {}", compiled.display());
+        match compile_model(output_path, output_dir) {
+            Ok(compiled) => println!("Done: {}", compiled.display()),
+            Err(e) => {
+                eprintln!("Warning: xcrun coremlcompiler failed: {e}");
+                eprintln!("  The .mlpackage was written successfully and may still be usable.");
+            }
+        }
     } else {
         println!("Note: xcrun coremlcompiler not found — skipping compilation step.");
         println!("  The .mlpackage can be compiled on a Mac with Xcode installed.");
     }
-    Ok(())
 }
 
 fn compile_coreml(input_path: &Path, ext: &str) -> Result<()> {

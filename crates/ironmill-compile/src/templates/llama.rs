@@ -34,7 +34,7 @@ pub fn build_program(
 ) -> Result<ConversionResult, MilError> {
     let config = provider.config().clone();
     let mut warnings: Vec<String> = Vec::new();
-    let mut program = Program::new("1.0.0");
+    let mut program = Program::new("1");
 
     if options.ane {
         // ANE mode: emit prefill (dynamic seq_len) and decode (seq_len=1).

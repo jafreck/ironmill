@@ -151,22 +151,43 @@ impl Program {
     }
 
     /// Materialize all `TensorData::External` references in the program.
+    ///
+    /// Resolves from the spill index first (for data written between passes),
+    /// then falls back to the weight provider (for original weight data).
+    /// Returns `Ok(())` immediately if no External tensors exist.
     pub fn materialize_all(&mut self) -> Result<(), MilError> {
-        let provider = self
-            .weight_provider
-            .clone()
-            .ok_or_else(|| MilError::Validation("no weight provider for materialization".into()))?;
+        let provider = self.weight_provider.clone();
         let spill_index = self.spill_index.clone();
 
+        // Check if there are any External tensors to materialize.
+        let has_external = self.functions.values().any(|f| {
+            f.body.operations.iter().any(|op| {
+                op.inputs
+                    .values()
+                    .chain(op.attributes.values())
+                    .any(|v| matches!(v, Value::Tensor { data, .. } if data.is_external()))
+            })
+        });
+        if !has_external {
+            return Ok(());
+        }
+
+        // Need at least a spill index or provider to resolve External refs.
+        if provider.is_none() && spill_index.is_empty() {
+            return Err(MilError::Validation(
+                "no weight provider or spill index for materialization".into(),
+            ));
+        }
+
         for function in self.functions.values_mut() {
-            Self::materialize_block(&mut function.body, &*provider, &spill_index)?;
+            Self::materialize_block(&mut function.body, provider.as_deref(), &spill_index)?;
         }
         Ok(())
     }
 
     fn materialize_block(
         block: &mut Block,
-        provider: &dyn WeightProvider,
+        provider: Option<&(dyn WeightProvider + Send + Sync)>,
         spill_index: &HashMap<String, PathBuf>,
     ) -> Result<(), MilError> {
         for op in &mut block.operations {
@@ -177,7 +198,12 @@ impl Program {
                         if let Some(path) = spill_index.get(key) {
                             return std::fs::read(path).map_err(MilError::Io);
                         }
-                        let tensor = provider.tensor(key)?;
+                        let p = provider.ok_or_else(|| {
+                            MilError::Validation(format!(
+                                "no weight provider attached; cannot resolve tensor '{key}'"
+                            ))
+                        })?;
+                        let tensor = p.tensor(key)?;
                         Ok(tensor.data.into_owned())
                     })?;
                 }

@@ -551,12 +551,7 @@ pub fn program_to_multi_function_model(
     }
 
     // Build the MIL Program proto with all functions.
-    let version: i64 = split.shared.version.parse().map_err(|_| {
-        MilError::Validation(format!(
-            "invalid program version string: '{}'",
-            split.shared.version
-        ))
-    })?;
+    let version: i64 = parse_mil_version(&split.shared.version)?;
     let proto_program = mil_spec::Program {
         version,
         functions: all_functions,
@@ -762,12 +757,7 @@ fn convert_operation_stub(
 // ---------------------------------------------------------------------------
 
 fn convert_program(program: &Program) -> Result<mil_spec::Program> {
-    let version: i64 = program.version.parse().map_err(|_| {
-        MilError::Validation(format!(
-            "invalid program version string: '{}'",
-            program.version
-        ))
-    })?;
+    let version: i64 = parse_mil_version(&program.version)?;
 
     let mut functions = HashMap::new();
     for (name, func) in &program.functions {
@@ -780,6 +770,27 @@ fn convert_program(program: &Program) -> Result<mil_spec::Program> {
         doc_string: String::new(),
         attributes: HashMap::new(),
     })
+}
+
+/// Parse a MIL program version string to the protobuf `i64` representation.
+///
+/// Accepts both plain integers ("1") and semver-like strings ("1.0.0"),
+/// extracting the major version in the latter case. The MIL protobuf spec
+/// defines version as `int64` — only the major component is meaningful.
+fn parse_mil_version(version_str: &str) -> Result<i64> {
+    // Try direct parse first (e.g. "1")
+    if let Ok(v) = version_str.parse::<i64>() {
+        return Ok(v);
+    }
+    // Try extracting major version from semver-like "1.0.0"
+    if let Some(major) = version_str.split('.').next() {
+        if let Ok(v) = major.parse::<i64>() {
+            return Ok(v);
+        }
+    }
+    Err(MilError::Validation(format!(
+        "invalid program version string: '{version_str}'"
+    )))
 }
 
 fn convert_function(func: &Function) -> Result<mil_spec::Function> {

@@ -141,7 +141,7 @@ fn extract_component(
         }
     }
 
-    let mut new_program = Program::new("1.0.0");
+    let mut new_program = Program::new("1");
     new_program.add_function(new_func);
     if program.is_autoregressive() {
         new_program.set_attribute("autoregressive", "true");
