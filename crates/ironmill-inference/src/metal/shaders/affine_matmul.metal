@@ -41,17 +41,24 @@ constant constexpr uint TN_STRIDE      = TN_TILE + 1;
 constant constexpr uint MATMUL_K_TILE  = 8;
 constant constexpr uint TN_BLOCKS      = TN_TILE / 8;
 
+// ── Blocked-layout constants (must match pack_quantized_blocked) ─
+constant constexpr uint BLK_N = 64;
+constant constexpr uint BLK_K = 8;
+
 // ── INT4 matvec (decode path, M=1) ──────────────────────────────
 //
 // One threadgroup per output row. Each lane processes K/(2·32) packed
 // bytes, unpacks two nibbles, applies per-group affine dequant, and
 // dot-products with A.
 //
+// B_packed is in blocked layout: [N_blocks, K_blocks, BLK_N, BLK_K/2]
+// produced by pack_quantized_blocked().
+//
 // Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
 
 kernel void affine_matvec_int4(
     device const half *A            [[buffer(0)]],   // [1, K]
-    device const uchar *B_packed    [[buffer(1)]],   // [N, K/2]
+    device const uchar *B_packed    [[buffer(1)]],   // blocked [N_blk, K_blk, 64, 4]
     device const half *scales       [[buffer(2)]],   // [N, num_groups]
     device const half *zeros        [[buffer(3)]],   // [N, num_groups]
     device half *C                  [[buffer(4)]],   // [1, N]
@@ -66,14 +73,25 @@ kernel void affine_matvec_int4(
     if (tid >= N) return;
 
     uint half_K = K / 2;
-    uint row_offset = tid * half_K;
     uint num_groups = (K + group_size - 1) / group_size;
     uint scale_row = tid * num_groups;
+
+    // Blocked layout addressing
+    uint k_blocks     = (K + BLK_K - 1) / BLK_K;
+    uint local_k_bytes = BLK_K / 2;            // 4
+    uint block_bytes   = BLK_N * local_k_bytes; // 256
+    uint n_block = tid / BLK_N;
+    uint n_local = tid % BLK_N;
 
     float acc = 0.0f;
 
     for (uint k = lane; k < half_K; k += 32) {
-        uchar packed = B_packed[row_offset + k];
+        uint kb = k / local_k_bytes;
+        uint b  = k % local_k_bytes;
+        uint byte_idx = (n_block * k_blocks + kb) * block_bytes
+                      + n_local * local_k_bytes + b;
+
+        uchar packed = B_packed[byte_idx];
         uchar lo = packed & 0x0F;
         uchar hi = (packed >> 4) & 0x0F;
 
@@ -261,11 +279,14 @@ kernel void affine_matmul_int4(
 //
 // One byte = one element (no nibble unpacking).
 //
+// B_packed is in blocked layout: [N_blocks, K_blocks, BLK_N, BLK_K]
+// produced by pack_quantized_blocked().
+//
 // Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
 
 kernel void affine_matvec_int8(
     device const half *A            [[buffer(0)]],   // [1, K]
-    device const uchar *B_packed    [[buffer(1)]],   // [N, K]
+    device const uchar *B_packed    [[buffer(1)]],   // blocked [N_blk, K_blk, 64, 8]
     device const half *scales       [[buffer(2)]],   // [N, num_groups]
     device const half *zeros        [[buffer(3)]],   // [N, num_groups]
     device half *C                  [[buffer(4)]],   // [1, N]
@@ -279,14 +300,25 @@ kernel void affine_matvec_int8(
 {
     if (tid >= N) return;
 
-    uint row_offset = tid * K;
     uint num_groups = (K + group_size - 1) / group_size;
     uint scale_row = tid * num_groups;
+
+    // Blocked layout addressing
+    uint k_blocks      = (K + BLK_K - 1) / BLK_K;
+    uint local_k_bytes = BLK_K;                // 8
+    uint block_bytes   = BLK_N * local_k_bytes; // 512
+    uint n_block = tid / BLK_N;
+    uint n_local = tid % BLK_N;
 
     float acc = 0.0f;
 
     for (uint k = lane; k < K; k += 32) {
-        uchar q = B_packed[row_offset + k];
+        uint kb = k / BLK_K;
+        uint b  = k % BLK_K;
+        uint byte_idx = (n_block * k_blocks + kb) * block_bytes
+                      + n_local * local_k_bytes + b;
+
+        uchar q = B_packed[byte_idx];
         uint grp = k / group_size;
         float s = float(scales[scale_row + grp]);
         float z = float(zeros[scale_row + grp]);

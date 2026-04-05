@@ -129,6 +129,8 @@ impl WeightProvider for MetalBundleProvider {
                 axis,
                 dtype,
                 awq_scales_file,
+                scale_dtype,
+                zero_point_dtype,
                 ..
             } => {
                 let quantized_data = self.read_file(quantized_data_file)?;
@@ -141,13 +143,22 @@ impl WeightProvider for MetalBundleProvider {
                 let dtype =
                     str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
 
+                let s_dtype = scale_dtype
+                    .as_ref()
+                    .and_then(|s| str_to_scalar_type(s).ok())
+                    .unwrap_or(ScalarType::Float16);
+                let zp_dtype = zero_point_dtype
+                    .as_ref()
+                    .and_then(|s| str_to_scalar_type(s).ok())
+                    .unwrap_or(ScalarType::Float16);
+
                 Ok(
                     WeightTensor::owned(quantized_data, shape.clone(), dtype).with_quant_info(
                         QuantizationInfo::AffineDequantize {
                             scale,
                             zero_point,
-                            scale_dtype: ScalarType::Float16,
-                            zero_point_dtype: ScalarType::Float16,
+                            scale_dtype: s_dtype,
+                            zero_point_dtype: zp_dtype,
                             axis: Some(*axis as usize),
                             bit_width: *bit_width,
                             group_size: Some(*group_size),
