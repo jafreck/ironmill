@@ -1064,6 +1064,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ironmill-compile",
+ "ironmill-torch",
  "serde_json",
  "tempfile",
  "toml",
@@ -1166,6 +1167,17 @@ dependencies = [
  "bindgen",
  "cmake",
  "half",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ironmill-torch"
+version = "0.1.0"
+dependencies = [
+ "ironmill-compile",
+ "ironmill-core",
+ "ironmill-inference",
+ "mil-rs",
  "thiserror 2.0.18",
 ]
 

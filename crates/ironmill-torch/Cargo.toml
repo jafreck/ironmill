@@ -1,0 +1,23 @@
+[package]
+name = "ironmill-torch"
+description = "High-level PyTorch-style model loading and inference API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["metal"]
+metal = ["ironmill-inference/metal"]
+ane = ["ironmill-inference/ane"]
+coreml = ["ironmill-inference/coreml"]
+hf-tokenizer = ["ironmill-core/hf-tokenizer"]
+async = ["ironmill-inference/async"]
+
+[dependencies]
+ironmill-core = { workspace = true }
+ironmill-compile = { workspace = true }
+ironmill-inference = { workspace = true }
+mil-rs = { workspace = true }
+thiserror = { workspace = true }
