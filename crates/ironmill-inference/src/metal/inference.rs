@@ -3707,7 +3707,7 @@ fn encode_kv_cache_and_attention(
             enc.set_buffer(&outlier.outlier_codebook, 0, 27);
             enc.set_buffer(&outlier.non_outlier_codebook, 0, 28);
             enc.set_bytes(&outlier.k_outlier_n_levels.to_le_bytes(), 29);
-            enc.set_bytes(&outlier.k_non_outlier_n_levels.to_le_bytes(), 30);
+            enc.set_bytes(&attn_scale.to_le_bytes(), 30);
             enc.dispatch_threadgroups(
                 (nh as usize, token_count, 1),
                 (256_usize.max(tg_size).min(1024), 1, 1),
@@ -3815,6 +3815,7 @@ fn encode_kv_cache_and_attention(
             enc.set_buffer(qjl_matrix, 0, 16);
             enc.set_buffer(k_r_norms, 0, 17);
             enc.set_bytes(&k_n_levels_val.to_le_bytes(), 18);
+            enc.set_bytes(&attn_scale.to_le_bytes(), 19);
             enc.dispatch_threadgroups(
                 (nh as usize, token_count, 1),
                 (256_usize.max(hd as usize).min(1024), 1, 1),

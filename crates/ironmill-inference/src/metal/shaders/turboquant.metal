@@ -194,6 +194,8 @@ kernel void turboquant_cache_write(
 //   buffer(15) v_codebook:      V cache codebook (b-bit levels for TurboQuant_mse)
 //   buffer(16) qjl_matrix:      [head_dim × head_dim] float
 //   buffer(17) k_r_norms:       [num_kv_heads × max_seq_len] float
+//   buffer(18) k_n_levels:      uint
+//   buffer(19) attn_scale:      float (QK attention scale; 1/sqrt(head_dim) or 1.0 for QK-normed models)
 //
 // Dispatch: (num_heads, token_count, 1) threadgroups, max(256, head_dim) threads per group.
 
@@ -216,6 +218,8 @@ kernel void turboquant_attention(
     device const float* v_codebook      [[buffer(15)]],
     device const float* qjl_matrix      [[buffer(16)]],
     device const float* k_r_norms       [[buffer(17)]],
+    constant uint& k_n_levels_val       [[buffer(18)]],
+    constant float& attn_scale          [[buffer(19)]],
     uint3 tid_3  [[thread_position_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tg_size_3 [[threads_per_threadgroup]],
@@ -258,7 +262,7 @@ kernel void turboquant_attention(
 
     uint heads_per_group = num_heads / num_kv_heads;
     uint kv_head = head_idx / heads_per_group;
-    float scale = 1.0f / sqrt(float(head_dim));
+    float scale = attn_scale;
     uint q_base = (token_idx * num_heads + head_idx) * head_dim;
     uint kv_base = kv_cache_base(kv_head, max_seq_len, head_dim, n_bits);
 
@@ -777,6 +781,8 @@ kernel void turboquant_outlier_attention(
     device const float* k_non_outlier_r_norms       [[buffer(26)]],
     device const float* v_outlier_codebook          [[buffer(27)]],
     device const float* v_non_outlier_codebook      [[buffer(28)]],
+    constant uint& k_outlier_n_levels_val           [[buffer(29)]],
+    constant float& attn_scale                      [[buffer(30)]],
     uint3 tid_3  [[thread_position_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tg_size_3 [[threads_per_threadgroup]],
@@ -824,7 +830,7 @@ kernel void turboquant_outlier_attention(
 
     uint heads_per_group = num_heads / num_kv_heads;
     uint kv_head = head_idx / heads_per_group;
-    float scale = 1.0f / sqrt(float(head_dim));
+    float scale = attn_scale;
     uint q_base = (token_idx * num_heads + head_idx) * head_dim;
     uint n_non = head_dim - n_outlier;
 
