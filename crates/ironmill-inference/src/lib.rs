@@ -40,20 +40,20 @@ pub mod mlx;
 mod weight_loading;
 
 // Re-exports for convenience.
-pub use batch_runner::{BatchRunner, BatchRunnerConfig, SchedulingPolicy, SequenceHandle};
 #[cfg(all(feature = "ane", target_os = "macos"))]
 pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
+pub use batch_runner::{BatchRunner, BatchRunnerConfig, SchedulingPolicy, SequenceHandle};
 pub use cache::{KvCacheSlice, KvLayerSlice, LinearPrefixCache, LruPolicy, PrefixCache, RadixTree};
 pub use engine::{
     BatchInferenceEngine, ConstrainedDecoder, InferenceEngine, InferenceError, SequenceId,
     prefill_with_cache,
 };
+#[cfg(feature = "async")]
+pub use generate::generate_async;
 pub use generate::{
     CancellationToken, FinishReason, GenerateError, GenerateEvent, GenerateRequest, GenerateResult,
     TokenStream, generate, generate_with_callback,
 };
-#[cfg(feature = "async")]
-pub use generate::generate_async;
 pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 pub use memory::{KvQuantLevel, MemoryEstimator, MemoryUsage, QuantLevel};
 #[cfg(all(feature = "mlx", target_os = "macos"))]

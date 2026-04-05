@@ -288,8 +288,7 @@ impl ModelBuilder {
             Device::Metal => {
                 use ironmill_inference::metal::{MetalBundleProvider, MetalConfig, MetalInference};
 
-                let bundle =
-                    MetalBundleProvider::open(&self.path).map_err(InferenceError::from)?;
+                let bundle = MetalBundleProvider::open(&self.path).map_err(InferenceError::from)?;
                 let config = MetalConfig::new().with_max_seq_len(self.max_seq_len);
                 let info = ModelInfo::from_config(bundle.config());
 

@@ -4,4 +4,3 @@
 //! for backward compatibility.
 
 pub use ironmill_core::model_info::ModelInfo;
-

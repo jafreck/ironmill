@@ -141,26 +141,42 @@ mod hf_impl {
             let (eos_tokens, bos_token) = Self::read_token_config(dir);
             let chat_template = Self::read_chat_template(dir);
 
-            Ok(Self { inner, eos_tokens, bos_token, chat_template })
+            Ok(Self {
+                inner,
+                eos_tokens,
+                bos_token,
+                chat_template,
+            })
         }
 
         /// Load from an explicit tokenizer.json path.
         pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TokenizerError> {
             let inner = tokenizers::Tokenizer::from_file(path.as_ref())
                 .map_err(|e| TokenizerError::Load(format!("failed to load tokenizer: {e}")))?;
-            Ok(Self { inner, eos_tokens: Vec::new(), bos_token: None, chat_template: None })
+            Ok(Self {
+                inner,
+                eos_tokens: Vec::new(),
+                bos_token: None,
+                chat_template: None,
+            })
         }
 
         fn read_token_config(dir: &Path) -> (Vec<u32>, Option<u32>) {
             let config_path = dir.join("tokenizer_config.json");
-            let Ok(data) = std::fs::read_to_string(&config_path) else { return (Vec::new(), None) };
-            let Ok(config) = serde_json::from_str::<serde_json::Value>(&data) else { return (Vec::new(), None) };
+            let Ok(data) = std::fs::read_to_string(&config_path) else {
+                return (Vec::new(), None);
+            };
+            let Ok(config) = serde_json::from_str::<serde_json::Value>(&data) else {
+                return (Vec::new(), None);
+            };
 
-            let eos = config.get("eos_token_id")
+            let eos = config
+                .get("eos_token_id")
                 .and_then(|v| v.as_u64())
                 .map(|id| vec![id as u32])
                 .unwrap_or_default();
-            let bos = config.get("bos_token_id")
+            let bos = config
+                .get("bos_token_id")
                 .and_then(|v| v.as_u64())
                 .map(|id| id as u32);
             (eos, bos)
@@ -170,7 +186,8 @@ mod hf_impl {
             let config_path = dir.join("tokenizer_config.json");
             let data = std::fs::read_to_string(&config_path).ok()?;
             let config: serde_json::Value = serde_json::from_str(&data).ok()?;
-            config.get("chat_template")
+            config
+                .get("chat_template")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         }
@@ -178,19 +195,27 @@ mod hf_impl {
 
     impl Tokenizer for HfTokenizer {
         fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
-            self.inner.encode(text, false)
+            self.inner
+                .encode(text, false)
                 .map(|enc| enc.get_ids().to_vec())
                 .map_err(|e| TokenizerError::Encode(e.to_string()))
         }
 
         fn decode(&self, tokens: &[u32]) -> Result<String, TokenizerError> {
-            self.inner.decode(tokens, true)
+            self.inner
+                .decode(tokens, true)
                 .map_err(|e| TokenizerError::Decode(e.to_string()))
         }
 
-        fn vocab_size(&self) -> usize { self.inner.get_vocab_size(false) }
-        fn eos_tokens(&self) -> &[u32] { &self.eos_tokens }
-        fn bos_token(&self) -> Option<u32> { self.bos_token }
+        fn vocab_size(&self) -> usize {
+            self.inner.get_vocab_size(false)
+        }
+        fn eos_tokens(&self) -> &[u32] {
+            &self.eos_tokens
+        }
+        fn bos_token(&self) -> Option<u32> {
+            self.bos_token
+        }
 
         fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String, TokenizerError> {
             let mut prompt = String::new();

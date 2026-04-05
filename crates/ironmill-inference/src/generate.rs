@@ -542,7 +542,10 @@ pub mod generate_async {
             }
         });
 
-        AsyncTokenStream { receiver: rx, cancel }
+        AsyncTokenStream {
+            receiver: rx,
+            cancel,
+        }
     }
 }
 

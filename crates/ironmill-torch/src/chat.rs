@@ -33,11 +33,7 @@ pub struct ChatSession<'m> {
 }
 
 impl<'m> ChatSession<'m> {
-    pub(crate) fn new(
-        model: &'m mut Model,
-        history: Vec<ChatMessage>,
-        params: GenParams,
-    ) -> Self {
+    pub(crate) fn new(model: &'m mut Model, history: Vec<ChatMessage>, params: GenParams) -> Self {
         Self {
             model,
             history,
@@ -73,10 +69,7 @@ impl<'m> ChatSession<'m> {
     }
 
     /// Send a message and stream the response.
-    pub fn send_stream<'a>(
-        &'a mut self,
-        message: &str,
-    ) -> Result<TextStream<'a>, TorchError> {
+    pub fn send_stream<'a>(&'a mut self, message: &str) -> Result<TextStream<'a>, TorchError> {
         let user_msg = ChatMessage::user(message);
         let mut messages = self.history.clone();
         messages.push(user_msg.clone());
@@ -95,11 +88,7 @@ impl<'m> ChatSession<'m> {
 
     /// Clear the conversation history, keeping the system prompt.
     pub fn reset(&mut self) {
-        let system = self
-            .history
-            .iter()
-            .find(|m| m.role == "system")
-            .cloned();
+        let system = self.history.iter().find(|m| m.role == "system").cloned();
         self.history.clear();
         if let Some(sys) = system {
             self.history.push(sys);

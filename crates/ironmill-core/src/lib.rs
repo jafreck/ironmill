@@ -14,6 +14,6 @@ pub mod weights;
 
 pub use device::Device;
 pub use model_info::ModelInfo;
-pub use tokenizer::{ChatMessage, Tokenizer, TokenizerError};
 #[cfg(feature = "hf-tokenizer")]
 pub use tokenizer::HfTokenizer;
+pub use tokenizer::{ChatMessage, Tokenizer, TokenizerError};
