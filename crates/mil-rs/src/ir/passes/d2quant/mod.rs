@@ -8,7 +8,7 @@
 pub mod dac;
 pub mod dual_scale;
 
-use super::tensor_utils::tensor_as_f32_slice;
+use super::tensor_utils::{tensor_as_f32_slice, tensor_f16_as_f32_slice};
 use crate::error::{MilError, Result};
 use crate::ir::pass::Pass;
 use crate::ir::program::Program;
@@ -72,21 +72,18 @@ impl Pass for D2QuantPass {
                 }
 
                 // val may live in inputs or attributes (ONNX puts it in attrs).
-                let in_inputs = matches!(
-                    op.inputs.get("val"),
-                    Some(Value::Tensor {
-                        dtype: ScalarType::Float32,
-                        ..
-                    })
-                );
-                let in_attrs = !in_inputs
-                    && matches!(
-                        op.attributes.get("val"),
+                // Accept Float32 and Float16 weight tensors.
+                let is_quantizable_dtype = |v: Option<&Value>| -> bool {
+                    matches!(
+                        v,
                         Some(Value::Tensor {
-                            dtype: ScalarType::Float32,
+                            dtype: ScalarType::Float32 | ScalarType::Float16,
                             ..
                         })
-                    );
+                    )
+                };
+                let in_inputs = is_quantizable_dtype(op.inputs.get("val"));
+                let in_attrs = !in_inputs && is_quantizable_dtype(op.attributes.get("val"));
 
                 if !in_inputs && !in_attrs {
                     continue;
@@ -105,12 +102,36 @@ impl Pass for D2QuantPass {
                 if let Value::Tensor {
                     mut data,
                     shape,
-                    dtype: _,
+                    dtype,
                 } = val
                 {
                     data.materialize_with(|key| resolve(key))?;
-                    let floats =
-                        tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"));
+                    let raw = data.as_bytes().expect("tensor not materialized");
+
+                    // Only quantize 2D weight matrices with sufficient size.
+                    // Skip 1D vectors (norms, biases), embeddings loaded as
+                    // dense, and very small tensors.
+                    let total_elements: usize = shape.iter().product();
+                    let is_weight_matrix = shape.len() == 2
+                        && shape[0] >= 64
+                        && shape[1] >= 64
+                        && total_elements >= 4096;
+                    if !is_weight_matrix {
+                        // Re-insert the tensor and skip quantization.
+                        let val = Value::Tensor { data, shape, dtype };
+                        if in_inputs {
+                            op.inputs.insert("val".to_string(), val);
+                        } else {
+                            op.attributes.insert("val".to_string(), val);
+                        }
+                        continue;
+                    }
+
+                    let floats = match dtype {
+                        ScalarType::Float32 => tensor_as_f32_slice(raw),
+                        ScalarType::Float16 => tensor_f16_as_f32_slice(raw),
+                        _ => unreachable!("dtype already checked"),
+                    };
 
                     // Partition along the last dimension per row so groups
                     // never span row (output-channel) boundaries.
@@ -269,10 +290,12 @@ mod tests {
 
     #[test]
     fn pass_rewrites_const_to_dual_scale_dequantize() {
-        let weights: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.1).collect();
+        let n = 64;
+        let k = 128;
+        let weights: Vec<f32> = (0..n * k).map(|i| (i as f32 - 4096.0) * 0.001).collect();
         let tensor_val = Value::Tensor {
             data: TensorData::Inline(f32_bytes(&weights)),
-            shape: vec![16],
+            shape: vec![n, k],
             dtype: ScalarType::Float32,
         };
 
@@ -349,10 +372,12 @@ mod tests {
 
     #[test]
     fn pass_handles_val_in_attributes() {
-        let weights: Vec<f32> = (0..8).map(|i| i as f32 * 0.5).collect();
+        let n = 64;
+        let k = 64;
+        let weights: Vec<f32> = (0..n * k).map(|i| i as f32 * 0.001).collect();
         let tensor_val = Value::Tensor {
             data: TensorData::Inline(f32_bytes(&weights)),
-            shape: vec![8],
+            shape: vec![n, k],
             dtype: ScalarType::Float32,
         };
 
@@ -374,10 +399,12 @@ mod tests {
 
     #[test]
     fn output_type_is_fp32_with_original_shape() {
-        let weights: Vec<f32> = vec![0.0; 24];
+        let n = 64;
+        let k = 128;
+        let weights: Vec<f32> = vec![0.0; n * k];
         let tensor_val = Value::Tensor {
             data: TensorData::Inline(f32_bytes(&weights)),
-            shape: vec![2, 3, 4],
+            shape: vec![n, k],
             dtype: ScalarType::Float32,
         };
 
@@ -392,6 +419,6 @@ mod tests {
         let op = &program.functions["main"].body.operations[0];
         let out_type = op.output_types[0].as_ref().expect("output type set");
         assert_eq!(out_type.scalar_type, ScalarType::Float32);
-        assert_eq!(out_type.shape, vec![Some(2), Some(3), Some(4)]);
+        assert_eq!(out_type.shape, vec![Some(n), Some(k)]);
     }
 }
