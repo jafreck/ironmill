@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-hf-tokenizer = []
+hf-tokenizer = ["dep:tokenizers"]
 
 [dependencies]
 mil-rs = { workspace = true }
@@ -17,3 +17,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 half = { workspace = true }
 anyhow = { workspace = true }
+tokenizers = { version = "0.21", optional = true }

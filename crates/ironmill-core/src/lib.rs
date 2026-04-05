@@ -25,3 +25,5 @@ pub use model::{Model, ModelBuilder};
 pub use model_info::ModelInfo;
 pub use text_output::{TextChunk, TextOutput, TextStream};
 pub use tokenizer::{ChatMessage, Tokenizer, TokenizerError};
+#[cfg(feature = "hf-tokenizer")]
+pub use tokenizer::HfTokenizer;
