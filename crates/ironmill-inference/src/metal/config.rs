@@ -322,6 +322,18 @@ impl MetalConfig {
         self
     }
 
+    /// Disable TurboQuant KV cache quantization.
+    pub fn without_turboquant(mut self) -> Self {
+        self.enable_turboquant = false;
+        self
+    }
+
+    /// Enable forced CPU dequantization for weight loading.
+    pub fn with_force_cpu_dequant(mut self, enable: bool) -> Self {
+        self.force_cpu_dequant = enable;
+        self
+    }
+
     /// Validate configuration.
     pub fn validate(&self) -> Result<(), crate::engine::InferenceError> {
         if self.max_seq_len == 0 {

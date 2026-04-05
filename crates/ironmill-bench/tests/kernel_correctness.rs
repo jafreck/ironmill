@@ -13,7 +13,7 @@ fn polarquant_matvec_int4_correctness() {
 
     let device = MetalDevice::system_default().expect("no Metal device");
     let queue = device.create_command_queue().expect("command queue");
-    let pipelines = MetalPipelines::compile(&device).expect("compile pipelines");
+    let pipelines = MetalPipelines::compile(&device, 128).expect("compile pipelines");
 
     // Small test case: A=[1, 8], B=[4, 8] → C=[1, 4]
     let m = 1usize;

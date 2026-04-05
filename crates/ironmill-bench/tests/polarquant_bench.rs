@@ -199,10 +199,7 @@ mod polarquant_bench {
         skip_if_missing(&model_dir, "Qwen3-0.6B");
 
         let sequences = load_dataset_1024();
-        let config = MetalConfig {
-            enable_turboquant: false,
-            ..MetalConfig::default()
-        };
+        let config = MetalConfig::default().without_turboquant();
         let provider =
             SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
         let (mut engine, _, _) = load_gpu_engine(&provider, config);
@@ -256,10 +253,7 @@ mod polarquant_bench {
             )
             .build()
             .expect("PolarQuant compile failed");
-        let pq_config = MetalConfig {
-            force_cpu_dequant: false,
-            ..config
-        };
+        let pq_config = config.clone().with_force_cpu_dequant(false);
         let (_engine_pq, pq_gpu_mb, pq_load_ms) = load_gpu_engine(&pq_provider, pq_config);
 
         let reduction_pct = (1.0 - pq_gpu_mb / fp16_gpu_mb) * 100.0;
@@ -302,10 +296,7 @@ mod polarquant_bench {
             )
             .build()
             .expect("PolarQuant compile failed");
-        let pq_config = MetalConfig {
-            force_cpu_dequant: false,
-            ..config
-        };
+        let pq_config = config.clone().with_force_cpu_dequant(false);
         let (mut engine_pq, pq_gpu_mb, _) = load_gpu_engine(&pq_provider, pq_config);
         let (pq_ms, pq_tps) = bench_decode(&mut engine_pq, decode_tokens);
 
@@ -419,10 +410,7 @@ mod polarquant_bench {
         skip_if_missing(&model_dir, "Qwen3-0.6B");
 
         let config = MetalConfig::default();
-        let pq_config = MetalConfig {
-            force_cpu_dequant: false,
-            ..config.clone()
-        };
+        let pq_config = config.clone().with_force_cpu_dequant(false);
         let decode_tokens = 50;
         let sequences = load_dataset();
         let max_seqs = 3;

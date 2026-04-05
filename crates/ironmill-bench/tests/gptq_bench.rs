@@ -239,10 +239,7 @@ mod gptq_bench {
         let model_dir = qwen_model_dir();
         skip_if_missing(&model_dir, "Qwen3-0.6B");
 
-        let config = MetalConfig {
-            enable_turboquant: false,
-            ..MetalConfig::default()
-        };
+        let config = MetalConfig::default().without_turboquant();
         let sequences = load_dataset();
 
         // FP16 baseline.
@@ -290,10 +287,7 @@ mod gptq_bench {
         let model_dir = qwen_model_dir();
         skip_if_missing(&model_dir, "Qwen3-0.6B");
 
-        let config = MetalConfig {
-            enable_turboquant: false,
-            ..MetalConfig::default()
-        };
+        let config = MetalConfig::default().without_turboquant();
         let sequences = load_dataset();
         let max_seqs = 5;
 
@@ -338,10 +332,7 @@ mod gptq_bench {
         let model_dir = qwen_model_dir();
         skip_if_missing(&model_dir, "Qwen3-0.6B");
 
-        let config = MetalConfig {
-            enable_turboquant: false,
-            ..MetalConfig::default()
-        };
+        let config = MetalConfig::default().without_turboquant();
         let decode_tokens = 50;
         let sequences = load_dataset();
         let max_seqs = 3;

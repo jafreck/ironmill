@@ -20,12 +20,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = &args[3];
 
     eprintln!("Loading model from {model_dir}...");
-    let config = MetalConfig {
-        max_seq_len: 2048,
-        prefill_chunk_size: Some(128),
-        enable_turboquant: false,
-        ..MetalConfig::default()
-    };
+    let config = MetalConfig::default()
+        .with_max_seq_len(2048)
+        .with_prefill_chunks(128)
+        .without_turboquant();
     let mut engine = MetalInference::new(config.clone())?;
     let provider = SafeTensorsProvider::load(std::path::Path::new(model_dir))?;
     engine.load_weights(&provider, config)?;

@@ -950,19 +950,19 @@ mod tests {
 
         // Unpack INT4 data if needed.
         let q_data: Vec<u8> = if bit_width == 4 {
-            unpack_int4(q_data_raw, original.len())
+            unpack_int4(q_data_raw.as_bytes().unwrap(), original.len())
         } else {
-            q_data_raw.to_vec()
+            q_data_raw.as_bytes().unwrap().to_vec()
         };
 
         // Get per-group scales and zero points.
         let scales = match op.attributes.get("scale") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data.as_bytes().unwrap()),
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing scale"),
         };
         let zero_points = match op.attributes.get("zero_point") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data.as_bytes().unwrap()),
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing zero_point"),
         };
@@ -974,7 +974,7 @@ mod tests {
 
         // Get AWQ channel scales if present.
         let channel_scales = match op.attributes.get("awq_channel_scales") {
-            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(data)),
+            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(data.as_bytes().unwrap())),
             _ => None,
         };
 
@@ -1035,17 +1035,17 @@ mod tests {
             _ => 8,
         };
         let q_data: Vec<u8> = if bit_width == 4 {
-            unpack_int4(q_data_raw, original.len())
+            unpack_int4(q_data_raw.as_bytes().unwrap(), original.len())
         } else {
-            q_data_raw.to_vec()
+            q_data_raw.as_bytes().unwrap().to_vec()
         };
         let scales = match op.attributes.get("scale") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data.as_bytes().unwrap()),
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing scale"),
         };
         let zero_points = match op.attributes.get("zero_point") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data.as_bytes().unwrap()),
             Some(Value::Float(f)) => vec![*f as f32],
             _ => panic!("missing zero_point"),
         };
@@ -1054,7 +1054,7 @@ mod tests {
             _ => original.len(),
         };
         let channel_scales = match op.attributes.get("awq_channel_scales") {
-            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(data)),
+            Some(Value::Tensor { data, .. }) => Some(tensor_as_f32_slice(data.as_bytes().unwrap())),
             _ => None,
         };
         let (num_rows, row_len) = match op.attributes.get("quantized_data") {
@@ -1192,7 +1192,7 @@ mod tests {
 
         let op = &prog.functions["main"].body.operations[0];
         let scales = match op.attributes.get("awq_channel_scales") {
-            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data),
+            Some(Value::Tensor { data, .. }) => tensor_as_f32_slice(data.as_bytes().unwrap()),
             _ => panic!("missing awq_channel_scales"),
         };
 
@@ -1327,7 +1327,7 @@ mod tests {
             Some(Value::Tensor { data, .. }) => data,
             _ => panic!("missing quantized_data"),
         };
-        for &b in q_data {
+        for &b in q_data.as_bytes().unwrap() {
             assert!(b <= 255, "INT8 value {b} out of range");
         }
     }
