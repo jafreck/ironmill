@@ -229,20 +229,28 @@ pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
             quip_sharp_seed,
         } => {
             if let Some(seed) = quip_sharp_seed {
-                let data = crate::metal::dequant::dequant_quip_sharp(
-                    indices,
-                    lut,
-                    *lut_dtype,
-                    original_shape,
-                    row_norms,
-                    *norms_dtype,
-                    *seed,
-                )?;
-                return Ok(DenseData {
-                    bytes: Cow::Owned(data),
-                    shape: original_shape,
-                    dtype: ScalarType::Float16,
-                });
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                {
+                    let data = crate::metal::dequant::dequant_quip_sharp(
+                        indices,
+                        lut,
+                        *lut_dtype,
+                        original_shape,
+                        row_norms,
+                        *norms_dtype,
+                        *seed,
+                    )?;
+                    return Ok(DenseData {
+                        bytes: Cow::Owned(data),
+                        shape: original_shape,
+                        dtype: ScalarType::Float16,
+                    });
+                }
+                #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                {
+                    let _ = seed;
+                    anyhow::bail!("QuIP# dequantization requires Metal backend");
+                }
             }
             let data = D::dequant_lut(
                 indices,

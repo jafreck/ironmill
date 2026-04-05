@@ -14,4 +14,4 @@ ironmill-compile = { workspace = true }
 anyhow = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-ironmill-inference = { workspace = true }
+ironmill-inference = { workspace = true, features = ["coreml"] }

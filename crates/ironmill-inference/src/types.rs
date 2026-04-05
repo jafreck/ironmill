@@ -146,20 +146,6 @@ pub trait RuntimeBackend: Send + Sync {
     ) -> Result<Box<dyn RuntimeModel>, crate::engine::InferenceError>;
 }
 
-/// Build dummy input tensors from input descriptions (for benchmarking).
-pub fn build_dummy_inputs(desc: &[InputFeatureDesc]) -> Vec<RuntimeTensor> {
-    desc.iter()
-        .map(|d| {
-            let shape: Vec<usize> = d
-                .shape
-                .iter()
-                .map(|&s| if s == 0 { 1 } else { s })
-                .collect();
-            RuntimeTensor::zeros(&d.name, shape, d.dtype)
-        })
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // Logits
 // ---------------------------------------------------------------------------

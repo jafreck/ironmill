@@ -65,7 +65,11 @@ impl InferenceBatch {
                     let last = seq.tokens.last().copied().unwrap_or(0);
                     batch.tokens.push(vec![last]);
                 }
-                SequenceStatus::Completed | SequenceStatus::Waiting => unreachable!(),
+                SequenceStatus::Completed => continue,
+                SequenceStatus::Waiting => {
+                    // Waiting sequences are not ready for batching; skip.
+                    continue;
+                }
             }
         }
 

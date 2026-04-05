@@ -318,9 +318,9 @@ pub fn speculative_decode<E: InferenceEngine>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_info::ModelInfo;
     use crate::sampling::SamplerConfig;
     use crate::types::Logits;
+    use ironmill_core::model_info::ModelInfo;
     use mil_rs::weights::Architecture;
 
     fn mock_model_info(vocab_size: usize) -> ModelInfo {

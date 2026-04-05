@@ -54,6 +54,7 @@ pub use generate::{
 };
 pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 pub use memory::{KvQuantLevel, MemoryEstimator, MemoryUsage, QuantLevel};
+#[allow(deprecated)]
 pub use model_info::ModelInfo;
 pub use sampling::{
     DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, apply_token_mask, is_eos_token, sample_token,
@@ -62,9 +63,7 @@ pub use speculative::{
     DraftCandidate, DraftHead, MsaHeadWeights, SpecConfig, SpeculativeEngine, SpeculativeStreaming,
     StreamingConfig, speculative_decode,
 };
-pub use types::{
-    ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor, build_dummy_inputs,
-};
+pub use types::{ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor};
 
 /// CoreML runtime types re-exported for downstream consumers.
 ///

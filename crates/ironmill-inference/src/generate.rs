@@ -559,7 +559,7 @@ mod tests {
     use super::*;
     use crate::engine::InferenceEngine;
     use crate::memory::MemoryUsage;
-    use crate::model_info::ModelInfo;
+    use ironmill_core::model_info::ModelInfo;
     use mil_rs::weights::Architecture;
 
     /// Minimal mock engine for testing the generation API.

@@ -52,7 +52,17 @@ impl ShaderCache {
     /// Look up a cached shader binary by key, returning `None` on miss.
     pub fn get(&self, key: &ShaderCacheKey) -> Option<Vec<u8>> {
         let path = self.key_path(key);
-        std::fs::read(&path).ok()
+        match std::fs::read(&path) {
+            Ok(data) => Some(data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                eprintln!(
+                    "Warning: shader cache read failed for {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
     }
 
     /// Store a compiled shader binary in the cache.
@@ -88,13 +98,19 @@ fn home_dir() -> PathBuf {
 }
 
 fn dir_size(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter_map(|e| e.metadata().ok())
-                .map(|m| m.len())
-                .sum()
-        })
-        .unwrap_or(0)
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            eprintln!(
+                "Warning: failed to read shader cache directory {}: {e}",
+                dir.display()
+            );
+            0
+        }
+    }
 }

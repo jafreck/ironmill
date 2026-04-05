@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ironmill-compile = { workspace = true }
 ironmill-core = { workspace = true }
-ironmill-inference = { workspace = true }
+ironmill-inference = { workspace = true, features = ["coreml"] }
 ironmill-iosurface = { workspace = true, optional = true }
 mil-rs = { workspace = true }
 clap = { workspace = true }
@@ -33,7 +33,7 @@ ironmill-metal-sys = { workspace = true }
 
 [features]
 default = []
-ane-direct = ["dep:ironmill-iosurface"]
+ane-direct = ["dep:ironmill-iosurface", "ironmill-inference/ane"]
 metal = ["ironmill-inference/metal"]
 gptq = ["ironmill-compile/gptq"]
 

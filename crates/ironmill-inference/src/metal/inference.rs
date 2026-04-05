@@ -26,8 +26,8 @@ use super::weights::{
 };
 use crate::calibration::ActivationHook;
 use crate::engine::{InferenceEngine, InferenceError};
-use crate::model_info::ModelInfo;
 use crate::types::Logits;
+use ironmill_core::model_info::ModelInfo;
 
 // ── Matmul tile dimensions — must match Metal shader constants ──
 const MATMUL_TM_TILE: usize = 64;
@@ -286,19 +286,12 @@ enum ProjectionMatmul {
 }
 
 impl ProjectionMatmul {
-    /// Returns the MPS matmul for a Dense projection.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called on a `Quantized` projection — callers must only invoke
-    /// this inside a [`WeightBuffer::Dense`] branch.
+    /// Returns the MPS matmul for a Dense projection, or `None` for Quantized.
     #[allow(dead_code)]
-    fn dense(&self) -> &MpsMatrixMultiply {
+    fn dense(&self) -> Option<&MpsMatrixMultiply> {
         match self {
-            Self::Dense(m) => m,
-            Self::Quantized => unreachable!(
-                "dense() called on Quantized projection — weight type / matmul mismatch"
-            ),
+            Self::Dense(m) => Some(m),
+            Self::Quantized => None,
         }
     }
 }
@@ -371,6 +364,12 @@ impl MetalInference {
         config
             .validate()
             .map_err(|e| MetalError::Config(e.to_string()))?;
+        if config.use_fa2_prefill {
+            eprintln!(
+                "Warning: FA2 prefill is not yet implemented; \
+                 falling back to standard attention."
+            );
+        }
         let device = MetalDevice::system_default().map_err(MetalError::Metal)?;
         let queue = device.create_command_queue().map_err(MetalError::Metal)?;
         // Pipelines are compiled in load() once head_dim is known.
@@ -593,7 +592,9 @@ impl MetalInference {
         _provider: &dyn mil_rs::weights::WeightProvider,
         _transforms: &crate::jit::TransformPipeline,
     ) -> Result<Self, crate::engine::InferenceError> {
-        todo!()
+        Err(crate::engine::InferenceError::Other(anyhow::anyhow!(
+            "JIT loading not yet implemented"
+        )))
     }
 
     // ── Memory query ─────────────────────────────────────────────

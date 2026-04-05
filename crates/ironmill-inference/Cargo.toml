@@ -23,8 +23,7 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = ["coreml", "ane"]
-int4 = []
+default = []
 metal = ["dep:ironmill-metal-sys"]
 ane = ["dep:ironmill-ane-sys", "dep:ironmill-iosurface"]
 coreml = ["dep:ironmill-coreml-sys"]

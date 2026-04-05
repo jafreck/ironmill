@@ -261,6 +261,10 @@ impl KvCacheManager {
     ///
     /// **Does not advance `seq_pos`.** Call [`advance_seq_pos`] once after
     /// all layers have been updated for a given token.
+    #[deprecated(
+        note = "Use update_cache_direct() instead, which performs IOSurface-to-IOSurface \
+                copy without intermediate allocations"
+    )]
     pub fn update_cache(
         &mut self,
         layer: usize,
@@ -1146,6 +1150,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn update_cache_direct_matches_update_cache() {
         let config = test_config();
         let channels = config.num_kv_heads * config.head_dim; // 32

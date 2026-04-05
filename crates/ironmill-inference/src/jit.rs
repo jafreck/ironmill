@@ -73,19 +73,25 @@ impl TransformPipeline {
 
     /// Add an int4 affine quantization transform (not yet implemented).
     pub fn with_int4(self, _group_size: usize) -> Self {
-        // TODO: Add Int4AffineTransform
+        // TODO: Implement Int4AffineTransform — requires int4 packing layout
+        // and affine dequantization parameters (scale, zero_point per group).
+        eprintln!("Warning: Int4AffineTransform not yet implemented; transform skipped.");
         self
     }
 
     /// Add a float16 cast transform (not yet implemented).
     pub fn with_fp16(self) -> Self {
-        // TODO: Add Fp16CastTransform
+        // TODO: Implement Fp16CastTransform — cast each weight tensor
+        // element from its source dtype (f32, bf16, etc.) to fp16.
+        eprintln!("Warning: Fp16CastTransform not yet implemented; transform skipped.");
         self
     }
 
     /// Add a polar quantization transform (not yet implemented).
     pub fn with_polar_quant(self, _bits: u8) -> Self {
-        // TODO: Add PolarQuantTransform
+        // TODO: Implement PolarQuantTransform — requires polar coordinate
+        // encoding of weight matrices and appropriate dequant kernel support.
+        eprintln!("Warning: PolarQuantTransform not yet implemented; transform skipped.");
         self
     }
 

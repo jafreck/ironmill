@@ -316,8 +316,8 @@ fn softmax_max(logits: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_info::ModelInfo;
     use crate::types::Logits;
+    use ironmill_core::model_info::ModelInfo;
     use mil_rs::weights::Architecture;
 
     fn mock_stream_model_info(vocab_size: usize) -> ModelInfo {

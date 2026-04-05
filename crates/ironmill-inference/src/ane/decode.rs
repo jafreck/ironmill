@@ -22,9 +22,9 @@ use super::turboquant::mil_emitter;
 use super::turboquant::mil_emitter::MIN_IO_SEQ;
 use crate::ane::{AneError, Result};
 use crate::engine::{InferenceEngine, InferenceError};
-use crate::model_info::ModelInfo;
 use crate::types::Logits;
 use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
+use ironmill_core::model_info::ModelInfo;
 use mil_rs::ir::ScalarType;
 use mil_rs::weights::Architecture;
 use std::sync::Arc;
@@ -789,9 +789,19 @@ impl<D: AneDevice> AneInference<D> {
             )
         };
 
-        // TODO: Load per-layer QK norm weights from bundle.
-        // QK norm weights need to be serialized into the bundle by
-        // compile_decode_bundle. For now, set to None.
+        // TODO(§4.10): Load per-layer QK norm weights from the ANE bundle.
+        //
+        // QK norm weights (q_norm, k_norm per layer) need to be serialized
+        // into the bundle by `compile_decode_bundle`. The bundle format must
+        // include these as additional tensors keyed by layer index. Once
+        // available, load them here as `Vec<(Vec<f16>, Vec<f16>)>` with one
+        // (q_norm, k_norm) pair per layer.
+        //
+        // Models that use QK norm (e.g. Qwen3) will produce incorrect
+        // attention scores without these weights.
+        // QK norm weight loading is not yet implemented. When the model
+        // architecture requires QK norm (e.g., Gemma), this will need to
+        // load per-layer weights from the bundle.
         let qk_norm_weights: Option<Vec<(Vec<f16>, Vec<f16>)>> = None;
 
         // Compute scratch buffer sizes from allocated tensors.
@@ -975,31 +985,28 @@ impl<D: AneDevice> AneInference<D> {
     /// These components depend on probe 15 results confirming that
     /// `MTLSharedEvent` is accepted by the ANE shared event API.
     fn try_hybrid_layer(&mut self, _hidden: &[f16], _layer_idx: usize) -> Result<Vec<f16>> {
-        // TODO: Implement actual Metal↔ANE shared-event handoff.
+        // TODO: Implement Metal↔ANE shared-event handoff.
         //
-        // Sketch of the implementation:
+        // Required components (not yet available):
+        //   1. A compiled Metal compute pipeline for Q/K/V projections
+        //   2. An `MTLSharedEvent` bridged to `SharedSignalEvent`/`SharedWaitEvent`
+        //   3. An `AneRequest::with_shared_events()` submission
         //
-        //   // 1. Create or reuse MTLSharedEvent.
-        //   // let shared_event = self.hybrid_shared_event()?;
+        // Sketch:
+        //   let shared_event = self.hybrid_shared_event()?;
+        //   let signal_val = (self.seq_pos as u64) * 2;
+        //   self.gpu_encode_qkv_projection(hidden, layer_idx, shared_event, signal_val)?;
+        //   let wait = SharedWaitEvent::new(signal_val, shared_event)?;
+        //   let signal = SharedSignalEvent::new(signal_val + 1, 0, 0, shared_event)?;
+        //   let events = SharedEvents::new(signal_array, wait_array)?;
+        //   let req = AneRequest::with_shared_events(..., events.as_raw())?;
+        //   self.gpu_encode_post_attn(layer_idx, shared_event, signal_val + 1)?;
         //
-        //   // 2. GPU: encode Q/K/V projection + signal at (seq_pos * 2).
-        //   // let signal_val = (self.seq_pos as u64) * 2;
-        //   // self.gpu_encode_qkv_projection(hidden, layer_idx, shared_event, signal_val)?;
-        //
-        //   // 3. ANE: create wait event for signal_val, signal at signal_val + 1.
-        //   // let wait = SharedWaitEvent::new(signal_val, shared_event)?;
-        //   // let signal = SharedSignalEvent::new(signal_val + 1, 0, 0, shared_event)?;
-        //   // let events = SharedEvents::new(signal_array, wait_array)?;
-        //   // let req = AneRequest::with_shared_events(..., events.as_raw())?;
-        //
-        //   // 4. GPU: encode wait for signal_val + 1, then post-attention.
-        //   // self.gpu_encode_post_attn(layer_idx, shared_event, signal_val + 1)?;
-        //
-        //   // 5. Commit both command buffers, let GPU↔ANE sync happen on-device.
-        //
+        // Blocked on: probe 15 validation of MTLSharedEvent↔ANE interop.
         Err(AneError::Other(anyhow::anyhow!(
             "hybrid ANE↔GPU execution not yet implemented — \
-             requires probe 15 validation of MTLSharedEvent↔ANE interop"
+             requires MTLSharedEvent↔ANE interop (probe 15) and \
+             compiled Metal Q/K/V projection pipelines"
         )))
     }
 
@@ -1024,6 +1031,8 @@ impl<D: AneDevice> AneInference<D> {
     /// The `_ANEChainingRequest` API is undocumented — this is a best-effort
     /// implementation that may fail on some hardware or macOS versions.
     fn try_chained_pre_attn(&mut self, _hidden: &[f16], _effective_layers: usize) -> Result<()> {
+        // TODO: Implement within-layer program chaining.
+        //
         // Cross-layer pre_attn chaining is architecturally unsound: each
         // layer's pre_attn input depends on the previous layer's complete
         // output (attention + FFN + both residuals). Pre_attn programs
@@ -1033,11 +1042,13 @@ impl<D: AneDevice> AneInference<D> {
         //   - Within-layer: pre_attn → attention → post_attn for one layer
         //   - Across-layer with full pipeline: all sub-programs for each layer
         //
-        // The chaining API probes (Probes 13 & 14 in ane_probe.rs) explore
-        // the API mechanics. Once validated, this method should be rewritten
-        // to chain within-layer programs instead.
+        // The _ANEChainingRequest API is undocumented. Probes 13 & 14
+        // (ane_probe.rs) explore the API mechanics. Once validated, rewrite
+        // this to chain within-layer programs instead.
         Err(AneError::Other(anyhow::anyhow!(
-            "cross-layer pre_attn chaining not yet implemented"
+            "cross-layer pre_attn chaining not yet implemented — \
+             requires within-layer chaining strategy and validated \
+             _ANEChainingRequest API (probes 13 & 14)"
         )))
     }
 

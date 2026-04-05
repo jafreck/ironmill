@@ -5,8 +5,8 @@
 
 use crate::cache::{KvCacheSlice, KvLayerSlice, PrefixCache};
 use crate::memory::MemoryUsage;
-use crate::model_info::ModelInfo;
 use crate::types::Logits;
+use ironmill_core::model_info::ModelInfo;
 
 /// Unique identifier for a sequence in batch inference.
 pub type SequenceId = u64;
@@ -145,13 +145,39 @@ pub fn prefill_with_cache(
         engine.prefill(tokens)?
     };
 
-    let kv_snapshot = KvCacheSlice {
-        layer_data: vec![KvLayerSlice {
-            k_data: Vec::new(),
-            v_data: Vec::new(),
-        }],
-        start_pos: 0,
-        len: tokens.len(),
+    // Build the KV snapshot from the slices returned by the cache lookup.
+    // Each slice covers a contiguous span; merge per-layer data across slices.
+    let kv_snapshot = if kv_slices.is_empty() {
+        KvCacheSlice {
+            layer_data: Vec::new(),
+            start_pos: 0,
+            len: tokens.len(),
+        }
+    } else {
+        let num_layers = kv_slices[0].layer_data.len();
+        let mut merged_layers: Vec<KvLayerSlice> = (0..num_layers)
+            .map(|_| KvLayerSlice {
+                k_data: Vec::new(),
+                v_data: Vec::new(),
+            })
+            .collect();
+        for slice in &kv_slices {
+            for (layer_idx, layer) in slice.layer_data.iter().enumerate() {
+                if layer_idx < merged_layers.len() {
+                    merged_layers[layer_idx]
+                        .k_data
+                        .extend_from_slice(&layer.k_data);
+                    merged_layers[layer_idx]
+                        .v_data
+                        .extend_from_slice(&layer.v_data);
+                }
+            }
+        }
+        KvCacheSlice {
+            layer_data: merged_layers,
+            start_pos: 0,
+            len: tokens.len(),
+        }
     };
     cache.insert(tokens, kv_snapshot);
 
