@@ -5,20 +5,27 @@ use crate::{ChatMessage, GenParams, ModelError, TextOutput};
 
 /// A stateful multi-turn chat session bound to a [`Model`].
 pub struct ChatSession<'m> {
-    model: &'m Model,
+    model: &'m mut Model,
     history: Vec<ChatMessage>,
     system_prompt: Option<String>,
     default_params: GenParams,
+    max_context_tokens: usize,
 }
 
 impl<'m> ChatSession<'m> {
     /// Create a new chat session backed by `model`.
-    pub fn new(model: &'m Model) -> Self {
+    pub(crate) fn new(
+        model: &'m mut Model,
+        history: Vec<ChatMessage>,
+        params: GenParams,
+        max_context_tokens: usize,
+    ) -> Self {
         Self {
             model,
-            history: Vec::new(),
+            history,
             system_prompt: None,
-            default_params: GenParams::default(),
+            default_params: params,
+            max_context_tokens,
         }
     }
 
@@ -46,10 +53,16 @@ impl<'m> ChatSession<'m> {
         _params: GenParams,
     ) -> Result<TextOutput, ModelError> {
         self.history.push(ChatMessage::user(message));
-        let _model = self.model;
+        let _model = &self.model;
         let _sys = &self.system_prompt;
         let _history = &self.history;
+        let _max_ctx = self.max_context_tokens;
         todo!("ChatSession::send requires ironmill-inference engine integration")
+    }
+
+    /// Send a message and stream the response.
+    pub fn say_stream(&mut self, _message: &str) -> Result<(), ModelError> {
+        todo!("ChatSession::say_stream requires ironmill-inference engine integration")
     }
 
     /// Return the conversation history accumulated so far.
@@ -60,5 +73,52 @@ impl<'m> ChatSession<'m> {
     /// Clear the conversation history, keeping the system prompt.
     pub fn reset(&mut self) {
         self.history.clear();
+    }
+}
+
+/// Builder for creating a [`ChatSession`] with configuration.
+pub struct ChatSessionBuilder<'a> {
+    model: &'a mut Model,
+    system_prompt: Option<String>,
+    params: GenParams,
+    max_context_tokens: usize,
+}
+
+impl<'a> ChatSessionBuilder<'a> {
+    pub(crate) fn new(model: &'a mut Model) -> Self {
+        let max_ctx = model.info().max_context_len;
+        Self {
+            model,
+            system_prompt: None,
+            params: GenParams::default(),
+            max_context_tokens: max_ctx,
+        }
+    }
+
+    /// Set the system prompt.
+    pub fn system(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Set generation parameters.
+    pub fn params(mut self, params: GenParams) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Set max context tokens.
+    pub fn max_context_tokens(mut self, n: usize) -> Self {
+        self.max_context_tokens = n;
+        self
+    }
+
+    /// Build the chat session.
+    pub fn build(self) -> ChatSession<'a> {
+        let mut history = Vec::new();
+        if let Some(sys) = self.system_prompt {
+            history.push(ChatMessage::system(sys));
+        }
+        ChatSession::new(self.model, history, self.params, self.max_context_tokens)
     }
 }

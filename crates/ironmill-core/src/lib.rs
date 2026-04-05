@@ -12,14 +12,16 @@ pub mod error;
 pub mod gen_params;
 pub mod gpu;
 pub mod model;
+pub mod model_info;
 pub mod text_output;
 pub mod tokenizer;
 pub mod weights;
 
-pub use chat::ChatSession;
+pub use chat::{ChatSession, ChatSessionBuilder};
 pub use device::Device;
 pub use error::ModelError;
 pub use gen_params::GenParams;
 pub use model::{Model, ModelBuilder};
-pub use text_output::{TextChunk, TextOutput};
+pub use model_info::ModelInfo;
+pub use text_output::{TextChunk, TextOutput, TextStream};
 pub use tokenizer::{ChatMessage, Tokenizer, TokenizerError};

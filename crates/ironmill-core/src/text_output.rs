@@ -24,3 +24,8 @@ pub struct TextChunk {
     pub finished: bool,
     pub finish_reason: Option<String>,
 }
+
+/// An iterator that yields [`TextChunk`]s during streaming generation.
+pub struct TextStream<'a> {
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
