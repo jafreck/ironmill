@@ -66,16 +66,20 @@ impl Model {
         let stream = TokenStream::new(&mut *self.engine, request, &cancel);
 
         let mut tokens = Vec::new();
-        let mut finish_reason = String::from("max_tokens");
+        let mut finish_reason = None;
         let start = std::time::Instant::now();
 
         for event in stream {
             match event? {
                 GenerateEvent::Token { token, .. } => tokens.push(token),
                 GenerateEvent::Finished { reason, .. } => {
-                    finish_reason = format!("{reason:?}");
+                    finish_reason = Some(reason);
                     break;
                 }
+                GenerateEvent::PromptProcessed { .. } => {
+                    // Prefill complete — continue to token generation.
+                }
+                // GenerateEvent is #[non_exhaustive]; handle future variants gracefully.
                 _ => {}
             }
         }
@@ -193,6 +197,9 @@ impl ModelBuilder {
     }
 
     /// Provide a progress sink for loading feedback.
+    ///
+    /// The sink receives stage names (e.g. "loading tokenizer", "loading model")
+    /// as loading progresses. Useful for showing progress bars or status messages.
     pub fn with_progress(mut self, sink: impl ProgressSink + 'static) -> Self {
         self.progress = Box::new(sink);
         self
@@ -277,6 +284,7 @@ impl ModelBuilder {
 
                 Ok((Box::new(engine), info))
             }
+            Device::Cpu => Err(TorchError::UnsupportedDevice(Device::Cpu)),
             _ => Err(TorchError::UnsupportedDevice(device)),
         }
     }
@@ -302,6 +310,7 @@ impl ModelBuilder {
 
                 Ok((Box::new(engine), info))
             }
+            Device::Cpu => Err(TorchError::UnsupportedDevice(Device::Cpu)),
             _ => Err(TorchError::UnsupportedDevice(device)),
         }
     }

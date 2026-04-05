@@ -30,8 +30,4 @@ pub enum TorchError {
     /// The requested device is not available on this platform.
     #[error("unsupported device {0:?} on this platform")]
     UnsupportedDevice(Device),
-
-    /// The model format could not be detected or is unsupported.
-    #[error("unknown model format at {0}")]
-    UnknownFormat(PathBuf),
 }

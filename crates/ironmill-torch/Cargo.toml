@@ -10,10 +10,7 @@ rust-version.workspace = true
 [features]
 default = ["metal"]
 metal = ["ironmill-inference/metal"]
-ane = ["ironmill-inference/ane"]
-coreml = ["ironmill-inference/coreml"]
 hf-tokenizer = ["ironmill-core/hf-tokenizer"]
-async = ["ironmill-inference/async"]
 
 [dependencies]
 ironmill-core = { workspace = true }

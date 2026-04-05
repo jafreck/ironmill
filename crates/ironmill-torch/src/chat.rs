@@ -68,7 +68,27 @@ impl<'m> ChatSession<'m> {
         Ok(output)
     }
 
-    /// Send a message and stream the response.
+    /// Send a message and stream the response token-by-token.
+    ///
+    /// Returns a [`TextStream`] iterator. The caller should consume the stream
+    /// to completion, then call [`finish_stream`](Self::finish_stream) with the
+    /// collected text to append the assistant reply to the conversation history.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use ironmill_torch::{Model, GenParams};
+    /// # let mut model = Model::from_pretrained("./model/").build().unwrap();
+    /// # let mut chat = model.chat().build();
+    /// let stream = chat.send_stream("Hello")?;
+    /// let mut full_text = String::new();
+    /// for chunk in stream {
+    ///     let chunk = chunk?;
+    ///     full_text.push_str(&chunk.text);
+    /// }
+    /// chat.finish_stream(full_text);
+    /// # Ok::<(), ironmill_torch::TorchError>(())
+    /// ```
     pub fn send_stream<'a>(&'a mut self, message: &str) -> Result<TextStream<'a>, TorchError> {
         let user_msg = ChatMessage::user(message);
         let mut messages = self.history.clone();
@@ -76,9 +96,18 @@ impl<'m> ChatSession<'m> {
         let prompt = self.model.tokenizer().apply_chat_template(&messages)?;
 
         // Append user message to history before streaming; the assistant
-        // response is appended when the caller processes the stream.
+        // response is appended via `finish_stream` after the caller collects it.
         self.history.push(user_msg);
         self.model.stream(&prompt, &self.default_params)
+    }
+
+    /// Append the assistant's reply after a streaming response completes.
+    ///
+    /// Call this after consuming the [`TextStream`] returned by
+    /// [`send_stream`](Self::send_stream) to keep the conversation history
+    /// in sync.
+    pub fn finish_stream(&mut self, assistant_text: impl Into<String>) {
+        self.history.push(ChatMessage::assistant(assistant_text));
     }
 
     /// Return the conversation history.

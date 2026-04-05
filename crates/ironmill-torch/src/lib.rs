@@ -32,3 +32,4 @@ pub use text_output::{TextChunk, TextOutput, TextStream};
 // Re-export commonly needed types from lower crates so users
 // don't need to add them as direct dependencies.
 pub use ironmill_core::{ChatMessage, Device, ModelInfo, Role, Tokenizer};
+pub use ironmill_inference::generate::FinishReason;

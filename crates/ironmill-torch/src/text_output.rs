@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use ironmill_core::tokenizer::Tokenizer;
-use ironmill_inference::generate::{CancellationToken, GenerateEvent, TokenStream};
+use ironmill_inference::generate::{CancellationToken, FinishReason, GenerateEvent, TokenStream};
 
 use crate::error::TorchError;
 
@@ -19,8 +19,8 @@ pub struct TextOutput {
     pub token_count: usize,
     /// Number of prompt tokens processed.
     pub prompt_token_count: usize,
-    /// Why generation stopped (e.g. "Stop", "MaxTokens").
-    pub finish_reason: String,
+    /// Why generation stopped.
+    pub finish_reason: Option<FinishReason>,
     /// Wall-clock generation time.
     pub elapsed: Duration,
 }
@@ -38,7 +38,7 @@ pub struct TextChunk {
     /// Whether generation has finished.
     pub finished: bool,
     /// Finish reason, if `finished` is true.
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<FinishReason>,
 }
 
 /// An iterator that yields [`TextChunk`]s during streaming generation.
@@ -80,7 +80,13 @@ impl Iterator for TextStream<'_> {
             Ok(GenerateEvent::Token {
                 token, position, ..
             }) => {
-                let text = self.tokenizer.decode(&[token]).unwrap_or_default();
+                let text = match self.tokenizer.decode(&[token]) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("warning: token decode failed for token {token}: {e}");
+                        "\u{FFFD}".to_string()
+                    }
+                };
                 Some(Ok(TextChunk {
                     text,
                     token,
@@ -94,14 +100,15 @@ impl Iterator for TextStream<'_> {
                 token: 0,
                 position: 0,
                 finished: true,
-                finish_reason: Some(format!("{reason:?}")),
+                finish_reason: Some(reason),
             })),
             Ok(GenerateEvent::PromptProcessed { .. }) => {
-                // Skip prefill events, advance to next
+                // Prefill complete — skip to the first generated token.
                 self.next()
             }
+            // GenerateEvent is #[non_exhaustive]; handle future variants gracefully.
+            Ok(_) => self.next(),
             Err(e) => Some(Err(e.into())),
-            _ => self.next(), // forward-compat
         }
     }
 }
