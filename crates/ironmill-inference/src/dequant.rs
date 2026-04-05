@@ -45,7 +45,7 @@ pub(crate) fn unpack_indices(packed: &[u8], n_bits: u8, total_elements: usize) -
             .collect();
     }
 
-    let mask = ((1u16 << n_bits) - 1) as u16;
+    let mask = (1u16 << n_bits) - 1;
     let mut indices = Vec::with_capacity(total_elements);
     let mut bit_offset = 0usize;
 
@@ -78,6 +78,7 @@ pub(crate) fn unpack_indices(packed: &[u8], n_bits: u8, total_elements: usize) -
 ///
 /// Applies `(quantized - zero_point) * scale` element-wise, where each
 /// byte of `data` is treated as an unsigned `u8` value.
+#[allow(dead_code)]
 pub(crate) fn dequant_affine_to_fp16(
     data: &[u8],
     scale: &[u8],
@@ -93,8 +94,8 @@ pub(crate) fn dequant_affine_to_fp16(
     let scale_elem_size = scale_dtype.byte_size();
     let zp_elem_size = zero_point_dtype.byte_size();
 
-    for i in 0..num_elements {
-        let q_val = data[i] as f32;
+    for (i, &byte_val) in data.iter().enumerate().take(num_elements) {
+        let q_val = byte_val as f32;
         let s_idx = if scale.len() / scale_elem_size > 1 {
             // Per-channel scale: index by row.
             let cols = if shape.len() > 1 { shape[1] } else { 1 };
@@ -124,6 +125,7 @@ pub(crate) fn dequant_affine_to_fp16(
 /// to each column. This is needed for GPTQ models with act-order
 /// (`desc_act=True`), where columns were quantized in importance order
 /// and `g_idx` records which group each column belongs to.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dequant_affine_with_g_idx(
     data: &[u8],
     scale: &[u8],
@@ -180,6 +182,8 @@ pub(crate) fn dequant_affine_with_g_idx(
 /// Unpacks `n_bits`-wide indices, looks up values in `lut`, multiplies
 /// by per-row norms, and returns FP16 bytes. Does **not** apply inverse
 /// Hadamard rotation (ignores `polar_quant_seed`).
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dequant_lut_to_fp16(
     indices: &[u8],
     lut: &[u8],

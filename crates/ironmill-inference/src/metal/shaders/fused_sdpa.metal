@@ -1,6 +1,5 @@
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
 
 #ifndef HEAD_DIM
 #define HEAD_DIM 128

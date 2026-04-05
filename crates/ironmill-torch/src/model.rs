@@ -264,8 +264,10 @@ impl ModelBuilder {
             Device::Metal => {
                 use ironmill_compile::weights::SafeTensorsProvider;
                 use ironmill_inference::metal::{MetalConfig, MetalInference};
+                use mil_rs::weights::WeightProvider;
 
-                let provider = SafeTensorsProvider::load(&self.path)?;
+                let provider = SafeTensorsProvider::load(&self.path)
+                    .map_err(|e| TorchError::Compile(e.into()))?;
                 let config = MetalConfig::new().with_max_seq_len(self.max_seq_len);
                 let info = ModelInfo::from_config(provider.config());
 
@@ -286,7 +288,9 @@ impl ModelBuilder {
         match device {
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Device::Metal => {
-                use ironmill_inference::metal::{MetalBundleProvider, MetalConfig, MetalInference};
+                use ironmill_inference::metal::bundle::MetalBundleProvider;
+                use ironmill_inference::metal::{MetalConfig, MetalInference};
+                use mil_rs::weights::WeightProvider;
 
                 let bundle = MetalBundleProvider::open(&self.path).map_err(InferenceError::from)?;
                 let config = MetalConfig::new().with_max_seq_len(self.max_seq_len);

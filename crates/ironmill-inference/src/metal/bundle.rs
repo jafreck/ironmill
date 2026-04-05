@@ -4,7 +4,6 @@
 //! loads tensors from a pre-compiled `.ironml-gpu` bundle directory. Weight
 //! files are read from disk on each `tensor()` call and returned as owned data.
 
-use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -97,34 +96,28 @@ impl WeightProvider for MetalBundleProvider {
                 let dtype =
                     str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
 
-                Ok(WeightTensor {
-                    data: Cow::Owned(Vec::new()),
-                    shape: shape.clone(),
-                    dtype,
-                    quant_info: QuantizationInfo::LutToDense {
-                        lut,
-                        lut_dtype: dtype,
-                        indices,
-                        original_shape: shape.clone(),
-                        n_bits: *n_bits,
-                        row_norms,
-                        norms_dtype: dtype,
-                        polar_quant_seed: None, // Bundle tensors are pre-unrotated
-                        quip_sharp_seed: quip_sharp_seed.map(|s| s as u64),
-                    },
-                })
+                Ok(
+                    WeightTensor::owned(Vec::new(), shape.clone(), dtype).with_quant_info(
+                        QuantizationInfo::LutToDense {
+                            lut,
+                            lut_dtype: dtype,
+                            indices,
+                            original_shape: shape.clone(),
+                            n_bits: *n_bits,
+                            row_norms,
+                            norms_dtype: dtype,
+                            polar_quant_seed: None, // Bundle tensors are pre-unrotated
+                            quip_sharp_seed: quip_sharp_seed.map(|s| s as u64),
+                        },
+                    ),
+                )
             }
             TensorManifest::Dense { file, shape, dtype } => {
                 let data = self.read_file(file)?;
                 let dtype =
                     str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
 
-                Ok(WeightTensor {
-                    data: Cow::Owned(data),
-                    shape: shape.clone(),
-                    dtype,
-                    quant_info: QuantizationInfo::None,
-                })
+                Ok(WeightTensor::owned(data, shape.clone(), dtype))
             }
             TensorManifest::AffineDequantize {
                 quantized_data_file,
@@ -147,22 +140,21 @@ impl WeightProvider for MetalBundleProvider {
                 let dtype =
                     str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
 
-                Ok(WeightTensor {
-                    data: Cow::Owned(quantized_data),
-                    shape: shape.clone(),
-                    dtype,
-                    quant_info: QuantizationInfo::AffineDequantize {
-                        scale,
-                        zero_point,
-                        scale_dtype: ScalarType::Float16,
-                        zero_point_dtype: ScalarType::Float16,
-                        axis: Some(*axis as usize),
-                        bit_width: *bit_width,
-                        group_size: Some(*group_size),
-                        awq_scales,
-                        g_idx: None,
-                    },
-                })
+                Ok(
+                    WeightTensor::owned(quantized_data, shape.clone(), dtype).with_quant_info(
+                        QuantizationInfo::AffineDequantize {
+                            scale,
+                            zero_point,
+                            scale_dtype: ScalarType::Float16,
+                            zero_point_dtype: ScalarType::Float16,
+                            axis: Some(*axis as usize),
+                            bit_width: *bit_width,
+                            group_size: Some(*group_size),
+                            awq_scales,
+                            g_idx: None,
+                        },
+                    ),
+                )
             }
         }
     }

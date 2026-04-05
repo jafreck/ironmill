@@ -451,6 +451,9 @@ fn load_weight_buffer(
             let packed = pack_weight_blocked(device, &buf, n, k)?;
             Ok(WeightBuffer::Dense { buf, packed })
         }
+        _ => Err(MetalError::WeightLoading(format!(
+            "{name}: unsupported quantization format"
+        ))),
     }
 }
 

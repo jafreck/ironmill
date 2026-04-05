@@ -61,35 +61,65 @@ impl LinearKernelKind {
 
 /// All compiled Metal pipeline states for the Metal backend.
 pub struct MetalPipelines {
+    /// RMSNorm kernel.
     pub rms_norm: ComputePipeline,
+    /// SiLU-gated activation kernel.
     pub silu_gate: ComputePipeline,
+    /// Rotary positional embedding kernel.
     pub rope: ComputePipeline,
+    /// Element-wise residual addition kernel.
     pub residual_add: ComputePipeline,
+    /// Token embedding lookup kernel.
     pub embedding_lookup: ComputePipeline,
+    /// TurboQuant KV cache write kernel.
     pub turboquant_cache_write: ComputePipeline,
+    /// TurboQuant attention kernel.
     pub turboquant_attention: ComputePipeline,
+    /// TurboQuant outlier KV cache write kernel.
     pub turboquant_outlier_cache_write: ComputePipeline,
+    /// TurboQuant outlier attention kernel.
     pub turboquant_outlier_attention: ComputePipeline,
+    /// Standard FP16 attention (decode) kernel.
     pub standard_attention: ComputePipeline,
+    /// Prefill attention kernel.
     pub prefill_attention: ComputePipeline,
+    /// FlashAttention-2 prefill kernel.
     pub prefill_attention_fa2: ComputePipeline,
+    /// PolarQuant INT4 matvec kernel.
     pub polarquant_matvec_int4: ComputePipeline,
+    /// PolarQuant INT4 matmul kernel.
     pub polarquant_matmul_int4: ComputePipeline,
+    /// PolarQuant INT8 matvec kernel.
     pub polarquant_matvec_int8: ComputePipeline,
+    /// PolarQuant INT8 matmul kernel.
     pub polarquant_matmul_int8: ComputePipeline,
+    /// Affine INT4 matvec kernel.
     pub affine_matvec_int4: ComputePipeline,
+    /// Affine INT4 matmul kernel.
     pub affine_matmul_int4: ComputePipeline,
+    /// Affine INT8 matvec kernel.
     pub affine_matvec_int8: ComputePipeline,
+    /// Affine INT8 matmul kernel.
     pub affine_matmul_int8: ComputePipeline,
+    /// KV scatter (cache write) kernel.
     pub kv_scatter: ComputePipeline,
+    /// Dense FP16 matvec kernel.
     pub matvec: ComputePipeline,
+    /// Dense FP16 matmul kernel.
     pub matmul: ComputePipeline,
+    /// Fused residual-add + RMSNorm kernel.
     pub fused_residual_rms_norm: ComputePipeline,
+    /// Fused QK normalization + RoPE kernel.
     pub fused_qk_norm_rope: ComputePipeline,
+    /// Fused embedding lookup + first-layer norm kernel.
     pub fused_embedding_norm: ComputePipeline,
+    /// INT4 dequantization kernel.
     pub int4_dequantize: ComputePipeline,
+    /// Fused scaled dot-product attention kernel.
     pub fused_sdpa: ComputePipeline,
+    /// QuIP# matvec kernel.
     pub quip_sharp_matvec: ComputePipeline,
+    /// QuIP# matmul kernel.
     pub quip_sharp_matmul: ComputePipeline,
 }
 
@@ -546,97 +576,161 @@ impl MetalPipelines {
 
 /// Parameters for [`encode_rms_norm`].
 pub struct RmsNormParams<'a> {
+    /// Input buffer.
     pub input: &'a MetalBuffer,
+    /// Norm weight buffer.
     pub weight: &'a MetalBuffer,
+    /// Output buffer.
     pub output: &'a MetalBuffer,
+    /// Hidden dimension size.
     pub hidden_size: u32,
+    /// Number of tokens in the batch.
     pub token_count: u32,
+    /// Epsilon for numerical stability.
     pub eps: f32,
 }
 
 /// Parameters for [`encode_rope`].
 pub struct RopeParams<'a> {
+    /// Q or K projection buffer (modified in-place).
     pub qk: &'a MetalBuffer,
+    /// Cosine cache buffer.
     pub cos_cache: &'a MetalBuffer,
+    /// Sine cache buffer.
     pub sin_cache: &'a MetalBuffer,
+    /// Number of attention heads.
     pub num_heads: u32,
+    /// Per-head dimension.
     pub head_dim: u32,
+    /// Sequence offset for position calculation.
     pub seq_offset: u32,
+    /// Number of tokens in the batch.
     pub token_count: u32,
 }
 
 /// Parameters for [`encode_embedding_lookup`].
 pub struct EmbeddingLookupParams<'a> {
+    /// Token ID buffer.
     pub token_ids: &'a MetalBuffer,
+    /// Embedding weight table buffer.
     pub embedding_table: &'a MetalBuffer,
+    /// Output buffer.
     pub output: &'a MetalBuffer,
+    /// Hidden dimension size.
     pub hidden_size: u32,
+    /// Number of tokens in the batch.
     pub token_count: u32,
+    /// Vocabulary size.
     pub vocab_size: u32,
 }
 
 /// Parameters for [`encode_standard_attention`].
 pub struct StandardAttentionParams<'a> {
+    /// Query projection buffer.
     pub q: &'a MetalBuffer,
+    /// K cache buffer.
     pub k_cache: &'a MetalBuffer,
+    /// V cache buffer.
     pub v_cache: &'a MetalBuffer,
+    /// Output buffer.
     pub output: &'a MetalBuffer,
+    /// Number of query heads.
     pub num_heads: u32,
+    /// Number of key-value heads.
     pub num_kv_heads: u32,
+    /// Per-head dimension.
     pub head_dim: u32,
+    /// Maximum sequence length (cache stride).
     pub max_seq_len: u32,
+    /// Current sequence length.
     pub seq_len: u32,
 }
 
 /// Parameters for [`encode_prefill_attention`].
 pub struct PrefillAttentionParams<'a> {
+    /// Query projection buffer.
     pub q: &'a MetalBuffer,
+    /// K cache buffer.
     pub k_cache: &'a MetalBuffer,
+    /// V cache buffer.
     pub v_cache: &'a MetalBuffer,
+    /// Output buffer.
     pub output: &'a MetalBuffer,
+    /// Number of query heads.
     pub num_heads: u32,
+    /// Number of key-value heads.
     pub num_kv_heads: u32,
+    /// Per-head dimension.
     pub head_dim: u32,
+    /// Maximum sequence length (cache stride).
     pub max_seq_len: u32,
+    /// Sequence offset (position of first token in batch).
     pub seq_offset: u32,
+    /// Number of tokens in the batch.
     pub token_count: u32,
 }
 
 /// Parameters for [`encode_fused_sdpa`].
 pub struct FusedSdpaParams<'a> {
+    /// Query buffer.
     pub q: &'a MetalBuffer,
+    /// Key buffer.
     pub k: &'a MetalBuffer,
+    /// Value buffer.
     pub v: &'a MetalBuffer,
+    /// Output buffer.
     pub output: &'a MetalBuffer,
+    /// Current sequence length.
     pub seq_len: u32,
+    /// Number of tokens in the batch.
     pub token_count: u32,
+    /// Per-head dimension.
     pub head_dim: u32,
+    /// Number of query heads.
     pub num_q_heads: u32,
+    /// Number of key-value heads.
     pub num_kv_heads: u32,
+    /// Attention scale factor.
     pub scale: f32,
+    /// Maximum sequence length (cache stride).
     pub max_seq_len: u32,
 }
 
 /// Parameters for [`encode_kv_scatter`].
 pub struct KvScatterParams<'a> {
+    /// Projection buffer to scatter into cache.
     pub proj: &'a MetalBuffer,
+    /// KV cache buffer.
     pub cache: &'a MetalBuffer,
+    /// Current sequence position.
     pub seq_pos: u32,
+    /// Number of tokens in the batch.
     pub token_count: u32,
+    /// Number of key-value heads.
     pub num_kv_heads: u32,
+    /// Per-head dimension.
     pub head_dim: u32,
+    /// Maximum sequence length (cache stride).
     pub max_seq_len: u32,
 }
 
 /// Parameters for [`encode_fused_residual_rms_norm`].
 pub struct FusedResidualRmsNormParams<'a> {
+    /// First input buffer for residual addition.
     pub a: &'a MetalBuffer,
+    /// Second input buffer for residual addition.
     pub b: &'a MetalBuffer,
+    /// Norm weight buffer.
     pub weight: &'a MetalBuffer,
+    /// Normalized output buffer.
     pub normed_output: &'a MetalBuffer,
+    /// Residual output buffer.
     pub residual_output: &'a MetalBuffer,
+    /// Epsilon for numerical stability.
     pub eps: f32,
+    /// Hidden dimension size.
     pub hidden_size: u32,
+    /// Number of tokens in the batch.
     pub token_count: u32,
 }
 
@@ -900,7 +994,7 @@ pub fn encode_matvec(
     encoder.set_buffer(output, 0, 2);
     encoder.set_bytes(&n.to_le_bytes(), 3);
     encoder.set_bytes(&k.to_le_bytes(), 4);
-    let tg_count = (n as usize + MATVEC_ROWS_PER_THREADGROUP - 1) / MATVEC_ROWS_PER_THREADGROUP;
+    let tg_count = (n as usize).div_ceil(MATVEC_ROWS_PER_THREADGROUP);
     encoder.dispatch_threadgroups((tg_count, 1, 1), (DEFAULT_THREADGROUP_WIDTH, 1, 1));
 }
 
@@ -909,6 +1003,7 @@ pub fn encode_matvec(
 /// Weights must be pre-packed into blocked [N/8, K/8, 8, 8] FP16 format.
 /// Dispatch: 2-D grid of threadgroups tiling M and N in 64-element blocks,
 /// [`DEFAULT_THREADGROUP_WIDTH`] threads (8 simdgroups).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_matmul(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -930,8 +1025,8 @@ pub fn encode_matmul(
     encoder.set_bytes(&n.to_le_bytes(), 4);
     encoder.set_bytes(&k.to_le_bytes(), 5);
 
-    let tg_m = (m as usize + TM_TILE - 1) / TM_TILE;
-    let tg_n = (n as usize + TN_TILE - 1) / TN_TILE;
+    let tg_m = (m as usize).div_ceil(TM_TILE);
+    let tg_n = (n as usize).div_ceil(TN_TILE);
     encoder.dispatch_threadgroups((tg_m, tg_n, 1), (DEFAULT_THREADGROUP_WIDTH, 1, 1));
 }
 

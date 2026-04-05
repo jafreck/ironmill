@@ -34,7 +34,7 @@ use mil_rs::weights::MlaConfig;
 /// # Arguments
 ///
 /// * `w_q`    — Q projection weights `[num_heads * qk_dim, hidden_size]`
-///              where `qk_dim = qk_nope_head_dim + qk_rope_head_dim`.
+///   where `qk_dim = qk_nope_head_dim + qk_rope_head_dim`.
 /// * `w_uk`   — K up-projection weights `[num_heads * qk_nope_head_dim, kv_latent_dim]`.
 /// * `w_o`    — Output projection weights `[hidden_size, num_heads * v_head_dim]`.
 /// * `w_uv`   — V up-projection weights `[num_heads * v_head_dim, kv_latent_dim]`.

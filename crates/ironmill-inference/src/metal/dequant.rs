@@ -96,6 +96,7 @@ pub fn dequant_quip_sharp(
 /// applies inverse Hadamard rotation (when `polar_quant_seed` is present),
 /// multiplies by per-row norms, and returns the result as little-endian
 /// FP16 bytes.
+#[allow(clippy::too_many_arguments)]
 pub fn dequant_lut_to_dense(
     indices: &[u8],
     lut: &[u8],
@@ -130,8 +131,7 @@ pub fn dequant_lut_to_dense(
 
     // Reconstruct f32 values from LUT.
     let mut f32_values: Vec<f32> = Vec::with_capacity(work_total);
-    for flat_idx in 0..work_total {
-        let lut_idx = unpacked[flat_idx];
+    for (flat_idx, &lut_idx) in unpacked.iter().enumerate().take(work_total) {
         if lut_idx >= max_lut_idx {
             bail!(
                 "LUT index {lut_idx} out of bounds (max {max_lut_idx}) at element {flat_idx}/{work_total}"
@@ -172,6 +172,7 @@ pub fn dequant_lut_to_dense(
 ///
 /// When `group_size` is `Some(gs)`, scales/zeros are per-group along the last
 /// axis: there are `ceil(K / gs)` groups per row.
+#[allow(clippy::too_many_arguments)]
 pub fn dequant_affine(
     quantized_data: &[u8],
     scale: &[u8],
@@ -212,7 +213,7 @@ pub fn dequant_affine(
             .iter()
             .product::<usize>()
             .max(1);
-        let num_groups = (k + gs - 1) / gs;
+        let num_groups = k.div_ceil(gs);
 
         for row in 0..n {
             for col in 0..k {
@@ -287,20 +288,12 @@ pub fn convert_params_to_f16(
     let total_elements: usize = shape.iter().product();
     let expected_groups = match axis {
         Some(ax) => {
-            let axis_size = shape[ax];
-            let groups_per_slice = (axis_size + group_size - 1) / group_size;
-            let other_dims: usize = shape
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != ax)
-                .map(|(_, s)| s)
-                .product();
             // For per-group along an axis, total groups = groups_per_slice * product(other dims)
             // But typically the params are just stored as [groups_per_slice * other_leading_dims].
             // We trust the caller provided the right number of params.
-            groups_per_slice * if other_dims > 0 { 1 } else { 1 }
+            shape[ax].div_ceil(group_size)
         }
-        None => (total_elements + group_size - 1) / group_size,
+        None => total_elements.div_ceil(group_size),
     };
     let _ = expected_groups; // Used for documentation; actual count comes from params.len()
 

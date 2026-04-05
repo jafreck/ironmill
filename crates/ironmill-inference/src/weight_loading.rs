@@ -163,8 +163,10 @@ pub struct DenseData<'a> {
     /// Byte data — either borrowed (unquantized) or owned (dequantized FP16).
     pub bytes: Cow<'a, [u8]>,
     /// Tensor shape.
+    #[allow(dead_code)]
     pub shape: &'a [usize],
     /// Element data type — original for unquantized, `Float16` for dequantized.
+    #[allow(dead_code)]
     pub dtype: ScalarType,
 }
 
@@ -172,6 +174,7 @@ pub struct DenseData<'a> {
 ///
 /// Each backend implements this to select its preferred routines for
 /// LUT-palettized and affine-quantized formats.
+#[allow(clippy::too_many_arguments)]
 pub trait CpuDequant {
     /// Dequantize a LUT-encoded tensor to FP16 bytes.
     fn dequant_lut(
@@ -303,5 +306,6 @@ pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
                 dtype: ScalarType::Float16,
             })
         }
+        _ => anyhow::bail!("unsupported quantization format for dequantization"),
     }
 }

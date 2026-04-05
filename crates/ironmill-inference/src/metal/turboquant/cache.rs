@@ -105,9 +105,8 @@ impl MetalKvCache {
         let mut k_qjl_signs = Vec::with_capacity(num_buffers);
         let mut k_r_norms = Vec::with_capacity(num_buffers);
 
-        for buf_idx in 0..num_buffers {
-            let ws = per_buffer_window[buf_idx];
-            let effective_seq = if ws > 0 { ws } else { config.max_seq_len };
+        for ws in &per_buffer_window {
+            let effective_seq = if *ws > 0 { *ws } else { config.max_seq_len };
             let layout = TurboQuantCacheLayout::new(
                 config.num_kv_heads,
                 config.head_dim,
@@ -167,9 +166,8 @@ impl MetalKvCache {
         let mut k_outlier_r_norms = Vec::with_capacity(num_buffers);
         let mut k_non_outlier_r_norms = Vec::with_capacity(num_buffers);
 
-        for buf_idx in 0..num_buffers {
-            let ws = per_buffer_window[buf_idx];
-            let effective_seq = if ws > 0 { ws } else { config.max_seq_len };
+        for ws in &per_buffer_window {
+            let effective_seq = if *ws > 0 { *ws } else { config.max_seq_len };
             let layout = TurboQuantCacheLayout::new(
                 config.num_kv_heads,
                 config.head_dim,

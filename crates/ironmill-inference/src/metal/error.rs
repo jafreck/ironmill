@@ -28,7 +28,12 @@ pub enum MetalError {
 
     /// Buffer size mismatch between expected and actual.
     #[error("buffer size mismatch: expected {expected}, got {actual}")]
-    BufferSizeMismatch { expected: usize, actual: usize },
+    BufferSizeMismatch {
+        /// Expected buffer size in bytes.
+        expected: usize,
+        /// Actual buffer size in bytes.
+        actual: usize,
+    },
 
     /// A generic error from an underlying operation.
     #[error("{0}")]

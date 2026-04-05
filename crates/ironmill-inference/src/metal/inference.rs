@@ -39,7 +39,9 @@ const MATMUL_THREADS_PER_TG: usize = 256;
 /// Artifacts passed to [`MetalInference::load`] via the type-erased
 /// [`InferenceEngine`] interface.
 pub struct MetalArtifacts<'a> {
+    /// Weight provider for loading model tensors.
     pub weights: &'a dyn WeightProvider,
+    /// Metal backend configuration.
     pub config: MetalConfig,
 }
 
@@ -53,11 +55,11 @@ struct Fp16KvCache {
     v_caches: Vec<MetalBuffer>,
     seq_pos: usize,
     /// Global max sequence length (for full-attention layers).
-    max_seq_len: usize,
+    _max_seq_len: usize,
     /// CLA anchor layers. When set, only anchor layers have physical buffers.
     anchor_layers: Option<Vec<usize>>,
     /// Per-buffer sliding window sizes. `0` = full attention for that buffer.
-    window_sizes: Vec<usize>,
+    _window_sizes: Vec<usize>,
 }
 
 impl Fp16KvCache {
@@ -89,9 +91,8 @@ impl Fp16KvCache {
 
         let mut k_caches = Vec::with_capacity(num_buffers);
         let mut v_caches = Vec::with_capacity(num_buffers);
-        for buf_idx in 0..num_buffers {
-            let ws = per_buffer_window[buf_idx];
-            let effective_seq = if ws > 0 { ws } else { max_seq_len };
+        for ws in &per_buffer_window {
+            let effective_seq = if *ws > 0 { *ws } else { max_seq_len };
             let size_bytes = num_kv_heads * effective_seq * head_dim * 2; // FP16
             k_caches.push(
                 device
@@ -108,9 +109,9 @@ impl Fp16KvCache {
             k_caches,
             v_caches,
             seq_pos: 0,
-            max_seq_len,
+            _max_seq_len: max_seq_len,
             anchor_layers,
-            window_sizes: per_buffer_window,
+            _window_sizes: per_buffer_window,
         })
     }
 
@@ -126,7 +127,7 @@ impl Fp16KvCache {
     }
 
     /// Returns true if `layer` is an anchor layer (or CLA is not configured).
-    fn is_anchor_layer(&self, layer: usize) -> bool {
+    fn _is_anchor_layer(&self, layer: usize) -> bool {
         match self.anchor_layers {
             Some(ref anchors) => anchors.binary_search(&layer).is_ok(),
             None => true,
@@ -139,9 +140,9 @@ impl Fp16KvCache {
     }
 
     /// Write position for ring buffer. For SWA layers, wraps at window_size.
-    fn ring_pos(&self, layer: usize) -> usize {
+    fn _ring_pos(&self, layer: usize) -> usize {
         let idx = self.kv_buffer_for_layer(layer);
-        let ws = self.window_sizes.get(idx).copied().unwrap_or(0);
+        let ws = self._window_sizes.get(idx).copied().unwrap_or(0);
         if ws > 0 {
             self.seq_pos % ws
         } else {
@@ -150,16 +151,16 @@ impl Fp16KvCache {
     }
 
     /// Effective max_seq_len for a layer's buffer.
-    fn effective_max_seq_len(&self, layer: usize) -> usize {
+    fn _effective_max_seq_len(&self, layer: usize) -> usize {
         let idx = self.kv_buffer_for_layer(layer);
-        let ws = self.window_sizes.get(idx).copied().unwrap_or(0);
-        if ws > 0 { ws } else { self.max_seq_len }
+        let ws = self._window_sizes.get(idx).copied().unwrap_or(0);
+        if ws > 0 { ws } else { self._max_seq_len }
     }
 
     /// Effective seq_len for attention (capped at window_size for SWA layers).
-    fn effective_seq_len(&self, layer: usize, total_tokens: usize) -> usize {
+    fn _effective_seq_len(&self, layer: usize, total_tokens: usize) -> usize {
         let idx = self.kv_buffer_for_layer(layer);
-        let ws = self.window_sizes.get(idx).copied().unwrap_or(0);
+        let ws = self._window_sizes.get(idx).copied().unwrap_or(0);
         if ws > 0 {
             total_tokens.min(ws)
         } else {
@@ -168,16 +169,16 @@ impl Fp16KvCache {
     }
 
     /// Window size for a layer. 0 = full attention.
-    fn window_size_for_layer(&self, layer: usize) -> usize {
+    fn _window_size_for_layer(&self, layer: usize) -> usize {
         let idx = self.kv_buffer_for_layer(layer);
-        self.window_sizes.get(idx).copied().unwrap_or(0)
+        self._window_sizes.get(idx).copied().unwrap_or(0)
     }
 
     fn reset(&mut self) {
         self.seq_pos = 0;
     }
 
-    fn seq_pos(&self) -> usize {
+    fn _seq_pos(&self) -> usize {
         self.seq_pos
     }
 
@@ -203,7 +204,7 @@ struct IntermediateBuffers {
     token_ids_buf: MetalBuffer,
     /// Second token IDs buffer for prefill pipelining — allows encoding
     /// the next chunk while the previous command buffer is still executing.
-    token_ids_buf_b: MetalBuffer,
+    _token_ids_buf_b: MetalBuffer,
     /// Current maximum token capacity of these buffers.
     capacity: usize,
 }
@@ -253,7 +254,7 @@ impl IntermediateBuffers {
             token_ids_buf: device
                 .create_buffer((max_tokens * 4).max(16), StorageMode::Shared) // CPU writes token IDs
                 .map_err(MetalError::Metal)?,
-            token_ids_buf_b: device
+            _token_ids_buf_b: device
                 .create_buffer((max_tokens * 4).max(16), StorageMode::Shared)
                 .map_err(MetalError::Metal)?,
             capacity: max_tokens,
@@ -279,6 +280,7 @@ impl IntermediateBuffers {
 /// while Quantized weights use a custom compute-shader path and carry no MPS
 /// object.
 enum ProjectionMatmul {
+    #[allow(dead_code)]
     Dense(MpsMatrixMultiply),
     Quantized,
 }
@@ -290,6 +292,7 @@ impl ProjectionMatmul {
     ///
     /// Panics if called on a `Quantized` projection — callers must only invoke
     /// this inside a [`WeightBuffer::Dense`] branch.
+    #[allow(dead_code)]
     fn dense(&self) -> &MpsMatrixMultiply {
         match self {
             Self::Dense(m) => m,
@@ -586,9 +589,9 @@ impl MetalInference {
     ///
     /// No compilation step, no MIL IR, no `.ironml-gpu` bundle.
     pub fn load_jit(
-        config: MetalConfig,
-        provider: &dyn mil_rs::weights::WeightProvider,
-        transforms: &crate::jit::TransformPipeline,
+        _config: MetalConfig,
+        _provider: &dyn mil_rs::weights::WeightProvider,
+        _transforms: &crate::jit::TransformPipeline,
     ) -> Result<Self, crate::engine::InferenceError> {
         todo!()
     }
@@ -837,7 +840,7 @@ impl MetalInference {
             }
             self.decode_matmuls
                 .as_ref()
-                .ok_or_else(|| InferenceError::runtime("decode_matmuls not populated".into()))?
+                .ok_or_else(|| InferenceError::runtime("decode_matmuls not populated"))?
         };
 
         // Write token IDs to GPU buffer (reuse persistent buffer).
@@ -873,7 +876,7 @@ impl MetalInference {
             enc.set_bytes(&(token_count as u32).to_le_bytes(), 6);
             enc.set_bytes(&(vocab as u32).to_le_bytes(), 7);
             enc.set_bytes(&eps.to_le_bytes(), 8);
-            let tg_size = (h as usize).min(1024);
+            let tg_size = h.min(1024);
             enc.dispatch_threadgroups((token_count, 1, 1), (tg_size, 1, 1));
         }
         enc.memory_barrier_buffers();
@@ -968,7 +971,7 @@ impl MetalInference {
                 .config
                 .cla_config
                 .as_ref()
-                .map_or(true, |cla| cla.is_anchor(layer_idx));
+                .is_none_or(|cla| cla.is_anchor(layer_idx));
             encode_kv_cache_and_attention(
                 &enc,
                 pipelines,
@@ -1241,7 +1244,7 @@ impl MetalInference {
         let matmuls = self
             .decode_matmuls
             .as_ref()
-            .ok_or_else(|| InferenceError::runtime("decode_matmuls not populated".into()))?;
+            .ok_or_else(|| InferenceError::runtime("decode_matmuls not populated"))?;
 
         // Write token IDs to GPU buffer.
         let token_bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
@@ -1420,7 +1423,7 @@ impl MetalInference {
                 .config
                 .cla_config
                 .as_ref()
-                .map_or(true, |cla| cla.is_anchor(layer_idx));
+                .is_none_or(|cla| cla.is_anchor(layer_idx));
             encode_kv_cache_and_attention(
                 &enc,
                 pipelines,
@@ -1950,6 +1953,7 @@ impl ModelConfigExt for ModelConfig {
 ///
 /// This applies uniformly across all weight representations (Dense, PolarQuant,
 /// AffineQuantized).
+#[allow(clippy::too_many_arguments)]
 fn encode_projection(
     enc: &ComputeEncoder,
     input_buf: &MetalBuffer,
@@ -2027,8 +2031,8 @@ fn encode_projection(
 /// Encode a PolarQuant quantized projection via compute kernel.
 ///
 /// Dispatches to the correct Metal kernel based on `n_bits` and kernel kind:
-/// - [`LinearKernelKind::Matvec`]: matvec (one threadgroup per output row)
-/// - [`LinearKernelKind::Matmul`]: tiled matmul with `token_count` rows
+/// - Matvec (`LinearKernelKind::Matvec`): one threadgroup per output row
+/// - Matmul (`LinearKernelKind::Matmul`): tiled matmul with `token_count` rows
 fn encode_polarquant_projection(
     encoder: &ironmill_metal_sys::ComputeEncoder,
     input: &MetalBuffer,
@@ -2041,7 +2045,7 @@ fn encode_polarquant_projection(
     let (n, k) = weight.shape; // (out_features, in_features)
 
     let pipeline = pipelines
-        .polarquant_pipeline(weight.n_bits, kind)
+        .polarquant_pipeline(weight.n_bits.into(), kind)
         .ok_or_else(|| InferenceError::runtime(format!("unsupported n_bits: {}", weight.n_bits)))?;
 
     encoder.set_pipeline(pipeline);
@@ -2064,8 +2068,8 @@ fn encode_polarquant_projection(
         encoder.set_bytes(&(k as u32).to_le_bytes(), 7);
         encoder.dispatch_threadgroups(
             (
-                (token_count + MATMUL_TM_TILE - 1) / MATMUL_TM_TILE,
-                (n + MATMUL_TN_TILE - 1) / MATMUL_TN_TILE,
+                token_count.div_ceil(MATMUL_TM_TILE),
+                n.div_ceil(MATMUL_TN_TILE),
                 1,
             ),
             (MATMUL_THREADS_PER_TG, 1, 1),
@@ -2077,8 +2081,8 @@ fn encode_polarquant_projection(
 /// Encode a fused affine quantized projection via compute kernel.
 ///
 /// Dispatches to the correct Metal kernel based on `bit_width` and kernel kind:
-/// - [`LinearKernelKind::Matvec`]: matvec (one threadgroup per output row)
-/// - [`LinearKernelKind::Matmul`]: tiled matmul with `token_count` rows
+/// - Matvec (`LinearKernelKind::Matvec`): one threadgroup per output row
+/// - Matmul (`LinearKernelKind::Matmul`): tiled matmul with `token_count` rows
 fn encode_affine_projection(
     encoder: &ironmill_metal_sys::ComputeEncoder,
     input: &MetalBuffer,
@@ -2091,7 +2095,7 @@ fn encode_affine_projection(
     let (n, k) = weight.shape;
 
     let pipeline = pipelines
-        .affine_pipeline(weight.bit_width, kind)
+        .affine_pipeline(weight.bit_width.into(), kind)
         .ok_or_else(|| {
             InferenceError::runtime(format!(
                 "unsupported affine bit_width: {}",
@@ -2135,8 +2139,8 @@ fn encode_affine_projection(
         encoder.set_bytes(&has_awq.to_le_bytes(), 10);
         encoder.dispatch_threadgroups(
             (
-                (token_count + MATMUL_TM_TILE - 1) / MATMUL_TM_TILE,
-                (n + MATMUL_TN_TILE - 1) / MATMUL_TN_TILE,
+                token_count.div_ceil(MATMUL_TM_TILE),
+                n.div_ceil(MATMUL_TN_TILE),
                 1,
             ),
             (MATMUL_THREADS_PER_TG, 1, 1),
@@ -2152,6 +2156,7 @@ fn encode_affine_projection(
 /// When QK-norm weights are present, uses a single fused kernel that
 /// normalizes and rotates each head in one pass. Otherwise falls back
 /// to standalone RoPE dispatches.
+#[allow(clippy::too_many_arguments)]
 fn encode_qk_norm_and_rope(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
@@ -2220,6 +2225,7 @@ fn encode_qk_norm_and_rope(
 /// Encode KV cache write and attention dispatch.
 ///
 /// Handles TurboQuant (outlier and standard) and FP16 KV cache paths.
+#[allow(clippy::too_many_arguments)]
 fn encode_kv_cache_and_attention(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
@@ -2269,10 +2275,10 @@ fn encode_kv_cache_and_attention(
 
     if enable_tq {
         let tq = turboquant.ok_or_else(|| {
-            InferenceError::runtime("turboquant must be initialized when enable_tq is true".into())
+            InferenceError::runtime("turboquant must be initialized when enable_tq is true")
         })?;
         let kv = kv_cache.ok_or_else(|| {
-            InferenceError::runtime("kv_cache must be initialized when enable_tq is true".into())
+            InferenceError::runtime("kv_cache must be initialized when enable_tq is true")
         })?;
 
         if let Some(ref outlier) = tq.outlier {
@@ -2486,9 +2492,7 @@ fn encode_kv_cache_and_attention(
     } else {
         // FP16 KV cache path — scatter projections into cache on GPU.
         let fp16_kv = fp16_kv_cache.ok_or_else(|| {
-            InferenceError::runtime(
-                "fp16_kv_cache must be initialized for FP16 KV cache path".into(),
-            )
+            InferenceError::runtime("fp16_kv_cache must be initialized for FP16 KV cache path")
         })?;
         let (k_cache, v_cache) = fp16_kv.layer_caches(layer_idx);
 
@@ -2551,6 +2555,7 @@ fn encode_kv_cache_and_attention(
 }
 
 /// Encode the FFN block: gate + up projections, SiLU activation, and down projection.
+#[allow(clippy::too_many_arguments)]
 fn encode_ffn_block(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,

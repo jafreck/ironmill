@@ -99,11 +99,17 @@ pub struct OutlierState {
 /// TurboQuant-specific configuration extracted from MetalConfig + model params.
 #[derive(Debug, Clone)]
 pub struct TurboQuantMetalConfig {
+    /// Quantization bit width.
     pub n_bits: u8,
+    /// Number of key-value attention heads.
     pub num_kv_heads: usize,
+    /// Per-head dimension.
     pub head_dim: usize,
+    /// Maximum sequence length.
     pub max_seq_len: usize,
+    /// Number of transformer layers.
     pub num_layers: usize,
+    /// Rotation seed for Hadamard transform.
     pub rotation_seed: u64,
     /// Optional outlier channel configuration.
     pub outlier: Option<OutlierConfig>,
