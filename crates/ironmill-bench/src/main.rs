@@ -596,29 +596,13 @@ fn main() -> Result<()> {
 
             // Run two configurations: FP16 baseline and TurboQuant INT4
             let configs: Vec<(&str, MetalConfig)> = vec![
-                (
-                    "fp16",
-                    MetalConfig {
-                        enable_turboquant: false,
-                        ..MetalConfig::default()
-                    },
-                ),
-                (
-                    "tq-int8",
-                    MetalConfig {
-                        enable_turboquant: true,
-                        n_bits: 8,
-                        ..MetalConfig::default()
-                    },
-                ),
-                (
-                    "tq-int4",
-                    MetalConfig {
-                        enable_turboquant: true,
-                        n_bits: 4,
-                        ..MetalConfig::default()
-                    },
-                ),
+                ("fp16", {
+                    let mut c = MetalConfig::default();
+                    c.enable_turboquant = false;
+                    c
+                }),
+                ("tq-int8", MetalConfig::default().with_turboquant(8)),
+                ("tq-int4", MetalConfig::default().with_turboquant(4)),
             ];
 
             let mut gpu_ppl_results: std::collections::HashMap<String, f64> =
@@ -658,21 +642,12 @@ fn main() -> Result<()> {
                     };
 
                     let bundle_configs: Vec<(&str, MetalConfig)> = vec![
-                        (
-                            "fp16-kv",
-                            MetalConfig {
-                                enable_turboquant: false,
-                                ..MetalConfig::default()
-                            },
-                        ),
-                        (
-                            "tq-int4-kv",
-                            MetalConfig {
-                                enable_turboquant: true,
-                                n_bits: 4,
-                                ..MetalConfig::default()
-                            },
-                        ),
+                        ("fp16-kv", {
+                            let mut c = MetalConfig::default();
+                            c.enable_turboquant = false;
+                            c
+                        }),
+                        ("tq-int4-kv", MetalConfig::default().with_turboquant(4)),
                     ];
 
                     for (kv_label, gpu_config) in &bundle_configs {
@@ -1078,21 +1053,12 @@ fn main() -> Result<()> {
                     };
 
                     let ppl_bundle_configs: Vec<(&str, MetalConfig)> = vec![
-                        (
-                            "fp16-kv",
-                            MetalConfig {
-                                enable_turboquant: false,
-                                ..MetalConfig::default()
-                            },
-                        ),
-                        (
-                            "tq-int4-kv",
-                            MetalConfig {
-                                enable_turboquant: true,
-                                n_bits: 4,
-                                ..MetalConfig::default()
-                            },
-                        ),
+                        ("fp16-kv", {
+                            let mut c = MetalConfig::default();
+                            c.enable_turboquant = false;
+                            c
+                        }),
+                        ("tq-int4-kv", MetalConfig::default().with_turboquant(4)),
                     ];
 
                     for (kv_label, gpu_config) in &ppl_bundle_configs {

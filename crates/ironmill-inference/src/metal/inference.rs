@@ -2966,6 +2966,7 @@ impl MetalInference {
 
         let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
+        self.gemma4_config = Gemma4Config::from_model_config(&mc);
         self.model_info = Some(ModelInfo::from_config(&mc));
 
         // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
@@ -2979,7 +2980,7 @@ impl MetalInference {
 
         // Allocate intermediate buffers (start at 1 token; run_pipeline_inner
         // grows them on demand for larger prefill batches).
-        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc)
+        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc, self.gemma4_config.as_ref())
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.intermediate_buffers = Some(bufs);
 
@@ -2989,14 +2990,58 @@ impl MetalInference {
             mc.head_dim,
             self.config.max_seq_len,
             mc.rope_theta,
+            1.0,
         )
         .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.rope_cos = Some(cos);
         self.rope_sin = Some(sin);
 
+        // Build global-layer RoPE tables if Gemma 4 uses a different theta.
+        if let Some(ref g4) = self.gemma4_config {
+            if let Some(rp) = mc.rope_parameters() {
+                if let Some(global_cfg) = rp.get("full_attention") {
+                    let global_hd = g4.global_head_dim;
+                    if global_hd != mc.head_dim
+                        || global_cfg.theta != mc.rope_theta
+                        || global_cfg.partial_rotary_factor != 1.0
+                    {
+                        let (gc, gs) = Self::build_rope_cache(
+                            &self.device,
+                            global_hd,
+                            self.config.max_seq_len,
+                            global_cfg.theta,
+                            1.0,
+                        )
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                        self.global_rope_cos = Some(gc);
+                        self.global_rope_sin = Some(gs);
+                    }
+                }
+            }
+
+            // Allocate unit-weight buffer for scale-free V-norm.
+            let max_hd = g4
+                .layer_configs
+                .iter()
+                .map(|lc| lc.head_dim)
+                .max()
+                .unwrap_or(0);
+            if max_hd > 0 {
+                let unit_data: Vec<u8> = (0..max_hd)
+                    .flat_map(|_| f16::from_f64(1.0).to_le_bytes())
+                    .collect();
+                let buf = self
+                    .device
+                    .create_buffer_with_data(&unit_data, StorageMode::Shared)
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                self.unit_norm_weight = Some(buf);
+            }
+        }
+
         // Build MPS matmul cache for single-token decode.
-        let decode_cache_t1 = Self::build_matmul_cache(&self.device, &mc, &weights, 1)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        let decode_cache_t1 =
+            Self::build_matmul_cache(&self.device, &mc, self.gemma4_config.as_ref(), &weights, 1)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
 
@@ -3065,6 +3110,19 @@ impl MetalInference {
 
         // Initialize KV cache.
         if self.config.enable_turboquant {
+            let tq_layer_configs: Vec<TurboQuantLayerConfig> =
+                if let Some(ref g4) = self.gemma4_config {
+                    g4.layer_configs
+                        .iter()
+                        .map(|lc| TurboQuantLayerConfig {
+                            head_dim: lc.head_dim,
+                            num_kv_heads: lc.num_kv_heads,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
             let tq_config = TurboQuantMetalConfig {
                 n_bits: self.config.n_bits,
                 num_kv_heads: mc.num_key_value_heads,
@@ -3075,6 +3133,7 @@ impl MetalInference {
                 outlier: None,
                 anchor_layers: cla_anchors.clone(),
                 window_sizes: layer_window_sizes.clone(),
+                layer_configs: tq_layer_configs,
             };
             let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -3084,6 +3143,13 @@ impl MetalInference {
             self.kv_cache = Some(kv_cache);
             self.fp16_kv_cache = None;
         } else {
+            let per_layer_dims: Option<Vec<(usize, usize)>> =
+                self.gemma4_config.as_ref().map(|g4| {
+                    g4.layer_configs
+                        .iter()
+                        .map(|lc| (lc.num_kv_heads, lc.head_dim))
+                        .collect()
+                });
             let fp16_kv = Fp16KvCache::new(
                 &self.device,
                 mc.num_hidden_layers,
@@ -3092,6 +3158,7 @@ impl MetalInference {
                 mc.head_dim,
                 cla_anchors.clone(),
                 &layer_window_sizes,
+                per_layer_dims.as_deref(),
             )
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.fp16_kv_cache = Some(fp16_kv);
@@ -4238,233 +4305,6 @@ fn read_f16_buffer(weight: &WeightBuffer, num_elements: usize) -> Result<Vec<u8>
 }
 
 impl InferenceEngine for MetalInference {
-    fn load(&mut self, artifacts: &dyn Any) -> Result<(), InferenceError> {
-        let gpu_artifacts = artifacts
-            .downcast_ref::<MetalArtifacts<'_>>()
-            .ok_or_else(|| {
-                InferenceError::runtime("MetalInference::load expects MetalArtifacts".into())
-            })?;
-
-        self.config = gpu_artifacts.config.clone();
-
-        // Load weights into Metal buffers.
-        let mut weights = MetalWeights::load(
-            &self.device,
-            gpu_artifacts.weights,
-            self.config.force_cpu_dequant,
-        )
-        .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
-        let mc = weights.config.clone();
-        self.model_config = Some(mc.clone());
-        self.gemma4_config = Gemma4Config::from_model_config(&mc);
-
-        // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
-        self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);
-
-        // Compile Metal shader pipelines with the model's head_dim so
-        // shared memory is sized exactly via #define HEAD_DIM.
-        let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        self.pipelines = Some(pipelines);
-
-        // Allocate intermediate buffers (start at 1 token; run_pipeline_inner
-        // grows them on demand for larger prefill batches).
-        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc, self.gemma4_config.as_ref())
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        self.intermediate_buffers = Some(bufs);
-
-        // Build RoPE cos/sin caches.
-        let (cos, sin) = Self::build_rope_cache(
-            &self.device,
-            mc.head_dim,
-            self.config.max_seq_len,
-            mc.rope_theta,
-            1.0,
-        )
-        .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        self.rope_cos = Some(cos);
-        self.rope_sin = Some(sin);
-
-        // Build global-layer RoPE tables if Gemma 4 uses a different theta.
-        if let Some(ref g4) = self.gemma4_config {
-            if let Some(rp) = mc.rope_parameters() {
-                if let Some(global_cfg) = rp.get("full_attention") {
-                    let global_hd = g4.global_head_dim;
-                    if global_hd != mc.head_dim
-                        || global_cfg.theta != mc.rope_theta
-                        || global_cfg.partial_rotary_factor != 1.0
-                    {
-                        let (gc, gs) = Self::build_rope_cache(
-                            &self.device,
-                            global_hd,
-                            self.config.max_seq_len,
-                            global_cfg.theta,
-                            // Gemma4 proportional RoPE: partial_rotary_factor is for
-                            // NTK frequency scaling, not dimension reduction.
-                            // All head dimensions are rotated.
-                            1.0,
-                        )
-                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
-                        self.global_rope_cos = Some(gc);
-                        self.global_rope_sin = Some(gs);
-                    }
-                }
-            }
-
-            // Allocate unit-weight buffer for scale-free V-norm.
-            let max_hd = g4
-                .layer_configs
-                .iter()
-                .map(|lc| lc.head_dim)
-                .max()
-                .unwrap_or(0);
-            if max_hd > 0 {
-                let unit_data: Vec<u8> = (0..max_hd)
-                    .flat_map(|_| f16::from_f64(1.0).to_le_bytes())
-                    .collect();
-                let buf = self
-                    .device
-                    .create_buffer_with_data(&unit_data, StorageMode::Shared)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
-                self.unit_norm_weight = Some(buf);
-            }
-        }
-
-        // Build MPS matmul cache for single-token decode.
-        let decode_cache_t1 =
-            Self::build_matmul_cache(&self.device, &mc, self.gemma4_config.as_ref(), &weights, 1)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        self.decode_matmuls_t1 = Some(decode_cache_t1);
-        self.decode_matmuls = None;
-
-        // Resolve CLA anchor layers.
-        let cla_anchors = self
-            .config
-            .cla_config
-            .as_ref()
-            .map(|c| c.anchor_layers.clone())
-            .or_else(|| mc.cla_anchor_layers());
-        if let Some(ref anchors) = cla_anchors {
-            let cla = super::config::ClaConfig {
-                anchor_layers: anchors.clone(),
-            };
-            cla.validate(mc.num_hidden_layers)
-                .map_err(|e| InferenceError::runtime(format!("CLA config invalid: {e}")))?;
-        }
-        // Back-fill cla_config so is_anchor checks during inference see the
-        // metadata-derived anchors, not the absent user config.
-        if self.config.cla_config.is_none() {
-            if let Some(ref anchors) = cla_anchors {
-                self.config.cla_config = Some(super::config::ClaConfig {
-                    anchor_layers: anchors.clone(),
-                });
-            }
-        }
-
-        // ── MLA detection and weight absorption ─────────────────
-        let mla_cfg = mc.mla_config();
-        if let Some(ref mla) = mla_cfg {
-            absorb_mla_weights(
-                &self.device,
-                &mut weights,
-                mla,
-                mc.hidden_size,
-                gpu_artifacts.weights,
-            )
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
-            let mla_cache = MlaKvCache::new(
-                &self.device,
-                mla,
-                mc.num_hidden_layers,
-                self.config.max_seq_len,
-            )
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            self.mla_kv_cache = Some(mla_cache);
-        } else {
-            self.mla_kv_cache = None;
-        }
-        self.mla_config = mla_cfg;
-
-        // Resolve sliding window config from model metadata.
-        if self.config.sliding_window.is_none() {
-            if let Some(ws) = mc.sliding_window() {
-                let mwl = mc.max_window_layers().unwrap_or(mc.num_hidden_layers);
-                self.config.sliding_window = Some(super::config::SlidingWindowConfig {
-                    window_size: ws,
-                    max_window_layers: mwl,
-                });
-            }
-        }
-
-        let layer_window_sizes: Vec<usize> = (0..mc.num_hidden_layers)
-            .map(|l| self.config.layer_window_size(l))
-            .collect();
-
-        // Initialize KV cache.
-        if self.config.enable_turboquant {
-            let tq_layer_configs: Vec<TurboQuantLayerConfig> =
-                if let Some(ref g4) = self.gemma4_config {
-                    g4.layer_configs
-                        .iter()
-                        .map(|lc| TurboQuantLayerConfig {
-                            head_dim: lc.head_dim,
-                            num_kv_heads: lc.num_kv_heads,
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-            let tq_config = TurboQuantMetalConfig {
-                n_bits: self.config.n_bits,
-                num_kv_heads: mc.num_key_value_heads,
-                head_dim: mc.head_dim,
-                max_seq_len: self.config.max_seq_len,
-                num_layers: mc.num_hidden_layers,
-                rotation_seed: self.config.rotation_seed,
-                outlier: None,
-                anchor_layers: cla_anchors.clone(),
-                window_sizes: layer_window_sizes.clone(),
-                layer_configs: tq_layer_configs,
-            };
-            let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            let kv_cache = MetalKvCache::new(&self.device, &tq_config)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            self.turboquant = Some(tq_model);
-            self.kv_cache = Some(kv_cache);
-            self.fp16_kv_cache = None;
-        } else {
-            let per_layer_dims: Option<Vec<(usize, usize)>> =
-                self.gemma4_config.as_ref().map(|g4| {
-                    g4.layer_configs
-                        .iter()
-                        .map(|lc| (lc.num_kv_heads, lc.head_dim))
-                        .collect()
-                });
-            let fp16_kv = Fp16KvCache::new(
-                &self.device,
-                mc.num_hidden_layers,
-                mc.num_key_value_heads,
-                self.config.max_seq_len,
-                mc.head_dim,
-                cla_anchors.clone(),
-                &layer_window_sizes,
-                per_layer_dims.as_deref(),
-            )
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            self.fp16_kv_cache = Some(fp16_kv);
-            self.turboquant = None;
-            self.kv_cache = None;
-        }
-
-        self.weights = Some(weights);
-        self.seq_pos = 0;
-        Ok(())
-    }
-
     fn decode_step(&mut self, token: u32) -> Result<Logits, InferenceError> {
         self.run_pipeline(&[token])
     }

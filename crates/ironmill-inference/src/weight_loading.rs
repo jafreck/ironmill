@@ -453,6 +453,6 @@ pub fn dequant_tensor_to_dense<'a, D: CpuDequant>(
                 dtype: ScalarType::Float16,
             })
         }
-        _ => anyhow::bail!("unsupported quantization format for dequantization"),
+        other => anyhow::bail!("unsupported quant_info variant: {other:?}"),
     }
 }
