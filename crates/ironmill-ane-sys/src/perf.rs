@@ -105,6 +105,10 @@ impl Drop for PerformanceStats {
 /// Performance stats tied to a specific IOSurface.
 ///
 /// Owns a retained `_ANEPerformanceStatsIOSurface` handle; released on drop.
+///
+/// **Note:** Currently unused outside tests. Retained for potential future use
+/// in ANE performance profiling.
+#[doc(hidden)]
 pub struct PerformanceStatsIOSurface {
     raw: *mut c_void,
 }
@@ -185,6 +189,10 @@ impl Drop for PerformanceStatsIOSurface {
 /// Maps between ANE QoS levels, program priorities, and queue indices.
 ///
 /// All methods are class methods on `_ANEQoSMapper` — no instance is needed.
+///
+/// **Note:** Currently unused outside tests. Retained for potential future use
+/// in ANE QoS-aware scheduling.
+#[doc(hidden)]
 pub struct QoSMapper;
 
 impl std::fmt::Debug for QoSMapper {

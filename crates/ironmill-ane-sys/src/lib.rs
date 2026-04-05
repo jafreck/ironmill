@@ -47,12 +47,15 @@ pub use events::{SharedEvents, SharedSignalEvent, SharedWaitEvent};
 pub use iosurface::{AneBuffer, AneIOSurfaceObject, IOSurfaceOutputSets};
 pub use mapper::ProgramIOSurfacesMapper;
 pub use model::{InMemoryModel, InMemoryModelDescriptor};
-pub use perf::{PerformanceStats, PerformanceStatsIOSurface, QoSMapper};
+pub use perf::PerformanceStats;
+// NOTE: PerformanceStatsIOSurface and QoSMapper are pub(crate) — currently
+// unused outside tests. Access via `ironmill_ane_sys::perf::` if needed internally.
 pub use process::current_rss;
 pub use program::ProgramForEvaluation;
 pub use request::{AneRequest, ChainingRequest};
 pub use token::ModelToken;
-pub use util::{AneCloneHelper, AneErrors, AneLog};
+// NOTE: AneCloneHelper, AneErrors, and AneLog are pub(crate) — currently
+// unused outside tests. Access via `ironmill_ane_sys::util::` if needed internally.
 pub use validate::{
     RawValidateFn, get_validate_network_supported_version, validate_mil_network_on_host_ptr,
     validate_mlir_network_on_host_ptr,

@@ -18,6 +18,10 @@ use crate::objc::{CFRelease, create_nsstring, get_class, objc_msgSend, sel, sel_
 ///
 /// All methods are class methods on `_ANELog` — no instance is needed.
 /// Each returns an opaque `os_log_t` pointer.
+///
+/// **Note:** Currently unused outside tests. Retained for potential future use
+/// in ANE diagnostics and debugging.
+#[doc(hidden)]
 pub struct AneLog;
 
 impl AneLog {
@@ -82,6 +86,10 @@ impl AneLog {
 ///
 /// All methods are class methods on `_ANEErrors` — no instance is needed.
 /// Returned `*mut c_void` pointers are autoreleased `NSError` objects.
+///
+/// **Note:** Currently unused outside tests. Retained for potential future use
+/// in ANE error reporting.
+#[doc(hidden)]
 pub struct AneErrors;
 
 impl AneErrors {
@@ -188,6 +196,10 @@ impl AneErrors {
 /// Helpers for cloning ANE model files.
 ///
 /// All methods are class methods on `_ANECloneHelper` — no instance is needed.
+///
+/// **Note:** Currently unused outside tests. Retained for potential future use
+/// in ANE model file management.
+#[doc(hidden)]
 pub struct AneCloneHelper;
 
 impl AneCloneHelper {

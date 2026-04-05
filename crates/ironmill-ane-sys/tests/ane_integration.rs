@@ -8,6 +8,8 @@
 
 #![cfg(target_os = "macos")]
 
+use ironmill_ane_sys::perf::QoSMapper;
+use ironmill_ane_sys::util::{AneErrors, AneLog};
 use ironmill_ane_sys::*;
 
 // =========================================================================

@@ -123,9 +123,19 @@ impl InMemoryModelDescriptor {
     ///
     /// Wraps `+[_ANEInMemoryModelDescriptor modelWithNetworkDescription:weights:optionsPlist:]`.
     ///
+    /// # Deprecation
+    ///
+    /// This method uses the legacy network-description format. New code should
+    /// use [`InMemoryModelDescriptor::from_mil_text`] instead, which accepts
+    /// MIL text — the only ANE input format going forward.
+    ///
     /// # Safety
     ///
     /// `weights_dict` must be a valid `NSDictionary` pointer or null.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Legacy non-MIL API. Use `InMemoryModelDescriptor::from_mil_text` instead."
+    )]
     pub unsafe fn from_network_description(
         desc: &[u8],
         weights_dict: *mut c_void,
@@ -711,7 +721,7 @@ pub fn compile_mil_text(
 
             // 3. Pre-populate temp directory
             if let Some(ref hex) = model.hex_string_identifier() {
-                populate_tmp_dir(hex, mil_text, weights);
+                populate_tmp_dir(hex, mil_text, weights)?;
             }
 
             // 4. Compile
@@ -781,7 +791,7 @@ pub fn patch_weights(
         let new_hex = model.hex_string_identifier().ok_or_else(|| {
             AneSysError::CompilationFailed("failed to get new model hexStringIdentifier".into())
         })?;
-        populate_tmp_dir(&new_hex, mil_text, weights);
+        populate_tmp_dir(&new_hex, mil_text, weights)?;
 
         // 4. Copy donor's net.plist → new model's temp dir (the key trick)
         let new_tmp = std::env::temp_dir().join(&new_hex);
@@ -1142,32 +1152,36 @@ fn build_multi_weight_dict(weights: &[(&str, &[u8])]) -> Result<*mut c_void, Ane
 }
 
 /// Pre-populate the model's temp directory with MIL text and weight blobs.
-fn populate_tmp_dir(hex_id: &str, mil_text: &str, weights: &[(&str, &[u8])]) {
+fn populate_tmp_dir(
+    hex_id: &str,
+    mil_text: &str,
+    weights: &[(&str, &[u8])],
+) -> Result<(), AneSysError> {
     let tmp_dir = std::env::temp_dir().join(hex_id);
     let weights_dir = tmp_dir.join("weights");
 
     #[cfg(debug_assertions)]
     eprintln!("[ane] hexId={hex_id}, tmp_dir={}", tmp_dir.display());
 
-    if let Ok(()) = std::fs::create_dir_all(&weights_dir) {
-        let _ = std::fs::write(tmp_dir.join("model.mil"), mil_text.as_bytes());
-        for (path_key, data) in weights {
-            let rel_path = path_key.strip_prefix("@model_path/").unwrap_or(path_key);
-            let full_path = tmp_dir.join(rel_path);
-            if let Some(parent) = full_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[ane] writing weight {} ({} bytes) → {}",
-                path_key,
-                data.len(),
-                full_path.display()
-            );
-            let blob = make_blobfile(data).unwrap_or_default();
-            let _ = std::fs::write(&full_path, &blob);
+    std::fs::create_dir_all(&weights_dir)?;
+    std::fs::write(tmp_dir.join("model.mil"), mil_text.as_bytes())?;
+    for (path_key, data) in weights {
+        let rel_path = path_key.strip_prefix("@model_path/").unwrap_or(path_key);
+        let full_path = tmp_dir.join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[ane] writing weight {} ({} bytes) → {}",
+            path_key,
+            data.len(),
+            full_path.display()
+        );
+        let blob = make_blobfile(data)?;
+        std::fs::write(&full_path, &blob)?;
     }
+    Ok(())
 }
 
 // =========================================================================
