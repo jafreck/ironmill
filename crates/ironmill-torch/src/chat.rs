@@ -1,6 +1,6 @@
 //! Multi-turn chat sessions.
 
-use ironmill_core::tokenizer::ChatMessage;
+use ironmill_core::tokenizer::{ChatMessage, Role};
 
 use crate::error::TorchError;
 use crate::gen_params::GenParams;
@@ -88,7 +88,11 @@ impl<'m> ChatSession<'m> {
 
     /// Clear the conversation history, keeping the system prompt.
     pub fn reset(&mut self) {
-        let system = self.history.iter().find(|m| m.role == "system").cloned();
+        let system = self
+            .history
+            .iter()
+            .find(|m| m.role == Role::System)
+            .cloned();
         self.history.clear();
         if let Some(sys) = system {
             self.history.push(sys);

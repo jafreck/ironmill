@@ -18,4 +18,4 @@ pub use device::Device;
 pub use model_info::ModelInfo;
 #[cfg(feature = "hf-tokenizer")]
 pub use tokenizer::HfTokenizer;
-pub use tokenizer::{ChatMessage, Tokenizer, TokenizerError};
+pub use tokenizer::{ChatMessage, Role, Tokenizer, TokenizerError};

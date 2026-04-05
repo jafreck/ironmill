@@ -13,8 +13,6 @@ pub enum Device {
     Ane,
     /// Use Core ML for inference.
     CoreMl,
-    /// Use an NVIDIA CUDA GPU.
-    Cuda,
     /// Use CPU-only inference.
     Cpu,
 }

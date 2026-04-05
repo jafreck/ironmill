@@ -89,7 +89,7 @@ const SKIP_ATTRIBUTES: &[&str] = &["compute_unit", "fused_activation", "has_fuse
 
 /// Accumulates MIL text output and tracks weight blob entries.
 struct MilTextEmitter<'a> {
-    config: &'a MilTextConfig,
+    _config: &'a MilTextConfig,
     output: String,
     weight_entries: Vec<WeightBlobEntry>,
     /// Maps original variable names → emitted names for I/O renaming.
@@ -101,13 +101,16 @@ struct MilTextEmitter<'a> {
 impl<'a> MilTextEmitter<'a> {
     fn new(config: &'a MilTextConfig) -> Self {
         Self {
-            config,
+            _config: config,
             output: String::new(),
             weight_entries: Vec::new(),
             rename_map: HashMap::new(),
             type_map: HashMap::new(),
         }
     }
+
+    // NOTE: All `write!(...).unwrap()` calls in this impl write to a `String`,
+    // which has an infallible `fmt::Write` implementation. The unwrap is safe.
 
     fn emit_program(&mut self, program: &Program) -> Result<()> {
         // Always emit the ANE-compatible MIL spec version.
@@ -156,7 +159,7 @@ impl<'a> MilTextEmitter<'a> {
                 write!(self.output, ", ").unwrap();
             }
             let emitted_name = self.resolve_name(name);
-            let type_str = self.format_tensor_type(ty);
+            let type_str = self.format_tensor_type(ty)?;
             write!(self.output, "{type_str} {emitted_name}").unwrap();
         }
         writeln!(self.output, ") {{").unwrap();
@@ -199,7 +202,7 @@ impl<'a> MilTextEmitter<'a> {
             .cloned()
             .or_else(|| self.infer_output_type_from_inputs(op));
         let type_str = match &output_type {
-            Some(ty) => self.format_tensor_type(ty),
+            Some(ty) => self.format_tensor_type(ty)?,
             None => {
                 eprintln!(
                     "error: could not infer output type for op '{}' (type: {})",
@@ -231,7 +234,7 @@ impl<'a> MilTextEmitter<'a> {
         });
         for key in input_keys {
             let val = &op.inputs[key];
-            params.push(format!("{}={}", key, self.format_value(val)));
+            params.push(format!("{}={}", key, self.format_value(val)?));
         }
 
         // Emit non-skipped attributes as params.
@@ -243,7 +246,7 @@ impl<'a> MilTextEmitter<'a> {
         attr_keys.sort();
         for key in attr_keys {
             let val = &op.attributes[key];
-            params.push(format!("{}={}", key, self.format_value(val)));
+            params.push(format!("{}={}", key, self.format_value(val)?));
         }
 
         // TYPE %name = op(params)[name=string("name")];
@@ -293,17 +296,17 @@ impl<'a> MilTextEmitter<'a> {
 
             if is_int_param {
                 // Emit inline: tensor<int32, [N]>([v1, v2, ...])
-                let type_str = self.format_tensor_type_from(shape, *dtype);
+                let type_str = self.format_tensor_type_from(shape, *dtype)?;
                 let values = format_tensor_elements(
                     data.as_bytes().expect("tensor not materialized"),
                     *dtype,
-                );
+                )?;
                 let num_elements: usize = shape.iter().product();
 
                 writeln!(
                     self.output,
                     "        {type_str} {output_name} = const()[name=string(\"{output_name}\"), val=tensor<{dtype_str}, [{num_elements}]>([{values}])];",
-                    dtype_str = format_scalar_type(*dtype, self.config.enable_int4),
+                    dtype_str = format_scalar_type(*dtype)?,
                 )
                 .unwrap();
             } else {
@@ -319,7 +322,7 @@ impl<'a> MilTextEmitter<'a> {
                 });
 
                 let emit_shape = to_ane_weight_shape(shape);
-                let type_str = self.format_tensor_type_from(&emit_shape, *dtype);
+                let type_str = self.format_tensor_type_from(&emit_shape, *dtype)?;
 
                 writeln!(
                     self.output,
@@ -329,7 +332,7 @@ impl<'a> MilTextEmitter<'a> {
             }
         } else if let Some(val) = op.inputs.get("val").or_else(|| op.attributes.get("val")) {
             // Scalar/list const → emit with typed value.
-            let (type_str, val_str) = self.format_typed_const_value(val);
+            let (type_str, val_str) = self.format_typed_const_value(val)?;
 
             // TYPE %name = const()[name=string("name"), val=TYPED_VALUE];
             writeln!(
@@ -350,8 +353,8 @@ impl<'a> MilTextEmitter<'a> {
     }
 
     /// Format a [`Value`] for operation input parameters.
-    fn format_value(&self, value: &Value) -> String {
-        match value {
+    fn format_value(&self, value: &Value) -> Result<String> {
+        let s = match value {
             Value::Reference(name) => self.resolve_name(name),
             Value::Int(n) => format!("int32({n})"),
             Value::Float(f) => format!("fp16({})", format_float(*f)),
@@ -371,34 +374,38 @@ impl<'a> MilTextEmitter<'a> {
                 format!("tensor<int32, [{n}]>([{}])", vals.join(","))
             }
             Value::List(items) => {
-                let parts: Vec<String> = items.iter().map(|v| self.format_value(v)).collect();
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|v| self.format_value(v))
+                    .collect::<Result<_>>()?;
                 format!("[{}]", parts.join(", "))
             }
-            Value::Type(ty) => self.format_tensor_type(ty),
+            Value::Type(ty) => self.format_tensor_type(ty)?,
             Value::Tensor { data, shape, dtype } => {
-                // Emit as inline typed tensor literal with 1-D shape.
-                // Op arguments (e.g., reshape's `shape`, reduce's `axes`)
-                // are always 1-D vectors. Flatten multi-dim shapes to [N].
-                let dtype_str = format_scalar_type(*dtype, self.config.enable_int4);
+                let dtype_str = format_scalar_type(*dtype)?;
                 let num_elements: usize = shape.iter().product();
                 let type_str = format!("tensor<{dtype_str}, [{num_elements}]>");
 
-                // Decode the raw bytes into element values.
                 let values = format_tensor_elements(
                     data.as_bytes().expect("tensor not materialized"),
                     *dtype,
-                );
+                )?;
                 format!("{type_str}([{values}])")
             }
-            _ => panic!("unsupported Value variant: {value:?}"),
-        }
+            _ => {
+                return Err(MilError::Validation(format!(
+                    "unsupported Value variant: {value:?}"
+                )));
+            }
+        };
+        Ok(s)
     }
 
     /// Format a value with its type prefix for const `val=` attributes.
     ///
     /// Returns `(type_string, typed_value_string)`.
-    fn format_typed_const_value(&self, val: &Value) -> (String, String) {
-        match val {
+    fn format_typed_const_value(&self, val: &Value) -> Result<(String, String)> {
+        let pair = match val {
             Value::Float(f) => ("fp16".into(), format!("fp16({})", format_float(*f))),
             Value::Int(n) => ("int32".into(), format!("int32({n})")),
             Value::Bool(b) => (
@@ -420,13 +427,14 @@ impl<'a> MilTextEmitter<'a> {
                     format!("tensor<int32, [{n}]>([{}])", vals.join(",")),
                 )
             }
-            _ => ("fp16".into(), self.format_value(val)),
-        }
+            _ => ("fp16".into(), self.format_value(val)?),
+        };
+        Ok(pair)
     }
 
     /// Format a [`TensorType`] as MIL text: `tensor<fp16, [1,768,1,32]>`.
-    fn format_tensor_type(&self, ty: &TensorType) -> String {
-        let dtype = format_scalar_type(ty.scalar_type, self.config.enable_int4);
+    fn format_tensor_type(&self, ty: &TensorType) -> Result<String> {
+        let dtype = format_scalar_type(ty.scalar_type)?;
         let dims: Vec<String> = ty
             .shape
             .iter()
@@ -435,14 +443,14 @@ impl<'a> MilTextEmitter<'a> {
                 None => "?".to_string(),
             })
             .collect();
-        format!("tensor<{dtype}, [{}]>", dims.join(","))
+        Ok(format!("tensor<{dtype}, [{}]>", dims.join(",")))
     }
 
     /// Format a tensor type from raw shape and dtype (for weight consts).
-    fn format_tensor_type_from(&self, shape: &[usize], dtype: ScalarType) -> String {
-        let dtype_str = format_scalar_type(dtype, self.config.enable_int4);
+    fn format_tensor_type_from(&self, shape: &[usize], dtype: ScalarType) -> Result<String> {
+        let dtype_str = format_scalar_type(dtype)?;
         let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
-        format!("tensor<{dtype_str}, [{}]>", dims.join(","))
+        Ok(format!("tensor<{dtype_str}, [{}]>", dims.join(",")))
     }
 
     /// Resolve a variable name through the rename map.
@@ -560,21 +568,23 @@ impl<'a> MilTextEmitter<'a> {
 }
 
 /// Format a [`ScalarType`] as a MIL type string.
-fn format_scalar_type(st: ScalarType, _enable_int4: bool) -> &'static str {
+fn format_scalar_type(st: ScalarType) -> Result<&'static str> {
     match st {
-        ScalarType::Float16 => "fp16",
-        ScalarType::Float32 => "fp32",
-        ScalarType::Float64 => "fp64",
-        ScalarType::Int8 => "int8",
-        ScalarType::Int16 => "int16",
-        ScalarType::Int32 => "int32",
-        ScalarType::Int64 => "int64",
-        ScalarType::UInt8 => "uint8",
-        ScalarType::UInt16 => "uint16",
-        ScalarType::UInt32 => "uint32",
-        ScalarType::UInt64 => "uint64",
-        ScalarType::Bool => "bool",
-        _ => panic!("unsupported scalar type: {st:?}"),
+        ScalarType::Float16 => Ok("fp16"),
+        ScalarType::Float32 => Ok("fp32"),
+        ScalarType::Float64 => Ok("fp64"),
+        ScalarType::Int8 => Ok("int8"),
+        ScalarType::Int16 => Ok("int16"),
+        ScalarType::Int32 => Ok("int32"),
+        ScalarType::Int64 => Ok("int64"),
+        ScalarType::UInt8 => Ok("uint8"),
+        ScalarType::UInt16 => Ok("uint16"),
+        ScalarType::UInt32 => Ok("uint32"),
+        ScalarType::UInt64 => Ok("uint64"),
+        ScalarType::Bool => Ok("bool"),
+        _ => Err(MilError::Validation(format!(
+            "unsupported scalar type: {st:?}"
+        ))),
     }
 }
 
@@ -612,7 +622,7 @@ fn to_ane_weight_shape(shape: &[usize]) -> Vec<usize> {
 /// Format raw tensor bytes as a comma-separated list of element values.
 ///
 /// Used for inline tensor literals in op arguments (e.g., reshape shape).
-fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> String {
+fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> Result<String> {
     let elem_size = dtype.byte_size();
     debug_assert!(
         elem_size <= 1 || data.len() % elem_size == 0,
@@ -622,7 +632,7 @@ fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> String {
         dtype,
     );
 
-    match dtype {
+    let s = match dtype {
         ScalarType::Int32 => data
             .chunks_exact(4)
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string())
@@ -691,8 +701,13 @@ fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> String {
             .map(|b| i16::from_le_bytes([b[0], b[1]]).to_string())
             .collect::<Vec<_>>()
             .join(","),
-        _ => panic!("unsupported scalar type for tensor elements: {dtype:?}"),
-    }
+        _ => {
+            return Err(MilError::Validation(format!(
+                "unsupported scalar type for tensor elements: {dtype:?}"
+            )));
+        }
+    };
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -986,13 +1001,13 @@ mod tests {
 
     #[test]
     fn mil_text_scalar_types() {
-        assert_eq!(format_scalar_type(ScalarType::Float16, false), "fp16");
-        assert_eq!(format_scalar_type(ScalarType::Float32, false), "fp32");
-        assert_eq!(format_scalar_type(ScalarType::Float64, false), "fp64");
-        assert_eq!(format_scalar_type(ScalarType::Int8, false), "int8");
-        assert_eq!(format_scalar_type(ScalarType::Int32, false), "int32");
-        assert_eq!(format_scalar_type(ScalarType::Bool, false), "bool");
-        assert_eq!(format_scalar_type(ScalarType::UInt8, false), "uint8");
+        assert_eq!(format_scalar_type(ScalarType::Float16).unwrap(), "fp16");
+        assert_eq!(format_scalar_type(ScalarType::Float32).unwrap(), "fp32");
+        assert_eq!(format_scalar_type(ScalarType::Float64).unwrap(), "fp64");
+        assert_eq!(format_scalar_type(ScalarType::Int8).unwrap(), "int8");
+        assert_eq!(format_scalar_type(ScalarType::Int32).unwrap(), "int32");
+        assert_eq!(format_scalar_type(ScalarType::Bool).unwrap(), "bool");
+        assert_eq!(format_scalar_type(ScalarType::UInt8).unwrap(), "uint8");
     }
 
     #[test]
@@ -1000,28 +1015,51 @@ mod tests {
         let config = MilTextConfig::default();
         let emitter = MilTextEmitter::new(&config);
 
-        assert_eq!(emitter.format_value(&Value::Int(42)), "int32(42)");
-        assert_eq!(emitter.format_value(&Value::Float(3.14)), "fp16(3.14)");
-        assert_eq!(emitter.format_value(&Value::Float(1.0)), "fp16(1.0)");
-        assert_eq!(emitter.format_value(&Value::Bool(true)), "bool(true)");
-        assert_eq!(emitter.format_value(&Value::Bool(false)), "bool(false)");
+        assert_eq!(emitter.format_value(&Value::Int(42)).unwrap(), "int32(42)");
         assert_eq!(
-            emitter.format_value(&Value::String("hello".into())),
+            emitter.format_value(&Value::Float(3.14)).unwrap(),
+            "fp16(3.14)"
+        );
+        assert_eq!(
+            emitter.format_value(&Value::Float(1.0)).unwrap(),
+            "fp16(1.0)"
+        );
+        assert_eq!(
+            emitter.format_value(&Value::Bool(true)).unwrap(),
+            "bool(true)"
+        );
+        assert_eq!(
+            emitter.format_value(&Value::Bool(false)).unwrap(),
+            "bool(false)"
+        );
+        assert_eq!(
+            emitter
+                .format_value(&Value::String("hello".into()))
+                .unwrap(),
             "string(\"hello\")"
         );
         assert_eq!(
-            emitter.format_value(&Value::List(vec![Value::Int(1), Value::Int(2)])),
+            emitter
+                .format_value(&Value::List(vec![Value::Int(1), Value::Int(2)]))
+                .unwrap(),
             "tensor<int32, [2]>([1,2])"
         );
-        assert_eq!(emitter.format_value(&Value::Reference("foo".into())), "foo");
+        assert_eq!(
+            emitter
+                .format_value(&Value::Reference("foo".into()))
+                .unwrap(),
+            "foo"
+        );
 
         // Tensor values should produce inline tensor literals.
         assert_eq!(
-            emitter.format_value(&Value::Tensor {
-                data: TensorData::Inline(vec![1, 0, 0, 0, 1, 0, 0, 0, 128, 0, 0, 0]), // [1, 1, 128] as int32
-                shape: vec![3],
-                dtype: ScalarType::Int32,
-            }),
+            emitter
+                .format_value(&Value::Tensor {
+                    data: TensorData::Inline(vec![1, 0, 0, 0, 1, 0, 0, 0, 128, 0, 0, 0]), // [1, 1, 128] as int32
+                    shape: vec![3],
+                    dtype: ScalarType::Int32,
+                })
+                .unwrap(),
             "tensor<int32, [3]>([1,1,128])"
         );
     }
@@ -1032,6 +1070,9 @@ mod tests {
             TensorType::with_dynamic_shape(ScalarType::Float16, vec![Some(1), None, Some(1), None]);
         let config = MilTextConfig::default();
         let emitter = MilTextEmitter::new(&config);
-        assert_eq!(emitter.format_tensor_type(&ty), "tensor<fp16, [1,?,1,?]>");
+        assert_eq!(
+            emitter.format_tensor_type(&ty).unwrap(),
+            "tensor<fp16, [1,?,1,?]>"
+        );
     }
 }

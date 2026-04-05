@@ -1,7 +1,65 @@
 //! Tokenizer abstraction (§9 of the API specification).
 //!
 //! Provides [`Tokenizer`] — a trait for text ↔ token-ID conversion —
-//! along with [`ChatMessage`] and [`TokenizerError`].
+//! along with [`ChatMessage`], [`Role`], and [`TokenizerError`].
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Role
+// ---------------------------------------------------------------------------
+
+/// The role of a participant in a chat conversation.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// System-level instructions.
+    System,
+    /// Human user input.
+    User,
+    /// Model-generated response.
+    Assistant,
+    /// Tool / function-call result.
+    Tool,
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for Role {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "system" => Ok(Role::System),
+            "user" => Ok(Role::User),
+            "assistant" => Ok(Role::Assistant),
+            "tool" => Ok(Role::Tool),
+            other => Err(format!("unknown role: {other}")),
+        }
+    }
+}
+
+impl From<&str> for Role {
+    /// Convert a role string to a [`Role`], defaulting to [`Role::User`]
+    /// for unrecognized values.
+    fn from(s: &str) -> Self {
+        s.parse().unwrap_or(Role::User)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ChatMessage
@@ -11,9 +69,9 @@
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
-    /// Role of the message sender (e.g., "system", "user", "assistant").
-    pub role: String,
-    /// Text content of the message.
+    /// The role of the message author.
+    pub role: Role,
+    /// The text content of the message.
     pub content: String,
 }
 
@@ -21,7 +79,7 @@ impl ChatMessage {
     /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self {
-            role: "system".into(),
+            role: Role::System,
             content: content.into(),
         }
     }
@@ -29,7 +87,7 @@ impl ChatMessage {
     /// Create a user message.
     pub fn user(content: impl Into<String>) -> Self {
         Self {
-            role: "user".into(),
+            role: Role::User,
             content: content.into(),
         }
     }
@@ -37,7 +95,7 @@ impl ChatMessage {
     /// Create an assistant message.
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            role: "assistant".into(),
+            role: Role::Assistant,
             content: content.into(),
         }
     }
@@ -51,27 +109,19 @@ impl ChatMessage {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum TokenizerError {
-    /// The tokenizer has not been initialized or loaded.
-    #[error("tokenizer not loaded: {0}")]
-    NotLoaded(String),
-
-    /// Failed to encode text into token IDs.
+    /// Failed to encode text into tokens.
     #[error("encoding error: {0}")]
     Encode(String),
 
-    /// Failed to decode token IDs back into text.
+    /// Failed to decode tokens back into text.
     #[error("decoding error: {0}")]
     Decode(String),
-
-    /// Failed to apply or render the chat template.
-    #[error("chat template error: {0}")]
-    Template(String),
 
     /// Failed to load a tokenizer from disk.
     #[error("load error: {0}")]
     Load(String),
 
-    /// An I/O error occurred while reading tokenizer files.
+    /// An I/O error occurred.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -159,7 +209,12 @@ mod hf_impl {
             })
         }
 
-        /// Load from an explicit tokenizer.json path.
+        /// Load from an explicit `tokenizer.json` path.
+        ///
+        /// Unlike [`from_model_dir`](Self::from_model_dir), this does not read
+        /// `tokenizer_config.json` — EOS/BOS tokens and the chat template
+        /// will not be populated. Use this when you only have the raw
+        /// tokenizer file without the surrounding model directory.
         pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TokenizerError> {
             let inner = tokenizers::Tokenizer::from_file(path.as_ref())
                 .map_err(|e| TokenizerError::Load(format!("failed to load tokenizer: {e}")))?;
@@ -169,6 +224,12 @@ mod hf_impl {
                 bos_token: None,
                 chat_template: None,
             })
+        }
+
+        /// Return the chat template string parsed from `tokenizer_config.json`,
+        /// if one was present when the tokenizer was loaded.
+        pub fn chat_template(&self) -> Option<&str> {
+            self.chat_template.as_deref()
         }
 
         fn read_token_config(dir: &Path) -> (Vec<u32>, Option<u32>) {
