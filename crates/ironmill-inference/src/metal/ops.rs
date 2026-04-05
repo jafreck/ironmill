@@ -65,6 +65,8 @@ pub struct MetalPipelines {
     pub rms_norm: ComputePipeline,
     /// SiLU-gated activation kernel.
     pub silu_gate: ComputePipeline,
+    /// GELU-gated activation kernel (Gemma 4).
+    pub ffn_gelu_gate: ComputePipeline,
     /// Rotary positional embedding kernel.
     pub rope: ComputePipeline,
     /// Element-wise residual addition kernel.
@@ -242,6 +244,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &act_lib
                         .get_function("silu_gate")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            ffn_gelu_gate: device
+                .create_compute_pipeline(
+                    &act_lib
+                        .get_function("gelu_gate")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,

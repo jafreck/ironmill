@@ -1522,11 +1522,43 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
             }
 
-            // Steps 12-15: FFN block (gate + up + SiLU + down)
-            encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, layer_inter, token_count)?;
+            // Steps 12-15: FFN block (gate + up + activation + down)
+            let use_gelu = self.gemma4_config.is_some();
+            encode_ffn_block(
+                &enc,
+                pipelines,
+                bufs,
+                lw,
+                lm,
+                h,
+                layer_inter,
+                token_count,
+                use_gelu,
+            )?;
             enc.memory_barrier_buffers();
 
-            // Gemma 4: apply post-feedforward layernorm to MLP output
+            // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
+            // with MoE expert outputs via router → expert FFNs → weighted combine.
+            // Must run BEFORE post_ffn_norm so the norm applies to the combined output.
+            if let Some(ref g4) = self.gemma4_config {
+                let lc = &g4.layer_configs[layer_idx];
+                if lc.enable_moe && g4.num_experts > 0 && !lw.expert_gate_projs.is_empty() {
+                    encode_moe_block(
+                        &enc,
+                        pipelines,
+                        bufs,
+                        lw,
+                        h,
+                        g4.moe_intermediate_size,
+                        token_count,
+                        g4.num_experts,
+                        g4.top_k_experts,
+                    )?;
+                }
+            }
+
+            // Gemma 4: apply post-feedforward layernorm to MLP output (after MoE combine).
+            // HF: hidden_states = self.post_feedforward_layernorm(hidden_states)
             if let Some(ref post_ffn) = lw.post_ffn_norm {
                 ops::encode_rms_norm(
                     &enc,
@@ -1551,25 +1583,6 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
             }
 
-            // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
-            // with MoE expert outputs via router → expert FFNs → weighted combine.
-            if let Some(ref g4) = self.gemma4_config {
-                let lc = &g4.layer_configs[layer_idx];
-                if lc.enable_moe && g4.num_experts > 0 && !lw.expert_gate_projs.is_empty() {
-                    encode_moe_block(
-                        &enc,
-                        pipelines,
-                        bufs,
-                        lw,
-                        h,
-                        g4.moe_intermediate_size,
-                        token_count,
-                        g4.num_experts,
-                        g4.top_k_experts,
-                    )?;
-                }
-            }
-
             // PLE per-layer: gate → GELU → multiply → project → norm → residual add.
             // When PLE is active, we split the fused residual+norm into separate steps
             // so PLE can be inserted between the FFN residual add and next layer's norm.
@@ -1592,17 +1605,6 @@ impl MetalInference {
                 let pipelines = self.pipelines()?;
 
                 // 1. Standalone FFN residual add: hidden_state = residual + ffn_down
-                // Apply layer_scalar to ffn_down before the residual add.
-                if let Some(ref scalar) = lw.layer_scalar {
-                    ops::encode_scale_buffer(
-                        &enc,
-                        &pipelines.scale_buffer,
-                        &bufs.ffn_down,
-                        scalar,
-                        (token_count * h) as u32,
-                    );
-                    enc.memory_barrier_buffers();
-                }
                 ops::encode_residual_add(
                     &enc,
                     &pipelines.residual_add,
@@ -1691,7 +1693,20 @@ impl MetalInference {
                 );
                 enc.memory_barrier_buffers();
 
-                // 7. Next layer's input norm (or skip for last layer)
+                // 7. Layer scalar: HF applies hidden_states *= layer_scalar
+                // AFTER all residual adds (including PLE).
+                if let Some(ref scalar) = lw.layer_scalar {
+                    ops::encode_scale_buffer(
+                        &enc,
+                        &pipelines.scale_buffer,
+                        &bufs.hidden_state,
+                        scalar,
+                        (token_count * h) as u32,
+                    );
+                    enc.memory_barrier_buffers();
+                }
+
+                // 8. Next layer's input norm (or skip for last layer)
                 if layer_idx + 1 < mc.num_hidden_layers {
                     let next_norm = &weights.layers[layer_idx + 1].input_norm;
                     ops::encode_rms_norm(
@@ -1709,32 +1724,60 @@ impl MetalInference {
                 }
                 enc.memory_barrier_buffers();
             } else {
-                // Step 16: Residual add + next layer's input norm (or standalone for last layer)
-                // Apply layer_scalar to ffn_down before the residual add.
-                if let Some(ref scalar) = lw.layer_scalar {
-                    ops::encode_scale_buffer(
+                // Step 16: Residual add + layer_scalar + next layer's input norm.
+                if lw.layer_scalar.is_some() {
+                    // Can't use fused residual+norm: need to insert layer_scalar
+                    // between the residual add and the next-layer norm.
+                    // HF: hidden_states = residual + hidden_states; hidden_states *= layer_scalar
+                    ops::encode_residual_add(
                         &enc,
-                        &pipelines.scale_buffer,
+                        &pipelines.residual_add,
+                        &bufs.residual,
                         &bufs.ffn_down,
-                        scalar,
+                        &bufs.hidden_state,
                         (token_count * h) as u32,
                     );
                     enc.memory_barrier_buffers();
-                }
-                let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
-                    Some(&weights.layers[layer_idx + 1].input_norm)
+                    ops::encode_scale_buffer(
+                        &enc,
+                        &pipelines.scale_buffer,
+                        &bufs.hidden_state,
+                        lw.layer_scalar.as_ref().unwrap(),
+                        (token_count * h) as u32,
+                    );
+                    enc.memory_barrier_buffers();
+                    if layer_idx + 1 < mc.num_hidden_layers {
+                        let next_norm = &weights.layers[layer_idx + 1].input_norm;
+                        ops::encode_rms_norm(
+                            &enc,
+                            &pipelines.rms_norm,
+                            &ops::RmsNormParams {
+                                input: &bufs.hidden_state,
+                                weight: next_norm,
+                                output: &bufs.norm_out,
+                                hidden_size: h as u32,
+                                token_count: token_count as u32,
+                                eps,
+                            },
+                        );
+                    }
                 } else {
-                    None
-                };
-                encode_end_of_layer_residual(
-                    &enc,
-                    pipelines,
-                    bufs,
-                    next_norm,
-                    h,
-                    token_count,
-                    eps,
-                )?;
+                    // No layer_scalar: use fused residual + norm for efficiency.
+                    let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
+                        Some(&weights.layers[layer_idx + 1].input_norm)
+                    } else {
+                        None
+                    };
+                    encode_end_of_layer_residual(
+                        &enc,
+                        pipelines,
+                        bufs,
+                        next_norm,
+                        h,
+                        token_count,
+                        eps,
+                    )?;
+                }
                 enc.memory_barrier_buffers();
             }
         }
@@ -2455,11 +2498,42 @@ impl MetalInference {
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
 
-            // Steps 12-15: FFN block (gate + up + SiLU + down)
-            encode_ffn_block(&enc, pipelines, bufs, lw, lm, h, layer_inter, token_count)?;
+            // Steps 12-15: FFN block (gate + up + activation + down)
+            let use_gelu = self.gemma4_config.is_some();
+            encode_ffn_block(
+                &enc,
+                pipelines,
+                bufs,
+                lw,
+                lm,
+                h,
+                layer_inter,
+                token_count,
+                use_gelu,
+            )?;
             enc.memory_barrier_buffers();
 
-            // Gemma 4: apply post-feedforward layernorm to MLP output
+            // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
+            // with MoE expert outputs via router → expert FFNs → weighted combine.
+            // Must run BEFORE post_ffn_norm so the norm applies to the combined output.
+            if let Some(ref g4) = self.gemma4_config {
+                let lc = &g4.layer_configs[layer_idx];
+                if lc.enable_moe && g4.num_experts > 0 && !lw.expert_gate_projs.is_empty() {
+                    encode_moe_block(
+                        &enc,
+                        pipelines,
+                        bufs,
+                        lw,
+                        h,
+                        g4.moe_intermediate_size,
+                        token_count,
+                        g4.num_experts,
+                        g4.top_k_experts,
+                    )?;
+                }
+            }
+
+            // Gemma 4: apply post-feedforward layernorm to MLP output (after MoE combine).
             if let Some(ref post_ffn) = lw.post_ffn_norm {
                 ops::encode_rms_norm(
                     &enc,
@@ -2484,25 +2558,6 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
             }
 
-            // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
-            // with MoE expert outputs via router → expert FFNs → weighted combine.
-            if let Some(ref g4) = self.gemma4_config {
-                let lc = &g4.layer_configs[layer_idx];
-                if lc.enable_moe && g4.num_experts > 0 && !lw.expert_gate_projs.is_empty() {
-                    encode_moe_block(
-                        &enc,
-                        pipelines,
-                        bufs,
-                        lw,
-                        h,
-                        g4.moe_intermediate_size,
-                        token_count,
-                        g4.num_experts,
-                        g4.top_k_experts,
-                    )?;
-                }
-            }
-
             // PLE per-layer dispatch (same logic as run_pipeline_inner).
             let has_ple = self
                 .gemma4_config
@@ -2521,17 +2576,7 @@ impl MetalInference {
                 let ple_buf = bufs.ple_per_layer_input.as_ref().unwrap();
                 let ple_scratch = bufs.ple_scratch.as_ref().unwrap();
 
-                // Apply layer_scalar to ffn_down before the residual add.
-                if let Some(ref scalar) = lw.layer_scalar {
-                    ops::encode_scale_buffer(
-                        &enc,
-                        &pipelines.scale_buffer,
-                        &bufs.ffn_down,
-                        scalar,
-                        (token_count * h) as u32,
-                    );
-                    enc.memory_barrier_buffers();
-                }
+                // Residual add: hidden_state = residual + ffn_down
                 ops::encode_residual_add(
                     &enc,
                     &pipelines.residual_add,
@@ -2615,6 +2660,18 @@ impl MetalInference {
                 );
                 enc.memory_barrier_buffers();
 
+                // Layer scalar: applied AFTER all residual adds (including PLE).
+                if let Some(ref scalar) = lw.layer_scalar {
+                    ops::encode_scale_buffer(
+                        &enc,
+                        &pipelines.scale_buffer,
+                        &bufs.hidden_state,
+                        scalar,
+                        (token_count * h) as u32,
+                    );
+                    enc.memory_barrier_buffers();
+                }
+
                 if layer_idx + 1 < mc.num_hidden_layers {
                     let next_norm = &weights.layers[layer_idx + 1].input_norm;
                     ops::encode_rms_norm(
@@ -2631,32 +2688,56 @@ impl MetalInference {
                     );
                 }
             } else {
-                // Step 16: Residual add + next layer's input norm (or standalone for last layer)
-                // Apply layer_scalar to ffn_down before the residual add.
-                if let Some(ref scalar) = lw.layer_scalar {
-                    ops::encode_scale_buffer(
+                // Step 16: Residual add + layer_scalar + next layer's input norm.
+                if lw.layer_scalar.is_some() {
+                    ops::encode_residual_add(
                         &enc,
-                        &pipelines.scale_buffer,
+                        &pipelines.residual_add,
+                        &bufs.residual,
                         &bufs.ffn_down,
-                        scalar,
+                        &bufs.hidden_state,
                         (token_count * h) as u32,
                     );
                     enc.memory_barrier_buffers();
-                }
-                let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
-                    Some(&weights.layers[layer_idx + 1].input_norm)
+                    ops::encode_scale_buffer(
+                        &enc,
+                        &pipelines.scale_buffer,
+                        &bufs.hidden_state,
+                        lw.layer_scalar.as_ref().unwrap(),
+                        (token_count * h) as u32,
+                    );
+                    enc.memory_barrier_buffers();
+                    if layer_idx + 1 < mc.num_hidden_layers {
+                        let next_norm = &weights.layers[layer_idx + 1].input_norm;
+                        ops::encode_rms_norm(
+                            &enc,
+                            &pipelines.rms_norm,
+                            &ops::RmsNormParams {
+                                input: &bufs.hidden_state,
+                                weight: next_norm,
+                                output: &bufs.norm_out,
+                                hidden_size: h as u32,
+                                token_count: token_count as u32,
+                                eps,
+                            },
+                        );
+                    }
                 } else {
-                    None
-                };
-                encode_end_of_layer_residual(
-                    &enc,
-                    pipelines,
-                    bufs,
-                    next_norm,
-                    h,
-                    token_count,
-                    eps,
-                )?;
+                    let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
+                        Some(&weights.layers[layer_idx + 1].input_norm)
+                    } else {
+                        None
+                    };
+                    encode_end_of_layer_residual(
+                        &enc,
+                        pipelines,
+                        bufs,
+                        next_norm,
+                        h,
+                        token_count,
+                        eps,
+                    )?;
+                }
             }
             enc.end_encoding();
 
@@ -3708,6 +3789,7 @@ fn encode_ffn_block(
     h: usize,
     inter: usize,
     token_count: usize,
+    use_gelu: bool,
 ) -> Result<(), InferenceError> {
     let row_bytes_h = h * 2;
     let row_bytes_inter = inter * 2;
@@ -3749,10 +3831,16 @@ fn encode_ffn_block(
 
     enc.memory_barrier_buffers();
 
-    // SiLU gate
+    // Gated activation: GELU-tanh for Gemma 4, SiLU for other architectures.
+    // Both kernels share the same buffer layout (gate, up, output, size).
+    let act_pipeline = if use_gelu {
+        &pipelines.ffn_gelu_gate
+    } else {
+        &pipelines.silu_gate
+    };
     ops::encode_silu_gate(
         enc,
-        &pipelines.silu_gate,
+        act_pipeline,
         &bufs.ffn_gate,
         &bufs.ffn_up,
         &bufs.ffn_gate, // in-place output into gate buffer
