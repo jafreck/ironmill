@@ -40,6 +40,7 @@ fn main() {
         "fused_embedding_norm",
         "int4_dequant",
         "affine_matmul",
+        "d2quant_matmul",
         "quip_sharp",
         "fused_softcap",
         "ple_kernels",

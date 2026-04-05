@@ -28,6 +28,8 @@ pub enum WeightBuffer {
     /// Dequantized to FP16 at inference time via a Metal compute kernel
     /// before feeding into MPS matmul.
     AffineQuantized(AffineQuantizedWeight),
+    /// D2Quant dual-scale quantized weight kept packed on GPU.
+    DualScaleQuantized(DualScaleQuantizedWeight),
 }
 
 impl WeightBuffer {
@@ -36,7 +38,9 @@ impl WeightBuffer {
     pub fn as_dense(&self) -> anyhow::Result<&MetalBuffer> {
         match self {
             WeightBuffer::Dense { buf, .. } => Ok(buf),
-            WeightBuffer::Quantized(_) | WeightBuffer::AffineQuantized(_) => Err(anyhow::anyhow!(
+            WeightBuffer::Quantized(_)
+            | WeightBuffer::AffineQuantized(_)
+            | WeightBuffer::DualScaleQuantized(_) => Err(anyhow::anyhow!(
                 "expected dense buffer, got quantized weight"
             )),
         }
@@ -48,7 +52,9 @@ impl WeightBuffer {
     pub fn packed_buf(&self) -> Option<&MetalBuffer> {
         match self {
             WeightBuffer::Dense { packed, .. } => packed.as_ref(),
-            WeightBuffer::Quantized(_) | WeightBuffer::AffineQuantized(_) => None,
+            WeightBuffer::Quantized(_)
+            | WeightBuffer::AffineQuantized(_)
+            | WeightBuffer::DualScaleQuantized(_) => None,
         }
     }
 }
@@ -88,6 +94,30 @@ pub struct AffineQuantizedWeight {
     /// When present, the kernel divides dequantized weights by these
     /// scales to compensate for activation-aware weight scaling.
     pub awq_scales: Option<MetalBuffer>,
+}
+
+/// D2Quant dual-scale quantized weight stored as packed 3-bit data with
+/// per-group dual-scale parameters on GPU. Dequantized inline during
+/// matmul via fused Metal compute kernels.
+pub struct DualScaleQuantizedWeight {
+    /// Packed 3-bit (or 2-bit) quantized data, row-major.
+    pub data: MetalBuffer,
+    /// Per-group FP32 normal-partition scales.
+    pub normal_scale: MetalBuffer,
+    /// Per-group FP32 normal-partition zero points.
+    pub normal_zero: MetalBuffer,
+    /// Per-group FP32 outlier-partition scales.
+    pub outlier_scale: MetalBuffer,
+    /// Per-group FP32 outlier-partition zero points.
+    pub outlier_zero: MetalBuffer,
+    /// Packed outlier mask (1 bit per weight).
+    pub outlier_mask: MetalBuffer,
+    /// Group size for quantization parameters.
+    pub group_size: u32,
+    /// Quantization bit width (2 or 3).
+    pub bit_width: u8,
+    /// `(out_features, in_features)` — logical element dimensions.
+    pub shape: (usize, usize),
 }
 
 /// Weights for a single transformer layer (type alias over shared layout).
@@ -472,23 +502,57 @@ fn load_weight_buffer(
             bit_width,
             group_size,
         } => {
-            let data = super::dequant::dequant_dual_scale(
-                quantized_data,
-                normal_scale,
-                normal_zero,
-                outlier_scale,
-                outlier_zero,
-                outlier_mask,
-                original_shape,
-                *bit_width,
-                *group_size,
-            )?;
-            let buf = device
-                .create_buffer_with_data(&data, StorageMode::Shared)
+            if force_cpu_dequant {
+                let data = super::dequant::dequant_dual_scale(
+                    quantized_data,
+                    normal_scale,
+                    normal_zero,
+                    outlier_scale,
+                    outlier_zero,
+                    outlier_mask,
+                    original_shape,
+                    *bit_width,
+                    *group_size,
+                )?;
+                let buf = device
+                    .create_buffer_with_data(&data, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+                let (n, k) = dense_shape(original_shape);
+                let packed = pack_weight_blocked(device, &buf, n, k)?;
+                return Ok(WeightBuffer::Dense { buf, packed });
+            }
+
+            // Upload packed data + params to GPU — no CPU dequant needed.
+            let data_buf = device
+                .create_buffer_with_data(quantized_data, StorageMode::Shared)
+                .map_err(MetalError::Metal)?;
+            let ns_buf = device
+                .create_buffer_with_data(normal_scale, StorageMode::Shared)
+                .map_err(MetalError::Metal)?;
+            let nz_buf = device
+                .create_buffer_with_data(normal_zero, StorageMode::Shared)
+                .map_err(MetalError::Metal)?;
+            let os_buf = device
+                .create_buffer_with_data(outlier_scale, StorageMode::Shared)
+                .map_err(MetalError::Metal)?;
+            let oz_buf = device
+                .create_buffer_with_data(outlier_zero, StorageMode::Shared)
+                .map_err(MetalError::Metal)?;
+            let mask_buf = device
+                .create_buffer_with_data(outlier_mask, StorageMode::Shared)
                 .map_err(MetalError::Metal)?;
             let (n, k) = dense_shape(original_shape);
-            let packed = pack_weight_blocked(device, &buf, n, k)?;
-            Ok(WeightBuffer::Dense { buf, packed })
+            Ok(WeightBuffer::DualScaleQuantized(DualScaleQuantizedWeight {
+                data: data_buf,
+                normal_scale: ns_buf,
+                normal_zero: nz_buf,
+                outlier_scale: os_buf,
+                outlier_zero: oz_buf,
+                outlier_mask: mask_buf,
+                group_size: *group_size as u32,
+                bit_width: *bit_width,
+                shape: (n, k),
+            }))
         }
         other => Err(MetalError::WeightLoading(format!(
             "{name}: unsupported quant_info variant: {other:?}"

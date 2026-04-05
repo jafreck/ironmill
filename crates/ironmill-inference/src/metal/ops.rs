@@ -141,6 +141,10 @@ pub struct MetalPipelines {
     pub moe_mul: ComputePipeline,
     /// MoE weighted expert combination kernel.
     pub moe_weighted_combine: ComputePipeline,
+    /// D2Quant 3-bit matvec kernel.
+    pub d2quant_matvec_3bit: ComputePipeline,
+    /// D2Quant 3-bit matmul kernel.
+    pub d2quant_matmul_3bit: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -235,6 +239,12 @@ impl MetalPipelines {
             .load_library_from_data(include_bytes!(concat!(
                 env!("OUT_DIR"),
                 "/affine_matmul.metallib"
+            )))
+            .map_err(MetalError::Metal)?;
+        let d2quant_mm_lib = device
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/d2quant_matmul.metallib"
             )))
             .map_err(MetalError::Metal)?;
 
@@ -543,6 +553,20 @@ impl MetalPipelines {
                     )
                     .map_err(MetalError::Metal)?
             },
+            d2quant_matvec_3bit: device
+                .create_compute_pipeline(
+                    &d2quant_mm_lib
+                        .get_function("d2quant_matvec_3bit")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            d2quant_matmul_3bit: device
+                .create_compute_pipeline(
+                    &d2quant_mm_lib
+                        .get_function("d2quant_matmul_3bit")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
         })
     }
 
@@ -697,6 +721,20 @@ impl MetalPipelines {
             (4, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int4),
             (8, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int8),
             (8, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int8),
+            _ => None,
+        }
+    }
+
+    /// Select the D2Quant dual-scale pipeline for a given bit-width and phase.
+    #[inline]
+    pub fn d2quant_pipeline(
+        &self,
+        bit_width: u32,
+        kind: LinearKernelKind,
+    ) -> Option<&ComputePipeline> {
+        match (bit_width, kind) {
+            (3, LinearKernelKind::Matvec) => Some(&self.d2quant_matvec_3bit),
+            (3, LinearKernelKind::Matmul) => Some(&self.d2quant_matmul_3bit),
             _ => None,
         }
     }

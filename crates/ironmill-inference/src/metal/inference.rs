@@ -25,7 +25,8 @@ use super::turboquant::{
     MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantLayerConfig, TurboQuantMetalConfig,
 };
 use super::weights::{
-    AffineQuantizedWeight, LayerWeights, MetalWeights, QuantizedWeight, WeightBuffer,
+    AffineQuantizedWeight, DualScaleQuantizedWeight, LayerWeights, MetalWeights, QuantizedWeight,
+    WeightBuffer,
 };
 use crate::calibration::ActivationHook;
 use crate::engine::{InferenceEngine, InferenceError};
@@ -925,6 +926,8 @@ impl MetalInference {
                 WeightBuffer::Quantized(_) => Ok(ProjectionMatmul::Quantized),
                 // AffineQuantized uses fused compute kernels — no MPS matmul needed.
                 WeightBuffer::AffineQuantized(_) => Ok(ProjectionMatmul::Quantized),
+                // DualScaleQuantized uses fused compute kernels — no MPS matmul needed.
+                WeightBuffer::DualScaleQuantized(_) => Ok(ProjectionMatmul::Quantized),
             }
         };
 
@@ -3330,6 +3333,17 @@ fn encode_projection(
                 token_count,
             )?;
         }
+        WeightBuffer::DualScaleQuantized(dq) => {
+            encode_d2quant_projection(
+                enc,
+                input_buf,
+                dq,
+                output_buf,
+                pipelines,
+                kernel_kind,
+                token_count,
+            )?;
+        }
     }
     Ok(())
 }
@@ -3445,6 +3459,67 @@ fn encode_affine_projection(
             encoder.set_buffer(&weight.data, 0, 9);
         }
         encoder.set_bytes(&has_awq.to_le_bytes(), 10);
+        encoder.dispatch_threadgroups(
+            (
+                token_count.div_ceil(MATMUL_TM_TILE),
+                n.div_ceil(MATMUL_TN_TILE),
+                1,
+            ),
+            (MATMUL_THREADS_PER_TG, 1, 1),
+        );
+    }
+    Ok(())
+}
+
+// ── D2Quant kernel dispatch ────────────────────────────────────
+
+/// Encode a fused D2Quant dual-scale quantized projection via compute kernel.
+///
+/// Dispatches to the correct Metal kernel based on `bit_width` and kernel kind:
+/// - Matvec (`LinearKernelKind::Matvec`): one threadgroup per output row
+/// - Matmul (`LinearKernelKind::Matmul`): tiled matmul with `token_count` rows
+#[allow(clippy::too_many_arguments)]
+fn encode_d2quant_projection(
+    encoder: &ironmill_metal_sys::ComputeEncoder,
+    input: &MetalBuffer,
+    weight: &DualScaleQuantizedWeight,
+    output: &MetalBuffer,
+    pipelines: &super::ops::MetalPipelines,
+    kind: LinearKernelKind,
+    token_count: usize,
+) -> Result<(), InferenceError> {
+    let (n, k) = weight.shape;
+
+    let pipeline = pipelines
+        .d2quant_pipeline(weight.bit_width.into(), kind)
+        .ok_or_else(|| {
+            InferenceError::runtime(format!(
+                "unsupported d2quant bit_width: {}",
+                weight.bit_width
+            ))
+        })?;
+
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(input, 0, 0);
+    encoder.set_buffer(&weight.data, 0, 1);
+    encoder.set_buffer(&weight.normal_scale, 0, 2);
+    encoder.set_buffer(&weight.normal_zero, 0, 3);
+    encoder.set_buffer(&weight.outlier_scale, 0, 4);
+    encoder.set_buffer(&weight.outlier_zero, 0, 5);
+    encoder.set_buffer(&weight.outlier_mask, 0, 6);
+    encoder.set_buffer(output, 0, 7);
+
+    if kind.is_decode() {
+        encoder.set_bytes(&(n as u32).to_le_bytes(), 8);
+        encoder.set_bytes(&(k as u32).to_le_bytes(), 9);
+        encoder.set_bytes(&weight.group_size.to_le_bytes(), 10);
+        let threads_per_group = 32;
+        encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
+    } else {
+        encoder.set_bytes(&(token_count as u32).to_le_bytes(), 8);
+        encoder.set_bytes(&(n as u32).to_le_bytes(), 9);
+        encoder.set_bytes(&(k as u32).to_le_bytes(), 10);
+        encoder.set_bytes(&weight.group_size.to_le_bytes(), 11);
         encoder.dispatch_threadgroups(
             (
                 token_count.div_ceil(MATMUL_TM_TILE),
