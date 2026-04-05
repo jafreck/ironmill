@@ -171,8 +171,12 @@ impl Pass for AwqQuantizePass {
 
                 if let Value::Tensor { data, shape, dtype } = val {
                     let floats = match dtype {
-                        ScalarType::Float32 => tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
-                        ScalarType::Float16 => tensor_f16_as_f32_slice(data.as_bytes().expect("tensor not materialized")),
+                        ScalarType::Float32 => {
+                            tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized"))
+                        }
+                        ScalarType::Float16 => tensor_f16_as_f32_slice(
+                            data.as_bytes().expect("tensor not materialized"),
+                        ),
                         other => {
                             return Err(MilError::TypeMismatch {
                                 expected: "Float32 or Float16".into(),
@@ -430,7 +434,7 @@ fn compute_scales(magnitudes: &[f32], alpha: f32) -> Vec<f32> {
 /// (matching the reference which uses PyTorch GPU tensor ops).
 ///
 /// Returns a flat array of optimal `max_val` per (row, group).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn search_clip_ranges(
     scaled_weights: &[f32],
     out_features: usize,

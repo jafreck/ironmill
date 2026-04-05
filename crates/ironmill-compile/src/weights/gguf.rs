@@ -1142,6 +1142,7 @@ fn dequant_q4_1_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilE
 ///   - 16 bytes: 32 × 4-bit low nibbles packed 2-per-byte (low nibble first)
 ///
 /// Dequantization: `value = d * (((high_bit << 4) | low_nibble) - 16)`
+#[allow(clippy::needless_range_loop)]
 fn dequant_q5_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 22;
@@ -1195,6 +1196,7 @@ fn dequant_q5_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilE
 ///   - 16 bytes: 32 × 4-bit low nibbles packed 2-per-byte (low nibble first)
 ///
 /// Dequantization: `value = d * ((high_bit << 4) | low_nibble) + m`
+#[allow(clippy::needless_range_loop)]
 fn dequant_q5_1_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 24;
@@ -1280,7 +1282,7 @@ fn dequant_q6_k_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilE
         for h in 0..2u32 {
             for l in 0..32u32 {
                 let q1 = (ql[(h * 64 + l) as usize] & 0x0F) as i32
-                    | ((((qh[(h * 32 + l) as usize] >> 0) & 3) as i32) << 4);
+                    | (((qh[(h * 32 + l) as usize] & 3) as i32) << 4);
                 let q2 = (ql[(h * 64 + l + 32) as usize] & 0x0F) as i32
                     | ((((qh[(h * 32 + l) as usize] >> 2) & 3) as i32) << 4);
                 let q3 = ((ql[(h * 64 + l) as usize] >> 4) & 0x0F) as i32

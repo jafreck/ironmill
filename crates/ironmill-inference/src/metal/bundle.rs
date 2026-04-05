@@ -129,6 +129,7 @@ impl WeightProvider for MetalBundleProvider {
                 axis,
                 dtype,
                 awq_scales_file,
+                ..
             } => {
                 let quantized_data = self.read_file(quantized_data_file)?;
                 let scale = self.read_file(scales_file)?;
