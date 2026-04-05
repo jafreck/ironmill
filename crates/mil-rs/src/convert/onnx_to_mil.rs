@@ -29,78 +29,78 @@ use crate::proto::onnx::{NodeProto, TensorProto};
 pub fn convert_node(node: &NodeProto) -> Result<Vec<Operation>> {
     match node.op_type.as_str() {
         // P0 — Essential ops
-        "Conv" => convert_conv(node),
-        "MatMul" => convert_matmul(node),
-        "Gemm" => convert_gemm(node),
-        "Relu" => convert_unary(node, "relu"),
-        "Add" => convert_binary(node, "add"),
-        "Mul" => convert_binary(node, "mul"),
-        "Reshape" => convert_reshape(node),
-        "Transpose" => convert_transpose(node),
-        "Softmax" => convert_softmax(node),
-        "BatchNormalization" => convert_batch_norm(node),
-        "MaxPool" => convert_pool(node, "max_pool"),
-        "AveragePool" => convert_pool(node, "avg_pool"),
-        "GlobalAveragePool" => convert_global_pool(node, "avg_pool"),
-        "Concat" => convert_concat(node),
-        "Flatten" => convert_flatten(node),
+        "Conv" => Ok(convert_conv(node)),
+        "MatMul" => Ok(convert_matmul(node)),
+        "Gemm" => Ok(convert_gemm(node)),
+        "Relu" => Ok(convert_unary(node, "relu")),
+        "Add" => Ok(convert_binary(node, "add")),
+        "Mul" => Ok(convert_binary(node, "mul")),
+        "Reshape" => Ok(convert_reshape(node)),
+        "Transpose" => Ok(convert_transpose(node)),
+        "Softmax" => Ok(convert_softmax(node)),
+        "BatchNormalization" => Ok(convert_batch_norm(node)),
+        "MaxPool" => Ok(convert_pool(node, "max_pool")),
+        "AveragePool" => Ok(convert_pool(node, "avg_pool")),
+        "GlobalAveragePool" => Ok(convert_global_pool(node, "avg_pool")),
+        "Concat" => Ok(convert_concat(node)),
+        "Flatten" => Ok(convert_flatten(node)),
 
         // P1 — Important ops
-        "Sigmoid" => convert_unary(node, "sigmoid"),
-        "Tanh" => convert_unary(node, "tanh"),
-        "Clip" => convert_clip(node),
-        "Gather" => convert_gather(node),
-        "Unsqueeze" => convert_unsqueeze(node),
-        "Squeeze" => convert_squeeze(node),
-        "Slice" => convert_slice(node),
-        "Pad" => convert_pad(node),
-        "ReduceMean" => convert_reduce_mean(node),
-        "LayerNormalization" => convert_layer_norm(node),
+        "Sigmoid" => Ok(convert_unary(node, "sigmoid")),
+        "Tanh" => Ok(convert_unary(node, "tanh")),
+        "Clip" => Ok(convert_clip(node)),
+        "Gather" => Ok(convert_gather(node)),
+        "Unsqueeze" => Ok(convert_unsqueeze(node)),
+        "Squeeze" => Ok(convert_squeeze(node)),
+        "Slice" => Ok(convert_slice(node)),
+        "Pad" => Ok(convert_pad(node)),
+        "ReduceMean" => Ok(convert_reduce_mean(node)),
+        "LayerNormalization" => Ok(convert_layer_norm(node)),
         "Cast" => convert_cast(node),
         "Constant" => convert_constant(node),
 
         // P2 — Additional ops
-        "Shape" => convert_shape(node),
-        "Split" => convert_split(node),
-        "Where" => convert_where(node),
-        "Pow" => convert_binary(node, "pow"),
-        "Sqrt" => convert_unary(node, "sqrt"),
-        "Div" => convert_binary(node, "real_div"),
-        "Sub" => convert_binary(node, "sub"),
-        "Erf" => convert_unary(node, "erf"),
-        "ConvTranspose" => convert_conv_transpose(node),
-        "Resize" => convert_resize(node),
+        "Shape" => Ok(convert_shape(node)),
+        "Split" => Ok(convert_split(node)),
+        "Where" => Ok(convert_where(node)),
+        "Pow" => Ok(convert_binary(node, "pow")),
+        "Sqrt" => Ok(convert_unary(node, "sqrt")),
+        "Div" => Ok(convert_binary(node, "real_div")),
+        "Sub" => Ok(convert_binary(node, "sub")),
+        "Erf" => Ok(convert_unary(node, "erf")),
+        "ConvTranspose" => Ok(convert_conv_transpose(node)),
+        "Resize" => Ok(convert_resize(node)),
 
         // Dropout is an identity in inference mode.
-        "Dropout" => convert_identity(node),
+        "Dropout" => Ok(convert_identity(node)),
 
         // P3 — Transformer / LLM ops
-        "Sin" => convert_unary(node, "sin"),
-        "Cos" => convert_unary(node, "cos"),
-        "Neg" => convert_unary(node, "neg"),
-        "Reciprocal" => convert_unary(node, "reciprocal"),
-        "Gelu" => convert_unary(node, "gelu"),
-        "Silu" => convert_unary(node, "silu"),
-        "Log" => convert_unary(node, "log"),
-        "Exp" => convert_unary(node, "exp"),
-        "Abs" => convert_unary(node, "abs"),
-        "Ceil" => convert_unary(node, "ceil"),
-        "Floor" => convert_unary(node, "floor"),
-        "Identity" => convert_identity(node),
-        "Equal" => convert_binary(node, "equal"),
-        "Less" => convert_binary(node, "less"),
-        "Greater" => convert_binary(node, "greater"),
-        "Not" => convert_unary(node, "logical_not"),
-        "CumSum" => convert_cumsum(node),
-        "Tile" => convert_tile(node),
-        "Expand" => convert_expand(node),
-        "ReduceSum" => convert_reduce_sum(node),
+        "Sin" => Ok(convert_unary(node, "sin")),
+        "Cos" => Ok(convert_unary(node, "cos")),
+        "Neg" => Ok(convert_unary(node, "neg")),
+        "Reciprocal" => Ok(convert_unary(node, "reciprocal")),
+        "Gelu" => Ok(convert_unary(node, "gelu")),
+        "Silu" => Ok(convert_unary(node, "silu")),
+        "Log" => Ok(convert_unary(node, "log")),
+        "Exp" => Ok(convert_unary(node, "exp")),
+        "Abs" => Ok(convert_unary(node, "abs")),
+        "Ceil" => Ok(convert_unary(node, "ceil")),
+        "Floor" => Ok(convert_unary(node, "floor")),
+        "Identity" => Ok(convert_identity(node)),
+        "Equal" => Ok(convert_binary(node, "equal")),
+        "Less" => Ok(convert_binary(node, "less")),
+        "Greater" => Ok(convert_binary(node, "greater")),
+        "Not" => Ok(convert_unary(node, "logical_not")),
+        "CumSum" => Ok(convert_cumsum(node)),
+        "Tile" => Ok(convert_tile(node)),
+        "Expand" => Ok(convert_expand(node)),
+        "ReduceSum" => Ok(convert_reduce_sum(node)),
 
         // P4 — ONNX Runtime contrib ops (com.microsoft domain)
-        "SimplifiedLayerNormalization" => convert_simplified_layer_norm(node),
-        "SkipSimplifiedLayerNormalization" => convert_skip_simplified_layer_norm(node),
-        "RotaryEmbedding" => convert_rotary_embedding(node),
-        "GroupQueryAttention" => convert_group_query_attention(node),
+        "SimplifiedLayerNormalization" => Ok(convert_simplified_layer_norm(node)),
+        "SkipSimplifiedLayerNormalization" => Ok(convert_skip_simplified_layer_norm(node)),
+        "RotaryEmbedding" => Ok(convert_rotary_embedding(node)),
+        "GroupQueryAttention" => Ok(convert_group_query_attention(node)),
 
         other => Err(MilError::UnsupportedOp(other.to_string())),
     }
@@ -270,18 +270,18 @@ fn onnx_dtype_to_mil(dtype: i32) -> Result<&'static str> {
 // ---------------------------------------------------------------------------
 
 /// Convert a generic unary op (relu, sigmoid, tanh, sqrt, erf, shape).
-fn convert_unary(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
+fn convert_unary(node: &NodeProto, mil_op: &str) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x"]);
     let mut op = Operation::new(mil_op, op_name(node));
     op.inputs = inputs;
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Convert a node to an identity op (pass-through).
 ///
 /// Used for ops like Dropout that are identity in inference mode.
 /// Only the first output is wired; extra outputs (e.g. mask) are ignored.
-fn convert_identity(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_identity(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x"]);
     let mut op = Operation::new("identity", op_name(node));
     op.inputs = inputs;
@@ -289,19 +289,19 @@ fn convert_identity(node: &NodeProto) -> Result<Vec<Operation>> {
     if let Some(out) = node.output.first() {
         op = op.with_output(out.clone());
     }
-    Ok(vec![op])
+    vec![op]
 }
 
 /// Convert a generic binary op (add, mul, sub, div, pow).
-fn convert_binary(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
+fn convert_binary(node: &NodeProto, mil_op: &str) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "y"]);
     let mut op = Operation::new(mil_op, op_name(node));
     op.inputs = inputs;
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Conv: map kernel_shape, strides, pads, dilations, group attributes.
-fn convert_conv(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_conv(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "weight", "bias"]);
     let mut op = Operation::new("conv", op_name(node));
     op.inputs = inputs;
@@ -353,32 +353,32 @@ fn convert_conv(node: &NodeProto) -> Result<Vec<Operation>> {
         }
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// MatMul: direct mapping with default transpose flags.
-fn convert_matmul(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_matmul(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "y"]);
     let mut op = Operation::new("matmul", op_name(node));
     op.inputs = inputs;
     op = op.with_attr("transpose_x", Value::Bool(false));
     op = op.with_attr("transpose_y", Value::Bool(false));
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Gemm: map alpha, beta, transA, transB to linear.
-fn convert_gemm(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_gemm(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "weight", "bias"]);
     let mut op = Operation::new("linear", op_name(node));
     op.inputs = inputs;
     // ONNX Gemm's alpha, beta, transA, transB are not supported by CoreML's
     // linear op. Most ONNX models use default values (alpha=1, beta=1,
     // transA=0, transB=1) which matches CoreML's linear semantics.
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Reshape: map shape input.
-fn convert_reshape(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_reshape(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "shape"]);
     let mut op = Operation::new("reshape", op_name(node));
     op.inputs = inputs;
@@ -387,11 +387,11 @@ fn convert_reshape(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("allowzero", Value::Bool(allowzero != 0));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Transpose: map perm attribute.
-fn convert_transpose(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_transpose(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x"]);
     let mut op = Operation::new("transpose", op_name(node));
     op.inputs = inputs;
@@ -400,11 +400,11 @@ fn convert_transpose(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("perm", int_tensor_value(&perm));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Softmax: map axis attribute.
-fn convert_softmax(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_softmax(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x"]);
     let mut op = Operation::new("softmax", op_name(node));
     op.inputs = inputs;
@@ -413,11 +413,11 @@ fn convert_softmax(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("axis", Value::Int(axis));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// BatchNormalization: map epsilon, momentum; ONNX inputs → MIL named inputs.
-fn convert_batch_norm(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_batch_norm(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "gamma", "beta", "mean", "variance"]);
     let mut op = Operation::new("batch_norm", op_name(node));
     op.inputs = inputs;
@@ -428,11 +428,11 @@ fn convert_batch_norm(node: &NodeProto) -> Result<Vec<Operation>> {
     // momentum is an ONNX training-only parameter; CoreML MIL does not
     // recognise it, so we intentionally skip it.
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// MaxPool / AveragePool: map kernel_shape, strides, pads.
-fn convert_pool(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
+fn convert_pool(node: &NodeProto, mil_op: &str) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x"]);
     let mut op = Operation::new(mil_op, op_name(node));
     op.inputs = inputs;
@@ -472,11 +472,11 @@ fn convert_pool(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
         );
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// GlobalAveragePool: maps to avg_pool with a `global` flag.
-fn convert_global_pool(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>> {
+fn convert_global_pool(node: &NodeProto, mil_op: &str) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x"]);
     let mut op = Operation::new(mil_op, op_name(node));
     op.inputs = inputs;
@@ -484,11 +484,11 @@ fn convert_global_pool(node: &NodeProto, mil_op: &str) -> Result<Vec<Operation>>
     // kernel_sizes in propagate_output_types once the input shape is known.
     // Mark as global via an internal attribute (skipped in proto serialization).
     op = op.with_attr("global_pool", Value::Bool(true));
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Concat: all ONNX inputs gathered into a single `values` list.
-fn convert_concat(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_concat(node: &NodeProto) -> Vec<Operation> {
     let values = Value::List(
         node.input
             .iter()
@@ -505,12 +505,12 @@ fn convert_concat(node: &NodeProto) -> Result<Vec<Operation>> {
     }
     op = op.with_attr("interleave", Value::Bool(false));
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Flatten → reshape with `flatten_axis` attribute. The graph builder
 /// computes the concrete output shape.
-fn convert_flatten(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_flatten(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x"]);
     let mut op = Operation::new("reshape", op_name(node));
     op.inputs = inputs;
@@ -518,7 +518,7 @@ fn convert_flatten(node: &NodeProto) -> Result<Vec<Operation>> {
     let axis = get_int_attr(node, "axis").unwrap_or(1);
     op = op.with_attr("flatten_axis", Value::Int(axis));
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +527,7 @@ fn convert_flatten(node: &NodeProto) -> Result<Vec<Operation>> {
 
 /// Clip: clamp values to [min, max]. Handles both attribute (opset < 11)
 /// and input (opset ≥ 11) forms.
-fn convert_clip(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_clip(node: &NodeProto) -> Vec<Operation> {
     let mut op = Operation::new("clip", op_name(node));
 
     // Input form (opset ≥ 11): [input, min, max]
@@ -553,11 +553,11 @@ fn convert_clip(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("beta", Value::Float(max as f64));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Gather: map axis attribute.
-fn convert_gather(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_gather(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "indices"]);
     let mut op = Operation::new("gather", op_name(node));
     op.inputs = inputs;
@@ -580,14 +580,14 @@ fn convert_gather(node: &NodeProto) -> Result<Vec<Operation>> {
         op.inputs
             .insert("indices".to_string(), Value::Reference(cast_output));
 
-        return Ok(vec![cast_op, with_outputs(op, node)]);
+        return vec![cast_op, with_outputs(op, node)];
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Unsqueeze: handles both attribute (opset < 13) and input (opset ≥ 13) forms.
-fn convert_unsqueeze(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_unsqueeze(node: &NodeProto) -> Vec<Operation> {
     let mut op = Operation::new("expand_dims", op_name(node));
 
     if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
@@ -605,11 +605,11 @@ fn convert_unsqueeze(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("axes", int_tensor_value(&axes));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Squeeze: handles both attribute (opset < 13) and input (opset ≥ 13) forms.
-fn convert_squeeze(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_squeeze(node: &NodeProto) -> Vec<Operation> {
     let mut op = Operation::new("squeeze", op_name(node));
 
     if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
@@ -625,19 +625,19 @@ fn convert_squeeze(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("axes", int_tensor_value(&axes));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Slice: ONNX inputs are [data, starts, ends, axes, steps].
-fn convert_slice(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_slice(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "begin", "end", "axes", "strides"]);
     let mut op = Operation::new("slice_by_index", op_name(node));
     op.inputs = inputs;
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Pad: handles both attribute (opset < 11) and input (opset ≥ 11) forms.
-fn convert_pad(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_pad(node: &NodeProto) -> Vec<Operation> {
     let mut op = Operation::new("pad", op_name(node));
 
     if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
@@ -666,11 +666,11 @@ fn convert_pad(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("constant_val", Value::Float(value as f64));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// ReduceMean: handles both attribute (opset ≤ 17) and input (opset 18+) axes.
-fn convert_reduce_mean(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_reduce_mean(node: &NodeProto) -> Vec<Operation> {
     let mut op = Operation::new("reduce_mean", op_name(node));
 
     if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
@@ -692,11 +692,11 @@ fn convert_reduce_mean(node: &NodeProto) -> Result<Vec<Operation>> {
     let keepdims = get_int_attr(node, "keepdims").unwrap_or(1);
     op = op.with_attr("keep_dims", Value::Bool(keepdims != 0));
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// LayerNormalization: map epsilon; axis → axes list.
-fn convert_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_layer_norm(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "gamma", "beta"]);
     let mut op = Operation::new("layer_norm", op_name(node));
     op.inputs = inputs;
@@ -708,7 +708,7 @@ fn convert_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("epsilon", Value::Float(epsilon as f64));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Cast: map ONNX `to` data-type integer to a MIL scalar-type name.
@@ -760,7 +760,7 @@ fn convert_constant(node: &NodeProto) -> Result<Vec<Operation>> {
 // ---------------------------------------------------------------------------
 
 /// Shape: returns the shape of the input tensor as an int32 1-D tensor.
-fn convert_shape(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_shape(node: &NodeProto) -> Vec<Operation> {
     let mut op = Operation::new("shape", op_name(node));
     if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
         op = op.with_input("x", Value::Reference(x.clone()));
@@ -770,11 +770,11 @@ fn convert_shape(node: &NodeProto) -> Result<Vec<Operation>> {
     let out_name = node.output.first().cloned().unwrap_or_default();
     op = op.with_output(&out_name);
     op.output_types = vec![Some(TensorType::new(ScalarType::Int32, vec![0]))];
-    Ok(vec![op])
+    vec![op]
 }
 
 /// Split: handles both attribute and input forms for split sizes.
-fn convert_split(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_split(node: &NodeProto) -> Vec<Operation> {
     let mut op = Operation::new("split", op_name(node));
 
     if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
@@ -800,19 +800,19 @@ fn convert_split(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("num_splits", Value::Int(num_outputs));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Where → select: map condition, a, b inputs.
-fn convert_where(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_where(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["cond", "a", "b"]);
     let mut op = Operation::new("select", op_name(node));
     op.inputs = inputs;
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// ConvTranspose: map strides, pads, dilations, group, output_shape.
-fn convert_conv_transpose(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_conv_transpose(node: &NodeProto) -> Vec<Operation> {
     let inputs = positional_to_named(node, &["x", "weight", "bias"]);
     let mut op = Operation::new("conv_transpose", op_name(node));
     op.inputs = inputs;
@@ -836,11 +836,11 @@ fn convert_conv_transpose(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("output_padding", int_tensor_value(&output_padding));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 /// Resize → upsample_bilinear: map scale/size inputs and coordinate mode.
-fn convert_resize(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_resize(node: &NodeProto) -> Vec<Operation> {
     let mut op = Operation::new("upsample_bilinear", op_name(node));
 
     // ONNX Resize inputs: [X, roi, scales, sizes]
@@ -869,10 +869,10 @@ fn convert_resize(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("align_corners", Value::Bool(align));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
-fn convert_cumsum(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_cumsum(node: &NodeProto) -> Vec<Operation> {
     let name = op_name(node);
     let mut op = Operation::new("cumsum", name);
     if !node.input.is_empty() {
@@ -881,10 +881,10 @@ fn convert_cumsum(node: &NodeProto) -> Result<Vec<Operation>> {
     if node.input.len() > 1 {
         op = op.with_input("axis", Value::Reference(node.input[1].clone()));
     }
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
-fn convert_tile(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_tile(node: &NodeProto) -> Vec<Operation> {
     let name = op_name(node);
     let mut op = Operation::new("tile", name);
     if !node.input.is_empty() {
@@ -893,10 +893,10 @@ fn convert_tile(node: &NodeProto) -> Result<Vec<Operation>> {
     if node.input.len() > 1 {
         op = op.with_input("reps", Value::Reference(node.input[1].clone()));
     }
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
-fn convert_expand(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_expand(node: &NodeProto) -> Vec<Operation> {
     // ONNX Expand broadcasts input to a target shape.
     let name = op_name(node);
     let mut op = Operation::new("expand_dims", name);
@@ -906,14 +906,14 @@ fn convert_expand(node: &NodeProto) -> Result<Vec<Operation>> {
     if node.input.len() > 1 {
         op = op.with_input("shape", Value::Reference(node.input[1].clone()));
     }
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 // ---------------------------------------------------------------------------
 // P3+ — ReduceSum
 // ---------------------------------------------------------------------------
 
-fn convert_reduce_sum(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_reduce_sum(node: &NodeProto) -> Vec<Operation> {
     let mut op = Operation::new("reduce_sum", op_name(node));
 
     if let Some(x) = node.input.first().filter(|s| !s.is_empty()) {
@@ -936,7 +936,7 @@ fn convert_reduce_sum(node: &NodeProto) -> Result<Vec<Operation>> {
         op = op.with_attr("noop_with_empty_axes", Value::Bool(noop != 0));
     }
 
-    Ok(vec![with_outputs(op, node)])
+    vec![with_outputs(op, node)]
 }
 
 // ---------------------------------------------------------------------------
@@ -950,7 +950,7 @@ fn convert_reduce_sum(node: &NodeProto) -> Result<Vec<Operation>> {
 /// `orion_mil_rmsnorm` — eval-verified on ANE. Uses axis=1 (channel
 /// dim in ANE `[1,C,1,S]` layout) with `reduce_sum` + manual division
 /// instead of `reduce_mean` to avoid ANE axis semantics issues.
-fn convert_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_simplified_layer_norm(node: &NodeProto) -> Vec<Operation> {
     let name = op_name(node);
     let eps = get_float_attr(node, "epsilon").unwrap_or(1e-5);
 
@@ -1016,9 +1016,9 @@ fn convert_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
         .with_input("y", Value::Reference(scale_ref))
         .with_output(output_name);
 
-    Ok(vec![
+    vec![
         x_sq, mean_op, eps_op, add_eps, nhalf_op, rsqrt_op, norm_op, scale_op,
-    ])
+    ]
 }
 
 /// SkipSimplifiedLayerNormalization: residual add then RMSNorm.
@@ -1026,7 +1026,7 @@ fn convert_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
 /// Outputs: (Y, ?, ?, skip_add)
 ///
 /// Decomposed RMSNorm with axis=1 following Orion's pattern.
-fn convert_skip_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_skip_simplified_layer_norm(node: &NodeProto) -> Vec<Operation> {
     let name = op_name(node);
     let eps = get_float_attr(node, "epsilon").unwrap_or(1e-5);
 
@@ -1107,14 +1107,14 @@ fn convert_skip_simplified_layer_norm(node: &NodeProto) -> Result<Vec<Operation>
         }
     }
 
-    Ok(ops)
+    ops
 }
 
 /// RotaryEmbedding (com.microsoft): decompose into standard MIL ops.
 ///
 /// Inputs: x, position_ids, cos_cache, sin_cache
 /// Applies RoPE: split x into halves, rotate using gathered cos/sin, concat.
-fn convert_rotary_embedding(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_rotary_embedding(node: &NodeProto) -> Vec<Operation> {
     let name = op_name(node);
     let interleaved = get_int_attr(node, "interleaved").unwrap_or(0) != 0;
 
@@ -1301,7 +1301,7 @@ fn convert_rotary_embedding(node: &NodeProto) -> Result<Vec<Operation>> {
         );
     }
 
-    Ok(ops)
+    ops
 }
 
 /// GroupQueryAttention (com.microsoft): decompose into standard MIL ops.
@@ -1314,7 +1314,7 @@ fn convert_rotary_embedding(node: &NodeProto) -> Result<Vec<Operation>> {
 /// 2. If num_kv_heads < num_heads, tile K/V to match
 /// 3. Compute scaled dot-product attention: softmax(Q @ K^T / sqrt(d)) @ V
 /// 4. Reshape output back to [batch, seq, hidden]
-fn convert_group_query_attention(node: &NodeProto) -> Result<Vec<Operation>> {
+fn convert_group_query_attention(node: &NodeProto) -> Vec<Operation> {
     let name = op_name(node);
     let num_heads = get_int_attr(node, "num_heads").unwrap_or(1);
     let kv_num_heads = get_int_attr(node, "kv_num_heads").unwrap_or(num_heads);
@@ -1528,7 +1528,7 @@ fn convert_group_query_attention(node: &NodeProto) -> Result<Vec<Operation>> {
         );
     }
 
-    Ok(ops)
+    ops
 }
 
 // ---------------------------------------------------------------------------

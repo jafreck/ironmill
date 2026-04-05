@@ -81,6 +81,10 @@ pub struct Operation {
 
     /// Compute unit preference for this operation.
     pub compute_unit: Option<ComputeUnit>,
+
+    /// Nested blocks for control flow (e.g., `cond`, `while_loop`).
+    /// Most operations have no nested blocks.
+    pub blocks: Vec<super::Block>,
 }
 
 impl Operation {
@@ -94,6 +98,7 @@ impl Operation {
             output_types: Vec::new(),
             attributes: HashMap::new(),
             compute_unit: None,
+            blocks: Vec::new(),
         }
     }
 

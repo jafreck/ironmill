@@ -85,6 +85,19 @@ impl TensorData {
         }
     }
 
+    /// Consume this `TensorData` and return the inline bytes, or an error
+    /// if the data is `External`.
+    pub fn try_into_bytes(self) -> Result<Vec<u8>, MilError> {
+        match self {
+            TensorData::Inline(data) => Ok(data),
+            TensorData::External { provider_key, .. } => Err(MilError::Validation(format!(
+                "cannot convert External tensor '{}' to bytes; \
+                 call resolve_with() or materialize_with() first",
+                provider_key
+            ))),
+        }
+    }
+
     /// Consume this `TensorData` and return the inline bytes, resolving
     /// external data via the provided closure if necessary.
     pub fn resolve_with<F>(self, loader: F) -> Result<Vec<u8>, MilError>
@@ -98,17 +111,28 @@ impl TensorData {
     }
 
     /// Resolve external data in-place using the provided closure.
-    /// No-op if already inline.
+    /// No-op if already inline. Returns an error if the materialized
+    /// data length doesn't match the expected `byte_len`.
     pub fn materialize_with<F>(&mut self, loader: F) -> Result<(), MilError>
     where
         F: FnOnce(&str) -> Result<Vec<u8>, MilError>,
     {
         if let TensorData::External {
-            ref provider_key, ..
+            ref provider_key,
+            byte_len,
         } = *self
         {
             let key = provider_key.clone();
+            let expected_len = byte_len;
             let data = loader(&key)?;
+            if data.len() != expected_len {
+                return Err(MilError::Validation(format!(
+                    "tensor '{}': materialized {} bytes but expected {}",
+                    key,
+                    data.len(),
+                    expected_len
+                )));
+            }
             *self = TensorData::Inline(data);
         }
         Ok(())
@@ -155,6 +179,14 @@ pub enum Value {
         shape: Vec<usize>,
         /// Element data type.
         dtype: ScalarType,
+    },
+
+    /// A reference to blob file storage (CoreML weight files).
+    BlobFile {
+        /// The blob file name.
+        file_name: String,
+        /// Byte offset within the blob file.
+        offset: u64,
     },
 }
 

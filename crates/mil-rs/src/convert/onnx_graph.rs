@@ -1866,6 +1866,7 @@ mod tests {
                 TensorType::new(ScalarType::Int32, vec![1, 128]),
             )],
             body: block,
+            attributes: HashMap::new(),
         };
         program.add_function(func);
 

@@ -1080,6 +1080,12 @@ impl PassPipeline {
                     || name == "int8-quantization"
                     || name == "palettization"
                     || name == "polar-quantization"
+                    || name == "affine-quantization"
+                    || name == "awq-quantization"
+                    || name == "gptq-quantization"
+                    || name == "quip-sharp"
+                    || name == "d2quant"
+                    || name == "spin-quantization"
             })
             .unwrap_or(self.passes.len());
         self.passes.insert(insert_pos, Box::new(shape_pass));

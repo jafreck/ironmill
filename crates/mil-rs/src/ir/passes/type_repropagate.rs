@@ -189,8 +189,8 @@ fn infer_tile_output(op: &Operation, type_map: &HashMap<String, TensorType>) -> 
             out_shape,
         ))
     } else {
-        // Can't resolve reps — return input type (incorrect but safe fallback).
-        Some(input_type)
+        // Can't resolve reps — return None to signal type inference failure.
+        None
     }
 }
 

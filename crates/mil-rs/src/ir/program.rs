@@ -288,6 +288,8 @@ pub struct Function {
     pub inputs: Vec<(String, TensorType)>,
     /// The function body.
     pub body: Block,
+    /// Function-level attributes/metadata from the proto.
+    pub attributes: HashMap<String, String>,
 }
 
 impl Function {
@@ -297,6 +299,7 @@ impl Function {
             name: name.into(),
             inputs: Vec::new(),
             body: Block::new(),
+            attributes: HashMap::new(),
         }
     }
 

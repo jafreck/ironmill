@@ -52,6 +52,8 @@ impl Graph {
     /// - All value references resolve to a defined output
     /// - No duplicate operation names
     /// - Outputs reference existing values
+    /// - No duplicate output names across operations
+    /// - Operations only reference values defined before them
     pub fn validate(&self) -> Result<()> {
         // Collect all defined values: graph inputs + operation outputs.
         let mut defined: HashSet<&str> = HashSet::new();
@@ -61,6 +63,9 @@ impl Graph {
 
         // Check for duplicate operation names.
         let mut op_names: HashSet<&str> = HashSet::new();
+        // Track all output names to detect duplicates.
+        let mut all_output_names: HashSet<&str> = HashSet::new();
+
         for op in &self.operations {
             if !op.name.is_empty() && !op_names.insert(op.name.as_str()) {
                 return Err(MilError::Validation(format!(
@@ -68,15 +73,22 @@ impl Graph {
                     op.name
                 )));
             }
-            for out in &op.outputs {
-                defined.insert(out.as_str());
-            }
-        }
 
-        // Check that all value references in operation inputs resolve.
-        for op in &self.operations {
+            // Check that all value references in operation inputs resolve
+            // to values defined before this operation.
             for (param, value) in &op.inputs {
                 Self::check_refs(value, &defined, &op.name, param)?;
+            }
+
+            // Check for duplicate output names.
+            for out in &op.outputs {
+                if !all_output_names.insert(out.as_str()) {
+                    return Err(MilError::Validation(format!(
+                        "duplicate output name '{}' in operation '{}'",
+                        out, op.name
+                    )));
+                }
+                defined.insert(out.as_str());
             }
         }
 

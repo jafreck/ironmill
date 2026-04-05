@@ -19,7 +19,9 @@ pub fn model_to_program(model: &Model) -> Result<Program> {
         Some(model::Type::MlProgram(program)) => program,
         Some(_) => {
             return Err(MilError::UnsupportedOp(
-                "only ML Program models are supported; this model uses a different type"
+                "only ML Program models (spec v7+) are supported for MIL IR conversion; \
+                 this model uses a legacy type (e.g. NeuralNetwork). Convert it to an \
+                 ML Program model first using coremltools or re-export from the source framework"
                     .to_string(),
             ));
         }
@@ -46,10 +48,21 @@ fn convert_program(proto: &mil_spec::Program) -> Result<Program> {
         functions.insert(name.clone(), function);
     }
 
+    // Preserve program-level attributes.
+    let mut attributes = std::collections::HashMap::new();
+    for (key, val) in &proto.attributes {
+        if let Ok(v) = convert_value(val) {
+            attributes.insert(key.clone(), format!("{v:?}"));
+        }
+    }
+    if !proto.doc_string.is_empty() {
+        attributes.insert("doc_string".to_string(), proto.doc_string.clone());
+    }
+
     Ok(Program {
         version,
         functions,
-        attributes: std::collections::HashMap::new(),
+        attributes,
         weight_provider: None,
         spill_dir: None,
         spill_index: std::collections::HashMap::new(),
@@ -85,10 +98,22 @@ fn convert_function(name: &str, proto: &mil_spec::Function) -> Result<Function> 
         )));
     };
 
+    // Preserve function-level attributes.
+    let mut attributes = std::collections::HashMap::new();
+    for (key, val) in &proto.attributes {
+        if let Ok(v) = convert_value(val) {
+            attributes.insert(key.clone(), format!("{v:?}"));
+        }
+    }
+    if !proto.opset.is_empty() {
+        attributes.insert("opset".to_string(), proto.opset.clone());
+    }
+
     Ok(Function {
         name: name.to_string(),
         inputs,
         body: block,
+        attributes,
     })
 }
 
@@ -146,6 +171,13 @@ fn convert_operation(proto: &mil_spec::Operation) -> Result<Operation> {
         _ => None,
     });
 
+    // Convert nested blocks (for control flow ops like cond/while).
+    let blocks = proto
+        .blocks
+        .iter()
+        .map(convert_block)
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(Operation {
         op_type: proto.r#type.clone(),
         name,
@@ -154,6 +186,7 @@ fn convert_operation(proto: &mil_spec::Operation) -> Result<Operation> {
         output_types,
         attributes,
         compute_unit,
+        blocks,
     })
 }
 
@@ -198,13 +231,10 @@ fn convert_value(proto: &mil_spec::Value) -> Result<Value> {
         Some(value::Value::ImmediateValue(imm)) => {
             convert_immediate_value(imm, proto.r#type.as_ref())
         }
-        Some(value::Value::BlobFileValue(blob)) => {
-            // Represent blob references as a string for now.
-            Ok(Value::String(format!(
-                "blob:{}@{}",
-                blob.file_name, blob.offset
-            )))
-        }
+        Some(value::Value::BlobFileValue(blob)) => Ok(Value::BlobFile {
+            file_name: blob.file_name.clone(),
+            offset: blob.offset,
+        }),
         None => {
             // A Value with no payload but a type set is used for type
             // annotations (e.g. on function inputs).
@@ -278,13 +308,14 @@ fn convert_tensor_value(
                 let shape: Vec<usize> = tt
                     .dimensions
                     .iter()
-                    .filter_map(|d| match &d.dimension {
-                        Some(mil_spec::dimension::Dimension::Constant(c)) => Some(c.size as usize),
-                        _ => None,
+                    .map(|d| match &d.dimension {
+                        Some(mil_spec::dimension::Dimension::Constant(c)) => c.size as usize,
+                        // Unknown dims: use 0 as sentinel to preserve rank.
+                        _ => 0,
                     })
                     .collect();
                 // Only reconstruct as Tensor for non-scalar shapes (rank >= 1).
-                if !shape.is_empty() {
+                if !shape.is_empty() && tt.dimensions.len() == tt.rank as usize {
                     let dtype = convert_data_type(tt.data_type)?;
                     let data: Vec<u8> = f.values.iter().flat_map(|v| v.to_le_bytes()).collect();
                     return Ok(Value::Tensor {
@@ -343,9 +374,10 @@ fn convert_tensor_value(
             let shape: Vec<usize> = tt
                 .dimensions
                 .iter()
-                .filter_map(|d| match &d.dimension {
-                    Some(mil_spec::dimension::Dimension::Constant(c)) => Some(c.size as usize),
-                    _ => None,
+                .map(|d| match &d.dimension {
+                    Some(mil_spec::dimension::Dimension::Constant(c)) => c.size as usize,
+                    // Unknown dims: use 0 as sentinel to preserve rank.
+                    _ => 0,
                 })
                 .collect();
 
@@ -472,7 +504,7 @@ mod tests {
         };
         let err = model_to_program(&model).unwrap_err();
         assert!(
-            err.to_string().contains("different type"),
+            err.to_string().contains("ML Program"),
             "unexpected error: {err}"
         );
     }

@@ -380,11 +380,17 @@ fn build_training_inputs(func: &Function, updatable_layers: &[String]) -> Vec<Fe
 
     // If no ops matched, fall back to the function's own inputs so the
     // training input list is never empty for an updatable model.
+    // NOTE: This is a legacy fallback for updatable models. The synthesized
+    // training inputs may not match the actual training data format.
     if training_inputs.is_empty() {
+        eprintln!(
+            "warning: updatable model has no matching updatable layers; \
+             falling back to function inputs as training inputs (legacy behavior)"
+        );
         for (name, tt) in &func.inputs {
             training_inputs.push(FeatureDescription {
                 name: name.clone(),
-                short_description: "Training input".to_string(),
+                short_description: "Training input (legacy fallback)".to_string(),
                 r#type: Some(tensor_type_to_feature_type(tt)),
             });
         }
@@ -457,6 +463,10 @@ fn build_update_params(
             .unwrap_or_else(|| first_layer.clone());
         (output_name.clone(), format!("{output_name}_target"))
     } else {
+        eprintln!(
+            "warning: updatable model config has no updatable layers; \
+             using default loss input/target names (legacy behavior)"
+        );
         ("output".to_string(), "target".to_string())
     };
 
@@ -988,40 +998,23 @@ fn convert_operation(
 
     // Emit compute unit preference as a proto attribute when set.
     if let Some(cu) = op.compute_unit() {
-        use crate::ir::ComputeUnit;
-        let cu_str = match cu {
-            ComputeUnit::Ane => "ane",
-            ComputeUnit::Gpu => "gpu",
-            ComputeUnit::Cuda => "cuda",
-            ComputeUnit::Cpu => "cpu",
-            ComputeUnit::Any => "any",
-        };
-        let tv = mil_spec::TensorValue {
-            value: Some(mil_spec::tensor_value::Value::Strings(
-                mil_spec::tensor_value::RepeatedStrings {
-                    values: vec![cu_str.to_string()],
-                },
-            )),
-        };
-        attributes.insert(
-            "compute_unit".to_string(),
-            mil_spec::Value {
-                doc_string: String::new(),
-                r#type: None,
-                value: Some(mil_spec::value::Value::ImmediateValue(
-                    mil_spec::value::ImmediateValue {
-                        value: Some(mil_spec::value::immediate_value::Value::Tensor(tv)),
-                    },
-                )),
-            },
-        );
+        let cu_str = cu.to_string();
+        let cu_value = convert_value_to_proto(&Value::String(cu_str))?;
+        attributes.insert("compute_unit".to_string(), cu_value);
     }
+
+    // Serialize nested blocks (for control flow ops).
+    let blocks = op
+        .blocks
+        .iter()
+        .map(|b| convert_block(b, type_map))
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(mil_spec::Operation {
         r#type: op.op_type.clone(),
         inputs,
         outputs,
-        blocks: vec![],
+        blocks,
         attributes,
     })
 }
@@ -1217,7 +1210,7 @@ fn scalar_value_type(dt: mil_spec::DataType) -> mil_spec::ValueType {
 /// Derive the `ValueType` that describes an IR `Value`.
 fn value_type_for(value: &Value) -> Option<mil_spec::ValueType> {
     match value {
-        Value::Int(_) => Some(scalar_value_type(mil_spec::DataType::Int32)),
+        Value::Int(_) => Some(scalar_value_type(mil_spec::DataType::Int64)),
         Value::Float(_) => Some(scalar_value_type(mil_spec::DataType::Float32)),
         Value::Bool(_) => Some(scalar_value_type(mil_spec::DataType::Bool)),
         Value::String(_) => Some(scalar_value_type(mil_spec::DataType::String)),
@@ -1263,8 +1256,8 @@ fn value_type_for(value: &Value) -> Option<mil_spec::ValueType> {
                 ))),
             })
         }
-        // Type-only values and references have their type handled separately.
-        Value::Type(_) | Value::Reference(_) => None,
+        // Type-only values, references, and blob refs have their type handled separately.
+        Value::Type(_) | Value::Reference(_) | Value::BlobFile { .. } => None,
     }
 }
 
@@ -1281,7 +1274,7 @@ fn try_list_as_tensor(
 
     // Check if all items are ints.
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
-        let ints: Vec<i32> = items
+        let ints: Vec<i64> = items
             .iter()
             .map(|v| {
                 let Value::Int(i) = v else {
@@ -1289,16 +1282,16 @@ fn try_list_as_tensor(
                         "expected Value::Int in list".to_string(),
                     ));
                 };
-                Ok(*i as i32)
+                Ok(*i)
             })
             .collect::<Result<Vec<_>>>()?;
         return Ok(Some((
             mil_spec::TensorValue {
-                value: Some(mil_spec::tensor_value::Value::Ints(
-                    mil_spec::tensor_value::RepeatedInts { values: ints },
+                value: Some(mil_spec::tensor_value::Value::LongInts(
+                    mil_spec::tensor_value::RepeatedLongInts { values: ints },
                 )),
             },
-            mil_spec::DataType::Int32,
+            mil_spec::DataType::Int64,
         )));
     }
 
@@ -1473,11 +1466,10 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
             )
         }
         Value::Int(v) => {
+            // Use i64 serialization to avoid truncating values > i32::MAX.
             let tv = mil_spec::TensorValue {
-                value: Some(mil_spec::tensor_value::Value::Ints(
-                    mil_spec::tensor_value::RepeatedInts {
-                        values: vec![*v as i32],
-                    },
+                value: Some(mil_spec::tensor_value::Value::LongInts(
+                    mil_spec::tensor_value::RepeatedLongInts { values: vec![*v] },
                 )),
             };
             (
@@ -1593,6 +1585,15 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
                 value_type_for(value),
             )
         }
+        Value::BlobFile { file_name, offset } => (
+            Some(value::Value::BlobFileValue(
+                mil_spec::value::BlobFileValue {
+                    file_name: file_name.clone(),
+                    offset: *offset,
+                },
+            )),
+            None,
+        ),
     };
 
     Ok(mil_spec::Value {
@@ -1668,13 +1669,39 @@ fn scalar_to_array_data_type(st: ScalarType) -> specification::array_feature_typ
 /// Convert an IR `TensorType` to a CoreML `FeatureType` (MultiArray).
 fn tensor_type_to_feature_type(tt: &TensorType) -> FeatureType {
     let shape: Vec<i64> = tt.shape.iter().map(|d| d.unwrap_or(1) as i64).collect();
+
+    // If any dimension is dynamic (None), express that via ShapeRange.
+    let shape_flexibility = if tt.shape.iter().any(|d| d.is_none()) {
+        let size_ranges: Vec<specification::SizeRange> = tt
+            .shape
+            .iter()
+            .map(|d| match d {
+                Some(size) => specification::SizeRange {
+                    lower_bound: *size as u64,
+                    upper_bound: *size as i64,
+                },
+                None => specification::SizeRange {
+                    lower_bound: 1,
+                    upper_bound: -1, // unbounded
+                },
+            })
+            .collect();
+        Some(
+            specification::array_feature_type::ShapeFlexibility::ShapeRange(
+                specification::array_feature_type::ShapeRange { size_ranges },
+            ),
+        )
+    } else {
+        None
+    };
+
     FeatureType {
         is_optional: false,
         r#type: Some(specification::feature_type::Type::MultiArrayType(
             ArrayFeatureType {
                 shape,
                 data_type: scalar_to_array_data_type(tt.scalar_type) as i32,
-                shape_flexibility: None,
+                shape_flexibility,
                 default_optional_value: None,
             },
         )),
@@ -1810,6 +1837,7 @@ mod tests {
             name: "main".to_string(),
             inputs: vec![("input".to_string(), input_ty.clone())],
             body: block,
+            attributes: HashMap::new(),
         };
 
         let mut program = Program::new("1");
@@ -1846,6 +1874,7 @@ mod tests {
             name: "encode".to_string(),
             inputs: vec![("tokens".to_string(), input_ty.clone())],
             body: Block::new(),
+            attributes: HashMap::new(),
         };
 
         let mut program = Program::new("1");
@@ -1875,6 +1904,7 @@ mod tests {
             name: "main".to_string(),
             inputs: vec![],
             body: block,
+            attributes: HashMap::new(),
         };
 
         let mut program = Program::new("1");
@@ -1918,6 +1948,7 @@ mod tests {
             name: "main".to_string(),
             inputs: vec![("input".to_string(), input_ty)],
             body: block,
+            attributes: HashMap::new(),
         };
 
         let mut program = Program::new("1");
@@ -1943,6 +1974,7 @@ mod tests {
             name: "main".to_string(),
             inputs: vec![("input".to_string(), input_ty)],
             body: Block::new(),
+            attributes: HashMap::new(),
         };
 
         let mut program = Program::new("1");
@@ -1962,6 +1994,7 @@ mod tests {
             name: "main".to_string(),
             inputs: vec![("input".to_string(), input_ty)],
             body: Block::new(),
+            attributes: HashMap::new(),
         };
 
         let mut program = Program::new("1");
@@ -2314,6 +2347,7 @@ mod tests {
                 TensorType::new(ScalarType::Float32, vec![1, 4, 512, 64]),
             )],
             body: block,
+            attributes: HashMap::new(),
         };
         program.add_function(func);
 
@@ -2376,6 +2410,7 @@ mod tests {
             name: "main".to_string(),
             inputs: vec![],
             body: block,
+            attributes: HashMap::new(),
         };
 
         let mut program = Program::new("1");
@@ -2419,6 +2454,7 @@ mod tests {
             name: "main".to_string(),
             inputs: vec![],
             body: block,
+            attributes: HashMap::new(),
         };
 
         let mut program = Program::new("1");
