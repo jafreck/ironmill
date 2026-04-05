@@ -30,13 +30,11 @@ pub mod types;
 pub mod ane;
 #[cfg(all(feature = "coreml", target_os = "macos"))]
 pub mod coreml;
-#[cfg(all(any(feature = "metal", feature = "mlx"), target_os = "macos"))]
+#[cfg(all(any(feature = "metal"), target_os = "macos"))]
 mod dequant;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
-#[cfg(all(feature = "mlx", target_os = "macos"))]
-pub mod mlx;
-#[cfg(all(any(feature = "metal", feature = "mlx"), target_os = "macos"))]
+#[cfg(all(any(feature = "metal"), target_os = "macos"))]
 mod weight_loading;
 
 // Re-exports for convenience.
@@ -56,8 +54,6 @@ pub use generate::{
 };
 pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 pub use memory::{KvQuantLevel, MemoryEstimator, MemoryUsage, QuantLevel};
-#[cfg(all(feature = "mlx", target_os = "macos"))]
-pub use mlx::{MlxArtifacts, MlxConfig, MlxInference};
 pub use model_info::ModelInfo;
 pub use sampling::{
     DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, apply_token_mask, is_eos_token, sample_token,

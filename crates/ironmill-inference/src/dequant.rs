@@ -1,4 +1,4 @@
-//! Shared dequantization helpers used by both Metal and MLX backends.
+//! Shared dequantization helpers used by the Metal backend.
 //!
 //! This module contains low-level routines for reading typed scalars
 //! and unpacking bit-packed indices—common operations needed by any
@@ -71,7 +71,7 @@ pub(crate) fn unpack_indices(packed: &[u8], n_bits: u8, total_elements: usize) -
     indices
 }
 
-// ── MLX-style dequant (moved from mlx/weights.rs) ───────────────
+// ── Affine dequant helpers ───────────────────────────────────────
 
 /// Dequantize an affine-quantized tensor to FP16 bytes (unsigned
 /// interpretation).

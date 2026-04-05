@@ -1,8 +1,7 @@
 //! Rotation sign and QJL random projection matrix generation for TurboQuant.
 //!
 //! These are backend-independent: the GPU backend consumes the raw `Vec<u8>`
-//! little-endian bytes directly, while the MLX backend can use the `_as_f32`
-//! conversion helpers.
+//! little-endian bytes directly.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -44,7 +43,7 @@ pub fn generate_qjl_matrix(dim: usize, seed: u64) -> Vec<u8> {
 }
 
 /// Convert little-endian f32 bytes (as returned by [`generate_rotation_signs`])
-/// into a `Vec<f32>`. Used by the MLX backend which needs typed float values.
+/// into a `Vec<f32>`.
 pub fn rotation_signs_as_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
@@ -53,7 +52,7 @@ pub fn rotation_signs_as_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Convert little-endian f32 bytes (as returned by [`generate_qjl_matrix`])
-/// into a `Vec<f32>`. Used by the MLX backend which needs typed float values.
+/// into a `Vec<f32>`.
 pub fn qjl_matrix_as_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)

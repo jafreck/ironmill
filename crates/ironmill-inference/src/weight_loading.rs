@@ -1,5 +1,5 @@
-//! Shared model‐layout enumeration and weight‐loading driver used by both
-//! the Metal and MLX backends.
+//! Shared model‐layout enumeration and weight‐loading driver used by the
+//! Metal backend.
 //!
 //! Each backend implements [`WeightVisitor`] to materialize tensors into its
 //! own buffer types; [`load_model_weights`] walks the standard LLaMA/Qwen
@@ -45,8 +45,8 @@ pub struct LoadedLayer<D, W> {
 
 /// Core model weights returned by [`load_model_weights`].
 ///
-/// Does **not** include `lm_head` because the two backends handle it
-/// differently (Metal always dequantizes; MLX may keep it quantized).
+/// Does **not** include `lm_head` because backends may handle it
+/// differently.
 pub struct LoadedModelCore<D, W> {
     /// Embedding table `[vocab_size, hidden_size]`.
     pub embedding: D,

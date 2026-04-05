@@ -1,4 +1,4 @@
-//! Shared TurboQuant logic used by both the GPU (Metal) and MLX backends.
+//! Shared TurboQuant logic used by the Metal backend.
 //!
 //! Contains the backend-independent math and data generation:
 //! - Lloyd-Max codebook computation

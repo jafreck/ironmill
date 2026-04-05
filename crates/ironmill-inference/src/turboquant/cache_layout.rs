@@ -1,15 +1,15 @@
 //! Shared buffer-size calculations for TurboQuant KV cache allocation.
 //!
-//! Both the Metal and MLX backends need the same set of buffers with the
-//! same dimensions.  [`TurboQuantCacheLayout`] centralises the arithmetic
-//! so each backend only has to map sizes → its own buffer type.
+//! The Metal backend needs a set of buffers with specific dimensions.
+//! [`TurboQuantCacheLayout`] centralises the arithmetic
+//! so the backend only has to map sizes → its own buffer type.
 
 use super::outlier::OutlierConfig;
 
 /// Precomputed buffer sizes for one layer of a TurboQuant KV cache.
 ///
 /// Construct via [`TurboQuantCacheLayout::new`] from model parameters;
-/// then use the public fields when allocating Metal buffers or MLX arrays.
+/// then use the public fields when allocating Metal buffers.
 #[derive(Debug, Clone)]
 pub struct TurboQuantCacheLayout {
     /// Number of KV heads.

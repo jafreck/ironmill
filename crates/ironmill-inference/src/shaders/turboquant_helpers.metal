@@ -1,7 +1,7 @@
-// Shared TurboQuant helper functions for Metal and MLX backends.
+// Shared TurboQuant helper functions for the Metal backend.
 //
-// This file is prepended (via include_str!) to both the Metal and MLX
-// TurboQuant kernel sources at compile time.  Keep only inline utility
+// This file is prepended (via include_str!) to TurboQuant kernel sources
+// at compile time.  Keep only inline utility
 // functions here — no [[kernel]] entry points.
 
 #ifndef TURBOQUANT_HELPERS_METAL

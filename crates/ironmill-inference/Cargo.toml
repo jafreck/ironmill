@@ -14,7 +14,6 @@ ironmill-ane-sys = { workspace = true, optional = true }
 ironmill-iosurface = { workspace = true, optional = true }
 ironmill-coreml-sys = { workspace = true, optional = true }
 ironmill-metal-sys = { workspace = true, optional = true }
-ironmill-mlx-sys = { workspace = true, optional = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -27,7 +26,6 @@ tempfile = { workspace = true }
 default = ["coreml", "ane"]
 int4 = []
 metal = ["dep:ironmill-metal-sys"]
-mlx = ["dep:ironmill-mlx-sys"]
 ane = ["dep:ironmill-ane-sys", "dep:ironmill-iosurface"]
 coreml = ["dep:ironmill-coreml-sys"]
 async = ["dep:tokio"]
