@@ -79,6 +79,17 @@ pub struct ModelConfig {
     pub rope_theta: f64,
     /// Whether the input and output embedding weights are shared.
     pub tie_word_embeddings: bool,
+    /// Attention scaling denominator: `attn_scale = 1 / sqrt(query_pre_attn_scalar)`.
+    ///
+    /// Defaults to `head_dim` (standard `1/sqrt(d_k)` scaling). Some
+    /// architectures (e.g. Gemma 2/4) expose this in config.json as
+    /// `query_pre_attn_scalar`.
+    pub query_pre_attn_scalar: usize,
+    /// FFN activation function name (e.g. `"silu"`, `"gelu"`).
+    ///
+    /// Determines which element-wise kernel is used between the gate and up
+    /// projections in the FFN block. Defaults to `"silu"`.
+    pub hidden_act: String,
     /// Architecture-specific parameters (e.g. Gemma sliding_window_size,
     /// Qwen attention bias flags). Templates access via architecture match.
     pub extra: HashMap<String, serde_json::Value>,
@@ -103,6 +114,8 @@ impl ModelConfig {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             tie_word_embeddings: false,
+            query_pre_attn_scalar: 0, // 0 = use head_dim
+            hidden_act: "silu".to_string(),
             extra: HashMap::new(),
         }
     }
@@ -173,10 +186,39 @@ impl ModelConfig {
         self
     }
 
+    /// Set the attention scaling denominator.
+    pub fn with_query_pre_attn_scalar(mut self, scalar: usize) -> Self {
+        self.query_pre_attn_scalar = scalar;
+        self
+    }
+
+    /// Set the FFN activation function.
+    pub fn with_hidden_act(mut self, hidden_act: String) -> Self {
+        self.hidden_act = hidden_act;
+        self
+    }
+
     /// Set extra architecture-specific parameters.
     pub fn with_extra(mut self, extra: HashMap<String, serde_json::Value>) -> Self {
         self.extra = extra;
         self
+    }
+
+    /// Compute the attention scale factor: `1 / sqrt(query_pre_attn_scalar)`.
+    ///
+    /// Uses `query_pre_attn_scalar` if set (> 0), otherwise falls back to `head_dim`.
+    pub fn attn_scale(&self) -> f32 {
+        let scalar = if self.query_pre_attn_scalar > 0 {
+            self.query_pre_attn_scalar
+        } else {
+            self.head_dim
+        };
+        1.0 / (scalar as f32).sqrt()
+    }
+
+    /// Whether the FFN uses GELU activation (vs SiLU).
+    pub fn use_gelu(&self) -> bool {
+        self.hidden_act == "gelu" || self.hidden_act == "gelu_pytorch_tanh"
     }
 
     /// Compute head_dim from hidden_size and num_attention_heads if not

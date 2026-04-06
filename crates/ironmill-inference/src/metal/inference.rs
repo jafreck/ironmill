@@ -1965,13 +1965,7 @@ impl MetalInference {
                     } else { (is_anchor, layer_idx) }
                 } else { (is_anchor, layer_idx) };
 
-                let attn_scale = if lw.q_norm.is_some() && self.gemma4_config.is_some() {
-                    // Gemma 4: scale-free QK-norm (unit RMSNorm, no weights)
-                    // produces unit-length Q/K, so Q·K ∈ [-1,1] — no scaling needed.
-                    1.0
-                } else {
-                    1.0 / (layer_hd as f32).sqrt()
-                };
+                let attn_scale = mc.attn_scale();
 
                 encode_kv_cache_and_attention(
                     &enc, pipelines, bufs,
@@ -2064,7 +2058,7 @@ impl MetalInference {
             };
 
             // Steps 12-15: FFN block (gate + up + activation + down)
-            let use_gelu = self.gemma4_config.is_some();
+            let use_gelu = mc.use_gelu();
             encode_ffn_block(
                 &enc,
                 pipelines,
@@ -2907,11 +2901,7 @@ impl MetalInference {
                 (is_anchor, layer_idx)
             };
 
-            let attn_scale = if lw.q_norm.is_some() && self.gemma4_config.is_some() {
-                1.0
-            } else {
-                1.0 / (layer_hd as f32).sqrt()
-            };
+            let attn_scale = mc.attn_scale();
 
             encode_kv_cache_and_attention(
                 &enc,
@@ -3070,7 +3060,7 @@ impl MetalInference {
             let pipelines = self.pipelines()?;
 
             // Steps 12-15: FFN block (gate + up + activation + down)
-            let use_gelu = self.gemma4_config.is_some();
+            let use_gelu = mc.use_gelu();
             encode_ffn_block(
                 &enc,
                 pipelines,

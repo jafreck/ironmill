@@ -308,6 +308,19 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Attention scaling denominator: query_pre_attn_scalar (Gemma 2/4) or head_dim.
+    let query_pre_attn_scalar = json_root
+        .get("query_pre_attn_scalar")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    // FFN activation: hidden_act (defaults to "silu").
+    let hidden_act = json_root
+        .get("hidden_act")
+        .and_then(|v| v.as_str())
+        .unwrap_or("silu")
+        .to_string();
+
     // Collect architecture-specific extra fields.
     let mut extra = HashMap::new();
     let known_keys: &[&str] = &[
@@ -344,6 +357,8 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
         .with_rms_norm_eps(rms_norm_eps)
         .with_rope_theta(rope_theta)
         .with_tie_word_embeddings(tie_word_embeddings)
+        .with_query_pre_attn_scalar(query_pre_attn_scalar)
+        .with_hidden_act(hidden_act)
         .with_extra(extra))
 }
 
