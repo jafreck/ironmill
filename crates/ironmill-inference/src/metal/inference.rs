@@ -1174,7 +1174,7 @@ impl MetalInference {
                     //    Gemma4TextScaledWordEmbedding; we apply the same scale
                     //    after the plain lookup.
                     match ple_embed {
-                        WeightBuffer::Dense { buf, .. } => {
+                        WeightBuffer::Dense { buf: Some(buf), .. } => {
                             ops::encode_embedding_lookup(
                                 &enc,
                                 &pipelines.embedding_lookup,
@@ -2178,7 +2178,7 @@ impl MetalInference {
                         enc.memory_barrier_buffers();
 
                         match ple_embed {
-                            WeightBuffer::Dense { buf, .. } => {
+                            WeightBuffer::Dense { buf: Some(buf), .. } => {
                                 ops::encode_embedding_lookup(
                                     &enc,
                                     &pipelines.embedding_lookup,
@@ -4439,11 +4439,11 @@ fn absorb_mla_weights(
 
         // Replace the Q and O projection weights with absorbed versions.
         weights.layers[layer_idx].q_proj = WeightBuffer::Dense {
-            buf: q_buf,
+            buf: Some(q_buf),
             packed: None, // Absorption changes dimensions; re-packing can be added later.
         };
         weights.layers[layer_idx].o_proj = WeightBuffer::Dense {
-            buf: o_buf,
+            buf: Some(o_buf),
             packed: None,
         };
     }
