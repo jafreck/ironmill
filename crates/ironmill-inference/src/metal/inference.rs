@@ -697,9 +697,20 @@ impl MetalInference {
         }
 
         // Build per-layer window sizes for buffer allocation.
-        let layer_window_sizes: Vec<usize> = (0..mc.num_hidden_layers)
-            .map(|l| self.config.layer_window_size(l))
-            .collect();
+        // For Gemma 4, use per-layer window sizes from layer_types config
+        // (global layers need 0 = full attention, not the generic sliding
+        // window size). The generic SlidingWindowConfig uses max_window_layers
+        // which incorrectly marks global layers as sliding, causing KV cache
+        // buffers to be too small — the head-major layout
+        // [num_kv_heads, max_seq_len, head_dim] needs max_seq_len-sized
+        // strides for global layers with num_kv_heads > 1.
+        let layer_window_sizes: Vec<usize> = if let Some(ref g4) = self.gemma4_config {
+            g4.layer_configs.iter().map(|lc| lc.window_size).collect()
+        } else {
+            (0..mc.num_hidden_layers)
+                .map(|l| self.config.layer_window_size(l))
+                .collect()
+        };
 
         if self.config.enable_turboquant {
             // Algorithm selection:
@@ -3134,9 +3145,13 @@ impl MetalInference {
             }
         }
 
-        let layer_window_sizes: Vec<usize> = (0..mc.num_hidden_layers)
-            .map(|l| self.config.layer_window_size(l))
-            .collect();
+        let layer_window_sizes: Vec<usize> = if let Some(ref g4) = self.gemma4_config {
+            g4.layer_configs.iter().map(|lc| lc.window_size).collect()
+        } else {
+            (0..mc.num_hidden_layers)
+                .map(|l| self.config.layer_window_size(l))
+                .collect()
+        };
 
         // Initialize KV cache.
         if self.config.enable_turboquant {
