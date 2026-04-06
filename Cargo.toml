@@ -35,3 +35,12 @@ statrs = "0.18"
 rand = "0.8"
 safetensors = "0.7"
 memmap2 = "0.9"
+
+# Optimize all dependencies in dev/test builds so that weight loading,
+# quantization, and inference aren't 10-50× slower than release.
+# The workspace crates themselves stay at opt-level 0 for fast rebuilds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test.package."*"]
+opt-level = 2
