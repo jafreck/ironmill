@@ -344,6 +344,15 @@ mod gemma4 {
             fp16_all.push(fp16_engine.prefill_all_logits(seq).expect("FP16 prefill"));
         }
 
+        // FP16 + TQ-INT8 logits
+        let tq8_config = MetalConfig::default().with_turboquant(8);
+        let (mut tq8_engine, _, _) = load_gpu_engine(&provider, tq8_config);
+        let mut tq8_all: Vec<Vec<Vec<f32>>> = Vec::new();
+        for seq in sequences.iter().take(eval_seqs) {
+            tq8_engine.reset();
+            tq8_all.push(tq8_engine.prefill_all_logits(seq).expect("TQ8 prefill"));
+        }
+
         // FP16 + TQ-INT4 logits
         let tq_config = MetalConfig::default().with_turboquant(4);
         let (mut tq_engine, _, _) = load_gpu_engine(&provider, tq_config);
@@ -478,6 +487,8 @@ mod gemma4 {
             }
         }
 
+        let tq8_metrics =
+            compute_metrics("FP16+TQ-INT8", &fp16_all, &tq8_all, &sequences, eval_seqs);
         let tq_metrics = compute_metrics("FP16+TQ-INT4", &fp16_all, &tq_all, &sequences, eval_seqs);
         let d2q_metrics =
             compute_metrics("D2Q-3+TQ-INT4", &fp16_all, &d2q_all, &sequences, eval_seqs);
@@ -501,7 +512,7 @@ mod gemma4 {
             "test PPL"
         );
         println!("  ───────────────────────────────────────────────────────────────────────────");
-        for m in [&tq_metrics, &d2q_metrics] {
+        for m in [&tq8_metrics, &tq_metrics, &d2q_metrics] {
             println!(
                 "  {:<18} {:>8.4} {:>8.4} {:>8.3} {:>8.2} {:>6.1}% {:>6.1}% {:>6.1}% {:>8.2} {:>8.2}",
                 m.label,
