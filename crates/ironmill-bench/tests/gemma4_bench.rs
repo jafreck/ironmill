@@ -373,12 +373,31 @@ mod gemma4 {
             )
             .build()
             .expect("D2Quant compile failed");
-        let d2q_config = MetalConfig::default().with_turboquant(4);
-        let (mut d2q_engine, _, _) = load_gpu_engine(&d2q_provider, d2q_config);
-        let mut d2q_all: Vec<Vec<Vec<f32>>> = Vec::new();
+
+        let d2q4_config = MetalConfig::default().with_turboquant(4);
+        let (mut d2q4_engine, _, _) = load_gpu_engine(&d2q_provider, d2q4_config);
+        let mut d2q4_all: Vec<Vec<Vec<f32>>> = Vec::new();
         for seq in sequences.iter().take(eval_seqs) {
-            d2q_engine.reset();
-            d2q_all.push(d2q_engine.prefill_all_logits(seq).expect("D2Q prefill"));
+            d2q4_engine.reset();
+            d2q4_all.push(
+                d2q4_engine
+                    .prefill_all_logits(seq)
+                    .expect("D2Q+TQ4 prefill"),
+            );
+        }
+        drop(d2q4_engine);
+
+        // D2Quant-3 + TQ-INT8 logits (reuse same provider)
+        let d2q8_config = MetalConfig::default().with_turboquant(8);
+        let (mut d2q8_engine, _, _) = load_gpu_engine(&d2q_provider, d2q8_config);
+        let mut d2q8_all: Vec<Vec<Vec<f32>>> = Vec::new();
+        for seq in sequences.iter().take(eval_seqs) {
+            d2q8_engine.reset();
+            d2q8_all.push(
+                d2q8_engine
+                    .prefill_all_logits(seq)
+                    .expect("D2Q+TQ8 prefill"),
+            );
         }
 
         // ── Compute metrics across all positions ─────────────────
@@ -490,8 +509,10 @@ mod gemma4 {
         let tq8_metrics =
             compute_metrics("FP16+TQ-INT8", &fp16_all, &tq8_all, &sequences, eval_seqs);
         let tq_metrics = compute_metrics("FP16+TQ-INT4", &fp16_all, &tq_all, &sequences, eval_seqs);
+        let d2q8_metrics =
+            compute_metrics("D2Q-3+TQ-INT8", &fp16_all, &d2q8_all, &sequences, eval_seqs);
         let d2q_metrics =
-            compute_metrics("D2Q-3+TQ-INT4", &fp16_all, &d2q_all, &sequences, eval_seqs);
+            compute_metrics("D2Q-3+TQ-INT4", &fp16_all, &d2q4_all, &sequences, eval_seqs);
 
         println!(
             "\n  Quantization Quality vs FP16 Baseline ({} positions)",
@@ -512,7 +533,7 @@ mod gemma4 {
             "test PPL"
         );
         println!("  ───────────────────────────────────────────────────────────────────────────");
-        for m in [&tq8_metrics, &tq_metrics, &d2q_metrics] {
+        for m in [&tq8_metrics, &tq_metrics, &d2q8_metrics, &d2q_metrics] {
             println!(
                 "  {:<18} {:>8.4} {:>8.4} {:>8.3} {:>8.2} {:>6.1}% {:>6.1}% {:>6.1}% {:>8.2} {:>8.2}",
                 m.label,
