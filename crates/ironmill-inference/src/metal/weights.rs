@@ -575,8 +575,11 @@ fn load_weight_buffer(
                     let packed_buf = device
                         .create_buffer_with_data(&packed_data, StorageMode::Shared)
                         .map_err(MetalError::Metal)?;
+                    let buf = device
+                        .create_buffer_with_data(&tensor.data, StorageMode::Shared)
+                        .map_err(MetalError::Metal)?;
                     return Ok(WeightBuffer::Dense {
-                        buf: None,
+                        buf: Some(buf),
                         packed: Some(packed_buf),
                     });
                 }

@@ -259,7 +259,7 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
         .or_else(|| json.get("model_type").and_then(|v| v.as_str()))
         .ok_or_else(|| MilError::Validation("config.json missing 'model_type'".into()))?;
 
-    // Gemma 4 multimodal wrapper — drill into text_config for the text decoder.
+    // Gemma 4 / Qwen 3.5 multimodal wrapper — drill into text_config for the text decoder.
     let (model_type, json_root) = if model_type == "gemma4" {
         let text_config = json.get("text_config").ok_or_else(|| {
             MilError::Validation("gemma4 config.json missing 'text_config'".into())
@@ -270,7 +270,7 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
             .unwrap_or("gemma4_text");
         (inner_type.to_string(), text_config.clone())
     } else {
-        (model_type.to_string(), json.clone())
+        (model_type.to_string(), config_json.clone())
     };
 
     let architecture = Architecture::from_str(&model_type)?;

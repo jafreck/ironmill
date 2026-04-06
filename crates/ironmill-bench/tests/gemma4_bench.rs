@@ -24,17 +24,15 @@ mod gemma4 {
     use ironmill_inference::engine::InferenceEngine;
     use ironmill_inference::metal::{MetalConfig, MetalInference};
 
-    fn hf_model_dir(model_id: &str) -> PathBuf {
+    fn gemma4_model_dir() -> PathBuf {
         let home = std::env::var("HOME").expect("HOME env var not set");
-        let hf_name = model_id.replace('/', "--");
-        let hf_cache = PathBuf::from(home)
-            .join(".cache/huggingface/hub")
-            .join(format!("models--{hf_name}"));
+        let hf_cache =
+            PathBuf::from(home).join(".cache/huggingface/hub/models--google--gemma-4-e2b-it");
         let snapshots = hf_cache.join("snapshots");
         if !snapshots.exists() {
             panic!(
-                "{model_id} not found. Download with:\n  \
-                 huggingface-cli download {model_id}"
+                "Gemma 4 E2B-IT not found. Download with:\n  \
+                 huggingface-cli download google/gemma-4-e2b-it"
             );
         }
         std::fs::read_dir(&snapshots)
@@ -43,10 +41,6 @@ mod gemma4 {
             .find(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
             .unwrap_or_else(|| panic!("no snapshot directory in {}", snapshots.display()))
             .path()
-    }
-
-    fn gemma4_model_dir() -> PathBuf {
-        hf_model_dir("google/gemma-4-e2b-it")
     }
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -104,132 +98,6 @@ mod gemma4 {
         (median_ms, tok_s)
     }
 
-    // ── Quality metrics helpers ──────────────────────────────────
-
-    fn softmax_f64(logits: &[f32]) -> Vec<f64> {
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-        let exps: Vec<f64> = logits.iter().map(|&x| (x as f64 - max).exp()).collect();
-        let sum: f64 = exps.iter().sum();
-        exps.iter().map(|&e| e / sum).collect()
-    }
-
-    fn kl_divergence(p: &[f64], q: &[f64]) -> f64 {
-        p.iter()
-            .zip(q.iter())
-            .map(|(&pi, &qi)| {
-                if pi > 1e-30 {
-                    pi * (pi / (qi + 1e-30)).ln()
-                } else {
-                    0.0
-                }
-            })
-            .sum()
-    }
-
-    fn top_k_agreement(a: &[f32], b: &[f32], k: usize) -> f64 {
-        let mut a_idx: Vec<usize> = (0..a.len()).collect();
-        let mut b_idx: Vec<usize> = (0..b.len()).collect();
-        a_idx.sort_by(|&i, &j| a[j].partial_cmp(&a[i]).unwrap_or(std::cmp::Ordering::Equal));
-        b_idx.sort_by(|&i, &j| b[j].partial_cmp(&b[i]).unwrap_or(std::cmp::Ordering::Equal));
-        let a_set: std::collections::HashSet<usize> = a_idx[..k].iter().copied().collect();
-        let b_set: std::collections::HashSet<usize> = b_idx[..k].iter().copied().collect();
-        a_set.intersection(&b_set).count() as f64 / k as f64
-    }
-
-    #[allow(dead_code)]
-    struct QualityMetrics {
-        label: &'static str,
-        mean_kl: f64,
-        median_kl: f64,
-        p95_kl: f64,
-        max_kl: f64,
-        top1_agree: f64,
-        top5_agree: f64,
-        top10_agree: f64,
-        ppl_ref: f64,
-        ppl_test: f64,
-        n_positions: usize,
-    }
-
-    fn compute_metrics(
-        label: &'static str,
-        ref_logits: &[Vec<Vec<f32>>],
-        test_logits: &[Vec<Vec<f32>>],
-        sequences: &[Vec<u32>],
-        eval_seqs: usize,
-    ) -> QualityMetrics {
-        let mut kl_values = Vec::new();
-        let mut top1_matches = 0usize;
-        let mut top5_total = 0.0f64;
-        let mut top10_total = 0.0f64;
-        let mut ref_ce = 0.0f64;
-        let mut test_ce = 0.0f64;
-        let mut n = 0usize;
-
-        for (si, seq) in sequences.iter().take(eval_seqs).enumerate() {
-            let ref_lg = &ref_logits[si];
-            let test_lg = &test_logits[si];
-            for pos in 0..seq.len() - 1 {
-                let target = seq[pos + 1] as usize;
-                let p = softmax_f64(&ref_lg[pos]);
-                let q = softmax_f64(&test_lg[pos]);
-                kl_values.push(kl_divergence(&p, &q));
-                ref_ce -= p[target].max(1e-30).ln();
-                test_ce -= q[target].max(1e-30).ln();
-                let r = &ref_lg[pos];
-                let t = &test_lg[pos];
-                top1_matches += top_k_agreement(r, t, 1) as usize;
-                top5_total += top_k_agreement(r, t, 5);
-                top10_total += top_k_agreement(r, t, 10);
-                n += 1;
-            }
-        }
-
-        kl_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let nan_count = kl_values.iter().filter(|v| v.is_nan()).count();
-        let finite_kl: Vec<f64> = kl_values
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect();
-        let mean_kl = if finite_kl.is_empty() {
-            f64::NAN
-        } else {
-            finite_kl.iter().sum::<f64>() / finite_kl.len() as f64
-        };
-        let median_kl = if finite_kl.is_empty() {
-            f64::NAN
-        } else {
-            finite_kl[finite_kl.len() / 2]
-        };
-        let p95_kl = if finite_kl.is_empty() {
-            f64::NAN
-        } else {
-            finite_kl[(finite_kl.len() as f64 * 0.95) as usize]
-        };
-        let max_kl = finite_kl.last().copied().unwrap_or(f64::NAN);
-        if nan_count > 0 {
-            eprintln!(
-                "    ⚠ {label}: {nan_count}/{} positions have NaN KL",
-                kl_values.len()
-            );
-        }
-
-        QualityMetrics {
-            label,
-            mean_kl,
-            median_kl,
-            p95_kl,
-            max_kl,
-            top1_agree: top1_matches as f64 / n as f64 * 100.0,
-            top5_agree: top5_total / n as f64 * 100.0,
-            top10_agree: top10_total / n as f64 * 100.0,
-            ppl_ref: (ref_ce / n as f64).exp(),
-            ppl_test: (test_ce / n as f64).exp(),
-            n_positions: n,
-        }
-    }
-
     /// Evaluate perplexity using batched prefill (prefill_all_logits).
     /// Returns (ppl, num_tokens, eval_tok_per_sec).
     fn eval_perplexity(
@@ -272,15 +140,13 @@ mod gemma4 {
         (ppl, total_tokens, tok_s)
     }
 
-    /// Load the OASST1 instruct-formatted dataset for Gemma 4.
-    /// Contiguous conversation threads formatted with Gemma's chat template,
-    /// split into 512-token sequences (~20K tokens total).
-    fn load_eval_dataset() -> Vec<Vec<u32>> {
-        let path = fixture_path("quality/oasst1-gemma4-instruct.json");
+    /// Load the Alpaca instruct dataset for Gemma 4.
+    fn load_alpaca_dataset() -> Vec<Vec<u32>> {
+        let path = fixture_path("quality/alpaca-gemma4-instruct.json");
         if !path.exists() {
             panic!(
-                "OASST1 dataset not found at {}.\n\
-                 Run: python /tmp/prepare_oasst_dataset.py",
+                "Alpaca dataset not found at {}.\n\
+                 Run: python scripts/prepare-quality-dataset.py --tokenizer google/gemma-4-e2b-it --dataset alpaca",
                 path.display()
             );
         }
@@ -316,34 +182,16 @@ mod gemma4 {
     fn benchmark() {
         let model_dir = gemma4_model_dir();
         let decode_tokens = 20;
-        let sequences = load_eval_dataset();
-        let ppl_seqs = sequences.len(); // use all sequences (~39)
+        let sequences = load_alpaca_dataset();
+        let ppl_seqs = 5;
         let mut results: Vec<BenchResult> = Vec::new();
 
         eprintln!("  Alpaca dataset: {} sequences loaded", sequences.len());
 
-        // ── FP16 baseline (FP16 KV cache) ────────────────────────
+        // ── FP16 + TurboQuant-INT4 KV (baseline) ─────────────────
         let fp16_provider =
             SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
 
-        {
-            let config = MetalConfig::default().without_turboquant();
-            let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
-            let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
-            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
-            eprintln!("  FP16 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
-            results.push(BenchResult {
-                label: "FP16",
-                load_ms,
-                gpu_mb,
-                ms_tok,
-                tok_s,
-                ppl,
-                ppl_tokens,
-            });
-        }
-
-        // ── FP16 + TurboQuant-INT4 KV ────────────────────────────
         {
             let config = MetalConfig::default().with_turboquant(4);
             let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
@@ -405,10 +253,7 @@ mod gemma4 {
         let fp16_gpu = results[0].gpu_mb;
         let fp16_ppl = results[0].ppl;
         println!();
-        println!(
-            "  Gemma 4 E2B-IT — Metal Benchmark (OASST1 instruct, {ppl_seqs} seqs, {} tokens)",
-            ppl_seqs * 512
-        );
+        println!("  Gemma 4 E2B-IT — Metal Benchmark (Alpaca instruct, {ppl_seqs} seqs)");
         println!("  ──────────────────────────────────────────────────────────────────────────");
         println!(
             "  {:<20} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
@@ -449,7 +294,7 @@ mod gemma4 {
                 r.ppl
             );
         }
-        let d2q = &results[2];
+        let d2q = &results[1];
         let mem_reduction = (1.0 - d2q.gpu_mb / fp16_gpu) * 100.0;
         assert!(
             mem_reduction > 20.0,
