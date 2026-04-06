@@ -1,52 +1,48 @@
-# Qwen 3.5-0.8B Metal GPU Benchmark Suite
+# Qwen 3.5-4B Metal GPU Benchmark Suite
 #
-# Compares FP16 baseline against optimized inference configurations:
-#   - D2Quant 3-bit weight quantization
-#   - TurboQuant INT4 KV cache compression
-#   - EAGLE-3 speculative decoding
+# Compares FP16 baseline against quantized inference configurations:
+#   1. FP16 baseline  – no weight/KV quantization
+#   2. FP16 + TQ-INT8 – FP16 weights, TurboQuant INT8 KV cache
+#   3. FP16 + TQ-INT4 – FP16 weights, TurboQuant INT4 KV cache
+#   4. D2Q-3 + TQ-INT8 – D2Quant 3-bit weights, TurboQuant INT8 KV cache
 #
 # Usage:
-#   # Baseline + TurboQuant (no bundle required):
 #   cargo run --release -p ironmill-bench --features metal -- \
 #     --config configs/qwen35-bench.toml -b metal \
+#     --baseline fp16-baseline \
 #     --perplexity --perplexity-dataset tests/fixtures/quality/wikitext2-qwen35.json
-#
-#   # With EAGLE-3 speculative decoding (requires specbundle):
-#   cargo run --release -p ironmill-bench --features metal -- \
-#     --config configs/qwen35-bench.toml -b metal \
-#     --specbundle models/Qwen3.5-0.8B/eagle3.specbundle
-#
-#   # With D2Quant 3-bit bundle (requires pre-compiled bundle):
-#   # First compile: ironmill-cli quantize --d2quant --bits 3 models/Qwen3.5-0.8B
-#   cargo run --release -p ironmill-bench --features metal -- \
-#     --config configs/qwen35-bench.toml -b metal
 
 [[model]]
 name = "Qwen3.5-4B"
 path = "unused-for-template-mode"
 model_dir = "models/Qwen3.5-4B"
 
-# ── FP16 baseline: no quantization, no KV cache compression ─────
+# ── 1. FP16 baseline: no quantization, no KV cache compression ──
 [[optimization]]
 name = "fp16-baseline"
 no_fusion = false
 kv_quant = "none"
 max_seq_len = 2048
 
-# ── TurboQuant INT4 KV cache (FP16 weights) ─────────────────────
+# ── 2. FP16 weights + TurboQuant INT8 KV cache ──────────────────
+[[optimization]]
+name = "fp16-tq-int8"
+no_fusion = false
+kv_quant = "turbo-int8"
+max_seq_len = 2048
+
+# ── 3. FP16 weights + TurboQuant INT4 KV cache ──────────────────
 [[optimization]]
 name = "fp16-tq-int4"
 no_fusion = false
 kv_quant = "turbo-int4"
 max_seq_len = 2048
 
-# ── D2Quant 3-bit weights + TurboQuant INT4 KV cache ────────────
-# Requires pre-compiled .ironml-gpu bundle with D2Quant weights.
-# Produce with: ironmill-cli quantize --d2quant --bits 3 models/Qwen3.5-0.8B
+# ── 4. D2Quant 3-bit weights + TurboQuant INT8 KV cache ─────────
 [[optimization]]
-name = "d2q3-tq-int4"
+name = "d2q3-tq-int8"
 d2quant = 3
-kv_quant = "turbo-int4"
+kv_quant = "turbo-int8"
 max_seq_len = 2048
 
 [settings]

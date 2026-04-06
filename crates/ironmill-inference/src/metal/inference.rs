@@ -793,8 +793,7 @@ impl LayerPlan {
                 };
 
                 // KV anchor / CLA mapping
-                let is_anchor_default = cla
-                    .is_none_or(|c| c.is_anchor(i));
+                let is_anchor_default = cla.is_none_or(|c| c.is_anchor(i));
 
                 let (kv_anchor, kv_cache_layer) = if let Some(g4) = g4 {
                     // Gemma 4: kv_anchor field overrides CLA mapping.
@@ -811,8 +810,7 @@ impl LayerPlan {
 
                 // Global pipelines (different HEAD_DIM compile)
                 let use_global_pipelines = if let Some(g4) = g4 {
-                    g4.layer_configs[i].is_global
-                        && g4.global_head_dim != mc.head_dim
+                    g4.layer_configs[i].is_global && g4.global_head_dim != mc.head_dim
                 } else {
                     false
                 };
@@ -1001,9 +999,12 @@ impl MetalInference {
         // pipeline set with that HEAD_DIM for correct shader dispatch.
         if let Some(ref g4) = self.gemma4_config {
             if g4.global_head_dim != mc.head_dim {
-                let global_pipelines =
-                    super::ops::MetalPipelines::compile(&self.device, g4.global_head_dim, g4.global_head_dim)
-                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                let global_pipelines = super::ops::MetalPipelines::compile(
+                    &self.device,
+                    g4.global_head_dim,
+                    g4.global_head_dim,
+                )
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 self.global_head_dim = g4.global_head_dim;
                 self.global_pipelines = Some(global_pipelines);
             }
@@ -1244,6 +1245,11 @@ impl MetalInference {
             self.gdn_state = None;
         }
 
+        // Free redundant row-major buffers now that all load-time transforms
+        // (split_q_gate_weight, norm offsets, MLA absorption) are complete.
+        // This typically halves GPU memory for dense FP16 models.
+        weights.drop_dense_row_major();
+
         self.weights = Some(weights);
 
         // ── Build per-layer execution plans ───────────────────────
@@ -1371,12 +1377,21 @@ impl MetalInference {
 
         // Only create MPS matmul instances for Dense weights; Quantized
         // projections use the custom compute kernel path instead.
+        // Empty placeholders (GDN layer Q/K/V/O) produce Quantized stubs
+        // that are never dispatched.
         let projection_matmul = |wb: &WeightBuffer,
                                  rows: usize,
                                  cols: usize,
                                  inner: usize|
          -> Result<ProjectionMatmul, MetalError> {
             match wb {
+                WeightBuffer::Dense {
+                    buf: None,
+                    packed: None,
+                } => {
+                    // Empty placeholder (GDN layer) — no GPU memory, never dispatched.
+                    Ok(ProjectionMatmul::Quantized)
+                }
                 WeightBuffer::Dense { .. } => {
                     Ok(ProjectionMatmul::Dense(make_matmul(rows, cols, inner)?))
                 }
@@ -1472,17 +1487,31 @@ impl MetalInference {
                     let path = format!("/tmp/im_logits_pos{pos}.bin");
                     let bytes: Vec<u8> = l.iter().flat_map(|v| v.to_le_bytes()).collect();
                     std::fs::write(&path, &bytes).ok();
-                    let target = if pos + 1 < n { token_ids[pos + 1] as usize } else { 0 };
+                    let target = if pos + 1 < n {
+                        token_ids[pos + 1] as usize
+                    } else {
+                        0
+                    };
                     let max_val = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mean: f32 = l.iter().sum::<f32>() / l.len() as f32;
-                    let log_sum_exp: f64 = l.iter().map(|&x| ((x - max_val) as f64).exp()).sum::<f64>().ln() + max_val as f64;
-                    let ce = if target < l.len() { -(l[target] as f64 - log_sum_exp) } else { 0.0 };
+                    let log_sum_exp: f64 = l
+                        .iter()
+                        .map(|&x| ((x - max_val) as f64).exp())
+                        .sum::<f64>()
+                        .ln()
+                        + max_val as f64;
+                    let ce = if target < l.len() {
+                        -(l[target] as f64 - log_sum_exp)
+                    } else {
+                        0.0
+                    };
                     eprintln!(
                         "  [SAVE] pos={pos} target={target} ce={ce:.4} max={max_val:.3} l[target]={:.3} mean={mean:.3} std={:.3} len={}",
                         if target < l.len() { l[target] } else { 0.0 },
                         {
                             let m = mean;
-                            (l.iter().map(|&x| (x - m) * (x - m)).sum::<f32>() / l.len() as f32).sqrt()
+                            (l.iter().map(|&x| (x - m) * (x - m)).sum::<f32>() / l.len() as f32)
+                                .sqrt()
                         },
                         l.len()
                     );
@@ -1498,9 +1527,23 @@ impl MetalInference {
                 let l = &all_logits[t];
                 let target = token_ids[t + 1] as usize;
                 let max_val = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let argmax = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(0);
-                let log_sum_exp: f64 = l.iter().map(|&x| ((x - max_val) as f64).exp()).sum::<f64>().ln() + max_val as f64;
-                let ce = if target < l.len() { -(l[target] as f64 - log_sum_exp) } else { 0.0 };
+                let argmax = l
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let log_sum_exp: f64 = l
+                    .iter()
+                    .map(|&x| ((x - max_val) as f64).exp())
+                    .sum::<f64>()
+                    .ln()
+                    + max_val as f64;
+                let ce = if target < l.len() {
+                    -(l[target] as f64 - log_sum_exp)
+                } else {
+                    0.0
+                };
                 debug_total_ce += ce;
                 debug_count += 1;
                 if t < 20 || t >= n - 3 {
@@ -1512,7 +1555,12 @@ impl MetalInference {
             }
             if debug_count > 0 {
                 let avg = debug_total_ce / debug_count as f64;
-                eprintln!("  [im] DEBUG PPL from logits: {:.2} (avg CE={:.4}, n={})", avg.exp(), avg, debug_count);
+                eprintln!(
+                    "  [im] DEBUG PPL from logits: {:.2} (avg CE={:.4}, n={})",
+                    avg.exp(),
+                    avg,
+                    debug_count
+                );
             }
         }
 
@@ -1907,344 +1955,587 @@ impl MetalInference {
             let row_bytes_kv = (layer_nkv as usize * layer_hd as usize) * 2;
 
             match &plan.attention {
-            AttentionKind::Gdn { gdn_index } => {
-                // ── GDN (linear-attention) layer — GPU path ─────
-                // Ensure scratch capacity for prefill before taking immutable borrows.
-                if token_count > 1 {
-                    let gdn_mut = self
+                AttentionKind::Gdn { gdn_index } => {
+                    // ── GDN (linear-attention) layer — GPU path ─────
+                    // Ensure scratch capacity for prefill before taking immutable borrows.
+                    if token_count > 1 {
+                        let gdn_mut = self
+                            .gdn_state
+                            .as_mut()
+                            .ok_or_else(|| InferenceError::runtime("GDN state not initialized"))?;
+                        gdn_mut
+                            .ensure_scratch_capacity(&self.device, token_count, h)
+                            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                    }
+
+                    let pipelines = self.pipelines()?;
+                    let gdn = self
                         .gdn_state
-                        .as_mut()
+                        .as_ref()
                         .ok_or_else(|| InferenceError::runtime("GDN state not initialized"))?;
-                    gdn_mut
-                        .ensure_scratch_capacity(&self.device, token_count, h)
+                    let gdn_cfg = &gdn.config;
+                    let gdn_idx = gdn.gdn_index_for_layer(layer_idx).ok_or_else(|| {
+                        InferenceError::runtime(format!("layer {layer_idx} is not a GDN layer"))
+                    })?;
+
+                    if token_count > 1 {
+                        // Prefill: batched GPU path (minimal dispatches)
+
+                        let dummy_matmul = ProjectionMatmul::Quantized;
+
+                        let qkv_dim = gdn_cfg.qkv_dim;
+                        let value_dim = gdn_cfg.value_dim;
+                        let num_v_heads = gdn_cfg.num_v_heads;
+                        let k_head_dim = gdn_cfg.k_head_dim;
+                        let v_head_dim = gdn_cfg.v_head_dim;
+                        let key_dim = gdn_cfg.key_dim;
+
+                        let norm_mat =
+                            MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
+                                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            lw.gdn_in_proj_qkv.as_ref().unwrap(),
+                            &gdn.gpu_temp_qkv,
+                            &dummy_matmul,
+                            pipelines,
+                            token_count,
+                            qkv_dim,
+                            h,
+                            row_bytes_h,
+                            qkv_dim * 2,
+                        )?;
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            lw.gdn_in_proj_z.as_ref().unwrap(),
+                            &gdn.gpu_temp_z,
+                            &dummy_matmul,
+                            pipelines,
+                            token_count,
+                            value_dim,
+                            h,
+                            row_bytes_h,
+                            value_dim * 2,
+                        )?;
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            lw.gdn_in_proj_a.as_ref().unwrap(),
+                            &gdn.gpu_temp_a,
+                            &dummy_matmul,
+                            pipelines,
+                            token_count,
+                            num_v_heads,
+                            h,
+                            row_bytes_h,
+                            num_v_heads * 2,
+                        )?;
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            lw.gdn_in_proj_b.as_ref().unwrap(),
+                            &gdn.gpu_temp_b,
+                            &dummy_matmul,
+                            pipelines,
+                            token_count,
+                            num_v_heads,
+                            h,
+                            row_bytes_h,
+                            num_v_heads * 2,
+                        )?;
+                        enc.memory_barrier_buffers();
+
+                        let layer_state = &gdn.layers[gdn_idx];
+                        ops::encode_gdn_prefill_conv1d_silu(
+                            &enc,
+                            &pipelines.gdn_prefill_conv1d_silu,
+                            &gdn.gpu_temp_qkv,
+                            lw.gdn_conv1d_weight.as_ref().unwrap(),
+                            &layer_state.conv_state,
+                            &gdn.gpu_conv_out,
+                            qkv_dim as u32,
+                            gdn_cfg.conv_kernel_size as u32,
+                            token_count as u32,
+                        );
+                        enc.memory_barrier_buffers();
+
+                        ops::encode_gdn_prefill_recurrent(
+                            &enc,
+                            &pipelines.gdn_prefill_recurrent,
+                            &gdn.gpu_conv_out,
+                            &gdn.gpu_temp_a,
+                            &gdn.gpu_temp_b,
+                            lw.gdn_a_log.as_ref().unwrap(),
+                            lw.gdn_dt_bias.as_ref().unwrap(),
+                            lw.gdn_norm.as_ref().unwrap(),
+                            &gdn.gpu_temp_z,
+                            &layer_state.recurrent_state,
+                            &gdn.gpu_gated_output,
+                            token_count as u32,
+                            qkv_dim as u32,
+                            key_dim as u32,
+                            value_dim as u32,
+                            num_v_heads as u32,
+                            k_head_dim as u32,
+                            v_head_dim as u32,
+                            1e-6f32,
+                            gdn_cfg.num_k_heads as u32,
+                        );
+                        enc.memory_barrier_buffers();
+
+                        let gated_mat = MpsMatrix::from_buffer(
+                            &gdn.gpu_gated_output,
+                            token_count,
+                            value_dim,
+                            value_dim * 2,
+                        )
                         .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                        encode_projection(
+                            &enc,
+                            &gdn.gpu_gated_output,
+                            &gated_mat,
+                            lw.gdn_out_proj.as_ref().unwrap(),
+                            &gdn.scratch,
+                            &dummy_matmul,
+                            pipelines,
+                            token_count,
+                            h,
+                            value_dim,
+                            value_dim * 2,
+                            h * 2,
+                        )?;
+                        enc.memory_barrier_buffers();
+
+                        ops::encode_fused_residual_rms_norm(
+                            &enc,
+                            &pipelines.fused_residual_rms_norm,
+                            &ops::FusedResidualRmsNormParams {
+                                a: &bufs.hidden_state,
+                                b: &gdn.scratch,
+                                weight: &lw.post_attn_norm,
+                                normed_output: &bufs.norm_out,
+                                residual_output: &bufs.residual,
+                                eps,
+                                hidden_size: h as u32,
+                                token_count: token_count as u32,
+                            },
+                        );
+                    } else {
+                        // Decode (single token): full GPU path
+                        let gdn = self
+                            .gdn_state
+                            .as_ref()
+                            .ok_or_else(|| InferenceError::runtime("GDN state not initialized"))?;
+
+                        let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, 1, h, row_bytes_h)
+                            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                        let dummy_matmul = ProjectionMatmul::Quantized;
+
+                        let qkv_dim = gdn_cfg.qkv_dim;
+                        let value_dim = gdn_cfg.value_dim;
+                        let num_v_heads = gdn_cfg.num_v_heads;
+                        let k_head_dim = gdn_cfg.k_head_dim;
+                        let v_head_dim = gdn_cfg.v_head_dim;
+                        let key_dim = gdn_cfg.key_dim;
+
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            lw.gdn_in_proj_qkv.as_ref().unwrap(),
+                            &gdn.gpu_temp_qkv,
+                            &dummy_matmul,
+                            pipelines,
+                            1,
+                            qkv_dim,
+                            h,
+                            row_bytes_h,
+                            qkv_dim * 2,
+                        )?;
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            lw.gdn_in_proj_z.as_ref().unwrap(),
+                            &gdn.gpu_temp_z,
+                            &dummy_matmul,
+                            pipelines,
+                            1,
+                            value_dim,
+                            h,
+                            row_bytes_h,
+                            value_dim * 2,
+                        )?;
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            lw.gdn_in_proj_a.as_ref().unwrap(),
+                            &gdn.gpu_temp_a,
+                            &dummy_matmul,
+                            pipelines,
+                            1,
+                            num_v_heads,
+                            h,
+                            row_bytes_h,
+                            num_v_heads * 2,
+                        )?;
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            lw.gdn_in_proj_b.as_ref().unwrap(),
+                            &gdn.gpu_temp_b,
+                            &dummy_matmul,
+                            pipelines,
+                            1,
+                            num_v_heads,
+                            h,
+                            row_bytes_h,
+                            num_v_heads * 2,
+                        )?;
+                        enc.memory_barrier_buffers();
+
+                        let layer_state = &gdn.layers[gdn_idx];
+                        ops::encode_gdn_conv1d_silu(
+                            &enc,
+                            &pipelines.gdn_conv1d_silu,
+                            &gdn.gpu_temp_qkv,
+                            lw.gdn_conv1d_weight.as_ref().unwrap(),
+                            &layer_state.conv_state,
+                            &gdn.gpu_conv_out,
+                            qkv_dim as u32,
+                            gdn_cfg.conv_kernel_size as u32,
+                        );
+                        enc.memory_barrier_buffers();
+
+                        ops::encode_gdn_recurrent_update(
+                            &enc,
+                            &pipelines.gdn_recurrent_update,
+                            &gdn.gpu_conv_out,
+                            &gdn.gpu_temp_a,
+                            &gdn.gpu_temp_b,
+                            lw.gdn_a_log.as_ref().unwrap(),
+                            lw.gdn_dt_bias.as_ref().unwrap(),
+                            &layer_state.recurrent_state,
+                            &gdn.gpu_raw_output,
+                            key_dim as u32,
+                            value_dim as u32,
+                            num_v_heads as u32,
+                            k_head_dim as u32,
+                            v_head_dim as u32,
+                            gdn_cfg.num_k_heads as u32,
+                        );
+                        enc.memory_barrier_buffers();
+
+                        ops::encode_gdn_output_gate(
+                            &enc,
+                            &pipelines.gdn_output_gate,
+                            &gdn.gpu_raw_output,
+                            &gdn.gpu_temp_z,
+                            lw.gdn_norm.as_ref().unwrap(),
+                            &gdn.gpu_gated_output,
+                            num_v_heads as u32,
+                            v_head_dim as u32,
+                            1e-6f32,
+                        );
+                        enc.memory_barrier_buffers();
+
+                        let gated_mat = MpsMatrix::from_buffer(
+                            &gdn.gpu_gated_output,
+                            1,
+                            value_dim,
+                            value_dim * 2,
+                        )
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                        encode_projection(
+                            &enc,
+                            &gdn.gpu_gated_output,
+                            &gated_mat,
+                            lw.gdn_out_proj.as_ref().unwrap(),
+                            &gdn.scratch,
+                            &dummy_matmul,
+                            pipelines,
+                            1,
+                            h,
+                            value_dim,
+                            value_dim * 2,
+                            h * 2,
+                        )?;
+                        enc.memory_barrier_buffers();
+
+                        ops::encode_fused_residual_rms_norm(
+                            &enc,
+                            &pipelines.fused_residual_rms_norm,
+                            &ops::FusedResidualRmsNormParams {
+                                a: &bufs.hidden_state,
+                                b: &gdn.scratch,
+                                weight: &lw.post_attn_norm,
+                                normed_output: &bufs.norm_out,
+                                residual_output: &bufs.residual,
+                                eps,
+                                hidden_size: h as u32,
+                                token_count: 1,
+                            },
+                        );
+                    }
+                    enc.memory_barrier_buffers();
                 }
-
-                let pipelines = self.pipelines()?;
-                let gdn = self
-                    .gdn_state
-                    .as_ref()
-                    .ok_or_else(|| InferenceError::runtime("GDN state not initialized"))?;
-                let gdn_cfg = &gdn.config;
-                let gdn_idx = gdn.gdn_index_for_layer(layer_idx).ok_or_else(|| {
-                    InferenceError::runtime(format!("layer {layer_idx} is not a GDN layer"))
-                })?;
-
-                if token_count > 1 {
-                    // Prefill: batched GPU path (minimal dispatches)
-
-                    let dummy_matmul = ProjectionMatmul::Quantized;
-
-                    let qkv_dim = gdn_cfg.qkv_dim;
-                    let value_dim = gdn_cfg.value_dim;
-                    let num_v_heads = gdn_cfg.num_v_heads;
-                    let k_head_dim = gdn_cfg.k_head_dim;
-                    let v_head_dim = gdn_cfg.v_head_dim;
-                    let key_dim = gdn_cfg.key_dim;
-
+                AttentionKind::Standard {
+                    has_output_gate,
+                    has_v_norm,
+                } => {
+                    // Standard attention layer
+                    let default_pipelines = self.pipelines()?;
+                    let pipelines = if plan.use_global_pipelines {
+                        self.global_pipelines.as_ref().unwrap_or(default_pipelines)
+                    } else {
+                        default_pipelines
+                    };
                     let norm_mat =
                         MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
                             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
-                    encode_projection(
-                        &enc, &bufs.norm_out, &norm_mat,
-                        lw.gdn_in_proj_qkv.as_ref().unwrap(),
-                        &gdn.gpu_temp_qkv, &dummy_matmul, pipelines,
-                        token_count, qkv_dim, h, row_bytes_h, qkv_dim * 2,
+                    let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
+                    let kv_out_features = layer_nkv as usize * layer_hd as usize;
+                    for (weight, output_buf, matmul, out_features, row_bytes_out) in [
+                        (
+                            &lw.q_proj,
+                            &bufs.q_proj,
+                            &lm.q,
+                            qkv_out_features,
+                            row_bytes_qo,
+                        ),
+                        (
+                            &lw.k_proj,
+                            &bufs.k_proj,
+                            &lm.k,
+                            kv_out_features,
+                            row_bytes_kv,
+                        ),
+                        (
+                            &lw.v_proj,
+                            &bufs.v_proj,
+                            &lm.v,
+                            kv_out_features,
+                            row_bytes_kv,
+                        ),
+                    ] {
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            weight,
+                            output_buf,
+                            matmul,
+                            pipelines,
+                            token_count,
+                            out_features,
+                            h,
+                            row_bytes_h,
+                            row_bytes_out,
+                        )?;
+                    }
+                    enc.memory_barrier_buffers();
+
+                    // Qwen3.5 attn_output_gate: compute gate projection.
+                    if let (Some(gate_w), Some(gate_m), Some(gate_buf)) =
+                        (&lw.attn_output_gate, &lm.q_gate, &bufs.q_gate)
+                    {
+                        encode_projection(
+                            &enc,
+                            &bufs.norm_out,
+                            &norm_mat,
+                            gate_w,
+                            gate_buf,
+                            gate_m,
+                            pipelines,
+                            token_count,
+                            qkv_out_features,
+                            h,
+                            row_bytes_h,
+                            row_bytes_qo,
+                        )?;
+                        enc.memory_barrier_buffers();
+                    }
+
+                    // Gemma 4 V-norm: scale-free RMSNorm on V projections.
+                    if *has_v_norm {
+                        if let Some(ref unit_w) = self.unit_norm_weight {
+                            ops::encode_rms_norm(
+                                &enc,
+                                &pipelines.rms_norm,
+                                &ops::RmsNormParams {
+                                    input: &bufs.v_proj,
+                                    weight: unit_w,
+                                    output: &bufs.v_proj,
+                                    hidden_size: layer_hd,
+                                    token_count: (token_count * layer_nkv as usize) as u32,
+                                    eps,
+                                },
+                            );
+                            enc.memory_barrier_buffers();
+                        }
+                    }
+
+                    // Step 6: QK normalization + RoPE
+                    let (layer_rope_cos, layer_rope_sin) = match plan.rope_table {
+                        RopeTable::Global => (
+                            self.global_rope_cos.as_ref().unwrap_or(rope_cos),
+                            self.global_rope_sin.as_ref().unwrap_or(rope_sin),
+                        ),
+                        RopeTable::Default => (rope_cos, rope_sin),
+                    };
+                    encode_qk_norm_and_rope(
+                        &enc,
+                        pipelines,
+                        bufs,
+                        lw.q_norm.as_ref(),
+                        lw.k_norm.as_ref(),
+                        layer_rope_cos,
+                        layer_rope_sin,
+                        nh,
+                        layer_nkv,
+                        layer_hd,
+                        seq_pos,
+                        token_count,
+                        eps,
                     )?;
-                    encode_projection(
-                        &enc, &bufs.norm_out, &norm_mat,
-                        lw.gdn_in_proj_z.as_ref().unwrap(),
-                        &gdn.gpu_temp_z, &dummy_matmul, pipelines,
-                        token_count, value_dim, h, row_bytes_h, value_dim * 2,
-                    )?;
-                    encode_projection(
-                        &enc, &bufs.norm_out, &norm_mat,
-                        lw.gdn_in_proj_a.as_ref().unwrap(),
-                        &gdn.gpu_temp_a, &dummy_matmul, pipelines,
-                        token_count, num_v_heads, h, row_bytes_h, num_v_heads * 2,
-                    )?;
-                    encode_projection(
-                        &enc, &bufs.norm_out, &norm_mat,
-                        lw.gdn_in_proj_b.as_ref().unwrap(),
-                        &gdn.gpu_temp_b, &dummy_matmul, pipelines,
-                        token_count, num_v_heads, h, row_bytes_h, num_v_heads * 2,
-                    )?;
                     enc.memory_barrier_buffers();
 
-                    let layer_state = &gdn.layers[gdn_idx];
-                    ops::encode_gdn_prefill_conv1d_silu(
-                        &enc, &pipelines.gdn_prefill_conv1d_silu,
-                        &gdn.gpu_temp_qkv, lw.gdn_conv1d_weight.as_ref().unwrap(),
-                        &layer_state.conv_state, &gdn.gpu_conv_out,
-                        qkv_dim as u32, gdn_cfg.conv_kernel_size as u32, token_count as u32,
-                    );
-                    enc.memory_barrier_buffers();
+                    // Steps 7-8: KV cache write + attention
+                    let attn_scale = plan.attn_scale;
 
-                    ops::encode_gdn_prefill_recurrent(
-                        &enc, &pipelines.gdn_prefill_recurrent,
-                        &gdn.gpu_conv_out, &gdn.gpu_temp_a, &gdn.gpu_temp_b,
-                        lw.gdn_a_log.as_ref().unwrap(), lw.gdn_dt_bias.as_ref().unwrap(),
-                        lw.gdn_norm.as_ref().unwrap(), &gdn.gpu_temp_z,
-                        &layer_state.recurrent_state, &gdn.gpu_gated_output,
-                        token_count as u32, qkv_dim as u32, key_dim as u32,
-                        value_dim as u32, num_v_heads as u32, k_head_dim as u32,
-                        v_head_dim as u32, 1e-6f32, gdn_cfg.num_k_heads as u32,
-                    );
-                    enc.memory_barrier_buffers();
-
-                    let gated_mat = MpsMatrix::from_buffer(
-                        &gdn.gpu_gated_output, token_count, value_dim, value_dim * 2,
-                    ).map_err(|e| InferenceError::runtime(e.to_string()))?;
-                    encode_projection(
-                        &enc, &gdn.gpu_gated_output, &gated_mat,
-                        lw.gdn_out_proj.as_ref().unwrap(),
-                        &gdn.scratch, &dummy_matmul, pipelines,
-                        token_count, h, value_dim, value_dim * 2, h * 2,
+                    encode_kv_cache_and_attention(
+                        &enc,
+                        pipelines,
+                        bufs,
+                        self.turboquant.as_ref(),
+                        self.kv_cache.as_ref(),
+                        self.fp16_kv_cache.as_ref(),
+                        self.config.max_seq_len,
+                        self.config.n_bits as usize,
+                        plan.kv_cache_layer,
+                        seq_pos,
+                        token_count,
+                        nh,
+                        layer_nkv,
+                        layer_hd,
+                        enable_tq,
+                        self.config.use_fa2_prefill,
+                        plan.kv_anchor,
+                        layer_window,
+                        attn_scale,
                     )?;
                     enc.memory_barrier_buffers();
 
-                    ops::encode_fused_residual_rms_norm(
-                        &enc, &pipelines.fused_residual_rms_norm,
-                        &ops::FusedResidualRmsNormParams {
-                            a: &bufs.hidden_state, b: &gdn.scratch,
-                            weight: &lw.post_attn_norm,
-                            normed_output: &bufs.norm_out,
-                            residual_output: &bufs.residual,
-                            eps, hidden_size: h as u32,
-                            token_count: token_count as u32,
-                        },
-                    );
-                } else {
-                    // Decode (single token): full GPU path
-                    let gdn = self.gdn_state.as_ref()
-                        .ok_or_else(|| InferenceError::runtime("GDN state not initialized"))?;
+                    // Qwen3.5 attn_output_gate: apply sigmoid(gate) to attention output.
+                    if *has_output_gate {
+                        if let Some(gate_buf) = &bufs.q_gate {
+                            let gate_size =
+                                (token_count * mc.num_attention_heads * layer_hd as usize) as u32;
+                            ops::encode_sigmoid_gate(
+                                &enc,
+                                &pipelines.sigmoid_gate,
+                                &bufs.attn_out,
+                                gate_buf,
+                                gate_size,
+                            );
+                            enc.memory_barrier_buffers();
+                        }
+                    }
 
-                    let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, 1, h, row_bytes_h)
-                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
-                    let dummy_matmul = ProjectionMatmul::Quantized;
-
-                    let qkv_dim = gdn_cfg.qkv_dim;
-                    let value_dim = gdn_cfg.value_dim;
-                    let num_v_heads = gdn_cfg.num_v_heads;
-                    let k_head_dim = gdn_cfg.k_head_dim;
-                    let v_head_dim = gdn_cfg.v_head_dim;
-                    let key_dim = gdn_cfg.key_dim;
-
-                    encode_projection(&enc, &bufs.norm_out, &norm_mat,
-                        lw.gdn_in_proj_qkv.as_ref().unwrap(), &gdn.gpu_temp_qkv,
-                        &dummy_matmul, pipelines, 1, qkv_dim, h, row_bytes_h, qkv_dim * 2)?;
-                    encode_projection(&enc, &bufs.norm_out, &norm_mat,
-                        lw.gdn_in_proj_z.as_ref().unwrap(), &gdn.gpu_temp_z,
-                        &dummy_matmul, pipelines, 1, value_dim, h, row_bytes_h, value_dim * 2)?;
-                    encode_projection(&enc, &bufs.norm_out, &norm_mat,
-                        lw.gdn_in_proj_a.as_ref().unwrap(), &gdn.gpu_temp_a,
-                        &dummy_matmul, pipelines, 1, num_v_heads, h, row_bytes_h, num_v_heads * 2)?;
-                    encode_projection(&enc, &bufs.norm_out, &norm_mat,
-                        lw.gdn_in_proj_b.as_ref().unwrap(), &gdn.gpu_temp_b,
-                        &dummy_matmul, pipelines, 1, num_v_heads, h, row_bytes_h, num_v_heads * 2)?;
-                    enc.memory_barrier_buffers();
-
-                    let layer_state = &gdn.layers[gdn_idx];
-                    ops::encode_gdn_conv1d_silu(
-                        &enc, &pipelines.gdn_conv1d_silu,
-                        &gdn.gpu_temp_qkv, lw.gdn_conv1d_weight.as_ref().unwrap(),
-                        &layer_state.conv_state, &gdn.gpu_conv_out,
-                        qkv_dim as u32, gdn_cfg.conv_kernel_size as u32,
-                    );
-                    enc.memory_barrier_buffers();
-
-                    ops::encode_gdn_recurrent_update(
-                        &enc, &pipelines.gdn_recurrent_update,
-                        &gdn.gpu_conv_out, &gdn.gpu_temp_a, &gdn.gpu_temp_b,
-                        lw.gdn_a_log.as_ref().unwrap(), lw.gdn_dt_bias.as_ref().unwrap(),
-                        &layer_state.recurrent_state, &gdn.gpu_raw_output,
-                        key_dim as u32, value_dim as u32, num_v_heads as u32,
-                        k_head_dim as u32, v_head_dim as u32, gdn_cfg.num_k_heads as u32,
-                    );
-                    enc.memory_barrier_buffers();
-
-                    ops::encode_gdn_output_gate(
-                        &enc, &pipelines.gdn_output_gate,
-                        &gdn.gpu_raw_output, &gdn.gpu_temp_z,
-                        lw.gdn_norm.as_ref().unwrap(), &gdn.gpu_gated_output,
-                        num_v_heads as u32, v_head_dim as u32, 1e-6f32,
-                    );
-                    enc.memory_barrier_buffers();
-
-                    let gated_mat = MpsMatrix::from_buffer(
-                        &gdn.gpu_gated_output, 1, value_dim, value_dim * 2,
-                    ).map_err(|e| InferenceError::runtime(e.to_string()))?;
-                    encode_projection(&enc, &gdn.gpu_gated_output, &gated_mat,
-                        lw.gdn_out_proj.as_ref().unwrap(), &gdn.scratch,
-                        &dummy_matmul, pipelines, 1, h, value_dim, value_dim * 2, h * 2)?;
-                    enc.memory_barrier_buffers();
-
-                    ops::encode_fused_residual_rms_norm(
-                        &enc, &pipelines.fused_residual_rms_norm,
-                        &ops::FusedResidualRmsNormParams {
-                            a: &bufs.hidden_state, b: &gdn.scratch,
-                            weight: &lw.post_attn_norm,
-                            normed_output: &bufs.norm_out,
-                            residual_output: &bufs.residual,
-                            eps, hidden_size: h as u32, token_count: 1,
-                        },
-                    );
-                }
-                enc.memory_barrier_buffers();
-            }
-            AttentionKind::Standard { has_output_gate, has_v_norm } => {
-                // Standard attention layer
-                let default_pipelines = self.pipelines()?;
-                let pipelines = if plan.use_global_pipelines {
-                    self.global_pipelines.as_ref().unwrap_or(default_pipelines)
-                } else {
-                    default_pipelines
-                };
-                let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
+                    // Step 9: Output projection
+                    let attn_out_features = mc.num_attention_heads * layer_hd as usize;
+                    let attn_mat = MpsMatrix::from_buffer(
+                        &bufs.attn_out,
+                        token_count,
+                        attn_out_features,
+                        row_bytes_qo,
+                    )
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
-                let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
-                let kv_out_features = layer_nkv as usize * layer_hd as usize;
-                for (weight, output_buf, matmul, out_features, row_bytes_out) in [
-                    (&lw.q_proj, &bufs.q_proj, &lm.q, qkv_out_features, row_bytes_qo),
-                    (&lw.k_proj, &bufs.k_proj, &lm.k, kv_out_features, row_bytes_kv),
-                    (&lw.v_proj, &bufs.v_proj, &lm.v, kv_out_features, row_bytes_kv),
-                ] {
                     encode_projection(
-                        &enc, &bufs.norm_out, &norm_mat, weight, output_buf,
-                        matmul, pipelines, token_count, out_features, h,
-                        row_bytes_h, row_bytes_out,
-                    )?;
-                }
-                enc.memory_barrier_buffers();
-
-                // Qwen3.5 attn_output_gate: compute gate projection.
-                if let (Some(gate_w), Some(gate_m), Some(gate_buf)) =
-                    (&lw.attn_output_gate, &lm.q_gate, &bufs.q_gate)
-                {
-                    encode_projection(
-                        &enc, &bufs.norm_out, &norm_mat, gate_w, gate_buf, gate_m,
-                        pipelines, token_count, qkv_out_features, h,
-                        row_bytes_h, row_bytes_qo,
+                        &enc,
+                        &bufs.attn_out,
+                        &attn_mat,
+                        &lw.o_proj,
+                        &bufs.ffn_down,
+                        &lm.o,
+                        pipelines,
+                        token_count,
+                        h,
+                        attn_out_features,
+                        row_bytes_qo,
+                        row_bytes_h,
                     )?;
                     enc.memory_barrier_buffers();
-                }
 
-                // Gemma 4 V-norm: scale-free RMSNorm on V projections.
-                if *has_v_norm {
-                    if let Some(ref unit_w) = self.unit_norm_weight {
+                    // Step 10-11: Residual add + post-attention RMSNorm
+                    if let Some(pre_ffn) = &lw.pre_ffn_norm {
+                        // Gemma 4: post_attention_layernorm before residual add
                         ops::encode_rms_norm(
-                            &enc, &pipelines.rms_norm,
+                            &enc,
+                            &pipelines.rms_norm,
                             &ops::RmsNormParams {
-                                input: &bufs.v_proj, weight: unit_w,
-                                output: &bufs.v_proj, hidden_size: layer_hd,
-                                token_count: (token_count * layer_nkv as usize) as u32,
+                                input: &bufs.ffn_down,
+                                weight: &lw.post_attn_norm,
+                                output: &bufs.ffn_down,
+                                hidden_size: h as u32,
+                                token_count: token_count as u32,
                                 eps,
                             },
                         );
                         enc.memory_barrier_buffers();
+
+                        ops::encode_residual_add(
+                            &enc,
+                            &pipelines.residual_add,
+                            &bufs.hidden_state,
+                            &bufs.ffn_down,
+                            &bufs.residual,
+                            (token_count * h) as u32,
+                        );
+                        enc.memory_barrier_buffers();
+
+                        ops::encode_rms_norm(
+                            &enc,
+                            &pipelines.rms_norm,
+                            &ops::RmsNormParams {
+                                input: &bufs.residual,
+                                weight: pre_ffn,
+                                output: &bufs.norm_out,
+                                hidden_size: h as u32,
+                                token_count: token_count as u32,
+                                eps,
+                            },
+                        );
+                        enc.memory_barrier_buffers();
+                    } else {
+                        // Standard pre-norm transformer: fused residual + norm
+                        ops::encode_fused_residual_rms_norm(
+                            &enc,
+                            &pipelines.fused_residual_rms_norm,
+                            &ops::FusedResidualRmsNormParams {
+                                a: &bufs.hidden_state,
+                                b: &bufs.ffn_down,
+                                weight: &lw.post_attn_norm,
+                                normed_output: &bufs.norm_out,
+                                residual_output: &bufs.residual,
+                                eps,
+                                hidden_size: h as u32,
+                                token_count: token_count as u32,
+                            },
+                        );
+                        enc.memory_barrier_buffers();
                     }
-                }
-
-                // Step 6: QK normalization + RoPE
-                let (layer_rope_cos, layer_rope_sin) = match plan.rope_table {
-                    RopeTable::Global => (
-                        self.global_rope_cos.as_ref().unwrap_or(rope_cos),
-                        self.global_rope_sin.as_ref().unwrap_or(rope_sin),
-                    ),
-                    RopeTable::Default => (rope_cos, rope_sin),
-                };
-                encode_qk_norm_and_rope(
-                    &enc, pipelines, bufs, lw.q_norm.as_ref(), lw.k_norm.as_ref(),
-                    layer_rope_cos, layer_rope_sin, nh, layer_nkv, layer_hd,
-                    seq_pos, token_count, eps,
-                )?;
-                enc.memory_barrier_buffers();
-
-                // Steps 7-8: KV cache write + attention
-                let attn_scale = plan.attn_scale;
-
-                encode_kv_cache_and_attention(
-                    &enc, pipelines, bufs,
-                    self.turboquant.as_ref(), self.kv_cache.as_ref(),
-                    self.fp16_kv_cache.as_ref(), self.config.max_seq_len,
-                    self.config.n_bits as usize, plan.kv_cache_layer, seq_pos,
-                    token_count, nh, layer_nkv, layer_hd, enable_tq,
-                    self.config.use_fa2_prefill, plan.kv_anchor, layer_window,
-                    attn_scale,
-                )?;
-                enc.memory_barrier_buffers();
-
-                // Qwen3.5 attn_output_gate: apply sigmoid(gate) to attention output.
-                if *has_output_gate {
-                    if let Some(gate_buf) = &bufs.q_gate {
-                    let gate_size = (token_count * mc.num_attention_heads * layer_hd as usize) as u32;
-                    ops::encode_sigmoid_gate(
-                        &enc, &pipelines.sigmoid_gate,
-                        &bufs.attn_out, gate_buf, gate_size,
-                    );
-                    enc.memory_barrier_buffers();
-                    }
-                }
-
-                // Step 9: Output projection
-                let attn_out_features = mc.num_attention_heads * layer_hd as usize;
-                let attn_mat = MpsMatrix::from_buffer(
-                    &bufs.attn_out, token_count, attn_out_features, row_bytes_qo,
-                ).map_err(|e| InferenceError::runtime(e.to_string()))?;
-                encode_projection(
-                    &enc, &bufs.attn_out, &attn_mat, &lw.o_proj,
-                    &bufs.ffn_down, &lm.o, pipelines,
-                    token_count, h, attn_out_features, row_bytes_qo, row_bytes_h,
-                )?;
-                enc.memory_barrier_buffers();
-
-                // Step 10-11: Residual add + post-attention RMSNorm
-                if let Some(pre_ffn) = &lw.pre_ffn_norm {
-                    // Gemma 4: post_attention_layernorm before residual add
-                    ops::encode_rms_norm(
-                        &enc, &pipelines.rms_norm,
-                        &ops::RmsNormParams {
-                            input: &bufs.ffn_down, weight: &lw.post_attn_norm,
-                            output: &bufs.ffn_down, hidden_size: h as u32,
-                            token_count: token_count as u32, eps,
-                        },
-                    );
-                    enc.memory_barrier_buffers();
-
-                    ops::encode_residual_add(
-                        &enc, &pipelines.residual_add,
-                        &bufs.hidden_state, &bufs.ffn_down, &bufs.residual,
-                        (token_count * h) as u32,
-                    );
-                    enc.memory_barrier_buffers();
-
-                    ops::encode_rms_norm(
-                        &enc, &pipelines.rms_norm,
-                        &ops::RmsNormParams {
-                            input: &bufs.residual, weight: pre_ffn,
-                            output: &bufs.norm_out, hidden_size: h as u32,
-                            token_count: token_count as u32, eps,
-                        },
-                    );
-                    enc.memory_barrier_buffers();
-                } else {
-                    // Standard pre-norm transformer: fused residual + norm
-                    ops::encode_fused_residual_rms_norm(
-                        &enc, &pipelines.fused_residual_rms_norm,
-                        &ops::FusedResidualRmsNormParams {
-                            a: &bufs.hidden_state, b: &bufs.ffn_down,
-                            weight: &lw.post_attn_norm,
-                            normed_output: &bufs.norm_out,
-                            residual_output: &bufs.residual,
-                            eps, hidden_size: h as u32,
-                            token_count: token_count as u32,
-                        },
-                    );
-                    enc.memory_barrier_buffers();
-                }
-            } // end AttentionKind::Standard
+                } // end AttentionKind::Standard
             } // end match plan.attention
 
             // Get pipelines for the remaining steps (FFN, MoE, PLE, etc.)
@@ -3919,6 +4210,8 @@ impl MetalInference {
         } else {
             self.gdn_state = None;
         }
+
+        weights.drop_dense_row_major();
 
         self.weights = Some(weights);
 

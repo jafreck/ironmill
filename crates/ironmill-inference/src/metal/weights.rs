@@ -36,6 +36,27 @@ pub enum WeightBuffer {
 }
 
 impl WeightBuffer {
+    /// Create an empty placeholder weight (no GPU memory).
+    ///
+    /// Used for GDN layer Q/K/V/O placeholders that are never dispatched.
+    pub fn empty() -> Self {
+        WeightBuffer::Dense {
+            buf: None,
+            packed: None,
+        }
+    }
+
+    /// Returns `true` if this weight has no GPU buffers allocated.
+    pub fn is_empty(&self) -> bool {
+        matches!(
+            self,
+            WeightBuffer::Dense {
+                buf: None,
+                packed: None
+            }
+        )
+    }
+
     /// Get the underlying row-major buffer (Dense only).
     /// Returns an error if the buffer is quantized or was dropped after packing.
     pub fn as_dense(&self) -> anyhow::Result<&MetalBuffer> {
@@ -61,6 +82,21 @@ impl WeightBuffer {
             WeightBuffer::Quantized(_)
             | WeightBuffer::AffineQuantized(_)
             | WeightBuffer::DualScaleQuantized(_) => None,
+        }
+    }
+
+    /// Drop the row-major `buf` when a packed copy exists.
+    ///
+    /// After all load-time transforms (split_q_gate_weight, norm offsets,
+    /// MLA absorption) the row-major buffer is no longer needed — inference
+    /// dispatches exclusively through the packed or quantized path.
+    fn drop_row_major_if_packed(&mut self) {
+        if let WeightBuffer::Dense {
+            buf,
+            packed: Some(_),
+        } = self
+        {
+            *buf = None;
         }
     }
 }
@@ -186,6 +222,10 @@ impl WeightVisitor for MetalVisitor<'_> {
     ) -> Result<WeightBuffer, MetalError> {
         load_weight_buffer(self.device, provider, name, self.force_cpu_dequant, false)
     }
+
+    fn empty_weight(&self) -> WeightBuffer {
+        WeightBuffer::empty()
+    }
 }
 
 impl MetalWeights {
@@ -267,6 +307,71 @@ impl MetalWeights {
         })
     }
 
+    /// Free row-major dense buffers that are redundant with packed copies.
+    ///
+    /// After all load-time transforms (split_q_gate_weight, norm offsets,
+    /// MLA absorption, D2Quant simulation) the row-major `buf` is no longer
+    /// needed — `encode_projection` dispatches exclusively through `packed`.
+    /// Calling this typically halves GPU memory for dense FP16 models.
+    pub fn drop_dense_row_major(&mut self) {
+        for layer in &mut self.layers {
+            for wb in [
+                &mut layer.q_proj,
+                &mut layer.k_proj,
+                &mut layer.v_proj,
+                &mut layer.o_proj,
+                &mut layer.gate_proj,
+                &mut layer.up_proj,
+                &mut layer.down_proj,
+            ] {
+                wb.drop_row_major_if_packed();
+            }
+            if let Some(ref mut w) = layer.attn_output_gate {
+                w.drop_row_major_if_packed();
+            }
+            if let Some(ref mut w) = layer.gdn_in_proj_qkv {
+                w.drop_row_major_if_packed();
+            }
+            if let Some(ref mut w) = layer.gdn_in_proj_z {
+                w.drop_row_major_if_packed();
+            }
+            if let Some(ref mut w) = layer.gdn_in_proj_a {
+                w.drop_row_major_if_packed();
+            }
+            if let Some(ref mut w) = layer.gdn_in_proj_b {
+                w.drop_row_major_if_packed();
+            }
+            if let Some(ref mut w) = layer.gdn_out_proj {
+                w.drop_row_major_if_packed();
+            }
+            if let Some(ref mut w) = layer.router_weight {
+                w.drop_row_major_if_packed();
+            }
+            for w in &mut layer.expert_gate_projs {
+                w.drop_row_major_if_packed();
+            }
+            for w in &mut layer.expert_up_projs {
+                w.drop_row_major_if_packed();
+            }
+            for w in &mut layer.expert_down_projs {
+                w.drop_row_major_if_packed();
+            }
+            if let Some(ref mut w) = layer.ple_gate {
+                w.drop_row_major_if_packed();
+            }
+            if let Some(ref mut w) = layer.ple_projection {
+                w.drop_row_major_if_packed();
+            }
+        }
+        self.lm_head.drop_row_major_if_packed();
+        if let Some(ref mut w) = self.ple_embed_tokens {
+            w.drop_row_major_if_packed();
+        }
+        if let Some(ref mut w) = self.ple_model_projection {
+            w.drop_row_major_if_packed();
+        }
+    }
+
     /// Apply D2Quant simulation in-place: quantize each weight buffer to
     /// `bits`-bit (2 or 3) using dual-scale quantization, then immediately
     /// dequantize back to FP16. This bakes the quantization error into the
@@ -320,7 +425,9 @@ fn d2quant_round_trip_weight_buffer(wb: &mut WeightBuffer, bits: u8) {
     let (dense_buf, packed_buf) = match wb {
         WeightBuffer::Dense { buf, packed } => (buf, packed),
         // Already quantized — skip.
-        WeightBuffer::Quantized(_) | WeightBuffer::AffineQuantized(_) | WeightBuffer::DualScaleQuantized(_) => return,
+        WeightBuffer::Quantized(_)
+        | WeightBuffer::AffineQuantized(_)
+        | WeightBuffer::DualScaleQuantized(_) => return,
     };
 
     // Helper: apply quantize→dequant round-trip to any FP16 Metal buffer.
@@ -398,9 +505,9 @@ fn split_q_gate_weight(
 
     let raw = match q_proj {
         &mut WeightBuffer::Dense { ref buf, .. } => {
-            let buf = buf.as_ref().ok_or_else(|| {
-                MetalError::WeightLoading("q_proj dense buffer is None".into())
-            })?;
+            let buf = buf
+                .as_ref()
+                .ok_or_else(|| MetalError::WeightLoading("q_proj dense buffer is None".into()))?;
             let mut data = vec![0u8; total_bytes];
             buf.read_bytes(&mut data, 0).map_err(MetalError::Metal)?;
             data

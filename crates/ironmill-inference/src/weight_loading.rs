@@ -148,6 +148,12 @@ pub trait WeightVisitor {
         // Default: same as load_weight. Backends override to skip packing.
         self.load_weight(provider, name)
     }
+
+    /// Create an empty placeholder weight with no GPU memory.
+    ///
+    /// Used for GDN layer Q/K/V/O fields that must be structurally present
+    /// but are never dispatched during inference.
+    fn empty_weight(&self) -> Self::Weight;
 }
 
 // ── Layout driver ───────────────────────────────────────────────
@@ -202,19 +208,16 @@ pub fn load_model_weights<V: WeightVisitor>(
                 visitor.load_dense(provider, &format!("{prefix}.linear_attn.norm.weight"))?;
 
             // For GDN layers, self_attn Q/K/V/O projections don't exist in the checkpoint.
-            // Re-use the GDN projections as placeholders so the struct is populated.
-            // The forward loop will check gdn_in_proj_qkv to decide the execution path.
-            let placeholder_qkv_name = &gdn_qkv_name;
-            let placeholder_out_name = format!("{prefix}.linear_attn.out_proj.weight");
-
+            // Use empty placeholders — the forward loop checks gdn_in_proj_qkv to
+            // decide the execution path, so these are never dispatched.
             layers.push(LoadedLayer {
                 input_norm: visitor
                     .load_dense(provider, &format!("{prefix}.input_layernorm.weight"))?,
-                // Placeholder projections — not used for GDN layers.
-                q_proj: visitor.load_weight(provider, placeholder_qkv_name)?,
-                k_proj: visitor.load_weight(provider, placeholder_qkv_name)?,
-                v_proj: visitor.load_weight(provider, placeholder_qkv_name)?,
-                o_proj: visitor.load_weight(provider, &placeholder_out_name)?,
+                // Empty placeholders — no GPU memory allocated.
+                q_proj: visitor.empty_weight(),
+                k_proj: visitor.empty_weight(),
+                v_proj: visitor.empty_weight(),
+                o_proj: visitor.empty_weight(),
                 post_attn_norm: visitor.load_dense(
                     provider,
                     &format!("{prefix}.post_attention_layernorm.weight"),

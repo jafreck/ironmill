@@ -624,7 +624,13 @@ fn emit_gdn_layer(
     // 4. Depthwise causal conv1d
     let conv_weight_name = format!("{attn_prefix}.conv1d.weight");
     let conv_weight_const = format!("l{li}_conv1d_weight");
-    emit_weight_const(block, provider, &conv_weight_name, &conv_weight_const, warnings)?;
+    emit_weight_const(
+        block,
+        provider,
+        &conv_weight_name,
+        &conv_weight_const,
+        warnings,
+    )?;
 
     let conv_bias_name = format!("{attn_prefix}.conv1d.bias");
     let conv_bias_const = format!("l{li}_conv1d_bias");
