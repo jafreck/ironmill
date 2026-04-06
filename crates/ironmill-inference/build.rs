@@ -42,6 +42,7 @@ fn main() {
         "affine_matmul",
         "d2quant_matmul",
         "quip_sharp",
+        "gdn_recurrent",
         "fused_softcap",
         "ple_kernels",
         "moe",

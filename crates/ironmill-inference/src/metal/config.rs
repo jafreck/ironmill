@@ -153,6 +153,81 @@ impl Gemma4Config {
     }
 }
 
+/// Gated Delta Network (GDN) model configuration.
+///
+/// Parsed from `config.extra` for Qwen 3.5 models. Controls the dimensions
+/// and structure of the linear attention (GDN) layers.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct GdnModelConfig {
+    /// Per-head key dimension for GDN layers.
+    pub k_head_dim: usize,
+    /// Per-head value dimension for GDN layers.
+    pub v_head_dim: usize,
+    /// Number of key/query heads in GDN layers.
+    pub num_k_heads: usize,
+    /// Number of value heads in GDN layers.
+    pub num_v_heads: usize,
+    /// Convolution kernel size for the causal conv1d.
+    pub conv_kernel_size: usize,
+    /// Total QKV dimension: 2 * key_dim + value_dim.
+    pub qkv_dim: usize,
+    /// Total key dimension: num_k_heads * k_head_dim.
+    pub key_dim: usize,
+    /// Total value dimension: num_v_heads * v_head_dim.
+    pub value_dim: usize,
+    /// Which layers are GDN (indices into the full layer list).
+    pub gdn_layer_indices: Vec<usize>,
+}
+
+impl GdnModelConfig {
+    /// Try to parse GDN config from ModelConfig extra fields.
+    ///
+    /// Returns `None` if the required fields are absent (non-Qwen3.5 model).
+    pub fn from_model_config(mc: &mil_rs::weights::ModelConfig) -> Option<Self> {
+        let k_head_dim = mc.extra.get("linear_key_head_dim")?.as_u64()? as usize;
+        let v_head_dim = mc.extra.get("linear_value_head_dim")?.as_u64()? as usize;
+        let num_k_heads = mc.extra.get("linear_num_key_heads")?.as_u64()? as usize;
+        let num_v_heads = mc.extra.get("linear_num_value_heads")?.as_u64()? as usize;
+        let conv_kernel_size = mc.extra.get("linear_conv_kernel_dim")?.as_u64()? as usize;
+
+        let key_dim = num_k_heads * k_head_dim;
+        let value_dim = num_v_heads * v_head_dim;
+        let qkv_dim = 2 * key_dim + value_dim;
+
+        // Parse layer_types to determine which layers are GDN.
+        let layer_types = mc.extra.get("layer_types")?.as_array()?;
+        let gdn_layer_indices: Vec<usize> = layer_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| {
+                let s = v.as_str()?;
+                if s == "linear_attention" {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if gdn_layer_indices.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            k_head_dim,
+            v_head_dim,
+            num_k_heads,
+            num_v_heads,
+            conv_kernel_size,
+            qkv_dim,
+            key_dim,
+            value_dim,
+            gdn_layer_indices,
+        })
+    }
+}
+
 /// Cross-Layer Attention configuration.
 ///
 /// When configured, only anchor layers maintain their own KV cache buffers.

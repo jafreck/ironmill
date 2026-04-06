@@ -13,7 +13,7 @@ pub mod ops;
 pub mod turboquant;
 pub mod weights;
 
-pub use config::{ClaConfig, Gemma4Config, Gemma4LayerConfig, MetalConfig};
+pub use config::{ClaConfig, GdnModelConfig, Gemma4Config, Gemma4LayerConfig, MetalConfig};
 pub use error::MetalError;
 pub use inference::{MetalArtifacts, MetalInference};
 pub use mla::MlaConfig;

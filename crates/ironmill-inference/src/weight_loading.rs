@@ -61,6 +61,30 @@ pub struct LoadedLayer<D, W> {
     pub ple_post_norm: Option<D>,
     /// Per-layer output scalar (Gemma 4 `layer_scalar`).
     pub layer_scalar: Option<D>,
+
+    /// Optional attention output gate weight `[num_heads × head_dim, hidden_size]`.
+    /// Present for Qwen3.5 models with `attn_output_gate: true`.
+    pub attn_output_gate: Option<W>,
+
+    // ── GDN (Gated Delta Network) weights — present for linear_attention layers ──
+    /// Fused QKV input projection `[2*key_dim + value_dim, hidden_size]`.
+    pub gdn_in_proj_qkv: Option<W>,
+    /// Z gate projection `[value_dim, hidden_size]`.
+    pub gdn_in_proj_z: Option<W>,
+    /// Alpha gate projection `[num_v_heads, hidden_size]`.
+    pub gdn_in_proj_a: Option<W>,
+    /// Beta gate projection `[num_v_heads, hidden_size]`.
+    pub gdn_in_proj_b: Option<W>,
+    /// Conv1d weight `[qkv_dim, 1, kernel_size]` stored as dense buffer.
+    pub gdn_conv1d_weight: Option<D>,
+    /// Log-space decay parameter `[num_v_heads]`.
+    pub gdn_a_log: Option<D>,
+    /// Softplus bias for dt `[num_v_heads]`.
+    pub gdn_dt_bias: Option<D>,
+    /// Output projection `[hidden_size, value_dim]`.
+    pub gdn_out_proj: Option<W>,
+    /// Per-head RMSNorm weight for output gating `[v_head_dim]`.
+    pub gdn_norm: Option<D>,
 }
 
 /// Core model weights returned by [`load_model_weights`].
@@ -146,120 +170,226 @@ pub fn load_model_weights<V: WeightVisitor>(
         let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
         let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
 
-        layers.push(LoadedLayer {
-            input_norm: visitor
-                .load_dense(provider, &format!("{prefix}.input_layernorm.weight"))?,
-            q_proj: visitor.load_weight(provider, &format!("{prefix}.self_attn.q_proj.weight"))?,
-            k_proj: visitor.load_weight(provider, &format!("{prefix}.self_attn.k_proj.weight"))?,
-            v_proj: visitor.load_weight(provider, &format!("{prefix}.self_attn.v_proj.weight"))?,
-            o_proj: visitor.load_weight(provider, &format!("{prefix}.self_attn.o_proj.weight"))?,
-            post_attn_norm: visitor.load_dense(
-                provider,
-                &format!("{prefix}.post_attention_layernorm.weight"),
-            )?,
-            gate_proj: visitor.load_weight(provider, &format!("{prefix}.mlp.gate_proj.weight"))?,
-            up_proj: visitor.load_weight(provider, &format!("{prefix}.mlp.up_proj.weight"))?,
-            down_proj: visitor.load_weight(provider, &format!("{prefix}.mlp.down_proj.weight"))?,
-            q_norm: if provider.has_tensor(&q_norm_name) {
-                Some(visitor.load_dense(provider, &q_norm_name)?)
-            } else {
-                None
-            },
-            k_norm: if provider.has_tensor(&k_norm_name) {
-                Some(visitor.load_dense(provider, &k_norm_name)?)
-            } else {
-                None
-            },
-            pre_ffn_norm: {
-                let name = format!("{prefix}.pre_feedforward_layernorm.weight");
-                if provider.has_tensor(&name) {
-                    Some(visitor.load_dense(provider, &name)?)
+        // Detect GDN (linear_attention) layers by checking for the fused QKV projection.
+        let gdn_qkv_name = format!("{prefix}.linear_attn.in_proj_qkv.weight");
+        let is_gdn = provider.has_tensor(&gdn_qkv_name);
+
+        if is_gdn {
+            // GDN layer — load linear_attn weights; standard attn projections are absent.
+            // For Q/K/V/O we need placeholder weights. We load the GDN output projection
+            // as the "o_proj" stand-in so the LayerMatmuls struct can still be built,
+            // and use the GDN QKV projection as the "q_proj" stand-in. The actual GDN
+            // weights are stored in the gdn_* fields and used at inference time.
+            //
+            // We load the GDN projections as the actual q/k/v/o fields to serve as
+            // placeholders that have valid buffer sizes. The inference loop checks
+            // gdn_in_proj_qkv.is_some() to dispatch to the GDN path.
+            let gdn_qkv = visitor.load_weight(provider, &gdn_qkv_name)?;
+            let gdn_z =
+                visitor.load_weight(provider, &format!("{prefix}.linear_attn.in_proj_z.weight"))?;
+            let gdn_a =
+                visitor.load_weight(provider, &format!("{prefix}.linear_attn.in_proj_a.weight"))?;
+            let gdn_b =
+                visitor.load_weight(provider, &format!("{prefix}.linear_attn.in_proj_b.weight"))?;
+            let gdn_conv1d =
+                visitor.load_dense(provider, &format!("{prefix}.linear_attn.conv1d.weight"))?;
+            let gdn_a_log = visitor.load_dense(provider, &format!("{prefix}.linear_attn.A_log"))?;
+            let gdn_dt_bias =
+                visitor.load_dense(provider, &format!("{prefix}.linear_attn.dt_bias"))?;
+            let gdn_out =
+                visitor.load_weight(provider, &format!("{prefix}.linear_attn.out_proj.weight"))?;
+            let gdn_norm =
+                visitor.load_dense(provider, &format!("{prefix}.linear_attn.norm.weight"))?;
+
+            // For GDN layers, self_attn Q/K/V/O projections don't exist in the checkpoint.
+            // Re-use the GDN projections as placeholders so the struct is populated.
+            // The forward loop will check gdn_in_proj_qkv to decide the execution path.
+            let placeholder_qkv_name = &gdn_qkv_name;
+            let placeholder_out_name = format!("{prefix}.linear_attn.out_proj.weight");
+
+            layers.push(LoadedLayer {
+                input_norm: visitor
+                    .load_dense(provider, &format!("{prefix}.input_layernorm.weight"))?,
+                // Placeholder projections — not used for GDN layers.
+                q_proj: visitor.load_weight(provider, placeholder_qkv_name)?,
+                k_proj: visitor.load_weight(provider, placeholder_qkv_name)?,
+                v_proj: visitor.load_weight(provider, placeholder_qkv_name)?,
+                o_proj: visitor.load_weight(provider, &placeholder_out_name)?,
+                post_attn_norm: visitor.load_dense(
+                    provider,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                )?,
+                gate_proj: visitor
+                    .load_weight(provider, &format!("{prefix}.mlp.gate_proj.weight"))?,
+                up_proj: visitor.load_weight(provider, &format!("{prefix}.mlp.up_proj.weight"))?,
+                down_proj: visitor
+                    .load_weight(provider, &format!("{prefix}.mlp.down_proj.weight"))?,
+                q_norm: if provider.has_tensor(&q_norm_name) {
+                    Some(visitor.load_dense(provider, &q_norm_name)?)
                 } else {
                     None
-                }
-            },
-            post_ffn_norm: {
-                let name = format!("{prefix}.post_feedforward_layernorm.weight");
-                if provider.has_tensor(&name) {
-                    Some(visitor.load_dense(provider, &name)?)
+                },
+                k_norm: if provider.has_tensor(&k_norm_name) {
+                    Some(visitor.load_dense(provider, &k_norm_name)?)
                 } else {
                     None
-                }
-            },
-            router_weight: {
-                let name = format!("{prefix}.mlp.router.weight");
-                if provider.has_tensor(&name) {
-                    Some(visitor.load_weight(provider, &name)?)
+                },
+                // Gemma4 fields — not applicable to GDN layers.
+                pre_ffn_norm: None,
+                post_ffn_norm: None,
+                router_weight: None,
+                expert_gate_projs: Vec::new(),
+                expert_up_projs: Vec::new(),
+                expert_down_projs: Vec::new(),
+                ple_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
+                layer_scalar: None,
+                // GDN weights
+                gdn_in_proj_qkv: Some(gdn_qkv),
+                gdn_in_proj_z: Some(gdn_z),
+                gdn_in_proj_a: Some(gdn_a),
+                gdn_in_proj_b: Some(gdn_b),
+                gdn_conv1d_weight: Some(gdn_conv1d),
+                gdn_a_log: Some(gdn_a_log),
+                gdn_dt_bias: Some(gdn_dt_bias),
+                gdn_out_proj: Some(gdn_out),
+                gdn_norm: Some(gdn_norm),
+                attn_output_gate: None,
+            });
+        } else {
+            // Standard attention layer.
+            layers.push(LoadedLayer {
+                input_norm: visitor
+                    .load_dense(provider, &format!("{prefix}.input_layernorm.weight"))?,
+                q_proj: visitor
+                    .load_weight(provider, &format!("{prefix}.self_attn.q_proj.weight"))?,
+                k_proj: visitor
+                    .load_weight(provider, &format!("{prefix}.self_attn.k_proj.weight"))?,
+                v_proj: visitor
+                    .load_weight(provider, &format!("{prefix}.self_attn.v_proj.weight"))?,
+                o_proj: visitor
+                    .load_weight(provider, &format!("{prefix}.self_attn.o_proj.weight"))?,
+                post_attn_norm: visitor.load_dense(
+                    provider,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                )?,
+                gate_proj: visitor
+                    .load_weight(provider, &format!("{prefix}.mlp.gate_proj.weight"))?,
+                up_proj: visitor.load_weight(provider, &format!("{prefix}.mlp.up_proj.weight"))?,
+                down_proj: visitor
+                    .load_weight(provider, &format!("{prefix}.mlp.down_proj.weight"))?,
+                q_norm: if provider.has_tensor(&q_norm_name) {
+                    Some(visitor.load_dense(provider, &q_norm_name)?)
                 } else {
                     None
-                }
-            },
-            expert_gate_projs: {
-                let mut projs = Vec::new();
-                for e in 0.. {
-                    let name = format!("{prefix}.mlp.experts.{e}.gate_proj.weight");
-                    if !provider.has_tensor(&name) {
-                        break;
+                },
+                k_norm: if provider.has_tensor(&k_norm_name) {
+                    Some(visitor.load_dense(provider, &k_norm_name)?)
+                } else {
+                    None
+                },
+                pre_ffn_norm: {
+                    let name = format!("{prefix}.pre_feedforward_layernorm.weight");
+                    if provider.has_tensor(&name) {
+                        Some(visitor.load_dense(provider, &name)?)
+                    } else {
+                        None
                     }
-                    projs.push(visitor.load_weight(provider, &name)?);
-                }
-                projs
-            },
-            expert_up_projs: {
-                let mut projs = Vec::new();
-                for e in 0.. {
-                    let name = format!("{prefix}.mlp.experts.{e}.up_proj.weight");
-                    if !provider.has_tensor(&name) {
-                        break;
+                },
+                post_ffn_norm: {
+                    let name = format!("{prefix}.post_feedforward_layernorm.weight");
+                    if provider.has_tensor(&name) {
+                        Some(visitor.load_dense(provider, &name)?)
+                    } else {
+                        None
                     }
-                    projs.push(visitor.load_weight(provider, &name)?);
-                }
-                projs
-            },
-            expert_down_projs: {
-                let mut projs = Vec::new();
-                for e in 0.. {
-                    let name = format!("{prefix}.mlp.experts.{e}.down_proj.weight");
-                    if !provider.has_tensor(&name) {
-                        break;
+                },
+                router_weight: {
+                    let name = format!("{prefix}.mlp.router.weight");
+                    if provider.has_tensor(&name) {
+                        Some(visitor.load_weight(provider, &name)?)
+                    } else {
+                        None
                     }
-                    projs.push(visitor.load_weight(provider, &name)?);
-                }
-                projs
-            },
-            ple_gate: {
-                let name = format!("{prefix}.per_layer_input_gate.weight");
-                if provider.has_tensor(&name) {
-                    Some(visitor.load_weight(provider, &name)?)
-                } else {
-                    None
-                }
-            },
-            ple_projection: {
-                let name = format!("{prefix}.per_layer_projection.weight");
-                if provider.has_tensor(&name) {
-                    Some(visitor.load_weight(provider, &name)?)
-                } else {
-                    None
-                }
-            },
-            ple_post_norm: {
-                let name = format!("{prefix}.post_per_layer_input_norm.weight");
-                if provider.has_tensor(&name) {
-                    Some(visitor.load_dense(provider, &name)?)
-                } else {
-                    None
-                }
-            },
-            layer_scalar: {
-                let name = format!("{prefix}.layer_scalar");
-                if provider.has_tensor(&name) {
-                    Some(visitor.load_dense(provider, &name)?)
-                } else {
-                    None
-                }
-            },
-        });
+                },
+                expert_gate_projs: {
+                    let mut projs = Vec::new();
+                    for e in 0.. {
+                        let name = format!("{prefix}.mlp.experts.{e}.gate_proj.weight");
+                        if !provider.has_tensor(&name) {
+                            break;
+                        }
+                        projs.push(visitor.load_weight(provider, &name)?);
+                    }
+                    projs
+                },
+                expert_up_projs: {
+                    let mut projs = Vec::new();
+                    for e in 0.. {
+                        let name = format!("{prefix}.mlp.experts.{e}.up_proj.weight");
+                        if !provider.has_tensor(&name) {
+                            break;
+                        }
+                        projs.push(visitor.load_weight(provider, &name)?);
+                    }
+                    projs
+                },
+                expert_down_projs: {
+                    let mut projs = Vec::new();
+                    for e in 0.. {
+                        let name = format!("{prefix}.mlp.experts.{e}.down_proj.weight");
+                        if !provider.has_tensor(&name) {
+                            break;
+                        }
+                        projs.push(visitor.load_weight(provider, &name)?);
+                    }
+                    projs
+                },
+                ple_gate: {
+                    let name = format!("{prefix}.per_layer_input_gate.weight");
+                    if provider.has_tensor(&name) {
+                        Some(visitor.load_weight(provider, &name)?)
+                    } else {
+                        None
+                    }
+                },
+                ple_projection: {
+                    let name = format!("{prefix}.per_layer_projection.weight");
+                    if provider.has_tensor(&name) {
+                        Some(visitor.load_weight(provider, &name)?)
+                    } else {
+                        None
+                    }
+                },
+                ple_post_norm: {
+                    let name = format!("{prefix}.post_per_layer_input_norm.weight");
+                    if provider.has_tensor(&name) {
+                        Some(visitor.load_dense(provider, &name)?)
+                    } else {
+                        None
+                    }
+                },
+                layer_scalar: {
+                    let name = format!("{prefix}.layer_scalar");
+                    if provider.has_tensor(&name) {
+                        Some(visitor.load_dense(provider, &name)?)
+                    } else {
+                        None
+                    }
+                },
+                gdn_in_proj_qkv: None,
+                gdn_in_proj_z: None,
+                gdn_in_proj_a: None,
+                gdn_in_proj_b: None,
+                gdn_conv1d_weight: None,
+                gdn_a_log: None,
+                gdn_dt_bias: None,
+                gdn_out_proj: None,
+                gdn_norm: None,
+                attn_output_gate: None,
+            });
+        }
     }
 
     let final_norm = visitor.load_dense(provider, "model.norm.weight")?;
