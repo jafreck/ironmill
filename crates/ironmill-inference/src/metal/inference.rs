@@ -1888,26 +1888,17 @@ impl MetalInference {
         for layer_idx in 0..mc.num_hidden_layers {
             let lw = &weights.layers[layer_idx];
             let lm = &matmuls.layer_matmuls[layer_idx];
+            let plan = &self.layer_plans[layer_idx];
 
-            // Gemma 4: use per-layer config if available.
-            let (layer_hd, layer_nkv, layer_window, layer_inter) =
-                if let Some(ref g4) = self.gemma4_config {
-                    let lc = &g4.layer_configs[layer_idx];
-                    (
-                        lc.head_dim as u32,
-                        lc.num_kv_heads as u32,
-                        lc.window_size,
-                        lc.intermediate_size,
-                    )
-                } else {
-                    (hd, nkv, self.config.layer_window_size(layer_idx), inter)
-                };
+            // Per-layer dims from plan (resolved at load time).
+            let layer_hd = plan.head_dim;
+            let layer_nkv = plan.num_kv_heads;
+            let layer_window = plan.window_size;
+            let layer_inter = plan.intermediate_size;
 
             // norm_out already contains the input-norm result:
             //   • layer 0: computed by the standalone dispatch above
             //   • layer 1+: produced by the previous layer's fused end-of-layer kernel
-
-            let is_gdn = lw.gdn_in_proj_qkv.is_some();
 
             // Steps 3-5: Q/K/V projections — dispatch by weight type.
             // These are independent (all read norm_out, write to different buffers).
@@ -1915,7 +1906,8 @@ impl MetalInference {
             let row_bytes_qo = (mc.num_attention_heads * layer_hd as usize) * 2;
             let row_bytes_kv = (layer_nkv as usize * layer_hd as usize) * 2;
 
-            if is_gdn {
+            match &plan.attention {
+            AttentionKind::Gdn { gdn_index } => {
                 // ── GDN (linear-attention) layer — GPU path ─────
                 // Ensure scratch capacity for prefill before taking immutable borrows.
                 if token_count > 1 {
@@ -2100,13 +2092,11 @@ impl MetalInference {
                     );
                 }
                 enc.memory_barrier_buffers();
-            } else {
+            }
+            AttentionKind::Standard { has_output_gate, has_v_norm } => {
                 // Standard attention layer
                 let default_pipelines = self.pipelines()?;
-                let pipelines = if self.global_head_dim > 0
-                    && layer_hd as usize == self.global_head_dim
-                    && self.global_head_dim != mc.head_dim
-                {
+                let pipelines = if plan.use_global_pipelines {
                     self.global_pipelines.as_ref().unwrap_or(default_pipelines)
                 } else {
                     default_pipelines
@@ -2142,8 +2132,8 @@ impl MetalInference {
                 }
 
                 // Gemma 4 V-norm: scale-free RMSNorm on V projections.
-                if let Some(ref unit_w) = self.unit_norm_weight {
-                    if self.gemma4_config.is_some() {
+                if *has_v_norm {
+                    if let Some(ref unit_w) = self.unit_norm_weight {
                         ops::encode_rms_norm(
                             &enc, &pipelines.rms_norm,
                             &ops::RmsNormParams {
@@ -2158,13 +2148,13 @@ impl MetalInference {
                 }
 
                 // Step 6: QK normalization + RoPE
-                let (layer_rope_cos, layer_rope_sin) = if let Some(ref g4) = self.gemma4_config {
-                    let lc = &g4.layer_configs[layer_idx];
-                    if lc.is_global {
-                        (self.global_rope_cos.as_ref().unwrap_or(rope_cos),
-                         self.global_rope_sin.as_ref().unwrap_or(rope_sin))
-                    } else { (rope_cos, rope_sin) }
-                } else { (rope_cos, rope_sin) };
+                let (layer_rope_cos, layer_rope_sin) = match plan.rope_table {
+                    RopeTable::Global => (
+                        self.global_rope_cos.as_ref().unwrap_or(rope_cos),
+                        self.global_rope_sin.as_ref().unwrap_or(rope_sin),
+                    ),
+                    RopeTable::Default => (rope_cos, rope_sin),
+                };
                 encode_qk_norm_and_rope(
                     &enc, pipelines, bufs, lw.q_norm.as_ref(), lw.k_norm.as_ref(),
                     layer_rope_cos, layer_rope_sin, nh, layer_nkv, layer_hd,
@@ -2173,36 +2163,29 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
 
                 // Steps 7-8: KV cache write + attention
-                let is_anchor = self.config.cla_config.as_ref()
-                    .is_none_or(|cla| cla.is_anchor(layer_idx));
-
-                let (is_anchor, kv_cache_layer) = if let Some(ref g4) = self.gemma4_config {
-                    if let Some(anchor) = g4.layer_configs[layer_idx].kv_anchor {
-                        (false, anchor)
-                    } else { (is_anchor, layer_idx) }
-                } else { (is_anchor, layer_idx) };
-
-                let attn_scale = mc.attn_scale();
+                let attn_scale = plan.attn_scale;
 
                 encode_kv_cache_and_attention(
                     &enc, pipelines, bufs,
                     self.turboquant.as_ref(), self.kv_cache.as_ref(),
                     self.fp16_kv_cache.as_ref(), self.config.max_seq_len,
-                    self.config.n_bits as usize, kv_cache_layer, seq_pos,
+                    self.config.n_bits as usize, plan.kv_cache_layer, seq_pos,
                     token_count, nh, layer_nkv, layer_hd, enable_tq,
-                    self.config.use_fa2_prefill, is_anchor, layer_window,
+                    self.config.use_fa2_prefill, plan.kv_anchor, layer_window,
                     attn_scale,
                 )?;
                 enc.memory_barrier_buffers();
 
                 // Qwen3.5 attn_output_gate: apply sigmoid(gate) to attention output.
-                if let Some(gate_buf) = &bufs.q_gate {
+                if *has_output_gate {
+                    if let Some(gate_buf) = &bufs.q_gate {
                     let gate_size = (token_count * mc.num_attention_heads * layer_hd as usize) as u32;
                     ops::encode_sigmoid_gate(
                         &enc, &pipelines.sigmoid_gate,
                         &bufs.attn_out, gate_buf, gate_size,
                     );
                     enc.memory_barrier_buffers();
+                    }
                 }
 
                 // Step 9: Output projection
@@ -2261,21 +2244,19 @@ impl MetalInference {
                     );
                     enc.memory_barrier_buffers();
                 }
-            } // end GDN / standard attention branch
+            } // end AttentionKind::Standard
+            } // end match plan.attention
 
             // Get pipelines for the remaining steps (FFN, MoE, PLE, etc.)
             let default_pipelines = self.pipelines()?;
-            let pipelines = if self.global_head_dim > 0
-                && layer_hd as usize == self.global_head_dim
-                && self.global_head_dim != mc.head_dim
-            {
+            let pipelines = if plan.use_global_pipelines {
                 self.global_pipelines.as_ref().unwrap_or(default_pipelines)
             } else {
                 default_pipelines
             };
 
             // Steps 12-15: FFN block (gate + up + activation + down)
-            let use_gelu = mc.use_gelu();
+            let use_gelu = plan.use_gelu;
             encode_ffn_block(
                 &enc,
                 pipelines,
@@ -2289,28 +2270,24 @@ impl MetalInference {
             )?;
             enc.memory_barrier_buffers();
 
-            // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
+            // MoE block: when enabled, dense MLP output is combined
             // with MoE expert outputs via router → expert FFNs → weighted combine.
             // Must run BEFORE post_ffn_norm so the norm applies to the combined output.
-            if let Some(ref g4) = self.gemma4_config {
-                let lc = &g4.layer_configs[layer_idx];
-                if lc.enable_moe && g4.num_experts > 0 && !lw.expert_gate_projs.is_empty() {
-                    encode_moe_block(
-                        &enc,
-                        pipelines,
-                        bufs,
-                        lw,
-                        h,
-                        g4.moe_intermediate_size,
-                        token_count,
-                        g4.num_experts,
-                        g4.top_k_experts,
-                    )?;
-                }
+            if let Some(ref moe) = plan.moe {
+                encode_moe_block(
+                    &enc,
+                    pipelines,
+                    bufs,
+                    lw,
+                    h,
+                    moe.moe_intermediate_size,
+                    token_count,
+                    moe.num_experts,
+                    moe.top_k,
+                )?;
             }
 
-            // Gemma 4: apply post-feedforward layernorm to MLP output (after MoE combine).
-            // HF: hidden_states = self.post_feedforward_layernorm(hidden_states)
+            // Post-feedforward layernorm (Gemma 4).
             if let Some(ref post_ffn) = lw.post_ffn_norm {
                 ops::encode_rms_norm(
                     &enc,
