@@ -427,8 +427,6 @@ struct MpsMatmulCache {
     token_count: usize,
     /// Per-layer matmul instances: (q, k, v, o, gate, up, down).
     layer_matmuls: Vec<LayerMatmuls>,
-    /// LM head matmul.
-    lm_head: MpsMatrixMultiply,
 }
 
 struct LayerMatmuls {
@@ -887,7 +885,6 @@ impl MetalInference {
         let nkv = mc.num_key_value_heads;
         let hd = mc.head_dim;
         let inter = mc.intermediate_size;
-        let vocab = mc.vocab_size;
 
         // Weight layout: [out_features, in_features] stored row-major FP16.
         // We compute: output = input × weight^T
@@ -952,12 +949,9 @@ impl MetalInference {
             });
         }
 
-        let lm_head = make_matmul(token_count, vocab, h)?;
-
         Ok(MpsMatmulCache {
             token_count,
             layer_matmuls,
-            lm_head,
         })
     }
 
@@ -1862,53 +1856,26 @@ impl MetalInference {
         );
         enc.memory_barrier_buffers();
 
-        // Step 18: LM head — select kernel variant based on prefill/decode phase.
-        // Prefer custom matvec/matmul when packed weights exist; fall back
-        // to MPS only when there is no packed buffer.
-        let row_bytes_h = h * 2;
-        let row_bytes_vocab = vocab * 2;
-        if let Some(ref packed_buf) = weights.lm_head_packed {
+        // Step 18: LM head projection — dispatches through encode_projection
+        // which handles Dense (packed blocked), D2Quant, affine INT4, etc.
+        {
             let pipelines = self.pipelines()?;
-            let lm_kind = LinearKernelKind::for_token_count(token_count);
-            let pipeline = pipelines.dense_linear_pipeline(lm_kind);
-            if lm_kind.is_decode() {
-                ops::encode_matvec(
-                    &enc,
-                    pipeline,
-                    &bufs.norm_out,
-                    packed_buf,
-                    &bufs.logits,
-                    vocab as u32,
-                    h as u32,
-                );
-            } else {
-                ops::encode_matmul(
-                    &enc,
-                    pipeline,
-                    &bufs.norm_out,
-                    packed_buf,
-                    &bufs.logits,
-                    token_count as u32,
-                    vocab as u32,
-                    h as u32,
-                );
-            }
+            encode_projection(
+                &enc,
+                &bufs.norm_out,
+                &MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, h * 2)
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?,
+                &weights.lm_head,
+                &bufs.logits,
+                &ProjectionMatmul::Quantized,
+                pipelines,
+                token_count,
+                vocab,
+                h,
+                h * 2,
+                vocab * 2,
+            )?;
             enc.end_encoding();
-        } else {
-            // MPS fallback — end shared encoder so MPS can create its own.
-            enc.end_encoding();
-            let final_norm_mat =
-                MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            let lm_head_weight_mat =
-                MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            let logits_mat =
-                MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            matmuls
-                .lm_head
-                .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
         }
 
         // Gemma 4: final logit softcapping (softcap * tanh(logits / softcap)).
@@ -2871,55 +2838,28 @@ impl MetalInference {
             enc.end_encoding();
         }
 
-        // Step 18: LM head — select kernel variant based on prefill/decode phase.
-        // Prefer custom matvec/matmul when packed weights exist; fall back
-        // to MPS only when there is no packed buffer.
-        let row_bytes_h = h * 2;
-        let row_bytes_vocab = vocab * 2;
-        if let Some(ref packed_buf) = weights.lm_head_packed {
+        // Step 18: LM head projection.
+        {
             let enc = cmd_buf
                 .compute_encoder()
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
-            let lm_kind = LinearKernelKind::for_token_count(token_count);
-            let pipeline = pipelines.dense_linear_pipeline(lm_kind);
-            if lm_kind.is_decode() {
-                ops::encode_matvec(
-                    &enc,
-                    pipeline,
-                    &bufs.norm_out,
-                    packed_buf,
-                    &bufs.logits,
-                    vocab as u32,
-                    h as u32,
-                );
-            } else {
-                ops::encode_matmul(
-                    &enc,
-                    pipeline,
-                    &bufs.norm_out,
-                    packed_buf,
-                    &bufs.logits,
-                    token_count as u32,
-                    vocab as u32,
-                    h as u32,
-                );
-            }
+            encode_projection(
+                &enc,
+                &bufs.norm_out,
+                &MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, h * 2)
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?,
+                &weights.lm_head,
+                &bufs.logits,
+                &ProjectionMatmul::Quantized,
+                pipelines,
+                token_count,
+                vocab,
+                h,
+                h * 2,
+                vocab * 2,
+            )?;
             enc.end_encoding();
-        } else {
-            // MPS fallback — only reached when packed weights are absent.
-            let final_norm_mat =
-                MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            let lm_head_weight_mat =
-                MpsMatrix::from_buffer(&weights.lm_head, vocab, h, row_bytes_h)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            let logits_mat =
-                MpsMatrix::from_buffer(&bufs.logits, token_count, vocab, row_bytes_vocab)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            matmuls
-                .lm_head
-                .encode(&cmd_buf, &final_norm_mat, &lm_head_weight_mat, &logits_mat);
         }
 
         // Final commit + wait.

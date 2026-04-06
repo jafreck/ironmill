@@ -137,10 +137,9 @@ pub struct MetalWeights {
     pub layers: Vec<LayerWeights>,
     /// Final RMSNorm weight [hidden_size] FP16.
     pub final_norm: MetalBuffer,
-    /// LM head weight [vocab_size × hidden_size] FP16.
-    pub lm_head: MetalBuffer,
-    /// Pre-packed LM head in blocked [N/8, K/8, 8, 8] FP16 (for custom matvec).
-    pub lm_head_packed: Option<MetalBuffer>,
+    /// LM head projection weight [vocab_size × hidden_size].
+    /// May be dense FP16 (packed blocked), D2Quant, or other quantized format.
+    pub lm_head: WeightBuffer,
     /// Model configuration extracted from weight metadata.
     pub config: ModelConfig,
 
@@ -210,31 +209,16 @@ impl MetalWeights {
         } else {
             "lm_head.weight"
         };
-        let lm_head_tensor = provider
-            .tensor(lm_head_name)
-            .map_err(|e| MetalError::WeightLoading(format!("{lm_head_name}: {e}")))?;
-        let lm_head_dense = dequant_tensor_to_dense::<MetalDequantOps>(&lm_head_tensor)?;
-
-        // Pack on CPU before GPU upload to avoid GPU→CPU→GPU roundtrip.
-        let lm_head_packed =
-            pack_bytes_blocked(&lm_head_dense.bytes, config.vocab_size, config.hidden_size)
-                .map(|packed_data| {
-                    device
-                        .create_buffer_with_data(&packed_data, StorageMode::Shared)
-                        .map_err(MetalError::Metal)
-                })
-                .transpose()?;
-
-        let lm_head = device
-            .create_buffer_with_data(&lm_head_dense.bytes, StorageMode::Shared)
-            .map_err(MetalError::Metal)?;
+        // Load lm_head as a full WeightBuffer so quantized formats (D2Quant,
+        // affine INT4, etc.) stay packed on GPU and dispatch through the
+        // fused projection kernels instead of forcing FP16 dequant.
+        let lm_head = load_weight_buffer(device, provider, lm_head_name, force_cpu_dequant, true)?;
 
         Ok(Self {
             embedding: core.embedding,
             layers: core.layers,
             final_norm: core.final_norm,
             lm_head,
-            lm_head_packed,
             config,
             ple_embed_tokens: core.ple_embed_tokens,
             ple_model_projection: core.ple_model_projection,
