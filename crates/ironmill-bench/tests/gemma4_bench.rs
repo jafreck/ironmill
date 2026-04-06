@@ -683,4 +683,120 @@ mod gemma4 {
             d2q8_metrics.mean_kl, d2q8_metrics.top1_agree
         );
     }
+
+    #[test]
+    #[ignore]
+    fn debug_e4b_nan() {
+        let model_dir = hf_model_dir("google/gemma-4-E4B-it");
+        let provider =
+            SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
+
+        // Test with FP16 no-TQ first (pure FP16)
+        let config = MetalConfig::default().without_turboquant();
+        let (mut engine, gpu_mb, _) = load_gpu_engine(&provider, config);
+        println!("E4B loaded: {gpu_mb:.0} MB GPU");
+
+        // Test 1: single decode step
+        engine.prefill(&[2, 651, 3488]).unwrap();
+        let logits = engine.decode_step(3488).unwrap();
+        let nans = logits.iter().filter(|x| x.is_nan()).count();
+        println!("Decode logits: len={}, NaN={nans}", logits.len());
+        engine.reset();
+
+        // Test 2: short prefill_all_logits
+        for len in [5, 10, 20, 50, 100] {
+            engine.reset();
+            let seq: Vec<u32> = vec![2; len];
+            let all = engine.prefill_all_logits(&seq).unwrap();
+            let nan_positions = all
+                .iter()
+                .enumerate()
+                .filter(|(_, lg)| lg.iter().any(|x| x.is_nan()))
+                .count();
+            let first_nan = all.iter().position(|lg| lg.iter().any(|x| x.is_nan()));
+            println!(
+                "prefill_all_logits(len={len}): {nan_positions}/{} NaN, first_nan={:?}",
+                all.len(),
+                first_nan
+            );
+            if nan_positions > 0 {
+                break;
+            }
+        }
+
+        // Test 3: actual OASST1 sequence — compare first 5 positions with HF
+        let sequences = load_eval_dataset();
+        let seq = &sequences[0];
+        engine.reset();
+        println!(
+            "\nOASST1 seq 0 ({} tokens) — first 10 tokens only:",
+            seq.len()
+        );
+        let short_seq: Vec<u32> = seq[..10].to_vec();
+        let all = engine.prefill_all_logits(&short_seq).unwrap();
+        for pos in 0..5 {
+            let lg = &all[pos];
+            let mut indexed: Vec<(usize, f32)> = lg.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top5_idx: Vec<usize> = indexed[..5].iter().map(|(i, _)| *i).collect();
+            let top5_val: Vec<f32> = indexed[..5].iter().map(|(_, v)| *v).collect();
+            println!(
+                "  pos {pos}: top5 idx={top5_idx:?} val=[{:.3}, {:.3}, {:.3}]",
+                top5_val[0], top5_val[1], top5_val[2]
+            );
+        }
+
+        // Full 512-token check
+        engine.reset();
+        println!("\nOASST1 seq 0 ({} tokens):", seq.len());
+        let all = engine.prefill_all_logits(seq).unwrap();
+        let mut nan_positions = Vec::new();
+        for (pos, lg) in all.iter().enumerate() {
+            if lg.iter().any(|x| x.is_nan() || x.is_infinite()) {
+                nan_positions.push(pos);
+            }
+        }
+        if nan_positions.is_empty() {
+            println!("  No NaN — computing PPL...");
+            let mut ce = 0.0f64;
+            for pos in 0..seq.len() - 1 {
+                let t = seq[pos + 1] as usize;
+                let lg = &all[pos];
+                let mx = lg.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let lse: f64 = lg
+                    .iter()
+                    .map(|&x| ((x - mx) as f64).exp())
+                    .sum::<f64>()
+                    .ln()
+                    + mx as f64;
+                ce -= lg[t] as f64 - lse;
+            }
+            let ppl = (ce / (seq.len() - 1) as f64).exp();
+            println!("  PPL: {ppl:.2}");
+        } else {
+            println!(
+                "  NaN at {}/{} positions, first: {:?}",
+                nan_positions.len(),
+                all.len(),
+                &nan_positions[..nan_positions.len().min(10)]
+            );
+        }
+
+        // Test 4: check model config
+        let mc = provider.config();
+        println!(
+            "\nModel: hidden={}, layers={}, heads={}, kv_heads={}, head_dim={}, vocab={}",
+            mc.hidden_size,
+            mc.num_hidden_layers,
+            mc.num_attention_heads,
+            mc.num_key_value_heads,
+            mc.head_dim,
+            mc.vocab_size,
+        );
+        println!(
+            "GQA ratio: {}:1, heads_per_group={}",
+            mc.num_attention_heads / mc.num_key_value_heads,
+            mc.num_attention_heads / mc.num_key_value_heads,
+        );
+    }
 }
