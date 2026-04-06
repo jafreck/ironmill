@@ -321,4 +321,174 @@ mod gemma4 {
             "D2Quant-3 should reduce GPU memory by >20%, got {mem_reduction:.1}%"
         );
     }
+
+    /// Compare per-token logits between FP16 and FP16+TQ-INT4 on a single
+    /// sequence to diagnose why TQ-INT4 shows lower PPL than FP16.
+    #[test]
+    #[ignore]
+    fn investigate_tq_ppl() {
+        let model_dir = gemma4_model_dir();
+        let sequences = load_eval_dataset();
+        let seq = &sequences[0]; // first 512-token sequence
+
+        let provider =
+            SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
+
+        // FP16 baseline logits
+        let fp16_config = MetalConfig::default().without_turboquant();
+        let (mut fp16_engine, _, _) = load_gpu_engine(&provider, fp16_config);
+        let fp16_logits = fp16_engine
+            .prefill_all_logits(seq)
+            .expect("FP16 prefill failed");
+
+        // FP16 + TQ-INT4 logits
+        let tq_config = MetalConfig::default().with_turboquant(4);
+        let (mut tq_engine, _, _) = load_gpu_engine(&provider, tq_config);
+        let tq_logits = tq_engine
+            .prefill_all_logits(seq)
+            .expect("TQ prefill failed");
+
+        assert_eq!(fp16_logits.len(), tq_logits.len());
+
+        // Per-position analysis
+        println!(
+            "\n  FP16 vs TQ-INT4 logit comparison ({} positions)",
+            seq.len()
+        );
+        println!("  ─────────────────────────────────────────────────────────────────");
+        println!(
+            "  {:>4} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10}",
+            "pos", "FP16 CE", "TQ CE", "ΔCE", "max|Δlog|", "cosine", "top1match"
+        );
+        println!("  ─────────────────────────────────────────────────────────────────");
+
+        let mut fp16_total_ce = 0.0f64;
+        let mut tq_total_ce = 0.0f64;
+        let mut ce_better = 0usize; // positions where TQ has lower CE
+        let mut ce_worse = 0usize;
+        let mut top1_mismatch = 0usize;
+        let mut max_logit_diff_positions: Vec<(usize, f64)> = Vec::new();
+
+        for pos in 0..seq.len() - 1 {
+            let target = seq[pos + 1] as usize;
+            let fp = &fp16_logits[pos];
+            let tq = &tq_logits[pos];
+
+            // Cross-entropy
+            let fp_max = fp.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let fp_lse: f64 = fp
+                .iter()
+                .map(|&x| ((x - fp_max) as f64).exp())
+                .sum::<f64>()
+                .ln()
+                + fp_max as f64;
+            let fp_ce = -(fp[target] as f64 - fp_lse);
+
+            let tq_max = tq.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let tq_lse: f64 = tq
+                .iter()
+                .map(|&x| ((x - tq_max) as f64).exp())
+                .sum::<f64>()
+                .ln()
+                + tq_max as f64;
+            let tq_ce = -(tq[target] as f64 - tq_lse);
+
+            fp16_total_ce += fp_ce;
+            tq_total_ce += tq_ce;
+
+            if tq_ce < fp_ce - 0.01 {
+                ce_better += 1;
+            } else if tq_ce > fp_ce + 0.01 {
+                ce_worse += 1;
+            }
+
+            // Max absolute logit difference
+            let max_diff: f64 = fp
+                .iter()
+                .zip(tq.iter())
+                .map(|(&a, &b)| (a as f64 - b as f64).abs())
+                .fold(0.0, f64::max);
+
+            // Cosine similarity
+            let dot: f64 = fp
+                .iter()
+                .zip(tq.iter())
+                .map(|(&a, &b)| a as f64 * b as f64)
+                .sum();
+            let fp_norm: f64 = fp.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+            let tq_norm: f64 = tq.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+            let cosine = dot / (fp_norm * tq_norm + 1e-10);
+
+            // Top-1 match
+            let fp_top1 = fp
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap()
+                .0;
+            let tq_top1 = tq
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap()
+                .0;
+            let top1_match = fp_top1 == tq_top1;
+            if !top1_match {
+                top1_mismatch += 1;
+            }
+
+            max_logit_diff_positions.push((pos, max_diff));
+
+            // Print every 50th position + first/last + any with large CE delta
+            let delta_ce = tq_ce - fp_ce;
+            if pos < 5
+                || pos % 100 == 0
+                || pos == seq.len() - 2
+                || delta_ce.abs() > 2.0
+                || max_diff > 5.0
+            {
+                println!(
+                    "  {:>4} {:>8.3} {:>8.3} {:>+10.3} {:>10.3} {:>10.6} {:>10}",
+                    pos,
+                    fp_ce,
+                    tq_ce,
+                    delta_ce,
+                    max_diff,
+                    cosine,
+                    if top1_match { "✓" } else { "✗" }
+                );
+            }
+        }
+
+        // Sort by max logit difference
+        max_logit_diff_positions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let fp_ppl = (fp16_total_ce / (seq.len() - 1) as f64).exp();
+        let tq_ppl = (tq_total_ce / (seq.len() - 1) as f64).exp();
+
+        println!("  ─────────────────────────────────────────────────────────────────");
+        println!("\n  Summary:");
+        println!("    FP16 PPL: {fp_ppl:.2}");
+        println!(
+            "    TQ-INT4 PPL: {tq_ppl:.2} ({:+.1}%)",
+            (tq_ppl - fp_ppl) / fp_ppl * 100.0
+        );
+        println!(
+            "    Positions where TQ is better: {ce_better} / worse: {ce_worse} / same: {}",
+            seq.len() - 1 - ce_better - ce_worse
+        );
+        println!("    Top-1 prediction mismatches: {top1_mismatch}");
+        println!(
+            "    Top 5 max |Δlogit| positions: {:?}",
+            max_logit_diff_positions[..5]
+                .iter()
+                .map(|(p, d)| format!("pos {p}: {d:.2}"))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "    Avg max |Δlogit|: {:.3}",
+            max_logit_diff_positions.iter().map(|(_, d)| d).sum::<f64>()
+                / max_logit_diff_positions.len() as f64
+        );
+    }
 }
