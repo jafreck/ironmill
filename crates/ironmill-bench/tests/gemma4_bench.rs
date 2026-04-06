@@ -9,7 +9,7 @@
 //! ```
 //!
 //! Requires: Metal GPU, Gemma 4 E2B-IT weights in HuggingFace cache,
-//! Alpaca instruct dataset at tests/fixtures/quality/alpaca-gemma4-instruct.json.
+//! OASST1 instruct dataset at tests/fixtures/quality/oasst1-gemma4-instruct.json.
 
 #[cfg(feature = "metal")]
 mod gemma4 {
@@ -137,13 +137,15 @@ mod gemma4 {
         (ppl, total_tokens, tok_s)
     }
 
-    /// Load the Alpaca instruct dataset for Gemma 4.
-    fn load_alpaca_dataset() -> Vec<Vec<u32>> {
-        let path = fixture_path("quality/alpaca-gemma4-instruct.json");
+    /// Load the OASST1 instruct-formatted dataset for Gemma 4.
+    /// Contiguous conversation threads formatted with Gemma's chat template,
+    /// split into 512-token sequences (~20K tokens total).
+    fn load_eval_dataset() -> Vec<Vec<u32>> {
+        let path = fixture_path("quality/oasst1-gemma4-instruct.json");
         if !path.exists() {
             panic!(
-                "Alpaca dataset not found at {}.\n\
-                 Run: python scripts/prepare-quality-dataset.py --tokenizer google/gemma-4-e2b-it --dataset alpaca",
+                "OASST1 dataset not found at {}.\n\
+                 Run: python /tmp/prepare_oasst_dataset.py",
                 path.display()
             );
         }
@@ -179,8 +181,8 @@ mod gemma4 {
     fn benchmark() {
         let model_dir = gemma4_model_dir();
         let decode_tokens = 20;
-        let sequences = load_alpaca_dataset();
-        let ppl_seqs = 5;
+        let sequences = load_eval_dataset();
+        let ppl_seqs = sequences.len(); // use all sequences (~39)
         let mut results: Vec<BenchResult> = Vec::new();
 
         eprintln!("  Alpaca dataset: {} sequences loaded", sequences.len());
@@ -268,7 +270,10 @@ mod gemma4 {
         let fp16_gpu = results[0].gpu_mb;
         let fp16_ppl = results[0].ppl;
         println!();
-        println!("  Gemma 4 E2B-IT — Metal Benchmark (Alpaca instruct, {ppl_seqs} seqs)");
+        println!(
+            "  Gemma 4 E2B-IT — Metal Benchmark (OASST1 instruct, {ppl_seqs} seqs, {} tokens)",
+            ppl_seqs * 512
+        );
         println!("  ──────────────────────────────────────────────────────────────────────────");
         println!(
             "  {:<20} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
