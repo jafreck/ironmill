@@ -138,8 +138,9 @@ pub struct MetalWeights {
     /// Model configuration extracted from weight metadata.
     pub config: ModelConfig,
 
-    /// PLE embedding table `[vocab_size, num_layers * ple_hidden_size]` FP16 (Gemma 4).
-    pub ple_embed_tokens: Option<MetalBuffer>,
+    /// PLE embedding table `[vocab_size, num_layers * ple_hidden_size]` (Gemma 4).
+    /// May be dense FP16 or D2Quant-compressed.
+    pub ple_embed_tokens: Option<WeightBuffer>,
     /// PLE model projection weight (Gemma 4).
     pub ple_model_projection: Option<WeightBuffer>,
     /// PLE projection norm weight (Gemma 4).

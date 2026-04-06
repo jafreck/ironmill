@@ -145,6 +145,8 @@ pub struct MetalPipelines {
     pub d2quant_matvec_3bit: ComputePipeline,
     /// D2Quant 3-bit matmul kernel.
     pub d2quant_matmul_3bit: ComputePipeline,
+    /// D2Quant 3-bit embedding lookup kernel.
+    pub d2quant_embedding_lookup_3bit: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -567,6 +569,13 @@ impl MetalPipelines {
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
+            d2quant_embedding_lookup_3bit: device
+                .create_compute_pipeline(
+                    &d2quant_mm_lib
+                        .get_function("d2quant_embedding_lookup_3bit")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
         })
     }
 
@@ -794,6 +803,22 @@ pub struct EmbeddingLookupParams<'a> {
     /// Output buffer.
     pub output: &'a MetalBuffer,
     /// Hidden dimension size.
+    pub hidden_size: u32,
+    /// Number of tokens in the batch.
+    pub token_count: u32,
+    /// Vocabulary size.
+    pub vocab_size: u32,
+}
+
+/// Parameters for [`encode_d2quant_embedding_lookup`].
+pub struct D2QuantEmbeddingLookupParams<'a> {
+    /// Token ID buffer.
+    pub token_ids: &'a MetalBuffer,
+    /// D2Quant dual-scale quantized weight table.
+    pub weight: &'a super::weights::DualScaleQuantizedWeight,
+    /// Output buffer (FP16).
+    pub output: &'a MetalBuffer,
+    /// Hidden dimension size (K = num_layers * ple_hidden_size).
     pub hidden_size: u32,
     /// Number of tokens in the batch.
     pub token_count: u32,
@@ -1050,6 +1075,37 @@ pub fn encode_embedding_lookup(
     encoder.set_bytes(&params.hidden_size.to_le_bytes(), 3);
     encoder.set_bytes(&params.token_count.to_le_bytes(), 4);
     encoder.set_bytes(&params.vocab_size.to_le_bytes(), 5);
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(params.hidden_size as usize);
+    encoder.dispatch_threadgroups(
+        (
+            (params.hidden_size as usize).div_ceil(tg_size),
+            params.token_count as usize,
+            1,
+        ),
+        (tg_size, 1, 1),
+    );
+}
+
+/// Encode D2Quant 3-bit embedding lookup: gather rows from a packed
+/// dual-scale quantized table and dequantize to FP16.
+pub fn encode_d2quant_embedding_lookup(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    params: &D2QuantEmbeddingLookupParams<'_>,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(params.token_ids, 0, 0);
+    encoder.set_buffer(&params.weight.data, 0, 1);
+    encoder.set_buffer(&params.weight.normal_scale, 0, 2);
+    encoder.set_buffer(&params.weight.normal_zero, 0, 3);
+    encoder.set_buffer(&params.weight.outlier_scale, 0, 4);
+    encoder.set_buffer(&params.weight.outlier_zero, 0, 5);
+    encoder.set_buffer(&params.weight.outlier_mask, 0, 6);
+    encoder.set_buffer(params.output, 0, 7);
+    encoder.set_bytes(&params.hidden_size.to_le_bytes(), 8);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 9);
+    encoder.set_bytes(&params.vocab_size.to_le_bytes(), 10);
+    encoder.set_bytes(&params.weight.group_size.to_le_bytes(), 11);
     let tg_size = DEFAULT_THREADGROUP_WIDTH.min(params.hidden_size as usize);
     encoder.dispatch_threadgroups(
         (

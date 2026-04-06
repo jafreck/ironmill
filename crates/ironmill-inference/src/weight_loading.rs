@@ -78,7 +78,7 @@ pub struct LoadedModelCore<D, W> {
     pub config: ModelConfig,
 
     /// PLE embedding table `[vocab_size, num_layers * ple_hidden_size]` (Gemma 4).
-    pub ple_embed_tokens: Option<D>,
+    pub ple_embed_tokens: Option<W>,
     /// PLE model projection weight `[num_layers * ple_hidden_size, hidden_size]` (Gemma 4).
     pub ple_model_projection: Option<W>,
     /// PLE projection norm weight `[num_layers * ple_hidden_size]` (Gemma 4).
@@ -252,7 +252,7 @@ pub fn load_model_weights<V: WeightVisitor>(
     // PLE model-level weights (Gemma 4).
     let ple_embed_name = "model.embed_tokens_per_layer.weight";
     let ple_embed_tokens = if provider.has_tensor(ple_embed_name) {
-        Some(visitor.load_dense(provider, ple_embed_name)?)
+        Some(visitor.load_weight(provider, ple_embed_name)?)
     } else {
         None
     };

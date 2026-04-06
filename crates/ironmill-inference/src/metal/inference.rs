@@ -1173,18 +1173,42 @@ impl MetalInference {
                     //    HF scales by sqrt(hidden_size_per_layer_input) inside
                     //    Gemma4TextScaledWordEmbedding; we apply the same scale
                     //    after the plain lookup.
-                    ops::encode_embedding_lookup(
-                        &enc,
-                        &pipelines.embedding_lookup,
-                        &ops::EmbeddingLookupParams {
-                            token_ids: &bufs.token_ids_buf,
-                            embedding_table: ple_embed,
-                            output: ple_buf,
-                            hidden_size: ple_total as u32,
-                            token_count: token_count as u32,
-                            vocab_size: vocab as u32,
-                        },
-                    );
+                    match ple_embed {
+                        WeightBuffer::Dense { buf, .. } => {
+                            ops::encode_embedding_lookup(
+                                &enc,
+                                &pipelines.embedding_lookup,
+                                &ops::EmbeddingLookupParams {
+                                    token_ids: &bufs.token_ids_buf,
+                                    embedding_table: buf,
+                                    output: ple_buf,
+                                    hidden_size: ple_total as u32,
+                                    token_count: token_count as u32,
+                                    vocab_size: vocab as u32,
+                                },
+                            );
+                        }
+                        WeightBuffer::DualScaleQuantized(dq) => {
+                            ops::encode_d2quant_embedding_lookup(
+                                &enc,
+                                &pipelines.d2quant_embedding_lookup_3bit,
+                                &ops::D2QuantEmbeddingLookupParams {
+                                    token_ids: &bufs.token_ids_buf,
+                                    weight: dq,
+                                    output: ple_buf,
+                                    hidden_size: ple_total as u32,
+                                    token_count: token_count as u32,
+                                    vocab_size: vocab as u32,
+                                },
+                            );
+                        }
+                        other => {
+                            return Err(InferenceError::runtime(format!(
+                                "unsupported PLE embedding weight type: {:?}",
+                                std::mem::discriminant(other)
+                            )));
+                        }
+                    }
                     enc.memory_barrier_buffers();
 
                     // Scale PLE embeddings by sqrt(ple_hidden_size) to match HF.
@@ -2153,18 +2177,42 @@ impl MetalInference {
 
                         enc.memory_barrier_buffers();
 
-                        ops::encode_embedding_lookup(
-                            &enc,
-                            &pipelines.embedding_lookup,
-                            &ops::EmbeddingLookupParams {
-                                token_ids: &bufs.token_ids_buf,
-                                embedding_table: ple_embed,
-                                output: ple_buf,
-                                hidden_size: ple_total as u32,
-                                token_count: token_count as u32,
-                                vocab_size: vocab as u32,
-                            },
-                        );
+                        match ple_embed {
+                            WeightBuffer::Dense { buf, .. } => {
+                                ops::encode_embedding_lookup(
+                                    &enc,
+                                    &pipelines.embedding_lookup,
+                                    &ops::EmbeddingLookupParams {
+                                        token_ids: &bufs.token_ids_buf,
+                                        embedding_table: buf,
+                                        output: ple_buf,
+                                        hidden_size: ple_total as u32,
+                                        token_count: token_count as u32,
+                                        vocab_size: vocab as u32,
+                                    },
+                                );
+                            }
+                            WeightBuffer::DualScaleQuantized(dq) => {
+                                ops::encode_d2quant_embedding_lookup(
+                                    &enc,
+                                    &pipelines.d2quant_embedding_lookup_3bit,
+                                    &ops::D2QuantEmbeddingLookupParams {
+                                        token_ids: &bufs.token_ids_buf,
+                                        weight: dq,
+                                        output: ple_buf,
+                                        hidden_size: ple_total as u32,
+                                        token_count: token_count as u32,
+                                        vocab_size: vocab as u32,
+                                    },
+                                );
+                            }
+                            other => {
+                                return Err(InferenceError::runtime(format!(
+                                    "unsupported PLE embedding weight type: {:?}",
+                                    std::mem::discriminant(other)
+                                )));
+                            }
+                        }
 
                         let row_bytes_h = h * 2;
                         let row_bytes_ple_total = ple_total * 2;

@@ -249,3 +249,61 @@ kernel void d2quant_matmul_3bit(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// ── D2Quant 3-bit embedding lookup ──────────────────────────────
+//
+// Gather rows from a D2Quant packed table and write FP16 output.
+// Each thread processes one output element [token, col].
+//
+// Dispatch: (ceil(hidden/tg), token_count, 1) threadgroups, (tg, 1, 1) threads.
+
+kernel void d2quant_embedding_lookup_3bit(
+    device const uint *token_ids       [[buffer(0)]],    // [token_count]
+    device const uchar *packed_table   [[buffer(1)]],    // [vocab, ceil(K/8)*3]
+    device const float *normal_scale   [[buffer(2)]],    // [vocab, num_groups]
+    device const float *normal_zero    [[buffer(3)]],    // [vocab, num_groups]
+    device const float *outlier_scale  [[buffer(4)]],    // [vocab, num_groups]
+    device const float *outlier_zero   [[buffer(5)]],    // [vocab, num_groups]
+    device const uchar *outlier_mask   [[buffer(6)]],    // [vocab, ceil(K/8)]
+    device half *output                [[buffer(7)]],    // [token_count, K]
+    constant uint &hidden_size         [[buffer(8)]],    // K
+    constant uint &token_count         [[buffer(9)]],
+    constant uint &vocab_size          [[buffer(10)]],
+    constant uint &group_size          [[buffer(11)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint col = gid.x;
+    uint tok = gid.y;
+    if (col >= hidden_size || tok >= token_count) return;
+
+    uint token_id = token_ids[tok];
+    if (token_id >= vocab_size) {
+        output[tok * hidden_size + col] = half(0.0f);
+        return;
+    }
+
+    uint K = hidden_size;
+    uint bytes_per_row = ((K + 7) / 8) * 3;
+    uint mask_bytes_per_row = (K + 7) / 8;
+    uint num_groups = (K + group_size - 1) / group_size;
+
+    // Unpack 3-bit value at (token_id, col)
+    uint group_of_8 = col / 8;
+    uint offset = col % 8;
+    uint byte_off = token_id * bytes_per_row + group_of_8 * 3;
+    uint bits = uint(packed_table[byte_off])
+              | (uint(packed_table[byte_off + 1]) << 8)
+              | (uint(packed_table[byte_off + 2]) << 16);
+    float q = float((bits >> (offset * 3)) & 0x07);
+
+    // Read outlier mask bit
+    bool is_outlier = (outlier_mask[token_id * mask_bytes_per_row + col / 8] >> (col % 8)) & 1;
+
+    // Select scale/zero based on partition
+    uint grp = col / group_size;
+    uint param_idx = token_id * num_groups + grp;
+    float s = is_outlier ? outlier_scale[param_idx] : normal_scale[param_idx];
+    float z = is_outlier ? outlier_zero[param_idx]  : normal_zero[param_idx];
+
+    output[tok * K + col] = half((q - z) * s);
+}
