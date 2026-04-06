@@ -13,13 +13,16 @@ use crate::weight_loading::{
 /// A weight buffer that is either dense FP16 or packed quantized data.
 #[non_exhaustive]
 pub enum WeightBuffer {
-    /// Dense FP16 buffer for MPS matmul, with an optional pre-packed blocked
-    /// buffer for the custom matvec kernel (decode path, M=1).
+    /// Dense FP16 buffer. Either a row-major buffer for gather/lookup access,
+    /// or a pre-packed blocked buffer for the custom matmul kernel (or both
+    /// when packing failed due to dimension constraints).
     Dense {
-        /// Original row-major [N, K] FP16 buffer (used by MPS for prefill).
-        buf: MetalBuffer,
-        /// Blocked [N/8, K/8, 8, 8] FP16 buffer for the custom matvec kernel.
-        /// `None` if N or K is not a multiple of 8.
+        /// Row-major [N, K] FP16 buffer. Used for embedding lookups and as
+        /// fallback when blocked packing isn't possible. `None` when only
+        /// the packed buffer is needed (matmul weights with valid dimensions).
+        buf: Option<MetalBuffer>,
+        /// Blocked [N/8, K/8, 8, 8] FP16 buffer for the custom matvec/matmul
+        /// kernel. `None` if N or K is not a multiple of 8.
         packed: Option<MetalBuffer>,
     },
     /// Packed quantized buffer for custom kernel.
@@ -33,11 +36,14 @@ pub enum WeightBuffer {
 }
 
 impl WeightBuffer {
-    /// Get the underlying buffer for MPS matmul (Dense only).
-    /// Returns an error if called on a Quantized or AffineQuantized variant.
+    /// Get the underlying row-major buffer (Dense only).
+    /// Returns an error if the buffer is quantized or was dropped after packing.
     pub fn as_dense(&self) -> anyhow::Result<&MetalBuffer> {
         match self {
-            WeightBuffer::Dense { buf, .. } => Ok(buf),
+            WeightBuffer::Dense { buf: Some(b), .. } => Ok(b),
+            WeightBuffer::Dense { buf: None, .. } => Err(anyhow::anyhow!(
+                "dense row-major buffer was dropped after packing"
+            )),
             WeightBuffer::Quantized(_)
             | WeightBuffer::AffineQuantized(_)
             | WeightBuffer::DualScaleQuantized(_) => Err(anyhow::anyhow!(
@@ -199,14 +205,29 @@ impl MetalWeights {
         let core = weight_loading::load_model_weights(&visitor, provider)?;
         let config = core.config;
 
-        let lm_head = if config.tie_word_embeddings {
-            load_dense_buffer(device, provider, "model.embed_tokens.weight")?
+        let lm_head_name = if config.tie_word_embeddings {
+            "model.embed_tokens.weight"
         } else {
-            load_dense_buffer(device, provider, "lm_head.weight")?
+            "lm_head.weight"
         };
+        let lm_head_tensor = provider
+            .tensor(lm_head_name)
+            .map_err(|e| MetalError::WeightLoading(format!("{lm_head_name}: {e}")))?;
+        let lm_head_dense = dequant_tensor_to_dense::<MetalDequantOps>(&lm_head_tensor)?;
 
+        // Pack on CPU before GPU upload to avoid GPU→CPU→GPU roundtrip.
         let lm_head_packed =
-            pack_weight_blocked(device, &lm_head, config.vocab_size, config.hidden_size)?;
+            pack_bytes_blocked(&lm_head_dense.bytes, config.vocab_size, config.hidden_size)
+                .map(|packed_data| {
+                    device
+                        .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                        .map_err(MetalError::Metal)
+                })
+                .transpose()?;
+
+        let lm_head = device
+            .create_buffer_with_data(&lm_head_dense.bytes, StorageMode::Shared)
+            .map_err(MetalError::Metal)?;
 
         Ok(Self {
             embedding: core.embedding,
@@ -222,24 +243,17 @@ impl MetalWeights {
     }
 }
 
-/// Pack a row-major [N, K] FP16 weight buffer into blocked [N/8, K/8, 8, 8] format.
+/// Pack a row-major [N, K] FP16 **byte slice** into blocked [N/8, K/8, 8, 8] format.
 ///
 /// Returns `None` if N or K is not a multiple of 8.
-fn pack_weight_blocked(
-    device: &MetalDevice,
-    original: &MetalBuffer,
-    n: usize,
-    k: usize,
-) -> Result<Option<MetalBuffer>, MetalError> {
+/// This operates entirely on CPU data — no GPU buffer roundtrip required.
+fn pack_bytes_blocked(src: &[u8], n: usize, k: usize) -> Option<Vec<u8>> {
     if n % 8 != 0 || k % 8 != 0 {
-        return Ok(None);
+        return None;
     }
 
     let total_bytes = n * k * 2; // FP16
-    let mut src = vec![0u8; total_bytes];
-    original
-        .read_bytes(&mut src, 0)
-        .map_err(MetalError::Metal)?;
+    debug_assert_eq!(src.len(), total_bytes);
 
     let mut dst = vec![0u8; total_bytes];
     let n_blocks = n / 8;
@@ -247,14 +261,13 @@ fn pack_weight_blocked(
 
     for nb in 0..n_blocks {
         for kb in 0..k_blocks {
-            for ri in 0..8u32 {
-                for ki in 0..8u32 {
-                    let src_row = nb * 8 + ri as usize;
-                    let src_col = kb * 8 + ki as usize;
+            for ri in 0..8usize {
+                let src_row = nb * 8 + ri;
+                let dst_block_base = ((nb * k_blocks + kb) * 8 + ri) * 8;
+                for ki in 0..8usize {
+                    let src_col = kb * 8 + ki;
                     let src_offset = (src_row * k + src_col) * 2;
-
-                    let dst_idx = ((nb * k_blocks + kb) * 8 + ri as usize) * 8 + ki as usize;
-                    let dst_offset = dst_idx * 2;
+                    let dst_offset = (dst_block_base + ki) * 2;
 
                     dst[dst_offset] = src[src_offset];
                     dst[dst_offset + 1] = src[src_offset + 1];
@@ -263,10 +276,7 @@ fn pack_weight_blocked(
         }
     }
 
-    let buf = device
-        .create_buffer_with_data(&dst, StorageMode::Shared)
-        .map_err(MetalError::Metal)?;
-    Ok(Some(buf))
+    Some(dst)
 }
 
 /// CPU dequant operations for the Metal backend.
@@ -340,16 +350,27 @@ fn load_weight_buffer(
         .map_err(|e| MetalError::WeightLoading(format!("{name}: {e}")))?;
     match &tensor.quant_info {
         QuantizationInfo::None => {
+            let (n, k) = dense_shape(&tensor.shape);
+            if pack_for_matmul {
+                if let Some(packed_data) = pack_bytes_blocked(&tensor.data, n, k) {
+                    // Pack on CPU, upload once — no GPU→CPU readback.
+                    let packed_buf = device
+                        .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                        .map_err(MetalError::Metal)?;
+                    return Ok(WeightBuffer::Dense {
+                        buf: None,
+                        packed: Some(packed_buf),
+                    });
+                }
+            }
+            // Fallback: dimensions not packable, or not needed for matmul.
             let buf = device
                 .create_buffer_with_data(&tensor.data, StorageMode::Shared)
                 .map_err(MetalError::Metal)?;
-            let (n, k) = dense_shape(&tensor.shape);
-            let packed = if pack_for_matmul {
-                pack_weight_blocked(device, &buf, n, k)?
-            } else {
-                None
-            };
-            Ok(WeightBuffer::Dense { buf, packed })
+            Ok(WeightBuffer::Dense {
+                buf: Some(buf),
+                packed: None,
+            })
         }
         QuantizationInfo::LutToDense {
             lut,
@@ -387,12 +408,24 @@ fn load_weight_buffer(
                         *polar_quant_seed,
                     )?
                 };
-                let buf = device
-                    .create_buffer_with_data(&data, StorageMode::Shared)
-                    .map_err(MetalError::Metal)?;
                 let (n, k) = dense_shape(original_shape);
-                let packed = pack_weight_blocked(device, &buf, n, k)?;
-                Ok(WeightBuffer::Dense { buf, packed })
+                if let Some(packed_data) = pack_bytes_blocked(&data, n, k) {
+                    let packed_buf = device
+                        .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                        .map_err(MetalError::Metal)?;
+                    Ok(WeightBuffer::Dense {
+                        buf: None,
+                        packed: Some(packed_buf),
+                    })
+                } else {
+                    let buf = device
+                        .create_buffer_with_data(&data, StorageMode::Shared)
+                        .map_err(MetalError::Metal)?;
+                    Ok(WeightBuffer::Dense {
+                        buf: Some(buf),
+                        packed: None,
+                    })
+                }
             } else {
                 let rows = original_shape[0];
                 let cols = if original_shape.len() > 1 {
@@ -499,12 +532,24 @@ fn load_weight_buffer(
                 *bit_width,
                 *group_size,
             )?;
-            let buf = device
-                .create_buffer_with_data(&data, StorageMode::Shared)
-                .map_err(MetalError::Metal)?;
             let (n, k) = dense_shape(&tensor.shape);
-            let packed = pack_weight_blocked(device, &buf, n, k)?;
-            Ok(WeightBuffer::Dense { buf, packed })
+            if let Some(packed_data) = pack_bytes_blocked(&data, n, k) {
+                let packed_buf = device
+                    .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+                Ok(WeightBuffer::Dense {
+                    buf: None,
+                    packed: Some(packed_buf),
+                })
+            } else {
+                let buf = device
+                    .create_buffer_with_data(&data, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+                Ok(WeightBuffer::Dense {
+                    buf: Some(buf),
+                    packed: None,
+                })
+            }
         }
         QuantizationInfo::DualScaleDequantize {
             quantized_data,
@@ -529,12 +574,23 @@ fn load_weight_buffer(
                     *bit_width,
                     *group_size,
                 )?;
+                let (n, k) = dense_shape(original_shape);
+                if let Some(packed_data) = pack_bytes_blocked(&data, n, k) {
+                    let packed_buf = device
+                        .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                        .map_err(MetalError::Metal)?;
+                    return Ok(WeightBuffer::Dense {
+                        buf: None,
+                        packed: Some(packed_buf),
+                    });
+                }
                 let buf = device
                     .create_buffer_with_data(&data, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;
-                let (n, k) = dense_shape(original_shape);
-                let packed = pack_weight_blocked(device, &buf, n, k)?;
-                return Ok(WeightBuffer::Dense { buf, packed });
+                return Ok(WeightBuffer::Dense {
+                    buf: Some(buf),
+                    packed: None,
+                });
             }
 
             // Upload packed data + params to GPU — no CPU dequant needed.

@@ -268,4 +268,78 @@ mod gemma4 {
             "D2Quant-3 should reduce GPU memory by >20%, got {reduction_pct:.1}%"
         );
     }
+
+    #[test]
+    #[ignore] // requires Metal GPU + Gemma 4 E2B-IT weights
+    fn profile_load_phases() {
+        let model_dir = gemma4_model_dir();
+
+        // Phase 1: SafeTensorsProvider::load (mmap + index)
+        let t0 = Instant::now();
+        let provider =
+            SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
+        let t_provider = t0.elapsed();
+        println!(
+            "\nPhase 1 — SafeTensorsProvider::load: {:.1}ms",
+            t_provider.as_secs_f64() * 1000.0
+        );
+        println!("  Tensor count: {}", provider.tensor_names().len());
+
+        // Phase 2: MetalInference::new (device init)
+        let config = MetalConfig::default().without_turboquant();
+        let t1 = Instant::now();
+        let mut engine = MetalInference::new(config.clone()).expect("MetalInference::new failed");
+        let t_new = t1.elapsed();
+        println!(
+            "Phase 2 — MetalInference::new: {:.1}ms",
+            t_new.as_secs_f64() * 1000.0
+        );
+
+        // Phase 3: load_weights (BF16 conv + block pack + GPU upload + shader compile)
+        let t2 = Instant::now();
+        engine
+            .load_weights(&provider, config)
+            .expect("load_weights failed");
+        let t_weights = t2.elapsed();
+        println!(
+            "Phase 3 — load_weights: {:.1}ms",
+            t_weights.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  GPU allocated: {:.1} MB",
+            engine.gpu_allocated_bytes() as f64 / (1024.0 * 1024.0)
+        );
+
+        // Phase 4: first prefill (includes any lazy shader compilation)
+        let prompt: Vec<u32> = vec![2, 651, 3488];
+        let t3 = Instant::now();
+        engine.prefill(&prompt).expect("prefill failed");
+        let t_prefill = t3.elapsed();
+        println!(
+            "Phase 4 — first prefill ({} tokens): {:.1}ms",
+            prompt.len(),
+            t_prefill.as_secs_f64() * 1000.0
+        );
+
+        // Phase 5: individual decode steps
+        let mut last_token = 3488u32;
+        println!("Phase 5 — decode steps:");
+        for i in 0..10 {
+            let t = Instant::now();
+            let logits = engine.decode_step(last_token).expect("decode failed");
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!("  step {i}: {ms:.2}ms ({:.1} tok/s)", 1000.0 / ms);
+            last_token = logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+        }
+
+        println!(
+            "\nTotal: {:.1}ms",
+            (t_provider + t_new + t_weights).as_secs_f64() * 1000.0
+        );
+    }
 }
