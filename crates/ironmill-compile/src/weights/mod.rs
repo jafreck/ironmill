@@ -11,8 +11,10 @@ pub use mil_rs::weights::{
 
 pub mod gguf;
 pub mod mil_provider;
+pub mod quantized;
 pub mod safetensors;
 
 pub use gguf::GgufProvider;
 pub use mil_provider::MilWeightProvider;
+pub use quantized::QuantizedWeightProvider;
 pub use safetensors::SafeTensorsProvider;

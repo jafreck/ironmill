@@ -17,6 +17,7 @@ mod gemma4 {
     use std::time::Instant;
 
     use ironmill_compile::gpu::GpuCompileBuilder;
+    use ironmill_compile::weights::quantized::{D2QuantConfig, QuantizedWeightProvider};
     use ironmill_compile::weights::{SafeTensorsProvider, WeightProvider};
     use ironmill_inference::engine::InferenceEngine;
     use ironmill_inference::metal::{MetalConfig, MetalInference};
@@ -742,28 +743,21 @@ mod gemma4 {
 
         drop(fp16_provider);
 
-        // ── D2Quant 3-bit + TurboQuant-INT8 KV ──────────────────
+        // ── D2Quant 3-bit (JIT) + TurboQuant-INT8 KV ─────────────
         {
-            let t_compile = Instant::now();
-            let d2q_provider = GpuCompileBuilder::new(model_dir.clone())
-                .with_pass_pipeline(
-                    ironmill_compile::mil::PassPipeline::new()
-                        .with_d2quant(3, 128, 0.99, None)
-                        .expect("D2Quant config"),
-                )
-                .build()
-                .expect("D2Quant compile failed");
-            let compile_ms = t_compile.elapsed().as_secs_f64() * 1000.0;
+            let d2q_provider = QuantizedWeightProvider::new(
+                SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed"),
+                D2QuantConfig::three_bit(),
+            );
 
             let config = MetalConfig::default().with_turboquant(8);
             let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&d2q_provider, config);
 
             let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
             let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
-            eprintln!("  D2Q-3 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
-            eprintln!("  D2Quant compile: {compile_ms:.0}ms");
+            eprintln!("  D2Q-3 (JIT) PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
             results.push(BenchResult {
-                label: "D2Q-3 + TQ-INT8 KV",
+                label: "D2Q-3 JIT + TQ-INT8",
                 load_ms,
                 gpu_mb,
                 ms_tok,
