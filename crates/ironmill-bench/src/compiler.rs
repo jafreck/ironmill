@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::{ModelConfig, OptConfig, cache_key};
 
@@ -25,20 +25,56 @@ fn build_pipeline(opt: &OptConfig) -> Result<ironmill_compile::mil::PassPipeline
     if let Some(bits) = opt.polar_quantize {
         pipeline = pipeline.with_polar_quant(bits)?;
     }
+    if let Some(bits) = opt.d2quant {
+        pipeline = pipeline.with_d2quant(bits, 128, 0.99, None)?;
+    }
     Ok(pipeline)
 }
 
-/// Parse an ONNX model into MIL IR without running any optimization passes.
+/// Parse a model into MIL IR without running any optimization passes.
 ///
-/// This is the expensive I/O + conversion step. Callers should cache the result
-/// and pass it to [`optimize_program`] or [`compile_model_from_program`] to
-/// avoid redundant parsing.
+/// When `model.model_dir` is set, loads weights from SafeTensors files and
+/// builds MIL IR using the architecture template. Otherwise falls back to
+/// ONNX parsing.
 pub fn parse_model(model: &ModelConfig) -> Result<ironmill_compile::mil::Program> {
+    if let Some(model_dir) = &model.model_dir {
+        parse_model_from_template(model_dir)
+    } else {
+        parse_model_from_onnx(model)
+    }
+}
+
+/// Parse an ONNX model into MIL IR.
+fn parse_model_from_onnx(model: &ModelConfig) -> Result<ironmill_compile::mil::Program> {
     let (mut onnx, model_dir) = ironmill_compile::mil::read_onnx_with_dir(&model.path)?;
     let mut config = ironmill_compile::mil::ConversionConfig::default();
     config.model_dir = Some(model_dir);
     let result = ironmill_compile::mil::onnx_to_program_with_config(&mut onnx, &config)?;
     Ok(result.program)
+}
+
+/// Build MIL IR from SafeTensors weights using the architecture template.
+fn parse_model_from_template(model_dir: &Path) -> Result<ironmill_compile::mil::Program> {
+    use std::sync::Arc;
+
+    let config_path = model_dir.join("config.json");
+    let _hf_config = ironmill_compile::weights::safetensors::parse_hf_config(&config_path)
+        .with_context(|| format!("failed to parse config.json in {}", model_dir.display()))?;
+
+    let provider = ironmill_compile::weights::SafeTensorsProvider::load(model_dir)
+        .with_context(|| format!("failed to load SafeTensors from {}", model_dir.display()))?;
+
+    let result = ironmill_compile::templates::weights_to_program(&provider)
+        .with_context(|| "failed to build MIL program from template")?;
+
+    for warning in &result.warnings {
+        eprintln!("template warning: {warning}");
+    }
+
+    let mut program = result.program;
+    // Attach the weight provider so optimization passes can resolve external tensors.
+    program.set_weight_provider(Arc::new(provider));
+    Ok(program)
 }
 
 /// Apply the optimization pipeline to a program in-place.
@@ -77,6 +113,11 @@ pub fn compile_model(
     let mut program = parse_model(model)?;
     optimize_program(&mut program, opt)?;
 
+    // Materialize all external tensor refs before serialization.
+    if program.has_weight_provider() {
+        program.materialize_all()?;
+    }
+
     let model_proto = ironmill_compile::mil::program_to_model(&program, 7)?;
 
     let mlpackage_path = entry_dir.join("model.mlpackage");
@@ -114,6 +155,10 @@ pub fn compile_model_from_program(
 
     let mut prog = program.clone();
     optimize_program(&mut prog, opt)?;
+
+    if prog.has_weight_provider() {
+        prog.materialize_all()?;
+    }
 
     let model_proto = ironmill_compile::mil::program_to_model(&prog, 7)?;
 

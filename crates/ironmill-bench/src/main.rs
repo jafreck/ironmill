@@ -131,6 +131,18 @@ struct Cli {
     /// Path to pre-tokenized dataset for perplexity evaluation
     #[arg(long, default_value = "tests/fixtures/quality/wikitext2-qwen3.json")]
     perplexity_dataset: PathBuf,
+
+    /// Stride for sliding-window PPL evaluation.
+    /// Standard HF methodology: each window overlaps by (max_seq_len - stride) tokens.
+    /// Default 512 matches HuggingFace baseline. Set equal to max_seq_len for independent
+    /// (non-overlapping) evaluation.
+    #[arg(long, default_value = "512")]
+    perplexity_stride: usize,
+
+    /// Path to EAGLE-3 speculative decoding bundle (.specbundle directory).
+    /// When provided, decode benchmarks use speculative decoding with the draft head.
+    #[arg(long)]
+    specbundle: Option<PathBuf>,
 }
 
 /// Run CoreML benchmark loop across models × optimizations × compute units.
@@ -371,6 +383,7 @@ fn main() -> Result<()> {
                     .to_string(),
                 path: p.clone(),
                 input_shapes: vec![],
+                model_dir: None,
             })
             .collect();
     }
@@ -594,16 +607,35 @@ fn main() -> Result<()> {
             eprintln!("\n  Metal GPU Backend Benchmark");
             eprintln!("  {}", "─".repeat(40));
 
-            // Run two configurations: FP16 baseline and TurboQuant INT4
-            let configs: Vec<(&str, MetalConfig)> = vec![
-                ("fp16", {
+            // Build Metal configs from TOML optimization entries.
+            // Track D2Quant bit-width (0 = none).
+            let configs: Vec<(String, MetalConfig, u8)> = matrix
+                .optimizations
+                .iter()
+                .map(|opt| {
                     let mut c = MetalConfig::default();
-                    c.enable_turboquant = false;
-                    c
-                }),
-                ("tq-int8", MetalConfig::default().with_turboquant(8)),
-                ("tq-int4", MetalConfig::default().with_turboquant(4)),
-            ];
+                    c.max_seq_len = opt.max_seq_len;
+                    match opt.kv_quant {
+                        config::KvQuantMode::None => {
+                            c.enable_turboquant = false;
+                        }
+                        config::KvQuantMode::TurboInt4 => {
+                            c.enable_turboquant = true;
+                            c.n_bits = 4;
+                        }
+                        config::KvQuantMode::TurboInt8 => {
+                            c.enable_turboquant = true;
+                            c.n_bits = 8;
+                        }
+                        config::KvQuantMode::TurboInt8Qjl => {
+                            c.enable_turboquant = true;
+                            c.n_bits = 8;
+                        }
+                    }
+                    let d2quant_bits = opt.d2quant.unwrap_or(0);
+                    (opt.name.clone(), c, d2quant_bits)
+                })
+                .collect();
 
             let mut gpu_ppl_results: std::collections::HashMap<String, f64> =
                 std::collections::HashMap::new();
@@ -647,7 +679,12 @@ fn main() -> Result<()> {
                             c.enable_turboquant = false;
                             c
                         }),
-                        ("tq-int4-kv", MetalConfig::default().with_turboquant(4)),
+                        ("tq-int4-kv", {
+                            let mut c = MetalConfig::default();
+                            c.enable_turboquant = true;
+                            c.n_bits = 4;
+                            c
+                        }),
                     ];
 
                     for (kv_label, gpu_config) in &bundle_configs {
@@ -781,7 +818,9 @@ fn main() -> Result<()> {
                 }
 
                 // Load weights once, reuse across configs (and perplexity if needed)
-                let model_dir = if model_cfg.path.is_dir() {
+                let model_dir = if let Some(ref md) = model_cfg.model_dir {
+                    md.clone()
+                } else if model_cfg.path.is_dir() {
                     model_cfg.path.clone()
                 } else if let Some(parent) = model_cfg.path.parent() {
                     parent.to_path_buf()
@@ -809,7 +848,7 @@ fn main() -> Result<()> {
                 }
                 let provider = cached_providers.get(&model_dir).unwrap();
 
-                for (config_name, gpu_config) in &configs {
+                for (config_name, gpu_config, d2quant_bits) in &configs {
                     eprintln!("  Metal/{config_name}: {}...", model_cfg.name);
 
                     let mut engine = match MetalInference::new(gpu_config.clone()) {
@@ -826,6 +865,13 @@ fn main() -> Result<()> {
                         eprintln!("  ✗ Metal model load failed: {e}");
                         continue;
                     }
+
+                    // JIT D2Quant simulation: quantize→dequant round-trip.
+                    if *d2quant_bits > 0 {
+                        eprintln!("    applying D2Quant-{d2quant_bits} simulation...");
+                        engine.weights_mut().apply_d2quant_simulation(*d2quant_bits);
+                    }
+
                     let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
                     let gpu_after = engine.gpu_allocated_bytes();
                     let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
@@ -934,6 +980,107 @@ fn main() -> Result<()> {
                 }
             }
 
+            // ── EAGLE-3 speculative decode benchmark ──
+            if let Some(ref specbundle_path) = cli.specbundle {
+                eprintln!("\n  Metal Speculative Decode (EAGLE-3)");
+                eprintln!("  {}", "─".repeat(40));
+
+                let model_cfg = matrix.models.first().unwrap();
+                let model_dir = model_cfg
+                    .model_dir
+                    .clone()
+                    .unwrap_or_else(|| model_cfg.path.parent().unwrap().to_path_buf());
+
+                // Use first FP16 (non-D2Quant) config as the target model config.
+                if let Some((config_name, gpu_config, _)) =
+                    configs.iter().find(|(_, _, d2q)| *d2q == 0)
+                {
+                    let mut engine = match MetalInference::new(gpu_config.clone()) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!("  ✗ Metal GPU init failed: {e}");
+                            // fall through to PPL eval
+                            std::process::exit(1);
+                        }
+                    };
+
+                    if !cached_providers.contains_key(&model_dir) {
+                        let p = SafeTensorsProvider::load(&model_dir)
+                            .map_err(|e| anyhow::anyhow!("weight load: {e}"))?;
+                        cached_providers.insert(model_dir.clone(), p);
+                    }
+                    let provider = cached_providers.get(&model_dir).unwrap();
+
+                    engine
+                        .load_weights(provider, gpu_config.clone())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                    let spec_config =
+                        ironmill_inference::speculative::config::SpecConfig::default();
+                    let sampler = ironmill_inference::sampling::Sampler::new(
+                        ironmill_inference::sampling::SamplerConfig::greedy(),
+                    );
+                    let mut spec_engine =
+                        ironmill_inference::SpeculativeEngine::new(engine, spec_config, sampler);
+
+                    match spec_engine.load_draft_head(specbundle_path) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            eprintln!("  ✗ failed to load specbundle: {e}");
+                            eprintln!("  Skipping speculative decode benchmarks.");
+                            // fall through to PPL eval
+                        }
+                    }
+
+                    if spec_engine.has_draft_head() {
+                        // Prefill
+                        let prompt_tokens: Vec<u32> = vec![9707, 1879];
+                        spec_engine
+                            .engine_mut()
+                            .prefill(&prompt_tokens)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                        let last_hidden =
+                            spec_engine.engine().last_hidden_state().unwrap_or_default();
+
+                        let mut total_tokens: usize = 0;
+                        let mut total_steps: usize = 0;
+                        let mut current_hidden = last_hidden;
+                        let mut current_token = prompt_tokens.last().copied().unwrap_or(0);
+
+                        let spec_start = std::time::Instant::now();
+
+                        for _ in 0..matrix.settings.iterations {
+                            match spec_engine.speculative_step(current_token, &current_hidden) {
+                                Ok(accepted) => {
+                                    let n_accepted = accepted.len();
+                                    total_tokens += n_accepted;
+                                    total_steps += 1;
+                                    current_token = *accepted.last().unwrap_or(&0);
+                                    current_hidden = spec_engine
+                                        .engine()
+                                        .last_hidden_state()
+                                        .unwrap_or_default();
+                                }
+                                Err(e) => {
+                                    eprintln!("  ✗ speculative step failed: {e}");
+                                    break;
+                                }
+                            }
+                        }
+
+                        let spec_elapsed = spec_start.elapsed().as_secs_f64();
+                        let effective_tok_s = total_tokens as f64 / spec_elapsed;
+                        let avg_accepted = total_tokens as f64 / total_steps.max(1) as f64;
+                        eprintln!(
+                            "  ✓ {config_name}+eagle3: {:.1} tok/s effective \
+                             ({} tokens in {:.1}s, {:.1} tok/step avg)",
+                            effective_tok_s, total_tokens, spec_elapsed, avg_accepted,
+                        );
+                    }
+                }
+            }
+
             // ── Perplexity evaluation on Metal ──
             if let Some(dataset) = &ppl_dataset {
                 eprintln!("\n  Metal Perplexity Evaluation");
@@ -947,7 +1094,9 @@ fn main() -> Result<()> {
 
                 // SafeTensors PPL evaluation (skip if first model is a bundle)
                 if !first_is_bundle {
-                    let model_dir = if model_cfg.path.is_dir() {
+                    let model_dir = if let Some(ref md) = model_cfg.model_dir {
+                        md.clone()
+                    } else if model_cfg.path.is_dir() {
                         model_cfg.path.clone()
                     } else {
                         model_cfg.path.parent().unwrap().to_path_buf()
@@ -961,7 +1110,7 @@ fn main() -> Result<()> {
                     }
                     let provider = cached_providers.get(&model_dir).unwrap();
 
-                    for (config_name, gpu_config) in &configs {
+                    for (config_name, gpu_config, d2quant_bits) in &configs {
                         eprintln!("  Evaluating {config_name}...");
 
                         let mut engine = MetalInference::new(gpu_config.clone())
@@ -970,29 +1119,52 @@ fn main() -> Result<()> {
                         engine
                             .load_weights(provider, gpu_config.clone())
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                        // JIT D2Quant simulation for PPL evaluation.
+                        if *d2quant_bits > 0 {
+                            engine.weights_mut().apply_d2quant_simulation(*d2quant_bits);
+                        }
                         let gpu_after = engine.gpu_allocated_bytes();
                         let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
                         let model_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
                         eprintln!("  GPU memory: {gpu_mb:.1} MB (model: {model_mb:.1} MB)");
 
                         let num_seqs = cli.perplexity_sequences.min(dataset.num_sequences);
+                        let stride = cli.perplexity_stride;
+
+                        // Concatenate sequences into a single token stream for
+                        // sliding-window evaluation.
+                        let full_tokens: Vec<u32> = dataset
+                            .sequences
+                            .iter()
+                            .take(num_seqs)
+                            .flatten()
+                            .copied()
+                            .collect();
+                        let max_length = dataset.seq_len;
+                        let windows = perplexity::sliding_window_schedule(
+                            full_tokens.len(),
+                            max_length,
+                            stride,
+                        );
+                        let num_windows = windows.len();
+
                         let mut all_losses = Vec::new();
                         let start = std::time::Instant::now();
 
-                        for (seq_idx, sequence) in
-                            dataset.sequences.iter().take(num_seqs).enumerate()
-                        {
+                        for (win_idx, step) in windows.iter().enumerate() {
                             engine.reset();
-                            if sequence.len() < 2 {
+                            let window = &full_tokens[step.begin..step.end];
+                            if window.len() < 2 {
                                 continue;
                             }
-                            for pos in 0..sequence.len() - 1 {
-                                let token = sequence[pos];
-                                let target = sequence[pos + 1];
-                                let logits = engine
-                                    .decode_step(token)
-                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                                let ce = perplexity::cross_entropy(&logits, target);
+                            let all_logits = engine
+                                .prefill_all_logits(window)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            // Only count losses for non-overlapping tokens (from loss_start onward).
+                            for pos in step.loss_start..window.len() - 1 {
+                                let target = window[pos + 1];
+                                let ce = perplexity::cross_entropy(&all_logits[pos], target);
                                 all_losses.push(ce);
                             }
                             let running_ppl = perplexity::perplexity_from_losses(&all_losses);
@@ -1000,8 +1172,8 @@ fn main() -> Result<()> {
                             let tok_per_sec = all_losses.len() as f64 / elapsed;
                             eprintln!(
                                 "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
-                                seq_idx + 1,
-                                num_seqs,
+                                win_idx + 1,
+                                num_windows,
                                 running_ppl,
                                 all_losses.len(),
                                 tok_per_sec,
@@ -1058,7 +1230,12 @@ fn main() -> Result<()> {
                             c.enable_turboquant = false;
                             c
                         }),
-                        ("tq-int4-kv", MetalConfig::default().with_turboquant(4)),
+                        ("tq-int4-kv", {
+                            let mut c = MetalConfig::default();
+                            c.enable_turboquant = true;
+                            c.n_bits = 4;
+                            c
+                        }),
                     ];
 
                     for (kv_label, gpu_config) in &ppl_bundle_configs {
@@ -1077,23 +1254,38 @@ fn main() -> Result<()> {
                         eprintln!("  GPU memory: {gpu_mb:.1} MB (model: {model_mb:.1} MB)");
 
                         let num_seqs = cli.perplexity_sequences.min(dataset.num_sequences);
+                        let stride = cli.perplexity_stride;
+
+                        let full_tokens: Vec<u32> = dataset
+                            .sequences
+                            .iter()
+                            .take(num_seqs)
+                            .flatten()
+                            .copied()
+                            .collect();
+                        let max_length = dataset.seq_len;
+                        let windows = perplexity::sliding_window_schedule(
+                            full_tokens.len(),
+                            max_length,
+                            stride,
+                        );
+                        let num_windows = windows.len();
+
                         let mut all_losses = Vec::new();
                         let start = std::time::Instant::now();
 
-                        for (seq_idx, sequence) in
-                            dataset.sequences.iter().take(num_seqs).enumerate()
-                        {
+                        for (win_idx, step) in windows.iter().enumerate() {
                             engine.reset();
-                            if sequence.len() < 2 {
+                            let window = &full_tokens[step.begin..step.end];
+                            if window.len() < 2 {
                                 continue;
                             }
-                            for pos in 0..sequence.len() - 1 {
-                                let token = sequence[pos];
-                                let target = sequence[pos + 1];
-                                let logits = engine
-                                    .decode_step(token)
-                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                                let ce = perplexity::cross_entropy(&logits, target);
+                            let all_logits = engine
+                                .prefill_all_logits(window)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            for pos in step.loss_start..window.len() - 1 {
+                                let target = window[pos + 1];
+                                let ce = perplexity::cross_entropy(&all_logits[pos], target);
                                 all_losses.push(ce);
                             }
                             let running_ppl = perplexity::perplexity_from_losses(&all_losses);
@@ -1101,8 +1293,8 @@ fn main() -> Result<()> {
                             let tok_per_sec = all_losses.len() as f64 / elapsed;
                             eprintln!(
                                 "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
-                                seq_idx + 1,
-                                num_seqs,
+                                win_idx + 1,
+                                num_windows,
                                 running_ppl,
                                 all_losses.len(),
                                 tok_per_sec,

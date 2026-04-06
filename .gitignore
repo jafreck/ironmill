@@ -49,3 +49,5 @@ Desktop.ini
 *.bak
 *.orig
 *.rej
+models/
+*.txt

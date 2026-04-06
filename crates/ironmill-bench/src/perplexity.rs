@@ -69,6 +69,65 @@ pub fn perplexity_from_losses(losses: &[f64]) -> f64 {
     avg_ce.exp()
 }
 
+/// A single sliding-window evaluation step.
+///
+/// Returned by [`sliding_window_schedule`] to describe which token range to
+/// feed into the model and which positions to count losses for.
+pub struct WindowStep {
+    /// Start index into the full token stream.
+    pub begin: usize,
+    /// End index (exclusive) into the full token stream.
+    pub end: usize,
+    /// Index within the window where loss counting starts (inclusive).
+    /// Positions before this are context-only (already counted by a
+    /// previous window).
+    pub loss_start: usize,
+}
+
+/// Compute the sliding-window schedule for a corpus of `total_tokens` tokens.
+///
+/// Uses the standard HuggingFace PPL methodology: windows of `max_length`
+/// tokens are slid by `stride` positions. Only the last `stride` tokens
+/// in each window contribute losses (except the first window, which
+/// counts all tokens).
+///
+/// Returns a sequence of [`WindowStep`] descriptors.
+pub fn sliding_window_schedule(
+    total_tokens: usize,
+    max_length: usize,
+    stride: usize,
+) -> Vec<WindowStep> {
+    let mut steps = Vec::new();
+    let mut prev_end: usize = 0;
+
+    let mut begin: usize = 0;
+    while begin < total_tokens {
+        let end = (begin + max_length).min(total_tokens);
+        if end <= 1 {
+            break;
+        }
+        let trg_len = end - prev_end;
+        // loss_start is the position within this window where we begin
+        // counting losses. Positions before this were already evaluated
+        // in the previous window.
+        let window_len = end - begin;
+        let loss_start = window_len.saturating_sub(trg_len);
+
+        steps.push(WindowStep {
+            begin,
+            end,
+            loss_start,
+        });
+
+        prev_end = end;
+        if end == total_tokens {
+            break;
+        }
+        begin += stride;
+    }
+    steps
+}
+
 /// Evaluate perplexity of a model on a pre-tokenized dataset.
 ///
 /// Feeds tokens one at a time via `decode()`, collecting cross-entropy
@@ -297,5 +356,75 @@ mod tests {
         let ds: PerplexityDataset = serde_json::from_str(json).unwrap();
         assert_eq!(ds.num_sequences, 2);
         assert_eq!(ds.sequences[0], vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn sliding_window_full_stride() {
+        // stride == max_length → no overlap, one window per chunk
+        let steps = sliding_window_schedule(8, 4, 4);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            (steps[0].begin, steps[0].end, steps[0].loss_start),
+            (0, 4, 0)
+        );
+        assert_eq!(
+            (steps[1].begin, steps[1].end, steps[1].loss_start),
+            (4, 8, 0)
+        );
+    }
+
+    #[test]
+    fn sliding_window_overlapping() {
+        // 10 tokens, window=6, stride=3
+        // Window 0: [0,6), all tokens new, loss_start=0
+        // Window 1: [3,9), new tokens=[6,9), loss_start=3
+        // Window 2: [6,10), new tokens=[9,10), loss_start=3
+        let steps = sliding_window_schedule(10, 6, 3);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(
+            (steps[0].begin, steps[0].end, steps[0].loss_start),
+            (0, 6, 0)
+        );
+        assert_eq!(
+            (steps[1].begin, steps[1].end, steps[1].loss_start),
+            (3, 9, 3)
+        );
+        assert_eq!(
+            (steps[2].begin, steps[2].end, steps[2].loss_start),
+            (6, 10, 3)
+        );
+    }
+
+    #[test]
+    fn sliding_window_exact_fit() {
+        // 2048 tokens, window=2048, stride=512 → first window covers all
+        let steps = sliding_window_schedule(2048, 2048, 512);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            (steps[0].begin, steps[0].end, steps[0].loss_start),
+            (0, 2048, 0)
+        );
+    }
+
+    #[test]
+    fn sliding_window_standard_hf() {
+        // 4096 tokens, window=2048, stride=512
+        // Window 0: [0, 2048), loss_start=0 (2048 new tokens)
+        // Window 1: [512, 2560), loss_start=1536 (512 new tokens)
+        // ...continuing until end
+        let steps = sliding_window_schedule(4096, 2048, 512);
+        assert_eq!(steps[0].loss_start, 0);
+        assert_eq!(steps[1].loss_start, 2048 - 512);
+        // Total tokens counted should equal total - 1 (no target for last token)
+        // Each counted token appears exactly once
+        let total_counted: usize = steps
+            .iter()
+            .map(|s| {
+                let wlen = s.end - s.begin;
+                // positions loss_start..wlen-1 are counted
+                wlen.saturating_sub(1).saturating_sub(s.loss_start)
+            })
+            .sum();
+        assert_eq!(total_counted, 4095); // 4096 - 1
     }
 }

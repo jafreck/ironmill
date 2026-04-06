@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum KvQuantMode {
     #[default]
     None,
+    TurboInt4,
     TurboInt8,
     TurboInt8Qjl,
 }
@@ -20,6 +21,7 @@ impl std::fmt::Display for KvQuantMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KvQuantMode::None => write!(f, "none"),
+            KvQuantMode::TurboInt4 => write!(f, "turbo-int4"),
             KvQuantMode::TurboInt8 => write!(f, "turbo-int8"),
             KvQuantMode::TurboInt8Qjl => write!(f, "turbo-int8-qjl"),
         }
@@ -41,6 +43,12 @@ pub struct ModelConfig {
     pub path: PathBuf,
     #[serde(default)]
     pub input_shapes: Vec<(String, Vec<usize>)>,
+    /// Optional HuggingFace model directory for template-based compilation.
+    /// When set, the benchmark loads weights from safetensors files in this
+    /// directory and builds MIL IR using the architecture template instead
+    /// of parsing an ONNX file.
+    #[serde(default)]
+    pub model_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +60,9 @@ pub struct OptConfig {
     pub palettize: Option<u8>,
     #[serde(default)]
     pub polar_quantize: Option<u8>,
+    /// D2Quant dual-scale quantization bit-width (2 or 3).
+    #[serde(default)]
+    pub d2quant: Option<u8>,
     #[serde(default)]
     pub no_fusion: bool,
     #[serde(default)]
@@ -139,6 +150,7 @@ pub fn default_matrix() -> BenchMatrix {
         name: "Qwen3-0.6B".to_string(),
         path: PathBuf::from("tests/fixtures/qwen3-0.6b.onnx"),
         input_shapes: vec![],
+        model_dir: None,
     }];
 
     let optimizations = vec![
@@ -147,6 +159,7 @@ pub fn default_matrix() -> BenchMatrix {
             quantize: None,
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: true,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -157,6 +170,7 @@ pub fn default_matrix() -> BenchMatrix {
             quantize: None,
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -167,6 +181,7 @@ pub fn default_matrix() -> BenchMatrix {
             quantize: Some("fp16".to_string()),
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -177,6 +192,7 @@ pub fn default_matrix() -> BenchMatrix {
             quantize: Some("int8".to_string()),
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -187,6 +203,7 @@ pub fn default_matrix() -> BenchMatrix {
             quantize: None,
             palettize: Some(4),
             polar_quantize: None,
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -197,6 +214,7 @@ pub fn default_matrix() -> BenchMatrix {
             quantize: None,
             palettize: None,
             polar_quantize: Some(4),
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -207,6 +225,7 @@ pub fn default_matrix() -> BenchMatrix {
             quantize: None,
             palettize: None,
             polar_quantize: Some(3),
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -218,6 +237,7 @@ pub fn default_matrix() -> BenchMatrix {
             quantize: None,
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::TurboInt8,
@@ -229,6 +249,7 @@ pub fn default_matrix() -> BenchMatrix {
             quantize: None,
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::TurboInt8Qjl,
@@ -374,6 +395,7 @@ backends = ["cpu", "gpu"]
             quantize: None,
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: true,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -397,6 +419,7 @@ backends = ["cpu", "gpu"]
             quantize: None,
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: true,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -407,6 +430,7 @@ backends = ["cpu", "gpu"]
             quantize: Some("fp16".to_string()),
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
@@ -427,6 +451,7 @@ backends = ["cpu", "gpu"]
             quantize: None,
             palettize: None,
             polar_quantize: None,
+            d2quant: None,
             no_fusion: false,
             disabled_passes: vec![],
             kv_quant: KvQuantMode::TurboInt8,

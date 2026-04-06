@@ -1,0 +1,15 @@
+[[model]]
+name = "Qwen3.5-0.8B"
+path = "unused-for-template-mode"
+model_dir = "models/Qwen3.5-0.8B"
+
+[[optimization]]
+name = "baseline"
+no_fusion = true
+kv_quant = "none"
+max_seq_len = 128
+
+[settings]
+iterations = 1
+warmup = 0
+runs = 1

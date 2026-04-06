@@ -1,0 +1,31 @@
+# Baseline FP16 vs fully-optimized ironmill benchmark
+# Usage: cargo run --release -p ironmill-bench -- --config bench-showoff.toml
+#
+# Optimized config uses D2Quant (SOTA 2-bit dual-scale quantization) for
+# weights plus TurboQuant INT8+QJL for KV cache compression. This represents
+# the most aggressive memory reduction ironmill can achieve today.
+
+[[model]]
+name = "Qwen3.5-0.8B"
+path = "unused-for-template-mode"
+model_dir = "models/Qwen3.5-0.8B"
+
+# --- Baseline: no quantization, no fusion, no KV cache compression ---
+[[optimization]]
+name = "baseline"
+no_fusion = true
+kv_quant = "none"
+max_seq_len = 2048
+
+# --- Fully optimized: D2Quant 2-bit + all fusions ---
+[[optimization]]
+name = "optimized-d2quant2"
+d2quant = 2
+no_fusion = false
+kv_quant = "none"
+max_seq_len = 2048
+
+[settings]
+iterations = 3
+warmup = 1
+runs = 3
