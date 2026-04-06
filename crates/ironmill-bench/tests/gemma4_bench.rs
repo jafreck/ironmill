@@ -322,173 +322,202 @@ mod gemma4 {
         );
     }
 
-    /// Compare per-token logits between FP16 and FP16+TQ-INT4 on a single
-    /// sequence to diagnose why TQ-INT4 shows lower PPL than FP16.
+    /// Compare per-token logit distributions between FP16 and quantized
+    /// configs using KL divergence, top-k agreement, and CE analysis.
     #[test]
     #[ignore]
     fn investigate_tq_ppl() {
         let model_dir = gemma4_model_dir();
         let sequences = load_eval_dataset();
-        let seq = &sequences[0]; // first 512-token sequence
+        // Use multiple sequences for more stable statistics
+        let eval_seqs = 5;
 
         let provider =
             SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
 
-        // FP16 baseline logits
+        // FP16 baseline logits (all sequences)
         let fp16_config = MetalConfig::default().without_turboquant();
         let (mut fp16_engine, _, _) = load_gpu_engine(&provider, fp16_config);
-        let fp16_logits = fp16_engine
-            .prefill_all_logits(seq)
-            .expect("FP16 prefill failed");
+        let mut fp16_all: Vec<Vec<Vec<f32>>> = Vec::new();
+        for seq in sequences.iter().take(eval_seqs) {
+            fp16_engine.reset();
+            fp16_all.push(fp16_engine.prefill_all_logits(seq).expect("FP16 prefill"));
+        }
 
         // FP16 + TQ-INT4 logits
         let tq_config = MetalConfig::default().with_turboquant(4);
         let (mut tq_engine, _, _) = load_gpu_engine(&provider, tq_config);
-        let tq_logits = tq_engine
-            .prefill_all_logits(seq)
-            .expect("TQ prefill failed");
+        let mut tq_all: Vec<Vec<Vec<f32>>> = Vec::new();
+        for seq in sequences.iter().take(eval_seqs) {
+            tq_engine.reset();
+            tq_all.push(tq_engine.prefill_all_logits(seq).expect("TQ prefill"));
+        }
 
-        assert_eq!(fp16_logits.len(), tq_logits.len());
+        drop(provider);
 
-        // Per-position analysis
-        println!(
-            "\n  FP16 vs TQ-INT4 logit comparison ({} positions)",
-            seq.len()
-        );
-        println!("  ─────────────────────────────────────────────────────────────────");
-        println!(
-            "  {:>4} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10}",
-            "pos", "FP16 CE", "TQ CE", "ΔCE", "max|Δlog|", "cosine", "top1match"
-        );
-        println!("  ─────────────────────────────────────────────────────────────────");
+        // D2Quant-3 + TQ-INT4 logits
+        let d2q_provider = GpuCompileBuilder::new(model_dir.clone())
+            .with_pass_pipeline(
+                ironmill_compile::mil::PassPipeline::new()
+                    .with_d2quant(3, 128, 0.99, None)
+                    .expect("D2Quant config"),
+            )
+            .build()
+            .expect("D2Quant compile failed");
+        let d2q_config = MetalConfig::default().with_turboquant(4);
+        let (mut d2q_engine, _, _) = load_gpu_engine(&d2q_provider, d2q_config);
+        let mut d2q_all: Vec<Vec<Vec<f32>>> = Vec::new();
+        for seq in sequences.iter().take(eval_seqs) {
+            d2q_engine.reset();
+            d2q_all.push(d2q_engine.prefill_all_logits(seq).expect("D2Q prefill"));
+        }
 
-        let mut fp16_total_ce = 0.0f64;
-        let mut tq_total_ce = 0.0f64;
-        let mut ce_better = 0usize; // positions where TQ has lower CE
-        let mut ce_worse = 0usize;
-        let mut top1_mismatch = 0usize;
-        let mut max_logit_diff_positions: Vec<(usize, f64)> = Vec::new();
+        // ── Compute metrics across all positions ─────────────────
+        fn softmax_f64(logits: &[f32]) -> Vec<f64> {
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let exps: Vec<f64> = logits.iter().map(|&x| (x as f64 - max).exp()).collect();
+            let sum: f64 = exps.iter().sum();
+            exps.iter().map(|&e| e / sum).collect()
+        }
 
-        for pos in 0..seq.len() - 1 {
-            let target = seq[pos + 1] as usize;
-            let fp = &fp16_logits[pos];
-            let tq = &tq_logits[pos];
+        fn kl_divergence(p: &[f64], q: &[f64]) -> f64 {
+            p.iter()
+                .zip(q.iter())
+                .map(|(&pi, &qi)| {
+                    if pi > 1e-30 {
+                        pi * (pi / (qi + 1e-30)).ln()
+                    } else {
+                        0.0
+                    }
+                })
+                .sum()
+        }
 
-            // Cross-entropy
-            let fp_max = fp.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let fp_lse: f64 = fp
-                .iter()
-                .map(|&x| ((x - fp_max) as f64).exp())
-                .sum::<f64>()
-                .ln()
-                + fp_max as f64;
-            let fp_ce = -(fp[target] as f64 - fp_lse);
+        fn top_k_agreement(a: &[f32], b: &[f32], k: usize) -> f64 {
+            let mut a_idx: Vec<usize> = (0..a.len()).collect();
+            let mut b_idx: Vec<usize> = (0..b.len()).collect();
+            a_idx.sort_by(|&i, &j| b[j].partial_cmp(&b[i]).unwrap_or(std::cmp::Ordering::Equal));
+            // Fix: sort a_idx by a's values
+            a_idx.sort_by(|&i, &j| a[j].partial_cmp(&a[i]).unwrap_or(std::cmp::Ordering::Equal));
+            b_idx.sort_by(|&i, &j| b[j].partial_cmp(&b[i]).unwrap_or(std::cmp::Ordering::Equal));
+            let a_set: std::collections::HashSet<usize> = a_idx[..k].iter().copied().collect();
+            let b_set: std::collections::HashSet<usize> = b_idx[..k].iter().copied().collect();
+            a_set.intersection(&b_set).count() as f64 / k as f64
+        }
 
-            let tq_max = tq.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let tq_lse: f64 = tq
-                .iter()
-                .map(|&x| ((x - tq_max) as f64).exp())
-                .sum::<f64>()
-                .ln()
-                + tq_max as f64;
-            let tq_ce = -(tq[target] as f64 - tq_lse);
+        struct QualityMetrics {
+            label: &'static str,
+            mean_kl: f64,
+            median_kl: f64,
+            p95_kl: f64,
+            max_kl: f64,
+            top1_agree: f64,
+            top5_agree: f64,
+            top10_agree: f64,
+            ppl_ref: f64,
+            ppl_test: f64,
+            n_positions: usize,
+        }
 
-            fp16_total_ce += fp_ce;
-            tq_total_ce += tq_ce;
+        fn compute_metrics(
+            label: &'static str,
+            ref_logits: &[Vec<Vec<f32>>],
+            test_logits: &[Vec<Vec<f32>>],
+            sequences: &[Vec<u32>],
+            eval_seqs: usize,
+        ) -> QualityMetrics {
+            let mut kl_values = Vec::new();
+            let mut top1_matches = 0usize;
+            let mut top5_total = 0.0f64;
+            let mut top10_total = 0.0f64;
+            let mut ref_ce = 0.0f64;
+            let mut test_ce = 0.0f64;
+            let mut n = 0usize;
 
-            if tq_ce < fp_ce - 0.01 {
-                ce_better += 1;
-            } else if tq_ce > fp_ce + 0.01 {
-                ce_worse += 1;
+            for (si, seq) in sequences.iter().take(eval_seqs).enumerate() {
+                let ref_lg = &ref_logits[si];
+                let test_lg = &test_logits[si];
+                for pos in 0..seq.len() - 1 {
+                    let target = seq[pos + 1] as usize;
+                    let p = softmax_f64(&ref_lg[pos]);
+                    let q = softmax_f64(&test_lg[pos]);
+                    kl_values.push(kl_divergence(&p, &q));
+
+                    // CE
+                    ref_ce -= p[target].max(1e-30).ln();
+                    test_ce -= q[target].max(1e-30).ln();
+
+                    // Top-k
+                    let r = &ref_lg[pos];
+                    let t = &test_lg[pos];
+                    top1_matches += top_k_agreement(r, t, 1) as usize;
+                    top5_total += top_k_agreement(r, t, 5);
+                    top10_total += top_k_agreement(r, t, 10);
+                    n += 1;
+                }
             }
 
-            // Max absolute logit difference
-            let max_diff: f64 = fp
-                .iter()
-                .zip(tq.iter())
-                .map(|(&a, &b)| (a as f64 - b as f64).abs())
-                .fold(0.0, f64::max);
+            kl_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mean_kl = kl_values.iter().sum::<f64>() / kl_values.len() as f64;
+            let median_kl = kl_values[kl_values.len() / 2];
+            let p95_kl = kl_values[(kl_values.len() as f64 * 0.95) as usize];
+            let max_kl = kl_values.last().copied().unwrap_or(0.0);
 
-            // Cosine similarity
-            let dot: f64 = fp
-                .iter()
-                .zip(tq.iter())
-                .map(|(&a, &b)| a as f64 * b as f64)
-                .sum();
-            let fp_norm: f64 = fp.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-            let tq_norm: f64 = tq.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-            let cosine = dot / (fp_norm * tq_norm + 1e-10);
-
-            // Top-1 match
-            let fp_top1 = fp
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap()
-                .0;
-            let tq_top1 = tq
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap()
-                .0;
-            let top1_match = fp_top1 == tq_top1;
-            if !top1_match {
-                top1_mismatch += 1;
-            }
-
-            max_logit_diff_positions.push((pos, max_diff));
-
-            // Print every 50th position + first/last + any with large CE delta
-            let delta_ce = tq_ce - fp_ce;
-            if pos < 5
-                || pos % 100 == 0
-                || pos == seq.len() - 2
-                || delta_ce.abs() > 2.0
-                || max_diff > 5.0
-            {
-                println!(
-                    "  {:>4} {:>8.3} {:>8.3} {:>+10.3} {:>10.3} {:>10.6} {:>10}",
-                    pos,
-                    fp_ce,
-                    tq_ce,
-                    delta_ce,
-                    max_diff,
-                    cosine,
-                    if top1_match { "✓" } else { "✗" }
-                );
+            QualityMetrics {
+                label,
+                mean_kl,
+                median_kl,
+                p95_kl,
+                max_kl,
+                top1_agree: top1_matches as f64 / n as f64 * 100.0,
+                top5_agree: top5_total / n as f64 * 100.0,
+                top10_agree: top10_total / n as f64 * 100.0,
+                ppl_ref: (ref_ce / n as f64).exp(),
+                ppl_test: (test_ce / n as f64).exp(),
+                n_positions: n,
             }
         }
 
-        // Sort by max logit difference
-        max_logit_diff_positions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let tq_metrics = compute_metrics("FP16+TQ-INT4", &fp16_all, &tq_all, &sequences, eval_seqs);
+        let d2q_metrics =
+            compute_metrics("D2Q-3+TQ-INT4", &fp16_all, &d2q_all, &sequences, eval_seqs);
 
-        let fp_ppl = (fp16_total_ce / (seq.len() - 1) as f64).exp();
-        let tq_ppl = (tq_total_ce / (seq.len() - 1) as f64).exp();
-
-        println!("  ─────────────────────────────────────────────────────────────────");
-        println!("\n  Summary:");
-        println!("    FP16 PPL: {fp_ppl:.2}");
         println!(
-            "    TQ-INT4 PPL: {tq_ppl:.2} ({:+.1}%)",
-            (tq_ppl - fp_ppl) / fp_ppl * 100.0
+            "\n  Quantization Quality vs FP16 Baseline ({} positions)",
+            tq_metrics.n_positions
         );
+        println!("  ═══════════════════════════════════════════════════════════════════════════");
         println!(
-            "    Positions where TQ is better: {ce_better} / worse: {ce_worse} / same: {}",
-            seq.len() - 1 - ce_better - ce_worse
+            "  {:<18} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>8} {:>8}",
+            "Config",
+            "mean KL",
+            "med KL",
+            "p95 KL",
+            "max KL",
+            "top1%",
+            "top5%",
+            "top10%",
+            "FP16 PPL",
+            "test PPL"
         );
-        println!("    Top-1 prediction mismatches: {top1_mismatch}");
-        println!(
-            "    Top 5 max |Δlogit| positions: {:?}",
-            max_logit_diff_positions[..5]
-                .iter()
-                .map(|(p, d)| format!("pos {p}: {d:.2}"))
-                .collect::<Vec<_>>()
-        );
-        println!(
-            "    Avg max |Δlogit|: {:.3}",
-            max_logit_diff_positions.iter().map(|(_, d)| d).sum::<f64>()
-                / max_logit_diff_positions.len() as f64
-        );
+        println!("  ───────────────────────────────────────────────────────────────────────────");
+        for m in [&tq_metrics, &d2q_metrics] {
+            println!(
+                "  {:<18} {:>8.4} {:>8.4} {:>8.3} {:>8.2} {:>6.1}% {:>6.1}% {:>6.1}% {:>8.2} {:>8.2}",
+                m.label,
+                m.mean_kl,
+                m.median_kl,
+                m.p95_kl,
+                m.max_kl,
+                m.top1_agree,
+                m.top5_agree,
+                m.top10_agree,
+                m.ppl_ref,
+                m.ppl_test
+            );
+        }
+        println!("  ═══════════════════════════════════════════════════════════════════════════");
+        println!();
+        println!("  KL divergence guide: ~0.01 = negligible, ~0.1 = noticeable, ~1.0 = severe");
     }
 }
