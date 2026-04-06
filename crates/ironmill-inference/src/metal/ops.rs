@@ -1177,7 +1177,12 @@ pub fn encode_prefill_attention(
 }
 
 /// Default Q-block tile size (Br) for fused SDPA.
-const FUSED_SDPA_DEFAULT_BR: usize = 32;
+/// Must match the SDPA_BR define used at shader compile time.
+/// For head_dim >= 256, the shader uses BR=16 to fit in register budget;
+/// smaller head dims use BR=32.
+fn fused_sdpa_br(head_dim: u32) -> usize {
+    if head_dim >= 256 { 16 } else { 32 }
+}
 
 /// Encode fused scaled dot-product attention.
 ///
@@ -1190,7 +1195,7 @@ pub fn encode_fused_sdpa(
     params: &FusedSdpaParams<'_>,
     tile_br: Option<usize>,
 ) {
-    let br = tile_br.unwrap_or(FUSED_SDPA_DEFAULT_BR);
+    let br = tile_br.unwrap_or_else(|| fused_sdpa_br(params.head_dim));
     let heads_per_group = (params.num_q_heads / params.num_kv_heads) as usize;
 
     encoder.set_pipeline(pipeline);

@@ -185,10 +185,28 @@ mod gemma4 {
 
         eprintln!("  Alpaca dataset: {} sequences loaded", sequences.len());
 
-        // ── FP16 + TurboQuant-INT4 KV (baseline) ─────────────────
+        // ── FP16 baseline (FP16 KV cache) ────────────────────────
         let fp16_provider =
             SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
 
+        {
+            let config = MetalConfig::default().without_turboquant();
+            let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
+            let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
+            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
+            eprintln!("  FP16 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
+            results.push(BenchResult {
+                label: "FP16",
+                load_ms,
+                gpu_mb,
+                ms_tok,
+                tok_s,
+                ppl,
+                ppl_tokens,
+            });
+        }
+
+        // ── FP16 + TurboQuant-INT4 KV ────────────────────────────
         {
             let config = MetalConfig::default().with_turboquant(4);
             let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
@@ -291,7 +309,7 @@ mod gemma4 {
                 r.ppl
             );
         }
-        let d2q = &results[1];
+        let d2q = &results[2];
         let mem_reduction = (1.0 - d2q.gpu_mb / fp16_gpu) * 100.0;
         assert!(
             mem_reduction > 20.0,
