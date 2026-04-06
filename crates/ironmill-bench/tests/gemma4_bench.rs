@@ -1,13 +1,15 @@
 //! Gemma 4 E2B Metal GPU benchmark.
 //!
-//! Single test that loads each config once and reports all metrics in one table.
+//! Single test that loads each config once, measures decode throughput and
+//! perplexity, and reports all metrics in one table.
 //! **Always use `--release`** — debug mode is 27× slower.
 //!
 //! ```bash
 //! cargo test --release -p ironmill-bench --features metal -- gemma4 --ignored --nocapture
 //! ```
 //!
-//! Requires: Metal GPU, Gemma 4 E2B-IT weights in HuggingFace cache.
+//! Requires: Metal GPU, Gemma 4 E2B-IT weights in HuggingFace cache,
+//! Alpaca instruct dataset at tests/fixtures/quality/alpaca-gemma4-instruct.json.
 
 #[cfg(feature = "metal")]
 mod gemma4 {
@@ -36,6 +38,13 @@ mod gemma4 {
             .find(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
             .unwrap_or_else(|| panic!("no snapshot directory in {}", snapshots.display()))
             .path()
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest)
+            .join("../../tests/fixtures")
+            .join(name)
     }
 
     fn load_gpu_engine(
@@ -86,49 +95,114 @@ mod gemma4 {
         (median_ms, tok_s)
     }
 
+    /// Evaluate perplexity using batched prefill (prefill_all_logits).
+    /// Returns (ppl, num_tokens, eval_tok_per_sec).
+    fn eval_perplexity(
+        engine: &mut MetalInference,
+        sequences: &[Vec<u32>],
+        max_seqs: usize,
+    ) -> (f64, usize, f64) {
+        let mut total_ce = 0.0f64;
+        let mut total_tokens = 0usize;
+        let start = Instant::now();
+
+        for sequence in sequences.iter().take(max_seqs) {
+            if sequence.len() < 2 {
+                continue;
+            }
+            engine.reset();
+            let all_logits = engine
+                .prefill_all_logits(sequence)
+                .expect("prefill_all_logits failed");
+
+            for pos in 0..sequence.len() - 1 {
+                let target = sequence[pos + 1] as usize;
+                let logits = &all_logits[pos];
+
+                let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sum_exp: f64 = logits.iter().map(|&x| ((x - max_logit) as f64).exp()).sum();
+                let log_softmax = (logits[target] - max_logit) as f64 - sum_exp.ln();
+                total_ce -= log_softmax;
+                total_tokens += 1;
+            }
+        }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        let ppl = if total_tokens > 0 {
+            (total_ce / total_tokens as f64).exp()
+        } else {
+            f64::INFINITY
+        };
+        let tok_s = total_tokens as f64 / elapsed;
+        (ppl, total_tokens, tok_s)
+    }
+
+    /// Load the Alpaca instruct dataset for Gemma 4.
+    fn load_alpaca_dataset() -> Vec<Vec<u32>> {
+        let path = fixture_path("quality/alpaca-gemma4-instruct.json");
+        if !path.exists() {
+            panic!(
+                "Alpaca dataset not found at {}.\n\
+                 Run: python scripts/prepare-quality-dataset.py --tokenizer google/gemma-4-e2b-it --dataset alpaca",
+                path.display()
+            );
+        }
+        let data: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        data["sequences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|seq| {
+                seq.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap() as u32)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
     struct BenchResult {
         label: &'static str,
         load_ms: f64,
         gpu_mb: f64,
         ms_tok: f64,
         tok_s: f64,
+        ppl: f64,
+        ppl_tokens: usize,
     }
 
     #[test]
-    #[ignore] // requires Metal GPU + Gemma 4 E2B-IT weights
+    #[ignore] // requires Metal GPU + Gemma 4 E2B-IT weights + Alpaca dataset
     fn benchmark() {
         let model_dir = gemma4_model_dir();
         let decode_tokens = 20;
+        let sequences = load_alpaca_dataset();
+        let ppl_seqs = 5;
         let mut results: Vec<BenchResult> = Vec::new();
 
-        // ── FP16 baseline ────────────────────────────────────────
+        eprintln!("  Alpaca dataset: {} sequences loaded", sequences.len());
+
+        // ── FP16 + TurboQuant-INT4 KV (baseline) ─────────────────
         let fp16_provider =
             SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
 
         {
-            let config = MetalConfig::default().without_turboquant();
-            let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
-            let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
-            results.push(BenchResult {
-                label: "FP16",
-                load_ms,
-                gpu_mb,
-                ms_tok,
-                tok_s,
-            });
-        }
-
-        // ── FP16 + TurboQuant-INT4 KV ────────────────────────────
-        {
             let config = MetalConfig::default().with_turboquant(4);
             let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
             let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
+            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
+            eprintln!("  FP16+TQ-INT4 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
             results.push(BenchResult {
                 label: "FP16 + TQ-INT4 KV",
                 load_ms,
                 gpu_mb,
                 ms_tok,
                 tok_s,
+                ppl,
+                ppl_tokens,
             });
         }
 
@@ -158,6 +232,8 @@ mod gemma4 {
             engine.reset();
 
             let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
+            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
+            eprintln!("  D2Q-3 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
             eprintln!("  D2Quant compile: {compile_ms:.0}ms");
             results.push(BenchResult {
                 label: "D2Q-3 + TQ-INT4 KV",
@@ -165,31 +241,39 @@ mod gemma4 {
                 gpu_mb,
                 ms_tok,
                 tok_s,
+                ppl,
+                ppl_tokens,
             });
         }
 
         // ── Print results table ──────────────────────────────────
         let fp16_gpu = results[0].gpu_mb;
+        let fp16_ppl = results[0].ppl;
         println!();
-        println!("  Gemma 4 E2B-IT — Metal Benchmark Results");
-        println!("  ─────────────────────────────────────────────────────────────");
+        println!("  Gemma 4 E2B-IT — Metal Benchmark (Alpaca instruct, {ppl_seqs} seqs)");
+        println!("  ──────────────────────────────────────────────────────────────────────────");
         println!(
-            "  {:<20} {:>8} {:>8} {:>8} {:>10}",
-            "Config", "GPU MB", "ms/tok", "tok/s", "Load ms"
+            "  {:<20} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
+            "Config", "GPU MB", "ms/tok", "tok/s", "PPL", "ΔPPL", "Load ms"
         );
-        println!("  ─────────────────────────────────────────────────────────────");
+        println!("  ──────────────────────────────────────────────────────────────────────────");
         for r in &results {
             let mem_note = if r.gpu_mb < fp16_gpu * 0.95 {
                 format!(" (−{:.0}%)", (1.0 - r.gpu_mb / fp16_gpu) * 100.0)
             } else {
                 String::new()
             };
+            let ppl_delta = if (r.ppl - fp16_ppl).abs() > 0.01 {
+                format!("{:>+.1}%", (r.ppl - fp16_ppl) / fp16_ppl * 100.0)
+            } else {
+                "—".to_string()
+            };
             println!(
-                "  {:<20} {:>7.0}{:<7} {:>7.2} {:>7.1} {:>10.0}",
-                r.label, r.gpu_mb, mem_note, r.ms_tok, r.tok_s, r.load_ms
+                "  {:<20} {:>7.0}{:<7} {:>7.2} {:>7.1} {:>7.2} {:>9} {:>10.0}",
+                r.label, r.gpu_mb, mem_note, r.ms_tok, r.tok_s, r.ppl, ppl_delta, r.load_ms
             );
         }
-        println!("  ─────────────────────────────────────────────────────────────");
+        println!("  ──────────────────────────────────────────────────────────────────────────");
         println!();
 
         // ── Assertions ───────────────────────────────────────────
@@ -200,8 +284,14 @@ mod gemma4 {
                 r.label,
                 r.tok_s
             );
+            assert!(
+                r.ppl.is_finite() && r.ppl > 0.0,
+                "{} PPL should be finite and positive, got {:.2}",
+                r.label,
+                r.ppl
+            );
         }
-        let d2q = &results[2];
+        let d2q = &results[1];
         let mem_reduction = (1.0 - d2q.gpu_mb / fp16_gpu) * 100.0;
         assert!(
             mem_reduction > 20.0,
