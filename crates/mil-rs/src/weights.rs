@@ -19,6 +19,8 @@ pub enum Architecture {
     Qwen,
     /// Google's Gemma family.
     Gemma,
+    /// Alibaba's Qwen 3.5 family (GDN + full attention hybrid).
+    Qwen35,
 }
 
 impl std::fmt::Display for Architecture {
@@ -27,6 +29,7 @@ impl std::fmt::Display for Architecture {
             Architecture::Llama => write!(f, "llama"),
             Architecture::Qwen => write!(f, "qwen"),
             Architecture::Gemma => write!(f, "gemma"),
+            Architecture::Qwen35 => write!(f, "qwen35"),
         }
     }
 }
@@ -39,6 +42,7 @@ impl std::str::FromStr for Architecture {
             "llama" | "llama2" | "llama3" | "codellama" | "mistral" => Ok(Architecture::Llama),
             "qwen" | "qwen2" | "qwen3" => Ok(Architecture::Qwen),
             "gemma" | "gemma2" | "gemma3" | "gemma4" | "gemma4_text" => Ok(Architecture::Gemma),
+            "qwen35" | "qwen3.5" | "qwen3_5" | "qwen3_5_text" => Ok(Architecture::Qwen35),
             _ => Err(MilError::Validation(format!(
                 "unsupported architecture: {s}"
             ))),

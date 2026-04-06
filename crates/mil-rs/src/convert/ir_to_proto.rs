@@ -936,16 +936,27 @@ fn convert_operation(
         .map(|(i, name)| {
             // Use the stored type for this specific output if available,
             // otherwise fall back to the inferred type.
-            let vt = op
-                .output_types
-                .get(i)
-                .and_then(|ot| ot.as_ref())
-                .map(|tt| mil_spec::ValueType {
-                    r#type: Some(mil_spec::value_type::Type::TensorType(convert_tensor_type(
-                        tt,
-                    ))),
-                })
-                .or_else(|| inferred_type.clone());
+            // For const ops, always use the inferred type (derived from val)
+            // to avoid type mismatches when passes set output_types to a
+            // different dtype (e.g., FP16) than the val attribute (e.g., FP32).
+            // For linear ops, always use inferred type from x input to ensure
+            // output rank matches x (not weight) rank.
+            let vt = if op.op_type == "const"
+                || op.op_type.starts_with("constexpr_")
+                || op.op_type == "linear"
+            {
+                inferred_type.clone()
+            } else {
+                op.output_types
+                    .get(i)
+                    .and_then(|ot| ot.as_ref())
+                    .map(|tt| mil_spec::ValueType {
+                        r#type: Some(mil_spec::value_type::Type::TensorType(convert_tensor_type(
+                            tt,
+                        ))),
+                    })
+                    .or_else(|| inferred_type.clone())
+            };
 
             // Register in the type map for downstream ops.
             if let Some(ref v) = vt {
@@ -1116,7 +1127,7 @@ fn infer_output_type(
         }
     }
 
-    // Try to resolve a type from a reference Value.
+    // Helper: resolve a Value reference to its type.
     let resolve = |v: &Value| -> Option<mil_spec::ValueType> {
         match v {
             Value::Reference(name) => type_map.get(name).cloned(),
@@ -1135,6 +1146,110 @@ fn infer_output_type(
         }
     };
 
+    // Helper: extract rank from a ValueType.
+    let rank_of = |vt: &mil_spec::ValueType| -> Option<i64> {
+        if let Some(mil_spec::value_type::Type::TensorType(tt)) = &vt.r#type {
+            Some(tt.rank)
+        } else {
+            None
+        }
+    };
+
+    // Helper: extract data_type from a ValueType.
+    let dtype_of = |vt: &mil_spec::ValueType| -> Option<i32> {
+        if let Some(mil_spec::value_type::Type::TensorType(tt)) = &vt.r#type {
+            Some(tt.data_type)
+        } else {
+            None
+        }
+    };
+
+    // Helper: build a ValueType with given data_type and rank (unknown dims).
+    let make_type = |data_type: i32, rank: i64| -> mil_spec::ValueType {
+        let dims: Vec<mil_spec::Dimension> = (0..rank)
+            .map(|_| mil_spec::Dimension {
+                dimension: Some(mil_spec::dimension::Dimension::Unknown(
+                    mil_spec::dimension::UnknownDimension { variadic: false },
+                )),
+            })
+            .collect();
+        mil_spec::ValueType {
+            r#type: Some(mil_spec::value_type::Type::TensorType(
+                mil_spec::TensorType {
+                    data_type,
+                    rank,
+                    dimensions: dims,
+                    attributes: HashMap::new(),
+                },
+            )),
+        }
+    };
+
+    // gather: output_rank = rank(x) - 1 + rank(indices)
+    if op.op_type == "gather" {
+        let x_resolved = op.inputs.get("x").and_then(&resolve);
+        let idx_resolved = op.inputs.get("indices").and_then(&resolve);
+        if let (Some(x_type), Some(idx_type)) = (x_resolved, idx_resolved) {
+            if let (Some(x_rank), Some(idx_rank), Some(dt)) =
+                (rank_of(&x_type), rank_of(&idx_type), dtype_of(&x_type))
+            {
+                let out_rank = x_rank - 1 + idx_rank;
+                return Some(make_type(dt, out_rank));
+            }
+        }
+    }
+
+    // reshape: output_rank = number of elements in shape const
+    if op.op_type == "reshape" {
+        if let Some(Value::Reference(shape_name)) = op.inputs.get("shape") {
+            // The shape is typically a const op whose type encodes the length.
+            if let Some(shape_type) = type_map.get(shape_name) {
+                if let Some(mil_spec::value_type::Type::TensorType(tt)) = &shape_type.r#type {
+                    // shape is a 1D tensor; the first dimension's size is the output rank.
+                    if let Some(dim) = tt.dimensions.first() {
+                        if let Some(mil_spec::dimension::Dimension::Constant(c)) = &dim.dimension {
+                            let out_rank = c.size as i64;
+                            // Get data type from input x.
+                            if let Some(x_type) = op.inputs.get("x").and_then(&resolve) {
+                                if let Some(dt) = dtype_of(&x_type) {
+                                    return Some(make_type(dt, out_rank));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // expand_dims: output_rank = rank(x) + number_of_axes
+    if op.op_type == "expand_dims" {
+        if let Some(x_type) = op.inputs.get("x").and_then(&resolve) {
+            if let (Some(x_rank), Some(dt)) = (rank_of(&x_type), dtype_of(&x_type)) {
+                let num_axes = match op.attributes.get("axes") {
+                    Some(Value::List(items)) => items.len() as i64,
+                    Some(Value::Int(_)) => 1,
+                    _ => 0,
+                };
+                return Some(make_type(dt, x_rank + num_axes));
+            }
+        }
+    }
+
+    // squeeze: output_rank = rank(x) - number_of_axes
+    if op.op_type == "squeeze" {
+        if let Some(x_type) = op.inputs.get("x").and_then(&resolve) {
+            if let (Some(x_rank), Some(dt)) = (rank_of(&x_type), dtype_of(&x_type)) {
+                let num_axes = match op.attributes.get("axes") {
+                    Some(Value::List(items)) => items.len() as i64,
+                    Some(Value::Int(_)) => 1,
+                    _ => 0,
+                };
+                return Some(make_type(dt, (x_rank - num_axes).max(0)));
+            }
+        }
+    }
+
     // For most ops, the output type matches the primary input's type.
     let primary_params = ["x", "data", "input", "values"];
     let first_input_type = primary_params
@@ -1147,7 +1262,17 @@ fn infer_output_type(
     }
 
     // Fallback: try any input.
-    op.inputs.values().find_map(resolve)
+    op.inputs.values().find_map(|v| match v {
+        Value::Reference(name) => type_map.get(name).cloned(),
+        Value::List(items) => items.iter().find_map(|item| {
+            if let Value::Reference(name) = item {
+                type_map.get(name).cloned()
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,7 +1335,13 @@ fn scalar_value_type(dt: mil_spec::DataType) -> mil_spec::ValueType {
 /// Derive the `ValueType` that describes an IR `Value`.
 fn value_type_for(value: &Value) -> Option<mil_spec::ValueType> {
     match value {
-        Value::Int(_) => Some(scalar_value_type(mil_spec::DataType::Int64)),
+        Value::Int(v) => {
+            if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                Some(scalar_value_type(mil_spec::DataType::Int32))
+            } else {
+                Some(scalar_value_type(mil_spec::DataType::Int64))
+            }
+        }
         Value::Float(_) => Some(scalar_value_type(mil_spec::DataType::Float32)),
         Value::Bool(_) => Some(scalar_value_type(mil_spec::DataType::Bool)),
         Value::String(_) => Some(scalar_value_type(mil_spec::DataType::String)),
@@ -1236,25 +1367,95 @@ fn value_type_for(value: &Value) -> Option<mil_spec::ValueType> {
             })
         }
         Value::List(items) => {
-            // Infer element type from the first item; fall back to int32.
-            let elem_type = items
-                .first()
-                .and_then(value_type_for)
-                .unwrap_or_else(|| scalar_value_type(mil_spec::DataType::Int32));
-            Some(mil_spec::ValueType {
-                r#type: Some(mil_spec::value_type::Type::ListType(Box::new(
-                    mil_spec::ListType {
-                        r#type: Some(Box::new(elem_type)),
-                        length: Some(mil_spec::Dimension {
-                            dimension: Some(mil_spec::dimension::Dimension::Constant(
-                                mil_spec::dimension::ConstantDimension {
-                                    size: items.len() as u64,
-                                },
-                            )),
-                        }),
-                    },
-                ))),
-            })
+            // Homogeneous int/float/bool lists are serialized as tensors by
+            // `try_list_as_tensor`, so the output type must be a tensor too.
+            if items.iter().all(|v| matches!(v, Value::Int(_))) {
+                let all_fit_i32 = items.iter().all(|v| {
+                    if let Value::Int(n) = v {
+                        i32::try_from(*n).is_ok()
+                    } else {
+                        false
+                    }
+                });
+                let dt = if all_fit_i32 {
+                    mil_spec::DataType::Int32
+                } else {
+                    mil_spec::DataType::Int64
+                };
+                let dim = mil_spec::Dimension {
+                    dimension: Some(mil_spec::dimension::Dimension::Constant(
+                        mil_spec::dimension::ConstantDimension {
+                            size: items.len() as u64,
+                        },
+                    )),
+                };
+                Some(mil_spec::ValueType {
+                    r#type: Some(mil_spec::value_type::Type::TensorType(
+                        mil_spec::TensorType {
+                            data_type: dt as i32,
+                            rank: 1,
+                            dimensions: vec![dim],
+                            attributes: HashMap::new(),
+                        },
+                    )),
+                })
+            } else if items.iter().all(|v| matches!(v, Value::Float(_))) {
+                let dim = mil_spec::Dimension {
+                    dimension: Some(mil_spec::dimension::Dimension::Constant(
+                        mil_spec::dimension::ConstantDimension {
+                            size: items.len() as u64,
+                        },
+                    )),
+                };
+                Some(mil_spec::ValueType {
+                    r#type: Some(mil_spec::value_type::Type::TensorType(
+                        mil_spec::TensorType {
+                            data_type: mil_spec::DataType::Float32 as i32,
+                            rank: 1,
+                            dimensions: vec![dim],
+                            attributes: HashMap::new(),
+                        },
+                    )),
+                })
+            } else if items.iter().all(|v| matches!(v, Value::Bool(_))) {
+                let dim = mil_spec::Dimension {
+                    dimension: Some(mil_spec::dimension::Dimension::Constant(
+                        mil_spec::dimension::ConstantDimension {
+                            size: items.len() as u64,
+                        },
+                    )),
+                };
+                Some(mil_spec::ValueType {
+                    r#type: Some(mil_spec::value_type::Type::TensorType(
+                        mil_spec::TensorType {
+                            data_type: mil_spec::DataType::Bool as i32,
+                            rank: 1,
+                            dimensions: vec![dim],
+                            attributes: HashMap::new(),
+                        },
+                    )),
+                })
+            } else {
+                // Mixed types: fall back to list type.
+                let elem_type = items
+                    .first()
+                    .and_then(value_type_for)
+                    .unwrap_or_else(|| scalar_value_type(mil_spec::DataType::Int32));
+                Some(mil_spec::ValueType {
+                    r#type: Some(mil_spec::value_type::Type::ListType(Box::new(
+                        mil_spec::ListType {
+                            r#type: Some(Box::new(elem_type)),
+                            length: Some(mil_spec::Dimension {
+                                dimension: Some(mil_spec::dimension::Dimension::Constant(
+                                    mil_spec::dimension::ConstantDimension {
+                                        size: items.len() as u64,
+                                    },
+                                )),
+                            }),
+                        },
+                    ))),
+                })
+            }
         }
         // Type-only values, references, and blob refs have their type handled separately.
         Value::Type(_) | Value::Reference(_) | Value::BlobFile { .. } => None,
@@ -1274,25 +1475,55 @@ fn try_list_as_tensor(
 
     // Check if all items are ints.
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
-        let ints: Vec<i64> = items
-            .iter()
-            .map(|v| {
-                let Value::Int(i) = v else {
-                    return Err(MilError::Validation(
-                        "expected Value::Int in list".to_string(),
-                    ));
-                };
-                Ok(*i)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        return Ok(Some((
-            mil_spec::TensorValue {
-                value: Some(mil_spec::tensor_value::Value::LongInts(
-                    mil_spec::tensor_value::RepeatedLongInts { values: ints },
-                )),
-            },
-            mil_spec::DataType::Int64,
-        )));
+        let all_fit_i32 = items.iter().all(|v| {
+            if let Value::Int(i) = v {
+                *i >= i32::MIN as i64 && *i <= i32::MAX as i64
+            } else {
+                false
+            }
+        });
+
+        if all_fit_i32 {
+            let ints: Vec<i32> = items
+                .iter()
+                .map(|v| {
+                    let Value::Int(i) = v else {
+                        return Err(MilError::Validation(
+                            "expected Value::Int in list".to_string(),
+                        ));
+                    };
+                    Ok(*i as i32)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Some((
+                mil_spec::TensorValue {
+                    value: Some(mil_spec::tensor_value::Value::Ints(
+                        mil_spec::tensor_value::RepeatedInts { values: ints },
+                    )),
+                },
+                mil_spec::DataType::Int32,
+            )));
+        } else {
+            let ints: Vec<i64> = items
+                .iter()
+                .map(|v| {
+                    let Value::Int(i) = v else {
+                        return Err(MilError::Validation(
+                            "expected Value::Int in list".to_string(),
+                        ));
+                    };
+                    Ok(*i)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Some((
+                mil_spec::TensorValue {
+                    value: Some(mil_spec::tensor_value::Value::LongInts(
+                        mil_spec::tensor_value::RepeatedLongInts { values: ints },
+                    )),
+                },
+                mil_spec::DataType::Int64,
+            )));
+        }
     }
 
     // Check if all items are floats.
@@ -1466,18 +1697,35 @@ fn convert_value_to_proto(value: &Value) -> Result<mil_spec::Value> {
             )
         }
         Value::Int(v) => {
-            // Use i64 serialization to avoid truncating values > i32::MAX.
-            let tv = mil_spec::TensorValue {
-                value: Some(mil_spec::tensor_value::Value::LongInts(
-                    mil_spec::tensor_value::RepeatedLongInts { values: vec![*v] },
-                )),
-            };
-            (
-                Some(value::Value::ImmediateValue(value::ImmediateValue {
-                    value: Some(value::immediate_value::Value::Tensor(tv)),
-                })),
-                value_type_for(value),
-            )
+            // Use i32 when the value fits; CoreML MIL ops like `gather` expect int32
+            // for parameters such as `axis`. Fall back to i64 for large values.
+            if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                let tv = mil_spec::TensorValue {
+                    value: Some(mil_spec::tensor_value::Value::Ints(
+                        mil_spec::tensor_value::RepeatedInts {
+                            values: vec![*v as i32],
+                        },
+                    )),
+                };
+                (
+                    Some(value::Value::ImmediateValue(value::ImmediateValue {
+                        value: Some(value::immediate_value::Value::Tensor(tv)),
+                    })),
+                    value_type_for(value),
+                )
+            } else {
+                let tv = mil_spec::TensorValue {
+                    value: Some(mil_spec::tensor_value::Value::LongInts(
+                        mil_spec::tensor_value::RepeatedLongInts { values: vec![*v] },
+                    )),
+                };
+                (
+                    Some(value::Value::ImmediateValue(value::ImmediateValue {
+                        value: Some(value::immediate_value::Value::Tensor(tv)),
+                    })),
+                    value_type_for(value),
+                )
+            }
         }
         Value::Float(v) => {
             let tv = mil_spec::TensorValue {

@@ -189,9 +189,14 @@ impl WeightProvider for SafeTensorsProvider {
             return Ok(WeightTensor::borrowed(data, shape.clone(), *dtype));
         }
 
+        // Try direct lookup, then fallback with `language_model.` prefix.
         let loc = self
             .tensor_index
             .get(name)
+            .or_else(|| {
+                let prefixed = name.replacen("model.", "model.language_model.", 1);
+                self.tensor_index.get(&prefixed)
+            })
             .ok_or_else(|| MilError::Validation(format!("tensor not found: {name}")))?;
 
         let mmap = &self.mmaps[loc.shard_index];
@@ -200,6 +205,14 @@ impl WeightProvider for SafeTensorsProvider {
         if loc.needs_bf16_conversion {
             let converted = convert_bf16_to_f16(data);
             Ok(WeightTensor::owned(converted, loc.shape.clone(), loc.dtype))
+        } else if loc.dtype == ScalarType::Float32 {
+            // Convert Float32 → Float16 for CoreML compatibility.
+            let converted = convert_f32_to_f16(data);
+            Ok(WeightTensor::owned(
+                converted,
+                loc.shape.clone(),
+                ScalarType::Float16,
+            ))
         } else {
             Ok(WeightTensor::borrowed(data, loc.shape.clone(), loc.dtype))
         }
@@ -214,7 +227,12 @@ impl WeightProvider for SafeTensorsProvider {
     }
 
     fn has_tensor(&self, name: &str) -> bool {
-        self.tensor_index.contains_key(name)
+        if self.tensor_index.contains_key(name) {
+            return true;
+        }
+        // Fallback: try with `language_model.` prefix for VLM models.
+        let prefixed = name.replacen("model.", "model.language_model.", 1);
+        self.tensor_index.contains_key(&prefixed)
     }
 }
 
@@ -228,9 +246,17 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| MilError::Validation(format!("invalid config.json: {e}")))?;
 
-    let model_type = json
+    // For VLM models with nested text_config, read model params from there.
+    let config_json = if json.get("text_config").is_some() {
+        json.get("text_config").unwrap().clone()
+    } else {
+        json.clone()
+    };
+
+    let model_type = config_json
         .get("model_type")
         .and_then(|v| v.as_str())
+        .or_else(|| json.get("model_type").and_then(|v| v.as_str()))
         .ok_or_else(|| MilError::Validation("config.json missing 'model_type'".into()))?;
 
     // Gemma 4 multimodal wrapper — drill into text_config for the text decoder.
@@ -270,7 +296,13 @@ pub fn parse_hf_config(config_path: &Path) -> Result<ModelConfig> {
     })?;
     let max_position_embeddings = json_usize(&json_root, "max_position_embeddings").unwrap_or(0);
     let rms_norm_eps = json_f64(&json_root, "rms_norm_eps").unwrap_or(1e-6);
-    let rope_theta = json_f64(&json_root, "rope_theta").unwrap_or(10000.0);
+    let rope_theta = json_f64(&json_root, "rope_theta")
+        .or_else(|| {
+            json_root
+                .get("rope_parameters")
+                .and_then(|rp| json_f64(rp, "rope_theta"))
+        })
+        .unwrap_or(10000.0);
     let tie_word_embeddings = json_root
         .get("tie_word_embeddings")
         .and_then(|v| v.as_bool())
@@ -573,6 +605,16 @@ fn convert_bf16_to_f16(data: &[u8]) -> Vec<u8> {
     for chunk in data.chunks_exact(2) {
         let bf = half::bf16::from_le_bytes([chunk[0], chunk[1]]);
         let fp = half::f16::from_f32(bf.to_f32());
+        out.extend_from_slice(&fp.to_le_bytes());
+    }
+    out
+}
+
+fn convert_f32_to_f16(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 2);
+    for chunk in data.chunks_exact(4) {
+        let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let fp = half::f16::from_f32(f);
         out.extend_from_slice(&fp.to_le_bytes());
     }
     out

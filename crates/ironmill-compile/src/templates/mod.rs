@@ -9,6 +9,7 @@ pub mod gemma;
 pub mod llama;
 pub(crate) mod moe;
 pub mod qwen;
+pub mod qwen35;
 pub(crate) mod shared;
 
 use crate::weights::{Architecture, WeightProvider};
@@ -78,6 +79,16 @@ pub fn weights_to_program_with_options(
                 ));
             }
             gemma::build_program(provider)
+        }
+        Architecture::Qwen35 => {
+            if options.ane {
+                return Err(MilError::Validation(
+                    "ANE lowering is not yet supported for Qwen 3.5. \
+                     Only LLaMA models support ANE compilation."
+                        .into(),
+                ));
+            }
+            qwen35::build_program(provider)
         }
         _ => Err(MilError::Validation(format!(
             "unsupported architecture: {:?}",

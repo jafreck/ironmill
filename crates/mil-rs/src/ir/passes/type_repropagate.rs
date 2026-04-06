@@ -19,7 +19,7 @@ use crate::ir::program::Program;
 use crate::ir::shape_inference::{
     infer_concat_output, infer_conv_output, infer_pool_output, read_int_list,
 };
-use crate::ir::tensor::TensorType;
+use crate::ir::tensor::{ScalarType, TensorType};
 use crate::ir::types::Value;
 
 /// Re-propagate output types for operations that are missing them.
@@ -96,6 +96,10 @@ fn infer_output_type(op: &Operation, type_map: &HashMap<String, TensorType>) -> 
         "tile" => infer_tile_output(op, type_map),
         "reduce_mean" | "reduce_sum" | "reduce_max" | "reduce_min" | "reduce_prod"
         | "reduce_l1" | "reduce_l2" => infer_reduce_output(op, type_map),
+        "gather" => infer_gather_output(op, type_map),
+        "reshape" => infer_reshape_output(op, type_map),
+        "expand_dims" => infer_expand_dims_output(op, type_map),
+        "squeeze" => infer_squeeze_output(op, type_map),
         _ => {
             // Element-wise / pass-through: output type matches primary input.
             resolve_primary_input(op, type_map)
@@ -103,7 +107,11 @@ fn infer_output_type(op: &Operation, type_map: &HashMap<String, TensorType>) -> 
     }
 }
 
-/// Resolve the type of the primary input ("x", "data", "input", "values").
+/// Resolve the output type for element-wise / pass-through ops.
+///
+/// For binary ops (add, mul, real_div, …) the output rank equals the
+/// maximum input rank due to broadcasting. We collect *all* resolved
+/// input types and return the one with the highest rank.
 fn resolve_primary_input(
     op: &Operation,
     type_map: &HashMap<String, TensorType>,
@@ -122,12 +130,24 @@ fn resolve_primary_input(
         }
     };
 
-    ["x", "data", "input", "values"]
-        .iter()
-        .filter_map(|&p| op.inputs.get(p))
-        .find_map(resolve)
-        .or_else(|| op.inputs.values().find_map(resolve))
-        .cloned()
+    // Gather all resolvable input types, preferring high-priority keys first.
+    let mut best: Option<TensorType> = None;
+    for &key in &["x", "data", "input", "values"] {
+        if let Some(tt) = op.inputs.get(key).and_then(resolve) {
+            match &best {
+                Some(b) if b.shape.len() >= tt.shape.len() => {}
+                _ => best = Some(tt.clone()),
+            }
+        }
+    }
+    // Also consider non-primary inputs (e.g., "y" for binary ops).
+    for tt in op.inputs.values().filter_map(resolve) {
+        match &best {
+            Some(b) if b.shape.len() >= tt.shape.len() => {}
+            _ => best = Some(tt.clone()),
+        }
+    }
+    best
 }
 
 /// Infer transpose output: permute the input dimensions.
@@ -277,14 +297,130 @@ fn infer_reduce_output(
     Some(TensorType::with_dynamic_shape(in_tt.scalar_type, out_shape))
 }
 
+/// Infer gather output: output_rank = rank(x) - 1 + rank(indices).
+fn infer_gather_output(
+    op: &Operation,
+    type_map: &HashMap<String, TensorType>,
+) -> Option<TensorType> {
+    let resolve_ref = |v: &Value| -> Option<&TensorType> {
+        if let Value::Reference(name) = v {
+            type_map.get(name)
+        } else {
+            None
+        }
+    };
+    let x_tt = op.inputs.get("x").and_then(resolve_ref)?;
+    let idx_tt = op.inputs.get("indices").and_then(resolve_ref)?;
+    let out_rank = x_tt.shape.len() - 1 + idx_tt.shape.len();
+    Some(TensorType::with_dynamic_shape(
+        x_tt.scalar_type,
+        vec![None; out_rank],
+    ))
+}
+
+/// Infer reshape output: rank = number of elements in the shape tensor.
+fn infer_reshape_output(
+    op: &Operation,
+    type_map: &HashMap<String, TensorType>,
+) -> Option<TensorType> {
+    let in_tt = op.inputs.get("x").and_then(|v| {
+        if let Value::Reference(n) = v {
+            type_map.get(n)
+        } else {
+            None
+        }
+    })?;
+
+    // shape can be an inline tensor, a list of ints, or a reference to a const.
+    let shape_val = op.inputs.get("shape")?;
+    let out_rank = match shape_val {
+        Value::Tensor { shape, .. } => {
+            // 1-D tensor: the first dim is the output rank.
+            shape.first().copied()
+        }
+        Value::List(items) => Some(items.len()),
+        Value::Reference(name) => {
+            // Look up the shape const's type: it's a 1-D tensor whose first
+            // dimension tells us how many output dims there are.
+            let tt = type_map.get(name)?;
+            tt.shape.first().and_then(|d| *d)
+        }
+        _ => None,
+    }?;
+    Some(TensorType::with_dynamic_shape(
+        in_tt.scalar_type,
+        vec![None; out_rank],
+    ))
+}
+
+/// Infer expand_dims output: rank = rank(x) + number_of_axes.
+fn infer_expand_dims_output(
+    op: &Operation,
+    type_map: &HashMap<String, TensorType>,
+) -> Option<TensorType> {
+    let in_tt = op.inputs.get("x").and_then(|v| {
+        if let Value::Reference(n) = v {
+            type_map.get(n)
+        } else {
+            None
+        }
+    })?;
+    let num_axes = match op.inputs.get("axes").or_else(|| op.attributes.get("axes")) {
+        Some(Value::List(items)) => items.len(),
+        Some(Value::Int(_)) => 1,
+        Some(Value::Tensor { shape, .. }) => shape.first().copied().unwrap_or(1),
+        _ => return Some(in_tt.clone()),
+    };
+    Some(TensorType::with_dynamic_shape(
+        in_tt.scalar_type,
+        vec![None; in_tt.shape.len() + num_axes],
+    ))
+}
+
+/// Infer squeeze output: rank = rank(x) - number_of_axes.
+fn infer_squeeze_output(
+    op: &Operation,
+    type_map: &HashMap<String, TensorType>,
+) -> Option<TensorType> {
+    let in_tt = op.inputs.get("x").and_then(|v| {
+        if let Value::Reference(n) = v {
+            type_map.get(n)
+        } else {
+            None
+        }
+    })?;
+    let num_axes = match op.inputs.get("axes").or_else(|| op.attributes.get("axes")) {
+        Some(Value::List(items)) => items.len(),
+        Some(Value::Int(_)) => 1,
+        Some(Value::Tensor { shape, .. }) => shape.first().copied().unwrap_or(1),
+        _ => return Some(in_tt.clone()),
+    };
+    let out_rank = in_tt.shape.len().saturating_sub(num_axes);
+    Some(TensorType::with_dynamic_shape(
+        in_tt.scalar_type,
+        vec![None; out_rank],
+    ))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Extract a `TensorType` from a `Value` (for const ops).
 fn tensor_type_for_value(value: &Value) -> Option<TensorType> {
-    if let Value::Tensor { shape, dtype, .. } = value {
-        Some(TensorType::new(*dtype, shape.clone()))
-    } else {
-        None
+    match value {
+        Value::Tensor { shape, dtype, .. } => Some(TensorType::new(*dtype, shape.clone())),
+        Value::List(items) if !items.is_empty() => {
+            // Lists of ints are serialized as 1-D Int32 tensors.
+            if items.iter().all(|v| matches!(v, Value::Int(_))) {
+                Some(TensorType::new(ScalarType::Int32, vec![items.len()]))
+            } else if items.iter().all(|v| matches!(v, Value::Float(_))) {
+                Some(TensorType::new(ScalarType::Float32, vec![items.len()]))
+            } else if items.iter().all(|v| matches!(v, Value::Bool(_))) {
+                Some(TensorType::new(ScalarType::Bool, vec![items.len()]))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

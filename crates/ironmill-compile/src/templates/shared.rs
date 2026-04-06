@@ -267,15 +267,15 @@ pub(super) fn emit_rope_tables(block: &mut Block, config: &ModelConfig) -> (Stri
     let theta = config.rope_theta;
     let half_dim = head_dim / 2;
 
-    let mut cos_bytes = Vec::with_capacity(max_pos * half_dim * 4);
-    let mut sin_bytes = Vec::with_capacity(max_pos * half_dim * 4);
+    let mut cos_bytes = Vec::with_capacity(max_pos * half_dim * 2);
+    let mut sin_bytes = Vec::with_capacity(max_pos * half_dim * 2);
 
     for t in 0..max_pos {
         for i in 0..half_dim {
             let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
             let angle = t as f64 * freq;
-            cos_bytes.extend_from_slice(&(angle.cos() as f32).to_le_bytes());
-            sin_bytes.extend_from_slice(&(angle.sin() as f32).to_le_bytes());
+            cos_bytes.extend_from_slice(&half::f16::from_f64(angle.cos()).to_le_bytes());
+            sin_bytes.extend_from_slice(&half::f16::from_f64(angle.sin()).to_le_bytes());
         }
     }
 
@@ -288,7 +288,7 @@ pub(super) fn emit_rope_tables(block: &mut Block, config: &ModelConfig) -> (Stri
             Value::Tensor {
                 data: TensorData::inline(cos_bytes),
                 shape: vec![max_pos, half_dim],
-                dtype: ScalarType::Float32,
+                dtype: ScalarType::Float16,
             },
         )
         .with_output(&cos_name);
@@ -300,7 +300,7 @@ pub(super) fn emit_rope_tables(block: &mut Block, config: &ModelConfig) -> (Stri
             Value::Tensor {
                 data: TensorData::inline(sin_bytes),
                 shape: vec![max_pos, half_dim],
-                dtype: ScalarType::Float32,
+                dtype: ScalarType::Float16,
             },
         )
         .with_output(&sin_name);
@@ -541,6 +541,7 @@ pub(super) fn emit_rope_apply(
                 Value::List(vec![Value::Reference(part1), Value::Reference(part2)]),
             )
             .with_attr("axis", Value::Int(-1))
+            .with_attr("interleave", Value::Bool(false))
             .with_output(&out_name);
         block.add_op(op);
         out_name
@@ -928,6 +929,7 @@ pub(super) fn emit_attention_core(
 // ---------------------------------------------------------------------------
 
 /// Emit the SwiGLU MLP: gate + up + silu + down.
+/// Emit the SwiGLU MLP: gate + up + silu + down (used by Llama-family models).
 pub(super) fn emit_mlp_silu(
     block: &mut Block,
     provider: &dyn WeightProvider,
@@ -961,6 +963,75 @@ pub(super) fn emit_mlp_silu(
         let out_name = format!("l{layer_idx}_gate_silu");
         let op = Operation::new("silu", format!("l{layer_idx}_silu_op"))
             .with_input("x", Value::Reference(gate))
+            .with_output(&out_name);
+        block.add_op(op);
+        out_name
+    };
+
+    // Element-wise multiply gate_act * up
+    let mlp_hidden = {
+        let out_name = format!("l{layer_idx}_mlp_hidden");
+        let op = Operation::new("mul", format!("l{layer_idx}_mlp_mul_op"))
+            .with_input("x", Value::Reference(gate_act))
+            .with_input("y", Value::Reference(up))
+            .with_output(&out_name);
+        block.add_op(op);
+        out_name
+    };
+
+    let down = emit_linear(
+        block,
+        provider,
+        &format!("{prefix}.down_proj"),
+        &mlp_hidden,
+        &format!("l{layer_idx}_down_proj"),
+        warnings,
+    )?;
+
+    Ok(down)
+}
+
+/// Emit the SwiGLU MLP with CoreML-compatible ops (decomposes `silu` to `x * sigmoid(x)`).
+pub(super) fn emit_mlp_silu_coreml(
+    block: &mut Block,
+    provider: &dyn WeightProvider,
+    _config: &ModelConfig,
+    layer_idx: usize,
+    input: &str,
+    warnings: &mut Vec<String>,
+) -> Result<String, MilError> {
+    let prefix = format!("model.layers.{layer_idx}.mlp");
+
+    let gate = emit_linear(
+        block,
+        provider,
+        &format!("{prefix}.gate_proj"),
+        input,
+        &format!("l{layer_idx}_gate_proj"),
+        warnings,
+    )?;
+
+    let up = emit_linear(
+        block,
+        provider,
+        &format!("{prefix}.up_proj"),
+        input,
+        &format!("l{layer_idx}_up_proj"),
+        warnings,
+    )?;
+
+    // SiLU activation on gate — decomposed: gate * sigmoid(gate)
+    let gate_act = {
+        let sig_name = format!("l{layer_idx}_gate_sigmoid");
+        let sig_op = Operation::new("sigmoid", format!("l{layer_idx}_sigmoid_op"))
+            .with_input("x", Value::Reference(gate.clone()))
+            .with_output(&sig_name);
+        block.add_op(sig_op);
+
+        let out_name = format!("l{layer_idx}_gate_silu");
+        let op = Operation::new("mul", format!("l{layer_idx}_silu_op"))
+            .with_input("x", Value::Reference(gate))
+            .with_input("y", Value::Reference(sig_name))
             .with_output(&out_name);
         block.add_op(op);
         out_name
