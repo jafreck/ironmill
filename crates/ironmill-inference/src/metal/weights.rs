@@ -171,7 +171,15 @@ impl WeightVisitor for MetalVisitor<'_> {
         provider: &dyn WeightProvider,
         name: &str,
     ) -> Result<WeightBuffer, MetalError> {
-        load_weight_buffer(self.device, provider, name, self.force_cpu_dequant)
+        load_weight_buffer(self.device, provider, name, self.force_cpu_dequant, true)
+    }
+
+    fn load_weight_for_gather(
+        &self,
+        provider: &dyn WeightProvider,
+        name: &str,
+    ) -> Result<WeightBuffer, MetalError> {
+        load_weight_buffer(self.device, provider, name, self.force_cpu_dequant, false)
     }
 }
 
@@ -317,13 +325,15 @@ impl CpuDequant for MetalDequantOps {
 /// Returns [`WeightBuffer::Quantized`] for LUT-quantized tensors, keeping
 /// packed indices, LUT, and norms as separate Metal buffers. Falls back to
 /// dense FP16 for unquantized or affine-quantized tensors.
-/// Dense weights are also pre-packed into blocked format for the custom
-/// matvec kernel when dimensions are multiples of 8.
+/// When `pack_for_matmul` is true, dense weights are also pre-packed into
+/// blocked format for the custom matvec kernel. Set to false for tensors
+/// used only for gather/lookup (e.g. embedding tables).
 fn load_weight_buffer(
     device: &MetalDevice,
     provider: &dyn WeightProvider,
     name: &str,
     force_cpu_dequant: bool,
+    pack_for_matmul: bool,
 ) -> Result<WeightBuffer, MetalError> {
     let tensor = provider
         .tensor(name)
@@ -334,7 +344,11 @@ fn load_weight_buffer(
                 .create_buffer_with_data(&tensor.data, StorageMode::Shared)
                 .map_err(MetalError::Metal)?;
             let (n, k) = dense_shape(&tensor.shape);
-            let packed = pack_weight_blocked(device, &buf, n, k)?;
+            let packed = if pack_for_matmul {
+                pack_weight_blocked(device, &buf, n, k)?
+            } else {
+                None
+            };
             Ok(WeightBuffer::Dense { buf, packed })
         }
         QuantizationInfo::LutToDense {

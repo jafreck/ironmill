@@ -104,11 +104,26 @@ pub trait WeightVisitor {
     ) -> Result<Self::Dense, Self::Error>;
 
     /// Load a tensor, potentially keeping its quantized representation.
+    /// The buffer is prepared for matmul dispatch (e.g. pre-packed into
+    /// blocked layout for the custom matvec kernel).
     fn load_weight(
         &self,
         provider: &dyn WeightProvider,
         name: &str,
     ) -> Result<Self::Weight, Self::Error>;
+
+    /// Load a tensor for gather/lookup access (embedding tables).
+    /// Keeps the quantized representation but skips matmul-specific
+    /// packing (e.g. blocked layout) since these tensors are only
+    /// accessed via index-based row reads, not matrix multiplication.
+    fn load_weight_for_gather(
+        &self,
+        provider: &dyn WeightProvider,
+        name: &str,
+    ) -> Result<Self::Weight, Self::Error> {
+        // Default: same as load_weight. Backends override to skip packing.
+        self.load_weight(provider, name)
+    }
 }
 
 // ── Layout driver ───────────────────────────────────────────────
@@ -252,7 +267,7 @@ pub fn load_model_weights<V: WeightVisitor>(
     // PLE model-level weights (Gemma 4).
     let ple_embed_name = "model.embed_tokens_per_layer.weight";
     let ple_embed_tokens = if provider.has_tensor(ple_embed_name) {
-        Some(visitor.load_weight(provider, ple_embed_name)?)
+        Some(visitor.load_weight_for_gather(provider, ple_embed_name)?)
     } else {
         None
     };
