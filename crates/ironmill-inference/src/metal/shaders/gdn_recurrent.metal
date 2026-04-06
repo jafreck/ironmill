@@ -21,7 +21,7 @@ using namespace metal;
 kernel void gdn_conv1d_silu(
     device const half* input_qkv   [[buffer(0)]],
     device const half* conv_weight  [[buffer(1)]],
-    device half* conv_state         [[buffer(2)]],
+    device float* conv_state        [[buffer(2)]],
     device half* output             [[buffer(3)]],
     constant uint4& params          [[buffer(4)]],
     uint tid [[thread_position_in_grid]])
@@ -36,23 +36,17 @@ kernel void gdn_conv1d_silu(
     uint state_base = ch * conv_state_len;
     uint w_base = ch * kernel_size;
 
-    // Match HF causal_conv1d_update: concat([state, new_val]), conv, update state.
-    // State stores the last (kernel-1) values. The full window is [state..., new_val].
-    // Dot product uses ALL kernel weights over the full window of kernel_size values.
-
     float val = 0.0f;
-    // weight[0] * state[0], weight[1] * state[1], ..., weight[kernel-2] * state[kernel-2]
     for (uint j = 0; j < conv_state_len; j++) {
-        val += float(conv_weight[w_base + j]) * float(conv_state[state_base + j]);
+        val += float(conv_weight[w_base + j]) * conv_state[state_base + j];
     }
-    // weight[kernel-1] * new_value
     val += float(conv_weight[w_base + conv_state_len]) * float(input_qkv[ch]);
 
     // Update state: shift left, append new value
     for (uint k = 0; k < conv_state_len - 1; k++) {
         conv_state[state_base + k] = conv_state[state_base + k + 1];
     }
-    conv_state[state_base + conv_state_len - 1] = input_qkv[ch];
+    conv_state[state_base + conv_state_len - 1] = float(input_qkv[ch]);
 
     // SiLU activation
     float silu_val = val / (1.0f + exp(-val));
@@ -164,11 +158,12 @@ kernel void gdn_recurrent_update(
 //
 // Batched version: processes ALL tokens sequentially per channel.
 // One thread per channel — loops over token_count internally.
+// Conv state is FP32 to prevent precision drift over long sequences.
 //
 // Buffers:
 //   buffer(0) all_qkv:      [token_count * qkv_dim] half — batched projection output
 //   buffer(1) conv_weight:   [qkv_dim * kernel_size] half — [ch, k] layout
-//   buffer(2) conv_state:    [qkv_dim * conv_state_len] half — [ch, time] layout, read/write
+//   buffer(2) conv_state:    [qkv_dim * conv_state_len] float — [ch, time] layout, read/write
 //   buffer(3) all_conv_out:  [token_count * qkv_dim] half — batched conv + silu result
 //   buffer(4) params:        uint4 — (qkv_dim, kernel_size, conv_state_len, token_count)
 //
@@ -177,7 +172,7 @@ kernel void gdn_recurrent_update(
 kernel void gdn_prefill_conv1d_silu(
     device const half* all_qkv       [[buffer(0)]],
     device const half* conv_weight    [[buffer(1)]],
-    device half* conv_state           [[buffer(2)]],
+    device float* conv_state          [[buffer(2)]],
     device half* all_conv_out         [[buffer(3)]],
     constant uint4& params            [[buffer(4)]],
     uint tid [[thread_position_in_grid]])
@@ -194,14 +189,13 @@ kernel void gdn_prefill_conv1d_silu(
     uint w_base = ch * kernel_size;
 
     for (uint t = 0; t < token_count; t++) {
-        half new_val = all_qkv[t * qkv_dim + ch];
+        float new_val = float(all_qkv[t * qkv_dim + ch]);
 
-        // Conv: dot product over full window [state..., new_val] using ALL weights
         float val = 0.0f;
         for (uint j = 0; j < conv_state_len; j++) {
-            val += float(conv_weight[w_base + j]) * float(conv_state[state_base + j]);
+            val += float(conv_weight[w_base + j]) * conv_state[state_base + j];
         }
-        val += float(conv_weight[w_base + conv_state_len]) * float(new_val);
+        val += float(conv_weight[w_base + conv_state_len]) * new_val;
 
         // Update state: shift left, append new value
         for (uint k = 0; k < conv_state_len - 1; k++) {

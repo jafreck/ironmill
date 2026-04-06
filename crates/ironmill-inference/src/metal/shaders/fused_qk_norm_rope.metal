@@ -99,15 +99,17 @@ kernel void fused_qk_norm_rope(
 
     // Step 2: RMSNorm + partial RoPE
     uint half_rotary = ROTARY_DIM / 2;
+    uint half_dim = HEAD_DIM / 2;
     uint pos = seq_offset + token_idx;
 
     // Part A: First ROTARY_DIM dims — normalize + RoPE rotation.
     // Pairing is (d, d + half_rotary) within the rotary dimensions.
+    // Cache layout: [pos × half_dim + d] — same stride as standalone rope kernel.
     for (uint d = tid; d < half_rotary; d += tg_size) {
         float x_lo = float(proj[base + d]) * rms_inv * float(norm_w[d]);
         float x_hi = float(proj[base + d + half_rotary]) * rms_inv * float(norm_w[d + half_rotary]);
 
-        uint cs_idx = pos * half_rotary + d;
+        uint cs_idx = pos * half_dim + d;
         float cos_val = float(cos_cache[cs_idx]);
         float sin_val = float(sin_cache[cs_idx]);
 

@@ -497,7 +497,7 @@ impl GdnState {
         gdn_cfg: &super::config::GdnModelConfig,
         hidden_size: usize,
     ) -> Result<Self, MetalError> {
-        let conv_state_size = gdn_cfg.qkv_dim * (gdn_cfg.conv_kernel_size - 1) * 2; // FP16
+        let conv_state_size = gdn_cfg.qkv_dim * (gdn_cfg.conv_kernel_size - 1) * 4; // FP32
         let recurrent_state_size =
             gdn_cfg.num_v_heads * gdn_cfg.v_head_dim * gdn_cfg.k_head_dim * 4; // FP16
 
@@ -631,7 +631,7 @@ impl GdnState {
     /// Reset all state buffers to zero.
     fn reset(&self) {
         let gdn_cfg = &self.config;
-        let conv_state_size = gdn_cfg.qkv_dim * (gdn_cfg.conv_kernel_size - 1) * 2;
+        let conv_state_size = gdn_cfg.qkv_dim * (gdn_cfg.conv_kernel_size - 1) * 4; // FP32
         let recurrent_state_size =
             gdn_cfg.num_v_heads * gdn_cfg.v_head_dim * gdn_cfg.k_head_dim * 4;
         for layer in &self.layers {
@@ -1078,10 +1078,9 @@ impl MetalInference {
         rotary_dim: usize,
         max_seq_len: usize,
         theta: f64,
-        partial_rotary_factor: f64,
+        _partial_rotary_factor: f64,
     ) -> Result<(MetalBuffer, MetalBuffer), MetalError> {
         let half_dim = head_dim / 2;
-        let rotary_dim = ((head_dim as f64 * partial_rotary_factor) as usize / 2) * 2;
         let rotary_half = rotary_dim / 2;
         let mut cos_data = vec![0u8; max_seq_len * half_dim * 2];
         let mut sin_data = vec![0u8; max_seq_len * half_dim * 2];
@@ -1090,10 +1089,7 @@ impl MetalInference {
             for i in 0..half_dim {
                 let offset = (pos * half_dim + i) * 2;
                 if i < rotary_half {
-                    // Proportional RoPE: frequency denominator is always head_dim,
-                    // even when partial_rotary_factor < 1.0 reduces the number of
-                    // rotated dimensions. HF: 1/base^(2i/head_dim)
-                    let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+                    let freq = 1.0 / theta.powf(2.0 * i as f64 / rotary_dim as f64);
                     let angle = pos as f64 * freq;
                     let c = f16::from_f64(angle.cos());
                     let s = f16::from_f64(angle.sin());
@@ -1251,6 +1247,58 @@ impl MetalInference {
             })
             .collect();
 
+        // DEBUG: save logits to disk for comparison with HF
+        if std::env::var("IRONMILL_SAVE_LOGITS").is_ok() {
+            for &pos in &[3usize, 20, 40] {
+                if pos < n {
+                    let l = &all_logits[pos];
+                    let path = format!("/tmp/im_logits_pos{pos}.bin");
+                    let bytes: Vec<u8> = l.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    std::fs::write(&path, &bytes).ok();
+                    let target = if pos + 1 < n { token_ids[pos + 1] as usize } else { 0 };
+                    let max_val = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mean: f32 = l.iter().sum::<f32>() / l.len() as f32;
+                    let log_sum_exp: f64 = l.iter().map(|&x| ((x - max_val) as f64).exp()).sum::<f64>().ln() + max_val as f64;
+                    let ce = if target < l.len() { -(l[target] as f64 - log_sum_exp) } else { 0.0 };
+                    eprintln!(
+                        "  [SAVE] pos={pos} target={target} ce={ce:.4} max={max_val:.3} l[target]={:.3} mean={mean:.3} std={:.3} len={}",
+                        if target < l.len() { l[target] } else { 0.0 },
+                        {
+                            let m = mean;
+                            (l.iter().map(|&x| (x - m) * (x - m)).sum::<f32>() / l.len() as f32).sqrt()
+                        },
+                        l.len()
+                    );
+                }
+            }
+        }
+
+        // DEBUG: print per-position CE
+        if std::env::var("IRONMILL_DEBUG_LOGITS").is_ok() {
+            let mut debug_total_ce = 0.0f64;
+            let mut debug_count = 0usize;
+            for t in 0..n.saturating_sub(1) {
+                let l = &all_logits[t];
+                let target = token_ids[t + 1] as usize;
+                let max_val = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let argmax = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(0);
+                let log_sum_exp: f64 = l.iter().map(|&x| ((x - max_val) as f64).exp()).sum::<f64>().ln() + max_val as f64;
+                let ce = if target < l.len() { -(l[target] as f64 - log_sum_exp) } else { 0.0 };
+                debug_total_ce += ce;
+                debug_count += 1;
+                if t < 20 || t >= n - 3 {
+                    eprintln!(
+                        "  [im] pos={:>2} argmax={:>6} max={:>7.3} ce={:>7.3}",
+                        t, argmax, max_val, ce
+                    );
+                }
+            }
+            if debug_count > 0 {
+                let avg = debug_total_ce / debug_count as f64;
+                eprintln!("  [im] DEBUG PPL from logits: {:.2} (avg CE={:.4}, n={})", avg.exp(), avg, debug_count);
+            }
+        }
+
         Ok(all_logits)
     }
 
@@ -1348,6 +1396,12 @@ impl MetalInference {
                 self.gemma4_config.as_ref(),
             )
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        // Grow GDN scratch buffers for prefill (token_count > 1).
+        if let Some(ref mut gdn) = self.gdn_state {
+            gdn.ensure_scratch_capacity(&self.device, token_ids.len(), mc.hidden_size)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        }
 
         let bufs = self
             .intermediate_buffers

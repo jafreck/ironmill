@@ -48,6 +48,11 @@ impl Gemma4Config {
     ///
     /// Returns None for non-Gemma-4 models (no layer_types in config).
     pub fn from_model_config(mc: &mil_rs::weights::ModelConfig) -> Option<Self> {
+        // Only activate for Gemma 4 models — Qwen 3.5 also has layer_types
+        // but uses a completely different layer structure (GDN linear attention).
+        if mc.architecture != mil_rs::weights::Architecture::Gemma {
+            return None;
+        }
         let layer_types = mc.layer_types()?;
         let global_head_dim = mc.global_head_dim();
         let num_global_kv_heads = mc.num_global_key_value_heads();
