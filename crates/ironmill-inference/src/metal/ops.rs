@@ -71,6 +71,8 @@ pub struct MetalPipelines {
     pub rope: ComputePipeline,
     /// Element-wise residual addition kernel.
     pub residual_add: ComputePipeline,
+    /// Buffer copy kernel (element-wise half → half).
+    pub copy_buffer: ComputePipeline,
     /// Token embedding lookup kernel.
     pub embedding_lookup: ComputePipeline,
     /// TurboQuant KV cache write kernel.
@@ -131,8 +133,6 @@ pub struct MetalPipelines {
     pub ple_add_scale: ComputePipeline,
     /// Element-wise buffer scaling kernel.
     pub scale_buffer: ComputePipeline,
-    /// Buffer copy kernel.
-    pub copy_buffer: ComputePipeline,
     /// MoE router softmax kernel.
     pub moe_softmax: ComputePipeline,
     /// MoE expert GELU activation kernel.
@@ -147,6 +147,18 @@ pub struct MetalPipelines {
     pub d2quant_matmul_3bit: ComputePipeline,
     /// D2Quant 3-bit embedding lookup kernel.
     pub d2quant_embedding_lookup_3bit: ComputePipeline,
+    /// Sigmoid gating kernel (Qwen3.5 attn_output_gate).
+    pub sigmoid_gate: ComputePipeline,
+    /// GDN conv1d + SiLU kernel.
+    pub gdn_conv1d_silu: ComputePipeline,
+    /// GDN recurrent state update kernel.
+    pub gdn_recurrent_update: ComputePipeline,
+    /// GDN per-head output gate (RMSNorm + silu(z)) kernel.
+    pub gdn_output_gate: ComputePipeline,
+    /// GDN prefill batched conv1d + SiLU kernel (all tokens, one dispatch).
+    pub gdn_prefill_conv1d_silu: ComputePipeline,
+    /// GDN prefill batched recurrent + norm + gate kernel (all tokens, one dispatch).
+    pub gdn_prefill_recurrent: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -157,7 +169,11 @@ impl MetalPipelines {
     /// (attention, turboquant) use precompiled variants for common head
     /// dimensions (64, 80, 128, 256) and fall back to runtime source
     /// compilation for uncommon values.
-    pub fn compile(device: &MetalDevice, head_dim: usize) -> Result<Self, MetalError> {
+    pub fn compile(
+        device: &MetalDevice,
+        head_dim: usize,
+        rotary_dim: usize,
+    ) -> Result<Self, MetalError> {
         // ── HEAD_DIM-independent shaders (precompiled) ──────────
         let norm_lib = device
             .load_library_from_data(include_bytes!(concat!(
@@ -249,9 +265,16 @@ impl MetalPipelines {
                 "/d2quant_matmul.metallib"
             )))
             .map_err(MetalError::Metal)?;
+        let gdn_lib = device
+            .load_library_from_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/gdn_recurrent.metallib"
+            )))
+            .map_err(MetalError::Metal)?;
 
         // ── HEAD_DIM-dependent shaders (precompiled or fallback) ─
-        let (attn_lib, tq_lib, sdpa_lib) = Self::load_head_dim_shaders(device, head_dim)?;
+        let (attn_lib, tq_lib, sdpa_lib) =
+            Self::load_head_dim_shaders(device, head_dim, rotary_dim)?;
 
         Ok(Self {
             rms_norm: device
@@ -282,6 +305,20 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &elem_lib
                         .get_function("residual_add")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            copy_buffer: device
+                .create_compute_pipeline(
+                    &elem_lib
+                        .get_function("copy_buffer")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            sigmoid_gate: device
+                .create_compute_pipeline(
+                    &elem_lib
+                        .get_function("sigmoid_gate_inplace")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -495,13 +532,6 @@ impl MetalPipelines {
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
-            copy_buffer: device
-                .create_compute_pipeline(
-                    &elem_lib
-                        .get_function("copy_buffer")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
             moe_softmax: {
                 let lib = device
                     .load_library_from_data(include_bytes!(concat!(
@@ -576,6 +606,41 @@ impl MetalPipelines {
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
+            gdn_conv1d_silu: device
+                .create_compute_pipeline(
+                    &gdn_lib
+                        .get_function("gdn_conv1d_silu")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            gdn_recurrent_update: device
+                .create_compute_pipeline(
+                    &gdn_lib
+                        .get_function("gdn_recurrent_update")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            gdn_output_gate: device
+                .create_compute_pipeline(
+                    &gdn_lib
+                        .get_function("gdn_output_gate")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            gdn_prefill_conv1d_silu: device
+                .create_compute_pipeline(
+                    &gdn_lib
+                        .get_function("gdn_prefill_conv1d_silu")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            gdn_prefill_recurrent: device
+                .create_compute_pipeline(
+                    &gdn_lib
+                        .get_function("gdn_prefill_recurrent")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
         })
     }
 
@@ -586,6 +651,7 @@ impl MetalPipelines {
     fn load_head_dim_shaders(
         device: &MetalDevice,
         head_dim: usize,
+        rotary_dim: usize,
     ) -> Result<
         (
             ironmill_metal_sys::ShaderLibrary,
@@ -646,11 +712,42 @@ impl MetalPipelines {
                 precompiled!(tq "128"),
                 precompiled!(sdpa "128"),
             ),
-            256 => try_precompiled(
-                precompiled!(attn "256"),
-                precompiled!(tq "256"),
-                precompiled!(sdpa "256"),
-            ),
+            256 => {
+                // Head dim 256: FA2 prefill kernel exceeds 32KB threadgroup limit
+                // with Q_CHUNK=32. Compile at runtime with reduced tile size.
+                let header = format!(
+                    "#define HEAD_DIM 256\n#define HEAD_DIM_PACKED 128\n#define ROTARY_DIM {rotary_dim}\n"
+                );
+                let attn_src_raw = include_str!("shaders/attention.metal");
+                let fused_qknr_src = include_str!("shaders/fused_qk_norm_rope.metal");
+                // Override FA2 tile sizes for head_dim=256 threadgroup limit
+                let attn_src_patched = attn_src_raw
+                    .replace(
+                        "constant constexpr uint FA2_Q_CHUNK = 32;",
+                        "constant constexpr uint FA2_Q_CHUNK = 8;",
+                    )
+                    .replace(
+                        "constant constexpr uint FA2_KV_TILE = 32;",
+                        "constant constexpr uint FA2_KV_TILE = 16;",
+                    );
+                let attn_src = format!("{header}{attn_src_patched}\n{fused_qknr_src}");
+                let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
+                let tq_src_raw = include_str!("shaders/turboquant.metal");
+                let tq_src = format!("{header}{tq_helpers}\n{tq_src_raw}");
+                let sdpa_src_raw = include_str!("shaders/fused_sdpa.metal");
+                let sdpa_src = format!("{header}{sdpa_src_raw}");
+
+                let attn = device
+                    .compile_shader_source(&attn_src)
+                    .map_err(MetalError::Metal)?;
+                let tq = device
+                    .compile_shader_source(&tq_src)
+                    .map_err(MetalError::Metal)?;
+                let sdpa = device
+                    .compile_shader_source(&sdpa_src)
+                    .map_err(MetalError::Metal)?;
+                Ok((attn, tq, sdpa))
+            }
             512 => try_precompiled(
                 precompiled!(attn "512"),
                 precompiled!(tq "512"),
@@ -659,7 +756,7 @@ impl MetalPipelines {
             _ => {
                 // Uncommon head_dim — fall back to runtime source compilation.
                 let header = format!(
-                    "#define HEAD_DIM {head_dim}\n#define HEAD_DIM_PACKED {}\n",
+                    "#define HEAD_DIM {head_dim}\n#define HEAD_DIM_PACKED {}\n#define ROTARY_DIM {rotary_dim}\n",
                     head_dim / 2
                 );
                 let attn_src_raw = include_str!("shaders/attention.metal");
@@ -1026,6 +1123,25 @@ pub fn encode_residual_add(
     encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
 }
 
+/// Encode sigmoid gating (Qwen3.5 attn_output_gate):
+/// `attn_out[i] *= sigmoid(gate[i])` for `size` elements.
+pub fn encode_sigmoid_gate(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    attn_out: &MetalBuffer,
+    gate: &MetalBuffer,
+    size: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(attn_out, 0, 0);
+    encoder.set_buffer(gate, 0, 1);
+    encoder.set_bytes(&size.to_le_bytes(), 2);
+    let threads = size as usize;
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
+    let tg_count = threads.div_ceil(tg_size);
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
+}
+
 /// Encode in-place scalar multiply: data[i] *= scalar[0] for i in 0..count.
 pub fn encode_scale_buffer(
     encoder: &ComputeEncoder,
@@ -1177,12 +1293,7 @@ pub fn encode_prefill_attention(
 }
 
 /// Default Q-block tile size (Br) for fused SDPA.
-/// Must match the SDPA_BR define used at shader compile time.
-/// For head_dim >= 256, the shader uses BR=16 to fit in register budget;
-/// smaller head dims use BR=32.
-fn fused_sdpa_br(head_dim: u32) -> usize {
-    if head_dim >= 256 { 16 } else { 32 }
-}
+const FUSED_SDPA_DEFAULT_BR: usize = 32;
 
 /// Encode fused scaled dot-product attention.
 ///
@@ -1195,7 +1306,7 @@ pub fn encode_fused_sdpa(
     params: &FusedSdpaParams<'_>,
     tile_br: Option<usize>,
 ) {
-    let br = tile_br.unwrap_or_else(|| fused_sdpa_br(params.head_dim));
+    let br = tile_br.unwrap_or(FUSED_SDPA_DEFAULT_BR);
     let heads_per_group = (params.num_q_heads / params.num_kv_heads) as usize;
 
     encoder.set_pipeline(pipeline);
@@ -1327,6 +1438,37 @@ pub fn encode_fused_residual_rms_norm(
     encoder.dispatch_threadgroups((params.token_count as usize, 1, 1), (tg_size, 1, 1));
 }
 
+// ── GDN kernel dispatches ────────────────────────────────────────
+
+/// Encode GDN conv1d + SiLU.
+///
+/// Shifts conv_state, computes causal conv1d dot product, applies SiLU.
+/// One thread per channel (qkv_dim threads).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gdn_conv1d_silu(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    input_qkv: &MetalBuffer,
+    conv_weight: &MetalBuffer,
+    conv_state: &MetalBuffer,
+    output: &MetalBuffer,
+    qkv_dim: u32,
+    kernel_size: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(input_qkv, 0, 0);
+    encoder.set_buffer(conv_weight, 0, 1);
+    encoder.set_buffer(conv_state, 0, 2);
+    encoder.set_buffer(output, 0, 3);
+    let params: [u32; 4] = [qkv_dim, kernel_size, kernel_size - 1, 0];
+    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    encoder.set_bytes(&params_bytes, 4);
+    let threads = qkv_dim as usize;
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
+    let tg_count = threads.div_ceil(tg_size);
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
+}
+
 /// Encode fused logit softcapping: `data[i] = softcap * tanh(data[i] / softcap)`.
 pub fn encode_fused_softcap(
     encoder: &ComputeEncoder,
@@ -1340,6 +1482,107 @@ pub fn encode_fused_softcap(
     encoder.set_bytes(&softcap.to_le_bytes(), 1);
     encoder.set_bytes(&count.to_le_bytes(), 2);
     let threads = count as usize;
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
+    let tg_count = threads.div_ceil(tg_size);
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode GDN recurrent state update.
+///
+/// Per-head: compute gates, update state matrix S, compute o = S @ q.
+/// One threadgroup per head, v_head_dim threads per threadgroup.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gdn_recurrent_update(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    conv_out: &MetalBuffer,
+    a_proj: &MetalBuffer,
+    b_proj: &MetalBuffer,
+    a_log: &MetalBuffer,
+    dt_bias: &MetalBuffer,
+    recurrent_state: &MetalBuffer,
+    output: &MetalBuffer,
+    key_dim: u32,
+    value_dim: u32,
+    num_v_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    num_k_heads: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(conv_out, 0, 0);
+    encoder.set_buffer(a_proj, 0, 1);
+    encoder.set_buffer(b_proj, 0, 2);
+    encoder.set_buffer(a_log, 0, 3);
+    encoder.set_buffer(dt_bias, 0, 4);
+    encoder.set_buffer(recurrent_state, 0, 5);
+    encoder.set_buffer(output, 0, 6);
+    let params: [u32; 6] = [
+        key_dim,
+        value_dim,
+        num_v_heads,
+        k_head_dim,
+        v_head_dim,
+        num_k_heads,
+    ];
+    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    encoder.set_bytes(&params_bytes, 7);
+    let tg_size = (v_head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP);
+    encoder.dispatch_threadgroups((num_v_heads as usize, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode GDN output gating: per-head RMSNorm + silu(z) multiplication.
+///
+/// One threadgroup per head, v_head_dim threads per threadgroup.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gdn_output_gate(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    raw_output: &MetalBuffer,
+    z: &MetalBuffer,
+    norm_weight: &MetalBuffer,
+    output: &MetalBuffer,
+    num_v_heads: u32,
+    v_head_dim: u32,
+    eps: f32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(raw_output, 0, 0);
+    encoder.set_buffer(z, 0, 1);
+    encoder.set_buffer(norm_weight, 0, 2);
+    encoder.set_buffer(output, 0, 3);
+    let params: [u32; 4] = [num_v_heads, v_head_dim, eps.to_bits(), 0];
+    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    encoder.set_bytes(&params_bytes, 4);
+    let tg_size = (v_head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP);
+    encoder.dispatch_threadgroups((num_v_heads as usize, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode GDN prefill batched conv1d + SiLU.
+///
+/// Processes ALL tokens sequentially per channel in a single dispatch.
+/// One thread per channel (qkv_dim threads total).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gdn_prefill_conv1d_silu(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    all_qkv: &MetalBuffer,
+    conv_weight: &MetalBuffer,
+    conv_state: &MetalBuffer,
+    all_conv_out: &MetalBuffer,
+    qkv_dim: u32,
+    kernel_size: u32,
+    token_count: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(all_qkv, 0, 0);
+    encoder.set_buffer(conv_weight, 0, 1);
+    encoder.set_buffer(conv_state, 0, 2);
+    encoder.set_buffer(all_conv_out, 0, 3);
+    let params: [u32; 4] = [qkv_dim, kernel_size, kernel_size - 1, token_count];
+    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    encoder.set_bytes(&params_bytes, 4);
+    let threads = qkv_dim as usize;
     let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
     let tg_count = threads.div_ceil(tg_size);
     encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
@@ -1473,4 +1716,58 @@ pub fn encode_moe_weighted_combine(
     encoder.set_bytes(&token_count.to_le_bytes(), 6);
     let tg_size = DEFAULT_THREADGROUP_WIDTH.min(hidden_size as usize);
     encoder.dispatch_threadgroups((token_count as usize, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode GDN prefill batched recurrent + RMSNorm + silu(z) gating.
+///
+/// Processes ALL tokens sequentially per head in a single dispatch.
+/// One threadgroup per head, v_head_dim threads per threadgroup.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gdn_prefill_recurrent(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    all_conv_out: &MetalBuffer,
+    all_a: &MetalBuffer,
+    all_b: &MetalBuffer,
+    a_log: &MetalBuffer,
+    dt_bias: &MetalBuffer,
+    norm_weight: &MetalBuffer,
+    all_z: &MetalBuffer,
+    recurrent_state: &MetalBuffer,
+    all_output: &MetalBuffer,
+    token_count: u32,
+    qkv_dim: u32,
+    key_dim: u32,
+    value_dim: u32,
+    num_v_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    eps: f32,
+    num_k_heads: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(all_conv_out, 0, 0);
+    encoder.set_buffer(all_a, 0, 1);
+    encoder.set_buffer(all_b, 0, 2);
+    encoder.set_buffer(a_log, 0, 3);
+    encoder.set_buffer(dt_bias, 0, 4);
+    encoder.set_buffer(norm_weight, 0, 5);
+    encoder.set_buffer(all_z, 0, 6);
+    encoder.set_buffer(recurrent_state, 0, 7);
+    encoder.set_buffer(all_output, 0, 8);
+    let params: [u32; 9] = [
+        token_count,
+        qkv_dim,
+        key_dim,
+        value_dim,
+        num_v_heads,
+        k_head_dim,
+        v_head_dim,
+        eps.to_bits(),
+        num_k_heads,
+    ];
+    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    encoder.set_bytes(&params_bytes, 9);
+    let tg_size = (v_head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP);
+    encoder.dispatch_threadgroups((num_v_heads as usize, 1, 1), (tg_size, 1, 1));
 }

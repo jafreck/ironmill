@@ -5,11 +5,19 @@ using namespace metal;
 #define HEAD_DIM 128
 #endif
 
-// Fused QK-norm + RoPE: RMSNorm each head then apply rotary embeddings.
+#ifndef ROTARY_DIM
+#define ROTARY_DIM HEAD_DIM
+#endif
+
+// Fused QK-norm + partial RoPE: RMSNorm each head then apply rotary
+// embeddings to the first ROTARY_DIM dimensions only.
 //
-// Replaces 4 separate dispatches (RMSNorm Q, RMSNorm K, RoPE Q, RoPE K)
-// with a single kernel that reads each head vector once, normalizes in
-// registers, applies RoPE rotation, and writes once.
+// When ROTARY_DIM < HEAD_DIM (e.g. Qwen 3.5 with partial_rotary_factor=0.25),
+// only the first ROTARY_DIM dims are rotated; the remaining dims are just
+// normalized and written back unchanged.
+//
+// RoPE uses half-split pairing WITHIN the rotary dimensions:
+//   pairs (d, d + ROTARY_DIM/2)  for d = 0..ROTARY_DIM/2-1.
 //
 // Dispatch: (num_heads_total, token_count, 1) threadgroups,
 //           (min(HEAD_DIM, 1024), 1, 1) threads per group.
@@ -19,12 +27,12 @@ using namespace metal;
 // repeats across all heads of the same type.
 //
 // Buffers:
-//   buffer(0)  q_proj:     [token_count × nh × head_dim]   half (in-place)
-//   buffer(1)  k_proj:     [token_count × nkv × head_dim]  half (in-place)
-//   buffer(2)  q_norm_w:   [head_dim]                       half
-//   buffer(3)  k_norm_w:   [head_dim]                       half
-//   buffer(4)  cos_cache:  [max_seq × half_head_dim]        half
-//   buffer(5)  sin_cache:  [max_seq × half_head_dim]        half
+//   buffer(0)  q_proj:     [token_count × nh × head_dim]      half (in-place)
+//   buffer(1)  k_proj:     [token_count × nkv × head_dim]     half (in-place)
+//   buffer(2)  q_norm_w:   [head_dim]                          half
+//   buffer(3)  k_norm_w:   [head_dim]                          half
+//   buffer(4)  cos_cache:  [max_seq × ROTARY_DIM/2]            half
+//   buffer(5)  sin_cache:  [max_seq × ROTARY_DIM/2]            half
 //   buffer(6)  nh:          uint
 //   buffer(7)  nkv:         uint
 //   buffer(8)  head_dim:    uint
@@ -67,7 +75,7 @@ kernel void fused_qk_norm_rope(
     // Shared memory for cross-simdgroup reduction.
     threadgroup float sg_partial[32];
 
-    // Step 1: sum of squares for RMSNorm
+    // Step 1: sum of squares for RMSNorm (over ALL head dims)
     float local_sum = 0.0f;
     for (uint d = tid; d < HEAD_DIM; d += tg_size) {
         float v = float(proj[base + d]);
@@ -89,21 +97,26 @@ kernel void fused_qk_norm_rope(
 
     float rms_inv = rsqrt(sg_partial[0] / float(HEAD_DIM) + eps);
 
-    // Step 2: RMSNorm + RoPE in one pass
-    uint half_dim = HEAD_DIM / 2;
+    // Step 2: RMSNorm + partial RoPE
+    uint half_rotary = ROTARY_DIM / 2;
     uint pos = seq_offset + token_idx;
 
-    for (uint d = tid; d < half_dim; d += tg_size) {
-        // Load and normalize both halves
+    // Part A: First ROTARY_DIM dims — normalize + RoPE rotation.
+    // Pairing is (d, d + half_rotary) within the rotary dimensions.
+    for (uint d = tid; d < half_rotary; d += tg_size) {
         float x_lo = float(proj[base + d]) * rms_inv * float(norm_w[d]);
-        float x_hi = float(proj[base + d + half_dim]) * rms_inv * float(norm_w[d + half_dim]);
+        float x_hi = float(proj[base + d + half_rotary]) * rms_inv * float(norm_w[d + half_rotary]);
 
-        // RoPE rotation
-        uint cs_idx = pos * half_dim + d;
+        uint cs_idx = pos * half_rotary + d;
         float cos_val = float(cos_cache[cs_idx]);
         float sin_val = float(sin_cache[cs_idx]);
 
-        proj[base + d]            = half(x_lo * cos_val - x_hi * sin_val);
-        proj[base + d + half_dim] = half(x_lo * sin_val + x_hi * cos_val);
+        proj[base + d]                = half(x_lo * cos_val - x_hi * sin_val);
+        proj[base + d + half_rotary]  = half(x_lo * sin_val + x_hi * cos_val);
+    }
+
+    // Part B: Remaining dims — just normalize (no rotation).
+    for (uint d = tid + ROTARY_DIM; d < HEAD_DIM; d += tg_size) {
+        proj[base + d] = half(float(proj[base + d]) * rms_inv * float(norm_w[d]));
     }
 }

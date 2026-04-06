@@ -201,8 +201,49 @@ impl MetalWeights {
             device,
             force_cpu_dequant,
         };
-        let core = weight_loading::load_model_weights(&visitor, provider)?;
+        let mut core = weight_loading::load_model_weights(&visitor, provider)?;
         let config = core.config;
+
+        // Qwen 3.5 centered RMSNorm: forward computes x * (1 + weight) / rms.
+        // Weights are stored as residuals from 1.0 (near zero). Pre-add 1.0
+        // at load time so the standard RMSNorm kernel (x * weight / rms) works.
+        // Only applies to Qwen3_5RMSNorm (input/post-attn/final/QK norms).
+        // Does NOT apply to GDN output gate norm (Qwen3_5RMSNormGated).
+        if config.architecture == mil_rs::weights::Architecture::Qwen35 {
+            for layer in &mut core.layers {
+                offset_norm_weight(&layer.input_norm);
+                offset_norm_weight(&layer.post_attn_norm);
+                if let Some(ref qn) = layer.q_norm {
+                    offset_norm_weight(qn);
+                }
+                if let Some(ref kn) = layer.k_norm {
+                    offset_norm_weight(kn);
+                }
+            }
+            offset_norm_weight(&core.final_norm);
+
+            // Qwen 3.5 attn_output_gate: the q_proj weight [2*nh*hd, h] contains
+            // interleaved Q and gate rows per head. Split into separate q_proj
+            // [nh*hd, h] and attn_output_gate [nh*hd, h] so the Q and gate
+            // projections can be dispatched independently.
+            let has_output_gate = config
+                .extra
+                .get("attn_output_gate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if has_output_gate {
+                let nh = config.num_attention_heads;
+                let hd = config.head_dim;
+                let h = config.hidden_size;
+                for layer in &mut core.layers {
+                    if layer.gdn_in_proj_qkv.is_some() {
+                        continue;
+                    }
+                    let gate_weight = split_q_gate_weight(device, &mut layer.q_proj, nh, hd, h)?;
+                    layer.attn_output_gate = Some(gate_weight);
+                }
+            }
+        }
 
         let lm_head_name = if config.tie_word_embeddings {
             "model.embed_tokens.weight"
@@ -225,6 +266,199 @@ impl MetalWeights {
             ple_projection_norm: core.ple_projection_norm,
         })
     }
+
+    /// Apply D2Quant simulation in-place: quantize each weight buffer to
+    /// `bits`-bit (2 or 3) using dual-scale quantization, then immediately
+    /// dequantize back to FP16. This bakes the quantization error into the
+    /// weights without requiring native GPU D2Quant kernels.
+    ///
+    /// Call after `load()` to measure the PPL impact of D2Quant quantization.
+    pub fn apply_d2quant_simulation(&mut self, bits: u8) {
+        for layer in &mut self.layers {
+            for wb in [
+                &mut layer.q_proj,
+                &mut layer.k_proj,
+                &mut layer.v_proj,
+                &mut layer.o_proj,
+                &mut layer.gate_proj,
+                &mut layer.up_proj,
+                &mut layer.down_proj,
+            ] {
+                d2quant_round_trip_weight_buffer(wb, bits);
+            }
+            if let Some(ref mut gdn_qkv) = layer.gdn_in_proj_qkv {
+                d2quant_round_trip_weight_buffer(gdn_qkv, bits);
+            }
+            if let Some(ref mut gdn_z) = layer.gdn_in_proj_z {
+                d2quant_round_trip_weight_buffer(gdn_z, bits);
+            }
+            if let Some(ref mut gdn_a) = layer.gdn_in_proj_a {
+                d2quant_round_trip_weight_buffer(gdn_a, bits);
+            }
+            if let Some(ref mut gdn_b) = layer.gdn_in_proj_b {
+                d2quant_round_trip_weight_buffer(gdn_b, bits);
+            }
+            if let Some(ref mut gdn_out) = layer.gdn_out_proj {
+                d2quant_round_trip_weight_buffer(gdn_out, bits);
+            }
+            if let Some(ref mut gate) = layer.attn_output_gate {
+                d2quant_round_trip_weight_buffer(gate, bits);
+            }
+        }
+    }
+}
+
+/// Apply D2Quant quantize→dequantize round-trip to a single weight buffer.
+///
+/// Reads FP16 data from the buffer, converts to F32, runs dual-scale
+/// quantization per 128-element group, dequantizes, converts back to FP16,
+/// and writes the result. Dense buffers are modified in-place; quantized
+/// buffers are skipped (they're already compressed).
+fn d2quant_round_trip_weight_buffer(wb: &mut WeightBuffer, bits: u8) {
+    use mil_rs::ir::passes::d2quant::dual_scale::{dual_scale_dequantize, dual_scale_quantize};
+
+    let (dense_buf, packed_buf) = match wb {
+        WeightBuffer::Dense { buf, packed } => (buf, packed),
+        // Already quantized — skip.
+        WeightBuffer::Quantized(_) | WeightBuffer::AffineQuantized(_) | WeightBuffer::DualScaleQuantized(_) => return,
+    };
+
+    // Helper: apply quantize→dequant round-trip to any FP16 Metal buffer.
+    let apply_round_trip = |buf: &MetalBuffer| {
+        let n = buf.length() / 2;
+        let mut raw = vec![0u8; buf.length()];
+        if buf.read_bytes(&mut raw, 0).is_err() {
+            return;
+        }
+        let f32_weights: Vec<f32> = raw
+            .chunks_exact(2)
+            .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect();
+        let group_size = 128;
+        let mut result = Vec::with_capacity(n);
+        for group in f32_weights.chunks(group_size) {
+            let (quantized, params) = dual_scale_quantize(group, bits, 0.99);
+            let dequantized = dual_scale_dequantize(&quantized, &params, bits);
+            result.extend_from_slice(&dequantized);
+        }
+        for i in 0..n {
+            let fp16 = half::f16::from_f32(result[i]);
+            let bytes = fp16.to_le_bytes();
+            raw[i * 2] = bytes[0];
+            raw[i * 2 + 1] = bytes[1];
+        }
+        let _ = buf.write_bytes(&raw, 0);
+    };
+
+    if let Some(buf) = dense_buf {
+        apply_round_trip(buf);
+    }
+    if let Some(packed) = packed_buf.as_ref() {
+        apply_round_trip(packed);
+    }
+}
+
+/// Add 1.0 to every FP16 element in a shared Metal buffer (in-place).
+/// Used for Qwen 3.5 centered RMSNorm weight transform.
+fn offset_norm_weight(buf: &MetalBuffer) {
+    let n = buf.length() / 2;
+    let mut data = vec![0u8; buf.length()];
+    if buf.read_bytes(&mut data, 0).is_err() {
+        return;
+    }
+    for i in 0..n {
+        let off = i * 2;
+        let val = half::f16::from_le_bytes([data[off], data[off + 1]]);
+        let new_val = half::f16::from_f32(val.to_f32() + 1.0);
+        let bytes = new_val.to_le_bytes();
+        data[off] = bytes[0];
+        data[off + 1] = bytes[1];
+    }
+    let _ = buf.write_bytes(&data, 0);
+}
+
+/// Split q_proj [2*nh*hd, h] into Q [nh*hd, h] (kept in q_proj) and gate [nh*hd, h].
+///
+/// The original q_proj weight has interleaved Q and gate rows per head:
+///   head 0: Q[0..hd], gate[0..hd], head 1: Q[0..hd], gate[0..hd], ...
+///
+/// Returns the gate WeightBuffer and overwrites q_proj with only the Q rows.
+fn split_q_gate_weight(
+    device: &MetalDevice,
+    q_proj: &mut WeightBuffer,
+    num_heads: usize,
+    head_dim: usize,
+    hidden_size: usize,
+) -> Result<WeightBuffer, MetalError> {
+    // Read the raw (unpacked) FP16 data from q_proj's buf.
+    let full_n = 2 * num_heads * head_dim;
+    let split_n = num_heads * head_dim;
+    let k = hidden_size;
+    let total_bytes = full_n * k * 2;
+
+    let raw = match q_proj {
+        &mut WeightBuffer::Dense { ref buf, .. } => {
+            let buf = buf.as_ref().ok_or_else(|| {
+                MetalError::WeightLoading("q_proj dense buffer is None".into())
+            })?;
+            let mut data = vec![0u8; total_bytes];
+            buf.read_bytes(&mut data, 0).map_err(MetalError::Metal)?;
+            data
+        }
+        _ => {
+            return Err(MetalError::WeightLoading(
+                "attn_output_gate requires dense q_proj weight".into(),
+            ));
+        }
+    };
+
+    // De-interleave: for each head, first head_dim rows are Q, next head_dim are gate.
+    let q_bytes = split_n * k * 2;
+    let mut q_data = vec![0u8; q_bytes];
+    let mut gate_data = vec![0u8; q_bytes];
+
+    for h in 0..num_heads {
+        let src_q_start = h * 2 * head_dim;
+        let src_g_start = h * 2 * head_dim + head_dim;
+        let dst_start = h * head_dim;
+
+        for r in 0..head_dim {
+            let src_q_off = (src_q_start + r) * k * 2;
+            let src_g_off = (src_g_start + r) * k * 2;
+            let dst_off = (dst_start + r) * k * 2;
+            let row_bytes = k * 2;
+
+            q_data[dst_off..dst_off + row_bytes]
+                .copy_from_slice(&raw[src_q_off..src_q_off + row_bytes]);
+            gate_data[dst_off..dst_off + row_bytes]
+                .copy_from_slice(&raw[src_g_off..src_g_off + row_bytes]);
+        }
+    }
+
+    // Create new buffers and pack them.
+    let q_buf = device
+        .create_buffer_with_data(&q_data, StorageMode::Shared)
+        .map_err(MetalError::Metal)?;
+    let q_packed = pack_bytes_blocked(&q_data, split_n, k)
+        .map(|packed_data| device.create_buffer_with_data(&packed_data, StorageMode::Shared))
+        .transpose()
+        .map_err(MetalError::Metal)?;
+    *q_proj = WeightBuffer::Dense {
+        buf: Some(q_buf),
+        packed: q_packed,
+    };
+
+    let gate_buf = device
+        .create_buffer_with_data(&gate_data, StorageMode::Shared)
+        .map_err(MetalError::Metal)?;
+    let gate_packed = pack_bytes_blocked(&gate_data, split_n, k)
+        .map(|packed_data| device.create_buffer_with_data(&packed_data, StorageMode::Shared))
+        .transpose()
+        .map_err(MetalError::Metal)?;
+    Ok(WeightBuffer::Dense {
+        buf: Some(gate_buf),
+        packed: gate_packed,
+    })
 }
 
 /// Pack a row-major [N, K] FP16 **byte slice** into blocked [N/8, K/8, 8, 8] format.
