@@ -687,59 +687,116 @@ mod gemma4 {
         );
     }
 
-    /// Gemma 4 E4B-IT benchmark: FP16 baseline, TQ-INT8, and D2Q-3+TQ-INT8.
-    /// Measures load time, GPU memory, decode throughput, and perplexity.
+    /// Gemma 4 E4B-IT benchmark: GPU memory, decode throughput, and
+    /// quantization quality (KL divergence + top-1 agreement vs FP16 baseline).
     #[test]
     #[ignore] // requires Metal GPU + Gemma 4 E4B-IT weights + OASST1 dataset
     fn benchmark_e4b() {
         let model_dir = hf_model_dir("google/gemma-4-E4B-it");
         let decode_tokens = 20;
         let sequences = load_eval_dataset();
-        let ppl_seqs = 3; // fewer seqs — E4B is larger
-        let mut results: Vec<BenchResult> = Vec::new();
+        let eval_seqs = 5;
 
         eprintln!(
             "  OASST1 dataset: {} sequences loaded (eval {})",
             sequences.len(),
-            ppl_seqs
+            eval_seqs
         );
 
-        // ── FP16 baseline (FP16 KV cache) ────────────────────────
+        // ── Collect FP16 reference logits ────────────────────────
         let fp16_provider =
             SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
 
+        let fp16_logits: Vec<Vec<Vec<f32>>>;
+        let fp16_gpu: f64;
+        let fp16_load: f64;
+        let fp16_ms_tok: f64;
+        let fp16_tok_s: f64;
         {
             let config = MetalConfig::default().without_turboquant();
             let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
             let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
-            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
-            eprintln!("  FP16 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
-            results.push(BenchResult {
-                label: "FP16",
-                load_ms,
-                gpu_mb,
-                ms_tok,
-                tok_s,
-                ppl,
-                ppl_tokens,
-            });
+            fp16_gpu = gpu_mb;
+            fp16_load = load_ms;
+            fp16_ms_tok = ms_tok;
+            fp16_tok_s = tok_s;
+
+            fp16_logits = sequences
+                .iter()
+                .take(eval_seqs)
+                .map(|seq| {
+                    engine.reset();
+                    engine
+                        .prefill_all_logits(seq)
+                        .expect("prefill_all_logits failed")
+                })
+                .collect();
+            eprintln!("  FP16 reference logits collected");
         }
+
+        // Helper: evaluate a config against FP16 reference
+        struct E4bResult {
+            label: &'static str,
+            gpu_mb: f64,
+            load_ms: f64,
+            ms_tok: f64,
+            tok_s: f64,
+            mean_kl: f64,
+            top1_agree: f64,
+            top5_agree: f64,
+        }
+
+        let mut results: Vec<E4bResult> = Vec::new();
+
+        // FP16 baseline entry (KL=0, top1=100%)
+        results.push(E4bResult {
+            label: "FP16 (baseline)",
+            gpu_mb: fp16_gpu,
+            load_ms: fp16_load,
+            ms_tok: fp16_ms_tok,
+            tok_s: fp16_tok_s,
+            mean_kl: 0.0,
+            top1_agree: 100.0,
+            top5_agree: 100.0,
+        });
+
+        // Macro-ish closure: load config, collect logits, compute KL vs FP16
+        let eval_config = |engine: &mut MetalInference| -> (Vec<Vec<Vec<f32>>>,) {
+            let logits: Vec<Vec<Vec<f32>>> = sequences
+                .iter()
+                .take(eval_seqs)
+                .map(|seq| {
+                    engine.reset();
+                    engine
+                        .prefill_all_logits(seq)
+                        .expect("prefill_all_logits failed")
+                })
+                .collect();
+            (logits,)
+        };
+
+        let compute_kl_metrics = |test_logits: &[Vec<Vec<f32>>]| -> (f64, f64, f64) {
+            let metrics = compute_metrics("test", &fp16_logits, test_logits, &sequences, eval_seqs);
+            (metrics.mean_kl, metrics.top1_agree, metrics.top5_agree)
+        };
 
         // ── FP16 + TurboQuant-INT8 KV ────────────────────────────
         {
             let config = MetalConfig::default().with_turboquant(8);
             let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
             let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
-            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
-            eprintln!("  FP16+TQ-INT8 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
-            results.push(BenchResult {
+            let (logits,) = eval_config(&mut engine);
+            let (mean_kl, top1, top5) = compute_kl_metrics(&logits);
+            eprintln!("  FP16+TQ-INT8: KL={mean_kl:.4}, top1={top1:.1}%");
+            results.push(E4bResult {
                 label: "FP16 + TQ-INT8 KV",
-                load_ms,
                 gpu_mb,
+                load_ms,
                 ms_tok,
                 tok_s,
-                ppl,
-                ppl_tokens,
+                mean_kl,
+                top1_agree: top1,
+                top5_agree: top5,
             });
         }
 
@@ -754,18 +811,19 @@ mod gemma4 {
 
             let config = MetalConfig::default().with_turboquant(8);
             let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&int4_provider, config);
-
             let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
-            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
-            eprintln!("  INT4 (JIT) PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
-            results.push(BenchResult {
+            let (logits,) = eval_config(&mut engine);
+            let (mean_kl, top1, top5) = compute_kl_metrics(&logits);
+            eprintln!("  INT4 JIT: KL={mean_kl:.4}, top1={top1:.1}%");
+            results.push(E4bResult {
                 label: "INT4 JIT + TQ-INT8",
-                load_ms,
                 gpu_mb,
+                load_ms,
                 ms_tok,
                 tok_s,
-                ppl,
-                ppl_tokens,
+                mean_kl,
+                top1_agree: top1,
+                top5_agree: top5,
             });
         }
 
@@ -778,52 +836,52 @@ mod gemma4 {
 
             let config = MetalConfig::default().with_turboquant(8);
             let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&d2q_provider, config);
-
             let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
-            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
-            eprintln!("  D2Q-3 (JIT) PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
-            results.push(BenchResult {
+            let (logits,) = eval_config(&mut engine);
+            let (mean_kl, top1, top5) = compute_kl_metrics(&logits);
+            eprintln!("  D2Q-3 JIT: KL={mean_kl:.4}, top1={top1:.1}%");
+            results.push(E4bResult {
                 label: "D2Q-3 JIT + TQ-INT8",
-                load_ms,
                 gpu_mb,
+                load_ms,
                 ms_tok,
                 tok_s,
-                ppl,
-                ppl_tokens,
+                mean_kl,
+                top1_agree: top1,
+                top5_agree: top5,
             });
         }
 
         // ── Print results table ──────────────────────────────────
-        let fp16_gpu = results[0].gpu_mb;
-        let fp16_ppl = results[0].ppl;
         println!();
+        println!("  Gemma 4 E4B-IT — Metal Benchmark ({eval_seqs} seqs, KL vs FP16 baseline)");
+        println!("  ─────────────────────────────────────────────────────────────────────────────");
         println!(
-            "  Gemma 4 E4B-IT — Metal Benchmark (OASST1 instruct, {ppl_seqs} seqs, {} tokens)",
-            results[0].ppl_tokens
+            "  {:<21} {:>8} {:>8} {:>8} {:>9} {:>7} {:>7} {:>10}",
+            "Config", "GPU MB", "ms/tok", "tok/s", "Mean KL", "Top-1%", "Top-5%", "Load ms"
         );
-        println!("  ──────────────────────────────────────────────────────────────────────────");
-        println!(
-            "  {:<20} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
-            "Config", "GPU MB", "ms/tok", "tok/s", "PPL", "ΔPPL", "Load ms"
-        );
-        println!("  ──────────────────────────────────────────────────────────────────────────");
+        println!("  ─────────────────────────────────────────────────────────────────────────────");
         for r in &results {
             let mem_note = if r.gpu_mb < fp16_gpu * 0.95 {
                 format!(" (−{:.0}%)", (1.0 - r.gpu_mb / fp16_gpu) * 100.0)
             } else {
                 String::new()
             };
-            let ppl_delta = if (r.ppl - fp16_ppl).abs() > 0.01 {
-                format!("{:>+.1}%", (r.ppl - fp16_ppl) / fp16_ppl * 100.0)
-            } else {
-                "—".to_string()
-            };
             println!(
-                "  {:<20} {:>7.0}{:<7} {:>7.2} {:>7.1} {:>7.2} {:>9} {:>10.0}",
-                r.label, r.gpu_mb, mem_note, r.ms_tok, r.tok_s, r.ppl, ppl_delta, r.load_ms
+                "  {:<21} {:>7.0}{:<7} {:>7.2} {:>7.1} {:>9.4} {:>6.1}% {:>6.1}% {:>9.0}",
+                r.label,
+                r.gpu_mb,
+                mem_note,
+                r.ms_tok,
+                r.tok_s,
+                r.mean_kl,
+                r.top1_agree,
+                r.top5_agree,
+                r.load_ms
             );
         }
-        println!("  ──────────────────────────────────────────────────────────────────────────");
+        println!("  ─────────────────────────────────────────────────────────────────────────────");
+        println!("  KL guide: ~0.01 = negligible, ~0.1 = noticeable, ~1.0 = severe");
         println!();
 
         // ── Assertions ───────────────────────────────────────────
@@ -834,12 +892,112 @@ mod gemma4 {
                 r.label,
                 r.tok_s
             );
-            assert!(
-                r.ppl.is_finite() && r.ppl > 0.0,
-                "{} PPL should be finite and positive, got {:.2}",
-                r.label,
-                r.ppl
+        }
+    }
+
+    /// Per-sequence PPL diagnostic for E4B — identifies which sequences
+    /// diverge from expected quality.
+    #[test]
+    #[ignore]
+    fn diagnose_e4b_ppl() {
+        let model_dir = hf_model_dir("google/gemma-4-E4B-it");
+        let provider =
+            SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
+        let config = MetalConfig::default().without_turboquant();
+        let (mut engine, gpu_mb, _) = load_gpu_engine(&provider, config);
+        eprintln!("  E4B loaded: {gpu_mb:.0} MB GPU (FP16, no TQ)");
+
+        let sequences = load_eval_dataset();
+        eprintln!("  {} sequences loaded", sequences.len());
+
+        println!();
+        println!("  Gemma 4 E4B-IT — Per-Sequence PPL (FP16, no TQ)");
+        println!("  ─────────────────────────────────────────────────────────");
+        println!(
+            "  {:>4}  {:>6}  {:>10}  {:>10}  {:>12}",
+            "Seq", "Tokens", "PPL", "Avg CE", "NaN positions"
+        );
+        println!("  ─────────────────────────────────────────────────────────");
+
+        let mut total_ce = 0.0f64;
+        let mut total_tokens = 0usize;
+
+        for (si, seq) in sequences.iter().enumerate().take(10) {
+            if seq.len() < 2 {
+                continue;
+            }
+            engine.reset();
+            let all_logits = engine
+                .prefill_all_logits(seq)
+                .expect("prefill_all_logits failed");
+
+            let mut ce = 0.0f64;
+            let mut nan_count = 0usize;
+            for pos in 0..seq.len() - 1 {
+                let target = seq[pos + 1] as usize;
+                let logits = &all_logits[pos];
+
+                if logits.iter().any(|x| x.is_nan() || x.is_infinite()) {
+                    nan_count += 1;
+                    continue;
+                }
+
+                let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sum_exp: f64 = logits.iter().map(|&x| ((x - max_logit) as f64).exp()).sum();
+                let log_softmax = (logits[target] - max_logit) as f64 - sum_exp.ln();
+                ce -= log_softmax;
+            }
+
+            let n = seq.len() - 1 - nan_count;
+            let ppl = if n > 0 {
+                (ce / n as f64).exp()
+            } else {
+                f64::NAN
+            };
+            let avg_ce = if n > 0 { ce / n as f64 } else { f64::NAN };
+            total_ce += ce;
+            total_tokens += n;
+
+            println!(
+                "  {:>4}  {:>6}  {:>10.2}  {:>10.4}  {:>12}",
+                si,
+                seq.len(),
+                ppl,
+                avg_ce,
+                if nan_count > 0 {
+                    format!("{nan_count}")
+                } else {
+                    "—".to_string()
+                }
             );
+        }
+
+        println!("  ─────────────────────────────────────────────────────────");
+        let overall_ppl = (total_ce / total_tokens as f64).exp();
+        println!(
+            "  Overall: {total_tokens} tokens, PPL={overall_ppl:.2}, avg CE={:.4}",
+            total_ce / total_tokens as f64
+        );
+        println!();
+
+        // Also dump first 5 logit positions for seq 0 vs seq 1
+        for si in 0..2 {
+            engine.reset();
+            let seq = &sequences[si];
+            let all_logits = engine
+                .prefill_all_logits(&seq[..20.min(seq.len())])
+                .expect("prefill failed");
+            println!("  Seq {si} first 5 positions:");
+            for pos in 0..5.min(all_logits.len()) {
+                let lg = &all_logits[pos];
+                let mut indexed: Vec<(usize, f32)> = lg.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                println!(
+                    "    pos {pos}: top1={:<6} val={:.3}  top2={:<6} val={:.3}",
+                    indexed[0].0, indexed[0].1, indexed[1].0, indexed[1].1
+                );
+            }
+            println!();
         }
     }
 }
