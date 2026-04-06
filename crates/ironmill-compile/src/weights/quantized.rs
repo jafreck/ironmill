@@ -1,8 +1,9 @@
 //! JIT quantized weight provider.
 //!
-//! Wraps any [`WeightProvider`] and applies D2Quant dual-scale quantization
-//! lazily on each `tensor()` call. Eligible weight matrices (2D, ≥64×64,
-//! ≥4096 elements) are returned with [`QuantizationInfo::DualScaleDequantize`];
+//! Wraps any [`WeightProvider`] and applies weight quantization lazily on
+//! each `tensor()` call. Supports D2Quant dual-scale (2/3-bit) and INT4
+//! affine per-group quantization. Eligible weight matrices (2D, ≥64×64,
+//! ≥4096 elements) are returned with the appropriate [`QuantizationInfo`];
 //! all other tensors pass through unchanged.
 //!
 //! This bypasses the MIL IR pipeline entirely — no compilation step, no
@@ -11,6 +12,7 @@
 
 use mil_rs::error::MilError;
 use mil_rs::ir::ScalarType;
+use mil_rs::ir::passes::affine_quantize::quantize_affine;
 use mil_rs::ir::passes::d2quant::dual_scale::{
     dual_scale_quantize, pack_2bit, pack_3bit, pack_mask,
 };
@@ -47,21 +49,61 @@ impl D2QuantConfig {
     }
 }
 
-/// A [`WeightProvider`] wrapper that applies D2Quant quantization on-the-fly.
+/// Configuration for JIT INT4 affine per-group quantization.
+#[derive(Debug, Clone)]
+pub struct AffineQuantConfig {
+    /// Number of weights per group along the reduction axis.
+    pub group_size: usize,
+}
+
+impl AffineQuantConfig {
+    /// Default INT4 per-group config: group_size=128.
+    pub fn int4(group_size: usize) -> Self {
+        Self { group_size }
+    }
+}
+
+impl Default for AffineQuantConfig {
+    fn default() -> Self {
+        Self { group_size: 128 }
+    }
+}
+
+/// Which quantization method to apply.
+#[derive(Debug, Clone)]
+pub enum QuantMethod {
+    /// D2Quant dual-scale 2/3-bit quantization.
+    D2Quant(D2QuantConfig),
+    /// INT4 affine per-group quantization (unsigned, 0–15).
+    AffineInt4(AffineQuantConfig),
+}
+
+/// A [`WeightProvider`] wrapper that applies weight quantization on-the-fly.
 ///
 /// Eligible tensors (2D weight matrices ≥64×64 with ≥4096 elements) are
-/// quantized and returned with [`QuantizationInfo::DualScaleDequantize`].
+/// quantized and returned with the appropriate [`QuantizationInfo`].
 /// All other tensors (norms, biases, embeddings, 1D vectors) pass through
 /// unchanged from the inner provider.
 pub struct QuantizedWeightProvider<P> {
     inner: P,
-    config: D2QuantConfig,
+    method: QuantMethod,
 }
 
 impl<P: WeightProvider> QuantizedWeightProvider<P> {
-    /// Create a new quantized provider wrapping `inner`.
+    /// Create a D2Quant quantized provider wrapping `inner`.
     pub fn new(inner: P, config: D2QuantConfig) -> Self {
-        Self { inner, config }
+        Self {
+            inner,
+            method: QuantMethod::D2Quant(config),
+        }
+    }
+
+    /// Create an INT4 affine quantized provider wrapping `inner`.
+    pub fn new_int4(inner: P, config: AffineQuantConfig) -> Self {
+        Self {
+            inner,
+            method: QuantMethod::AffineInt4(config),
+        }
     }
 
     /// Consume this wrapper and return the inner provider.
@@ -166,13 +208,80 @@ fn quantize_tensor(
     (all_quantized_packed, quant_info)
 }
 
+/// Quantize a float tensor using INT4 affine per-group quantization.
+///
+/// Each group of `group_size` elements along the last dimension gets its
+/// own scale and zero_point. Returns packed INT4 data (2 values per byte)
+/// with `QuantizationInfo::AffineDequantize`.
+fn quantize_tensor_int4(
+    floats: &[f32],
+    shape: &[usize],
+    config: &AffineQuantConfig,
+) -> (Vec<u8>, QuantizationInfo) {
+    let last_dim = shape[shape.len() - 1];
+    let outer_count: usize = if shape.len() > 1 {
+        shape[..shape.len() - 1].iter().product()
+    } else {
+        1
+    };
+    let n_groups_per_row = last_dim.div_ceil(config.group_size);
+
+    let qmax: f32 = 15.0; // INT4 unsigned
+
+    let mut all_quantized: Vec<u8> = Vec::new();
+    let mut all_scale: Vec<f32> = Vec::new();
+    let mut all_zero: Vec<f32> = Vec::new();
+
+    for row in 0..outer_count {
+        let row_start = row * last_dim;
+        for g in 0..n_groups_per_row {
+            let g_start = row_start + g * config.group_size;
+            let g_end = (g_start + config.group_size).min(row_start + last_dim);
+            let group = &floats[g_start..g_end];
+
+            let (quantized, scale, zero_point) = quantize_affine(group, qmax);
+            all_quantized.extend_from_slice(&quantized);
+            all_scale.push(scale);
+            all_zero.push(zero_point);
+        }
+    }
+
+    // Pack INT4: 2 values per byte, low nibble first.
+    let mut packed = Vec::with_capacity(all_quantized.len().div_ceil(2));
+    for chunk in all_quantized.chunks(2) {
+        let lo = chunk[0] & 0x0F;
+        let hi = if chunk.len() > 1 { chunk[1] & 0x0F } else { 0 };
+        packed.push(lo | (hi << 4));
+    }
+
+    let f32_bytes =
+        |vals: &[f32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+    let quant_info = QuantizationInfo::AffineDequantize {
+        scale: f32_bytes(&all_scale),
+        zero_point: f32_bytes(&all_zero),
+        scale_dtype: ScalarType::Float32,
+        zero_point_dtype: ScalarType::Float32,
+        axis: Some(shape.len() - 1),
+        bit_width: 4,
+        group_size: Some(config.group_size),
+        awq_scales: None,
+        g_idx: None,
+    };
+
+    (packed, quant_info)
+}
+
 impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
     fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError> {
         let t = self.inner.tensor(name)?;
 
-        // Only quantize FP32/FP16/BF16 2D weight matrices of sufficient size.
+        // Only quantize FP32/FP16 2D weight matrices of sufficient size.
+        // Skip embedding tables — the inference engine has specialized
+        // embedding lookup kernels that only support Dense or D2Quant.
         let is_float = matches!(t.dtype, ScalarType::Float32 | ScalarType::Float16);
-        if !is_float || !is_quantizable(&t.shape) {
+        let is_embedding = name.contains("embed_tokens");
+        if !is_float || !is_quantizable(&t.shape) || is_embedding {
             return Ok(t);
         }
 
@@ -185,7 +294,10 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
             MilError::Validation(format!("unsupported dtype for quantization: {:?}", t.dtype))
         })?;
 
-        let (packed_data, quant_info) = quantize_tensor(&floats, &t.shape, &self.config);
+        let (packed_data, quant_info) = match &self.method {
+            QuantMethod::D2Quant(config) => quantize_tensor(&floats, &t.shape, config),
+            QuantMethod::AffineInt4(config) => quantize_tensor_int4(&floats, &t.shape, config),
+        };
 
         Ok(
             WeightTensor::owned(packed_data, t.shape, ScalarType::UInt8)

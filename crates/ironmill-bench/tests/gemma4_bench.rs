@@ -17,7 +17,9 @@ mod gemma4 {
     use std::time::Instant;
 
     use ironmill_compile::gpu::GpuCompileBuilder;
-    use ironmill_compile::weights::quantized::{D2QuantConfig, QuantizedWeightProvider};
+    use ironmill_compile::weights::quantized::{
+        AffineQuantConfig, D2QuantConfig, QuantizedWeightProvider,
+    };
     use ironmill_compile::weights::{SafeTensorsProvider, WeightProvider};
     use ironmill_inference::engine::InferenceEngine;
     use ironmill_inference::metal::{MetalConfig, MetalInference};
@@ -742,6 +744,30 @@ mod gemma4 {
         }
 
         drop(fp16_provider);
+
+        // ── INT4 affine per-group (JIT) + TurboQuant-INT8 KV ─────
+        {
+            let int4_provider = QuantizedWeightProvider::new_int4(
+                SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed"),
+                AffineQuantConfig::int4(128),
+            );
+
+            let config = MetalConfig::default().with_turboquant(8);
+            let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&int4_provider, config);
+
+            let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
+            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
+            eprintln!("  INT4 (JIT) PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
+            results.push(BenchResult {
+                label: "INT4 JIT + TQ-INT8",
+                load_ms,
+                gpu_mb,
+                ms_tok,
+                tok_s,
+                ppl,
+                ppl_tokens,
+            });
+        }
 
         // ── D2Quant 3-bit (JIT) + TurboQuant-INT8 KV ─────────────
         {
