@@ -95,6 +95,26 @@ Passes live in `crates/mil-rs/src/ir/passes/`.
 - Run the full suite: `cargo test --workspace`.
 - Run a single test: `cargo test -p mil-rs test_name`.
 
+### Metal / GPU benchmark tests
+
+**Always use `--release` for Metal inference benchmarks.** Debug mode is
+~27× slower due to unoptimized BF16→FP16 conversion and block repacking
+loops (e.g. 360s vs 13s model load for Gemma 4 E2B).
+
+```bash
+# Run a specific benchmark (e.g. Gemma 4 FP16 decode)
+cargo test --release -p ironmill-bench --features metal -- gemma4::fp16_decode --ignored --nocapture
+
+# Run all benchmarks for a model
+cargo test --release -p ironmill-bench --features metal -- gemma4 --ignored --nocapture
+
+# Run all Metal benchmarks
+cargo test --release -p ironmill-bench --features metal -- --ignored --nocapture
+```
+
+GPU benchmark tests are `#[ignore]`d because they require specific model
+weights and a Metal GPU. Use `--ignored` to include them.
+
 ## Code style
 
 - Use `cargo fmt` before committing.
