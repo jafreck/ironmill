@@ -1,14 +1,14 @@
-//! Gemma 4 E2B Metal GPU benchmark.
+//! Gemma 4 E2B / E4B Metal GPU benchmark.
 //!
-//! Single test that loads each config once, measures decode throughput and
-//! perplexity, and reports all metrics in one table.
+//! Single test per model size that loads each config once, measures decode
+//! throughput, GPU memory, and perplexity, reporting all metrics in one table.
 //! **Always use `--release`** — debug mode is 27× slower.
 //!
 //! ```bash
 //! cargo test --release -p ironmill-bench --features metal -- gemma4 --ignored --nocapture
 //! ```
 //!
-//! Requires: Metal GPU, Gemma 4 E2B-IT weights in HuggingFace cache,
+//! Requires: Metal GPU, Gemma 4 weights in HuggingFace cache,
 //! OASST1 instruct dataset at tests/fixtures/quality/oasst1-gemma4-instruct.json.
 
 #[cfg(feature = "metal")]
@@ -684,119 +684,142 @@ mod gemma4 {
         );
     }
 
+    /// Gemma 4 E4B-IT benchmark: FP16 baseline, TQ-INT8, and D2Q-3+TQ-INT8.
+    /// Measures load time, GPU memory, decode throughput, and perplexity.
     #[test]
-    #[ignore]
-    fn debug_e4b_nan() {
+    #[ignore] // requires Metal GPU + Gemma 4 E4B-IT weights + OASST1 dataset
+    fn benchmark_e4b() {
         let model_dir = hf_model_dir("google/gemma-4-E4B-it");
-        let provider =
+        let decode_tokens = 20;
+        let sequences = load_eval_dataset();
+        let ppl_seqs = 3; // fewer seqs — E4B is larger
+        let mut results: Vec<BenchResult> = Vec::new();
+
+        eprintln!(
+            "  OASST1 dataset: {} sequences loaded (eval {})",
+            sequences.len(),
+            ppl_seqs
+        );
+
+        // ── FP16 baseline (FP16 KV cache) ────────────────────────
+        let fp16_provider =
             SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
 
-        // Test with FP16 no-TQ first (pure FP16)
-        let config = MetalConfig::default().without_turboquant();
-        let (mut engine, gpu_mb, _) = load_gpu_engine(&provider, config);
-        println!("E4B loaded: {gpu_mb:.0} MB GPU");
-
-        // Test 1: single decode step
-        engine.prefill(&[2, 651, 3488]).unwrap();
-        let logits = engine.decode_step(3488).unwrap();
-        let nans = logits.iter().filter(|x| x.is_nan()).count();
-        println!("Decode logits: len={}, NaN={nans}", logits.len());
-        engine.reset();
-
-        // Test 2: short prefill_all_logits
-        for len in [5, 10, 20, 50, 100] {
-            engine.reset();
-            let seq: Vec<u32> = vec![2; len];
-            let all = engine.prefill_all_logits(&seq).unwrap();
-            let nan_positions = all
-                .iter()
-                .enumerate()
-                .filter(|(_, lg)| lg.iter().any(|x| x.is_nan()))
-                .count();
-            let first_nan = all.iter().position(|lg| lg.iter().any(|x| x.is_nan()));
-            println!(
-                "prefill_all_logits(len={len}): {nan_positions}/{} NaN, first_nan={:?}",
-                all.len(),
-                first_nan
-            );
-            if nan_positions > 0 {
-                break;
-            }
+        {
+            let config = MetalConfig::default().without_turboquant();
+            let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
+            let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
+            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
+            eprintln!("  FP16 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
+            results.push(BenchResult {
+                label: "FP16",
+                load_ms,
+                gpu_mb,
+                ms_tok,
+                tok_s,
+                ppl,
+                ppl_tokens,
+            });
         }
 
-        // Test 3: actual OASST1 sequence — compare first 5 positions with HF
-        let sequences = load_eval_dataset();
-        let seq = &sequences[0];
-        engine.reset();
+        // ── FP16 + TurboQuant-INT8 KV ────────────────────────────
+        {
+            let config = MetalConfig::default().with_turboquant(8);
+            let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&fp16_provider, config);
+            let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
+            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
+            eprintln!("  FP16+TQ-INT8 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
+            results.push(BenchResult {
+                label: "FP16 + TQ-INT8 KV",
+                load_ms,
+                gpu_mb,
+                ms_tok,
+                tok_s,
+                ppl,
+                ppl_tokens,
+            });
+        }
+
+        drop(fp16_provider);
+
+        // ── D2Quant 3-bit + TurboQuant-INT8 KV ──────────────────
+        {
+            let t_compile = Instant::now();
+            let d2q_provider = GpuCompileBuilder::new(model_dir.clone())
+                .with_pass_pipeline(
+                    ironmill_compile::mil::PassPipeline::new()
+                        .with_d2quant(3, 128, 0.99, None)
+                        .expect("D2Quant config"),
+                )
+                .build()
+                .expect("D2Quant compile failed");
+            let compile_ms = t_compile.elapsed().as_secs_f64() * 1000.0;
+
+            let config = MetalConfig::default().with_turboquant(8);
+            let (mut engine, gpu_mb, load_ms) = load_gpu_engine(&d2q_provider, config);
+
+            let (ms_tok, tok_s) = bench_decode(&mut engine, decode_tokens);
+            let (ppl, ppl_tokens, ppl_tps) = eval_perplexity(&mut engine, &sequences, ppl_seqs);
+            eprintln!("  D2Q-3 PPL: {ppl:.2} ({ppl_tokens} tokens, {ppl_tps:.0} tok/s)");
+            eprintln!("  D2Quant compile: {compile_ms:.0}ms");
+            results.push(BenchResult {
+                label: "D2Q-3 + TQ-INT8 KV",
+                load_ms,
+                gpu_mb,
+                ms_tok,
+                tok_s,
+                ppl,
+                ppl_tokens,
+            });
+        }
+
+        // ── Print results table ──────────────────────────────────
+        let fp16_gpu = results[0].gpu_mb;
+        let fp16_ppl = results[0].ppl;
+        println!();
         println!(
-            "\nOASST1 seq 0 ({} tokens) — first 10 tokens only:",
-            seq.len()
+            "  Gemma 4 E4B-IT — Metal Benchmark (OASST1 instruct, {ppl_seqs} seqs, {} tokens)",
+            results[0].ppl_tokens
         );
-        let short_seq: Vec<u32> = seq[..10].to_vec();
-        let all = engine.prefill_all_logits(&short_seq).unwrap();
-        for pos in 0..5 {
-            let lg = &all[pos];
-            let mut indexed: Vec<(usize, f32)> = lg.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top5_idx: Vec<usize> = indexed[..5].iter().map(|(i, _)| *i).collect();
-            let top5_val: Vec<f32> = indexed[..5].iter().map(|(_, v)| *v).collect();
+        println!("  ──────────────────────────────────────────────────────────────────────────");
+        println!(
+            "  {:<20} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
+            "Config", "GPU MB", "ms/tok", "tok/s", "PPL", "ΔPPL", "Load ms"
+        );
+        println!("  ──────────────────────────────────────────────────────────────────────────");
+        for r in &results {
+            let mem_note = if r.gpu_mb < fp16_gpu * 0.95 {
+                format!(" (−{:.0}%)", (1.0 - r.gpu_mb / fp16_gpu) * 100.0)
+            } else {
+                String::new()
+            };
+            let ppl_delta = if (r.ppl - fp16_ppl).abs() > 0.01 {
+                format!("{:>+.1}%", (r.ppl - fp16_ppl) / fp16_ppl * 100.0)
+            } else {
+                "—".to_string()
+            };
             println!(
-                "  pos {pos}: top5 idx={top5_idx:?} val=[{:.3}, {:.3}, {:.3}]",
-                top5_val[0], top5_val[1], top5_val[2]
+                "  {:<20} {:>7.0}{:<7} {:>7.2} {:>7.1} {:>7.2} {:>9} {:>10.0}",
+                r.label, r.gpu_mb, mem_note, r.ms_tok, r.tok_s, r.ppl, ppl_delta, r.load_ms
             );
         }
+        println!("  ──────────────────────────────────────────────────────────────────────────");
+        println!();
 
-        // Full 512-token check
-        engine.reset();
-        println!("\nOASST1 seq 0 ({} tokens):", seq.len());
-        let all = engine.prefill_all_logits(seq).unwrap();
-        let mut nan_positions = Vec::new();
-        for (pos, lg) in all.iter().enumerate() {
-            if lg.iter().any(|x| x.is_nan() || x.is_infinite()) {
-                nan_positions.push(pos);
-            }
-        }
-        if nan_positions.is_empty() {
-            println!("  No NaN — computing PPL...");
-            let mut ce = 0.0f64;
-            for pos in 0..seq.len() - 1 {
-                let t = seq[pos + 1] as usize;
-                let lg = &all[pos];
-                let mx = lg.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let lse: f64 = lg
-                    .iter()
-                    .map(|&x| ((x - mx) as f64).exp())
-                    .sum::<f64>()
-                    .ln()
-                    + mx as f64;
-                ce -= lg[t] as f64 - lse;
-            }
-            let ppl = (ce / (seq.len() - 1) as f64).exp();
-            println!("  PPL: {ppl:.2}");
-        } else {
-            println!(
-                "  NaN at {}/{} positions, first: {:?}",
-                nan_positions.len(),
-                all.len(),
-                &nan_positions[..nan_positions.len().min(10)]
+        // ── Assertions ───────────────────────────────────────────
+        for r in &results {
+            assert!(
+                r.tok_s > 0.0,
+                "{} should produce >0 tok/s, got {:.1}",
+                r.label,
+                r.tok_s
+            );
+            assert!(
+                r.ppl.is_finite() && r.ppl > 0.0,
+                "{} PPL should be finite and positive, got {:.2}",
+                r.label,
+                r.ppl
             );
         }
-
-        // Test 4: check model config
-        let mc = provider.config();
-        println!(
-            "\nModel: hidden={}, layers={}, heads={}, kv_heads={}, head_dim={}, vocab={}",
-            mc.hidden_size,
-            mc.num_hidden_layers,
-            mc.num_attention_heads,
-            mc.num_key_value_heads,
-            mc.head_dim,
-            mc.vocab_size,
-        );
-        println!(
-            "GQA ratio: {}:1, heads_per_group={}",
-            mc.num_attention_heads / mc.num_key_value_heads,
-            mc.num_attention_heads / mc.num_key_value_heads,
-        );
     }
 }
