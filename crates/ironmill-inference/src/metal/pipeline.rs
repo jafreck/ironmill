@@ -64,21 +64,62 @@ impl MetalInference {
             })
             .collect();
 
-        // DEBUG: save logits to disk for comparison with HF
-        if std::env::var("IRONMILL_SAVE_LOGITS").is_ok() {
-            for &pos in &[3usize, 20, 40] {
-                if pos < n {
-                    let l = &all_logits[pos];
-                    let path = format!("/tmp/im_logits_pos{pos}.bin");
-                    let bytes: Vec<u8> = l.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    std::fs::write(&path, &bytes).ok();
-                    let target = if pos + 1 < n {
-                        token_ids[pos + 1] as usize
-                    } else {
-                        0
-                    };
+        #[cfg(debug_assertions)]
+        {
+            // DEBUG: save logits to disk for comparison with HF
+            if std::env::var("IRONMILL_SAVE_LOGITS").is_ok() {
+                for &pos in &[3usize, 20, 40] {
+                    if pos < n {
+                        let l = &all_logits[pos];
+                        let path = format!("/tmp/im_logits_pos{pos}.bin");
+                        let bytes: Vec<u8> = l.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        std::fs::write(&path, &bytes).ok();
+                        let target = if pos + 1 < n {
+                            token_ids[pos + 1] as usize
+                        } else {
+                            0
+                        };
+                        let max_val = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mean: f32 = l.iter().sum::<f32>() / l.len() as f32;
+                        let log_sum_exp: f64 = l
+                            .iter()
+                            .map(|&x| ((x - max_val) as f64).exp())
+                            .sum::<f64>()
+                            .ln()
+                            + max_val as f64;
+                        let ce = if target < l.len() {
+                            -(l[target] as f64 - log_sum_exp)
+                        } else {
+                            0.0
+                        };
+                        eprintln!(
+                            "  [SAVE] pos={pos} target={target} ce={ce:.4} max={max_val:.3} l[target]={:.3} mean={mean:.3} std={:.3} len={}",
+                            if target < l.len() { l[target] } else { 0.0 },
+                            {
+                                let m = mean;
+                                (l.iter().map(|&x| (x - m) * (x - m)).sum::<f32>() / l.len() as f32)
+                                    .sqrt()
+                            },
+                            l.len()
+                        );
+                    }
+                }
+            }
+
+            // DEBUG: print per-position CE
+            if std::env::var("IRONMILL_DEBUG_LOGITS").is_ok() {
+                let mut debug_total_ce = 0.0f64;
+                let mut debug_count = 0usize;
+                for t in 0..n.saturating_sub(1) {
+                    let l = &all_logits[t];
+                    let target = token_ids[t + 1] as usize;
                     let max_val = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mean: f32 = l.iter().sum::<f32>() / l.len() as f32;
+                    let argmax = l
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                     let log_sum_exp: f64 = l
                         .iter()
                         .map(|&x| ((x - max_val) as f64).exp())
@@ -90,62 +131,24 @@ impl MetalInference {
                     } else {
                         0.0
                     };
+                    debug_total_ce += ce;
+                    debug_count += 1;
+                    if t < 20 || t >= n - 3 {
+                        eprintln!(
+                            "  [im] pos={:>2} argmax={:>6} max={:>7.3} ce={:>7.3}",
+                            t, argmax, max_val, ce
+                        );
+                    }
+                }
+                if debug_count > 0 {
+                    let avg = debug_total_ce / debug_count as f64;
                     eprintln!(
-                        "  [SAVE] pos={pos} target={target} ce={ce:.4} max={max_val:.3} l[target]={:.3} mean={mean:.3} std={:.3} len={}",
-                        if target < l.len() { l[target] } else { 0.0 },
-                        {
-                            let m = mean;
-                            (l.iter().map(|&x| (x - m) * (x - m)).sum::<f32>() / l.len() as f32)
-                                .sqrt()
-                        },
-                        l.len()
+                        "  [im] DEBUG PPL from logits: {:.2} (avg CE={:.4}, n={})",
+                        avg.exp(),
+                        avg,
+                        debug_count
                     );
                 }
-            }
-        }
-
-        // DEBUG: print per-position CE
-        if std::env::var("IRONMILL_DEBUG_LOGITS").is_ok() {
-            let mut debug_total_ce = 0.0f64;
-            let mut debug_count = 0usize;
-            for t in 0..n.saturating_sub(1) {
-                let l = &all_logits[t];
-                let target = token_ids[t + 1] as usize;
-                let max_val = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let argmax = l
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                let log_sum_exp: f64 = l
-                    .iter()
-                    .map(|&x| ((x - max_val) as f64).exp())
-                    .sum::<f64>()
-                    .ln()
-                    + max_val as f64;
-                let ce = if target < l.len() {
-                    -(l[target] as f64 - log_sum_exp)
-                } else {
-                    0.0
-                };
-                debug_total_ce += ce;
-                debug_count += 1;
-                if t < 20 || t >= n - 3 {
-                    eprintln!(
-                        "  [im] pos={:>2} argmax={:>6} max={:>7.3} ce={:>7.3}",
-                        t, argmax, max_val, ce
-                    );
-                }
-            }
-            if debug_count > 0 {
-                let avg = debug_total_ce / debug_count as f64;
-                eprintln!(
-                    "  [im] DEBUG PPL from logits: {:.2} (avg CE={:.4}, n={})",
-                    avg.exp(),
-                    avg,
-                    debug_count
-                );
             }
         }
 
