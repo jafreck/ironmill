@@ -15,6 +15,7 @@ pub mod inference;
 pub(crate) mod kv_cache;
 pub mod mla;
 pub mod ops;
+pub(crate) mod pipeline;
 pub(crate) mod plan;
 pub(crate) mod ple;
 pub(crate) mod projection;
