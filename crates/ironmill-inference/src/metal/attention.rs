@@ -352,33 +352,102 @@ pub(crate) fn encode_kv_cache_and_attention(
                 );
             } // end is_anchor
 
-            // TurboQuant attention — batched over all tokens
-            // (always runs, reading from the anchor's KV buffer)
-            enc.set_pipeline(&pipelines.turboquant_attention);
-            enc.set_buffer(&bufs.q_proj, 0, 0);
-            enc.set_buffer(k_cache, 0, 1);
-            enc.set_buffer(v_cache, 0, 2);
-            enc.set_buffer(rotation_signs, 0, 3);
-            enc.set_buffer(&bufs.attn_out, 0, 4);
-            enc.set_bytes(&nh.to_le_bytes(), 5);
-            enc.set_bytes(&nkv.to_le_bytes(), 6);
-            enc.set_bytes(&hd.to_le_bytes(), 7);
-            enc.set_bytes(&max_seq.to_le_bytes(), 8);
-            enc.set_bytes(&attn_base_seq.to_le_bytes(), 9);
-            enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
-            enc.set_bytes(&n_bits.to_le_bytes(), 11);
-            enc.set_buffer(k_scale, 0, 12);
-            enc.set_buffer(v_scale, 0, 13);
-            enc.set_buffer(k_codebook, 0, 14);
-            enc.set_buffer(v_codebook, 0, 15);
-            enc.set_buffer(qjl_matrix, 0, 16);
-            enc.set_buffer(k_r_norms, 0, 17);
-            enc.set_bytes(&k_n_levels_val.to_le_bytes(), 18);
-            enc.set_bytes(&attn_scale.to_le_bytes(), 19);
-            enc.dispatch_threadgroups(
-                (nh as usize, token_count, 1),
-                (256_usize.max(hd as usize).min(1024), 1, 1),
-            );
+            // TurboQuant attention — FlashDecoding split when possible.
+            let total_seq = (attn_seq_pos + token_count) as u32;
+            let tq_tg_size = 256_usize.max(hd as usize).min(1024);
+
+            let use_tq_split = token_count == 1
+                && total_seq as usize >= 256
+                && bufs.flash_decode_partial_o.is_some();
+
+            if use_tq_split {
+                let po = bufs.flash_decode_partial_o.as_ref().unwrap();
+                let pm = bufs.flash_decode_partial_max.as_ref().unwrap();
+                let ps = bufs.flash_decode_partial_sum.as_ref().unwrap();
+                let mh = bufs.flash_decode_max_hint.as_ref().unwrap();
+                let max_splits = bufs.flash_decode_max_splits;
+
+                let num_splits = {
+                    let target = (gpu_max_threadgroups / (nh as usize).max(1)).max(2);
+                    let from_seq = (total_seq as usize).div_ceil(256);
+                    target.min(from_seq).min(max_splits).max(2)
+                };
+
+                // Single dispatch: grid (num_heads, token_count, num_splits).
+                enc.set_pipeline(&pipelines.turboquant_attention);
+                enc.set_buffer(&bufs.q_proj, 0, 0);
+                enc.set_buffer(k_cache, 0, 1);
+                enc.set_buffer(v_cache, 0, 2);
+                enc.set_buffer(rotation_signs, 0, 3);
+                enc.set_buffer(&bufs.attn_out, 0, 4); // unused in split mode
+                enc.set_bytes(&nh.to_le_bytes(), 5);
+                enc.set_bytes(&nkv.to_le_bytes(), 6);
+                enc.set_bytes(&hd.to_le_bytes(), 7);
+                enc.set_bytes(&max_seq.to_le_bytes(), 8);
+                enc.set_bytes(&attn_base_seq.to_le_bytes(), 9);
+                enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
+                enc.set_bytes(&n_bits.to_le_bytes(), 11);
+                enc.set_buffer(k_scale, 0, 12);
+                enc.set_buffer(v_scale, 0, 13);
+                enc.set_buffer(k_codebook, 0, 14);
+                enc.set_buffer(v_codebook, 0, 15);
+                enc.set_buffer(qjl_matrix, 0, 16);
+                enc.set_buffer(k_r_norms, 0, 17);
+                enc.set_bytes(&k_n_levels_val.to_le_bytes(), 18);
+                enc.set_bytes(&attn_scale.to_le_bytes(), 19);
+                enc.set_bytes(&(num_splits as u32).to_le_bytes(), 20);
+                enc.set_buffer(po, 0, 21);
+                enc.set_buffer(pm, 0, 22);
+                enc.set_buffer(ps, 0, 23);
+                enc.dispatch_threadgroups(
+                    (nh as usize, token_count, num_splits),
+                    (tq_tg_size, 1, 1),
+                );
+
+                // Barrier + reduce (reuses FP16 reduce kernel).
+                enc.memory_barrier_with_resources(&[po, pm, ps]);
+                ops::encode_flash_decode_reduce(
+                    enc,
+                    &pipelines.fused_sdpa_reduce,
+                    po,
+                    pm,
+                    ps,
+                    &bufs.attn_out,
+                    mh,
+                    nh,
+                    hd,
+                    num_splits as u32,
+                );
+            } else {
+                // Standard single-pass TQ attention (short context or prefill).
+                enc.set_pipeline(&pipelines.turboquant_attention);
+                enc.set_buffer(&bufs.q_proj, 0, 0);
+                enc.set_buffer(k_cache, 0, 1);
+                enc.set_buffer(v_cache, 0, 2);
+                enc.set_buffer(rotation_signs, 0, 3);
+                enc.set_buffer(&bufs.attn_out, 0, 4);
+                enc.set_bytes(&nh.to_le_bytes(), 5);
+                enc.set_bytes(&nkv.to_le_bytes(), 6);
+                enc.set_bytes(&hd.to_le_bytes(), 7);
+                enc.set_bytes(&max_seq.to_le_bytes(), 8);
+                enc.set_bytes(&attn_base_seq.to_le_bytes(), 9);
+                enc.set_bytes(&tq.deq_scale.to_le_bytes(), 10);
+                enc.set_bytes(&n_bits.to_le_bytes(), 11);
+                enc.set_buffer(k_scale, 0, 12);
+                enc.set_buffer(v_scale, 0, 13);
+                enc.set_buffer(k_codebook, 0, 14);
+                enc.set_buffer(v_codebook, 0, 15);
+                enc.set_buffer(qjl_matrix, 0, 16);
+                enc.set_buffer(k_r_norms, 0, 17);
+                enc.set_bytes(&k_n_levels_val.to_le_bytes(), 18);
+                enc.set_bytes(&attn_scale.to_le_bytes(), 19);
+                // Non-split mode: num_splits=0, grid Z=1.
+                enc.set_bytes(&0u32.to_le_bytes(), 20);
+                enc.set_buffer(&bufs.attn_out, 0, 21);
+                enc.set_buffer(&bufs.attn_out, 0, 22);
+                enc.set_buffer(&bufs.attn_out, 0, 23);
+                enc.dispatch_threadgroups((nh as usize, token_count, 1), (tq_tg_size, 1, 1));
+            }
         }
     } else {
         // FP16 KV cache path — scatter projections into cache on GPU.

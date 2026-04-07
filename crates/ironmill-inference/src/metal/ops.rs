@@ -1715,6 +1715,35 @@ pub fn encode_flash_decode(
     encoder.dispatch_threadgroups((num_q, 1, 1), (32, 1, 1));
 }
 
+/// Dispatch the FlashDecoding reduce kernel — shared by FP16 and TQ paths.
+///
+/// Combines partial (unnormalized) attention outputs from split kernels,
+/// applies softmax normalization, and writes the final half output.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_flash_decode_reduce(
+    encoder: &ComputeEncoder,
+    reduce_pipeline: &ComputePipeline,
+    partial_o: &MetalBuffer,
+    partial_max: &MetalBuffer,
+    partial_sum: &MetalBuffer,
+    output: &MetalBuffer,
+    max_hint: &MetalBuffer,
+    num_q_heads: u32,
+    head_dim: u32,
+    num_splits: u32,
+) {
+    encoder.set_pipeline(reduce_pipeline);
+    encoder.set_buffer(partial_o, 0, 0);
+    encoder.set_buffer(partial_max, 0, 1);
+    encoder.set_buffer(partial_sum, 0, 2);
+    encoder.set_buffer(output, 0, 3);
+    encoder.set_bytes(&num_q_heads.to_le_bytes(), 4);
+    encoder.set_bytes(&head_dim.to_le_bytes(), 5);
+    encoder.set_bytes(&num_splits.to_le_bytes(), 6);
+    encoder.set_buffer(max_hint, 0, 7);
+    encoder.dispatch_threadgroups((num_q_heads as usize, 1, 1), (32, 1, 1));
+}
+
 /// Encode KV scatter — copy projections into FP16 KV cache on GPU.
 pub fn encode_kv_scatter(
     encoder: &ComputeEncoder,

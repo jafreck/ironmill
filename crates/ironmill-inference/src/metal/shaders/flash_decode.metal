@@ -152,6 +152,8 @@ kernel void fused_sdpa_split(
 
 // ============================================================================
 // FlashDecoding++ reduce — combine partial results from splits into final output.
+// Handles both simd-striped partials (FP16 split kernel) and contiguous
+// partials (TQ split kernel) via the same contiguous access pattern.
 // Also writes back the global max for use as max_hint in the next decode step.
 //
 // Grid: (num_q_heads, 1, 1), Threadgroup: (32, 1, 1)
@@ -184,6 +186,7 @@ kernel void fused_sdpa_reduce(
     }
 
     // Combine: rescale each split's partial O and sum to the global max.
+    // Reads simd-striped layout: element d = [c * SIMD_SIZE + lane].
     float combined_o[DIM_VECS];
     for (uint c = 0; c < DIM_VECS; ++c)
         combined_o[c] = 0.0f;

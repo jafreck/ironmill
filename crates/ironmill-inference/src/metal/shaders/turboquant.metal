@@ -220,6 +220,13 @@ kernel void turboquant_attention(
     device const float* k_r_norms       [[buffer(17)]],
     constant uint& k_n_levels_val       [[buffer(18)]],
     constant float& attn_scale          [[buffer(19)]],
+    // FlashDecoding split parameters (buffer 20-24):
+    // When num_splits > 0, the grid Z dimension encodes split_id.
+    // Writes partial (unnormalized) results for the reduce kernel.
+    constant uint& num_splits           [[buffer(20)]],
+    device float* partial_o             [[buffer(21)]],
+    device float* partial_max           [[buffer(22)]],
+    device float* partial_sum           [[buffer(23)]],
     uint3 tid_3  [[thread_position_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tg_size_3 [[threads_per_threadgroup]],
@@ -312,9 +319,21 @@ kernel void turboquant_attention(
 
     uint bpp = bytes_per_pos(n_bits, head_dim);
 
-    // ---- Step 2: Tiled flash attention ----
-    for (uint tile_start = 0; tile_start < seq_len; tile_start += TILE) {
-        uint tile_end = min(tile_start + TILE, seq_len);
+    // FlashDecoding: compute KV range for this split.
+    bool is_split = (num_splits > 0);
+    uint split_id_val = tgid.z;  // grid Z = split_id (0 when not splitting)
+    uint kv_range_start = 0;
+    uint kv_range_end = seq_len;
+    if (is_split) {
+        uint chunk_size = (seq_len + num_splits - 1) / num_splits;
+        kv_range_start = split_id_val * chunk_size;
+        kv_range_end = min(kv_range_start + chunk_size, seq_len);
+        if (kv_range_start >= seq_len) return;
+    }
+
+    // ---- Step 2: Tiled flash attention (over split range) ----
+    for (uint tile_start = kv_range_start; tile_start < kv_range_end; tile_start += TILE) {
+        uint tile_end = min(tile_start + TILE, kv_range_end);
         uint actual_tile = tile_end - tile_start;
 
         // Cooperative load of K tile raw bytes into threadgroup SRAM
@@ -403,19 +422,42 @@ kernel void turboquant_attention(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // ---- Step 3: Normalize ----
-    float denom = max(softmax_sum[0], 1e-10f);
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        shared_output[d] /= denom;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (is_split) {
+        // FlashDecoding: un-rotate partial output BEFORE writing, so the
+        // universal reduce kernel can combine partials directly in un-rotated
+        // space. This works because Hadamard is an involution and the
+        // attention output (before normalization) is unnormalized ∑(w·v).
+        // After combining + normalizing in the reduce kernel, the result
+        // is already in the correct un-rotated space.
+        hadamard_rotate_inplace(shared_output, rotation_signs, head_dim, tid, tg_size);
 
-    // ---- Step 4: Un-rotate via butterfly (self-inverse) ----
-    hadamard_rotate_inplace(shared_output, rotation_signs, head_dim, tid, tg_size);
+        uint out_idx = split_id_val * num_heads + head_idx;
+        if (tid == 0) {
+            partial_max[out_idx] = softmax_max[0];
+            partial_sum[out_idx] = softmax_sum[0];
+        }
+        // Write contiguous — 256 threads cooperate to write head_dim elements.
+        // The reduce kernel reads with 32-lane simd_stride; rewrite in that
+        // layout so the same reduce kernel works for both FP16 and TQ.
+        uint o_base = out_idx * head_dim;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_o[o_base + d] = shared_output[d];
+        }
+    } else {
+        // ---- Step 3: Normalize ----
+        float denom = max(softmax_sum[0], 1e-10f);
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            shared_output[d] /= denom;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint out_base = (token_idx * num_heads + head_idx) * head_dim;
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        output[out_base + d] = half(shared_output[d]);
+        // ---- Step 4: Un-rotate via butterfly (self-inverse) ----
+        hadamard_rotate_inplace(shared_output, rotation_signs, head_dim, tid, tg_size);
+
+        uint out_base = (token_idx * num_heads + head_idx) * head_dim;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            output[out_base + d] = half(shared_output[d]);
+        }
     }
 }
 
