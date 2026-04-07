@@ -170,8 +170,13 @@ pub type LayerWeights = LoadedLayer<MetalBuffer, WeightBuffer>;
 
 /// All model weights loaded into Metal buffers, organized by layer.
 pub struct MetalWeights {
-    /// Embedding table [vocab_size × hidden_size] FP16.
+    /// Embedding table [vocab_size × hidden_size] FP16 (for FP16 models).
+    /// When INT4 quantized, this is used as a dequant scratch buffer and the
+    /// actual data lives in `embedding_quantized`.
     pub embedding: MetalBuffer,
+    /// INT4 quantized embedding table. When `Some`, the pipeline dispatches
+    /// `affine_embedding_lookup_int4` to dequant on gather.
+    pub embedding_quantized: Option<AffineQuantizedWeight>,
     /// Per-layer weights.
     pub layers: Vec<LayerWeights>,
     /// Final RMSNorm weight [hidden_size] FP16.
@@ -293,27 +298,81 @@ impl MetalWeights {
             }
         }
 
-        let lm_head = if config.tie_word_embeddings {
-            // Tied embedding: build lm_head directly from the already-loaded
-            // embedding buffer instead of loading the same tensor from disk
-            // again. This avoids a ~1.2 GB duplicate for large-vocab models.
-            let vocab = config.vocab_size;
-            let h = config.hidden_size;
-            let embed_bytes = vocab * h * 2; // FP16
-            let mut raw = vec![0u8; embed_bytes];
-            core.embedding
-                .read_bytes(&mut raw, 0)
-                .map_err(MetalError::Metal)?;
-            if let Some(packed_data) = pack_bytes_blocked(&raw, vocab, h) {
-                let packed_buf = device
-                    .create_buffer_with_data(&packed_data, StorageMode::Shared)
+        // Try loading embedding as INT4 quantized. The QuantizedWeightProvider
+        // wraps the original FP16 data with affine INT4 quantization metadata.
+        // We load the raw tensor to get row-major packed data for gather
+        // (not the blocked layout used for matmul).
+        let embed_tensor = provider
+            .tensor("model.embed_tokens.weight")
+            .map_err(|e| MetalError::WeightLoading(format!("embed_tokens: {e}")))?;
+        let (embedding, embedding_quantized) = match &embed_tensor.quant_info {
+            mil_rs::weights::QuantizationInfo::AffineDequantize {
+                scale,
+                zero_point,
+                scale_dtype,
+                zero_point_dtype,
+                axis,
+                bit_width,
+                group_size,
+                ..
+            } if *bit_width == 4 && !force_cpu_dequant => {
+                let (n, k) = dense_shape(&embed_tensor.shape);
+                let gs = group_size.unwrap_or(k);
+
+                // Keep row-major layout for embedding gather (not blocked).
+                let data_buf = device
+                    .create_buffer_with_data(&embed_tensor.data, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;
-                WeightBuffer::Dense {
-                    buf: None,
-                    packed: Some(packed_buf),
-                }
-            } else {
-                // Dimensions not packable — fall back to loading from provider.
+
+                let scales_f16 = super::dequant::convert_params_to_f16(
+                    scale,
+                    *scale_dtype,
+                    *axis,
+                    &embed_tensor.shape,
+                    gs,
+                )?;
+                let zeros_f16 = super::dequant::convert_params_to_f16(
+                    zero_point,
+                    *zero_point_dtype,
+                    *axis,
+                    &embed_tensor.shape,
+                    gs,
+                )?;
+
+                let scales_buf = device
+                    .create_buffer_with_data(&scales_f16, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+                let zeros_buf = device
+                    .create_buffer_with_data(&zeros_f16, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+
+                let h = config.hidden_size;
+                let scratch = device
+                    .create_buffer((h * 2).max(16), StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+                (
+                    scratch,
+                    Some(AffineQuantizedWeight {
+                        data: data_buf, // row-major for embedding gather
+                        scales: scales_buf,
+                        zeros: zeros_buf,
+                        group_size: gs as u32,
+                        bit_width: *bit_width,
+                        shape: (n, k),
+                        awq_scales: None,
+                    }),
+                )
+            }
+            _ => {
+                // FP16 or other format — dequant to dense.
+                (core.embedding, None)
+            }
+        };
+
+        let lm_head = if config.tie_word_embeddings {
+            if embedding_quantized.is_some() {
+                // Tied INT4 embedding: load lm_head as quantized weight
+                // (same tensor, different layout — packed for matmul).
                 load_weight_buffer(
                     device,
                     provider,
@@ -321,13 +380,40 @@ impl MetalWeights {
                     force_cpu_dequant,
                     true,
                 )?
+            } else {
+                // Tied FP16 embedding: build packed lm_head from embedding data.
+                let vocab = config.vocab_size;
+                let h = config.hidden_size;
+                let embed_bytes = vocab * h * 2;
+                let mut raw = vec![0u8; embed_bytes];
+                embedding
+                    .read_bytes(&mut raw, 0)
+                    .map_err(MetalError::Metal)?;
+                if let Some(packed_data) = pack_bytes_blocked(&raw, vocab, h) {
+                    let packed_buf = device
+                        .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                        .map_err(MetalError::Metal)?;
+                    WeightBuffer::Dense {
+                        buf: None,
+                        packed: Some(packed_buf),
+                    }
+                } else {
+                    load_weight_buffer(
+                        device,
+                        provider,
+                        "model.embed_tokens.weight",
+                        force_cpu_dequant,
+                        true,
+                    )?
+                }
             }
         } else {
             load_weight_buffer(device, provider, "lm_head.weight", force_cpu_dequant, true)?
         };
 
         Ok(Self {
-            embedding: core.embedding,
+            embedding,
+            embedding_quantized,
             layers: core.layers,
             final_norm: core.final_norm,
             lm_head,

@@ -187,6 +187,8 @@ pub struct MetalPipelines {
     pub quantize_input_q8: ComputePipeline,
     /// INT4×Q8 integer dot product matvec (decode path).
     pub affine_matvec_int4xq8: ComputePipeline,
+    /// INT4 affine embedding lookup with on-the-fly dequantization.
+    pub affine_embedding_lookup_int4: ComputePipeline,
     /// FlashDecoding split kernel: each threadgroup processes a KV slice.
     pub fused_sdpa_split: ComputePipeline,
     /// FlashDecoding reduce kernel: combines partial results across splits.
@@ -758,6 +760,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &affine_mm_lib
                         .get_function("affine_matvec_int4xq8")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            affine_embedding_lookup_int4: device
+                .create_compute_pipeline(
+                    &elem_lib
+                        .get_function("affine_embedding_lookup_int4")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,

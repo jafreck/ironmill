@@ -342,19 +342,60 @@ impl MetalInference {
         {
             let lw0 = &weights.layers[0];
             let pipelines = self.pipelines()?;
-            enc.set_pipeline(&pipelines.fused_embedding_norm);
-            enc.set_buffer(active_token_buf, 0, 0);
-            enc.set_buffer(&weights.embedding, 0, 1);
-            enc.set_buffer(&lw0.input_norm, 0, 2);
-            enc.set_buffer(&bufs.norm_out, 0, 3);
-            enc.set_buffer(&bufs.hidden_state, 0, 4);
-            enc.set_bytes(&(h as u32).to_le_bytes(), 5);
-            enc.set_bytes(&(token_count as u32).to_le_bytes(), 6);
-            enc.set_bytes(&(vocab as u32).to_le_bytes(), 7);
-            enc.set_bytes(&eps.to_le_bytes(), 8);
-            enc.set_bytes(&embed_scale.to_le_bytes(), 9);
-            let tg_size = h.min(1024);
-            enc.dispatch_threadgroups((token_count, 1, 1), (tg_size, 1, 1));
+
+            if let Some(ref aq) = weights.embedding_quantized {
+                // INT4 embedding: dequant-on-gather → hidden_state, then norm.
+                enc.set_pipeline(&pipelines.affine_embedding_lookup_int4);
+                enc.set_buffer(active_token_buf, 0, 0);
+                enc.set_buffer(&aq.data, 0, 1);
+                enc.set_buffer(&aq.scales, 0, 2);
+                enc.set_buffer(&aq.zeros, 0, 3);
+                enc.set_buffer(&bufs.hidden_state, 0, 4);
+                enc.set_bytes(&(h as u32).to_le_bytes(), 5);
+                enc.set_bytes(&(token_count as u32).to_le_bytes(), 6);
+                enc.set_bytes(&(vocab as u32).to_le_bytes(), 7);
+                enc.set_bytes(&aq.group_size.to_le_bytes(), 8);
+                let tg_x = h.min(256);
+                enc.dispatch_threads((h, token_count, 1), (tg_x, 1, 1));
+                enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
+
+                // Apply embed_scale in-place if needed (Gemma models only).
+                // TODO: add a scalar-immediate scale kernel for this path.
+                // For now, Qwen3.5 always has embed_scale=1.0.
+                debug_assert!(
+                    (embed_scale - 1.0).abs() < 1e-6,
+                    "INT4 embedding with embed_scale != 1.0 not yet supported"
+                );
+
+                // RMSNorm on dequanted embedding → norm_out.
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.hidden_state,
+                        weight: &lw0.input_norm,
+                        output: &bufs.norm_out,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+            } else {
+                // FP16 embedding: use fused embedding+norm kernel directly.
+                enc.set_pipeline(&pipelines.fused_embedding_norm);
+                enc.set_buffer(active_token_buf, 0, 0);
+                enc.set_buffer(&weights.embedding, 0, 1);
+                enc.set_buffer(&lw0.input_norm, 0, 2);
+                enc.set_buffer(&bufs.norm_out, 0, 3);
+                enc.set_buffer(&bufs.hidden_state, 0, 4);
+                enc.set_bytes(&(h as u32).to_le_bytes(), 5);
+                enc.set_bytes(&(token_count as u32).to_le_bytes(), 6);
+                enc.set_bytes(&(vocab as u32).to_le_bytes(), 7);
+                enc.set_bytes(&eps.to_le_bytes(), 8);
+                enc.set_bytes(&embed_scale.to_le_bytes(), 9);
+                let tg_size = h.min(1024);
+                enc.dispatch_threadgroups((token_count, 1, 1), (tg_size, 1, 1));
+            }
         }
         enc.memory_barrier_with_resources(&[&bufs.norm_out, &bufs.hidden_state]);
 

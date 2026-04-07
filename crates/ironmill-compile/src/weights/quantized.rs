@@ -277,10 +277,7 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
         let t = self.inner.tensor(name)?;
 
         // Only quantize FP32/FP16 2D weight matrices of sufficient size.
-        // Skip embedding tables — the inference engine has specialized
-        // embedding lookup kernels that only support Dense or D2Quant.
         let is_float = matches!(t.dtype, ScalarType::Float32 | ScalarType::Float16);
-        let is_embedding = name.contains("embed_tokens");
         // Skip q_proj when attn_output_gate is active: the weight contains
         // interleaved Q + gate rows that must be split while still in dense
         // FP16 format. The split halves are quantized separately afterward.
@@ -292,7 +289,7 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let is_gated_q_proj = has_output_gate && name.ends_with("q_proj.weight");
-        if !is_float || !is_quantizable(&t.shape) || is_embedding || is_gated_q_proj {
+        if !is_float || !is_quantizable(&t.shape) || is_gated_q_proj {
             return Ok(t);
         }
 
