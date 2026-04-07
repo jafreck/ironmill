@@ -142,9 +142,7 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
         let correction_logits = if accepted_indices.is_empty() {
             // All rejected — use the first position's target logits.
             target_logits_batch.first().cloned().ok_or_else(|| {
-                InferenceError::Decode(
-                    "speculative verification produced no target logits".into(),
-                )
+                InferenceError::Decode("speculative verification produced no target logits".into())
             })?
         } else {
             let last_accepted = *accepted_indices.last().unwrap();
@@ -178,7 +176,9 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
     /// Fallback: standard single-token decode.
     pub fn standard_step(&mut self, token: u32) -> Result<u32, InferenceError> {
         let mut logits = self.engine.decode_step(token)?;
-        let token = self.sampler.sample(&mut logits)
+        let token = self
+            .sampler
+            .sample(&mut logits)
             .map_err(|e| InferenceError::Sampling(e.to_string()))?;
         Ok(token)
     }

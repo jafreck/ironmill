@@ -50,7 +50,11 @@ impl RuntimeModel for CoremlRuntimeModel {
             if t.data.len() != expected_bytes {
                 return Err(crate::engine::InferenceError::runtime(format!(
                     "tensor '{}' buffer size mismatch: expected {} bytes for {:?} shape {:?}, got {}",
-                    t.name, expected_bytes, t.dtype, t.shape, t.data.len()
+                    t.name,
+                    expected_bytes,
+                    t.dtype,
+                    t.shape,
+                    t.data.len()
                 )));
             }
             let data_f32: Vec<f32> = match t.dtype {

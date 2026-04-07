@@ -415,7 +415,7 @@ mod fa2_prefill_tests {
             let total_seq = (seq_offset + token_count) as u32;
             super::super::ops::encode_fused_sdpa(
                 &enc,
-                &pipelines.fused_sdpa,
+                pipelines.fused_sdpa.as_ref().expect("fused_sdpa pipeline"),
                 &super::super::ops::FusedSdpaParams {
                     q: &q_buf,
                     k: &k_buf,

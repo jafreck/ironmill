@@ -52,17 +52,21 @@ impl MemoryEstimator {
         kv_quant: Option<KvQuantLevel>,
     ) -> u64 {
         let bytes_per_element: f64 = match kv_quant {
-            None | Some(KvQuantLevel::None) => 2.0,        // FP16
-            Some(KvQuantLevel::Int8) => 1.0,               // 8-bit
-            Some(KvQuantLevel::TurboInt4) => 0.5,          // 4-bit
-            Some(KvQuantLevel::TurboInt8) => 1.0,          // 8-bit turbo
+            None | Some(KvQuantLevel::None) => 2.0, // FP16
+            Some(KvQuantLevel::Int8) => 1.0,        // 8-bit
+            Some(KvQuantLevel::TurboInt4) => 0.5,   // 4-bit
+            Some(KvQuantLevel::TurboInt8) => 1.0,   // 8-bit turbo
         };
         // 2 (K+V) * layers * bytes_per_element * kv_heads * head_dim * seq_len * batch_size
         let kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
         let layers = config.num_hidden_layers;
-        (2.0 * layers as f64 * bytes_per_element * kv_heads as f64 * head_dim as f64
-            * seq_len as f64 * batch_size as f64) as u64
+        (2.0 * layers as f64
+            * bytes_per_element
+            * kv_heads as f64
+            * head_dim as f64
+            * seq_len as f64
+            * batch_size as f64) as u64
     }
 
     /// Estimate maximum sequence length that fits in the given memory budget.

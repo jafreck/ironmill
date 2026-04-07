@@ -360,8 +360,7 @@ fn apply_top_k(logits: &mut [f32], k: usize) {
     indexed.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     // Collect the indices of the top-k tokens to keep.
-    let keep: std::collections::HashSet<usize> =
-        indexed.iter().take(k).map(|&(i, _)| i).collect();
+    let keep: std::collections::HashSet<usize> = indexed.iter().take(k).map(|&(i, _)| i).collect();
 
     for (i, l) in logits.iter_mut().enumerate() {
         if !keep.contains(&i) {

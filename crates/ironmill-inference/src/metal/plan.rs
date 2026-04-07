@@ -83,7 +83,6 @@ impl LayerPlan {
             });
         let has_v_norm = g4.is_some();
 
-
         (0..mc.num_hidden_layers)
             .map(|i| {
                 let lw = &weights.layers[i];
@@ -113,9 +112,7 @@ impl LayerPlan {
                 // Attention kind
                 let attention = if is_gdn {
                     let gdn = gdn_cfg.ok_or_else(|| {
-                        MetalError::Config(format!(
-                            "layer {i} is GDN but no GDN config provided"
-                        ))
+                        MetalError::Config(format!("layer {i} is GDN but no GDN config provided"))
                     })?;
                     // Validate that this layer is listed in gdn_layer_indices.
                     let _gdn_index = gdn

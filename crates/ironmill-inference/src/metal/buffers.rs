@@ -60,6 +60,10 @@ pub(crate) struct IntermediateBuffers {
     pub(crate) flash_decode_partial_max: Option<MetalBuffer>,
     /// FlashDecoding partial softmax sum `[max_splits × num_q_heads]` float.
     pub(crate) flash_decode_partial_sum: Option<MetalBuffer>,
+    /// FlashDecoding max hint from previous decode step `[num_q_heads]` float.
+    /// Used as the initial softmax max estimate to avoid rescaling when the
+    /// running max hasn't changed between adjacent tokens.
+    pub(crate) flash_decode_max_hint: Option<MetalBuffer>,
     /// Maximum number of KV splits supported by current buffer allocation.
     pub(crate) flash_decode_max_splits: usize,
     /// Current maximum token capacity of these buffers.
@@ -255,6 +259,20 @@ impl IntermediateBuffers {
                         .create_buffer(size.max(16), StorageMode::Private)
                         .map_err(MetalError::Metal)?,
                 )
+            },
+            flash_decode_max_hint: {
+                // Initialized to -INFINITY; reduce kernel writes actual max.
+                let size = nh * 4; // float per Q head
+                let buf = device
+                    .create_buffer(size.max(16), StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+                // Initialize to -INFINITY so first step has no bias.
+                let neg_inf_bytes: Vec<u8> = (0..nh)
+                    .flat_map(|_| f32::NEG_INFINITY.to_le_bytes())
+                    .collect();
+                buf.write_bytes(&neg_inf_bytes, 0)
+                    .map_err(MetalError::Metal)?;
+                Some(buf)
             },
             flash_decode_max_splits: 256,
             capacity: max_tokens,

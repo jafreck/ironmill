@@ -99,10 +99,12 @@ impl TurboQuantCacheLayout {
         n_bits: u8,
         outlier: Option<&OutlierConfig>,
     ) -> Result<Self, CacheLayoutOverflow> {
-        let bytes_per_pos =
-            checked_mul(head_dim, n_bits as usize, "bytes_per_pos (head_dim * n_bits)")? / 8;
-        let cache_bytes =
-            checked_mul3(num_kv_heads, max_seq_len, bytes_per_pos, "cache_bytes")?;
+        let bytes_per_pos = checked_mul(
+            head_dim,
+            n_bits as usize,
+            "bytes_per_pos (head_dim * n_bits)",
+        )? / 8;
+        let cache_bytes = checked_mul3(num_kv_heads, max_seq_len, bytes_per_pos, "cache_bytes")?;
         let scale_count = checked_mul(num_kv_heads, max_seq_len, "scale_count")?;
         let qjl_signs_bytes =
             checked_mul3(num_kv_heads, max_seq_len, head_dim / 8, "qjl_signs_bytes")?;
@@ -110,8 +112,11 @@ impl TurboQuantCacheLayout {
         let outlier_layout = match outlier {
             Some(cfg) => {
                 let n_outlier = cfg.outlier_channels.len();
-                let d_o_padded =
-                    if n_outlier == 0 { 0 } else { n_outlier.next_power_of_two() };
+                let d_o_padded = if n_outlier == 0 {
+                    0
+                } else {
+                    n_outlier.next_power_of_two()
+                };
                 let d_n = head_dim.saturating_sub(n_outlier);
                 let d_n_padded = if d_n == 0 { 0 } else { d_n.next_power_of_two() };
                 Some(OutlierCacheLayout {

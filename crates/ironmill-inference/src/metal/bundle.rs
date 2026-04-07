@@ -145,12 +145,15 @@ impl WeightProvider for MetalBundleProvider {
 
                 let s_dtype = scale_dtype
                     .as_ref()
-                    .map(|s| str_to_scalar_type(s).map_err(|e| MilError::Validation(
-                        format!("invalid scale_dtype: {e}")
-                    )))
+                    .map(|s| {
+                        str_to_scalar_type(s)
+                            .map_err(|e| MilError::Validation(format!("invalid scale_dtype: {e}")))
+                    })
                     .transpose()?
                     .unwrap_or_else(|| {
-                        eprintln!("warning: scale_dtype not specified in bundle, defaulting to Float16");
+                        eprintln!(
+                            "warning: scale_dtype not specified in bundle, defaulting to Float16"
+                        );
                         ScalarType::Float16
                     });
                 let zp_dtype = zero_point_dtype

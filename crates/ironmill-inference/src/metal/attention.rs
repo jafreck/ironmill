@@ -465,25 +465,33 @@ pub(crate) fn encode_kv_cache_and_attention(
                 scale: attn_scale,
                 max_seq_len: max_seq,
             };
-            if let (Some(po), Some(pm), Some(ps)) = (
+            if let (Some(po), Some(pm), Some(ps), Some(mh)) = (
                 bufs.flash_decode_partial_o.as_ref(),
                 bufs.flash_decode_partial_max.as_ref(),
                 bufs.flash_decode_partial_sum.as_ref(),
+                bufs.flash_decode_max_hint.as_ref(),
             ) {
                 ops::encode_flash_decode(
                     enc,
                     &pipelines.fused_sdpa_split,
                     &pipelines.fused_sdpa_reduce,
-                    &pipelines.fused_sdpa,
+                    pipelines.fused_sdpa.as_ref(),
                     &sdpa_params,
                     po,
                     pm,
                     ps,
+                    mh,
                     bufs.flash_decode_max_splits,
                     gpu_max_threadgroups,
                 );
+            } else if let Some(ref sdpa) = pipelines.fused_sdpa {
+                ops::encode_fused_sdpa(enc, sdpa, &sdpa_params, None);
             } else {
-                ops::encode_fused_sdpa(enc, &pipelines.fused_sdpa, &sdpa_params, None);
+                // Neither FlashDecoding buffers nor fused_sdpa available.
+                // This shouldn't happen in practice — buffers are always allocated.
+                return Err(InferenceError::runtime(
+                    "no attention kernel available: FlashDecoding buffers and fused_sdpa both unavailable",
+                ));
             }
         }
     }

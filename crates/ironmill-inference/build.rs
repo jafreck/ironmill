@@ -85,7 +85,7 @@ fn main() {
 
         // Fused SDPA — reduce tile sizes for large head dims to fit in 32KB threadgroup memory.
         let sdpa_tile_defines = if hd >= 256 {
-            "#define SDPA_BR 16\n#define SDPA_BC 16\n".to_string()
+            "#define SDPA_BR 4\n#define SDPA_BC 4\n".to_string()
         } else {
             String::new()
         };
@@ -94,6 +94,22 @@ fn main() {
         compile_shader(
             &sdpa_tmp,
             &out_dir.join(format!("fused_sdpa_hd{hd}.metallib")),
+            &[],
+        );
+
+        // FlashDecoding split+reduce (separate metallib to avoid inflating
+        // the original fused_sdpa kernel's threadgroup memory budget).
+        let fd_src = std::fs::read_to_string(shader_dir.join("flash_decode.metal")).unwrap();
+        let fd_tile_defines = if hd >= 256 {
+            "#define SPLIT_BC 8\n".to_string()
+        } else {
+            String::new()
+        };
+        let fd_tmp = out_dir.join(format!("_fd_hd{hd}.metal"));
+        std::fs::write(&fd_tmp, format!("{header}{fd_tile_defines}{fd_src}")).unwrap();
+        compile_shader(
+            &fd_tmp,
+            &out_dir.join(format!("flash_decode_hd{hd}.metallib")),
             &[],
         );
 

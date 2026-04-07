@@ -70,9 +70,7 @@ impl ConvertCtx {
     }
 
     fn convert_schema(&mut self, schema: &Value) -> Result<Element, GrammarError> {
-        let type_str = schema
-            .get("type")
-            .and_then(Value::as_str);
+        let type_str = schema.get("type").and_then(Value::as_str);
 
         match type_str {
             Some("string") => Ok(self.convert_string()),
@@ -161,13 +159,19 @@ impl ConvertCtx {
 
         // Warn about unsupported constraints.
         if schema.get("uniqueItems").is_some() {
-            eprintln!("warning: JSON Schema 'uniqueItems' constraint is not supported and will be ignored");
+            eprintln!(
+                "warning: JSON Schema 'uniqueItems' constraint is not supported and will be ignored"
+            );
         }
         if schema.get("minProperties").is_some() {
-            eprintln!("warning: JSON Schema 'minProperties' constraint is not supported and will be ignored");
+            eprintln!(
+                "warning: JSON Schema 'minProperties' constraint is not supported and will be ignored"
+            );
         }
         if schema.get("maxProperties").is_some() {
-            eprintln!("warning: JSON Schema 'maxProperties' constraint is not supported and will be ignored");
+            eprintln!(
+                "warning: JSON Schema 'maxProperties' constraint is not supported and will be ignored"
+            );
         }
 
         if properties.is_empty() {

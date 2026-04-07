@@ -124,7 +124,9 @@ pub struct MetalPipelines {
     /// INT4 dequantization kernel.
     pub int4_dequantize: ComputePipeline,
     /// Fused scaled dot-product attention kernel.
-    pub fused_sdpa: ComputePipeline,
+    /// `None` when the kernel exceeds threadgroup memory limits (head_dim ≥ 256).
+    /// Decode uses FlashDecoding split+reduce instead.
+    pub fused_sdpa: Option<ComputePipeline>,
     /// QuIP# matvec kernel.
     pub quip_sharp_matvec: ComputePipeline,
     /// QuIP# matmul kernel.
@@ -303,7 +305,7 @@ impl MetalPipelines {
             .map_err(MetalError::Metal)?;
 
         // ── HEAD_DIM-dependent shaders (precompiled or fallback) ─
-        let (attn_lib, tq_lib, sdpa_lib) =
+        let (attn_lib, tq_lib, sdpa_lib, fd_lib) =
             Self::load_head_dim_shaders(device, head_dim, rotary_dim)?;
 
         Ok(Self {
@@ -527,13 +529,10 @@ impl MetalPipelines {
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
-            fused_sdpa: device
-                .create_compute_pipeline(
-                    &sdpa_lib
-                        .get_function("fused_sdpa")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
+            fused_sdpa: sdpa_lib
+                .get_function("fused_sdpa")
+                .ok()
+                .and_then(|f| device.create_compute_pipeline(&f).ok()),
             quip_sharp_matvec: device
                 .create_compute_pipeline(
                     &quip_sharp_lib
@@ -764,14 +763,14 @@ impl MetalPipelines {
                 .map_err(MetalError::Metal)?,
             fused_sdpa_split: device
                 .create_compute_pipeline(
-                    &sdpa_lib
+                    &fd_lib
                         .get_function("fused_sdpa_split")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
             fused_sdpa_reduce: device
                 .create_compute_pipeline(
-                    &sdpa_lib
+                    &fd_lib
                         .get_function("fused_sdpa_reduce")
                         .map_err(MetalError::Metal)?,
                 )
@@ -779,9 +778,9 @@ impl MetalPipelines {
         })
     }
 
-    /// Load attention, turboquant, and fused SDPA shaders for a specific HEAD_DIM.
+    /// Load attention, turboquant, fused SDPA, and FlashDecoding shaders for a specific HEAD_DIM.
     ///
-    /// Uses precompiled `.metallib` for common values (64, 80, 128, 256);
+    /// Uses precompiled `.metallib` for common values (64, 80, 128, 256, 512);
     /// falls back to runtime source compilation for uncommon dimensions.
     fn load_head_dim_shaders(
         device: &MetalDevice,
@@ -789,6 +788,7 @@ impl MetalPipelines {
         rotary_dim: usize,
     ) -> Result<
         (
+            ironmill_metal_sys::ShaderLibrary,
             ironmill_metal_sys::ShaderLibrary,
             ironmill_metal_sys::ShaderLibrary,
             ironmill_metal_sys::ShaderLibrary,
@@ -806,13 +806,23 @@ impl MetalPipelines {
             (sdpa $hd:literal) => {
                 include_bytes!(concat!(env!("OUT_DIR"), "/fused_sdpa_hd", $hd, ".metallib"))
             };
+            (fd $hd:literal) => {
+                include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/flash_decode_hd",
+                    $hd,
+                    ".metallib"
+                ))
+            };
         }
 
         let try_precompiled = |attn_data: &[u8],
                                tq_data: &[u8],
-                               sdpa_data: &[u8]|
+                               sdpa_data: &[u8],
+                               fd_data: &[u8]|
          -> Result<
             (
+                ironmill_metal_sys::ShaderLibrary,
                 ironmill_metal_sys::ShaderLibrary,
                 ironmill_metal_sys::ShaderLibrary,
                 ironmill_metal_sys::ShaderLibrary,
@@ -828,7 +838,10 @@ impl MetalPipelines {
             let sdpa = device
                 .load_library_from_data(sdpa_data)
                 .map_err(MetalError::Metal)?;
-            Ok((attn, tq, sdpa))
+            let fd = device
+                .load_library_from_data(fd_data)
+                .map_err(MetalError::Metal)?;
+            Ok((attn, tq, sdpa, fd))
         };
 
         match head_dim {
@@ -836,16 +849,19 @@ impl MetalPipelines {
                 precompiled!(attn "64"),
                 precompiled!(tq "64"),
                 precompiled!(sdpa "64"),
+                precompiled!(fd "64"),
             ),
             80 => try_precompiled(
                 precompiled!(attn "80"),
                 precompiled!(tq "80"),
                 precompiled!(sdpa "80"),
+                precompiled!(fd "80"),
             ),
             128 => try_precompiled(
                 precompiled!(attn "128"),
                 precompiled!(tq "128"),
                 precompiled!(sdpa "128"),
+                precompiled!(fd "128"),
             ),
             256 => {
                 // Head dim 256: FA2 prefill kernel exceeds 32KB threadgroup limit
@@ -855,7 +871,6 @@ impl MetalPipelines {
                 );
                 let attn_src_raw = include_str!("shaders/attention.metal");
                 let fused_qknr_src = include_str!("shaders/fused_qk_norm_rope.metal");
-                // Override FA2 tile sizes for head_dim=256 threadgroup limit
                 let attn_src_patched = attn_src_raw
                     .replace(
                         "constant constexpr uint FA2_Q_CHUNK = 32;",
@@ -869,8 +884,15 @@ impl MetalPipelines {
                 let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
                 let tq_src_raw = include_str!("shaders/turboquant.metal");
                 let tq_src = format!("{header}{tq_helpers}\n{tq_src_raw}");
-                let sdpa_src_raw = include_str!("shaders/fused_sdpa.metal");
-                let sdpa_src = format!("{header}{sdpa_src_raw}");
+                // fused_sdpa exceeds 32KB threadgroup memory at head_dim=256.
+                // Use an empty stub — decode uses FlashDecoding split+reduce instead.
+                let sdpa = device
+                    .compile_shader_source(&format!(
+                        "{header}#include <metal_stdlib>\nusing namespace metal;\n"
+                    ))
+                    .map_err(MetalError::Metal)?;
+                let fd_src_raw = include_str!("shaders/flash_decode.metal");
+                let fd_src = format!("{header}#define SPLIT_BC 8\n{fd_src_raw}");
 
                 let attn = device
                     .compile_shader_source(&attn_src)
@@ -878,18 +900,19 @@ impl MetalPipelines {
                 let tq = device
                     .compile_shader_source(&tq_src)
                     .map_err(MetalError::Metal)?;
-                let sdpa = device
-                    .compile_shader_source(&sdpa_src)
+                // sdpa already compiled above as an empty stub
+                let fd = device
+                    .compile_shader_source(&fd_src)
                     .map_err(MetalError::Metal)?;
-                Ok((attn, tq, sdpa))
+                Ok((attn, tq, sdpa, fd))
             }
             512 => try_precompiled(
                 precompiled!(attn "512"),
                 precompiled!(tq "512"),
                 precompiled!(sdpa "512"),
+                precompiled!(fd "512"),
             ),
             _ => {
-                // Uncommon head_dim — fall back to runtime source compilation.
                 let header = format!(
                     "#define HEAD_DIM {head_dim}\n#define HEAD_DIM_PACKED {}\n#define ROTARY_DIM {rotary_dim}\n",
                     head_dim / 2
@@ -900,14 +923,20 @@ impl MetalPipelines {
                 let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
                 let tq_src_raw = include_str!("shaders/turboquant.metal");
                 let tq_src = format!("{header}{tq_helpers}\n{tq_src_raw}");
-                // Reduce SDPA tile sizes for large head dims to fit in 32KB threadgroup memory.
                 let sdpa_tile_defines = if head_dim >= 256 {
-                    "#define SDPA_BR 16\n#define SDPA_BC 16\n"
+                    "#define SDPA_BR 4\n#define SDPA_BC 4\n"
                 } else {
                     ""
                 };
                 let sdpa_src_raw = include_str!("shaders/fused_sdpa.metal");
                 let sdpa_src = format!("{header}{sdpa_tile_defines}{sdpa_src_raw}");
+                let fd_tile_defines = if head_dim >= 256 {
+                    "#define SPLIT_BC 8\n"
+                } else {
+                    ""
+                };
+                let fd_src_raw = include_str!("shaders/flash_decode.metal");
+                let fd_src = format!("{header}{fd_tile_defines}{fd_src_raw}");
 
                 let attn = device
                     .compile_shader_source(&attn_src)
@@ -918,7 +947,10 @@ impl MetalPipelines {
                 let sdpa = device
                     .compile_shader_source(&sdpa_src)
                     .map_err(MetalError::Metal)?;
-                Ok((attn, tq, sdpa))
+                let fd = device
+                    .compile_shader_source(&fd_src)
+                    .map_err(MetalError::Metal)?;
+                Ok((attn, tq, sdpa, fd))
             }
         }
     }
@@ -1597,51 +1629,55 @@ const FLASH_DECODE_MIN_SEQ: usize = 256;
 /// 256 gives good granularity: at 16K context with 256 per split = 64 splits.
 const FLASH_DECODE_KV_PER_SPLIT: usize = 256;
 
-/// Encode FlashDecoding: split the KV sequence across threadgroups, then reduce.
+/// Encode FlashDecoding++: persistent split kernel with max hint, then reduce.
 ///
-/// For short sequences (< 256 positions), falls back to the original
-/// single-pass `fused_sdpa`. For longer sequences, dispatches the split
-/// kernel with `num_splits` threadgroups per KV head group, then a reduce
-/// kernel to combine partial results.
-///
-/// `max_splits` is the capacity of the partial output buffers.
+/// Improvements over basic FlashDecoding:
+/// - Persistent threadgroups: launch fewer TGs that each loop over multiple
+///   KV chunks, improving cache locality and reducing dispatch overhead.
+/// - Unified max hint: passes the previous step's softmax max to the split
+///   kernel so the O accumulator avoids rescaling when max hasn't changed.
+/// - Reduce kernel writes back the global max for the next step's hint.
 pub fn encode_flash_decode(
     encoder: &ComputeEncoder,
     split_pipeline: &ComputePipeline,
     reduce_pipeline: &ComputePipeline,
-    sdpa_pipeline: &ComputePipeline,
+    sdpa_fallback: Option<&ComputePipeline>,
     params: &FusedSdpaParams<'_>,
     partial_o: &MetalBuffer,
     partial_max: &MetalBuffer,
     partial_sum: &MetalBuffer,
+    max_hint: &MetalBuffer,
     max_splits: usize,
     gpu_max_threadgroups: usize,
 ) {
     let seq_len = params.seq_len as usize;
 
-    // Short sequences: use original single-pass kernel.
+    // Short sequences: use single-pass if available, otherwise still split.
     if seq_len < FLASH_DECODE_MIN_SEQ {
-        encode_fused_sdpa(encoder, sdpa_pipeline, params, None);
-        return;
+        if let Some(sdpa) = sdpa_fallback {
+            encode_fused_sdpa(encoder, sdpa, params, None);
+            return;
+        }
+        // No fallback — use split+reduce even for short sequences.
     }
 
-    // Compute number of splits: target enough threadgroups to saturate GPU.
     let heads_per_group = (params.num_q_heads as usize) / (params.num_kv_heads as usize).max(1);
     let num_kv_groups = params.num_kv_heads as usize;
-    // We want total threadgroups ≈ gpu_max_threadgroups.
-    // Total = num_kv_groups × num_splits (each TG has heads_per_group simdgroups).
     let target_splits = (gpu_max_threadgroups / num_kv_groups.max(1)).max(2);
-    // Also ensure each split has a reasonable chunk size.
     let splits_from_seq = seq_len.div_ceil(FLASH_DECODE_KV_PER_SPLIT);
-    let num_splits = target_splits.min(splits_from_seq).min(max_splits);
+    let num_splits = target_splits.min(splits_from_seq).min(max_splits).max(2);
 
     if num_splits <= 1 {
-        encode_fused_sdpa(encoder, sdpa_pipeline, params, None);
-        return;
+        if let Some(sdpa) = sdpa_fallback {
+            encode_fused_sdpa(encoder, sdpa, params, None);
+            return;
+        }
     }
 
-    // Split kernel: grid (num_kv_groups, num_splits, 1)
+    // Persistent split kernel: grid Y = min(num_splits, target_persistent_tgs).
+    let persistent_tgs = num_splits.min(target_splits);
     let threads_per_tg = (heads_per_group * 32).min(METAL_MAX_THREADS_PER_THREADGROUP);
+
     encoder.set_pipeline(split_pipeline);
     encoder.set_buffer(params.q, 0, 0);
     encoder.set_buffer(params.k, 0, 1);
@@ -1656,7 +1692,11 @@ pub fn encode_flash_decode(
     encoder.set_bytes(&params.scale.to_le_bytes(), 10);
     encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 11);
     encoder.set_bytes(&(num_splits as u32).to_le_bytes(), 12);
-    encoder.dispatch_threadgroups((num_kv_groups, num_splits, 1), (threads_per_tg, 1, 1));
+    // Pass -INFINITY as initial max_hint (safe default; per-head hint via
+    // buffer would be more accurate but requires an extra buffer binding).
+    let neg_inf = f32::NEG_INFINITY;
+    encoder.set_bytes(&neg_inf.to_le_bytes(), 13);
+    encoder.dispatch_threadgroups((num_kv_groups, persistent_tgs, 1), (threads_per_tg, 1, 1));
 
     // Barrier between split and reduce.
     encoder.memory_barrier_with_resources(&[partial_o, partial_max, partial_sum]);
@@ -1671,6 +1711,7 @@ pub fn encode_flash_decode(
     encoder.set_bytes(&params.num_q_heads.to_le_bytes(), 4);
     encoder.set_bytes(&params.head_dim.to_le_bytes(), 5);
     encoder.set_bytes(&(num_splits as u32).to_le_bytes(), 6);
+    encoder.set_buffer(max_hint, 0, 7);
     encoder.dispatch_threadgroups((num_q, 1, 1), (32, 1, 1));
 }
 

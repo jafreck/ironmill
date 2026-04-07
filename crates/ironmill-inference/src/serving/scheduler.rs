@@ -105,7 +105,9 @@ impl BatchScheduler {
     /// transitions `Prefilling → Decoding`. Grows the KV allocation if
     /// capacity is reached. Returns an error if the sequence ID is unknown.
     pub fn advance(&mut self, id: SequenceId, new_token: u32) -> Result<(), InferenceError> {
-        let seq = self.sequences.get_mut(&id)
+        let seq = self
+            .sequences
+            .get_mut(&id)
             .ok_or(InferenceError::SequenceNotFound(id))?;
         seq.tokens.push(new_token);
 
@@ -114,7 +116,9 @@ impl BatchScheduler {
         }
 
         // Check capacity and grow if needed before recording usage.
-        let alloc = self.pool.get(id)
+        let alloc = self
+            .pool
+            .get(id)
             .ok_or(InferenceError::SequenceNotFound(id))?;
         let at_capacity = alloc.used >= alloc.capacity;
 
@@ -131,7 +135,9 @@ impl BatchScheduler {
     ///
     /// Returns an error if the sequence ID is not found.
     pub fn complete_sequence(&mut self, id: SequenceId) -> Result<(), InferenceError> {
-        let seq = self.sequences.get_mut(&id)
+        let seq = self
+            .sequences
+            .get_mut(&id)
             .ok_or(InferenceError::SequenceNotFound(id))?;
         seq.status = SequenceStatus::Completed;
         Ok(())

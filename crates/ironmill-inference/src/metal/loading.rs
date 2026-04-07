@@ -62,7 +62,9 @@ impl MetalInference {
                     .and_then(|v| v.as_f64())
             })
             .unwrap_or_else(|| {
-                eprintln!("partial_rotary_factor not specified, defaulting to 1.0 (full-head RoPE)");
+                eprintln!(
+                    "partial_rotary_factor not specified, defaulting to 1.0 (full-head RoPE)"
+                );
                 1.0
             });
         let rotary_dim = (mc.head_dim as f64 * partial_rotary_factor) as usize;
@@ -112,7 +114,8 @@ impl MetalInference {
                         || global_cfg.theta != mc.rope_theta
                         || global_cfg.partial_rotary_factor != 1.0
                     {
-                        let global_rotary_dim = (global_hd as f64 * global_cfg.partial_rotary_factor) as usize;
+                        let global_rotary_dim =
+                            (global_hd as f64 * global_cfg.partial_rotary_factor) as usize;
                         let (gc, gs) = build_rope_cache(
                             &self.device,
                             global_hd,
@@ -430,7 +433,9 @@ impl MetalInference {
                     .and_then(|v| v.as_f64())
             })
             .unwrap_or_else(|| {
-                eprintln!("partial_rotary_factor not specified, defaulting to 1.0 (full-head RoPE)");
+                eprintln!(
+                    "partial_rotary_factor not specified, defaulting to 1.0 (full-head RoPE)"
+                );
                 1.0
             });
         let rotary_dim = (mc.head_dim as f64 * partial_rotary_factor) as usize;
@@ -469,7 +474,8 @@ impl MetalInference {
                         || global_cfg.theta != mc.rope_theta
                         || global_cfg.partial_rotary_factor != 1.0
                     {
-                        let global_rotary_dim = (global_hd as f64 * global_cfg.partial_rotary_factor) as usize;
+                        let global_rotary_dim =
+                            (global_hd as f64 * global_cfg.partial_rotary_factor) as usize;
                         let (gc, gs) = build_rope_cache(
                             &self.device,
                             global_hd,

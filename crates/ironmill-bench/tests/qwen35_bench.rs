@@ -314,14 +314,20 @@ mod qwen35_bench {
 
         // ── Config 3: D2Quant 3-bit weights, FP16 KV cache ──
         let (mut engine_d2q_fp16, d2q_fp16_gpu, _) = load_engine(fp16_config());
-        engine_d2q_fp16.weights_mut().unwrap().apply_d2quant_simulation(3);
+        engine_d2q_fp16
+            .weights_mut()
+            .unwrap()
+            .apply_d2quant_simulation(3);
         let (d2q_fp16_ms, d2q_fp16_tps) = bench_decode(&mut engine_d2q_fp16, decode_tokens);
         let d2q_fp16_ppl = eval_perplexity(&mut engine_d2q_fp16, &sequences, ppl_seqs, 512);
         drop(engine_d2q_fp16);
 
         // ── Config 4: D2Quant 3-bit weights + TurboQuant INT4 KV cache ──
         let (mut engine_d2q_tq, d2q_tq_gpu, _) = load_engine(tq_int4_config());
-        engine_d2q_tq.weights_mut().unwrap().apply_d2quant_simulation(3);
+        engine_d2q_tq
+            .weights_mut()
+            .unwrap()
+            .apply_d2quant_simulation(3);
         let (d2q_tq_ms, d2q_tq_tps) = bench_decode(&mut engine_d2q_tq, decode_tokens);
         let d2q_tq_ppl = eval_perplexity(&mut engine_d2q_tq, &sequences, ppl_seqs, 512);
         drop(engine_d2q_tq);
