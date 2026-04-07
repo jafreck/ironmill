@@ -45,10 +45,12 @@ impl KvPool {
     /// Allocate a contiguous region for the given sequence.
     ///
     /// Uses first-fit strategy over the sorted free list.
+    /// `initial_used` sets the number of slots already occupied (e.g. prompt length).
     pub fn allocate(
         &mut self,
         id: SequenceId,
         initial_capacity: usize,
+        initial_used: usize,
     ) -> Result<&KvAllocation, InferenceError> {
         if initial_capacity == 0 {
             return Err(InferenceError::Allocation(
@@ -58,6 +60,11 @@ impl KvPool {
         if self.allocations.contains_key(&id) {
             return Err(InferenceError::Allocation(format!(
                 "sequence {id} already has an allocation"
+            )));
+        }
+        if initial_used > initial_capacity {
+            return Err(InferenceError::Allocation(format!(
+                "initial_used ({initial_used}) exceeds initial_capacity ({initial_capacity})"
             )));
         }
 
@@ -84,7 +91,7 @@ impl KvPool {
             KvAllocation {
                 offset,
                 capacity: initial_capacity,
-                used: 0,
+                used: initial_used,
             },
         );
 
@@ -248,7 +255,7 @@ mod tests {
     #[test]
     fn serving_pool_allocate_basic() {
         let mut pool = KvPool::new(1024);
-        let alloc = pool.allocate(1, 128).unwrap();
+        let alloc = pool.allocate(1, 128, 0).unwrap();
         assert_eq!(alloc.offset, 0);
         assert_eq!(alloc.capacity, 128);
         assert_eq!(alloc.used, 0);
@@ -258,8 +265,8 @@ mod tests {
     #[test]
     fn serving_pool_allocate_multiple() {
         let mut pool = KvPool::new(1024);
-        pool.allocate(1, 256).unwrap();
-        let alloc2 = pool.allocate(2, 256).unwrap();
+        pool.allocate(1, 256, 0).unwrap();
+        let alloc2 = pool.allocate(2, 256, 0).unwrap();
         assert_eq!(alloc2.offset, 256);
         assert_eq!(pool.free_space(), 512);
         assert_eq!(pool.allocation_count(), 2);
@@ -268,34 +275,34 @@ mod tests {
     #[test]
     fn serving_pool_allocate_duplicate_id_fails() {
         let mut pool = KvPool::new(1024);
-        pool.allocate(1, 128).unwrap();
-        assert!(pool.allocate(1, 128).is_err());
+        pool.allocate(1, 128, 0).unwrap();
+        assert!(pool.allocate(1, 128, 0).is_err());
     }
 
     #[test]
     fn serving_pool_allocate_zero_capacity_fails() {
         let mut pool = KvPool::new(1024);
-        assert!(pool.allocate(1, 0).is_err());
+        assert!(pool.allocate(1, 0, 0).is_err());
     }
 
     #[test]
     fn serving_pool_allocate_too_large_fails() {
         let mut pool = KvPool::new(256);
-        assert!(pool.allocate(1, 512).is_err());
+        assert!(pool.allocate(1, 512, 0).is_err());
     }
 
     #[test]
     fn serving_pool_free_reclaims_memory() {
         let mut pool = KvPool::new(512);
-        pool.allocate(1, 256).unwrap();
-        pool.allocate(2, 256).unwrap();
+        pool.allocate(1, 256, 0).unwrap();
+        pool.allocate(2, 256, 0).unwrap();
         assert_eq!(pool.free_space(), 0);
 
         pool.free(1).unwrap();
         assert_eq!(pool.free_space(), 256);
 
         // Can re-use the freed space.
-        let alloc = pool.allocate(3, 128).unwrap();
+        let alloc = pool.allocate(3, 128, 0).unwrap();
         assert_eq!(alloc.offset, 0);
         assert_eq!(pool.free_space(), 128);
     }
@@ -309,9 +316,9 @@ mod tests {
     #[test]
     fn serving_pool_free_coalesces_adjacent() {
         let mut pool = KvPool::new(512);
-        pool.allocate(1, 128).unwrap(); // [0..128)
-        pool.allocate(2, 128).unwrap(); // [128..256)
-        pool.allocate(3, 128).unwrap(); // [256..384)
+        pool.allocate(1, 128, 0).unwrap(); // [0..128)
+        pool.allocate(2, 128, 0).unwrap(); // [128..256)
+        pool.allocate(3, 128, 0).unwrap(); // [256..384)
 
         // Free the middle, then the first — should coalesce into one region.
         pool.free(2).unwrap();
@@ -319,7 +326,7 @@ mod tests {
         assert_eq!(pool.free_space(), 384); // 512 - 128 (only seq 3 remains)
 
         // Should be able to allocate a single 256-slot region at offset 0.
-        let alloc = pool.allocate(4, 256).unwrap();
+        let alloc = pool.allocate(4, 256, 0).unwrap();
         assert_eq!(alloc.offset, 0);
         assert_eq!(alloc.capacity, 256);
     }
@@ -327,7 +334,7 @@ mod tests {
     #[test]
     fn serving_pool_grow_in_place() {
         let mut pool = KvPool::new(1024);
-        pool.allocate(1, 128).unwrap();
+        pool.allocate(1, 128, 0).unwrap();
         assert_eq!(pool.get(1).unwrap().capacity, 128);
 
         pool.grow(1).unwrap();
@@ -339,8 +346,8 @@ mod tests {
     #[test]
     fn serving_pool_grow_with_relocation() {
         let mut pool = KvPool::new(512);
-        pool.allocate(1, 128).unwrap(); // [0..128)
-        pool.allocate(2, 128).unwrap(); // [128..256)
+        pool.allocate(1, 128, 0).unwrap(); // [0..128)
+        pool.allocate(2, 128, 0).unwrap(); // [128..256)
 
         // Growing seq 1 can't extend in-place (seq 2 is adjacent).
         // It should relocate to [256..512).
@@ -359,9 +366,9 @@ mod tests {
     #[test]
     fn serving_pool_defragment_compacts() {
         let mut pool = KvPool::new(1024);
-        pool.allocate(1, 128).unwrap(); // [0..128)
-        pool.allocate(2, 128).unwrap(); // [128..256)
-        pool.allocate(3, 128).unwrap(); // [256..384)
+        pool.allocate(1, 128, 0).unwrap(); // [0..128)
+        pool.allocate(2, 128, 0).unwrap(); // [128..256)
+        pool.allocate(3, 128, 0).unwrap(); // [256..384)
 
         // Free the middle sequence — creates a gap.
         pool.free(2).unwrap();
@@ -380,8 +387,8 @@ mod tests {
     #[test]
     fn serving_pool_defragment_no_gaps() {
         let mut pool = KvPool::new(512);
-        pool.allocate(1, 128).unwrap();
-        pool.allocate(2, 128).unwrap();
+        pool.allocate(1, 128, 0).unwrap();
+        pool.allocate(2, 128, 0).unwrap();
 
         let relocations = pool.defragment().unwrap();
         assert!(relocations.is_empty());
@@ -392,7 +399,7 @@ mod tests {
         let mut pool = KvPool::new(1024);
 
         for id in 1..=4u64 {
-            let alloc = pool.allocate(id, 128).unwrap();
+            let alloc = pool.allocate(id, 128, 0).unwrap();
             assert_eq!(alloc.offset, (id as usize - 1) * 128);
         }
         assert_eq!(pool.allocation_count(), 4);
@@ -415,19 +422,19 @@ mod tests {
         let mut pool = KvPool::new(256);
 
         // Fill the pool.
-        pool.allocate(1, 64).unwrap();
-        pool.allocate(2, 64).unwrap();
-        pool.allocate(3, 64).unwrap();
-        pool.allocate(4, 64).unwrap();
+        pool.allocate(1, 64, 0).unwrap();
+        pool.allocate(2, 64, 0).unwrap();
+        pool.allocate(3, 64, 0).unwrap();
+        pool.allocate(4, 64, 0).unwrap();
         assert_eq!(pool.free_space(), 0);
 
         // Can't allocate more.
-        assert!(pool.allocate(5, 64).is_err());
+        assert!(pool.allocate(5, 64, 0).is_err());
 
         // Free and reallocate.
         pool.free(3).unwrap();
         assert_eq!(pool.free_space(), 64);
-        let alloc = pool.allocate(5, 64).unwrap();
+        let alloc = pool.allocate(5, 64, 0).unwrap();
         assert_eq!(alloc.offset, 128); // reuses seq 3's slot
     }
 }

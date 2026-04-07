@@ -33,9 +33,14 @@ impl QuipHessianAccumulator {
     }
 
     /// Finalize the Hessian: returns H = X^T X / n as a flat f32 vector.
-    pub fn finalize(&self) -> Vec<f32> {
-        let n = self.sample_count.max(1) as f64;
-        self.xtx.iter().map(|&v| (v / n) as f32).collect()
+    ///
+    /// Returns an error if no samples have been accumulated.
+    pub fn finalize(&self) -> Result<Vec<f32>, &'static str> {
+        if self.sample_count == 0 {
+            return Err("no calibration samples collected");
+        }
+        let n = self.sample_count as f64;
+        Ok(self.xtx.iter().map(|&v| (v / n) as f32).collect())
     }
 }
 

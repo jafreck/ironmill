@@ -36,13 +36,15 @@ impl BatchScheduler {
     /// Add a sequence with the given prompt tokens.
     ///
     /// Allocates KV cache memory sized to the prompt length (minimum 1)
-    /// and returns the assigned sequence ID.
+    /// and sets initial usage to the prompt length. Returns the assigned
+    /// sequence ID.
     pub fn add_sequence(&mut self, tokens: Vec<u32>) -> Result<SequenceId, InferenceError> {
         let id = self.next_id;
         self.next_id += 1;
 
-        let initial_capacity = tokens.len().max(1);
-        let alloc = self.pool.allocate(id, initial_capacity)?;
+        let prompt_len = tokens.len();
+        let initial_capacity = prompt_len.max(1);
+        let alloc = self.pool.allocate(id, initial_capacity, prompt_len)?;
         let kv_allocation = alloc.clone();
 
         self.sequences.insert(
@@ -100,26 +102,39 @@ impl BatchScheduler {
     /// Record a newly generated token for the given sequence.
     ///
     /// Appends the token, updates the KV allocation usage counter, and
-    /// transitions `Prefilling → Decoding`.
-    pub fn advance(&mut self, id: SequenceId, new_token: u32) {
-        if let Some(seq) = self.sequences.get_mut(&id) {
-            seq.tokens.push(new_token);
+    /// transitions `Prefilling → Decoding`. Grows the KV allocation if
+    /// capacity is reached. Returns an error if the sequence ID is unknown.
+    pub fn advance(&mut self, id: SequenceId, new_token: u32) -> Result<(), InferenceError> {
+        let seq = self.sequences.get_mut(&id)
+            .ok_or(InferenceError::SequenceNotFound(id))?;
+        seq.tokens.push(new_token);
 
-            if seq.status == SequenceStatus::Prefilling {
-                seq.status = SequenceStatus::Decoding;
-            }
+        if seq.status == SequenceStatus::Prefilling {
+            seq.status = SequenceStatus::Decoding;
         }
 
-        if let Some(alloc) = self.pool.get_mut(id) {
-            alloc.used += 1;
+        // Check capacity and grow if needed before recording usage.
+        let alloc = self.pool.get(id)
+            .ok_or(InferenceError::SequenceNotFound(id))?;
+        let at_capacity = alloc.used >= alloc.capacity;
+
+        if at_capacity {
+            self.pool.grow(id)?;
         }
+
+        let alloc = self.pool.get_mut(id).unwrap();
+        alloc.used += 1;
+        Ok(())
     }
 
     /// Mark a sequence as completed.
-    pub fn complete_sequence(&mut self, id: SequenceId) {
-        if let Some(seq) = self.sequences.get_mut(&id) {
-            seq.status = SequenceStatus::Completed;
-        }
+    ///
+    /// Returns an error if the sequence ID is not found.
+    pub fn complete_sequence(&mut self, id: SequenceId) -> Result<(), InferenceError> {
+        let seq = self.sequences.get_mut(&id)
+            .ok_or(InferenceError::SequenceNotFound(id))?;
+        seq.status = SequenceStatus::Completed;
+        Ok(())
     }
 
     /// Access a sequence state by ID.
@@ -192,7 +207,7 @@ mod tests {
         let id2 = sched.add_sequence(vec![2]).unwrap();
 
         // Transition id1 to Decoding.
-        sched.advance(id1, 100);
+        sched.advance(id1, 100).unwrap();
 
         let batch = sched.select_batch();
         assert!(batch.contains(&id1));
@@ -210,7 +225,7 @@ mod tests {
             SequenceStatus::Prefilling
         );
 
-        sched.advance(id, 42);
+        sched.advance(id, 42).unwrap();
         let seq = sched.get_sequence(id).unwrap();
         assert_eq!(seq.status, SequenceStatus::Decoding);
         assert_eq!(seq.tokens, vec![1, 2, 42]);
@@ -220,7 +235,7 @@ mod tests {
     fn serving_scheduler_complete_sequence() {
         let mut sched = BatchScheduler::new(1024, 4);
         let id = sched.add_sequence(vec![1]).unwrap();
-        sched.complete_sequence(id);
+        sched.complete_sequence(id).unwrap();
         assert_eq!(
             sched.get_sequence(id).unwrap().status,
             SequenceStatus::Completed
@@ -232,7 +247,7 @@ mod tests {
         let mut sched = BatchScheduler::new(4096, 4);
         let id1 = sched.add_sequence(vec![1]).unwrap();
         let id2 = sched.add_sequence(vec![2]).unwrap();
-        sched.complete_sequence(id1);
+        sched.complete_sequence(id1).unwrap();
 
         let batch = sched.select_batch();
         assert!(!batch.contains(&id1));
@@ -258,7 +273,7 @@ mod tests {
 
         // Advance each.
         for &id in &ids {
-            sched.advance(id, 99);
+            sched.advance(id, 99).unwrap();
         }
 
         // Remove two, verify memory reclamation.

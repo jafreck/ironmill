@@ -82,7 +82,12 @@ impl CalibrationDataset {
     ///
     /// Each yielded slice contains up to `batch_size` sequences.
     /// The last batch may be smaller than `batch_size`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `batch_size` is 0.
     pub fn iter_batches(&self, batch_size: usize) -> impl Iterator<Item = &[Vec<u32>]> {
+        assert!(batch_size > 0, "batch_size must be > 0");
         self.sequences.chunks(batch_size)
     }
 

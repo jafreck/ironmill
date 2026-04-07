@@ -60,6 +60,8 @@ impl BatchRunner {
     }
 
     /// Submit a generation request and receive a handle for tracking.
+    ///
+    /// **Stub**: Not yet implemented. Always returns an error.
     pub fn submit(&mut self, _request: GenerateRequest) -> Result<SequenceHandle, InferenceError> {
         Err(InferenceError::Other(anyhow::anyhow!(
             "BatchRunner not yet implemented"
@@ -67,6 +69,8 @@ impl BatchRunner {
     }
 
     /// Advance the batch by one decode step, returning events for each active sequence.
+    ///
+    /// **Stub**: Not yet implemented. Always returns an error.
     pub fn step(&mut self) -> Result<Vec<(SequenceHandle, GenerateEvent)>, InferenceError> {
         Err(InferenceError::Other(anyhow::anyhow!(
             "BatchRunner not yet implemented"
@@ -74,16 +78,22 @@ impl BatchRunner {
     }
 
     /// Cancel a previously submitted sequence.
+    ///
+    /// **Stub**: Not yet implemented. Currently a no-op.
     pub fn cancel(&mut self, _handle: SequenceHandle) {
         // BatchRunner not yet implemented; cancel is a no-op.
     }
 
     /// Returns `true` if there are pending or active sequences.
+    ///
+    /// **Stub**: Not yet implemented. Always returns `false`.
     pub fn has_pending(&self) -> bool {
         false
     }
 
     /// Returns the number of currently active sequences.
+    ///
+    /// **Stub**: Not yet implemented. Always returns `0`.
     pub fn active_count(&self) -> usize {
         0
     }

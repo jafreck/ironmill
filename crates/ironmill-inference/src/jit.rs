@@ -72,27 +72,33 @@ impl TransformPipeline {
     }
 
     /// Add an int4 affine quantization transform (not yet implemented).
-    pub fn with_int4(self, _group_size: usize) -> Self {
+    #[allow(unused)]
+    pub fn with_int4(self, _group_size: usize) -> Result<Self, TransformError> {
         // TODO: Implement Int4AffineTransform — requires int4 packing layout
         // and affine dequantization parameters (scale, zero_point per group).
-        eprintln!("Warning: Int4AffineTransform not yet implemented; transform skipped.");
-        self
+        Err(TransformError::Unsupported(
+            "Int4AffineTransform not yet implemented".into(),
+        ))
     }
 
     /// Add a float16 cast transform (not yet implemented).
-    pub fn with_fp16(self) -> Self {
+    #[allow(unused)]
+    pub fn with_fp16(self) -> Result<Self, TransformError> {
         // TODO: Implement Fp16CastTransform — cast each weight tensor
         // element from its source dtype (f32, bf16, etc.) to fp16.
-        eprintln!("Warning: Fp16CastTransform not yet implemented; transform skipped.");
-        self
+        Err(TransformError::Unsupported(
+            "Fp16CastTransform not yet implemented".into(),
+        ))
     }
 
     /// Add a polar quantization transform (not yet implemented).
-    pub fn with_polar_quant(self, _bits: u8) -> Self {
+    #[allow(unused)]
+    pub fn with_polar_quant(self, _bits: u8) -> Result<Self, TransformError> {
         // TODO: Implement PolarQuantTransform — requires polar coordinate
         // encoding of weight matrices and appropriate dequant kernel support.
-        eprintln!("Warning: PolarQuantTransform not yet implemented; transform skipped.");
-        self
+        Err(TransformError::Unsupported(
+            "PolarQuantTransform not yet implemented".into(),
+        ))
     }
 
     /// Return a slice of the registered transforms.

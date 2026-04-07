@@ -62,6 +62,12 @@ impl InferenceBatch {
                 }
                 SequenceStatus::Decoding => {
                     // Only the last token is needed for autoregressive decode.
+                    if seq.tokens.is_empty() {
+                        eprintln!(
+                            "warning: sequence {} has no tokens during decode, using token 0",
+                            id
+                        );
+                    }
                     let last = seq.tokens.last().copied().unwrap_or(0);
                     batch.tokens.push(vec![last]);
                 }
@@ -108,8 +114,8 @@ mod tests {
     #[test]
     fn serving_batch_assemble_decoding() {
         let mut pool = KvPool::new(1024);
-        pool.allocate(1, 64).unwrap();
-        pool.allocate(2, 64).unwrap();
+        pool.allocate(1, 64, 0).unwrap();
+        pool.allocate(2, 64, 0).unwrap();
 
         let mut seqs = HashMap::new();
         seqs.insert(1, make_state(1, vec![10, 20], SequenceStatus::Decoding));
@@ -126,7 +132,7 @@ mod tests {
     #[test]
     fn serving_batch_assemble_prefilling() {
         let mut pool = KvPool::new(1024);
-        pool.allocate(1, 64).unwrap();
+        pool.allocate(1, 64, 0).unwrap();
 
         let mut seqs = HashMap::new();
         seqs.insert(1, make_state(1, vec![5, 6, 7], SequenceStatus::Prefilling));
@@ -149,8 +155,8 @@ mod tests {
     #[test]
     fn serving_batch_kv_offsets() {
         let mut pool = KvPool::new(1024);
-        pool.allocate(1, 128).unwrap();
-        pool.allocate(2, 256).unwrap();
+        pool.allocate(1, 128, 0).unwrap();
+        pool.allocate(2, 256, 0).unwrap();
 
         let mut seqs = HashMap::new();
         seqs.insert(1, make_state(1, vec![1], SequenceStatus::Decoding));

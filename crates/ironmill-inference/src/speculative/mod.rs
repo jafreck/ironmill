@@ -141,7 +141,11 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
         //    target_logits_batch[last_accepted].
         let correction_logits = if accepted_indices.is_empty() {
             // All rejected — use the first position's target logits.
-            target_logits_batch.first().cloned().unwrap_or_default()
+            target_logits_batch.first().cloned().ok_or_else(|| {
+                InferenceError::Decode(
+                    "speculative verification produced no target logits".into(),
+                )
+            })?
         } else {
             let last_accepted = *accepted_indices.last().unwrap();
             target_logits_batch[last_accepted].clone()
