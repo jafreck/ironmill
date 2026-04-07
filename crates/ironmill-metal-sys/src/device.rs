@@ -160,6 +160,54 @@ impl MetalDevice {
         self.raw
     }
 
+    /// Recommended number of threadgroups for saturating the GPU.
+    ///
+    /// Uses the device name heuristic to estimate core count, then
+    /// multiplies by an occupancy factor (4 threadgroups per core is
+    /// a good target for register-heavy kernels like attention).
+    /// Returns at least 32 for any Apple Silicon device.
+    pub fn recommended_max_working_set_threadgroups(&self) -> usize {
+        // Apple doesn't expose core count directly. Estimate from device name.
+        let name = self.name();
+        let cores = if name.contains("Ultra") {
+            // M1/M2/M3/M4 Ultra: 2× Max die
+            if name.contains("M4") {
+                80
+            } else if name.contains("M3") {
+                80
+            } else if name.contains("M2") {
+                76
+            } else {
+                64
+            }
+        } else if name.contains("Max") {
+            if name.contains("M4") {
+                40
+            } else if name.contains("M3") {
+                40
+            } else if name.contains("M2") {
+                38
+            } else {
+                32
+            }
+        } else if name.contains("Pro") {
+            if name.contains("M4") {
+                20
+            } else if name.contains("M3") {
+                18
+            } else if name.contains("M2") {
+                19
+            } else {
+                16
+            }
+        } else {
+            // M1/M2/M3/M4 base
+            10
+        };
+        // 4 threadgroups per core gives good occupancy for attention kernels.
+        (cores * 4).max(32)
+    }
+
     // -- Factory methods for other Metal objects --
 
     /// Create a Metal buffer with the given size and storage mode.

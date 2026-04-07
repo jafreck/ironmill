@@ -618,6 +618,7 @@ impl MetalInference {
                         plan.kv_anchor,
                         layer_window,
                         attn_scale,
+                        self.gpu_max_threadgroups,
                     )?;
                     enc.memory_barrier_with_resources(&[&bufs.attn_out]);
 

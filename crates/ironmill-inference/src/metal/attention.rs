@@ -97,6 +97,7 @@ pub(crate) fn encode_kv_cache_and_attention(
     is_anchor: bool,
     window_size: usize,
     attn_scale: f32,
+    gpu_max_threadgroups: usize,
 ) -> Result<(), InferenceError> {
     // For SWA layers, use window_size as the buffer stride and ring-buffer
     // write position. For full-attention layers, use the global max_seq_len.
@@ -434,24 +435,39 @@ pub(crate) fn encode_kv_cache_and_attention(
             );
         } else {
             let total_seq_len = (attn_seq_pos + token_count) as u32;
-            ops::encode_fused_sdpa(
-                enc,
-                &pipelines.fused_sdpa,
-                &ops::FusedSdpaParams {
-                    q: &bufs.q_proj,
-                    k: k_cache,
-                    v: v_cache,
-                    output: &bufs.attn_out,
-                    seq_len: total_seq_len,
-                    token_count: token_count as u32,
-                    head_dim: hd,
-                    num_q_heads: nh,
-                    num_kv_heads: nkv,
-                    scale: attn_scale,
-                    max_seq_len: max_seq,
-                },
-                None,
-            );
+            let sdpa_params = ops::FusedSdpaParams {
+                q: &bufs.q_proj,
+                k: k_cache,
+                v: v_cache,
+                output: &bufs.attn_out,
+                seq_len: total_seq_len,
+                token_count: token_count as u32,
+                head_dim: hd,
+                num_q_heads: nh,
+                num_kv_heads: nkv,
+                scale: attn_scale,
+                max_seq_len: max_seq,
+            };
+            if let (Some(po), Some(pm), Some(ps)) = (
+                bufs.flash_decode_partial_o.as_ref(),
+                bufs.flash_decode_partial_max.as_ref(),
+                bufs.flash_decode_partial_sum.as_ref(),
+            ) {
+                ops::encode_flash_decode(
+                    enc,
+                    &pipelines.fused_sdpa_split,
+                    &pipelines.fused_sdpa_reduce,
+                    &pipelines.fused_sdpa,
+                    &sdpa_params,
+                    po,
+                    pm,
+                    ps,
+                    bufs.flash_decode_max_splits,
+                    gpu_max_threadgroups,
+                );
+            } else {
+                ops::encode_fused_sdpa(enc, &pipelines.fused_sdpa, &sdpa_params, None);
+            }
         }
     }
 

@@ -89,6 +89,8 @@ pub struct MetalInference {
     /// Each buffer is `[hidden_size]` FP16. Added to post-attention LayerNorm
     /// output to compensate for quantization-induced mean shift.
     pub(crate) dac_biases: Option<Vec<MetalBuffer>>,
+    /// Recommended total threadgroups to saturate this GPU (cached at init).
+    pub(crate) gpu_max_threadgroups: usize,
 }
 
 impl MetalInference {
@@ -105,6 +107,7 @@ impl MetalInference {
         let device = MetalDevice::system_default().map_err(MetalError::Metal)?;
         let queue = device.create_command_queue().map_err(MetalError::Metal)?;
         // Pipelines are compiled in load() once head_dim is known.
+        let gpu_max_threadgroups = device.recommended_max_working_set_threadgroups();
         Ok(Self {
             device,
             queue,
@@ -136,6 +139,7 @@ impl MetalInference {
             layer_plans: Vec::new(),
             model_plan: None,
             dac_biases: None,
+            gpu_max_threadgroups,
         })
     }
 

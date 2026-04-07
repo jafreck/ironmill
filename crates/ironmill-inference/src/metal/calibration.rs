@@ -507,6 +507,7 @@ impl MetalInference {
                     is_anchor,
                     layer_window,
                     attn_scale,
+                    self.gpu_max_threadgroups,
                 )?;
                 enc.memory_barrier_buffers();
 

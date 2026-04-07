@@ -185,6 +185,10 @@ pub struct MetalPipelines {
     pub quantize_input_q8: ComputePipeline,
     /// INT4×Q8 integer dot product matvec (decode path).
     pub affine_matvec_int4xq8: ComputePipeline,
+    /// FlashDecoding split kernel: each threadgroup processes a KV slice.
+    pub fused_sdpa_split: ComputePipeline,
+    /// FlashDecoding reduce kernel: combines partial results across splits.
+    pub fused_sdpa_reduce: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -755,6 +759,20 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &affine_mm_lib
                         .get_function("affine_matvec_int4xq8")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            fused_sdpa_split: device
+                .create_compute_pipeline(
+                    &sdpa_lib
+                        .get_function("fused_sdpa_split")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            fused_sdpa_reduce: device
+                .create_compute_pipeline(
+                    &sdpa_lib
+                        .get_function("fused_sdpa_reduce")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -1564,6 +1582,91 @@ pub fn encode_fused_sdpa(
     let threads_per_tg = (heads_per_group * 32).min(METAL_MAX_THREADS_PER_THREADGROUP);
 
     encoder.dispatch_threadgroups((num_kv_groups, q_blocks, 1), (threads_per_tg, 1, 1));
+}
+
+/// Minimum sequence length to trigger FlashDecoding split.
+/// Below this, the original single-pass kernel is used.
+const FLASH_DECODE_MIN_SEQ: usize = 256;
+
+/// KV positions per split — each split gets a chunk of the sequence.
+/// 256 gives good granularity: at 16K context with 256 per split = 64 splits.
+const FLASH_DECODE_KV_PER_SPLIT: usize = 256;
+
+/// Encode FlashDecoding: split the KV sequence across threadgroups, then reduce.
+///
+/// For short sequences (< 256 positions), falls back to the original
+/// single-pass `fused_sdpa`. For longer sequences, dispatches the split
+/// kernel with `num_splits` threadgroups per KV head group, then a reduce
+/// kernel to combine partial results.
+///
+/// `max_splits` is the capacity of the partial output buffers.
+pub fn encode_flash_decode(
+    encoder: &ComputeEncoder,
+    split_pipeline: &ComputePipeline,
+    reduce_pipeline: &ComputePipeline,
+    sdpa_pipeline: &ComputePipeline,
+    params: &FusedSdpaParams<'_>,
+    partial_o: &MetalBuffer,
+    partial_max: &MetalBuffer,
+    partial_sum: &MetalBuffer,
+    max_splits: usize,
+    gpu_max_threadgroups: usize,
+) {
+    let seq_len = params.seq_len as usize;
+
+    // Short sequences: use original single-pass kernel.
+    if seq_len < FLASH_DECODE_MIN_SEQ {
+        encode_fused_sdpa(encoder, sdpa_pipeline, params, None);
+        return;
+    }
+
+    // Compute number of splits: target enough threadgroups to saturate GPU.
+    let heads_per_group = (params.num_q_heads as usize) / (params.num_kv_heads as usize).max(1);
+    let num_kv_groups = params.num_kv_heads as usize;
+    // We want total threadgroups ≈ gpu_max_threadgroups.
+    // Total = num_kv_groups × num_splits (each TG has heads_per_group simdgroups).
+    let target_splits = (gpu_max_threadgroups / num_kv_groups.max(1)).max(2);
+    // Also ensure each split has a reasonable chunk size.
+    let splits_from_seq = seq_len.div_ceil(FLASH_DECODE_KV_PER_SPLIT);
+    let num_splits = target_splits.min(splits_from_seq).min(max_splits);
+
+    if num_splits <= 1 {
+        encode_fused_sdpa(encoder, sdpa_pipeline, params, None);
+        return;
+    }
+
+    // Split kernel: grid (num_kv_groups, num_splits, 1)
+    let threads_per_tg = (heads_per_group * 32).min(METAL_MAX_THREADS_PER_THREADGROUP);
+    encoder.set_pipeline(split_pipeline);
+    encoder.set_buffer(params.q, 0, 0);
+    encoder.set_buffer(params.k, 0, 1);
+    encoder.set_buffer(params.v, 0, 2);
+    encoder.set_buffer(partial_o, 0, 3);
+    encoder.set_buffer(partial_max, 0, 4);
+    encoder.set_buffer(partial_sum, 0, 5);
+    encoder.set_bytes(&params.seq_len.to_le_bytes(), 6);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 7);
+    encoder.set_bytes(&params.num_q_heads.to_le_bytes(), 8);
+    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 9);
+    encoder.set_bytes(&params.scale.to_le_bytes(), 10);
+    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 11);
+    encoder.set_bytes(&(num_splits as u32).to_le_bytes(), 12);
+    encoder.dispatch_threadgroups((num_kv_groups, num_splits, 1), (threads_per_tg, 1, 1));
+
+    // Barrier between split and reduce.
+    encoder.memory_barrier_with_resources(&[partial_o, partial_max, partial_sum]);
+
+    // Reduce kernel: grid (num_q_heads, 1, 1)
+    let num_q = params.num_q_heads as usize;
+    encoder.set_pipeline(reduce_pipeline);
+    encoder.set_buffer(partial_o, 0, 0);
+    encoder.set_buffer(partial_max, 0, 1);
+    encoder.set_buffer(partial_sum, 0, 2);
+    encoder.set_buffer(params.output, 0, 3);
+    encoder.set_bytes(&params.num_q_heads.to_le_bytes(), 4);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 5);
+    encoder.set_bytes(&(num_splits as u32).to_le_bytes(), 6);
+    encoder.dispatch_threadgroups((num_q, 1, 1), (32, 1, 1));
 }
 
 /// Encode KV scatter — copy projections into FP16 KV cache on GPU.

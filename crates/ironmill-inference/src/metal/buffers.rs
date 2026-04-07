@@ -57,6 +57,14 @@ pub(crate) struct IntermediateBuffers {
     pub(crate) q8_data: MetalBuffer,
     /// Q8 per-group scale factors `[max_tokens * hidden_size / Q8_GROUP_SIZE]` float.
     pub(crate) q8_scales: MetalBuffer,
+    /// FlashDecoding partial output `[max_splits × num_q_heads × head_dim]` float.
+    pub(crate) flash_decode_partial_o: Option<MetalBuffer>,
+    /// FlashDecoding partial softmax max `[max_splits × num_q_heads]` float.
+    pub(crate) flash_decode_partial_max: Option<MetalBuffer>,
+    /// FlashDecoding partial softmax sum `[max_splits × num_q_heads]` float.
+    pub(crate) flash_decode_partial_sum: Option<MetalBuffer>,
+    /// Maximum number of KV splits supported by current buffer allocation.
+    pub(crate) flash_decode_max_splits: usize,
     /// Current maximum token capacity of these buffers.
     pub(crate) capacity: usize,
 }
@@ -222,6 +230,36 @@ impl IntermediateBuffers {
                     StorageMode::Private,
                 )
                 .map_err(MetalError::Metal)?,
+            // FlashDecoding partial buffers: sized for max_splits × num_q_heads × head_dim.
+            // Use 256 splits as initial max (covers up to ~256K context with 1K per split).
+            flash_decode_partial_o: {
+                let max_splits: usize = 256;
+                let size = max_splits * nh * hd * 4; // float
+                Some(
+                    device
+                        .create_buffer(size.max(16), StorageMode::Private)
+                        .map_err(MetalError::Metal)?,
+                )
+            },
+            flash_decode_partial_max: {
+                let max_splits: usize = 256;
+                let size = max_splits * nh * 4; // float
+                Some(
+                    device
+                        .create_buffer(size.max(16), StorageMode::Private)
+                        .map_err(MetalError::Metal)?,
+                )
+            },
+            flash_decode_partial_sum: {
+                let max_splits: usize = 256;
+                let size = max_splits * nh * 4; // float
+                Some(
+                    device
+                        .create_buffer(size.max(16), StorageMode::Private)
+                        .map_err(MetalError::Metal)?,
+                )
+            },
+            flash_decode_max_splits: 256,
             capacity: max_tokens,
         })
     }
