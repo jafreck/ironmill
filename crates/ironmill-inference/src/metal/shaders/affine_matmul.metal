@@ -1050,3 +1050,92 @@ kernel void fused_ffn_gate_up_act_int4(
         C[tid] = half(act * up_acc);
     }
 }
+
+// ── INT4×Q8 integer dot product matvec (decode path, M=1) ───────
+//
+// Uses pre-quantized INT8 input (from quantize_input_q8) to replace float
+// dequant with integer multiply-add. The per-group Q8 scale is combined
+// with the weight scale in the final reduction.
+//
+// B_packed is in blocked layout: [N_blocks, K_blocks, BLK_N, BLK_K/2]
+// (same as affine_matvec_int4).
+//
+// Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
+
+kernel void affine_matvec_int4xq8(
+    device const char *A_q8         [[buffer(0)]],   // [K] int8
+    device const float *A_scales    [[buffer(1)]],   // [K/q8_group_size] float
+    device const uchar *B_packed    [[buffer(2)]],   // blocked [N_blk, K_blk, 64, 4]
+    device const half *w_scales     [[buffer(3)]],   // [N, num_groups]
+    device const half *w_zeros      [[buffer(4)]],   // [N, num_groups]
+    device half *C                  [[buffer(5)]],   // [1, N]
+    constant uint &N                [[buffer(6)]],
+    constant uint &K                [[buffer(7)]],
+    constant uint &group_size       [[buffer(8)]],   // weight group size
+    constant uint &q8_group_size    [[buffer(9)]],   // Q8 input group size
+    uint tid  [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    if (tid >= N) return;
+
+    uint half_K = K / 2;
+    uint num_groups = (K + group_size - 1) / group_size;
+    uint scale_row = tid * num_groups;
+
+    // Blocked layout addressing (same as affine_matvec_int4)
+    uint k_blocks      = (K + BLK_K - 1) / BLK_K;
+    uint local_k_bytes = BLK_K / 2;             // 4
+    uint block_bytes   = BLK_N * local_k_bytes;  // 256
+    uint n_block = tid / BLK_N;
+    uint n_local = tid % BLK_N;
+
+    float acc = 0.0f;
+    uint prev_wg = 0xFFFFFFFF;
+    float ws = 0.0f;
+    float wz = 0.0f;
+
+    for (uint k = lane; k < half_K; k += 32) {
+        uint kb = k / local_k_bytes;
+        uint b  = k % local_k_bytes;
+        uint byte_idx = (n_block * k_blocks + kb) * block_bytes
+                      + n_local * local_k_bytes + b;
+
+        uchar packed = B_packed[byte_idx];
+        int lo = int(packed & 0x0F);
+        int hi = int((packed >> 4) & 0x0F);
+
+        uint k2 = k * 2;
+        uint wg0 = k2 / group_size;
+        uint wg1 = (k2 + 1) / group_size;
+        uint ag0 = k2 / q8_group_size;
+        uint ag1 = (k2 + 1) / q8_group_size;
+
+        // Weight group 0
+        if (wg0 != prev_wg) {
+            ws = float(w_scales[scale_row + wg0]);
+            wz = float(w_zeros[scale_row + wg0]);
+            prev_wg = wg0;
+        }
+        int iz = int(rint(wz));
+        int w0 = lo - iz;
+        float a_scale0 = A_scales[ag0];
+        acc += float(int(A_q8[k2])) * float(w0) * ws * a_scale0;
+
+        // Weight group 1 (may differ if crossing group boundary)
+        if (wg1 != wg0) {
+            ws = float(w_scales[scale_row + wg1]);
+            wz = float(w_zeros[scale_row + wg1]);
+            prev_wg = wg1;
+            iz = int(rint(wz));
+        }
+        int w1 = hi - iz;
+        float a_scale1 = A_scales[ag1];
+        acc += float(int(A_q8[k2 + 1])) * float(w1) * ws * a_scale1;
+    }
+
+    acc = simd_sum(acc);
+
+    if (lane == 0) {
+        C[tid] = half(acc);
+    }
+}

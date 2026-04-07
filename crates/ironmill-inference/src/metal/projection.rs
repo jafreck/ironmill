@@ -2,6 +2,7 @@
 
 use ironmill_metal_sys::{ComputeEncoder, MetalBuffer};
 
+use super::buffers::{IntermediateBuffers, Q8_GROUP_SIZE};
 use super::ops;
 use super::ops::LinearKernelKind;
 use super::weights::{
@@ -14,11 +15,20 @@ const MATMUL_TM_TILE: usize = 64;
 const MATMUL_TN_TILE: usize = 64;
 const MATMUL_THREADS_PER_TG: usize = 256;
 
+/// Q8-quantized input references for INT4×Q8 decode path.
+pub(crate) struct Q8Input<'a> {
+    pub(crate) data: &'a MetalBuffer,
+    pub(crate) scales: &'a MetalBuffer,
+}
+
 /// Encode a single Q/K/V-style linear projection.
 ///
 /// Automatically selects the optimal kernel variant based on `token_count`:
 /// - **Decode (token_count == 1):** memory-bandwidth-optimized matvec kernels.
 /// - **Prefill (token_count > 1):** compute-optimized batched matmul kernels.
+///
+/// When `q8` is `Some(...)`, uses the INT4×Q8 integer dot product kernel for
+/// affine INT4 decode, which is ~2× faster than the float dequant path.
 ///
 /// This applies uniformly across all weight representations (Dense, PolarQuant,
 /// AffineQuantized).
@@ -32,6 +42,32 @@ pub(crate) fn encode_projection(
     token_count: usize,
     out_features: usize,
     in_features: usize,
+) -> Result<(), InferenceError> {
+    encode_projection_q8(
+        enc,
+        input_buf,
+        weight,
+        output_buf,
+        pipelines,
+        token_count,
+        out_features,
+        in_features,
+        None,
+    )
+}
+
+/// Encode a linear projection with optional Q8 input for INT4 decode.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_projection_q8(
+    enc: &ComputeEncoder,
+    input_buf: &MetalBuffer,
+    weight: &WeightBuffer,
+    output_buf: &MetalBuffer,
+    pipelines: &super::ops::MetalPipelines,
+    token_count: usize,
+    out_features: usize,
+    in_features: usize,
+    q8: Option<&Q8Input<'_>>,
 ) -> Result<(), InferenceError> {
     let kernel_kind = LinearKernelKind::for_token_count(token_count);
 
@@ -84,6 +120,23 @@ pub(crate) fn encode_projection(
             )?;
         }
         WeightBuffer::AffineQuantized(aq) => {
+            // For decode + INT4 + no AWQ: use Q8 integer dot product if available.
+            if let Some(q8_input) = q8 {
+                if kernel_kind.is_decode() && aq.bit_width == 4 && aq.awq_scales.is_none() {
+                    ops::encode_affine_matvec_int4xq8(
+                        enc,
+                        &pipelines.affine_matvec_int4xq8,
+                        q8_input.data,
+                        q8_input.scales,
+                        aq,
+                        output_buf,
+                        out_features as u32,
+                        in_features as u32,
+                        Q8_GROUP_SIZE as u32,
+                    );
+                    return Ok(());
+                }
+            }
             encode_affine_projection(
                 enc,
                 input_buf,

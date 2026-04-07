@@ -254,6 +254,53 @@ impl Drop for CommandBuffer {
 // ComputeEncoder
 // ---------------------------------------------------------------------------
 
+/// Cached ObjC selectors for ComputeEncoder methods.
+///
+/// Each selector is resolved once via `sel_registerName` and then reused
+/// for all subsequent calls, avoiding ~50-100 ns per lookup × ~1800
+/// lookups per decode step.
+struct CachedSelectors {
+    set_pipeline: *mut c_void,
+    set_buffer: *mut c_void,
+    set_bytes: *mut c_void,
+    set_threadgroup_memory_length: *mut c_void,
+    dispatch_threads: *mut c_void,
+    dispatch_threadgroups: *mut c_void,
+    end_encoding: *mut c_void,
+    memory_barrier_scope: *mut c_void,
+    memory_barrier_resources: *mut c_void,
+}
+
+// SAFETY: ObjC selector pointers are globally stable and thread-safe.
+unsafe impl Send for CachedSelectors {}
+unsafe impl Sync for CachedSelectors {}
+
+static CACHED_SELS: std::sync::OnceLock<CachedSelectors> = std::sync::OnceLock::new();
+
+fn cached_sels() -> &'static CachedSelectors {
+    CACHED_SELS.get_or_init(|| unsafe {
+        CachedSelectors {
+            set_pipeline: objc::sel_registerName(sel!("setComputePipelineState:")),
+            set_buffer: objc::sel_registerName(sel!("setBuffer:offset:atIndex:")),
+            set_bytes: objc::sel_registerName(sel!("setBytes:length:atIndex:")),
+            set_threadgroup_memory_length: objc::sel_registerName(sel!(
+                "setThreadgroupMemoryLength:atIndex:"
+            )),
+            dispatch_threads: objc::sel_registerName(sel!(
+                "dispatchThreads:threadsPerThreadgroup:"
+            )),
+            dispatch_threadgroups: objc::sel_registerName(sel!(
+                "dispatchThreadgroups:threadsPerThreadgroup:"
+            )),
+            end_encoding: objc::sel_registerName(sel!("endEncoding")),
+            memory_barrier_scope: objc::sel_registerName(sel!("memoryBarrierWithScope:")),
+            memory_barrier_resources: objc::sel_registerName(sel!(
+                "memoryBarrierWithResources:count:"
+            )),
+        }
+    })
+}
+
 /// Safe wrapper around an `MTLComputeCommandEncoder`.
 pub struct ComputeEncoder {
     raw: *mut c_void,
@@ -265,45 +312,53 @@ unsafe impl Send for ComputeEncoder {}
 impl ComputeEncoder {
     /// Set the compute pipeline state for subsequent dispatch calls.
     pub fn set_pipeline(&self, pipeline: &ComputePipeline) {
-        // SAFETY: `self.raw` is a valid encoder and `pipeline` is a valid
-        // retained pipeline state. "setComputePipelineState:" binds the
-        // pipeline for subsequent dispatch calls.
         type SetFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
-        let sel = unsafe { objc::sel_registerName(sel!("setComputePipelineState:")) };
         let f: SetFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
-        unsafe { f(self.raw, sel, pipeline.as_raw_ptr()) };
+        unsafe { f(self.raw, cached_sels().set_pipeline, pipeline.as_raw_ptr()) };
     }
 
     /// Bind a buffer at the given index with an offset.
     pub fn set_buffer(&self, buffer: &MetalBuffer, offset: usize, index: usize) {
-        // SAFETY: `self.raw` is a valid encoder and `buffer` is a valid
-        // retained Metal buffer. "setBuffer:offset:atIndex:" binds the buffer
-        // at the specified index for compute kernel access.
         type SetFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, usize, usize);
-        let sel = unsafe { objc::sel_registerName(sel!("setBuffer:offset:atIndex:")) };
         let f: SetFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
-        unsafe { f(self.raw, sel, buffer.as_raw_ptr(), offset, index) };
+        unsafe {
+            f(
+                self.raw,
+                cached_sels().set_buffer,
+                buffer.as_raw_ptr(),
+                offset,
+                index,
+            )
+        };
     }
 
     /// Set inline bytes at the given index.
     pub fn set_bytes(&self, data: &[u8], index: usize) {
-        // SAFETY: `self.raw` is a valid encoder. `data.as_ptr()` and
-        // `data.len()` describe a valid byte slice. "setBytes:length:atIndex:"
-        // copies the bytes into the encoder's argument table.
         type SetFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, usize);
-        let sel = unsafe { objc::sel_registerName(sel!("setBytes:length:atIndex:")) };
         let f: SetFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
-        unsafe { f(self.raw, sel, data.as_ptr(), data.len(), index) };
+        unsafe {
+            f(
+                self.raw,
+                cached_sels().set_bytes,
+                data.as_ptr(),
+                data.len(),
+                index,
+            )
+        };
     }
 
     /// Set threadgroup memory length at the given index.
     pub fn set_threadgroup_memory_length(&self, length: usize, index: usize) {
-        // SAFETY: `self.raw` is a valid encoder.
-        // "setThreadgroupMemoryLength:atIndex:" reserves threadgroup memory.
         type SetFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize);
-        let sel = unsafe { objc::sel_registerName(sel!("setThreadgroupMemoryLength:atIndex:")) };
         let f: SetFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
-        unsafe { f(self.raw, sel, length, index) };
+        unsafe {
+            f(
+                self.raw,
+                cached_sels().set_threadgroup_memory_length,
+                length,
+                index,
+            )
+        };
     }
 
     /// Dispatch threads with a non-uniform grid (requires Apple GPU family 4+).
@@ -318,12 +373,7 @@ impl ComputeEncoder {
             height: usize,
             depth: usize,
         }
-        // SAFETY: `self.raw` is a valid encoder. MtlSize is #[repr(C)] matching
-        // MTLSize layout. "dispatchThreads:threadsPerThreadgroup:" dispatches a
-        // non-uniform grid. On arm64, small structs are returned in registers
-        // so objc_msgSend (not _stret) is correct.
         type DispatchFn = unsafe extern "C" fn(*mut c_void, *mut c_void, MtlSize, MtlSize);
-        let sel = unsafe { objc::sel_registerName(sel!("dispatchThreads:threadsPerThreadgroup:")) };
         let f: DispatchFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
         let grid = MtlSize {
             width: grid_size.0,
@@ -335,7 +385,7 @@ impl ComputeEncoder {
             height: threadgroup_size.1,
             depth: threadgroup_size.2,
         };
-        unsafe { f(self.raw, sel, grid, tg) };
+        unsafe { f(self.raw, cached_sels().dispatch_threads, grid, tg) };
     }
 
     /// Dispatch threadgroups with explicit counts.
@@ -350,12 +400,7 @@ impl ComputeEncoder {
             height: usize,
             depth: usize,
         }
-        // SAFETY: `self.raw` is a valid encoder. MtlSize is #[repr(C)] matching
-        // MTLSize layout. "dispatchThreadgroups:threadsPerThreadgroup:" dispatches
-        // the specified number of threadgroups.
         type DispatchFn = unsafe extern "C" fn(*mut c_void, *mut c_void, MtlSize, MtlSize);
-        let sel =
-            unsafe { objc::sel_registerName(sel!("dispatchThreadgroups:threadsPerThreadgroup:")) };
         let f: DispatchFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
         let groups = MtlSize {
             width: threadgroup_count.0,
@@ -367,15 +412,14 @@ impl ComputeEncoder {
             height: threads_per_threadgroup.1,
             depth: threads_per_threadgroup.2,
         };
-        unsafe { f(self.raw, sel, groups, tg) };
+        unsafe { f(self.raw, cached_sels().dispatch_threadgroups, groups, tg) };
     }
 
     /// End encoding. Must be called before committing the command buffer.
     pub fn end_encoding(&self) {
         type EndFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
-        let sel = unsafe { objc::sel_registerName(sel!("endEncoding")) };
         let f: EndFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
-        unsafe { f(self.raw, sel) };
+        unsafe { f(self.raw, cached_sels().end_encoding) };
     }
 
     /// Insert a memory barrier for buffer writes.
@@ -385,9 +429,31 @@ impl ComputeEncoder {
     pub fn memory_barrier_buffers(&self) {
         // MTLBarrierScope::Buffers = 1
         type BarrierFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize);
-        let sel = unsafe { objc::sel_registerName(sel!("memoryBarrierWithScope:")) };
         let f: BarrierFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
-        unsafe { f(self.raw, sel, 1) };
+        unsafe { f(self.raw, cached_sels().memory_barrier_scope, 1) };
+    }
+
+    /// Insert a resource-specific memory barrier.
+    ///
+    /// Only flushes GPU caches for the specified buffers, unlike
+    /// [`memory_barrier_buffers`] which flushes ALL buffer caches.
+    /// This reduces GPU stall time when only a subset of buffers
+    /// were written by prior dispatches.
+    ///
+    /// Requires Apple GPU Family 4+ (Apple 8 / M1+).
+    pub fn memory_barrier_with_resources(&self, buffers: &[&MetalBuffer]) {
+        let ptrs: Vec<*mut c_void> = buffers.iter().map(|b| b.as_raw_ptr()).collect();
+        type BarrierResFn =
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *const *mut c_void, usize);
+        let f: BarrierResFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        unsafe {
+            f(
+                self.raw,
+                cached_sels().memory_barrier_resources,
+                ptrs.as_ptr(),
+                ptrs.len(),
+            )
+        };
     }
 
     /// Returns the raw encoder pointer.

@@ -19,8 +19,8 @@ use super::engine::MetalInference;
 
 #[cfg(test)]
 mod calibration_tests {
-    use super::*;
     use super::super::buffers::bytes_as_f16;
+    use super::*;
 
     /// Verify that the calibration method signature compiles and the
     /// callback type is properly accepted as a trait object.

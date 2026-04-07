@@ -102,7 +102,7 @@ pub(crate) fn encode_ffn_block(
             )?;
         }
 
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[&bufs.ffn_gate, &bufs.ffn_up]);
 
         let act_pipeline = if use_gelu {
             &pipelines.ffn_gelu_gate
@@ -119,7 +119,7 @@ pub(crate) fn encode_ffn_block(
         );
     }
 
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&bufs.ffn_gate]);
 
     // Down projection
     encode_projection(
@@ -177,7 +177,7 @@ pub(crate) fn encode_moe_block(
         num_experts,
         h,
     )?;
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[router_logits]);
 
     // 2. Softmax over router logits [token_count, num_experts]
     ops::encode_moe_softmax(
@@ -187,7 +187,7 @@ pub(crate) fn encode_moe_block(
         num_experts as u32,
         token_count as u32,
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[router_logits]);
 
     // 3. Dense eval: run all expert FFNs
     let expert_slice_size = token_count * h;
@@ -219,7 +219,7 @@ pub(crate) fn encode_moe_block(
             moe_inter,
             h,
         )?;
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[expert_gate_buf, expert_up_buf]);
 
         // GELU activation on gate (in-place)
         ops::encode_moe_gelu(
@@ -228,7 +228,7 @@ pub(crate) fn encode_moe_block(
             expert_gate_buf,
             (token_count * moe_inter) as u32,
         );
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[expert_gate_buf]);
 
         // Element-wise multiply: gate *= up (in-place on gate)
         ops::encode_moe_mul(
@@ -238,7 +238,7 @@ pub(crate) fn encode_moe_block(
             expert_up_buf,
             (token_count * moe_inter) as u32,
         );
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[expert_gate_buf]);
 
         // Down projection: expert_gate_buf → expert_outputs[e] [moe_inter → hidden]
         // We write to the slice expert_outputs[e * token_count * h ..]
@@ -254,7 +254,7 @@ pub(crate) fn encode_moe_block(
             h,
             moe_inter,
         )?;
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[moe_combined]);
 
         // Copy moe_combined → expert_outputs at offset [e * token_count * h]
         enc.set_pipeline(&pipelines.copy_buffer);
@@ -265,7 +265,7 @@ pub(crate) fn encode_moe_block(
         let tg_size = 256usize.min(expert_slice_size);
         let tg_count = expert_slice_size.div_ceil(tg_size);
         enc.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[expert_outputs]);
     }
 
     // 4. Weighted combine: top-k selection + weighted sum → moe_combined
@@ -280,7 +280,7 @@ pub(crate) fn encode_moe_block(
         h as u32,
         token_count as u32,
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[moe_combined]);
 
     // 5. Add MoE output to dense MLP output: ffn_down += moe_combined
     ops::encode_residual_add(
@@ -291,7 +291,7 @@ pub(crate) fn encode_moe_block(
         &bufs.ffn_down,
         (token_count * h) as u32,
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
 
     Ok(())
 }

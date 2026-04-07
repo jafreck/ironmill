@@ -7,14 +7,14 @@ use mil_rs::weights::Architecture;
 use super::attention::{
     encode_end_of_layer_residual, encode_kv_cache_and_attention, encode_qk_norm_and_rope,
 };
-use super::buffers::{build_matmul_cache, ModelConfigExt};
+use super::buffers::{ModelConfigExt, Q8_GROUP_SIZE, build_matmul_cache};
+use super::engine::MetalInference;
 use super::ffn::{encode_ffn_block, encode_moe_block};
 use super::gdn::{encode_gdn_decode, encode_gdn_prefill};
-use super::engine::MetalInference;
-use super::projection::encode_projection;
 use super::ops;
 use super::plan::{AttentionKind, RopeTable};
 use super::ple;
+use super::projection::{Q8Input, encode_projection, encode_projection_q8};
 use super::weights::WeightBuffer;
 use crate::engine::InferenceError;
 use crate::types::Logits;
@@ -30,7 +30,10 @@ impl MetalInference {
     /// so arbitrarily long sequences work without OOM.
     ///
     /// Used for efficient perplexity evaluation.
-    pub(crate) fn prefill_all_logits(&mut self, token_ids: &[u32]) -> Result<Vec<Logits>, InferenceError> {
+    pub(crate) fn prefill_all_logits(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<Vec<Logits>, InferenceError> {
         let mc = self
             .model_config
             .as_ref()
@@ -361,7 +364,7 @@ impl MetalInference {
             let tg_size = h.min(1024);
             enc.dispatch_threadgroups((token_count, 1, 1), (tg_size, 1, 1));
         }
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[&bufs.norm_out, &bufs.hidden_state]);
 
         // PLE model-level computation: compute per-layer embeddings before the layer loop.
         // Result lives in ple_per_layer_input for the duration of all layers.
@@ -451,7 +454,11 @@ impl MetalInference {
                             &enc, bufs, gdn, lw, pipelines, gdn_idx, h, eps, p1_skip,
                         )?;
                     }
-                    enc.memory_barrier_buffers();
+                    enc.memory_barrier_with_resources(&[
+                        &bufs.norm_out,
+                        &bufs.residual,
+                        &bufs.hidden_state,
+                    ]);
                 }
                 AttentionKind::Standard {
                     has_output_gate,
@@ -468,6 +475,35 @@ impl MetalInference {
                     let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
                     let kv_out_features = layer_nkv as usize * layer_hd as usize;
 
+                    // Q8 input quantization for decode: quantize norm_out once,
+                    // reuse for all affine INT4 projections (Q, K, V, gate).
+                    let q8_input = if token_count == 1 {
+                        // Check if any projection uses affine INT4 (common case).
+                        let has_affine_int4 = matches!(&lw.q_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4)
+                            || matches!(&lw.k_proj, WeightBuffer::AffineQuantized(aq) if aq.bit_width == 4);
+                        if has_affine_int4 {
+                            let pipelines_ref = self.pipelines()?;
+                            ops::encode_quantize_input_q8(
+                                &enc,
+                                &pipelines_ref.quantize_input_q8,
+                                &bufs.norm_out,
+                                &bufs.q8_data,
+                                &bufs.q8_scales,
+                                h as u32,
+                                Q8_GROUP_SIZE as u32,
+                            );
+                            enc.memory_barrier_with_resources(&[&bufs.q8_data, &bufs.q8_scales]);
+                            Some(Q8Input {
+                                data: &bufs.q8_data,
+                                scales: &bufs.q8_scales,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
                     // Build the projection list: skip Q if P1 fusion already computed it.
                     let mut projections: Vec<(&WeightBuffer, &MetalBuffer, usize)> = Vec::new();
                     if !p1_skip {
@@ -475,16 +511,17 @@ impl MetalInference {
                     }
                     projections.push((&lw.k_proj, &bufs.k_proj, kv_out_features));
                     projections.push((&lw.v_proj, &bufs.v_proj, kv_out_features));
-                    for (weight, output_buf, out_features) in projections {
-                        encode_projection(
+                    for (weight, output_buf, out_features) in &projections {
+                        encode_projection_q8(
                             &enc,
                             &bufs.norm_out,
                             weight,
                             output_buf,
                             pipelines,
                             token_count,
-                            out_features,
+                            *out_features,
                             h,
+                            q8_input.as_ref(),
                         )?;
                     }
 
@@ -493,7 +530,7 @@ impl MetalInference {
                     // The gate result is only consumed later by sigmoid_gate after attention,
                     // so no separate barrier is needed here.
                     if let (Some(gate_w), Some(gate_buf)) = (&lw.attn_output_gate, &bufs.q_gate) {
-                        encode_projection(
+                        encode_projection_q8(
                             &enc,
                             &bufs.norm_out,
                             gate_w,
@@ -502,9 +539,18 @@ impl MetalInference {
                             token_count,
                             qkv_out_features,
                             h,
+                            q8_input.as_ref(),
                         )?;
                     }
-                    enc.memory_barrier_buffers();
+                    // Barrier for Q/K/V/gate projection outputs.
+                    {
+                        let mut barrier_bufs: Vec<&MetalBuffer> =
+                            vec![&bufs.q_proj, &bufs.k_proj, &bufs.v_proj];
+                        if let Some(ref gate_buf) = bufs.q_gate {
+                            barrier_bufs.push(gate_buf);
+                        }
+                        enc.memory_barrier_with_resources(&barrier_bufs);
+                    }
 
                     // Gemma 4 V-norm: scale-free RMSNorm on V projections.
                     if *has_v_norm {
@@ -521,7 +567,9 @@ impl MetalInference {
                                     eps,
                                 },
                             );
-                            enc.memory_barrier_buffers();
+                            // No barrier needed: next dispatch (QK norm+RoPE) reads
+                            // q_proj/k_proj, not v_proj. v_proj is covered by the
+                            // barrier after QK norm before KV cache scatter.
                         }
                     }
 
@@ -548,7 +596,8 @@ impl MetalInference {
                         token_count,
                         eps,
                     )?;
-                    enc.memory_barrier_buffers();
+                    // Barrier includes v_proj for KV cache (covers V-norm write if present).
+                    enc.memory_barrier_with_resources(&[&bufs.q_proj, &bufs.k_proj, &bufs.v_proj]);
 
                     // Steps 7-8: KV cache write + attention
                     let attn_scale = plan.attn_scale;
@@ -573,7 +622,7 @@ impl MetalInference {
                         layer_window,
                         attn_scale,
                     )?;
-                    enc.memory_barrier_buffers();
+                    enc.memory_barrier_with_resources(&[&bufs.attn_out]);
 
                     // Qwen3.5 attn_output_gate: apply sigmoid(gate) to attention output.
                     if *has_output_gate {
@@ -587,7 +636,7 @@ impl MetalInference {
                                 gate_buf,
                                 gate_size,
                             );
-                            enc.memory_barrier_buffers();
+                            enc.memory_barrier_with_resources(&[&bufs.attn_out]);
                         }
                     }
 
@@ -603,7 +652,7 @@ impl MetalInference {
                         h,
                         attn_out_features,
                     )?;
-                    enc.memory_barrier_buffers();
+                    enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
 
                     // Step 10-11: Residual add + post-attention RMSNorm
                     if let Some(pre_ffn) = &lw.pre_ffn_norm {
@@ -620,7 +669,7 @@ impl MetalInference {
                                 eps,
                             },
                         );
-                        enc.memory_barrier_buffers();
+                        enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
 
                         ops::encode_residual_add(
                             &enc,
@@ -630,7 +679,7 @@ impl MetalInference {
                             &bufs.residual,
                             (token_count * h) as u32,
                         );
-                        enc.memory_barrier_buffers();
+                        enc.memory_barrier_with_resources(&[&bufs.residual]);
 
                         ops::encode_rms_norm(
                             &enc,
@@ -644,7 +693,7 @@ impl MetalInference {
                                 eps,
                             },
                         );
-                        enc.memory_barrier_buffers();
+                        enc.memory_barrier_with_resources(&[&bufs.norm_out]);
                     } else {
                         // Standard pre-norm transformer: fused residual + norm
                         ops::encode_fused_residual_rms_norm(
@@ -661,7 +710,7 @@ impl MetalInference {
                                 token_count: token_count as u32,
                             },
                         );
-                        enc.memory_barrier_buffers();
+                        enc.memory_barrier_with_resources(&[&bufs.norm_out, &bufs.residual]);
                     }
                 } // end AttentionKind::Standard
             } // end match plan.attention
@@ -679,7 +728,7 @@ impl MetalInference {
                         h as u32,
                         (token_count * h) as u32,
                     );
-                    enc.memory_barrier_buffers();
+                    enc.memory_barrier_with_resources(&[&bufs.norm_out]);
                 }
             }
 
@@ -703,7 +752,7 @@ impl MetalInference {
                 token_count,
                 use_gelu,
             )?;
-            enc.memory_barrier_buffers();
+            enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
 
             // MoE block: when enabled, dense MLP output is combined
             // with MoE expert outputs via router → expert FFNs → weighted combine.
@@ -736,7 +785,7 @@ impl MetalInference {
                         eps,
                     },
                 );
-                enc.memory_barrier_buffers();
+                enc.memory_barrier_with_resources(&[&bufs.ffn_gate]);
                 ops::encode_copy_buffer(
                     &enc,
                     &pipelines.copy_buffer,
@@ -744,7 +793,7 @@ impl MetalInference {
                     &bufs.ffn_down,
                     (token_count * h) as u32,
                 );
-                enc.memory_barrier_buffers();
+                enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
             }
 
             // PLE per-layer: gate → GELU → multiply → project → norm → residual add.
@@ -783,7 +832,7 @@ impl MetalInference {
                         &bufs.hidden_state,
                         (token_count * h) as u32,
                     );
-                    enc.memory_barrier_buffers();
+                    enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
                     ops::encode_scale_buffer(
                         &enc,
                         &pipelines.scale_buffer,
@@ -791,7 +840,7 @@ impl MetalInference {
                         scalar,
                         (token_count * h) as u32,
                     );
-                    enc.memory_barrier_buffers();
+                    enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
                     if layer_idx + 1 < mc.num_hidden_layers {
                         let next_norm = &weights.layers[layer_idx + 1].input_norm;
                         ops::encode_rms_norm(
@@ -861,7 +910,7 @@ impl MetalInference {
                     // computed. Signal the next iteration to skip it.
                     skip_first_proj = fused;
                 }
-                enc.memory_barrier_buffers();
+                enc.memory_barrier_with_resources(&[&bufs.hidden_state, &bufs.norm_out]);
             }
         }
         ops::encode_rms_norm(
@@ -876,7 +925,7 @@ impl MetalInference {
                 eps,
             },
         );
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[&bufs.norm_out]);
 
         // Step 18: LM head projection — dispatches through encode_projection
         // which handles Dense (packed blocked), D2Quant, affine INT4, etc.

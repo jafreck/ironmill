@@ -258,11 +258,9 @@ impl ModelPlan {
 
         let final_logit_softcapping = g4.and_then(|g| g.final_logit_softcapping);
 
-        let ple = g4
-            .filter(|g| g.ple_hidden_size > 0)
-            .map(|g| PlePlan {
-                ple_hidden_size: g.ple_hidden_size,
-            });
+        let ple = g4.filter(|g| g.ple_hidden_size > 0).map(|g| PlePlan {
+            ple_hidden_size: g.ple_hidden_size,
+        });
 
         Self {
             hidden_size: mc.hidden_size,

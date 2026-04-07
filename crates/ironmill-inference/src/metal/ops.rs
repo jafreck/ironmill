@@ -181,6 +181,10 @@ pub struct MetalPipelines {
     pub fused_residual_norm_matvec: ComputePipeline,
     /// Fused residual+RMSNorm+affine INT4 matvec in one dispatch.
     pub fused_residual_norm_affine_matvec_int4: ComputePipeline,
+    /// Q8 input quantization kernel: FP16 → INT8 with per-group scales.
+    pub quantize_input_q8: ComputePipeline,
+    /// INT4×Q8 integer dot product matvec (decode path).
+    pub affine_matvec_int4xq8: ComputePipeline,
 }
 
 impl MetalPipelines {
@@ -737,6 +741,20 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &fused_rn_lib
                         .get_function("fused_residual_norm_affine_matvec_int4")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            quantize_input_q8: device
+                .create_compute_pipeline(
+                    &elem_lib
+                        .get_function("quantize_input_q8")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            affine_matvec_int4xq8: device
+                .create_compute_pipeline(
+                    &affine_mm_lib
+                        .get_function("affine_matvec_int4xq8")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -2308,4 +2326,59 @@ pub fn encode_gdn_prefill_recurrent(
     encoder.set_bytes(&params_bytes, 9);
     let tg_size = (v_head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP);
     encoder.dispatch_threadgroups((num_v_heads as usize, 1, 1), (tg_size, 1, 1));
+}
+
+// ── Q8 input quantization dispatch ──────────────────────────────
+
+/// Encode Q8 input quantization: FP16 → INT8 with per-group scale factors.
+///
+/// One dispatch quantizes the full input vector. The result is reused by
+/// all subsequent INT4×Q8 projections reading the same input.
+pub fn encode_quantize_input_q8(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    input: &MetalBuffer,
+    q8_data: &MetalBuffer,
+    q8_scales: &MetalBuffer,
+    k: u32,
+    group_size: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(input, 0, 0);
+    encoder.set_buffer(q8_data, 0, 1);
+    encoder.set_buffer(q8_scales, 0, 2);
+    encoder.set_bytes(&k.to_le_bytes(), 3);
+    encoder.set_bytes(&group_size.to_le_bytes(), 4);
+    let num_groups = k.div_ceil(group_size) as usize;
+    let tg_size = (group_size as usize).min(METAL_MAX_THREADS_PER_THREADGROUP);
+    encoder.dispatch_threadgroups((num_groups, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode INT4×Q8 integer dot product matvec for decode.
+///
+/// Uses pre-quantized INT8 input and per-group scales instead of FP16 input.
+/// The integer multiply-add inner loop is ~2× faster than float dequant.
+pub fn encode_affine_matvec_int4xq8(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    q8_data: &MetalBuffer,
+    q8_scales: &MetalBuffer,
+    weight: &super::weights::AffineQuantizedWeight,
+    output: &MetalBuffer,
+    n: u32,
+    k: u32,
+    q8_group_size: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(q8_data, 0, 0);
+    encoder.set_buffer(q8_scales, 0, 1);
+    encoder.set_buffer(&weight.data, 0, 2);
+    encoder.set_buffer(&weight.scales, 0, 3);
+    encoder.set_buffer(&weight.zeros, 0, 4);
+    encoder.set_buffer(output, 0, 5);
+    encoder.set_bytes(&n.to_le_bytes(), 6);
+    encoder.set_bytes(&k.to_le_bytes(), 7);
+    encoder.set_bytes(&weight.group_size.to_le_bytes(), 8);
+    encoder.set_bytes(&q8_group_size.to_le_bytes(), 9);
+    encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }

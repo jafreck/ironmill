@@ -4,7 +4,7 @@ use half::f16;
 use ironmill_metal_sys::StorageMode;
 use mil_rs::weights::WeightProvider;
 
-use super::buffers::{build_matmul_cache, build_rope_cache, IntermediateBuffers};
+use super::buffers::{IntermediateBuffers, build_matmul_cache, build_rope_cache};
 use super::config::Gemma4Config;
 use super::config::MetalConfig;
 use super::engine::{MetalArtifacts, MetalInference};

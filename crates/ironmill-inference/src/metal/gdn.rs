@@ -2,9 +2,7 @@
 
 use ironmill_metal_sys::{ComputeEncoder, MetalBuffer, MetalDevice, StorageMode};
 
-use super::buffers::{
-    IntermediateBuffers, read_buffer_f32, read_weight_f32, write_buffer_f32,
-};
+use super::buffers::{IntermediateBuffers, read_buffer_f32, read_weight_f32, write_buffer_f32};
 use super::error::MetalError;
 use super::ops;
 use super::projection::encode_projection;
@@ -274,7 +272,12 @@ pub(crate) fn encode_gdn_prefill(
         num_v_heads,
         h,
     )?;
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[
+        &gdn.gpu_temp_qkv,
+        &gdn.gpu_temp_z,
+        &gdn.gpu_temp_a,
+        &gdn.gpu_temp_b,
+    ]);
 
     let layer_state = &gdn.layers[gdn_idx];
     ops::encode_gdn_prefill_conv1d_silu(
@@ -288,7 +291,7 @@ pub(crate) fn encode_gdn_prefill(
         gdn_cfg.conv_kernel_size as u32,
         token_count as u32,
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&gdn.gpu_conv_out]);
 
     ops::encode_gdn_prefill_recurrent(
         enc,
@@ -312,7 +315,7 @@ pub(crate) fn encode_gdn_prefill(
         1e-6f32,
         gdn_cfg.num_k_heads as u32,
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&gdn.gpu_gated_output]);
 
     encode_projection(
         enc,
@@ -324,7 +327,7 @@ pub(crate) fn encode_gdn_prefill(
         h,
         value_dim,
     )?;
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&gdn.scratch]);
 
     ops::encode_fused_residual_rms_norm(
         enc,
@@ -490,7 +493,12 @@ pub(crate) fn encode_gdn_decode(
             )?;
         }
     }
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[
+        &gdn.gpu_temp_qkv,
+        &gdn.gpu_temp_z,
+        &gdn.gpu_temp_a,
+        &gdn.gpu_temp_b,
+    ]);
 
     // Fused conv1d+SiLU + recurrent update + output gate in a single dispatch.
     // Replaces 3 separate dispatches (conv1d, recurrent, output_gate) and
@@ -521,7 +529,7 @@ pub(crate) fn encode_gdn_decode(
         gdn_cfg.num_k_heads as u32,
         1e-6f32,
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&gdn.gpu_gated_output]);
 
     encode_projection(
         enc,
@@ -533,7 +541,7 @@ pub(crate) fn encode_gdn_decode(
         h,
         value_dim,
     )?;
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&gdn.scratch]);
 
     ops::encode_fused_residual_rms_norm(
         enc,

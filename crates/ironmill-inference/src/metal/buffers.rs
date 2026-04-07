@@ -13,6 +13,10 @@ use crate::engine::InferenceError;
 
 // ── Intermediate activation buffers ─────────────────────────────
 
+/// Group size for Q8 input quantization. Each group of elements shares
+/// one FP32 scale factor. 128 matches llama.cpp's Q8_0 group size.
+pub(crate) const Q8_GROUP_SIZE: usize = 128;
+
 /// Reusable intermediate activation buffers.
 pub(crate) struct IntermediateBuffers {
     pub(crate) hidden_state: MetalBuffer,
@@ -48,6 +52,11 @@ pub(crate) struct IntermediateBuffers {
     pub(crate) moe_expert_outputs: Option<MetalBuffer>,
     /// MoE combined output `[token_count, hidden_size]`. None when no MoE.
     pub(crate) moe_combined: Option<MetalBuffer>,
+    /// Q8-quantized input data `[max_tokens * hidden_size]` int8.
+    /// Used for INT4×Q8 integer dot product in decode path.
+    pub(crate) q8_data: MetalBuffer,
+    /// Q8 per-group scale factors `[max_tokens * hidden_size / Q8_GROUP_SIZE]` float.
+    pub(crate) q8_scales: MetalBuffer,
     /// Current maximum token capacity of these buffers.
     pub(crate) capacity: usize,
 }
@@ -202,6 +211,17 @@ impl IntermediateBuffers {
             moe_expert_up,
             moe_expert_outputs,
             moe_combined,
+            // Q8 input quantization buffers: int8 data + float scales.
+            // Sized for max_tokens × hidden_size (same as norm_out).
+            q8_data: device
+                .create_buffer((max_tokens * h).max(16), StorageMode::Private)
+                .map_err(MetalError::Metal)?,
+            q8_scales: device
+                .create_buffer(
+                    (max_tokens * h.div_ceil(Q8_GROUP_SIZE) * 4).max(16),
+                    StorageMode::Private,
+                )
+                .map_err(MetalError::Metal)?,
             capacity: max_tokens,
         })
     }

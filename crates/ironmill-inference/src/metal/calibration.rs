@@ -9,7 +9,7 @@ use mil_rs::weights::Architecture;
 use super::attention::{
     encode_end_of_layer_residual, encode_kv_cache_and_attention, encode_qk_norm_and_rope,
 };
-use super::buffers::{build_matmul_cache, bytes_as_f16, ModelConfigExt};
+use super::buffers::{ModelConfigExt, build_matmul_cache, bytes_as_f16};
 use super::engine::MetalInference;
 use super::ffn::{encode_ffn_block, encode_moe_block};
 use super::gdn::encode_gdn_prefill;
@@ -109,7 +109,6 @@ impl MetalInference {
         self.reset();
         Ok(())
     }
-
 
     // ── Calibration-mode pipeline ───────────────────────────────
 

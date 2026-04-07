@@ -15,7 +15,7 @@
 pub mod absorption;
 pub mod cache;
 
-pub use absorption::absorb_weights;
 pub(crate) use absorption::absorb_mla_weights;
+pub use absorption::absorb_weights;
 pub use cache::MlaKvCache;
 pub use mil_rs::weights::MlaConfig;
