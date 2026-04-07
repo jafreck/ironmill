@@ -10,6 +10,7 @@ pub mod error;
 pub mod inference;
 pub mod mla;
 pub mod ops;
+pub(crate) mod plan;
 pub mod turboquant;
 pub mod weights;
 
