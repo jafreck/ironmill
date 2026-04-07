@@ -76,6 +76,10 @@ pub struct AffineQuantConfig {
     /// GPTQ Hessian dampening factor (default: 0.01).
     #[cfg(feature = "gptq")]
     pub gptq_dampening: f64,
+    /// Layer indices to quantize at INT8 instead of INT4.
+    /// Typically the first and last 1-2 layers, which handle the
+    /// embedding→hidden and hidden→logit transformations.
+    pub sensitive_layers: Vec<usize>,
 }
 
 impl AffineQuantConfig {
@@ -92,6 +96,7 @@ impl AffineQuantConfig {
             gptq_block_size: 128,
             #[cfg(feature = "gptq")]
             gptq_dampening: 0.01,
+            sensitive_layers: Vec::new(),
         }
     }
 
@@ -111,6 +116,7 @@ impl AffineQuantConfig {
             gptq_block_size: 128,
             #[cfg(feature = "gptq")]
             gptq_dampening: 0.01,
+            sensitive_layers: Vec::new(),
         }
     }
 
@@ -132,6 +138,7 @@ impl AffineQuantConfig {
             gptq_block_size: 128,
             #[cfg(feature = "gptq")]
             gptq_dampening: 0.01,
+            sensitive_layers: Vec::new(),
         }
     }
 
@@ -166,6 +173,28 @@ impl AffineQuantConfig {
             ..Default::default()
         }
     }
+
+    /// INT4 with first/last N layers at INT8 (most common configuration).
+    pub fn int4_with_sensitive(
+        group_size: usize,
+        num_layers: usize,
+        sensitive_count: usize,
+    ) -> Self {
+        let mut layers = Vec::new();
+        for i in 0..sensitive_count.min(num_layers) {
+            layers.push(i);
+        }
+        for i in num_layers.saturating_sub(sensitive_count)..num_layers {
+            if !layers.contains(&i) {
+                layers.push(i);
+            }
+        }
+        Self {
+            group_size,
+            sensitive_layers: layers,
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for AffineQuantConfig {
@@ -181,6 +210,7 @@ impl Default for AffineQuantConfig {
             gptq_block_size: 128,
             #[cfg(feature = "gptq")]
             gptq_dampening: 0.01,
+            sensitive_layers: Vec::new(),
         }
     }
 }
@@ -573,6 +603,75 @@ fn quantize_tensor_int4_gptq(
     Ok((packed, quant_info))
 }
 
+/// Extract the layer index from a tensor name, if present.
+/// e.g., "model.layers.5.self_attn.q_proj.weight" → Some(5)
+fn extract_layer_index(name: &str) -> Option<usize> {
+    let parts: Vec<&str> = name.split('.').collect();
+    for (i, &p) in parts.iter().enumerate() {
+        if p == "layers" && i + 1 < parts.len() {
+            if let Ok(idx) = parts[i + 1].parse::<usize>() {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+/// Quantize a float tensor using INT8 affine per-group quantization.
+///
+/// Same algorithm as INT4 but with 8-bit range (0-255) and no packing —
+/// each byte holds one INT8 value.
+fn quantize_tensor_int8(
+    floats: &[f32],
+    shape: &[usize],
+    group_size: usize,
+) -> (Vec<u8>, QuantizationInfo) {
+    let last_dim = shape[shape.len() - 1];
+    let outer_count: usize = if shape.len() > 1 {
+        shape[..shape.len() - 1].iter().product()
+    } else {
+        1
+    };
+    let n_groups_per_row = last_dim.div_ceil(group_size);
+
+    let qmax: f32 = 255.0; // INT8 unsigned
+
+    let mut all_quantized: Vec<u8> = Vec::new();
+    let mut all_scale: Vec<f32> = Vec::new();
+    let mut all_zero: Vec<f32> = Vec::new();
+
+    for row in 0..outer_count {
+        let row_start = row * last_dim;
+        for g in 0..n_groups_per_row {
+            let g_start = row_start + g * group_size;
+            let g_end = (g_start + group_size).min(row_start + last_dim);
+            let group = &floats[g_start..g_end];
+
+            let (quantized, scale, zero_point) = quantize_affine(group, qmax);
+            all_quantized.extend_from_slice(&quantized);
+            all_scale.push(scale);
+            all_zero.push(zero_point);
+        }
+    }
+
+    let f32_bytes =
+        |vals: &[f32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+    let quant_info = QuantizationInfo::AffineDequantize {
+        scale: f32_bytes(&all_scale),
+        zero_point: f32_bytes(&all_zero),
+        scale_dtype: ScalarType::Float32,
+        zero_point_dtype: ScalarType::Float32,
+        axis: Some(shape.len() - 1),
+        bit_width: 8,
+        group_size: Some(group_size),
+        awq_scales: None,
+        g_idx: None,
+    };
+
+    (all_quantized, quant_info)
+}
+
 /// INT4 quantization with optional AWQ activation-aware scaling.
 ///
 /// When `awq_magnitudes` is provided, computes per-channel importance scales
@@ -679,6 +778,32 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
         let (packed_data, quant_info) = match &self.method {
             QuantMethod::D2Quant(config) => quantize_tensor(&floats, &t.shape, config),
             QuantMethod::AffineInt4(config) => {
+                // Check if this is a sensitive layer → use INT8 instead of INT4.
+                if !config.sensitive_layers.is_empty() {
+                    // Embedding and lm_head tensors get INT8 when sensitive layers are configured.
+                    let is_embedding = name.contains("embed_tokens") || name.contains("embedding");
+                    let is_lm_head = name.contains("lm_head");
+                    if is_embedding || is_lm_head {
+                        let (packed_data, quant_info) =
+                            quantize_tensor_int8(&floats, &t.shape, config.group_size);
+                        return Ok(WeightTensor::owned(packed_data, t.shape, ScalarType::UInt8)
+                            .with_quant_info(quant_info));
+                    }
+
+                    if let Some(layer_idx) = extract_layer_index(name) {
+                        if config.sensitive_layers.contains(&layer_idx) {
+                            let (packed_data, quant_info) =
+                                quantize_tensor_int8(&floats, &t.shape, config.group_size);
+                            return Ok(WeightTensor::owned(
+                                packed_data,
+                                t.shape,
+                                ScalarType::UInt8,
+                            )
+                            .with_quant_info(quant_info));
+                        }
+                    }
+                }
+
                 let awq_key = tensor_name_to_awq_key(name);
                 let last_dim = *t.shape.last().unwrap_or(&0);
 
@@ -924,6 +1049,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_extract_layer_index() {
+        assert_eq!(
+            extract_layer_index("model.layers.5.self_attn.q_proj.weight"),
+            Some(5)
+        );
+        assert_eq!(
+            extract_layer_index("model.layers.0.mlp.gate_proj.weight"),
+            Some(0)
+        );
+        assert_eq!(
+            extract_layer_index("model.layers.31.self_attn.k_proj.weight"),
+            Some(31)
+        );
+        assert_eq!(extract_layer_index("model.embed_tokens.weight"), None);
+        assert_eq!(extract_layer_index("lm_head.weight"), None);
+        assert_eq!(extract_layer_index("model.norm.weight"), None);
+        // Edge case: "layers" without a numeric successor.
+        assert_eq!(extract_layer_index("model.layers.abc.weight"), None);
+    }
+
+    #[test]
+    fn test_quantize_int8_basic() {
+        let rows = 64;
+        let cols = 128;
+        let floats: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.01 - 40.0).collect();
+        let shape = vec![rows, cols];
+        let group_size = 128;
+
+        let (data, quant_info) = quantize_tensor_int8(&floats, &shape, group_size);
+
+        // INT8: one byte per value, no packing.
+        assert_eq!(data.len(), rows * cols);
+
+        match &quant_info {
+            QuantizationInfo::AffineDequantize {
+                bit_width,
+                group_size: gs,
+                ..
+            } => {
+                assert_eq!(*bit_width, 8);
+                assert_eq!(*gs, Some(group_size));
+            }
+            other => panic!("expected AffineDequantize, got {:?}", other),
+        }
+    }
+
     #[cfg(feature = "gptq")]
     #[test]
     fn test_gptq_differs_from_round_to_nearest() {
@@ -1062,5 +1234,25 @@ mod tests {
         }
 
         assert!(dispatched_to_gptq, "dispatch should have chosen GPTQ path");
+    }
+
+    #[test]
+    fn test_int4_with_sensitive_constructor() {
+        // 32 layers, sensitive_count=2 → layers 0, 1, 30, 31.
+        let config = AffineQuantConfig::int4_with_sensitive(128, 32, 2);
+        assert_eq!(config.group_size, 128);
+        assert_eq!(config.sensitive_layers, vec![0, 1, 30, 31]);
+
+        // Edge case: sensitive_count >= num_layers → all layers sensitive.
+        let config2 = AffineQuantConfig::int4_with_sensitive(128, 4, 4);
+        assert_eq!(config2.sensitive_layers, vec![0, 1, 2, 3]);
+
+        // sensitive_count=0 → no sensitive layers.
+        let config3 = AffineQuantConfig::int4_with_sensitive(128, 32, 0);
+        assert!(config3.sensitive_layers.is_empty());
+
+        // sensitive_count=1 with 1 layer → just layer 0.
+        let config4 = AffineQuantConfig::int4_with_sensitive(128, 1, 1);
+        assert_eq!(config4.sensitive_layers, vec![0]);
     }
 }
