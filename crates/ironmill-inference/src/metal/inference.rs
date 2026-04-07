@@ -1,48 +1,10 @@
-//! Calibration and hook-based pipeline helpers.
+//! Tests for Metal inference modules.
 //!
-//! The [`MetalInference`] struct and trait impls live in [`super::engine`].
-//! Weight loading and initialization live in [`super::loading`].
-//! This module contains calibration-mode pipelines and activation-hook
-//! bridges.
+//! Contains compile-time API surface tests for the calibration pipeline
+//! and correctness tests for FlashAttention-2 prefill kernels.
 
-use half::f16;
-use ironmill_metal_sys::{
-    ComputeEncoder, MetalBuffer, MetalDevice, StorageMode,
-};
-use mil_rs::weights::WeightProvider;
-
-use super::buffers::{
-    IntermediateBuffers,
-    build_matmul_cache, build_rope_cache,
-};
-use super::config::Gemma4Config;
-use super::config::MetalConfig;
-use super::engine::{MetalArtifacts, MetalInference};
-use super::error::MetalError;
-use super::gdn::GdnState;
-use super::kv_cache::Fp16KvCache;
-use super::mla::{MlaConfig, MlaKvCache, absorb_mla_weights};
-use super::ops;
-use super::ops::LinearKernelKind;
-use super::plan::{LayerPlan, ModelPlan};
-use super::turboquant::{
-    MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantLayerConfig, TurboQuantMetalConfig,
-};
-use super::weights::{
-    AffineQuantizedWeight, DualScaleQuantizedWeight, MetalWeights, QuantizedWeight,
-    WeightBuffer,
-};
-use crate::engine::InferenceError;
-use ironmill_core::model_info::ModelInfo;
-
-// ── Matmul tile dimensions — must match Metal shader constants ──
-const MATMUL_TM_TILE: usize = 64;
-const MATMUL_TN_TILE: usize = 64;
-const MATMUL_THREADS_PER_TG: usize = 256;
-
-
-impl MetalInference {
-}
+#[cfg(test)]
+use super::engine::MetalInference;
 
 // ── Calibration tests ──────────────────────────────────────────
 //
