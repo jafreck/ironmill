@@ -323,10 +323,12 @@ impl Iterator for TokenStream<'_> {
             state.advance(token);
             if state.is_complete() {
                 self.finished = true;
-                return Some(Ok(GenerateEvent::Finished {
-                    reason: FinishReason::GrammarComplete,
-                    tokens_generated: self.position + 1,
-                    prompt_tokens: self.request.prompt_tokens.len(),
+                self.position += 1;
+                self.pending_finish = Some(FinishReason::GrammarComplete);
+                return Some(Ok(GenerateEvent::Token {
+                    token,
+                    logprob,
+                    position: self.position - 1,
                 }));
             }
         }
@@ -334,10 +336,12 @@ impl Iterator for TokenStream<'_> {
         // ── Check stop conditions ──
         if self.effective_stop_tokens.contains(&token) {
             self.finished = true;
-            return Some(Ok(GenerateEvent::Finished {
-                reason: FinishReason::Stop,
-                tokens_generated: self.position,
-                prompt_tokens: self.request.prompt_tokens.len(),
+            self.position += 1;
+            self.pending_finish = Some(FinishReason::Stop);
+            return Some(Ok(GenerateEvent::Token {
+                token,
+                logprob,
+                position: self.position - 1,
             }));
         }
 

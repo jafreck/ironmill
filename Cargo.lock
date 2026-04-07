@@ -1078,6 +1078,7 @@ dependencies = [
  "ironmill-coreml-sys",
  "ironmill-iosurface",
  "ironmill-metal-sys",
+ "log",
  "mil-rs",
  "rand 0.8.5",
  "serde",

@@ -85,6 +85,19 @@ pub trait InferenceEngine: Send {
     fn memory_usage(&self) -> Option<MemoryUsage> {
         None
     }
+
+    /// Restore KV cache activations from CPU-side snapshots.
+    ///
+    /// Returns `Ok(true)` if the KV state was successfully restored
+    /// (the engine's [`seq_pos`](Self::seq_pos) should then equal the
+    /// total number of restored tokens). Returns `Ok(false)` if the
+    /// backend does not support KV restoration, allowing the caller
+    /// to fall back to re-prefilling.
+    ///
+    /// The default implementation returns `Ok(false)` (not supported).
+    fn restore_kv(&mut self, _slices: &[&KvCacheSlice]) -> Result<bool, InferenceError> {
+        Ok(false)
+    }
 }
 
 /// Batch inference engine for concurrent sequence processing.
@@ -129,18 +142,43 @@ pub fn prefill_with_cache(
     let (matched, kv_slices) = cache.lookup(tokens);
 
     let logits = if matched > 0 && !kv_slices.is_empty() && matched <= tokens.len() {
-        // Cache hit — reset engine and replay the cached prefix, then
-        // prefill only the new suffix.
+        // Cache hit — reset engine, attempt KV restore.
         engine.reset();
 
-        if matched < tokens.len() {
-            engine.prefill(&tokens[..matched])?;
-            engine.prefill(&tokens[matched..])?
+        if engine.restore_kv(&kv_slices)? {
+            // KV state restored from cache, only prefill remaining tokens.
+            if matched < tokens.len() {
+                engine.prefill(&tokens[matched..])?
+            } else {
+                // Entire prompt cached. Truncate the last position and
+                // re-prefill the final token to produce logits.
+                engine.truncate_to(matched - 1);
+                engine.prefill(&tokens[matched - 1..])?
+            }
         } else {
-            engine.prefill(&tokens[..matched])?
+            // Backend doesn't support KV restore — re-prefill the prefix.
+            log::warn!("KV restore not supported by backend, re-prefilling prefix");
+            if matched < tokens.len() {
+                engine.prefill(&tokens[..matched])?;
+                engine.prefill(&tokens[matched..])?
+            } else {
+                engine.prefill(tokens)?
+            }
         }
     } else {
         // No cache hit — full prefill.
+        if matched > 0 && kv_slices.is_empty() {
+            log::warn!(
+                "prefix cache metadata matched {} tokens but KV slices are empty; \
+                 falling back to full prefill",
+                matched,
+            );
+        } else if matched == 0 {
+            log::warn!(
+                "prefix cache miss for {} token prompt; performing full prefill",
+                tokens.len(),
+            );
+        }
         engine.reset();
         engine.prefill(tokens)?
     };
