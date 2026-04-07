@@ -142,7 +142,7 @@ impl MetalInference {
     // ── Memory query ─────────────────────────────────────────────
 
     /// Returns the current Metal device allocation size in bytes.
-    pub(crate) fn gpu_allocated_bytes(&self) -> usize {
+    pub fn gpu_allocated_bytes(&self) -> usize {
         self.device.current_allocated_size()
     }
 

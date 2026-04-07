@@ -28,19 +28,72 @@ and an experimental direct-ANE backend built on reverse-engineered private APIs.
 ### Compiler
 
 Imports models, applies optimization passes, and outputs backend-specific
-bundles:
+bundles.
 
-- **Model import:** ONNX, SafeTensors, GGUF, CoreML (.mlmodel/.mlpackage)
-- **MIL IR:** full read/write/manipulation of Apple's Model Intermediate Language
-- **General optimization:** dead code elimination, constant folding, op fusion
-  (conv+batchnorm, conv+relu, linear+relu, SDPA)
-- **Quantization:** FP16, INT8 weight-only, 2/4/6/8-bit weight quantization (PolarQuant)
-- **ANE lowering:** matmul→conv1×1, layout optimization, op substitution,
-  automatic model splitting into ANE-sized sub-programs
-- **Output formats:**
-  - `.mlpackage` for CoreML (with optional `xcrun coremlcompiler` compilation)
-  - `.ironml` bundles for ANE Direct (MIL text + weight blobs)
-  - `.ironml-gpu` bundles for Metal GPU
+#### Model Import
+
+- **ONNX** (`.onnx`) via MIL conversion
+- **SafeTensors** directories with architecture auto-detection from `config.json`
+- **GGUF** quantized model files
+- **CoreML** (`.mlmodel` / `.mlpackage`) with full MIL round-trip
+
+#### Architecture Templates
+
+Built-in templates generate MIL programs from SafeTensors/GGUF weights for
+supported architectures:
+
+| Architecture | Variants | Notes |
+|---|---|---|
+| LLaMA | LLaMA 2/3, CodeLlama, Mistral | ANE lowering with static KV cache, 1×1 conv projections |
+| Qwen | Qwen, Qwen 2/3 | Q/K/V biases, sliding-window metadata |
+| Qwen 3.5 | Qwen 3.5 | GDN layers, partial rotary (25%), attention output gate |
+| Gemma | Gemma 2/3/4 | Embedding scaling, PLE, MoE, KV-shared layers, logit softcapping |
+
+#### General Optimization Passes
+
+| Pass | Description |
+|---|---|
+| Dead code elimination | Removes unreachable ops from the graph |
+| Constant folding | Evaluates compile-time constant expressions |
+| Identity elimination | Strips no-op identity operations |
+| Op fusion | Conv+BatchNorm, Conv+ReLU, Linear+ReLU, SDPA fusion |
+
+#### Weight Quantization
+
+| Method | Bits | Description |
+|---|---|---|
+| FP16 | 16 | Half-precision float conversion |
+| INT8 | 8 | Symmetric weight-only quantization |
+| INT4 | 4 | Affine per-group quantization |
+| PolarQuant | 2/4 | LUT-based quantization with codebook indices |
+| D2Quant | 2/3 | Dual-scale quantization (coarse + fine scales) |
+| AWQ | 4 | Activation-aware quantization with calibration data |
+| GPTQ | 4 | Post-training quantization with calibration (requires `gptq` feature) |
+| QuIP# | 2 | E8 lattice quantization with Hadamard rotation |
+| Palettization | 2/4/6/8 | Weight clustering with shared codebooks |
+
+#### ANE Lowering Passes
+
+| Pass | Description |
+|---|---|
+| `AneMatmulToConvPass` | Lowers matmul to 1×1 convolution for ANE execution |
+| `AneLayoutPass` | Reshapes tensors to ANE-native `[1, C, 1, S]` layout |
+| `OpSubstitutionPass` | Rewrites ops for ANE (GELU expansion, SiLU fusion, rsqrt rewrite) |
+| `AttentionDecomposePass` | Decomposes SDPA into matmul/mask/softmax/matmul |
+| `OpSplittingPass` | Tiles oversized matmul/linear/conv ops to fit ANE memory budget |
+| `ModelSplitPass` | Splits model into draft/verifier programs for speculative decoding |
+| `KvCachePass` | Inserts KV-cache read/update ops with static cache shapes |
+| `ComputeUnitAnnotationPass` | Annotates ops with preferred compute unit (ANE/GPU/CPU) |
+| `LayerSchedulePass` | Layer-type aware scheduling (conv/attention/ffn/norm) |
+| `MixedPrecisionPass` | Per-op FP16/INT8 precision assignment |
+| `PerExpertQuantPass` | Per-expert quantization for MoE models |
+| `CodebookOptimizationPass` | Fuses RVQ codebook gather+sum, adds palettize hints |
+
+#### Output Formats
+
+- `.mlpackage` for CoreML (with optional `xcrun coremlcompiler` compilation)
+- `.ironml` bundles for ANE Direct (MIL text + weight blobs)
+- `.ironml-gpu` bundles for Metal GPU
 
 ### Inference Runtime
 

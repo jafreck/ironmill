@@ -1,0 +1,71 @@
+# TurboQuant KV Cache Compression Benchmark — Qwen3.5-4B
+#
+# Demonstrates TurboQuant's value at long context lengths where the
+# FP16 KV cache becomes a significant fraction of GPU memory.
+#
+# The model has 8 standard attention layers (4 KV heads, head_dim=256).
+# FP16 KV cache cost: 8 layers × 2 × 4 × 256 × 2B = 32 KB per token.
+#
+# Reproduce:
+#   cargo run --release -p ironmill-bench --features metal -- \
+#     --config configs/qwen35-turboquant-bench.toml -b metal \
+#     --baseline fp16-2k
+
+[[model]]
+name = "Qwen3.5-4B"
+path = "unused"
+model_dir = "models/Qwen3.5-4B"
+
+# ── Short context (2K) — KV cache is negligible ─────────────────
+[[optimization]]
+name = "fp16-2k"
+kv_quant = "none"
+max_seq_len = 2048
+
+[[optimization]]
+name = "tq-int8-2k"
+kv_quant = "turbo-int8"
+max_seq_len = 2048
+
+[[optimization]]
+name = "tq-int4-2k"
+kv_quant = "turbo-int4"
+max_seq_len = 2048
+
+# ── Medium context (32K) — KV cache ~1 GB FP16 ──────────────────
+[[optimization]]
+name = "fp16-32k"
+kv_quant = "none"
+max_seq_len = 32768
+
+[[optimization]]
+name = "tq-int8-32k"
+kv_quant = "turbo-int8"
+max_seq_len = 32768
+
+[[optimization]]
+name = "tq-int4-32k"
+kv_quant = "turbo-int4"
+max_seq_len = 32768
+
+# ── Long context (128K) — KV cache ~4 GB FP16 ───────────────────
+[[optimization]]
+name = "fp16-128k"
+kv_quant = "none"
+max_seq_len = 131072
+
+[[optimization]]
+name = "tq-int8-128k"
+kv_quant = "turbo-int8"
+max_seq_len = 131072
+
+[[optimization]]
+name = "tq-int4-128k"
+kv_quant = "turbo-int4"
+max_seq_len = 131072
+
+[settings]
+iterations = 20
+warmup = 5
+runs = 1
+backends = ["metal"]

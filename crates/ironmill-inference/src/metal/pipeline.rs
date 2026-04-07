@@ -30,10 +30,7 @@ impl MetalInference {
     /// so arbitrarily long sequences work without OOM.
     ///
     /// Used for efficient perplexity evaluation.
-    pub(crate) fn prefill_all_logits(
-        &mut self,
-        token_ids: &[u32],
-    ) -> Result<Vec<Logits>, InferenceError> {
+    pub fn prefill_all_logits(&mut self, token_ids: &[u32]) -> Result<Vec<Logits>, InferenceError> {
         let mc = self
             .model_config
             .as_ref()
@@ -202,7 +199,7 @@ impl MetalInference {
     /// Returns the content of `norm_out` (final RMSNorm output before LM head)
     /// as FP32. Call after `decode_step()`, `prefill()`, or `speculative_step()`
     /// to get the hidden state without re-running the pipeline.
-    pub(crate) fn last_hidden_state(&self) -> Result<Vec<f32>, InferenceError> {
+    pub fn last_hidden_state(&self) -> Result<Vec<f32>, InferenceError> {
         let mc = self
             .model_config
             .as_ref()

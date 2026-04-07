@@ -20,7 +20,9 @@ use clap::Parser;
 use config::{ModelConfig, Settings};
 use report::{BenchReport, MemorySummary, OutputFormat, ReportRow, UtilizationSummary};
 #[allow(unused_imports)]
-use stats::{aggregate_runs, compute_stats, compute_stats_with_flops, welch_t_test};
+use stats::{
+    AggregatedResult, aggregate_runs, compute_stats, compute_stats_with_flops, welch_t_test,
+};
 
 /// Backends to benchmark.
 /// Values: coreml-cpu, coreml-gpu, coreml-ane, coreml-all, metal
@@ -143,6 +145,16 @@ struct Cli {
     /// When provided, decode benchmarks use speculative decoding with the draft head.
     #[arg(long)]
     specbundle: Option<PathBuf>,
+
+    /// Run prefill throughput benchmark at various input lengths
+    #[arg(long)]
+    prefill_bench: bool,
+
+    /// Comma-separated context lengths for decode-at-context benchmark.
+    /// Prefills this many tokens before measuring decode latency.
+    /// Example: "128,1024,4096,16384"
+    #[arg(long, value_delimiter = ',')]
+    context_lengths: Vec<usize>,
 }
 
 /// Run CoreML benchmark loop across models × optimizations × compute units.
@@ -1017,6 +1029,189 @@ fn main() -> Result<()> {
                             memory: Some(measured_memory),
                             load_time_ms: Some(load_time_ms),
                         });
+                    }
+
+                    // ── Prefill throughput benchmark ──
+                    if cli.prefill_bench {
+                        eprintln!("\n  Metal Prefill Throughput");
+                        eprintln!("  {}", "─".repeat(40));
+
+                        let prefill_lengths: Vec<usize> = vec![128, 512, 1024, 2048, 4096];
+                        for &prefill_len in &prefill_lengths {
+                            if prefill_len > gpu_config.max_seq_len {
+                                eprintln!(
+                                    "  ⚠ skipping prefill_len={prefill_len}: exceeds max_seq_len={}",
+                                    gpu_config.max_seq_len
+                                );
+                                continue;
+                            }
+
+                            let tokens: Vec<u32> = vec![9707u32; prefill_len];
+                            let mut prefill_times_ms = Vec::new();
+
+                            for _ in 0..matrix.settings.runs.max(1) {
+                                engine.reset();
+                                let t0 = std::time::Instant::now();
+                                match engine.prefill(&tokens) {
+                                    Ok(_) => {
+                                        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                        prefill_times_ms.push(elapsed_ms);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("  ✗ prefill failed at len={prefill_len}: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if prefill_times_ms.is_empty() {
+                                continue;
+                            }
+
+                            let mean_ms = prefill_times_ms.iter().sum::<f64>()
+                                / prefill_times_ms.len() as f64;
+                            let tok_per_sec = prefill_len as f64 / (mean_ms / 1000.0);
+
+                            let label = format!(
+                                "{}/metal-{config_name}/prefill-{prefill_len}",
+                                model_cfg.name
+                            );
+                            let mut stats = compute_stats(&label, &prefill_times_ms);
+                            stats.tokens_per_sec = Some(tok_per_sec);
+
+                            let stddev = if prefill_times_ms.len() > 1 {
+                                let var = prefill_times_ms
+                                    .iter()
+                                    .map(|v| (v - mean_ms).powi(2))
+                                    .sum::<f64>()
+                                    / (prefill_times_ms.len() - 1) as f64;
+                                var.sqrt()
+                            } else {
+                                0.0
+                            };
+
+                            eprintln!(
+                                "  ✓ {config_name}[prefill={prefill_len}]: {mean_ms:.2}ms ({tok_per_sec:.0} tok/s) ± {stddev:.2}ms"
+                            );
+
+                            let aggregated = AggregatedResult {
+                                config_label: label,
+                                pooled: stats,
+                                per_run_means: prefill_times_ms.clone(),
+                                between_run_stddev: stddev,
+                                runs: prefill_times_ms.len(),
+                            };
+
+                            report_rows.push(ReportRow {
+                                model: model_cfg.name.clone(),
+                                optimization: "default".to_string(),
+                                backend: format!("metal-{config_name}[prefill={prefill_len}]"),
+                                kv_quant: config_name.to_string(),
+                                result: aggregated,
+                                significance: None,
+                                energy: None,
+                                utilization: None,
+                                memory: None,
+                                load_time_ms: None,
+                            });
+                        }
+                    }
+
+                    // ── Decode-at-context benchmark ──
+                    if !cli.context_lengths.is_empty() {
+                        eprintln!("\n  Metal Decode at Long Context");
+                        eprintln!("  {}", "─".repeat(40));
+
+                        for &ctx_len in &cli.context_lengths {
+                            if ctx_len > gpu_config.max_seq_len {
+                                eprintln!(
+                                    "  ⚠ skipping ctx={ctx_len}: exceeds max_seq_len={}",
+                                    gpu_config.max_seq_len
+                                );
+                                continue;
+                            }
+
+                            let prefill_tokens: Vec<u32> = vec![9707u32; ctx_len];
+
+                            let mut run_results_ctx = Vec::new();
+                            for run_idx in 0..matrix.settings.runs {
+                                engine.reset();
+
+                                if let Err(e) = engine.prefill(&prefill_tokens) {
+                                    eprintln!("  ✗ prefill failed at ctx={ctx_len}: {e}");
+                                    continue;
+                                }
+
+                                let mut last_token = 9707u32;
+                                let mut latencies = Vec::with_capacity(matrix.settings.iterations);
+
+                                for _ in 0..matrix.settings.iterations {
+                                    let t0 = std::time::Instant::now();
+                                    match engine.decode_step(last_token) {
+                                        Ok(logits) => {
+                                            let elapsed = t0.elapsed();
+                                            latencies.push(elapsed);
+                                            last_token = logits
+                                                .iter()
+                                                .enumerate()
+                                                .max_by(|(_, a), (_, b)| {
+                                                    a.partial_cmp(b)
+                                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                                })
+                                                .map(|(i, _)| i as u32)
+                                                .unwrap_or(0);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("  ✗ decode failed at ctx={ctx_len}: {e}");
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if latencies.is_empty() {
+                                    continue;
+                                }
+
+                                let latencies_ms: Vec<f64> =
+                                    latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+
+                                let label = format!(
+                                    "{}/metal-{config_name}[ctx={ctx_len}]/run{run_idx}",
+                                    model_cfg.name
+                                );
+                                run_results_ctx.push(compute_stats(&label, &latencies_ms));
+                            }
+
+                            if !run_results_ctx.is_empty() {
+                                let label = format!(
+                                    "{}/metal-{config_name}[ctx={ctx_len}]",
+                                    model_cfg.name
+                                );
+                                let mut aggregated = aggregate_runs(&label, &run_results_ctx);
+
+                                let tok_per_sec = 1000.0 / aggregated.pooled.median;
+                                aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
+                                aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
+
+                                eprintln!(
+                                    "  ✓ {config_name}[ctx={ctx_len}]: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms",
+                                    aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
+                                );
+
+                                report_rows.push(ReportRow {
+                                    model: model_cfg.name.clone(),
+                                    optimization: "default".to_string(),
+                                    backend: format!("metal-{config_name}[ctx={ctx_len}]"),
+                                    kv_quant: config_name.to_string(),
+                                    result: aggregated,
+                                    significance: None,
+                                    energy: None,
+                                    utilization: None,
+                                    memory: None,
+                                    load_time_ms: None,
+                                });
+                            }
+                        }
                     }
                 }
             }

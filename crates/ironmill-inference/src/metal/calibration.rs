@@ -26,7 +26,7 @@ impl MetalInference {
     /// compensate for quantization-induced activation drift.
     ///
     /// Reference: D²Quant (arXiv:2602.02546) §3.3, Algorithm 1 lines 3–10.
-    pub(crate) fn calibrate_dac(
+    pub fn calibrate_dac(
         &mut self,
         fp_provider: &dyn mil_rs::weights::WeightProvider,
         calibration_tokens: &[u32],
