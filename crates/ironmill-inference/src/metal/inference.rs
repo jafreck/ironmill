@@ -6194,3 +6194,436 @@ mod calibration_tests {
             .expect("should create compute pipeline");
     }
 }
+
+// ── FA2 prefill attention correctness tests ────────────────────
+//
+// These tests verify that the FlashAttention-2 prefill kernel produces
+// the same output as the fused SDPA kernel for the same inputs.
+// Requires a Metal GPU.
+
+#[cfg(test)]
+mod fa2_prefill_tests {
+    use half::f16;
+    use ironmill_metal_sys::{MetalDevice, StorageMode};
+
+    /// Create a Metal buffer filled with FP16 data from f32 values.
+    fn make_fp16_buffer(
+        device: &MetalDevice,
+        data: &[f32],
+    ) -> ironmill_metal_sys::MetalBuffer {
+        let bytes: Vec<u8> = data
+            .iter()
+            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+            .collect();
+        device
+            .create_buffer_with_data(&bytes, StorageMode::Shared)
+            .expect("create buffer")
+    }
+
+    /// Read FP16 buffer back as f32 values.
+    fn read_fp16_buffer(buf: &ironmill_metal_sys::MetalBuffer, count: usize) -> Vec<f32> {
+        let byte_count = count * 2;
+        let mut bytes = vec![0u8; byte_count];
+        buf.read_bytes(&mut bytes, 0).expect("read_bytes");
+        bytes
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    }
+
+    /// CPU reference: causal scaled dot-product attention.
+    ///
+    /// Q: [token_count, num_q_heads, head_dim]
+    /// K/V cache: [num_kv_heads, max_seq_len, head_dim] (filled up to seq_offset + token_count)
+    fn cpu_attention(
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        seq_offset: usize,
+        token_count: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let heads_per_group = num_q_heads / num_kv_heads;
+        let mut output = vec![0.0f32; token_count * num_q_heads * head_dim];
+
+        for t in 0..token_count {
+            let causal_len = seq_offset + t + 1;
+            for h in 0..num_q_heads {
+                let kv_h = h / heads_per_group;
+                let q_base = (t * num_q_heads + h) * head_dim;
+
+                // Compute QK^T scores
+                let mut scores = vec![-f32::INFINITY; causal_len];
+                for p in 0..causal_len {
+                    let k_base = (kv_h * max_seq_len + p) * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[q_base + d] * k_cache[k_base + d];
+                    }
+                    scores[p] = dot * scale;
+                }
+
+                // Softmax
+                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - max_score).exp();
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+
+                // Weighted sum of V
+                let o_base = (t * num_q_heads + h) * head_dim;
+                for p in 0..causal_len {
+                    let v_base = (kv_h * max_seq_len + p) * head_dim;
+                    for d in 0..head_dim {
+                        output[o_base + d] += scores[p] * v_cache[v_base + d];
+                    }
+                }
+            }
+        }
+        output
+    }
+
+    /// Generate deterministic pseudo-random f32 values in [-1, 1].
+    fn pseudo_random(seed: u64, count: usize) -> Vec<f32> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                // xorshift64
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Fill KV cache positions 0..token_count from flat fill arrays.
+    fn fill_kv_cache(
+        cache: &mut [f32],
+        fill: &[f32],
+        num_kv_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        token_count: usize,
+    ) {
+        for kv_h in 0..num_kv_heads {
+            for t in 0..token_count {
+                for d in 0..head_dim {
+                    cache[kv_h * max_seq_len * head_dim + t * head_dim + d] =
+                        fill[kv_h * token_count * head_dim + t * head_dim + d];
+                }
+            }
+        }
+    }
+
+    /// Verify FA2 prefill produces the same output as fused SDPA.
+    ///
+    /// Uses head_dim=128 (precompiled shaders), 4 Q heads, 2 KV heads,
+    /// 8 tokens of prefill.
+    #[test]
+    fn fa2_matches_fused_sdpa() {
+        let device = match MetalDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("SKIP: no Metal device");
+                return;
+            }
+        };
+        let queue = device.create_command_queue().expect("command queue");
+
+        let head_dim = 128usize;
+        let num_q_heads = 4u32;
+        let num_kv_heads = 2u32;
+        let token_count = 8usize;
+        let max_seq_len = 64usize;
+        let seq_offset = 0usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q_data = pseudo_random(42, token_count * num_q_heads as usize * head_dim);
+        let mut k_data = vec![0.0f32; num_kv_heads as usize * max_seq_len * head_dim];
+        let mut v_data = vec![0.0f32; num_kv_heads as usize * max_seq_len * head_dim];
+        fill_kv_cache(
+            &mut k_data,
+            &pseudo_random(123, num_kv_heads as usize * token_count * head_dim),
+            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+        );
+        fill_kv_cache(
+            &mut v_data,
+            &pseudo_random(456, num_kv_heads as usize * token_count * head_dim),
+            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+        );
+
+        let expected = cpu_attention(
+            &q_data, &k_data, &v_data,
+            num_q_heads as usize, num_kv_heads as usize,
+            head_dim, max_seq_len, seq_offset, token_count, scale,
+        );
+
+        let q_buf = make_fp16_buffer(&device, &q_data);
+        let k_buf = make_fp16_buffer(&device, &k_data);
+        let v_buf = make_fp16_buffer(&device, &v_data);
+        let output_size = token_count * num_q_heads as usize * head_dim;
+        let output_fa2 = device
+            .create_buffer(output_size * 2, StorageMode::Shared)
+            .expect("output fa2");
+        let output_sdpa = device
+            .create_buffer(output_size * 2, StorageMode::Shared)
+            .expect("output sdpa");
+
+        let pipelines =
+            super::super::ops::MetalPipelines::compile(&device, head_dim, head_dim)
+                .expect("compile pipelines");
+
+        // --- Dispatch FA2 ---
+        {
+            let cmd = queue.command_buffer().expect("cmd");
+            let enc = cmd.compute_encoder().expect("enc");
+            super::super::ops::encode_fa2_prefill_attention(
+                &enc,
+                &pipelines.prefill_attention_fa2,
+                &super::super::ops::PrefillAttentionParams {
+                    q: &q_buf,
+                    k_cache: &k_buf,
+                    v_cache: &v_buf,
+                    output: &output_fa2,
+                    num_heads: num_q_heads,
+                    num_kv_heads,
+                    head_dim: head_dim as u32,
+                    max_seq_len: max_seq_len as u32,
+                    seq_offset: seq_offset as u32,
+                    token_count: token_count as u32,
+                    window_size: 0,
+                    attn_scale: scale,
+                },
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        // --- Dispatch fused SDPA ---
+        {
+            let cmd = queue.command_buffer().expect("cmd");
+            let enc = cmd.compute_encoder().expect("enc");
+            let total_seq = (seq_offset + token_count) as u32;
+            super::super::ops::encode_fused_sdpa(
+                &enc,
+                &pipelines.fused_sdpa,
+                &super::super::ops::FusedSdpaParams {
+                    q: &q_buf,
+                    k: &k_buf,
+                    v: &v_buf,
+                    output: &output_sdpa,
+                    seq_len: total_seq,
+                    token_count: token_count as u32,
+                    head_dim: head_dim as u32,
+                    num_q_heads,
+                    num_kv_heads,
+                    scale,
+                    max_seq_len: max_seq_len as u32,
+                },
+                None,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        let fa2_result = read_fp16_buffer(&output_fa2, output_size);
+        let sdpa_result = read_fp16_buffer(&output_sdpa, output_size);
+
+        let mut max_diff_fa2_sdpa = 0.0f32;
+        let mut max_diff_fa2_cpu = 0.0f32;
+        let mut max_diff_sdpa_cpu = 0.0f32;
+        for i in 0..output_size {
+            max_diff_fa2_sdpa = max_diff_fa2_sdpa.max((fa2_result[i] - sdpa_result[i]).abs());
+            max_diff_fa2_cpu = max_diff_fa2_cpu.max((fa2_result[i] - expected[i]).abs());
+            max_diff_sdpa_cpu = max_diff_sdpa_cpu.max((sdpa_result[i] - expected[i]).abs());
+        }
+
+        println!("FA2 vs SDPA max diff:  {max_diff_fa2_sdpa:.6}");
+        println!("FA2 vs CPU  max diff:  {max_diff_fa2_cpu:.6}");
+        println!("SDPA vs CPU max diff:  {max_diff_sdpa_cpu:.6}");
+
+        // FP16 accumulation error: tolerate up to 0.05 for head_dim=128
+        assert!(max_diff_fa2_sdpa < 0.05, "FA2 vs SDPA diverged: {max_diff_fa2_sdpa}");
+        assert!(max_diff_fa2_cpu < 0.1, "FA2 vs CPU diverged: {max_diff_fa2_cpu}");
+        assert!(max_diff_sdpa_cpu < 0.1, "SDPA vs CPU diverged: {max_diff_sdpa_cpu}");
+    }
+
+    /// Verify FA2 handles GQA (grouped-query attention) correctly:
+    /// multiple Q heads share the same KV head.
+    #[test]
+    fn fa2_gqa_correctness() {
+        let device = match MetalDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("SKIP: no Metal device");
+                return;
+            }
+        };
+        let queue = device.create_command_queue().expect("command queue");
+
+        let head_dim = 64usize;
+        let num_q_heads = 8u32;
+        let num_kv_heads = 2u32;
+        let token_count = 4usize;
+        let max_seq_len = 32usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q_data = pseudo_random(77, token_count * num_q_heads as usize * head_dim);
+        let mut k_data = vec![0.0f32; num_kv_heads as usize * max_seq_len * head_dim];
+        let mut v_data = vec![0.0f32; num_kv_heads as usize * max_seq_len * head_dim];
+        fill_kv_cache(
+            &mut k_data,
+            &pseudo_random(88, num_kv_heads as usize * token_count * head_dim),
+            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+        );
+        fill_kv_cache(
+            &mut v_data,
+            &pseudo_random(99, num_kv_heads as usize * token_count * head_dim),
+            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+        );
+
+        let expected = cpu_attention(
+            &q_data, &k_data, &v_data,
+            num_q_heads as usize, num_kv_heads as usize,
+            head_dim, max_seq_len, 0, token_count, scale,
+        );
+
+        let q_buf = make_fp16_buffer(&device, &q_data);
+        let k_buf = make_fp16_buffer(&device, &k_data);
+        let v_buf = make_fp16_buffer(&device, &v_data);
+        let output_size = token_count * num_q_heads as usize * head_dim;
+        let output_buf = device.create_buffer(output_size * 2, StorageMode::Shared).expect("out");
+
+        let pipelines =
+            super::super::ops::MetalPipelines::compile(&device, head_dim, head_dim)
+                .expect("compile");
+
+        let cmd = queue.command_buffer().expect("cmd");
+        let enc = cmd.compute_encoder().expect("enc");
+        super::super::ops::encode_fa2_prefill_attention(
+            &enc,
+            &pipelines.prefill_attention_fa2,
+            &super::super::ops::PrefillAttentionParams {
+                q: &q_buf,
+                k_cache: &k_buf,
+                v_cache: &v_buf,
+                output: &output_buf,
+                num_heads: num_q_heads,
+                num_kv_heads,
+                head_dim: head_dim as u32,
+                max_seq_len: max_seq_len as u32,
+                seq_offset: 0,
+                token_count: token_count as u32,
+                window_size: 0,
+                attn_scale: scale,
+            },
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let result = read_fp16_buffer(&output_buf, output_size);
+        let mut max_diff = 0.0f32;
+        for i in 0..output_size {
+            max_diff = max_diff.max((result[i] - expected[i]).abs());
+        }
+        println!("FA2 GQA (8:2) vs CPU max diff: {max_diff:.6}");
+        assert!(max_diff < 0.1, "FA2 GQA diverged: max_diff={max_diff}");
+    }
+
+    /// Verify FA2 with attn_scale=1.0 (QK-normed models like Gemma 4).
+    #[test]
+    fn fa2_unit_attn_scale() {
+        let device = match MetalDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("SKIP: no Metal device");
+                return;
+            }
+        };
+        let queue = device.create_command_queue().expect("command queue");
+
+        let head_dim = 128usize;
+        let num_q_heads = 2u32;
+        let num_kv_heads = 2u32;
+        let token_count = 4usize;
+        let max_seq_len = 16usize;
+        let scale = 1.0f32;
+
+        // Use small values so softmax doesn't saturate with scale=1.0
+        let q_data: Vec<f32> = pseudo_random(111, token_count * num_q_heads as usize * head_dim)
+            .iter().map(|&v| v * 0.1).collect();
+        let mut k_data = vec![0.0f32; num_kv_heads as usize * max_seq_len * head_dim];
+        let mut v_data = vec![0.0f32; num_kv_heads as usize * max_seq_len * head_dim];
+        let k_fill: Vec<f32> = pseudo_random(222, num_kv_heads as usize * token_count * head_dim)
+            .iter().map(|&v| v * 0.1).collect();
+        fill_kv_cache(
+            &mut k_data, &k_fill,
+            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+        );
+        fill_kv_cache(
+            &mut v_data,
+            &pseudo_random(333, num_kv_heads as usize * token_count * head_dim),
+            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+        );
+
+        let expected = cpu_attention(
+            &q_data, &k_data, &v_data,
+            num_q_heads as usize, num_kv_heads as usize,
+            head_dim, max_seq_len, 0, token_count, scale,
+        );
+
+        let q_buf = make_fp16_buffer(&device, &q_data);
+        let k_buf = make_fp16_buffer(&device, &k_data);
+        let v_buf = make_fp16_buffer(&device, &v_data);
+        let output_size = token_count * num_q_heads as usize * head_dim;
+        let output_buf = device.create_buffer(output_size * 2, StorageMode::Shared).expect("out");
+
+        let pipelines =
+            super::super::ops::MetalPipelines::compile(&device, head_dim, head_dim)
+                .expect("compile");
+
+        let cmd = queue.command_buffer().expect("cmd");
+        let enc = cmd.compute_encoder().expect("enc");
+        super::super::ops::encode_fa2_prefill_attention(
+            &enc,
+            &pipelines.prefill_attention_fa2,
+            &super::super::ops::PrefillAttentionParams {
+                q: &q_buf,
+                k_cache: &k_buf,
+                v_cache: &v_buf,
+                output: &output_buf,
+                num_heads: num_q_heads,
+                num_kv_heads,
+                head_dim: head_dim as u32,
+                max_seq_len: max_seq_len as u32,
+                seq_offset: 0,
+                token_count: token_count as u32,
+                window_size: 0,
+                attn_scale: scale,
+            },
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let result = read_fp16_buffer(&output_buf, output_size);
+        let mut max_diff = 0.0f32;
+        for i in 0..output_size {
+            max_diff = max_diff.max((result[i] - expected[i]).abs());
+        }
+        println!("FA2 scale=1.0 vs CPU max diff: {max_diff:.6}");
+        assert!(max_diff < 0.1, "FA2 scale=1.0 diverged: max_diff={max_diff}");
+    }
+}
