@@ -221,3 +221,114 @@ kernel void matmul(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+
+// ============================================================================
+// Batched FP16 matrix-vector product for GDN projections.
+//
+// Computes 4 independent matvecs in a single dispatch:
+//   y_i = x · W_i^T   for i in {0, 1, 2, 3}
+//
+// All 4 projections share the same input x but have different weight matrices
+// and output buffers. Threadgroups are partitioned across the 4 projections
+// using cumulative N boundaries.
+//
+// Each threadgroup handles ROWS_PER_TG (64) output rows, identical to the
+// single matvec kernel. The threadgroup index determines which projection
+// and which row offset within that projection.
+//
+// Dispatch: (ceil(N0/64) + ceil(N1/64) + ceil(N2/64) + ceil(N3/64), 1, 1)
+//           threadgroups, (256, 1, 1) threads per group.
+//
+// Buffers:
+//   buffer(0)  x:       [1, K] input vector (shared)
+//   buffer(1)  w0:      [N0/8, K/8, 8, 8] blocked weights (projection 0)
+//   buffer(2)  w1:      [N1/8, K/8, 8, 8] blocked weights (projection 1)
+//   buffer(3)  w2:      [N2/8, K/8, 8, 8] blocked weights (projection 2)
+//   buffer(4)  w3:      [N3/8, K/8, 8, 8] blocked weights (projection 3)
+//   buffer(5)  y0:      [1, N0] output (projection 0)
+//   buffer(6)  y1:      [1, N1] output (projection 1)
+//   buffer(7)  y2:      [1, N2] output (projection 2)
+//   buffer(8)  y3:      [1, N3] output (projection 3)
+//   buffer(9)  params:  uint[6] — (K, N0, N1, N2, N3, 0)
+// ============================================================================
+
+kernel void gdn_batched_matvec(
+    device const half* x              [[buffer(0)]],
+    device const half* w0             [[buffer(1)]],
+    device const half* w1             [[buffer(2)]],
+    device const half* w2             [[buffer(3)]],
+    device const half* w3             [[buffer(4)]],
+    device half* y0                   [[buffer(5)]],
+    device half* y1                   [[buffer(6)]],
+    device half* y2                   [[buffer(7)]],
+    device half* y3                   [[buffer(8)]],
+    constant uint* params             [[buffer(9)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint sgid   [[simdgroup_index_in_threadgroup]],
+    uint lane   [[thread_index_in_simdgroup]])
+{
+    uint K  = params[0];
+    uint N0 = params[1];
+    uint N1 = params[2];
+    uint N2 = params[3];
+    uint N3 = params[4];
+
+    // Determine which projection this threadgroup belongs to
+    uint tg0 = (N0 + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    uint tg1 = (N1 + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    uint tg2 = (N2 + ROWS_PER_TG - 1) / ROWS_PER_TG;
+
+    uint local_tgid;
+    device const half* w_packed;
+    device half* y;
+    uint N;
+
+    if (tgid < tg0) {
+        local_tgid = tgid;
+        w_packed = w0; y = y0; N = N0;
+    } else if (tgid < tg0 + tg1) {
+        local_tgid = tgid - tg0;
+        w_packed = w1; y = y1; N = N1;
+    } else if (tgid < tg0 + tg1 + tg2) {
+        local_tgid = tgid - tg0 - tg1;
+        w_packed = w2; y = y2; N = N2;
+    } else {
+        local_tgid = tgid - tg0 - tg1 - tg2;
+        w_packed = w3; y = y3; N = N3;
+    }
+
+    // Standard matvec: 8 simdgroups × 8 rows = 64 output rows per threadgroup
+    uint row_base = local_tgid * ROWS_PER_TG + sgid * ROWS_PER_SG;
+    if (row_base >= N) return;
+
+    uint n_blocks = K / TILE_K;
+    uint row_block = row_base / 8;
+
+    simdgroup_matrix<float, 8, 8> acc(0);
+
+    for (uint kb = 0; kb < n_blocks; kb++) {
+        simdgroup_matrix<half, 8, 8> w_T;
+        simdgroup_load(w_T, w_packed + (row_block * n_blocks + kb) * 64, 8,
+                       ulong2(0, 0), true);
+
+        simdgroup_matrix<half, 8, 8> x_mat;
+        simdgroup_load(x_mat, x + kb * TILE_K, 0);
+
+        simdgroup_multiply_accumulate(acc, x_mat, w_T, acc);
+    }
+
+    threadgroup float tg_result[SIMDGROUPS * 64];
+    simdgroup_store(acc, tg_result + sgid * 64, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        for (uint r = 0; r < ROWS_PER_SG; r++) {
+            uint n_row = row_base + r;
+            if (n_row < N) {
+                y[n_row] = half(tg_result[sgid * 64 + r]);
+            }
+        }
+    }
+}
