@@ -11,7 +11,7 @@ use super::buffers::{build_matmul_cache, ModelConfigExt};
 use super::ffn::{encode_ffn_block, encode_moe_block};
 use super::gdn::{encode_gdn_decode, encode_gdn_prefill};
 use super::engine::MetalInference;
-use super::inference::encode_projection;
+use super::projection::encode_projection;
 use super::ops;
 use super::plan::{AttentionKind, RopeTable};
 use super::ple;

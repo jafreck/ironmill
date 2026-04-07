@@ -14,6 +14,7 @@ pub(crate) mod ffn;
 pub(crate) mod gdn;
 pub(crate) mod inference;
 pub(crate) mod kv_cache;
+pub(crate) mod loading;
 pub mod mla;
 pub mod ops;
 pub(crate) mod pipeline;
