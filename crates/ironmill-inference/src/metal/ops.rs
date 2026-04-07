@@ -171,6 +171,10 @@ pub struct MetalPipelines {
     pub batched_affine_matvec_int4: ComputePipeline,
     /// Batched affine INT4 matvec for 4 GDN projections in one dispatch.
     pub gdn_batched_affine_matvec_int4: ComputePipeline,
+    /// AMX-accelerated INT4 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
+    pub affine_matvec_int4_amx: ComputePipeline,
+    /// Row-major INT4 matvec for decode: ~32× better cache utilization than blocked layout.
+    pub affine_matvec_int4_rowmajor: ComputePipeline,
     /// Fused residual+RMSNorm+dense matvec in one dispatch.
     pub fused_residual_norm_matvec: ComputePipeline,
     /// Fused residual+RMSNorm+affine INT4 matvec in one dispatch.
@@ -696,6 +700,20 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &affine_mm_lib
                         .get_function("gdn_batched_affine_matvec_int4")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            affine_matvec_int4_amx: device
+                .create_compute_pipeline(
+                    &affine_mm_lib
+                        .get_function("affine_matvec_int4_amx")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            affine_matvec_int4_rowmajor: device
+                .create_compute_pipeline(
+                    &affine_mm_lib
+                        .get_function("affine_matvec_int4_rowmajor")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,

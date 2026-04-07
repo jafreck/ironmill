@@ -4763,20 +4763,24 @@ fn encode_affine_projection(
     encoder.set_buffer(output, 0, 4);
 
     if kind.is_decode() {
+        // Use row-major kernel for INT4 decode when available (32× better cache utilization)
+        let use_rowmajor = weight.bit_width == 4 && weight.data_row_major.is_some();
+        if use_rowmajor {
+            encoder.set_pipeline(&pipelines.affine_matvec_int4_rowmajor);
+            encoder.set_buffer(weight.data_row_major.as_ref().unwrap(), 0, 1);
+        }
         encoder.set_bytes(&(n as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 6);
         encoder.set_bytes(&weight.group_size.to_le_bytes(), 7);
-        // AWQ scales: buffer 8 = scales data, buffer 9 = has_awq flag
         let has_awq: u32 = if weight.awq_scales.is_some() { 1 } else { 0 };
         if let Some(ref awq_buf) = weight.awq_scales {
             encoder.set_buffer(awq_buf, 0, 8);
         } else {
-            // Bind the data buffer as a dummy (won't be read when has_awq=0).
             encoder.set_buffer(&weight.data, 0, 8);
         }
         encoder.set_bytes(&has_awq.to_le_bytes(), 9);
-        let threads_per_group = 32;
-        encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
+        // Both row-major and blocked scalar use same dispatch: 1 row per TG, 32 threads
+        encoder.dispatch_threadgroups((n, 1, 1), (32, 1, 1));
     } else {
         encoder.set_bytes(&(token_count as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 6);

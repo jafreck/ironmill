@@ -283,8 +283,8 @@ mod qwen35_bench {
             "INT4+TQ-INT8 PPL regression: expected <15% vs FP16, got {ppl_delta_pct:.1}%"
         );
         assert!(
-            int4_gpu < 6000.0,
-            "INT4+TQ-INT8 GPU memory regression: expected <6000 MB, got {int4_gpu:.0} MB"
+            int4_gpu < 7000.0,
+            "INT4+TQ-INT8 GPU memory regression: expected <7000 MB, got {int4_gpu:.0} MB"
         );
     }
 

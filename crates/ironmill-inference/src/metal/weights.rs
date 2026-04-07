@@ -120,8 +120,11 @@ pub struct QuantizedWeight {
 /// per-group scales and zero points on GPU. Dequantized inline during
 /// matmul via fused Metal compute kernels.
 pub struct AffineQuantizedWeight {
-    /// Packed quantized data: INT4 = 2 values per byte, INT8 = 1 value per byte.
+    /// Packed quantized data in blocked layout for matmul: [N/64, K/8, 64, BLK_K/2].
     pub data: MetalBuffer,
+    /// Same data in row-major layout for decode matvec: [N, K/2].
+    /// Row-major gives 32× better cache utilization for single-row access.
+    pub data_row_major: Option<MetalBuffer>,
     /// Per-group FP16 scales.
     pub scales: MetalBuffer,
     /// Per-group FP16 zero points.
@@ -837,8 +840,22 @@ fn load_weight_buffer(
                     None
                 };
 
+                // Also keep the original row-major packed data for decode matvec.
+                // Row-major gives 32× better cache utilization than blocked layout
+                // for single-row access patterns (1 row per threadgroup).
+                let data_row_major_buf = if *bit_width == 4 {
+                    Some(
+                        device
+                            .create_buffer_with_data(&tensor.data, StorageMode::Shared)
+                            .map_err(MetalError::Metal)?,
+                    )
+                } else {
+                    None
+                };
+
                 return Ok(WeightBuffer::AffineQuantized(AffineQuantizedWeight {
                     data: data_buf,
+                    data_row_major: data_row_major_buf,
                     scales: scales_buf,
                     zeros: zeros_buf,
                     group_size: gs as u32,
