@@ -68,7 +68,14 @@ impl ShaderCache {
     /// Store a compiled shader binary in the cache.
     pub fn put(&self, key: &ShaderCacheKey, binary: &[u8]) -> Result<(), std::io::Error> {
         let path = self.key_path(key);
-        std::fs::write(&path, binary)
+        std::fs::write(&path, binary)?;
+
+        // Enforce max_size_bytes by evicting oldest entries when over limit.
+        let current = self.size();
+        if current > self.max_size_bytes {
+            self.evict_oldest(current - self.max_size_bytes)?;
+        }
+        Ok(())
     }
 
     /// Remove all cached shaders from disk.
@@ -86,8 +93,40 @@ impl ShaderCache {
     }
 
     fn key_path(&self, key: &ShaderCacheKey) -> PathBuf {
+        // Sanitize key components to prevent path traversal.
+        let safe_hash = key.shader_hash.replace(['/', '\\', '.'], "_");
+        let safe_spec = key.specialization.replace(['/', '\\', '.'], "_");
         self.cache_dir
-            .join(format!("{}_{}.bin", key.shader_hash, key.specialization))
+            .join(format!("{}_{}.bin", safe_hash, safe_spec))
+    }
+
+    /// Evict oldest cache entries until at least `bytes_to_free` bytes are reclaimed.
+    fn evict_oldest(&self, bytes_to_free: u64) -> Result<(), std::io::Error> {
+        let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> =
+            match std::fs::read_dir(&self.cache_dir) {
+                Ok(rd) => rd
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let meta = e.metadata().ok()?;
+                        let modified = meta.modified().ok()?;
+                        Some((e.path(), meta.len(), modified))
+                    })
+                    .collect(),
+                Err(_) => return Ok(()),
+            };
+        // Sort oldest first.
+        entries.sort_by_key(|e| e.2);
+
+        let mut freed = 0u64;
+        for (path, size, _) in &entries {
+            if freed >= bytes_to_free {
+                break;
+            }
+            if std::fs::remove_file(path).is_ok() {
+                freed += size;
+            }
+        }
+        Ok(())
     }
 }
 

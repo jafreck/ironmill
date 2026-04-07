@@ -533,6 +533,13 @@ impl RuntimeModel for AneRuntimeModel {
                 };
 
                 // Convert raw bytes to f16 values.
+                let expected_bytes = t.numel() * t.dtype.byte_size();
+                if t.data.len() != expected_bytes {
+                    return Err(crate::engine::InferenceError::runtime(format!(
+                        "ANE tensor '{}' buffer size mismatch: expected {} bytes for {:?} shape {:?}, got {}",
+                        t.name, expected_bytes, t.dtype, t.shape, t.data.len()
+                    )));
+                }
                 let f16_data: Vec<half::f16> = match t.dtype {
                     ElementType::Float16 => t
                         .data

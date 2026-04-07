@@ -46,6 +46,13 @@ impl RuntimeModel for CoremlRuntimeModel {
         let mut pi =
             PredictionInput::new().map_err(|e| crate::engine::InferenceError::Runtime(e.into()))?;
         for t in inputs {
+            let expected_bytes = t.numel() * t.dtype.byte_size();
+            if t.data.len() != expected_bytes {
+                return Err(crate::engine::InferenceError::runtime(format!(
+                    "tensor '{}' buffer size mismatch: expected {} bytes for {:?} shape {:?}, got {}",
+                    t.name, expected_bytes, t.dtype, t.shape, t.data.len()
+                )));
+            }
             let data_f32: Vec<f32> = match t.dtype {
                 ElementType::Float32 => t
                     .data

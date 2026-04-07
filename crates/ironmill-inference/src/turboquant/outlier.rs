@@ -37,6 +37,15 @@ impl OutlierConfig {
         outlier_bits: u8,
         non_outlier_bits: u8,
     ) -> Self {
+        if head_dim == 0 || out_features == 0 {
+            return Self {
+                outlier_channels: Vec::new(),
+                outlier_bits,
+                non_outlier_bits,
+            };
+        }
+        let n_outlier = n_outlier.min(head_dim);
+
         // Accumulate per-channel (per-head-dim-index) squared norms across
         // all KV heads and layers. Channel index is dim % head_dim.
         let mut channel_energy = vec![0.0f64; head_dim];

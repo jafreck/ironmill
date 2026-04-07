@@ -261,7 +261,24 @@ pub(crate) fn encode_kv_cache_and_attention(
             let (k_qjl_signs, k_r_norms) = kv.layer_k_qjl(layer_idx);
 
             // Select per-layer codebooks if this layer uses a non-default head_dim.
+            // When codebooks_for_layer() returns None, the layer uses the same
+            // head_dim as the global config, so global codebooks are correct.
+            // If layer_configs exists but has no matching DimCodebooks entry,
+            // the global codebooks are used as a fallback — this is expected
+            // for layers that share the default head_dim.
             let dim_cb = tq.codebooks_for_layer(layer_idx);
+            if dim_cb.is_none() && !tq.config.layer_configs.is_empty() {
+                if let Some(lc) = tq.config.layer_configs.get(layer_idx) {
+                    if lc.head_dim != tq.config.head_dim {
+                        eprintln!(
+                            "Warning: layer {} has head_dim {} but no per-layer codebooks found; \
+                             falling back to global codebooks (head_dim={}). \
+                             Attention quality may be degraded.",
+                            layer_idx, lc.head_dim, tq.config.head_dim
+                        );
+                    }
+                }
+            }
             let rotation_signs = dim_cb
                 .map(|dc| &dc.rotation_signs)
                 .unwrap_or(&tq.rotation_signs);

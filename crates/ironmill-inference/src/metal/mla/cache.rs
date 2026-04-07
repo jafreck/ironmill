@@ -87,7 +87,12 @@ impl MlaKvCache {
 
     /// Advance the sequence position by `count` tokens.
     pub fn advance_by(&mut self, count: usize) -> Result<(), MetalError> {
-        let new_pos = self.seq_pos + count;
+        let new_pos = self.seq_pos.checked_add(count).ok_or_else(|| {
+            MetalError::Config(format!(
+                "MLA KV cache position overflow: {} + {} wraps usize",
+                self.seq_pos, count,
+            ))
+        })?;
         if new_pos > self.max_seq_len {
             return Err(MetalError::Config(format!(
                 "MLA KV cache overflow: position {} + {} exceeds max_seq_len {}",

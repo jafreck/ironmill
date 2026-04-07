@@ -94,6 +94,20 @@ pub(crate) fn dequant_affine_to_fp16(
     let scale_elem_size = scale_dtype.byte_size();
     let zp_elem_size = zero_point_dtype.byte_size();
 
+    let n_scale_groups = scale.len() / scale_elem_size;
+    let n_zp_groups = if zero_point.is_empty() {
+        0
+    } else {
+        zero_point.len() / zp_elem_size
+    };
+    if !zero_point.is_empty() && n_zp_groups != n_scale_groups {
+        anyhow::bail!(
+            "dequant_affine_to_fp16: zero-point group count ({}) does not match scale group count ({})",
+            n_zp_groups,
+            n_scale_groups,
+        );
+    }
+
     for (i, &byte_val) in data.iter().enumerate().take(num_elements) {
         let q_val = byte_val as f32;
         let s_idx = if scale.len() / scale_elem_size > 1 {

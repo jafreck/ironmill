@@ -117,12 +117,28 @@ impl MetalKvCache {
                 .layer_configs
                 .get(layer)
                 .map(|lc| lc.head_dim)
-                .unwrap_or(config.head_dim);
+                .unwrap_or_else(|| {
+                    if !config.layer_configs.is_empty() {
+                        eprintln!(
+                            "Warning: layer {} has no per-layer config; defaulting to global head_dim={}",
+                            layer, config.head_dim
+                        );
+                    }
+                    config.head_dim
+                });
             let layer_num_kv = config
                 .layer_configs
                 .get(layer)
                 .map(|lc| lc.num_kv_heads)
-                .unwrap_or(config.num_kv_heads);
+                .unwrap_or_else(|| {
+                    if !config.layer_configs.is_empty() {
+                        eprintln!(
+                            "Warning: layer {} has no per-layer config; defaulting to global num_kv_heads={}",
+                            layer, config.num_kv_heads
+                        );
+                    }
+                    config.num_kv_heads
+                });
             let layout = TurboQuantCacheLayout::new(
                 layer_num_kv,
                 layer_head_dim,
@@ -130,7 +146,8 @@ impl MetalKvCache {
                 config.num_layers,
                 config.n_bits,
                 config.outlier.as_ref(),
-            );
+            )
+            .map_err(|e| MetalError::Config(e.to_string()))?;
 
             let cache_size = layout.cache_bytes;
             let scale_size = layout.scale_bytes();
@@ -194,12 +211,28 @@ impl MetalKvCache {
                 .layer_configs
                 .get(layer)
                 .map(|lc| lc.head_dim)
-                .unwrap_or(config.head_dim);
+                .unwrap_or_else(|| {
+                    if !config.layer_configs.is_empty() {
+                        eprintln!(
+                            "Warning: layer {} has no per-layer config; defaulting to global head_dim={}",
+                            layer, config.head_dim
+                        );
+                    }
+                    config.head_dim
+                });
             let layer_num_kv = config
                 .layer_configs
                 .get(layer)
                 .map(|lc| lc.num_kv_heads)
-                .unwrap_or(config.num_kv_heads);
+                .unwrap_or_else(|| {
+                    if !config.layer_configs.is_empty() {
+                        eprintln!(
+                            "Warning: layer {} has no per-layer config; defaulting to global num_kv_heads={}",
+                            layer, config.num_kv_heads
+                        );
+                    }
+                    config.num_kv_heads
+                });
             let layout = TurboQuantCacheLayout::new(
                 layer_num_kv,
                 layer_head_dim,
@@ -207,7 +240,8 @@ impl MetalKvCache {
                 config.num_layers,
                 config.n_bits,
                 config.outlier.as_ref(),
-            );
+            )
+            .map_err(|e| MetalError::Config(e.to_string()))?;
             let scale_size = layout.scale_bytes();
             let (outlier_cache_size, non_outlier_cache_size) = if let Some(ref ol) = layout.outlier
             {

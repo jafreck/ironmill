@@ -155,6 +155,14 @@ impl<E: InferenceEngine> SpeculativeStreaming<E> {
         let msa: Vec<MsaHeadWeights> = weights
             .iter()
             .map(|layer_data| {
+                let expected_elements = elements_per_proj * num_streams;
+                if layer_data.len() < expected_elements {
+                    eprintln!(
+                        "Warning: MSA layer weight has {} elements, expected {} ({} streams × {} per proj); \
+                         available streams will be fewer than configured",
+                        layer_data.len(), expected_elements, num_streams, elements_per_proj
+                    );
+                }
                 let projections: Vec<Vec<f16>> = layer_data
                     .chunks_exact(elements_per_proj)
                     .take(num_streams)

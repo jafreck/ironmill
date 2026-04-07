@@ -208,7 +208,10 @@ pub fn dequant_affine(
     if let Some(gs) = group_size {
         // Per-group: scales/zeros have one entry per group of `gs` elements
         // along the last axis. Layout: [N, num_groups] where num_groups = ceil(K/gs).
-        let k = *shape.last().unwrap_or(&1);
+        if shape.is_empty() {
+            bail!("dequant_affine: shape must be non-empty");
+        }
+        let k = *shape.last().unwrap();
         let n: usize = shape[..shape.len().saturating_sub(1)]
             .iter()
             .product::<usize>()
@@ -230,6 +233,13 @@ pub fn dequant_affine(
     } else {
         match axis {
             Some(ax) => {
+                if ax >= shape.len() {
+                    bail!(
+                        "dequant_affine: axis {} is out of bounds for shape with {} dimensions",
+                        ax,
+                        shape.len()
+                    );
+                }
                 // Per-axis: scale and zero_point have one entry per slice along `ax`.
                 let stride: usize = shape[ax + 1..].iter().product();
                 let axis_size = shape[ax];
