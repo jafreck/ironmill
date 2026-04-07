@@ -5,8 +5,8 @@ use ironmill_metal_sys::ComputeEncoder;
 use crate::engine::InferenceError;
 
 use super::buffers::IntermediateBuffers;
-use super::projection::encode_projection;
 use super::ops;
+use super::projection::encode_projection;
 use super::weights::{LayerWeights, WeightBuffer};
 
 /// Encode the FFN block: gate + up projections, SiLU activation, and down projection.

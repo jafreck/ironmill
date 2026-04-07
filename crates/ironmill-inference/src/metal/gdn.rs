@@ -6,8 +6,8 @@ use super::buffers::{
     IntermediateBuffers, read_buffer_f32, read_weight_f32, write_buffer_f32,
 };
 use super::error::MetalError;
-use super::projection::encode_projection;
 use super::ops;
+use super::projection::encode_projection;
 use super::weights::{LayerWeights, WeightBuffer};
 use crate::engine::InferenceError;
 
