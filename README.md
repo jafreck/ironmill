@@ -110,12 +110,73 @@ hardware:
 
 #### Metal GPU
 
-Primary backend for LLM inference on Apple Silicon GPUs:
+Primary backend for LLM inference on Apple Silicon GPUs.
 
-- MPS matrix multiplication for linear layers
-- Custom Metal kernels for RMSNorm, RoPE, SiLU, attention, and residuals
-- TurboQuant INT8 KV cache with fused quantize/dequantize shaders
-- Prefill and single-step decode modes
+**Fused Compute Kernels:**
+
+| Kernel | Description |
+|---|---|
+| `fused_residual_norm` | Residual add + RMSNorm in a single dispatch |
+| `fused_residual_norm_matvec` | Residual + RMSNorm + matrix-vector projection |
+| `fused_qk_norm_rope` | QK normalization + partial RoPE (supports Qwen 3.5 25% rotary) |
+| `fused_embedding_norm` | Token embedding lookup + RMSNorm |
+| `fused_sdpa` | FlashAttention-style SDPA with online softmax and conditional rescaling |
+| `fused_softcap` | Logit softcapping (Gemma) |
+| `gdn_fused_decode` | GDN conv1d + SiLU + recurrent update + output gate in one dispatch |
+| `gdn_batched_matvec` | 4 GDN dense projections in a single dispatch |
+| `batched_affine_matvec` | FFN gate + up projection fused for INT4/INT8 |
+
+**Attention:**
+
+- Standard FP16 single-step decode attention
+- FlashAttention-2 prefill with tiled Q/KV and online softmax
+- Sliding-window attention with ring-buffer KV cache
+- CLA (Cross-Layer Attention) with anchor-layer KV reuse
+- Per-layer head_dim and kv_head configuration (Gemma 4)
+
+**Weight Quantization at Runtime:**
+
+| Format | Description |
+|---|---|
+| FP16 | Half-precision with blocked layout for GPU cache efficiency |
+| INT4 affine | Per-group quantization with optional AWQ activation scales |
+| INT8 affine | Symmetric per-channel quantization |
+| D2Quant | 3-bit dual-scale (coarse + fine) quantization |
+| PolarQuant | LUT-based dequantization via codebook indices |
+| QuIP# | E8 lattice quantization with Hadamard rotation |
+| Q8 input | On-the-fly input activation quantization for INT4×Q8 decode |
+
+**KV Cache Quantization ([TurboQuant](docs/design/turboquant.md)):**
+
+- INT4 and INT8 cache compression with outlier-aware quantization
+- QJL (Quantized Johnson-Lindenstrauss) random projection variant
+- Fused quantize-on-write and dequantize-on-read shaders
+- Sliding-window ring buffers with quantized storage
+
+**Architecture-Specific Optimizations:**
+
+| Architecture | Optimizations |
+|---|---|
+| Gemma 4 | Per-layer head_dim/kv_heads, global + sliding window layers, PLE, MoE routing, V-norm, logit softcapping |
+| Qwen 3.5 | GDN (Gated Delta Network) linear attention layers, centered RMSNorm, attention output gate, partial rotary (25%) |
+| DeepSeek V2/V3 | MLA (Multi-Latent Attention) with weight absorption, compressed KV cache (latent + RoPE key) |
+| LLaMA/Qwen | Standard GQA attention, SiLU-gated FFN |
+
+**Memory Optimizations:**
+
+- Tied embedding reuse — shares `lm_head` weights with token embeddings
+- Blocked weight packing — cache-friendly layout for GPU matvec
+- Buffer compaction — drops redundant weight copies after load transforms
+- Private vs shared GPU buffers — GPU-only storage for weights, CPU-visible for I/O
+- On-demand activation buffer growth — allocates as needed during prefill
+- Prefix-cache radix tree with LRU eviction
+
+**Additional Features:**
+
+- Speculative decoding with draft + verifier models
+- Grammar-constrained decoding
+- Batch inference runner
+- Precompiled Metal shader library with runtime fallback for large head_dim
 
 #### CoreML
 
@@ -244,6 +305,95 @@ ironmill inspect model.onnx
 ironmill validate model.onnx --format json
 ```
 
+### Rust API — High-Level (`ironmill-torch`)
+
+`ironmill-torch` provides a PyTorch-level abstraction over the lower-level
+compile and inference crates.
+
+#### Quick Start
+
+```rust
+use ironmill_torch::{Model, GenParams};
+
+let mut model = Model::from_pretrained("./Qwen3-0.6B/")
+    .build()?;
+
+let output = model.generate("What is Rust?", &GenParams::default())?;
+println!("{}", output.text);
+```
+
+#### Model Loading
+
+```rust
+use ironmill_torch::{Model, Device};
+
+// Load from a SafeTensors directory (auto-detects architecture)
+let mut model = Model::from_pretrained("./model/")
+    .device(Device::Metal)
+    .max_seq_len(8192)
+    .build()?;
+
+// Or load from a pre-compiled .ironml-gpu bundle
+let mut model = Model::from_compiled("model.ironml-gpu")
+    .build()?;
+```
+
+#### Streaming Generation
+
+```rust
+use ironmill_torch::{Model, GenParams};
+
+let mut model = Model::from_pretrained("./model/").build()?;
+let params = GenParams::default()
+    .with_temperature(0.8)
+    .with_max_tokens(256)
+    .with_top_p(0.95);
+
+for chunk in model.stream("Once upon a time", &params)? {
+    let chunk = chunk?;
+    print!("{}", chunk.text);
+}
+```
+
+#### Multi-Turn Chat
+
+```rust
+use ironmill_torch::{Model, GenParams};
+
+let mut model = Model::from_pretrained("./model/").build()?;
+let mut chat = model.chat()
+    .system("You are a helpful assistant.")
+    .params(GenParams::default().with_temperature(0.7))
+    .build();
+
+let reply = chat.send("What is Rust?")?;
+println!("{}", reply.text);
+
+let followup = chat.send("How does its borrow checker work?")?;
+println!("{}", followup.text);
+
+// Streaming chat
+let stream = chat.send_stream("Tell me more")?;
+let mut full_text = String::new();
+for chunk in stream {
+    let chunk = chunk?;
+    full_text.push_str(&chunk.text);
+    print!("{}", chunk.text);
+}
+chat.finish_stream(full_text);
+```
+
+#### GenParams
+
+| Parameter | Default | Description |
+|---|---|---|
+| `temperature` | 0.7 | Sampling temperature (0.0 = greedy) |
+| `max_tokens` | 512 | Maximum tokens to generate |
+| `top_p` | 0.9 | Nucleus sampling threshold (1.0 = disabled) |
+| `top_k` | 0 | Top-k filtering (0 = disabled) |
+| `min_p` | 0.0 | Min-p threshold (0.0 = disabled) |
+| `stop_tokens` | `[]` | Token IDs that signal end of generation |
+
 ### Rust API — Compilation
 
 Compile an ONNX model to a CoreML package:
@@ -319,6 +469,7 @@ let tokens = model.generate(&[1, 2, 3], 128, 0.8)?;
 
 ### C API & Framework Bridges
 
+- **High-level API:** [`ironmill-torch`](crates/ironmill-torch/) — PyTorch-style model loading, generation, streaming, and chat
 - **C API:** stable C ABI for Swift, C++, Go, or any FFI language ([docs](docs/C_API.md))
 - **[candle-coreml](crates/candle-coreml/):** ONNX→CoreML conversion + runtime for [candle](https://github.com/huggingface/candle)
 - **[burn-coreml](crates/burn-coreml/):** export + inference bridge for [Burn](https://github.com/tracel-ai/burn)
@@ -378,6 +529,7 @@ flowchart TD
         direction LR
         cli["ironmill-cli"]
         bench["ironmill-bench"]
+        torch["ironmill-torch"]
         burn["burn-coreml"]
         candle["candle-coreml"]
     end
@@ -405,6 +557,8 @@ flowchart TD
     bench --> compile
     bench --> inference
     bench -. "ane-direct" .-> ios
+    torch --> compile
+    torch --> inference
     burn --> compile
     burn -. "macos" .-> inference
     candle --> compile
@@ -428,12 +582,14 @@ flowchart TD
 | [`ironmill-core`](crates/ironmill-core/) | Shared types: bundle schemas, weight traits, model configs, MIL text emitter |
 | [`ironmill-compile`](crates/ironmill-compile/) | Compiler: optimization passes, CoreML/ANE/GPU build APIs, weight providers |
 | [`ironmill-inference`](crates/ironmill-inference/) | Inference: Metal GPU, CoreML, and ANE Direct backends |
+| [`ironmill-torch`](crates/ironmill-torch/) | High-level PyTorch-style API: model loading, generation, streaming, chat |
 | [`ironmill-ane-sys`](crates/ironmill-ane-sys/) | FFI bindings for ANE private APIs (macOS) |
 | [`ironmill-iosurface`](crates/ironmill-iosurface/) | IOSurface tensor management for ANE I/O (macOS) |
 | [`ironmill-coreml-sys`](crates/ironmill-coreml-sys/) | CoreML runtime bindings via objc2 (macOS) |
 | [`ironmill-metal-sys`](crates/ironmill-metal-sys/) | Metal and MPS framework bindings (macOS) |
 | [`ironmill-cli`](crates/ironmill-cli/) | CLI: `compile`, `inspect`, `validate`, `compile-pipeline`, `pipeline-report` |
 | [`ironmill-bench`](crates/ironmill-bench/) | Benchmarks: latency, power, perplexity |
+| [`ironmill-compile-ffi`](crates/ironmill-compile-ffi/) | C FFI for the compilation pipeline |
 | [`candle-coreml`](crates/candle-coreml/) | [candle](https://github.com/huggingface/candle) bridge: ONNX→CoreML + runtime |
 | [`burn-coreml`](crates/burn-coreml/) | [Burn](https://github.com/tracel-ai/burn) bridge: export + inference |
 
