@@ -158,15 +158,20 @@ After each phase, verify:
 2. Decode throughput unchanged (AWQ/GPTQ are quantization-time only)
 3. GPU memory unchanged (same INT4 format, just better-chosen values)
 
+See [docs/benchmarks/qwen35-reproduction.md](../benchmarks/qwen35-reproduction.md)
+for exact commands, config files, and baseline numbers to compare against.
+The AWQ-INT4 + TQ-INT8 benchmark (Section 1) is the primary validation
+target — run it before and after each phase to measure PPL delta.
+
 ```bash
 # Calibrate
 cargo run --release --example awq_calibrate --features metal -p ironmill-bench -- \
     models/Qwen3.5-4B tests/fixtures/quality/wikitext2-qwen35.json /tmp/awq_calib
 
-# Benchmark
+# Benchmark (use the AWQ config from the reproduction guide)
 cargo run --release -p ironmill-bench --features metal -- \
-    --config configs/qwen35-bench.toml -b metal \
-    -i 20 -w 5 -r 3 \
+    --config /tmp/bench_awq.toml -b metal \
+    -i 5 -w 2 -r 1 \
     --perplexity --perplexity-sequences 50 \
     --perplexity-dataset tests/fixtures/quality/wikitext2-qwen35.json
 ```
