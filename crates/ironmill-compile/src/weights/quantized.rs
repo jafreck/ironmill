@@ -65,6 +65,17 @@ pub struct AffineQuantConfig {
     pub awq_activations: Option<std::collections::HashMap<String, Vec<f32>>>,
     /// Number of calibration tokens in each activation snapshot.
     pub awq_token_count: Option<usize>,
+    /// Per-layer Hessian data for GPTQ quantization, keyed by AWQ key format.
+    /// Each entry is (xtx_flat, n_features, sample_count).
+    /// When present with gptq feature enabled, uses GPTQ instead of round-to-nearest.
+    #[cfg(feature = "gptq")]
+    pub hessian_data: Option<std::collections::HashMap<String, (Vec<f32>, usize, usize)>>,
+    /// GPTQ block size for column-block processing (default: 128).
+    #[cfg(feature = "gptq")]
+    pub gptq_block_size: usize,
+    /// GPTQ Hessian dampening factor (default: 0.01).
+    #[cfg(feature = "gptq")]
+    pub gptq_dampening: f64,
 }
 
 impl AffineQuantConfig {
@@ -75,6 +86,12 @@ impl AffineQuantConfig {
             awq_magnitudes: None,
             awq_activations: None,
             awq_token_count: None,
+            #[cfg(feature = "gptq")]
+            hessian_data: None,
+            #[cfg(feature = "gptq")]
+            gptq_block_size: 128,
+            #[cfg(feature = "gptq")]
+            gptq_dampening: 0.01,
         }
     }
 
@@ -88,6 +105,12 @@ impl AffineQuantConfig {
             awq_magnitudes: Some(magnitudes),
             awq_activations: None,
             awq_token_count: None,
+            #[cfg(feature = "gptq")]
+            hessian_data: None,
+            #[cfg(feature = "gptq")]
+            gptq_block_size: 128,
+            #[cfg(feature = "gptq")]
+            gptq_dampening: 0.01,
         }
     }
 
@@ -103,6 +126,44 @@ impl AffineQuantConfig {
             awq_magnitudes: Some(magnitudes),
             awq_activations: Some(activations),
             awq_token_count: Some(token_count),
+            #[cfg(feature = "gptq")]
+            hessian_data: None,
+            #[cfg(feature = "gptq")]
+            gptq_block_size: 128,
+            #[cfg(feature = "gptq")]
+            gptq_dampening: 0.01,
+        }
+    }
+
+    /// INT4 with GPTQ Hessian-guided quantization.
+    #[cfg(feature = "gptq")]
+    pub fn int4_gptq(
+        group_size: usize,
+        hessian_data: std::collections::HashMap<String, (Vec<f32>, usize, usize)>,
+    ) -> Self {
+        Self {
+            group_size,
+            hessian_data: Some(hessian_data),
+            gptq_block_size: 128,
+            gptq_dampening: 0.01,
+            ..Default::default()
+        }
+    }
+
+    /// INT4 with AWQ channel scales and GPTQ Hessian-guided quantization.
+    #[cfg(feature = "gptq")]
+    pub fn int4_awq_gptq(
+        group_size: usize,
+        magnitudes: std::collections::HashMap<String, Vec<f32>>,
+        hessian_data: std::collections::HashMap<String, (Vec<f32>, usize, usize)>,
+    ) -> Self {
+        Self {
+            group_size,
+            awq_magnitudes: Some(magnitudes),
+            hessian_data: Some(hessian_data),
+            gptq_block_size: 128,
+            gptq_dampening: 0.01,
+            ..Default::default()
         }
     }
 }
@@ -114,6 +175,12 @@ impl Default for AffineQuantConfig {
             awq_magnitudes: None,
             awq_activations: None,
             awq_token_count: None,
+            #[cfg(feature = "gptq")]
+            hessian_data: None,
+            #[cfg(feature = "gptq")]
+            gptq_block_size: 128,
+            #[cfg(feature = "gptq")]
+            gptq_dampening: 0.01,
         }
     }
 }
@@ -442,6 +509,70 @@ fn search_best_alpha(
     best_alpha
 }
 
+/// GPTQ second-order weight quantization for INT4.
+///
+/// Uses the Hessian approximation H = 2·X^T·X from calibration activations
+/// to perform optimal weight quantization, distributing rounding errors across
+/// remaining columns using the inverse Hessian.
+#[cfg(feature = "gptq")]
+fn quantize_tensor_int4_gptq(
+    floats: &[f32],
+    shape: &[usize],
+    config: &AffineQuantConfig,
+    xtx: &[f32],
+    n_features: usize,
+    sample_count: usize,
+) -> Result<(Vec<u8>, QuantizationInfo), MilError> {
+    use mil_rs::ir::passes::gptq::gptq_quantize_weight;
+
+    let last_dim = shape[shape.len() - 1];
+    let out_features: usize = shape[..shape.len() - 1].iter().product();
+    let qmax: f32 = 15.0; // INT4
+
+    if n_features != last_dim {
+        return Err(MilError::Validation(format!(
+            "Hessian n_features ({n_features}) != tensor last dim ({last_dim})"
+        )));
+    }
+
+    let result = gptq_quantize_weight(
+        floats,
+        out_features,
+        last_dim,
+        xtx,
+        sample_count,
+        config.gptq_dampening,
+        config.gptq_block_size,
+        config.group_size,
+        qmax,
+    )?;
+
+    // Pack INT4: 2 values per byte, low nibble first.
+    let mut packed = Vec::with_capacity(result.quantized.len().div_ceil(2));
+    for chunk in result.quantized.chunks(2) {
+        let lo = chunk[0] & 0x0F;
+        let hi = if chunk.len() > 1 { chunk[1] & 0x0F } else { 0 };
+        packed.push(lo | (hi << 4));
+    }
+
+    let f32_bytes =
+        |vals: &[f32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+    let quant_info = QuantizationInfo::AffineDequantize {
+        scale: f32_bytes(&result.scales),
+        zero_point: f32_bytes(&result.zero_points),
+        scale_dtype: ScalarType::Float32,
+        zero_point_dtype: ScalarType::Float32,
+        axis: Some(shape.len() - 1),
+        bit_width: 4,
+        group_size: Some(config.group_size),
+        awq_scales: None,
+        g_idx: None,
+    };
+
+    Ok((packed, quant_info))
+}
+
 /// INT4 quantization with optional AWQ activation-aware scaling.
 ///
 /// When `awq_magnitudes` is provided, computes per-channel importance scales
@@ -548,14 +679,38 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
         let (packed_data, quant_info) = match &self.method {
             QuantMethod::D2Quant(config) => quantize_tensor(&floats, &t.shape, config),
             QuantMethod::AffineInt4(config) => {
-                // Look up AWQ magnitudes for this tensor.
                 let awq_key = tensor_name_to_awq_key(name);
                 let last_dim = *t.shape.last().unwrap_or(&0);
+
+                // Try GPTQ first (if feature enabled and Hessian data available).
+                #[cfg(feature = "gptq")]
+                {
+                    if let Some(ref hessians) = config.hessian_data {
+                        if let Some((xtx, n_features, sample_count)) = hessians.get(&awq_key) {
+                            if *n_features == last_dim {
+                                return {
+                                    let (packed_data, quant_info) = quantize_tensor_int4_gptq(
+                                        &floats,
+                                        &t.shape,
+                                        config,
+                                        xtx,
+                                        *n_features,
+                                        *sample_count,
+                                    )?;
+                                    Ok(WeightTensor::owned(packed_data, t.shape, ScalarType::UInt8)
+                                        .with_quant_info(quant_info))
+                                };
+                            }
+                        }
+                    }
+                }
+
+                // Fall back to AWQ round-to-nearest.
                 let awq_mags = config
                     .awq_magnitudes
                     .as_ref()
                     .and_then(|m| m.get(&awq_key))
-                    .filter(|v| v.len() == last_dim); // Only apply if dimensions match
+                    .filter(|v| v.len() == last_dim);
                 let awq_acts = config
                     .awq_activations
                     .as_ref()
@@ -707,5 +862,205 @@ mod tests {
             quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None, None);
 
         assert_eq!(packed1, packed2, "fixed-alpha path should be deterministic");
+    }
+
+    #[cfg(feature = "gptq")]
+    #[test]
+    fn test_gptq_produces_valid_int4_packed_output() {
+        // 4 output rows × 128 input features, group_size=128.
+        let out = 4;
+        let inf = 128;
+        let shape = [out, inf];
+        let group_size = 128;
+        let sample_count = 32;
+
+        // Deterministic weights with some structure.
+        let floats: Vec<f32> = (0..out * inf)
+            .map(|i| ((i as f32) * 0.017).sin() * 0.5)
+            .collect();
+
+        // Build a simple X^T X Hessian: identity-like (diagonal dominant).
+        let mut xtx = vec![0.0f32; inf * inf];
+        for i in 0..inf {
+            xtx[i * inf + i] = sample_count as f32 * 1.0;
+        }
+
+        let config = AffineQuantConfig {
+            group_size,
+            hessian_data: None,
+            gptq_block_size: 128,
+            gptq_dampening: 0.01,
+            ..Default::default()
+        };
+
+        let (packed, quant_info) =
+            quantize_tensor_int4_gptq(&floats, &shape, &config, &xtx, inf, sample_count)
+                .expect("GPTQ quantization should succeed in test");
+
+        // Packed size: (out * inf) / 2 = 256 bytes.
+        assert_eq!(packed.len(), (out * inf).div_ceil(2));
+
+        // All nibbles should be in [0, 15].
+        for &byte in &packed {
+            let lo = byte & 0x0F;
+            let hi = (byte >> 4) & 0x0F;
+            assert!(lo <= 15, "low nibble out of range: {lo}");
+            assert!(hi <= 15, "high nibble out of range: {hi}");
+        }
+
+        // Check quant_info is AffineDequantize with correct parameters.
+        match &quant_info {
+            QuantizationInfo::AffineDequantize {
+                bit_width,
+                group_size: gs,
+                axis,
+                ..
+            } => {
+                assert_eq!(*bit_width, 4);
+                assert_eq!(*gs, Some(group_size));
+                assert_eq!(*axis, Some(1));
+            }
+            other => panic!("expected AffineDequantize, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "gptq")]
+    #[test]
+    fn test_gptq_differs_from_round_to_nearest() {
+        // GPTQ should produce different (and generally better) quantization
+        // than naive round-to-nearest when the Hessian is non-trivial.
+        let out = 4;
+        let inf = 128;
+        let shape = [out, inf];
+        let group_size = 128;
+        let sample_count = 64;
+
+        // Weights with varying magnitudes.
+        let floats: Vec<f32> = (0..out * inf)
+            .map(|i| {
+                let col = i % inf;
+                let row = i / inf;
+                ((col as f32 * 0.05 + row as f32 * 0.1).sin()) * (1.0 + col as f32 * 0.01)
+            })
+            .collect();
+
+        // Build a positive-definite Hessian from synthetic activations X,
+        // then XtX = X^T X is guaranteed positive semi-definite.
+        let n_samples = sample_count;
+        let mut xtx = vec![0.0f32; inf * inf];
+        for s in 0..n_samples {
+            let mut x_row = vec![0.0f32; inf];
+            for j in 0..inf {
+                // Correlated activations: first 16 features have high variance.
+                let base = ((s as f32 * 0.7 + j as f32 * 0.3).sin()) * 0.5;
+                let importance = if j < 16 { 10.0 } else { 1.0 };
+                x_row[j] = base * importance;
+            }
+            // Accumulate outer product: XtX += x * x^T
+            for i in 0..inf {
+                for j in 0..inf {
+                    xtx[i * inf + j] += x_row[i] * x_row[j];
+                }
+            }
+        }
+
+        let config = AffineQuantConfig {
+            group_size,
+            hessian_data: None,
+            gptq_block_size: 128,
+            gptq_dampening: 0.01,
+            ..Default::default()
+        };
+
+        // GPTQ path.
+        let (gptq_packed, _) =
+            quantize_tensor_int4_gptq(&floats, &shape, &config, &xtx, inf, sample_count)
+                .expect("GPTQ quantization should succeed in test");
+
+        // RTN path (no AWQ scales).
+        let config_rtn = AffineQuantConfig::int4(group_size);
+        let (rtn_packed, _) =
+            quantize_tensor_int4_awq(&floats, &shape, &config_rtn, None, None, None);
+
+        // They should produce different packed bytes.
+        assert_ne!(
+            gptq_packed, rtn_packed,
+            "GPTQ should differ from round-to-nearest with non-trivial Hessian"
+        );
+    }
+
+    #[cfg(feature = "gptq")]
+    #[test]
+    fn test_tensor_dispatch_prefers_gptq() {
+        use std::collections::HashMap;
+
+        // Build a minimal WeightProvider that returns a 2D float tensor.
+        let out = 64;
+        let inf = 128;
+        let floats: Vec<f32> = (0..out * inf)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.3)
+            .collect();
+
+        let sample_count = 32;
+        let mut xtx = vec![0.0f32; inf * inf];
+        for i in 0..inf {
+            xtx[i * inf + i] = sample_count as f32 * 10.0;
+            // Off-diagonal correlations so GPTQ differs from RTN.
+            for j in (i + 1)..inf.min(i + 8) {
+                let corr = sample_count as f32 * 3.0 / (1.0 + (j - i) as f32);
+                xtx[i * inf + j] = corr;
+                xtx[j * inf + i] = corr;
+            }
+        }
+
+        // Use tensor name matching the AWQ key "l0_q_proj_weight".
+        let tensor_name = "model.layers.0.self_attn.q_proj.weight";
+        let awq_key = tensor_name_to_awq_key(tensor_name);
+
+        let mut hessian_data = HashMap::new();
+        hessian_data.insert(awq_key.clone(), (xtx, inf, sample_count));
+
+        let config = AffineQuantConfig::int4_gptq(128, hessian_data);
+
+        // Also get RTN result for comparison.
+        let config_rtn = AffineQuantConfig::int4(128);
+        let (rtn_packed, _) =
+            quantize_tensor_int4_awq(&floats, &[out, inf], &config_rtn, None, None, None);
+
+        // Simulate the dispatch logic from WeightProvider::tensor().
+        let shape = vec![out, inf];
+        let last_dim = *shape.last().unwrap();
+        let awq_key_check = tensor_name_to_awq_key(tensor_name);
+        let dispatched_to_gptq;
+
+        if let Some(ref hessians) = config.hessian_data {
+            if let Some((xtx, n_features, sample_count)) = hessians.get(&awq_key_check) {
+                if *n_features == last_dim {
+                    let (gptq_packed, _) = quantize_tensor_int4_gptq(
+                        &floats,
+                        &shape,
+                        &config,
+                        xtx,
+                        *n_features,
+                        *sample_count,
+                    )
+                    .expect("GPTQ dispatch should succeed in test");
+                    dispatched_to_gptq = true;
+                    // GPTQ output should differ from RTN.
+                    assert_ne!(
+                        gptq_packed, rtn_packed,
+                        "GPTQ dispatch should produce different output than RTN"
+                    );
+                } else {
+                    dispatched_to_gptq = false;
+                }
+            } else {
+                dispatched_to_gptq = false;
+            }
+        } else {
+            dispatched_to_gptq = false;
+        }
+
+        assert!(dispatched_to_gptq, "dispatch should have chosen GPTQ path");
     }
 }

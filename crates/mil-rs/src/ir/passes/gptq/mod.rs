@@ -213,13 +213,13 @@ impl Pass for GptqQuantizePass {
 // ---------------------------------------------------------------------------
 
 /// Result of GPTQ quantization for a single weight matrix.
-struct GptqResult {
+pub struct GptqResult {
     /// Quantized weight values (u8), shape [out_features, in_features].
-    quantized: Vec<u8>,
+    pub quantized: Vec<u8>,
     /// Per-group scales, shape [out_features, n_groups].
-    scales: Vec<f32>,
+    pub scales: Vec<f32>,
     /// Per-group zero points, shape [out_features, n_groups].
-    zero_points: Vec<f32>,
+    pub zero_points: Vec<f32>,
 }
 
 /// Apply the GPTQ column-block quantization algorithm to a weight matrix.
@@ -236,7 +236,7 @@ struct GptqResult {
 /// The upper Cholesky factor U encodes the conditional/Schur-complement
 /// structure: U[i,i] is the correct denominator for the OBQ update at
 /// column i, and U[i, j>i] gives the correct propagation coefficients.
-fn gptq_quantize_weight(
+pub fn gptq_quantize_weight(
     w: &[f32],
     out_features: usize,
     in_features: usize,
@@ -400,7 +400,7 @@ fn emit_gptq_result(
     };
 
     let quantized_val = Value::Tensor {
-        data: quantized_data,
+        data: crate::ir::types::TensorData::Inline(quantized_data),
         shape: shape.to_vec(),
         dtype: ScalarType::UInt8,
     };
@@ -423,7 +423,7 @@ fn emit_gptq_result(
     op.attributes.insert(
         "scale".to_string(),
         Value::Tensor {
-            data: scale_bytes,
+            data: crate::ir::types::TensorData::Inline(scale_bytes),
             shape: param_shape.clone(),
             dtype: ScalarType::Float32,
         },
@@ -431,7 +431,7 @@ fn emit_gptq_result(
     op.attributes.insert(
         "zero_point".to_string(),
         Value::Tensor {
-            data: zp_bytes,
+            data: crate::ir::types::TensorData::Inline(zp_bytes),
             shape: param_shape,
             dtype: ScalarType::Float32,
         },
