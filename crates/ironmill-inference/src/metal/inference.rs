@@ -2232,7 +2232,6 @@ impl MetalInference {
                         layer_nkv,
                         layer_hd,
                         enable_tq,
-                        self.config.use_fa2_prefill,
                         plan.kv_anchor,
                         layer_window,
                         attn_scale,
@@ -3282,7 +3281,6 @@ impl MetalInference {
                     layer_nkv,
                     layer_hd,
                     enable_tq,
-                    self.config.use_fa2_prefill,
                     is_anchor,
                     layer_window,
                     attn_scale,
@@ -4844,7 +4842,6 @@ fn encode_kv_cache_and_attention(
     nkv: u32,
     hd: u32,
     enable_tq: bool,
-    use_fa2: bool,
     is_anchor: bool,
     window_size: usize,
     attn_scale: f32,
@@ -5152,15 +5149,13 @@ fn encode_kv_cache_and_attention(
             );
         } // end is_anchor
 
-        // FP16 attention — use register-tiled FA2 v2 for prefill,
-        // fused SDPA for decode (token_count == 1).
+        // FP16 attention — V2 register-tiled kernel for prefill,
+        // fused SDPA for decode.
         //
         // V2 combines cooperative KV tile loading (amortized across GQA
-        // group via threadgroup memory) with register-based accumulators
-        // and online softmax. This avoids both the redundant device memory
-        // reads of fused SDPA and the threadgroup memory bottleneck of
-        // the original FA2 kernel.
-        if use_fa2 && token_count > 1 {
+        // group via threadgroup memory) with register-based accumulators.
+        // Benchmarks show V2 dominates fused SDPA at all prefill lengths.
+        if token_count > 1 {
             let seq_offset = attn_seq_pos as u32;
             let window = if window_size > 0 {
                 window_size as u32

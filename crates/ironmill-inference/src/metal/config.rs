@@ -324,11 +324,6 @@ pub struct MetalConfig {
     /// creating Metal buffers (Phase 1 load-time dequant). When false,
     /// keep quantized weights packed in VRAM and use custom kernels.
     pub force_cpu_dequant: bool,
-    /// Use FlashAttention-2 style multi-query prefill attention kernel.
-    /// Groups multiple query tokens per threadgroup for better KV tile
-    /// reuse. Beneficial for large models (7B+) and long sequences; may
-    /// be slower for small models where KV tiles fit in L1 cache.
-    pub use_fa2_prefill: bool,
     /// Tile size for the fused SDPA kernel (Br: Q block size).
     /// None = auto-select based on head_dim.
     pub fused_sdpa_tile_br: Option<usize>,
@@ -350,7 +345,6 @@ impl Default for MetalConfig {
             rotation_seed: 42,
             n_bits: 8,
             force_cpu_dequant: false,
-            use_fa2_prefill: true,
             fused_sdpa_tile_br: None,
             fused_sdpa_tile_bc: None,
             cla_config: None,
@@ -375,12 +369,6 @@ impl MetalConfig {
     pub fn with_turboquant(mut self, bits: u8) -> Self {
         self.enable_turboquant = true;
         self.n_bits = bits;
-        self
-    }
-
-    /// Enable or disable FlashAttention-2 style prefill.
-    pub fn with_fa2_prefill(mut self, enable: bool) -> Self {
-        self.use_fa2_prefill = enable;
         self
     }
 
