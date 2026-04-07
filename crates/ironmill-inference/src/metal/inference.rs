@@ -31,7 +31,7 @@ use super::kv_cache::Fp16KvCache;
 use super::mla::{MlaConfig, MlaKvCache};
 use super::ops;
 use super::ops::LinearKernelKind;
-use super::plan::{AttentionKind, LayerPlan, RopeTable};
+use super::plan::{AttentionKind, LayerPlan, ModelPlan, RopeTable};
 use super::ple;
 use super::turboquant::{
     MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantLayerConfig, TurboQuantMetalConfig,
@@ -112,6 +112,8 @@ pub struct MetalInference {
     gdn_state: Option<GdnState>,
     /// Per-layer execution plan, resolved at load time.
     layer_plans: Vec<LayerPlan>,
+    /// Model-level execution plan, resolved at load time.
+    model_plan: Option<ModelPlan>,
     /// D2Quant Deviation-Aware Correction (DAC) per-layer bias vectors.
     /// Each buffer is `[hidden_size]` FP16. Added to post-attention LayerNorm
     /// output to compensate for quantization-induced mean shift.
@@ -161,6 +163,7 @@ impl MetalInference {
             model_info: None,
             gdn_state: None,
             layer_plans: Vec::new(),
+            model_plan: None,
             dac_biases: None,
         })
     }
@@ -469,6 +472,14 @@ impl MetalInference {
             self.config.cla_config.as_ref(),
             self.weights.as_ref().unwrap(),
         );
+
+        // ── Build model-level execution plan ──────────────────────
+        self.model_plan = Some(ModelPlan::build(
+            &mc,
+            &self.config,
+            self.gemma4_config.as_ref(),
+            self.layer_plans.clone(),
+        ));
 
         self.seq_pos = 0;
         Ok(())
@@ -2636,6 +2647,14 @@ impl MetalInference {
             self.config.cla_config.as_ref(),
             self.weights.as_ref().unwrap(),
         );
+
+        // ── Build model-level execution plan ──────────────────────
+        self.model_plan = Some(ModelPlan::build(
+            &mc,
+            &self.config,
+            self.gemma4_config.as_ref(),
+            self.layer_plans.clone(),
+        ));
 
         self.seq_pos = 0;
         Ok(())
