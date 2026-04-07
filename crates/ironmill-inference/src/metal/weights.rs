@@ -90,8 +90,6 @@ impl WeightBuffer {
     /// kernel path, so secondary layout copies are dead weight:
     ///
     /// - **Dense:** drops the row-major `buf` when a packed blocked copy exists.
-    /// - **AffineQuantized:** drops `data_row_major` (blocked layout is used
-    ///   for both matvec and matmul).
     /// - **Other variants:** no-op (no redundant copies).
     pub fn compact(&mut self) {
         match self {
@@ -100,9 +98,6 @@ impl WeightBuffer {
                 packed: Some(_),
             } => {
                 *buf = None;
-            }
-            WeightBuffer::AffineQuantized(aq) => {
-                aq.data_row_major = None;
             }
             _ => {}
         }
@@ -130,9 +125,6 @@ pub struct QuantizedWeight {
 pub struct AffineQuantizedWeight {
     /// Packed quantized data in blocked layout for matmul: [N/64, K/8, 64, BLK_K/2].
     pub data: MetalBuffer,
-    /// Same data in row-major layout for decode matvec: [N, K/2].
-    /// Row-major gives 32× better cache utilization for single-row access.
-    pub data_row_major: Option<MetalBuffer>,
     /// Per-group FP16 scales.
     pub scales: MetalBuffer,
     /// Per-group FP16 zero points.
@@ -353,7 +345,6 @@ impl MetalWeights {
     /// primary dispatch layout. This calls [`WeightBuffer::compact`] on
     /// every weight to drop secondary copies:
     /// - Dense: drops row-major `buf` when a packed blocked copy exists
-    /// - AffineQuantized: drops `data_row_major` (blocked layout is always used)
     pub fn compact(&mut self) {
         for layer in &mut self.layers {
             for wb in [
@@ -895,22 +886,8 @@ fn load_weight_buffer(
                     None
                 };
 
-                // Also keep the original row-major packed data for decode matvec.
-                // Row-major gives 32× better cache utilization than blocked layout
-                // for single-row access patterns (1 row per threadgroup).
-                let data_row_major_buf = if *bit_width == 4 {
-                    Some(
-                        device
-                            .create_buffer_with_data(&tensor.data, StorageMode::Shared)
-                            .map_err(MetalError::Metal)?,
-                    )
-                } else {
-                    None
-                };
-
                 return Ok(WeightBuffer::AffineQuantized(AffineQuantizedWeight {
                     data: data_buf,
-                    data_row_major: data_row_major_buf,
                     scales: scales_buf,
                     zeros: zeros_buf,
                     group_size: gs as u32,

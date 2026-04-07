@@ -1,15 +1,12 @@
 //! Intermediate GPU buffers, MPS matmul caching, and buffer utilities.
 
 use half::f16;
-use ironmill_metal_sys::{
-    MetalBuffer, MetalDevice, MpsMatrixMultiply, MpsMatrixMultiplyConfig, StorageMode,
-};
+use ironmill_metal_sys::{MetalBuffer, MetalDevice, StorageMode};
 use mil_rs::weights::ModelConfig;
 
 use super::config::Gemma4Config;
 use super::error::MetalError;
-use super::weights::{MetalWeights, WeightBuffer};
-use crate::engine::InferenceError;
+use super::weights::MetalWeights;
 
 // ── Intermediate activation buffers ─────────────────────────────
 
@@ -280,46 +277,10 @@ impl IntermediateBuffers {
     }
 }
 
-// ── Projection matmul types ─────────────────────────────────────
-
-/// Per-projection matmul state: Dense weights use MPS matrix multiplication
-/// while Quantized weights use a custom compute-shader path and carry no MPS
-/// object.
-pub(crate) enum ProjectionMatmul {
-    #[allow(dead_code)]
-    Dense(MpsMatrixMultiply),
-    Quantized,
-}
-
-impl ProjectionMatmul {
-    /// Returns the MPS matmul for a Dense projection, or `None` for Quantized.
-    #[allow(dead_code)]
-    pub(crate) fn dense(&self) -> Option<&MpsMatrixMultiply> {
-        match self {
-            Self::Dense(m) => Some(m),
-            Self::Quantized => None,
-        }
-    }
-}
-
 /// Cached MPS matmul instances for a given token count.
 pub(crate) struct MpsMatmulCache {
     /// Token count these were built for.
     pub(crate) token_count: usize,
-    /// Per-layer matmul instances: (q, k, v, o, gate, up, down).
-    pub(crate) layer_matmuls: Vec<LayerMatmuls>,
-}
-
-pub(crate) struct LayerMatmuls {
-    pub(crate) q: ProjectionMatmul,
-    pub(crate) k: ProjectionMatmul,
-    pub(crate) v: ProjectionMatmul,
-    pub(crate) o: ProjectionMatmul,
-    /// Gate projection matmul for attn_output_gate (Qwen3.5).
-    pub(crate) q_gate: Option<ProjectionMatmul>,
-    pub(crate) gate: ProjectionMatmul,
-    pub(crate) up: ProjectionMatmul,
-    pub(crate) down: ProjectionMatmul,
 }
 
 // ── RoPE cache builder ──────────────────────────────────────────
@@ -369,99 +330,13 @@ pub(crate) fn build_rope_cache(
 // ── MPS matmul cache builder ────────────────────────────────────
 
 pub(crate) fn build_matmul_cache(
-    device: &MetalDevice,
-    mc: &ModelConfig,
-    g4: Option<&Gemma4Config>,
-    weights: &MetalWeights,
+    _device: &MetalDevice,
+    _mc: &ModelConfig,
+    _g4: Option<&Gemma4Config>,
+    _weights: &MetalWeights,
     token_count: usize,
 ) -> Result<MpsMatmulCache, MetalError> {
-    let h = mc.hidden_size;
-    let nh = mc.num_attention_heads;
-    let nkv = mc.num_key_value_heads;
-    let hd = mc.head_dim;
-    let inter = mc.intermediate_size;
-
-    // Weight layout: [out_features, in_features] stored row-major FP16.
-    // We compute: output = input × weight^T
-    // MPS: result = left × right
-    //   left  = input  [token_count × in_features]
-    //   right = weight [out_features × in_features], transpose_right=true
-    //   result = [token_count × out_features]
-    let make_matmul =
-        |rows: usize, cols: usize, inner: usize| -> Result<MpsMatrixMultiply, MetalError> {
-            MpsMatrixMultiply::new(
-                device,
-                &MpsMatrixMultiplyConfig {
-                    transpose_left: false,
-                    transpose_right: true,   // weights are [out, in]
-                    result_rows: rows,       // token_count
-                    result_columns: cols,    // out_features
-                    interior_columns: inner, // in_features
-                    alpha: 1.0,
-                    beta: 0.0,
-                },
-            )
-            .map_err(MetalError::Metal)
-        };
-
-    // Only create MPS matmul instances for Dense weights; Quantized
-    // projections use the custom compute kernel path instead.
-    // Empty placeholders (GDN layer Q/K/V/O) produce Quantized stubs
-    // that are never dispatched.
-    let projection_matmul = |wb: &WeightBuffer,
-                             rows: usize,
-                             cols: usize,
-                             inner: usize|
-     -> Result<ProjectionMatmul, MetalError> {
-        match wb {
-            WeightBuffer::Dense {
-                buf: None,
-                packed: None,
-            } => {
-                // Empty placeholder (GDN layer) — no GPU memory, never dispatched.
-                Ok(ProjectionMatmul::Quantized)
-            }
-            WeightBuffer::Dense { .. } => {
-                Ok(ProjectionMatmul::Dense(make_matmul(rows, cols, inner)?))
-            }
-            WeightBuffer::Quantized(_) => Ok(ProjectionMatmul::Quantized),
-            // AffineQuantized uses fused compute kernels — no MPS matmul needed.
-            WeightBuffer::AffineQuantized(_) => Ok(ProjectionMatmul::Quantized),
-            // DualScaleQuantized uses fused compute kernels — no MPS matmul needed.
-            WeightBuffer::DualScaleQuantized(_) => Ok(ProjectionMatmul::Quantized),
-        }
-    };
-
-    let mut layer_matmuls = Vec::with_capacity(mc.num_hidden_layers);
-    for i in 0..mc.num_hidden_layers {
-        let lw = &weights.layers[i];
-        // Use per-layer head_dim/kv_heads/intermediate_size for Gemma 4.
-        let (layer_hd, layer_nkv, layer_inter) = if let Some(g4) = g4 {
-            let lc = &g4.layer_configs[i];
-            (lc.head_dim, lc.num_kv_heads, lc.intermediate_size)
-        } else {
-            (hd, nkv, inter)
-        };
-        layer_matmuls.push(LayerMatmuls {
-            q: projection_matmul(&lw.q_proj, token_count, nh * layer_hd, h)?,
-            k: projection_matmul(&lw.k_proj, token_count, layer_nkv * layer_hd, h)?,
-            v: projection_matmul(&lw.v_proj, token_count, layer_nkv * layer_hd, h)?,
-            o: projection_matmul(&lw.o_proj, token_count, h, nh * layer_hd)?,
-            q_gate: if let Some(ref gw) = lw.attn_output_gate {
-                Some(projection_matmul(gw, token_count, nh * layer_hd, h)?)
-            } else {
-                None
-            },
-            gate: projection_matmul(&lw.gate_proj, token_count, layer_inter, h)?,
-            up: projection_matmul(&lw.up_proj, token_count, layer_inter, h)?,
-            down: projection_matmul(&lw.down_proj, token_count, h, layer_inter)?,
-        });
-    }
-
-    Ok(MpsMatmulCache {
-        token_count,
-        layer_matmuls,
-    })
+    Ok(MpsMatmulCache { token_count })
 }
 
 // ── Byte → f16 conversion helper ───────────────────────────────
@@ -502,42 +377,4 @@ impl ModelConfigExt for ModelConfig {
     fn num_kv_heads(&self) -> usize {
         self.num_key_value_heads
     }
-}
-
-// ── Buffer read/write utilities ─────────────────────────────────
-
-/// Read an FP16 Metal buffer into a Vec<f32>, converting from f16.
-pub(crate) fn read_buffer_f32(
-    buf: &MetalBuffer,
-    num_elements: usize,
-) -> Result<Vec<f32>, InferenceError> {
-    let byte_count = num_elements * 2;
-    let mut raw = vec![0u8; byte_count];
-    buf.read_bytes(&mut raw, 0)
-        .map_err(|e| InferenceError::runtime(e.to_string()))?;
-    Ok(raw
-        .chunks_exact(2)
-        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-        .collect())
-}
-
-/// Write a Vec<f32> into a shared Metal buffer as FP16.
-pub(crate) fn write_buffer_f32(buf: &MetalBuffer, data: &[f32]) -> Result<(), InferenceError> {
-    let bytes: Vec<u8> = data
-        .iter()
-        .flat_map(|v| f16::from_f32(*v).to_le_bytes())
-        .collect();
-    buf.write_bytes(&bytes, 0)
-        .map_err(|e| InferenceError::runtime(e.to_string()))
-}
-
-/// Read a weight buffer as dense FP32 values.
-pub(crate) fn read_weight_f32(
-    wb: &WeightBuffer,
-    num_elements: usize,
-) -> Result<Vec<f32>, InferenceError> {
-    let buf = wb
-        .as_dense()
-        .map_err(|e| InferenceError::runtime(format!("GDN requires dense weights: {e}")))?;
-    read_buffer_f32(buf, num_elements)
 }

@@ -149,11 +149,6 @@ impl MetalInference {
     pub fn gpu_allocated_bytes(&self) -> usize {
         self.device.current_allocated_size()
     }
-
-    /// Mutable access to loaded weights for post-load transforms (e.g. D2Quant simulation).
-    pub(crate) fn weights_mut(&mut self) -> Result<&mut MetalWeights, InferenceError> {
-        self.weights.as_mut().ok_or(InferenceError::NotLoaded)
-    }
 }
 
 // ── InferenceEngine trait impl ─────────────────────────────────

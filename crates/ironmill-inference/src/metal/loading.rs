@@ -378,10 +378,7 @@ impl MetalInference {
         Ok(())
     }
 
-    /// Load model using the JIT path: weights are loaded, transformed, and
-    /// uploaded to GPU in a single streaming pass.
-    ///
-    /// No compilation step, no MIL IR, no `.ironml-gpu` bundle.
+    /// JIT weight loading with on-the-fly transforms (not yet implemented).
     pub(crate) fn load_jit(
         _config: MetalConfig,
         _provider: &dyn mil_rs::weights::WeightProvider,

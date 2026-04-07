@@ -182,10 +182,7 @@ pub fn load_model_weights<V: WeightVisitor>(
 
         if is_gdn {
             // GDN layer — load linear_attn weights; standard attn projections are absent.
-            // For Q/K/V/O we need placeholder weights. We load the GDN output projection
-            // as the "o_proj" stand-in so the LayerMatmuls struct can still be built,
-            // and use the GDN QKV projection as the "q_proj" stand-in. The actual GDN
-            // weights are stored in the gdn_* fields and used at inference time.
+            // We load the GDN projections as placeholders for Q/K/V/O.
             //
             // We load the GDN projections as the actual q/k/v/o fields to serve as
             // placeholders that have valid buffer sizes. The inference loop checks

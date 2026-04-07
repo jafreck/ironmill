@@ -39,8 +39,6 @@ impl MetalInference {
         let vocab = mc.vocab_size;
         let n = token_ids.len();
 
-        // Run full pipeline — buffers grow on demand inside run_pipeline_inner.
-        // Skip the built-in last-token readback; we read ALL positions below.
         self.run_pipeline_inner(token_ids, true, false, false)?;
 
         let bufs = self
@@ -66,7 +64,6 @@ impl MetalInference {
 
         #[cfg(debug_assertions)]
         {
-            // DEBUG: save logits to disk for comparison with HF
             if std::env::var("IRONMILL_SAVE_LOGITS").is_ok() {
                 for &pos in &[3usize, 20, 40] {
                     if pos < n {
@@ -106,7 +103,6 @@ impl MetalInference {
                 }
             }
 
-            // DEBUG: print per-position CE
             if std::env::var("IRONMILL_DEBUG_LOGITS").is_ok() {
                 let mut debug_total_ce = 0.0f64;
                 let mut debug_count = 0usize;
@@ -181,7 +177,6 @@ impl MetalInference {
             .as_ref()
             .ok_or(InferenceError::NotLoaded)?;
 
-        // Read back the final normed hidden state (FP16 → FP32).
         let mut data = vec![0u8; h * 2];
         bufs.norm_out
             .read_bytes(&mut data, 0)
@@ -414,7 +409,7 @@ impl MetalInference {
             // These are independent (all read norm_out, write to different buffers).
 
             match &plan.attention {
-                AttentionKind::Gdn { gdn_index: _ } => {
+                AttentionKind::Gdn => {
                     // ── GDN (linear-attention) layer — GPU path ─────
                     // Ensure scratch capacity for prefill before taking immutable borrows.
                     if token_count > 1 {
@@ -876,7 +871,7 @@ impl MetalInference {
                                 let qkv_out = mc.num_attention_heads * next_plan.head_dim as usize;
                                 Some((&next_lw.q_proj, &bufs.q_proj, qkv_out))
                             }
-                            AttentionKind::Gdn { .. } => {
+                            AttentionKind::Gdn => {
                                 // Fuse with QKV projection (first of QKV/Z/A/B)
                                 let gdn = self.gdn_state.as_ref().ok_or_else(|| {
                                     InferenceError::runtime("GDN state not initialized")

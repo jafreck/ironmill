@@ -228,7 +228,6 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    #[allow(dead_code)]
     fn at_end(&self) -> bool {
         self.pos >= self.input.len()
     }

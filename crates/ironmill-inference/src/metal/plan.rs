@@ -17,10 +17,7 @@ pub(crate) enum AttentionKind {
         has_v_norm: bool,
     },
     /// GDN (Gated Delta Network) linear attention with recurrent state.
-    Gdn {
-        /// Index into `GdnState::layers` for this layer's conv/recurrent state.
-        gdn_index: usize,
-    },
+    Gdn,
 }
 
 /// Which RoPE cos/sin table to use.
@@ -63,11 +60,6 @@ pub(crate) struct LayerPlan {
     // ── FFN ──
     pub(crate) use_gelu: bool,
     pub(crate) moe: Option<MoeLayerConfig>,
-
-    // ── Post-layer ──
-    pub(crate) has_post_ffn_norm: bool,
-    pub(crate) has_layer_scalar: bool,
-    pub(crate) has_ple: bool,
 }
 
 impl LayerPlan {
@@ -91,7 +83,6 @@ impl LayerPlan {
             });
         let has_v_norm = g4.is_some();
 
-        let ple_enabled = g4.is_some_and(|g| g.ple_hidden_size > 0);
 
         (0..mc.num_hidden_layers)
             .map(|i| {
@@ -126,7 +117,8 @@ impl LayerPlan {
                             "layer {i} is GDN but no GDN config provided"
                         ))
                     })?;
-                    let gdn_index = gdn
+                    // Validate that this layer is listed in gdn_layer_indices.
+                    let _gdn_index = gdn
                         .gdn_layer_indices
                         .iter()
                         .position(|&l| l == i)
@@ -135,7 +127,7 @@ impl LayerPlan {
                                 "layer {i} is GDN but not in gdn_layer_indices"
                             ))
                         })?;
-                    AttentionKind::Gdn { gdn_index }
+                    AttentionKind::Gdn
                 } else {
                     AttentionKind::Standard {
                         has_output_gate,
@@ -206,9 +198,6 @@ impl LayerPlan {
                     use_global_pipelines,
                     use_gelu: mc.use_gelu(),
                     moe,
-                    has_post_ffn_norm: lw.post_ffn_norm.is_some(),
-                    has_layer_scalar: lw.layer_scalar.is_some(),
-                    has_ple: ple_enabled && lw.ple_gate.is_some(),
                 })
             })
             .collect()
@@ -217,23 +206,6 @@ impl LayerPlan {
 
 // ── Model-level execution plan ─────────────────────────────────
 
-/// PLE (Per-Layer Embedding) configuration for the model.
-#[derive(Clone, Debug)]
-pub(crate) struct PlePlan {
-    pub(crate) ple_hidden_size: usize,
-}
-
-/// Strategy for residual connections around the attention block.
-#[derive(Clone, Debug)]
-pub(crate) enum ResidualStrategy {
-    /// Standard pre-norm: fused residual + RMSNorm in one dispatch.
-    Fused,
-    /// Split residual add and norm (e.g. when layer_scalar is present).
-    SplitWithScale,
-    /// Gemma 4 post-attention norm: norm before residual, then separate pre-FFN norm.
-    GemmaPostAttnNorm,
-}
-
 /// Pre-computed model-level execution plan.
 ///
 /// Captures all architecture-specific decisions that would otherwise require
@@ -241,28 +213,18 @@ pub(crate) enum ResidualStrategy {
 /// pipeline iteration.
 #[derive(Clone, Debug)]
 pub(crate) struct ModelPlan {
-    pub(crate) hidden_size: usize,
-    pub(crate) num_attention_heads: u32,
-    pub(crate) vocab_size: usize,
-    pub(crate) rms_norm_eps: f32,
     /// 1.0 for most models, sqrt(hidden_size) for Gemma.
     pub(crate) embed_scale: f32,
-    pub(crate) layers: Vec<LayerPlan>,
     pub(crate) final_logit_softcapping: Option<f32>,
-    pub(crate) enable_turboquant: bool,
-    pub(crate) max_seq_len: usize,
-    pub(crate) tq_n_bits: usize,
-    pub(crate) ple: Option<PlePlan>,
-    pub(crate) has_dac: bool,
 }
 
 impl ModelPlan {
     /// Build a model-level plan from config objects and pre-built layer plans.
     pub(crate) fn build(
         mc: &ModelConfig,
-        config: &MetalConfig,
+        _config: &MetalConfig,
         g4: Option<&Gemma4Config>,
-        layers: Vec<LayerPlan>,
+        _layers: Vec<LayerPlan>,
     ) -> Self {
         let embed_scale = if mc.architecture == Architecture::Gemma {
             (mc.hidden_size as f32).sqrt()
@@ -272,23 +234,9 @@ impl ModelPlan {
 
         let final_logit_softcapping = g4.and_then(|g| g.final_logit_softcapping);
 
-        let ple = g4.filter(|g| g.ple_hidden_size > 0).map(|g| PlePlan {
-            ple_hidden_size: g.ple_hidden_size,
-        });
-
         Self {
-            hidden_size: mc.hidden_size,
-            num_attention_heads: mc.num_attention_heads as u32,
-            vocab_size: mc.vocab_size,
-            rms_norm_eps: mc.rms_norm_eps as f32,
             embed_scale,
-            layers,
             final_logit_softcapping,
-            enable_turboquant: config.enable_turboquant,
-            max_seq_len: config.max_seq_len,
-            tq_n_bits: config.n_bits as usize,
-            ple,
-            has_dac: false, // Set after DAC calibration.
         }
     }
 }

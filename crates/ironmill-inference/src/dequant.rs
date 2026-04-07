@@ -73,65 +73,6 @@ pub(crate) fn unpack_indices(packed: &[u8], n_bits: u8, total_elements: usize) -
 
 // ── Affine dequant helpers ───────────────────────────────────────
 
-/// Dequantize an affine-quantized tensor to FP16 bytes (unsigned
-/// interpretation).
-///
-/// Applies `(quantized - zero_point) * scale` element-wise, where each
-/// byte of `data` is treated as an unsigned `u8` value.
-#[allow(dead_code)]
-pub(crate) fn dequant_affine_to_fp16(
-    data: &[u8],
-    scale: &[u8],
-    zero_point: &[u8],
-    scale_dtype: ScalarType,
-    zero_point_dtype: ScalarType,
-    _axis: Option<usize>,
-    shape: &[usize],
-) -> anyhow::Result<Vec<u8>> {
-    let num_elements: usize = shape.iter().product();
-    let mut output = Vec::with_capacity(num_elements * 2);
-
-    let scale_elem_size = scale_dtype.byte_size();
-    let zp_elem_size = zero_point_dtype.byte_size();
-
-    let n_scale_groups = scale.len() / scale_elem_size;
-    let n_zp_groups = if zero_point.is_empty() {
-        0
-    } else {
-        zero_point.len() / zp_elem_size
-    };
-    if !zero_point.is_empty() && n_zp_groups != n_scale_groups {
-        anyhow::bail!(
-            "dequant_affine_to_fp16: zero-point group count ({}) does not match scale group count ({})",
-            n_zp_groups,
-            n_scale_groups,
-        );
-    }
-
-    for (i, &byte_val) in data.iter().enumerate().take(num_elements) {
-        let q_val = byte_val as f32;
-        let s_idx = if scale.len() / scale_elem_size > 1 {
-            // Per-channel scale: index by row.
-            let cols = if shape.len() > 1 { shape[1] } else { 1 };
-            i / cols
-        } else {
-            0
-        };
-        let s = read_typed_f32(scale, s_idx * scale_elem_size, scale_dtype)?;
-        let zp = if zero_point.is_empty() {
-            0.0
-        } else {
-            let zp_idx = s_idx.min(zero_point.len() / zp_elem_size - 1);
-            read_typed_f32(zero_point, zp_idx * zp_elem_size, zero_point_dtype)?
-        };
-        let val = (q_val - zp) * s;
-        let h = f16::from_f32(val);
-        output.extend_from_slice(&h.to_le_bytes());
-    }
-
-    Ok(output)
-}
-
 /// Dequantize an affine-quantized tensor using GPTQ `g_idx` group mapping.
 ///
 /// Like [`dequant_affine_to_fp16`] but uses `g_idx[col]` instead of
@@ -185,52 +126,6 @@ pub(crate) fn dequant_affine_with_g_idx(
                 read_typed_f32(zero_point, zp_idx * zp_elem_size, zero_point_dtype)?
             };
             let val = (q_val - zp) * s;
-            let h = f16::from_f32(val);
-            output.extend_from_slice(&h.to_le_bytes());
-        }
-    }
-
-    Ok(output)
-}
-///
-/// Unpacks `n_bits`-wide indices, looks up values in `lut`, multiplies
-/// by per-row norms, and returns FP16 bytes. Does **not** apply inverse
-/// Hadamard rotation (ignores `polar_quant_seed`).
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn dequant_lut_to_fp16(
-    indices: &[u8],
-    lut: &[u8],
-    lut_dtype: ScalarType,
-    original_shape: &[usize],
-    n_bits: u8,
-    row_norms: &[u8],
-    norms_dtype: ScalarType,
-    _polar_quant_seed: Option<u64>,
-) -> anyhow::Result<Vec<u8>> {
-    let num_elements: usize = original_shape.iter().product();
-    let cols = if original_shape.len() > 1 {
-        original_shape[1]
-    } else {
-        num_elements
-    };
-    let rows = num_elements / cols;
-
-    let palette_size = 1usize << n_bits;
-    let lut_elem_size = lut_dtype.byte_size();
-
-    let unpacked = unpack_indices(indices, n_bits, num_elements);
-
-    let mut output = Vec::with_capacity(num_elements * 2);
-
-    for row in 0..rows {
-        let norm = read_typed_f32(row_norms, row * norms_dtype.byte_size(), norms_dtype)?;
-        let lut_row_offset = row * palette_size * lut_elem_size;
-
-        for col in 0..cols {
-            let idx = unpacked[row * cols + col];
-            let lut_val = read_typed_f32(lut, lut_row_offset + idx * lut_elem_size, lut_dtype)?;
-            let val = lut_val * norm;
             let h = f16::from_f32(val);
             output.extend_from_slice(&h.to_le_bytes());
         }
