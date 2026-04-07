@@ -117,7 +117,7 @@ impl MetalInference {
                     let argmax = l
                         .iter()
                         .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .max_by(|a, b| a.1.total_cmp(b.1))
                         .map(|(i, _)| i)
                         .unwrap_or(0);
                     let log_sum_exp: f64 = l
@@ -274,9 +274,9 @@ impl MetalInference {
 
         let h = mc.hidden_size;
         let nh = mc.num_attention_heads as u32;
-        let nkv = mc.num_kv_heads() as u32;
-        let hd = mc.head_dim as u32;
-        let inter = mc.intermediate_size;
+        let _nkv = mc.num_kv_heads() as u32;
+        let _hd = mc.head_dim as u32;
+        let _inter = mc.intermediate_size;
         let vocab = mc.vocab_size;
         let eps = mc.rms_norm_eps as f32;
         let enable_tq = self.config.enable_turboquant && self.turboquant.is_some();
@@ -325,11 +325,11 @@ impl MetalInference {
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         // Create command buffer and single shared compute encoder.
-        let mut cmd_buf = self
+        let cmd_buf = self
             .queue
             .command_buffer()
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        let mut enc = cmd_buf
+        let enc = cmd_buf
             .compute_encoder()
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
@@ -999,16 +999,11 @@ impl MetalInference {
             // SIMD-accelerated FP16→FP32 via half crate's platform-optimized batch conversion.
             // On Apple Silicon this uses NEON vcvt instructions (~8× faster than scalar).
             use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
-            let u16_slice: &[u16] = {
-                let ptr = self.logits_fp16_buf.as_ptr() as *const u16;
-                let len = self.logits_fp16_buf.len() / 2;
-                // SAFETY: logits_fp16_buf is aligned to 2 bytes (from Metal buffer readback)
-                // and len is always even (vocab * 2 bytes). The lifetime is bounded by self.
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::slice::from_raw_parts(ptr, len)
-                }
-            };
+            let u16_slice: Vec<u16> = self
+                .logits_fp16_buf
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
             let f16_slice: &[f16] = u16_slice.reinterpret_cast();
             let mut logits_f32 = vec![0.0f32; f16_slice.len()];
             f16_slice.convert_to_f32_slice(&mut logits_f32);

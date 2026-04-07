@@ -106,7 +106,9 @@ pub(crate) fn encode_projection_q8(
                 }
                 return Ok(());
             }
-            panic!("MPS dense fallback not supported in single-encoder mode");
+            return Err(InferenceError::runtime(
+                "MPS dense fallback not supported in single-encoder mode",
+            ));
         }
         WeightBuffer::Quantized(q) => {
             encode_polarquant_projection(

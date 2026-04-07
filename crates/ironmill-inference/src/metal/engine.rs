@@ -151,10 +151,8 @@ impl MetalInference {
     }
 
     /// Mutable access to loaded weights for post-load transforms (e.g. D2Quant simulation).
-    pub(crate) fn weights_mut(&mut self) -> &mut MetalWeights {
-        self.weights
-            .as_mut()
-            .expect("weights_mut() called before load()")
+    pub(crate) fn weights_mut(&mut self) -> Result<&mut MetalWeights, InferenceError> {
+        self.weights.as_mut().ok_or(InferenceError::NotLoaded)
     }
 }
 
