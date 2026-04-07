@@ -2030,6 +2030,11 @@ impl MetalInference {
         // (from the fused embedding+norm above). Subsequent layers receive
         // their input norm from the previous layer's fused end-of-layer dispatch.
 
+        // P1 fusion tracking: when the previous layer's end-of-layer kernel
+        // fused residual+norm+first_projection, the current layer should skip
+        // its first projection (Q for Standard, QKV for GDN).
+        let mut skip_first_proj = false;
+
         for layer_idx in 0..mc.num_hidden_layers {
             let lw = &weights.layers[layer_idx];
             let lm = &matmuls.layer_matmuls[layer_idx];
@@ -2044,6 +2049,10 @@ impl MetalInference {
             // norm_out already contains the input-norm result:
             //   • layer 0: computed by the standalone dispatch above
             //   • layer 1+: produced by the previous layer's fused end-of-layer kernel
+
+            // Check if we should skip the first projection (pre-computed by P1 fusion).
+            let p1_skip = skip_first_proj;
+            skip_first_proj = false;
 
             // Steps 3-5: Q/K/V projections — dispatch by weight type.
             // These are independent (all read norm_out, write to different buffers).
@@ -2085,7 +2094,9 @@ impl MetalInference {
                             eps,
                         )?;
                     } else {
-                        encode_gdn_decode(&enc, bufs, gdn, lw, pipelines, gdn_idx, h, eps)?;
+                        encode_gdn_decode(
+                            &enc, bufs, gdn, lw, pipelines, gdn_idx, h, eps, p1_skip,
+                        )?;
                     }
                     enc.memory_barrier_buffers();
                 }
@@ -2106,29 +2117,39 @@ impl MetalInference {
 
                     let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
                     let kv_out_features = layer_nkv as usize * layer_hd as usize;
-                    for (weight, output_buf, matmul, out_features, row_bytes_out) in [
-                        (
+
+                    // Build the projection list: skip Q if P1 fusion already computed it.
+                    let mut projections: Vec<(
+                        &WeightBuffer,
+                        &MetalBuffer,
+                        &ProjectionMatmul,
+                        usize,
+                        usize,
+                    )> = Vec::new();
+                    if !p1_skip {
+                        projections.push((
                             &lw.q_proj,
                             &bufs.q_proj,
                             &lm.q,
                             qkv_out_features,
                             row_bytes_qo,
-                        ),
-                        (
-                            &lw.k_proj,
-                            &bufs.k_proj,
-                            &lm.k,
-                            kv_out_features,
-                            row_bytes_kv,
-                        ),
-                        (
-                            &lw.v_proj,
-                            &bufs.v_proj,
-                            &lm.v,
-                            kv_out_features,
-                            row_bytes_kv,
-                        ),
-                    ] {
+                        ));
+                    }
+                    projections.push((
+                        &lw.k_proj,
+                        &bufs.k_proj,
+                        &lm.k,
+                        kv_out_features,
+                        row_bytes_kv,
+                    ));
+                    projections.push((
+                        &lw.v_proj,
+                        &bufs.v_proj,
+                        &lm.v,
+                        kv_out_features,
+                        row_bytes_kv,
+                    ));
+                    for (weight, output_buf, matmul, out_features, row_bytes_out) in projections {
                         encode_projection(
                             &enc,
                             &bufs.norm_out,
@@ -2622,7 +2643,18 @@ impl MetalInference {
                                 let qkv_out = mc.num_attention_heads * next_plan.head_dim as usize;
                                 Some((&next_lw.q_proj, &bufs.q_proj, qkv_out))
                             }
-                            AttentionKind::Gdn { .. } => None, // GDN uses batched projections
+                            AttentionKind::Gdn { .. } => {
+                                // Fuse with QKV projection (first of QKV/Z/A/B)
+                                let gdn = self.gdn_state.as_ref().ok_or_else(|| {
+                                    InferenceError::runtime("GDN state not initialized")
+                                })?;
+                                let qkv_dim = gdn.config.qkv_dim;
+                                Some((
+                                    next_lw.gdn_in_proj_qkv.as_ref().unwrap(),
+                                    &gdn.gpu_temp_qkv,
+                                    qkv_dim,
+                                ))
+                            }
                         }
                     } else {
                         None
@@ -2639,10 +2671,9 @@ impl MetalInference {
                         eps,
                     )?;
 
-                    // If P1 fusion was used, the next layer's Q projection is already
-                    // computed. We store this flag for the next iteration.
-                    // For now, we still emit the barrier and let the layer loop handle it.
-                    let _ = fused;
+                    // If P1 fusion was used, the next layer's first projection is already
+                    // computed. Signal the next iteration to skip it.
+                    skip_first_proj = fused;
                 }
                 enc.memory_barrier_buffers();
             }
@@ -4329,6 +4360,7 @@ fn encode_gdn_decode(
     gdn_idx: usize,
     h: usize,
     eps: f32,
+    skip_qkv: bool,
 ) -> Result<(), InferenceError> {
     let row_bytes_h = h * 2;
     let gdn_cfg = &gdn.config;
@@ -4341,19 +4373,43 @@ fn encode_gdn_decode(
     let v_head_dim = gdn_cfg.v_head_dim;
     let key_dim = gdn_cfg.key_dim;
 
-    // Try batched dense matvec for all 4 GDN projections in one dispatch.
+    // Try batched matvec for all 4 GDN projections in one dispatch.
     let w_qkv = lw.gdn_in_proj_qkv.as_ref().unwrap();
     let w_z = lw.gdn_in_proj_z.as_ref().unwrap();
     let w_a = lw.gdn_in_proj_a.as_ref().unwrap();
     let w_b = lw.gdn_in_proj_b.as_ref().unwrap();
 
-    if let (Some(p_qkv), Some(p_z), Some(p_a), Some(p_b)) = (
+    if skip_qkv {
+        // QKV was pre-computed by P1 fusion — only dispatch Z/A/B projections.
+        let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, 1, h, row_bytes_h)
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        for (weight, output_buf, out_features) in [
+            (w_z, &gdn.gpu_temp_z, value_dim),
+            (w_a, &gdn.gpu_temp_a, num_v_heads),
+            (w_b, &gdn.gpu_temp_b, num_v_heads),
+        ] {
+            encode_projection(
+                enc,
+                &bufs.norm_out,
+                &norm_mat,
+                weight,
+                output_buf,
+                &dummy_matmul,
+                pipelines,
+                1,
+                out_features,
+                h,
+                row_bytes_h,
+                out_features * 2,
+            )?;
+        }
+    } else if let (Some(p_qkv), Some(p_z), Some(p_a), Some(p_b)) = (
         w_qkv.packed_buf(),
         w_z.packed_buf(),
         w_a.packed_buf(),
         w_b.packed_buf(),
     ) {
-        // All 4 weights are dense with packed buffers: use batched matvec.
+        // All 4 weights are dense with packed buffers: use batched FP16 matvec.
         ops::encode_gdn_batched_matvec(
             enc,
             &pipelines.gdn_batched_matvec,
@@ -4372,8 +4428,65 @@ fn encode_gdn_decode(
             num_v_heads as u32,
             num_v_heads as u32,
         );
+    } else if let (
+        WeightBuffer::AffineQuantized(aq_qkv),
+        WeightBuffer::AffineQuantized(aq_z),
+        WeightBuffer::AffineQuantized(aq_a),
+        WeightBuffer::AffineQuantized(aq_b),
+    ) = (w_qkv, w_z, w_a, w_b)
+    {
+        if aq_qkv.bit_width == 4
+            && aq_z.bit_width == 4
+            && aq_a.bit_width == 4
+            && aq_b.bit_width == 4
+        {
+            // All 4 weights are INT4 affine: use batched INT4 matvec.
+            ops::encode_gdn_batched_affine_matvec_int4(
+                enc,
+                &pipelines.gdn_batched_affine_matvec_int4,
+                &bufs.norm_out,
+                aq_qkv,
+                &gdn.gpu_temp_qkv,
+                qkv_dim as u32,
+                aq_z,
+                &gdn.gpu_temp_z,
+                value_dim as u32,
+                aq_a,
+                &gdn.gpu_temp_a,
+                num_v_heads as u32,
+                aq_b,
+                &gdn.gpu_temp_b,
+                num_v_heads as u32,
+                h as u32,
+            );
+        } else {
+            // Mixed bit widths: fallback to individual projections.
+            let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, 1, h, row_bytes_h)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            for (weight, output_buf, out_features) in [
+                (w_qkv as &WeightBuffer, &gdn.gpu_temp_qkv, qkv_dim),
+                (w_z as &WeightBuffer, &gdn.gpu_temp_z, value_dim),
+                (w_a as &WeightBuffer, &gdn.gpu_temp_a, num_v_heads),
+                (w_b as &WeightBuffer, &gdn.gpu_temp_b, num_v_heads),
+            ] {
+                encode_projection(
+                    enc,
+                    &bufs.norm_out,
+                    &norm_mat,
+                    weight,
+                    output_buf,
+                    &dummy_matmul,
+                    pipelines,
+                    1,
+                    out_features,
+                    h,
+                    row_bytes_h,
+                    out_features * 2,
+                )?;
+            }
+        }
     } else {
-        // Fallback: individual projections for non-dense weights.
+        // Fallback: individual projections for other weight types.
         let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, 1, h, row_bytes_h)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
         for (weight, output_buf, out_features) in [
@@ -5556,6 +5669,7 @@ fn encode_end_of_layer_residual(
                         &bufs.hidden_state,
                         packed,
                         proj_output,
+                        &bufs.norm_out,
                         h as u32,
                         out_features as u32,
                         eps,
@@ -5574,6 +5688,7 @@ fn encode_end_of_layer_residual(
                             &bufs.hidden_state,
                             aq,
                             proj_output,
+                            &bufs.norm_out,
                             out_features as u32,
                             h as u32,
                             eps,
@@ -6798,18 +6913,31 @@ mod fa2_prefill_tests {
         fill_kv_cache(
             &mut k_data,
             &pseudo_random(123, num_kv_heads as usize * token_count * head_dim),
-            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+            num_kv_heads as usize,
+            max_seq_len,
+            head_dim,
+            token_count,
         );
         fill_kv_cache(
             &mut v_data,
             &pseudo_random(456, num_kv_heads as usize * token_count * head_dim),
-            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+            num_kv_heads as usize,
+            max_seq_len,
+            head_dim,
+            token_count,
         );
 
         let expected = cpu_attention(
-            &q_data, &k_data, &v_data,
-            num_q_heads as usize, num_kv_heads as usize,
-            head_dim, max_seq_len, seq_offset, token_count, scale,
+            &q_data,
+            &k_data,
+            &v_data,
+            num_q_heads as usize,
+            num_kv_heads as usize,
+            head_dim,
+            max_seq_len,
+            seq_offset,
+            token_count,
+            scale,
         );
 
         let q_buf = make_fp16_buffer(&device, &q_data);
@@ -6817,12 +6945,13 @@ mod fa2_prefill_tests {
         let v_buf = make_fp16_buffer(&device, &v_data);
         let output_size = token_count * num_q_heads as usize * head_dim;
 
-        let pipelines =
-            super::super::ops::MetalPipelines::compile(&device, head_dim, head_dim)
-                .expect("compile pipelines");
+        let pipelines = super::super::ops::MetalPipelines::compile(&device, head_dim, head_dim)
+            .expect("compile pipelines");
 
         // --- Dispatch v2 ---
-        let output_v2 = device.create_buffer(output_size * 2, StorageMode::Shared).expect("out");
+        let output_v2 = device
+            .create_buffer(output_size * 2, StorageMode::Shared)
+            .expect("out");
         {
             let cmd = queue.command_buffer().expect("cmd");
             let enc = cmd.compute_encoder().expect("enc");
@@ -6850,7 +6979,9 @@ mod fa2_prefill_tests {
         }
 
         // --- Dispatch FA2 (original) ---
-        let output_fa2 = device.create_buffer(output_size * 2, StorageMode::Shared).expect("out");
+        let output_fa2 = device
+            .create_buffer(output_size * 2, StorageMode::Shared)
+            .expect("out");
         {
             let cmd = queue.command_buffer().expect("cmd");
             let enc = cmd.compute_encoder().expect("enc");

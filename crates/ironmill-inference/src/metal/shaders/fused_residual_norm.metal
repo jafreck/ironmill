@@ -98,7 +98,7 @@ kernel void fused_residual_rms_norm(
 // So we compute the un-normalized dot product in the main loop, accumulate
 // sum_sq in parallel, and multiply by rms_inv at the end.
 //
-// Threadgroup 0 also writes residual_output = a + b.
+// Threadgroup 0 writes residual_output = a + b AND normed_output = RMSNorm(a+b).
 //
 // Buffers:
 //   buffer(0)  a:               [hidden_size] half
@@ -108,6 +108,7 @@ kernel void fused_residual_rms_norm(
 //   buffer(4)  w_packed:        [N/8, K/8, 8, 8] half (blocked dense weights)
 //   buffer(5)  y:               [N] half (projection output)
 //   buffer(6)  params:          uint[4] — (K, N, eps_bits, 0)
+//   buffer(7)  normed_output:   [hidden_size] half (RMSNorm result for subsequent projections)
 //
 // Dispatch: ((N + 63) / 64, 1, 1) threadgroups, (256, 1, 1) threads.
 // ============================================================================
@@ -125,6 +126,7 @@ kernel void fused_residual_norm_matvec(
     device const half* w_packed        [[buffer(4)]],
     device half* y                     [[buffer(5)]],
     constant uint* params              [[buffer(6)]],
+    device half* normed_output         [[buffer(7)]],
     uint tgid   [[threadgroup_position_in_grid]],
     uint tid    [[thread_index_in_threadgroup]],
     uint sgid   [[simdgroup_index_in_threadgroup]],
@@ -170,13 +172,14 @@ kernel void fused_residual_norm_matvec(
     float rms_inv = rsqrt(sg_sq_partial[0] / float(K) + eps);
 
     // Step 1b: Write normed input to threadgroup memory in blocked format.
-    // The simdgroup_matrix multiply expects blocked [K/8, 8] with stride 0
-    // for broadcast. We write the normed values as a flat array and load
-    // with stride=0.
+    // Also write normed_output for subsequent projections (threadgroup 0).
     for (uint i = tid; i < K; i += 256) {
         float val = float(a[i]) + float(b[i]);
         float normed = val * rms_inv * float(norm_weight[i]);
         tg_input[i] = half(normed);
+        if (tgid == 0) {
+            normed_output[i] = half(normed);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -223,7 +226,7 @@ kernel void fused_residual_norm_matvec(
 // One threadgroup per output row, 32 threads (1 simdgroup).
 // Each thread loops over K/2 packed bytes (2 nibbles each).
 //
-// Threadgroup 0 also writes residual_output = a + b.
+// Threadgroup 0 writes residual_output = a + b AND normed_output = RMSNorm(a+b).
 //
 // Buffers:
 //   buffer(0)  a:               [K] half
@@ -237,6 +240,7 @@ kernel void fused_residual_norm_matvec(
 //   buffer(8)  params:          uint[4] — (N, K, group_size, eps_bits)
 //   buffer(9)  awq_scales:      [K] half or empty
 //   buffer(10) has_awq:         uint
+//   buffer(11) normed_output:   [K] half (RMSNorm result for subsequent projections)
 //
 // Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads.
 // ============================================================================
@@ -256,6 +260,7 @@ kernel void fused_residual_norm_affine_matvec_int4(
     constant uint* params              [[buffer(8)]],
     device const half* awq_scales      [[buffer(9)]],
     constant uint& has_awq             [[buffer(10)]],
+    device half* normed_output         [[buffer(11)]],
     uint tid  [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -326,15 +331,19 @@ kernel void fused_residual_norm_affine_matvec_int4(
     sq_acc = simd_sum(sq_acc);
     dot_acc = simd_sum(dot_acc);
 
+    float rms_inv;
     if (lane == 0) {
-        float rms_inv = rsqrt(sq_acc / float(K) + eps);
+        rms_inv = rsqrt(sq_acc / float(K) + eps);
         C[tid] = half(dot_acc * rms_inv);
     }
 
-    // Threadgroup 0 writes residual output (only need to do this once)
+    // Threadgroup 0 writes residual output AND normed output
     if (tid == 0) {
+        rms_inv = simd_broadcast_first(rms_inv);
         for (uint i = lane; i < K; i += 32) {
-            residual_output[i] = half(float(a[i]) + float(b[i]));
+            float val = float(a[i]) + float(b[i]);
+            residual_output[i] = half(val);
+            normed_output[i] = half(val * rms_inv * float(norm_weight[i]));
         }
     }
 }

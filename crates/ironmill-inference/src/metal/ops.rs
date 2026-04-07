@@ -169,6 +169,8 @@ pub struct MetalPipelines {
     pub gdn_batched_matvec: ComputePipeline,
     /// Batched affine INT4 matvec for FFN gate+up in one dispatch.
     pub batched_affine_matvec_int4: ComputePipeline,
+    /// Batched affine INT4 matvec for 4 GDN projections in one dispatch.
+    pub gdn_batched_affine_matvec_int4: ComputePipeline,
     /// Fused residual+RMSNorm+dense matvec in one dispatch.
     pub fused_residual_norm_matvec: ComputePipeline,
     /// Fused residual+RMSNorm+affine INT4 matvec in one dispatch.
@@ -687,6 +689,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &affine_mm_lib
                         .get_function("batched_affine_matvec_int4")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            gdn_batched_affine_matvec_int4: device
+                .create_compute_pipeline(
+                    &affine_mm_lib
+                        .get_function("gdn_batched_affine_matvec_int4")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -1467,10 +1476,7 @@ pub fn encode_v2_prefill_attention(
     encoder.set_bytes(&params.window_size.to_le_bytes(), 10);
     encoder.set_bytes(&params.attn_scale.to_le_bytes(), 11);
     let threads_per_tg = (heads_per_group * 32).min(METAL_MAX_THREADS_PER_THREADGROUP);
-    encoder.dispatch_threadgroups(
-        (num_kv_groups, q_blocks, 1),
-        (threads_per_tg, 1, 1),
-    );
+    encoder.dispatch_threadgroups((num_kv_groups, q_blocks, 1), (threads_per_tg, 1, 1));
 }
 
 /// Default Q-block tile size (Br) for fused SDPA.
@@ -1891,12 +1897,66 @@ pub fn encode_batched_affine_matvec_int4(
     encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
 }
 
+/// Encode batched affine INT4 matvec for 4 GDN projections in a single dispatch.
+///
+/// Computes qkv = x·W0^T, z = x·W1^T, a = x·W2^T, b = x·W3^T concurrently.
+/// Saves 3 dispatches per GDN layer compared to 4 separate `affine_matvec_int4` calls.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gdn_batched_affine_matvec_int4(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    input: &MetalBuffer,
+    w0: &super::weights::AffineQuantizedWeight,
+    out0: &MetalBuffer,
+    n0: u32,
+    w1: &super::weights::AffineQuantizedWeight,
+    out1: &MetalBuffer,
+    n1: u32,
+    w2: &super::weights::AffineQuantizedWeight,
+    out2: &MetalBuffer,
+    n2: u32,
+    w3: &super::weights::AffineQuantizedWeight,
+    out3: &MetalBuffer,
+    n3: u32,
+    k: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(input, 0, 0);
+    encoder.set_buffer(&w0.data, 0, 1);
+    encoder.set_buffer(&w0.scales, 0, 2);
+    encoder.set_buffer(&w0.zeros, 0, 3);
+    encoder.set_buffer(out0, 0, 4);
+    encoder.set_buffer(&w1.data, 0, 5);
+    encoder.set_buffer(&w1.scales, 0, 6);
+    encoder.set_buffer(&w1.zeros, 0, 7);
+    encoder.set_buffer(out1, 0, 8);
+    encoder.set_buffer(&w2.data, 0, 9);
+    encoder.set_buffer(&w2.scales, 0, 10);
+    encoder.set_buffer(&w2.zeros, 0, 11);
+    encoder.set_buffer(out2, 0, 12);
+    encoder.set_buffer(&w3.data, 0, 13);
+    encoder.set_buffer(&w3.scales, 0, 14);
+    encoder.set_buffer(&w3.zeros, 0, 15);
+    encoder.set_buffer(out3, 0, 16);
+    let has_awq = w0.awq_scales.is_some() as u32;
+    let params_words: [u32; 7] = [n0, n1, n2, n3, k, w0.group_size, has_awq];
+    let params_bytes: Vec<u8> = params_words.iter().flat_map(|v| v.to_le_bytes()).collect();
+    encoder.set_bytes(&params_bytes, 17);
+    if let Some(ref awq) = w0.awq_scales {
+        encoder.set_buffer(awq, 0, 18);
+    } else {
+        encoder.set_buffer(&w0.data, 0, 18); // dummy
+    }
+    let tg_count = (n0 + n1 + n2 + n3) as usize;
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
+}
+
 /// Encode fused residual + RMSNorm + dense FP16 matvec.
 ///
 /// Replaces `encode_fused_residual_rms_norm` + barrier + `encode_matvec`.
 /// Each threadgroup computes (a+b), derives rms_inv, and performs the
 /// matvec using the normed input — all in one dispatch.
-/// Threadgroup 0 also writes `residual_output = a + b`.
+/// Threadgroup 0 writes `residual_output = a + b` and `normed_output = RMSNorm(a+b)`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_fused_residual_norm_matvec(
     encoder: &ComputeEncoder,
@@ -1907,6 +1967,7 @@ pub fn encode_fused_residual_norm_matvec(
     residual_output: &MetalBuffer,
     w_packed: &MetalBuffer,
     y: &MetalBuffer,
+    normed_output: &MetalBuffer,
     k: u32,
     n: u32,
     eps: f32,
@@ -1922,6 +1983,7 @@ pub fn encode_fused_residual_norm_matvec(
     let params: [u32; 4] = [k, n, eps.to_bits(), 0];
     let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
     encoder.set_bytes(&params_bytes, 6);
+    encoder.set_buffer(normed_output, 0, 7);
     let tg_count = n.div_ceil(ROWS_PER_TG);
     encoder.dispatch_threadgroups((tg_count as usize, 1, 1), (DEFAULT_THREADGROUP_WIDTH, 1, 1));
 }
@@ -1930,6 +1992,7 @@ pub fn encode_fused_residual_norm_matvec(
 ///
 /// Same fusion as `encode_fused_residual_norm_matvec` but for INT4 weights.
 /// One threadgroup per output row, 32 threads per group.
+/// Also writes `normed_output` for subsequent projections.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_fused_residual_norm_affine_matvec_int4(
     encoder: &ComputeEncoder,
@@ -1940,6 +2003,7 @@ pub fn encode_fused_residual_norm_affine_matvec_int4(
     residual_output: &MetalBuffer,
     weight: &super::weights::AffineQuantizedWeight,
     output: &MetalBuffer,
+    normed_output: &MetalBuffer,
     n: u32,
     k: u32,
     eps: f32,
@@ -1963,6 +2027,7 @@ pub fn encode_fused_residual_norm_affine_matvec_int4(
         encoder.set_buffer(&weight.data, 0, 9); // dummy
         encoder.set_bytes(&0u32.to_le_bytes(), 10);
     }
+    encoder.set_buffer(normed_output, 0, 11);
     encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }
 

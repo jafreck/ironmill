@@ -1,6 +1,6 @@
 # Metal Inference Refactoring — Implementation Plan
 
-> Refactor the `ironmill-inference` Metal backend from a 6,600-line monolith
+> Refactor the `ironmill-inference` Metal backend from a ~6,900-line monolith
 > into focused, single-concern modules while preserving every optimization and
 > the public API surface.
 
@@ -10,7 +10,7 @@
 
 ## Problem
 
-`metal/inference.rs` has grown to 6,629 lines. It contains weight loading,
+`metal/inference.rs` has grown to ~6,900 lines. It contains weight loading,
 buffer allocation, RoPE cache construction, MPS matmul caching, the full decode
 pipeline, a near-duplicate calibration pipeline, GDN linear-attention helpers,
 MoE dispatch, PLE dispatch, MLA weight absorption, CPU GDN fallback, and
@@ -19,7 +19,7 @@ DeepSeek/MLA, and standard LLaMA-like models is interleaved throughout.
 
 Key pain points:
 
-- **Readability:** the `run_pipeline_inner` function alone is ~1,000 lines with
+- **Readability:** the `run_pipeline_inner` function alone is ~1,050 lines with
   nested architecture branches.
 - **Duplication:** `run_pipeline_calibration` duplicates most of the pipeline
   logic with per-layer GPU sync inserted. `load()` and `load_weights()` share
@@ -45,13 +45,16 @@ plan, not vtable calls. All existing optimizations are preserved.
 ```
 src/metal/
 ├── mod.rs                  re-exports
-├── config.rs               MetalConfig, Gemma4Config, GdnModelConfig (unchanged)
+├── config.rs               MetalConfig, Gemma4Config, GdnModelConfig, ClaConfig, SlidingWindowConfig (unchanged)
 ├── error.rs                MetalError (unchanged)
 ├── ops.rs                  MetalPipelines + encode_* wrappers (unchanged)
 ├── weights.rs              WeightBuffer, MetalWeights (unchanged)
 ├── dequant.rs              CPU dequant helpers (unchanged)
 ├── bundle.rs               .ironml-gpu bundle loader (unchanged)
-├── mla.rs                  MLA config + absorb_mla_weights (moved from inference.rs)
+├── mla/                    MLA module (already split out)
+│   ├── mod.rs              re-exports, MlaConfig
+│   ├── absorption.rs       absorb_weights (weight transform at load time)
+│   └── cache.rs            MlaKvCache (latent + RoPE-key cache)
 │
 ├── engine.rs        NEW    MetalInference struct + InferenceEngine impl
 ├── plan.rs          NEW    ModelPlan, LayerPlan, AttentionKind, ResidualStrategy
@@ -66,7 +69,7 @@ src/metal/
 ├── kv_cache.rs      NEW    Fp16KvCache
 ├── buffers.rs       NEW    IntermediateBuffers, MpsMatmulCache, RoPE cache, helpers
 │
-├── turboquant/             (unchanged)
+├── turboquant/             (unchanged: mod.rs, cache.rs, codebook.rs)
 ```
 
 ## Detailed Design
@@ -166,11 +169,13 @@ with clear sub-steps:
 Both public entry points (`load()` and `load_weights()`) call into this shared
 flow, differing only in how they obtain the `WeightProvider` and `MetalConfig`.
 
-### MLA Absorption (mla.rs)
+### MLA Absorption (mla/)
 
-`absorb_mla_weights` and `read_f16_buffer` move from inference.rs into `mla.rs`,
-which already owns `MlaConfig`, `MlaKvCache`, and `absorb_weights`. This
-colocates the load-time weight transform with the MLA math it depends on.
+`absorb_mla_weights` and `read_f16_buffer` move from inference.rs into
+`mla/absorption.rs`, which already owns `absorb_weights`. The `mla/` module
+already contains `MlaConfig` (re-exported from `mil_rs`), `MlaKvCache`, and
+`absorb_weights`. This colocates the load-time weight transform with the MLA
+math it depends on.
 
 ## Phases
 
@@ -190,9 +195,9 @@ that compiles and passes tests.
 | 1.7 | `attention.rs` | ~450 | `encode_qk_norm_and_rope`, `encode_kv_cache_and_attention`, `encode_end_of_layer_residual` |
 | 1.8 | `ple.rs` | ~200 | PLE model-level computation, PLE per-layer block |
 
-After Phase 1, `inference.rs` drops to ~2,500 lines: the struct definition,
-`load()`, `load_weights()`, `run_pipeline_inner`, `run_pipeline_calibration`,
-MLA absorption, and trait impls.
+After Phase 1, `inference.rs` drops to ~2,800 lines: the struct definition,
+`load()`, `load_weights()`, `load_jit()`, `run_pipeline_inner`,
+`run_pipeline_calibration`, MLA absorption, and trait impls.
 
 **Validation:** `cargo build --release -p ironmill-inference --features metal`
 and `cargo test --release -p ironmill-bench --features metal` after each step.
@@ -204,7 +209,7 @@ and `cargo test --release -p ironmill-bench --features metal` after each step.
 | 2.1 | Add `ModelPlan`, `PlePlan`, `ResidualStrategy` to `plan.rs` |
 | 2.2 | Build `ModelPlan` in loading code, store as `engine.plan` |
 | 2.3 | Rewrite `run_pipeline_inner` to read `ModelPlan` exclusively (no more `self.gemma4_config`, `self.model_config`, `self.gdn_state` reads in the loop) |
-| 2.4 | Create `engine.rs` — move `MetalInference` struct + `MetalArtifacts` + `new()` + `InferenceEngine` impl + `CalibratingEngine` impl |
+| 2.4 | Create `engine.rs` — move `MetalInference` struct + `MetalArtifacts` + `new()` + `InferenceEngine` impl + `CalibratingEngine` impl (from `crate::calibration`) |
 
 After Phase 2, `inference.rs` no longer exists. The pipeline loop is ~100 lines.
 
@@ -216,7 +221,7 @@ After Phase 2, `inference.rs` no longer exists. The pipeline loop is ~100 lines.
 |------|--------|
 | 3.1 | Create `loading.rs` — merge `load()` and `load_weights()` into shared init flow |
 | 3.2 | Create `calibration.rs` — refactor `run_pipeline_calibration` to reuse encode functions from Phase 1 modules |
-| 3.3 | Move `absorb_mla_weights` + `read_f16_buffer` into `mla.rs` |
+| 3.3 | Move `absorb_mla_weights` + `read_f16_buffer` into `mla/absorption.rs` |
 
 **Validation:** calibration tests + benchmark PPL match.
 
@@ -246,7 +251,7 @@ After Phase 2, `inference.rs` no longer exists. The pipeline loop is ~100 lines.
 | `kv_cache.rs` | ~200 | FP16 KV cache |
 | `buffers.rs` | ~350 | Intermediate buffers, helpers |
 
-Total: ~4,000 lines (down from 6,629 — reduced by eliminating calibration
+Total: ~4,000 lines (down from ~6,900 — reduced by eliminating calibration
 pipeline duplication and debug instrumentation).
 
 ## What Does Not Change
@@ -255,12 +260,16 @@ pipeline duplication and debug instrumentation).
 - `build.rs` (shader precompilation)
 - `ops.rs` (pipeline compilation + encode wrappers)
 - `weights.rs` (weight buffer types + loading)
-- `config.rs` (architecture config parsing)
+- `config.rs` (architecture config parsing: MetalConfig, Gemma4Config,
+  GdnModelConfig, ClaConfig, SlidingWindowConfig)
 - `bundle.rs` (`.ironml-gpu` format)
 - `dequant.rs` (CPU dequantization)
 - `turboquant/` (TurboQuant KV cache compression)
-- Public API surface (`MetalInference::new`, `load`, `load_weights`, all
-  `InferenceEngine` / `CalibratingEngine` methods)
+- Public API surface (`MetalInference::new`, `load`, `load_weights`, `load_jit`,
+  `gpu_allocated_bytes`, `calibrate_dac`, `prefill_all_logits`,
+  `decode_step_with_hidden`, `last_hidden_state`, and all `InferenceEngine` /
+  `CalibratingEngine` trait methods)
+- `mla/` module (already extracted: `MlaKvCache`, `absorb_weights`, `MlaConfig`)
 - All optimizations: TurboQuant, FA2 prefill, CLA, DAC, MLA absorption,
   fused kernels, layer_scalar, PLE, MoE, GDN, sliding window
 

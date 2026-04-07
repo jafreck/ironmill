@@ -54,11 +54,26 @@ fn main() {
     ];
 
     let seq_configs = vec![
-        SeqConfig { token_count: 32, max_seq_len: 64 },
-        SeqConfig { token_count: 128, max_seq_len: 256 },
-        SeqConfig { token_count: 512, max_seq_len: 1024 },
-        SeqConfig { token_count: 1024, max_seq_len: 2048 },
-        SeqConfig { token_count: 2048, max_seq_len: 4096 },
+        SeqConfig {
+            token_count: 32,
+            max_seq_len: 64,
+        },
+        SeqConfig {
+            token_count: 128,
+            max_seq_len: 256,
+        },
+        SeqConfig {
+            token_count: 512,
+            max_seq_len: 1024,
+        },
+        SeqConfig {
+            token_count: 1024,
+            max_seq_len: 2048,
+        },
+        SeqConfig {
+            token_count: 2048,
+            max_seq_len: 4096,
+        },
     ];
 
     let device = MetalDevice::system_default().expect("no Metal device");
@@ -119,16 +134,17 @@ fn main() {
         std::collections::HashMap::new();
 
     for mc in &model_configs {
-        println!("── {} ({} Q heads, {} KV heads, hd={}) ──",
-            mc.label, mc.num_q_heads, mc.num_kv_heads, mc.head_dim);
+        println!(
+            "── {} ({} Q heads, {} KV heads, hd={}) ──",
+            mc.label, mc.num_q_heads, mc.num_kv_heads, mc.head_dim
+        );
         println!(
             "  {:>8}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}",
             "tokens", "V2 (µs)", "FA2 (µs)", "SDPA (µs)", "V2/SDPA", "V2/FA2"
         );
 
         let pipelines = pipeline_cache.entry(mc.head_dim).or_insert_with(|| {
-            MetalPipelines::compile(&device, mc.head_dim, mc.head_dim)
-                .expect("compile pipelines")
+            MetalPipelines::compile(&device, mc.head_dim, mc.head_dim).expect("compile pipelines")
         });
 
         let scale = 1.0 / (mc.head_dim as f32).sqrt();
@@ -258,7 +274,10 @@ fn main() {
 
             println!(
                 "  {:>8}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8}  {:>8}",
-                sc.token_count, v2_median, fa2_median, sdpa_median,
+                sc.token_count,
+                v2_median,
+                fa2_median,
+                sdpa_median,
                 fmt_speedup(sdpa_median / v2_median),
                 fmt_speedup(fa2_median / v2_median),
             );
