@@ -5342,22 +5342,23 @@ fn encode_ffn_block(
     let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
         .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
-    // For decode (token_count == 1), try batched gate+up when both are affine INT4.
-    let used_batched = if token_count == 1 {
+    // For decode (token_count == 1), try fused gate+up+activation when both are affine INT4.
+    // This eliminates the separate activation dispatch and intermediate buffer writes.
+    let used_fused_gate_up_act = if token_count == 1 {
         if let (WeightBuffer::AffineQuantized(aq_gate), WeightBuffer::AffineQuantized(aq_up)) =
             (&lw.gate_proj, &lw.up_proj)
         {
             if aq_gate.bit_width == 4 && aq_up.bit_width == 4 {
-                ops::encode_batched_affine_matvec_int4(
+                ops::encode_fused_ffn_gate_up_act_int4(
                     enc,
-                    &pipelines.batched_affine_matvec_int4,
+                    &pipelines.fused_ffn_gate_up_act_int4,
                     &bufs.norm_out,
                     aq_gate,
-                    &bufs.ffn_gate,
                     aq_up,
-                    &bufs.ffn_up,
+                    &bufs.ffn_gate, // output: activation result
                     inter as u32,
                     h as u32,
+                    use_gelu,
                 );
                 true
             } else {
@@ -5370,57 +5371,82 @@ fn encode_ffn_block(
         false
     };
 
-    if !used_batched {
-        // Gate projection
-        encode_projection(
+    if !used_fused_gate_up_act {
+        // Fallback: separate gate+up projections, then activation.
+        let used_batched = if token_count == 1 {
+            if let (WeightBuffer::AffineQuantized(aq_gate), WeightBuffer::AffineQuantized(aq_up)) =
+                (&lw.gate_proj, &lw.up_proj)
+            {
+                if aq_gate.bit_width == 4 && aq_up.bit_width == 4 {
+                    ops::encode_batched_affine_matvec_int4(
+                        enc,
+                        &pipelines.batched_affine_matvec_int4,
+                        &bufs.norm_out,
+                        aq_gate,
+                        &bufs.ffn_gate,
+                        aq_up,
+                        &bufs.ffn_up,
+                        inter as u32,
+                        h as u32,
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !used_batched {
+            encode_projection(
+                enc,
+                &bufs.norm_out,
+                &norm_mat,
+                &lw.gate_proj,
+                &bufs.ffn_gate,
+                &lm.gate,
+                pipelines,
+                token_count,
+                inter,
+                h,
+                row_bytes_h,
+                row_bytes_inter,
+            )?;
+            encode_projection(
+                enc,
+                &bufs.norm_out,
+                &norm_mat,
+                &lw.up_proj,
+                &bufs.ffn_up,
+                &lm.up,
+                pipelines,
+                token_count,
+                inter,
+                h,
+                row_bytes_h,
+                row_bytes_inter,
+            )?;
+        }
+
+        enc.memory_barrier_buffers();
+
+        let act_pipeline = if use_gelu {
+            &pipelines.ffn_gelu_gate
+        } else {
+            &pipelines.silu_gate
+        };
+        ops::encode_silu_gate(
             enc,
-            &bufs.norm_out,
-            &norm_mat,
-            &lw.gate_proj,
+            act_pipeline,
             &bufs.ffn_gate,
-            &lm.gate,
-            pipelines,
-            token_count,
-            inter,
-            h,
-            row_bytes_h,
-            row_bytes_inter,
-        )?;
-
-        // Up projection
-        encode_projection(
-            enc,
-            &bufs.norm_out,
-            &norm_mat,
-            &lw.up_proj,
             &bufs.ffn_up,
-            &lm.up,
-            pipelines,
-            token_count,
-            inter,
-            h,
-            row_bytes_h,
-            row_bytes_inter,
-        )?;
+            &bufs.ffn_gate,
+            (token_count * inter) as u32,
+        );
     }
-
-    enc.memory_barrier_buffers();
-
-    // Gated activation: GELU-tanh for Gemma 4, SiLU for other architectures.
-    // Both kernels share the same buffer layout (gate, up, output, size).
-    let act_pipeline = if use_gelu {
-        &pipelines.ffn_gelu_gate
-    } else {
-        &pipelines.silu_gate
-    };
-    ops::encode_silu_gate(
-        enc,
-        act_pipeline,
-        &bufs.ffn_gate,
-        &bufs.ffn_up,
-        &bufs.ffn_gate, // in-place output into gate buffer
-        (token_count * inter) as u32,
-    );
 
     enc.memory_barrier_buffers();
 

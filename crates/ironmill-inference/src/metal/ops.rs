@@ -175,6 +175,8 @@ pub struct MetalPipelines {
     pub affine_matvec_int4_amx: ComputePipeline,
     /// Row-major INT4 matvec for decode: ~32× better cache utilization than blocked layout.
     pub affine_matvec_int4_rowmajor: ComputePipeline,
+    /// Fused FFN gate+up+activation for INT4 decode: gate+up dot products + SiLU/GELU inline.
+    pub fused_ffn_gate_up_act_int4: ComputePipeline,
     /// Fused residual+RMSNorm+dense matvec in one dispatch.
     pub fused_residual_norm_matvec: ComputePipeline,
     /// Fused residual+RMSNorm+affine INT4 matvec in one dispatch.
@@ -714,6 +716,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &affine_mm_lib
                         .get_function("affine_matvec_int4_rowmajor")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            fused_ffn_gate_up_act_int4: device
+                .create_compute_pipeline(
+                    &affine_mm_lib
+                        .get_function("fused_ffn_gate_up_act_int4")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -1915,7 +1924,45 @@ pub fn encode_batched_affine_matvec_int4(
     encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
 }
 
-/// Encode batched affine INT4 matvec for 4 GDN projections in a single dispatch.
+/// Encode fused FFN gate+up+activation for INT4 decode.
+///
+/// Computes output[i] = activation(x · W_gate^T[i]) * (x · W_up^T[i]) in one dispatch.
+/// Eliminates gate/up intermediate writes + the separate activation dispatch.
+/// Saves 1 dispatch + 1 barrier per layer compared to batched_affine_matvec_int4 + silu_gate.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_fused_ffn_gate_up_act_int4(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    input: &MetalBuffer,
+    gate_weight: &super::weights::AffineQuantizedWeight,
+    up_weight: &super::weights::AffineQuantizedWeight,
+    output: &MetalBuffer,
+    n: u32,
+    k: u32,
+    use_gelu: bool,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(input, 0, 0);
+    encoder.set_buffer(&gate_weight.data, 0, 1);
+    encoder.set_buffer(&gate_weight.scales, 0, 2);
+    encoder.set_buffer(&gate_weight.zeros, 0, 3);
+    encoder.set_buffer(&up_weight.data, 0, 4);
+    encoder.set_buffer(&up_weight.scales, 0, 5);
+    encoder.set_buffer(&up_weight.zeros, 0, 6);
+    encoder.set_buffer(output, 0, 7);
+    encoder.set_bytes(&n.to_le_bytes(), 8);
+    encoder.set_bytes(&k.to_le_bytes(), 9);
+    encoder.set_bytes(&gate_weight.group_size.to_le_bytes(), 10);
+    if let Some(ref awq) = gate_weight.awq_scales {
+        encoder.set_buffer(awq, 0, 11);
+        encoder.set_bytes(&1u32.to_le_bytes(), 12);
+    } else {
+        encoder.set_buffer(&gate_weight.data, 0, 11); // dummy
+        encoder.set_bytes(&0u32.to_le_bytes(), 12);
+    }
+    encoder.set_bytes(&(use_gelu as u32).to_le_bytes(), 13);
+    encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
+}
 ///
 /// Computes qkv = x·W0^T, z = x·W1^T, a = x·W2^T, b = x·W3^T concurrently.
 /// Saves 3 dispatches per GDN layer compared to 4 separate `affine_matvec_int4` calls.
