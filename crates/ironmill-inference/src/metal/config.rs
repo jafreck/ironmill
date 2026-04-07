@@ -350,7 +350,7 @@ impl Default for MetalConfig {
             rotation_seed: 42,
             n_bits: 8,
             force_cpu_dequant: false,
-            use_fa2_prefill: false,
+            use_fa2_prefill: true,
             fused_sdpa_tile_br: None,
             fused_sdpa_tile_bc: None,
             cla_config: None,

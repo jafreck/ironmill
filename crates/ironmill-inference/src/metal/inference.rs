@@ -222,7 +222,7 @@ struct IntermediateBuffers {
     token_ids_buf: MetalBuffer,
     /// Second token IDs buffer for prefill pipelining — allows encoding
     /// the next chunk while the previous command buffer is still executing.
-    _token_ids_buf_b: MetalBuffer,
+    token_ids_buf_b: MetalBuffer,
     /// PLE per-layer input buffer `[token_count, num_layers * ple_hidden_size]`.
     /// None when the model has no PLE.
     ple_per_layer_input: Option<MetalBuffer>,
@@ -383,7 +383,7 @@ impl IntermediateBuffers {
             token_ids_buf: device
                 .create_buffer((max_tokens * 4).max(16), StorageMode::Shared) // CPU writes token IDs
                 .map_err(MetalError::Metal)?,
-            _token_ids_buf_b: device
+            token_ids_buf_b: device
                 .create_buffer((max_tokens * 4).max(16), StorageMode::Shared)
                 .map_err(MetalError::Metal)?,
             ple_per_layer_input,
@@ -919,12 +919,6 @@ impl MetalInference {
         config
             .validate()
             .map_err(|e| MetalError::Config(e.to_string()))?;
-        if config.use_fa2_prefill {
-            eprintln!(
-                "Warning: FA2 prefill is not yet implemented; \
-                 falling back to standard attention."
-            );
-        }
         let device = MetalDevice::system_default().map_err(MetalError::Metal)?;
         let queue = device.create_command_queue().map_err(MetalError::Metal)?;
         // Pipelines are compiled in load() once head_dim is known.
@@ -1556,7 +1550,7 @@ impl MetalInference {
 
         // Run full pipeline — buffers grow on demand inside run_pipeline_inner.
         // Skip the built-in last-token readback; we read ALL positions below.
-        self.run_pipeline_inner(token_ids, true)?;
+        self.run_pipeline_inner(token_ids, true, false, false)?;
 
         let bufs = self
             .intermediate_buffers
@@ -1670,7 +1664,7 @@ impl MetalInference {
     /// Run the transformer decode pipeline for `token_count` tokens.
     /// Returns logits for the last token position.
     fn run_pipeline(&mut self, token_ids: &[u32]) -> Result<Logits, InferenceError> {
-        self.run_pipeline_inner(token_ids, false)
+        self.run_pipeline_inner(token_ids, false, false, false)
     }
 
     /// Decode one token, returning logits AND the final hidden state (FP32).
@@ -1731,17 +1725,12 @@ impl MetalInference {
             .collect())
     }
 
-    /// Run the pipeline without reading logits — used for non-last prefill
-    /// chunks where logits are immediately discarded.
-    fn run_pipeline_no_logits(&mut self, token_ids: &[u32]) -> Result<(), InferenceError> {
-        self.run_pipeline_inner(token_ids, true)?;
-        Ok(())
-    }
-
     fn run_pipeline_inner(
         &mut self,
         token_ids: &[u32],
         skip_logits: bool,
+        use_alt_token_buf: bool,
+        skip_wait: bool,
     ) -> Result<Logits, InferenceError> {
         let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
         let mc = self
@@ -1826,10 +1815,18 @@ impl MetalInference {
         };
 
         // Write token IDs to GPU buffer (reuse persistent buffer).
+        // When pipelining prefill chunks, alternate between two token ID
+        // buffers so the CPU can write the next chunk while the GPU still
+        // reads the previous one.
         self.token_bytes_buf.clear();
         self.token_bytes_buf
             .extend(token_ids.iter().flat_map(|t| t.to_le_bytes()));
-        bufs.token_ids_buf
+        let active_token_buf = if use_alt_token_buf {
+            &bufs.token_ids_buf_b
+        } else {
+            &bufs.token_ids_buf
+        };
+        active_token_buf
             .write_bytes(&self.token_bytes_buf, 0)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
@@ -1855,7 +1852,7 @@ impl MetalInference {
             let lw0 = &weights.layers[0];
             let pipelines = self.pipelines()?;
             enc.set_pipeline(&pipelines.fused_embedding_norm);
-            enc.set_buffer(&bufs.token_ids_buf, 0, 0);
+            enc.set_buffer(active_token_buf, 0, 0);
             enc.set_buffer(&weights.embedding, 0, 1);
             enc.set_buffer(&lw0.input_norm, 0, 2);
             enc.set_buffer(&bufs.norm_out, 0, 3);
@@ -1902,7 +1899,7 @@ impl MetalInference {
                                 &enc,
                                 &pipelines.embedding_lookup,
                                 &ops::EmbeddingLookupParams {
-                                    token_ids: &bufs.token_ids_buf,
+                                    token_ids: active_token_buf,
                                     embedding_table: buf,
                                     output: ple_buf,
                                     hidden_size: ple_total as u32,
@@ -1916,7 +1913,7 @@ impl MetalInference {
                                 &enc,
                                 &pipelines.d2quant_embedding_lookup_3bit,
                                 &ops::D2QuantEmbeddingLookupParams {
-                                    token_ids: &bufs.token_ids_buf,
+                                    token_ids: active_token_buf,
                                     weight: dq,
                                     output: ple_buf,
                                     hidden_size: ple_total as u32,
@@ -2677,14 +2674,18 @@ impl MetalInference {
             }
         }
 
-        // Step 19: Commit and wait.
+        // Step 19: Commit and optionally wait.
+        // When pipelining prefill chunks, skip_wait allows the GPU to execute
+        // this command buffer while the CPU encodes the next chunk.
         cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        if !skip_wait {
+            cmd_buf.wait_until_completed();
 
-        if cmd_buf.status() == CommandBufferStatus::Error {
-            return Err(InferenceError::Decode(
-                "Metal command buffer execution failed".into(),
-            ));
+            if cmd_buf.status() == CommandBufferStatus::Error {
+                return Err(InferenceError::Decode(
+                    "Metal command buffer execution failed".into(),
+                ));
+            }
         }
 
         // Step 20: Read logits for the last token position → Vec<f32>.
@@ -4859,7 +4860,6 @@ fn encode_kv_cache_and_attention(
     };
     let max_seq = effective_max as u32;
     let n_bits = n_bits as u32;
-    let _ = use_fa2;
 
     if enable_tq {
         let tq = turboquant.ok_or_else(|| {
@@ -5138,27 +5138,57 @@ fn encode_kv_cache_and_attention(
             );
         } // end is_anchor
 
-        // FP16 attention — use fused SDPA for both prefill and decode.
-        // The kernel reads directly from the KV cache (contiguous layout).
-        let total_seq_len = (attn_seq_pos + token_count) as u32;
-        ops::encode_fused_sdpa(
-            enc,
-            &pipelines.fused_sdpa,
-            &ops::FusedSdpaParams {
-                q: &bufs.q_proj,
-                k: k_cache,
-                v: v_cache,
-                output: &bufs.attn_out,
-                seq_len: total_seq_len,
-                token_count: token_count as u32,
-                head_dim: hd,
-                num_q_heads: nh,
-                num_kv_heads: nkv,
-                scale: attn_scale,
-                max_seq_len: max_seq,
-            },
-            None,
-        );
+        // FP16 attention.
+        // Prefill (token_count > 1): use FA2 prefill kernel with per-query
+        //   sliding window and KV-tile reuse across queries.
+        // Decode (token_count == 1): use fused SDPA (register-tiled, optimal
+        //   for single-token attention).
+        if use_fa2 && token_count > 1 {
+            let seq_offset = attn_seq_pos as u32;
+            let window = if window_size > 0 {
+                window_size as u32
+            } else {
+                0
+            };
+            ops::encode_fa2_prefill_attention(
+                enc,
+                &pipelines.prefill_attention_fa2,
+                &ops::PrefillAttentionParams {
+                    q: &bufs.q_proj,
+                    k_cache,
+                    v_cache,
+                    output: &bufs.attn_out,
+                    num_heads: nh,
+                    num_kv_heads: nkv,
+                    head_dim: hd,
+                    max_seq_len: max_seq,
+                    seq_offset,
+                    token_count: token_count as u32,
+                    window_size: window,
+                    attn_scale,
+                },
+            );
+        } else {
+            let total_seq_len = (attn_seq_pos + token_count) as u32;
+            ops::encode_fused_sdpa(
+                enc,
+                &pipelines.fused_sdpa,
+                &ops::FusedSdpaParams {
+                    q: &bufs.q_proj,
+                    k: k_cache,
+                    v: v_cache,
+                    output: &bufs.attn_out,
+                    seq_len: total_seq_len,
+                    token_count: token_count as u32,
+                    head_dim: hd,
+                    num_q_heads: nh,
+                    num_kv_heads: nkv,
+                    scale: attn_scale,
+                    max_seq_len: max_seq,
+                },
+                None,
+            );
+        }
     }
 
     Ok(())
@@ -5911,11 +5941,24 @@ impl InferenceEngine for MetalInference {
         let chunks: Vec<&[u32]> = tokens.chunks(chunk_size).collect();
         let n_chunks = chunks.len();
 
-        for chunk in &chunks[..n_chunks - 1] {
-            self.run_pipeline_no_logits(chunk)?;
+        if n_chunks <= 1 {
+            // Single chunk — no pipelining needed.
+            return self.run_pipeline(chunks[0]);
         }
 
-        self.run_pipeline(chunks[n_chunks - 1])
+        // Pipelined chunked prefill: submit non-last chunks with
+        // skip_wait=true so the GPU executes while the CPU encodes the
+        // next chunk. Alternate token ID buffers to avoid write-after-read
+        // hazards on the Shared buffer.
+        for (i, chunk) in chunks[..n_chunks - 1].iter().enumerate() {
+            let use_alt = i % 2 != 0;
+            self.run_pipeline_inner(chunk, true, use_alt, true)?;
+        }
+
+        // Last chunk: use the opposite buffer parity, wait for completion,
+        // and read back logits.
+        let last_alt = (n_chunks - 1) % 2 != 0;
+        self.run_pipeline_inner(chunks[n_chunks - 1], false, last_alt, false)
     }
 
     fn reset(&mut self) {

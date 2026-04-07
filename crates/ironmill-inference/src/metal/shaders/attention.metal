@@ -210,6 +210,7 @@ kernel void prefill_attention(
     constant uint& seq_offset    [[buffer(8)]],
     constant uint& token_count   [[buffer(9)]],
     constant uint& window_size   [[buffer(10)]],
+    constant float& attn_scale   [[buffer(11)]],
     uint3 tid_3d  [[thread_position_in_threadgroup]],
     uint3 tgid_3d [[threadgroup_position_in_grid]],
     uint3 tg_size_3d [[threads_per_threadgroup]],
@@ -250,7 +251,7 @@ kernel void prefill_attention(
     uint heads_per_group = num_heads / num_kv_heads;
     uint kv_head = (num_kv_heads < num_heads) ? head_idx / heads_per_group : head_idx;
 
-    float scale = 1.0f / sqrt(float(head_dim));
+    float scale = attn_scale;
 
     // Load Q vector for this (token, head) pair
     uint q_base = (token_idx * num_heads + head_idx) * head_dim;
@@ -372,6 +373,7 @@ kernel void prefill_attention_fa2(
     constant uint& seq_offset    [[buffer(8)]],
     constant uint& token_count   [[buffer(9)]],
     constant uint& window_size   [[buffer(10)]],
+    constant float& attn_scale   [[buffer(11)]],
     uint3 tid_3d  [[thread_position_in_threadgroup]],
     uint3 tgid_3d [[threadgroup_position_in_grid]],
     uint3 tg_size_3d [[threads_per_threadgroup]],
@@ -396,7 +398,7 @@ kernel void prefill_attention_fa2(
 
     uint heads_per_group = num_heads / num_kv_heads;
     uint kv_head = (num_kv_heads < num_heads) ? head_idx / heads_per_group : head_idx;
-    float scale = 1.0f / sqrt(float(HEAD_DIM));
+    float scale = attn_scale;
 
     threadgroup half  kv_tile[FA2_KV_TILE * HEAD_DIM];
     threadgroup float out_acc[FA2_Q_CHUNK * HEAD_DIM];

@@ -976,6 +976,10 @@ pub struct PrefillAttentionParams<'a> {
     pub seq_offset: u32,
     /// Number of tokens in the batch.
     pub token_count: u32,
+    /// Sliding window size (0 = full attention).
+    pub window_size: u32,
+    /// Attention scale factor (1/sqrt(head_dim) or 1.0 for QK-normed models).
+    pub attn_scale: f32,
 }
 
 /// Parameters for [`encode_fused_sdpa`].
@@ -1313,8 +1317,58 @@ pub fn encode_prefill_attention(
     encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 7);
     encoder.set_bytes(&params.seq_offset.to_le_bytes(), 8);
     encoder.set_bytes(&params.token_count.to_le_bytes(), 9);
+    encoder.set_bytes(&params.window_size.to_le_bytes(), 10);
+    encoder.set_bytes(&params.attn_scale.to_le_bytes(), 11);
     encoder.dispatch_threadgroups(
         (params.num_heads as usize, params.token_count as usize, 1),
+        (
+            ATTENTION_MIN_THREADGROUP_WIDTH
+                .max(params.head_dim as usize)
+                .min(METAL_MAX_THREADS_PER_THREADGROUP),
+            1,
+            1,
+        ),
+    );
+}
+
+/// FA2 Q-chunk sizes matching the compile-time constants in attention.metal.
+fn fa2_q_chunk(head_dim: u32) -> u32 {
+    if head_dim >= 512 {
+        4
+    } else if head_dim >= 256 {
+        8
+    } else {
+        32
+    }
+}
+
+/// Encode FlashAttention-2 style prefill attention.
+///
+/// Groups `FA2_Q_CHUNK` queries per threadgroup, loading each KV tile once
+/// and reusing it across all queries. Better bandwidth utilization for
+/// large models where KV tiles don't fit in L1 cache.
+pub fn encode_fa2_prefill_attention(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    params: &PrefillAttentionParams<'_>,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(params.q, 0, 0);
+    encoder.set_buffer(params.k_cache, 0, 1);
+    encoder.set_buffer(params.v_cache, 0, 2);
+    encoder.set_buffer(params.output, 0, 3);
+    encoder.set_bytes(&params.num_heads.to_le_bytes(), 4);
+    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 5);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 6);
+    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 7);
+    encoder.set_bytes(&params.seq_offset.to_le_bytes(), 8);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 9);
+    encoder.set_bytes(&params.window_size.to_le_bytes(), 10);
+    encoder.set_bytes(&params.attn_scale.to_le_bytes(), 11);
+    let q_chunk = fa2_q_chunk(params.head_dim) as usize;
+    let q_blocks = (params.token_count as usize).div_ceil(q_chunk);
+    encoder.dispatch_threadgroups(
+        (params.num_heads as usize, q_blocks, 1),
         (
             ATTENTION_MIN_THREADGROUP_WIDTH
                 .max(params.head_dim as usize)
