@@ -401,6 +401,7 @@ backends = ["cpu", "gpu"]
             name: "test".to_string(),
             path: PathBuf::from("nonexistent.onnx"),
             input_shapes: vec![],
+            model_dir: None,
         };
         let opt = OptConfig {
             name: "baseline".to_string(),
@@ -426,6 +427,7 @@ backends = ["cpu", "gpu"]
             name: "test".to_string(),
             path: PathBuf::from("nonexistent.onnx"),
             input_shapes: vec![],
+            model_dir: None,
         };
         let opt1 = OptConfig {
             name: "baseline".to_string(),
@@ -460,6 +462,7 @@ backends = ["cpu", "gpu"]
             name: "test".to_string(),
             path: PathBuf::from("nonexistent.onnx"),
             input_shapes: vec![],
+            model_dir: None,
         };
         let opt = OptConfig {
             name: "turbo-int8".to_string(),

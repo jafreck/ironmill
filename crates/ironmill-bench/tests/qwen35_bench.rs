@@ -214,6 +214,80 @@ mod qwen35_bench {
 
     // ── Tests ────────────────────────────────────────────────────────
 
+    /// PPL regression guard for INT4+TQ-INT8 — the primary deployment config.
+    ///
+    /// Baseline captured 2026-04-07 on M2 Max 64 GB (512-token windows):
+    ///   FP16:          PPL ~12.3
+    ///   INT4+TQ-INT8:  PPL ~13.3 (+8.6%)
+    ///   INT4+TQ-INT8 GPU: 4675 MB
+    ///
+    /// Full-context (2048-token) baselines from bench harness:
+    ///   FP16: PPL 7.37 | INT4+TQ-INT8: PPL 7.53 (+2.2%)
+    ///
+    /// Thresholds are calibrated for the 512-token test window. The INT4
+    /// delta is larger here (~9%) than full-context (~2%) because shorter
+    /// windows amplify quantization error. Real deployment uses full context.
+    #[test]
+    #[ignore] // requires Metal GPU + Qwen3.5-4B + wikitext2-qwen35 dataset
+    fn qwen35_int4_tq_int8_ppl_regression() {
+        let sequences = load_dataset();
+        let ppl_seqs = 1;
+        let stride = 512;
+
+        // FP16 baseline PPL
+        let (mut engine_fp16, fp16_gpu, _) = load_engine(fp16_config());
+        let fp16_ppl = eval_perplexity(&mut engine_fp16, &sequences, ppl_seqs, stride);
+        drop(engine_fp16);
+
+        // INT4 + TQ-INT8
+        let mut int4_tq_config = MetalConfig::default();
+        int4_tq_config.enable_turboquant = true;
+        int4_tq_config.n_bits = 8;
+        int4_tq_config.prefill_chunk_size = Some(256);
+
+        let model_dir = qwen35_model_dir();
+        let provider =
+            SafeTensorsProvider::load(&model_dir).expect("SafeTensorsProvider::load failed");
+        let int4_config = ironmill_compile::weights::quantized::AffineQuantConfig::default();
+        let q_provider = ironmill_compile::weights::quantized::QuantizedWeightProvider::new_int4(
+            &provider,
+            int4_config,
+        );
+
+        let mut engine_int4 =
+            MetalInference::new(int4_tq_config.clone()).expect("MetalInference::new failed");
+        let gpu_before = engine_int4.gpu_allocated_bytes();
+        engine_int4
+            .load_weights(&q_provider, int4_tq_config)
+            .expect("load_weights failed");
+        let int4_gpu = engine_int4.gpu_allocated_bytes() as f64 / (1024.0 * 1024.0);
+        let _ = gpu_before;
+
+        let int4_ppl = eval_perplexity(&mut engine_int4, &sequences, ppl_seqs, stride);
+        drop(engine_int4);
+
+        let ppl_delta_pct = (int4_ppl - fp16_ppl) / fp16_ppl * 100.0;
+
+        println!("\n  PPL Regression Check (INT4+TQ-INT8)");
+        println!("  ────────────────────────────────────");
+        println!("  FP16 baseline PPL: {fp16_ppl:.2}");
+        println!("  INT4+TQ-INT8 PPL:  {int4_ppl:.2} ({ppl_delta_pct:+.1}%)");
+        println!("  INT4+TQ-INT8 GPU:  {int4_gpu:.0} MB\n");
+
+        assert!(
+            fp16_ppl < 15.0,
+            "FP16 PPL regression: expected <15.0 (512-token window), got {fp16_ppl:.2}"
+        );
+        assert!(
+            ppl_delta_pct < 15.0,
+            "INT4+TQ-INT8 PPL regression: expected <15% vs FP16, got {ppl_delta_pct:.1}%"
+        );
+        assert!(
+            int4_gpu < 6000.0,
+            "INT4+TQ-INT8 GPU memory regression: expected <6000 MB, got {int4_gpu:.0} MB"
+        );
+    }
+
     /// Full comparison: FP16 vs TQ-INT4 vs D2Q-3 vs D2Q-3+TQ-INT4.
     ///
     /// Measures PPL, tok/s, and GPU memory for all four configs in a single
