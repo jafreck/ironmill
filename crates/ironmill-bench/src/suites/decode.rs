@@ -80,7 +80,32 @@ pub(crate) fn load_metal_engine(
                 "    AWQ: loaded {} channel magnitude vectors",
                 magnitudes.len()
             );
-            ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(128, magnitudes)
+            let act_path = std::path::Path::new(awq_dir).join("awq_activations.json");
+            let tc_path = std::path::Path::new(awq_dir).join("awq_token_count.json");
+            if let (Ok(act_json), Ok(tc_json)) = (
+                std::fs::read_to_string(&act_path),
+                std::fs::read_to_string(&tc_path),
+            ) {
+                if let (Ok(activations), Ok(token_count)) = (
+                    serde_json::from_str::<std::collections::HashMap<String, Vec<f32>>>(&act_json),
+                    serde_json::from_str::<usize>(&tc_json),
+                ) {
+                    eprintln!(
+                        "    AWQ: loaded {} activation matrices ({} tokens) — alpha grid search enabled",
+                        activations.len(),
+                        token_count,
+                    );
+                    ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq_with_activations(
+                        128, magnitudes, activations, token_count,
+                    )
+                } else {
+                    ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(
+                        128, magnitudes,
+                    )
+                }
+            } else {
+                ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(128, magnitudes)
+            }
         } else {
             ironmill_compile::weights::quantized::AffineQuantConfig::default()
         };

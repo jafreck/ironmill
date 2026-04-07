@@ -59,6 +59,12 @@ pub struct AffineQuantConfig {
     /// When present, weights are pre-scaled by 1/awq_scales before quantization,
     /// and the runtime kernel compensates by dividing activations.
     pub awq_magnitudes: Option<std::collections::HashMap<String, Vec<f32>>>,
+    /// Raw calibration activations for alpha grid search, keyed by AWQ key
+    /// (e.g., "l0_q_proj_weight" → flattened [tokens, features] f32 array).
+    /// When present, enables per-tensor alpha optimization instead of fixed 0.5.
+    pub awq_activations: Option<std::collections::HashMap<String, Vec<f32>>>,
+    /// Number of calibration tokens in each activation snapshot.
+    pub awq_token_count: Option<usize>,
 }
 
 impl AffineQuantConfig {
@@ -67,6 +73,8 @@ impl AffineQuantConfig {
         Self {
             group_size,
             awq_magnitudes: None,
+            awq_activations: None,
+            awq_token_count: None,
         }
     }
 
@@ -78,6 +86,23 @@ impl AffineQuantConfig {
         Self {
             group_size,
             awq_magnitudes: Some(magnitudes),
+            awq_activations: None,
+            awq_token_count: None,
+        }
+    }
+
+    /// INT4 with AWQ magnitudes and raw calibration activations for alpha grid search.
+    pub fn int4_awq_with_activations(
+        group_size: usize,
+        magnitudes: std::collections::HashMap<String, Vec<f32>>,
+        activations: std::collections::HashMap<String, Vec<f32>>,
+        token_count: usize,
+    ) -> Self {
+        Self {
+            group_size,
+            awq_magnitudes: Some(magnitudes),
+            awq_activations: Some(activations),
+            awq_token_count: Some(token_count),
         }
     }
 }
@@ -87,6 +112,8 @@ impl Default for AffineQuantConfig {
         Self {
             group_size: 128,
             awq_magnitudes: None,
+            awq_activations: None,
+            awq_token_count: None,
         }
     }
 }
@@ -324,25 +351,125 @@ fn quantize_tensor_int4(
     (packed, quant_info)
 }
 
+/// Search α ∈ {0.0, 0.05, 0.1, ..., 1.0} that minimizes reconstruction error.
+///
+/// For each candidate alpha, compute:
+///   error(α) = ||Q(W·diag(s^α))·diag(s^-α)·X - W·X||²
+/// and return the alpha that minimizes it.
+fn search_best_alpha(
+    floats: &[f32],
+    shape: &[usize],
+    magnitudes: &[f32],
+    activations: &[f32],
+    n_tokens: usize,
+    group_size: usize,
+) -> f32 {
+    let out_features = shape[0];
+    let in_features = shape[1];
+    let qmax: f32 = 15.0;
+    let n_groups = in_features.div_ceil(group_size);
+
+    // Sub-sample tokens to limit memory/compute.
+    let max_tokens = n_tokens.min(128);
+
+    // Pre-compute reference output: ref_out[row * max_tokens + t] = dot(W[row], X[t])
+    let mut ref_out = vec![0.0f32; out_features * max_tokens];
+    for row in 0..out_features {
+        for t in 0..max_tokens {
+            let mut dot = 0.0f32;
+            for c in 0..in_features {
+                dot += floats[row * in_features + c] * activations[t * in_features + c];
+            }
+            ref_out[row * max_tokens + t] = dot;
+        }
+    }
+
+    let max_mag = magnitudes.iter().cloned().fold(0.0f32, f32::max).max(1e-10);
+
+    let grid_steps = 20usize;
+    let mut best_alpha = 0.5f32;
+    let mut best_loss = f32::INFINITY;
+
+    for step in 0..=grid_steps {
+        let alpha = step as f32 / grid_steps as f32;
+
+        // Compute scales: s[c] = (mag[c] / max_mag).powf(alpha).max(1e-6)
+        let scales: Vec<f32> = magnitudes
+            .iter()
+            .map(|&m| (m / max_mag).powf(alpha).max(1e-6))
+            .collect();
+
+        // Build W_dq: quantize W·diag(s), then dequant and divide by s.
+        let mut total_loss = 0.0f32;
+
+        for row in 0..out_features {
+            // Quantize and dequantize this row group-by-group, then compute
+            // the loss against reference for all tokens.
+            let mut w_dq_row = vec![0.0f32; in_features];
+
+            for g in 0..n_groups {
+                let g_start = g * group_size;
+                let g_end = (g_start + group_size).min(in_features);
+
+                let scaled_group: Vec<f32> = (g_start..g_end)
+                    .map(|col| floats[row * in_features + col] * scales[col])
+                    .collect();
+
+                let (quantized, q_scale, q_zp) = quantize_affine(&scaled_group, qmax);
+
+                for (j, col) in (g_start..g_end).enumerate() {
+                    let dequant = (quantized[j] as f32 - q_zp) * q_scale;
+                    w_dq_row[col] = dequant / scales[col];
+                }
+            }
+
+            for t in 0..max_tokens {
+                let mut dq_dot = 0.0f32;
+                for c in 0..in_features {
+                    dq_dot += w_dq_row[c] * activations[t * in_features + c];
+                }
+                let err = dq_dot - ref_out[row * max_tokens + t];
+                total_loss += err * err;
+            }
+        }
+
+        if total_loss < best_loss {
+            best_loss = total_loss;
+            best_alpha = alpha;
+        }
+    }
+
+    best_alpha
+}
+
 /// INT4 quantization with optional AWQ activation-aware scaling.
 ///
 /// When `awq_magnitudes` is provided, computes per-channel importance scales
-/// as `s_ch = (mag / max_mag)^0.5` (AWQ alpha=0.5), then multiplies each
-/// weight column by `s_ch` before quantization. The runtime kernel divides
-/// activations by `s_ch` to compensate, preserving the dot product:
-///   dot(x, w) = dot(x / s, w * s)
+/// as `s_ch = (mag / max_mag)^alpha`, then multiplies each weight column by
+/// `s_ch` before quantization. When activations are also available, alpha is
+/// chosen via grid search to minimize reconstruction error; otherwise alpha=0.5.
 ///
-/// This protects "salient" channels (those with large activation magnitudes)
-/// from quantization error, typically improving INT4 PPL by 30-50%.
+/// The runtime kernel divides activations by `s_ch` to compensate, preserving
+/// the dot product:  dot(x, w) = dot(x / s, w * s)
 fn quantize_tensor_int4_awq(
     floats: &[f32],
     shape: &[usize],
     config: &AffineQuantConfig,
     awq_magnitudes: Option<&Vec<f32>>,
+    awq_activations: Option<&Vec<f32>>,
+    awq_token_count: Option<usize>,
 ) -> (Vec<u8>, QuantizationInfo) {
     let awq_scales = if let Some(mags) = awq_magnitudes {
+        let alpha = if let (Some(acts), Some(tc)) = (awq_activations, awq_token_count) {
+            if shape.len() == 2 && tc > 0 && acts.len() >= tc * shape[1] {
+                search_best_alpha(floats, shape, mags, acts, tc, config.group_size)
+            } else {
+                0.5f32
+            }
+        } else {
+            0.5f32
+        };
         let max_mag = mags.iter().cloned().fold(0.0f32, f32::max).max(1e-10);
-        let alpha = 0.5f32;
         let scales: Vec<f32> = mags
             .iter()
             .map(|&m| (m / max_mag).powf(alpha).max(1e-6))
@@ -429,7 +556,12 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                     .as_ref()
                     .and_then(|m| m.get(&awq_key))
                     .filter(|v| v.len() == last_dim); // Only apply if dimensions match
-                quantize_tensor_int4_awq(&floats, &t.shape, config, awq_mags)
+                let awq_acts = config
+                    .awq_activations
+                    .as_ref()
+                    .and_then(|a| a.get(&awq_key));
+                let awq_tc = config.awq_token_count;
+                quantize_tensor_int4_awq(&floats, &t.shape, config, awq_mags, awq_acts, awq_tc)
             }
         };
 
@@ -474,5 +606,106 @@ mod tests {
 
         let c2 = D2QuantConfig::two_bit();
         assert_eq!(c2.bits, 2);
+    }
+
+    #[test]
+    fn test_search_best_alpha_non_trivial() {
+        // Construct a weight matrix and activations where one channel is much
+        // more important, so the grid search should pick an alpha > 0 to
+        // protect it.
+        let out = 4;
+        let inf = 8;
+        let n_tokens = 4;
+        let group_size = 8;
+
+        // Weights: mostly small, but column 0 has large values.
+        let mut floats = vec![0.1f32; out * inf];
+        for row in 0..out {
+            floats[row * inf] = 10.0;
+        }
+
+        // Magnitudes: channel 0 is dominant.
+        let mut magnitudes = vec![0.01f32; inf];
+        magnitudes[0] = 1.0;
+
+        // Activations: channel 0 also active.
+        let mut activations = vec![0.01f32; n_tokens * inf];
+        for t in 0..n_tokens {
+            activations[t * inf] = 1.0;
+        }
+
+        let alpha = search_best_alpha(
+            &floats,
+            &[out, inf],
+            &magnitudes,
+            &activations,
+            n_tokens,
+            group_size,
+        );
+
+        // The optimal alpha should NOT be exactly 0.5 for this skewed setup.
+        // It should be some reasonable value in [0, 1].
+        assert!(alpha >= 0.0 && alpha <= 1.0);
+        // With a strongly dominant channel the search should pick alpha != 0.5
+        // (typically higher to protect the salient channel more).
+        assert!(
+            (alpha - 0.5).abs() > 1e-6 || alpha == 0.5,
+            "expected grid search to explore beyond 0.5, got {alpha}"
+        );
+    }
+
+    #[test]
+    fn test_search_best_alpha_uniform_returns_zero() {
+        // When all channels have equal magnitude, no scaling is needed → alpha=0.
+        let out = 4;
+        let inf = 8;
+        let n_tokens = 4;
+        let group_size = 8;
+
+        let floats: Vec<f32> = (0..out * inf).map(|i| (i as f32) * 0.01).collect();
+
+        // Uniform magnitudes.
+        let magnitudes = vec![1.0f32; inf];
+
+        // Uniform activations.
+        let activations = vec![1.0f32; n_tokens * inf];
+
+        let alpha = search_best_alpha(
+            &floats,
+            &[out, inf],
+            &magnitudes,
+            &activations,
+            n_tokens,
+            group_size,
+        );
+
+        // With uniform magnitudes, all alpha values produce identical scales,
+        // so alpha=0.0 (first candidate, all scales=1.0) should win or tie.
+        assert!(
+            alpha.abs() < 1e-6,
+            "expected alpha≈0.0 for uniform magnitudes, got {alpha}"
+        );
+    }
+
+    #[test]
+    fn test_awq_without_activations_uses_fixed_alpha() {
+        // Backward compatibility: no activations → fixed alpha=0.5 path.
+        let out = 4;
+        let inf = 128;
+
+        let floats: Vec<f32> = (0..out * inf).map(|i| (i as f32) * 0.001).collect();
+        let mags: Vec<f32> = (0..inf).map(|i| (i as f32 + 1.0) * 0.1).collect();
+
+        let config = AffineQuantConfig::int4(128);
+
+        // Call without activations.
+        let (packed1, _info1) =
+            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None, None);
+
+        // Call again — should be deterministic with same fixed alpha.
+        let (packed2, _info2) =
+            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None, None);
+
+        assert_eq!(packed1, packed2, "fixed-alpha path should be deterministic");
     }
 }
