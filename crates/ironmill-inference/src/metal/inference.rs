@@ -32,6 +32,7 @@ use super::mla::{MlaConfig, MlaKvCache};
 use super::ops;
 use super::ops::LinearKernelKind;
 use super::plan::{AttentionKind, LayerPlan, RopeTable};
+use super::ple;
 use super::turboquant::{
     MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantLayerConfig, TurboQuantMetalConfig,
 };
@@ -936,153 +937,21 @@ impl MetalInference {
 
         // PLE model-level computation: compute per-layer embeddings before the layer loop.
         // Result lives in ple_per_layer_input for the duration of all layers.
-        if let Some(ref g4) = self.gemma4_config {
-            let ple_h = g4.ple_hidden_size;
-            if ple_h > 0 {
-                if let (
-                    Some(ple_embed),
-                    Some(ple_proj),
-                    Some(ple_norm),
-                    Some(ple_buf),
-                    Some(_ple_scratch),
-                ) = (
-                    &weights.ple_embed_tokens,
-                    &weights.ple_model_projection,
-                    &weights.ple_projection_norm,
-                    &bufs.ple_per_layer_input,
-                    &bufs.ple_scratch,
-                ) {
-                    let ple_total = mc.num_hidden_layers * ple_h;
-                    let pipelines = self.pipelines()?;
-
-                    // 1. Gather from ple_embed_tokens using token_ids → ple_per_layer_input
-                    //    Shape: [tokens, num_layers * ple_hidden]
-                    //    HF scales by sqrt(hidden_size_per_layer_input) inside
-                    //    Gemma4TextScaledWordEmbedding; we apply the same scale
-                    //    after the plain lookup.
-                    match ple_embed {
-                        WeightBuffer::Dense { buf: Some(buf), .. } => {
-                            ops::encode_embedding_lookup(
-                                &enc,
-                                &pipelines.embedding_lookup,
-                                &ops::EmbeddingLookupParams {
-                                    token_ids: active_token_buf,
-                                    embedding_table: buf,
-                                    output: ple_buf,
-                                    hidden_size: ple_total as u32,
-                                    token_count: token_count as u32,
-                                    vocab_size: vocab as u32,
-                                },
-                            );
-                        }
-                        WeightBuffer::DualScaleQuantized(dq) => {
-                            ops::encode_d2quant_embedding_lookup(
-                                &enc,
-                                &pipelines.d2quant_embedding_lookup_3bit,
-                                &ops::D2QuantEmbeddingLookupParams {
-                                    token_ids: active_token_buf,
-                                    weight: dq,
-                                    output: ple_buf,
-                                    hidden_size: ple_total as u32,
-                                    token_count: token_count as u32,
-                                    vocab_size: vocab as u32,
-                                },
-                            );
-                        }
-                        other => {
-                            return Err(InferenceError::runtime(format!(
-                                "unsupported PLE embedding weight type: {:?}",
-                                std::mem::discriminant(other)
-                            )));
-                        }
-                    }
-                    enc.memory_barrier_buffers();
-
-                    // Scale PLE embeddings by sqrt(ple_hidden_size) to match HF.
-                    {
-                        let ple_embed_scale = (ple_h as f32).sqrt();
-                        let scale_half = f16::from_f32(ple_embed_scale);
-                        let scale_buf = self
-                            .device
-                            .create_buffer_with_data(&scale_half.to_le_bytes(), StorageMode::Shared)
-                            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-                        ops::encode_scale_buffer(
-                            &enc,
-                            &pipelines.scale_buffer,
-                            ple_buf,
-                            &scale_buf,
-                            (token_count * ple_total) as u32,
-                        );
-                        enc.memory_barrier_buffers();
-                    }
-
-                    // 2. Project hidden_state via ple_model_projection → ffn_gate (temp)
-                    //    HF then scales by per_layer_model_projection_scale = 1/sqrt(hidden_size).
-                    encode_projection(
-                        &enc,
-                        &bufs.hidden_state,
-                        ple_proj,
-                        &bufs.ffn_gate, // temp output: [tokens, ple_total] fits in ffn_gate
-                        pipelines,
-                        token_count,
-                        ple_total,
-                        h,
-                    )?;
-                    enc.memory_barrier_buffers();
-
-                    // Scale projection output by 1/sqrt(hidden_size) to match HF's
-                    // per_layer_model_projection_scale.
-                    {
-                        let proj_scale = 1.0 / (h as f32).sqrt();
-                        let scale_half = f16::from_f32(proj_scale);
-                        let scale_buf = self
-                            .device
-                            .create_buffer_with_data(&scale_half.to_le_bytes(), StorageMode::Shared)
-                            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-                        ops::encode_scale_buffer(
-                            &enc,
-                            &pipelines.scale_buffer,
-                            &bufs.ffn_gate,
-                            &scale_buf,
-                            (token_count * ple_total) as u32,
-                        );
-                        enc.memory_barrier_buffers();
-                    }
-
-                    // 3. RMSNorm the projection output per-layer (NOT over ple_total).
-                    //    HF reshapes to [..., num_layers, ple_h] and norms the last dim (ple_h).
-                    //    We achieve the same by treating each layer's ple_h slice as a separate
-                    //    "token" — hidden_size=ple_h, token_count=token_count*num_layers.
-                    ops::encode_rms_norm(
-                        &enc,
-                        &pipelines.rms_norm,
-                        &ops::RmsNormParams {
-                            input: &bufs.ffn_gate,
-                            weight: ple_norm,
-                            output: &bufs.ffn_up,
-                            hidden_size: ple_h as u32,
-                            token_count: (token_count * mc.num_hidden_layers) as u32,
-                            eps,
-                        },
-                    );
-                    enc.memory_barrier_buffers();
-
-                    // 4+5. Add embed (ple_buf) + normed projection (ffn_up), scale by 2^(-0.5)
-                    //       → store result back in ple_per_layer_input
-                    let ple_scale: f32 = std::f32::consts::FRAC_1_SQRT_2; // 2^(-0.5) = 0.7071
-                    ops::encode_add_scale(
-                        &enc,
-                        &pipelines.ple_add_scale,
-                        ple_buf,
-                        &bufs.ffn_up,
-                        ple_buf,
-                        (token_count * ple_total) as u32,
-                        ple_scale,
-                    );
-                    enc.memory_barrier_buffers();
-                }
-            }
-        }
+        ple::encode_ple_model_level(
+            &enc,
+            self.pipelines()?,
+            &self.device,
+            weights,
+            bufs,
+            active_token_buf,
+            &mc,
+            self.gemma4_config.as_ref(),
+            token_count,
+            h,
+            vocab,
+            eps,
+            true,
+        )?;
 
         // Per-layer processing.
         //
@@ -1451,132 +1320,26 @@ impl MetalInference {
             // PLE per-layer: gate → GELU → multiply → project → norm → residual add.
             // When PLE is active, we split the fused residual+norm into separate steps
             // so PLE can be inserted between the FFN residual add and next layer's norm.
-            let has_ple = self
-                .gemma4_config
-                .as_ref()
-                .is_some_and(|g4| g4.ple_hidden_size > 0)
-                && lw.ple_gate.is_some()
-                && bufs.ple_per_layer_input.is_some();
-
-            if has_ple {
-                let g4 = self.gemma4_config.as_ref().unwrap();
-                let ple_h = g4.ple_hidden_size;
-                let ple_total = mc.num_hidden_layers * ple_h;
-                let ple_gate = lw.ple_gate.as_ref().unwrap();
-                let ple_proj = lw.ple_projection.as_ref().unwrap();
-                let ple_post_norm = lw.ple_post_norm.as_ref().unwrap();
-                let ple_buf = bufs.ple_per_layer_input.as_ref().unwrap();
-                let ple_scratch = bufs.ple_scratch.as_ref().unwrap();
-                let pipelines = self.pipelines()?;
-
-                // 1. Standalone FFN residual add: hidden_state = residual + ffn_down
-                ops::encode_residual_add(
-                    &enc,
-                    &pipelines.residual_add,
-                    &bufs.residual,
-                    &bufs.ffn_down,
-                    &bufs.hidden_state,
-                    (token_count * h) as u32,
-                );
-                enc.memory_barrier_buffers();
-
-                // 2. PLE gate: linear(hidden_state → ple_scratch) [hidden → ple_hidden]
-                encode_projection(
-                    &enc,
-                    &bufs.hidden_state,
-                    ple_gate,
-                    ple_scratch,
-                    pipelines,
-                    token_count,
-                    ple_h,
-                    h,
-                )?;
-                enc.memory_barrier_buffers();
-
-                // 3. GELU activation + multiply with per-layer input slice
-                ops::encode_gelu_gate(
-                    &enc,
-                    &pipelines.ple_gelu_gate,
-                    ple_scratch,
-                    ple_buf,
-                    ple_scratch, // in-place
-                    ple_h as u32,
-                    token_count as u32,
-                    ple_total as u32,           // stride: full row width
-                    (layer_idx * ple_h) as u32, // offset: this layer's slice
-                );
-                enc.memory_barrier_buffers();
-
-                // 4. Project back: linear(ple_scratch → ffn_down) [ple_hidden → hidden]
-                encode_projection(
-                    &enc,
-                    ple_scratch,
-                    ple_proj,
-                    &bufs.ffn_down, // reuse ffn_down as temp
-                    pipelines,
-                    token_count,
-                    h,
-                    ple_h,
-                )?;
-                enc.memory_barrier_buffers();
-
-                // 5. RMSNorm the projected output
-                ops::encode_rms_norm(
-                    &enc,
-                    &pipelines.rms_norm,
-                    &ops::RmsNormParams {
-                        input: &bufs.ffn_down,
-                        weight: ple_post_norm,
-                        output: &bufs.ffn_up, // temp
-                        hidden_size: h as u32,
-                        token_count: token_count as u32,
-                        eps,
-                    },
-                );
-                enc.memory_barrier_buffers();
-
-                // 6. PLE residual add: hidden_state += normed PLE output
-                ops::encode_residual_add(
-                    &enc,
-                    &pipelines.residual_add,
-                    &bufs.hidden_state,
-                    &bufs.ffn_up,
-                    &bufs.hidden_state, // in-place
-                    (token_count * h) as u32,
-                );
-                enc.memory_barrier_buffers();
-
-                // 7. Layer scalar: HF applies hidden_states *= layer_scalar
-                // AFTER all residual adds (including PLE).
-                if let Some(ref scalar) = lw.layer_scalar {
-                    ops::encode_scale_buffer(
-                        &enc,
-                        &pipelines.scale_buffer,
-                        &bufs.hidden_state,
-                        scalar,
-                        (token_count * h) as u32,
-                    );
-                    enc.memory_barrier_buffers();
-                }
-
-                // 8. Next layer's input norm (or skip for last layer)
-                if layer_idx + 1 < mc.num_hidden_layers {
-                    let next_norm = &weights.layers[layer_idx + 1].input_norm;
-                    ops::encode_rms_norm(
-                        &enc,
-                        &pipelines.rms_norm,
-                        &ops::RmsNormParams {
-                            input: &bufs.hidden_state,
-                            weight: next_norm,
-                            output: &bufs.norm_out,
-                            hidden_size: h as u32,
-                            token_count: token_count as u32,
-                            eps,
-                        },
-                    );
-                }
-                enc.memory_barrier_buffers();
+            let next_input_norm = if layer_idx + 1 < mc.num_hidden_layers {
+                Some(&weights.layers[layer_idx + 1].input_norm)
             } else {
+                None
+            };
+            let ple_applied = ple::encode_ple_per_layer(
+                &enc,
+                self.pipelines()?,
+                bufs,
+                lw,
+                next_input_norm,
+                self.gemma4_config.as_ref(),
+                mc.num_hidden_layers,
+                layer_idx,
+                token_count,
+                h,
+                eps,
+            )?;
+
+            if !ple_applied {
                 // Step 16: Residual add + layer_scalar + next layer's input norm.
                 if let Some(scalar) = &lw.layer_scalar {
                     // Can't use fused residual+norm: need to insert layer_scalar
@@ -1960,104 +1723,21 @@ impl MetalInference {
             );
 
             // PLE model-level: compute per-layer embeddings.
-            if let Some(ref g4) = self.gemma4_config {
-                let ple_h = g4.ple_hidden_size;
-                if ple_h > 0 {
-                    if let (
-                        Some(ple_embed),
-                        Some(ple_proj),
-                        Some(ple_norm),
-                        Some(ple_buf),
-                        Some(_ple_scratch_unused),
-                    ) = (
-                        &weights.ple_embed_tokens,
-                        &weights.ple_model_projection,
-                        &weights.ple_projection_norm,
-                        &bufs.ple_per_layer_input,
-                        &bufs.ple_scratch,
-                    ) {
-                        // ple_scratch_unused available but not used here
-                        let ple_total = mc.num_hidden_layers * ple_h;
-                        let pipelines = self.pipelines()?;
-
-                        enc.memory_barrier_buffers();
-
-                        match ple_embed {
-                            WeightBuffer::Dense { buf: Some(buf), .. } => {
-                                ops::encode_embedding_lookup(
-                                    &enc,
-                                    &pipelines.embedding_lookup,
-                                    &ops::EmbeddingLookupParams {
-                                        token_ids: &bufs.token_ids_buf,
-                                        embedding_table: buf,
-                                        output: ple_buf,
-                                        hidden_size: ple_total as u32,
-                                        token_count: token_count as u32,
-                                        vocab_size: vocab as u32,
-                                    },
-                                );
-                            }
-                            WeightBuffer::DualScaleQuantized(dq) => {
-                                ops::encode_d2quant_embedding_lookup(
-                                    &enc,
-                                    &pipelines.d2quant_embedding_lookup_3bit,
-                                    &ops::D2QuantEmbeddingLookupParams {
-                                        token_ids: &bufs.token_ids_buf,
-                                        weight: dq,
-                                        output: ple_buf,
-                                        hidden_size: ple_total as u32,
-                                        token_count: token_count as u32,
-                                        vocab_size: vocab as u32,
-                                    },
-                                );
-                            }
-                            other => {
-                                return Err(InferenceError::runtime(format!(
-                                    "unsupported PLE embedding weight type: {:?}",
-                                    std::mem::discriminant(other)
-                                )));
-                            }
-                        }
-
-                        encode_projection(
-                            &enc,
-                            &bufs.hidden_state,
-                            ple_proj,
-                            &bufs.ffn_gate,
-                            pipelines,
-                            token_count,
-                            ple_total,
-                            h,
-                        )?;
-                        enc.memory_barrier_buffers();
-
-                        ops::encode_rms_norm(
-                            &enc,
-                            &pipelines.rms_norm,
-                            &ops::RmsNormParams {
-                                input: &bufs.ffn_gate,
-                                weight: ple_norm,
-                                output: &bufs.ffn_up,
-                                hidden_size: ple_total as u32,
-                                token_count: token_count as u32,
-                                eps,
-                            },
-                        );
-                        enc.memory_barrier_buffers();
-
-                        let ple_scale: f32 = std::f32::consts::FRAC_1_SQRT_2;
-                        ops::encode_add_scale(
-                            &enc,
-                            &pipelines.ple_add_scale,
-                            ple_buf,
-                            &bufs.ffn_up,
-                            ple_buf,
-                            (token_count * ple_total) as u32,
-                            ple_scale,
-                        );
-                    }
-                }
-            }
+            ple::encode_ple_model_level(
+                &enc,
+                self.pipelines()?,
+                &self.device,
+                weights,
+                bufs,
+                &bufs.token_ids_buf,
+                &mc,
+                self.gemma4_config.as_ref(),
+                token_count,
+                h,
+                vocab,
+                eps,
+                false,
+            )?;
 
             enc.end_encoding();
         }
@@ -2451,123 +2131,26 @@ impl MetalInference {
             }
 
             // PLE per-layer dispatch (same logic as run_pipeline_inner).
-            let has_ple = self
-                .gemma4_config
-                .as_ref()
-                .is_some_and(|g4| g4.ple_hidden_size > 0)
-                && lw.ple_gate.is_some()
-                && bufs.ple_per_layer_input.is_some();
-
-            if has_ple {
-                let g4 = self.gemma4_config.as_ref().unwrap();
-                let ple_h = g4.ple_hidden_size;
-                let ple_total = mc.num_hidden_layers * ple_h;
-                let ple_gate = lw.ple_gate.as_ref().unwrap();
-                let ple_proj = lw.ple_projection.as_ref().unwrap();
-                let ple_post_norm = lw.ple_post_norm.as_ref().unwrap();
-                let ple_buf = bufs.ple_per_layer_input.as_ref().unwrap();
-                let ple_scratch = bufs.ple_scratch.as_ref().unwrap();
-
-                // Residual add: hidden_state = residual + ffn_down
-                ops::encode_residual_add(
-                    &enc,
-                    &pipelines.residual_add,
-                    &bufs.residual,
-                    &bufs.ffn_down,
-                    &bufs.hidden_state,
-                    (token_count * h) as u32,
-                );
-                enc.memory_barrier_buffers();
-
-                encode_projection(
-                    &enc,
-                    &bufs.hidden_state,
-                    ple_gate,
-                    ple_scratch,
-                    pipelines,
-                    token_count,
-                    ple_h,
-                    h,
-                )?;
-                enc.memory_barrier_buffers();
-
-                ops::encode_gelu_gate(
-                    &enc,
-                    &pipelines.ple_gelu_gate,
-                    ple_scratch,
-                    ple_buf,
-                    ple_scratch,
-                    ple_h as u32,
-                    token_count as u32,
-                    ple_total as u32,
-                    (layer_idx * ple_h) as u32,
-                );
-                enc.memory_barrier_buffers();
-
-                encode_projection(
-                    &enc,
-                    ple_scratch,
-                    ple_proj,
-                    &bufs.ffn_down,
-                    pipelines,
-                    token_count,
-                    h,
-                    ple_h,
-                )?;
-                enc.memory_barrier_buffers();
-
-                ops::encode_rms_norm(
-                    &enc,
-                    &pipelines.rms_norm,
-                    &ops::RmsNormParams {
-                        input: &bufs.ffn_down,
-                        weight: ple_post_norm,
-                        output: &bufs.ffn_up,
-                        hidden_size: h as u32,
-                        token_count: token_count as u32,
-                        eps,
-                    },
-                );
-                enc.memory_barrier_buffers();
-
-                ops::encode_residual_add(
-                    &enc,
-                    &pipelines.residual_add,
-                    &bufs.hidden_state,
-                    &bufs.ffn_up,
-                    &bufs.hidden_state,
-                    (token_count * h) as u32,
-                );
-                enc.memory_barrier_buffers();
-
-                // Layer scalar: applied AFTER all residual adds (including PLE).
-                if let Some(ref scalar) = lw.layer_scalar {
-                    ops::encode_scale_buffer(
-                        &enc,
-                        &pipelines.scale_buffer,
-                        &bufs.hidden_state,
-                        scalar,
-                        (token_count * h) as u32,
-                    );
-                    enc.memory_barrier_buffers();
-                }
-
-                if layer_idx + 1 < mc.num_hidden_layers {
-                    let next_norm = &weights.layers[layer_idx + 1].input_norm;
-                    ops::encode_rms_norm(
-                        &enc,
-                        &pipelines.rms_norm,
-                        &ops::RmsNormParams {
-                            input: &bufs.hidden_state,
-                            weight: next_norm,
-                            output: &bufs.norm_out,
-                            hidden_size: h as u32,
-                            token_count: token_count as u32,
-                            eps,
-                        },
-                    );
-                }
+            let next_input_norm = if layer_idx + 1 < mc.num_hidden_layers {
+                Some(&weights.layers[layer_idx + 1].input_norm)
             } else {
+                None
+            };
+            let ple_applied = ple::encode_ple_per_layer(
+                &enc,
+                pipelines,
+                bufs,
+                lw,
+                next_input_norm,
+                self.gemma4_config.as_ref(),
+                mc.num_hidden_layers,
+                layer_idx,
+                token_count,
+                h,
+                eps,
+            )?;
+
+            if !ple_applied {
                 // Step 16: Residual add + layer_scalar + next layer's input norm.
                 if let Some(scalar) = &lw.layer_scalar {
                     ops::encode_residual_add(

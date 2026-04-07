@@ -16,6 +16,7 @@ pub(crate) mod kv_cache;
 pub mod mla;
 pub mod ops;
 pub(crate) mod plan;
+pub(crate) mod ple;
 pub(crate) mod projection;
 pub mod turboquant;
 pub mod weights;
