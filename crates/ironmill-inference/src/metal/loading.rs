@@ -342,7 +342,7 @@ impl MetalInference {
     /// uploaded to GPU in a single streaming pass.
     ///
     /// No compilation step, no MIL IR, no `.ironml-gpu` bundle.
-    pub fn load_jit(
+    pub(crate) fn load_jit(
         _config: MetalConfig,
         _provider: &dyn mil_rs::weights::WeightProvider,
         _transforms: &crate::jit::TransformPipeline,

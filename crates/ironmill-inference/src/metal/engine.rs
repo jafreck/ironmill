@@ -142,12 +142,12 @@ impl MetalInference {
     // ── Memory query ─────────────────────────────────────────────
 
     /// Returns the current Metal device allocation size in bytes.
-    pub fn gpu_allocated_bytes(&self) -> usize {
+    pub(crate) fn gpu_allocated_bytes(&self) -> usize {
         self.device.current_allocated_size()
     }
 
     /// Mutable access to loaded weights for post-load transforms (e.g. D2Quant simulation).
-    pub fn weights_mut(&mut self) -> &mut MetalWeights {
+    pub(crate) fn weights_mut(&mut self) -> &mut MetalWeights {
         self.weights
             .as_mut()
             .expect("weights_mut() called before load()")

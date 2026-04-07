@@ -30,7 +30,7 @@ impl MetalInference {
     /// so arbitrarily long sequences work without OOM.
     ///
     /// Used for efficient perplexity evaluation.
-    pub fn prefill_all_logits(&mut self, token_ids: &[u32]) -> Result<Vec<Logits>, InferenceError> {
+    pub(crate) fn prefill_all_logits(&mut self, token_ids: &[u32]) -> Result<Vec<Logits>, InferenceError> {
         let mc = self
             .model_config
             .as_ref()
@@ -166,7 +166,7 @@ impl MetalInference {
     /// The hidden state is the output of the final RMSNorm (before the LM head
     /// projection), read back from `norm_out`. Used by EAGLE-3 speculative
     /// decoding where the draft head needs the target model's hidden state.
-    pub fn decode_step_with_hidden(
+    pub(crate) fn decode_step_with_hidden(
         &mut self,
         token: u32,
     ) -> Result<(Logits, Vec<f32>), InferenceError> {
@@ -199,7 +199,7 @@ impl MetalInference {
     /// Returns the content of `norm_out` (final RMSNorm output before LM head)
     /// as FP32. Call after `decode_step()`, `prefill()`, or `speculative_step()`
     /// to get the hidden state without re-running the pipeline.
-    pub fn last_hidden_state(&self) -> Result<Vec<f32>, InferenceError> {
+    pub(crate) fn last_hidden_state(&self) -> Result<Vec<f32>, InferenceError> {
         let mc = self
             .model_config
             .as_ref()

@@ -26,7 +26,7 @@ impl MetalInference {
     /// compensate for quantization-induced activation drift.
     ///
     /// Reference: D²Quant (arXiv:2602.02546) §3.3, Algorithm 1 lines 3–10.
-    pub fn calibrate_dac(
+    pub(crate) fn calibrate_dac(
         &mut self,
         fp_provider: &dyn mil_rs::weights::WeightProvider,
         calibration_tokens: &[u32],
@@ -127,7 +127,7 @@ impl MetalInference {
     /// - `raw_bytes`: the FP16 activation data (token_count × hidden_size × 2 bytes)
     ///
     /// Returns the same logits as [`run_pipeline`].
-    pub fn run_pipeline_calibration(
+    pub(crate) fn run_pipeline_calibration(
         &mut self,
         token_ids: &[u32],
         layer_callback: &mut dyn FnMut(usize, &str, &[u8]),
@@ -892,7 +892,7 @@ impl MetalInference {
     /// This is the calibration-mode equivalent of [`prefill`]. It processes
     /// all tokens in a single chunk (no chunking — calibration sequences are
     /// typically short).
-    pub fn prefill_calibration(
+    pub(crate) fn prefill_calibration(
         &mut self,
         tokens: &[u32],
         layer_callback: &mut dyn FnMut(usize, &str, &[u8]),
@@ -910,7 +910,7 @@ impl MetalInference {
     /// forwarding them to the hook. `n_features` is the model's
     /// `hidden_size` (both `attn_norm` and `ffn_norm` outputs have this
     /// dimensionality).
-    pub fn run_pipeline_with_hooks(
+    pub(crate) fn run_pipeline_with_hooks(
         &mut self,
         token_ids: &[u32],
         hooks: &mut dyn ActivationHook,
@@ -933,7 +933,7 @@ impl MetalInference {
     /// Processes all tokens in a single chunk (calibration sequences are
     /// typically short) and invokes the hook for every linear-input
     /// readback.
-    pub fn prefill_with_hooks(
+    pub(crate) fn prefill_with_hooks(
         &mut self,
         tokens: &[u32],
         hooks: &mut dyn ActivationHook,
