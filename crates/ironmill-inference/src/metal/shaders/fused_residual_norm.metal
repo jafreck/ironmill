@@ -23,7 +23,11 @@ using namespace metal;
 // Uses strided loops and threadgroup reduction, matching the existing rms_norm
 // kernel pattern for hidden_size > threadgroup size.
 
-constant constexpr uint TG_INPUT_MAX = 16384;
+// Maximum input dimension that fits in threadgroup memory alongside
+// tg_result (FRN_SIMDGROUPS * 64 * 4 = 2048 bytes) and sg_sq_partial
+// (32 * 4 = 128 bytes). Total budget: 32768 bytes.
+// 15296 half = 30592 bytes, + 2048 + 128 = 32768.
+constant constexpr uint TG_INPUT_MAX = 15296;
 
 kernel void fused_residual_rms_norm(
     device const half* a               [[buffer(0)]],
