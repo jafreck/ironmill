@@ -1,8 +1,7 @@
 //! Linear projection dispatch by weight format.
 
-use ironmill_metal_sys::{ComputeEncoder, MetalBuffer, MpsMatrix};
+use ironmill_metal_sys::{ComputeEncoder, MetalBuffer};
 
-use super::buffers::ProjectionMatmul;
 use super::ops;
 use super::ops::LinearKernelKind;
 use super::weights::{
@@ -27,16 +26,12 @@ const MATMUL_THREADS_PER_TG: usize = 256;
 pub(crate) fn encode_projection(
     enc: &ComputeEncoder,
     input_buf: &MetalBuffer,
-    _input_mat: &MpsMatrix,
     weight: &WeightBuffer,
     output_buf: &MetalBuffer,
-    _matmul: &ProjectionMatmul,
     pipelines: &super::ops::MetalPipelines,
     token_count: usize,
     out_features: usize,
     in_features: usize,
-    _row_bytes_in: usize,
-    _row_bytes_out: usize,
 ) -> Result<(), InferenceError> {
     let kernel_kind = LinearKernelKind::for_token_count(token_count);
 

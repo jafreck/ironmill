@@ -8,6 +8,7 @@ pub mod bundle;
 pub mod config;
 pub mod dequant;
 pub mod error;
+pub(crate) mod gdn;
 pub mod inference;
 pub(crate) mod kv_cache;
 pub mod mla;
