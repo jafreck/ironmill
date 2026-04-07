@@ -69,7 +69,21 @@ pub(crate) fn load_metal_engine(
         }
     } else if opt.int4 {
         eprintln!("    JIT INT4 quantization...");
-        let int4_config = ironmill_compile::weights::quantized::AffineQuantConfig::default();
+        let int4_config = if let Some(ref awq_dir) = opt.awq_calib_dir {
+            let mag_path = std::path::Path::new(awq_dir).join("awq_magnitudes.json");
+            let mag_json = std::fs::read_to_string(&mag_path)
+                .map_err(|e| anyhow::anyhow!("failed to read AWQ magnitudes: {e}"))?;
+            let magnitudes: std::collections::HashMap<String, Vec<f32>> =
+                serde_json::from_str(&mag_json)
+                    .map_err(|e| anyhow::anyhow!("failed to parse AWQ magnitudes: {e}"))?;
+            eprintln!(
+                "    AWQ: loaded {} channel magnitude vectors",
+                magnitudes.len()
+            );
+            ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(128, magnitudes)
+        } else {
+            ironmill_compile::weights::quantized::AffineQuantConfig::default()
+        };
         let q_provider = QuantizedWeightProvider::new_int4(&provider, int4_config);
         engine
             .load_weights(&q_provider, gpu_config.clone())

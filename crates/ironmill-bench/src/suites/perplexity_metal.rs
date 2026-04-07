@@ -102,8 +102,20 @@ impl BenchmarkSuite for MetalPerplexitySuite {
                         .collect();
                     let _ = engine.calibrate_dac(&provider, &dac_tokens);
                 } else if opt_cfg.int4 {
-                    let int4_config =
-                        ironmill_compile::weights::quantized::AffineQuantConfig::default();
+                    let int4_config = if let Some(ref awq_dir) = opt_cfg.awq_calib_dir {
+                        let mag_path = std::path::Path::new(awq_dir).join("awq_magnitudes.json");
+                        let magnitudes: std::collections::HashMap<String, Vec<f32>> =
+                            serde_json::from_str(
+                                &std::fs::read_to_string(&mag_path)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                            )
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(
+                            128, magnitudes,
+                        )
+                    } else {
+                        ironmill_compile::weights::quantized::AffineQuantConfig::default()
+                    };
                     let q_provider = QuantizedWeightProvider::new_int4(&provider, int4_config);
                     engine
                         .load_weights(&q_provider, gpu_config.clone())

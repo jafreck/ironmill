@@ -68,6 +68,10 @@ pub struct OptConfig {
     /// JIT INT4 affine per-group weight quantization.
     #[serde(default)]
     pub int4: bool,
+    /// AWQ calibration directory containing awq_magnitudes.json.
+    /// When set with int4=true, applies activation-aware scaling.
+    #[serde(default)]
+    pub awq_calib_dir: Option<String>,
     #[serde(default)]
     pub no_fusion: bool,
     #[serde(default)]
@@ -213,6 +217,7 @@ pub fn default_matrix() -> BenchMatrix {
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         },
         OptConfig {
             name: "default".to_string(),
@@ -225,6 +230,7 @@ pub fn default_matrix() -> BenchMatrix {
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         },
         OptConfig {
             name: "fp16".to_string(),
@@ -237,6 +243,7 @@ pub fn default_matrix() -> BenchMatrix {
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         },
         OptConfig {
             name: "int8".to_string(),
@@ -249,6 +256,7 @@ pub fn default_matrix() -> BenchMatrix {
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         },
         OptConfig {
             name: "palettize-4".to_string(),
@@ -261,6 +269,7 @@ pub fn default_matrix() -> BenchMatrix {
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         },
         OptConfig {
             name: "polar-4".to_string(),
@@ -273,6 +282,7 @@ pub fn default_matrix() -> BenchMatrix {
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         },
         OptConfig {
             name: "polar-3".to_string(),
@@ -285,6 +295,7 @@ pub fn default_matrix() -> BenchMatrix {
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         },
         // TurboQuant INT8
         OptConfig {
@@ -298,6 +309,7 @@ pub fn default_matrix() -> BenchMatrix {
             disabled_passes: vec![],
             kv_quant: KvQuantMode::TurboInt8,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         },
         // TurboQuant INT8 + QJL
         OptConfig {
@@ -311,6 +323,7 @@ pub fn default_matrix() -> BenchMatrix {
             disabled_passes: vec![],
             kv_quant: KvQuantMode::TurboInt8Qjl,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         },
     ];
 
@@ -460,6 +473,7 @@ backends = ["cpu", "gpu"]
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         };
         let key1 = cache_key(&model, &opt);
         let key2 = cache_key(&model, &opt);
@@ -486,6 +500,7 @@ backends = ["cpu", "gpu"]
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         };
         let opt2 = OptConfig {
             name: "fp16".to_string(),
@@ -498,6 +513,7 @@ backends = ["cpu", "gpu"]
             disabled_passes: vec![],
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
+            awq_calib_dir: None,
         };
         assert_ne!(cache_key(&model, &opt1), cache_key(&model, &opt2));
     }

@@ -54,18 +54,40 @@ impl D2QuantConfig {
 pub struct AffineQuantConfig {
     /// Number of weights per group along the reduction axis.
     pub group_size: usize,
+    /// Per-channel AWQ activation scales, keyed by layer weight name
+    /// (e.g., "l0_q_proj_weight" → [hidden_size] f32 magnitudes).
+    /// When present, weights are pre-scaled by 1/awq_scales before quantization,
+    /// and the runtime kernel compensates by dividing activations.
+    pub awq_magnitudes: Option<std::collections::HashMap<String, Vec<f32>>>,
 }
 
 impl AffineQuantConfig {
     /// Default INT4 per-group config: group_size=128.
     pub fn int4(group_size: usize) -> Self {
-        Self { group_size }
+        Self {
+            group_size,
+            awq_magnitudes: None,
+        }
+    }
+
+    /// INT4 with AWQ channel scales loaded from calibration output.
+    pub fn int4_awq(
+        group_size: usize,
+        magnitudes: std::collections::HashMap<String, Vec<f32>>,
+    ) -> Self {
+        Self {
+            group_size,
+            awq_magnitudes: Some(magnitudes),
+        }
     }
 }
 
 impl Default for AffineQuantConfig {
     fn default() -> Self {
-        Self { group_size: 128 }
+        Self {
+            group_size: 128,
+            awq_magnitudes: None,
+        }
     }
 }
 
@@ -115,6 +137,36 @@ impl<P: WeightProvider> QuantizedWeightProvider<P> {
 /// Check whether a tensor shape is eligible for D2Quant quantization.
 fn is_quantizable(shape: &[usize]) -> bool {
     shape.len() == 2 && shape[0] >= 64 && shape[1] >= 64 && shape.iter().product::<usize>() >= 4096
+}
+
+/// Map a safetensors weight name to the AWQ calibration key format.
+///
+/// e.g., "model.layers.5.self_attn.q_proj.weight" → "l5_q_proj_weight"
+///       "model.layers.12.mlp.gate_proj.weight" → "l12_gate_proj_weight"
+fn tensor_name_to_awq_key(name: &str) -> String {
+    // Extract layer index and projection name from dotted path.
+    let parts: Vec<&str> = name.split('.').collect();
+    // Look for "layers.N.*.proj_name.weight"
+    for (i, &p) in parts.iter().enumerate() {
+        if p == "layers" && i + 1 < parts.len() {
+            if let Ok(layer_idx) = parts[i + 1].parse::<usize>() {
+                // Find the projection name (q_proj, k_proj, gate_proj, etc.)
+                for j in (i + 2)..parts.len() {
+                    if parts[j].ends_with("_proj") {
+                        let block = if j > i + 2 && parts[j - 1] == "mlp" {
+                            "ffn"
+                        } else {
+                            "attn"
+                        };
+                        let _ = block; // block info is in the key via proj name
+                        return format!("l{}_{}_weight", layer_idx, parts[j]);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: use the full name with dots replaced.
+    name.replace('.', "_")
 }
 
 /// Convert raw tensor bytes to f32 based on dtype.
@@ -272,6 +324,70 @@ fn quantize_tensor_int4(
     (packed, quant_info)
 }
 
+/// INT4 quantization with optional AWQ activation-aware scaling.
+///
+/// When `awq_magnitudes` is provided, computes per-channel importance scales
+/// as `s_ch = (mag / max_mag)^0.5` (AWQ alpha=0.5), then multiplies each
+/// weight column by `s_ch` before quantization. The runtime kernel divides
+/// activations by `s_ch` to compensate, preserving the dot product:
+///   dot(x, w) = dot(x / s, w * s)
+///
+/// This protects "salient" channels (those with large activation magnitudes)
+/// from quantization error, typically improving INT4 PPL by 30-50%.
+fn quantize_tensor_int4_awq(
+    floats: &[f32],
+    shape: &[usize],
+    config: &AffineQuantConfig,
+    awq_magnitudes: Option<&Vec<f32>>,
+) -> (Vec<u8>, QuantizationInfo) {
+    let awq_scales = if let Some(mags) = awq_magnitudes {
+        let max_mag = mags.iter().cloned().fold(0.0f32, f32::max).max(1e-10);
+        let alpha = 0.5f32;
+        let scales: Vec<f32> = mags
+            .iter()
+            .map(|&m| (m / max_mag).powf(alpha).max(1e-6))
+            .collect();
+        Some(scales)
+    } else {
+        None
+    };
+
+    // Apply AWQ scaling to weights: w_scaled[row, col] = w[row, col] * s[col]
+    let scaled_floats = if let Some(ref scales) = awq_scales {
+        let last_dim = shape[shape.len() - 1];
+        if scales.len() == last_dim {
+            floats
+                .iter()
+                .enumerate()
+                .map(|(i, &w)| w * scales[i % last_dim])
+                .collect::<Vec<f32>>()
+        } else {
+            floats.to_vec()
+        }
+    } else {
+        floats.to_vec()
+    };
+
+    let (packed, mut quant_info) = quantize_tensor_int4(&scaled_floats, shape, config);
+
+    // Attach AWQ scales to the quant info for the runtime kernel.
+    if let Some(scales) = awq_scales {
+        if let QuantizationInfo::AffineDequantize {
+            awq_scales: ref mut aw,
+            ..
+        } = quant_info
+        {
+            let scale_bytes: Vec<u8> = scales
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect();
+            *aw = Some(scale_bytes);
+        }
+    }
+
+    (packed, quant_info)
+}
+
 impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
     fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError> {
         let t = self.inner.tensor(name)?;
@@ -304,7 +420,17 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
 
         let (packed_data, quant_info) = match &self.method {
             QuantMethod::D2Quant(config) => quantize_tensor(&floats, &t.shape, config),
-            QuantMethod::AffineInt4(config) => quantize_tensor_int4(&floats, &t.shape, config),
+            QuantMethod::AffineInt4(config) => {
+                // Look up AWQ magnitudes for this tensor.
+                let awq_key = tensor_name_to_awq_key(name);
+                let last_dim = *t.shape.last().unwrap_or(&0);
+                let awq_mags = config
+                    .awq_magnitudes
+                    .as_ref()
+                    .and_then(|m| m.get(&awq_key))
+                    .filter(|v| v.len() == last_dim); // Only apply if dimensions match
+                quantize_tensor_int4_awq(&floats, &t.shape, config, awq_mags)
+            }
         };
 
         Ok(
