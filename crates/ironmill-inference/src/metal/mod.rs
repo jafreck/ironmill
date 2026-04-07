@@ -8,6 +8,7 @@ pub mod config;
 pub mod dequant;
 pub mod error;
 pub mod inference;
+pub(crate) mod kv_cache;
 pub mod mla;
 pub mod ops;
 pub(crate) mod plan;
