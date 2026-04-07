@@ -1520,6 +1520,11 @@ pub fn encode_v2_prefill_attention(
     pipeline: &ComputePipeline,
     params: &PrefillAttentionParams<'_>,
 ) {
+    assert!(params.num_kv_heads > 0, "num_kv_heads must be > 0");
+    assert!(
+        params.num_heads % params.num_kv_heads == 0,
+        "num_heads must be divisible by num_kv_heads"
+    );
     let heads_per_group = (params.num_heads / params.num_kv_heads) as usize;
     let num_kv_groups = params.num_kv_heads as usize;
     let br = v2_br(params.head_dim) as usize;

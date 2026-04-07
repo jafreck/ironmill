@@ -18,10 +18,6 @@ using namespace metal;
 //   - matmul (M>1): tiled GEMM with threadgroup-shared tiles
 // ============================================================================
 
-constant constexpr uint TILE_M = 8;
-constant constexpr uint TILE_N = 32;
-constant constexpr uint TILE_K = 32;
-
 // ── Matmul tuning parameters ──
 // N_SIMDGROUPS controls the threadgroup size: N_SIMDGROUPS * 32 threads.
 // Increasing to 16 (512 threads) doubles output rows per threadgroup but

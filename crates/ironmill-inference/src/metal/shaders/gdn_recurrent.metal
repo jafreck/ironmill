@@ -517,52 +517,56 @@ kernel void gdn_fused_decode(
 
     // ── Phase 2: Recurrent state update ─────────────────────────
     uint vi = tid;
-    if (vi >= v_head_dim) return; // remaining threads exit after conv1d
+    // All threads must reach the barriers below, so we guard writes
+    // with (vi < v_head_dim) instead of returning early.
 
-    uint k_idx = h_idx * num_k_heads / num_v_heads;
-
-    device const half* q_head = conv_out_scratch + k_idx * k_head_dim;
-    device const half* k_head = conv_out_scratch + key_dim + k_idx * k_head_dim;
-    device const half* v_head = conv_out_scratch + 2 * key_dim + h_idx * v_head_dim;
-
-    // L2-normalize Q and K
-    float q_sq = 0.0f, k_sq = 0.0f;
-    for (uint ki = 0; ki < k_head_dim; ki++) {
-        float qv = float(q_head[ki]);
-        float kv = float(k_head[ki]);
-        q_sq += qv * qv;
-        k_sq += kv * kv;
-    }
-    float q_inv = rsqrt(q_sq + 1e-6f);
-    float k_inv = rsqrt(k_sq + 1e-6f);
-    float scale = rsqrt(float(k_head_dim));
-
-    // Gates
-    float b_val = float(b_proj[h_idx]);
-    float beta = 1.0f / (1.0f + exp(-b_val));
-    float a_val = float(a_proj[h_idx]) + float(dt_bias[h_idx]);
-    float dt = (a_val > 20.0f) ? a_val : log(1.0f + exp(a_val));
-    float decay = exp(-exp(float(a_log[h_idx])) * dt);
-
-    uint s_base = h_idx * v_head_dim * k_head_dim;
-    uint row_base = s_base + vi * k_head_dim;
-
-    // Delta rule: memory read
-    float kv_mem = 0.0f;
-    for (uint ki = 0; ki < k_head_dim; ki++) {
-        float s_decayed = decay * recurrent_state[row_base + ki];
-        kv_mem += s_decayed * float(k_head[ki]) * k_inv;
-    }
-
-    // Delta correction + state update + output
-    float delta_vi = beta * (float(v_head[vi]) - kv_mem);
     float o_sum = 0.0f;
-    for (uint ki = 0; ki < k_head_dim; ki++) {
-        float s_decayed = decay * recurrent_state[row_base + ki];
-        float k_n = float(k_head[ki]) * k_inv;
-        float s_new = s_decayed + k_n * delta_vi;
-        recurrent_state[row_base + ki] = s_new;
-        o_sum += s_new * float(q_head[ki]) * q_inv * scale;
+
+    if (vi < v_head_dim) {
+        uint k_idx = h_idx * num_k_heads / num_v_heads;
+
+        device const half* q_head = conv_out_scratch + k_idx * k_head_dim;
+        device const half* k_head = conv_out_scratch + key_dim + k_idx * k_head_dim;
+        device const half* v_head = conv_out_scratch + 2 * key_dim + h_idx * v_head_dim;
+
+        // L2-normalize Q and K
+        float q_sq = 0.0f, k_sq = 0.0f;
+        for (uint ki = 0; ki < k_head_dim; ki++) {
+            float qv = float(q_head[ki]);
+            float kv = float(k_head[ki]);
+            q_sq += qv * qv;
+            k_sq += kv * kv;
+        }
+        float q_inv = rsqrt(q_sq + 1e-6f);
+        float k_inv = rsqrt(k_sq + 1e-6f);
+        float scale = rsqrt(float(k_head_dim));
+
+        // Gates
+        float b_val = float(b_proj[h_idx]);
+        float beta = 1.0f / (1.0f + exp(-b_val));
+        float a_val = float(a_proj[h_idx]) + float(dt_bias[h_idx]);
+        float dt = (a_val > 20.0f) ? a_val : log(1.0f + exp(a_val));
+        float decay = exp(-exp(float(a_log[h_idx])) * dt);
+
+        uint s_base = h_idx * v_head_dim * k_head_dim;
+        uint row_base = s_base + vi * k_head_dim;
+
+        // Delta rule: memory read
+        float kv_mem = 0.0f;
+        for (uint ki = 0; ki < k_head_dim; ki++) {
+            float s_decayed = decay * recurrent_state[row_base + ki];
+            kv_mem += s_decayed * float(k_head[ki]) * k_inv;
+        }
+
+        // Delta correction + state update + output
+        float delta_vi = beta * (float(v_head[vi]) - kv_mem);
+        for (uint ki = 0; ki < k_head_dim; ki++) {
+            float s_decayed = decay * recurrent_state[row_base + ki];
+            float k_n = float(k_head[ki]) * k_inv;
+            float s_new = s_decayed + k_n * delta_vi;
+            recurrent_state[row_base + ki] = s_new;
+            o_sum += s_new * float(q_head[ki]) * q_inv * scale;
+        }
     }
 
     // ── Phase 3: RMSNorm + silu(z) output gating ────────────────
@@ -582,12 +586,14 @@ kernel void gdn_fused_decode(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float rms_inv = rsqrt(sg_partial[0] / float(v_head_dim) + eps);
-    float normed = o_sum * rms_inv * float(norm_weight[vi]);
+    if (vi < v_head_dim) {
+        float rms_inv = rsqrt(sg_partial[0] / float(v_head_dim) + eps);
+        float normed = o_sum * rms_inv * float(norm_weight[vi]);
 
-    uint head_base = h_idx * v_head_dim;
-    float z_val = float(z_proj[head_base + vi]);
-    float z_silu = z_val / (1.0f + exp(-z_val));
+        uint head_base = h_idx * v_head_dim;
+        float z_val = float(z_proj[head_base + vi]);
+        float z_silu = z_val / (1.0f + exp(-z_val));
 
-    output[head_base + vi] = half(normed * z_silu);
+        output[head_base + vi] = half(normed * z_silu);
+    }
 }

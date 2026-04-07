@@ -15,8 +15,6 @@ using namespace metal;
 #define SDPA_BC 32
 #endif
 
-// simdgroup_matrix tile dimension (Apple GPU fixed at 8×8).
-constant constexpr uint SM = 8;
 constant constexpr uint SIMD_SIZE = 32;
 
 // ============================================================================

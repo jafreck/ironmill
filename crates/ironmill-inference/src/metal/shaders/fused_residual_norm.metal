@@ -141,7 +141,9 @@ kernel void fused_residual_norm_matvec(
 
     // Phase 1: Compute normed input in threadgroup memory.
     // All 256 threads cooperate to compute a+b, sum_sq, and normed values.
-    threadgroup half tg_input[4096]; // supports hidden_size up to 4096
+    constant constexpr uint TG_INPUT_MAX = 16384;
+    if (K > TG_INPUT_MAX) return;
+    threadgroup half tg_input[TG_INPUT_MAX];
 
     // Step 1a: Compute a+b and accumulate sum_sq (only for pass 1 in first SG).
     // All simdgroups participate in the reduction for rms_inv.
