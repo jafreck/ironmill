@@ -313,7 +313,7 @@ impl MetalInference {
         // Free redundant row-major buffers now that all load-time transforms
         // (split_q_gate_weight, norm offsets, MLA absorption) are complete.
         // This typically halves GPU memory for dense FP16 models.
-        weights.drop_dense_row_major();
+        weights.compact();
 
         self.weights = Some(weights);
 
@@ -592,7 +592,7 @@ impl MetalInference {
             self.gdn_state = None;
         }
 
-        weights.drop_dense_row_major();
+        weights.compact();
 
         self.weights = Some(weights);
 

@@ -85,18 +85,26 @@ impl WeightBuffer {
         }
     }
 
-    /// Drop the row-major `buf` when a packed copy exists.
+    /// Drop redundant buffers that are no longer needed after load-time
+    /// transforms. Inference dispatches exclusively through the primary
+    /// kernel path, so secondary layout copies are dead weight:
     ///
-    /// After all load-time transforms (split_q_gate_weight, norm offsets,
-    /// MLA absorption) the row-major buffer is no longer needed — inference
-    /// dispatches exclusively through the packed or quantized path.
-    fn drop_row_major_if_packed(&mut self) {
-        if let WeightBuffer::Dense {
-            buf,
-            packed: Some(_),
-        } = self
-        {
-            *buf = None;
+    /// - **Dense:** drops the row-major `buf` when a packed blocked copy exists.
+    /// - **AffineQuantized:** drops `data_row_major` (blocked layout is used
+    ///   for both matvec and matmul).
+    /// - **Other variants:** no-op (no redundant copies).
+    pub fn compact(&mut self) {
+        match self {
+            WeightBuffer::Dense {
+                buf,
+                packed: Some(_),
+            } => {
+                *buf = None;
+            }
+            WeightBuffer::AffineQuantized(aq) => {
+                aq.data_row_major = None;
+            }
+            _ => {}
         }
     }
 }
@@ -288,15 +296,38 @@ impl MetalWeights {
             }
         }
 
-        let lm_head_name = if config.tie_word_embeddings {
-            "model.embed_tokens.weight"
+        let lm_head = if config.tie_word_embeddings {
+            // Tied embedding: build lm_head directly from the already-loaded
+            // embedding buffer instead of loading the same tensor from disk
+            // again. This avoids a ~1.2 GB duplicate for large-vocab models.
+            let vocab = config.vocab_size;
+            let h = config.hidden_size;
+            let embed_bytes = vocab * h * 2; // FP16
+            let mut raw = vec![0u8; embed_bytes];
+            core.embedding
+                .read_bytes(&mut raw, 0)
+                .map_err(MetalError::Metal)?;
+            if let Some(packed_data) = pack_bytes_blocked(&raw, vocab, h) {
+                let packed_buf = device
+                    .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+                WeightBuffer::Dense {
+                    buf: None,
+                    packed: Some(packed_buf),
+                }
+            } else {
+                // Dimensions not packable — fall back to loading from provider.
+                load_weight_buffer(
+                    device,
+                    provider,
+                    "model.embed_tokens.weight",
+                    force_cpu_dequant,
+                    true,
+                )?
+            }
         } else {
-            "lm_head.weight"
+            load_weight_buffer(device, provider, "lm_head.weight", force_cpu_dequant, true)?
         };
-        // Load lm_head as a full WeightBuffer so quantized formats (D2Quant,
-        // affine INT4, etc.) stay packed on GPU and dispatch through the
-        // fused projection kernels instead of forcing FP16 dequant.
-        let lm_head = load_weight_buffer(device, provider, lm_head_name, force_cpu_dequant, true)?;
 
         Ok(Self {
             embedding: core.embedding,
@@ -310,13 +341,15 @@ impl MetalWeights {
         })
     }
 
-    /// Free row-major dense buffers that are redundant with packed copies.
+    /// Free redundant weight buffers across all layers and projections.
     ///
     /// After all load-time transforms (split_q_gate_weight, norm offsets,
-    /// MLA absorption, D2Quant simulation) the row-major `buf` is no longer
-    /// needed — `encode_projection` dispatches exclusively through `packed`.
-    /// Calling this typically halves GPU memory for dense FP16 models.
-    pub fn drop_dense_row_major(&mut self) {
+    /// MLA absorption, D2Quant simulation) each weight only needs its
+    /// primary dispatch layout. This calls [`WeightBuffer::compact`] on
+    /// every weight to drop secondary copies:
+    /// - Dense: drops row-major `buf` when a packed blocked copy exists
+    /// - AffineQuantized: drops `data_row_major` (blocked layout is always used)
+    pub fn compact(&mut self) {
         for layer in &mut self.layers {
             for wb in [
                 &mut layer.q_proj,
@@ -327,51 +360,51 @@ impl MetalWeights {
                 &mut layer.up_proj,
                 &mut layer.down_proj,
             ] {
-                wb.drop_row_major_if_packed();
+                wb.compact();
             }
             if let Some(ref mut w) = layer.attn_output_gate {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             if let Some(ref mut w) = layer.gdn_in_proj_qkv {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             if let Some(ref mut w) = layer.gdn_in_proj_z {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             if let Some(ref mut w) = layer.gdn_in_proj_a {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             if let Some(ref mut w) = layer.gdn_in_proj_b {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             if let Some(ref mut w) = layer.gdn_out_proj {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             if let Some(ref mut w) = layer.router_weight {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             for w in &mut layer.expert_gate_projs {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             for w in &mut layer.expert_up_projs {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             for w in &mut layer.expert_down_projs {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             if let Some(ref mut w) = layer.ple_gate {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
             if let Some(ref mut w) = layer.ple_projection {
-                w.drop_row_major_if_packed();
+                w.compact();
             }
         }
-        self.lm_head.drop_row_major_if_packed();
+        self.lm_head.compact();
         if let Some(ref mut w) = self.ple_embed_tokens {
-            w.drop_row_major_if_packed();
+            w.compact();
         }
         if let Some(ref mut w) = self.ple_model_projection {
-            w.drop_row_major_if_packed();
+            w.compact();
         }
     }
 
