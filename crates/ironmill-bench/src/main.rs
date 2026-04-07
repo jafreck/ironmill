@@ -609,8 +609,12 @@ fn main() -> Result<()> {
             eprintln!("  {}", "─".repeat(40));
 
             // Build Metal configs from TOML optimization entries.
-            // Track D2Quant bit-width (0 = none).
-            let configs: Vec<(String, MetalConfig, u8)> = matrix
+            // Track weight quantization method alongside MetalConfig.
+            struct WeightQuant {
+                d2quant_bits: u8,
+                int4: bool,
+            }
+            let configs: Vec<(String, MetalConfig, WeightQuant)> = matrix
                 .optimizations
                 .iter()
                 .map(|opt| {
@@ -633,8 +637,11 @@ fn main() -> Result<()> {
                             c.n_bits = 8;
                         }
                     }
-                    let d2quant_bits = opt.d2quant.unwrap_or(0);
-                    (opt.name.clone(), c, d2quant_bits)
+                    let wq = WeightQuant {
+                        d2quant_bits: opt.d2quant.unwrap_or(0),
+                        int4: opt.int4,
+                    };
+                    (opt.name.clone(), c, wq)
                 })
                 .collect();
 
@@ -849,7 +856,7 @@ fn main() -> Result<()> {
                 }
                 let provider = cached_providers.get(&model_dir).unwrap();
 
-                for (config_name, gpu_config, d2quant_bits) in &configs {
+                for (config_name, gpu_config, wq) in &configs {
                     eprintln!("  Metal/{config_name}: {}...", model_cfg.name);
 
                     let mut engine = match MetalInference::new(gpu_config.clone()) {
@@ -863,12 +870,11 @@ fn main() -> Result<()> {
                     let load_start = std::time::Instant::now();
                     let gpu_before = engine.gpu_allocated_bytes();
 
-                    // For D2Quant configs, wrap the provider to JIT-quantize
-                    // weights to packed 3-bit — real compression, not simulation.
-                    if *d2quant_bits > 0 {
-                        eprintln!("    JIT D2Quant-{d2quant_bits} quantization...");
+                    // Weight quantization dispatch: D2Quant, INT4, or FP16.
+                    if wq.d2quant_bits > 0 {
+                        eprintln!("    JIT D2Quant-{} quantization...", wq.d2quant_bits);
                         let d2q_config = D2QuantConfig {
-                            bits: *d2quant_bits,
+                            bits: wq.d2quant_bits,
                             group_size: 128,
                             outlier_threshold: 0.99,
                         };
@@ -879,13 +885,10 @@ fn main() -> Result<()> {
                         }
                         // DAC calibration: compute correction biases using
                         // FP16 reference vs quantized post-attention norm outputs.
-                        // Use the first 2048 tokens from the perplexity dataset as
-                        // calibration data, matching the D²Quant paper's methodology.
                         eprintln!("    calibrating DAC...");
                         let dac_tokens: Vec<u32> = if let Some(ref ds) = ppl_dataset {
                             ds.sequences.iter().flatten().copied().take(2048).collect()
                         } else {
-                            // Fallback: load calibration dataset from default path.
                             match perplexity::PerplexityDataset::load(&cli.perplexity_dataset) {
                                 Ok(ds) => {
                                     ds.sequences.iter().flatten().copied().take(2048).collect()
@@ -895,6 +898,15 @@ fn main() -> Result<()> {
                         };
                         if let Err(e) = engine.calibrate_dac(provider, &dac_tokens) {
                             eprintln!("    ⚠ DAC calibration failed: {e}");
+                        }
+                    } else if wq.int4 {
+                        eprintln!("    JIT INT4 quantization...");
+                        let int4_config =
+                            ironmill_compile::weights::quantized::AffineQuantConfig::default();
+                        let q_provider = QuantizedWeightProvider::new_int4(provider, int4_config);
+                        if let Err(e) = engine.load_weights(&q_provider, gpu_config.clone()) {
+                            eprintln!("  ✗ Metal model load failed: {e}");
+                            continue;
                         }
                     } else if let Err(e) = engine.load_weights(provider, gpu_config.clone()) {
                         eprintln!("  ✗ Metal model load failed: {e}");
@@ -1021,8 +1033,9 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| model_cfg.path.parent().unwrap().to_path_buf());
 
                 // Use first FP16 (non-D2Quant) config as the target model config.
-                if let Some((config_name, gpu_config, _)) =
-                    configs.iter().find(|(_, _, d2q)| *d2q == 0)
+                if let Some((config_name, gpu_config, _)) = configs
+                    .iter()
+                    .find(|(_, _, wq)| wq.d2quant_bits == 0 && !wq.int4)
                 {
                     let mut engine = match MetalInference::new(gpu_config.clone()) {
                         Ok(e) => e,
@@ -1139,17 +1152,17 @@ fn main() -> Result<()> {
                     }
                     let provider = cached_providers.get(&model_dir).unwrap();
 
-                    for (config_name, gpu_config, d2quant_bits) in &configs {
+                    for (config_name, gpu_config, wq) in &configs {
                         eprintln!("  Evaluating {config_name}...");
 
                         let mut engine = MetalInference::new(gpu_config.clone())
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         let gpu_before = engine.gpu_allocated_bytes();
 
-                        // JIT D2Quant: wrap provider for real packed 3-bit weights.
-                        if *d2quant_bits > 0 {
+                        // Weight quantization dispatch.
+                        if wq.d2quant_bits > 0 {
                             let d2q_config = D2QuantConfig {
-                                bits: *d2quant_bits,
+                                bits: wq.d2quant_bits,
                                 group_size: 128,
                                 outlier_threshold: 0.99,
                             };
@@ -1165,6 +1178,14 @@ fn main() -> Result<()> {
                                 .take(2048)
                                 .collect();
                             let _ = engine.calibrate_dac(provider, &dac_tokens);
+                        } else if wq.int4 {
+                            let int4_config =
+                                ironmill_compile::weights::quantized::AffineQuantConfig::default();
+                            let q_provider =
+                                QuantizedWeightProvider::new_int4(provider, int4_config);
+                            engine
+                                .load_weights(&q_provider, gpu_config.clone())
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
                         } else {
                             engine
                                 .load_weights(provider, gpu_config.clone())

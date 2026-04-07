@@ -45,6 +45,13 @@ d2quant = 3
 kv_quant = "turbo-int8"
 max_seq_len = 2048
 
+# ── 5. INT4 affine weights + TurboQuant INT8 KV cache ───────────
+[[optimization]]
+name = "int4-tq-int8"
+int4 = true
+kv_quant = "turbo-int8"
+max_seq_len = 2048
+
 [settings]
 iterations = 20
 warmup = 5
