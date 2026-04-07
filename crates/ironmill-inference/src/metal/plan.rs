@@ -3,6 +3,7 @@
 use mil_rs::weights::{Architecture, ModelConfig};
 
 use super::config::{ClaConfig, GdnModelConfig, Gemma4Config, MetalConfig};
+use super::error::MetalError;
 use super::weights::MetalWeights;
 
 /// How the attention block is computed for this layer.
@@ -77,12 +78,17 @@ impl LayerPlan {
         gdn_cfg: Option<&GdnModelConfig>,
         cla: Option<&ClaConfig>,
         weights: &MetalWeights,
-    ) -> Vec<Self> {
+    ) -> Result<Vec<Self>, MetalError> {
         let has_output_gate = mc
             .extra
             .get("attn_output_gate")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "debug: 'attn_output_gate' not found in model config, defaulting to false"
+                );
+                false
+            });
         let has_v_norm = g4.is_some();
 
         let ple_enabled = g4.is_some_and(|g| g.ple_hidden_size > 0);
@@ -115,12 +121,20 @@ impl LayerPlan {
 
                 // Attention kind
                 let attention = if is_gdn {
-                    let gdn = gdn_cfg.expect("GDN layer but no GDN config");
+                    let gdn = gdn_cfg.ok_or_else(|| {
+                        MetalError::Config(format!(
+                            "layer {i} is GDN but no GDN config provided"
+                        ))
+                    })?;
                     let gdn_index = gdn
                         .gdn_layer_indices
                         .iter()
                         .position(|&l| l == i)
-                        .expect("GDN layer not in gdn_layer_indices");
+                        .ok_or_else(|| {
+                            MetalError::Config(format!(
+                                "layer {i} is GDN but not in gdn_layer_indices"
+                            ))
+                        })?;
                     AttentionKind::Gdn { gdn_index }
                 } else {
                     AttentionKind::Standard {
@@ -179,7 +193,7 @@ impl LayerPlan {
                     None
                 };
 
-                LayerPlan {
+                Ok(LayerPlan {
                     head_dim: hd,
                     num_kv_heads: nkv,
                     window_size: ws,
@@ -195,7 +209,7 @@ impl LayerPlan {
                     has_post_ffn_norm: lw.post_ffn_norm.is_some(),
                     has_layer_scalar: lw.layer_scalar.is_some(),
                     has_ple: ple_enabled && lw.ple_gate.is_some(),
-                }
+                })
             })
             .collect()
     }

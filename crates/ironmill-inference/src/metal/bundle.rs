@@ -145,12 +145,24 @@ impl WeightProvider for MetalBundleProvider {
 
                 let s_dtype = scale_dtype
                     .as_ref()
-                    .and_then(|s| str_to_scalar_type(s).ok())
-                    .unwrap_or(ScalarType::Float16);
+                    .map(|s| str_to_scalar_type(s).map_err(|e| MilError::Validation(
+                        format!("invalid scale_dtype: {e}")
+                    )))
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        eprintln!("warning: scale_dtype not specified in bundle, defaulting to Float16");
+                        ScalarType::Float16
+                    });
                 let zp_dtype = zero_point_dtype
                     .as_ref()
-                    .and_then(|s| str_to_scalar_type(s).ok())
-                    .unwrap_or(ScalarType::Float16);
+                    .map(|s| str_to_scalar_type(s).map_err(|e| MilError::Validation(
+                        format!("invalid zero_point_dtype: {e}")
+                    )))
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        eprintln!("warning: zero_point_dtype not specified in bundle, defaulting to Float16");
+                        ScalarType::Float16
+                    });
 
                 Ok(
                     WeightTensor::owned(quantized_data, shape.clone(), dtype).with_quant_info(

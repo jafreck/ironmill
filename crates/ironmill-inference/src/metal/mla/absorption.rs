@@ -66,7 +66,7 @@ pub fn absorb_weights(
     // Derive hidden_size from the Q weight shape:
     // w_q is [num_heads * qk_dim, hidden_size]
     let hidden_size = w_q.len() / (nh * qk_dim);
-    debug_assert_eq!(
+    assert_eq!(
         w_q.len(),
         nh * qk_dim * hidden_size,
         "w_q size mismatch: expected {} * {} * {}, got {}",

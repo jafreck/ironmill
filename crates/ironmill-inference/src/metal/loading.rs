@@ -364,7 +364,7 @@ impl MetalInference {
             gdn_cfg.as_ref(),
             self.config.cla_config.as_ref(),
             self.weights.as_ref().unwrap(),
-        );
+        )?;
 
         // ── Build model-level execution plan ──────────────────────
         self.model_plan = Some(ModelPlan::build(
@@ -656,7 +656,7 @@ impl MetalInference {
             gdn_cfg.as_ref(),
             self.config.cla_config.as_ref(),
             self.weights.as_ref().unwrap(),
-        );
+        )?;
 
         // ── Build model-level execution plan ──────────────────────
         self.model_plan = Some(ModelPlan::build(

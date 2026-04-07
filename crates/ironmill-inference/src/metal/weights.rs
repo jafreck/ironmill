@@ -281,7 +281,12 @@ impl MetalWeights {
                 .extra
                 .get("attn_output_gate")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "warning: Qwen 3.5 model missing 'attn_output_gate' config, defaulting to disabled"
+                    );
+                    false
+                });
             if has_output_gate {
                 let nh = config.num_attention_heads;
                 let hd = config.head_dim;
@@ -470,7 +475,8 @@ fn d2quant_round_trip_weight_buffer(wb: &mut WeightBuffer, bits: u8) {
     let apply_round_trip = |buf: &MetalBuffer| {
         let n = buf.length() / 2;
         let mut raw = vec![0u8; buf.length()];
-        if buf.read_bytes(&mut raw, 0).is_err() {
+        if let Err(e) = buf.read_bytes(&mut raw, 0) {
+            eprintln!("d2quant round-trip: failed to read buffer: {e}");
             return;
         }
         let f32_weights: Vec<f32> = raw
@@ -490,7 +496,9 @@ fn d2quant_round_trip_weight_buffer(wb: &mut WeightBuffer, bits: u8) {
             raw[i * 2] = bytes[0];
             raw[i * 2 + 1] = bytes[1];
         }
-        let _ = buf.write_bytes(&raw, 0);
+        if let Err(e) = buf.write_bytes(&raw, 0) {
+            eprintln!("d2quant round-trip: failed to write buffer: {e}");
+        }
     };
 
     if let Some(buf) = dense_buf {
@@ -506,7 +514,8 @@ fn d2quant_round_trip_weight_buffer(wb: &mut WeightBuffer, bits: u8) {
 fn offset_norm_weight(buf: &MetalBuffer) {
     let n = buf.length() / 2;
     let mut data = vec![0u8; buf.length()];
-    if buf.read_bytes(&mut data, 0).is_err() {
+    if let Err(e) = buf.read_bytes(&mut data, 0) {
+        eprintln!("offset_norm_weight: failed to read buffer: {e}");
         return;
     }
     for i in 0..n {
@@ -517,7 +526,9 @@ fn offset_norm_weight(buf: &MetalBuffer) {
         data[off] = bytes[0];
         data[off + 1] = bytes[1];
     }
-    let _ = buf.write_bytes(&data, 0);
+    if let Err(e) = buf.write_bytes(&data, 0) {
+        eprintln!("offset_norm_weight: failed to write buffer: {e}");
+    }
 }
 
 /// Split q_proj [2*nh*hd, h] into Q [nh*hd, h] (kept in q_proj) and gate [nh*hd, h].
@@ -773,23 +784,25 @@ fn load_weight_buffer(
                     )?
                 };
                 let (n, k) = dense_shape(original_shape);
-                if let Some(packed_data) = pack_bytes_blocked(&data, n, k) {
-                    let packed_buf = device
-                        .create_buffer_with_data(&packed_data, StorageMode::Shared)
-                        .map_err(MetalError::Metal)?;
-                    Ok(WeightBuffer::Dense {
-                        buf: None,
-                        packed: Some(packed_buf),
-                    })
-                } else {
-                    let buf = device
-                        .create_buffer_with_data(&data, StorageMode::Shared)
-                        .map_err(MetalError::Metal)?;
-                    Ok(WeightBuffer::Dense {
-                        buf: Some(buf),
-                        packed: None,
-                    })
+                if pack_for_matmul {
+                    if let Some(packed_data) = pack_bytes_blocked(&data, n, k) {
+                        let packed_buf = device
+                            .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                            .map_err(MetalError::Metal)?;
+                        return Ok(WeightBuffer::Dense {
+                            buf: None,
+                            packed: Some(packed_buf),
+                        });
+                    }
                 }
+                // Gather/lookup or packing failed: always provide row-major buf.
+                let buf = device
+                    .create_buffer_with_data(&data, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+                Ok(WeightBuffer::Dense {
+                    buf: Some(buf),
+                    packed: None,
+                })
             } else {
                 let rows = original_shape[0];
                 let cols = if original_shape.len() > 1 {
@@ -832,7 +845,16 @@ fn load_weight_buffer(
             if (*bit_width == 4 || *bit_width == 8) && !force_cpu_dequant {
                 let (n, k) = dense_shape(&tensor.shape);
                 let total_elements = n * k;
-                let gs = group_size.unwrap_or(total_elements);
+                let gs = match group_size {
+                    Some(g) => *g,
+                    None => {
+                        eprintln!(
+                            "warning: {name}: group_size metadata missing, defaulting to tensor size {}",
+                            total_elements
+                        );
+                        total_elements
+                    }
+                };
 
                 let repacked = pack_quantized_blocked(&tensor.data, n, k, *bit_width as usize);
                 let data_buf = device
@@ -911,23 +933,24 @@ fn load_weight_buffer(
                 *group_size,
             )?;
             let (n, k) = dense_shape(&tensor.shape);
-            if let Some(packed_data) = pack_bytes_blocked(&data, n, k) {
-                let packed_buf = device
-                    .create_buffer_with_data(&packed_data, StorageMode::Shared)
-                    .map_err(MetalError::Metal)?;
-                Ok(WeightBuffer::Dense {
-                    buf: None,
-                    packed: Some(packed_buf),
-                })
-            } else {
-                let buf = device
-                    .create_buffer_with_data(&data, StorageMode::Shared)
-                    .map_err(MetalError::Metal)?;
-                Ok(WeightBuffer::Dense {
-                    buf: Some(buf),
-                    packed: None,
-                })
+            if pack_for_matmul {
+                if let Some(packed_data) = pack_bytes_blocked(&data, n, k) {
+                    let packed_buf = device
+                        .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                        .map_err(MetalError::Metal)?;
+                    return Ok(WeightBuffer::Dense {
+                        buf: None,
+                        packed: Some(packed_buf),
+                    });
+                }
             }
+            let buf = device
+                .create_buffer_with_data(&data, StorageMode::Shared)
+                .map_err(MetalError::Metal)?;
+            Ok(WeightBuffer::Dense {
+                buf: Some(buf),
+                packed: None,
+            })
         }
         QuantizationInfo::DualScaleDequantize {
             quantized_data,
@@ -953,14 +976,16 @@ fn load_weight_buffer(
                     *group_size,
                 )?;
                 let (n, k) = dense_shape(original_shape);
-                if let Some(packed_data) = pack_bytes_blocked(&data, n, k) {
-                    let packed_buf = device
-                        .create_buffer_with_data(&packed_data, StorageMode::Shared)
-                        .map_err(MetalError::Metal)?;
-                    return Ok(WeightBuffer::Dense {
-                        buf: None,
-                        packed: Some(packed_buf),
-                    });
+                if pack_for_matmul {
+                    if let Some(packed_data) = pack_bytes_blocked(&data, n, k) {
+                        let packed_buf = device
+                            .create_buffer_with_data(&packed_data, StorageMode::Shared)
+                            .map_err(MetalError::Metal)?;
+                        return Ok(WeightBuffer::Dense {
+                            buf: None,
+                            packed: Some(packed_buf),
+                        });
+                    }
                 }
                 let buf = device
                     .create_buffer_with_data(&data, StorageMode::Shared)
