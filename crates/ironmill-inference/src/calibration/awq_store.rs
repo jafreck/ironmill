@@ -107,20 +107,25 @@ impl Default for AwqActivationStore {
 impl AwqActivationStore {
     /// Convert to the format expected by `AwqQuantizePass`.
     ///
-    /// The Metal hook captures activations at norm outputs (`"layer_{i}_attn_norm"`,
-    /// `"layer_{i}_ffn_norm"`). The MIL pass needs per-weight-op magnitudes.
-    /// Since each norm output feeds multiple projections (attn_norm → Q/K/V/O,
-    /// ffn_norm → gate/up/down), we duplicate the magnitudes for each projection.
-    ///
-    /// `weight_names` maps const-op output names to (layer_index, projection_group).
-    /// projection_group is `"attn"` or `"ffn"`.
+    /// Maps captured activations to per-weight magnitudes:
+    /// - `attn_norm` → Q/K/V/gate projections (same hidden_size input)
+    /// - `o_proj_input` → O projection (num_heads × head_dim input)
+    /// - `ffn_norm` → gate/up projections (hidden_size input)
+    /// - `down_proj_input` → down projection (intermediate_size input)
     pub fn to_channel_magnitudes(
         &self,
         weight_names: &[(String, usize, &str)],
     ) -> HashMap<String, Vec<f32>> {
         let mut result = HashMap::new();
         for (name, layer_idx, group) in weight_names {
-            let store_key = format!("layer_{}_{}_norm", layer_idx, group);
+            // Determine which capture point feeds this projection.
+            let store_key = if name.contains("o_proj") {
+                format!("layer_{}_o_proj_input", layer_idx)
+            } else if name.contains("down_proj") {
+                format!("layer_{}_down_proj_input", layer_idx)
+            } else {
+                format!("layer_{}_{}_norm", layer_idx, group)
+            };
             if let Some(mag) = self.magnitudes.get(&store_key) {
                 result.insert(name.clone(), mag.mean_abs.clone());
             }
@@ -152,7 +157,13 @@ impl AwqActivationStore {
     ) -> HashMap<String, Vec<f32>> {
         let mut result = HashMap::new();
         for (name, layer_idx, group) in weight_names {
-            let store_key = format!("layer_{}_{}_norm", layer_idx, group);
+            let store_key = if name.contains("o_proj") {
+                format!("layer_{}_o_proj_input", layer_idx)
+            } else if name.contains("down_proj") {
+                format!("layer_{}_down_proj_input", layer_idx)
+            } else {
+                format!("layer_{}_{}_norm", layer_idx, group)
+            };
             if let Some(snapshots) = self.activations.get(&store_key) {
                 if let Some(first) = snapshots.first() {
                     result.insert(name.clone(), first.clone());

@@ -53,20 +53,23 @@ impl MetalInference {
                 .map_err(|e| InferenceError::runtime(format!("DAC FP16 load: {e}")))?;
 
             let mut norms: Vec<Vec<f32>> = vec![vec![0.0f32; h]; num_layers];
-            fp_engine.prefill_calibration(calibration_tokens, &mut |layer, name, data| {
-                if name == "ffn_norm" && layer < num_layers {
-                    // data is FP16 bytes: [token_count × hidden_size]
-                    let f16_vals: Vec<f32> = data
-                        .chunks_exact(2)
-                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                        .collect();
-                    // Mean across tokens for each channel
-                    for ch in 0..h {
-                        let sum: f32 = (0..token_count).map(|t| f16_vals[t * h + ch]).sum();
-                        norms[layer][ch] = sum / token_count as f32;
+            fp_engine.prefill_calibration(
+                calibration_tokens,
+                &mut |layer, name, data, _n_features| {
+                    if name == "ffn_norm" && layer < num_layers {
+                        // data is FP16 bytes: [token_count × hidden_size]
+                        let f16_vals: Vec<f32> = data
+                            .chunks_exact(2)
+                            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                            .collect();
+                        // Mean across tokens for each channel
+                        for ch in 0..h {
+                            let sum: f32 = (0..token_count).map(|t| f16_vals[t * h + ch]).sum();
+                            norms[layer][ch] = sum / token_count as f32;
+                        }
                     }
-                }
-            })?;
+                },
+            )?;
             norms
         };
         // FP16 engine is dropped here, freeing GPU memory.
@@ -74,7 +77,7 @@ impl MetalInference {
         // 2. Run quantized (self) model to capture post-attention norm outputs.
         let q_norms = {
             let mut norms: Vec<Vec<f32>> = vec![vec![0.0f32; h]; num_layers];
-            self.prefill_calibration(calibration_tokens, &mut |layer, name, data| {
+            self.prefill_calibration(calibration_tokens, &mut |layer, name, data, _n_features| {
                 if name == "ffn_norm" && layer < num_layers {
                     let f16_vals: Vec<f32> = data
                         .chunks_exact(2)
@@ -121,15 +124,16 @@ impl MetalInference {
     ///
     /// The `layer_callback` is invoked after each transformer layer with:
     /// - `layer_index`: the 0-based layer number
-    /// - `projection_name`: one of `"attn_norm"` (input to Q/K/V/O projections)
-    ///   or `"ffn_norm"` (input to gate/up/down projections)
-    /// - `raw_bytes`: the FP16 activation data (token_count × hidden_size × 2 bytes)
+    /// - `projection_name`: one of `"attn_norm"`, `"ffn_norm"`, `"o_proj_input"`,
+    ///   or `"down_proj_input"`
+    /// - `raw_bytes`: the FP16 activation data (token_count × n_features × 2 bytes)
+    /// - `n_features`: number of features per token for this capture point
     ///
     /// Returns the same logits as [`run_pipeline`].
     pub(crate) fn run_pipeline_calibration(
         &mut self,
         token_ids: &[u32],
-        layer_callback: &mut dyn FnMut(usize, &str, &[u8]),
+        layer_callback: &mut dyn FnMut(usize, &str, &[u8], usize),
     ) -> Result<Logits, InferenceError> {
         let total_start = Instant::now();
 
@@ -211,6 +215,16 @@ impl MetalInference {
 
         // Reusable readback buffer for norm_out: token_count × hidden_size × 2 bytes (FP16).
         let norm_readback_bytes = token_count * h * 2;
+
+        // Calibration readback scratch for non-hidden-size activations (attn_out, ffn_gate).
+        // Shared-mode so CPU can read back GPU results.
+        let attn_out_features = mc.num_attention_heads * mc.head_dim;
+        let max_readback_features = h.max(attn_out_features).max(mc.intermediate_size);
+        let calib_scratch_bytes = token_count * max_readback_features * 2;
+        let calib_scratch = self
+            .device
+            .create_buffer(calib_scratch_bytes.max(16), StorageMode::Shared)
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         // Timing accumulators.
         let mut gpu_time_ms = 0.0f64;
@@ -350,7 +364,7 @@ impl MetalInference {
                     .read_bytes(readback, 0)
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
-                layer_callback(layer_idx, "attn_norm", readback);
+                layer_callback(layer_idx, "attn_norm", readback, h);
             }
 
             // Create new command buffer for this layer's attention block.
@@ -367,11 +381,11 @@ impl MetalInference {
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
             }
 
-            let cmd_buf = self
+            let mut cmd_buf = self
                 .queue
                 .command_buffer()
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            let enc = cmd_buf
+            let mut enc = cmd_buf
                 .compute_encoder()
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let default_pipelines = self.pipelines()?;
@@ -524,6 +538,45 @@ impl MetalInference {
                     enc.memory_barrier_buffers();
                 }
 
+                // ── Capture O_proj input (attn_out) ──
+                // Copy attn_out (Private) → calib_scratch (Shared) for CPU readback.
+                {
+                    let attn_out_features_local = mc.num_attention_heads * layer_hd as usize;
+                    let copy_elems = (token_count * attn_out_features_local) as u32;
+                    ops::encode_copy_buffer(
+                        &enc,
+                        &pipelines.copy_buffer,
+                        &bufs.attn_out,
+                        &calib_scratch,
+                        copy_elems,
+                    );
+                    enc.end_encoding();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+
+                    let rb_bytes = token_count * attn_out_features_local * 2;
+                    let rb_start = Instant::now();
+                    let mut rb_u16 = vec![0u16; rb_bytes / 2];
+                    #[allow(unsafe_code)]
+                    let rb = unsafe {
+                        std::slice::from_raw_parts_mut(rb_u16.as_mut_ptr() as *mut u8, rb_bytes)
+                    };
+                    calib_scratch
+                        .read_bytes(rb, 0)
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                    readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
+                    layer_callback(layer_idx, "o_proj_input", rb, attn_out_features_local);
+
+                    // New command buffer to continue.
+                    cmd_buf = self
+                        .queue
+                        .command_buffer()
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                    enc = cmd_buf
+                        .compute_encoder()
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                }
+
                 // Step 9: Output projection
                 let attn_out_features = mc.num_attention_heads * layer_hd as usize;
                 encode_projection(
@@ -621,15 +674,15 @@ impl MetalInference {
                     .read_bytes(readback, 0)
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
-                layer_callback(layer_idx, "ffn_norm", readback);
+                layer_callback(layer_idx, "ffn_norm", readback, h);
             }
 
             // ── New command buffer for FFN block ────────────────
-            let cmd_buf = self
+            let mut cmd_buf = self
                 .queue
                 .command_buffer()
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            let enc = cmd_buf
+            let mut enc = cmd_buf
                 .compute_encoder()
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let pipelines = self.pipelines()?;
@@ -646,6 +699,45 @@ impl MetalInference {
                 token_count,
                 use_gelu,
             )?;
+
+            // ── Capture down_proj input (ffn_gate = activated gate*up) ──
+            // ffn_gate still holds the SiLU/GELU-gated intermediate from encode_ffn_block.
+            // Copy to calib_scratch for CPU readback before any post-FFN ops.
+            {
+                let copy_elems = (token_count * layer_inter) as u32;
+                ops::encode_copy_buffer(
+                    &enc,
+                    &pipelines.copy_buffer,
+                    &bufs.ffn_gate,
+                    &calib_scratch,
+                    copy_elems,
+                );
+                enc.end_encoding();
+                cmd_buf.commit();
+                cmd_buf.wait_until_completed();
+
+                let rb_bytes = token_count * layer_inter * 2;
+                let rb_start = Instant::now();
+                let mut rb_u16 = vec![0u16; rb_bytes / 2];
+                #[allow(unsafe_code)]
+                let rb = unsafe {
+                    std::slice::from_raw_parts_mut(rb_u16.as_mut_ptr() as *mut u8, rb_bytes)
+                };
+                calib_scratch
+                    .read_bytes(rb, 0)
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
+                layer_callback(layer_idx, "down_proj_input", rb, layer_inter);
+
+                // New command buffer.
+                cmd_buf = self
+                    .queue
+                    .command_buffer()
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                enc = cmd_buf
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            }
             enc.memory_barrier_buffers();
 
             // MoE block (Gemma 4 26B): when enabled, dense MLP output is combined
@@ -895,7 +987,7 @@ impl MetalInference {
     pub(crate) fn prefill_calibration(
         &mut self,
         tokens: &[u32],
-        layer_callback: &mut dyn FnMut(usize, &str, &[u8]),
+        layer_callback: &mut dyn FnMut(usize, &str, &[u8], usize),
     ) -> Result<Logits, InferenceError> {
         if tokens.is_empty() {
             return Err(InferenceError::Decode("empty calibration tokens".into()));
@@ -907,23 +999,17 @@ impl MetalInference {
     ///
     /// Wraps [`run_pipeline_calibration`](Self::run_pipeline_calibration),
     /// converting the raw byte readbacks to typed `&[f16]` slices and
-    /// forwarding them to the hook. `n_features` is the model's
-    /// `hidden_size` (both `attn_norm` and `ffn_norm` outputs have this
-    /// dimensionality).
+    /// forwarding them to the hook. Uses the per-capture-point `n_features`
+    /// from the callback (hidden_size for norms, num_heads×head_dim for
+    /// O_proj, intermediate_size for down_proj).
     pub(crate) fn run_pipeline_with_hooks(
         &mut self,
         token_ids: &[u32],
         hooks: &mut dyn ActivationHook,
     ) -> Result<Logits, InferenceError> {
-        let hidden_size = self
-            .model_config
-            .as_ref()
-            .ok_or(InferenceError::NotLoaded)?
-            .hidden_size;
-
-        self.run_pipeline_calibration(token_ids, &mut |layer, name, raw_bytes| {
+        self.run_pipeline_calibration(token_ids, &mut |layer, name, raw_bytes, n_features| {
             let f16_data = bytes_as_f16(raw_bytes);
-            hooks.on_linear_input(layer, name, f16_data, hidden_size);
+            hooks.on_linear_input(layer, name, f16_data, n_features);
         })
     }
 

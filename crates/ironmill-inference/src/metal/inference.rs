@@ -36,8 +36,8 @@ mod calibration_tests {
 
         fn _assert_method_exists(engine: &mut MetalInference) {
             let mut count = 0usize;
-            let mut callback = |layer: usize, name: &str, data: &[u8]| {
-                let _ = (layer, name, data);
+            let mut callback = |layer: usize, name: &str, data: &[u8], n_features: usize| {
+                let _ = (layer, name, data, n_features);
                 count += 1;
             };
             // These calls would fail at runtime (no model loaded), but they
