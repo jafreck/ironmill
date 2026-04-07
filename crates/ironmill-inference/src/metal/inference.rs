@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use half::f16;
 use ironmill_metal_sys::{
-    CommandBufferStatus, ComputeEncoder, MetalBuffer, MetalDevice, MpsMatrix, MpsMatrixMultiply,
+    CommandBufferStatus, ComputeEncoder, MetalBuffer, MetalDevice, MpsMatrixMultiply,
     MpsMatrixMultiplyConfig, StorageMode,
 };
 use mil_rs::weights::{Architecture, ModelConfig, WeightProvider};
@@ -1789,7 +1789,7 @@ impl MetalInference {
 
         // Use the pre-built single-token matmul cache for decode steps;
         // only rebuild the general cache for prefill (token_count > 1).
-        let matmuls = if token_count == 1 {
+        let _matmuls = if token_count == 1 {
             self.decode_matmuls_t1
                 .as_ref()
                 .ok_or(InferenceError::NotLoaded)?
@@ -1951,22 +1951,15 @@ impl MetalInference {
 
                     // 2. Project hidden_state via ple_model_projection → ffn_gate (temp)
                     //    HF then scales by per_layer_model_projection_scale = 1/sqrt(hidden_size).
-                    let row_bytes_h = h * 2;
-                    let row_bytes_ple_total = ple_total * 2;
                     encode_projection(
                         &enc,
                         &bufs.hidden_state,
-                        &MpsMatrix::from_buffer(&bufs.hidden_state, token_count, h, row_bytes_h)
-                            .map_err(|e| InferenceError::runtime(e.to_string()))?,
                         ple_proj,
                         &bufs.ffn_gate, // temp output: [tokens, ple_total] fits in ffn_gate
-                        &ProjectionMatmul::Quantized, // placeholder, encode_projection selects by weight type
                         pipelines,
                         token_count,
                         ple_total,
                         h,
-                        row_bytes_h,
-                        row_bytes_ple_total,
                     )?;
                     enc.memory_barrier_buffers();
 
@@ -2037,7 +2030,6 @@ impl MetalInference {
 
         for layer_idx in 0..mc.num_hidden_layers {
             let lw = &weights.layers[layer_idx];
-            let lm = &matmuls.layer_matmuls[layer_idx];
             let plan = &self.layer_plans[layer_idx];
 
             // Per-layer dims from plan (resolved at load time).
@@ -2056,10 +2048,6 @@ impl MetalInference {
 
             // Steps 3-5: Q/K/V projections — dispatch by weight type.
             // These are independent (all read norm_out, write to different buffers).
-            let row_bytes_h = h * 2; // FP16
-            let row_bytes_qo = (mc.num_attention_heads * layer_hd as usize) * 2;
-            let row_bytes_kv = (layer_nkv as usize * layer_hd as usize) * 2;
-
             match &plan.attention {
                 AttentionKind::Gdn { gdn_index: _ } => {
                     // ── GDN (linear-attention) layer — GPU path ─────
@@ -2111,58 +2099,26 @@ impl MetalInference {
                     } else {
                         default_pipelines
                     };
-                    let norm_mat =
-                        MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
                     let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
                     let kv_out_features = layer_nkv as usize * layer_hd as usize;
 
                     // Build the projection list: skip Q if P1 fusion already computed it.
-                    let mut projections: Vec<(
-                        &WeightBuffer,
-                        &MetalBuffer,
-                        &ProjectionMatmul,
-                        usize,
-                        usize,
-                    )> = Vec::new();
+                    let mut projections: Vec<(&WeightBuffer, &MetalBuffer, usize)> = Vec::new();
                     if !p1_skip {
-                        projections.push((
-                            &lw.q_proj,
-                            &bufs.q_proj,
-                            &lm.q,
-                            qkv_out_features,
-                            row_bytes_qo,
-                        ));
+                        projections.push((&lw.q_proj, &bufs.q_proj, qkv_out_features));
                     }
-                    projections.push((
-                        &lw.k_proj,
-                        &bufs.k_proj,
-                        &lm.k,
-                        kv_out_features,
-                        row_bytes_kv,
-                    ));
-                    projections.push((
-                        &lw.v_proj,
-                        &bufs.v_proj,
-                        &lm.v,
-                        kv_out_features,
-                        row_bytes_kv,
-                    ));
-                    for (weight, output_buf, matmul, out_features, row_bytes_out) in projections {
+                    projections.push((&lw.k_proj, &bufs.k_proj, kv_out_features));
+                    projections.push((&lw.v_proj, &bufs.v_proj, kv_out_features));
+                    for (weight, output_buf, out_features) in projections {
                         encode_projection(
                             &enc,
                             &bufs.norm_out,
-                            &norm_mat,
                             weight,
                             output_buf,
-                            matmul,
                             pipelines,
                             token_count,
                             out_features,
                             h,
-                            row_bytes_h,
-                            row_bytes_out,
                         )?;
                     }
 
@@ -2170,22 +2126,16 @@ impl MetalInference {
                     // (reads norm_out, writes q_gate — independent of Q/K/V outputs).
                     // The gate result is only consumed later by sigmoid_gate after attention,
                     // so no separate barrier is needed here.
-                    if let (Some(gate_w), Some(gate_m), Some(gate_buf)) =
-                        (&lw.attn_output_gate, &lm.q_gate, &bufs.q_gate)
-                    {
+                    if let (Some(gate_w), Some(gate_buf)) = (&lw.attn_output_gate, &bufs.q_gate) {
                         encode_projection(
                             &enc,
                             &bufs.norm_out,
-                            &norm_mat,
                             gate_w,
                             gate_buf,
-                            gate_m,
                             pipelines,
                             token_count,
                             qkv_out_features,
                             h,
-                            row_bytes_h,
-                            row_bytes_qo,
                         )?;
                     }
                     enc.memory_barrier_buffers();
@@ -2277,26 +2227,15 @@ impl MetalInference {
 
                     // Step 9: Output projection
                     let attn_out_features = mc.num_attention_heads * layer_hd as usize;
-                    let attn_mat = MpsMatrix::from_buffer(
-                        &bufs.attn_out,
-                        token_count,
-                        attn_out_features,
-                        row_bytes_qo,
-                    )
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
                     encode_projection(
                         &enc,
                         &bufs.attn_out,
-                        &attn_mat,
                         &lw.o_proj,
                         &bufs.ffn_down,
-                        &lm.o,
                         pipelines,
                         token_count,
                         h,
                         attn_out_features,
-                        row_bytes_qo,
-                        row_bytes_h,
                     )?;
                     enc.memory_barrier_buffers();
 
@@ -2393,7 +2332,6 @@ impl MetalInference {
                 pipelines,
                 bufs,
                 lw,
-                lm,
                 h,
                 layer_inter,
                 token_count,
@@ -2476,22 +2414,15 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
 
                 // 2. PLE gate: linear(hidden_state → ple_scratch) [hidden → ple_hidden]
-                let row_bytes_h = h * 2;
-                let row_bytes_ple = ple_h * 2;
                 encode_projection(
                     &enc,
                     &bufs.hidden_state,
-                    &MpsMatrix::from_buffer(&bufs.hidden_state, token_count, h, row_bytes_h)
-                        .map_err(|e| InferenceError::runtime(e.to_string()))?,
                     ple_gate,
                     ple_scratch,
-                    &ProjectionMatmul::Quantized,
                     pipelines,
                     token_count,
                     ple_h,
                     h,
-                    row_bytes_h,
-                    row_bytes_ple,
                 )?;
                 enc.memory_barrier_buffers();
 
@@ -2513,17 +2444,12 @@ impl MetalInference {
                 encode_projection(
                     &enc,
                     ple_scratch,
-                    &MpsMatrix::from_buffer(ple_scratch, token_count, ple_h, row_bytes_ple)
-                        .map_err(|e| InferenceError::runtime(e.to_string()))?,
                     ple_proj,
                     &bufs.ffn_down, // reuse ffn_down as temp
-                    &ProjectionMatmul::Quantized,
                     pipelines,
                     token_count,
                     h,
                     ple_h,
-                    row_bytes_ple,
-                    row_bytes_h,
                 )?;
                 enc.memory_barrier_buffers();
 
@@ -2699,17 +2625,12 @@ impl MetalInference {
             encode_projection(
                 &enc,
                 &bufs.norm_out,
-                &MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, h * 2)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?,
                 &weights.lm_head,
                 &bufs.logits,
-                &ProjectionMatmul::Quantized,
                 pipelines,
                 token_count,
                 vocab,
                 h,
-                h * 2,
-                vocab * 2,
             )?;
             enc.end_encoding();
         }
@@ -2761,13 +2682,23 @@ impl MetalInference {
                 .read_bytes(&mut self.logits_fp16_buf, last_token_offset)
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
-            self.logits_fp16_buf
-                .chunks_exact(2)
-                .map(|chunk| {
-                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    f16::from_bits(bits).to_f32()
-                })
-                .collect()
+            // SIMD-accelerated FP16→FP32 via half crate's platform-optimized batch conversion.
+            // On Apple Silicon this uses NEON vcvt instructions (~8× faster than scalar).
+            use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
+            let u16_slice: &[u16] = {
+                let ptr = self.logits_fp16_buf.as_ptr() as *const u16;
+                let len = self.logits_fp16_buf.len() / 2;
+                // SAFETY: logits_fp16_buf is aligned to 2 bytes (from Metal buffer readback)
+                // and len is always even (vocab * 2 bytes). The lifetime is bounded by self.
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::slice::from_raw_parts(ptr, len)
+                }
+            };
+            let f16_slice: &[f16] = u16_slice.reinterpret_cast();
+            let mut logits_f32 = vec![0.0f32; f16_slice.len()];
+            f16_slice.convert_to_f32_slice(&mut logits_f32);
+            logits_f32
         };
 
         self.seq_pos += token_count;
@@ -2875,7 +2806,7 @@ impl MetalInference {
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
             self.decode_matmuls = Some(cache);
         }
-        let matmuls = self
+        let _matmuls = self
             .decode_matmuls
             .as_ref()
             .ok_or_else(|| InferenceError::runtime("decode_matmuls not populated"))?;
@@ -3021,27 +2952,15 @@ impl MetalInference {
                             }
                         }
 
-                        let row_bytes_h = h * 2;
-                        let row_bytes_ple_total = ple_total * 2;
                         encode_projection(
                             &enc,
                             &bufs.hidden_state,
-                            &MpsMatrix::from_buffer(
-                                &bufs.hidden_state,
-                                token_count,
-                                h,
-                                row_bytes_h,
-                            )
-                            .map_err(|e| InferenceError::runtime(e.to_string()))?,
                             ple_proj,
                             &bufs.ffn_gate,
-                            &ProjectionMatmul::Quantized,
                             pipelines,
                             token_count,
                             ple_total,
                             h,
-                            row_bytes_h,
-                            row_bytes_ple_total,
                         )?;
                         enc.memory_barrier_buffers();
 
@@ -3090,7 +3009,6 @@ impl MetalInference {
         // ── Per-layer processing with per-layer commit ──────────
         for layer_idx in 0..mc.num_hidden_layers {
             let lw = &weights.layers[layer_idx];
-            let lm = &matmuls.layer_matmuls[layer_idx];
 
             // Gemma 4: use per-layer config if available.
             let (layer_hd, layer_nkv, layer_window, layer_inter) =
@@ -3174,72 +3092,37 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
             } else {
                 // ── Standard attention layer ─────────────────────
-                let row_bytes_h = h * 2;
-                let row_bytes_qo = (mc.num_attention_heads * layer_hd as usize) * 2;
-                let row_bytes_kv = (layer_nkv as usize * layer_hd as usize) * 2;
-
-                let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
                 let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
                 let kv_out_features = layer_nkv as usize * layer_hd as usize;
-                for (weight, output_buf, matmul, out_features, row_bytes_out) in [
-                    (
-                        &lw.q_proj,
-                        &bufs.q_proj,
-                        &lm.q,
-                        qkv_out_features,
-                        row_bytes_qo,
-                    ),
-                    (
-                        &lw.k_proj,
-                        &bufs.k_proj,
-                        &lm.k,
-                        kv_out_features,
-                        row_bytes_kv,
-                    ),
-                    (
-                        &lw.v_proj,
-                        &bufs.v_proj,
-                        &lm.v,
-                        kv_out_features,
-                        row_bytes_kv,
-                    ),
+                for (weight, output_buf, out_features) in [
+                    (&lw.q_proj, &bufs.q_proj, qkv_out_features),
+                    (&lw.k_proj, &bufs.k_proj, kv_out_features),
+                    (&lw.v_proj, &bufs.v_proj, kv_out_features),
                 ] {
                     encode_projection(
                         &enc,
                         &bufs.norm_out,
-                        &norm_mat,
                         weight,
                         output_buf,
-                        matmul,
                         pipelines,
                         token_count,
                         out_features,
                         h,
-                        row_bytes_h,
-                        row_bytes_out,
                     )?;
                 }
                 enc.memory_barrier_buffers();
 
                 // Qwen3.5 attn_output_gate: compute gate projection.
-                if let (Some(gate_w), Some(gate_m), Some(gate_buf)) =
-                    (&lw.attn_output_gate, &lm.q_gate, &bufs.q_gate)
-                {
+                if let (Some(gate_w), Some(gate_buf)) = (&lw.attn_output_gate, &bufs.q_gate) {
                     encode_projection(
                         &enc,
                         &bufs.norm_out,
-                        &norm_mat,
                         gate_w,
                         gate_buf,
-                        gate_m,
                         pipelines,
                         token_count,
                         qkv_out_features,
                         h,
-                        row_bytes_h,
-                        row_bytes_qo,
                     )?;
                     enc.memory_barrier_buffers();
                 }
@@ -3333,26 +3216,15 @@ impl MetalInference {
 
                 // Step 9: Output projection
                 let attn_out_features = mc.num_attention_heads * layer_hd as usize;
-                let attn_mat = MpsMatrix::from_buffer(
-                    &bufs.attn_out,
-                    token_count,
-                    attn_out_features,
-                    row_bytes_qo,
-                )
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 encode_projection(
                     &enc,
                     &bufs.attn_out,
-                    &attn_mat,
                     &lw.o_proj,
                     &bufs.ffn_down,
-                    &lm.o,
                     pipelines,
                     token_count,
                     h,
                     attn_out_features,
-                    row_bytes_qo,
-                    row_bytes_h,
                 )?;
                 enc.memory_barrier_buffers();
 
@@ -3459,7 +3331,6 @@ impl MetalInference {
                 pipelines,
                 bufs,
                 lw,
-                lm,
                 h,
                 layer_inter,
                 token_count,
@@ -3541,22 +3412,15 @@ impl MetalInference {
                 );
                 enc.memory_barrier_buffers();
 
-                let row_bytes_h = h * 2;
-                let row_bytes_ple = ple_h * 2;
                 encode_projection(
                     &enc,
                     &bufs.hidden_state,
-                    &MpsMatrix::from_buffer(&bufs.hidden_state, token_count, h, row_bytes_h)
-                        .map_err(|e| InferenceError::runtime(e.to_string()))?,
                     ple_gate,
                     ple_scratch,
-                    &ProjectionMatmul::Quantized,
                     pipelines,
                     token_count,
                     ple_h,
                     h,
-                    row_bytes_h,
-                    row_bytes_ple,
                 )?;
                 enc.memory_barrier_buffers();
 
@@ -3576,17 +3440,12 @@ impl MetalInference {
                 encode_projection(
                     &enc,
                     ple_scratch,
-                    &MpsMatrix::from_buffer(ple_scratch, token_count, ple_h, row_bytes_ple)
-                        .map_err(|e| InferenceError::runtime(e.to_string()))?,
                     ple_proj,
                     &bufs.ffn_down,
-                    &ProjectionMatmul::Quantized,
                     pipelines,
                     token_count,
                     h,
                     ple_h,
-                    row_bytes_ple,
-                    row_bytes_h,
                 )?;
                 enc.memory_barrier_buffers();
 
@@ -3745,17 +3604,12 @@ impl MetalInference {
             encode_projection(
                 &enc,
                 &bufs.norm_out,
-                &MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, h * 2)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?,
                 &weights.lm_head,
                 &bufs.logits,
-                &ProjectionMatmul::Quantized,
                 pipelines,
                 token_count,
                 vocab,
                 h,
-                h * 2,
-                vocab * 2,
             )?;
             enc.end_encoding();
         }
@@ -4198,9 +4052,7 @@ fn encode_gdn_prefill(
     h: usize,
     eps: f32,
 ) -> Result<(), InferenceError> {
-    let row_bytes_h = h * 2;
     let gdn_cfg = &gdn.config;
-    let dummy_matmul = ProjectionMatmul::Quantized;
 
     let qkv_dim = gdn_cfg.qkv_dim;
     let value_dim = gdn_cfg.value_dim;
@@ -4209,64 +4061,45 @@ fn encode_gdn_prefill(
     let v_head_dim = gdn_cfg.v_head_dim;
     let key_dim = gdn_cfg.key_dim;
 
-    let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-        .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
     encode_projection(
         enc,
         &bufs.norm_out,
-        &norm_mat,
         lw.gdn_in_proj_qkv.as_ref().unwrap(),
         &gdn.gpu_temp_qkv,
-        &dummy_matmul,
         pipelines,
         token_count,
         qkv_dim,
         h,
-        row_bytes_h,
-        qkv_dim * 2,
     )?;
     encode_projection(
         enc,
         &bufs.norm_out,
-        &norm_mat,
         lw.gdn_in_proj_z.as_ref().unwrap(),
         &gdn.gpu_temp_z,
-        &dummy_matmul,
         pipelines,
         token_count,
         value_dim,
         h,
-        row_bytes_h,
-        value_dim * 2,
     )?;
     encode_projection(
         enc,
         &bufs.norm_out,
-        &norm_mat,
         lw.gdn_in_proj_a.as_ref().unwrap(),
         &gdn.gpu_temp_a,
-        &dummy_matmul,
         pipelines,
         token_count,
         num_v_heads,
         h,
-        row_bytes_h,
-        num_v_heads * 2,
     )?;
     encode_projection(
         enc,
         &bufs.norm_out,
-        &norm_mat,
         lw.gdn_in_proj_b.as_ref().unwrap(),
         &gdn.gpu_temp_b,
-        &dummy_matmul,
         pipelines,
         token_count,
         num_v_heads,
         h,
-        row_bytes_h,
-        num_v_heads * 2,
     )?;
     enc.memory_barrier_buffers();
 
@@ -4308,22 +4141,15 @@ fn encode_gdn_prefill(
     );
     enc.memory_barrier_buffers();
 
-    let gated_mat =
-        MpsMatrix::from_buffer(&gdn.gpu_gated_output, token_count, value_dim, value_dim * 2)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
     encode_projection(
         enc,
         &gdn.gpu_gated_output,
-        &gated_mat,
         lw.gdn_out_proj.as_ref().unwrap(),
         &gdn.scratch,
-        &dummy_matmul,
         pipelines,
         token_count,
         h,
         value_dim,
-        value_dim * 2,
-        h * 2,
     )?;
     enc.memory_barrier_buffers();
 
@@ -4362,9 +4188,7 @@ fn encode_gdn_decode(
     eps: f32,
     skip_qkv: bool,
 ) -> Result<(), InferenceError> {
-    let row_bytes_h = h * 2;
     let gdn_cfg = &gdn.config;
-    let dummy_matmul = ProjectionMatmul::Quantized;
 
     let qkv_dim = gdn_cfg.qkv_dim;
     let value_dim = gdn_cfg.value_dim;
@@ -4381,8 +4205,6 @@ fn encode_gdn_decode(
 
     if skip_qkv {
         // QKV was pre-computed by P1 fusion — only dispatch Z/A/B projections.
-        let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, 1, h, row_bytes_h)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         for (weight, output_buf, out_features) in [
             (w_z, &gdn.gpu_temp_z, value_dim),
             (w_a, &gdn.gpu_temp_a, num_v_heads),
@@ -4391,16 +4213,12 @@ fn encode_gdn_decode(
             encode_projection(
                 enc,
                 &bufs.norm_out,
-                &norm_mat,
                 weight,
                 output_buf,
-                &dummy_matmul,
                 pipelines,
                 1,
                 out_features,
                 h,
-                row_bytes_h,
-                out_features * 2,
             )?;
         }
     } else if let (Some(p_qkv), Some(p_z), Some(p_a), Some(p_b)) = (
@@ -4461,8 +4279,6 @@ fn encode_gdn_decode(
             );
         } else {
             // Mixed bit widths: fallback to individual projections.
-            let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, 1, h, row_bytes_h)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             for (weight, output_buf, out_features) in [
                 (w_qkv as &WeightBuffer, &gdn.gpu_temp_qkv, qkv_dim),
                 (w_z as &WeightBuffer, &gdn.gpu_temp_z, value_dim),
@@ -4472,23 +4288,17 @@ fn encode_gdn_decode(
                 encode_projection(
                     enc,
                     &bufs.norm_out,
-                    &norm_mat,
                     weight,
                     output_buf,
-                    &dummy_matmul,
                     pipelines,
                     1,
                     out_features,
                     h,
-                    row_bytes_h,
-                    out_features * 2,
                 )?;
             }
         }
     } else {
         // Fallback: individual projections for other weight types.
-        let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, 1, h, row_bytes_h)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
         for (weight, output_buf, out_features) in [
             (w_qkv, &gdn.gpu_temp_qkv, qkv_dim),
             (w_z, &gdn.gpu_temp_z, value_dim),
@@ -4498,16 +4308,12 @@ fn encode_gdn_decode(
             encode_projection(
                 enc,
                 &bufs.norm_out,
-                &norm_mat,
                 weight,
                 output_buf,
-                &dummy_matmul,
                 pipelines,
                 1,
                 out_features,
                 h,
-                row_bytes_h,
-                out_features * 2,
             )?;
         }
     }
@@ -4544,21 +4350,15 @@ fn encode_gdn_decode(
     );
     enc.memory_barrier_buffers();
 
-    let gated_mat = MpsMatrix::from_buffer(&gdn.gpu_gated_output, 1, value_dim, value_dim * 2)
-        .map_err(|e| InferenceError::runtime(e.to_string()))?;
     encode_projection(
         enc,
         &gdn.gpu_gated_output,
-        &gated_mat,
         lw.gdn_out_proj.as_ref().unwrap(),
         &gdn.scratch,
-        &dummy_matmul,
         pipelines,
         1,
         h,
         value_dim,
-        value_dim * 2,
-        h * 2,
     )?;
     enc.memory_barrier_buffers();
 
@@ -4591,16 +4391,12 @@ fn encode_gdn_decode(
 fn encode_projection(
     enc: &ComputeEncoder,
     input_buf: &MetalBuffer,
-    _input_mat: &MpsMatrix,
     weight: &WeightBuffer,
     output_buf: &MetalBuffer,
-    _matmul: &ProjectionMatmul,
     pipelines: &super::ops::MetalPipelines,
     token_count: usize,
     out_features: usize,
     in_features: usize,
-    _row_bytes_in: usize,
-    _row_bytes_out: usize,
 ) -> Result<(), InferenceError> {
     let kernel_kind = LinearKernelKind::for_token_count(token_count);
 
@@ -5330,18 +5126,11 @@ fn encode_ffn_block(
     pipelines: &super::ops::MetalPipelines,
     bufs: &IntermediateBuffers,
     lw: &LayerWeights,
-    lm: &LayerMatmuls,
     h: usize,
     inter: usize,
     token_count: usize,
     use_gelu: bool,
 ) -> Result<(), InferenceError> {
-    let row_bytes_h = h * 2;
-    let row_bytes_inter = inter * 2;
-
-    let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-        .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
     // For decode (token_count == 1), try fused gate+up+activation when both are affine INT4.
     // This eliminates the separate activation dispatch and intermediate buffer writes.
     let used_fused_gate_up_act = if token_count == 1 {
@@ -5404,30 +5193,22 @@ fn encode_ffn_block(
             encode_projection(
                 enc,
                 &bufs.norm_out,
-                &norm_mat,
                 &lw.gate_proj,
                 &bufs.ffn_gate,
-                &lm.gate,
                 pipelines,
                 token_count,
                 inter,
                 h,
-                row_bytes_h,
-                row_bytes_inter,
             )?;
             encode_projection(
                 enc,
                 &bufs.norm_out,
-                &norm_mat,
                 &lw.up_proj,
                 &bufs.ffn_up,
-                &lm.up,
                 pipelines,
                 token_count,
                 inter,
                 h,
-                row_bytes_h,
-                row_bytes_inter,
             )?;
         }
 
@@ -5451,21 +5232,15 @@ fn encode_ffn_block(
     enc.memory_barrier_buffers();
 
     // Down projection
-    let gate_mat = MpsMatrix::from_buffer(&bufs.ffn_gate, token_count, inter, row_bytes_inter)
-        .map_err(|e| InferenceError::runtime(e.to_string()))?;
     encode_projection(
         enc,
         &bufs.ffn_gate,
-        &gate_mat,
         &lw.down_proj,
         &bufs.ffn_down,
-        &lm.down,
         pipelines,
         token_count,
         h,
         inter,
-        row_bytes_inter,
-        row_bytes_h,
     )?;
 
     Ok(())
@@ -5501,25 +5276,16 @@ fn encode_moe_block(
     let expert_outputs = bufs.moe_expert_outputs.as_ref().unwrap();
     let moe_combined = bufs.moe_combined.as_ref().unwrap();
 
-    let row_bytes_h = h * 2;
-    let row_bytes_moe_inter = moe_inter * 2;
-
     // 1. Router: linear(norm_out → router_logits) [hidden_size → num_experts]
-    let norm_mat = MpsMatrix::from_buffer(&bufs.norm_out, token_count, h, row_bytes_h)
-        .map_err(|e| InferenceError::runtime(e.to_string()))?;
     encode_projection(
         enc,
         &bufs.norm_out,
-        &norm_mat,
         router_weight,
         router_logits,
-        &ProjectionMatmul::Quantized,
         pipelines,
         token_count,
         num_experts,
         h,
-        row_bytes_h,
-        num_experts * 2,
     )?;
     enc.memory_barrier_buffers();
 
@@ -5544,32 +5310,24 @@ fn encode_moe_block(
         encode_projection(
             enc,
             &bufs.norm_out,
-            &norm_mat,
             e_gate,
             expert_gate_buf,
-            &ProjectionMatmul::Quantized,
             pipelines,
             token_count,
             moe_inter,
             h,
-            row_bytes_h,
-            row_bytes_moe_inter,
         )?;
 
         // Up projection: norm_out → expert_up_buf [hidden → moe_inter]
         encode_projection(
             enc,
             &bufs.norm_out,
-            &norm_mat,
             e_up,
             expert_up_buf,
-            &ProjectionMatmul::Quantized,
             pipelines,
             token_count,
             moe_inter,
             h,
-            row_bytes_h,
-            row_bytes_moe_inter,
         )?;
         enc.memory_barrier_buffers();
 
@@ -5596,22 +5354,15 @@ fn encode_moe_block(
         // We write to the slice expert_outputs[e * token_count * h ..]
         // Since encode_projection writes to the start of the output buffer,
         // we need to use moe_combined as a temp and then copy.
-        let gate_mat =
-            MpsMatrix::from_buffer(expert_gate_buf, token_count, moe_inter, row_bytes_moe_inter)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
         encode_projection(
             enc,
             expert_gate_buf,
-            &gate_mat,
             e_down,
             moe_combined,
-            &ProjectionMatmul::Quantized,
             pipelines,
             token_count,
             h,
             moe_inter,
-            row_bytes_moe_inter,
-            row_bytes_h,
         )?;
         enc.memory_barrier_buffers();
 
