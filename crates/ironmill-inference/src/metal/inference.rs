@@ -21,7 +21,7 @@ use super::engine::{MetalArtifacts, MetalInference};
 use super::error::MetalError;
 use super::gdn::GdnState;
 use super::kv_cache::Fp16KvCache;
-use super::mla::MlaKvCache;
+use super::mla::{MlaConfig, MlaKvCache, absorb_mla_weights};
 use super::ops;
 use super::ops::LinearKernelKind;
 use super::plan::{LayerPlan, ModelPlan};
