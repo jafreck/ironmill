@@ -6,6 +6,29 @@ use super::TurboQuantMetalConfig;
 use crate::metal::error::MetalError;
 use crate::turboquant::cache_layout::TurboQuantCacheLayout;
 
+/// KV cache precision mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvCachePrecision {
+    /// Standard FP16 (no quantization).
+    Fp16,
+    /// TurboQuant INT8 with Lloyd-Max codebook.
+    TqInt8,
+    /// TurboQuant INT4 with Lloyd-Max codebook.
+    TqInt4,
+    /// FP8 E4M3 (requires Metal 3.1+, Apple M3+).
+    Fp8E4m3,
+}
+
+/// Check if the current GPU supports FP8 operations (Metal 3.1+).
+///
+/// Returns `true` on Apple M3 or later GPUs that support Metal 3.1
+/// with native FP8 data types.
+pub fn gpu_supports_fp8(device: &MetalDevice) -> bool {
+    // Metal 3.1+ is required for FP8 support (Apple family 9+).
+    // MTLGPUFamily.apple9 corresponds to M3 and later.
+    device.supports_family(ironmill_metal_sys::GpuFamily::Apple9)
+}
+
 /// GPU-resident quantized KV cache for TurboQuant inference.
 ///
 /// Each layer has separate K and V cache buffers stored as INT8 or INT4,

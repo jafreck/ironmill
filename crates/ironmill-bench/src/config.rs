@@ -15,6 +15,10 @@ pub enum KvQuantMode {
     TurboInt4,
     TurboInt8,
     TurboInt8Qjl,
+    /// TurboInt8 with per-head adaptive codebooks.
+    TurboInt8PerHead,
+    /// FP8 E4M3 KV cache (requires Metal 3.1+, M3+).
+    Fp8,
 }
 
 impl std::fmt::Display for KvQuantMode {
@@ -24,6 +28,8 @@ impl std::fmt::Display for KvQuantMode {
             KvQuantMode::TurboInt4 => write!(f, "turbo-int4"),
             KvQuantMode::TurboInt8 => write!(f, "turbo-int8"),
             KvQuantMode::TurboInt8Qjl => write!(f, "turbo-int8-qjl"),
+            KvQuantMode::TurboInt8PerHead => write!(f, "turbo-int8-per-head"),
+            KvQuantMode::Fp8 => write!(f, "fp8"),
         }
     }
 }
@@ -372,7 +378,10 @@ pub fn cache_key(model: &ModelConfig, opt: &OptConfig) -> String {
     // Include KV quant mode explicitly for readable cache directory names
     if matches!(
         opt.kv_quant,
-        KvQuantMode::TurboInt8 | KvQuantMode::TurboInt8Qjl
+        KvQuantMode::TurboInt8
+            | KvQuantMode::TurboInt8Qjl
+            | KvQuantMode::TurboInt8PerHead
+            | KvQuantMode::Fp8
     ) {
         key.push_str(&format!("_kv-{}_seq-{}", opt.kv_quant, opt.max_seq_len));
     }
@@ -537,6 +546,7 @@ backends = ["cpu", "gpu"]
             disabled_passes: vec![],
             kv_quant: KvQuantMode::TurboInt8,
             max_seq_len: 4096,
+            awq_calib_dir: None,
         };
         let key = cache_key(&model, &opt);
         assert!(key.contains("_kv-turbo-int8_seq-4096"));
@@ -545,8 +555,14 @@ backends = ["cpu", "gpu"]
     #[test]
     fn test_kv_quant_mode_display() {
         assert_eq!(KvQuantMode::None.to_string(), "none");
+        assert_eq!(KvQuantMode::TurboInt4.to_string(), "turbo-int4");
         assert_eq!(KvQuantMode::TurboInt8.to_string(), "turbo-int8");
         assert_eq!(KvQuantMode::TurboInt8Qjl.to_string(), "turbo-int8-qjl");
+        assert_eq!(
+            KvQuantMode::TurboInt8PerHead.to_string(),
+            "turbo-int8-per-head"
+        );
+        assert_eq!(KvQuantMode::Fp8.to_string(), "fp8");
     }
 
     #[test]

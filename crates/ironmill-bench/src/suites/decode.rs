@@ -159,6 +159,15 @@ pub(crate) fn build_metal_config(
             c.enable_turboquant = true;
             c.n_bits = 8;
         }
+        config::KvQuantMode::TurboInt8PerHead => {
+            c.enable_turboquant = true;
+            c.n_bits = 8;
+        }
+        config::KvQuantMode::Fp8 => {
+            // FP8 mode: disable TurboQuant integer quantization.
+            // FP8 KV cache is handled by a separate code path.
+            c.enable_turboquant = false;
+        }
     }
     c
 }

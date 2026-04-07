@@ -14,7 +14,8 @@ use super::kv_cache::Fp16KvCache;
 use super::mla::MlaKvCache;
 use super::plan::{LayerPlan, ModelPlan};
 use super::turboquant::{
-    MetalKvCache, MetalTurboQuantModel, OutlierConfig, TurboQuantLayerConfig, TurboQuantMetalConfig,
+    MetalKvCache, MetalTurboQuantModel, OutlierConfig, OutlierQuantConfig, TurboQuantLayerConfig,
+    TurboQuantMetalConfig,
 };
 use super::weights::{MetalWeights, WeightBuffer};
 use crate::engine::InferenceError;
@@ -294,6 +295,8 @@ impl MetalInference {
                         .map(|lc| TurboQuantLayerConfig {
                             head_dim: lc.head_dim,
                             num_kv_heads: lc.num_kv_heads,
+                            per_head_k_codebooks: None,
+                            per_head_v_codebooks: None,
                         })
                         .collect()
                 } else {
@@ -308,6 +311,7 @@ impl MetalInference {
                 num_layers: mc.num_hidden_layers,
                 rotation_seed: self.config.rotation_seed,
                 outlier: outlier_cfg,
+                outlier_config: OutlierQuantConfig::default(),
                 anchor_layers: cla_anchors.clone(),
                 window_sizes: layer_window_sizes.clone(),
                 layer_configs: tq_layer_configs,
@@ -589,6 +593,8 @@ impl MetalInference {
                         .map(|lc| TurboQuantLayerConfig {
                             head_dim: lc.head_dim,
                             num_kv_heads: lc.num_kv_heads,
+                            per_head_k_codebooks: None,
+                            per_head_v_codebooks: None,
                         })
                         .collect()
                 } else {
@@ -603,6 +609,7 @@ impl MetalInference {
                 num_layers: mc.num_hidden_layers,
                 rotation_seed: self.config.rotation_seed,
                 outlier: None,
+                outlier_config: OutlierQuantConfig::default(),
                 anchor_layers: cla_anchors.clone(),
                 window_sizes: layer_window_sizes.clone(),
                 layer_configs: tq_layer_configs,

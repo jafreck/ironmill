@@ -7,7 +7,8 @@ pub mod cache;
 pub mod codebook;
 
 pub use crate::turboquant::outlier::OutlierConfig;
-pub use cache::MetalKvCache;
+pub use cache::{KvCachePrecision, MetalKvCache, gpu_supports_fp8};
+pub use codebook::PerHeadCodebooks;
 
 use ironmill_metal_sys::MetalDevice;
 
@@ -126,6 +127,30 @@ pub struct OutlierState {
     pub non_outlier_n_levels: u32,
 }
 
+/// Configuration for outlier-aware TurboQuant quantization.
+#[derive(Debug, Clone)]
+pub struct OutlierQuantConfig {
+    /// Enable outlier-channel separation for K cache.
+    pub k_outlier_enabled: bool,
+    /// Enable outlier-channel separation for V cache.
+    pub v_outlier_enabled: bool,
+    /// Number of outlier channels to separate (typically 2-8).
+    pub num_outlier_channels: usize,
+    /// Outlier detection threshold (z-score, e.g. 3.0).
+    pub outlier_threshold: f32,
+}
+
+impl Default for OutlierQuantConfig {
+    fn default() -> Self {
+        Self {
+            k_outlier_enabled: false,
+            v_outlier_enabled: false,
+            num_outlier_channels: 4,
+            outlier_threshold: 3.0,
+        }
+    }
+}
+
 /// Per-layer TurboQuant configuration for heterogeneous head dims (e.g. Gemma 4).
 #[derive(Debug, Clone)]
 pub struct TurboQuantLayerConfig {
@@ -133,6 +158,12 @@ pub struct TurboQuantLayerConfig {
     pub head_dim: usize,
     /// Number of key-value heads for this layer.
     pub num_kv_heads: usize,
+    /// Optional per-head codebooks for K cache.
+    /// When present, overrides the shared codebook with head-specific tables.
+    pub per_head_k_codebooks: Option<PerHeadCodebooks>,
+    /// Optional per-head codebooks for V cache.
+    /// When present, overrides the shared codebook with head-specific tables.
+    pub per_head_v_codebooks: Option<PerHeadCodebooks>,
 }
 
 /// TurboQuant-specific configuration extracted from MetalConfig + model params.
@@ -152,6 +183,8 @@ pub struct TurboQuantMetalConfig {
     pub rotation_seed: u64,
     /// Optional outlier channel configuration.
     pub outlier: Option<OutlierConfig>,
+    /// Outlier-aware quantization configuration.
+    pub outlier_config: OutlierQuantConfig,
     /// CLA anchor layers. None = all layers are anchors (standard behavior).
     pub anchor_layers: Option<Vec<usize>>,
     /// Per-layer sliding window sizes. `0` = full attention.
