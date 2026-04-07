@@ -1,0 +1,44 @@
+# Gemma 4 Metal GPU Benchmark
+#
+# Replaces the former tests/gemma4_bench.rs test file.
+# Benchmarks FP16 baseline decode throughput and perplexity.
+#
+# Reproduce:
+#   cargo run --release -p ironmill-bench --features metal -- \
+#     --config configs/gemma4-bench.toml -b metal \
+#     -i 20 -w 5 -r 3
+
+[[model]]
+name = "Gemma-4-E2B-IT"
+path = "unused-for-template-mode"
+model_dir = "models/Gemma-4-E2B-IT"
+
+# ── FP16 baseline ───────────────────────────────────────────────
+[[optimization]]
+name = "fp16-baseline"
+no_fusion = false
+kv_quant = "none"
+max_seq_len = 4096
+
+# ── D2Quant 2-bit ──────────────────────────────────────────────
+[[optimization]]
+name = "d2q2"
+d2quant = 2
+kv_quant = "none"
+max_seq_len = 4096
+
+# ── INT4 affine ─────────────────────────────────────────────────
+[[optimization]]
+name = "int4"
+int4 = true
+kv_quant = "none"
+max_seq_len = 4096
+
+[settings]
+iterations = 20
+warmup = 5
+runs = 3
+backends = ["metal"]
+
+[benchmarks]
+suites = ["decode"]

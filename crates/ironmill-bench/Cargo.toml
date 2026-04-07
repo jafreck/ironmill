@@ -29,7 +29,20 @@ tempfile = { workspace = true }
 ironmill-ane-sys = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 ironmill-metal-sys = { workspace = true }
+
+[[bench]]
+name = "stats"
+harness = false
+
+[[bench]]
+name = "perplexity_math"
+harness = false
+
+[[bench]]
+name = "report_format"
+harness = false
 
 [features]
 default = []

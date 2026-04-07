@@ -1,0 +1,48 @@
+# PolarQuant Bundle Benchmark — Qwen3-0.6B
+#
+# Replaces the former tests/polarquant_bench.rs test file.
+# Benchmarks PolarQuant 4-bit bundle decode throughput and perplexity.
+#
+# Reproduce:
+#   cargo run --release -p ironmill-bench --features metal -- \
+#     --config configs/polarquant-bench.toml -b metal \
+#     -i 20 -w 5 -r 3 \
+#     --perplexity --perplexity-sequences 10
+
+[[model]]
+name = "Qwen3-0.6B"
+path = "unused-for-template-mode"
+model_dir = "models/Qwen3-0.6B"
+
+# ── FP16 baseline ───────────────────────────────────────────────
+[[optimization]]
+name = "fp16-baseline"
+no_fusion = false
+kv_quant = "none"
+max_seq_len = 2048
+
+# ── PolarQuant 4-bit + FP16 KV ─────────────────────────────────
+[[optimization]]
+name = "pq4-fp16kv"
+polar_quantize = 4
+kv_quant = "none"
+max_seq_len = 2048
+
+# ── PolarQuant 4-bit + TurboQuant INT4 KV ──────────────────────
+[[optimization]]
+name = "pq4-tq-int4kv"
+polar_quantize = 4
+kv_quant = "turbo-int4"
+max_seq_len = 2048
+
+[settings]
+iterations = 20
+warmup = 5
+runs = 3
+backends = ["metal"]
+
+[benchmarks]
+suites = ["decode"]
+quality = true
+perplexity = true
+perplexity_sequences = 10
