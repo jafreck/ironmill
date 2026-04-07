@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 ironmill-core = { workspace = true }
 mil-rs = { workspace = true }
+rayon = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }

@@ -10,6 +10,9 @@
 //! graph construction — making it suitable for both Metal GPU JIT loading
 //! and as a pre-quantized input to CoreML compilation.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use mil_rs::error::MilError;
 use mil_rs::ir::ScalarType;
 use mil_rs::ir::passes::affine_quantize::quantize_affine;
@@ -17,6 +20,7 @@ use mil_rs::ir::passes::d2quant::dual_scale::{
     dual_scale_quantize, pack_2bit, pack_3bit, pack_mask,
 };
 use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
+use rayon::prelude::*;
 
 /// Configuration for JIT D2Quant quantization.
 #[derive(Debug, Clone)]
@@ -233,6 +237,10 @@ pub enum QuantMethod {
 pub struct QuantizedWeightProvider<P> {
     inner: P,
     method: QuantMethod,
+    /// Cache of alpha search results keyed by AWQ magnitude key.
+    /// Projections sharing the same input (e.g. Q/K/V/O from the same norm)
+    /// reuse the first search result instead of repeating the expensive search.
+    alpha_cache: Mutex<HashMap<u64, f32>>,
 }
 
 impl<P: WeightProvider> QuantizedWeightProvider<P> {
@@ -241,6 +249,7 @@ impl<P: WeightProvider> QuantizedWeightProvider<P> {
         Self {
             inner,
             method: QuantMethod::D2Quant(config),
+            alpha_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -249,6 +258,7 @@ impl<P: WeightProvider> QuantizedWeightProvider<P> {
         Self {
             inner,
             method: QuantMethod::AffineInt4(config),
+            alpha_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -448,11 +458,12 @@ fn quantize_tensor_int4(
     (packed, quant_info)
 }
 
-/// Search α ∈ {0.0, 0.05, 0.1, ..., 1.0} that minimizes reconstruction error.
+/// Search α ∈ {0.0, 0.1, 0.2, ..., 1.0} that minimizes reconstruction error.
 ///
-/// For each candidate alpha, compute:
-///   error(α) = ||Q(W·diag(s^α))·diag(s^-α)·X - W·X||²
-/// and return the alpha that minimizes it.
+/// Uses an activation-weighted per-column MSE approximation:
+///   loss(α) ≈ Σ_c (W_dq[c] − W[c])² · Σ_t X[t,c]²
+/// which is O(rows × cols) instead of O(rows × tokens × cols).
+/// Alpha steps are evaluated in parallel via rayon.
 fn search_best_alpha(
     floats: &[f32],
     shape: &[usize],
@@ -466,77 +477,142 @@ fn search_best_alpha(
     let qmax: f32 = 15.0;
     let n_groups = in_features.div_ceil(group_size);
 
-    // Sub-sample tokens to limit memory/compute.
-    let max_tokens = n_tokens.min(128);
+    // 32 tokens is sufficient for alpha selection (matches the MIL IR pass).
+    let max_tokens = n_tokens.min(32);
 
-    // Pre-compute reference output: ref_out[row * max_tokens + t] = dot(W[row], X[t])
-    let mut ref_out = vec![0.0f32; out_features * max_tokens];
-    for row in 0..out_features {
-        for t in 0..max_tokens {
-            let mut dot = 0.0f32;
-            for c in 0..in_features {
-                dot += floats[row * in_features + c] * activations[t * in_features + c];
-            }
-            ref_out[row * max_tokens + t] = dot;
+    // Pre-compute per-channel activation power: Σ_t X[t,c]².
+    // This lets us compute activation-weighted MSE without the full matmul:
+    //   loss ≈ Σ_c (W_dq[c] − W[c])² · act_sq[c]
+    let mut act_sq = vec![0.0f32; in_features];
+    for t in 0..max_tokens {
+        for c in 0..in_features {
+            let x = activations[t * in_features + c];
+            act_sq[c] += x * x;
         }
     }
 
     let max_mag = magnitudes.iter().cloned().fold(0.0f32, f32::max).max(1e-10);
 
-    let grid_steps = 20usize;
-    let mut best_alpha = 0.5f32;
-    let mut best_loss = f32::INFINITY;
+    // Sub-sample rows for large matrices.
+    let max_rows = out_features.min(256);
+    let row_stride = if out_features > max_rows {
+        out_features / max_rows
+    } else {
+        1
+    };
 
-    for step in 0..=grid_steps {
-        let alpha = step as f32 / grid_steps as f32;
+    let grid_steps = 10usize;
 
-        // Compute scales: s[c] = (mag[c] / max_mag).powf(alpha).max(1e-6)
-        let scales: Vec<f32> = magnitudes
-            .iter()
-            .map(|&m| (m / max_mag).powf(alpha).max(1e-6))
-            .collect();
+    // Evaluate all alpha candidates in parallel. Each rayon task owns its
+    // own pre-allocated buffers, so there is no contention.
+    let mut results: Vec<(f32, f32)> = (0..=grid_steps)
+        .into_par_iter()
+        .map(|step| {
+            let alpha = step as f32 / grid_steps as f32;
 
-        // Build W_dq: quantize W·diag(s), then dequant and divide by s.
-        let mut total_loss = 0.0f32;
+            let scales: Vec<f32> = magnitudes
+                .iter()
+                .map(|&m| (m / max_mag).powf(alpha).max(1e-6))
+                .collect();
 
-        for row in 0..out_features {
-            // Quantize and dequantize this row group-by-group, then compute
-            // the loss against reference for all tokens.
-            let mut w_dq_row = vec![0.0f32; in_features];
+            let mut scaled_group_buf = vec![0.0f32; group_size];
+            let mut quant_buf = vec![0u8; group_size];
+            let mut total_loss = 0.0f32;
 
-            for g in 0..n_groups {
-                let g_start = g * group_size;
-                let g_end = (g_start + group_size).min(in_features);
+            let mut row = 0;
+            while row < out_features {
+                for g in 0..n_groups {
+                    let g_start = g * group_size;
+                    let g_end = (g_start + group_size).min(in_features);
+                    let g_len = g_end - g_start;
 
-                let scaled_group: Vec<f32> = (g_start..g_end)
-                    .map(|col| floats[row * in_features + col] * scales[col])
-                    .collect();
+                    for (j, col) in (g_start..g_end).enumerate() {
+                        scaled_group_buf[j] = floats[row * in_features + col] * scales[col];
+                    }
 
-                let (quantized, q_scale, q_zp) = quantize_affine(&scaled_group, qmax);
+                    let (q_scale, q_zp) = quantize_affine_into(
+                        &scaled_group_buf[..g_len],
+                        qmax,
+                        &mut quant_buf[..g_len],
+                    );
 
-                for (j, col) in (g_start..g_end).enumerate() {
-                    let dequant = (quantized[j] as f32 - q_zp) * q_scale;
-                    w_dq_row[col] = dequant / scales[col];
+                    for (j, col) in (g_start..g_end).enumerate() {
+                        let dequant = (quant_buf[j] as f32 - q_zp) * q_scale;
+                        let w_orig = floats[row * in_features + col];
+                        let w_dq = dequant / scales[col];
+                        let err = w_dq - w_orig;
+                        total_loss += err * err * act_sq[col];
+                    }
                 }
+                row += row_stride;
             }
 
-            for t in 0..max_tokens {
-                let mut dq_dot = 0.0f32;
-                for c in 0..in_features {
-                    dq_dot += w_dq_row[c] * activations[t * in_features + c];
-                }
-                let err = dq_dot - ref_out[row * max_tokens + t];
-                total_loss += err * err;
-            }
-        }
+            (alpha, total_loss)
+        })
+        .collect();
 
-        if total_loss < best_loss {
-            best_loss = total_loss;
-            best_alpha = alpha;
+    // Sort by loss, then by alpha (prefer lower alpha on ties).
+    results.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    results.first().map(|r| r.0).unwrap_or(0.5)
+}
+
+/// Quantize values into a pre-allocated buffer, returning (scale, zero_point).
+/// Avoids the heap allocation of [`quantize_affine`].
+fn quantize_affine_into(values: &[f32], qmax: f32, out: &mut [u8]) -> (f32, f32) {
+    debug_assert!(out.len() >= values.len());
+    if values.is_empty() {
+        return (1.0, 0.0);
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &v in values {
+        if v.is_finite() {
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
         }
     }
+    if !min.is_finite() || !max.is_finite() {
+        for o in out[..values.len()].iter_mut() {
+            *o = 0;
+        }
+        return (1.0, 0.0);
+    }
+    let (scale, zp_float) = if (max - min).abs() < f32::EPSILON {
+        let zp = (-min).round();
+        (1.0_f32, zp)
+    } else {
+        let s = (max - min) / qmax;
+        let zp = (-min / s).round();
+        (s, zp)
+    };
+    for (i, &x) in values.iter().enumerate() {
+        let q = (x / scale + zp_float).round().clamp(0.0, qmax);
+        out[i] = q as u8;
+    }
+    (scale, zp_float)
+}
 
-    best_alpha
+/// Hash magnitude data for the alpha cache. Projections sharing identical
+/// magnitude vectors (e.g. Q/K/V from the same layer norm) will share a
+/// single alpha search result.
+fn magnitude_cache_key(magnitudes: &[f32]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    magnitudes.len().hash(&mut hasher);
+    for &m in magnitudes {
+        m.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// GPTQ second-order weight quantization for INT4.
@@ -676,8 +752,8 @@ fn quantize_tensor_int8(
 ///
 /// When `awq_magnitudes` is provided, computes per-channel importance scales
 /// as `s_ch = (mag / max_mag)^alpha`, then multiplies each weight column by
-/// `s_ch` before quantization. When activations are also available, alpha is
-/// chosen via grid search to minimize reconstruction error; otherwise alpha=0.5.
+/// `s_ch` before quantization. `alpha` should be pre-computed via
+/// [`search_best_alpha`] or a cached result; defaults to 0.5 when `None`.
 ///
 /// The runtime kernel divides activations by `s_ch` to compensate, preserving
 /// the dot product:  dot(x, w) = dot(x / s, w * s)
@@ -686,19 +762,10 @@ fn quantize_tensor_int4_awq(
     shape: &[usize],
     config: &AffineQuantConfig,
     awq_magnitudes: Option<&Vec<f32>>,
-    awq_activations: Option<&Vec<f32>>,
-    awq_token_count: Option<usize>,
+    alpha: Option<f32>,
 ) -> (Vec<u8>, QuantizationInfo) {
     let awq_scales = if let Some(mags) = awq_magnitudes {
-        let alpha = if let (Some(acts), Some(tc)) = (awq_activations, awq_token_count) {
-            if shape.len() == 2 && tc > 0 && acts.len() >= tc * shape[1] {
-                search_best_alpha(floats, shape, mags, acts, tc, config.group_size)
-            } else {
-                0.5f32
-            }
-        } else {
-            0.5f32
-        };
+        let alpha = alpha.unwrap_or(0.5);
         let max_mag = mags.iter().cloned().fold(0.0f32, f32::max).max(1e-10);
         let scales: Vec<f32> = mags
             .iter()
@@ -836,12 +903,46 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                     .as_ref()
                     .and_then(|m| m.get(&awq_key))
                     .filter(|v| v.len() == last_dim);
-                let awq_acts = config
-                    .awq_activations
-                    .as_ref()
-                    .and_then(|a| a.get(&awq_key));
-                let awq_tc = config.awq_token_count;
-                quantize_tensor_int4_awq(&floats, &t.shape, config, awq_mags, awq_acts, awq_tc)
+
+                // Resolve alpha: check cache first, then search if needed.
+                // Projections sharing identical magnitude vectors (e.g. Q/K/V
+                // from the same layer norm) reuse a single search result.
+                let resolved_alpha = if let Some(mags) = awq_mags {
+                    let cache_key = magnitude_cache_key(mags);
+                    let cached = self.alpha_cache.lock().unwrap().get(&cache_key).copied();
+                    if let Some(alpha) = cached {
+                        Some(alpha)
+                    } else if let Some(acts) = config
+                        .awq_activations
+                        .as_ref()
+                        .and_then(|a| a.get(&awq_key))
+                    {
+                        if let Some(tc) = config.awq_token_count {
+                            if t.shape.len() == 2 && tc > 0 && acts.len() >= tc * last_dim {
+                                let alpha = search_best_alpha(
+                                    &floats,
+                                    &t.shape,
+                                    mags,
+                                    acts,
+                                    tc,
+                                    config.group_size,
+                                );
+                                self.alpha_cache.lock().unwrap().insert(cache_key, alpha);
+                                Some(alpha)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                quantize_tensor_int4_awq(&floats, &t.shape, config, awq_mags, resolved_alpha)
             }
         };
 
@@ -980,11 +1081,11 @@ mod tests {
 
         // Call without activations.
         let (packed1, _info1) =
-            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None, None);
+            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None);
 
         // Call again — should be deterministic with same fixed alpha.
         let (packed2, _info2) =
-            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None, None);
+            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None);
 
         assert_eq!(packed1, packed2, "fixed-alpha path should be deterministic");
     }
@@ -1151,8 +1252,7 @@ mod tests {
 
         // RTN path (no AWQ scales).
         let config_rtn = AffineQuantConfig::int4(group_size);
-        let (rtn_packed, _) =
-            quantize_tensor_int4_awq(&floats, &shape, &config_rtn, None, None, None);
+        let (rtn_packed, _) = quantize_tensor_int4_awq(&floats, &shape, &config_rtn, None, None);
 
         // They should produce different packed bytes.
         assert_ne!(
@@ -1197,7 +1297,7 @@ mod tests {
         // Also get RTN result for comparison.
         let config_rtn = AffineQuantConfig::int4(128);
         let (rtn_packed, _) =
-            quantize_tensor_int4_awq(&floats, &[out, inf], &config_rtn, None, None, None);
+            quantize_tensor_int4_awq(&floats, &[out, inf], &config_rtn, None, None);
 
         // Simulate the dispatch logic from WeightProvider::tensor().
         let shape = vec![out, inf];

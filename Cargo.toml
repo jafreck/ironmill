@@ -34,6 +34,7 @@ glob-match = "0.2"
 statrs = "0.18"
 rand = "0.8"
 log = "0.4"
+rayon = "1.11"
 safetensors = "0.7"
 memmap2 = "0.9"
 
