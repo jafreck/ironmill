@@ -225,7 +225,9 @@ impl InferenceEngine for MetalInference {
             mla_kv.reset();
         }
         if let Some(gdn) = self.gdn_state.as_ref() {
-            gdn.reset();
+            if let Err(e) = gdn.reset() {
+                eprintln!("warning: GDN state reset failed: {e}");
+            }
         }
     }
 

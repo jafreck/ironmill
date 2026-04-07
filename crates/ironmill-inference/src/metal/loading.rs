@@ -30,6 +30,15 @@ impl MetalInference {
     ) -> Result<(), InferenceError> {
         self.config = config;
 
+        // Reset Gemma 4-specific state to avoid stale buffers from a
+        // previously loaded model.
+        self.global_head_dim = 0;
+        self.global_pipelines = None;
+        self.global_rope_cos = None;
+        self.global_rope_sin = None;
+        self.unit_norm_weight = None;
+        self.gemma4_config = None;
+
         let mut weights = MetalWeights::load(&self.device, provider, self.config.force_cpu_dequant)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
@@ -52,7 +61,10 @@ impl MetalInference {
                     .get("partial_rotary_factor")
                     .and_then(|v| v.as_f64())
             })
-            .unwrap_or(1.0);
+            .unwrap_or_else(|| {
+                eprintln!("partial_rotary_factor not specified, defaulting to 1.0 (full-head RoPE)");
+                1.0
+            });
         let rotary_dim = (mc.head_dim as f64 * partial_rotary_factor) as usize;
 
         // Compile Metal shader pipelines with the model's head_dim and rotary_dim.
@@ -100,10 +112,11 @@ impl MetalInference {
                         || global_cfg.theta != mc.rope_theta
                         || global_cfg.partial_rotary_factor != 1.0
                     {
+                        let global_rotary_dim = (global_hd as f64 * global_cfg.partial_rotary_factor) as usize;
                         let (gc, gs) = build_rope_cache(
                             &self.device,
                             global_hd,
-                            global_hd,
+                            global_rotary_dim,
                             self.config.max_seq_len,
                             global_cfg.theta,
                             global_cfg.partial_rotary_factor,
@@ -220,9 +233,13 @@ impl MetalInference {
                     if let (Ok(k_t), Ok(v_t)) = (provider.tensor(&k_name), provider.tensor(&v_name))
                     {
                         weight_data.push((k_t.data.to_vec(), v_t.data.to_vec()));
+                    } else {
+                        eprintln!(
+                            "warning: TurboQuant outlier config: skipping layer {layer} (missing k_proj or v_proj tensor)"
+                        );
                     }
                 }
-                if !weight_data.is_empty() {
+                if weight_data.len() == mc.num_hidden_layers {
                     let refs: Vec<(&[u8], &[u8])> = weight_data
                         .iter()
                         .map(|(k, v)| (k.as_slice(), v.as_slice()))
@@ -237,8 +254,31 @@ impl MetalInference {
                         self.config.n_bits,
                         self.config.n_bits,
                     ))
+                } else if weight_data.is_empty() {
+                    return Err(InferenceError::runtime(
+                        "TurboQuant outlier config: all layers failed to load k_proj/v_proj tensors"
+                            .to_string(),
+                    ));
                 } else {
-                    None
+                    eprintln!(
+                        "warning: TurboQuant outlier config: only {}/{} layers loaded, proceeding with partial data",
+                        weight_data.len(),
+                        mc.num_hidden_layers,
+                    );
+                    let refs: Vec<(&[u8], &[u8])> = weight_data
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect();
+                    let out_features = mc.num_key_value_heads * mc.head_dim;
+                    let n_outlier = mc.head_dim / 4;
+                    Some(OutlierConfig::from_weight_norms(
+                        &refs,
+                        out_features,
+                        mc.head_dim,
+                        n_outlier,
+                        self.config.n_bits,
+                        self.config.n_bits,
+                    ))
                 }
             } else {
                 None
@@ -356,6 +396,15 @@ impl MetalInference {
     pub fn load(&mut self, artifacts: &MetalArtifacts<'_>) -> Result<(), InferenceError> {
         self.config = artifacts.config.clone();
 
+        // Reset Gemma 4-specific state to avoid stale buffers from a
+        // previously loaded model.
+        self.global_head_dim = 0;
+        self.global_pipelines = None;
+        self.global_rope_cos = None;
+        self.global_rope_sin = None;
+        self.unit_norm_weight = None;
+        self.gemma4_config = None;
+
         // Load weights into Metal buffers.
         let mut weights = MetalWeights::load(
             &self.device,
@@ -383,7 +432,10 @@ impl MetalInference {
                     .get("partial_rotary_factor")
                     .and_then(|v| v.as_f64())
             })
-            .unwrap_or(1.0);
+            .unwrap_or_else(|| {
+                eprintln!("partial_rotary_factor not specified, defaulting to 1.0 (full-head RoPE)");
+                1.0
+            });
         let rotary_dim = (mc.head_dim as f64 * partial_rotary_factor) as usize;
 
         // Compile Metal shader pipelines with the model's head_dim so
@@ -420,10 +472,11 @@ impl MetalInference {
                         || global_cfg.theta != mc.rope_theta
                         || global_cfg.partial_rotary_factor != 1.0
                     {
+                        let global_rotary_dim = (global_hd as f64 * global_cfg.partial_rotary_factor) as usize;
                         let (gc, gs) = build_rope_cache(
                             &self.device,
                             global_hd,
-                            global_hd,
+                            global_rotary_dim,
                             self.config.max_seq_len,
                             global_cfg.theta,
                             global_cfg.partial_rotary_factor,

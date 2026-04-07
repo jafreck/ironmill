@@ -183,17 +183,22 @@ impl GdnState {
     }
 
     /// Reset all state buffers to zero.
-    pub(crate) fn reset(&self) {
+    pub(crate) fn reset(&self) -> Result<(), MetalError> {
         let gdn_cfg = &self.config;
         let conv_state_size = gdn_cfg.qkv_dim * (gdn_cfg.conv_kernel_size - 1) * 4; // FP32
         let recurrent_state_size =
             gdn_cfg.num_v_heads * gdn_cfg.v_head_dim * gdn_cfg.k_head_dim * 4;
         for layer in &self.layers {
-            let _ = layer.conv_state.write_bytes(&vec![0u8; conv_state_size], 0);
-            let _ = layer
+            layer
+                .conv_state
+                .write_bytes(&vec![0u8; conv_state_size], 0)
+                .map_err(MetalError::Metal)?;
+            layer
                 .recurrent_state
-                .write_bytes(&vec![0u8; recurrent_state_size], 0);
+                .write_bytes(&vec![0u8; recurrent_state_size], 0)
+                .map_err(MetalError::Metal)?;
         }
+        Ok(())
     }
 
     /// Find the GDN state index for a given global layer index.
@@ -312,7 +317,7 @@ pub(crate) fn encode_gdn_prefill(
         num_v_heads as u32,
         k_head_dim as u32,
         v_head_dim as u32,
-        1e-6f32,
+        eps,
         gdn_cfg.num_k_heads as u32,
     );
     enc.memory_barrier_with_resources(&[&gdn.gpu_gated_output]);
@@ -527,7 +532,7 @@ pub(crate) fn encode_gdn_decode(
         k_head_dim as u32,
         v_head_dim as u32,
         gdn_cfg.num_k_heads as u32,
-        1e-6f32,
+        eps,
     );
     enc.memory_barrier_with_resources(&[&gdn.gpu_gated_output]);
 
@@ -571,6 +576,7 @@ pub(crate) fn run_gdn_layer_cpu(
     layer_idx: usize,
     token_count: usize,
     hidden_size: usize,
+    eps: f32,
     bufs: &IntermediateBuffers,
     lw: &LayerWeights,
     gdn_state: &mut GdnState,
@@ -723,7 +729,7 @@ pub(crate) fn run_gdn_layer_cpu(
         }
 
         // 7. Output gating: per-head RMSNorm, then multiply by silu(z)
-        let rms_eps = 1e-6f32;
+        let rms_eps = eps;
         for h_idx in 0..num_v_heads {
             let head_start = h_idx * v_head_dim;
             let head_slice = &mut o_flat[head_start..head_start + v_head_dim];
