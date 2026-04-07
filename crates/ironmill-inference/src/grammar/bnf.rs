@@ -107,6 +107,17 @@ pub enum GrammarError {
     },
     /// Reference to an undefined rule name.
     UndefinedRule(String),
+    /// Line does not contain `::=` separator.
+    MalformedRule(String),
+    /// Trailing content after a valid rule expression.
+    TrailingContent {
+        /// Byte position where trailing content starts.
+        pos: usize,
+    },
+    /// Duplicate rule name.
+    DuplicateRule(String),
+    /// Unknown or unsupported JSON Schema type.
+    UnsupportedType(String),
 }
 
 impl fmt::Display for GrammarError {
@@ -133,6 +144,18 @@ impl fmt::Display for GrammarError {
             Self::UndefinedRule(name) => {
                 write!(f, "undefined rule: {name}")
             }
+            Self::MalformedRule(line) => {
+                write!(f, "malformed rule (missing '::='): {line}")
+            }
+            Self::TrailingContent { pos } => {
+                write!(f, "trailing content after expression at position {pos}")
+            }
+            Self::DuplicateRule(name) => {
+                write!(f, "duplicate rule name: {name}")
+            }
+            Self::UnsupportedType(ty) => {
+                write!(f, "unsupported JSON Schema type: {ty}")
+            }
         }
     }
 }
@@ -145,6 +168,7 @@ impl Grammar {
     /// Parse a grammar from BNF notation.
     ///
     /// The first rule defined becomes the start symbol.
+    /// Returns an error for non-empty, non-comment lines that lack `::=`.
     pub fn from_bnf(input: &str) -> Result<Self, GrammarError> {
         let mut rules = Vec::new();
 
@@ -158,6 +182,8 @@ impl Grammar {
                 let body = body.trim();
                 let expr = parse_expression(body)?;
                 rules.push(Rule { name, expr });
+            } else {
+                return Err(GrammarError::MalformedRule(line.to_string()));
             }
         }
 
@@ -209,9 +235,15 @@ impl<'a> Cursor<'a> {
 }
 
 /// Parse a full expression (entry point).
+///
+/// Returns an error if there is trailing content after the expression.
 fn parse_expression(input: &str) -> Result<Element, GrammarError> {
     let mut cursor = Cursor::new(input);
     let expr = parse_alternation(&mut cursor)?;
+    cursor.skip_whitespace();
+    if !cursor.at_end() {
+        return Err(GrammarError::TrailingContent { pos: cursor.pos });
+    }
     Ok(expr)
 }
 

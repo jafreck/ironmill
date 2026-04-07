@@ -57,7 +57,8 @@ pub use memory::{KvQuantLevel, MemoryEstimator, MemoryUsage, QuantLevel};
 #[allow(deprecated)]
 pub use model_info::ModelInfo;
 pub use sampling::{
-    DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, apply_token_mask, is_eos_token, sample_token,
+    DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, SamplingError, apply_token_mask, is_eos_token,
+    sample_token,
 };
 pub use speculative::{
     DraftCandidate, DraftHead, MsaHeadWeights, SpecConfig, SpeculativeEngine, SpeculativeStreaming,

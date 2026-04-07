@@ -107,8 +107,18 @@ impl GrammarState {
     ///
     /// Feeds each character of the token's text through the automaton
     /// and retains only branches that survive.
+    ///
+    /// # Panics
+    /// Panics if `token_id` is out of range for the vocabulary.
     pub fn advance(&mut self, token_id: u32) {
-        let text = self.grammar.vocab[token_id as usize].clone();
+        let idx = token_id as usize;
+        assert!(
+            idx < self.grammar.vocab.len(),
+            "token_id {} out of range for vocabulary of size {}",
+            token_id,
+            self.grammar.vocab.len(),
+        );
+        let text = self.grammar.vocab[idx].clone();
         for ch in text.chars() {
             self.advance_char(ch);
         }

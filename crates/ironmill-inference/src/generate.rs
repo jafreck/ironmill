@@ -310,7 +310,13 @@ impl Iterator for TokenStream<'_> {
         }
 
         // ── Sample ──
-        let token = self.sampler.sample(&mut self.logits);
+        let token = match self.sampler.sample(&mut self.logits) {
+            Ok(t) => t,
+            Err(e) => {
+                self.finished = true;
+                return Some(Err(InferenceError::Sampling(e.to_string())));
+            }
+        };
         let logprob = self
             .logits
             .get(token as usize)

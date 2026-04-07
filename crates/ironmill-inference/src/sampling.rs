@@ -9,6 +9,29 @@
 //! sample) matching the llama.cpp `llama_sampler` default ordering.
 
 use std::collections::VecDeque;
+use std::fmt;
+
+// ---------------------------------------------------------------------------
+// Sampling errors
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur during token sampling.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SamplingError {
+    /// No valid (finite-logit) tokens remain after filtering.
+    EmptyDistribution,
+}
+
+impl fmt::Display for SamplingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyDistribution => write!(f, "no valid tokens remain after filtering"),
+        }
+    }
+}
+
+impl std::error::Error for SamplingError {}
 
 // ---------------------------------------------------------------------------
 // Legacy single-shot sampler (kept for backward compatibility)
@@ -223,7 +246,9 @@ impl Sampler {
     }
 
     /// Apply the full sampler chain and return a sampled token ID.
-    pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
+    ///
+    /// Returns an error if all logits are filtered to -∞ (empty distribution).
+    pub fn sample(&mut self, logits: &mut [f32]) -> Result<u32, SamplingError> {
         assert!(!logits.is_empty(), "logits must not be empty");
 
         // 1. Repetition / frequency / presence penalty.
@@ -236,10 +261,10 @@ impl Sampler {
 
         // 5. Temperature → 6. Categorical sample (or greedy).
         let token = if self.config.temperature <= 0.0 {
-            argmax(logits)
+            argmax(logits)?
         } else {
             apply_temperature(logits, self.config.temperature);
-            categorical_sample(logits)
+            categorical_sample(logits)?
         };
 
         // Track the token for future repetition penalties.
@@ -248,7 +273,7 @@ impl Sampler {
             self.recent_tokens.pop_front();
         }
 
-        token
+        Ok(token)
     }
 
     /// Reset token history (e.g., on conversation clear).
@@ -303,40 +328,43 @@ impl Sampler {
 // ---------------------------------------------------------------------------
 
 /// Greedy argmax over logits.
-fn argmax(logits: &[f32]) -> u32 {
+///
+/// Returns an error if no finite logits remain.
+fn argmax(logits: &[f32]) -> Result<u32, SamplingError> {
     logits
         .iter()
         .enumerate()
+        .filter(|(_, v)| **v != f32::NEG_INFINITY)
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+        .ok_or(SamplingError::EmptyDistribution)
 }
 
 /// Top-k: keep only the `k` highest logits; set the rest to -∞.
+///
+/// Ties at the k-th position are broken deterministically by token index
+/// (lower index wins), so exactly `k` tokens survive.
 fn apply_top_k(logits: &mut [f32], k: usize) {
     if k == 0 || k >= logits.len() {
         return;
     }
 
-    // Find the k-th largest value via a partial sort using a min-heap of size k.
-    let mut heap = std::collections::BinaryHeap::<std::cmp::Reverse<FloatOrd>>::new();
-    for &v in logits.iter() {
-        if v == f32::NEG_INFINITY {
-            continue;
-        }
-        if heap.len() < k {
-            heap.push(std::cmp::Reverse(FloatOrd(v)));
-        } else if let Some(&std::cmp::Reverse(FloatOrd(min))) = heap.peek() {
-            if v > min {
-                heap.pop();
-                heap.push(std::cmp::Reverse(FloatOrd(v)));
-            }
-        }
-    }
+    // Build (index, logit) pairs for non-neg-inf logits, sorted descending
+    // by logit then ascending by index to break ties deterministically.
+    let mut indexed: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v != f32::NEG_INFINITY)
+        .map(|(i, &v)| (i, v))
+        .collect();
+    indexed.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    let threshold = heap.peek().map_or(f32::NEG_INFINITY, |r| r.0.0);
-    for l in logits.iter_mut() {
-        if *l < threshold {
+    // Collect the indices of the top-k tokens to keep.
+    let keep: std::collections::HashSet<usize> =
+        indexed.iter().take(k).map(|&(i, _)| i).collect();
+
+    for (i, l) in logits.iter_mut().enumerate() {
+        if !keep.contains(&i) {
             *l = f32::NEG_INFINITY;
         }
     }
@@ -406,17 +434,30 @@ fn apply_temperature(logits: &mut [f32], temperature: f32) {
 }
 
 /// Categorical sample from logits (applies softmax, then samples).
-fn categorical_sample(logits: &[f32]) -> u32 {
+///
+/// Returns an error if no finite logits remain (all are -∞).
+fn categorical_sample(logits: &[f32]) -> Result<u32, SamplingError> {
     let probs = softmax(logits);
+    // Check that at least one token has non-zero probability.
+    let has_valid = probs.iter().any(|&p| p > 0.0);
+    if !has_valid {
+        return Err(SamplingError::EmptyDistribution);
+    }
     let threshold = simple_random_f32();
     let mut cumulative = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cumulative += p;
         if cumulative >= threshold {
-            return i as u32;
+            return Ok(i as u32);
         }
     }
-    (logits.len() - 1) as u32
+    // Floating-point rounding: return the last token with non-zero probability.
+    for (i, &p) in probs.iter().enumerate().rev() {
+        if p > 0.0 {
+            return Ok(i as u32);
+        }
+    }
+    Err(SamplingError::EmptyDistribution)
 }
 
 /// Numerically-stable softmax returning a probability vector.
@@ -437,28 +478,6 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
         return vec![0.0; logits.len()];
     }
     exps.iter().map(|&e| e / sum).collect()
-}
-
-/// Newtype for total-ordering f32 in a BinaryHeap.
-#[derive(Clone, Copy)]
-struct FloatOrd(f32);
-
-impl PartialEq for FloatOrd {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.total_cmp(&other.0) == std::cmp::Ordering::Equal
-    }
-}
-impl Eq for FloatOrd {}
-
-impl PartialOrd for FloatOrd {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for FloatOrd {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.total_cmp(&other.0)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +548,7 @@ mod tests {
             ..SamplerConfig::default()
         });
         let mut logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-        let token = sampler.sample(&mut logits);
+        let token = sampler.sample(&mut logits).unwrap();
         assert_eq!(token, 3);
     }
 
@@ -549,7 +568,7 @@ mod tests {
         });
         for _ in 0..20 {
             let mut logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-            let token = sampler.sample(&mut logits);
+            let token = sampler.sample(&mut logits).unwrap();
             assert!(token < 5, "token {token} out of range");
         }
     }
@@ -760,7 +779,7 @@ mod tests {
         // Sample 5 tokens — history should never exceed 3.
         for _ in 0..5 {
             let mut logits = vec![1.0, 2.0, 3.0];
-            sampler.sample(&mut logits);
+            sampler.sample(&mut logits).unwrap();
         }
         assert!(sampler.recent_tokens.len() <= 3);
     }
@@ -783,7 +802,7 @@ mod tests {
         });
         for _ in 0..50 {
             let mut logits = vec![10.0, 1.0, 1.0, 1.0, 1.0];
-            let token = sampler.sample(&mut logits);
+            let token = sampler.sample(&mut logits).unwrap();
             assert_eq!(token, 0, "dominant token should always be selected");
         }
     }

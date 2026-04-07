@@ -28,7 +28,7 @@ pub fn json_schema_to_grammar(schema: &Value) -> Result<Grammar, GrammarError> {
     // Add shared helper rules.
     ctx.add_whitespace_rule();
 
-    let root_expr = ctx.convert_schema(schema);
+    let root_expr = ctx.convert_schema(schema)?;
     ctx.rules.push(Rule {
         name: "root".into(),
         expr: root_expr,
@@ -69,21 +69,21 @@ impl ConvertCtx {
         });
     }
 
-    fn convert_schema(&mut self, schema: &Value) -> Element {
+    fn convert_schema(&mut self, schema: &Value) -> Result<Element, GrammarError> {
         let type_str = schema
             .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("string");
+            .and_then(Value::as_str);
 
         match type_str {
-            "string" => self.convert_string(),
-            "number" => self.convert_number(),
-            "integer" => self.convert_integer(),
-            "boolean" => self.convert_boolean(),
-            "null" => Element::Literal("null".into()),
-            "object" => self.convert_object(schema),
-            "array" => self.convert_array(schema),
-            _ => self.convert_string(),
+            Some("string") => Ok(self.convert_string()),
+            Some("number") => Ok(self.convert_number()),
+            Some("integer") => Ok(self.convert_integer()),
+            Some("boolean") => Ok(self.convert_boolean()),
+            Some("null") => Ok(Element::Literal("null".into())),
+            Some("object") => self.convert_object(schema),
+            Some("array") => self.convert_array(schema),
+            Some(other) => Err(GrammarError::UnsupportedType(other.to_string())),
+            None => Err(GrammarError::UnsupportedType("(missing)".to_string())),
         }
     }
 
@@ -135,29 +135,68 @@ impl ConvertCtx {
         ])
     }
 
-    fn convert_object(&mut self, schema: &Value) -> Element {
+    fn convert_object(&mut self, schema: &Value) -> Result<Element, GrammarError> {
         let properties = schema
             .get("properties")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
 
+        // Determine which properties are required.
+        let required_set: std::collections::HashSet<String> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let additional_props_allowed = schema
+            .get("additionalProperties")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        // Warn about unsupported constraints.
+        if schema.get("uniqueItems").is_some() {
+            eprintln!("warning: JSON Schema 'uniqueItems' constraint is not supported and will be ignored");
+        }
+        if schema.get("minProperties").is_some() {
+            eprintln!("warning: JSON Schema 'minProperties' constraint is not supported and will be ignored");
+        }
+        if schema.get("maxProperties").is_some() {
+            eprintln!("warning: JSON Schema 'maxProperties' constraint is not supported and will be ignored");
+        }
+
         if properties.is_empty() {
+            if !additional_props_allowed {
+                // No properties allowed, only empty object.
+                return Ok(Element::Sequence(vec![
+                    Element::Literal("{".into()),
+                    Element::RuleRef("__ws".into()),
+                    Element::Literal("}".into()),
+                ]));
+            }
             // Empty object: '{' ws '}'
-            return Element::Sequence(vec![
+            return Ok(Element::Sequence(vec![
                 Element::Literal("{".into()),
                 Element::RuleRef("__ws".into()),
                 Element::Literal("}".into()),
-            ]);
+            ]));
         }
 
-        // Build a rule for each property: '"key"' ws ':' ws value
-        let mut member_alts = Vec::new();
+        // Build a member expression for each property.
+        // Required properties are emitted directly; optional ones are wrapped
+        // in an alternation with the empty production.
+        let mut required_members = Vec::new();
+        let mut optional_members = Vec::new();
         let prop_keys: Vec<String> = properties.keys().cloned().collect();
 
         for key in &prop_keys {
             let prop_schema = &properties[key];
-            let value_expr = self.convert_schema(prop_schema);
+            let value_expr = self.convert_schema(prop_schema)?;
 
             let value_rule_name = self.fresh_name(&format!("prop_{key}"));
             self.rules.push(Rule {
@@ -177,42 +216,75 @@ impl ConvertCtx {
                 ]),
             });
 
-            member_alts.push(Element::RuleRef(member_rule_name));
+            if required_set.contains(key) {
+                required_members.push(Element::RuleRef(member_rule_name));
+            } else {
+                optional_members.push(Element::RuleRef(member_rule_name));
+            }
         }
 
-        // member ::= member_key1 | member_key2 | ...
-        let member_rule_name = self.fresh_name("member");
-        self.rules.push(Rule {
-            name: member_rule_name.clone(),
-            expr: Element::Alternation(member_alts),
-        });
-
-        // more_members ::= ',' ws member
-        let more_rule_name = self.fresh_name("more_members");
-        self.rules.push(Rule {
-            name: more_rule_name.clone(),
-            expr: Element::Sequence(vec![
+        // Build the object body: required properties form a mandatory
+        // fixed-order sequence; optional properties are each individually
+        // wrapped in Optional and appended after.
+        if !required_members.is_empty() {
+            let mut body = Vec::new();
+            for (i, member) in required_members.into_iter().enumerate() {
+                if i > 0 {
+                    body.push(Element::RuleRef("__ws".into()));
+                    body.push(Element::Literal(",".into()));
+                    body.push(Element::RuleRef("__ws".into()));
+                }
+                body.push(member);
+            }
+            for member in optional_members {
+                body.push(Element::Optional(Box::new(Element::Sequence(vec![
+                    Element::RuleRef("__ws".into()),
+                    Element::Literal(",".into()),
+                    Element::RuleRef("__ws".into()),
+                    member,
+                ]))));
+            }
+            Ok(Element::Sequence(vec![
+                Element::Literal("{".into()),
                 Element::RuleRef("__ws".into()),
-                Element::Literal(",".into()),
+                Element::Sequence(body),
                 Element::RuleRef("__ws".into()),
-                Element::RuleRef(member_rule_name.clone()),
-            ]),
-        });
+                Element::Literal("}".into()),
+            ]))
+        } else {
+            // No required properties — all are optional.
+            // Structure: (opt1 ("," ws opt2)? ("," ws opt3)?)?
+            let mut inner = Vec::new();
+            for (i, member) in optional_members.into_iter().enumerate() {
+                if i == 0 {
+                    inner.push(member);
+                } else {
+                    inner.push(Element::Optional(Box::new(Element::Sequence(vec![
+                        Element::RuleRef("__ws".into()),
+                        Element::Literal(",".into()),
+                        Element::RuleRef("__ws".into()),
+                        member,
+                    ]))));
+                }
+            }
 
-        // '{' ws (member (more_members)*)? ws '}'
-        Element::Sequence(vec![
-            Element::Literal("{".into()),
-            Element::RuleRef("__ws".into()),
-            Element::Optional(Box::new(Element::Sequence(vec![
-                Element::RuleRef(member_rule_name),
-                Element::ZeroOrMore(Box::new(Element::RuleRef(more_rule_name))),
-            ]))),
-            Element::RuleRef("__ws".into()),
-            Element::Literal("}".into()),
-        ])
+            let body = if inner.len() == 1 {
+                Element::Optional(Box::new(inner.pop().unwrap()))
+            } else {
+                Element::Optional(Box::new(Element::Sequence(inner)))
+            };
+
+            Ok(Element::Sequence(vec![
+                Element::Literal("{".into()),
+                Element::RuleRef("__ws".into()),
+                body,
+                Element::RuleRef("__ws".into()),
+                Element::Literal("}".into()),
+            ]))
+        }
     }
 
-    fn convert_array(&mut self, schema: &Value) -> Element {
+    fn convert_array(&mut self, schema: &Value) -> Result<Element, GrammarError> {
         let items_schema =
             schema
                 .get("items")
@@ -222,7 +294,7 @@ impl ConvertCtx {
                     Value::String("string".into()),
                 )])));
 
-        let item_expr = self.convert_schema(&items_schema);
+        let item_expr = self.convert_schema(&items_schema)?;
         let item_rule_name = self.fresh_name("item");
         self.rules.push(Rule {
             name: item_rule_name.clone(),
@@ -242,7 +314,7 @@ impl ConvertCtx {
         });
 
         // '[' ws (item (more_items)*)? ws ']'
-        Element::Sequence(vec![
+        Ok(Element::Sequence(vec![
             Element::Literal("[".into()),
             Element::RuleRef("__ws".into()),
             Element::Optional(Box::new(Element::Sequence(vec![
@@ -251,7 +323,7 @@ impl ConvertCtx {
             ]))),
             Element::RuleRef("__ws".into()),
             Element::Literal("]".into()),
-        ])
+        ]))
     }
 }
 

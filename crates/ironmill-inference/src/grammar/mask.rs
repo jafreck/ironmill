@@ -65,7 +65,15 @@ impl TokenMask {
     }
 
     /// Bitwise AND in-place: keep only tokens allowed in both masks.
+    ///
+    /// # Panics
+    /// Panics if the two masks have different vocabulary sizes.
     pub fn and_inplace(&mut self, other: &TokenMask) {
+        assert_eq!(
+            self.vocab_size, other.vocab_size,
+            "TokenMask::and_inplace: vocab size mismatch ({} vs {})",
+            self.vocab_size, other.vocab_size,
+        );
         for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
             *a &= *b;
         }

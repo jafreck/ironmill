@@ -23,6 +23,8 @@ using namespace metal;
 // Uses strided loops and threadgroup reduction, matching the existing rms_norm
 // kernel pattern for hidden_size > threadgroup size.
 
+constant constexpr uint TG_INPUT_MAX = 16384;
+
 kernel void fused_residual_rms_norm(
     device const half* a               [[buffer(0)]],
     device const half* b               [[buffer(1)]],
@@ -141,7 +143,6 @@ kernel void fused_residual_norm_matvec(
 
     // Phase 1: Compute normed input in threadgroup memory.
     // All 256 threads cooperate to compute a+b, sum_sq, and normed values.
-    constant constexpr uint TG_INPUT_MAX = 16384;
     if (K > TG_INPUT_MAX) return;
     threadgroup half tg_input[TG_INPUT_MAX];
 

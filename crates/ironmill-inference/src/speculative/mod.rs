@@ -152,7 +152,9 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
         };
 
         let correction_token = if !correction_logits.is_empty() {
-            self.sampler.sample(&mut correction_logits.clone())
+            self.sampler
+                .sample(&mut correction_logits.clone())
+                .map_err(|e| InferenceError::Sampling(e.to_string()))?
         } else {
             // Shouldn't happen, but fallback.
             return Ok(accepted_tokens);
@@ -176,7 +178,8 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
     /// Fallback: standard single-token decode.
     pub fn standard_step(&mut self, token: u32) -> Result<u32, InferenceError> {
         let mut logits = self.engine.decode_step(token)?;
-        let token = self.sampler.sample(&mut logits);
+        let token = self.sampler.sample(&mut logits)
+            .map_err(|e| InferenceError::Sampling(e.to_string()))?;
         Ok(token)
     }
 

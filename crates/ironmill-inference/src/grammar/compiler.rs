@@ -74,6 +74,9 @@ impl CompiledGrammar {
 
         // First pass: reserve slots for user-defined rules.
         for rule in &grammar.rules {
+            if rule_index.contains_key(&rule.name) {
+                return Err(GrammarError::DuplicateRule(rule.name.clone()));
+            }
             let idx = rules.len();
             rule_index.insert(rule.name.clone(), idx);
             rules.push(CompiledRule {

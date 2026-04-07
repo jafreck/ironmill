@@ -297,13 +297,17 @@ impl<E: InferenceEngine> SpeculativeStreaming<E> {
 // ── Helpers ─────────────────────────────────────────────────────
 
 /// Greedy argmax over a logit slice.
+///
+/// # Panics
+/// Panics if `logits` is empty or contains no finite values.
 fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
+        .filter(|(_, v)| **v != f32::NEG_INFINITY)
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+        .expect("argmax called on empty or all-neg-inf logits")
 }
 
 /// Maximum softmax probability (confidence of the top token).
