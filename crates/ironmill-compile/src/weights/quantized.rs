@@ -281,7 +281,18 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
         // embedding lookup kernels that only support Dense or D2Quant.
         let is_float = matches!(t.dtype, ScalarType::Float32 | ScalarType::Float16);
         let is_embedding = name.contains("embed_tokens");
-        if !is_float || !is_quantizable(&t.shape) || is_embedding {
+        // Skip q_proj when attn_output_gate is active: the weight contains
+        // interleaved Q + gate rows that must be split while still in dense
+        // FP16 format. The split halves are quantized separately afterward.
+        let has_output_gate = self
+            .inner
+            .config()
+            .extra
+            .get("attn_output_gate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let is_gated_q_proj = has_output_gate && name.ends_with("q_proj.weight");
+        if !is_float || !is_quantizable(&t.shape) || is_embedding || is_gated_q_proj {
             return Ok(t);
         }
 

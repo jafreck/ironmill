@@ -549,6 +549,25 @@ pub trait WeightProvider: Send + Sync {
     }
 }
 
+/// Blanket impl: references to providers are also providers.
+impl<T: WeightProvider + ?Sized> WeightProvider for &T {
+    fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, MilError> {
+        (**self).tensor(name)
+    }
+
+    fn tensor_names(&self) -> Vec<&str> {
+        (**self).tensor_names()
+    }
+
+    fn config(&self) -> &ModelConfig {
+        (**self).config()
+    }
+
+    fn has_tensor(&self, name: &str) -> bool {
+        (**self).has_tensor(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

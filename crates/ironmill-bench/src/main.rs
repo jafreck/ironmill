@@ -600,6 +600,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "metal")]
         {
             use ironmill_compile::weights::SafeTensorsProvider;
+            use ironmill_compile::weights::quantized::{D2QuantConfig, QuantizedWeightProvider};
             use ironmill_inference::engine::InferenceEngine;
             use ironmill_inference::metal::bundle::MetalBundleProvider;
             use ironmill_inference::metal::{MetalConfig, MetalInference};
@@ -861,15 +862,24 @@ fn main() -> Result<()> {
 
                     let load_start = std::time::Instant::now();
                     let gpu_before = engine.gpu_allocated_bytes();
-                    if let Err(e) = engine.load_weights(provider, gpu_config.clone()) {
+
+                    // For D2Quant configs, wrap the provider to JIT-quantize
+                    // weights to packed 3-bit — real compression, not simulation.
+                    if *d2quant_bits > 0 {
+                        eprintln!("    JIT D2Quant-{d2quant_bits} quantization...");
+                        let d2q_config = D2QuantConfig {
+                            bits: *d2quant_bits,
+                            group_size: 128,
+                            outlier_threshold: 0.99,
+                        };
+                        let q_provider = QuantizedWeightProvider::new(provider, d2q_config);
+                        if let Err(e) = engine.load_weights(&q_provider, gpu_config.clone()) {
+                            eprintln!("  ✗ Metal model load failed: {e}");
+                            continue;
+                        }
+                    } else if let Err(e) = engine.load_weights(provider, gpu_config.clone()) {
                         eprintln!("  ✗ Metal model load failed: {e}");
                         continue;
-                    }
-
-                    // JIT D2Quant simulation: quantize→dequant round-trip.
-                    if *d2quant_bits > 0 {
-                        eprintln!("    applying D2Quant-{d2quant_bits} simulation...");
-                        engine.weights_mut().apply_d2quant_simulation(*d2quant_bits);
                     }
 
                     let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
@@ -1116,13 +1126,22 @@ fn main() -> Result<()> {
                         let mut engine = MetalInference::new(gpu_config.clone())
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         let gpu_before = engine.gpu_allocated_bytes();
-                        engine
-                            .load_weights(provider, gpu_config.clone())
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-                        // JIT D2Quant simulation for PPL evaluation.
+                        // JIT D2Quant: wrap provider for real packed 3-bit weights.
                         if *d2quant_bits > 0 {
-                            engine.weights_mut().apply_d2quant_simulation(*d2quant_bits);
+                            let d2q_config = D2QuantConfig {
+                                bits: *d2quant_bits,
+                                group_size: 128,
+                                outlier_threshold: 0.99,
+                            };
+                            let q_provider = QuantizedWeightProvider::new(provider, d2q_config);
+                            engine
+                                .load_weights(&q_provider, gpu_config.clone())
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        } else {
+                            engine
+                                .load_weights(provider, gpu_config.clone())
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
                         }
                         let gpu_after = engine.gpu_allocated_bytes();
                         let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
