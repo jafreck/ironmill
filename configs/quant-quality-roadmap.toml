@@ -1,0 +1,57 @@
+# Quantization quality roadmap benchmark (P0–P2)
+#
+# Compares INT4 quantization quality across AWQ configurations:
+#   1. INT4 naive (no AWQ) — baseline quality gap
+#   2. INT4 + AWQ fixed α=0.5 — magnitude-only scaling
+#   3. INT4 + AWQ alpha grid search (P0) — per-tensor optimal scaling
+#   4. INT4 + AWQ alpha search + sensitive layers (P0+P2) — mixed precision
+#
+# Reproduce:
+#   cargo run --release -p ironmill-bench --features metal -- \
+#     --config configs/quant-quality-roadmap.toml -b metal \
+#     -i 5 -w 2 -r 1 \
+#     --perplexity --perplexity-sequences 10 \
+#     --perplexity-dataset tests/fixtures/quality/wikitext2-qwen35.json
+
+[[model]]
+name = "Qwen3.5-4B"
+path = "unused-for-template-mode"
+model_dir = "models/Qwen3.5-4B"
+
+# ── 1. INT4 naive (no AWQ) + TQ-INT8 ────────────────────────────
+[[optimization]]
+name = "int4-naive"
+int4 = true
+kv_quant = "turbo-int8"
+max_seq_len = 2048
+
+# ── 2. INT4 + AWQ magnitudes only (α=0.5 fixed) + TQ-INT8 ──────
+[[optimization]]
+name = "int4-awq-fixed"
+int4 = true
+awq_calib_dir = "/tmp/awq_calib_mags_only"
+kv_quant = "turbo-int8"
+max_seq_len = 2048
+
+# ── 3. INT4 + AWQ alpha grid search (P0) + TQ-INT8 ─────────────
+[[optimization]]
+name = "int4-awq-alpha"
+int4 = true
+awq_calib_dir = "/tmp/awq_calib"
+kv_quant = "turbo-int8"
+max_seq_len = 2048
+
+# ── 4. INT4 + AWQ alpha + sensitive layers 0,31 (P0+P2) + TQ-INT8
+[[optimization]]
+name = "int4-awq-alpha-sensitive"
+int4 = true
+awq_calib_dir = "/tmp/awq_calib"
+sensitive_layers = [0, 31]
+kv_quant = "turbo-int8"
+max_seq_len = 2048
+
+[settings]
+iterations = 5
+warmup = 2
+runs = 1
+backends = ["metal"]
