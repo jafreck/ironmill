@@ -91,6 +91,8 @@ pub struct MetalPipelines {
     pub prefill_attention: ComputePipeline,
     /// FlashAttention-2 prefill kernel.
     pub prefill_attention_fa2: ComputePipeline,
+    /// Register-tiled FA2 prefill kernel (v2).
+    pub prefill_attention_v2: ComputePipeline,
     /// PolarQuant INT4 matvec kernel.
     pub polarquant_matvec_int4: ComputePipeline,
     /// PolarQuant INT4 matmul kernel.
@@ -394,6 +396,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &attn_lib
                         .get_function("prefill_attention_fa2")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            prefill_attention_v2: device
+                .create_compute_pipeline(
+                    &attn_lib
+                        .get_function("prefill_attention_v2")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -1421,6 +1430,46 @@ pub fn encode_fa2_prefill_attention(
             1,
             1,
         ),
+    );
+}
+
+/// V2 query block size matching the compile-time constant in attention.metal.
+fn v2_br(head_dim: u32) -> u32 {
+    if head_dim >= 256 { 16 } else { 32 }
+}
+
+/// Encode register-tiled FA2 prefill attention (v2).
+///
+/// Combines cooperative KV tile loading (amortized across GQA group) with
+/// register-based accumulation. Dispatches one threadgroup per
+/// (kv_group, q_block), with one simdgroup per Q head in the group.
+pub fn encode_v2_prefill_attention(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    params: &PrefillAttentionParams<'_>,
+) {
+    let heads_per_group = (params.num_heads / params.num_kv_heads) as usize;
+    let num_kv_groups = params.num_kv_heads as usize;
+    let br = v2_br(params.head_dim) as usize;
+    let q_blocks = (params.token_count as usize).div_ceil(br);
+
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(params.q, 0, 0);
+    encoder.set_buffer(params.k_cache, 0, 1);
+    encoder.set_buffer(params.v_cache, 0, 2);
+    encoder.set_buffer(params.output, 0, 3);
+    encoder.set_bytes(&params.num_heads.to_le_bytes(), 4);
+    encoder.set_bytes(&params.num_kv_heads.to_le_bytes(), 5);
+    encoder.set_bytes(&params.head_dim.to_le_bytes(), 6);
+    encoder.set_bytes(&params.max_seq_len.to_le_bytes(), 7);
+    encoder.set_bytes(&params.seq_offset.to_le_bytes(), 8);
+    encoder.set_bytes(&params.token_count.to_le_bytes(), 9);
+    encoder.set_bytes(&params.window_size.to_le_bytes(), 10);
+    encoder.set_bytes(&params.attn_scale.to_le_bytes(), 11);
+    let threads_per_tg = (heads_per_group * 32).min(METAL_MAX_THREADS_PER_THREADGROUP);
+    encoder.dispatch_threadgroups(
+        (num_kv_groups, q_blocks, 1),
+        (threads_per_tg, 1, 1),
     );
 }
 

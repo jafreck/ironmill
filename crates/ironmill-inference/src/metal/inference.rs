@@ -5152,11 +5152,14 @@ fn encode_kv_cache_and_attention(
             );
         } // end is_anchor
 
-        // FP16 attention.
-        // Prefill (token_count > 1): use FA2 prefill kernel with per-query
-        //   sliding window and KV-tile reuse across queries.
-        // Decode (token_count == 1): use fused SDPA (register-tiled, optimal
-        //   for single-token attention).
+        // FP16 attention — use register-tiled FA2 v2 for prefill,
+        // fused SDPA for decode (token_count == 1).
+        //
+        // V2 combines cooperative KV tile loading (amortized across GQA
+        // group via threadgroup memory) with register-based accumulators
+        // and online softmax. This avoids both the redundant device memory
+        // reads of fused SDPA and the threadgroup memory bottleneck of
+        // the original FA2 kernel.
         if use_fa2 && token_count > 1 {
             let seq_offset = attn_seq_pos as u32;
             let window = if window_size > 0 {
@@ -5164,9 +5167,9 @@ fn encode_kv_cache_and_attention(
             } else {
                 0
             };
-            ops::encode_fa2_prefill_attention(
+            ops::encode_v2_prefill_attention(
                 enc,
-                &pipelines.prefill_attention_fa2,
+                &pipelines.prefill_attention_v2,
                 &ops::PrefillAttentionParams {
                     q: &bufs.q_proj,
                     k_cache,
@@ -6771,5 +6774,128 @@ mod fa2_prefill_tests {
             max_diff < 0.1,
             "FA2 scale=1.0 diverged: max_diff={max_diff}"
         );
+    }
+
+    /// Verify v2 register-tiled prefill produces the same output as
+    /// fused SDPA and the original FA2 kernel.
+    #[test]
+    fn v2_matches_fa2_and_sdpa() {
+        let device = match MetalDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("SKIP: no Metal device");
+                return;
+            }
+        };
+        let queue = device.create_command_queue().expect("command queue");
+
+        let head_dim = 128usize;
+        let num_q_heads = 4u32;
+        let num_kv_heads = 2u32;
+        let token_count = 16usize;
+        let max_seq_len = 64usize;
+        let seq_offset = 0usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q_data = pseudo_random(42, token_count * num_q_heads as usize * head_dim);
+        let mut k_data = vec![0.0f32; num_kv_heads as usize * max_seq_len * head_dim];
+        let mut v_data = vec![0.0f32; num_kv_heads as usize * max_seq_len * head_dim];
+        fill_kv_cache(
+            &mut k_data,
+            &pseudo_random(123, num_kv_heads as usize * token_count * head_dim),
+            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+        );
+        fill_kv_cache(
+            &mut v_data,
+            &pseudo_random(456, num_kv_heads as usize * token_count * head_dim),
+            num_kv_heads as usize, max_seq_len, head_dim, token_count,
+        );
+
+        let expected = cpu_attention(
+            &q_data, &k_data, &v_data,
+            num_q_heads as usize, num_kv_heads as usize,
+            head_dim, max_seq_len, seq_offset, token_count, scale,
+        );
+
+        let q_buf = make_fp16_buffer(&device, &q_data);
+        let k_buf = make_fp16_buffer(&device, &k_data);
+        let v_buf = make_fp16_buffer(&device, &v_data);
+        let output_size = token_count * num_q_heads as usize * head_dim;
+
+        let pipelines =
+            super::super::ops::MetalPipelines::compile(&device, head_dim, head_dim)
+                .expect("compile pipelines");
+
+        // --- Dispatch v2 ---
+        let output_v2 = device.create_buffer(output_size * 2, StorageMode::Shared).expect("out");
+        {
+            let cmd = queue.command_buffer().expect("cmd");
+            let enc = cmd.compute_encoder().expect("enc");
+            super::super::ops::encode_v2_prefill_attention(
+                &enc,
+                &pipelines.prefill_attention_v2,
+                &super::super::ops::PrefillAttentionParams {
+                    q: &q_buf,
+                    k_cache: &k_buf,
+                    v_cache: &v_buf,
+                    output: &output_v2,
+                    num_heads: num_q_heads,
+                    num_kv_heads,
+                    head_dim: head_dim as u32,
+                    max_seq_len: max_seq_len as u32,
+                    seq_offset: seq_offset as u32,
+                    token_count: token_count as u32,
+                    window_size: 0,
+                    attn_scale: scale,
+                },
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        // --- Dispatch FA2 (original) ---
+        let output_fa2 = device.create_buffer(output_size * 2, StorageMode::Shared).expect("out");
+        {
+            let cmd = queue.command_buffer().expect("cmd");
+            let enc = cmd.compute_encoder().expect("enc");
+            super::super::ops::encode_fa2_prefill_attention(
+                &enc,
+                &pipelines.prefill_attention_fa2,
+                &super::super::ops::PrefillAttentionParams {
+                    q: &q_buf,
+                    k_cache: &k_buf,
+                    v_cache: &v_buf,
+                    output: &output_fa2,
+                    num_heads: num_q_heads,
+                    num_kv_heads,
+                    head_dim: head_dim as u32,
+                    max_seq_len: max_seq_len as u32,
+                    seq_offset: seq_offset as u32,
+                    token_count: token_count as u32,
+                    window_size: 0,
+                    attn_scale: scale,
+                },
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        let v2_result = read_fp16_buffer(&output_v2, output_size);
+        let fa2_result = read_fp16_buffer(&output_fa2, output_size);
+
+        let mut max_v2_fa2 = 0.0f32;
+        let mut max_v2_cpu = 0.0f32;
+        for i in 0..output_size {
+            max_v2_fa2 = max_v2_fa2.max((v2_result[i] - fa2_result[i]).abs());
+            max_v2_cpu = max_v2_cpu.max((v2_result[i] - expected[i]).abs());
+        }
+
+        println!("V2 vs FA2 max diff:  {max_v2_fa2:.6}");
+        println!("V2 vs CPU max diff:  {max_v2_cpu:.6}");
+
+        assert!(max_v2_fa2 < 0.05, "V2 vs FA2 diverged: {max_v2_fa2}");
+        assert!(max_v2_cpu < 0.1, "V2 vs CPU diverged: {max_v2_cpu}");
     }
 }

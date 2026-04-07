@@ -529,3 +529,222 @@ kernel void prefill_attention_fa2(
             output[out_base + d] = half(out_acc[qi * HEAD_DIM + d] / denom);
     }
 }
+
+// ============================================================================
+// Register-tiled FA2 prefill attention (v2)
+//
+// Combines FlashAttention-2's cooperative KV tile sharing with fused SDPA's
+// register-based accumulators and online softmax. Each simdgroup handles
+// one Q head; all simdgroups in the threadgroup cooperatively load KV tiles
+// into shared memory, amortizing device memory bandwidth across the GQA
+// group.
+//
+// For GQA ratio N:1, this reduces KV device memory reads by N× compared
+// to fused_sdpa (where each simdgroup reads KV independently). The
+// register-tiled accumulation avoids the threadgroup memory bottleneck
+// that limits the original FA2 kernel at long sequences.
+//
+// Supports sliding window attention via the window_size parameter.
+//
+// Buffers:
+//   buffer(0)  q            [token_count × num_heads × head_dim]          half
+//   buffer(1)  k_cache      [num_kv_heads × max_seq_len × head_dim]      half
+//   buffer(2)  v_cache      [num_kv_heads × max_seq_len × head_dim]      half
+//   buffer(3)  output       [token_count × num_heads × head_dim]          half
+//   buffer(4)  num_heads     uint
+//   buffer(5)  num_kv_heads  uint
+//   buffer(6)  head_dim      uint (must == HEAD_DIM)
+//   buffer(7)  max_seq_len   uint (cache stride)
+//   buffer(8)  seq_offset    uint (KV positions before this batch)
+//   buffer(9)  token_count   uint
+//   buffer(10) window_size   uint (0 = full attention)
+//   buffer(11) attn_scale    float
+//
+// Dispatch:
+//   grid:       (num_kv_groups, ceil(token_count / V2_BR), 1)
+//   threadgroup: (heads_per_group * 32, 1, 1)
+// ============================================================================
+
+constant constexpr uint V2_BR = (HEAD_DIM >= 256) ? 16 : 32;
+constant constexpr uint V2_BC = (HEAD_DIM >= 256) ? 16 : 32;
+
+kernel void prefill_attention_v2(
+    device const half* q         [[buffer(0)]],
+    device const half* k_cache   [[buffer(1)]],
+    device const half* v_cache   [[buffer(2)]],
+    device half* output          [[buffer(3)]],
+    constant uint& num_heads     [[buffer(4)]],
+    constant uint& num_kv_heads  [[buffer(5)]],
+    constant uint& head_dim      [[buffer(6)]],
+    constant uint& max_seq_len   [[buffer(7)]],
+    constant uint& seq_offset    [[buffer(8)]],
+    constant uint& token_count   [[buffer(9)]],
+    constant uint& window_size   [[buffer(10)]],
+    constant float& attn_scale   [[buffer(11)]],
+    uint3 tgid       [[threadgroup_position_in_grid]],
+    uint  simd_lane  [[thread_index_in_simdgroup]],
+    uint  simd_id    [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint SIMD_SZ = 32;
+    constexpr uint HD_LANES = HEAD_DIM / SIMD_SZ;
+
+    if (head_dim != HEAD_DIM) return;
+
+    uint kv_group = tgid.x;
+    uint q_block_id = tgid.y;
+    uint heads_per_group = num_heads / num_kv_heads;
+
+    uint local_head = simd_id;
+    if (local_head >= heads_per_group) return;
+
+    uint q_head = kv_group * heads_per_group + local_head;
+    uint kv_head = kv_group;
+
+    uint q_start = q_block_id * V2_BR;
+    uint q_end = min(q_start + V2_BR, token_count);
+    uint actual_q = q_end - q_start;
+    if (actual_q == 0) return;
+
+    // Thread ID within the threadgroup for cooperative loads.
+    uint tid = simd_id * SIMD_SZ + simd_lane;
+    uint tg_threads = heads_per_group * SIMD_SZ;
+
+    // ── Per-lane register state ─────────────────────────────────
+    float row_max[V2_BR];
+    float row_sum[V2_BR];
+    float o_acc[V2_BR * HD_LANES];
+    float q_reg[V2_BR * HD_LANES];
+
+    for (uint r = 0; r < V2_BR; ++r) {
+        row_max[r] = -INFINITY;
+        row_sum[r] = 0.0f;
+    }
+    for (uint i = 0; i < V2_BR * HD_LANES; ++i)
+        o_acc[i] = 0.0f;
+
+    // Load Q into registers.
+    for (uint r = 0; r < actual_q; ++r) {
+        uint q_base = ((q_start + r) * num_heads + q_head) * HEAD_DIM;
+        for (uint c = 0; c < HD_LANES; ++c)
+            q_reg[r * HD_LANES + c] = float(q[q_base + c * SIMD_SZ + simd_lane]);
+    }
+    for (uint r = actual_q; r < V2_BR; ++r)
+        for (uint c = 0; c < HD_LANES; ++c)
+            q_reg[r * HD_LANES + c] = 0.0f;
+
+    // ── Threadgroup memory for cooperative KV tile loading ──────
+    threadgroup half kv_shared[V2_BC * HEAD_DIM];
+
+    uint kv_base = kv_head * max_seq_len * HEAD_DIM;
+
+    // Causal + sliding window bounds.
+    uint max_causal = min(seq_offset + q_end, (uint)(max_seq_len));
+    uint kv_begin = 0;
+    if (window_size > 0) {
+        uint earliest_causal = seq_offset + q_start + 1;
+        kv_begin = (earliest_causal > window_size)
+            ? (earliest_causal - window_size) : 0;
+    }
+
+    // ── KV tile loop ────────────────────────────────────────────
+    for (uint kv_iter = kv_begin; kv_iter < max_causal; kv_iter += V2_BC) {
+        uint kv_tile_end = min(kv_iter + V2_BC, max_causal);
+        uint actual_kv = kv_tile_end - kv_iter;
+
+        // ── Cooperative K tile load ─────────────────────────────
+        uint k_offset = kv_base + kv_iter * HEAD_DIM;
+        uint elems = actual_kv * HEAD_DIM;
+        for (uint i = tid; i < elems; i += tg_threads)
+            kv_shared[i] = k_cache[k_offset + i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Compute S = Q · K^T ────────────────────────────────
+        float s_tile[V2_BR * V2_BC];
+
+        for (uint p = 0; p < actual_kv; ++p) {
+            float k_val[HD_LANES];
+            for (uint c = 0; c < HD_LANES; ++c)
+                k_val[c] = float(kv_shared[p * HEAD_DIM + c * SIMD_SZ + simd_lane]);
+
+            for (uint r = 0; r < V2_BR; ++r) {
+                float dot = 0.0f;
+                for (uint c = 0; c < HD_LANES; ++c)
+                    dot += q_reg[r * HD_LANES + c] * k_val[c];
+                dot = simd_sum(dot);
+
+                bool masked = (r >= actual_q);
+                if (!masked) {
+                    uint kv_pos = kv_iter + p;
+                    uint causal_len = seq_offset + q_start + r + 1;
+                    if (window_size > 0 && causal_len > max_seq_len)
+                        causal_len = max_seq_len;
+                    uint q_kv_start = (window_size > 0 && causal_len > window_size)
+                        ? (causal_len - window_size) : 0;
+                    masked = (kv_pos >= causal_len) || (kv_pos < q_kv_start);
+                }
+
+                s_tile[r * V2_BC + p] = masked ? -INFINITY : (dot * attn_scale);
+            }
+        }
+
+        // ── Online softmax (FA4 conditional rescale) ────────────
+        for (uint r = 0; r < actual_q; ++r) {
+            float tile_max = -INFINITY;
+            for (uint p = 0; p < actual_kv; ++p)
+                tile_max = max(tile_max, s_tile[r * V2_BC + p]);
+
+            float old_max = row_max[r];
+            float new_max = max(old_max, tile_max);
+
+            if (new_max > old_max) {
+                float corr = exp(old_max - new_max);
+                row_sum[r] *= corr;
+                for (uint c = 0; c < HD_LANES; ++c)
+                    o_acc[r * HD_LANES + c] *= corr;
+                row_max[r] = new_max;
+            }
+
+            float tile_sum = 0.0f;
+            for (uint p = 0; p < actual_kv; ++p) {
+                float w = exp(s_tile[r * V2_BC + p] - row_max[r]);
+                s_tile[r * V2_BC + p] = w;
+                tile_sum += w;
+            }
+            row_sum[r] += tile_sum;
+        }
+
+        // ── Cooperative V tile load (reuse kv_shared) ───────────
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint v_offset = kv_base + kv_iter * HEAD_DIM;
+        for (uint i = tid; i < elems; i += tg_threads)
+            kv_shared[i] = v_cache[v_offset + i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Accumulate O += S · V ───────────────────────────────
+        for (uint p = 0; p < actual_kv; ++p) {
+            float v_val[HD_LANES];
+            for (uint c = 0; c < HD_LANES; ++c)
+                v_val[c] = float(kv_shared[p * HEAD_DIM + c * SIMD_SZ + simd_lane]);
+
+            for (uint r = 0; r < actual_q; ++r) {
+                float w = s_tile[r * V2_BC + p];
+                if (w > 0.0f) {
+                    for (uint c = 0; c < HD_LANES; ++c)
+                        o_acc[r * HD_LANES + c] += w * v_val[c];
+                }
+            }
+        }
+
+        // Barrier before next iteration's K load.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } // end KV tile loop
+
+    // ── Normalize and write output ──────────────────────────────
+    for (uint r = 0; r < actual_q; ++r) {
+        float denom = max(row_sum[r], 1e-10f);
+        uint o_base = ((q_start + r) * num_heads + q_head) * HEAD_DIM;
+        for (uint c = 0; c < HD_LANES; ++c)
+            output[o_base + c * SIMD_SZ + simd_lane] =
+                half(o_acc[r * HD_LANES + c] / denom);
+    }
+}

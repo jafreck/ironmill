@@ -122,8 +122,8 @@ fn main() {
         println!("── {} ({} Q heads, {} KV heads, hd={}) ──",
             mc.label, mc.num_q_heads, mc.num_kv_heads, mc.head_dim);
         println!(
-            "  {:>8}  {:>10}  {:>10}  {:>8}",
-            "tokens", "FA2 (µs)", "SDPA (µs)", "speedup"
+            "  {:>8}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}",
+            "tokens", "V2 (µs)", "FA2 (µs)", "SDPA (µs)", "V2/SDPA", "V2/FA2"
         );
 
         let pipelines = pipeline_cache.entry(mc.head_dim).or_insert_with(|| {
@@ -206,23 +206,61 @@ fn main() {
                 }
             }
 
+            // --- Benchmark V2 (register-tiled FA2) ---
+            let mut v2_times = Vec::with_capacity(WARMUP + ITERATIONS);
+            for i in 0..(WARMUP + ITERATIONS) {
+                let cmd = queue.command_buffer().expect("cmd");
+                let enc = cmd.compute_encoder().expect("enc");
+                ops::encode_v2_prefill_attention(
+                    &enc,
+                    &pipelines.prefill_attention_v2,
+                    &PrefillAttentionParams {
+                        q: &q_buf,
+                        k_cache: &k_buf,
+                        v_cache: &v_buf,
+                        output: &out_fa2,
+                        num_heads: nh,
+                        num_kv_heads: nkv,
+                        head_dim: hd,
+                        max_seq_len: ms,
+                        seq_offset: 0,
+                        token_count: tc,
+                        window_size: 0,
+                        attn_scale: scale,
+                    },
+                );
+                enc.end_encoding();
+                let t0 = Instant::now();
+                cmd.commit();
+                cmd.wait_until_completed();
+                let elapsed = t0.elapsed();
+                if i >= WARMUP {
+                    v2_times.push(elapsed.as_micros() as f64);
+                }
+            }
+
             fa2_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
             sdpa_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v2_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let fa2_median = fa2_times[fa2_times.len() / 2];
             let sdpa_median = sdpa_times[sdpa_times.len() / 2];
-            let speedup = sdpa_median / fa2_median;
+            let v2_median = v2_times[v2_times.len() / 2];
 
-            let speedup_str = if speedup > 1.05 {
-                format!("\x1b[32m{speedup:.2}×\x1b[0m")
-            } else if speedup < 0.95 {
-                format!("\x1b[31m{speedup:.2}×\x1b[0m")
-            } else {
-                format!("{speedup:.2}×")
+            let fmt_speedup = |ratio: f64| -> String {
+                if ratio > 1.05 {
+                    format!("\x1b[32m{ratio:.2}×\x1b[0m")
+                } else if ratio < 0.95 {
+                    format!("\x1b[31m{ratio:.2}×\x1b[0m")
+                } else {
+                    format!("{ratio:.2}×")
+                }
             };
 
             println!(
-                "  {:>8}  {:>10.0}  {:>10.0}  {:>8}",
-                sc.token_count, fa2_median, sdpa_median, speedup_str,
+                "  {:>8}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8}  {:>8}",
+                sc.token_count, v2_median, fa2_median, sdpa_median,
+                fmt_speedup(sdpa_median / v2_median),
+                fmt_speedup(fa2_median / v2_median),
             );
         }
         println!();
