@@ -1,8 +1,8 @@
-//! Pre-computed per-layer execution plan.
+//! Pre-computed per-layer and model-level execution plans.
 
-use mil_rs::weights::ModelConfig;
+use mil_rs::weights::{Architecture, ModelConfig};
 
-use super::config::{ClaConfig, GdnModelConfig, Gemma4Config};
+use super::config::{ClaConfig, GdnModelConfig, Gemma4Config, MetalConfig};
 use super::weights::MetalWeights;
 
 /// How the attention block is computed for this layer.
@@ -198,5 +198,85 @@ impl LayerPlan {
                 }
             })
             .collect()
+    }
+}
+
+// ── Model-level execution plan ─────────────────────────────────
+
+/// PLE (Per-Layer Embedding) configuration for the model.
+#[derive(Clone, Debug)]
+pub(crate) struct PlePlan {
+    pub(crate) ple_hidden_size: usize,
+}
+
+/// Strategy for residual connections around the attention block.
+#[derive(Clone, Debug)]
+pub(crate) enum ResidualStrategy {
+    /// Standard pre-norm: fused residual + RMSNorm in one dispatch.
+    Fused,
+    /// Split residual add and norm (e.g. when layer_scalar is present).
+    SplitWithScale,
+    /// Gemma 4 post-attention norm: norm before residual, then separate pre-FFN norm.
+    GemmaPostAttnNorm,
+}
+
+/// Pre-computed model-level execution plan.
+///
+/// Captures all architecture-specific decisions that would otherwise require
+/// querying `ModelConfig`, `MetalConfig`, and `Gemma4Config` at every
+/// pipeline iteration.
+#[derive(Clone, Debug)]
+pub(crate) struct ModelPlan {
+    pub(crate) hidden_size: usize,
+    pub(crate) num_attention_heads: u32,
+    pub(crate) vocab_size: usize,
+    pub(crate) rms_norm_eps: f32,
+    /// 1.0 for most models, sqrt(hidden_size) for Gemma.
+    pub(crate) embed_scale: f32,
+    pub(crate) layers: Vec<LayerPlan>,
+    pub(crate) final_logit_softcapping: Option<f32>,
+    pub(crate) enable_turboquant: bool,
+    pub(crate) max_seq_len: usize,
+    pub(crate) tq_n_bits: usize,
+    pub(crate) ple: Option<PlePlan>,
+    pub(crate) has_dac: bool,
+}
+
+impl ModelPlan {
+    /// Build a model-level plan from config objects and pre-built layer plans.
+    pub(crate) fn build(
+        mc: &ModelConfig,
+        config: &MetalConfig,
+        g4: Option<&Gemma4Config>,
+        layers: Vec<LayerPlan>,
+    ) -> Self {
+        let embed_scale = if mc.architecture == Architecture::Gemma {
+            (mc.hidden_size as f32).sqrt()
+        } else {
+            1.0
+        };
+
+        let final_logit_softcapping = g4.and_then(|g| g.final_logit_softcapping);
+
+        let ple = g4
+            .filter(|g| g.ple_hidden_size > 0)
+            .map(|g| PlePlan {
+                ple_hidden_size: g.ple_hidden_size,
+            });
+
+        Self {
+            hidden_size: mc.hidden_size,
+            num_attention_heads: mc.num_attention_heads as u32,
+            vocab_size: mc.vocab_size,
+            rms_norm_eps: mc.rms_norm_eps as f32,
+            embed_scale,
+            layers,
+            final_logit_softcapping,
+            enable_turboquant: config.enable_turboquant,
+            max_seq_len: config.max_seq_len,
+            tq_n_bits: config.n_bits as usize,
+            ple,
+            has_dac: false, // Set after DAC calibration.
+        }
     }
 }
