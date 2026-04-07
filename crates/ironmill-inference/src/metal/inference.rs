@@ -902,6 +902,10 @@ pub struct MetalInference {
     gdn_state: Option<GdnState>,
     /// Per-layer execution plan, resolved at load time.
     layer_plans: Vec<LayerPlan>,
+    /// D2Quant Deviation-Aware Correction (DAC) per-layer bias vectors.
+    /// Each buffer is `[hidden_size]` FP16. Added to post-attention LayerNorm
+    /// output to compensate for quantization-induced mean shift.
+    dac_biases: Option<Vec<MetalBuffer>>,
 }
 
 impl MetalInference {
@@ -953,6 +957,7 @@ impl MetalInference {
             model_info: None,
             gdn_state: None,
             layer_plans: Vec::new(),
+            dac_biases: None,
         })
     }
 
@@ -1291,6 +1296,101 @@ impl MetalInference {
         self.weights
             .as_mut()
             .expect("weights_mut() called before load()")
+    }
+
+    // ── DAC (Deviation-Aware Correction) ────────────────────────
+
+    /// Calibrate D2Quant Deviation-Aware Correction biases.
+    ///
+    /// Runs calibration tokens through a full-precision reference model and
+    /// the current (quantized) model, computing the per-channel mean
+    /// deviation at each layer's post-attention LayerNorm output. The
+    /// resulting bias vectors are stored and applied during inference to
+    /// compensate for quantization-induced activation drift.
+    ///
+    /// Reference: D²Quant (arXiv:2602.02546) §3.3, Algorithm 1 lines 3–10.
+    pub fn calibrate_dac(
+        &mut self,
+        fp_provider: &dyn mil_rs::weights::WeightProvider,
+        calibration_tokens: &[u32],
+    ) -> Result<(), InferenceError> {
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
+        let h = mc.hidden_size;
+        let num_layers = mc.num_hidden_layers;
+        let token_count = calibration_tokens.len();
+
+        if token_count == 0 {
+            return Ok(());
+        }
+
+        // 1. Run FP16 reference model to capture post-attention norm outputs.
+        let fp_norms = {
+            let mut fp_engine = MetalInference::new(self.config.clone())
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            fp_engine
+                .load_weights(fp_provider, self.config.clone())
+                .map_err(|e| InferenceError::runtime(format!("DAC FP16 load: {e}")))?;
+
+            let mut norms: Vec<Vec<f32>> = vec![vec![0.0f32; h]; num_layers];
+            fp_engine.prefill_calibration(calibration_tokens, &mut |layer, name, data| {
+                if name == "ffn_norm" && layer < num_layers {
+                    // data is FP16 bytes: [token_count × hidden_size]
+                    let f16_vals: Vec<f32> = data
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect();
+                    // Mean across tokens for each channel
+                    for ch in 0..h {
+                        let sum: f32 = (0..token_count).map(|t| f16_vals[t * h + ch]).sum();
+                        norms[layer][ch] = sum / token_count as f32;
+                    }
+                }
+            })?;
+            norms
+        };
+        // FP16 engine is dropped here, freeing GPU memory.
+
+        // 2. Run quantized (self) model to capture post-attention norm outputs.
+        let q_norms = {
+            let mut norms: Vec<Vec<f32>> = vec![vec![0.0f32; h]; num_layers];
+            self.prefill_calibration(calibration_tokens, &mut |layer, name, data| {
+                if name == "ffn_norm" && layer < num_layers {
+                    let f16_vals: Vec<f32> = data
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect();
+                    for ch in 0..h {
+                        let sum: f32 = (0..token_count).map(|t| f16_vals[t * h + ch]).sum();
+                        norms[layer][ch] = sum / token_count as f32;
+                    }
+                }
+            })?;
+            norms
+        };
+
+        // 3. Compute per-layer correction bias: μ = mean(Y_fp) - mean(Y_q)
+        let mut biases = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            let bias_f16: Vec<u8> = (0..h)
+                .flat_map(|ch| {
+                    let deviation = fp_norms[layer][ch] - q_norms[layer][ch];
+                    half::f16::from_f32(deviation).to_le_bytes()
+                })
+                .collect();
+            let buf = self
+                .device
+                .create_buffer_with_data(&bias_f16, StorageMode::Shared)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            biases.push(buf);
+        }
+
+        self.dac_biases = Some(biases);
+        self.reset();
+        Ok(())
     }
 
     // ── RoPE cache ──────────────────────────────────────────────
@@ -2537,6 +2637,23 @@ impl MetalInference {
                     }
                 } // end AttentionKind::Standard
             } // end match plan.attention
+
+            // D2Quant DAC: add per-layer correction bias to post-attention
+            // norm output to compensate for quantization-induced mean shift.
+            if let Some(ref dac) = self.dac_biases {
+                if layer_idx < dac.len() {
+                    let pipelines = self.pipelines()?;
+                    ops::encode_bias_add(
+                        &enc,
+                        &pipelines.bias_add,
+                        &bufs.norm_out,
+                        &dac[layer_idx],
+                        h as u32,
+                        (token_count * h) as u32,
+                    );
+                    enc.memory_barrier_buffers();
+                }
+            }
 
             // Get pipelines for the remaining steps (FFN, MoE, PLE, etc.)
             let default_pipelines = self.pipelines()?;
@@ -4297,6 +4414,13 @@ fn encode_projection(
     let kernel_kind = LinearKernelKind::for_token_count(token_count);
 
     match weight {
+        WeightBuffer::Dense {
+            buf: None,
+            packed: None,
+        } => {
+            // Empty placeholder (e.g., GDN layer Q/K/V/O) — skip dispatch.
+            return Ok(());
+        }
         WeightBuffer::Dense { buf: _, packed } => {
             if let Some(packed_buf) = packed {
                 let pipeline = pipelines.dense_linear_pipeline(kernel_kind);

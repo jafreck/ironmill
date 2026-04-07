@@ -877,6 +877,25 @@ fn main() -> Result<()> {
                             eprintln!("  ✗ Metal model load failed: {e}");
                             continue;
                         }
+                        // DAC calibration: compute correction biases using
+                        // FP16 reference vs quantized post-attention norm outputs.
+                        // Use the first 2048 tokens from the perplexity dataset as
+                        // calibration data, matching the D²Quant paper's methodology.
+                        eprintln!("    calibrating DAC...");
+                        let dac_tokens: Vec<u32> = if let Some(ref ds) = ppl_dataset {
+                            ds.sequences.iter().flatten().copied().take(2048).collect()
+                        } else {
+                            // Fallback: load calibration dataset from default path.
+                            match perplexity::PerplexityDataset::load(&cli.perplexity_dataset) {
+                                Ok(ds) => {
+                                    ds.sequences.iter().flatten().copied().take(2048).collect()
+                                }
+                                Err(_) => (100..2148).collect(),
+                            }
+                        };
+                        if let Err(e) = engine.calibrate_dac(provider, &dac_tokens) {
+                            eprintln!("    ⚠ DAC calibration failed: {e}");
+                        }
                     } else if let Err(e) = engine.load_weights(provider, gpu_config.clone()) {
                         eprintln!("  ✗ Metal model load failed: {e}");
                         continue;
@@ -1138,6 +1157,14 @@ fn main() -> Result<()> {
                             engine
                                 .load_weights(&q_provider, gpu_config.clone())
                                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            let dac_tokens: Vec<u32> = dataset
+                                .sequences
+                                .iter()
+                                .flatten()
+                                .copied()
+                                .take(2048)
+                                .collect();
+                            let _ = engine.calibrate_dac(provider, &dac_tokens);
                         } else {
                             engine
                                 .load_weights(provider, gpu_config.clone())

@@ -71,6 +71,8 @@ pub struct MetalPipelines {
     pub rope: ComputePipeline,
     /// Element-wise residual addition kernel.
     pub residual_add: ComputePipeline,
+    /// Broadcast bias add: data[i] += bias[i % H]. Used for DAC correction.
+    pub bias_add: ComputePipeline,
     /// Buffer copy kernel (element-wise half → half).
     pub copy_buffer: ComputePipeline,
     /// Token embedding lookup kernel.
@@ -305,6 +307,13 @@ impl MetalPipelines {
                 .create_compute_pipeline(
                     &elem_lib
                         .get_function("residual_add")
+                        .map_err(MetalError::Metal)?,
+                )
+                .map_err(MetalError::Metal)?,
+            bias_add: device
+                .create_compute_pipeline(
+                    &elem_lib
+                        .get_function("bias_add")
                         .map_err(MetalError::Metal)?,
                 )
                 .map_err(MetalError::Metal)?,
@@ -1118,6 +1127,30 @@ pub fn encode_residual_add(
     encoder.set_buffer(output, 0, 2);
     encoder.set_bytes(&size.to_le_bytes(), 3);
     let threads = size as usize;
+    let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
+    let tg_count = threads.div_ceil(tg_size);
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
+}
+
+/// Encode broadcast bias add (D2Quant DAC):
+/// `data[i] += bias[i % hidden_size]` for `total_size` elements.
+///
+/// Adds a per-channel correction bias `[hidden_size]` to a matrix
+/// `[token_count × hidden_size]`, broadcasting across all tokens.
+pub fn encode_bias_add(
+    encoder: &ComputeEncoder,
+    pipeline: &ComputePipeline,
+    data: &MetalBuffer,
+    bias: &MetalBuffer,
+    hidden_size: u32,
+    total_size: u32,
+) {
+    encoder.set_pipeline(pipeline);
+    encoder.set_buffer(data, 0, 0);
+    encoder.set_buffer(bias, 0, 1);
+    encoder.set_bytes(&hidden_size.to_le_bytes(), 2);
+    encoder.set_bytes(&total_size.to_le_bytes(), 3);
+    let threads = total_size as usize;
     let tg_size = DEFAULT_THREADGROUP_WIDTH.min(threads);
     let tg_count = threads.div_ceil(tg_size);
     encoder.dispatch_threadgroups((tg_count, 1, 1), (tg_size, 1, 1));
