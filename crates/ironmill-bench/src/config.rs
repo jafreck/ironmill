@@ -35,6 +35,8 @@ pub struct BenchMatrix {
     pub optimizations: Vec<OptConfig>,
     pub backends: Vec<String>,
     pub settings: Settings,
+    #[serde(default)]
+    pub benchmarks: BenchmarkSelection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +116,46 @@ impl Default for Settings {
     }
 }
 
+/// Which benchmark suites to run. Selectable from TOML config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BenchmarkSelection {
+    /// Suite IDs to run (e.g. ["decode", "prefill", "quality"]).
+    /// Empty means "run all applicable suites".
+    #[serde(default)]
+    pub suites: Vec<String>,
+    /// Prefill lengths for the prefill suite.
+    #[serde(default)]
+    pub prefill_lengths: Vec<usize>,
+    /// Context lengths for the context-decode suite.
+    #[serde(default)]
+    pub context_lengths: Vec<usize>,
+    /// Enable perplexity evaluation.
+    #[serde(default)]
+    pub perplexity: bool,
+    /// Number of sequences for perplexity.
+    #[serde(default = "default_perplexity_sequences")]
+    pub perplexity_sequences: usize,
+    /// Perplexity stride.
+    #[serde(default = "default_perplexity_stride")]
+    pub perplexity_stride: usize,
+    /// Path to perplexity dataset.
+    #[serde(default = "default_perplexity_dataset")]
+    pub perplexity_dataset: String,
+    /// Enable weight fidelity quality benchmarks.
+    #[serde(default)]
+    pub quality: bool,
+}
+
+fn default_perplexity_sequences() -> usize {
+    50
+}
+fn default_perplexity_stride() -> usize {
+    512
+}
+fn default_perplexity_dataset() -> String {
+    "tests/fixtures/quality/wikitext2-qwen3.json".to_string()
+}
+
 /// Intermediate struct matching the TOML array-of-tables layout.
 #[derive(Deserialize)]
 struct ConfigFile {
@@ -121,6 +163,8 @@ struct ConfigFile {
     optimization: Vec<OptConfig>,
     #[serde(default)]
     settings: Settings,
+    #[serde(default)]
+    benchmarks: BenchmarkSelection,
 }
 
 /// Load a benchmark matrix from a TOML config file.
@@ -141,6 +185,7 @@ pub fn load_config(path: &Path) -> anyhow::Result<BenchMatrix> {
         optimizations: file.optimization,
         backends,
         settings: file.settings,
+        benchmarks: file.benchmarks,
     })
 }
 
@@ -274,6 +319,7 @@ pub fn default_matrix() -> BenchMatrix {
         optimizations,
         backends: vec!["all".to_string()],
         settings: Settings::default(),
+        benchmarks: BenchmarkSelection::default(),
     }
 }
 

@@ -11,18 +11,18 @@ mod power;
 mod quality;
 mod report;
 mod stats;
+mod suite;
+mod suites;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
 
 use config::{ModelConfig, Settings};
-use report::{BenchReport, MemorySummary, OutputFormat, ReportRow, UtilizationSummary};
-#[allow(unused_imports)]
-use stats::{
-    AggregatedResult, aggregate_runs, compute_stats, compute_stats_with_flops, welch_t_test,
-};
+use report::OutputFormat;
+use suite::{BenchmarkContext, SuiteRegistry};
 
 /// Backends to benchmark.
 /// Values: coreml-cpu, coreml-gpu, coreml-ane, coreml-all, metal
@@ -41,15 +41,13 @@ enum Backend {
 }
 
 impl Backend {
-    /// Return the CoreML `ComputeUnits` for CoreML variants, or `None` for non-CoreML backends.
-    fn compute_units(&self) -> Option<ironmill_inference::coreml_runtime::ComputeUnits> {
-        use ironmill_inference::coreml_runtime::ComputeUnits;
+    fn to_config_string(&self) -> &str {
         match self {
-            Backend::CoremlCpu => Some(ComputeUnits::CpuOnly),
-            Backend::CoremlGpu => Some(ComputeUnits::CpuAndGpu),
-            Backend::CoremlAne => Some(ComputeUnits::CpuAndNeuralEngine),
-            Backend::CoremlAll => Some(ComputeUnits::All),
-            Backend::Metal => None,
+            Backend::CoremlCpu => "cpu",
+            Backend::CoremlGpu => "gpu",
+            Backend::CoremlAne => "ane",
+            Backend::CoremlAll => "all",
+            Backend::Metal => "metal",
         }
     }
 }
@@ -98,10 +96,6 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
-    /// Also benchmark the ANE direct runtime (experimental, requires --features ane-direct).
-    #[arg(long)]
-    ane_direct: bool,
-
     /// Remove all cached compilation artifacts
     #[arg(long)]
     clean_cache: bool,
@@ -122,7 +116,7 @@ struct Cli {
     #[arg(long)]
     quality: bool,
 
-    /// Run perplexity evaluation (requires ane-direct feature + model weights + dataset)
+    /// Run perplexity evaluation (requires model weights + dataset)
     #[arg(long)]
     perplexity: bool,
 
@@ -135,235 +129,25 @@ struct Cli {
     perplexity_dataset: PathBuf,
 
     /// Stride for sliding-window PPL evaluation.
-    /// Standard HF methodology: each window overlaps by (max_seq_len - stride) tokens.
-    /// Default 512 matches HuggingFace baseline. Set equal to max_seq_len for independent
-    /// (non-overlapping) evaluation.
     #[arg(long, default_value = "512")]
     perplexity_stride: usize,
-
-    /// Path to EAGLE-3 speculative decoding bundle (.specbundle directory).
-    /// When provided, decode benchmarks use speculative decoding with the draft head.
-    #[arg(long)]
-    specbundle: Option<PathBuf>,
 
     /// Run prefill throughput benchmark at various input lengths
     #[arg(long)]
     prefill_bench: bool,
 
     /// Comma-separated context lengths for decode-at-context benchmark.
-    /// Prefills this many tokens before measuring decode latency.
-    /// Example: "128,1024,4096,16384"
     #[arg(long, value_delimiter = ',')]
     context_lengths: Vec<usize>,
-}
 
-/// Run CoreML benchmark loop across models × optimizations × compute units.
-///
-/// When a pre-parsed `programs` map is provided, compilation uses the cached
-/// program instead of re-reading ONNX from disk.
-#[allow(clippy::too_many_arguments)]
-fn run_coreml_benchmarks(
-    matrix: &config::BenchMatrix,
-    programs: &std::collections::HashMap<String, ironmill_compile::mil::Program>,
-    compute_units: &[ironmill_inference::coreml_runtime::ComputeUnits],
-    cache_dir: &std::path::Path,
-    no_cache: bool,
-    power_enabled: bool,
-    idle_power: &Option<power::PowerMetrics>,
-    report_rows: &mut Vec<ReportRow>,
-) -> Result<()> {
-    for model_cfg in &matrix.models {
-        let model_flops = programs
-            .get(&model_cfg.name)
-            .and_then(|p| {
-                let f = p.total_flops();
-                if f > 0 { Some(f) } else { None }
-            })
-            .or_else(|| compute_model_flops(model_cfg));
+    /// Run only specific benchmark suites (comma-separated).
+    /// Available: coreml, decode, prefill, context-decode, quality, perplexity
+    #[arg(long, value_delimiter = ',')]
+    suite: Vec<String>,
 
-        if let Some(flops) = model_flops {
-            eprintln!(
-                "  Model FLOPs: {:.2}G ({:.2}M MACs)",
-                flops as f64 / 1e9,
-                flops as f64 / 2e6
-            );
-        }
-
-        for opt_cfg in &matrix.optimizations {
-            eprintln!("Compiling {} with {}...", model_cfg.name, opt_cfg.name);
-            let mlmodelc = if let Some(prog) = programs.get(&model_cfg.name) {
-                compiler::compile_model_from_program(prog, model_cfg, opt_cfg, cache_dir, no_cache)?
-            } else {
-                compiler::compile_model(model_cfg, opt_cfg, cache_dir, no_cache)?
-            };
-
-            for &cu in compute_units {
-                eprintln!("  Running inference ({cu})...");
-
-                let power_sampler = if power_enabled {
-                    let expected_duration_sec =
-                        matrix.settings.iterations as f64 * 0.001 * matrix.settings.runs as f64;
-                    let samples = (expected_duration_sec * 10.0).max(20.0) as usize;
-                    power::PowerSampler::start(100, samples)
-                } else {
-                    None
-                };
-
-                // Load the model once and run all runs on it.
-                let (run_inference_results, _load_time) = inference::run_inference_multi_run(
-                    &mlmodelc,
-                    cu,
-                    matrix.settings.iterations,
-                    matrix.settings.warmup,
-                    matrix.settings.runs,
-                )?;
-
-                let mut run_results = Vec::new();
-                let mut last_utilization = None;
-                let mut last_memory = None;
-                let mut last_load_time = None;
-
-                for (run_idx, result) in run_inference_results.into_iter().enumerate() {
-                    last_load_time = Some(result.load_time.as_secs_f64() * 1000.0);
-                    last_utilization = result.utilization;
-                    last_memory = result.memory;
-
-                    let latencies_ms: Vec<f64> = result
-                        .latencies
-                        .iter()
-                        .map(|d| d.as_secs_f64() * 1000.0)
-                        .collect();
-
-                    let label =
-                        format!("{}/{}/{}/run{}", model_cfg.name, opt_cfg.name, cu, run_idx);
-                    run_results.push(compute_stats_with_flops(&label, &latencies_ms, model_flops));
-                }
-
-                let label = format!("{}/{}/{}", model_cfg.name, opt_cfg.name, cu);
-                let aggregated = aggregate_runs(&label, &run_results);
-
-                let energy = power_sampler.and_then(|sampler| {
-                    let power_metrics = sampler.finish()?;
-                    Some(power::compute_energy_metrics(
-                        power_metrics,
-                        idle_power.clone(),
-                        aggregated.pooled.inferences_per_sec,
-                        aggregated.pooled.median / 1000.0,
-                        aggregated.pooled.tflops,
-                        aggregated.pooled.tokens_per_sec,
-                    ))
-                });
-
-                let utilization_summary = last_utilization
-                    .as_ref()
-                    .map(UtilizationSummary::from_metrics);
-                let memory_summary = last_memory.as_ref().map(MemorySummary::from_metrics);
-
-                report_rows.push(ReportRow {
-                    model: model_cfg.name.clone(),
-                    optimization: opt_cfg.name.clone(),
-                    backend: cu.to_string(),
-                    kv_quant: opt_cfg.kv_quant.to_string(),
-                    result: aggregated,
-                    significance: None,
-                    energy,
-                    utilization: utilization_summary,
-                    memory: memory_summary,
-                    load_time_ms: last_load_time,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Apply Welch t-test significance against a named baseline optimization.
-fn apply_baseline_significance(report_rows: &mut [ReportRow], baseline_name: &str, alpha: f64) {
-    let baseline_rows: Vec<_> = report_rows
-        .iter()
-        .filter(|r| r.optimization == *baseline_name)
-        .cloned()
-        .collect();
-
-    for row in report_rows.iter_mut() {
-        if row.optimization == *baseline_name {
-            continue;
-        }
-        if let Some(bl) = baseline_rows
-            .iter()
-            .find(|b| b.model == row.model && b.backend == row.backend)
-        {
-            let sig = welch_t_test(&bl.result.pooled, &row.result.pooled, alpha);
-            row.significance = Some(sig);
-        }
-    }
-}
-
-/// Run weight fidelity quality benchmarks for quantized optimizations.
-///
-/// Uses pre-parsed programs when available to avoid re-reading ONNX.
-fn run_quality_eval(
-    matrix: &config::BenchMatrix,
-    programs: &std::collections::HashMap<String, ironmill_compile::mil::Program>,
-) {
-    eprintln!("\nRunning weight fidelity quality benchmarks...");
-    let mut summaries = Vec::new();
-
-    for model_cfg in &matrix.models {
-        for opt_cfg in &matrix.optimizations {
-            let (method, bits) = match (&opt_cfg.polar_quantize, &opt_cfg.palettize) {
-                (Some(b), _) => ("polar", *b),
-                (_, Some(b)) => ("palettize", *b),
-                _ => continue,
-            };
-
-            eprintln!(
-                "  Quality: {} with {} ({}-bit)...",
-                model_cfg.name, opt_cfg.name, bits
-            );
-
-            let program_result = if let Some(prog) = programs.get(&model_cfg.name) {
-                compiler::build_optimized_program_from(prog, opt_cfg)
-            } else {
-                compiler::build_optimized_program(model_cfg, opt_cfg)
-            };
-
-            match program_result {
-                Ok(program) => {
-                    let results = quality::measure_program_quality(&program, method, bits);
-                    if let Some(summary) = quality::summarize_quality(&model_cfg.name, &results) {
-                        summaries.push(summary);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("    ✗ failed: {e}");
-                }
-            }
-        }
-    }
-
-    if !summaries.is_empty() {
-        eprintln!();
-        eprint!("{}", quality::format_quality_summary(&summaries));
-    } else {
-        eprintln!("  No quantized optimizations to measure.");
-    }
-}
-
-/// Convert report rows to baseline entries for save/compare.
-fn build_baseline_entries(rows: &[ReportRow]) -> Vec<baseline::BaselineEntry> {
-    rows.iter()
-        .map(|row| baseline::BaselineEntry {
-            model: row.model.clone(),
-            optimization: row.optimization.clone(),
-            backend: row.backend.clone(),
-            median_ms: row.result.pooled.median,
-            mean_ms: row.result.pooled.mean,
-            p95_ms: row.result.pooled.p95,
-            inferences_per_sec: row.result.pooled.inferences_per_sec,
-            tflops: row.result.pooled.tflops,
-        })
-        .collect()
+    /// List available benchmark suites and exit
+    #[arg(long)]
+    list_suites: bool,
 }
 
 fn main() -> Result<()> {
@@ -377,12 +161,26 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Build the suite registry
+    let mut registry = SuiteRegistry::new();
+    suites::register_suites(&mut registry);
+
+    if cli.list_suites {
+        println!("Available benchmark suites:");
+        for id in registry.suite_ids() {
+            println!("  {id}");
+        }
+        return Ok(());
+    }
+
+    // Load config
     let mut matrix = if let Some(config_path) = &cli.config {
         config::load_config(config_path)?
     } else {
         config::default_matrix()
     };
 
+    // CLI overrides
     if !cli.model.is_empty() {
         matrix.models = cli
             .model
@@ -405,34 +203,18 @@ fn main() -> Result<()> {
         warmup: cli.warmup,
         runs: cli.runs,
         backends: if cli.backend.is_empty() {
-            vec!["cpu".to_string(), "gpu".to_string(), "ane".to_string()]
+            if matrix.settings.backends.is_empty() {
+                vec!["cpu".to_string(), "gpu".to_string(), "ane".to_string()]
+            } else {
+                matrix.settings.backends.clone()
+            }
         } else {
             cli.backend
                 .iter()
-                .filter_map(|b| b.compute_units())
-                .map(|cu| cu.to_string())
+                .map(|b| b.to_config_string().to_string())
                 .collect()
         },
     };
-
-    // Extract CoreML compute-units from the unified --backend flag.
-    // Default (no --backend): run all three CoreML backends.
-    let compute_units: Vec<ironmill_inference::coreml_runtime::ComputeUnits> =
-        if cli.backend.is_empty() {
-            use ironmill_inference::coreml_runtime::ComputeUnits;
-            vec![
-                ComputeUnits::CpuOnly,
-                ComputeUnits::CpuAndGpu,
-                ComputeUnits::CpuAndNeuralEngine,
-            ]
-        } else {
-            cli.backend
-                .iter()
-                .filter_map(|b| b.compute_units())
-                .collect()
-        };
-
-    let has_metal = cli.backend.contains(&Backend::Metal);
 
     // Power sampling setup
     let power_enabled = cli.power && power::is_power_available();
@@ -440,7 +222,6 @@ fn main() -> Result<()> {
         eprintln!("Energy metrics unavailable (requires sudo)");
     }
 
-    // Sample idle power if power measurement is enabled
     let idle_power = if power_enabled {
         eprintln!("Sampling idle power (2s)...");
         power::sample_idle_power(std::time::Duration::from_secs(2))
@@ -448,1282 +229,126 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut report_rows = Vec::new();
-
-    // Skip the main benchmark loop if only perplexity is requested
-    // or only metal/ane-direct are requested (they have their own paths)
-    let run_latency_bench = !cli.perplexity || cli.ane_direct || has_metal || cli.quality;
-    let run_coreml_bench = run_latency_bench && !compute_units.is_empty();
-
-    // ── Pre-parse ONNX models once, reuse across all benchmark phases ──
-    // This avoids redundant I/O for FLOPs computation, CoreML compilation,
-    // quality benchmarks, and ANE-direct compilation.
-    let mut parsed_programs: std::collections::HashMap<String, ironmill_compile::mil::Program> =
-        std::collections::HashMap::new();
-
-    let needs_program = run_coreml_bench || cli.quality || cli.ane_direct;
-    if needs_program {
-        for model_cfg in &matrix.models {
-            if !model_cfg.path.exists() {
-                continue;
-            }
-            let ext = model_cfg.path.extension().and_then(|e| e.to_str());
-            if ext != Some("onnx") {
-                continue;
-            }
-            eprintln!("Parsing {} (ONNX → MIL IR)...", model_cfg.name);
-            match compiler::parse_model(model_cfg) {
-                Ok(program) => {
-                    parsed_programs.insert(model_cfg.name.clone(), program);
-                }
-                Err(e) => {
-                    eprintln!("  ✗ failed to parse {}: {e}", model_cfg.name);
-                }
-            }
+    // Build extra context from CLI flags
+    let mut extra = HashMap::new();
+    if cli.quality || matrix.benchmarks.quality {
+        extra.insert("quality".to_string(), "true".to_string());
+    }
+    if cli.perplexity || matrix.benchmarks.perplexity {
+        extra.insert("perplexity".to_string(), "true".to_string());
+        extra.insert(
+            "perplexity_sequences".to_string(),
+            cli.perplexity_sequences.to_string(),
+        );
+        extra.insert(
+            "perplexity_stride".to_string(),
+            cli.perplexity_stride.to_string(),
+        );
+        extra.insert(
+            "perplexity_dataset".to_string(),
+            cli.perplexity_dataset.to_string_lossy().to_string(),
+        );
+    }
+    if cli.prefill_bench || !matrix.benchmarks.prefill_lengths.is_empty() {
+        extra.insert("prefill_bench".to_string(), "true".to_string());
+        if !matrix.benchmarks.prefill_lengths.is_empty() {
+            extra.insert(
+                "prefill_lengths".to_string(),
+                matrix
+                    .benchmarks
+                    .prefill_lengths
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
     }
-
-    if run_coreml_bench {
-        run_coreml_benchmarks(
-            &matrix,
-            &parsed_programs,
-            &compute_units,
-            &cache_dir,
-            cli.no_cache,
-            power_enabled,
-            &idle_power,
-            &mut report_rows,
-        )?;
+    if !cli.context_lengths.is_empty() || !matrix.benchmarks.context_lengths.is_empty() {
+        let lengths = if !cli.context_lengths.is_empty() {
+            &cli.context_lengths
+        } else {
+            &matrix.benchmarks.context_lengths
+        };
+        extra.insert(
+            "context_lengths".to_string(),
+            lengths
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
     }
 
-    // ── ANE-direct and Metal benchmarks (independent of CoreML) ──
-
-    if cli.ane_direct {
-        #[cfg(feature = "ane-direct")]
-        {
-            eprintln!("\n  ANE Direct Runtime Benchmark");
-            eprintln!("  {}", "─".repeat(40));
-            eprintln!("  ⚠ ANE direct benchmarking requires runtime verification");
-            eprintln!("    (private API selectors must be validated on this macOS version)");
-
-            for model_cfg in &matrix.models {
-                for opt_cfg in &matrix.optimizations {
-                    eprintln!(
-                        "  Compiling {} with {} (ANE direct)...",
-                        model_cfg.name, opt_cfg.name
-                    );
-
-                    let program = if let Some(prog) = parsed_programs.get(&model_cfg.name) {
-                        match compiler::build_optimized_program_from(prog, opt_cfg) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!("  ✗ failed to build program: {e}");
-                                continue;
-                            }
-                        }
-                    } else {
-                        match compiler::build_optimized_program(model_cfg, opt_cfg) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!("  ✗ failed to build program: {e}");
-                                continue;
-                            }
-                        }
-                    };
-
-                    let config = ironmill_inference::AneConfig::default();
-
-                    let mut run_results = Vec::new();
-                    for run_idx in 0..matrix.settings.runs {
-                        let result = match inference::run_ane_direct_inference(
-                            &program,
-                            config.clone(),
-                            matrix.settings.warmup,
-                            matrix.settings.iterations,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("  ✗ ANE direct inference failed: {e}");
-                                continue;
-                            }
-                        };
-
-                        let latencies_ms: Vec<f64> = result
-                            .latencies
-                            .iter()
-                            .map(|d| d.as_secs_f64() * 1000.0)
-                            .collect();
-
-                        let label = format!(
-                            "{}/{}/ane-direct/run{}",
-                            model_cfg.name, opt_cfg.name, run_idx
-                        );
-                        run_results.push(compute_stats(&label, &latencies_ms));
-                    }
-
-                    if !run_results.is_empty() {
-                        let label = format!("{}/{}/ane-direct", model_cfg.name, opt_cfg.name);
-                        let aggregated = aggregate_runs(&label, &run_results);
-
-                        report_rows.push(ReportRow {
-                            model: model_cfg.name.clone(),
-                            optimization: opt_cfg.name.clone(),
-                            backend: "ane-direct".to_string(),
-                            kv_quant: opt_cfg.kv_quant.to_string(),
-                            result: aggregated,
-                            significance: None,
-                            energy: None,
-                            utilization: None,
-                            memory: None,
-                            load_time_ms: None,
-                        });
-                    }
-                }
-            }
-        }
-        #[cfg(not(feature = "ane-direct"))]
-        {
-            eprintln!("warning: --ane-direct requires --features ane-direct, skipping");
-        }
-    }
-
-    // ── Pre-load perplexity dataset once if needed by any backend ──
-    #[allow(unused_variables)]
-    let ppl_dataset = if cli.perplexity {
-        match perplexity::PerplexityDataset::load(&cli.perplexity_dataset) {
-            Ok(ds) => {
-                eprintln!(
-                    "Perplexity dataset: {} ({} seqs × {} tokens)",
-                    ds.name, ds.num_sequences, ds.seq_len
-                );
-                Some(ds)
-            }
-            Err(e) => {
-                eprintln!("  ✗ Failed to load dataset: {e}");
-                eprintln!("  Run: python scripts/prepare-quality-dataset.py");
-                None
-            }
-        }
-    } else {
-        None
+    let ctx = BenchmarkContext {
+        matrix: &matrix,
+        cache_dir: &cache_dir,
+        no_cache: cli.no_cache,
+        power_enabled,
+        idle_power: &idle_power,
+        extra,
     };
 
-    if has_metal {
-        #[cfg(feature = "metal")]
-        {
-            use ironmill_compile::weights::SafeTensorsProvider;
-            use ironmill_compile::weights::quantized::{D2QuantConfig, QuantizedWeightProvider};
-            use ironmill_inference::engine::InferenceEngine;
-            use ironmill_inference::metal::bundle::MetalBundleProvider;
-            use ironmill_inference::metal::{MetalConfig, MetalInference};
-
-            eprintln!("\n  Metal GPU Backend Benchmark");
-            eprintln!("  {}", "─".repeat(40));
-
-            // Build Metal configs from TOML optimization entries.
-            // Track weight quantization method alongside MetalConfig.
-            struct WeightQuant {
-                d2quant_bits: u8,
-                int4: bool,
-            }
-            let configs: Vec<(String, MetalConfig, WeightQuant)> = matrix
-                .optimizations
-                .iter()
-                .map(|opt| {
-                    let mut c = MetalConfig::default();
-                    c.max_seq_len = opt.max_seq_len;
-                    match opt.kv_quant {
-                        config::KvQuantMode::None => {
-                            c.enable_turboquant = false;
-                        }
-                        config::KvQuantMode::TurboInt4 => {
-                            c.enable_turboquant = true;
-                            c.n_bits = 4;
-                        }
-                        config::KvQuantMode::TurboInt8 => {
-                            c.enable_turboquant = true;
-                            c.n_bits = 8;
-                        }
-                        config::KvQuantMode::TurboInt8Qjl => {
-                            c.enable_turboquant = true;
-                            c.n_bits = 8;
-                        }
-                    }
-                    let wq = WeightQuant {
-                        d2quant_bits: opt.d2quant.unwrap_or(0),
-                        int4: opt.int4,
-                    };
-                    (opt.name.clone(), c, wq)
-                })
-                .collect();
-
-            let mut gpu_ppl_results: std::collections::HashMap<String, f64> =
-                std::collections::HashMap::new();
-
-            // Cache SafeTensorsProvider per model directory to avoid reloading
-            // weights for perplexity evaluation after latency benchmarks.
-            let mut cached_providers: std::collections::HashMap<PathBuf, SafeTensorsProvider> =
-                std::collections::HashMap::new();
-
-            for model_cfg in &matrix.models {
-                // Check if this is a pre-compiled .ironml-gpu bundle
-                let is_gpu_bundle = model_cfg
-                    .path
-                    .extension()
-                    .map_or(false, |ext| ext == "ironml-gpu");
-
-                if is_gpu_bundle {
-                    let provider = match MetalBundleProvider::open(&model_cfg.path) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!(
-                                "  ✗ failed to open GPU bundle {}: {e}",
-                                model_cfg.path.display()
-                            );
-                            continue;
-                        }
-                    };
-
-                    let quant_info = &provider.manifest().quantization;
-                    let weight_label = match quant_info.method.as_str() {
-                        "polarquant" => format!("PQ-INT{}", quant_info.n_bits),
-                        "affine" => format!("Affine-INT{}", quant_info.n_bits),
-                        "none" => "FP16".to_string(),
-                        "mixed" => format!("Mixed-INT{}", quant_info.n_bits),
-                        other => other.to_string(),
-                    };
-
-                    let bundle_configs: Vec<(&str, MetalConfig)> = vec![
-                        ("fp16-kv", {
-                            let mut c = MetalConfig::default();
-                            c.enable_turboquant = false;
-                            c
-                        }),
-                        ("tq-int4-kv", {
-                            let mut c = MetalConfig::default();
-                            c.enable_turboquant = true;
-                            c.n_bits = 4;
-                            c
-                        }),
-                    ];
-
-                    for (kv_label, gpu_config) in &bundle_configs {
-                        eprintln!(
-                            "  Metal/{weight_label}/{kv_label}: {} (bundle)...",
-                            model_cfg.name
-                        );
-
-                        let mut engine = match MetalInference::new(gpu_config.clone()) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                eprintln!("  ✗ Metal GPU init failed: {e}");
-                                continue;
-                            }
-                        };
-
-                        let load_start = std::time::Instant::now();
-                        let gpu_before = engine.gpu_allocated_bytes();
-                        if let Err(e) = engine.load_weights(&provider, gpu_config.clone()) {
-                            eprintln!("  ✗ Metal bundle load failed: {e}");
-                            continue;
-                        }
-                        let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
-                        let gpu_after = engine.gpu_allocated_bytes();
-                        let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
-                        let gpu_growth_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
-                        eprintln!(
-                            "  ✓ loaded in {load_time_ms:.1}ms (GPU: {gpu_mb:.1} MB, model: {gpu_growth_mb:.1} MB)"
-                        );
-
-                        let prompt_tokens: Vec<u32> = vec![9707, 1879];
-
-                        let mut run_results = Vec::new();
-                        for run_idx in 0..matrix.settings.runs {
-                            engine.reset();
-
-                            // Build warmup context: prefill prompt + synthetic tokens in one
-                            // batched call instead of sequential decode steps. Uses the
-                            // matmul path which is much faster than N individual decode steps.
-                            let warmup_tokens: Vec<u32> = if matrix.settings.warmup > 0 {
-                                let mut tokens = prompt_tokens.clone();
-                                tokens.resize(prompt_tokens.len() + matrix.settings.warmup, 9707);
-                                tokens
-                            } else {
-                                prompt_tokens.clone()
-                            };
-
-                            if let Err(e) = engine.prefill(&warmup_tokens) {
-                                eprintln!("  ✗ prefill failed: {e}");
-                                continue;
-                            }
-
-                            let mut last_token = warmup_tokens.last().copied().unwrap_or(0);
-
-                            let mut latencies = Vec::with_capacity(matrix.settings.iterations);
-                            for _ in 0..matrix.settings.iterations {
-                                let t0 = std::time::Instant::now();
-                                match engine.decode_step(last_token) {
-                                    Ok(logits) => {
-                                        let elapsed = t0.elapsed();
-                                        latencies.push(elapsed);
-                                        last_token = logits
-                                            .iter()
-                                            .enumerate()
-                                            .max_by(|(_, a), (_, b)| {
-                                                a.partial_cmp(b)
-                                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                            })
-                                            .map(|(i, _)| i as u32)
-                                            .unwrap_or(0);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("  ✗ decode failed at iteration: {e}");
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if latencies.is_empty() {
-                                continue;
-                            }
-
-                            let latencies_ms: Vec<f64> =
-                                latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
-
-                            let label = format!(
-                                "{}/metal-{weight_label}-{kv_label}/run{run_idx}",
-                                model_cfg.name
-                            );
-                            run_results.push(compute_stats(&label, &latencies_ms));
-                        }
-
-                        if !run_results.is_empty() {
-                            let label =
-                                format!("{}/metal-{weight_label}-{kv_label}", model_cfg.name);
-                            let mut aggregated = aggregate_runs(&label, &run_results);
-
-                            let tok_per_sec = 1000.0 / aggregated.pooled.median;
-                            aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
-                            aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
-
-                            eprintln!(
-                                "  ✓ {weight_label}/{kv_label}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms | GPU: {gpu_mb:.1} MB",
-                                aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
-                            );
-
-                            let measured_memory = MemorySummary {
-                                rss_after_load_mb: gpu_mb,
-                                peak_rss_mb: gpu_mb,
-                                rss_growth_mb: gpu_growth_mb,
-                                model_file_size_mb: 0.0,
-                                efficiency_ratio: 0.0,
-                            };
-
-                            report_rows.push(ReportRow {
-                                model: model_cfg.name.clone(),
-                                optimization: "default".to_string(),
-                                backend: format!("metal-{weight_label}-{kv_label}"),
-                                kv_quant: kv_label.to_string(),
-                                result: aggregated,
-                                significance: None,
-                                energy: None,
-                                utilization: None,
-                                memory: Some(measured_memory),
-                                load_time_ms: Some(load_time_ms),
-                            });
-                        }
-                    }
-
-                    continue;
-                }
-
-                // Load weights once, reuse across configs (and perplexity if needed)
-                let model_dir = if let Some(ref md) = model_cfg.model_dir {
-                    md.clone()
-                } else if model_cfg.path.is_dir() {
-                    model_cfg.path.clone()
-                } else if let Some(parent) = model_cfg.path.parent() {
-                    parent.to_path_buf()
-                } else {
-                    eprintln!(
-                        "  ✗ cannot determine model directory for {}",
-                        model_cfg.name
-                    );
-                    continue;
-                };
-
-                if !cached_providers.contains_key(&model_dir) {
-                    match SafeTensorsProvider::load(&model_dir) {
-                        Ok(p) => {
-                            cached_providers.insert(model_dir.clone(), p);
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "  ✗ failed to load weights from {}: {e}",
-                                model_dir.display()
-                            );
-                            continue;
-                        }
-                    }
-                }
-                let provider = cached_providers.get(&model_dir).unwrap();
-
-                for (config_name, gpu_config, wq) in &configs {
-                    eprintln!("  Metal/{config_name}: {}...", model_cfg.name);
-
-                    let mut engine = match MetalInference::new(gpu_config.clone()) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            eprintln!("  ✗ Metal GPU init failed: {e}");
-                            continue;
-                        }
-                    };
-
-                    let load_start = std::time::Instant::now();
-                    let gpu_before = engine.gpu_allocated_bytes();
-
-                    // Weight quantization dispatch: D2Quant, INT4, or FP16.
-                    if wq.d2quant_bits > 0 {
-                        eprintln!("    JIT D2Quant-{} quantization...", wq.d2quant_bits);
-                        let d2q_config = D2QuantConfig {
-                            bits: wq.d2quant_bits,
-                            group_size: 128,
-                            outlier_threshold: 0.99,
-                        };
-                        let q_provider = QuantizedWeightProvider::new(provider, d2q_config);
-                        if let Err(e) = engine.load_weights(&q_provider, gpu_config.clone()) {
-                            eprintln!("  ✗ Metal model load failed: {e}");
-                            continue;
-                        }
-                        // DAC calibration: compute correction biases using
-                        // FP16 reference vs quantized post-attention norm outputs.
-                        eprintln!("    calibrating DAC...");
-                        let dac_tokens: Vec<u32> = if let Some(ref ds) = ppl_dataset {
-                            ds.sequences.iter().flatten().copied().take(2048).collect()
-                        } else {
-                            match perplexity::PerplexityDataset::load(&cli.perplexity_dataset) {
-                                Ok(ds) => {
-                                    ds.sequences.iter().flatten().copied().take(2048).collect()
-                                }
-                                Err(_) => (100..2148).collect(),
-                            }
-                        };
-                        if let Err(e) = engine.calibrate_dac(provider, &dac_tokens) {
-                            eprintln!("    ⚠ DAC calibration failed: {e}");
-                        }
-                    } else if wq.int4 {
-                        eprintln!("    JIT INT4 quantization...");
-                        let int4_config =
-                            ironmill_compile::weights::quantized::AffineQuantConfig::default();
-                        let q_provider = QuantizedWeightProvider::new_int4(provider, int4_config);
-                        if let Err(e) = engine.load_weights(&q_provider, gpu_config.clone()) {
-                            eprintln!("  ✗ Metal model load failed: {e}");
-                            continue;
-                        }
-                    } else if let Err(e) = engine.load_weights(provider, gpu_config.clone()) {
-                        eprintln!("  ✗ Metal model load failed: {e}");
-                        continue;
-                    }
-
-                    let load_time_ms = load_start.elapsed().as_secs_f64() * 1000.0;
-                    let gpu_after = engine.gpu_allocated_bytes();
-                    let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
-                    let gpu_growth_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
-                    eprintln!(
-                        "  ✓ loaded in {load_time_ms:.1}ms (GPU: {gpu_mb:.1} MB, model: {gpu_growth_mb:.1} MB)"
-                    );
-
-                    // Prefill with a short prompt (token IDs for "Hello world")
-                    let prompt_tokens: Vec<u32> = vec![9707, 1879];
-
-                    let mut run_results = Vec::new();
-                    for run_idx in 0..matrix.settings.runs {
-                        engine.reset();
-
-                        // Build warmup context: prefill prompt + synthetic tokens in one
-                        // batched call instead of sequential decode steps.
-                        let warmup_tokens: Vec<u32> = if matrix.settings.warmup > 0 {
-                            let mut tokens = prompt_tokens.clone();
-                            tokens.resize(prompt_tokens.len() + matrix.settings.warmup, 9707);
-                            tokens
-                        } else {
-                            prompt_tokens.clone()
-                        };
-
-                        if let Err(e) = engine.prefill(&warmup_tokens) {
-                            eprintln!("  ✗ prefill failed: {e}");
-                            continue;
-                        }
-
-                        let mut last_token = warmup_tokens.last().copied().unwrap_or(0);
-
-                        // Timed decode steps
-                        let mut latencies = Vec::with_capacity(matrix.settings.iterations);
-                        for _ in 0..matrix.settings.iterations {
-                            let t0 = std::time::Instant::now();
-                            match engine.decode_step(last_token) {
-                                Ok(logits) => {
-                                    let elapsed = t0.elapsed();
-                                    latencies.push(elapsed);
-                                    last_token = logits
-                                        .iter()
-                                        .enumerate()
-                                        .max_by(|(_, a), (_, b)| {
-                                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                                        })
-                                        .map(|(i, _)| i as u32)
-                                        .unwrap_or(0);
-                                }
-                                Err(e) => {
-                                    eprintln!("  ✗ decode failed at iteration: {e}");
-                                    break;
-                                }
-                            }
-                        }
-
-                        if latencies.is_empty() {
-                            continue;
-                        }
-
-                        let latencies_ms: Vec<f64> =
-                            latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
-
-                        let label = format!(
-                            "{}/{}/metal-{config_name}/run{run_idx}",
-                            model_cfg.name, "default"
-                        );
-                        run_results.push(compute_stats(&label, &latencies_ms));
-                    }
-
-                    if !run_results.is_empty() {
-                        let label = format!("{}/metal-{config_name}", model_cfg.name);
-                        let mut aggregated = aggregate_runs(&label, &run_results);
-
-                        // Set tok/s metrics on the pooled result.
-                        let tok_per_sec = 1000.0 / aggregated.pooled.median;
-                        aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
-                        aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
-
-                        eprintln!(
-                            "  ✓ {config_name}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms | GPU: {gpu_mb:.1} MB",
-                            aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
-                        );
-
-                        let measured_memory = MemorySummary {
-                            rss_after_load_mb: gpu_mb,
-                            peak_rss_mb: gpu_mb,
-                            rss_growth_mb: gpu_growth_mb,
-                            model_file_size_mb: 0.0,
-                            efficiency_ratio: 0.0,
-                        };
-
-                        report_rows.push(ReportRow {
-                            model: model_cfg.name.clone(),
-                            optimization: "default".to_string(),
-                            backend: format!("metal-{config_name}"),
-                            kv_quant: config_name.to_string(),
-                            result: aggregated,
-                            significance: None,
-                            energy: None,
-                            utilization: None,
-                            memory: Some(measured_memory),
-                            load_time_ms: Some(load_time_ms),
-                        });
-                    }
-
-                    // ── Prefill throughput benchmark ──
-                    if cli.prefill_bench {
-                        eprintln!("\n  Metal Prefill Throughput");
-                        eprintln!("  {}", "─".repeat(40));
-
-                        let prefill_lengths: Vec<usize> = vec![128, 512, 1024, 2048, 4096];
-                        for &prefill_len in &prefill_lengths {
-                            if prefill_len > gpu_config.max_seq_len {
-                                eprintln!(
-                                    "  ⚠ skipping prefill_len={prefill_len}: exceeds max_seq_len={}",
-                                    gpu_config.max_seq_len
-                                );
-                                continue;
-                            }
-
-                            let tokens: Vec<u32> = vec![9707u32; prefill_len];
-                            let mut prefill_times_ms = Vec::new();
-
-                            for _ in 0..matrix.settings.runs.max(1) {
-                                engine.reset();
-                                let t0 = std::time::Instant::now();
-                                match engine.prefill(&tokens) {
-                                    Ok(_) => {
-                                        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                        prefill_times_ms.push(elapsed_ms);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("  ✗ prefill failed at len={prefill_len}: {e}");
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if prefill_times_ms.is_empty() {
-                                continue;
-                            }
-
-                            let mean_ms = prefill_times_ms.iter().sum::<f64>()
-                                / prefill_times_ms.len() as f64;
-                            let tok_per_sec = prefill_len as f64 / (mean_ms / 1000.0);
-
-                            let label = format!(
-                                "{}/metal-{config_name}/prefill-{prefill_len}",
-                                model_cfg.name
-                            );
-                            let mut stats = compute_stats(&label, &prefill_times_ms);
-                            stats.tokens_per_sec = Some(tok_per_sec);
-
-                            let stddev = if prefill_times_ms.len() > 1 {
-                                let var = prefill_times_ms
-                                    .iter()
-                                    .map(|v| (v - mean_ms).powi(2))
-                                    .sum::<f64>()
-                                    / (prefill_times_ms.len() - 1) as f64;
-                                var.sqrt()
-                            } else {
-                                0.0
-                            };
-
-                            eprintln!(
-                                "  ✓ {config_name}[prefill={prefill_len}]: {mean_ms:.2}ms ({tok_per_sec:.0} tok/s) ± {stddev:.2}ms"
-                            );
-
-                            let aggregated = AggregatedResult {
-                                config_label: label,
-                                pooled: stats,
-                                per_run_means: prefill_times_ms.clone(),
-                                between_run_stddev: stddev,
-                                runs: prefill_times_ms.len(),
-                            };
-
-                            report_rows.push(ReportRow {
-                                model: model_cfg.name.clone(),
-                                optimization: "default".to_string(),
-                                backend: format!("metal-{config_name}[prefill={prefill_len}]"),
-                                kv_quant: config_name.to_string(),
-                                result: aggregated,
-                                significance: None,
-                                energy: None,
-                                utilization: None,
-                                memory: None,
-                                load_time_ms: None,
-                            });
-                        }
-                    }
-
-                    // ── Decode-at-context benchmark ──
-                    if !cli.context_lengths.is_empty() {
-                        eprintln!("\n  Metal Decode at Long Context");
-                        eprintln!("  {}", "─".repeat(40));
-
-                        for &ctx_len in &cli.context_lengths {
-                            if ctx_len > gpu_config.max_seq_len {
-                                eprintln!(
-                                    "  ⚠ skipping ctx={ctx_len}: exceeds max_seq_len={}",
-                                    gpu_config.max_seq_len
-                                );
-                                continue;
-                            }
-
-                            let prefill_tokens: Vec<u32> = vec![9707u32; ctx_len];
-
-                            let mut run_results_ctx = Vec::new();
-                            for run_idx in 0..matrix.settings.runs {
-                                engine.reset();
-
-                                if let Err(e) = engine.prefill(&prefill_tokens) {
-                                    eprintln!("  ✗ prefill failed at ctx={ctx_len}: {e}");
-                                    continue;
-                                }
-
-                                let mut last_token = 9707u32;
-                                let mut latencies = Vec::with_capacity(matrix.settings.iterations);
-
-                                for _ in 0..matrix.settings.iterations {
-                                    let t0 = std::time::Instant::now();
-                                    match engine.decode_step(last_token) {
-                                        Ok(logits) => {
-                                            let elapsed = t0.elapsed();
-                                            latencies.push(elapsed);
-                                            last_token = logits
-                                                .iter()
-                                                .enumerate()
-                                                .max_by(|(_, a), (_, b)| {
-                                                    a.partial_cmp(b)
-                                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                                })
-                                                .map(|(i, _)| i as u32)
-                                                .unwrap_or(0);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("  ✗ decode failed at ctx={ctx_len}: {e}");
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if latencies.is_empty() {
-                                    continue;
-                                }
-
-                                let latencies_ms: Vec<f64> =
-                                    latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
-
-                                let label = format!(
-                                    "{}/metal-{config_name}[ctx={ctx_len}]/run{run_idx}",
-                                    model_cfg.name
-                                );
-                                run_results_ctx.push(compute_stats(&label, &latencies_ms));
-                            }
-
-                            if !run_results_ctx.is_empty() {
-                                let label = format!(
-                                    "{}/metal-{config_name}[ctx={ctx_len}]",
-                                    model_cfg.name
-                                );
-                                let mut aggregated = aggregate_runs(&label, &run_results_ctx);
-
-                                let tok_per_sec = 1000.0 / aggregated.pooled.median;
-                                aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
-                                aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
-
-                                eprintln!(
-                                    "  ✓ {config_name}[ctx={ctx_len}]: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms",
-                                    aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev
-                                );
-
-                                report_rows.push(ReportRow {
-                                    model: model_cfg.name.clone(),
-                                    optimization: "default".to_string(),
-                                    backend: format!("metal-{config_name}[ctx={ctx_len}]"),
-                                    kv_quant: config_name.to_string(),
-                                    result: aggregated,
-                                    significance: None,
-                                    energy: None,
-                                    utilization: None,
-                                    memory: None,
-                                    load_time_ms: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ── EAGLE-3 speculative decode benchmark ──
-            if let Some(ref specbundle_path) = cli.specbundle {
-                eprintln!("\n  Metal Speculative Decode (EAGLE-3)");
-                eprintln!("  {}", "─".repeat(40));
-
-                let model_cfg = matrix.models.first().unwrap();
-                let model_dir = model_cfg
-                    .model_dir
-                    .clone()
-                    .unwrap_or_else(|| model_cfg.path.parent().unwrap().to_path_buf());
-
-                // Use first FP16 (non-D2Quant) config as the target model config.
-                if let Some((config_name, gpu_config, _)) = configs
-                    .iter()
-                    .find(|(_, _, wq)| wq.d2quant_bits == 0 && !wq.int4)
-                {
-                    let mut engine = match MetalInference::new(gpu_config.clone()) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            eprintln!("  ✗ Metal GPU init failed: {e}");
-                            // fall through to PPL eval
-                            std::process::exit(1);
-                        }
-                    };
-
-                    if !cached_providers.contains_key(&model_dir) {
-                        let p = SafeTensorsProvider::load(&model_dir)
-                            .map_err(|e| anyhow::anyhow!("weight load: {e}"))?;
-                        cached_providers.insert(model_dir.clone(), p);
-                    }
-                    let provider = cached_providers.get(&model_dir).unwrap();
-
-                    engine
-                        .load_weights(provider, gpu_config.clone())
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                    let spec_config =
-                        ironmill_inference::speculative::config::SpecConfig::default();
-                    let sampler = ironmill_inference::sampling::Sampler::new(
-                        ironmill_inference::sampling::SamplerConfig::greedy(),
-                    );
-                    let mut spec_engine =
-                        ironmill_inference::SpeculativeEngine::new(engine, spec_config, sampler);
-
-                    match spec_engine.load_draft_head(specbundle_path) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            eprintln!("  ✗ failed to load specbundle: {e}");
-                            eprintln!("  Skipping speculative decode benchmarks.");
-                            // fall through to PPL eval
-                        }
-                    }
-
-                    if spec_engine.has_draft_head() {
-                        // Prefill
-                        let prompt_tokens: Vec<u32> = vec![9707, 1879];
-                        spec_engine
-                            .engine_mut()
-                            .prefill(&prompt_tokens)
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                        let last_hidden =
-                            spec_engine.engine().last_hidden_state().unwrap_or_default();
-
-                        let mut total_tokens: usize = 0;
-                        let mut total_steps: usize = 0;
-                        let mut current_hidden = last_hidden;
-                        let mut current_token = prompt_tokens.last().copied().unwrap_or(0);
-
-                        let spec_start = std::time::Instant::now();
-
-                        for _ in 0..matrix.settings.iterations {
-                            match spec_engine.speculative_step(current_token, &current_hidden) {
-                                Ok(accepted) => {
-                                    let n_accepted = accepted.len();
-                                    total_tokens += n_accepted;
-                                    total_steps += 1;
-                                    current_token = *accepted.last().unwrap_or(&0);
-                                    current_hidden = spec_engine
-                                        .engine()
-                                        .last_hidden_state()
-                                        .unwrap_or_default();
-                                }
-                                Err(e) => {
-                                    eprintln!("  ✗ speculative step failed: {e}");
-                                    break;
-                                }
-                            }
-                        }
-
-                        let spec_elapsed = spec_start.elapsed().as_secs_f64();
-                        let effective_tok_s = total_tokens as f64 / spec_elapsed;
-                        let avg_accepted = total_tokens as f64 / total_steps.max(1) as f64;
-                        eprintln!(
-                            "  ✓ {config_name}+eagle3: {:.1} tok/s effective \
-                             ({} tokens in {:.1}s, {:.1} tok/step avg)",
-                            effective_tok_s, total_tokens, spec_elapsed, avg_accepted,
-                        );
-                    }
-                }
-            }
-
-            // ── Perplexity evaluation on Metal ──
-            if let Some(dataset) = &ppl_dataset {
-                eprintln!("\n  Metal Perplexity Evaluation");
-                eprintln!("  {}", "─".repeat(40));
-
-                let model_cfg = matrix.models.first().unwrap();
-                let first_is_bundle = model_cfg
-                    .path
-                    .extension()
-                    .map_or(false, |ext| ext == "ironml-gpu");
-
-                // SafeTensors PPL evaluation (skip if first model is a bundle)
-                if !first_is_bundle {
-                    let model_dir = if let Some(ref md) = model_cfg.model_dir {
-                        md.clone()
-                    } else if model_cfg.path.is_dir() {
-                        model_cfg.path.clone()
-                    } else {
-                        model_cfg.path.parent().unwrap().to_path_buf()
-                    };
-
-                    // Reuse cached provider if already loaded during latency benchmarks.
-                    if !cached_providers.contains_key(&model_dir) {
-                        let p = SafeTensorsProvider::load(&model_dir)
-                            .map_err(|e| anyhow::anyhow!("weight load: {e}"))?;
-                        cached_providers.insert(model_dir.clone(), p);
-                    }
-                    let provider = cached_providers.get(&model_dir).unwrap();
-
-                    for (config_name, gpu_config, wq) in &configs {
-                        eprintln!("  Evaluating {config_name}...");
-
-                        let mut engine = MetalInference::new(gpu_config.clone())
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        let gpu_before = engine.gpu_allocated_bytes();
-
-                        // Weight quantization dispatch.
-                        if wq.d2quant_bits > 0 {
-                            let d2q_config = D2QuantConfig {
-                                bits: wq.d2quant_bits,
-                                group_size: 128,
-                                outlier_threshold: 0.99,
-                            };
-                            let q_provider = QuantizedWeightProvider::new(provider, d2q_config);
-                            engine
-                                .load_weights(&q_provider, gpu_config.clone())
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            let dac_tokens: Vec<u32> = dataset
-                                .sequences
-                                .iter()
-                                .flatten()
-                                .copied()
-                                .take(2048)
-                                .collect();
-                            let _ = engine.calibrate_dac(provider, &dac_tokens);
-                        } else if wq.int4 {
-                            let int4_config =
-                                ironmill_compile::weights::quantized::AffineQuantConfig::default();
-                            let q_provider =
-                                QuantizedWeightProvider::new_int4(provider, int4_config);
-                            engine
-                                .load_weights(&q_provider, gpu_config.clone())
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        } else {
-                            engine
-                                .load_weights(provider, gpu_config.clone())
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        }
-                        let gpu_after = engine.gpu_allocated_bytes();
-                        let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
-                        let model_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
-                        eprintln!("  GPU memory: {gpu_mb:.1} MB (model: {model_mb:.1} MB)");
-
-                        let num_seqs = cli.perplexity_sequences.min(dataset.num_sequences);
-                        let stride = cli.perplexity_stride;
-
-                        // Concatenate sequences into a single token stream for
-                        // sliding-window evaluation.
-                        let full_tokens: Vec<u32> = dataset
-                            .sequences
-                            .iter()
-                            .take(num_seqs)
-                            .flatten()
-                            .copied()
-                            .collect();
-                        let max_length = dataset.seq_len;
-                        let windows = perplexity::sliding_window_schedule(
-                            full_tokens.len(),
-                            max_length,
-                            stride,
-                        );
-                        let num_windows = windows.len();
-
-                        let mut all_losses = Vec::new();
-                        let start = std::time::Instant::now();
-
-                        for (win_idx, step) in windows.iter().enumerate() {
-                            engine.reset();
-                            let window = &full_tokens[step.begin..step.end];
-                            if window.len() < 2 {
-                                continue;
-                            }
-                            let all_logits = engine
-                                .prefill_all_logits(window)
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            // Only count losses for non-overlapping tokens (from loss_start onward).
-                            for pos in step.loss_start..window.len() - 1 {
-                                let target = window[pos + 1];
-                                let ce = perplexity::cross_entropy(&all_logits[pos], target);
-                                all_losses.push(ce);
-                            }
-                            let running_ppl = perplexity::perplexity_from_losses(&all_losses);
-                            let elapsed = start.elapsed().as_secs_f64();
-                            let tok_per_sec = all_losses.len() as f64 / elapsed;
-                            eprintln!(
-                                "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
-                                win_idx + 1,
-                                num_windows,
-                                running_ppl,
-                                all_losses.len(),
-                                tok_per_sec,
-                            );
-                        }
-
-                        if all_losses.is_empty() {
-                            eprintln!("  ⚠ {config_name}: no valid losses computed");
-                        } else {
-                            let ppl = perplexity::perplexity_from_losses(&all_losses);
-                            let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
-                            eprintln!(
-                                "  ✓ {config_name}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
-                                ppl, avg_ce
-                            );
-                            gpu_ppl_results.insert(config_name.to_string(), ppl);
-                        }
-                    }
-                }
-
-                // Bundle PPL evaluation
-                for bundle_cfg in &matrix.models {
-                    let is_bundle = bundle_cfg
-                        .path
-                        .extension()
-                        .map_or(false, |ext| ext == "ironml-gpu");
-                    if !is_bundle {
-                        continue;
-                    }
-
-                    let provider = match MetalBundleProvider::open(&bundle_cfg.path) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!(
-                                "  ✗ failed to open GPU bundle {}: {e}",
-                                bundle_cfg.path.display()
-                            );
-                            continue;
-                        }
-                    };
-
-                    let quant_info = &provider.manifest().quantization;
-                    let weight_label = match quant_info.method.as_str() {
-                        "polarquant" => format!("PQ-INT{}", quant_info.n_bits),
-                        "affine" => format!("Affine-INT{}", quant_info.n_bits),
-                        "none" => "FP16".to_string(),
-                        "mixed" => format!("Mixed-INT{}", quant_info.n_bits),
-                        other => other.to_string(),
-                    };
-
-                    let ppl_bundle_configs: Vec<(&str, MetalConfig)> = vec![
-                        ("fp16-kv", {
-                            let mut c = MetalConfig::default();
-                            c.enable_turboquant = false;
-                            c
-                        }),
-                        ("tq-int4-kv", {
-                            let mut c = MetalConfig::default();
-                            c.enable_turboquant = true;
-                            c.n_bits = 4;
-                            c
-                        }),
-                    ];
-
-                    for (kv_label, gpu_config) in &ppl_bundle_configs {
-                        let combined_label = format!("{weight_label}-{kv_label}");
-                        eprintln!("  Evaluating {combined_label} (bundle)...");
-
-                        let mut engine = MetalInference::new(gpu_config.clone())
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        let gpu_before = engine.gpu_allocated_bytes();
-                        engine
-                            .load_weights(&provider, gpu_config.clone())
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        let gpu_after = engine.gpu_allocated_bytes();
-                        let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
-                        let model_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
-                        eprintln!("  GPU memory: {gpu_mb:.1} MB (model: {model_mb:.1} MB)");
-
-                        let num_seqs = cli.perplexity_sequences.min(dataset.num_sequences);
-                        let stride = cli.perplexity_stride;
-
-                        let full_tokens: Vec<u32> = dataset
-                            .sequences
-                            .iter()
-                            .take(num_seqs)
-                            .flatten()
-                            .copied()
-                            .collect();
-                        let max_length = dataset.seq_len;
-                        let windows = perplexity::sliding_window_schedule(
-                            full_tokens.len(),
-                            max_length,
-                            stride,
-                        );
-                        let num_windows = windows.len();
-
-                        let mut all_losses = Vec::new();
-                        let start = std::time::Instant::now();
-
-                        for (win_idx, step) in windows.iter().enumerate() {
-                            engine.reset();
-                            let window = &full_tokens[step.begin..step.end];
-                            if window.len() < 2 {
-                                continue;
-                            }
-                            let all_logits = engine
-                                .prefill_all_logits(window)
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            for pos in step.loss_start..window.len() - 1 {
-                                let target = window[pos + 1];
-                                let ce = perplexity::cross_entropy(&all_logits[pos], target);
-                                all_losses.push(ce);
-                            }
-                            let running_ppl = perplexity::perplexity_from_losses(&all_losses);
-                            let elapsed = start.elapsed().as_secs_f64();
-                            let tok_per_sec = all_losses.len() as f64 / elapsed;
-                            eprintln!(
-                                "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
-                                win_idx + 1,
-                                num_windows,
-                                running_ppl,
-                                all_losses.len(),
-                                tok_per_sec,
-                            );
-                        }
-
-                        if all_losses.is_empty() {
-                            eprintln!("  ⚠ {combined_label}: no valid losses computed");
-                        } else {
-                            let ppl = perplexity::perplexity_from_losses(&all_losses);
-                            let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
-                            eprintln!(
-                                "  ✓ {combined_label}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
-                                ppl, avg_ce
-                            );
-                            gpu_ppl_results.insert(combined_label, ppl);
-                        }
-                    }
-                }
-            }
-
-            // ── GPU Quantized Inference Comparison Table ──
-            let metal_rows: Vec<&ReportRow> = report_rows
-                .iter()
-                .filter(|r| r.backend.starts_with("metal-"))
-                .collect();
-
-            if metal_rows.len() > 1 {
-                let entries: Vec<report::GpuComparisonEntry> = metal_rows
-                    .iter()
-                    .map(|row| {
-                        let config_key = row.backend.strip_prefix("metal-").unwrap_or(&row.backend);
-                        report::GpuComparisonEntry {
-                            config: config_key.to_string(),
-                            perplexity: gpu_ppl_results.get(config_key).copied(),
-                            tok_per_sec: row.result.pooled.tokens_per_sec.unwrap_or(0.0),
-                            ms_per_tok: row.result.pooled.median,
-                            gpu_mb: row.memory.as_ref().map_or(0.0, |m| m.rss_after_load_mb),
-                        }
-                    })
-                    .collect();
-
-                eprintln!("\n  GPU Quantized Inference Comparison");
-                eprintln!("  {}", "─".repeat(40));
-                eprint!("{}", report::format_gpu_comparison_table(&entries));
-            }
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            eprintln!("warning: --backend metal requires --features metal, skipping");
-        }
-    }
-
+    // Run suites
+    let suite_results = if !cli.suite.is_empty() {
+        let ids: Vec<&str> = cli.suite.iter().map(|s| s.as_str()).collect();
+        registry.run_selected(&ids, &ctx)?
+    } else if !matrix.benchmarks.suites.is_empty() {
+        let ids: Vec<&str> = matrix
+            .benchmarks
+            .suites
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        registry.run_selected(&ids, &ctx)?
+    } else {
+        registry.run_all(&ctx)?
+    };
+
+    // Convert suite results to legacy ReportRows for output formatting
+    let report_rows: Vec<report::ReportRow> = suite_results
+        .iter()
+        .map(|r| report::ReportRow {
+            model: r.model.clone(),
+            optimization: r.optimization.clone(),
+            backend: if let Some(ref v) = r.variant {
+                format!("{}[{}]", r.backend, v)
+            } else {
+                r.backend.clone()
+            },
+            kv_quant: r
+                .metadata
+                .get("kv_quant")
+                .cloned()
+                .unwrap_or_else(|| "none".to_string()),
+            result: r.result.clone(),
+            significance: None,
+            energy: None,
+            utilization: None,
+            memory: r.gpu_memory_mb.map(|mb| report::MemorySummary {
+                rss_after_load_mb: mb,
+                peak_rss_mb: mb,
+                rss_growth_mb: 0.0,
+                model_file_size_mb: 0.0,
+                efficiency_ratio: 0.0,
+            }),
+            load_time_ms: r.load_time_ms,
+        })
+        .collect();
+
+    // Apply significance tests if baseline specified
+    let mut report_rows = report_rows;
     if let Some(baseline_name) = &cli.baseline {
         apply_baseline_significance(&mut report_rows, baseline_name, cli.alpha);
     }
 
-    let bench_report = BenchReport {
+    let bench_report = report::BenchReport {
         rows: report_rows,
         settings: matrix.settings.clone(),
     };
 
-    if run_latency_bench && !bench_report.rows.is_empty() {
+    if !bench_report.rows.is_empty() {
         print!("{}", report::format_report(&bench_report, cli.output));
-    }
-
-    if cli.quality {
-        run_quality_eval(&matrix, &parsed_programs);
-    }
-
-    // Perplexity evaluation — measure model quality via cross-entropy on text corpus
-    #[cfg(feature = "ane-direct")]
-    if cli.perplexity {
-        if let Some(dataset) = &ppl_dataset {
-            use ironmill_inference::ane::{AneInference, HardwareAneDevice};
-            use std::sync::Arc;
-
-            eprintln!("\nRunning ANE perplexity evaluation...");
-
-            // Build an optimized program from the first model config
-            let model_cfg = match matrix.models.first() {
-                Some(m) => m,
-                None => {
-                    eprintln!("  ✗ No model configured. Use --model <path.onnx>");
-                    return Ok(());
-                }
-            };
-            let opt_cfg = &matrix.optimizations[0]; // baseline
-
-            eprintln!("  Model: {} ({})", model_cfg.name, model_cfg.path.display());
-            eprintln!(
-                "  Evaluating {} sequences...",
-                cli.perplexity_sequences.min(dataset.num_sequences)
-            );
-
-            let program = if let Some(prog) = parsed_programs.get(&model_cfg.name) {
-                match compiler::build_optimized_program_from(prog, opt_cfg) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("  ✗ Failed to build program: {e}");
-                        return Ok(());
-                    }
-                }
-            } else {
-                match compiler::build_optimized_program(model_cfg, opt_cfg) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("  ✗ Failed to build program: {e}");
-                        return Ok(());
-                    }
-                }
-            };
-
-            let device = Arc::new(HardwareAneDevice::new().map_err(|e| anyhow::anyhow!("{e}"))?);
-
-            let compile_result = (|| -> anyhow::Result<AneInference<HardwareAneDevice>> {
-                let bundle = ironmill_compile::ane::bundle::compile_decode_bundle(
-                    &program,
-                    &ironmill_compile::ane::bundle::AneDecodeConfig {
-                        max_seq_len: 2048,
-                        num_heads: 32,
-                        num_kv_heads: 8,
-                        head_dim: 128,
-                        rope_theta: 1_000_000.0,
-                        eos_tokens: Vec::new(),
-                        fuse_cache_write: false,
-                        enable_qjl: false,
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("compile failed: {e}"))?;
-                let tmp = tempfile::tempdir()?;
-                let bundle_path = tmp.path().join("model.ironml");
-                bundle
-                    .save(&bundle_path)
-                    .map_err(|e| anyhow::anyhow!("save failed: {e}"))?;
-                AneInference::from_bundle(device, &bundle_path, None, 33)
-                    .map_err(|e| anyhow::anyhow!("load failed: {e}"))
-            })();
-
-            match compile_result {
-                Ok(mut inference) => {
-                    match perplexity::evaluate_perplexity(
-                        &mut inference,
-                        dataset,
-                        Some(cli.perplexity_sequences),
-                    ) {
-                        Ok(mut result) => {
-                            result.config_name = format!("{} ({})", model_cfg.name, opt_cfg.name);
-                            eprintln!();
-                            eprint!("{}", perplexity::format_perplexity_table(&[result]));
-                        }
-                        Err(e) => {
-                            eprintln!("  ✗ Perplexity evaluation failed: {e}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  ✗ Failed to compile ANE inference: {e}");
-                }
-            }
-        }
-    }
-
-    #[cfg(not(feature = "ane-direct"))]
-    if cli.perplexity && !has_metal {
-        eprintln!("Perplexity evaluation requires --features ane-direct");
-        eprintln!("Run: cargo run -p ironmill-bench --features ane-direct -- --perplexity ...");
     }
 
     // Save baseline if requested
@@ -1748,24 +373,44 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Try to compute model FLOPs by parsing the ONNX model into MIL IR.
-fn compute_model_flops(model_cfg: &ModelConfig) -> Option<u64> {
-    if !model_cfg.path.exists() {
-        return None;
-    }
+/// Apply Welch t-test significance against a named baseline optimization.
+fn apply_baseline_significance(
+    report_rows: &mut [report::ReportRow],
+    baseline_name: &str,
+    alpha: f64,
+) {
+    let baseline_rows: Vec<_> = report_rows
+        .iter()
+        .filter(|r| r.optimization == *baseline_name)
+        .cloned()
+        .collect();
 
-    let ext = model_cfg.path.extension()?.to_str()?;
-    match ext {
-        "onnx" => {
-            let (mut onnx, model_dir) =
-                ironmill_compile::mil::read_onnx_with_dir(model_cfg.path.to_str()?).ok()?;
-            let mut config = ironmill_compile::mil::ConversionConfig::default();
-            config.model_dir = Some(model_dir);
-            let result =
-                ironmill_compile::mil::onnx_to_program_with_config(&mut onnx, &config).ok()?;
-            let flops = result.program.total_flops();
-            if flops > 0 { Some(flops) } else { None }
+    for row in report_rows.iter_mut() {
+        if row.optimization == *baseline_name {
+            continue;
         }
-        _ => None,
+        if let Some(bl) = baseline_rows
+            .iter()
+            .find(|b| b.model == row.model && b.backend == row.backend)
+        {
+            let sig = stats::welch_t_test(&bl.result.pooled, &row.result.pooled, alpha);
+            row.significance = Some(sig);
+        }
     }
+}
+
+/// Convert report rows to baseline entries for save/compare.
+fn build_baseline_entries(rows: &[report::ReportRow]) -> Vec<baseline::BaselineEntry> {
+    rows.iter()
+        .map(|row| baseline::BaselineEntry {
+            model: row.model.clone(),
+            optimization: row.optimization.clone(),
+            backend: row.backend.clone(),
+            median_ms: row.result.pooled.median,
+            mean_ms: row.result.pooled.mean,
+            p95_ms: row.result.pooled.p95,
+            inferences_per_sec: row.result.pooled.inferences_per_sec,
+            tflops: row.result.pooled.tflops,
+        })
+        .collect()
 }

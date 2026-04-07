@@ -528,7 +528,7 @@ fn format_markdown(report: &BenchReport) -> String {
 }
 
 /// Entry for the GPU quantized inference comparison table.
-#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct GpuComparisonEntry {
     pub config: String,
@@ -541,7 +541,7 @@ pub struct GpuComparisonEntry {
 /// Format a GPU quantized inference comparison table.
 ///
 /// The first entry is used as the baseline for ΔPPL and ΔMem columns.
-#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+#[allow(dead_code)]
 pub fn format_gpu_comparison_table(entries: &[GpuComparisonEntry]) -> String {
     let mut out = String::new();
 

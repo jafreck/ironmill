@@ -13,3 +13,8 @@ max_seq_len = 128
 iterations = 1
 warmup = 0
 runs = 1
+backends = ["metal"]
+
+# Run only decode latency for quick smoke test
+[benchmarks]
+suites = ["decode"]

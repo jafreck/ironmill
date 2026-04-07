@@ -1,5 +1,5 @@
 # Baseline FP16 vs fully-optimized ironmill benchmark
-# Usage: cargo run --release -p ironmill-bench -- --config bench-showoff.toml
+# Usage: cargo run --release -p ironmill-bench -- --config bench-showoff.toml -b metal
 #
 # Optimized config uses D2Quant (SOTA 2-bit dual-scale quantization) for
 # weights plus TurboQuant INT8+QJL for KV cache compression. This represents
@@ -29,3 +29,10 @@ max_seq_len = 2048
 iterations = 3
 warmup = 1
 runs = 3
+backends = ["metal"]
+
+# --- Benchmark suite selection ---
+# Run only specific suites, or leave empty to run all applicable suites.
+# Available suites: coreml, decode, prefill, context-decode, quality, perplexity
+[benchmarks]
+suites = ["decode"]
