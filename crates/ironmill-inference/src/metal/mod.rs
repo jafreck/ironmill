@@ -5,6 +5,7 @@
 
 pub(crate) mod attention;
 pub(crate) mod buffers;
+pub(crate) mod calibration;
 pub mod bundle;
 pub mod config;
 pub mod dequant;
