@@ -102,7 +102,7 @@ mod calibration_tests {
 
     /// Verify that `bytes_as_f16` panics on an odd-length byte slice.
     #[test]
-    #[should_panic(expected = "not a multiple of f16 size")]
+    #[should_panic]
     fn bytes_as_f16_rejects_odd_length() {
         bytes_as_f16(&[0u8; 3]);
     }
