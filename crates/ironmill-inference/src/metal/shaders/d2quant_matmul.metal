@@ -84,15 +84,15 @@ kernel void d2quant_matvec_3bit(
     }
 }
 
-// ── D2Quant matmul tuning parameters ────────────────────────────
+// ── Matmul tuning parameters (shared naming across all formats) ──
 
-constant constexpr uint D2Q_N_SIMDGROUPS = 8;
-constant constexpr uint D2Q_THREADS_PER_TG = D2Q_N_SIMDGROUPS * 32;
-constant constexpr uint D2Q_TM_TILE = D2Q_N_SIMDGROUPS * 8;   // 64
-constant constexpr uint D2Q_TN_TILE = 64;
-constant constexpr uint D2Q_TN_STRIDE = D2Q_TN_TILE + 1;
-constant constexpr uint D2Q_K_TILE = 8;
-constant constexpr uint D2Q_TN_BLOCKS = D2Q_TN_TILE / 8;
+constant constexpr uint N_SIMDGROUPS   = 8;
+constant constexpr uint THREADS_PER_TG = N_SIMDGROUPS * 32;
+constant constexpr uint TM_TILE        = N_SIMDGROUPS * 8;   // 64
+constant constexpr uint TN_TILE        = 64;
+constant constexpr uint TN_STRIDE      = TN_TILE + 1;
+constant constexpr uint MATMUL_K_TILE  = 8;
+constant constexpr uint TN_BLOCKS      = TN_TILE / 8;
 
 // ── D2Quant tiled GEMM (prefill path, M>1) ──────────────────────
 //
@@ -101,7 +101,7 @@ constant constexpr uint D2Q_TN_BLOCKS = D2Q_TN_TILE / 8;
 //
 // B data is row-major packed 3-bit with dual-scale dequant.
 //
-// Dispatch: (ceil(M/D2Q_TM_TILE), ceil(N/D2Q_TN_TILE), 1) threadgroups,
+// Dispatch: (ceil(M/TM_TILE), ceil(N/TN_TILE), 1) threadgroups,
 //           (256, 1, 1) threads per group.
 
 kernel void d2quant_matmul_3bit(
@@ -122,36 +122,36 @@ kernel void d2quant_matmul_3bit(
     uint sgid  [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]])
 {
-    uint tg_m = group_id.x * D2Q_TM_TILE;
-    uint tg_n = group_id.y * D2Q_TN_TILE;
+    uint tg_m = group_id.x * TM_TILE;
+    uint tg_n = group_id.y * TN_TILE;
 
-    threadgroup half tg_a[2][D2Q_TM_TILE * D2Q_K_TILE];
-    threadgroup half tg_bt[2][D2Q_K_TILE * D2Q_TN_STRIDE];
+    threadgroup half tg_a[2][TM_TILE * MATMUL_K_TILE];
+    threadgroup half tg_bt[2][MATMUL_K_TILE * TN_STRIDE];
 
     uint num_groups_k = (K + group_size - 1) / group_size;
-    uint num_k_steps = (K + D2Q_K_TILE - 1) / D2Q_K_TILE;
+    uint num_k_steps = (K + MATMUL_K_TILE - 1) / MATMUL_K_TILE;
     uint bytes_per_row = ((K + 7) / 8) * 3;
     uint mask_bytes_per_row = (K + 7) / 8;
 
-    simdgroup_matrix<float, 8, 8> acc[D2Q_TN_BLOCKS];
-    for (uint j = 0; j < D2Q_TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
+    for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
 
     // Prologue: load first tile into buf[0]
     {
         uint k_base = 0;
         // Load A tile
-        for (uint i = tid; i < D2Q_TM_TILE * D2Q_K_TILE; i += D2Q_THREADS_PER_TG) {
-            uint m = i / D2Q_K_TILE;
-            uint k = i % D2Q_K_TILE;
+        for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
+            uint m = i / MATMUL_K_TILE;
+            uint k = i % MATMUL_K_TILE;
             uint g_row = tg_m + m;
             uint g_col = k_base + k;
             half a_val = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
             tg_a[0][i] = a_val;
         }
         // Load B tile (3-bit unpack + dual-scale dequant)
-        for (uint i = tid; i < D2Q_TN_TILE * D2Q_K_TILE; i += D2Q_THREADS_PER_TG) {
-            uint n = i / D2Q_K_TILE;
-            uint k = i % D2Q_K_TILE;
+        for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
+            uint n = i / MATMUL_K_TILE;
+            uint k = i % MATMUL_K_TILE;
             uint g_n = tg_n + n;
             uint g_k = k_base + k;
             half val = half(0);
@@ -169,7 +169,7 @@ kernel void d2quant_matmul_3bit(
                 float z = is_out ? outlier_zero[g_n * num_groups_k + grp]  : normal_zero[g_n * num_groups_k + grp];
                 val = half((q - z) * s);
             }
-            tg_bt[0][k * D2Q_TN_STRIDE + n] = val;
+            tg_bt[0][k * TN_STRIDE + n] = val;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -181,20 +181,20 @@ kernel void d2quant_matmul_3bit(
 
         // Load NEXT tile (if not the last step)
         if (t + 1 < num_k_steps) {
-            uint k_base = (t + 1) * D2Q_K_TILE;
+            uint k_base = (t + 1) * MATMUL_K_TILE;
             // Load A tile
-            for (uint i = tid; i < D2Q_TM_TILE * D2Q_K_TILE; i += D2Q_THREADS_PER_TG) {
-                uint m = i / D2Q_K_TILE;
-                uint k = i % D2Q_K_TILE;
+            for (uint i = tid; i < TM_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
+                uint m = i / MATMUL_K_TILE;
+                uint k = i % MATMUL_K_TILE;
                 uint g_row = tg_m + m;
                 uint g_col = k_base + k;
                 half a_val = (g_row < M && g_col < K) ? A[g_row * K + g_col] : half(0);
                 tg_a[nxt][i] = a_val;
             }
             // Load B tile (3-bit unpack + dual-scale dequant)
-            for (uint i = tid; i < D2Q_TN_TILE * D2Q_K_TILE; i += D2Q_THREADS_PER_TG) {
-                uint n = i / D2Q_K_TILE;
-                uint k = i % D2Q_K_TILE;
+            for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
+                uint n = i / MATMUL_K_TILE;
+                uint k = i % MATMUL_K_TILE;
                 uint g_n = tg_n + n;
                 uint g_k = k_base + k;
                 half val = half(0);
@@ -212,16 +212,16 @@ kernel void d2quant_matmul_3bit(
                     float z = is_out ? outlier_zero[g_n * num_groups_k + grp]  : normal_zero[g_n * num_groups_k + grp];
                     val = half((q - z) * s);
                 }
-                tg_bt[nxt][k * D2Q_TN_STRIDE + n] = val;
+                tg_bt[nxt][k * TN_STRIDE + n] = val;
             }
         }
 
         // Compute on CURRENT tile
         simdgroup_matrix<half, 8, 8> a_mat;
-        simdgroup_load(a_mat, tg_a[cur] + sgid * 8 * D2Q_K_TILE, D2Q_K_TILE);
-        for (uint j = 0; j < D2Q_TN_BLOCKS; j++) {
+        simdgroup_load(a_mat, tg_a[cur] + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
+        for (uint j = 0; j < TN_BLOCKS; j++) {
             simdgroup_matrix<half, 8, 8> bt_mat;
-            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, D2Q_TN_STRIDE);
+            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, TN_STRIDE);
             simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
         }
 
@@ -229,13 +229,13 @@ kernel void d2quant_matmul_3bit(
     }
 
     // Store results via threadgroup memory
-    threadgroup float tg_out[D2Q_N_SIMDGROUPS * 8 * 8];
+    threadgroup float tg_out[N_SIMDGROUPS * 8 * 8];
 
-    for (uint j = 0; j < D2Q_TN_BLOCKS; j++) {
+    for (uint j = 0; j < TN_BLOCKS; j++) {
         simdgroup_store(acc[j], tg_out + sgid * 64, 8);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint i = tid; i < D2Q_TM_TILE * 8; i += D2Q_THREADS_PER_TG) {
+        for (uint i = tid; i < TM_TILE * 8; i += THREADS_PER_TG) {
             uint local_m = i / 8;
             uint local_n = i % 8;
             uint out_row = tg_m + local_m;
