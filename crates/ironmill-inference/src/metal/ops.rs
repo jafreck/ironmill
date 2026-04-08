@@ -217,6 +217,7 @@ struct ShaderLibraries {
     rope: ShaderLibrary,
     elem: ShaderLibrary,
     embed: ShaderLibrary,
+    quantize: ShaderLibrary,
     qmm: ShaderLibrary,
     kv_scatter: ShaderLibrary,
     matvec: ShaderLibrary,
@@ -428,6 +429,12 @@ impl MetalPipelines {
                     "/embedding.metallib"
                 )))
                 .map_err(MetalError::Metal)?,
+            quantize: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/quantize.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
             qmm: device
                 .load_library_from_data(include_bytes!(concat!(
                     env!("OUT_DIR"),
@@ -550,11 +557,11 @@ impl MetalPipelines {
             make_pipeline(device, &libs.elem, "residual_add")?,
             make_pipeline(device, &libs.elem, "bias_add")?,
             make_pipeline(device, &libs.elem, "copy_buffer")?,
-            make_pipeline(device, &libs.elem, "sigmoid_gate_inplace")?,
+            make_pipeline(device, &libs.act, "sigmoid_gate_inplace")?,
             make_pipeline(device, &libs.embed, "embedding_lookup")?,
             make_pipeline(device, &libs.elem, "scale_buffer")?,
-            make_pipeline(device, &libs.elem, "quantize_input_q8")?,
-            make_pipeline(device, &libs.elem, "affine_embedding_lookup_int4")?,
+            make_pipeline(device, &libs.quantize, "quantize_input_q8")?,
+            make_pipeline(device, &libs.embed, "affine_embedding_lookup_int4")?,
         ))
     }
 

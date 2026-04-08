@@ -33,6 +33,7 @@ fn main() {
         "rope",
         "elementwise",
         "embedding",
+        "quantize",
         "quantized_matmul",
         "kv_scatter",
         "matvec",

@@ -54,3 +54,28 @@ kernel void gelu_gate(
 
     output[tid] = half(gelu_g * u);
 }
+
+// Sigmoid gate (in-place): attn_out[i] *= sigmoid(gate[i])
+//
+// Used by Qwen3.5 attn_output_gate: the Q projection produces interleaved
+// Q + gate values.  After attention, the output is gated element-wise with
+// sigmoid(gate) before the O projection.
+//
+// Buffers:
+//   buffer(0) attn_out: [token_count × dim]  half  (read-write, modified in place)
+//   buffer(1) gate:     [token_count × dim]  half  (read-only)
+//   buffer(2) size:     uint (total element count = token_count * dim)
+//
+// Dispatch: one thread per element.
+
+kernel void sigmoid_gate_inplace(
+    device half* attn_out     [[buffer(0)]],
+    device const half* gate   [[buffer(1)]],
+    constant uint& size       [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= size) return;
+    float g = float(gate[tid]);
+    float s = 1.0f / (1.0f + exp(-g));
+    attn_out[tid] = half(float(attn_out[tid]) * s);
+}
