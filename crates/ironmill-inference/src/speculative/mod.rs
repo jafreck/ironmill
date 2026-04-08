@@ -164,7 +164,7 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
         let rollback_pos = base_pos + accepted_tokens.len();
         let current_pos = self.engine.seq_pos();
         if rollback_pos < current_pos {
-            self.engine.truncate_to(rollback_pos);
+            self.engine.truncate_to(rollback_pos)?;
         }
 
         // 8. Combine accepted tokens + correction token.
@@ -225,7 +225,7 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
         for &idx in &order {
             let target_pos = base_pos + candidates[idx].depth;
             if self.engine.seq_pos() > target_pos {
-                self.engine.truncate_to(target_pos);
+                self.engine.truncate_to(target_pos)?;
             }
             let logits = self.engine.decode_step(candidates[idx].token_id)?;
             all_logits[idx] = logits;
@@ -393,13 +393,19 @@ mod tests {
             self.pos
         }
 
-        fn truncate_to(&mut self, pos: usize) {
-            assert!(pos <= self.pos);
+        fn truncate_to(&mut self, pos: usize) -> Result<(), InferenceError> {
+            if pos > self.pos {
+                return Err(InferenceError::runtime(format!(
+                    "cannot truncate forward: pos {pos} > seq_pos {}",
+                    self.pos
+                )));
+            }
             self.pos = pos;
+            Ok(())
         }
 
-        fn model_info(&self) -> &ModelInfo {
-            &self.model_info
+        fn model_info(&self) -> Result<&ModelInfo, InferenceError> {
+            Ok(&self.model_info)
         }
     }
 

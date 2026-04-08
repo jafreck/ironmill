@@ -1856,8 +1856,13 @@ impl<D: AneDevice + Send + 'static> InferenceEngine for AneInference<D> {
         AneInference::seq_pos(self)
     }
 
-    fn truncate_to(&mut self, pos: usize) {
-        assert!(pos <= self.seq_pos, "cannot truncate forward");
+    fn truncate_to(&mut self, pos: usize) -> Result<(), InferenceError> {
+        if pos > self.seq_pos {
+            return Err(InferenceError::runtime(format!(
+                "cannot truncate forward: pos {pos} > seq_pos {}",
+                self.seq_pos
+            )));
+        }
         self.seq_pos = pos;
         // FP16 KV caches are pre-allocated with max_seq_len and written
         // positionally, so truncation only needs to reset the write pointer.
@@ -1867,14 +1872,15 @@ impl<D: AneDevice + Send + 'static> InferenceEngine for AneInference<D> {
         if let Some(ref mut tq) = self.turboquant {
             tq.reset();
         }
+        Ok(())
     }
 
     fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
 
-    fn model_info(&self) -> &ModelInfo {
-        &self.model_info
+    fn model_info(&self) -> Result<&ModelInfo, InferenceError> {
+        Ok(&self.model_info)
     }
 }
 

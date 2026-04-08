@@ -58,7 +58,7 @@ mod qwen35_correctness {
         let hidden = engine
             .last_hidden_state()
             .expect("last_hidden_state failed");
-        let model_info = engine.model_info();
+        let model_info = engine.model_info().expect("model not loaded");
         let expected_len = model_info.hidden_size;
 
         assert_eq!(

@@ -136,7 +136,10 @@ impl KvPool {
             } else {
                 self.free_list[idx] = (free_off + grow_by, free_len - grow_by);
             }
-            let alloc = self.allocations.get_mut(&id).unwrap();
+            let alloc = self
+                .allocations
+                .get_mut(&id)
+                .ok_or(InferenceError::SequenceNotFound(id))?;
             alloc.capacity += grow_by;
             return Ok(());
         }
@@ -168,7 +171,10 @@ impl KvPool {
         self.free_list.push((old_offset, old_capacity));
         self.coalesce_free_list();
 
-        let alloc = self.allocations.get_mut(&id).unwrap();
+        let alloc = self
+            .allocations
+            .get_mut(&id)
+            .ok_or(InferenceError::SequenceNotFound(id))?;
         alloc.offset = new_offset;
         alloc.capacity = new_capacity;
         alloc.used = old_used;
@@ -196,7 +202,10 @@ impl KvPool {
         for (id, old_offset, capacity) in sorted {
             if old_offset != cursor {
                 relocations.push((id, old_offset, cursor));
-                let alloc = self.allocations.get_mut(&id).unwrap();
+                let alloc = self
+                    .allocations
+                    .get_mut(&id)
+                    .ok_or(InferenceError::SequenceNotFound(id))?;
                 alloc.offset = cursor;
             }
             cursor += capacity;

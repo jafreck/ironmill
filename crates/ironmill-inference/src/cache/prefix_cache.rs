@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use crate::cache::policy::{EvictionPolicy, LruPolicy};
 use crate::cache::radix_tree::{KvCacheSlice, RadixTree};
+use crate::engine::InferenceError;
 
 // ---------------------------------------------------------------------------
 // PrefixCache (radix-tree backed)
@@ -49,12 +50,13 @@ impl PrefixCache {
     ///
     /// If the insertion would exceed the memory budget, LRU eviction runs
     /// first.
-    pub fn insert(&mut self, tokens: &[u32], kv_data: KvCacheSlice) {
+    pub fn insert(&mut self, tokens: &[u32], kv_data: KvCacheSlice) -> Result<(), InferenceError> {
         let new_bytes = kv_data.memory_bytes();
-        let displaced = self.tree.insert(tokens, kv_data);
+        let displaced = self.tree.insert(tokens, kv_data)?;
         self.current_memory = self.current_memory.saturating_sub(displaced);
         self.current_memory += new_bytes;
         self.evict_to_budget();
+        Ok(())
     }
 
     /// Evict least-recently-used entries until memory usage is within budget.
@@ -193,13 +195,15 @@ impl LinearPrefixCache {
         if self.entries.is_empty() {
             return;
         }
-        let oldest_idx = self
+        let Some(oldest_idx) = self
             .entries
             .iter()
             .enumerate()
             .min_by_key(|(_, e)| e.last_access)
             .map(|(i, _)| i)
-            .unwrap();
+        else {
+            return;
+        };
         let freed = self.entries[oldest_idx].kv.memory_bytes();
         self.entries.remove(oldest_idx);
         self.current_memory = self.current_memory.saturating_sub(freed);
@@ -249,7 +253,7 @@ mod tests {
     fn cache_prefix_cache_hit_full_prompt() {
         let mut cache = PrefixCache::new(10_000);
         let tokens: Vec<u32> = (0..1024).collect();
-        cache.insert(&tokens, make_kv(0, 1024, 200));
+        cache.insert(&tokens, make_kv(0, 1024, 200)).unwrap();
 
         let (matched, slices) = cache.lookup(&tokens);
         assert_eq!(matched, 1024, "repeated 1024-token prompt should fully hit");
@@ -261,7 +265,7 @@ mod tests {
         let mut cache = PrefixCache::new(100_000);
 
         let prompt_a: Vec<u32> = (0..1000).collect();
-        cache.insert(&prompt_a, make_kv(0, 1000, 200));
+        cache.insert(&prompt_a, make_kv(0, 1000, 200)).unwrap();
 
         // prompt_b shares 800 tokens with prompt_a, then diverges.
         let mut prompt_b: Vec<u32> = (0..800).collect();
@@ -279,11 +283,11 @@ mod tests {
         // Budget = 500 bytes. Each entry = 200 bytes (1 layer, 100+100).
         let mut cache = PrefixCache::new(500);
 
-        cache.insert(&[1, 2, 3], make_kv(0, 3, 100));
+        cache.insert(&[1, 2, 3], make_kv(0, 3, 100)).unwrap();
         thread::sleep(Duration::from_millis(10));
-        cache.insert(&[4, 5, 6], make_kv(0, 3, 100));
+        cache.insert(&[4, 5, 6], make_kv(0, 3, 100)).unwrap();
         thread::sleep(Duration::from_millis(10));
-        cache.insert(&[7, 8, 9], make_kv(0, 3, 100));
+        cache.insert(&[7, 8, 9], make_kv(0, 3, 100)).unwrap();
 
         // All three fit (200 * 3 = 600 > 500), so the oldest should be evicted.
         assert!(
@@ -303,12 +307,12 @@ mod tests {
     #[test]
     fn cache_prefix_cache_overwrite_memory_accounting() {
         let mut cache = PrefixCache::new(10_000);
-        cache.insert(&[1, 2, 3], make_kv(0, 3, 100)); // 200 bytes
+        cache.insert(&[1, 2, 3], make_kv(0, 3, 100)).unwrap(); // 200 bytes
         assert_eq!(cache.current_memory(), 200);
 
         // Overwrite with larger KV data — memory should reflect only
         // the new entry, not old + new.
-        cache.insert(&[1, 2, 3], make_kv(0, 3, 150)); // 300 bytes
+        cache.insert(&[1, 2, 3], make_kv(0, 3, 150)).unwrap(); // 300 bytes
         assert_eq!(
             cache.current_memory(),
             300,

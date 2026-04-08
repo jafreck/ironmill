@@ -246,8 +246,13 @@ impl InferenceEngine for MetalInference {
         self.seq_pos
     }
 
-    fn truncate_to(&mut self, pos: usize) {
-        assert!(pos <= self.seq_pos);
+    fn truncate_to(&mut self, pos: usize) -> Result<(), InferenceError> {
+        if pos > self.seq_pos {
+            return Err(InferenceError::runtime(format!(
+                "cannot truncate forward: pos {pos} > seq_pos {}",
+                self.seq_pos
+            )));
+        }
         self.seq_pos = pos;
         if let Some(kv) = self.kv_cache.as_mut() {
             kv.truncate_to(pos);
@@ -258,12 +263,11 @@ impl InferenceEngine for MetalInference {
         if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
             mla_kv.truncate_to(pos);
         }
+        Ok(())
     }
 
-    fn model_info(&self) -> &ModelInfo {
-        self.model_info
-            .as_ref()
-            .expect("model_info() called before load()")
+    fn model_info(&self) -> Result<&ModelInfo, InferenceError> {
+        self.model_info.as_ref().ok_or(InferenceError::NotLoaded)
     }
 }
 

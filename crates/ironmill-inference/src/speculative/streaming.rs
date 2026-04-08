@@ -221,7 +221,7 @@ impl<E: InferenceEngine> SpeculativeStreaming<E> {
         // Rollback any unverified positions from the KV cache.
         let target_pos = base_pos + verified_count;
         if self.engine.seq_pos() > target_pos {
-            self.engine.truncate_to(target_pos);
+            self.engine.truncate_to(target_pos)?;
         }
 
         // Collect accepted tokens: primary + all verified speculative.
@@ -402,13 +402,19 @@ mod tests {
             self.pos
         }
 
-        fn truncate_to(&mut self, pos: usize) {
-            assert!(pos <= self.pos);
+        fn truncate_to(&mut self, pos: usize) -> Result<(), InferenceError> {
+            if pos > self.pos {
+                return Err(InferenceError::runtime(format!(
+                    "cannot truncate forward: pos {pos} > seq_pos {}",
+                    self.pos
+                )));
+            }
             self.pos = pos;
+            Ok(())
         }
 
-        fn model_info(&self) -> &ModelInfo {
-            &self.model_info
+        fn model_info(&self) -> Result<&ModelInfo, InferenceError> {
+            Ok(&self.model_info)
         }
     }
 

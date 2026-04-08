@@ -75,7 +75,7 @@ pub trait InferenceEngine: Send {
     fn seq_pos(&self) -> usize;
 
     /// Truncate KV cache to the given position, discarding tokens after `pos`.
-    fn truncate_to(&mut self, pos: usize);
+    fn truncate_to(&mut self, pos: usize) -> Result<(), InferenceError>;
 
     /// Maximum sequence length this engine supports.
     fn max_seq_len(&self) -> usize {
@@ -83,7 +83,7 @@ pub trait InferenceEngine: Send {
     }
 
     /// Model info for this loaded engine (see §4.13).
-    fn model_info(&self) -> &ModelInfo;
+    fn model_info(&self) -> Result<&ModelInfo, InferenceError>;
 
     /// Current memory usage. Returns `None` if the backend doesn't track memory.
     fn memory_usage(&self) -> Option<MemoryUsage> {
@@ -156,7 +156,7 @@ pub fn prefill_with_cache(
             } else {
                 // Entire prompt cached. Truncate the last position and
                 // re-prefill the final token to produce logits.
-                engine.truncate_to(matched - 1);
+                engine.truncate_to(matched - 1)?;
                 engine.prefill(&tokens[matched - 1..])?
             }
         } else {
@@ -221,7 +221,7 @@ pub fn prefill_with_cache(
             len: tokens.len(),
         }
     };
-    cache.insert(tokens, kv_snapshot);
+    cache.insert(tokens, kv_snapshot)?;
 
     Ok(logits)
 }

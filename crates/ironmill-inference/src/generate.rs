@@ -277,7 +277,15 @@ impl Iterator for TokenStream<'_> {
                     self.logits = logits;
                     // Resolve stop tokens: use explicit list, or fall back to model's EOS.
                     if self.request.stop_tokens.is_empty() {
-                        self.effective_stop_tokens = self.engine.model_info().eos_tokens.clone();
+                        match self.engine.model_info() {
+                            Ok(info) => {
+                                self.effective_stop_tokens = info.eos_tokens.clone();
+                            }
+                            Err(e) => {
+                                self.finished = true;
+                                return Some(Err(e));
+                            }
+                        }
                     } else {
                         self.effective_stop_tokens = self.request.stop_tokens.clone();
                     }
@@ -634,12 +642,13 @@ mod tests {
             self.pos
         }
 
-        fn truncate_to(&mut self, pos: usize) {
+        fn truncate_to(&mut self, pos: usize) -> Result<(), InferenceError> {
             self.pos = pos;
+            Ok(())
         }
 
-        fn model_info(&self) -> &ModelInfo {
-            &self.model_info
+        fn model_info(&self) -> Result<&ModelInfo, InferenceError> {
+            Ok(&self.model_info)
         }
     }
 
@@ -683,11 +692,12 @@ mod tests {
             fn seq_pos(&self) -> usize {
                 self.pos
             }
-            fn truncate_to(&mut self, pos: usize) {
+            fn truncate_to(&mut self, pos: usize) -> Result<(), InferenceError> {
                 self.pos = pos;
+                Ok(())
             }
-            fn model_info(&self) -> &ModelInfo {
-                &self.info
+            fn model_info(&self) -> Result<&ModelInfo, InferenceError> {
+                Ok(&self.info)
             }
         }
 

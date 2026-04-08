@@ -8,6 +8,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::engine::InferenceError;
+
 // ---------------------------------------------------------------------------
 // KV cache slice types
 // ---------------------------------------------------------------------------
@@ -183,11 +185,20 @@ impl RadixTree {
     ///
     /// Returns the number of bytes freed by overwriting an existing node's
     /// KV data (0 if no overwrite occurred).
-    pub fn insert(&mut self, tokens: &[u32], kv_data: KvCacheSlice) -> usize {
+    pub fn insert(
+        &mut self,
+        tokens: &[u32],
+        kv_data: KvCacheSlice,
+    ) -> Result<usize, InferenceError> {
         self.insert_at(&mut 0, tokens, kv_data)
     }
 
-    fn insert_at(&mut self, pos: &mut usize, tokens: &[u32], kv_data: KvCacheSlice) -> usize {
+    fn insert_at(
+        &mut self,
+        pos: &mut usize,
+        tokens: &[u32],
+        kv_data: KvCacheSlice,
+    ) -> Result<usize, InferenceError> {
         let mut node = &mut self.root;
         node.last_access.set(Instant::now());
 
@@ -202,10 +213,14 @@ impl RadixTree {
                 leaf.last_access.set(Instant::now());
                 e.insert(Box::new(leaf));
                 *pos = tokens.len();
-                return 0;
+                return Ok(0);
             }
 
-            let child = node.children.get_mut(&next_token).unwrap();
+            let child = node.children.get_mut(&next_token).ok_or_else(|| {
+                InferenceError::runtime(format!(
+                    "radix tree inconsistency: missing child for token {next_token}"
+                ))
+            })?;
             let span_len = child.token_span.len();
             let remaining = &tokens[*pos..];
 
@@ -251,7 +266,7 @@ impl RadixTree {
                     // The insertion ends exactly at the split point.
                     child.kv_slice = Some(kv_data);
                 }
-                return 0;
+                return Ok(0);
             }
 
             // Full edge match — advance into child.
@@ -259,13 +274,17 @@ impl RadixTree {
             *pos += span_len;
 
             // We need to move `node` to point at the child. We re-borrow.
-            node = node.children.get_mut(&next_token).unwrap();
+            node = node.children.get_mut(&next_token).ok_or_else(|| {
+                InferenceError::runtime(format!(
+                    "radix tree inconsistency: missing child for token {next_token}"
+                ))
+            })?;
         }
 
         // tokens exactly matched an existing path — update KV data.
         let displaced = node.local_memory();
         node.kv_slice = Some(kv_data);
-        displaced
+        Ok(displaced)
     }
 
     /// Collect all nodes (as mutable references) in the tree via DFS.
@@ -352,7 +371,7 @@ mod tests {
         let mut tree = RadixTree::new();
 
         // Insert [1, 2, 3, 4, 5]
-        tree.insert(&[1, 2, 3, 4, 5], make_kv(0, 5, 100));
+        tree.insert(&[1, 2, 3, 4, 5], make_kv(0, 5, 100)).unwrap();
 
         // Exact match
         let (matched, slices) = tree.lookup(&[1, 2, 3, 4, 5]);
@@ -374,10 +393,10 @@ mod tests {
         let mut tree = RadixTree::new();
 
         // Insert [1, 2, 3, 4, 5]
-        tree.insert(&[1, 2, 3, 4, 5], make_kv(0, 5, 100));
+        tree.insert(&[1, 2, 3, 4, 5], make_kv(0, 5, 100)).unwrap();
 
         // Insert [1, 2, 3, 6, 7] — shares 3-token prefix
-        tree.insert(&[1, 2, 3, 6, 7], make_kv(0, 5, 100));
+        tree.insert(&[1, 2, 3, 6, 7], make_kv(0, 5, 100)).unwrap();
 
         // Lookup the first sequence
         let (matched, _) = tree.lookup(&[1, 2, 3, 4, 5]);
@@ -396,8 +415,8 @@ mod tests {
     fn cache_radix_tree_edge_split() {
         let mut tree = RadixTree::new();
 
-        tree.insert(&[10, 20, 30, 40], make_kv(0, 4, 50));
-        tree.insert(&[10, 20, 50, 60], make_kv(0, 4, 50));
+        tree.insert(&[10, 20, 30, 40], make_kv(0, 4, 50)).unwrap();
+        tree.insert(&[10, 20, 50, 60], make_kv(0, 4, 50)).unwrap();
 
         let (m1, _) = tree.lookup(&[10, 20, 30, 40]);
         assert_eq!(m1, 4);
@@ -413,7 +432,7 @@ mod tests {
     #[test]
     fn cache_radix_tree_memory_tracking() {
         let mut tree = RadixTree::new();
-        tree.insert(&[1, 2, 3], make_kv(0, 3, 100));
+        tree.insert(&[1, 2, 3], make_kv(0, 3, 100)).unwrap();
         // 1 layer, 100 bytes k + 100 bytes v = 200
         assert_eq!(tree.root.subtree_memory(), 200);
     }
@@ -421,8 +440,8 @@ mod tests {
     #[test]
     fn cache_radix_tree_overwrite_existing() {
         let mut tree = RadixTree::new();
-        tree.insert(&[1, 2, 3], make_kv(0, 3, 100));
-        tree.insert(&[1, 2, 3], make_kv(0, 3, 200));
+        tree.insert(&[1, 2, 3], make_kv(0, 3, 100)).unwrap();
+        tree.insert(&[1, 2, 3], make_kv(0, 3, 200)).unwrap();
         let (matched, slices) = tree.lookup(&[1, 2, 3]);
         assert_eq!(matched, 3);
         assert_eq!(slices[0].layer_data[0].k_data.len(), 200);
