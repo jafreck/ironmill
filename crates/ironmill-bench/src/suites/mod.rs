@@ -29,6 +29,7 @@ pub fn register_suites(registry: &mut SuiteRegistry) {
         registry.register(Box::new(prefill::MetalPrefillSuite));
         registry.register(Box::new(context_decode::MetalContextDecodeSuite));
         registry.register(Box::new(perplexity_metal::MetalPerplexitySuite));
+        registry.register(Box::new(perplexity_metal::MetalDecodePerplexitySuite));
     }
 
     registry.register(Box::new(quality::QualitySuite));

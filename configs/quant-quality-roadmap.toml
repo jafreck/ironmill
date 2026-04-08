@@ -6,7 +6,7 @@
 #   3. INT4 + AWQ alpha grid search (P0) — per-tensor optimal scaling
 #   4. INT4 + AWQ alpha search + sensitive layers (P0+P2) — mixed precision
 #
-# Reproduce:
+# Reproduce (combined decode + perplexity, loads model once per config):
 #   cargo run --release -p ironmill-bench --features metal -- \
 #     --config configs/quant-quality-roadmap.toml -b metal \
 #     -i 5 -w 2 -r 1 \

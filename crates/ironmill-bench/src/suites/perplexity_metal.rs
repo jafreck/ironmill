@@ -8,33 +8,96 @@ use anyhow::Result;
 use crate::perplexity;
 use crate::suite::{BackendKind, BenchmarkContext, BenchmarkResult, BenchmarkSuite};
 
-pub struct MetalPerplexitySuite;
+/// Result of a perplexity evaluation on a loaded engine.
+#[cfg(feature = "metal")]
+pub(crate) struct PerplexityEvalResult {
+    pub ppl: f64,
+    pub avg_ce: f64,
+    pub num_tokens: usize,
+    pub num_seqs: usize,
+}
 
-impl BenchmarkSuite for MetalPerplexitySuite {
-    fn name(&self) -> &str {
-        "Metal Perplexity Evaluation"
+/// Run perplexity evaluation on an already-loaded engine.
+///
+/// Reusable by any suite that has a `MetalInference` engine ready.
+#[cfg(feature = "metal")]
+pub(crate) fn run_perplexity_eval(
+    engine: &mut ironmill_inference::metal::MetalInference,
+    dataset: &perplexity::PerplexityDataset,
+    num_seqs: usize,
+    stride: usize,
+    config_name: &str,
+) -> Result<PerplexityEvalResult> {
+    use ironmill_inference::engine::InferenceEngine;
+
+    let full_tokens: Vec<u32> = dataset
+        .sequences
+        .iter()
+        .take(num_seqs)
+        .flatten()
+        .copied()
+        .collect();
+    let max_length = dataset.seq_len;
+    let windows = perplexity::sliding_window_schedule(full_tokens.len(), max_length, stride);
+    let num_windows = windows.len();
+
+    let mut all_losses = Vec::new();
+    let start = std::time::Instant::now();
+
+    for (win_idx, step) in windows.iter().enumerate() {
+        engine.reset();
+        let window = &full_tokens[step.begin..step.end];
+        if window.len() < 2 {
+            continue;
+        }
+        let all_logits = engine
+            .prefill_all_logits(window)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for pos in step.loss_start..window.len() - 1 {
+            let target = window[pos + 1];
+            let ce = perplexity::cross_entropy(&all_logits[pos], target);
+            all_losses.push(ce);
+        }
+        let running_ppl = perplexity::perplexity_from_losses(&all_losses);
+        let elapsed = start.elapsed().as_secs_f64();
+        let tok_per_sec = all_losses.len() as f64 / elapsed;
+        eprintln!(
+            "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
+            win_idx + 1,
+            num_windows,
+            running_ppl,
+            all_losses.len(),
+            tok_per_sec,
+        );
     }
 
-    fn id(&self) -> &str {
-        "perplexity"
+    if all_losses.is_empty() {
+        anyhow::bail!("{config_name}: no valid losses computed");
     }
 
-    fn supported_backends(&self) -> &[BackendKind] {
-        &[BackendKind::Metal]
-    }
+    let ppl = perplexity::perplexity_from_losses(&all_losses);
+    let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
+    eprintln!("  ✓ {config_name}: PPL={ppl:.2}, Avg CE={avg_ce:.4}");
 
-    fn should_run(&self, ctx: &BenchmarkContext) -> bool {
-        ctx.matrix.settings.backends.iter().any(|b| b == "metal")
-            && ctx.extra.contains_key("perplexity")
-    }
+    Ok(PerplexityEvalResult {
+        ppl,
+        avg_ce,
+        num_tokens: all_losses.len(),
+        num_seqs,
+    })
+}
 
-    #[cfg(feature = "metal")]
-    fn run(&self, ctx: &BenchmarkContext) -> Result<Vec<BenchmarkResult>> {
-        use ironmill_compile::weights::SafeTensorsProvider;
-        use ironmill_compile::weights::quantized::{D2QuantConfig, QuantizedWeightProvider};
-        use ironmill_inference::engine::InferenceEngine;
-        use ironmill_inference::metal::MetalInference;
+/// Parse perplexity-related settings from the benchmark context.
+#[cfg(feature = "metal")]
+pub(crate) struct PerplexitySettings {
+    pub dataset: perplexity::PerplexityDataset,
+    pub num_seqs: usize,
+    pub stride: usize,
+}
 
+#[cfg(feature = "metal")]
+impl PerplexitySettings {
+    pub fn from_context(ctx: &BenchmarkContext) -> Result<Self> {
         let dataset_path = ctx
             .extra
             .get("perplexity_dataset")
@@ -60,178 +123,236 @@ impl BenchmarkSuite for MetalPerplexitySuite {
             .and_then(|s| s.parse().ok())
             .unwrap_or(512);
 
+        Ok(Self {
+            dataset,
+            num_seqs,
+            stride,
+        })
+    }
+}
+
+#[cfg(feature = "metal")]
+fn build_ppl_result(
+    suite_id: &str,
+    model_name: &str,
+    config_name: &str,
+    gpu_mb: f64,
+    load_time_ms: Option<f64>,
+    eval: &PerplexityEvalResult,
+) -> BenchmarkResult {
+    let dummy_result = crate::stats::AggregatedResult {
+        config_label: format!("{model_name}/{config_name}/ppl"),
+        pooled: crate::stats::compute_stats("ppl", &[0.0]),
+        per_run_means: vec![],
+        between_run_stddev: 0.0,
+        runs: 1,
+    };
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "avg_cross_entropy".to_string(),
+        format!("{:.4}", eval.avg_ce),
+    );
+    metadata.insert("num_tokens".to_string(), eval.num_tokens.to_string());
+    metadata.insert("num_sequences".to_string(), eval.num_seqs.to_string());
+
+    BenchmarkResult {
+        suite: suite_id.to_string(),
+        model: model_name.to_string(),
+        optimization: config_name.to_string(),
+        backend: format!("metal-{config_name}"),
+        variant: None,
+        result: dummy_result,
+        gpu_memory_mb: Some(gpu_mb),
+        load_time_ms,
+        perplexity: Some(eval.ppl),
+        metadata,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone perplexity suite (loads its own engine)
+// ---------------------------------------------------------------------------
+
+pub struct MetalPerplexitySuite;
+
+impl BenchmarkSuite for MetalPerplexitySuite {
+    fn name(&self) -> &str {
+        "Metal Perplexity Evaluation"
+    }
+
+    fn id(&self) -> &str {
+        "perplexity"
+    }
+
+    fn supported_backends(&self) -> &[BackendKind] {
+        &[BackendKind::Metal]
+    }
+
+    fn should_run(&self, ctx: &BenchmarkContext) -> bool {
+        ctx.matrix.settings.backends.iter().any(|b| b == "metal")
+            && ctx.extra.contains_key("perplexity")
+    }
+
+    #[cfg(feature = "metal")]
+    fn run(&self, ctx: &BenchmarkContext) -> Result<Vec<BenchmarkResult>> {
+        let ppl_settings = PerplexitySettings::from_context(ctx)?;
         let mut results = Vec::new();
 
         for model_cfg in &ctx.matrix.models {
-            let model_dir = if let Some(ref md) = model_cfg.model_dir {
-                md.clone()
-            } else if model_cfg.path.is_dir() {
-                model_cfg.path.clone()
-            } else {
-                model_cfg.path.parent().unwrap().to_path_buf()
-            };
-
-            let provider = SafeTensorsProvider::load(&model_dir)?;
-
             for opt_cfg in &ctx.matrix.optimizations {
                 let gpu_config = super::decode::build_metal_config(opt_cfg);
                 let config_name = &opt_cfg.name;
                 eprintln!("  Evaluating {config_name}...");
 
-                let mut engine =
-                    MetalInference::new(gpu_config.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
-                let gpu_before = engine.gpu_allocated_bytes();
-
-                let d2quant_bits = opt_cfg.d2quant.unwrap_or(0);
-                if d2quant_bits > 0 {
-                    let d2q_config = D2QuantConfig {
-                        bits: d2quant_bits,
-                        group_size: 128,
-                        outlier_threshold: 0.99,
-                    };
-                    let q_provider = QuantizedWeightProvider::new(&provider, d2q_config);
-                    engine
-                        .load_weights(&q_provider, gpu_config.clone())
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let dac_tokens: Vec<u32> = dataset
-                        .sequences
-                        .iter()
-                        .flatten()
-                        .copied()
-                        .take(2048)
-                        .collect();
-                    let _ = engine.calibrate_dac(&provider, &dac_tokens);
-                } else if opt_cfg.int4 {
-                    let int4_config = if let Some(ref awq_dir) = opt_cfg.awq_calib_dir {
-                        let mag_path = std::path::Path::new(awq_dir).join("awq_magnitudes.json");
-                        let magnitudes: std::collections::HashMap<String, Vec<f32>> =
-                            serde_json::from_str(
-                                &std::fs::read_to_string(&mag_path)
-                                    .map_err(|e| anyhow::anyhow!("{e}"))?,
-                            )
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        let act_path = std::path::Path::new(awq_dir).join("awq_activations.json");
-                        let tc_path = std::path::Path::new(awq_dir).join("awq_token_count.json");
-                        if let (Ok(act_json), Ok(tc_json)) = (
-                            std::fs::read_to_string(&act_path),
-                            std::fs::read_to_string(&tc_path),
-                        ) {
-                            if let (Ok(activations), Ok(token_count)) = (
-                                serde_json::from_str::<std::collections::HashMap<String, Vec<f32>>>(
-                                    &act_json,
-                                ),
-                                serde_json::from_str::<usize>(&tc_json),
-                            ) {
-                                ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq_with_activations(
-                                    128, magnitudes, activations, token_count,
-                                )
-                            } else {
-                                ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(
-                                    128, magnitudes,
-                                )
-                            }
-                        } else {
-                            ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(
-                                128, magnitudes,
-                            )
-                        }
-                    } else {
-                        ironmill_compile::weights::quantized::AffineQuantConfig::default()
-                    };
-                    let q_provider = QuantizedWeightProvider::new_int4(&provider, int4_config);
-                    engine
-                        .load_weights(&q_provider, gpu_config.clone())
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                } else {
-                    engine
-                        .load_weights(&provider, gpu_config.clone())
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                }
-
-                let gpu_after = engine.gpu_allocated_bytes();
-                let gpu_mb = gpu_after as f64 / (1024.0 * 1024.0);
-                let model_mb = (gpu_after - gpu_before) as f64 / (1024.0 * 1024.0);
-                eprintln!("  GPU memory: {gpu_mb:.1} MB (model: {model_mb:.1} MB)");
-
-                let full_tokens: Vec<u32> = dataset
-                    .sequences
-                    .iter()
-                    .take(num_seqs)
-                    .flatten()
-                    .copied()
-                    .collect();
-                let max_length = dataset.seq_len;
-                let windows =
-                    perplexity::sliding_window_schedule(full_tokens.len(), max_length, stride);
-                let num_windows = windows.len();
-
-                let mut all_losses = Vec::new();
-                let start = std::time::Instant::now();
-
-                for (win_idx, step) in windows.iter().enumerate() {
-                    engine.reset();
-                    let window = &full_tokens[step.begin..step.end];
-                    if window.len() < 2 {
+                let mut handle = match super::decode::load_metal_engine(
+                    model_cfg,
+                    opt_cfg,
+                    &gpu_config,
+                    config_name,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("  ✗ {e}");
                         continue;
                     }
-                    let all_logits = engine
-                        .prefill_all_logits(window)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    for pos in step.loss_start..window.len() - 1 {
-                        let target = window[pos + 1];
-                        let ce = perplexity::cross_entropy(&all_logits[pos], target);
-                        all_losses.push(ce);
-                    }
-                    let running_ppl = perplexity::perplexity_from_losses(&all_losses);
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let tok_per_sec = all_losses.len() as f64 / elapsed;
-                    eprintln!(
-                        "  [{}/{}] PPL: {:.2} ({} tokens, {:.1} tok/s)",
-                        win_idx + 1,
-                        num_windows,
-                        running_ppl,
-                        all_losses.len(),
-                        tok_per_sec,
-                    );
-                }
-
-                if all_losses.is_empty() {
-                    eprintln!("  ⚠ {config_name}: no valid losses computed");
-                    continue;
-                }
-
-                let ppl = perplexity::perplexity_from_losses(&all_losses);
-                let avg_ce = all_losses.iter().sum::<f64>() / all_losses.len() as f64;
-                eprintln!(
-                    "  ✓ {config_name}: PPL={:.2}, Avg CE={:.4}, GPU={gpu_mb:.1} MB",
-                    ppl, avg_ce
-                );
-
-                let dummy_result = crate::stats::AggregatedResult {
-                    config_label: format!("{}/{config_name}/ppl", model_cfg.name),
-                    pooled: crate::stats::compute_stats("ppl", &[0.0]),
-                    per_run_means: vec![],
-                    between_run_stddev: 0.0,
-                    runs: 1,
                 };
 
-                let mut metadata = HashMap::new();
-                metadata.insert("avg_cross_entropy".to_string(), format!("{avg_ce:.4}"));
-                metadata.insert("num_tokens".to_string(), all_losses.len().to_string());
-                metadata.insert("num_sequences".to_string(), num_seqs.to_string());
+                match run_perplexity_eval(
+                    &mut handle.engine,
+                    &ppl_settings.dataset,
+                    ppl_settings.num_seqs,
+                    ppl_settings.stride,
+                    config_name,
+                ) {
+                    Ok(eval) => {
+                        results.push(build_ppl_result(
+                            self.id(),
+                            &model_cfg.name,
+                            config_name,
+                            handle.gpu_mb,
+                            Some(handle.load_time_ms),
+                            &eval,
+                        ));
+                    }
+                    Err(e) => eprintln!("  ⚠ {e}"),
+                }
+            }
+        }
 
-                results.push(BenchmarkResult {
-                    suite: self.id().to_string(),
-                    model: model_cfg.name.clone(),
-                    optimization: opt_cfg.name.clone(),
-                    backend: format!("metal-{config_name}"),
-                    variant: None,
-                    result: dummy_result,
-                    gpu_memory_mb: Some(gpu_mb),
-                    load_time_ms: None,
-                    perplexity: Some(ppl),
-                    metadata,
-                });
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "metal"))]
+    fn run(&self, _ctx: &BenchmarkContext) -> Result<Vec<BenchmarkResult>> {
+        eprintln!("  Metal backend not available (compile with --features metal)");
+        Ok(Vec::new())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combined decode + perplexity suite (single model load)
+// ---------------------------------------------------------------------------
+
+pub struct MetalDecodePerplexitySuite;
+
+impl BenchmarkSuite for MetalDecodePerplexitySuite {
+    fn name(&self) -> &str {
+        "Metal Decode + Perplexity"
+    }
+
+    fn id(&self) -> &str {
+        "decode-ppl"
+    }
+
+    fn supported_backends(&self) -> &[BackendKind] {
+        &[BackendKind::Metal]
+    }
+
+    fn should_run(&self, ctx: &BenchmarkContext) -> bool {
+        ctx.matrix.settings.backends.iter().any(|b| b == "metal")
+            && ctx.extra.contains_key("perplexity")
+    }
+
+    #[cfg(feature = "metal")]
+    fn run(&self, ctx: &BenchmarkContext) -> Result<Vec<BenchmarkResult>> {
+        let ppl_settings = PerplexitySettings::from_context(ctx)?;
+        let mut results = Vec::new();
+
+        for model_cfg in &ctx.matrix.models {
+            for opt_cfg in &ctx.matrix.optimizations {
+                let gpu_config = super::decode::build_metal_config(opt_cfg);
+                let config_name = &opt_cfg.name;
+                eprintln!("  Metal/{config_name}: {}...", model_cfg.name);
+
+                let mut handle = match super::decode::load_metal_engine(
+                    model_cfg,
+                    opt_cfg,
+                    &gpu_config,
+                    config_name,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("  ✗ {e}");
+                        continue;
+                    }
+                };
+
+                // Decode latency benchmark
+                let label = format!("{}/metal-{config_name}", model_cfg.name);
+                match super::decode::run_decode_loop(
+                    &mut handle.engine,
+                    ctx.matrix.settings.warmup,
+                    ctx.matrix.settings.iterations,
+                    ctx.matrix.settings.runs,
+                    &label,
+                ) {
+                    Ok((mut aggregated, tok_per_sec)) => {
+                        aggregated.pooled.tokens_per_sec = Some(tok_per_sec);
+                        aggregated.pooled.decode_tok_per_sec = Some(tok_per_sec);
+                        eprintln!(
+                            "  ✓ {config_name}: {:.2}ms/tok ({:.1} tok/s) ± {:.2}ms",
+                            aggregated.pooled.mean, tok_per_sec, aggregated.pooled.stddev,
+                        );
+                        results.push(BenchmarkResult {
+                            suite: "decode".to_string(),
+                            model: model_cfg.name.clone(),
+                            optimization: opt_cfg.name.clone(),
+                            backend: format!("metal-{config_name}"),
+                            variant: None,
+                            result: aggregated,
+                            gpu_memory_mb: Some(handle.gpu_mb),
+                            load_time_ms: Some(handle.load_time_ms),
+                            perplexity: None,
+                            metadata: HashMap::new(),
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("  ✗ decode failed: {e}");
+                    }
+                }
+
+                // Perplexity evaluation (reuses the same loaded engine)
+                eprintln!("  Evaluating perplexity for {config_name}...");
+                match run_perplexity_eval(
+                    &mut handle.engine,
+                    &ppl_settings.dataset,
+                    ppl_settings.num_seqs,
+                    ppl_settings.stride,
+                    config_name,
+                ) {
+                    Ok(eval) => {
+                        results.push(build_ppl_result(
+                            "perplexity",
+                            &model_cfg.name,
+                            config_name,
+                            handle.gpu_mb,
+                            Some(handle.load_time_ms),
+                            &eval,
+                        ));
+                    }
+                    Err(e) => eprintln!("  ⚠ perplexity: {e}"),
+                }
             }
         }
 
