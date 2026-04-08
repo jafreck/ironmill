@@ -622,7 +622,8 @@ fn magnitude_cache_key(magnitudes: &[f32]) -> u64 {
 /// force a wide quantization range — clipping them trades outlier accuracy
 /// for much better precision on the majority of weights.
 ///
-/// Ported from the MIL IR pass (`awq_quantize.rs::search_clip_ranges`).
+/// Rows are processed in parallel via rayon. Large matrices sub-sample
+/// rows (cap 256) and broadcast the median clip value to all rows.
 #[allow(clippy::too_many_arguments)]
 fn search_clip_ranges(
     scaled_weights: &[f32],
@@ -636,17 +637,24 @@ fn search_clip_ranges(
     max_shrink: f32,
 ) -> Vec<f32> {
     let n_groups = in_features.div_ceil(group_size);
+    let n_steps = (max_shrink * clip_grid as f32) as usize;
     let mut clip_maxvals = vec![f32::INFINITY; out_features * n_groups];
 
-    let mut clipped = vec![0.0f32; group_size];
-    let mut quantized = vec![0u8; group_size];
-
     let n_sample = n_tokens.min(4);
-    let stride = if n_tokens > n_sample {
+    let token_stride = if n_tokens > n_sample {
         n_tokens / n_sample
     } else {
         1
     };
+
+    // Sub-sample rows for large matrices.
+    let max_rows = out_features.min(256);
+    let row_stride = if out_features > max_rows {
+        out_features / max_rows
+    } else {
+        1
+    };
+    let sampled_rows: Vec<usize> = (0..out_features).step_by(row_stride).collect();
 
     for g in 0..n_groups {
         let g_start = g * group_size;
@@ -655,78 +663,95 @@ fn search_clip_ranges(
 
         let act_g: Vec<f32> = (0..n_sample)
             .flat_map(|si| {
-                let t = si * stride;
+                let t = si * token_stride;
                 (0..gsize).map(move |j| activations[t * in_features + g_start + j])
             })
             .collect();
 
-        for row in 0..out_features {
-            let w_base = row * in_features + g_start;
-            let w_slice = &scaled_weights[w_base..w_base + gsize];
+        // Search clip values for sampled rows in parallel.
+        let row_clips: Vec<(usize, f32)> = sampled_rows
+            .par_iter()
+            .map(|&row| {
+                let w_base = row * in_features + g_start;
+                let w_slice = &scaled_weights[w_base..w_base + gsize];
 
-            let org_max = w_slice.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
-            if org_max < 1e-8 {
-                clip_maxvals[row * n_groups + g] = org_max;
-                continue;
-            }
-
-            // Reference output per sample token.
-            let mut org_out = [0.0f32; 16];
-            for si in 0..n_sample {
-                let mut dot = 0.0f32;
-                let ab = si * gsize;
-                for j in 0..gsize {
-                    dot += w_slice[j] * act_g[ab + j];
-                }
-                org_out[si] = dot;
-            }
-
-            let mut best_err = f32::INFINITY;
-            let mut best_max = org_max;
-
-            let n_steps = (max_shrink * clip_grid as f32) as usize;
-            for step in 0..n_steps {
-                let max_val = org_max * (1.0 - step as f32 / clip_grid as f32);
-
-                for j in 0..gsize {
-                    clipped[j] = w_slice[j].clamp(-max_val, max_val);
+                let org_max = w_slice.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+                if org_max < 1e-8 {
+                    return (row, org_max);
                 }
 
-                // Inline affine quantization (no alloc).
-                let mut wmin = f32::INFINITY;
-                let mut wmax = f32::NEG_INFINITY;
-                for j in 0..gsize {
-                    if clipped[j] < wmin {
-                        wmin = clipped[j];
-                    }
-                    if clipped[j] > wmax {
-                        wmax = clipped[j];
-                    }
-                }
-                let scale = ((wmax - wmin) / qmax).max(1e-10);
-                let zp = (-wmin / scale).round();
-                for j in 0..gsize {
-                    quantized[j] = (clipped[j] / scale + zp).round().clamp(0.0, qmax) as u8;
-                }
-
-                let mut err = 0.0f32;
+                let mut org_out = [0.0f32; 16];
                 for si in 0..n_sample {
-                    let mut q_out = 0.0f32;
+                    let mut dot = 0.0f32;
                     let ab = si * gsize;
                     for j in 0..gsize {
-                        q_out += (quantized[j] as f32 - zp) * scale * act_g[ab + j];
+                        dot += w_slice[j] * act_g[ab + j];
                     }
-                    let diff = q_out - org_out[si];
-                    err += diff * diff;
+                    org_out[si] = dot;
                 }
 
-                if err < best_err {
-                    best_err = err;
-                    best_max = max_val;
+                let mut clipped_buf = vec![0.0f32; gsize];
+                let mut quant_buf = vec![0u8; gsize];
+                let mut best_err = f32::INFINITY;
+                let mut best_max = org_max;
+
+                for step in 0..n_steps {
+                    let max_val = org_max * (1.0 - step as f32 / clip_grid as f32);
+
+                    for j in 0..gsize {
+                        clipped_buf[j] = w_slice[j].clamp(-max_val, max_val);
+                    }
+
+                    let mut wmin = f32::INFINITY;
+                    let mut wmax = f32::NEG_INFINITY;
+                    for j in 0..gsize {
+                        if clipped_buf[j] < wmin {
+                            wmin = clipped_buf[j];
+                        }
+                        if clipped_buf[j] > wmax {
+                            wmax = clipped_buf[j];
+                        }
+                    }
+                    let scale = ((wmax - wmin) / qmax).max(1e-10);
+                    let zp = (-wmin / scale).round();
+                    for j in 0..gsize {
+                        quant_buf[j] = (clipped_buf[j] / scale + zp).round().clamp(0.0, qmax) as u8;
+                    }
+
+                    let mut err = 0.0f32;
+                    for si in 0..n_sample {
+                        let mut q_out = 0.0f32;
+                        let ab = si * gsize;
+                        for j in 0..gsize {
+                            q_out += (quant_buf[j] as f32 - zp) * scale * act_g[ab + j];
+                        }
+                        let diff = q_out - org_out[si];
+                        err += diff * diff;
+                    }
+
+                    if err < best_err {
+                        best_err = err;
+                        best_max = max_val;
+                    }
                 }
+
+                (row, best_max)
+            })
+            .collect();
+
+        if row_stride == 1 {
+            // Every row was searched — store directly.
+            for (row, clip) in row_clips {
+                clip_maxvals[row * n_groups + g] = clip;
             }
-
-            clip_maxvals[row * n_groups + g] = best_max;
+        } else {
+            // Sub-sampled: compute median clip and broadcast to all rows.
+            let mut clips: Vec<f32> = row_clips.iter().map(|r| r.1).collect();
+            clips.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = clips[clips.len() / 2];
+            for row in 0..out_features {
+                clip_maxvals[row * n_groups + g] = median;
+            }
         }
     }
 
