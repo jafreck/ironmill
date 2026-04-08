@@ -8,23 +8,13 @@ use crate::metal::error::MetalError;
 /// All loaded shader libraries, passed to `compile_*_shaders` helpers.
 pub(super) struct ShaderLibraries {
     pub norm: ShaderLibrary,
-    pub act: ShaderLibrary,
-    pub rope: ShaderLibrary,
     pub elem: ShaderLibrary,
-    pub embed: ShaderLibrary,
-    pub quantize: ShaderLibrary,
-    pub qmm: ShaderLibrary,
+    pub quantized: ShaderLibrary,
     pub kv_scatter: ShaderLibrary,
     pub matvec: ShaderLibrary,
-    pub fused_rn: ShaderLibrary,
-    pub fused_en: ShaderLibrary,
-    pub int4_dequant: ShaderLibrary,
-    pub quip_sharp: ShaderLibrary,
-    pub fused_softcap: ShaderLibrary,
-    pub ple: ShaderLibrary,
     pub affine_mm: ShaderLibrary,
-    pub d2quant_mm: ShaderLibrary,
     pub gdn: ShaderLibrary,
+    pub ple: ShaderLibrary,
     pub attn: ShaderLibrary,
     pub tq: ShaderLibrary,
     pub sdpa: ShaderLibrary,
@@ -41,19 +31,7 @@ impl ShaderLibraries {
         let (attn, tq, sdpa, fd) = Self::load_head_dim_shaders(device, head_dim, rotary_dim)?;
         Ok(ShaderLibraries {
             norm: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/normalization.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
-            act: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/activation.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
-            rope: device
-                .load_library_from_data(include_bytes!(concat!(env!("OUT_DIR"), "/rope.metallib")))
+                .load_library_from_data(include_bytes!(concat!(env!("OUT_DIR"), "/norm.metallib")))
                 .map_err(MetalError::Metal)?,
             elem: device
                 .load_library_from_data(include_bytes!(concat!(
@@ -61,22 +39,10 @@ impl ShaderLibraries {
                     "/elementwise.metallib"
                 )))
                 .map_err(MetalError::Metal)?,
-            embed: device
+            quantized: device
                 .load_library_from_data(include_bytes!(concat!(
                     env!("OUT_DIR"),
-                    "/embedding.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
-            quantize: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/quantize.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
-            qmm: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/quantized_matmul.metallib"
+                    "/quantized.metallib"
                 )))
                 .map_err(MetalError::Metal)?,
             kv_scatter: device
@@ -91,58 +57,22 @@ impl ShaderLibraries {
                     "/matvec.metallib"
                 )))
                 .map_err(MetalError::Metal)?,
-            fused_rn: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/fused_residual_norm.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
-            fused_en: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/fused_embedding_norm.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
-            int4_dequant: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/int4_dequant.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
-            quip_sharp: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/quip_sharp.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
-            fused_softcap: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/fused_softcap.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
-            ple: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/ple_kernels.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
             affine_mm: device
                 .load_library_from_data(include_bytes!(concat!(
                     env!("OUT_DIR"),
                     "/affine_matmul.metallib"
                 )))
                 .map_err(MetalError::Metal)?,
-            d2quant_mm: device
-                .load_library_from_data(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/d2quant_matmul.metallib"
-                )))
-                .map_err(MetalError::Metal)?,
             gdn: device
                 .load_library_from_data(include_bytes!(concat!(
                     env!("OUT_DIR"),
                     "/gdn_recurrent.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            ple: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/ple_kernels.metallib"
                 )))
                 .map_err(MetalError::Metal)?,
             attn,

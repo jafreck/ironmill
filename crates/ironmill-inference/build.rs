@@ -30,21 +30,54 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let shader_include_dir = manifest_dir.join("src/metal/shaders");
 
-    // ── HEAD_DIM-independent shaders (compiled once) ────────────
-    let independent: &[(&str, &str)] = &[
+    // ── Consolidated domain metallibs ──────────────────────────
+    // Group related single-kernel metallibs into domain bundles to reduce
+    // the number of include_bytes! calls and simplify ShaderLibraries.
+    let norm_shaders: &[(&str, &str)] = &[
         ("normalization", "norm"),
         ("fused_residual_norm", "norm"),
         ("fused_embedding_norm", "norm"),
         ("fused_softcap", "attention"),
-        ("activation", "elementwise"),
+    ];
+    compile_shader_group(
+        norm_shaders,
+        "norm",
+        shader_dir,
+        &out_dir,
+        &shader_include_dir,
+    );
+
+    let elementwise_shaders: &[(&str, &str)] = &[
         ("elementwise", "elementwise"),
-        ("rope", "rope"),
+        ("activation", "elementwise"),
         ("embedding", "embedding"),
-        ("quantize", "quantized"),
+        ("rope", "rope"),
+    ];
+    compile_shader_group(
+        elementwise_shaders,
+        "elementwise",
+        shader_dir,
+        &out_dir,
+        &shader_include_dir,
+    );
+
+    let quantized_shaders: &[(&str, &str)] = &[
         ("quantized_matmul", "quantized"),
         ("int4_dequant", "quantized"),
         ("d2quant_matmul", "quantized"),
         ("quip_sharp", "quantized"),
+        ("quantize", "quantized"),
+    ];
+    compile_shader_group(
+        quantized_shaders,
+        "quantized",
+        shader_dir,
+        &out_dir,
+        &shader_include_dir,
+    );
+
+    // ── Individual metallibs (already domain-scoped) ────────────
+    let individual: &[(&str, &str)] = &[
         ("kv_scatter", "kv"),
         ("matvec", "linear"),
         ("gdn_recurrent", "gdn"),
@@ -52,7 +85,7 @@ fn main() {
         ("moe", "moe"),
     ];
 
-    for &(name, subdir) in independent {
+    for &(name, subdir) in individual {
         let src = shader_dir.join(subdir).join(format!("{name}.metal"));
         let lib = out_dir.join(format!("{name}.metallib"));
         compile_shader(&src, &lib, &[], &shader_include_dir);
@@ -166,6 +199,70 @@ fn main() {
     println!("cargo:rerun-if-changed=src/metal/shaders");
     println!("cargo:rerun-if-changed=src/metal/shaders/common");
     println!("cargo:rerun-if-changed=src/shaders");
+}
+
+/// Compile multiple `.metal` files into individual `.air` files, then link them
+/// into a single `.metallib`.  This consolidates related kernels into one GPU
+/// binary, reducing `include_bytes!` calls and `ShaderLibraries` fields.
+fn compile_shader_group(
+    shaders: &[(&str, &str)],
+    output_name: &str,
+    shader_dir: &Path,
+    out_dir: &Path,
+    include_dir: &Path,
+) {
+    let mut air_files: Vec<PathBuf> = Vec::new();
+
+    // Step 1: compile each .metal → .air
+    for &(name, subdir) in shaders {
+        let src = shader_dir.join(subdir).join(format!("{name}.metal"));
+        let air = out_dir.join(format!("{name}.air"));
+
+        let result = Command::new("xcrun")
+            .arg("metal")
+            .arg("-c")
+            .arg("-Wno-unused-variable")
+            .arg("-I")
+            .arg(include_dir)
+            .arg(&src)
+            .arg("-o")
+            .arg(&air)
+            .output()
+            .expect("failed to run `xcrun metal` — is Xcode installed?");
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            panic!(
+                "Metal shader compilation failed for {}: {}",
+                src.display(),
+                stderr
+            );
+        }
+        air_files.push(air);
+    }
+
+    // Step 2: link all .air files → one .metallib
+    let output = out_dir.join(format!("{output_name}.metallib"));
+    let mut cmd = Command::new("xcrun");
+    cmd.arg("metallib");
+    for air in &air_files {
+        cmd.arg(air);
+    }
+    cmd.arg("-o").arg(&output);
+
+    let result = cmd.output().expect("failed to run `xcrun metallib`");
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        panic!(
+            "metallib creation failed for {}: {}",
+            output.display(),
+            stderr
+        );
+    }
+
+    // Clean up intermediate .air files.
+    for air in &air_files {
+        let _ = std::fs::remove_file(air);
+    }
 }
 
 fn compile_shader(src: &Path, output: &Path, extra_args: &[String], include_dir: &Path) {

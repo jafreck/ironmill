@@ -326,9 +326,9 @@ impl MetalPipelines {
     > {
         Ok((
             make_pipeline(device, &libs.norm, "rms_norm")?,
-            make_pipeline(device, &libs.act, "silu_gate")?,
-            make_pipeline(device, &libs.act, "gelu_gate")?,
-            make_pipeline(device, &libs.rope, "rope")?,
+            make_pipeline(device, &libs.elem, "silu_gate")?,
+            make_pipeline(device, &libs.elem, "gelu_gate")?,
+            make_pipeline(device, &libs.elem, "rope")?,
         ))
     }
 
@@ -354,11 +354,11 @@ impl MetalPipelines {
             make_pipeline(device, &libs.elem, "residual_add")?,
             make_pipeline(device, &libs.elem, "bias_add")?,
             make_pipeline(device, &libs.elem, "copy_buffer")?,
-            make_pipeline(device, &libs.act, "sigmoid_gate_inplace")?,
-            make_pipeline(device, &libs.embed, "embedding_lookup")?,
+            make_pipeline(device, &libs.elem, "sigmoid_gate_inplace")?,
+            make_pipeline(device, &libs.elem, "embedding_lookup")?,
             make_pipeline(device, &libs.elem, "scale_buffer")?,
-            make_pipeline(device, &libs.quantize, "quantize_input_q8")?,
-            make_pipeline(device, &libs.embed, "affine_embedding_lookup_int4")?,
+            make_pipeline(device, &libs.quantized, "quantize_input_q8")?,
+            make_pipeline(device, &libs.elem, "affine_embedding_lookup_int4")?,
         ))
     }
 
@@ -437,10 +437,10 @@ impl MetalPipelines {
         MetalError,
     > {
         Ok((
-            make_pipeline(device, &libs.qmm, "polarquant_matvec_int4")?,
-            make_pipeline(device, &libs.qmm, "polarquant_matmul_int4")?,
-            make_pipeline(device, &libs.qmm, "polarquant_matvec_int8")?,
-            make_pipeline(device, &libs.qmm, "polarquant_matmul_int8")?,
+            make_pipeline(device, &libs.quantized, "polarquant_matvec_int4")?,
+            make_pipeline(device, &libs.quantized, "polarquant_matmul_int4")?,
+            make_pipeline(device, &libs.quantized, "polarquant_matvec_int8")?,
+            make_pipeline(device, &libs.quantized, "polarquant_matmul_int8")?,
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int4")?,
             make_pipeline(device, &libs.affine_mm, "affine_matmul_int4")?,
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int8")?,
@@ -466,8 +466,8 @@ impl MetalPipelines {
             make_pipeline(device, &libs.kv_scatter, "kv_scatter")?,
             make_pipeline(device, &libs.matvec, "matvec")?,
             make_pipeline(device, &libs.matvec, "matmul")?,
-            make_pipeline(device, &libs.quip_sharp, "quip_sharp_matvec")?,
-            make_pipeline(device, &libs.quip_sharp, "quip_sharp_matmul")?,
+            make_pipeline(device, &libs.quantized, "quip_sharp_matvec")?,
+            make_pipeline(device, &libs.quantized, "quip_sharp_matmul")?,
         ))
     }
 
@@ -491,13 +491,13 @@ impl MetalPipelines {
         MetalError,
     > {
         Ok((
-            make_pipeline(device, &libs.int4_dequant, "int4_dequantize")?,
+            make_pipeline(device, &libs.quantized, "int4_dequantize")?,
             make_pipeline(device, &libs.affine_mm, "batched_affine_matvec_int4")?,
             make_pipeline(device, &libs.affine_mm, "gdn_batched_affine_matvec_int4")?,
             make_pipeline(device, &libs.matvec, "gdn_batched_matvec")?,
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int4_amx")?,
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int8_amx")?,
-            make_pipeline(device, &libs.d2quant_mm, "d2quant_matvec_3bit_amx")?,
+            make_pipeline(device, &libs.quantized, "d2quant_matvec_3bit_amx")?,
             make_pipeline(device, &libs.affine_mm, "fused_ffn_gate_up_act_int4")?,
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int4xq8")?,
         ))
@@ -521,17 +521,13 @@ impl MetalPipelines {
         MetalError,
     > {
         Ok((
-            make_pipeline(device, &libs.fused_rn, "fused_residual_rms_norm")?,
-            make_pipeline(device, &libs.fused_en, "fused_embedding_norm")?,
-            make_pipeline(device, &libs.fused_softcap, "fused_softcap")?,
+            make_pipeline(device, &libs.norm, "fused_residual_rms_norm")?,
+            make_pipeline(device, &libs.norm, "fused_embedding_norm")?,
+            make_pipeline(device, &libs.norm, "fused_softcap")?,
             make_pipeline(device, &libs.ple, "ple_gelu_gate")?,
             make_pipeline(device, &libs.ple, "add_scale")?,
-            make_pipeline(device, &libs.fused_rn, "fused_residual_norm_matvec")?,
-            make_pipeline(
-                device,
-                &libs.fused_rn,
-                "fused_residual_norm_affine_matvec_int4",
-            )?,
+            make_pipeline(device, &libs.norm, "fused_residual_norm_matvec")?,
+            make_pipeline(device, &libs.norm, "fused_residual_norm_affine_matvec_int4")?,
         ))
     }
 
@@ -564,9 +560,9 @@ impl MetalPipelines {
         libs: &ShaderLibraries,
     ) -> Result<(ComputePipeline, ComputePipeline, ComputePipeline), MetalError> {
         Ok((
-            make_pipeline(device, &libs.d2quant_mm, "d2quant_matvec_3bit")?,
-            make_pipeline(device, &libs.d2quant_mm, "d2quant_matmul_3bit")?,
-            make_pipeline(device, &libs.d2quant_mm, "d2quant_embedding_lookup_3bit")?,
+            make_pipeline(device, &libs.quantized, "d2quant_matvec_3bit")?,
+            make_pipeline(device, &libs.quantized, "d2quant_matmul_3bit")?,
+            make_pipeline(device, &libs.quantized, "d2quant_embedding_lookup_3bit")?,
         ))
     }
 
