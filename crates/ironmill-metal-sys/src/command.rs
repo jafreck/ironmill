@@ -151,6 +151,24 @@ impl CommandBuffer {
         unsafe { f(self.raw, sel) };
     }
 
+    /// Returns the GPU start time (seconds, Mach absolute time).
+    /// Only valid after `wait_until_completed()`.
+    pub fn gpu_start_time(&self) -> f64 {
+        type TimeFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> f64;
+        let sel = unsafe { objc::sel_registerName(sel!("GPUStartTime")) };
+        let f: TimeFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        unsafe { f(self.raw, sel) }
+    }
+
+    /// Returns the GPU end time (seconds, Mach absolute time).
+    /// Only valid after `wait_until_completed()`.
+    pub fn gpu_end_time(&self) -> f64 {
+        type TimeFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> f64;
+        let sel = unsafe { objc::sel_registerName(sel!("GPUEndTime")) };
+        let f: TimeFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        unsafe { f(self.raw, sel) }
+    }
+
     /// Returns the current status of the command buffer.
     pub fn status(&self) -> CommandBufferStatus {
         // SAFETY: `self.raw` is a valid, retained id<MTLCommandBuffer>.
