@@ -1,6 +1,8 @@
 //! Kernel dispatch helpers — compile shaders and dispatch compute operations.
 
-use ironmill_metal_sys::{ComputeEncoder, ComputePipeline, MetalBuffer, MetalDevice};
+use ironmill_metal_sys::{
+    ComputeEncoder, ComputePipeline, MetalBuffer, MetalDevice, ShaderLibrary,
+};
 
 use super::error::MetalError;
 
@@ -175,10 +177,8 @@ pub struct MetalPipelines {
     pub gdn_batched_affine_matvec_int4: ComputePipeline,
     /// AMX-accelerated INT4 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
     pub affine_matvec_int4_amx: ComputePipeline,
-    /// AMX-accelerated INT8 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
-    pub affine_matvec_int8_amx: ComputePipeline,
-    /// D2Quant AMX-accelerated 3-bit matvec: dual-scale dequant + simdgroup matrix multiply.
-    pub d2quant_matvec_3bit_amx: ComputePipeline,
+    /// Row-major INT4 matvec for decode: ~32× better cache utilization than blocked layout.
+    pub affine_matvec_int4_rowmajor: ComputePipeline,
     /// Fused FFN gate+up+activation for INT4 decode: gate+up dot products + SiLU/GELU inline.
     pub fused_ffn_gate_up_act_int4: ComputePipeline,
     /// Fused residual+RMSNorm+dense matvec in one dispatch.
@@ -197,6 +197,42 @@ pub struct MetalPipelines {
     pub fused_sdpa_reduce: ComputePipeline,
 }
 
+/// Create a compute pipeline from a shader library function.
+fn make_pipeline(
+    device: &MetalDevice,
+    lib: &ShaderLibrary,
+    name: &str,
+) -> Result<ComputePipeline, MetalError> {
+    device
+        .create_compute_pipeline(&lib.get_function(name).map_err(MetalError::Metal)?)
+        .map_err(MetalError::Metal)
+}
+
+/// All loaded shader libraries, passed to `compile_*_shaders` helpers.
+struct ShaderLibraries {
+    norm: ShaderLibrary,
+    act: ShaderLibrary,
+    rope: ShaderLibrary,
+    elem: ShaderLibrary,
+    embed: ShaderLibrary,
+    qmm: ShaderLibrary,
+    kv_scatter: ShaderLibrary,
+    matvec: ShaderLibrary,
+    fused_rn: ShaderLibrary,
+    fused_en: ShaderLibrary,
+    int4_dequant: ShaderLibrary,
+    quip_sharp: ShaderLibrary,
+    fused_softcap: ShaderLibrary,
+    ple: ShaderLibrary,
+    affine_mm: ShaderLibrary,
+    d2quant_mm: ShaderLibrary,
+    gdn: ShaderLibrary,
+    attn: ShaderLibrary,
+    tq: ShaderLibrary,
+    sdpa: ShaderLibrary,
+    fd: ShaderLibrary,
+}
+
 impl MetalPipelines {
     /// Load precompiled Metal shader libraries and create pipeline states.
     ///
@@ -210,590 +246,543 @@ impl MetalPipelines {
         head_dim: usize,
         rotary_dim: usize,
     ) -> Result<Self, MetalError> {
-        // ── HEAD_DIM-independent shaders (precompiled) ──────────
-        let norm_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/normalization.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let act_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/activation.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let rope_lib = device
-            .load_library_from_data(include_bytes!(concat!(env!("OUT_DIR"), "/rope.metallib")))
-            .map_err(MetalError::Metal)?;
-        let elem_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/elementwise.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let embed_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/embedding.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let qmm_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/quantized_matmul.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let kv_scatter_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/kv_scatter.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let matvec_lib = device
-            .load_library_from_data(include_bytes!(concat!(env!("OUT_DIR"), "/matvec.metallib")))
-            .map_err(MetalError::Metal)?;
-        let fused_rn_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/fused_residual_norm.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let fused_en_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/fused_embedding_norm.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let int4_dequant_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/int4_dequant.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let quip_sharp_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/quip_sharp.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let fused_softcap_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/fused_softcap.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let ple_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/ple_kernels.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let affine_mm_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/affine_matmul.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let d2quant_mm_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/d2quant_matmul.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
-        let gdn_lib = device
-            .load_library_from_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/gdn_recurrent.metallib"
-            )))
-            .map_err(MetalError::Metal)?;
+        let libs = Self::load_shader_libraries(device, head_dim, rotary_dim)?;
 
-        // ── HEAD_DIM-dependent shaders (precompiled or fallback) ─
-        let (attn_lib, tq_lib, sdpa_lib, fd_lib) =
-            Self::load_head_dim_shaders(device, head_dim, rotary_dim)?;
+        let (rms_norm, silu_gate, ffn_gelu_gate, rope) =
+            Self::compile_normalization_shaders(device, &libs)?;
+        let (
+            residual_add,
+            bias_add,
+            copy_buffer,
+            sigmoid_gate,
+            embedding_lookup,
+            scale_buffer,
+            quantize_input_q8,
+            affine_embedding_lookup_int4,
+        ) = Self::compile_elementwise_shaders(device, &libs)?;
+        let (
+            turboquant_cache_write,
+            turboquant_attention,
+            turboquant_outlier_cache_write,
+            turboquant_outlier_attention,
+        ) = Self::compile_turboquant_shaders(device, &libs)?;
+        let (
+            standard_attention,
+            prefill_attention,
+            prefill_attention_fa2,
+            prefill_attention_v2,
+            fused_qk_norm_rope,
+            fused_sdpa,
+            fused_sdpa_split,
+            fused_sdpa_reduce,
+        ) = Self::compile_attention_shaders(device, &libs)?;
+        let (
+            polarquant_matvec_int4,
+            polarquant_matmul_int4,
+            polarquant_matvec_int8,
+            polarquant_matmul_int8,
+            affine_matvec_int4,
+            affine_matmul_int4,
+            affine_matvec_int8,
+            affine_matmul_int8,
+        ) = Self::compile_quantized_matmul_shaders(device, &libs)?;
+        let (kv_scatter, matvec, matmul, quip_sharp_matvec, quip_sharp_matmul) =
+            Self::compile_dense_matmul_shaders(device, &libs)?;
+        let (
+            int4_dequantize,
+            batched_affine_matvec_int4,
+            gdn_batched_affine_matvec_int4,
+            gdn_batched_matvec,
+            affine_matvec_int4_amx,
+            affine_matvec_int4_rowmajor,
+            fused_ffn_gate_up_act_int4,
+            affine_matvec_int4xq8,
+        ) = Self::compile_advanced_matmul_shaders(device, &libs)?;
+        let (
+            fused_residual_rms_norm,
+            fused_embedding_norm,
+            fused_softcap,
+            ple_gelu_gate,
+            ple_add_scale,
+            fused_residual_norm_matvec,
+            fused_residual_norm_affine_matvec_int4,
+        ) = Self::compile_fused_shaders(device, &libs)?;
+        let (moe_softmax, moe_gelu, moe_mul, moe_weighted_combine) =
+            Self::compile_moe_shaders(device)?;
+        let (d2quant_matvec_3bit, d2quant_matmul_3bit, d2quant_embedding_lookup_3bit) =
+            Self::compile_d2quant_shaders(device, &libs)?;
+        let (
+            gdn_conv1d_silu,
+            gdn_recurrent_update,
+            gdn_output_gate,
+            gdn_prefill_conv1d_silu,
+            gdn_prefill_recurrent,
+            gdn_fused_decode,
+        ) = Self::compile_gdn_shaders(device, &libs)?;
 
         Ok(Self {
-            rms_norm: device
-                .create_compute_pipeline(
-                    &norm_lib
-                        .get_function("rms_norm")
-                        .map_err(MetalError::Metal)?,
-                )
+            rms_norm,
+            silu_gate,
+            ffn_gelu_gate,
+            rope,
+            residual_add,
+            bias_add,
+            copy_buffer,
+            embedding_lookup,
+            turboquant_cache_write,
+            turboquant_attention,
+            turboquant_outlier_cache_write,
+            turboquant_outlier_attention,
+            standard_attention,
+            prefill_attention,
+            prefill_attention_fa2,
+            prefill_attention_v2,
+            polarquant_matvec_int4,
+            polarquant_matmul_int4,
+            polarquant_matvec_int8,
+            polarquant_matmul_int8,
+            affine_matvec_int4,
+            affine_matmul_int4,
+            affine_matvec_int8,
+            affine_matmul_int8,
+            kv_scatter,
+            matvec,
+            matmul,
+            fused_residual_rms_norm,
+            fused_qk_norm_rope,
+            fused_embedding_norm,
+            int4_dequantize,
+            fused_sdpa,
+            quip_sharp_matvec,
+            quip_sharp_matmul,
+            fused_softcap,
+            ple_gelu_gate,
+            ple_add_scale,
+            scale_buffer,
+            moe_softmax,
+            moe_gelu,
+            moe_mul,
+            moe_weighted_combine,
+            d2quant_matvec_3bit,
+            d2quant_matmul_3bit,
+            d2quant_embedding_lookup_3bit,
+            sigmoid_gate,
+            gdn_conv1d_silu,
+            gdn_recurrent_update,
+            gdn_output_gate,
+            gdn_prefill_conv1d_silu,
+            gdn_prefill_recurrent,
+            gdn_fused_decode,
+            gdn_batched_matvec,
+            batched_affine_matvec_int4,
+            gdn_batched_affine_matvec_int4,
+            affine_matvec_int4_amx,
+            affine_matvec_int4_rowmajor,
+            fused_ffn_gate_up_act_int4,
+            fused_residual_norm_matvec,
+            fused_residual_norm_affine_matvec_int4,
+            quantize_input_q8,
+            affine_matvec_int4xq8,
+            affine_embedding_lookup_int4,
+            fused_sdpa_split,
+            fused_sdpa_reduce,
+        })
+    }
+
+    /// Load all precompiled shader libraries from embedded metallib binaries.
+    fn load_shader_libraries(
+        device: &MetalDevice,
+        head_dim: usize,
+        rotary_dim: usize,
+    ) -> Result<ShaderLibraries, MetalError> {
+        let (attn, tq, sdpa, fd) = Self::load_head_dim_shaders(device, head_dim, rotary_dim)?;
+        Ok(ShaderLibraries {
+            norm: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/normalization.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            silu_gate: device
-                .create_compute_pipeline(
-                    &act_lib
-                        .get_function("silu_gate")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            ffn_gelu_gate: device
-                .create_compute_pipeline(
-                    &act_lib
-                        .get_function("gelu_gate")
-                        .map_err(MetalError::Metal)?,
-                )
+            act: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/activation.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
             rope: device
-                .create_compute_pipeline(&rope_lib.get_function("rope").map_err(MetalError::Metal)?)
+                .load_library_from_data(include_bytes!(concat!(env!("OUT_DIR"), "/rope.metallib")))
                 .map_err(MetalError::Metal)?,
-            residual_add: device
-                .create_compute_pipeline(
-                    &elem_lib
-                        .get_function("residual_add")
-                        .map_err(MetalError::Metal)?,
-                )
+            elem: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/elementwise.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            bias_add: device
-                .create_compute_pipeline(
-                    &elem_lib
-                        .get_function("bias_add")
-                        .map_err(MetalError::Metal)?,
-                )
+            embed: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/embedding.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            copy_buffer: device
-                .create_compute_pipeline(
-                    &elem_lib
-                        .get_function("copy_buffer")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            sigmoid_gate: device
-                .create_compute_pipeline(
-                    &elem_lib
-                        .get_function("sigmoid_gate_inplace")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            embedding_lookup: device
-                .create_compute_pipeline(
-                    &embed_lib
-                        .get_function("embedding_lookup")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            turboquant_cache_write: device
-                .create_compute_pipeline(
-                    &tq_lib
-                        .get_function("turboquant_cache_write")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            turboquant_attention: device
-                .create_compute_pipeline(
-                    &tq_lib
-                        .get_function("turboquant_attention")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            turboquant_outlier_cache_write: device
-                .create_compute_pipeline(
-                    &tq_lib
-                        .get_function("turboquant_outlier_cache_write")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            turboquant_outlier_attention: device
-                .create_compute_pipeline(
-                    &tq_lib
-                        .get_function("turboquant_outlier_attention")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            standard_attention: device
-                .create_compute_pipeline(
-                    &attn_lib
-                        .get_function("standard_attention")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            prefill_attention: device
-                .create_compute_pipeline(
-                    &attn_lib
-                        .get_function("prefill_attention")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            prefill_attention_fa2: device
-                .create_compute_pipeline(
-                    &attn_lib
-                        .get_function("prefill_attention_fa2")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            prefill_attention_v2: device
-                .create_compute_pipeline(
-                    &attn_lib
-                        .get_function("prefill_attention_v2")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            polarquant_matvec_int4: device
-                .create_compute_pipeline(
-                    &qmm_lib
-                        .get_function("polarquant_matvec_int4")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            polarquant_matmul_int4: device
-                .create_compute_pipeline(
-                    &qmm_lib
-                        .get_function("polarquant_matmul_int4")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            polarquant_matvec_int8: device
-                .create_compute_pipeline(
-                    &qmm_lib
-                        .get_function("polarquant_matvec_int8")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            polarquant_matmul_int8: device
-                .create_compute_pipeline(
-                    &qmm_lib
-                        .get_function("polarquant_matmul_int8")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            affine_matvec_int4: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("affine_matvec_int4")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            affine_matmul_int4: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("affine_matmul_int4")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            affine_matvec_int8: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("affine_matvec_int8")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            affine_matmul_int8: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("affine_matmul_int8")
-                        .map_err(MetalError::Metal)?,
-                )
+            qmm: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/quantized_matmul.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
             kv_scatter: device
-                .create_compute_pipeline(
-                    &kv_scatter_lib
-                        .get_function("kv_scatter")
-                        .map_err(MetalError::Metal)?,
-                )
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/kv_scatter.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
             matvec: device
-                .create_compute_pipeline(
-                    &matvec_lib
-                        .get_function("matvec")
-                        .map_err(MetalError::Metal)?,
-                )
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/matvec.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            matmul: device
-                .create_compute_pipeline(
-                    &matvec_lib
-                        .get_function("matmul")
-                        .map_err(MetalError::Metal)?,
-                )
+            fused_rn: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/fused_residual_norm.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            fused_residual_rms_norm: device
-                .create_compute_pipeline(
-                    &fused_rn_lib
-                        .get_function("fused_residual_rms_norm")
-                        .map_err(MetalError::Metal)?,
-                )
+            fused_en: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/fused_embedding_norm.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            fused_qk_norm_rope: device
-                .create_compute_pipeline(
-                    &attn_lib
-                        .get_function("fused_qk_norm_rope")
-                        .map_err(MetalError::Metal)?,
-                )
+            int4_dequant: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/int4_dequant.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            fused_embedding_norm: device
-                .create_compute_pipeline(
-                    &fused_en_lib
-                        .get_function("fused_embedding_norm")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            int4_dequantize: device
-                .create_compute_pipeline(
-                    &int4_dequant_lib
-                        .get_function("int4_dequantize")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            fused_sdpa: sdpa_lib
-                .get_function("fused_sdpa")
-                .ok()
-                .and_then(|f| device.create_compute_pipeline(&f).ok()),
-            quip_sharp_matvec: device
-                .create_compute_pipeline(
-                    &quip_sharp_lib
-                        .get_function("quip_sharp_matvec")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            quip_sharp_matmul: device
-                .create_compute_pipeline(
-                    &quip_sharp_lib
-                        .get_function("quip_sharp_matmul")
-                        .map_err(MetalError::Metal)?,
-                )
+            quip_sharp: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/quip_sharp.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
             fused_softcap: device
-                .create_compute_pipeline(
-                    &fused_softcap_lib
-                        .get_function("fused_softcap")
-                        .map_err(MetalError::Metal)?,
-                )
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/fused_softcap.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            ple_gelu_gate: device
-                .create_compute_pipeline(
-                    &ple_lib
-                        .get_function("gelu_gate")
-                        .map_err(MetalError::Metal)?,
-                )
+            ple: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/ple_kernels.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            ple_add_scale: device
-                .create_compute_pipeline(
-                    &ple_lib
-                        .get_function("add_scale")
-                        .map_err(MetalError::Metal)?,
-                )
+            affine_mm: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/affine_matmul.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            scale_buffer: device
-                .create_compute_pipeline(
-                    &elem_lib
-                        .get_function("scale_buffer")
-                        .map_err(MetalError::Metal)?,
-                )
+            d2quant_mm: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/d2quant_matmul.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            moe_softmax: {
-                let lib = device
-                    .load_library_from_data(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/moe.metallib"
-                    )))
-                    .map_err(MetalError::Metal)?;
-                device
-                    .create_compute_pipeline(
-                        &lib.get_function("moe_softmax").map_err(MetalError::Metal)?,
-                    )
-                    .map_err(MetalError::Metal)?
-            },
-            moe_gelu: {
-                let lib = device
-                    .load_library_from_data(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/moe.metallib"
-                    )))
-                    .map_err(MetalError::Metal)?;
-                device
-                    .create_compute_pipeline(
-                        &lib.get_function("moe_gelu").map_err(MetalError::Metal)?,
-                    )
-                    .map_err(MetalError::Metal)?
-            },
-            moe_mul: {
-                let lib = device
-                    .load_library_from_data(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/moe.metallib"
-                    )))
-                    .map_err(MetalError::Metal)?;
-                device
-                    .create_compute_pipeline(
-                        &lib.get_function("moe_mul").map_err(MetalError::Metal)?,
-                    )
-                    .map_err(MetalError::Metal)?
-            },
-            moe_weighted_combine: {
-                let lib = device
-                    .load_library_from_data(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/moe.metallib"
-                    )))
-                    .map_err(MetalError::Metal)?;
-                device
-                    .create_compute_pipeline(
-                        &lib.get_function("moe_weighted_combine")
-                            .map_err(MetalError::Metal)?,
-                    )
-                    .map_err(MetalError::Metal)?
-            },
-            d2quant_matvec_3bit: device
-                .create_compute_pipeline(
-                    &d2quant_mm_lib
-                        .get_function("d2quant_matvec_3bit")
-                        .map_err(MetalError::Metal)?,
-                )
+            gdn: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/gdn_recurrent.metallib"
+                )))
                 .map_err(MetalError::Metal)?,
-            d2quant_matmul_3bit: device
-                .create_compute_pipeline(
-                    &d2quant_mm_lib
-                        .get_function("d2quant_matmul_3bit")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            d2quant_embedding_lookup_3bit: device
-                .create_compute_pipeline(
-                    &d2quant_mm_lib
-                        .get_function("d2quant_embedding_lookup_3bit")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            gdn_conv1d_silu: device
-                .create_compute_pipeline(
-                    &gdn_lib
-                        .get_function("gdn_conv1d_silu")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            gdn_recurrent_update: device
-                .create_compute_pipeline(
-                    &gdn_lib
-                        .get_function("gdn_recurrent_update")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            gdn_output_gate: device
-                .create_compute_pipeline(
-                    &gdn_lib
-                        .get_function("gdn_output_gate")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            gdn_prefill_conv1d_silu: device
-                .create_compute_pipeline(
-                    &gdn_lib
-                        .get_function("gdn_prefill_conv1d_silu")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            gdn_prefill_recurrent: device
-                .create_compute_pipeline(
-                    &gdn_lib
-                        .get_function("gdn_prefill_recurrent")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            gdn_fused_decode: device
-                .create_compute_pipeline(
-                    &gdn_lib
-                        .get_function("gdn_fused_decode")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            gdn_batched_matvec: device
-                .create_compute_pipeline(
-                    &matvec_lib
-                        .get_function("gdn_batched_matvec")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            batched_affine_matvec_int4: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("batched_affine_matvec_int4")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            gdn_batched_affine_matvec_int4: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("gdn_batched_affine_matvec_int4")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            affine_matvec_int4_amx: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("affine_matvec_int4_amx")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            affine_matvec_int8_amx: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("affine_matvec_int8_amx")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            d2quant_matvec_3bit_amx: device
-                .create_compute_pipeline(
-                    &d2quant_mm_lib
-                        .get_function("d2quant_matvec_3bit_amx")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            fused_ffn_gate_up_act_int4: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("fused_ffn_gate_up_act_int4")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            fused_residual_norm_matvec: device
-                .create_compute_pipeline(
-                    &fused_rn_lib
-                        .get_function("fused_residual_norm_matvec")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            fused_residual_norm_affine_matvec_int4: device
-                .create_compute_pipeline(
-                    &fused_rn_lib
-                        .get_function("fused_residual_norm_affine_matvec_int4")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            quantize_input_q8: device
-                .create_compute_pipeline(
-                    &elem_lib
-                        .get_function("quantize_input_q8")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            affine_matvec_int4xq8: device
-                .create_compute_pipeline(
-                    &affine_mm_lib
-                        .get_function("affine_matvec_int4xq8")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            affine_embedding_lookup_int4: device
-                .create_compute_pipeline(
-                    &elem_lib
-                        .get_function("affine_embedding_lookup_int4")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            fused_sdpa_split: device
-                .create_compute_pipeline(
-                    &fd_lib
-                        .get_function("fused_sdpa_split")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
-            fused_sdpa_reduce: device
-                .create_compute_pipeline(
-                    &fd_lib
-                        .get_function("fused_sdpa_reduce")
-                        .map_err(MetalError::Metal)?,
-                )
-                .map_err(MetalError::Metal)?,
+            attn,
+            tq,
+            sdpa,
+            fd,
         })
+    }
+
+    /// Compile normalization and activation pipelines.
+    fn compile_normalization_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        Ok((
+            make_pipeline(device, &libs.norm, "rms_norm")?,
+            make_pipeline(device, &libs.act, "silu_gate")?,
+            make_pipeline(device, &libs.act, "gelu_gate")?,
+            make_pipeline(device, &libs.rope, "rope")?,
+        ))
+    }
+
+    /// Compile element-wise, embedding, and utility pipelines.
+    #[allow(clippy::type_complexity)]
+    fn compile_elementwise_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        Ok((
+            make_pipeline(device, &libs.elem, "residual_add")?,
+            make_pipeline(device, &libs.elem, "bias_add")?,
+            make_pipeline(device, &libs.elem, "copy_buffer")?,
+            make_pipeline(device, &libs.elem, "sigmoid_gate_inplace")?,
+            make_pipeline(device, &libs.embed, "embedding_lookup")?,
+            make_pipeline(device, &libs.elem, "scale_buffer")?,
+            make_pipeline(device, &libs.elem, "quantize_input_q8")?,
+            make_pipeline(device, &libs.elem, "affine_embedding_lookup_int4")?,
+        ))
+    }
+
+    /// Compile TurboQuant cache-write and attention pipelines.
+    fn compile_turboquant_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        Ok((
+            make_pipeline(device, &libs.tq, "turboquant_cache_write")?,
+            make_pipeline(device, &libs.tq, "turboquant_attention")?,
+            make_pipeline(device, &libs.tq, "turboquant_outlier_cache_write")?,
+            make_pipeline(device, &libs.tq, "turboquant_outlier_attention")?,
+        ))
+    }
+
+    /// Compile standard/prefill attention and fused SDPA pipelines.
+    #[allow(clippy::type_complexity)]
+    fn compile_attention_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            Option<ComputePipeline>,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        let fused_sdpa = libs
+            .sdpa
+            .get_function("fused_sdpa")
+            .ok()
+            .and_then(|f| device.create_compute_pipeline(&f).ok());
+        Ok((
+            make_pipeline(device, &libs.attn, "standard_attention")?,
+            make_pipeline(device, &libs.attn, "prefill_attention")?,
+            make_pipeline(device, &libs.attn, "prefill_attention_fa2")?,
+            make_pipeline(device, &libs.attn, "prefill_attention_v2")?,
+            make_pipeline(device, &libs.attn, "fused_qk_norm_rope")?,
+            fused_sdpa,
+            make_pipeline(device, &libs.fd, "fused_sdpa_split")?,
+            make_pipeline(device, &libs.fd, "fused_sdpa_reduce")?,
+        ))
+    }
+
+    /// Compile PolarQuant and Affine quantized matmul pipelines.
+    #[allow(clippy::type_complexity)]
+    fn compile_quantized_matmul_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        Ok((
+            make_pipeline(device, &libs.qmm, "polarquant_matvec_int4")?,
+            make_pipeline(device, &libs.qmm, "polarquant_matmul_int4")?,
+            make_pipeline(device, &libs.qmm, "polarquant_matvec_int8")?,
+            make_pipeline(device, &libs.qmm, "polarquant_matmul_int8")?,
+            make_pipeline(device, &libs.affine_mm, "affine_matvec_int4")?,
+            make_pipeline(device, &libs.affine_mm, "affine_matmul_int4")?,
+            make_pipeline(device, &libs.affine_mm, "affine_matvec_int8")?,
+            make_pipeline(device, &libs.affine_mm, "affine_matmul_int8")?,
+        ))
+    }
+
+    /// Compile dense FP16 matmul, KV scatter, and QuIP# pipelines.
+    fn compile_dense_matmul_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        Ok((
+            make_pipeline(device, &libs.kv_scatter, "kv_scatter")?,
+            make_pipeline(device, &libs.matvec, "matvec")?,
+            make_pipeline(device, &libs.matvec, "matmul")?,
+            make_pipeline(device, &libs.quip_sharp, "quip_sharp_matvec")?,
+            make_pipeline(device, &libs.quip_sharp, "quip_sharp_matmul")?,
+        ))
+    }
+
+    /// Compile advanced matmul variants: batched, AMX, row-major, and fused.
+    #[allow(clippy::type_complexity)]
+    fn compile_advanced_matmul_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        Ok((
+            make_pipeline(device, &libs.int4_dequant, "int4_dequantize")?,
+            make_pipeline(device, &libs.affine_mm, "batched_affine_matvec_int4")?,
+            make_pipeline(device, &libs.affine_mm, "gdn_batched_affine_matvec_int4")?,
+            make_pipeline(device, &libs.matvec, "gdn_batched_matvec")?,
+            make_pipeline(device, &libs.affine_mm, "affine_matvec_int4_amx")?,
+            make_pipeline(device, &libs.affine_mm, "affine_matvec_int4_rowmajor")?,
+            make_pipeline(device, &libs.affine_mm, "fused_ffn_gate_up_act_int4")?,
+            make_pipeline(device, &libs.affine_mm, "affine_matvec_int4xq8")?,
+        ))
+    }
+
+    /// Compile fused residual-norm, embedding-norm, softcap, and PLE pipelines.
+    #[allow(clippy::type_complexity)]
+    fn compile_fused_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        Ok((
+            make_pipeline(device, &libs.fused_rn, "fused_residual_rms_norm")?,
+            make_pipeline(device, &libs.fused_en, "fused_embedding_norm")?,
+            make_pipeline(device, &libs.fused_softcap, "fused_softcap")?,
+            make_pipeline(device, &libs.ple, "gelu_gate")?,
+            make_pipeline(device, &libs.ple, "add_scale")?,
+            make_pipeline(device, &libs.fused_rn, "fused_residual_norm_matvec")?,
+            make_pipeline(
+                device,
+                &libs.fused_rn,
+                "fused_residual_norm_affine_matvec_int4",
+            )?,
+        ))
+    }
+
+    /// Compile Mixture-of-Experts pipelines (loads dedicated metallib).
+    fn compile_moe_shaders(
+        device: &MetalDevice,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        let moe_lib = device
+            .load_library_from_data(include_bytes!(concat!(env!("OUT_DIR"), "/moe.metallib")))
+            .map_err(MetalError::Metal)?;
+        Ok((
+            make_pipeline(device, &moe_lib, "moe_softmax")?,
+            make_pipeline(device, &moe_lib, "moe_gelu")?,
+            make_pipeline(device, &moe_lib, "moe_mul")?,
+            make_pipeline(device, &moe_lib, "moe_weighted_combine")?,
+        ))
+    }
+
+    /// Compile D2Quant 3-bit matmul and embedding pipelines.
+    fn compile_d2quant_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<(ComputePipeline, ComputePipeline, ComputePipeline), MetalError> {
+        Ok((
+            make_pipeline(device, &libs.d2quant_mm, "d2quant_matvec_3bit")?,
+            make_pipeline(device, &libs.d2quant_mm, "d2quant_matmul_3bit")?,
+            make_pipeline(device, &libs.d2quant_mm, "d2quant_embedding_lookup_3bit")?,
+        ))
+    }
+
+    /// Compile GDN recurrent pipelines.
+    fn compile_gdn_shaders(
+        device: &MetalDevice,
+        libs: &ShaderLibraries,
+    ) -> Result<
+        (
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+            ComputePipeline,
+        ),
+        MetalError,
+    > {
+        Ok((
+            make_pipeline(device, &libs.gdn, "gdn_conv1d_silu")?,
+            make_pipeline(device, &libs.gdn, "gdn_recurrent_update")?,
+            make_pipeline(device, &libs.gdn, "gdn_output_gate")?,
+            make_pipeline(device, &libs.gdn, "gdn_prefill_conv1d_silu")?,
+            make_pipeline(device, &libs.gdn, "gdn_prefill_recurrent")?,
+            make_pipeline(device, &libs.gdn, "gdn_fused_decode")?,
+        ))
     }
 
     /// Load attention, turboquant, fused SDPA, and FlashDecoding shaders for a specific HEAD_DIM.
@@ -804,15 +793,7 @@ impl MetalPipelines {
         device: &MetalDevice,
         head_dim: usize,
         rotary_dim: usize,
-    ) -> Result<
-        (
-            ironmill_metal_sys::ShaderLibrary,
-            ironmill_metal_sys::ShaderLibrary,
-            ironmill_metal_sys::ShaderLibrary,
-            ironmill_metal_sys::ShaderLibrary,
-        ),
-        MetalError,
-    > {
+    ) -> Result<(ShaderLibrary, ShaderLibrary, ShaderLibrary, ShaderLibrary), MetalError> {
         // Macro to embed a precompiled metallib by head_dim.
         macro_rules! precompiled {
             (attn $hd:literal) => {
@@ -839,12 +820,7 @@ impl MetalPipelines {
                                sdpa_data: &[u8],
                                fd_data: &[u8]|
          -> Result<
-            (
-                ironmill_metal_sys::ShaderLibrary,
-                ironmill_metal_sys::ShaderLibrary,
-                ironmill_metal_sys::ShaderLibrary,
-                ironmill_metal_sys::ShaderLibrary,
-            ),
+            (ShaderLibrary, ShaderLibrary, ShaderLibrary, ShaderLibrary),
             MetalError,
         > {
             let attn = device
@@ -1008,9 +984,9 @@ impl MetalPipelines {
         kind: LinearKernelKind,
     ) -> Option<&ComputePipeline> {
         match (bit_width, kind) {
-            (4, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int4_amx),
+            (4, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int4),
             (4, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int4),
-            (8, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int8_amx),
+            (8, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int8),
             (8, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int8),
             _ => None,
         }
@@ -1024,7 +1000,7 @@ impl MetalPipelines {
         kind: LinearKernelKind,
     ) -> Option<&ComputePipeline> {
         match (bit_width, kind) {
-            (3, LinearKernelKind::Matvec) => Some(&self.d2quant_matvec_3bit_amx),
+            (3, LinearKernelKind::Matvec) => Some(&self.d2quant_matvec_3bit),
             (3, LinearKernelKind::Matmul) => Some(&self.d2quant_matmul_3bit),
             _ => None,
         }
@@ -2135,11 +2111,8 @@ pub fn encode_batched_affine_matvec_int4(
         encoder.set_buffer(&gate_weight.data, 0, 12); // dummy
         encoder.set_bytes(&0u32.to_le_bytes(), 13);
     }
-    let amx_rows_per_tg = 64usize;
-    let n_gate_tgs = (n_gate as usize).div_ceil(amx_rows_per_tg);
-    let n_up_tgs = (n_gate as usize).div_ceil(amx_rows_per_tg); // N_up == N_gate
-    let tg_count = n_gate_tgs + n_up_tgs;
-    encoder.dispatch_threadgroups((tg_count, 1, 1), (256, 1, 1));
+    let tg_count = (2 * n_gate) as usize;
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
 }
 
 /// Encode fused FFN gate+up+activation for INT4 decode.
@@ -2179,9 +2152,7 @@ pub fn encode_fused_ffn_gate_up_act_int4(
         encoder.set_bytes(&0u32.to_le_bytes(), 12);
     }
     encoder.set_bytes(&(use_gelu as u32).to_le_bytes(), 13);
-    let amx_rows_per_tg = 64usize;
-    let tg_count = (n as usize).div_ceil(amx_rows_per_tg);
-    encoder.dispatch_threadgroups((tg_count, 1, 1), (256, 1, 1));
+    encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }
 ///
 /// Computes qkv = x·W0^T, z = x·W1^T, a = x·W2^T, b = x·W3^T concurrently.
@@ -2232,12 +2203,8 @@ pub fn encode_gdn_batched_affine_matvec_int4(
     } else {
         encoder.set_buffer(&w0.data, 0, 18); // dummy
     }
-    let amx_rows_per_tg = 64usize;
-    let tg_count = (n0 as usize).div_ceil(amx_rows_per_tg)
-        + (n1 as usize).div_ceil(amx_rows_per_tg)
-        + (n2 as usize).div_ceil(amx_rows_per_tg)
-        + (n3 as usize).div_ceil(amx_rows_per_tg);
-    encoder.dispatch_threadgroups((tg_count, 1, 1), (256, 1, 1));
+    let tg_count = (n0 + n1 + n2 + n3) as usize;
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
 }
 
 /// Encode fused residual + RMSNorm + dense FP16 matvec.
@@ -2587,7 +2554,5 @@ pub fn encode_affine_matvec_int4xq8(
     encoder.set_bytes(&k.to_le_bytes(), 7);
     encoder.set_bytes(&weight.group_size.to_le_bytes(), 8);
     encoder.set_bytes(&q8_group_size.to_le_bytes(), 9);
-    let amx_rows_per_tg = 64usize;
-    let num_tgs = (n as usize).div_ceil(amx_rows_per_tg);
-    encoder.dispatch_threadgroups((num_tgs, 1, 1), (256, 1, 1));
+    encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }

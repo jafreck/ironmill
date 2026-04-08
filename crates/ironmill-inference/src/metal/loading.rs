@@ -33,6 +33,16 @@ impl MetalInference {
         provider: &dyn WeightProvider,
         compute_outliers: bool,
     ) -> Result<(), InferenceError> {
+        let rotary_dim = self.load_model_config(&weights)?;
+        self.init_pipelines(rotary_dim)?;
+        self.init_weight_buffers(rotary_dim, &weights)?;
+        self.init_kv_cache(&mut weights, provider, compute_outliers)?;
+        self.finalize_model_state(weights)?;
+        Ok(())
+    }
+
+    /// Reset stale state, load model config and metadata, compute rotary_dim.
+    fn load_model_config(&mut self, weights: &MetalWeights) -> Result<usize, InferenceError> {
         // Reset Gemma 4-specific state to avoid stale buffers from a
         // previously loaded model.
         self.global_head_dim = 0;
@@ -68,8 +78,16 @@ impl MetalInference {
                 1.0
             });
         let rotary_dim = (mc.head_dim as f64 * partial_rotary_factor) as usize;
+        Ok(rotary_dim)
+    }
 
-        // Compile Metal shader pipelines with the model's head_dim and rotary_dim.
+    /// Compile Metal shader pipelines (main + optional global for Gemma 4).
+    fn init_pipelines(&mut self, rotary_dim: usize) -> Result<(), InferenceError> {
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?;
+
         let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim, rotary_dim)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.pipelines = Some(pipelines);
@@ -88,6 +106,21 @@ impl MetalInference {
                 self.global_pipelines = Some(global_pipelines);
             }
         }
+
+        Ok(())
+    }
+
+    /// Allocate intermediate buffers, RoPE caches, and the decode matmul cache.
+    fn init_weight_buffers(
+        &mut self,
+        rotary_dim: usize,
+        weights: &MetalWeights,
+    ) -> Result<(), InferenceError> {
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
 
         let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc, self.gemma4_config.as_ref())
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -151,10 +184,27 @@ impl MetalInference {
         }
 
         let decode_cache_t1 =
-            build_matmul_cache(&self.device, &mc, self.gemma4_config.as_ref(), &weights, 1)
+            build_matmul_cache(&self.device, &mc, self.gemma4_config.as_ref(), weights, 1)
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
         self.decode_matmuls_t1 = Some(decode_cache_t1);
         self.decode_matmuls = None;
+
+        Ok(())
+    }
+
+    /// Resolve CLA anchors, MLA, sliding window, and build the KV cache
+    /// (TurboQuant or FP16).
+    fn init_kv_cache(
+        &mut self,
+        weights: &mut MetalWeights,
+        provider: &dyn WeightProvider,
+        compute_outliers: bool,
+    ) -> Result<(), InferenceError> {
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
 
         // Resolve CLA anchor layers: explicit config takes priority, then
         // fall back to model metadata. Validate against num_layers.
@@ -183,7 +233,7 @@ impl MetalInference {
         // ── MLA detection and weight absorption ─────────────────
         let mla_cfg = mc.mla_config();
         if let Some(ref mla) = mla_cfg {
-            absorb_mla_weights(&self.device, &mut weights, mla, mc.hidden_size, provider)
+            absorb_mla_weights(&self.device, weights, mla, mc.hidden_size, provider)
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
             let mla_cache = MlaKvCache::new(
@@ -347,6 +397,17 @@ impl MetalInference {
             self.turboquant = None;
             self.kv_cache = None;
         }
+
+        Ok(())
+    }
+
+    /// Allocate GDN state, compact weights, build execution plans, reset seq_pos.
+    fn finalize_model_state(&mut self, mut weights: MetalWeights) -> Result<(), InferenceError> {
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
 
         // ── GDN state allocation ────────────────────────────────
         let gdn_cfg = super::config::GdnModelConfig::from_model_config(&mc);

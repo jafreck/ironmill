@@ -984,7 +984,20 @@ impl MetalInference {
         layer_idx: usize,
         token_count: usize,
     ) -> Result<(), InferenceError> {
-        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
+        self.prepare_calibration_buffers(layer_idx, token_count)?;
+        self.encode_calibration_attention_phase(layer_idx, token_count)?;
+        self.encode_calibration_ffn_phase(layer_idx, token_count)?;
+        self.advance_calibration_state(token_count)?;
+        Ok(())
+    }
+
+    /// Ensure intermediate and scratch buffers are sized for the current
+    /// token count and rebuild the matmul cache if necessary.
+    fn prepare_calibration_buffers(
+        &mut self,
+        layer_idx: usize,
+        token_count: usize,
+    ) -> Result<(), InferenceError> {
         let mc = self
             .model_config
             .as_ref()
@@ -997,6 +1010,60 @@ impl MetalInference {
             .ensure_capacity(&self.device, token_count, &mc, self.gemma4_config.as_ref())
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
+        // Build or reuse MPS matmul cache for this token count.
+        let need_rebuild = self
+            .decode_matmuls
+            .as_ref()
+            .is_none_or(|c| c.token_count != token_count);
+        if need_rebuild {
+            let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
+            let cache = build_matmul_cache(
+                &self.device,
+                &mc,
+                self.gemma4_config.as_ref(),
+                weights,
+                token_count,
+            )
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            self.decode_matmuls = Some(cache);
+        }
+
+        // GDN layers need scratch capacity grown before taking immutable borrows.
+        let is_gdn = self
+            .weights
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .layers[layer_idx]
+            .gdn_in_proj_qkv
+            .is_some();
+        if is_gdn {
+            let h = mc.hidden_size;
+            let gdn_mut = self
+                .gdn_state
+                .as_mut()
+                .ok_or_else(|| InferenceError::runtime("GDN state not initialized"))?;
+            gdn_mut
+                .ensure_scratch_capacity(&self.device, token_count, h)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Encode the attention phase: Q/K/V projections, QK-norm + RoPE,
+    /// KV-cache write + attention, optional gates, output projection,
+    /// and residual-add + post-attention norm.
+    fn encode_calibration_attention_phase(
+        &mut self,
+        layer_idx: usize,
+        token_count: usize,
+    ) -> Result<(), InferenceError> {
+        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
         let bufs = self
             .intermediate_buffers
             .as_ref()
@@ -1009,31 +1076,13 @@ impl MetalInference {
         let nh = mc.num_attention_heads as u32;
         let nkv = mc.num_kv_heads() as u32;
         let hd = mc.head_dim as u32;
-        let inter = mc.intermediate_size;
         let eps = mc.rms_norm_eps as f32;
         let enable_tq = self.config.enable_turboquant && self.turboquant.is_some();
-
-        // Build or reuse MPS matmul cache for this token count.
-        let need_rebuild = self
-            .decode_matmuls
-            .as_ref()
-            .is_none_or(|c| c.token_count != token_count);
-        if need_rebuild {
-            let cache = build_matmul_cache(
-                &self.device,
-                &mc,
-                self.gemma4_config.as_ref(),
-                weights,
-                token_count,
-            )
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            self.decode_matmuls = Some(cache);
-        }
 
         let lw = &weights.layers[layer_idx];
 
         // Gemma 4: use per-layer config if available.
-        let (layer_hd, layer_nkv, layer_window, layer_inter) =
+        let (layer_hd, layer_nkv, layer_window, _layer_inter) =
             if let Some(ref g4) = self.gemma4_config {
                 let lc = &g4.layer_configs[layer_idx];
                 (
@@ -1043,23 +1092,16 @@ impl MetalInference {
                     lc.intermediate_size,
                 )
             } else {
-                (hd, nkv, self.config.layer_window_size(layer_idx), inter)
+                (
+                    hd,
+                    nkv,
+                    self.config.layer_window_size(layer_idx),
+                    mc.intermediate_size,
+                )
             };
 
         let is_gdn = lw.gdn_in_proj_qkv.is_some();
 
-        // GDN layers need scratch capacity grown before taking immutable borrows.
-        if is_gdn {
-            let gdn_mut = self
-                .gdn_state
-                .as_mut()
-                .ok_or_else(|| InferenceError::runtime("GDN state not initialized"))?;
-            gdn_mut
-                .ensure_scratch_capacity(&self.device, token_count, h)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        }
-
-        // ── Attention phase ─────────────────────────────────────
         let cmd_buf = self
             .queue
             .command_buffer()
@@ -1290,7 +1332,38 @@ impl MetalInference {
             )));
         }
 
-        // ── FFN phase ───────────────────────────────────────────
+        Ok(())
+    }
+
+    /// Encode the FFN phase: feed-forward block, optional MoE, post-FFN
+    /// norm, PLE dispatch, and end-of-layer residual.
+    fn encode_calibration_ffn_phase(
+        &mut self,
+        layer_idx: usize,
+        token_count: usize,
+    ) -> Result<(), InferenceError> {
+        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
+        let bufs = self
+            .intermediate_buffers
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?;
+
+        let h = mc.hidden_size;
+        let inter = mc.intermediate_size;
+        let eps = mc.rms_norm_eps as f32;
+
+        let lw = &weights.layers[layer_idx];
+        let layer_inter = if let Some(ref g4) = self.gemma4_config {
+            g4.layer_configs[layer_idx].intermediate_size
+        } else {
+            inter
+        };
+
         let cmd_buf = self
             .queue
             .command_buffer()
@@ -1439,7 +1512,13 @@ impl MetalInference {
             )));
         }
 
-        // Advance sequence position.
+        Ok(())
+    }
+
+    /// Advance sequence position and KV cache state after a layer completes.
+    fn advance_calibration_state(&mut self, token_count: usize) -> Result<(), InferenceError> {
+        let enable_tq = self.config.enable_turboquant && self.turboquant.is_some();
+
         self.seq_pos += token_count;
         if enable_tq {
             if let Some(kv) = self.kv_cache.as_mut() {

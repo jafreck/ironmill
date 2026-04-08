@@ -59,307 +59,8 @@ impl MilWeightProvider {
 
         let ops = &mut function.body.operations;
 
-        // Pre-collect norms data keyed by the original output name prefix so we
-        // can associate them with the corresponding constexpr_lut_to_dense op.
-        // Norms ops are named `{original_output}_polar_norms` with a matching
-        // output name.
-        let mut norms_map: HashMap<String, (Vec<u8>, ScalarType)> = HashMap::new();
-        for op in ops.iter_mut() {
-            if op.op_type != "const" {
-                continue;
-            }
-            let output_name: &str = match op.outputs.first() {
-                Some(n) => n.as_str(),
-                None => continue,
-            };
-            if !output_name.ends_with("_polar_norms") && !output_name.ends_with("_quip_norms") {
-                continue;
-            }
-            // Extract the tensor value from inputs or attributes.
-            let val = op
-                .inputs
-                .get_mut("val")
-                .or_else(|| op.attributes.get_mut("val"));
-            if let Some(Value::Tensor { data, dtype, .. }) = val {
-                let suffix = if output_name.ends_with("_polar_norms") {
-                    "_polar_norms"
-                } else {
-                    "_quip_norms"
-                };
-                let prefix = &output_name[..output_name.len() - suffix.len()];
-                resolve(data)?;
-                norms_map.insert(
-                    prefix.to_string(),
-                    (
-                        mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
-                        *dtype,
-                    ),
-                );
-            }
-        }
-
-        let mut tensors = HashMap::new();
-
-        for op in ops.iter_mut() {
-            match op.op_type.as_str() {
-                "constexpr_lut_to_dense" => {
-                    let name = tensor_name_for_op(op);
-                    let name = match name {
-                        Some(n) => n,
-                        None => continue,
-                    };
-
-                    let (lut_data, lut_dtype) =
-                        extract_tensor_attr(&mut op.attributes, "lut", &resolve)?;
-                    let (indices_data, indices_dtype) =
-                        extract_tensor_attr(&mut op.attributes, "indices", &resolve)?;
-                    let (shape_bytes, _) =
-                        extract_tensor_attr(&mut op.attributes, "shape", &resolve)?;
-
-                    let original_shape = u32_bytes_to_usize_vec(&shape_bytes);
-
-                    // Derive n_bits from the LUT element count.
-                    let lut_elements = lut_data.len() / lut_dtype.byte_size();
-                    if !lut_elements.is_power_of_two() {
-                        return Err(MilError::Validation(format!(
-                            "LUT element count {lut_elements} is not a power of two for tensor '{name}'"
-                        )));
-                    }
-                    let n_bits = (lut_elements as f64).log2() as u8;
-
-                    // Look up the corresponding row norms.
-                    let output_name: &str = op.outputs.first().map(String::as_str).unwrap_or("");
-                    let (row_norms, norms_dtype) = norms_map
-                        .remove(output_name)
-                        .unwrap_or_else(|| (Vec::new(), lut_dtype));
-
-                    // Extract polar_quant_seed for Hadamard rotation.
-                    let polar_quant_seed = match op.attributes.get("polar_quant_seed") {
-                        Some(Value::Int(v)) => Some(*v as u64),
-                        _ => None,
-                    };
-
-                    // Extract quip_sharp_seed for E8 lattice dequantization.
-                    let quip_sharp_seed = match op.attributes.get("quip_sharp_seed") {
-                        Some(Value::Int(v)) => Some(*v as u64),
-                        _ => None,
-                    };
-
-                    // The stored data is the packed indices (the primary payload
-                    // consumers will unpack during GPU dispatch).
-                    let extracted = ExtractedTensor {
-                        data: Vec::new(),
-                        shape: original_shape.clone(),
-                        dtype: indices_dtype,
-                        quant_info: QuantizationInfo::LutToDense {
-                            lut: lut_data,
-                            lut_dtype,
-                            indices: indices_data,
-                            original_shape,
-                            n_bits,
-                            row_norms,
-                            norms_dtype,
-                            polar_quant_seed,
-                            quip_sharp_seed,
-                        },
-                    };
-                    tensors.insert(name, extracted);
-                }
-
-                "constexpr_affine_dequantize" => {
-                    let name = tensor_name_for_op(op);
-                    let name = match name {
-                        Some(n) => n,
-                        None => continue,
-                    };
-
-                    let (quantized_data, quantized_dtype) =
-                        extract_tensor_attr(&mut op.attributes, "quantized_data", &resolve)?;
-                    let quantized_shape =
-                        extract_tensor_shape(&mut op.attributes, "quantized_data")?;
-
-                    let (scale_data, scale_dtype) =
-                        extract_scale_or_zp(&mut op.attributes, "scale", &resolve)?;
-                    let (zp_data, zp_dtype) =
-                        extract_scale_or_zp(&mut op.attributes, "zero_point", &resolve)?;
-
-                    let axis = match op.attributes.get("axis") {
-                        Some(Value::Int(v)) => Some(*v as usize),
-                        _ => None,
-                    };
-
-                    // Default bit_width=8 for backward compat with legacy INT8 models.
-                    let bit_width = match op.attributes.get("bit_width") {
-                        Some(Value::Int(v)) => *v as u8,
-                        _ => {
-                            eprintln!(
-                                "Warning: legacy INT8 defaulting: tensor has no explicit bit_width \
-                                 attribute, defaulting to 8. This behavior is deprecated; \
-                                 quantized models should specify bit_width explicitly."
-                            );
-                            8
-                        }
-                    };
-
-                    let group_size = match op.attributes.get("group_size") {
-                        Some(Value::Int(v)) => Some(*v as usize),
-                        _ => None,
-                    };
-
-                    let awq_scales = match op.attributes.get("awq_channel_scales") {
-                        Some(Value::Tensor {
-                            data,
-                            dtype: ScalarType::Float32,
-                            ..
-                        }) => {
-                            let raw = data.as_bytes().ok_or_else(|| {
-                                MilError::Validation(
-                                    "awq_channel_scales tensor not materialized".into(),
-                                )
-                            })?;
-                            let fp16_bytes: Vec<u8> = raw
-                                .chunks_exact(4)
-                                .flat_map(|c| {
-                                    let val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                                    half::f16::from_f32(val).to_le_bytes()
-                                })
-                                .collect();
-                            Some(fp16_bytes)
-                        }
-                        _ => None,
-                    };
-
-                    let g_idx = match op.attributes.get("g_idx") {
-                        Some(Value::Tensor {
-                            data,
-                            dtype: ScalarType::Int32,
-                            ..
-                        }) => {
-                            let raw = data.as_bytes().ok_or_else(|| {
-                                MilError::Validation("g_idx tensor not materialized".into())
-                            })?;
-                            let indices: Vec<u32> = raw
-                                .chunks_exact(4)
-                                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
-                                .collect();
-                            Some(indices)
-                        }
-                        _ => None,
-                    };
-
-                    let extracted = ExtractedTensor {
-                        data: quantized_data,
-                        shape: quantized_shape,
-                        dtype: quantized_dtype,
-                        quant_info: QuantizationInfo::AffineDequantize {
-                            scale: scale_data,
-                            zero_point: zp_data,
-                            scale_dtype,
-                            zero_point_dtype: zp_dtype,
-                            axis,
-                            bit_width,
-                            group_size,
-                            awq_scales,
-                            g_idx,
-                        },
-                    };
-                    tensors.insert(name, extracted);
-                }
-
-                "constexpr_dual_scale_dequantize" => {
-                    let name = tensor_name_for_op(op);
-                    let name = match name {
-                        Some(n) => n,
-                        None => continue,
-                    };
-
-                    let (quantized_data, _quantized_dtype) =
-                        extract_tensor_attr(&mut op.attributes, "quantized_data", &resolve)?;
-                    let (normal_scale, _) =
-                        extract_tensor_attr(&mut op.attributes, "normal_scale", &resolve)?;
-                    let (normal_zero, _) =
-                        extract_tensor_attr(&mut op.attributes, "normal_zero", &resolve)?;
-                    let (outlier_scale, _) =
-                        extract_tensor_attr(&mut op.attributes, "outlier_scale", &resolve)?;
-                    let (outlier_zero, _) =
-                        extract_tensor_attr(&mut op.attributes, "outlier_zero", &resolve)?;
-                    let (outlier_mask, _) =
-                        extract_tensor_attr(&mut op.attributes, "outlier_mask", &resolve)?;
-
-                    let bit_width = match op.attributes.get("bit_width") {
-                        Some(Value::Int(v)) => *v as u8,
-                        _ => 3,
-                    };
-                    let group_size = match op.attributes.get("group_size") {
-                        Some(Value::Int(v)) => *v as usize,
-                        _ => 128,
-                    };
-
-                    // Recover original shape from the output type.
-                    let original_shape: Vec<usize> = op
-                        .output_types
-                        .first()
-                        .and_then(|t| t.as_ref())
-                        .map(|t| t.shape.iter().filter_map(|d| *d).collect())
-                        .unwrap_or_default();
-
-                    let extracted = ExtractedTensor {
-                        data: Vec::new(),
-                        shape: original_shape.clone(),
-                        dtype: ScalarType::UInt8,
-                        quant_info: QuantizationInfo::DualScaleDequantize {
-                            quantized_data,
-                            normal_scale,
-                            normal_zero,
-                            outlier_scale,
-                            outlier_zero,
-                            outlier_mask,
-                            original_shape,
-                            bit_width,
-                            group_size,
-                        },
-                    };
-                    tensors.insert(name, extracted);
-                }
-
-                "const" => {
-                    // Skip norms ops — they are already consumed above.
-                    let output_name: &str = op.outputs.first().map(String::as_str).unwrap_or("");
-                    if output_name.ends_with("_polar_norms") || output_name.ends_with("_quip_norms")
-                    {
-                        continue;
-                    }
-
-                    let name = tensor_name_for_op(op);
-                    let name = match name {
-                        Some(n) => n,
-                        None => continue,
-                    };
-
-                    let val = op
-                        .inputs
-                        .get_mut("val")
-                        .or_else(|| op.attributes.get_mut("val"));
-                    let val = match val {
-                        Some(v) => v,
-                        None => continue,
-                    };
-
-                    if let Value::Tensor { data, shape, dtype } = val {
-                        resolve(data)?;
-                        let extracted = ExtractedTensor {
-                            data: mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
-                            shape: mem::take(shape),
-                            dtype: *dtype,
-                            quant_info: QuantizationInfo::None,
-                        };
-                        tensors.insert(name, extracted);
-                    }
-                }
-
-                _ => {}
-            }
-        }
+        let norms_map = collect_norms(ops, &resolve)?;
+        let tensors = extract_weight_tensors(ops, norms_map, &resolve)?;
 
         Ok(Self { tensors, config })
     }
@@ -401,6 +102,337 @@ impl WeightProvider for MilWeightProvider {
 
     fn config(&self) -> &ModelConfig {
         &self.config
+    }
+}
+
+/// Pre-collect norms data keyed by the output name prefix.
+fn collect_norms(
+    ops: &mut [Operation],
+    resolve: &impl Fn(&mut TensorData) -> Result<(), MilError>,
+) -> Result<HashMap<String, (Vec<u8>, ScalarType)>, MilError> {
+    let mut norms_map: HashMap<String, (Vec<u8>, ScalarType)> = HashMap::new();
+    for op in ops.iter_mut() {
+        if op.op_type != "const" {
+            continue;
+        }
+        let output_name: &str = match op.outputs.first() {
+            Some(n) => n.as_str(),
+            None => continue,
+        };
+        if !output_name.ends_with("_polar_norms") && !output_name.ends_with("_quip_norms") {
+            continue;
+        }
+        let val = op
+            .inputs
+            .get_mut("val")
+            .or_else(|| op.attributes.get_mut("val"));
+        if let Some(Value::Tensor { data, dtype, .. }) = val {
+            let suffix = if output_name.ends_with("_polar_norms") {
+                "_polar_norms"
+            } else {
+                "_quip_norms"
+            };
+            let prefix = &output_name[..output_name.len() - suffix.len()];
+            resolve(data)?;
+            norms_map.insert(
+                prefix.to_string(),
+                (
+                    mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
+                    *dtype,
+                ),
+            );
+        }
+    }
+    Ok(norms_map)
+}
+
+/// Walk all ops and extract weight tensors by op family.
+fn extract_weight_tensors(
+    ops: &mut [Operation],
+    mut norms_map: HashMap<String, (Vec<u8>, ScalarType)>,
+    resolve: &impl Fn(&mut TensorData) -> Result<(), MilError>,
+) -> Result<HashMap<String, ExtractedTensor>, MilError> {
+    let mut tensors = HashMap::new();
+    for op in ops.iter_mut() {
+        match op.op_type.as_str() {
+            "constexpr_lut_to_dense" => {
+                if let Some((name, t)) = handle_lut_to_dense(op, &mut norms_map, resolve)? {
+                    tensors.insert(name, t);
+                }
+            }
+            "constexpr_affine_dequantize" => {
+                if let Some((name, t)) = handle_affine_dequant(op, resolve)? {
+                    tensors.insert(name, t);
+                }
+            }
+            "constexpr_dual_scale_dequantize" => {
+                if let Some((name, t)) = handle_dual_scale_dequant(op, resolve)? {
+                    tensors.insert(name, t);
+                }
+            }
+            "const" => {
+                if let Some((name, t)) = handle_const(op, resolve)? {
+                    tensors.insert(name, t);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(tensors)
+}
+
+/// Extract a `constexpr_lut_to_dense` op into a named tensor.
+fn handle_lut_to_dense(
+    op: &mut Operation,
+    norms_map: &mut HashMap<String, (Vec<u8>, ScalarType)>,
+    resolve: &impl Fn(&mut TensorData) -> Result<(), MilError>,
+) -> Result<Option<(String, ExtractedTensor)>, MilError> {
+    let name = match tensor_name_for_op(op) {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+
+    let (lut_data, lut_dtype) = extract_tensor_attr(&mut op.attributes, "lut", resolve)?;
+    let (indices_data, indices_dtype) =
+        extract_tensor_attr(&mut op.attributes, "indices", resolve)?;
+    let (shape_bytes, _) = extract_tensor_attr(&mut op.attributes, "shape", resolve)?;
+
+    let original_shape = u32_bytes_to_usize_vec(&shape_bytes);
+
+    // Derive n_bits from the LUT element count.
+    let lut_elements = lut_data.len() / lut_dtype.byte_size();
+    if !lut_elements.is_power_of_two() {
+        return Err(MilError::Validation(format!(
+            "LUT element count {lut_elements} is not a power of two for tensor '{name}'"
+        )));
+    }
+    let n_bits = (lut_elements as f64).log2() as u8;
+
+    // Look up the corresponding row norms.
+    let output_name: &str = op.outputs.first().map(String::as_str).unwrap_or("");
+    let (row_norms, norms_dtype) = norms_map
+        .remove(output_name)
+        .unwrap_or_else(|| (Vec::new(), lut_dtype));
+
+    // Extract polar_quant_seed for Hadamard rotation.
+    let polar_quant_seed = match op.attributes.get("polar_quant_seed") {
+        Some(Value::Int(v)) => Some(*v as u64),
+        _ => None,
+    };
+
+    // Extract quip_sharp_seed for E8 lattice dequantization.
+    let quip_sharp_seed = match op.attributes.get("quip_sharp_seed") {
+        Some(Value::Int(v)) => Some(*v as u64),
+        _ => None,
+    };
+
+    let extracted = ExtractedTensor {
+        data: Vec::new(),
+        shape: original_shape.clone(),
+        dtype: indices_dtype,
+        quant_info: QuantizationInfo::LutToDense {
+            lut: lut_data,
+            lut_dtype,
+            indices: indices_data,
+            original_shape,
+            n_bits,
+            row_norms,
+            norms_dtype,
+            polar_quant_seed,
+            quip_sharp_seed,
+        },
+    };
+    Ok(Some((name, extracted)))
+}
+
+/// Extract a `constexpr_affine_dequantize` op into a named tensor.
+fn handle_affine_dequant(
+    op: &mut Operation,
+    resolve: &impl Fn(&mut TensorData) -> Result<(), MilError>,
+) -> Result<Option<(String, ExtractedTensor)>, MilError> {
+    let name = match tensor_name_for_op(op) {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+
+    let (quantized_data, quantized_dtype) =
+        extract_tensor_attr(&mut op.attributes, "quantized_data", resolve)?;
+    let quantized_shape = extract_tensor_shape(&mut op.attributes, "quantized_data")?;
+
+    let (scale_data, scale_dtype) = extract_scale_or_zp(&mut op.attributes, "scale", resolve)?;
+    let (zp_data, zp_dtype) = extract_scale_or_zp(&mut op.attributes, "zero_point", resolve)?;
+
+    let axis = match op.attributes.get("axis") {
+        Some(Value::Int(v)) => Some(*v as usize),
+        _ => None,
+    };
+
+    // Default bit_width=8 for backward compat with legacy INT8 models.
+    let bit_width = match op.attributes.get("bit_width") {
+        Some(Value::Int(v)) => *v as u8,
+        _ => {
+            eprintln!(
+                "Warning: legacy INT8 defaulting: tensor has no explicit bit_width \
+                 attribute, defaulting to 8. This behavior is deprecated; \
+                 quantized models should specify bit_width explicitly."
+            );
+            8
+        }
+    };
+
+    let group_size = match op.attributes.get("group_size") {
+        Some(Value::Int(v)) => Some(*v as usize),
+        _ => None,
+    };
+
+    let awq_scales = match op.attributes.get("awq_channel_scales") {
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::Float32,
+            ..
+        }) => {
+            let raw = data.as_bytes().ok_or_else(|| {
+                MilError::Validation("awq_channel_scales tensor not materialized".into())
+            })?;
+            let fp16_bytes: Vec<u8> = raw
+                .chunks_exact(4)
+                .flat_map(|c| {
+                    let val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    half::f16::from_f32(val).to_le_bytes()
+                })
+                .collect();
+            Some(fp16_bytes)
+        }
+        _ => None,
+    };
+
+    let g_idx = match op.attributes.get("g_idx") {
+        Some(Value::Tensor {
+            data,
+            dtype: ScalarType::Int32,
+            ..
+        }) => {
+            let raw = data
+                .as_bytes()
+                .ok_or_else(|| MilError::Validation("g_idx tensor not materialized".into()))?;
+            let indices: Vec<u32> = raw
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+                .collect();
+            Some(indices)
+        }
+        _ => None,
+    };
+
+    let extracted = ExtractedTensor {
+        data: quantized_data,
+        shape: quantized_shape,
+        dtype: quantized_dtype,
+        quant_info: QuantizationInfo::AffineDequantize {
+            scale: scale_data,
+            zero_point: zp_data,
+            scale_dtype,
+            zero_point_dtype: zp_dtype,
+            axis,
+            bit_width,
+            group_size,
+            awq_scales,
+            g_idx,
+        },
+    };
+    Ok(Some((name, extracted)))
+}
+
+/// Extract a `constexpr_dual_scale_dequantize` op into a named tensor.
+fn handle_dual_scale_dequant(
+    op: &mut Operation,
+    resolve: &impl Fn(&mut TensorData) -> Result<(), MilError>,
+) -> Result<Option<(String, ExtractedTensor)>, MilError> {
+    let name = match tensor_name_for_op(op) {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+
+    let (quantized_data, _quantized_dtype) =
+        extract_tensor_attr(&mut op.attributes, "quantized_data", resolve)?;
+    let (normal_scale, _) = extract_tensor_attr(&mut op.attributes, "normal_scale", resolve)?;
+    let (normal_zero, _) = extract_tensor_attr(&mut op.attributes, "normal_zero", resolve)?;
+    let (outlier_scale, _) = extract_tensor_attr(&mut op.attributes, "outlier_scale", resolve)?;
+    let (outlier_zero, _) = extract_tensor_attr(&mut op.attributes, "outlier_zero", resolve)?;
+    let (outlier_mask, _) = extract_tensor_attr(&mut op.attributes, "outlier_mask", resolve)?;
+
+    let bit_width = match op.attributes.get("bit_width") {
+        Some(Value::Int(v)) => *v as u8,
+        _ => 3,
+    };
+    let group_size = match op.attributes.get("group_size") {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 128,
+    };
+
+    // Recover original shape from the output type.
+    let original_shape: Vec<usize> = op
+        .output_types
+        .first()
+        .and_then(|t| t.as_ref())
+        .map(|t| t.shape.iter().filter_map(|d| *d).collect())
+        .unwrap_or_default();
+
+    let extracted = ExtractedTensor {
+        data: Vec::new(),
+        shape: original_shape.clone(),
+        dtype: ScalarType::UInt8,
+        quant_info: QuantizationInfo::DualScaleDequantize {
+            quantized_data,
+            normal_scale,
+            normal_zero,
+            outlier_scale,
+            outlier_zero,
+            outlier_mask,
+            original_shape,
+            bit_width,
+            group_size,
+        },
+    };
+    Ok(Some((name, extracted)))
+}
+
+/// Extract a plain `const` op into a named tensor (skips norm ops).
+fn handle_const(
+    op: &mut Operation,
+    resolve: &impl Fn(&mut TensorData) -> Result<(), MilError>,
+) -> Result<Option<(String, ExtractedTensor)>, MilError> {
+    // Skip norms ops — they are already consumed in collect_norms.
+    let output_name: &str = op.outputs.first().map(String::as_str).unwrap_or("");
+    if output_name.ends_with("_polar_norms") || output_name.ends_with("_quip_norms") {
+        return Ok(None);
+    }
+
+    let name = match tensor_name_for_op(op) {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+
+    let val = op
+        .inputs
+        .get_mut("val")
+        .or_else(|| op.attributes.get_mut("val"));
+    let val = match val {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    if let Value::Tensor { data, shape, dtype } = val {
+        resolve(data)?;
+        let extracted = ExtractedTensor {
+            data: mem::replace(data, TensorData::Inline(Vec::new())).into_bytes(),
+            shape: mem::take(shape),
+            dtype: *dtype,
+            quant_info: QuantizationInfo::None,
+        };
+        Ok(Some((name, extracted)))
+    } else {
+        Ok(None)
     }
 }
 

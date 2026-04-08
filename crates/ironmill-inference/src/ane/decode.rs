@@ -492,9 +492,117 @@ impl<D: AneDevice> AneInference<D> {
 
         let programs_dir = bundle_path.join("programs");
         let weights_dir = bundle_path.join("weights");
-
-        // 2. Load CPU weights.
         let cpu_weights_dir = bundle_path.join("cpu_weights");
+
+        // 2. Load CPU weights and caches.
+        let (
+            embed_weight,
+            lm_head,
+            final_norm_weight,
+            rope_cos_cache,
+            rope_sin_cache,
+            rope_cache_dim,
+        ) = Self::load_cpu_weights_and_caches(&cpu_weights_dir, arch, Arc::clone(&device), qos)?;
+
+        // 3. Compile per-layer sub-programs from bundle.
+        let num_layers = decode.layers.len();
+        let (layers, cache_write_fused) = Self::compile_layer_programs(
+            &decode.layers,
+            &programs_dir,
+            &weights_dir,
+            &*device,
+            turbo_config.as_ref(),
+            num_layers,
+            qos,
+        )?;
+
+        // 4. Set up TurboQuant or FP16 caches.
+        let (
+            turboquant,
+            fp16_kv_caches,
+            fp16_attn_program,
+            fp16_attn_q_staging,
+            fp16_attn_out_staging,
+            fp16_attn_mask,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+        ) = Self::setup_execution_mode(Arc::clone(&device), turbo_config, arch, num_layers, qos)?;
+
+        // 5. Load per-layer QK norm weights.
+        let qk_norm_weights =
+            Self::load_qk_norm_weights(&cpu_weights_dir, arch, head_dim, num_layers)?;
+
+        // 6. Size and allocate scratch buffers.
+        let scratch = Self::compute_scratch_buffers(
+            &layers,
+            fp16_attn_q_staging.as_ref(),
+            fp16_attn_out_staging.as_ref(),
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+            arch.hidden_size,
+        );
+
+        Ok(Self {
+            embed_weight,
+            layers,
+            lm_head,
+            final_norm_weight,
+            turboquant,
+            fp16_kv_caches,
+            fp16_attn_program,
+            fp16_attn_q_staging,
+            fp16_attn_out_staging,
+            fp16_attn_mask,
+            device,
+            qos,
+            seq_pos: 0,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+            rope_cos_cache,
+            rope_sin_cache,
+            rope_cache_dim,
+            cache_write_fused,
+            qk_norm_weights,
+            enable_profiling: false,
+            enable_chaining: false,
+            enable_fusion: false,
+            enable_hybrid: false,
+            scratch,
+            model_info: ModelInfo {
+                architecture: Architecture::Llama,
+                num_layers,
+                hidden_size: arch.hidden_size,
+                vocab_size: arch.vocab_size,
+                max_context_len: arch.max_seq_len,
+                weight_quantization: String::from("fp16"),
+                eos_tokens: arch.eos_tokens.clone(),
+                param_count_m: 0.0, // not available from bundle manifest
+                uses_gqa: arch.num_kv_heads < arch.num_heads,
+                uses_mla: false,
+                head_dim: arch.head_dim,
+                num_attention_heads: arch.num_heads,
+                num_kv_heads: arch.num_kv_heads,
+            },
+        })
+    }
+
+    /// Load embedding, lm_head, final_norm, and RoPE caches from the CPU weights directory.
+    fn load_cpu_weights_and_caches(
+        cpu_weights_dir: &std::path::Path,
+        arch: &super::bundle_manifest::ArchConfig,
+        device: Arc<D>,
+        qos: u32,
+    ) -> Result<(
+        CpuWeight,
+        LmHead<D>,
+        Option<Vec<f16>>,
+        Vec<f16>,
+        Vec<f16>,
+        usize,
+    )> {
         let embed_data = std::fs::read(cpu_weights_dir.join("embedding.bin")).map_err(|e| {
             AneError::Other(anyhow::anyhow!("failed to read embedding weights: {e}"))
         })?;
@@ -538,8 +646,8 @@ impl<D: AneDevice> AneInference<D> {
             arch.head_dim / 2
         };
 
-        // 3. Compile LM head (try ANE, fall back to CPU).
-        let lm_head = match AneLmHead::compile(Arc::clone(&device), &lm_head_cpu_weight, qos) {
+        // Compile LM head (try ANE, fall back to CPU).
+        let lm_head = match AneLmHead::compile(device, &lm_head_cpu_weight, qos) {
             Ok(ane_lm_head) => LmHead::Ane(ane_lm_head),
             Err(e) => {
                 eprintln!("warning: ANE lm_head compilation failed: {e}");
@@ -547,11 +655,28 @@ impl<D: AneDevice> AneInference<D> {
             }
         };
 
-        // 4. Compile per-layer sub-programs from bundle.
-        let num_layers = decode.layers.len();
+        Ok((
+            embed_weight,
+            lm_head,
+            final_norm_weight,
+            rope_cos_cache,
+            rope_sin_cache,
+            rope_cache_dim,
+        ))
+    }
 
-        // Pre_attn min output alloc for TurboQuant compatibility.
-        let pre_attn_min_output_alloc = if let Some(ref tc) = turbo_config {
+    /// Compile per-layer sub-programs (pre_attn, post_attn, fp16_attn) from
+    /// the bundle, using donor-patching where possible for layers 1+.
+    fn compile_layer_programs(
+        layer_manifests: &[super::bundle_manifest::LayerManifest],
+        programs_dir: &std::path::Path,
+        weights_dir: &std::path::Path,
+        device: &D,
+        turbo_config: Option<&TurboQuantConfig>,
+        num_layers: usize,
+        qos: u32,
+    ) -> Result<(Vec<LayerPrograms<D>>, bool)> {
+        let pre_attn_min_output_alloc = if let Some(tc) = turbo_config {
             let kv_ch = tc.num_kv_heads * tc.head_dim;
             let q_ch = tc.num_heads * tc.head_dim;
             uniform_alloc_size(&[
@@ -567,17 +692,17 @@ impl<D: AneDevice> AneInference<D> {
             0
         };
 
-        let cache_write_fused = decode.layers.first().is_some_and(|l| l.cache_write_fused);
+        let cache_write_fused = layer_manifests.first().is_some_and(|l| l.cache_write_fused);
 
         let mut layers: Vec<LayerPrograms<D>> = Vec::with_capacity(num_layers);
-        for (i, layer_manifest) in decode.layers.iter().enumerate() {
+        for (i, layer_manifest) in layer_manifests.iter().enumerate() {
             let pre = if i == 0 || !layer_manifest.donor_compatible {
                 // First layer or non-donor-compatible: full compile.
                 compile_sub_from_bundle(
                     &layer_manifest.pre_attn,
-                    &programs_dir,
-                    &weights_dir,
-                    &*device,
+                    programs_dir,
+                    weights_dir,
+                    device,
                     pre_attn_min_output_alloc,
                     qos,
                 )?
@@ -586,9 +711,9 @@ impl<D: AneDevice> AneInference<D> {
                 match compile_sub_from_bundle_with_donor(
                     &layer_manifest.pre_attn,
                     &layers[0].pre_attn.program,
-                    &programs_dir,
-                    &weights_dir,
-                    &*device,
+                    programs_dir,
+                    weights_dir,
+                    device,
                     pre_attn_min_output_alloc,
                     qos,
                 ) {
@@ -601,9 +726,9 @@ impl<D: AneDevice> AneInference<D> {
                         );
                         compile_sub_from_bundle(
                             &layer_manifest.pre_attn,
-                            &programs_dir,
-                            &weights_dir,
-                            &*device,
+                            programs_dir,
+                            weights_dir,
+                            device,
                             pre_attn_min_output_alloc,
                             qos,
                         )?
@@ -615,9 +740,9 @@ impl<D: AneDevice> AneInference<D> {
                 if i == 0 || !layer_manifest.donor_compatible {
                     Some(compile_sub_from_bundle(
                         post_manifest,
-                        &programs_dir,
-                        &weights_dir,
-                        &*device,
+                        programs_dir,
+                        weights_dir,
+                        device,
                         0,
                         qos,
                     )?)
@@ -625,9 +750,9 @@ impl<D: AneDevice> AneInference<D> {
                     match compile_sub_from_bundle_with_donor(
                         post_manifest,
                         &donor_post.program,
-                        &programs_dir,
-                        &weights_dir,
-                        &*device,
+                        programs_dir,
+                        weights_dir,
+                        device,
                         0,
                         qos,
                     ) {
@@ -640,9 +765,9 @@ impl<D: AneDevice> AneInference<D> {
                             );
                             Some(compile_sub_from_bundle(
                                 post_manifest,
-                                &programs_dir,
-                                &weights_dir,
-                                &*device,
+                                programs_dir,
+                                weights_dir,
+                                device,
                                 0,
                                 qos,
                             )?)
@@ -651,9 +776,9 @@ impl<D: AneDevice> AneInference<D> {
                 } else {
                     Some(compile_sub_from_bundle(
                         post_manifest,
-                        &programs_dir,
-                        &weights_dir,
-                        &*device,
+                        programs_dir,
+                        weights_dir,
+                        device,
                         0,
                         qos,
                     )?)
@@ -665,9 +790,9 @@ impl<D: AneDevice> AneInference<D> {
             let fp16_attn = if let Some(ref attn_manifest) = layer_manifest.fp16_attn {
                 match compile_sub_from_bundle(
                     attn_manifest,
-                    &programs_dir,
-                    &weights_dir,
-                    &*device,
+                    programs_dir,
+                    weights_dir,
+                    device,
                     0,
                     qos,
                 ) {
@@ -701,23 +826,35 @@ impl<D: AneDevice> AneInference<D> {
             );
         }
 
-        // 5. Set up TurboQuant or FP16 caches (same as compile()).
-        let (
-            turboquant,
-            fp16_kv_caches,
-            fp16_attn_program,
-            fp16_attn_q_staging,
-            fp16_attn_out_staging,
-            fp16_attn_mask,
-            num_kv_heads,
-            head_dim,
-            max_seq_len,
-        ) = if let Some(tq_config) = turbo_config {
+        Ok((layers, cache_write_fused))
+    }
+
+    /// Set up TurboQuant or FP16 attention caches and compile the shared
+    /// FP16 attention program when needed.
+    #[allow(clippy::type_complexity)]
+    fn setup_execution_mode(
+        device: Arc<D>,
+        turbo_config: Option<TurboQuantConfig>,
+        arch: &super::bundle_manifest::ArchConfig,
+        num_layers: usize,
+        qos: u32,
+    ) -> Result<(
+        Option<TurboQuantModel<D>>,
+        Option<Vec<(AneTensor, AneTensor)>>,
+        Option<D::Program>,
+        Option<AneTensor>,
+        Option<AneTensor>,
+        Option<AneTensor>,
+        usize,
+        usize,
+        usize,
+    )> {
+        if let Some(tq_config) = turbo_config {
             let nkv = tq_config.num_kv_heads;
             let hd = tq_config.head_dim;
             let msl = tq_config.max_seq_len;
             let tq = TurboQuantModel::compile(Arc::clone(&device), tq_config)?;
-            (Some(tq), None, None, None, None, None, nkv, hd, msl)
+            Ok((Some(tq), None, None, None, None, None, nkv, hd, msl))
         } else {
             let nh = arch.num_heads;
             let nkv = arch.num_kv_heads;
@@ -776,7 +913,7 @@ impl<D: AneDevice> AneInference<D> {
             let mask_data = vec![neg_inf; msl];
             mask_tensor.write_f16(&mask_data)?;
 
-            (
+            Ok((
                 None,
                 Some(caches),
                 Some(attn_compiled),
@@ -786,76 +923,93 @@ impl<D: AneDevice> AneInference<D> {
                 nkv,
                 hd,
                 msl,
-            )
-        };
+            ))
+        }
+    }
 
-        // Load per-layer QK norm weights from the bundle when present.
-        let qk_norm_weights: Option<Vec<(Vec<f16>, Vec<f16>)>> = if arch.qk_norm {
-            let q_path = cpu_weights_dir.join("qk_norm_q.bin");
-            let k_path = cpu_weights_dir.join("qk_norm_k.bin");
-            match (std::fs::read(&q_path), std::fs::read(&k_path)) {
-                (Ok(q_data), Ok(k_data)) => {
-                    let q_all: Vec<f16> = q_data
-                        .chunks_exact(2)
-                        .map(|c| f16::from_le_bytes([c[0], c[1]]))
-                        .collect();
-                    let k_all: Vec<f16> = k_data
-                        .chunks_exact(2)
-                        .map(|c| f16::from_le_bytes([c[0], c[1]]))
-                        .collect();
-                    let hd = head_dim;
-                    if hd == 0 || q_all.len() % hd != 0 || k_all.len() % hd != 0 {
-                        return Err(AneError::Other(anyhow::anyhow!(
-                            "QK norm weight size not divisible by head_dim \
-                             (q={}, k={}, head_dim={})",
-                            q_all.len(),
-                            k_all.len(),
-                            hd,
-                        )));
-                    }
-                    if q_all.len() != k_all.len() {
-                        return Err(AneError::Other(anyhow::anyhow!(
-                            "QK norm Q/K size mismatch: q={} vs k={} \
-                             (expected equal lengths for {} layers × head_dim={})",
-                            q_all.len(),
-                            k_all.len(),
-                            num_layers,
-                            hd,
-                        )));
-                    }
-                    let loaded_layers = q_all.len() / hd;
-                    if loaded_layers != num_layers {
-                        return Err(AneError::Other(anyhow::anyhow!(
-                            "QK norm layer count mismatch: weights have {} layers \
-                             but model has {} layers",
-                            loaded_layers,
-                            num_layers,
-                        )));
-                    }
-                    let mut norms = Vec::with_capacity(loaded_layers);
-                    for i in 0..loaded_layers {
-                        let q_w = q_all[i * hd..(i + 1) * hd].to_vec();
-                        let k_w = k_all[i * hd..(i + 1) * hd].to_vec();
-                        norms.push((q_w, k_w));
-                    }
-                    Some(norms)
-                }
-                _ => {
+    /// Load and validate per-layer QK normalization weights when the model
+    /// architecture requires them.
+    fn load_qk_norm_weights(
+        cpu_weights_dir: &std::path::Path,
+        arch: &super::bundle_manifest::ArchConfig,
+        head_dim: usize,
+        num_layers: usize,
+    ) -> Result<Option<Vec<(Vec<f16>, Vec<f16>)>>> {
+        if !arch.qk_norm {
+            return Ok(None);
+        }
+
+        let q_path = cpu_weights_dir.join("qk_norm_q.bin");
+        let k_path = cpu_weights_dir.join("qk_norm_k.bin");
+        match (std::fs::read(&q_path), std::fs::read(&k_path)) {
+            (Ok(q_data), Ok(k_data)) => {
+                let q_all: Vec<f16> = q_data
+                    .chunks_exact(2)
+                    .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let k_all: Vec<f16> = k_data
+                    .chunks_exact(2)
+                    .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let hd = head_dim;
+                if hd == 0 || q_all.len() % hd != 0 || k_all.len() % hd != 0 {
                     return Err(AneError::Other(anyhow::anyhow!(
-                        "model requires QK norm but qk_norm_q.bin / qk_norm_k.bin \
-                         not found in bundle"
+                        "QK norm weight size not divisible by head_dim \
+                         (q={}, k={}, head_dim={})",
+                        q_all.len(),
+                        k_all.len(),
+                        hd,
                     )));
                 }
+                if q_all.len() != k_all.len() {
+                    return Err(AneError::Other(anyhow::anyhow!(
+                        "QK norm Q/K size mismatch: q={} vs k={} \
+                         (expected equal lengths for {} layers × head_dim={})",
+                        q_all.len(),
+                        k_all.len(),
+                        num_layers,
+                        hd,
+                    )));
+                }
+                let loaded_layers = q_all.len() / hd;
+                if loaded_layers != num_layers {
+                    return Err(AneError::Other(anyhow::anyhow!(
+                        "QK norm layer count mismatch: weights have {} layers \
+                         but model has {} layers",
+                        loaded_layers,
+                        num_layers,
+                    )));
+                }
+                let mut norms = Vec::with_capacity(loaded_layers);
+                for i in 0..loaded_layers {
+                    let q_w = q_all[i * hd..(i + 1) * hd].to_vec();
+                    let k_w = k_all[i * hd..(i + 1) * hd].to_vec();
+                    norms.push((q_w, k_w));
+                }
+                Ok(Some(norms))
             }
-        } else {
-            None
-        };
+            _ => Err(AneError::Other(anyhow::anyhow!(
+                "model requires QK norm but qk_norm_q.bin / qk_norm_k.bin \
+                 not found in bundle"
+            ))),
+        }
+    }
 
-        // Compute scratch buffer sizes from allocated tensors.
+    /// Compute scratch buffer sizes by scanning all layer tensors and allocate
+    /// the reusable scratch vectors.
+    fn compute_scratch_buffers(
+        layers: &[LayerPrograms<D>],
+        fp16_attn_q_staging: Option<&AneTensor>,
+        fp16_attn_out_staging: Option<&AneTensor>,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        hidden_size: usize,
+    ) -> ScratchBuffers {
         let mut max_padded = 0usize;
         let mut max_out_channels = 0usize;
         let mut max_packed_residual = 0usize;
-        for layer in &layers {
+        for layer in layers {
             for t in &layer.pre_attn.input_tensors {
                 max_padded = max_padded.max(t.shape()[1] * t.shape()[3]);
             }
@@ -882,17 +1036,16 @@ impl<D: AneDevice> AneInference<D> {
             }
         }
         // Also account for FP16 attention staging tensors.
-        if let Some(ref qs) = fp16_attn_q_staging {
+        if let Some(qs) = fp16_attn_q_staging {
             max_padded = max_padded.max(qs.shape()[1] * qs.shape()[3]);
         }
-        if let Some(ref os) = fp16_attn_out_staging {
+        if let Some(os) = fp16_attn_out_staging {
             max_out_channels = max_out_channels.max(os.shape()[1]);
         }
 
         let kv_cache_size = num_kv_heads * head_dim * max_seq_len;
-        let hidden_size = arch.hidden_size;
 
-        let scratch = ScratchBuffers {
+        ScratchBuffers {
             padded: vec![f16::ZERO; max_padded],
             packed_residual: vec![f16::ZERO; max_packed_residual],
             zeros: vec![f16::ZERO; kv_cache_size.max(max_seq_len)],
@@ -903,51 +1056,7 @@ impl<D: AneDevice> AneInference<D> {
             k_data: Vec::with_capacity(max_out_channels),
             v_data: Vec::with_capacity(max_out_channels),
             residual: Vec::with_capacity(max_out_channels),
-        };
-
-        Ok(Self {
-            embed_weight,
-            layers,
-            lm_head,
-            final_norm_weight,
-            turboquant,
-            fp16_kv_caches,
-            fp16_attn_program,
-            fp16_attn_q_staging,
-            fp16_attn_out_staging,
-            fp16_attn_mask,
-            device,
-            qos,
-            seq_pos: 0,
-            num_kv_heads,
-            head_dim,
-            max_seq_len,
-            rope_cos_cache,
-            rope_sin_cache,
-            rope_cache_dim,
-            cache_write_fused,
-            qk_norm_weights,
-            enable_profiling: false,
-            enable_chaining: false,
-            enable_fusion: false,
-            enable_hybrid: false,
-            scratch,
-            model_info: ModelInfo {
-                architecture: Architecture::Llama,
-                num_layers,
-                hidden_size: arch.hidden_size,
-                vocab_size: arch.vocab_size,
-                max_context_len: arch.max_seq_len,
-                weight_quantization: String::from("fp16"),
-                eos_tokens: arch.eos_tokens.clone(),
-                param_count_m: 0.0, // not available from bundle manifest
-                uses_gqa: arch.num_kv_heads < arch.num_heads,
-                uses_mla: false,
-                head_dim: arch.head_dim,
-                num_attention_heads: arch.num_heads,
-                num_kv_heads: arch.num_kv_heads,
-            },
-        })
+        }
     }
 
     /// Enable or disable ANE hardware profiling.
