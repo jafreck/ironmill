@@ -103,7 +103,10 @@ depends_on = ["feature_extractor"]
     assert!(debug.contains("classifier"));
     assert!(debug.contains("fe.onnx"));
     assert!(debug.contains("cls.onnx"));
-    assert!(debug.contains("fp16"));
+    assert!(
+        debug.contains("Fp16"),
+        "debug output should contain Fp16 variant"
+    );
 
     // Verify the dependency structure can be used to derive edges:
     // classifier depends on feature_extractor.
