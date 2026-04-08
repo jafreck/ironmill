@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn int4_dequant_shader_source_is_valid_metal() {
         // Verify the shader source is included and contains the expected kernel.
-        let src = include_str!("shaders/int4_dequant.metal");
+        let src = include_str!("shaders/quantized/int4_dequant.metal");
         assert!(src.contains("kernel void int4_dequantize("));
         assert!(src.contains("buffer(0)"));
         assert!(src.contains("buffer(5)"));

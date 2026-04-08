@@ -987,8 +987,8 @@ impl MetalPipelines {
                 let header = format!(
                     "#define HEAD_DIM 256\n#define HEAD_DIM_PACKED 128\n#define ROTARY_DIM {rotary_dim}\n"
                 );
-                let attn_src_raw = include_str!("shaders/attention.metal");
-                let fused_qknr_src = include_str!("shaders/fused_qk_norm_rope.metal");
+                let attn_src_raw = include_str!("shaders/attention/attention.metal");
+                let fused_qknr_src = include_str!("shaders/norm/fused_qk_norm_rope.metal");
                 let attn_src_patched = attn_src_raw
                     .replace(
                         "constant constexpr uint FA2_Q_CHUNK = 32;",
@@ -1000,7 +1000,7 @@ impl MetalPipelines {
                     );
                 let attn_src = format!("{header}{attn_src_patched}\n{fused_qknr_src}");
                 let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
-                let tq_src_raw = include_str!("shaders/turboquant.metal");
+                let tq_src_raw = include_str!("shaders/turboquant/turboquant.metal");
                 let tq_src = format!("{header}{tq_helpers}\n{tq_src_raw}");
                 // fused_sdpa exceeds 32KB threadgroup memory at head_dim=256.
                 // Use an empty stub — decode uses FlashDecoding split+reduce instead.
@@ -1009,7 +1009,7 @@ impl MetalPipelines {
                         "{header}#include <metal_stdlib>\nusing namespace metal;\n"
                     ))
                     .map_err(MetalError::Metal)?;
-                let fd_src_raw = include_str!("shaders/flash_decode.metal");
+                let fd_src_raw = include_str!("shaders/attention/flash_decode.metal");
                 let fd_src = format!("{header}#define SPLIT_BC 8\n{fd_src_raw}");
 
                 let attn = device
@@ -1035,25 +1035,25 @@ impl MetalPipelines {
                     "#define HEAD_DIM {head_dim}\n#define HEAD_DIM_PACKED {}\n#define ROTARY_DIM {rotary_dim}\n",
                     head_dim / 2
                 );
-                let attn_src_raw = include_str!("shaders/attention.metal");
-                let fused_qk_src = include_str!("shaders/fused_qk_norm_rope.metal");
+                let attn_src_raw = include_str!("shaders/attention/attention.metal");
+                let fused_qk_src = include_str!("shaders/norm/fused_qk_norm_rope.metal");
                 let attn_src = format!("{header}{attn_src_raw}\n{fused_qk_src}");
                 let tq_helpers = include_str!("../shaders/turboquant_helpers.metal");
-                let tq_src_raw = include_str!("shaders/turboquant.metal");
+                let tq_src_raw = include_str!("shaders/turboquant/turboquant.metal");
                 let tq_src = format!("{header}{tq_helpers}\n{tq_src_raw}");
                 let sdpa_tile_defines = if head_dim >= 256 {
                     "#define SDPA_BR 4\n#define SDPA_BC 4\n"
                 } else {
                     ""
                 };
-                let sdpa_src_raw = include_str!("shaders/fused_sdpa.metal");
+                let sdpa_src_raw = include_str!("shaders/attention/fused_sdpa.metal");
                 let sdpa_src = format!("{header}{sdpa_tile_defines}{sdpa_src_raw}");
                 let fd_tile_defines = if head_dim >= 256 {
                     "#define SPLIT_BC 8\n"
                 } else {
                     ""
                 };
-                let fd_src_raw = include_str!("shaders/flash_decode.metal");
+                let fd_src_raw = include_str!("shaders/attention/flash_decode.metal");
                 let fd_src = format!("{header}{fd_tile_defines}{fd_src_raw}");
 
                 let attn = device

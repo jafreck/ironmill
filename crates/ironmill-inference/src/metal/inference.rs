@@ -173,7 +173,7 @@ mod calibration_tests {
             }
         };
 
-        let src = include_str!("shaders/int4_dequant.metal");
+        let src = include_str!("shaders/quantized/int4_dequant.metal");
         let lib = device
             .compile_shader_source(src)
             .expect("int4_dequant.metal should compile");

@@ -27,37 +27,38 @@ fn main() {
     let helpers_dir = Path::new("src/shaders");
 
     // ── HEAD_DIM-independent shaders (compiled once) ────────────
-    let independent = [
-        "normalization",
-        "activation",
-        "rope",
-        "elementwise",
-        "embedding",
-        "quantize",
-        "quantized_matmul",
-        "kv_scatter",
-        "matvec",
-        "fused_residual_norm",
-        "fused_embedding_norm",
-        "int4_dequant",
-        "d2quant_matmul",
-        "quip_sharp",
-        "gdn_recurrent",
-        "fused_softcap",
-        "ple_kernels",
-        "moe",
+    let independent: &[(&str, &str)] = &[
+        ("normalization", "norm"),
+        ("fused_residual_norm", "norm"),
+        ("fused_embedding_norm", "norm"),
+        ("fused_softcap", "attention"),
+        ("activation", "elementwise"),
+        ("elementwise", "elementwise"),
+        ("rope", "rope"),
+        ("embedding", "embedding"),
+        ("quantize", "quantized"),
+        ("quantized_matmul", "quantized"),
+        ("int4_dequant", "quantized"),
+        ("d2quant_matmul", "quantized"),
+        ("quip_sharp", "quantized"),
+        ("kv_scatter", "kv"),
+        ("matvec", "linear"),
+        ("gdn_recurrent", "gdn"),
+        ("ple_kernels", "ple"),
+        ("moe", "moe"),
     ];
 
-    for name in &independent {
-        let src = shader_dir.join(format!("{name}.metal"));
+    for &(name, subdir) in independent {
+        let src = shader_dir.join(subdir).join(format!("{name}.metal"));
         let lib = out_dir.join(format!("{name}.metallib"));
         compile_shader(&src, &lib, &[]);
     }
 
     // ── Affine matmul: concatenate common + split files into one metallib ──
     {
+        let quantized_dir = shader_dir.join("quantized");
         let affine_common =
-            std::fs::read_to_string(shader_dir.join("affine_common.metal")).unwrap();
+            std::fs::read_to_string(quantized_dir.join("affine_common.metal")).unwrap();
         let affine_parts = [
             "affine_matmul",
             "affine_matvec",
@@ -67,7 +68,7 @@ fn main() {
         ];
         let mut combined = affine_common;
         for part in &affine_parts {
-            let src = std::fs::read_to_string(shader_dir.join(format!("{part}.metal"))).unwrap();
+            let src = std::fs::read_to_string(quantized_dir.join(format!("{part}.metal"))).unwrap();
             combined.push('\n');
             combined.push_str(&src);
         }
@@ -80,11 +81,12 @@ fn main() {
     // Turboquant needs helpers prepended; we write a merged temp file.
     let tq_helpers_src =
         std::fs::read_to_string(helpers_dir.join("turboquant_helpers.metal")).unwrap();
-    let tq_main_src = std::fs::read_to_string(shader_dir.join("turboquant.metal")).unwrap();
-    let attn_src = std::fs::read_to_string(shader_dir.join("attention.metal")).unwrap();
+    let tq_main_src =
+        std::fs::read_to_string(shader_dir.join("turboquant/turboquant.metal")).unwrap();
+    let attn_src = std::fs::read_to_string(shader_dir.join("attention/attention.metal")).unwrap();
     let fused_qk_src =
-        std::fs::read_to_string(shader_dir.join("fused_qk_norm_rope.metal")).unwrap();
-    let sdpa_src = std::fs::read_to_string(shader_dir.join("fused_sdpa.metal")).unwrap();
+        std::fs::read_to_string(shader_dir.join("norm/fused_qk_norm_rope.metal")).unwrap();
+    let sdpa_src = std::fs::read_to_string(shader_dir.join("attention/fused_sdpa.metal")).unwrap();
 
     for &hd in HEAD_DIMS {
         let defines = [
@@ -121,7 +123,8 @@ fn main() {
 
         // FlashDecoding split+reduce (separate metallib to avoid inflating
         // the original fused_sdpa kernel's threadgroup memory budget).
-        let fd_src = std::fs::read_to_string(shader_dir.join("flash_decode.metal")).unwrap();
+        let fd_src =
+            std::fs::read_to_string(shader_dir.join("attention/flash_decode.metal")).unwrap();
         let fd_tile_defines = if hd >= 256 {
             "#define SPLIT_BC 8\n".to_string()
         } else {
