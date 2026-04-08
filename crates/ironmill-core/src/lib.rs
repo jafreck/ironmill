@@ -7,6 +7,8 @@
 
 /// Apple Neural Engine bundle types and utilities.
 pub mod ane;
+/// Shared AWQ calibration primitives (scales, magnitudes, projection groups).
+pub mod calibration;
 /// Shared CPU dequantization routines (affine, dual-scale, parameter conversion).
 pub mod dequant;
 pub mod device;

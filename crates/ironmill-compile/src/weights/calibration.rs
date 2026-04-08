@@ -16,86 +16,13 @@ use crate::error::{CompileError, Result};
 
 pub use super::quantized::AwqTensorConfig;
 
-/// Projection names under `self_attn` in the HuggingFace naming convention.
-pub const ATTN_PROJS: &[&str] = &["q_proj", "k_proj", "v_proj", "o_proj"];
-/// Projection names under `mlp` in the HuggingFace naming convention.
-pub const FFN_PROJS: &[&str] = &["gate_proj", "up_proj", "down_proj"];
-
-/// A group of projections that share the same activation norm for AWQ scaling.
-pub struct WeightGroup {
-    /// Projection names in this group.
-    pub proj_names: Vec<&'static str>,
-    /// Which norm feeds this group: `"attn"` or `"ffn"`.
-    pub norm_key: &'static str,
-}
-
-/// Standard AWQ weight groupings.
-///
-/// Q/K/V share a single alpha (all fed by attn_norm), O_proj gets its own
-/// (different input distribution), gate/up share one (ffn_norm), and
-/// down_proj gets its own.
-pub fn weight_groups() -> Vec<WeightGroup> {
-    vec![
-        WeightGroup {
-            proj_names: vec!["q_proj", "k_proj", "v_proj"],
-            norm_key: "attn",
-        },
-        WeightGroup {
-            proj_names: vec!["o_proj"],
-            norm_key: "attn",
-        },
-        WeightGroup {
-            proj_names: vec!["gate_proj", "up_proj"],
-            norm_key: "ffn",
-        },
-        WeightGroup {
-            proj_names: vec!["down_proj"],
-            norm_key: "ffn",
-        },
-    ]
-}
-
-/// Compute AWQ scales from activation magnitudes and an alpha value.
-///
-/// Matches the reference AWQ normalisation:
-///   `scales[c] = x_max[c]^alpha`
-///   `scales /= sqrt(max(scales) * min(scales))`
-pub fn compute_awq_scales(x_max: &[f32], alpha: f32) -> Vec<f32> {
-    if alpha == 0.0 {
-        return vec![1.0; x_max.len()];
-    }
-    let mut scales: Vec<f32> = x_max.iter().map(|&m| m.powf(alpha).max(1e-4)).collect();
-    let max_s = scales.iter().cloned().fold(0.0_f32, f32::max);
-    let min_s = scales.iter().cloned().fold(f32::INFINITY, f32::min);
-    let norm = (max_s * min_s).sqrt().max(1e-8);
-    for s in &mut scales {
-        *s /= norm;
-    }
-    scales
-}
-
-/// Compute per-channel mean absolute activation (x_max) from flat
-/// `[tokens × features]` data.
-pub fn compute_channel_magnitudes(activations: &[f32], n_features: usize) -> Vec<f32> {
-    if n_features == 0 || activations.is_empty() {
-        return Vec::new();
-    }
-    let n_tokens = activations.len() / n_features;
-    let mut mags = vec![0.0_f32; n_features];
-    for t in 0..n_tokens {
-        let row = &activations[t * n_features..(t + 1) * n_features];
-        for (c, &val) in row.iter().enumerate() {
-            mags[c] += val.abs();
-        }
-    }
-    if n_tokens > 0 {
-        let inv = 1.0 / n_tokens as f32;
-        for m in &mut mags {
-            *m *= inv;
-        }
-    }
-    mags
-}
+// Re-export shared calibration primitives from core so that downstream
+// callers (e.g. `awq_block_calibrate` example) continue to import from
+// `ironmill_compile::weights::calibration::*`.
+pub use ironmill_core::calibration::{
+    ATTN_PROJS, FFN_PROJS, WeightGroup, compute_awq_scales, compute_channel_magnitudes,
+    weight_groups,
+};
 
 /// Quantize-then-dequantize a weight matrix with AWQ scaling applied.
 ///
