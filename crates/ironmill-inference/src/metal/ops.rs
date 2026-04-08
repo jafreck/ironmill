@@ -2587,5 +2587,7 @@ pub fn encode_affine_matvec_int4xq8(
     encoder.set_bytes(&k.to_le_bytes(), 7);
     encoder.set_bytes(&weight.group_size.to_le_bytes(), 8);
     encoder.set_bytes(&q8_group_size.to_le_bytes(), 9);
-    encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
+    let amx_rows_per_tg = 64usize;
+    let num_tgs = (n as usize).div_ceil(amx_rows_per_tg);
+    encoder.dispatch_threadgroups((num_tgs, 1, 1), (256, 1, 1));
 }

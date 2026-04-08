@@ -1270,6 +1270,20 @@ kernel void fused_ffn_gate_up_act_int4(
 //
 // Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
 
+// ============================================================================
+// AMX-accelerated INT4×Q8 matvec (decode path, M=1)
+//
+// Two-phase approach per K-tile (same as affine_matvec_int4_amx):
+//   Phase 1a: Dequant Q8 input to FP16 in threadgroup memory.
+//   Phase 1b: All 256 threads cooperatively dequant a [64 x TILE_K] INT4 tile
+//             into FP16 threadgroup memory (zero is integer-rounded).
+//   Phase 2: Each of 8 simdgroups uses simdgroup_matrix_multiply_accumulate
+//            (Apple AMX hardware) on its 8-row slice.
+//
+// Same buffer layout as the scalar affine_matvec_int4xq8 for drop-in replacement.
+// Dispatch: (ceil(N/64), 1, 1) threadgroups, (256, 1, 1) threads.
+// ============================================================================
+
 kernel void affine_matvec_int4xq8(
     device const char *A_q8         [[buffer(0)]],   // [K] int8
     device const float *A_scales    [[buffer(1)]],   // [K/q8_group_size] float
@@ -1281,69 +1295,109 @@ kernel void affine_matvec_int4xq8(
     constant uint &K                [[buffer(7)]],
     constant uint &group_size       [[buffer(8)]],   // weight group size
     constant uint &q8_group_size    [[buffer(9)]],   // Q8 input group size
-    uint tid  [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]])
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint sgid   [[simdgroup_index_in_threadgroup]],
+    uint lane   [[thread_index_in_simdgroup]])
 {
-    if (tid >= N) return;
+    uint row_base = tgid * AMX_ROWS_PER_TG;
+    if (row_base >= N) return;
 
-    uint half_K = K / 2;
+    uint rows_this_tg = min(AMX_ROWS_PER_TG, N - row_base);
+    uint n_block_base = row_base / BLK_N;
+    uint k_blocks_total = (K + BLK_K - 1) / BLK_K;
     uint num_groups = (K + group_size - 1) / group_size;
-    uint scale_row = tid * num_groups;
 
-    // Blocked layout addressing (same as affine_matvec_int4)
-    uint k_blocks      = (K + BLK_K - 1) / BLK_K;
-    uint local_k_bytes = BLK_K / 2;             // 4
-    uint block_bytes   = BLK_N * local_k_bytes;  // 256
-    uint n_block = tid / BLK_N;
-    uint n_local = tid % BLK_N;
+    threadgroup half tg_w[AMX_ROWS_PER_TG * AMX_TILE_K]; // 16 KB
+    threadgroup half tg_x[AMX_TILE_K];                    // 256 B
 
-    float acc = 0.0f;
-    uint prev_wg = 0xFFFFFFFF;
-    float ws = 0.0f;
-    float wz = 0.0f;
+    simdgroup_matrix<float, 8, 8> acc_mat(0);
 
-    for (uint k = lane; k < half_K; k += 32) {
-        uint kb = k / local_k_bytes;
-        uint b  = k % local_k_bytes;
-        uint byte_idx = (n_block * k_blocks + kb) * block_bytes
-                      + n_local * local_k_bytes + b;
+    for (uint kt = 0; kt < K; kt += AMX_TILE_K) {
+        uint tile_k = min(AMX_TILE_K, K - kt);
 
-        uchar packed = B_packed[byte_idx];
-        int lo = int(packed & 0x0F);
-        int hi = int((packed >> 4) & 0x0F);
-
-        uint k2 = k * 2;
-        uint wg0 = k2 / group_size;
-        uint wg1 = (k2 + 1) / group_size;
-        uint ag0 = k2 / q8_group_size;
-        uint ag1 = (k2 + 1) / q8_group_size;
-
-        // Weight group 0
-        if (wg0 != prev_wg) {
-            ws = float(w_scales[scale_row + wg0]);
-            wz = float(w_zeros[scale_row + wg0]);
-            prev_wg = wg0;
+        // -- Phase 1a: Load Q8 input into threadgroup FP16 --
+        for (uint i = tid; i < tile_k; i += AMX_TG_SIZE) {
+            uint k_abs = kt + i;
+            float q8_val = float(A_q8[k_abs]);
+            float a_scale = A_scales[k_abs / q8_group_size];
+            tg_x[i] = half(q8_val * a_scale);
         }
-        int iz = int(rint(wz));
-        int w0 = lo - iz;
-        float a_scale0 = A_scales[ag0];
-        acc += float(int(A_q8[k2])) * float(w0) * ws * a_scale0;
 
-        // Weight group 1 (may differ if crossing group boundary)
-        if (wg1 != wg0) {
-            ws = float(w_scales[scale_row + wg1]);
-            wz = float(w_zeros[scale_row + wg1]);
-            prev_wg = wg1;
-            iz = int(rint(wz));
+        // -- Phase 1b: Cooperative INT4 dequant (integer-rounded zero) --
+        uint half_tile_k = tile_k / 2;
+        uint total_pairs = rows_this_tg * half_tile_k;
+        for (uint i = tid; i < total_pairs; i += AMX_TG_SIZE) {
+            uint n_local = i / half_tile_k;
+            uint kp      = i % half_tile_k;
+            uint k_abs   = kt + kp * 2;
+            uint n_abs   = row_base + n_local;
+
+            uint kb_idx   = k_abs / BLK_K;
+            uint k_local  = k_abs % BLK_K;
+            uint byte_idx = (n_block_base * k_blocks_total + kb_idx) * (BLK_N * BLK_K / 2)
+                          + n_local * (BLK_K / 2)
+                          + k_local / 2;
+
+            uchar packed = B_packed[byte_idx];
+
+            uint g0 = k_abs / group_size;
+            float s0 = float(w_scales[n_abs * num_groups + g0]);
+            int iz0 = int(rint(float(w_zeros[n_abs * num_groups + g0])));
+            float w0 = float(int(packed & 0x0F) - iz0) * s0;
+
+            uint g1 = (k_abs + 1) / group_size;
+            float s1 = (g1 == g0) ? s0 : float(w_scales[n_abs * num_groups + g1]);
+            int iz1 = (g1 == g0) ? iz0 : int(rint(float(w_zeros[n_abs * num_groups + g1])));
+            float w1 = float(int(packed >> 4) - iz1) * s1;
+
+            tg_w[n_local * AMX_TILE_K + kp * 2]     = half(w0);
+            tg_w[n_local * AMX_TILE_K + kp * 2 + 1] = half(w1);
         }
-        int w1 = hi - iz;
-        float a_scale1 = A_scales[ag1];
-        acc += float(int(A_q8[k2 + 1])) * float(w1) * ws * a_scale1;
+        if (tile_k < AMX_TILE_K) {
+            for (uint i = tid; i < rows_this_tg; i += AMX_TG_SIZE) {
+                for (uint j = tile_k; j < AMX_TILE_K; j++) {
+                    tg_w[i * AMX_TILE_K + j] = 0;
+                }
+            }
+            for (uint i = tile_k + tid; i < AMX_TILE_K; i += AMX_TG_SIZE) {
+                tg_x[i] = 0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // -- Phase 2: simdgroup matrix multiply (AMX) --
+        uint sg_row = sgid * AMX_ROWS_PER_SG;
+        if (sg_row < rows_this_tg) {
+            uint n_k_tiles = (tile_k + 7) / 8;
+            for (uint kb = 0; kb < n_k_tiles; kb++) {
+                simdgroup_matrix<half, 8, 8> w_T;
+                simdgroup_load(w_T, tg_w + sg_row * AMX_TILE_K + kb * 8,
+                               AMX_TILE_K, ulong2(0, 0), true);
+
+                simdgroup_matrix<half, 8, 8> x_mat;
+                simdgroup_load(x_mat, tg_x + kb * 8, 0);
+
+                simdgroup_multiply_accumulate(acc_mat, x_mat, w_T, acc_mat);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    acc = simd_sum(acc);
+    // -- Extract and store results --
+    uint sg_row = sgid * AMX_ROWS_PER_SG;
+    if (sg_row >= rows_this_tg) return;
+
+    threadgroup float tg_result[AMX_SIMDGROUPS * 64];
+    simdgroup_store(acc_mat, tg_result + sgid * 64, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (lane == 0) {
-        C[tid] = half(acc);
+        for (uint r = 0; r < AMX_ROWS_PER_SG; r++) {
+            uint n_row = row_base + sg_row + r;
+            if (n_row < N) {
+                C[n_row] = half(tg_result[sgid * 64 + r]);
+            }
+        }
     }
 }
