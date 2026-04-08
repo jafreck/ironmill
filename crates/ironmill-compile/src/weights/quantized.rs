@@ -647,15 +647,6 @@ fn search_clip_ranges(
         1
     };
 
-    // Sub-sample rows for large matrices.
-    let max_rows = out_features.min(256);
-    let row_stride = if out_features > max_rows {
-        out_features / max_rows
-    } else {
-        1
-    };
-    let sampled_rows: Vec<usize> = (0..out_features).step_by(row_stride).collect();
-
     for g in 0..n_groups {
         let g_start = g * group_size;
         let g_end = (g_start + group_size).min(in_features);
@@ -668,10 +659,10 @@ fn search_clip_ranges(
             })
             .collect();
 
-        // Search clip values for sampled rows in parallel.
-        let row_clips: Vec<(usize, f32)> = sampled_rows
-            .par_iter()
-            .map(|&row| {
+        // Search clip values for all rows in parallel.
+        let row_clips: Vec<(usize, f32)> = (0..out_features)
+            .into_par_iter()
+            .map(|row| {
                 let w_base = row * in_features + g_start;
                 let w_slice = &scaled_weights[w_base..w_base + gsize];
 
@@ -739,19 +730,8 @@ fn search_clip_ranges(
             })
             .collect();
 
-        if row_stride == 1 {
-            // Every row was searched — store directly.
-            for (row, clip) in row_clips {
-                clip_maxvals[row * n_groups + g] = clip;
-            }
-        } else {
-            // Sub-sampled: compute median clip and broadcast to all rows.
-            let mut clips: Vec<f32> = row_clips.iter().map(|r| r.1).collect();
-            clips.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = clips[clips.len() / 2];
-            for row in 0..out_features {
-                clip_maxvals[row * n_groups + g] = median;
-            }
+        for (row, clip) in row_clips {
+            clip_maxvals[row * n_groups + g] = clip;
         }
     }
 
