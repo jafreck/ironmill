@@ -187,7 +187,8 @@ impl<E: InferenceEngine> SpeculativeStreaming<E> {
             return Err(InferenceError::Decode("empty primary logits".into()));
         }
 
-        let primary_token = argmax(primary_logits);
+        let primary_token = argmax(primary_logits)
+            .ok_or_else(|| InferenceError::Decode("no finite logits for primary token".into()))?;
         let mut accepted = Vec::new();
 
         // --- Phase 1: verify pending speculative tokens ---
@@ -204,7 +205,10 @@ impl<E: InferenceEngine> SpeculativeStreaming<E> {
                 // verified tokens through the engine to get their primary logits.
                 for i in 1..pending.len() {
                     let verify_logits = self.engine.decode_step(pending[i - 1].0)?;
-                    let verify_token = argmax(&verify_logits);
+                    let verify_token = match argmax(&verify_logits) {
+                        Some(t) => t,
+                        None => break,
+                    };
                     if verify_token == pending[i].0 && pending[i].1 >= self.config.min_confidence {
                         verified_count = i + 1;
                     } else {
@@ -257,7 +261,10 @@ impl<E: InferenceEngine> SpeculativeStreaming<E> {
                     }
 
                     let confidence = softmax_max(&combined);
-                    let spec_token = argmax(&combined);
+                    let spec_token = match argmax(&combined) {
+                        Some(t) => t,
+                        None => break,
+                    };
                     new_speculative.push((spec_token, confidence));
                 }
 
@@ -298,16 +305,14 @@ impl<E: InferenceEngine> SpeculativeStreaming<E> {
 
 /// Greedy argmax over a logit slice.
 ///
-/// # Panics
-/// Panics if `logits` is empty or contains no finite values.
-fn argmax(logits: &[f32]) -> u32 {
+/// Returns `None` if `logits` is empty or all values are negative infinity.
+fn argmax(logits: &[f32]) -> Option<u32> {
     logits
         .iter()
         .enumerate()
         .filter(|(_, v)| **v != f32::NEG_INFINITY)
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| i as u32)
-        .expect("argmax called on empty or all-neg-inf logits")
 }
 
 /// Maximum softmax probability (confidence of the top token).
@@ -491,7 +496,7 @@ mod tests {
         let logits = ss.standard_step(0).unwrap();
         assert_eq!(logits.len(), 10);
         // Favored token 3 should have highest logit.
-        assert_eq!(argmax(&logits), 3);
+        assert_eq!(argmax(&logits), Some(3));
     }
 
     #[test]
@@ -502,7 +507,7 @@ mod tests {
 
         let logits = ss.standard_step(0).unwrap();
         assert_eq!(logits.len(), 8);
-        assert_eq!(argmax(&logits), 2);
+        assert_eq!(argmax(&logits), Some(2));
     }
 
     #[test]
@@ -705,9 +710,19 @@ mod tests {
 
     #[test]
     fn streaming_argmax_basic() {
-        assert_eq!(argmax(&[0.1, 0.9, 0.5]), 1);
-        assert_eq!(argmax(&[3.0, 1.0, 2.0]), 0);
-        assert_eq!(argmax(&[0.0, 0.0, 1.0]), 2);
+        assert_eq!(argmax(&[0.1, 0.9, 0.5]), Some(1));
+        assert_eq!(argmax(&[3.0, 1.0, 2.0]), Some(0));
+        assert_eq!(argmax(&[0.0, 0.0, 1.0]), Some(2));
+    }
+
+    #[test]
+    fn streaming_argmax_empty_returns_none() {
+        assert_eq!(argmax(&[]), None);
+    }
+
+    #[test]
+    fn streaming_argmax_all_neg_inf_returns_none() {
+        assert_eq!(argmax(&[f32::NEG_INFINITY, f32::NEG_INFINITY]), None);
     }
 
     #[test]
