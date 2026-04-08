@@ -66,12 +66,19 @@ pub use speculative::{
 };
 pub use types::{ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor};
 
-/// CoreML runtime types re-exported for downstream consumers.
+/// **Internal** — CoreML sys-layer types re-exported for sibling crates.
 ///
-/// User-facing crates should depend on `ironmill-inference`, not
-/// `ironmill-coreml-sys` directly.
+/// These re-exports exist so that `burn-coreml` and `candle-coreml` can
+/// consume `ironmill_coreml_sys` types without adding a direct dependency on
+/// the sys crate.  **External consumers should not rely on this module.**
+/// Its contents may change or be removed without a semver bump.
+///
+/// Prefer the [`ComputeDevice`] abstraction enum (defined below) over
+/// [`ComputeUnits`] when writing new code.
+#[doc(hidden)]
 #[cfg(all(feature = "coreml", target_os = "macos"))]
 pub mod coreml_runtime {
+    #[doc(hidden)]
     pub use ironmill_coreml_sys::{
         ComputeUnits, ExtractedOutput, InputDescription, InputFeature, Model, MultiArrayDataType,
         OutputTensorData, PredictionInput, PredictionOutput, build_dummy_input,
@@ -88,6 +95,63 @@ pub mod coreml_runtime {
             pi.add_multi_array(name, shape, MultiArrayDataType::Float32, data)?;
         }
         Ok(pi)
+    }
+}
+
+// ── Abstraction over CoreML compute-unit selection ───────────────
+/// Hardware target for CoreML model execution.
+///
+/// This is the stable, crate-owned replacement for the sys-layer
+/// [`ironmill_coreml_sys::ComputeUnits`] enum.  New code should prefer this
+/// type; the sys re-export in [`coreml_runtime`] is `#[doc(hidden)]` and may
+/// be removed in a future release.
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComputeDevice {
+    /// CPU only — safest, always available.
+    CpuOnly,
+    /// CPU + GPU.
+    CpuAndGpu,
+    /// CPU + Apple Neural Engine.
+    CpuAndNeuralEngine,
+    /// All available compute units (CPU, GPU, ANE).
+    All,
+}
+
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+impl ComputeDevice {
+    /// Convert to the underlying sys-layer [`ComputeUnits`](ironmill_coreml_sys::ComputeUnits).
+    #[doc(hidden)]
+    pub fn to_compute_units(self) -> ironmill_coreml_sys::ComputeUnits {
+        match self {
+            ComputeDevice::CpuOnly => ironmill_coreml_sys::ComputeUnits::CpuOnly,
+            ComputeDevice::CpuAndGpu => ironmill_coreml_sys::ComputeUnits::CpuAndGpu,
+            ComputeDevice::CpuAndNeuralEngine => {
+                ironmill_coreml_sys::ComputeUnits::CpuAndNeuralEngine
+            }
+            ComputeDevice::All => ironmill_coreml_sys::ComputeUnits::All,
+        }
+    }
+}
+
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+impl From<ComputeDevice> for ironmill_coreml_sys::ComputeUnits {
+    fn from(d: ComputeDevice) -> Self {
+        d.to_compute_units()
+    }
+}
+
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+impl From<ironmill_coreml_sys::ComputeUnits> for ComputeDevice {
+    fn from(cu: ironmill_coreml_sys::ComputeUnits) -> Self {
+        match cu {
+            ironmill_coreml_sys::ComputeUnits::CpuOnly => ComputeDevice::CpuOnly,
+            ironmill_coreml_sys::ComputeUnits::CpuAndGpu => ComputeDevice::CpuAndGpu,
+            ironmill_coreml_sys::ComputeUnits::CpuAndNeuralEngine => {
+                ComputeDevice::CpuAndNeuralEngine
+            }
+            ironmill_coreml_sys::ComputeUnits::All => ComputeDevice::All,
+        }
     }
 }
 
