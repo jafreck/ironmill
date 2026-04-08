@@ -197,17 +197,20 @@ impl CommandBuffer {
 
         unsafe extern "C" fn invoke_block(block: *mut BlockLiteral, _cmd_buf: *mut c_void) {
             // SAFETY: `block.closure` is a valid leaked Box<dyn Fn()>.
-            let closure = unsafe { &*(*block).closure };
+            // Metal calls the completion handler exactly once, so we
+            // reclaim ownership of the Box to free it after invocation.
+            let closure = unsafe { Box::from_raw((*block).closure) };
             closure();
         }
 
         // SAFETY: We create a heap block via _Block_copy so it survives
-        // past this stack frame. The closure is leaked into a raw pointer
-        // and never freed (the handler runs exactly once per command buffer).
+        // past this stack frame. The closure is freed inside invoke_block
+        // after the handler fires (Metal calls it exactly once).
         #[link(name = "System")]
         unsafe extern "C" {
             static _NSConcreteStackBlock: *const c_void;
             fn _Block_copy(block: *const c_void) -> *mut c_void;
+            fn _Block_release(block: *mut c_void);
         }
 
         let boxed: Box<dyn Fn()> = Box::new(closure);
@@ -215,7 +218,7 @@ impl CommandBuffer {
 
         let stack_block = BlockLiteral {
             isa: std::ptr::addr_of!(_NSConcreteStackBlock) as *const c_void,
-            flags: 1 << 25, // BLOCK_HAS_COPY_DISPOSE not needed for simple case
+            flags: 0,
             reserved: 0,
             invoke: invoke_block,
             descriptor: &DESCRIPTOR,
@@ -232,6 +235,9 @@ impl CommandBuffer {
         let sel = unsafe { objc::sel_registerName(sel!("addCompletedHandler:")) };
         let f: AddHandlerFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
         unsafe { f(self.raw, sel, heap_block) };
+
+        // Release our reference; Metal retains its own copy.
+        unsafe { _Block_release(heap_block) };
     }
 
     /// Returns the raw `id<MTLCommandBuffer>` pointer.
