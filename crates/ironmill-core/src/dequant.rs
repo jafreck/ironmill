@@ -312,14 +312,36 @@ pub fn convert_params_to_f16(
     let elem_size = dtype.byte_size();
     let num_params = params.len() / elem_size;
 
-    let mut output = Vec::with_capacity(num_params * 2);
-    for i in 0..num_params {
-        let val = read_typed_f32(params, i * elem_size, dtype)?;
-        let fp16 = f16::from_f32(val);
-        output.extend_from_slice(&fp16.to_le_bytes());
+    match dtype {
+        ScalarType::Float16 => {
+            // Already FP16 — just copy the bytes.
+            Ok(params[..num_params * 2].to_vec())
+        }
+        ScalarType::Float32 => {
+            let mut output = vec![0u8; num_params * 2];
+            let src = params;
+            for i in 0..num_params {
+                let off = i * 4;
+                let val = f32::from_le_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
+                let fp16 = f16::from_f32(val);
+                let dst_off = i * 2;
+                let bytes = fp16.to_le_bytes();
+                output[dst_off] = bytes[0];
+                output[dst_off + 1] = bytes[1];
+            }
+            Ok(output)
+        }
+        _ => {
+            // Fallback: element-by-element via read_typed_f32.
+            let mut output = Vec::with_capacity(num_params * 2);
+            for i in 0..num_params {
+                let val = read_typed_f32(params, i * elem_size, dtype)?;
+                let fp16 = f16::from_f32(val);
+                output.extend_from_slice(&fp16.to_le_bytes());
+            }
+            Ok(output)
+        }
     }
-
-    Ok(output)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

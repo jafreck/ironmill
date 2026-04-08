@@ -837,20 +837,17 @@ fn pack_bytes_blocked(src: &[u8], n: usize, k: usize) -> Option<Vec<u8>> {
     let mut dst = vec![0u8; total_bytes];
     let n_blocks = n / 8;
     let k_blocks = k / 8;
+    let row_stride = k * 2; // bytes per row in FP16
 
     for nb in 0..n_blocks {
         for kb in 0..k_blocks {
+            let src_col_byte = kb * 8 * 2; // 8 FP16 elements = 16 bytes
             for ri in 0..8usize {
                 let src_row = nb * 8 + ri;
-                let dst_block_base = ((nb * k_blocks + kb) * 8 + ri) * 8;
-                for ki in 0..8usize {
-                    let src_col = kb * 8 + ki;
-                    let src_offset = (src_row * k + src_col) * 2;
-                    let dst_offset = (dst_block_base + ki) * 2;
+                let src_offset = src_row * row_stride + src_col_byte;
+                let dst_offset = ((nb * k_blocks + kb) * 8 + ri) * 8 * 2;
 
-                    dst[dst_offset] = src[src_offset];
-                    dst[dst_offset + 1] = src[src_offset + 1];
-                }
+                dst[dst_offset..dst_offset + 16].copy_from_slice(&src[src_offset..src_offset + 16]);
             }
         }
     }
@@ -1270,22 +1267,20 @@ fn pack_quantized_blocked(data: &[u8], n: usize, k: usize, bit_width: usize) -> 
     let mut out = vec![0u8; total_bytes];
 
     for nb in 0..n_blocks {
+        let rows_in_block = n_tile.min(n - nb * n_tile);
         for kb in 0..k_blocks {
-            for n_local in 0..n_tile {
+            let src_col_byte = kb * local_k_bytes;
+            let copy_len = local_k_bytes.min(bytes_per_row.saturating_sub(src_col_byte));
+            if copy_len == 0 {
+                continue;
+            }
+            let dst_block_base = (nb * k_blocks + kb) * block_bytes;
+            for n_local in 0..rows_in_block {
                 let g_n = nb * n_tile + n_local;
-                if g_n >= n {
-                    continue;
-                }
-                for b in 0..local_k_bytes {
-                    let src_byte = kb * local_k_bytes + b;
-                    if src_byte >= bytes_per_row {
-                        continue;
-                    }
-                    let src_offset = g_n * bytes_per_row + src_byte;
-                    let dst_offset =
-                        (nb * k_blocks + kb) * block_bytes + n_local * local_k_bytes + b;
-                    out[dst_offset] = data[src_offset];
-                }
+                let src_offset = g_n * bytes_per_row + src_col_byte;
+                let dst_offset = dst_block_base + n_local * local_k_bytes;
+                out[dst_offset..dst_offset + copy_len]
+                    .copy_from_slice(&data[src_offset..src_offset + copy_len]);
             }
         }
     }
@@ -1466,5 +1461,132 @@ mod superblock_tests {
         assert_eq!(&packed[0..2], &[0x00, 0x3C]);
         assert_eq!(&packed[2..4], &[0x00, 0x00]);
         assert!(packed[4..].iter().all(|&b| b == 0xAB));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reference (naive) implementation of pack_quantized_blocked for testing.
+    fn pack_quantized_blocked_naive(data: &[u8], n: usize, k: usize, bit_width: usize) -> Vec<u8> {
+        let k_tile: usize = 8;
+        let n_tile: usize = 64;
+        let n_blocks = n.div_ceil(n_tile);
+        let k_blocks = k.div_ceil(k_tile);
+        let elements_per_byte = 8 / bit_width;
+        let bytes_per_row = k / elements_per_byte;
+        let local_k_bytes = k_tile / elements_per_byte;
+        let block_bytes = n_tile * local_k_bytes;
+        let total_bytes = n_blocks * k_blocks * block_bytes;
+        let mut out = vec![0u8; total_bytes];
+        for nb in 0..n_blocks {
+            for kb in 0..k_blocks {
+                for n_local in 0..n_tile {
+                    let g_n = nb * n_tile + n_local;
+                    if g_n >= n {
+                        continue;
+                    }
+                    for b in 0..local_k_bytes {
+                        let src_byte = kb * local_k_bytes + b;
+                        if src_byte >= bytes_per_row {
+                            continue;
+                        }
+                        let src_offset = g_n * bytes_per_row + src_byte;
+                        let dst_offset =
+                            (nb * k_blocks + kb) * block_bytes + n_local * local_k_bytes + b;
+                        out[dst_offset] = data[src_offset];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Reference (naive) implementation of pack_bytes_blocked for testing.
+    fn pack_bytes_blocked_naive(src: &[u8], n: usize, k: usize) -> Option<Vec<u8>> {
+        if n % 8 != 0 || k % 8 != 0 {
+            return None;
+        }
+        let total_bytes = n * k * 2;
+        let mut dst = vec![0u8; total_bytes];
+        let n_blocks = n / 8;
+        let k_blocks = k / 8;
+        for nb in 0..n_blocks {
+            for kb in 0..k_blocks {
+                for ri in 0..8usize {
+                    let src_row = nb * 8 + ri;
+                    let dst_block_base = ((nb * k_blocks + kb) * 8 + ri) * 8;
+                    for ki in 0..8usize {
+                        let src_col = kb * 8 + ki;
+                        let src_offset = (src_row * k + src_col) * 2;
+                        let dst_offset = (dst_block_base + ki) * 2;
+                        dst[dst_offset] = src[src_offset];
+                        dst[dst_offset + 1] = src[src_offset + 1];
+                    }
+                }
+            }
+        }
+        Some(dst)
+    }
+
+    #[test]
+    fn pack_quantized_int4_matches_naive() {
+        // 128×256 INT4 matrix
+        let n = 128;
+        let k = 256;
+        let bytes_per_row = k / 2;
+        let data: Vec<u8> = (0..n * bytes_per_row).map(|i| (i % 251) as u8).collect();
+        let expected = pack_quantized_blocked_naive(&data, n, k, 4);
+        let actual = pack_quantized_blocked(&data, n, k, 4);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pack_quantized_int8_matches_naive() {
+        // 64×128 INT8 matrix
+        let n = 64;
+        let k = 128;
+        let data: Vec<u8> = (0..n * k).map(|i| (i % 253) as u8).collect();
+        let expected = pack_quantized_blocked_naive(&data, n, k, 8);
+        let actual = pack_quantized_blocked(&data, n, k, 8);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pack_quantized_non_aligned_n() {
+        // N not aligned to 64
+        let n = 100;
+        let k = 128;
+        let bytes_per_row = k / 2;
+        let data: Vec<u8> = (0..n * bytes_per_row).map(|i| (i % 199) as u8).collect();
+        let expected = pack_quantized_blocked_naive(&data, n, k, 4);
+        let actual = pack_quantized_blocked(&data, n, k, 4);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pack_bytes_blocked_matches_naive() {
+        // 64×64 FP16 matrix
+        let n = 64;
+        let k = 64;
+        let data: Vec<u8> = (0..n * k * 2).map(|i| (i % 241) as u8).collect();
+        let expected = pack_bytes_blocked_naive(&data, n, k);
+        let actual = pack_bytes_blocked(&data, n, k);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pack_bytes_blocked_larger() {
+        // 128×256 FP16 matrix
+        let n = 128;
+        let k = 256;
+        let data: Vec<u8> = (0..n * k * 2).map(|i| (i % 223) as u8).collect();
+        let expected = pack_bytes_blocked_naive(&data, n, k);
+        let actual = pack_bytes_blocked(&data, n, k);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pack_bytes_blocked_rejects_unaligned() {
+        assert!(pack_bytes_blocked(&[0u8; 100], 5, 10).is_none());
     }
 }

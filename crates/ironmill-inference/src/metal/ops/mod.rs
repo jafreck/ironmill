@@ -208,8 +208,50 @@ impl MetalPipelines {
     ) -> Result<Self, MetalError> {
         let libs = ShaderLibraries::load(device, head_dim, rotary_dim)?;
 
-        let (rms_norm, silu_gate, ffn_gelu_gate, rope) =
-            Self::compile_normalization_shaders(device, &libs)?;
+        // Compile all pipeline groups in parallel using scoped threads.
+        // Each group reads from the shared device + libs and returns its
+        // compiled pipelines. Metal pipeline state creation is thread-safe.
+        let (
+            norm_result,
+            elem_result,
+            tq_result,
+            attn_result,
+            qmm_result,
+            dense_result,
+            adv_result,
+            fused_result,
+            moe_result,
+            d2q_result,
+            gdn_result,
+        ) = std::thread::scope(|s| {
+            let h_norm = s.spawn(|| Self::compile_normalization_shaders(device, &libs));
+            let h_elem = s.spawn(|| Self::compile_elementwise_shaders(device, &libs));
+            let h_tq = s.spawn(|| Self::compile_turboquant_shaders(device, &libs));
+            let h_attn = s.spawn(|| Self::compile_attention_shaders(device, &libs));
+            let h_qmm = s.spawn(|| Self::compile_quantized_matmul_shaders(device, &libs));
+            let h_dense = s.spawn(|| Self::compile_dense_matmul_shaders(device, &libs));
+            let h_adv = s.spawn(|| Self::compile_advanced_matmul_shaders(device, &libs));
+            let h_fused = s.spawn(|| Self::compile_fused_shaders(device, &libs));
+            let h_moe = s.spawn(|| Self::compile_moe_shaders(device));
+            let h_d2q = s.spawn(|| Self::compile_d2quant_shaders(device, &libs));
+            let h_gdn = s.spawn(|| Self::compile_gdn_shaders(device, &libs));
+
+            (
+                h_norm.join().expect("norm shader thread panicked"),
+                h_elem.join().expect("elem shader thread panicked"),
+                h_tq.join().expect("tq shader thread panicked"),
+                h_attn.join().expect("attn shader thread panicked"),
+                h_qmm.join().expect("qmm shader thread panicked"),
+                h_dense.join().expect("dense shader thread panicked"),
+                h_adv.join().expect("adv shader thread panicked"),
+                h_fused.join().expect("fused shader thread panicked"),
+                h_moe.join().expect("moe shader thread panicked"),
+                h_d2q.join().expect("d2q shader thread panicked"),
+                h_gdn.join().expect("gdn shader thread panicked"),
+            )
+        });
+
+        let (rms_norm, silu_gate, ffn_gelu_gate, rope) = norm_result?;
         let (
             residual_add,
             bias_add,
@@ -219,13 +261,13 @@ impl MetalPipelines {
             scale_buffer,
             quantize_input_q8,
             affine_embedding_lookup_int4,
-        ) = Self::compile_elementwise_shaders(device, &libs)?;
+        ) = elem_result?;
         let (
             turboquant_cache_write,
             turboquant_attention,
             turboquant_outlier_cache_write,
             turboquant_outlier_attention,
-        ) = Self::compile_turboquant_shaders(device, &libs)?;
+        ) = tq_result?;
         let (
             standard_attention,
             prefill_attention,
@@ -235,7 +277,7 @@ impl MetalPipelines {
             fused_sdpa,
             fused_sdpa_split,
             fused_sdpa_reduce,
-        ) = Self::compile_attention_shaders(device, &libs)?;
+        ) = attn_result?;
         let (
             polarquant_matvec_int4,
             polarquant_matmul_int4,
@@ -245,9 +287,8 @@ impl MetalPipelines {
             affine_matmul_int4,
             affine_matvec_int8,
             affine_matmul_int8,
-        ) = Self::compile_quantized_matmul_shaders(device, &libs)?;
-        let (kv_scatter, matvec, matmul, quip_sharp_matvec, quip_sharp_matmul) =
-            Self::compile_dense_matmul_shaders(device, &libs)?;
+        ) = qmm_result?;
+        let (kv_scatter, matvec, matmul, quip_sharp_matvec, quip_sharp_matmul) = dense_result?;
         let (
             int4_dequantize,
             batched_affine_matvec_int4,
@@ -266,7 +307,7 @@ impl MetalPipelines {
             sb_batched_matvec_int4,
             sb_gdn_batched_matvec_int4,
             sb_matvec_int4xq8,
-        ) = Self::compile_advanced_matmul_shaders(device, &libs)?;
+        ) = adv_result?;
         let (
             fused_residual_rms_norm,
             fused_embedding_norm,
@@ -276,11 +317,9 @@ impl MetalPipelines {
             fused_residual_norm_matvec,
             fused_residual_norm_affine_matvec_int4,
             sb_fused_residual_norm_affine_matvec_int4,
-        ) = Self::compile_fused_shaders(device, &libs)?;
-        let (moe_softmax, moe_gelu, moe_mul, moe_weighted_combine) =
-            Self::compile_moe_shaders(device)?;
-        let (d2quant_matvec_3bit, d2quant_matmul_3bit, d2quant_embedding_lookup_3bit) =
-            Self::compile_d2quant_shaders(device, &libs)?;
+        ) = fused_result?;
+        let (moe_softmax, moe_gelu, moe_mul, moe_weighted_combine) = moe_result?;
+        let (d2quant_matvec_3bit, d2quant_matmul_3bit, d2quant_embedding_lookup_3bit) = d2q_result?;
         let (
             gdn_conv1d_silu,
             gdn_recurrent_update,
@@ -288,7 +327,7 @@ impl MetalPipelines {
             gdn_prefill_conv1d_silu,
             gdn_prefill_recurrent,
             gdn_fused_decode,
-        ) = Self::compile_gdn_shaders(device, &libs)?;
+        ) = gdn_result?;
 
         Ok(Self {
             norm: NormPipelines {

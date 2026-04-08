@@ -1,5 +1,7 @@
 //! Weight loading and resource initialization.
 
+use std::time::Instant;
+
 use half::f16;
 use ironmill_metal_sys::StorageMode;
 use mil_rs::weights::WeightProvider;
@@ -34,10 +36,31 @@ impl MetalInference {
         compute_outliers: bool,
     ) -> Result<(), InferenceError> {
         let rotary_dim = self.load_model_config(&weights)?;
+
+        let t0 = Instant::now();
         self.init_pipelines(rotary_dim)?;
+        let t_pipelines = t0.elapsed();
+
+        let t1 = Instant::now();
         self.init_weight_buffers(rotary_dim, &weights)?;
+        let t_buffers = t1.elapsed();
+
+        let t2 = Instant::now();
         self.init_kv_cache(&mut weights, provider, compute_outliers)?;
+        let t_kv = t2.elapsed();
+
+        let t3 = Instant::now();
         self.finalize_model_state(weights)?;
+        let t_finalize = t3.elapsed();
+
+        eprintln!(
+            "  load: pipelines={:.0}ms  buffers={:.0}ms  kv_cache={:.0}ms  finalize={:.0}ms  total={:.0}ms",
+            t_pipelines.as_secs_f64() * 1000.0,
+            t_buffers.as_secs_f64() * 1000.0,
+            t_kv.as_secs_f64() * 1000.0,
+            t_finalize.as_secs_f64() * 1000.0,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
         Ok(())
     }
 
@@ -456,8 +479,13 @@ impl MetalInference {
     ) -> Result<(), InferenceError> {
         self.config = config;
 
+        let t_weight_start = Instant::now();
         let weights = MetalWeights::load(&self.device, provider, self.config.force_cpu_dequant)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        eprintln!(
+            "  load: weight_loading={:.0}ms",
+            t_weight_start.elapsed().as_secs_f64() * 1000.0,
+        );
 
         self.init_model_state(weights, provider, true)
     }
@@ -478,12 +506,17 @@ impl MetalInference {
     pub fn load(&mut self, artifacts: &MetalArtifacts<'_>) -> Result<(), InferenceError> {
         self.config = artifacts.config.clone();
 
+        let t_weight_start = Instant::now();
         let weights = MetalWeights::load(
             &self.device,
             artifacts.weights,
             self.config.force_cpu_dequant,
         )
         .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        eprintln!(
+            "  load: weight_loading={:.0}ms",
+            t_weight_start.elapsed().as_secs_f64() * 1000.0,
+        );
 
         self.init_model_state(weights, artifacts.weights, false)
     }
