@@ -16,7 +16,7 @@ pub use ironmill_inference::coreml_runtime::SessionOutput as InferenceOutput;
 ///
 /// ```no_run
 /// use burn_coreml::inference::CoreMlInference;
-/// use ironmill_inference::coreml_runtime::ComputeUnits;
+/// use ironmill_inference::coreml_runtime::{ComputeUnits, CoreMlError};
 ///
 /// let session = CoreMlInference::load("model.mlmodelc", ComputeUnits::All)?;
 /// let inputs = session.input_description()?;

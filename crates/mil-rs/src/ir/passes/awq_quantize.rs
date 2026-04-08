@@ -928,6 +928,7 @@ mod tests {
     }
 
     /// Compute MSE between original floats and dequantized reconstruction.
+    #[allow(dead_code)]
     fn reconstruction_mse(original: &[f32], program: &Program) -> f32 {
         use crate::ir::passes::int4_pack::unpack_int4;
 
@@ -1327,9 +1328,11 @@ mod tests {
             Some(Value::Tensor { data, .. }) => data,
             _ => panic!("missing quantized_data"),
         };
-        for &b in q_data.as_bytes().unwrap() {
-            assert!(b <= 255, "INT8 value {b} out of range");
-        }
+        // b is u8 (always <= 255); verify data is non-empty instead.
+        assert!(
+            !q_data.as_bytes().unwrap().is_empty(),
+            "quantized data should be non-empty"
+        );
     }
 
     // -----------------------------------------------------------------------

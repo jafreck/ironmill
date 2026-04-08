@@ -50,7 +50,7 @@ pub type ConvertResult = ironmill_compile::coreml::build_api::ConvertOutput;
 /// # Example
 ///
 /// ```no_run
-/// use candle_coreml::convert::{convert_onnx, ConvertOptions};
+/// use candle_coreml::convert::{convert_onnx, CompileError, ConvertOptions};
 ///
 /// let result = convert_onnx("model.onnx", "out.mlpackage", ConvertOptions::default())?;
 /// println!("wrote {}", result.mlpackage.display());

@@ -9,8 +9,8 @@ use mil_rs::convert::moe::{ExpertFrequencyProfile, detect_moe, fuse_top_k_expert
 use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
 use mil_rs::ir::passes::{GroupedPalettizePass, PalettizePass};
 use mil_rs::{
-    Function, Operation, Pass, PassPipeline, PipelineReport, Program, ScalarType, TensorData,
-    TensorType, Value, program_to_multi_function_model,
+    Function, Operation, Pass, PassPipeline, PipelineReport, Program, ScalarType, TensorType,
+    Value, program_to_multi_function_model,
 };
 
 use ironmill_compile::ane::passes::{

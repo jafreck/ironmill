@@ -37,7 +37,7 @@ pub type ExportResult = ironmill_compile::coreml::build_api::ConvertOutput;
 /// # Example
 ///
 /// ```no_run
-/// use burn_coreml::export::{export_to_coreml, ExportOptions};
+/// use burn_coreml::export::{export_to_coreml, ExportOptions, CompileError};
 ///
 /// let result = export_to_coreml(
 ///     "my_model.onnx",

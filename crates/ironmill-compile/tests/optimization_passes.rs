@@ -227,7 +227,8 @@ fn validate_json_report_structure() {
     let total_flops = json["total_estimated_flops"]
         .as_u64()
         .expect("total_estimated_flops should be a number");
-    assert!(total_flops >= 0, "total_estimated_flops should be >= 0");
+    // total_flops is u64 so it's always >= 0; just assert it parsed.
+    let _ = total_flops;
 
     let ane_pct = json["ane_compute_pct"]
         .as_f64()
@@ -1102,7 +1103,7 @@ this is not valid toml at all !!!
 fn op_splitting_budget_smaller_than_one_tile() {
     let mut program = Program::new("1");
     let input_ty = TensorType::new(ScalarType::Float32, vec![64, 64]);
-    let mut func = Function::new("main").with_input("x", input_ty.clone());
+    let func = Function::new("main").with_input("x", input_ty.clone());
     program.add_function(func);
 
     let block = &mut program.functions.get_mut("main").unwrap().body;

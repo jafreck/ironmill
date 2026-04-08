@@ -518,7 +518,7 @@ mod tests {
                 let row = i / cols;
                 let col = i % cols;
                 let row_scale = 2.0f32.powi(row as i32 / 4);
-                ((col as f32 * 0.3 + row as f32 * 0.7).sin() * row_scale)
+                (col as f32 * 0.3 + row as f32 * 0.7).sin() * row_scale
             })
             .collect();
 

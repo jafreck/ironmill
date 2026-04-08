@@ -31,7 +31,7 @@ pub use ironmill_inference::coreml_runtime::SessionOutput as OutputTensor;
 /// # Example
 ///
 /// ```no_run
-/// use candle_coreml::runtime::{CoreMlModel, ComputeUnits};
+/// use candle_coreml::runtime::{CoreMlModel, CoreMlError, ComputeUnits};
 ///
 /// let model = CoreMlModel::load("model.mlmodelc", ComputeUnits::All)?;
 /// let desc = model.input_description()?;
