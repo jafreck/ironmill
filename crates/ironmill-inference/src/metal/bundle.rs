@@ -95,7 +95,7 @@ impl WeightProvider for MetalBundleProvider {
 mod tests {
     use super::*;
     use mil_rs::ir::ScalarType;
-    use std::collections::HashMap;
+    use mil_rs::weights::QuantizationInfo;
 
     /// Write a minimal `.ironml-gpu` bundle directory from raw components.
     fn write_test_bundle(

@@ -7,7 +7,6 @@
 mod common;
 
 use common::test_model;
-use mil_rs::TensorData;
 use mil_rs::ir::{ScalarType, Value};
 
 // ── Program structure ───────────────────────────────────────────────────

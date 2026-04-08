@@ -478,8 +478,7 @@ fn model_split_plus_different_pipelines() {
 #[test]
 fn configurable_pipeline_with_all_new_passes() {
     use ironmill_compile::ane::passes::{
-        CodebookOptimizationPass, ComputeUnitAnnotationPass, KvCachePass, LayerSchedulePass,
-        OpSplittingPass,
+        CodebookOptimizationPass, ComputeUnitAnnotationPass, KvCachePass, OpSplittingPass,
     };
 
     let mut pipeline = PassPipeline::new();

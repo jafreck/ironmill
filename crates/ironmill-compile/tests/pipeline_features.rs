@@ -645,7 +645,7 @@ onnx = "b.onnx"
 depends_on = ["A"]
 "#;
 
-    let manifest = parse_pipeline_manifest(toml).expect("TOML should parse");
+    let _manifest = parse_pipeline_manifest(toml).expect("TOML should parse");
 
     // Validation (which runs topological sort) should detect the cycle.
     // We use convert_pipeline's internal validate_manifest by constructing

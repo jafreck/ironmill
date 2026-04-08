@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 
 use half::f16;
-use mil_rs::TensorData;
 use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
 use mil_rs::{
     ConversionConfig, PassPipeline, Program, ScalarType, Value, onnx_to_program_with_config,
@@ -31,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         .to_string_lossy();
     println!("Model: {model_name}\n");
 
-    let (mut onnx_model, model_dir) = read_onnx_with_dir(input)?;
+    let (onnx_model, model_dir) = read_onnx_with_dir(input)?;
     let mut conversion_config = ConversionConfig::default();
     conversion_config.model_dir = Some(model_dir);
 
