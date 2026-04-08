@@ -64,7 +64,6 @@ pub fn encode_sigmoid_gate(
 ///
 /// The `input` buffer has row stride `input_stride` elements and each layer's
 /// slice starts at column `input_offset`.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_gelu_gate(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,

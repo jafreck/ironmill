@@ -82,7 +82,6 @@ pub fn unpack_indices(packed: &[u8], n_bits: u8, total_elements: usize) -> Vec<u
 ///
 /// When `group_size` is `Some(gs)`, scales/zeros are per-group along the last
 /// axis: there are `ceil(K / gs)` groups per row.
-#[allow(clippy::too_many_arguments)]
 pub fn dequant_affine(
     quantized_data: &[u8],
     scale: &[u8],
@@ -187,7 +186,6 @@ pub fn dequant_affine(
 /// This is needed for GPTQ models with act-order (`desc_act=True`), where
 /// columns were quantized in importance order and `g_idx` records which group
 /// each column belongs to.
-#[allow(clippy::too_many_arguments)]
 pub fn dequant_affine_with_g_idx(
     data: &[u8],
     scale: &[u8],
@@ -250,7 +248,6 @@ pub fn dequant_affine_with_g_idx(
 /// group `g` is:
 /// - If `outlier_mask[i]` is 1: `(quantized[i] - outlier_zero[g]) * outlier_scale[g]`
 /// - If `outlier_mask[i]` is 0: `(quantized[i] - normal_zero[g]) * normal_scale[g]`
-#[allow(clippy::too_many_arguments)]
 pub fn dequant_dual_scale(
     quantized_data: &[u8],
     normal_scale: &[u8],

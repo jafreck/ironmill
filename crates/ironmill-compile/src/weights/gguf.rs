@@ -1140,7 +1140,6 @@ fn dequant_q4_1_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilE
 ///   - 16 bytes: 32 × 4-bit low nibbles packed 2-per-byte (low nibble first)
 ///
 /// Dequantization: `value = d * (((high_bit << 4) | low_nibble) - 16)`
-#[allow(clippy::needless_range_loop)]
 fn dequant_q5_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 22;
@@ -1166,8 +1165,7 @@ fn dequant_q5_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilE
         let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
         let quant_data = &block[6..BLOCK_BYTES];
 
-        for j in 0..16 {
-            let byte = quant_data[j];
+        for (j, &byte) in quant_data.iter().enumerate() {
             let lo_nibble = (byte & 0x0F) as i32;
             let hi_nibble = ((byte >> 4) & 0x0F) as i32;
 
@@ -1194,7 +1192,6 @@ fn dequant_q5_0_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilE
 ///   - 16 bytes: 32 × 4-bit low nibbles packed 2-per-byte (low nibble first)
 ///
 /// Dequantization: `value = d * ((high_bit << 4) | low_nibble) + m`
-#[allow(clippy::needless_range_loop)]
 fn dequant_q5_1_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilError> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 24;
@@ -1221,8 +1218,7 @@ fn dequant_q5_1_to_fp16(raw: &[u8], num_elements: usize) -> Result<Vec<u8>, MilE
         let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
         let quant_data = &block[8..BLOCK_BYTES];
 
-        for j in 0..16 {
-            let byte = quant_data[j];
+        for (j, &byte) in quant_data.iter().enumerate() {
             let lo_nibble = (byte & 0x0F) as i32;
             let hi_nibble = ((byte >> 4) & 0x0F) as i32;
 

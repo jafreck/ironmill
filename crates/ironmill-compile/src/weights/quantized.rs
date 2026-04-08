@@ -682,7 +682,6 @@ fn magnitude_cache_key(magnitudes: &[f32]) -> u64 {
 ///
 /// Rows are processed in parallel via rayon. Large matrices sub-sample
 /// rows (cap 256) and broadcast the median clip value to all rows.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub(crate) fn search_clip_ranges(
     scaled_weights: &[f32],
     out_features: usize,
@@ -730,14 +729,13 @@ pub(crate) fn search_clip_ranges(
                 }
 
                 let mut org_out = [0.0f32; 16];
-                #[allow(clippy::needless_range_loop)]
-                for si in 0..n_sample {
+                for (si, org) in org_out[..n_sample].iter_mut().enumerate() {
                     let mut dot = 0.0f32;
                     let ab = si * gsize;
                     for j in 0..gsize {
                         dot += w_slice[j] * act_g[ab + j];
                     }
-                    org_out[si] = dot;
+                    *org = dot;
                 }
 
                 let mut clipped_buf = vec![0.0f32; gsize];
@@ -769,14 +767,13 @@ pub(crate) fn search_clip_ranges(
                     }
 
                     let mut err = 0.0f32;
-                    #[allow(clippy::needless_range_loop)]
-                    for si in 0..n_sample {
+                    for (si, &org) in org_out[..n_sample].iter().enumerate() {
                         let mut q_out = 0.0f32;
                         let ab = si * gsize;
                         for j in 0..gsize {
                             q_out += (quant_buf[j] as f32 - zp) * scale * act_g[ab + j];
                         }
-                        let diff = q_out - org_out[si];
+                        let diff = q_out - org;
                         err += diff * diff;
                     }
 
@@ -964,7 +961,6 @@ fn quantize_tensor_int8(
 ///
 /// The runtime kernel divides activations by `s_ch` to compensate, preserving
 /// the dot product:  dot(x, w) = dot(x / s, w * s)
-#[allow(clippy::too_many_arguments)]
 fn quantize_tensor_int4_awq(
     floats: &[f32],
     shape: &[usize],

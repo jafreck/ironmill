@@ -555,7 +555,6 @@ fn emit_qwen35_full_attention_layer(
 // GDN (Gated Delta Network) layer
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn emit_gdn_layer(
     block: &mut Block,
     provider: &dyn WeightProvider,
@@ -1131,7 +1130,6 @@ fn emit_gdn_layer(
 ///
 /// `input_rank` specifies the rank of the input tensor so the norm weight
 /// can be reshaped to match (CoreML requires same-rank tensors for mul).
-#[allow(clippy::too_many_arguments)]
 fn emit_rms_norm_decomposed(
     block: &mut Block,
     provider: &dyn WeightProvider,
@@ -1418,7 +1416,6 @@ fn emit_partial_rope_tables(
 
 /// Apply RoPE to only the first `rotary_dim` dimensions, leaving the rest unchanged.
 /// Input Q/K have shape [B, heads, T, head_dim].
-#[allow(clippy::too_many_arguments)]
 fn emit_partial_rotary_embedding(
     block: &mut Block,
     q_name: &str,

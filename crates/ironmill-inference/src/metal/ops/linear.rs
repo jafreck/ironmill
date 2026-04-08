@@ -54,7 +54,6 @@ pub fn encode_matvec(
 /// Weights must be pre-packed into blocked [N/8, K/8, 8, 8] FP16 format.
 /// Dispatch: 2-D grid of threadgroups tiling M and N in 64-element blocks,
 /// [`DEFAULT_THREADGROUP_WIDTH`] threads (8 simdgroups).
-#[allow(clippy::too_many_arguments)]
 pub fn encode_matmul(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,

@@ -442,7 +442,6 @@ fn compute_scales(magnitudes: &[f32], alpha: f32) -> Vec<f32> {
 /// (matching the reference which uses PyTorch GPU tensor ops).
 ///
 /// Returns a flat array of optimal `max_val` per (row, group).
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn search_clip_ranges(
     scaled_weights: &[f32],
     out_features: usize,
@@ -494,13 +493,13 @@ fn search_clip_ranges(
 
             // Reference output per sample token (stack array, n_sample <= 16).
             let mut org_out = [0.0f32; 16];
-            for si in 0..n_sample {
+            for (si, org) in org_out[..n_sample].iter_mut().enumerate() {
                 let mut dot = 0.0f32;
                 let ab = si * gsize;
                 for j in 0..gsize {
                     dot += w_slice[j] * act_g[ab + j];
                 }
-                org_out[si] = dot;
+                *org = dot;
             }
 
             let mut best_err = f32::INFINITY;
@@ -518,12 +517,12 @@ fn search_clip_ranges(
                 // Inline affine quantization (no alloc).
                 let mut wmin = f32::INFINITY;
                 let mut wmax = f32::NEG_INFINITY;
-                for j in 0..gsize {
-                    if clipped[j] < wmin {
-                        wmin = clipped[j];
+                for &val in &clipped[..gsize] {
+                    if val < wmin {
+                        wmin = val;
                     }
-                    if clipped[j] > wmax {
-                        wmax = clipped[j];
+                    if val > wmax {
+                        wmax = val;
                     }
                 }
                 let scale = ((wmax - wmin) / qmax).max(1e-10);
@@ -534,13 +533,13 @@ fn search_clip_ranges(
 
                 // Compute error against reference.
                 let mut err = 0.0f32;
-                for si in 0..n_sample {
+                for (si, &org) in org_out[..n_sample].iter().enumerate() {
                     let mut q_out = 0.0f32;
                     let ab = si * gsize;
                     for j in 0..gsize {
                         q_out += (quantized[j] as f32 - zp) * scale * act_g[ab + j];
                     }
-                    let diff = q_out - org_out[si];
+                    let diff = q_out - org;
                     err += diff * diff;
                 }
 

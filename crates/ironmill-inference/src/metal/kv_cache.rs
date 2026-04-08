@@ -20,7 +20,6 @@ pub(crate) struct Fp16KvCache {
 }
 
 impl Fp16KvCache {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         device: &MetalDevice,
         num_layers: usize,

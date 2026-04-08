@@ -32,7 +32,6 @@ pub(crate) struct Q8Input<'a> {
 ///
 /// This applies uniformly across all weight representations (Dense, PolarQuant,
 /// AffineQuantized).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_projection(
     enc: &ComputeEncoder,
     input_buf: &MetalBuffer,
@@ -57,7 +56,6 @@ pub(crate) fn encode_projection(
 }
 
 /// Encode a linear projection with optional Q8 input for INT4 decode.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_projection_q8(
     enc: &ComputeEncoder,
     input_buf: &MetalBuffer,
@@ -294,7 +292,6 @@ fn encode_affine_projection(
 /// Dispatches to the correct Metal kernel based on `bit_width` and kernel kind:
 /// - Matvec (`LinearKernelKind::Matvec`): one threadgroup per output row
 /// - Matmul (`LinearKernelKind::Matmul`): tiled matmul with `token_count` rows
-#[allow(clippy::too_many_arguments)]
 fn encode_d2quant_projection(
     encoder: &ironmill_metal_sys::ComputeEncoder,
     input: &MetalBuffer,

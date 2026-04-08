@@ -69,7 +69,6 @@ pub fn encode_moe_mul(
 }
 
 /// Encode MoE top-k weighted combine of expert outputs.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_moe_weighted_combine(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,

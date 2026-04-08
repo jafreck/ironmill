@@ -830,7 +830,6 @@ impl<D: AneDevice> AneInference<D> {
 
     /// Set up TurboQuant or FP16 attention caches and compile the shared
     /// FP16 attention program when needed.
-    #[allow(clippy::type_complexity)]
     fn setup_execution_mode(
         device: Arc<D>,
         turbo_config: Option<TurboQuantConfig>,
@@ -1254,7 +1253,6 @@ impl<D: AneDevice> AneInference<D> {
     ///
     /// Writes the attention output into `attn_out`. The `q_buf`/`k_buf`/`v_buf`
     /// scratch buffers are only used by the shared FP16 cache path.
-    #[allow(clippy::too_many_arguments)]
     fn run_attention_layer(
         &mut self,
         layer_idx: usize,
@@ -1544,7 +1542,6 @@ impl<D: AneDevice> AneInference<D> {
     }
 
     /// Print profiling and HW profiling statistics for one decode step.
-    #[allow(clippy::too_many_arguments)]
     fn decode_print_profiling(
         t_total: Option<std::time::Instant>,
         d_embed: Option<std::time::Duration>,

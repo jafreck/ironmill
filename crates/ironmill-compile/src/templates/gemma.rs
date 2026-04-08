@@ -427,7 +427,6 @@ fn emit_embedding_norm(
 /// Handles standard Gemma layers and Gemma 4 extensions (KV sharing,
 /// PLE, double-wide MLP). When Gemma 4 features are not configured,
 /// behaves identically to the original Gemma layer.
-#[allow(clippy::too_many_arguments)]
 fn emit_gemma4_transformer_layer(
     block: &mut Block,
     ctx: &LayerContext<'_>,

@@ -178,7 +178,6 @@ pub struct GdnPrefillRecurrentParams<'a> {
 ///
 /// Shifts conv_state, computes causal conv1d dot product, applies SiLU.
 /// One thread per channel (qkv_dim threads).
-#[allow(clippy::too_many_arguments)]
 pub fn encode_gdn_conv1d_silu(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -238,7 +237,6 @@ pub(crate) fn encode_gdn_recurrent_update(
 /// Encode GDN output gating: per-head RMSNorm + silu(z) multiplication.
 ///
 /// One threadgroup per head, v_head_dim threads per threadgroup.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_gdn_output_gate(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -349,7 +347,6 @@ pub(crate) fn encode_gdn_batched_matvec(
 ///
 /// Processes ALL tokens sequentially per channel in a single dispatch.
 /// One thread per channel (qkv_dim threads total).
-#[allow(clippy::too_many_arguments)]
 pub fn encode_gdn_prefill_conv1d_silu(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,

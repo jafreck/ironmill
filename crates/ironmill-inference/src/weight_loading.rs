@@ -458,7 +458,6 @@ pub struct DenseData<'a> {
 ///
 /// Each backend implements this to select its preferred routines for
 /// LUT-palettized and affine-quantized formats.
-#[allow(clippy::too_many_arguments)]
 pub trait CpuDequant {
     /// Dequantize a LUT-encoded tensor to FP16 bytes.
     fn dequant_lut(

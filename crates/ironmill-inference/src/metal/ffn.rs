@@ -10,7 +10,6 @@ use super::projection::encode_projection;
 use super::weights::{LayerWeights, WeightBuffer};
 
 /// Encode the FFN block: gate + up projections, SiLU activation, and down projection.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_ffn_block(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
@@ -141,7 +140,6 @@ pub(crate) fn encode_ffn_block(
 /// Dense evaluation: all experts are run and top-k selection + weighted sum is
 /// applied afterward. The MoE output is written to `bufs.moe_combined` and then
 /// added to `bufs.ffn_down` (the dense MLP output).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_moe_block(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,

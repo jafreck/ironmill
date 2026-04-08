@@ -114,7 +114,6 @@ pub fn f16_slice_to_bytes(data: &[f16]) -> Vec<u8> {
 ///
 /// Thin wrapper around the internal clip search in `quantized.rs`.
 /// See [`super::quantized::search_clip_ranges`] for the full algorithm.
-#[allow(clippy::too_many_arguments)]
 pub fn search_clip_ranges(
     scaled_weights: &[f32],
     out_features: usize,

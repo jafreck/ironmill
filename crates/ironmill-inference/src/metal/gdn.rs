@@ -208,7 +208,6 @@ impl GdnState {
 /// output projection → residual + post-attention RMSNorm.
 ///
 /// Shared between `run_pipeline_inner` and `run_pipeline_calibration`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_gdn_prefill(
     enc: &ComputeEncoder,
     bufs: &IntermediateBuffers,
@@ -351,7 +350,6 @@ pub(crate) fn encode_gdn_prefill(
 /// output gate → output projection → residual + post-attention RMSNorm.
 ///
 /// Shared between `run_pipeline_inner` and `run_pipeline_calibration`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_gdn_decode(
     enc: &ComputeEncoder,
     bufs: &IntermediateBuffers,

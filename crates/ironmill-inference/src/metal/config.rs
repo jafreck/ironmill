@@ -76,14 +76,12 @@ impl Gemma4Config {
         let prev_types = &layer_types[..first_shared_idx];
         let mut layer_configs = Vec::with_capacity(mc.num_hidden_layers);
         // Index used both for iteration and to look up layer_types / compute kv_anchor.
-        #[allow(clippy::needless_range_loop)]
-        for layer_idx in 0..mc.num_hidden_layers {
-            let is_global = layer_types[layer_idx] == "full_attention";
+        for (layer_idx, layer_type) in layer_types[..mc.num_hidden_layers].iter().enumerate() {
+            let is_global = *layer_type == "full_attention";
             let is_kv_shared = num_kv_shared > 0 && layer_idx >= first_shared_idx;
 
             let kv_anchor = if is_kv_shared {
-                let lt = &layer_types[layer_idx];
-                prev_types.iter().rposition(|t| t == lt)
+                prev_types.iter().rposition(|t| t == layer_type)
             } else {
                 None
             };

@@ -104,7 +104,6 @@ pub fn dequant_quip_sharp(
 /// applies inverse Hadamard rotation (when `polar_quant_seed` is present),
 /// multiplies by per-row norms, and returns the result as little-endian
 /// FP16 bytes.
-#[allow(clippy::too_many_arguments)]
 pub fn dequant_lut_to_dense(
     indices: &[u8],
     lut: &[u8],

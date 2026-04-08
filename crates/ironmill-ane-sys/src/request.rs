@@ -160,7 +160,6 @@ impl AneRequest {
     /// Every pointer in `inputs` and `outputs` must be a valid
     /// `_ANEIOSurfaceObject`.  `weights_buffer`, `perf_stats`, and
     /// `shared_events` must be valid ObjC object pointers or null.
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn with_shared_events(
         inputs: &[*mut c_void],
         input_indices: &[i64],
@@ -242,7 +241,6 @@ impl AneRequest {
     /// `_ANEIOSurfaceObject`.  `weights_buffer`, `perf_stats`,
     /// `shared_events`, and `transaction_handle` must be valid ObjC object
     /// pointers or null.
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn with_transaction(
         inputs: &[*mut c_void],
         input_indices: &[i64],
@@ -267,7 +265,6 @@ impl AneRequest {
         // SAFETY: create_nsnumber_i64 returns an autoreleased NSNumber.
         let proc_idx = unsafe { create_nsnumber_i64(procedure_index) };
 
-        #[allow(clippy::type_complexity)]
         type FactoryFn = unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
@@ -562,7 +559,6 @@ impl ChainingRequest {
     ///
     /// `inputs`, `output_sets`, `lb_input_symbol_id`, `lb_output_symbol_id`,
     /// and `signal_events` must be valid `NSArray` pointers or null.
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         inputs: *mut c_void,
         output_sets: *mut c_void,
@@ -582,7 +578,6 @@ impl ChainingRequest {
         let delay = unsafe { create_nsnumber_i64(fw_enqueue_delay) };
         let pool_id = unsafe { create_nsnumber_i64(memory_pool_id) };
 
-        #[allow(clippy::type_complexity)]
         type FactoryFn = unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,

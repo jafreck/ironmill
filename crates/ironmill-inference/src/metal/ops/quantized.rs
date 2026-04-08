@@ -165,7 +165,6 @@ pub struct GdnBatchedAffineInt4Params<'a> {
 ///
 /// Computes gate = x · W_gate^T and up = x · W_up^T concurrently.
 /// Saves 1 dispatch per layer compared to 2 separate `affine_matvec_int4` calls.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_batched_affine_matvec_int4(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -207,7 +206,6 @@ pub fn encode_batched_affine_matvec_int4(
 /// Computes output[i] = activation(x · W_gate^T[i]) * (x · W_up^T[i]) in one dispatch.
 /// Eliminates gate/up intermediate writes + the separate activation dispatch.
 /// Saves 1 dispatch + 1 barrier per layer compared to batched_affine_matvec_int4 + silu_gate.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_fused_ffn_gate_up_act_int4(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -317,7 +315,6 @@ pub fn encode_quantize_input_q8(
 ///
 /// Uses pre-quantized INT8 input and per-group scales instead of FP16 input.
 /// The integer multiply-add inner loop is ~2× faster than float dequant.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_affine_matvec_int4xq8(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,

@@ -55,11 +55,11 @@ impl HessianAccumulator {
         for t in 0..n_tokens {
             let row = &activation[t * n..(t + 1) * n];
             // Upper triangle (including diagonal).
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..n {
-                let xi = row[i].to_f32();
-                for j in i..n {
-                    let xj = row[j].to_f32();
+            for (i, xi_elem) in row[..n].iter().enumerate() {
+                let xi = xi_elem.to_f32();
+                for (offset, xj_elem) in row[i..n].iter().enumerate() {
+                    let j = i + offset;
+                    let xj = xj_elem.to_f32();
                     self.xtx[i * n + j] += xi * xj;
                 }
             }

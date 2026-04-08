@@ -420,7 +420,6 @@ pub(crate) fn encode_flash_decode(
 ///
 /// Combines partial (unnormalized) attention outputs from split kernels,
 /// applies softmax normalization, and writes the final half output.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_flash_decode_reduce(
     encoder: &ComputeEncoder,
     reduce_pipeline: &ComputePipeline,
