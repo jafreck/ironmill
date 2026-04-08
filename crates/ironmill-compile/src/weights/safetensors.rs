@@ -911,8 +911,9 @@ mod tests {
 
         let tensor = provider.tensor("test.weight").unwrap();
         assert_eq!(tensor.shape, vec![2, 2]);
-        assert_eq!(tensor.dtype, ScalarType::Float32);
-        assert_eq!(tensor.data.len(), 16);
+        // F32 tensors are auto-converted to F16 during loading for CoreML compatibility.
+        assert_eq!(tensor.dtype, ScalarType::Float16);
+        assert_eq!(tensor.data.len(), 8); // 4 elements × 2 bytes (f16)
     }
 
     #[test]

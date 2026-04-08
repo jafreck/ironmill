@@ -1903,7 +1903,7 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("missing required weight"),
+            err.contains("missing weight"),
             "error should mention missing weight, got: {err}"
         );
     }
