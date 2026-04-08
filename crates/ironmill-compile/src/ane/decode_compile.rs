@@ -12,6 +12,7 @@ use mil_rs::ir::{Operation, Program, ScalarType, TensorType, Value};
 
 use crate::ane::split::SubProgram;
 use ironmill_core::ane::TensorDescriptor;
+use ironmill_core::rope::RopeCacheData;
 
 // ---------------------------------------------------------------------------
 // Shared tensor conversion helper
@@ -40,9 +41,6 @@ fn bytes_to_f16(data: &[u8], dtype: ScalarType) -> Option<Vec<f16>> {
 // ---------------------------------------------------------------------------
 // RoPE cache extraction
 // ---------------------------------------------------------------------------
-
-/// Extracted RoPE cos/sin cache data: `(cos_values, sin_values, values_per_position)`.
-pub type RopeCacheData = (Vec<f16>, Vec<f16>, usize);
 
 /// Extract RoPE cos/sin cache data from model const ops.
 ///
@@ -119,19 +117,9 @@ pub fn extract_rope_caches(program: &Program) -> Option<RopeCacheData> {
 ///
 /// Used as a fallback when the model's const tables can't be extracted.
 pub fn precompute_rope_cache(head_dim: usize, max_pos: usize, theta: f32) -> RopeCacheData {
-    let half_dim = head_dim / 2;
-    let mut cos_cache = Vec::with_capacity(max_pos * half_dim);
-    let mut sin_cache = Vec::with_capacity(max_pos * half_dim);
-
-    for pos in 0..max_pos {
-        for i in 0..half_dim {
-            let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
-            let angle = pos as f32 * freq;
-            cos_cache.push(f16::from_f32(angle.cos()));
-            sin_cache.push(f16::from_f32(angle.sin()));
-        }
-    }
-    (cos_cache, sin_cache, half_dim)
+    // NOTE: shared implementation computes in f64 (matching inference path),
+    // which improves precision over the previous f32 fallback computation.
+    ironmill_core::rope::precompute_rope_cache(head_dim, max_pos, theta as f64, None)
 }
 
 // ---------------------------------------------------------------------------

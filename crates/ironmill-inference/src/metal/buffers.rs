@@ -311,36 +311,17 @@ pub(crate) fn build_rope_cache(
     theta: f64,
     _partial_rotary_factor: f64,
 ) -> Result<(MetalBuffer, MetalBuffer), MetalError> {
-    let half_dim = head_dim / 2;
-    let rotary_half = rotary_dim / 2;
-    let mut cos_data = vec![0u8; max_seq_len * half_dim * 2];
-    let mut sin_data = vec![0u8; max_seq_len * half_dim * 2];
+    let (cos_f16, sin_f16, _half_dim) =
+        ironmill_core::rope::precompute_rope_cache(head_dim, max_seq_len, theta, Some(rotary_dim));
 
-    for pos in 0..max_seq_len {
-        for i in 0..half_dim {
-            let offset = (pos * half_dim + i) * 2;
-            if i < rotary_half {
-                let freq = 1.0 / theta.powf(2.0 * i as f64 / rotary_dim as f64);
-                let angle = pos as f64 * freq;
-                let c = f16::from_f64(angle.cos());
-                let s = f16::from_f64(angle.sin());
-                cos_data[offset..offset + 2].copy_from_slice(&c.to_le_bytes());
-                sin_data[offset..offset + 2].copy_from_slice(&s.to_le_bytes());
-            } else {
-                // Non-rotated dimensions: identity (cos=1, sin=0)
-                let c = f16::from_f64(1.0);
-                let s = f16::from_f64(0.0);
-                cos_data[offset..offset + 2].copy_from_slice(&c.to_le_bytes());
-                sin_data[offset..offset + 2].copy_from_slice(&s.to_le_bytes());
-            }
-        }
-    }
+    let cos_bytes = ironmill_core::f16_utils::f16_as_bytes(&cos_f16);
+    let sin_bytes = ironmill_core::f16_utils::f16_as_bytes(&sin_f16);
 
     let cos_buf = device
-        .create_buffer_with_data(&cos_data, StorageMode::Shared)
+        .create_buffer_with_data(cos_bytes, StorageMode::Shared)
         .map_err(MetalError::Metal)?;
     let sin_buf = device
-        .create_buffer_with_data(&sin_data, StorageMode::Shared)
+        .create_buffer_with_data(sin_bytes, StorageMode::Shared)
         .map_err(MetalError::Metal)?;
     Ok((cos_buf, sin_buf))
 }
@@ -366,7 +347,7 @@ pub(crate) fn build_matmul_cache(
 /// Panics if `bytes.len()` is not a multiple of 2 or if the pointer is not
 /// 2-byte aligned. Both conditions are guaranteed for Metal buffer readbacks.
 pub(crate) fn bytes_as_f16(bytes: &[u8]) -> &[f16] {
-    bytemuck::cast_slice::<u8, f16>(bytes)
+    ironmill_core::f16_utils::bytes_as_f16(bytes)
 }
 
 // ── Helpers on ModelConfig ──────────────────────────────────────

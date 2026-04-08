@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ironmill-core = { path = "../ironmill-core" }
 thiserror = { workspace = true }
 half = { workspace = true }
 mil-rs = { workspace = true }

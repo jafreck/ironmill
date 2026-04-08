@@ -8,9 +8,13 @@
 /// Apple Neural Engine bundle types and utilities.
 pub mod ane;
 pub mod device;
+/// Shared f16 ↔ byte conversion utilities.
+pub mod f16_utils;
 /// GPU bundle types and quantization manifest schemas.
 pub mod gpu;
 pub mod model_info;
+/// Shared RoPE (Rotary Position Embedding) cache generation.
+pub mod rope;
 pub mod tokenizer;
 pub mod weights;
 

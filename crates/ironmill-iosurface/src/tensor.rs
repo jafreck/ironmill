@@ -6,6 +6,7 @@
 use std::ffi::c_void;
 
 use half::f16;
+use ironmill_core::f16_utils;
 use mil_rs::ir::ScalarType;
 
 #[cfg(target_os = "macos")]
@@ -136,10 +137,7 @@ impl AneTensor {
                 data.len()
             )));
         }
-        let byte_len = data.len() * 2;
-        // SAFETY: `data` is a valid f16 slice; reinterpreting as bytes is sound
-        // because f16 has no alignment requirement stricter than u8 for reads.
-        let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+        let src = f16_utils::f16_as_bytes(data);
         self.write_bytes(src)
     }
 
@@ -157,12 +155,7 @@ impl AneTensor {
             .ok_or_else(|| IOSurfaceError::CopyFailed("read_f16: byte length overflow".into()))?;
         let bytes = self.read_bytes(byte_len)?;
         let mut out = vec![f16::ZERO; n];
-        // SAFETY: `bytes` has exactly `byte_len` bytes and `out` has exactly
-        // `n` f16 values (byte_len = n * 2). Both
-        // pointers are valid and non-overlapping.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, byte_len);
-        }
+        f16_utils::copy_bytes_to_f16(&bytes, &mut out);
         Ok(out)
     }
 
@@ -237,11 +230,7 @@ impl AneTensor {
         let byte_offset = offset_elements.checked_mul(2).ok_or_else(|| {
             IOSurfaceError::CopyFailed("write_f16_at: offset_elements too large".into())
         })?;
-        let byte_len = data.len().checked_mul(2).ok_or_else(|| {
-            IOSurfaceError::CopyFailed("write_f16_at: data length too large".into())
-        })?;
-        // SAFETY: `data` is a valid f16 slice; reinterpreting as bytes is sound.
-        let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+        let src = f16_utils::f16_as_bytes(data);
         self.write_bytes_at(byte_offset, src)
     }
 
@@ -255,11 +244,7 @@ impl AneTensor {
             .ok_or_else(|| IOSurfaceError::CopyFailed("read_f16_at: length too large".into()))?;
         let bytes = self.read_bytes_at(byte_offset, byte_len)?;
         let mut out = vec![f16::ZERO; len];
-        // SAFETY: `bytes` has exactly `byte_len` bytes and `out` has `len`
-        // f16 values. Both pointers are valid and non-overlapping.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, byte_len);
-        }
+        f16_utils::copy_bytes_to_f16(&bytes, &mut out);
         Ok(out)
     }
 
