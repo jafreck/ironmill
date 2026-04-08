@@ -1461,6 +1461,8 @@ mod superblock_tests {
         assert_eq!(&packed[0..2], &[0x00, 0x3C]);
         assert_eq!(&packed[2..4], &[0x00, 0x00]);
         assert!(packed[4..].iter().all(|&b| b == 0xAB));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1558,6 +1560,18 @@ mod tests {
         let k = 128;
         let bytes_per_row = k / 2;
         let data: Vec<u8> = (0..n * bytes_per_row).map(|i| (i % 199) as u8).collect();
+        let expected = pack_quantized_blocked_naive(&data, n, k, 4);
+        let actual = pack_quantized_blocked(&data, n, k, 4);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pack_quantized_non_aligned_k() {
+        // K not aligned to k_tile (8): exercises copy_len clamping
+        let n = 64;
+        let k = 100; // 100 / 8 = 12.5 → 13 k-blocks, last block partial
+        let bytes_per_row = k / 2; // INT4: 2 elements per byte
+        let data: Vec<u8> = (0..n * bytes_per_row).map(|i| (i % 197) as u8).collect();
         let expected = pack_quantized_blocked_naive(&data, n, k, 4);
         let actual = pack_quantized_blocked(&data, n, k, 4);
         assert_eq!(actual, expected);
