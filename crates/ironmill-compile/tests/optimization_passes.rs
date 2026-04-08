@@ -227,8 +227,10 @@ fn validate_json_report_structure() {
     let total_flops = json["total_estimated_flops"]
         .as_u64()
         .expect("total_estimated_flops should be a number");
-    // total_flops is u64 so it's always >= 0; just assert it parsed.
-    let _ = total_flops;
+    assert!(
+        total_flops > 0,
+        "total_estimated_flops should be positive for a non-trivial program"
+    );
 
     let ane_pct = json["ane_compute_pct"]
         .as_f64()

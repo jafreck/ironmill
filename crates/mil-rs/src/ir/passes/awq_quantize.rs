@@ -1328,11 +1328,8 @@ mod tests {
             Some(Value::Tensor { data, .. }) => data,
             _ => panic!("missing quantized_data"),
         };
-        // b is u8 (always <= 255); verify data is non-empty instead.
-        assert!(
-            !q_data.as_bytes().unwrap().is_empty(),
-            "quantized data should be non-empty"
-        );
+        let bytes = q_data.as_bytes().unwrap();
+        assert!(!bytes.is_empty(), "quantized data should be non-empty");
     }
 
     // -----------------------------------------------------------------------
