@@ -5,20 +5,13 @@
 #   1. INT4 affine + TQ-INT8 KV cache (primary target)
 #   2. D2Quant 3-bit + TQ-INT8 KV cache
 #
-# Decode throughput:
+# Run all selected benchmarks in one command:
 #   cargo run --release -p ironmill-bench --features metal -- \
-#     --config configs/qwen35-4b-kernel-perf.toml -b metal -i 20 -w 5 -r 3
+#     --config configs/qwen35-4b-kernel-perf.toml
 #
-# Prefill throughput:
-#   cargo run --release -p ironmill-bench --features metal -- \
-#     --config configs/qwen35-4b-kernel-perf.toml -b metal -i 20 -w 5 -r 3 \
-#     --prefill-bench
-#
-# PPL regression (must not regress beyond ±0.05 of baseline):
-#   cargo run --release -p ironmill-bench --features metal -- \
-#     --config configs/qwen35-4b-kernel-perf.toml -b metal \
-#     --perplexity --perplexity-sequences 1 \
-#     --perplexity-dataset tests/fixtures/quality/wikitext2-qwen35.json
+# The [benchmarks] section controls which benchmarks run. Set any
+# combination of decode, prefill, and perplexity to true. CLI flags
+# (--prefill-bench, --perplexity) still work as overrides.
 
 [[model]]
 name = "Qwen3.5-4B"
@@ -44,3 +37,10 @@ iterations = 20
 warmup = 5
 runs = 3
 backends = ["metal"]
+
+[benchmarks]
+decode = true
+prefill = true
+perplexity = true
+perplexity_sequences = 1
+perplexity_dataset = "tests/fixtures/quality/wikitext2-qwen35.json"

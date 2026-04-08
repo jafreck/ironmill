@@ -229,27 +229,39 @@ fn main() -> Result<()> {
         None
     };
 
-    // Build extra context from CLI flags
+    // Build extra context from CLI flags and config bools.
+    // Config bools (decode, prefill, perplexity, quality) are resolved into
+    // benchmarks.suites by resolve_suites(), but suites' run() methods also
+    // read ctx.extra for parameters — so we populate both paths.
     let mut extra = HashMap::new();
     if cli.quality || matrix.benchmarks.quality {
         extra.insert("quality".to_string(), "true".to_string());
     }
     if cli.perplexity || matrix.benchmarks.perplexity {
         extra.insert("perplexity".to_string(), "true".to_string());
-        extra.insert(
-            "perplexity_sequences".to_string(),
-            cli.perplexity_sequences.to_string(),
-        );
-        extra.insert(
-            "perplexity_stride".to_string(),
-            cli.perplexity_stride.to_string(),
-        );
-        extra.insert(
-            "perplexity_dataset".to_string(),
-            cli.perplexity_dataset.to_string_lossy().to_string(),
-        );
+        let seq = if cli.perplexity {
+            cli.perplexity_sequences
+        } else {
+            matrix.benchmarks.perplexity_sequences
+        };
+        let stride = if cli.perplexity {
+            cli.perplexity_stride
+        } else {
+            matrix.benchmarks.perplexity_stride
+        };
+        let dataset = if cli.perplexity {
+            cli.perplexity_dataset.to_string_lossy().to_string()
+        } else {
+            matrix.benchmarks.perplexity_dataset.clone()
+        };
+        extra.insert("perplexity_sequences".to_string(), seq.to_string());
+        extra.insert("perplexity_stride".to_string(), stride.to_string());
+        extra.insert("perplexity_dataset".to_string(), dataset);
     }
-    if cli.prefill_bench || !matrix.benchmarks.prefill_lengths.is_empty() {
+    if cli.prefill_bench
+        || matrix.benchmarks.prefill
+        || !matrix.benchmarks.prefill_lengths.is_empty()
+    {
         extra.insert("prefill_bench".to_string(), "true".to_string());
         if !matrix.benchmarks.prefill_lengths.is_empty() {
             extra.insert(

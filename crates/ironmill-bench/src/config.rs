@@ -139,15 +139,23 @@ impl Default for Settings {
 pub struct BenchmarkSelection {
     /// Suite IDs to run (e.g. ["decode", "prefill", "quality"]).
     /// Empty means "run all applicable suites".
+    /// Convenience bools (`decode`, `prefill`, `perplexity`, `quality`)
+    /// are merged into this list at load time.
     #[serde(default)]
     pub suites: Vec<String>,
+    /// Shorthand: add "decode" to suites.
+    #[serde(default)]
+    pub decode: bool,
+    /// Shorthand: add "prefill" to suites.
+    #[serde(default)]
+    pub prefill: bool,
     /// Prefill lengths for the prefill suite.
     #[serde(default)]
     pub prefill_lengths: Vec<usize>,
     /// Context lengths for the context-decode suite.
     #[serde(default)]
     pub context_lengths: Vec<usize>,
-    /// Enable perplexity evaluation.
+    /// Enable perplexity evaluation (also adds "decode-ppl" to suites).
     #[serde(default)]
     pub perplexity: bool,
     /// Number of sequences for perplexity.
@@ -159,9 +167,28 @@ pub struct BenchmarkSelection {
     /// Path to perplexity dataset.
     #[serde(default = "default_perplexity_dataset")]
     pub perplexity_dataset: String,
-    /// Enable weight fidelity quality benchmarks.
+    /// Enable weight fidelity quality benchmarks (also adds "quality" to suites).
     #[serde(default)]
     pub quality: bool,
+}
+
+impl BenchmarkSelection {
+    /// Merge convenience bools into the `suites` list so downstream code
+    /// only needs to check `suites`.
+    pub fn resolve_suites(&mut self) {
+        if self.decode && !self.suites.iter().any(|s| s == "decode") {
+            self.suites.push("decode".to_string());
+        }
+        if self.prefill && !self.suites.iter().any(|s| s == "prefill") {
+            self.suites.push("prefill".to_string());
+        }
+        if self.perplexity && !self.suites.iter().any(|s| s == "decode-ppl") {
+            self.suites.push("decode-ppl".to_string());
+        }
+        if self.quality && !self.suites.iter().any(|s| s == "quality") {
+            self.suites.push("quality".to_string());
+        }
+    }
 }
 
 fn default_perplexity_sequences() -> usize {
@@ -198,12 +225,15 @@ pub fn load_config(path: &Path) -> anyhow::Result<BenchMatrix> {
         file.settings.backends.clone()
     };
 
+    let mut benchmarks = file.benchmarks;
+    benchmarks.resolve_suites();
+
     Ok(BenchMatrix {
         models: file.model,
         optimizations: file.optimization,
         backends,
         settings: file.settings,
-        benchmarks: file.benchmarks,
+        benchmarks,
     })
 }
 
