@@ -172,6 +172,6 @@ cargo run --release --example awq_calibrate --features metal -p ironmill-bench -
 cargo run --release -p ironmill-bench --features metal -- \
     --config /tmp/bench_awq.toml -b metal \
     -i 5 -w 2 -r 1 \
-    --perplexity --perplexity-sequences 50 \
+    --perplexity --perplexity-sequences 20 \
     --perplexity-dataset tests/fixtures/quality/wikitext2-qwen35.json
 ```

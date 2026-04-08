@@ -18,6 +18,13 @@ name = "Qwen3.5-4B"
 path = "unused-for-template-mode"
 model_dir = "models/Qwen3.5-4B"
 
+# ── 0. FP16 baseline: no quantization, no KV cache compression ──
+[[optimization]]
+name = "fp16-baseline"
+no_fusion = false
+kv_quant = "none"
+max_seq_len = 2048
+
 # ── 1. INT4 naive (no AWQ) + TQ-INT8 ────────────────────────────
 [[optimization]]
 name = "int4-naive"

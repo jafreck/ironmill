@@ -615,6 +615,148 @@ fn magnitude_cache_key(magnitudes: &[f32]) -> u64 {
     hasher.finish()
 }
 
+/// Search for the optimal per-group clipping range on already-scaled weights.
+///
+/// AWQ paper Section 3.2: for each (row, group), find the `max_val` that
+/// minimizes activation-weighted quantization error. Outliers in a group
+/// force a wide quantization range — clipping them trades outlier accuracy
+/// for much better precision on the majority of weights.
+///
+/// Ported from the MIL IR pass (`awq_quantize.rs::search_clip_ranges`).
+#[allow(clippy::too_many_arguments)]
+fn search_clip_ranges(
+    scaled_weights: &[f32],
+    out_features: usize,
+    in_features: usize,
+    group_size: usize,
+    qmax: f32,
+    activations: &[f32],
+    n_tokens: usize,
+    clip_grid: usize,
+    max_shrink: f32,
+) -> Vec<f32> {
+    let n_groups = in_features.div_ceil(group_size);
+    let mut clip_maxvals = vec![f32::INFINITY; out_features * n_groups];
+
+    let mut clipped = vec![0.0f32; group_size];
+    let mut quantized = vec![0u8; group_size];
+
+    let n_sample = n_tokens.min(4);
+    let stride = if n_tokens > n_sample {
+        n_tokens / n_sample
+    } else {
+        1
+    };
+
+    for g in 0..n_groups {
+        let g_start = g * group_size;
+        let g_end = (g_start + group_size).min(in_features);
+        let gsize = g_end - g_start;
+
+        let act_g: Vec<f32> = (0..n_sample)
+            .flat_map(|si| {
+                let t = si * stride;
+                (0..gsize).map(move |j| activations[t * in_features + g_start + j])
+            })
+            .collect();
+
+        for row in 0..out_features {
+            let w_base = row * in_features + g_start;
+            let w_slice = &scaled_weights[w_base..w_base + gsize];
+
+            let org_max = w_slice.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+            if org_max < 1e-8 {
+                clip_maxvals[row * n_groups + g] = org_max;
+                continue;
+            }
+
+            // Reference output per sample token.
+            let mut org_out = [0.0f32; 16];
+            for si in 0..n_sample {
+                let mut dot = 0.0f32;
+                let ab = si * gsize;
+                for j in 0..gsize {
+                    dot += w_slice[j] * act_g[ab + j];
+                }
+                org_out[si] = dot;
+            }
+
+            let mut best_err = f32::INFINITY;
+            let mut best_max = org_max;
+
+            let n_steps = (max_shrink * clip_grid as f32) as usize;
+            for step in 0..n_steps {
+                let max_val = org_max * (1.0 - step as f32 / clip_grid as f32);
+
+                for j in 0..gsize {
+                    clipped[j] = w_slice[j].clamp(-max_val, max_val);
+                }
+
+                // Inline affine quantization (no alloc).
+                let mut wmin = f32::INFINITY;
+                let mut wmax = f32::NEG_INFINITY;
+                for j in 0..gsize {
+                    if clipped[j] < wmin {
+                        wmin = clipped[j];
+                    }
+                    if clipped[j] > wmax {
+                        wmax = clipped[j];
+                    }
+                }
+                let scale = ((wmax - wmin) / qmax).max(1e-10);
+                let zp = (-wmin / scale).round();
+                for j in 0..gsize {
+                    quantized[j] = (clipped[j] / scale + zp).round().clamp(0.0, qmax) as u8;
+                }
+
+                let mut err = 0.0f32;
+                for si in 0..n_sample {
+                    let mut q_out = 0.0f32;
+                    let ab = si * gsize;
+                    for j in 0..gsize {
+                        q_out += (quantized[j] as f32 - zp) * scale * act_g[ab + j];
+                    }
+                    let diff = q_out - org_out[si];
+                    err += diff * diff;
+                }
+
+                if err < best_err {
+                    best_err = err;
+                    best_max = max_val;
+                }
+            }
+
+            clip_maxvals[row * n_groups + g] = best_max;
+        }
+    }
+
+    clip_maxvals
+}
+
+/// Apply per-group clipping to a weight matrix in-place.
+fn apply_clip(
+    weights: &mut [f32],
+    out_features: usize,
+    in_features: usize,
+    group_size: usize,
+    clip_maxvals: &[f32],
+) {
+    let n_groups = in_features.div_ceil(group_size);
+    for row in 0..out_features {
+        for g in 0..n_groups {
+            let max_val = clip_maxvals[row * n_groups + g];
+            if max_val < f32::INFINITY {
+                let g_start = g * group_size;
+                let g_end = (g_start + group_size).min(in_features);
+                for c in g_start..g_end {
+                    let idx = row * in_features + c;
+                    weights[idx] = weights[idx].clamp(-max_val, max_val);
+                }
+            }
+        }
+    }
+}
+
 /// GPTQ second-order weight quantization for INT4.
 ///
 /// Uses the Hessian approximation H = 2·X^T·X from calibration activations
@@ -763,6 +905,8 @@ fn quantize_tensor_int4_awq(
     config: &AffineQuantConfig,
     awq_magnitudes: Option<&Vec<f32>>,
     alpha: Option<f32>,
+    awq_activations: Option<&Vec<f32>>,
+    awq_token_count: Option<usize>,
 ) -> (Vec<u8>, QuantizationInfo) {
     let awq_scales = if let Some(mags) = awq_magnitudes {
         let alpha = alpha.unwrap_or(0.5);
@@ -777,7 +921,7 @@ fn quantize_tensor_int4_awq(
     };
 
     // Apply AWQ scaling to weights: w_scaled[row, col] = w[row, col] * s[col]
-    let scaled_floats = if let Some(ref scales) = awq_scales {
+    let mut scaled_floats = if let Some(ref scales) = awq_scales {
         let last_dim = shape[shape.len() - 1];
         if scales.len() == last_dim {
             floats
@@ -791,6 +935,37 @@ fn quantize_tensor_int4_awq(
     } else {
         floats.to_vec()
     };
+
+    // AWQ weight clipping (paper Section 3.2): search for optimal per-group
+    // clip range on the scaled weights, then clip before quantization.
+    // This is where most of AWQ's quality gain comes from — outliers in a
+    // 128-element group force a wide quantization range, wasting precision.
+    if awq_magnitudes.is_some() && shape.len() == 2 {
+        if let (Some(acts), Some(tc)) = (awq_activations, awq_token_count) {
+            let out_features = shape[0];
+            let in_features = shape[1];
+            if tc > 0 && acts.len() >= tc * in_features {
+                let clip_maxvals = search_clip_ranges(
+                    &scaled_floats,
+                    out_features,
+                    in_features,
+                    config.group_size,
+                    15.0, // qmax for INT4
+                    acts,
+                    tc,
+                    20,  // clip_grid (matching MIL pass)
+                    0.5, // max_shrink
+                );
+                apply_clip(
+                    &mut scaled_floats,
+                    out_features,
+                    in_features,
+                    config.group_size,
+                    &clip_maxvals,
+                );
+            }
+        }
+    }
 
     let (packed, mut quant_info) = quantize_tensor_int4(&scaled_floats, shape, config);
 
@@ -904,6 +1079,13 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                     .and_then(|m| m.get(&awq_key))
                     .filter(|v| v.len() == last_dim);
 
+                // Resolve alpha and look up activations for clipping.
+                let awq_acts = config
+                    .awq_activations
+                    .as_ref()
+                    .and_then(|a| a.get(&awq_key));
+                let awq_tc = config.awq_token_count;
+
                 // Resolve alpha: check cache first, then search if needed.
                 // Projections sharing identical magnitude vectors (e.g. Q/K/V
                 // from the same layer norm) reuse a single search result.
@@ -912,12 +1094,8 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                     let cached = self.alpha_cache.lock().unwrap().get(&cache_key).copied();
                     if let Some(alpha) = cached {
                         Some(alpha)
-                    } else if let Some(acts) = config
-                        .awq_activations
-                        .as_ref()
-                        .and_then(|a| a.get(&awq_key))
-                    {
-                        if let Some(tc) = config.awq_token_count {
+                    } else if let Some(acts) = awq_acts {
+                        if let Some(tc) = awq_tc {
                             if t.shape.len() == 2 && tc > 0 && acts.len() >= tc * last_dim {
                                 let alpha = search_best_alpha(
                                     &floats,
@@ -942,7 +1120,15 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                     None
                 };
 
-                quantize_tensor_int4_awq(&floats, &t.shape, config, awq_mags, resolved_alpha)
+                quantize_tensor_int4_awq(
+                    &floats,
+                    &t.shape,
+                    config,
+                    awq_mags,
+                    resolved_alpha,
+                    awq_acts,
+                    awq_tc,
+                )
             }
         };
 
@@ -1081,11 +1267,11 @@ mod tests {
 
         // Call without activations.
         let (packed1, _info1) =
-            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None);
+            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None, None, None);
 
         // Call again — should be deterministic with same fixed alpha.
         let (packed2, _info2) =
-            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None);
+            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None, None, None);
 
         assert_eq!(packed1, packed2, "fixed-alpha path should be deterministic");
     }
@@ -1252,7 +1438,8 @@ mod tests {
 
         // RTN path (no AWQ scales).
         let config_rtn = AffineQuantConfig::int4(group_size);
-        let (rtn_packed, _) = quantize_tensor_int4_awq(&floats, &shape, &config_rtn, None, None);
+        let (rtn_packed, _) =
+            quantize_tensor_int4_awq(&floats, &shape, &config_rtn, None, None, None, None);
 
         // They should produce different packed bytes.
         assert_ne!(
@@ -1297,7 +1484,7 @@ mod tests {
         // Also get RTN result for comparison.
         let config_rtn = AffineQuantConfig::int4(128);
         let (rtn_packed, _) =
-            quantize_tensor_int4_awq(&floats, &[out, inf], &config_rtn, None, None);
+            quantize_tensor_int4_awq(&floats, &[out, inf], &config_rtn, None, None, None, None);
 
         // Simulate the dispatch logic from WeightProvider::tensor().
         let shape = vec![out, inf];
