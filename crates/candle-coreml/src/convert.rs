@@ -4,7 +4,7 @@
 //! platforms — no macOS or Xcode required for conversion itself.
 //!
 //! The heavy lifting is done by [`ironmill_compile::coreml::build_api::convert`];
-//! this module provides candle-flavoured option/result types on top.
+//! this module re-exports the shared types with candle-flavoured aliases.
 //! See also: `burn-coreml::export` for the Burn equivalent.
 //!
 //! # Example
@@ -21,35 +21,20 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use ironmill_compile::coreml::build_api::{
-    ConvertConfig, Quantization, TargetComputeUnit, convert,
-};
+use ironmill_compile::coreml::build_api::convert_to_coreml;
+pub use ironmill_compile::coreml::build_api::{Quantization, TargetComputeUnit};
 
 /// Options for ONNX → CoreML conversion.
-#[derive(Debug, Clone, Default)]
-pub struct ConvertOptions {
-    /// Quantization mode (default: None).
-    pub quantization: Quantization,
-    /// Target compute units (default: builder default, All).
-    pub target: Option<TargetComputeUnit>,
-    /// Fixed input shapes for ANE compatibility.
-    pub input_shapes: Vec<(String, Vec<usize>)>,
-    /// Also compile to `.mlmodelc` via `xcrun` (macOS only).
-    pub compile: bool,
-    /// Palettization bit-width (2, 4, 6, or 8).
-    pub palettize_bits: Option<u8>,
-}
+///
+/// Re-export of [`ironmill_compile::coreml::build_api::ConvertConfig`].
+pub type ConvertOptions = ironmill_compile::coreml::build_api::ConvertConfig;
 
 /// Result of a successful ONNX → CoreML conversion.
-#[derive(Debug)]
-pub struct ConvertResult {
-    /// Path to the generated `.mlpackage`.
-    pub mlpackage: PathBuf,
-    /// Path to the compiled `.mlmodelc`, if compilation was requested and succeeded.
-    pub mlmodelc: Option<PathBuf>,
-}
+///
+/// Re-export of [`ironmill_compile::coreml::build_api::ConvertOutput`].
+pub type ConvertResult = ironmill_compile::coreml::build_api::ConvertOutput;
 
 /// Convert an ONNX model to CoreML `.mlpackage` format.
 ///
@@ -75,22 +60,8 @@ pub fn convert_onnx(
     output_path: impl AsRef<Path>,
     options: ConvertOptions,
 ) -> anyhow::Result<ConvertResult> {
-    let config = ConvertConfig {
-        quantization: options.quantization,
-        target: options.target,
-        input_shapes: options.input_shapes,
-        compile: options.compile,
-        palettize_bits: options.palettize_bits,
-        no_fusion: false,
-    };
-
-    let output = convert(onnx_path.as_ref(), output_path.as_ref(), config)
-        .map_err(|e| anyhow::anyhow!("ONNX to CoreML conversion failed: {e}"))?;
-
-    Ok(ConvertResult {
-        mlpackage: output.mlpackage,
-        mlmodelc: output.mlmodelc,
-    })
+    convert_to_coreml(onnx_path.as_ref(), output_path.as_ref(), options)
+        .map_err(|e| anyhow::anyhow!("ONNX to CoreML conversion failed: {e}"))
 }
 
 #[cfg(test)]
@@ -125,6 +96,7 @@ mod tests {
             input_shapes: vec![("input".to_string(), vec![1, 3, 224, 224])],
             compile: true,
             palettize_bits: Some(4),
+            ..Default::default()
         };
         assert_eq!(opts.quantization, Quantization::Fp16);
         assert_eq!(opts.target, Some(TargetComputeUnit::CpuAndNeuralEngine));

@@ -79,6 +79,8 @@ pub use types::{ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, Run
 #[cfg(all(feature = "coreml", target_os = "macos"))]
 pub mod coreml_runtime {
     #[doc(hidden)]
+    use std::path::Path;
+
     pub use ironmill_coreml_sys::{
         ComputeUnits, ExtractedOutput, InputDescription, InputFeature, Model, MultiArrayDataType,
         OutputTensorData, PredictionInput, PredictionOutput, build_dummy_input,
@@ -95,6 +97,89 @@ pub mod coreml_runtime {
             pi.add_multi_array(name, shape, MultiArrayDataType::Float32, data)?;
         }
         Ok(pi)
+    }
+
+    // ── Shared inference session ─────────────────────────────────────
+
+    /// Description of a model input tensor.
+    #[derive(Debug, Clone)]
+    pub struct SessionInputDesc {
+        /// Input feature name.
+        pub name: String,
+        /// Expected tensor shape.
+        pub shape: Vec<usize>,
+    }
+
+    /// An output tensor from CoreML inference.
+    #[derive(Debug, Clone)]
+    pub struct SessionOutput {
+        /// Output feature name.
+        pub name: String,
+        /// Output tensor shape.
+        pub shape: Vec<usize>,
+        /// Flattened f32 data.
+        pub data: Vec<f32>,
+    }
+
+    /// Shared CoreML inference session used by framework bridge crates.
+    ///
+    /// Wraps a loaded [`Model`] and provides load / describe / predict
+    /// methods that both `burn-coreml` and `candle-coreml` delegate to.
+    pub struct CoreMlSession {
+        model: Model,
+    }
+
+    impl CoreMlSession {
+        /// Load a compiled CoreML model (`.mlmodelc` or `.mlpackage`).
+        pub fn load(path: &Path, compute_units: ComputeUnits) -> anyhow::Result<Self> {
+            let model = Model::load(path, compute_units)?;
+            Ok(Self { model })
+        }
+
+        /// Get descriptions of the model's expected inputs.
+        pub fn input_description(&self) -> anyhow::Result<Vec<SessionInputDesc>> {
+            let desc = self.model.input_description()?;
+            Ok(desc
+                .features
+                .into_iter()
+                .map(|f| SessionInputDesc {
+                    name: f.name,
+                    shape: f.shape,
+                })
+                .collect())
+        }
+
+        /// Run inference with f32 input tensors.
+        ///
+        /// Each input is a tuple of `(name, shape, data)`. Returns output
+        /// tensors with names, shapes, and f32 data.
+        pub fn predict(
+            &self,
+            inputs: &[(&str, &[usize], &[f32])],
+        ) -> anyhow::Result<Vec<SessionOutput>> {
+            let output = self.predict_raw(inputs)?;
+            let extracted = self.model.extract_outputs(&output)?;
+
+            Ok(extracted
+                .into_iter()
+                .map(|e| SessionOutput {
+                    name: e.name,
+                    shape: e.shape,
+                    data: e.data,
+                })
+                .collect())
+        }
+
+        /// Run inference and return the raw [`PredictionOutput`].
+        ///
+        /// Use this when you need custom output extraction logic.
+        pub fn predict_raw(
+            &self,
+            inputs: &[(&str, &[usize], &[f32])],
+        ) -> anyhow::Result<PredictionOutput> {
+            let pi = build_f32_input(inputs)?;
+            self.model.predict(&pi)
+        }
     }
 }
 

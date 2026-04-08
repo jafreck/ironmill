@@ -4,42 +4,23 @@
 //! then this module converts the ONNX file to a CoreML `.mlpackage`.
 //!
 //! The heavy lifting is done by [`ironmill_compile::coreml::build_api::convert`];
-//! this module provides Burn-flavoured option/result types on top.
+//! this module re-exports the shared types with Burn-flavoured aliases.
 //! See also: `candle-coreml::convert` for the candle equivalent.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use ironmill_compile::coreml::build_api::{
-    ConvertConfig, Quantization, TargetComputeUnit, convert,
-};
+use ironmill_compile::coreml::build_api::convert_to_coreml;
+pub use ironmill_compile::coreml::build_api::{Quantization, TargetComputeUnit};
 
 /// Options for exporting to CoreML.
-#[derive(Debug, Clone, Default)]
-pub struct ExportOptions {
-    /// Quantization mode.
-    pub quantization: Quantization,
-    /// Target compute units.
-    pub target: Option<TargetComputeUnit>,
-    /// Fixed input shapes for ANE compatibility.
-    ///
-    /// Each entry is `(input_name, shape_dimensions)`.
-    pub input_shapes: Vec<(String, Vec<usize>)>,
-    /// Also compile to `.mlmodelc` via `xcrun` (macOS only).
-    pub compile: bool,
-    /// Palettization bit-width (2, 4, 6, or 8).
-    pub palettize_bits: Option<u8>,
-    /// Disable optimization/fusion passes.
-    pub no_fusion: bool,
-}
+///
+/// Re-export of [`ironmill_compile::coreml::build_api::ConvertConfig`].
+pub type ExportOptions = ironmill_compile::coreml::build_api::ConvertConfig;
 
 /// Result of a successful export.
-#[derive(Debug)]
-pub struct ExportResult {
-    /// Path to the generated `.mlpackage`.
-    pub mlpackage_path: PathBuf,
-    /// Path to the compiled `.mlmodelc`, if compilation was requested and succeeded.
-    pub mlmodelc_path: Option<PathBuf>,
-}
+///
+/// Re-export of [`ironmill_compile::coreml::build_api::ConvertOutput`].
+pub type ExportResult = ironmill_compile::coreml::build_api::ConvertOutput;
 
 /// Export a Burn model (via its ONNX representation) to CoreML.
 ///
@@ -62,7 +43,7 @@ pub struct ExportResult {
 ///     "my_model.mlpackage",
 ///     ExportOptions::default(),
 /// )?;
-/// println!("exported to {}", result.mlpackage_path.display());
+/// println!("exported to {}", result.mlpackage.display());
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn export_to_coreml(
@@ -70,21 +51,11 @@ pub fn export_to_coreml(
     output_path: impl AsRef<Path>,
     options: ExportOptions,
 ) -> anyhow::Result<ExportResult> {
-    let config = ConvertConfig {
-        quantization: options.quantization,
-        target: options.target,
-        input_shapes: options.input_shapes,
-        compile: options.compile,
-        palettize_bits: options.palettize_bits,
-        no_fusion: options.no_fusion,
-    };
-
-    let output = convert(onnx_path.as_ref(), output_path.as_ref(), config)?;
-
-    Ok(ExportResult {
-        mlpackage_path: output.mlpackage,
-        mlmodelc_path: output.mlmodelc,
-    })
+    Ok(convert_to_coreml(
+        onnx_path.as_ref(),
+        output_path.as_ref(),
+        options,
+    )?)
 }
 
 #[cfg(test)]

@@ -24,7 +24,7 @@
 //! use burn_coreml::export::{export_to_coreml, ExportOptions};
 //!
 //! let result = export_to_coreml("model.onnx", "model.mlpackage", ExportOptions::default())?;
-//! println!("exported to {}", result.mlpackage_path.display());
+//! println!("exported to {}", result.mlpackage.display());
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 

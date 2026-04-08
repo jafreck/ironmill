@@ -1,14 +1,14 @@
 //! CoreML inference for running exported models on macOS.
 //!
 //! This module provides [`CoreMlInference`], a lightweight wrapper around
-//! the CoreML runtime for running exported Burn models.
-//!
-//! The input-building logic is shared with `candle-coreml::runtime` via
-//! [`ironmill_inference::coreml_runtime::build_f32_input`].
+//! the shared [`CoreMlSession`] from `ironmill-inference`.
 
 use std::path::Path;
 
-use ironmill_inference::coreml_runtime::{ComputeUnits, Model, build_f32_input};
+use ironmill_inference::coreml_runtime::{ComputeUnits, CoreMlSession};
+
+pub use ironmill_inference::coreml_runtime::SessionInputDesc as InputDesc;
+pub use ironmill_inference::coreml_runtime::SessionOutput as InferenceOutput;
 
 /// A CoreML inference session for running exported models.
 ///
@@ -31,27 +31,7 @@ use ironmill_inference::coreml_runtime::{ComputeUnits, Model, build_f32_input};
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub struct CoreMlInference {
-    model: Model,
-}
-
-/// Description of a model input tensor.
-#[derive(Debug, Clone)]
-pub struct InputDesc {
-    /// Input feature name.
-    pub name: String,
-    /// Expected tensor shape.
-    pub shape: Vec<usize>,
-}
-
-/// An output tensor from inference.
-#[derive(Debug, Clone)]
-pub struct InferenceOutput {
-    /// Output feature name.
-    pub name: String,
-    /// Output tensor shape.
-    pub shape: Vec<usize>,
-    /// Output data as f32 values.
-    pub data: Vec<f32>,
+    session: CoreMlSession,
 }
 
 impl CoreMlInference {
@@ -62,21 +42,13 @@ impl CoreMlInference {
     /// * `path` — Path to a compiled `.mlmodelc` bundle
     /// * `compute_units` — Which hardware to use for inference
     pub fn load(path: impl AsRef<Path>, compute_units: ComputeUnits) -> anyhow::Result<Self> {
-        let model = Model::load(path.as_ref(), compute_units)?;
-        Ok(Self { model })
+        let session = CoreMlSession::load(path.as_ref(), compute_units)?;
+        Ok(Self { session })
     }
 
     /// Get descriptions of the model's expected inputs.
     pub fn input_description(&self) -> anyhow::Result<Vec<InputDesc>> {
-        let desc = self.model.input_description()?;
-        Ok(desc
-            .features
-            .into_iter()
-            .map(|f| InputDesc {
-                name: f.name,
-                shape: f.shape,
-            })
-            .collect())
+        self.session.input_description()
     }
 
     /// Run inference with f32 input tensors.
@@ -87,17 +59,7 @@ impl CoreMlInference {
         &self,
         inputs: &[(&str, &[usize], &[f32])],
     ) -> anyhow::Result<Vec<InferenceOutput>> {
-        let output = self.predict_raw(inputs)?;
-        let extracted = output.extract_multi_arrays()?;
-
-        Ok(extracted
-            .into_iter()
-            .map(|e| InferenceOutput {
-                name: e.name,
-                shape: e.shape,
-                data: e.data,
-            })
-            .collect())
+        self.session.predict(inputs)
     }
 
     /// Run inference and return the raw `PredictionOutput`.
@@ -108,8 +70,7 @@ impl CoreMlInference {
         &self,
         inputs: &[(&str, &[usize], &[f32])],
     ) -> anyhow::Result<ironmill_inference::coreml_runtime::PredictionOutput> {
-        let pi = build_f32_input(inputs)?;
-        self.model.predict(&pi)
+        self.session.predict_raw(inputs)
     }
 }
 

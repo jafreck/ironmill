@@ -332,6 +332,27 @@ pub struct ConvertConfig {
     pub no_fusion: bool,
 }
 
+/// Simplified output for framework bridge crates.
+///
+/// Contains only the output paths, without the optimization report
+/// included in [`BuildOutput`].
+#[derive(Debug)]
+pub struct ConvertOutput {
+    /// Path to the generated `.mlpackage`.
+    pub mlpackage: PathBuf,
+    /// Path to the compiled `.mlmodelc`, if compilation was requested and succeeded.
+    pub mlmodelc: Option<PathBuf>,
+}
+
+impl From<BuildOutput> for ConvertOutput {
+    fn from(o: BuildOutput) -> Self {
+        Self {
+            mlpackage: o.mlpackage,
+            mlmodelc: o.mlmodelc,
+        }
+    }
+}
+
 /// Convert an ONNX model to CoreML using [`ConvertConfig`].
 ///
 /// This is the single-function entry point used by framework bridge crates.
@@ -368,6 +389,18 @@ pub fn convert(onnx_path: &Path, output_path: &Path, config: ConvertConfig) -> R
     }
 
     builder.build()
+}
+
+/// Convert an ONNX model to CoreML, returning a simplified [`ConvertOutput`].
+///
+/// This is a convenience wrapper around [`convert`] that drops the
+/// optimization report, which bridge crates typically don't need.
+pub fn convert_to_coreml(
+    onnx_path: &Path,
+    output_path: &Path,
+    config: ConvertConfig,
+) -> Result<ConvertOutput> {
+    convert(onnx_path, output_path, config).map(ConvertOutput::from)
 }
 
 // ── Input format detection ──────────────────────────────────────────────
