@@ -108,7 +108,7 @@ fn map_sys_err(e: ironmill_ane_sys::AneSysError) -> AneError {
             used: count,
             limit: 119,
         },
-        other => AneError::Other(anyhow::anyhow!("{other}")),
+        other => AneError::Other(other.into()),
     }
 }
 

@@ -123,7 +123,7 @@ pub enum AneError {
 
     /// IOSurface creation or I/O failed.
     #[error("IOSurface error: {0}")]
-    SurfaceError(String),
+    SurfaceError(#[from] IOSurfaceError),
 
     /// The compile budget (~119 per process) has been exhausted.
     #[error("ANE compile budget exhausted ({used}/{limit} compilations used)")]
@@ -137,11 +137,4 @@ pub enum AneError {
     /// A generic error from an underlying operation.
     #[error("{0}")]
     Other(#[from] anyhow::Error),
-}
-
-#[cfg(all(feature = "ane", target_os = "macos"))]
-impl From<IOSurfaceError> for AneError {
-    fn from(e: IOSurfaceError) -> Self {
-        AneError::SurfaceError(e.to_string())
-    }
 }
