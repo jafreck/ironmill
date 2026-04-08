@@ -531,7 +531,7 @@ impl MetalWeights {
     }
 
     /// Temporarily replace a layer's projection weight buffer and return the original.
-    pub fn swap_layer_weight(
+    pub(crate) fn swap_layer_weight(
         &mut self,
         layer_idx: usize,
         proj_name: &str,
@@ -556,7 +556,7 @@ impl MetalWeights {
 }
 
 /// Create a Dense (row-major only) FP16 [`WeightBuffer`] from f32 data on CPU.
-pub fn create_dense_f16_buffer(
+pub(crate) fn create_dense_f16_buffer(
     device: &MetalDevice,
     data_f32: &[f32],
 ) -> Result<WeightBuffer, MetalError> {
@@ -577,7 +577,7 @@ pub fn create_dense_f16_buffer(
 ///
 /// The buffer is Shared-mode and zero-initialised. Use
 /// [`update_dense_f16_data`] to populate it before dispatching.
-pub fn create_dense_f16_buffer_sized(
+pub(crate) fn create_dense_f16_buffer_sized(
     device: &MetalDevice,
     n_elements: usize,
 ) -> Result<WeightBuffer, MetalError> {
@@ -598,7 +598,7 @@ pub fn create_dense_f16_buffer_sized(
 /// # Errors
 /// Returns an error if `wb` is not a Dense buffer, has no row-major buffer,
 /// or the data is too large for the existing allocation.
-pub fn update_dense_f16_data(wb: &WeightBuffer, data_f32: &[f32]) -> Result<(), MetalError> {
+pub(crate) fn update_dense_f16_data(wb: &WeightBuffer, data_f32: &[f32]) -> Result<(), MetalError> {
     let buf = match wb {
         WeightBuffer::Dense { buf: Some(b), .. } => b,
         _ => {

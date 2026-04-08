@@ -21,98 +21,6 @@ use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
 
 impl MetalInference {
-    /// deviation at each layer's post-attention LayerNorm output. The
-    /// resulting bias vectors are stored and applied during inference to
-    /// compensate for quantization-induced activation drift.
-    ///
-    /// Reference: D²Quant (arXiv:2602.02546) §3.3, Algorithm 1 lines 3–10.
-    pub fn calibrate_dac(
-        &mut self,
-        fp_provider: &dyn mil_rs::weights::WeightProvider,
-        calibration_tokens: &[u32],
-    ) -> Result<(), InferenceError> {
-        let mc = self
-            .model_config
-            .as_ref()
-            .ok_or(InferenceError::NotLoaded)?
-            .clone();
-        let h = mc.hidden_size;
-        let num_layers = mc.num_hidden_layers;
-        let token_count = calibration_tokens.len();
-
-        if token_count == 0 {
-            return Ok(());
-        }
-
-        // 1. Run FP16 reference model to capture post-attention norm outputs.
-        let fp_norms = {
-            let mut fp_engine = MetalInference::new(self.config.clone())
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            fp_engine
-                .load_weights(fp_provider, self.config.clone())
-                .map_err(|e| InferenceError::runtime(format!("DAC FP16 load: {e}")))?;
-
-            let mut norms: Vec<Vec<f32>> = vec![vec![0.0f32; h]; num_layers];
-            fp_engine.prefill_calibration(
-                calibration_tokens,
-                &mut |layer, name, data, _n_features| {
-                    if name == "ffn_norm" && layer < num_layers {
-                        // data is FP16 bytes: [token_count × hidden_size]
-                        let f16_vals: Vec<f32> = data
-                            .chunks_exact(2)
-                            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                            .collect();
-                        // Mean across tokens for each channel
-                        for ch in 0..h {
-                            let sum: f32 = (0..token_count).map(|t| f16_vals[t * h + ch]).sum();
-                            norms[layer][ch] = sum / token_count as f32;
-                        }
-                    }
-                },
-            )?;
-            norms
-        };
-        // FP16 engine is dropped here, freeing GPU memory.
-
-        // 2. Run quantized (self) model to capture post-attention norm outputs.
-        let q_norms = {
-            let mut norms: Vec<Vec<f32>> = vec![vec![0.0f32; h]; num_layers];
-            self.prefill_calibration(calibration_tokens, &mut |layer, name, data, _n_features| {
-                if name == "ffn_norm" && layer < num_layers {
-                    let f16_vals: Vec<f32> = data
-                        .chunks_exact(2)
-                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                        .collect();
-                    for ch in 0..h {
-                        let sum: f32 = (0..token_count).map(|t| f16_vals[t * h + ch]).sum();
-                        norms[layer][ch] = sum / token_count as f32;
-                    }
-                }
-            })?;
-            norms
-        };
-
-        // 3. Compute per-layer correction bias: μ = mean(Y_fp) - mean(Y_q)
-        let mut biases = Vec::with_capacity(num_layers);
-        for layer in 0..num_layers {
-            let bias_f16: Vec<u8> = (0..h)
-                .flat_map(|ch| {
-                    let deviation = fp_norms[layer][ch] - q_norms[layer][ch];
-                    half::f16::from_f32(deviation).to_le_bytes()
-                })
-                .collect();
-            let buf = self
-                .device
-                .create_buffer_with_data(&bias_f16, StorageMode::Shared)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            biases.push(buf);
-        }
-
-        self.dac_biases = Some(biases);
-        self.reset();
-        Ok(())
-    }
-
     // ── Calibration-mode pipeline ───────────────────────────────
 
     /// Run the transformer decode pipeline with per-layer command buffer
@@ -1090,100 +998,6 @@ impl MetalInference {
         self.run_pipeline_with_hooks(tokens, hooks)
     }
 
-    /// Run a single transformer layer forward on GPU.
-    ///
-    /// Writes `input_hidden_state` to the engine's hidden_state buffer,
-    /// computes the input norm for `layer_idx`, then runs the calibration
-    /// pipeline through just that one layer. Returns the output hidden
-    /// state as raw FP16 bytes.
-    ///
-    /// Uses a lightweight reset (seq_pos = 0) instead of a full engine
-    /// reset, and does not advance sequence position afterwards — this
-    /// makes it safe to call repeatedly for the same layer without
-    /// accumulating KV cache state.
-    pub fn run_single_layer(
-        &mut self,
-        layer_idx: usize,
-        input_hidden_state: &[u8],
-        token_count: usize,
-    ) -> Result<Vec<u8>, InferenceError> {
-        // 1. Lightweight reset: only seq_pos needs to be 0 for correct RoPE
-        //    and KV cache addressing. Skips full KV/GDN reset since the
-        //    layer forward will overwrite position 0 regardless.
-        self.seq_pos = 0;
-
-        // 2. Ensure intermediate buffers are large enough for this token count.
-        let mc = self
-            .model_config
-            .as_ref()
-            .ok_or(InferenceError::NotLoaded)?
-            .clone();
-        self.intermediate_buffers
-            .as_mut()
-            .ok_or(InferenceError::NotLoaded)?
-            .ensure_capacity(&self.device, token_count, &mc, self.gemma4_config.as_ref())
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
-        // 3. Write input to hidden_state buffer.
-        let bufs = self
-            .intermediate_buffers
-            .as_ref()
-            .ok_or(InferenceError::NotLoaded)?;
-        bufs.hidden_state
-            .write_bytes(input_hidden_state, 0)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
-        // 4. Compute input norm for this layer.
-        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
-        let h = mc.hidden_size;
-        let eps = mc.rms_norm_eps as f32;
-        let lw = &weights.layers[layer_idx];
-
-        let cmd_buf = self
-            .queue
-            .command_buffer()
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        {
-            let enc = cmd_buf
-                .compute_encoder()
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            ops::encode_rms_norm(
-                &enc,
-                &self.pipelines()?.rms_norm,
-                &ops::RmsNormParams {
-                    input: &bufs.hidden_state,
-                    weight: &lw.input_norm,
-                    output: &bufs.norm_out,
-                    hidden_size: h as u32,
-                    token_count: token_count as u32,
-                    eps,
-                },
-            );
-            enc.end_encoding();
-        }
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
-
-        // 5. Run one layer via the calibration pipeline.
-        self.run_pipeline_calibration_from_layer(layer_idx, token_count)?;
-
-        // 6. Readback hidden_state (block output).
-        //    Reset seq_pos so caller doesn't need to — the run above
-        //    advanced it by token_count.
-        self.seq_pos = 0;
-        let bufs = self
-            .intermediate_buffers
-            .as_ref()
-            .ok_or(InferenceError::NotLoaded)?;
-        let output_bytes = token_count * h * 2; // FP16
-        let mut output = vec![0u8; output_bytes];
-        bufs.hidden_state
-            .read_bytes(&mut output, 0)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
-        Ok(output)
-    }
-
     /// Run a single transformer layer's forward pass (attention + FFN +
     /// residual), assuming `hidden_state` and `norm_out` are already
     /// populated by the caller.
@@ -1664,14 +1478,302 @@ impl MetalInference {
 
         Ok(())
     }
+}
 
-    // ── Block-level calibration helpers ────────────────────────────
+// ── GPU calibration trait ─────────────────────────────────────────
 
-    /// Swap a layer's projection weight, forwarding to [`MetalWeights::swap_layer_weight`].
+/// GPU-specific calibration operations on a loaded inference engine.
+///
+/// Provides the building blocks for block-level AWQ alpha search,
+/// clip calibration, and DAC bias computation. These methods are
+/// deliberately separated from the core [`InferenceEngine`] trait so
+/// that production inference code never sees weight-swapping or
+/// single-layer evaluation in its API surface.
+///
+/// Import this trait to access calibration methods on [`MetalInference`]:
+/// ```ignore
+/// use ironmill_inference::metal::GpuCalibrationEngine;
+/// engine.calibrate_dac(&fp_provider, &tokens)?;
+/// engine.run_single_layer(layer_idx, &input, token_count)?;
+/// ```
+pub trait GpuCalibrationEngine {
+    /// The weight buffer type used by this engine.
+    type WeightBuffer;
+
+    /// Run DAC (Deviation-Aware Correction) calibration.
     ///
-    /// Returns `None` if the engine has no weights loaded or the projection
-    /// name is not recognised.
-    pub fn swap_layer_weight(
+    /// Computes per-layer bias vectors that compensate for quantization-
+    /// induced activation drift. The biases are stored on the engine
+    /// and applied automatically during subsequent inference.
+    ///
+    /// Reference: D²Quant (arXiv:2602.02546) §3.3, Algorithm 1.
+    fn calibrate_dac(
+        &mut self,
+        fp_provider: &dyn mil_rs::weights::WeightProvider,
+        calibration_tokens: &[u32],
+    ) -> Result<(), InferenceError>;
+
+    /// Run a single transformer layer forward on GPU.
+    ///
+    /// Writes `input_hidden_state` (FP16 bytes) to the hidden_state
+    /// buffer, runs one layer, and returns the output hidden state.
+    /// Safe to call repeatedly for the same layer without accumulating
+    /// KV cache state.
+    fn run_single_layer(
+        &mut self,
+        layer_idx: usize,
+        input_hidden_state: &[u8],
+        token_count: usize,
+    ) -> Result<Vec<u8>, InferenceError>;
+
+    /// Swap a layer's projection weight, returning the original.
+    ///
+    /// `proj_name` is one of: `"q_proj"`, `"k_proj"`, `"v_proj"`,
+    /// `"o_proj"`, `"gate_proj"`, `"up_proj"`, `"down_proj"`.
+    fn swap_layer_weight(
+        &mut self,
+        layer_idx: usize,
+        proj_name: &str,
+        new_weight: Self::WeightBuffer,
+    ) -> Option<Self::WeightBuffer>;
+
+    /// Create a Dense FP16 GPU buffer from CPU f32 data.
+    fn create_dense_f16_buffer(
+        &self,
+        data_f32: &[f32],
+    ) -> Result<Self::WeightBuffer, InferenceError>;
+
+    /// Create an empty Dense FP16 GPU buffer sized for `n_elements` values.
+    ///
+    /// Use [`update_weight_buffer_f16`] to populate it before dispatching.
+    fn create_dense_f16_buffer_sized(
+        &self,
+        n_elements: usize,
+    ) -> Result<Self::WeightBuffer, InferenceError>;
+}
+
+/// Overwrite the contents of a Dense FP16 [`WeightBuffer`](super::weights::WeightBuffer)
+/// with new f32 data, avoiding a GPU allocation.
+///
+/// This is a free function rather than a trait method because it
+/// operates on the buffer alone, without engine state.
+pub fn update_weight_buffer_f16(
+    wb: &super::weights::WeightBuffer,
+    data_f32: &[f32],
+) -> Result<(), InferenceError> {
+    super::weights::update_dense_f16_data(wb, data_f32)
+        .map_err(|e| InferenceError::runtime(e.to_string()))
+}
+
+impl GpuCalibrationEngine for MetalInference {
+    type WeightBuffer = super::weights::WeightBuffer;
+
+    fn calibrate_dac(
+        &mut self,
+        fp_provider: &dyn mil_rs::weights::WeightProvider,
+        calibration_tokens: &[u32],
+    ) -> Result<(), InferenceError> {
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
+        let h = mc.hidden_size;
+        let num_layers = mc.num_hidden_layers;
+        let token_count = calibration_tokens.len();
+
+        if token_count == 0 {
+            return Ok(());
+        }
+
+        // 1. Run FP16 reference model to capture post-attention norm outputs.
+        let fp_norms = {
+            let mut fp_engine = MetalInference::new(self.config.clone())
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            fp_engine
+                .load_weights(fp_provider, self.config.clone())
+                .map_err(|e| InferenceError::runtime(format!("DAC FP16 load: {e}")))?;
+
+            let mut norms: Vec<Vec<f32>> = vec![vec![0.0f32; h]; num_layers];
+            fp_engine.prefill_calibration(
+                calibration_tokens,
+                &mut |layer, name, data, _n_features| {
+                    if name == "ffn_norm" && layer < num_layers {
+                        let f16_vals: Vec<f32> = data
+                            .chunks_exact(2)
+                            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                            .collect();
+                        for ch in 0..h {
+                            let sum: f32 = (0..token_count).map(|t| f16_vals[t * h + ch]).sum();
+                            norms[layer][ch] = sum / token_count as f32;
+                        }
+                    }
+                },
+            )?;
+            norms
+        };
+
+        // 2. Run quantized (self) model to capture post-attention norm outputs.
+        let q_norms = {
+            let mut norms: Vec<Vec<f32>> = vec![vec![0.0f32; h]; num_layers];
+            self.prefill_calibration(calibration_tokens, &mut |layer, name, data, _n_features| {
+                if name == "ffn_norm" && layer < num_layers {
+                    let f16_vals: Vec<f32> = data
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect();
+                    for ch in 0..h {
+                        let sum: f32 = (0..token_count).map(|t| f16_vals[t * h + ch]).sum();
+                        norms[layer][ch] = sum / token_count as f32;
+                    }
+                }
+            })?;
+            norms
+        };
+
+        // 3. Compute per-layer correction bias: μ = mean(Y_fp) - mean(Y_q)
+        let mut biases = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            let bias_f16: Vec<u8> = (0..h)
+                .flat_map(|ch| {
+                    let deviation = fp_norms[layer][ch] - q_norms[layer][ch];
+                    half::f16::from_f32(deviation).to_le_bytes()
+                })
+                .collect();
+            let buf = self
+                .device
+                .create_buffer_with_data(&bias_f16, StorageMode::Shared)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            biases.push(buf);
+        }
+
+        self.dac_biases = Some(biases);
+        self.reset();
+        Ok(())
+    }
+
+    fn run_single_layer(
+        &mut self,
+        layer_idx: usize,
+        input_hidden_state: &[u8],
+        token_count: usize,
+    ) -> Result<Vec<u8>, InferenceError> {
+        // Lightweight reset: only seq_pos needs to be 0 for correct RoPE
+        // and KV cache addressing.
+        self.seq_pos = 0;
+
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
+        self.intermediate_buffers
+            .as_mut()
+            .ok_or(InferenceError::NotLoaded)?
+            .ensure_capacity(&self.device, token_count, &mc, self.gemma4_config.as_ref())
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        // Write input to hidden_state (Private storage — stage via Shared).
+        let bufs = self
+            .intermediate_buffers
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?;
+        let h = mc.hidden_size;
+        let staging = self
+            .device
+            .create_buffer_with_data(input_hidden_state, StorageMode::Shared)
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        {
+            let cmd = self
+                .queue
+                .command_buffer()
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            let enc = cmd
+                .compute_encoder()
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            ops::encode_copy_buffer(
+                &enc,
+                &self.pipelines()?.copy_buffer,
+                &staging,
+                &bufs.hidden_state,
+                (token_count * h) as u32,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        // Compute input norm for this layer.
+        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let eps = mc.rms_norm_eps as f32;
+        let lw = &weights.layers[layer_idx];
+
+        let cmd_buf = self
+            .queue
+            .command_buffer()
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        {
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            ops::encode_rms_norm(
+                &enc,
+                &self.pipelines()?.rms_norm,
+                &ops::RmsNormParams {
+                    input: &bufs.hidden_state,
+                    weight: &lw.input_norm,
+                    output: &bufs.norm_out,
+                    hidden_size: h as u32,
+                    token_count: token_count as u32,
+                    eps,
+                },
+            );
+            enc.end_encoding();
+        }
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        self.run_pipeline_calibration_from_layer(layer_idx, token_count)?;
+
+        // Readback hidden_state (Private → Shared copy).
+        self.seq_pos = 0;
+        let bufs = self
+            .intermediate_buffers
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?;
+        let output_bytes = token_count * h * 2;
+        let scratch = self
+            .device
+            .create_buffer(output_bytes.max(16), StorageMode::Shared)
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        {
+            let cmd = self
+                .queue
+                .command_buffer()
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            let enc = cmd
+                .compute_encoder()
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            ops::encode_copy_buffer(
+                &enc,
+                &self.pipelines()?.copy_buffer,
+                &bufs.hidden_state,
+                &scratch,
+                (token_count * h) as u32,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+        let mut output = vec![0u8; output_bytes];
+        scratch
+            .read_bytes(&mut output, 0)
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        Ok(output)
+    }
+
+    fn swap_layer_weight(
         &mut self,
         layer_idx: usize,
         proj_name: &str,
@@ -1682,9 +1784,7 @@ impl MetalInference {
             .swap_layer_weight(layer_idx, proj_name, new_weight)
     }
 
-    /// Create a Dense FP16 GPU buffer from CPU f32 data, forwarding to
-    /// [`super::weights::create_dense_f16_buffer`].
-    pub fn create_dense_f16_buffer(
+    fn create_dense_f16_buffer(
         &self,
         data_f32: &[f32],
     ) -> Result<super::weights::WeightBuffer, InferenceError> {
@@ -1692,25 +1792,11 @@ impl MetalInference {
             .map_err(|e| InferenceError::runtime(e.to_string()))
     }
 
-    /// Create an empty Dense FP16 GPU buffer sized for `n_elements` values.
-    ///
-    /// Use [`update_dense_f16_buffer`](Self::update_dense_f16_buffer) to
-    /// write data before dispatching.
-    pub fn create_dense_f16_buffer_sized(
+    fn create_dense_f16_buffer_sized(
         &self,
         n_elements: usize,
     ) -> Result<super::weights::WeightBuffer, InferenceError> {
         super::weights::create_dense_f16_buffer_sized(&self.device, n_elements)
-            .map_err(|e| InferenceError::runtime(e.to_string()))
-    }
-
-    /// Overwrite the contents of a Dense FP16 buffer with new f32 data,
-    /// avoiding a GPU allocation.
-    pub fn update_dense_f16_buffer(
-        wb: &super::weights::WeightBuffer,
-        data_f32: &[f32],
-    ) -> Result<(), InferenceError> {
-        super::weights::update_dense_f16_data(wb, data_f32)
             .map_err(|e| InferenceError::runtime(e.to_string()))
     }
 }

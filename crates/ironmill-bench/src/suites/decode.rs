@@ -31,7 +31,7 @@ pub(crate) fn load_metal_engine(
 ) -> Result<MetalEngineHandle> {
     use ironmill_compile::weights::SafeTensorsProvider;
     use ironmill_compile::weights::quantized::{D2QuantConfig, QuantizedWeightProvider};
-    use ironmill_inference::metal::MetalInference;
+    use ironmill_inference::metal::{GpuCalibrationEngine, MetalInference};
 
     let model_dir = if let Some(ref md) = model_cfg.model_dir {
         md.clone()

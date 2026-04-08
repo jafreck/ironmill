@@ -30,3 +30,7 @@ pub use engine::{MetalArtifacts, MetalInference};
 pub use error::MetalError;
 pub use mla::MlaConfig;
 pub use ops::LinearKernelKind;
+
+// Calibration API — import `GpuCalibrationEngine` to access calibration
+// methods on `MetalInference` (DAC, block-level alpha search, weight swapping).
+pub use calibration::{GpuCalibrationEngine, update_weight_buffer_f16};

@@ -23,7 +23,9 @@ use ironmill_compile::weights::calibration::{
 use ironmill_compile::weights::{SafeTensorsProvider, WeightProvider};
 use ironmill_inference::calibration::{ActivationHook, CalibrationDataset};
 use ironmill_inference::engine::InferenceEngine;
-use ironmill_inference::metal::{MetalConfig, MetalInference};
+use ironmill_inference::metal::{
+    GpuCalibrationEngine, MetalConfig, MetalInference, update_weight_buffer_f16,
+};
 use mil_rs::ir::ScalarType;
 
 // ── Custom hook: captures per-layer activation data ────────────
@@ -365,7 +367,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return Ok(f64::INFINITY);
                         }
                         let dq = quantize_dequant_scaled(w, out_f, in_f, &scales, group_size);
-                        MetalInference::update_dense_f16_buffer(&scratch_bufs[i], &dq)?;
+                        update_weight_buffer_f16(&scratch_bufs[i], &dq)?;
                         let scratch = std::mem::replace(
                             &mut scratch_bufs[i],
                             ironmill_inference::metal::weights::WeightBuffer::empty(),
@@ -462,7 +464,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clip_projs: &[&str] = &["v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"];
 
     for layer_idx in 0..n_layers {
+        let gdn = is_gdn_layer(&provider, layer_idx);
         for &proj in clip_projs {
+            // Skip attention projections for GDN layers
+            if gdn && ATTN_PROJS.contains(&proj) {
+                continue;
+            }
             let key = format!("l{layer_idx}_{proj}_weight");
             let alpha = block_config.get(&key).map(|c| c.alpha).unwrap_or(0.5);
 
