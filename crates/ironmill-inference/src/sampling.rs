@@ -19,6 +19,8 @@ use std::fmt;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SamplingError {
+    /// The caller supplied an empty logits slice.
+    EmptyLogits,
     /// No valid (finite-logit) tokens remain after filtering.
     EmptyDistribution,
 }
@@ -26,6 +28,7 @@ pub enum SamplingError {
 impl fmt::Display for SamplingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyLogits => write!(f, "logits slice must not be empty"),
             Self::EmptyDistribution => write!(f, "no valid tokens remain after filtering"),
         }
     }
@@ -249,7 +252,9 @@ impl Sampler {
     ///
     /// Returns an error if all logits are filtered to -∞ (empty distribution).
     pub fn sample(&mut self, logits: &mut [f32]) -> Result<u32, SamplingError> {
-        assert!(!logits.is_empty(), "logits must not be empty");
+        if logits.is_empty() {
+            return Err(SamplingError::EmptyLogits);
+        }
 
         // 1. Repetition / frequency / presence penalty.
         self.apply_repetition_penalty(logits);
