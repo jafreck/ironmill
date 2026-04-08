@@ -71,31 +71,49 @@ impl TransformPipeline {
         self
     }
 
-    /// Add an int4 affine quantization transform (not yet implemented).
-    #[allow(unused)]
+    /// Add an int4 affine quantization transform.
+    ///
+    /// **Not yet implemented.** Currently returns [`TransformError::Unsupported`].
+    /// Requires int4 packing layout and affine dequantization parameters
+    /// (scale, zero_point per group).
+    ///
+    /// # Arguments
+    /// * `_group_size` — Number of elements per quantization group.
+    ///
+    /// # Errors
+    /// Always returns [`TransformError::Unsupported`] until implemented.
     pub fn with_int4(self, _group_size: usize) -> Result<Self, TransformError> {
-        // TODO: Implement Int4AffineTransform — requires int4 packing layout
-        // and affine dequantization parameters (scale, zero_point per group).
         Err(TransformError::Unsupported(
             "Int4AffineTransform not yet implemented".into(),
         ))
     }
 
-    /// Add a float16 cast transform (not yet implemented).
-    #[allow(unused)]
+    /// Add a float16 cast transform.
+    ///
+    /// **Not yet implemented.** Currently returns [`TransformError::Unsupported`].
+    /// Will cast each weight tensor element from its source dtype (f32, bf16, etc.)
+    /// to fp16.
+    ///
+    /// # Errors
+    /// Always returns [`TransformError::Unsupported`] until implemented.
     pub fn with_fp16(self) -> Result<Self, TransformError> {
-        // TODO: Implement Fp16CastTransform — cast each weight tensor
-        // element from its source dtype (f32, bf16, etc.) to fp16.
         Err(TransformError::Unsupported(
             "Fp16CastTransform not yet implemented".into(),
         ))
     }
 
-    /// Add a polar quantization transform (not yet implemented).
-    #[allow(unused)]
+    /// Add a polar quantization transform.
+    ///
+    /// **Not yet implemented.** Currently returns [`TransformError::Unsupported`].
+    /// Requires polar coordinate encoding of weight matrices and appropriate
+    /// dequant kernel support.
+    ///
+    /// # Arguments
+    /// * `_bits` — Bit width for polar quantization.
+    ///
+    /// # Errors
+    /// Always returns [`TransformError::Unsupported`] until implemented.
     pub fn with_polar_quant(self, _bits: u8) -> Result<Self, TransformError> {
-        // TODO: Implement PolarQuantTransform — requires polar coordinate
-        // encoding of weight matrices and appropriate dequant kernel support.
         Err(TransformError::Unsupported(
             "PolarQuantTransform not yet implemented".into(),
         ))

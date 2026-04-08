@@ -102,14 +102,17 @@ fn simple_random_f32() -> f32 {
 // EOS helpers
 // ---------------------------------------------------------------------------
 
-/// Common EOS token IDs across popular tokenizers.
+/// Fallback EOS token IDs used when a model does not declare its own.
 ///
 /// - 2: LLaMA, Qwen
 /// - 151643: Qwen3 (tiktoken-based)
 /// - 128001: LLaMA-3
 ///
-/// TODO: These should come from `ModelArchitecture` metadata so each model
-/// declares its own EOS tokens rather than relying on a shared default.
+/// Prefer [`ModelInfo::eos_tokens`](ironmill_core::model_info::ModelInfo::eos_tokens)
+/// when available — each model should declare its own EOS tokens via
+/// `generation_config.json` or `tokenizer_config.json`. This constant
+/// exists only as a last-resort fallback for legacy code paths that lack
+/// access to model metadata.
 pub const DEFAULT_EOS_TOKENS: &[u32] = &[2, 151643, 128001];
 
 /// Check if a token ID is an end-of-sequence marker.

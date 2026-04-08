@@ -1778,8 +1778,14 @@ impl<D: AneDevice> AneInference<D> {
                 AneError::Other(anyhow::anyhow!("sampling produced empty logits"))
             })?;
 
-            // EOS detection (common EOS token IDs).
-            if is_eos_token(token_id, DEFAULT_EOS_TOKENS) {
+            // EOS detection — use model-specific EOS tokens.
+            let eos = &self.model_info.eos_tokens;
+            let eos_tokens = if eos.is_empty() {
+                DEFAULT_EOS_TOKENS
+            } else {
+                eos.as_slice()
+            };
+            if is_eos_token(token_id, eos_tokens) {
                 break;
             }
 

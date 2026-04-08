@@ -57,7 +57,8 @@ pub mod mil {
     pub use mil_rs::reader::{print_model_summary, print_onnx_summary};
 
     /// Protobuf model types — kept for backward compatibility with ironmill-compile-ffi.
-    // TODO(§3.6): deprecate and remove once downstream crates import from mil-rs directly.
+    // NOTE: Deprecated since 0.2.0. Still used by ironmill-compile-ffi;
+    // remove once that crate imports from mil_rs::proto directly.
     #[deprecated(
         since = "0.2.0",
         note = "import protobuf types from `mil_rs::proto` directly instead of `ironmill_compile::mil::proto`"
@@ -84,7 +85,8 @@ pub mod mil {
         pub use mil_rs::ir::passes::IdentityEliminationPass;
         pub use mil_rs::ir::passes::PolarQuantPass;
 
-        // TODO(§3.6): deprecate and remove — used by ironmill-bench quality module.
+        // NOTE: Deprecated since 0.2.0. Still used by ironmill-bench quality module;
+        // remove once that crate imports from mil_rs::ir::passes directly.
         #[deprecated(
             since = "0.2.0",
             note = "import `tensor_utils` from `mil_rs::ir::passes` directly"

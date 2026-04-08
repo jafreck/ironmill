@@ -132,7 +132,6 @@ pub(super) fn emit_linear(
 }
 
 /// Emit a MIL `gather` operation to index into an embedding table.
-#[allow(dead_code)]
 pub(super) fn emit_gather(
     block: &mut Block,
     provider: &dyn WeightProvider,
@@ -243,7 +242,6 @@ pub(super) fn emit_transpose(
 }
 
 /// Emit a softmax operation along the last axis.
-#[allow(dead_code)]
 pub(super) fn emit_softmax(block: &mut Block, input: &str, op_name: &str) -> String {
     let out_name = format!("{op_name}_out");
     let op = Operation::new("softmax", op_name)
@@ -312,7 +310,6 @@ pub(super) fn emit_rope_tables(block: &mut Block, config: &ModelConfig) -> (Stri
 /// Precompute cos/sin frequency tables with explicit parameters.
 /// Supports partial rotation: only the first `rotary_dim` dimensions are rotated.
 /// Returns `(cos_table_name, sin_table_name)`.
-#[allow(dead_code)]
 pub(super) fn emit_rope_tables_with_params(
     block: &mut Block,
     head_dim: usize,
