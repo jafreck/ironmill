@@ -22,15 +22,17 @@ use crate::engine::InferenceError;
 use ironmill_core::model_info::ModelInfo;
 
 impl MetalInference {
-    /// Load model weights directly from a [`WeightProvider`], bypassing
-    /// the type-erased [`InferenceEngine::load`] interface.
-    pub fn load_weights(
+    /// Shared model bootstrapping logic called by both [`load_weights`] and
+    /// [`load`] after weights have been loaded and `self.config` has been set.
+    ///
+    /// `compute_outliers` controls whether TurboQuant outlier detection runs
+    /// (requires reading K/V projection tensors from the provider).
+    fn init_model_state(
         &mut self,
-        provider: &dyn mil_rs::weights::WeightProvider,
-        config: MetalConfig,
+        mut weights: MetalWeights,
+        provider: &dyn WeightProvider,
+        compute_outliers: bool,
     ) -> Result<(), InferenceError> {
-        self.config = config;
-
         // Reset Gemma 4-specific state to avoid stale buffers from a
         // previously loaded model.
         self.global_head_dim = 0;
@@ -39,9 +41,6 @@ impl MetalInference {
         self.global_rope_sin = None;
         self.unit_norm_weight = None;
         self.gemma4_config = None;
-
-        let mut weights = MetalWeights::load(&self.device, provider, self.config.force_cpu_dequant)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         let mc = weights.config.clone();
         self.model_config = Some(mc.clone());
@@ -184,12 +183,9 @@ impl MetalInference {
         // ── MLA detection and weight absorption ─────────────────
         let mla_cfg = mc.mla_config();
         if let Some(ref mla) = mla_cfg {
-            // Perform weight absorption: fuse W_uk into Q and W_uv into O
-            // at load time so inference works directly on compressed latents.
             absorb_mla_weights(&self.device, &mut weights, mla, mc.hidden_size, provider)
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
-            // Create MLA compressed KV cache.
             let mla_cache = MlaKvCache::new(
                 &self.device,
                 mla,
@@ -227,62 +223,67 @@ impl MetalInference {
             // - b < 4: Algorithm 2 ((b-1)-bit K codebook + QJL). Outlier
             //   channel strategy (§4.3) auto-detects high-energy channels
             //   for independent quantization per group.
-            let use_qjl = self.config.n_bits < 4;
-            let outlier_cfg: Option<OutlierConfig> = if use_qjl {
-                let mut weight_data: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                for layer in 0..mc.num_hidden_layers {
-                    let prefix = format!("model.layers.{layer}");
-                    let k_name = format!("{prefix}.self_attn.k_proj.weight");
-                    let v_name = format!("{prefix}.self_attn.v_proj.weight");
-                    if let (Ok(k_t), Ok(v_t)) = (provider.tensor(&k_name), provider.tensor(&v_name))
-                    {
-                        weight_data.push((k_t.data.to_vec(), v_t.data.to_vec()));
+            let outlier_cfg: Option<OutlierConfig> = if compute_outliers {
+                let use_qjl = self.config.n_bits < 4;
+                if use_qjl {
+                    let mut weight_data: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    for layer in 0..mc.num_hidden_layers {
+                        let prefix = format!("model.layers.{layer}");
+                        let k_name = format!("{prefix}.self_attn.k_proj.weight");
+                        let v_name = format!("{prefix}.self_attn.v_proj.weight");
+                        if let (Ok(k_t), Ok(v_t)) =
+                            (provider.tensor(&k_name), provider.tensor(&v_name))
+                        {
+                            weight_data.push((k_t.data.to_vec(), v_t.data.to_vec()));
+                        } else {
+                            eprintln!(
+                                "warning: TurboQuant outlier config: skipping layer {layer} (missing k_proj or v_proj tensor)"
+                            );
+                        }
+                    }
+                    if weight_data.len() == mc.num_hidden_layers {
+                        let refs: Vec<(&[u8], &[u8])> = weight_data
+                            .iter()
+                            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                            .collect();
+                        let out_features = mc.num_key_value_heads * mc.head_dim;
+                        let n_outlier = mc.head_dim / 4;
+                        Some(OutlierConfig::from_weight_norms(
+                            &refs,
+                            out_features,
+                            mc.head_dim,
+                            n_outlier,
+                            self.config.n_bits,
+                            self.config.n_bits,
+                        ))
+                    } else if weight_data.is_empty() {
+                        return Err(InferenceError::runtime(
+                            "TurboQuant outlier config: all layers failed to load k_proj/v_proj tensors"
+                                .to_string(),
+                        ));
                     } else {
                         eprintln!(
-                            "warning: TurboQuant outlier config: skipping layer {layer} (missing k_proj or v_proj tensor)"
+                            "warning: TurboQuant outlier config: only {}/{} layers loaded, proceeding with partial data",
+                            weight_data.len(),
+                            mc.num_hidden_layers,
                         );
+                        let refs: Vec<(&[u8], &[u8])> = weight_data
+                            .iter()
+                            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                            .collect();
+                        let out_features = mc.num_key_value_heads * mc.head_dim;
+                        let n_outlier = mc.head_dim / 4;
+                        Some(OutlierConfig::from_weight_norms(
+                            &refs,
+                            out_features,
+                            mc.head_dim,
+                            n_outlier,
+                            self.config.n_bits,
+                            self.config.n_bits,
+                        ))
                     }
-                }
-                if weight_data.len() == mc.num_hidden_layers {
-                    let refs: Vec<(&[u8], &[u8])> = weight_data
-                        .iter()
-                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                        .collect();
-                    let out_features = mc.num_key_value_heads * mc.head_dim;
-                    let n_outlier = mc.head_dim / 4;
-                    Some(OutlierConfig::from_weight_norms(
-                        &refs,
-                        out_features,
-                        mc.head_dim,
-                        n_outlier,
-                        self.config.n_bits,
-                        self.config.n_bits,
-                    ))
-                } else if weight_data.is_empty() {
-                    return Err(InferenceError::runtime(
-                        "TurboQuant outlier config: all layers failed to load k_proj/v_proj tensors"
-                            .to_string(),
-                    ));
                 } else {
-                    eprintln!(
-                        "warning: TurboQuant outlier config: only {}/{} layers loaded, proceeding with partial data",
-                        weight_data.len(),
-                        mc.num_hidden_layers,
-                    );
-                    let refs: Vec<(&[u8], &[u8])> = weight_data
-                        .iter()
-                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                        .collect();
-                    let out_features = mc.num_key_value_heads * mc.head_dim;
-                    let n_outlier = mc.head_dim / 4;
-                    Some(OutlierConfig::from_weight_norms(
-                        &refs,
-                        out_features,
-                        mc.head_dim,
-                        n_outlier,
-                        self.config.n_bits,
-                        self.config.n_bits,
-                    ))
+                    None
                 }
             } else {
                 None
@@ -385,6 +386,21 @@ impl MetalInference {
         Ok(())
     }
 
+    /// Load model weights directly from a [`WeightProvider`], bypassing
+    /// the type-erased [`InferenceEngine::load`] interface.
+    pub fn load_weights(
+        &mut self,
+        provider: &dyn mil_rs::weights::WeightProvider,
+        config: MetalConfig,
+    ) -> Result<(), InferenceError> {
+        self.config = config;
+
+        let weights = MetalWeights::load(&self.device, provider, self.config.force_cpu_dequant)
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        self.init_model_state(weights, provider, true)
+    }
+
     /// JIT weight loading with on-the-fly transforms (not yet implemented).
     #[allow(dead_code)]
     pub(crate) fn load_jit(
@@ -401,284 +417,14 @@ impl MetalInference {
     pub fn load(&mut self, artifacts: &MetalArtifacts<'_>) -> Result<(), InferenceError> {
         self.config = artifacts.config.clone();
 
-        // Reset Gemma 4-specific state to avoid stale buffers from a
-        // previously loaded model.
-        self.global_head_dim = 0;
-        self.global_pipelines = None;
-        self.global_rope_cos = None;
-        self.global_rope_sin = None;
-        self.unit_norm_weight = None;
-        self.gemma4_config = None;
-
-        // Load weights into Metal buffers.
-        let mut weights = MetalWeights::load(
+        let weights = MetalWeights::load(
             &self.device,
             artifacts.weights,
             self.config.force_cpu_dequant,
         )
         .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
-        let mc = weights.config.clone();
-        self.model_config = Some(mc.clone());
-        self.gemma4_config = Gemma4Config::from_model_config(&mc);
-        self.model_info = Some(ModelInfo::from_config(&mc));
-
-        // Pre-allocate logits readback buffer (vocab × 2 bytes for FP16).
-        self.logits_fp16_buf.resize(mc.vocab_size * 2, 0);
-
-        // Compute rotary_dim from partial_rotary_factor (defaults to head_dim).
-        let partial_rotary_factor = mc
-            .extra
-            .get("rope_parameters")
-            .and_then(|rp| rp.get("partial_rotary_factor"))
-            .and_then(|v| v.as_f64())
-            .or_else(|| {
-                mc.extra
-                    .get("partial_rotary_factor")
-                    .and_then(|v| v.as_f64())
-            })
-            .unwrap_or_else(|| {
-                eprintln!(
-                    "partial_rotary_factor not specified, defaulting to 1.0 (full-head RoPE)"
-                );
-                1.0
-            });
-        let rotary_dim = (mc.head_dim as f64 * partial_rotary_factor) as usize;
-
-        // Compile Metal shader pipelines with the model's head_dim so
-        // shared memory is sized exactly via #define HEAD_DIM.
-        let pipelines = super::ops::MetalPipelines::compile(&self.device, mc.head_dim, rotary_dim)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        self.pipelines = Some(pipelines);
-
-        // Allocate intermediate buffers (start at 1 token; run_pipeline_inner
-        // grows them on demand for larger prefill batches).
-        let bufs = IntermediateBuffers::allocate(&self.device, 1, &mc, self.gemma4_config.as_ref())
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        self.intermediate_buffers = Some(bufs);
-
-        // Build RoPE cos/sin caches.
-        let (cos, sin) = build_rope_cache(
-            &self.device,
-            mc.head_dim,
-            rotary_dim,
-            self.config.max_seq_len,
-            mc.rope_theta,
-            1.0,
-        )
-        .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        self.rope_cos = Some(cos);
-        self.rope_sin = Some(sin);
-
-        // Build global-layer RoPE tables if Gemma 4 uses a different theta.
-        if let Some(ref g4) = self.gemma4_config {
-            if let Some(rp) = mc.rope_parameters() {
-                if let Some(global_cfg) = rp.get("full_attention") {
-                    let global_hd = g4.global_head_dim;
-                    if global_hd != mc.head_dim
-                        || global_cfg.theta != mc.rope_theta
-                        || global_cfg.partial_rotary_factor != 1.0
-                    {
-                        let global_rotary_dim =
-                            (global_hd as f64 * global_cfg.partial_rotary_factor) as usize;
-                        let (gc, gs) = build_rope_cache(
-                            &self.device,
-                            global_hd,
-                            global_rotary_dim,
-                            self.config.max_seq_len,
-                            global_cfg.theta,
-                            global_cfg.partial_rotary_factor,
-                        )
-                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
-                        self.global_rope_cos = Some(gc);
-                        self.global_rope_sin = Some(gs);
-                    }
-                }
-            }
-
-            // Allocate unit-weight buffer for scale-free V-norm.
-            let max_hd = g4
-                .layer_configs
-                .iter()
-                .map(|lc| lc.head_dim)
-                .max()
-                .unwrap_or(0);
-            if max_hd > 0 {
-                let unit_data: Vec<u8> = (0..max_hd)
-                    .flat_map(|_| f16::from_f64(1.0).to_le_bytes())
-                    .collect();
-                let buf = self
-                    .device
-                    .create_buffer_with_data(&unit_data, StorageMode::Shared)
-                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
-                self.unit_norm_weight = Some(buf);
-            }
-        }
-
-        // Build MPS matmul cache for single-token decode.
-        let decode_cache_t1 =
-            build_matmul_cache(&self.device, &mc, self.gemma4_config.as_ref(), &weights, 1)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        self.decode_matmuls_t1 = Some(decode_cache_t1);
-        self.decode_matmuls = None;
-
-        // Resolve CLA anchor layers.
-        let cla_anchors = self
-            .config
-            .cla_config
-            .as_ref()
-            .map(|c| c.anchor_layers.clone())
-            .or_else(|| mc.cla_anchor_layers());
-        if let Some(ref anchors) = cla_anchors {
-            let cla = super::config::ClaConfig {
-                anchor_layers: anchors.clone(),
-            };
-            cla.validate(mc.num_hidden_layers)?;
-        }
-        // Back-fill cla_config so is_anchor checks during inference see the
-        // metadata-derived anchors, not the absent user config.
-        if self.config.cla_config.is_none() {
-            if let Some(ref anchors) = cla_anchors {
-                self.config.cla_config = Some(super::config::ClaConfig {
-                    anchor_layers: anchors.clone(),
-                });
-            }
-        }
-
-        // ── MLA detection and weight absorption ─────────────────
-        let mla_cfg = mc.mla_config();
-        if let Some(ref mla) = mla_cfg {
-            absorb_mla_weights(
-                &self.device,
-                &mut weights,
-                mla,
-                mc.hidden_size,
-                artifacts.weights,
-            )
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-
-            let mla_cache = MlaKvCache::new(
-                &self.device,
-                mla,
-                mc.num_hidden_layers,
-                self.config.max_seq_len,
-            )
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            self.mla_kv_cache = Some(mla_cache);
-        } else {
-            self.mla_kv_cache = None;
-        }
-        self.mla_config = mla_cfg;
-
-        // Resolve sliding window config from model metadata.
-        if self.config.sliding_window.is_none() {
-            if let Some(ws) = mc.sliding_window() {
-                let mwl = mc.max_window_layers().unwrap_or(mc.num_hidden_layers);
-                self.config.sliding_window = Some(super::config::SlidingWindowConfig {
-                    window_size: ws,
-                    max_window_layers: mwl,
-                });
-            }
-        }
-
-        let layer_window_sizes: Vec<usize> = (0..mc.num_hidden_layers)
-            .map(|l| self.config.layer_window_size(l))
-            .collect();
-
-        // Initialize KV cache.
-        if self.config.enable_turboquant {
-            let tq_layer_configs: Vec<TurboQuantLayerConfig> =
-                if let Some(ref g4) = self.gemma4_config {
-                    g4.layer_configs
-                        .iter()
-                        .map(|lc| TurboQuantLayerConfig {
-                            head_dim: lc.head_dim,
-                            num_kv_heads: lc.num_kv_heads,
-                            per_head_k_codebooks: None,
-                            per_head_v_codebooks: None,
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-            let tq_config = TurboQuantMetalConfig {
-                n_bits: self.config.n_bits,
-                num_kv_heads: mc.num_key_value_heads,
-                head_dim: mc.head_dim,
-                max_seq_len: self.config.max_seq_len,
-                num_layers: mc.num_hidden_layers,
-                rotation_seed: self.config.rotation_seed,
-                outlier: None,
-                outlier_config: OutlierQuantConfig::default(),
-                anchor_layers: cla_anchors.clone(),
-                window_sizes: layer_window_sizes.clone(),
-                layer_configs: tq_layer_configs,
-            };
-            let tq_model = MetalTurboQuantModel::new(&self.device, tq_config.clone())
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            let kv_cache = MetalKvCache::new(&self.device, &tq_config)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            self.turboquant = Some(tq_model);
-            self.kv_cache = Some(kv_cache);
-            self.fp16_kv_cache = None;
-        } else {
-            let per_layer_dims: Option<Vec<(usize, usize)>> =
-                self.gemma4_config.as_ref().map(|g4| {
-                    g4.layer_configs
-                        .iter()
-                        .map(|lc| (lc.num_kv_heads, lc.head_dim))
-                        .collect()
-                });
-            let fp16_kv = Fp16KvCache::new(
-                &self.device,
-                mc.num_hidden_layers,
-                mc.num_key_value_heads,
-                self.config.max_seq_len,
-                mc.head_dim,
-                cla_anchors.clone(),
-                &layer_window_sizes,
-                per_layer_dims.as_deref(),
-            )
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            self.fp16_kv_cache = Some(fp16_kv);
-            self.turboquant = None;
-            self.kv_cache = None;
-        }
-
-        // ── GDN state allocation ────────────────────────────────
-        let gdn_cfg = super::config::GdnModelConfig::from_model_config(&mc);
-        if let Some(ref cfg) = gdn_cfg {
-            let gdn = GdnState::new(&self.device, cfg, mc.hidden_size)
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
-            self.gdn_state = Some(gdn);
-        } else {
-            self.gdn_state = None;
-        }
-
-        weights.compact();
-
-        self.weights = Some(weights);
-
-        // ── Build per-layer execution plans ───────────────────────
-        self.layer_plans = LayerPlan::build(
-            &mc,
-            self.gemma4_config.as_ref(),
-            gdn_cfg.as_ref(),
-            self.config.cla_config.as_ref(),
-            self.weights.as_ref().unwrap(),
-        )?;
-
-        // ── Build model-level execution plan ──────────────────────
-        self.model_plan = Some(ModelPlan::build(
-            &mc,
-            &self.config,
-            self.gemma4_config.as_ref(),
-            self.layer_plans.clone(),
-        ));
-
-        self.seq_pos = 0;
-        Ok(())
+        self.init_model_state(weights, artifacts.weights, false)
     }
 }
 
