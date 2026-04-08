@@ -17,51 +17,51 @@ pub struct FusedPipelines {
 // ── Parameter structs ────────────────────────────────────────────
 
 /// Parameters for [`encode_fused_residual_norm_matvec`].
-pub(crate) struct FusedResidualNormMatvecParams<'a> {
+pub struct FusedResidualNormMatvecParams<'a> {
     /// First residual addend.
-    pub(crate) a: &'a MetalBuffer,
+    pub a: &'a MetalBuffer,
     /// Second residual addend.
-    pub(crate) b: &'a MetalBuffer,
+    pub b: &'a MetalBuffer,
     /// RMSNorm weight buffer.
-    pub(crate) norm_weight: &'a MetalBuffer,
+    pub norm_weight: &'a MetalBuffer,
     /// Output buffer for residual sum (a + b).
-    pub(crate) residual_output: &'a MetalBuffer,
+    pub residual_output: &'a MetalBuffer,
     /// Packed FP16 weight matrix.
-    pub(crate) w_packed: &'a MetalBuffer,
+    pub w_packed: &'a MetalBuffer,
     /// Matvec output buffer.
-    pub(crate) y: &'a MetalBuffer,
+    pub y: &'a MetalBuffer,
     /// Output buffer for the normed intermediate.
-    pub(crate) normed_output: &'a MetalBuffer,
+    pub normed_output: &'a MetalBuffer,
     /// Input dimension (hidden size).
-    pub(crate) k: u32,
+    pub k: u32,
     /// Output dimension (projection size).
-    pub(crate) n: u32,
+    pub n: u32,
     /// RMSNorm epsilon.
-    pub(crate) eps: f32,
+    pub eps: f32,
 }
 
 /// Parameters for [`encode_fused_residual_norm_affine_matvec_int4`].
-pub(crate) struct FusedResidualNormAffineInt4Params<'a> {
+pub struct FusedResidualNormAffineInt4Params<'a> {
     /// First residual addend.
-    pub(crate) a: &'a MetalBuffer,
+    pub a: &'a MetalBuffer,
     /// Second residual addend.
-    pub(crate) b: &'a MetalBuffer,
+    pub b: &'a MetalBuffer,
     /// RMSNorm weight buffer.
-    pub(crate) norm_weight: &'a MetalBuffer,
+    pub norm_weight: &'a MetalBuffer,
     /// Output buffer for residual sum (a + b).
-    pub(crate) residual_output: &'a MetalBuffer,
+    pub residual_output: &'a MetalBuffer,
     /// Affine INT4 quantized weight.
-    pub(crate) weight: &'a crate::metal::weights::AffineQuantizedWeight,
+    pub weight: &'a crate::metal::weights::AffineQuantizedWeight,
     /// Matvec output buffer.
-    pub(crate) output: &'a MetalBuffer,
+    pub output: &'a MetalBuffer,
     /// Output buffer for the normed intermediate.
-    pub(crate) normed_output: &'a MetalBuffer,
+    pub normed_output: &'a MetalBuffer,
     /// Output dimension (projection size).
-    pub(crate) n: u32,
+    pub n: u32,
     /// Input dimension (hidden size).
-    pub(crate) k: u32,
+    pub k: u32,
     /// RMSNorm epsilon.
-    pub(crate) eps: f32,
+    pub eps: f32,
 }
 
 // ── Dispatch helpers ─────────────────────────────────────────────
@@ -72,7 +72,7 @@ pub(crate) struct FusedResidualNormAffineInt4Params<'a> {
 /// Each threadgroup computes (a+b), derives rms_inv, and performs the
 /// matvec using the normed input — all in one dispatch.
 /// Threadgroup 0 writes `residual_output = a + b` and `normed_output = RMSNorm(a+b)`.
-pub fn encode_fused_residual_norm_matvec(
+pub(crate) fn encode_fused_residual_norm_matvec(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
     params: &FusedResidualNormMatvecParams<'_>,
@@ -98,7 +98,7 @@ pub fn encode_fused_residual_norm_matvec(
 /// Same fusion as `encode_fused_residual_norm_matvec` but for INT4 weights.
 /// One threadgroup per output row, 32 threads per group.
 /// Also writes `normed_output` for subsequent projections.
-pub fn encode_fused_residual_norm_affine_matvec_int4(
+pub(crate) fn encode_fused_residual_norm_affine_matvec_int4(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
     params: &FusedResidualNormAffineInt4Params<'_>,

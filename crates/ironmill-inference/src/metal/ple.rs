@@ -12,6 +12,20 @@ use super::projection::encode_projection;
 use super::weights::{LayerWeights, MetalWeights, WeightBuffer};
 use crate::engine::InferenceError;
 
+pub(crate) struct PleModelLevelParams<'a> {
+    pub(crate) device: &'a MetalDevice,
+    pub(crate) weights: &'a MetalWeights,
+    pub(crate) bufs: &'a IntermediateBuffers,
+    pub(crate) token_ids_buf: &'a MetalBuffer,
+    pub(crate) mc: &'a ModelConfig,
+    pub(crate) gemma4_config: Option<&'a Gemma4Config>,
+    pub(crate) token_count: usize,
+    pub(crate) h: usize,
+    pub(crate) vocab: usize,
+    pub(crate) eps: f32,
+    pub(crate) apply_scaling: bool,
+}
+
 /// Encode PLE model-level computation (before layer loop).
 ///
 /// When `apply_scaling` is true (normal inference), the embedding output is
@@ -21,22 +35,24 @@ use crate::engine::InferenceError;
 ///
 /// When `apply_scaling` is false (calibration), those scaling steps are
 /// skipped and RMSNorm treats the full ple_total width as hidden_size.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_ple_model_level(
     enc: &ComputeEncoder,
     pipelines: &MetalPipelines,
-    device: &MetalDevice,
-    weights: &MetalWeights,
-    bufs: &IntermediateBuffers,
-    token_ids_buf: &MetalBuffer,
-    mc: &ModelConfig,
-    gemma4_config: Option<&Gemma4Config>,
-    token_count: usize,
-    h: usize,
-    vocab: usize,
-    eps: f32,
-    apply_scaling: bool,
+    params: &PleModelLevelParams<'_>,
 ) -> Result<(), InferenceError> {
+    let PleModelLevelParams {
+        device,
+        weights,
+        bufs,
+        token_ids_buf,
+        mc,
+        gemma4_config,
+        token_count,
+        h,
+        vocab,
+        eps,
+        apply_scaling,
+    } = *params;
     let g4 = match gemma4_config {
         Some(g4) => g4,
         None => return Ok(()),
@@ -191,25 +207,39 @@ pub(crate) fn encode_ple_model_level(
     Ok(())
 }
 
+pub(crate) struct PlePerLayerParams<'a> {
+    pub(crate) bufs: &'a IntermediateBuffers,
+    pub(crate) lw: &'a LayerWeights,
+    pub(crate) next_input_norm: Option<&'a MetalBuffer>,
+    pub(crate) gemma4_config: Option<&'a Gemma4Config>,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) layer_idx: usize,
+    pub(crate) token_count: usize,
+    pub(crate) h: usize,
+    pub(crate) eps: f32,
+}
+
 /// Encode PLE per-layer gate and addition (inside layer loop).
 ///
 /// Returns `true` if PLE was applied (caller should skip the normal
 /// fused residual+norm path), or `false` if PLE is not active for this
 /// layer.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_ple_per_layer(
     enc: &ComputeEncoder,
     pipelines: &MetalPipelines,
-    bufs: &IntermediateBuffers,
-    lw: &LayerWeights,
-    next_input_norm: Option<&MetalBuffer>,
-    gemma4_config: Option<&Gemma4Config>,
-    num_hidden_layers: usize,
-    layer_idx: usize,
-    token_count: usize,
-    h: usize,
-    eps: f32,
+    params: &PlePerLayerParams<'_>,
 ) -> Result<bool, InferenceError> {
+    let PlePerLayerParams {
+        bufs,
+        lw,
+        next_input_norm,
+        gemma4_config,
+        num_hidden_layers,
+        layer_idx,
+        token_count,
+        h,
+        eps,
+    } = *params;
     let has_ple = gemma4_config
         .as_ref()
         .is_some_and(|g4| g4.ple_hidden_size > 0)

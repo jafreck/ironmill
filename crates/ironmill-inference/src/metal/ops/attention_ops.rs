@@ -314,25 +314,25 @@ const FLASH_DECODE_MIN_SEQ: usize = 256;
 const FLASH_DECODE_KV_PER_SPLIT: usize = 256;
 
 /// Parameters for [`encode_flash_decode`] — FlashDecoding-specific buffers and config.
-pub(crate) struct FlashDecodeParams<'a> {
+pub struct FlashDecodeParams<'a> {
     /// FlashDecoding split kernel pipeline.
-    pub(crate) split_pipeline: &'a ComputePipeline,
+    pub split_pipeline: &'a ComputePipeline,
     /// FlashDecoding reduce kernel pipeline.
-    pub(crate) reduce_pipeline: &'a ComputePipeline,
+    pub reduce_pipeline: &'a ComputePipeline,
     /// Single-pass fused SDPA fallback (used for short sequences).
-    pub(crate) sdpa_fallback: Option<&'a ComputePipeline>,
+    pub sdpa_fallback: Option<&'a ComputePipeline>,
     /// Partial output accumulator buffer (one per split × head).
-    pub(crate) partial_o: &'a MetalBuffer,
+    pub partial_o: &'a MetalBuffer,
     /// Partial softmax-max buffer (one per split × head).
-    pub(crate) partial_max: &'a MetalBuffer,
+    pub partial_max: &'a MetalBuffer,
     /// Partial softmax-sum buffer (one per split × head).
-    pub(crate) partial_sum: &'a MetalBuffer,
+    pub partial_sum: &'a MetalBuffer,
     /// Per-head max hint from previous step.
-    pub(crate) max_hint: &'a MetalBuffer,
+    pub max_hint: &'a MetalBuffer,
     /// Maximum number of KV splits to launch.
-    pub(crate) max_splits: usize,
+    pub max_splits: usize,
     /// GPU limit on concurrent threadgroups.
-    pub(crate) gpu_max_threadgroups: usize,
+    pub gpu_max_threadgroups: usize,
 }
 
 /// Encode FlashDecoding++: persistent split kernel with max hint, then reduce.
@@ -343,7 +343,7 @@ pub(crate) struct FlashDecodeParams<'a> {
 /// - Unified max hint: passes the previous step's softmax max to the split
 ///   kernel so the O accumulator avoids rescaling when max hasn't changed.
 /// - Reduce kernel writes back the global max for the next step's hint.
-pub fn encode_flash_decode(
+pub(crate) fn encode_flash_decode(
     encoder: &ComputeEncoder,
     params: &FusedSdpaParams<'_>,
     flash: &FlashDecodeParams<'_>,

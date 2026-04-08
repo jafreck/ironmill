@@ -25,151 +25,151 @@ pub struct GdnPipelines {
 // ── Parameter structs ────────────────────────────────────────────
 
 /// Parameters for [`encode_gdn_recurrent_update`].
-pub(crate) struct GdnRecurrentUpdateParams<'a> {
+pub struct GdnRecurrentUpdateParams<'a> {
     /// Conv1d + SiLU output buffer.
-    pub(crate) conv_out: &'a MetalBuffer,
+    pub conv_out: &'a MetalBuffer,
     /// A projection buffer.
-    pub(crate) a_proj: &'a MetalBuffer,
+    pub a_proj: &'a MetalBuffer,
     /// B projection buffer.
-    pub(crate) b_proj: &'a MetalBuffer,
+    pub b_proj: &'a MetalBuffer,
     /// Log-space A parameter buffer.
-    pub(crate) a_log: &'a MetalBuffer,
+    pub a_log: &'a MetalBuffer,
     /// Δt bias buffer.
-    pub(crate) dt_bias: &'a MetalBuffer,
+    pub dt_bias: &'a MetalBuffer,
     /// Recurrent state matrix buffer (read/write).
-    pub(crate) recurrent_state: &'a MetalBuffer,
+    pub recurrent_state: &'a MetalBuffer,
     /// Output buffer.
-    pub(crate) output: &'a MetalBuffer,
+    pub output: &'a MetalBuffer,
     /// Total key dimension.
-    pub(crate) key_dim: u32,
+    pub key_dim: u32,
     /// Total value dimension.
-    pub(crate) value_dim: u32,
+    pub value_dim: u32,
     /// Number of value heads.
-    pub(crate) num_v_heads: u32,
+    pub num_v_heads: u32,
     /// Per-head key dimension.
-    pub(crate) k_head_dim: u32,
+    pub k_head_dim: u32,
     /// Per-head value dimension.
-    pub(crate) v_head_dim: u32,
+    pub v_head_dim: u32,
     /// Number of key heads.
-    pub(crate) num_k_heads: u32,
+    pub num_k_heads: u32,
 }
 
 /// Parameters for [`encode_gdn_fused_decode`].
-pub(crate) struct GdnFusedDecodeParams<'a> {
+pub struct GdnFusedDecodeParams<'a> {
     /// QKV input buffer.
-    pub(crate) input_qkv: &'a MetalBuffer,
+    pub input_qkv: &'a MetalBuffer,
     /// Conv1d weight buffer.
-    pub(crate) conv_weight: &'a MetalBuffer,
+    pub conv_weight: &'a MetalBuffer,
     /// Conv state buffer (read/write).
-    pub(crate) conv_state: &'a MetalBuffer,
+    pub conv_state: &'a MetalBuffer,
     /// A projection buffer.
-    pub(crate) a_proj: &'a MetalBuffer,
+    pub a_proj: &'a MetalBuffer,
     /// B projection buffer.
-    pub(crate) b_proj: &'a MetalBuffer,
+    pub b_proj: &'a MetalBuffer,
     /// Log-space A parameter buffer.
-    pub(crate) a_log: &'a MetalBuffer,
+    pub a_log: &'a MetalBuffer,
     /// Δt bias buffer.
-    pub(crate) dt_bias: &'a MetalBuffer,
+    pub dt_bias: &'a MetalBuffer,
     /// Recurrent state matrix buffer (read/write).
-    pub(crate) recurrent_state: &'a MetalBuffer,
+    pub recurrent_state: &'a MetalBuffer,
     /// Z (gate) projection buffer.
-    pub(crate) z_proj: &'a MetalBuffer,
+    pub z_proj: &'a MetalBuffer,
     /// RMSNorm weight buffer.
-    pub(crate) norm_weight: &'a MetalBuffer,
+    pub norm_weight: &'a MetalBuffer,
     /// Output buffer.
-    pub(crate) output: &'a MetalBuffer,
+    pub output: &'a MetalBuffer,
     /// Scratch buffer for intermediate conv1d output.
-    pub(crate) conv_out_scratch: &'a MetalBuffer,
+    pub conv_out_scratch: &'a MetalBuffer,
     /// Total QKV dimension.
-    pub(crate) qkv_dim: u32,
+    pub qkv_dim: u32,
     /// Conv1d kernel size.
-    pub(crate) kernel_size: u32,
+    pub kernel_size: u32,
     /// Total key dimension.
-    pub(crate) key_dim: u32,
+    pub key_dim: u32,
     /// Total value dimension.
-    pub(crate) value_dim: u32,
+    pub value_dim: u32,
     /// Number of value heads.
-    pub(crate) num_v_heads: u32,
+    pub num_v_heads: u32,
     /// Per-head key dimension.
-    pub(crate) k_head_dim: u32,
+    pub k_head_dim: u32,
     /// Per-head value dimension.
-    pub(crate) v_head_dim: u32,
+    pub v_head_dim: u32,
     /// Number of key heads.
-    pub(crate) num_k_heads: u32,
+    pub num_k_heads: u32,
     /// RMSNorm epsilon.
-    pub(crate) eps: f32,
+    pub eps: f32,
 }
 
 /// Parameters for [`encode_gdn_batched_matvec`].
-pub(crate) struct GdnBatchedMatvecParams<'a> {
+pub struct GdnBatchedMatvecParams<'a> {
     /// Shared input buffer.
-    pub(crate) input: &'a MetalBuffer,
+    pub input: &'a MetalBuffer,
     /// QKV weight matrix (packed FP16).
-    pub(crate) w_qkv: &'a MetalBuffer,
+    pub w_qkv: &'a MetalBuffer,
     /// Z weight matrix.
-    pub(crate) w_z: &'a MetalBuffer,
+    pub w_z: &'a MetalBuffer,
     /// A weight matrix.
-    pub(crate) w_a: &'a MetalBuffer,
+    pub w_a: &'a MetalBuffer,
     /// B weight matrix.
-    pub(crate) w_b: &'a MetalBuffer,
+    pub w_b: &'a MetalBuffer,
     /// QKV output buffer.
-    pub(crate) y_qkv: &'a MetalBuffer,
+    pub y_qkv: &'a MetalBuffer,
     /// Z output buffer.
-    pub(crate) y_z: &'a MetalBuffer,
+    pub y_z: &'a MetalBuffer,
     /// A output buffer.
-    pub(crate) y_a: &'a MetalBuffer,
+    pub y_a: &'a MetalBuffer,
     /// B output buffer.
-    pub(crate) y_b: &'a MetalBuffer,
+    pub y_b: &'a MetalBuffer,
     /// Input dimension (hidden size).
-    pub(crate) k: u32,
+    pub k: u32,
     /// QKV output dimension.
-    pub(crate) n_qkv: u32,
+    pub n_qkv: u32,
     /// Z output dimension.
-    pub(crate) n_z: u32,
+    pub n_z: u32,
     /// A output dimension.
-    pub(crate) n_a: u32,
+    pub n_a: u32,
     /// B output dimension.
-    pub(crate) n_b: u32,
+    pub n_b: u32,
 }
 
 /// Parameters for [`encode_gdn_prefill_recurrent`].
-pub(crate) struct GdnPrefillRecurrentParams<'a> {
+pub struct GdnPrefillRecurrentParams<'a> {
     /// All-token conv1d output buffer.
-    pub(crate) all_conv_out: &'a MetalBuffer,
+    pub all_conv_out: &'a MetalBuffer,
     /// All-token A projection buffer.
-    pub(crate) all_a: &'a MetalBuffer,
+    pub all_a: &'a MetalBuffer,
     /// All-token B projection buffer.
-    pub(crate) all_b: &'a MetalBuffer,
+    pub all_b: &'a MetalBuffer,
     /// Log-space A parameter buffer.
-    pub(crate) a_log: &'a MetalBuffer,
+    pub a_log: &'a MetalBuffer,
     /// Δt bias buffer.
-    pub(crate) dt_bias: &'a MetalBuffer,
+    pub dt_bias: &'a MetalBuffer,
     /// RMSNorm weight buffer.
-    pub(crate) norm_weight: &'a MetalBuffer,
+    pub norm_weight: &'a MetalBuffer,
     /// All-token Z (gate) projection buffer.
-    pub(crate) all_z: &'a MetalBuffer,
+    pub all_z: &'a MetalBuffer,
     /// Recurrent state matrix buffer (read/write).
-    pub(crate) recurrent_state: &'a MetalBuffer,
+    pub recurrent_state: &'a MetalBuffer,
     /// All-token output buffer.
-    pub(crate) all_output: &'a MetalBuffer,
+    pub all_output: &'a MetalBuffer,
     /// Number of tokens in the prefill batch.
-    pub(crate) token_count: u32,
+    pub token_count: u32,
     /// Total QKV dimension.
-    pub(crate) qkv_dim: u32,
+    pub qkv_dim: u32,
     /// Total key dimension.
-    pub(crate) key_dim: u32,
+    pub key_dim: u32,
     /// Total value dimension.
-    pub(crate) value_dim: u32,
+    pub value_dim: u32,
     /// Number of value heads.
-    pub(crate) num_v_heads: u32,
+    pub num_v_heads: u32,
     /// Per-head key dimension.
-    pub(crate) k_head_dim: u32,
+    pub k_head_dim: u32,
     /// Per-head value dimension.
-    pub(crate) v_head_dim: u32,
+    pub v_head_dim: u32,
     /// RMSNorm epsilon.
-    pub(crate) eps: f32,
+    pub eps: f32,
     /// Number of key heads.
-    pub(crate) num_k_heads: u32,
+    pub num_k_heads: u32,
 }
 
 // ── Dispatch helpers ─────────────────────────────────────────────
@@ -207,7 +207,8 @@ pub fn encode_gdn_conv1d_silu(
 ///
 /// Per-head: compute gates, update state matrix S, compute o = S @ q.
 /// One threadgroup per head, v_head_dim threads per threadgroup.
-pub fn encode_gdn_recurrent_update(
+#[allow(dead_code)]
+pub(crate) fn encode_gdn_recurrent_update(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
     params: &GdnRecurrentUpdateParams<'_>,
@@ -266,7 +267,7 @@ pub fn encode_gdn_output_gate(
 ///
 /// One threadgroup per value head. Threads cooperate on conv1d channels,
 /// then each thread handles one row of the recurrent state matrix.
-pub fn encode_gdn_fused_decode(
+pub(crate) fn encode_gdn_fused_decode(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
     params: &GdnFusedDecodeParams<'_>,
@@ -311,7 +312,7 @@ pub fn encode_gdn_fused_decode(
 ///
 /// Computes y_i = x · W_i^T for i in {QKV, Z, A, B}. All share the same input x.
 /// Saves 3 dispatches per GDN layer compared to 4 separate `encode_matvec` calls.
-pub fn encode_gdn_batched_matvec(
+pub(crate) fn encode_gdn_batched_matvec(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
     params: &GdnBatchedMatvecParams<'_>,
@@ -378,7 +379,7 @@ pub fn encode_gdn_prefill_conv1d_silu(
 ///
 /// Processes ALL tokens sequentially per head in a single dispatch.
 /// One threadgroup per head, v_head_dim threads per threadgroup.
-pub fn encode_gdn_prefill_recurrent(
+pub(crate) fn encode_gdn_prefill_recurrent(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
     params: &GdnPrefillRecurrentParams<'_>,

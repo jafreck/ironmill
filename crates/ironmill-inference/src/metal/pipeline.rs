@@ -5,7 +5,8 @@ use ironmill_metal_sys::{CommandBufferStatus, MetalBuffer};
 use mil_rs::weights::Architecture;
 
 use super::attention::{
-    encode_end_of_layer_residual, encode_kv_cache_and_attention, encode_qk_norm_and_rope,
+    KvCacheAndAttentionParams, QkNormAndRopeParams, encode_end_of_layer_residual,
+    encode_kv_cache_and_attention, encode_qk_norm_and_rope,
 };
 use super::buffers::{ModelConfigExt, Q8_GROUP_SIZE, build_matmul_cache};
 use super::engine::MetalInference;
@@ -405,17 +406,19 @@ impl MetalInference {
         ple::encode_ple_model_level(
             &enc,
             self.pipelines()?,
-            &self.device,
-            weights,
-            bufs,
-            active_token_buf,
-            &mc,
-            self.gemma4_config.as_ref(),
-            token_count,
-            h,
-            vocab,
-            eps,
-            true,
+            &ple::PleModelLevelParams {
+                device: &self.device,
+                weights,
+                bufs,
+                token_ids_buf: active_token_buf,
+                mc: &mc,
+                gemma4_config: self.gemma4_config.as_ref(),
+                token_count,
+                h,
+                vocab,
+                eps,
+                apply_scaling: true,
+            },
         )?;
 
         // Per-layer processing.
@@ -618,17 +621,19 @@ impl MetalInference {
                     encode_qk_norm_and_rope(
                         &enc,
                         pipelines,
-                        bufs,
-                        lw.q_norm.as_ref(),
-                        lw.k_norm.as_ref(),
-                        layer_rope_cos,
-                        layer_rope_sin,
-                        nh,
-                        layer_nkv,
-                        layer_hd,
-                        seq_pos,
-                        token_count,
-                        eps,
+                        &QkNormAndRopeParams {
+                            bufs,
+                            q_norm: lw.q_norm.as_ref(),
+                            k_norm: lw.k_norm.as_ref(),
+                            rope_cos: layer_rope_cos,
+                            rope_sin: layer_rope_sin,
+                            nh,
+                            nkv: layer_nkv,
+                            hd: layer_hd,
+                            seq_pos,
+                            token_count,
+                            eps,
+                        },
                     )?;
                     // Barrier includes v_proj for KV cache (covers V-norm write if present).
                     enc.memory_barrier_with_resources(&[&bufs.q_proj, &bufs.k_proj, &bufs.v_proj]);
@@ -639,23 +644,25 @@ impl MetalInference {
                     encode_kv_cache_and_attention(
                         &enc,
                         pipelines,
-                        bufs,
-                        self.turboquant.as_ref(),
-                        self.kv_cache.as_ref(),
-                        self.fp16_kv_cache.as_ref(),
-                        self.config.max_seq_len,
-                        self.config.n_bits as usize,
-                        plan.kv_cache_layer,
-                        seq_pos,
-                        token_count,
-                        nh,
-                        layer_nkv,
-                        layer_hd,
-                        enable_tq,
-                        plan.kv_anchor,
-                        layer_window,
-                        attn_scale,
-                        self.gpu_max_threadgroups,
+                        &KvCacheAndAttentionParams {
+                            bufs,
+                            turboquant: self.turboquant.as_ref(),
+                            kv_cache: self.kv_cache.as_ref(),
+                            fp16_kv_cache: self.fp16_kv_cache.as_ref(),
+                            max_seq_len: self.config.max_seq_len,
+                            n_bits: self.config.n_bits as usize,
+                            layer_idx: plan.kv_cache_layer,
+                            seq_pos,
+                            token_count,
+                            nh,
+                            nkv: layer_nkv,
+                            hd: layer_hd,
+                            enable_tq,
+                            is_anchor: plan.kv_anchor,
+                            window_size: layer_window,
+                            attn_scale,
+                            gpu_max_threadgroups: self.gpu_max_threadgroups,
+                        },
                     )?;
                     enc.memory_barrier_with_resources(&[&bufs.attn_out]);
 
@@ -842,15 +849,17 @@ impl MetalInference {
             let ple_applied = ple::encode_ple_per_layer(
                 &enc,
                 self.pipelines()?,
-                bufs,
-                lw,
-                next_input_norm,
-                self.gemma4_config.as_ref(),
-                mc.num_hidden_layers,
-                layer_idx,
-                token_count,
-                h,
-                eps,
+                &ple::PlePerLayerParams {
+                    bufs,
+                    lw,
+                    next_input_norm,
+                    gemma4_config: self.gemma4_config.as_ref(),
+                    num_hidden_layers: mc.num_hidden_layers,
+                    layer_idx,
+                    token_count,
+                    h,
+                    eps,
+                },
             )?;
 
             if !ple_applied {

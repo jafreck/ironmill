@@ -9,22 +9,38 @@ use super::turboquant::{MetalKvCache, MetalTurboQuantModel};
 use super::weights::WeightBuffer;
 use crate::engine::InferenceError;
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct QkNormAndRopeParams<'a> {
+    pub(crate) bufs: &'a IntermediateBuffers,
+    pub(crate) q_norm: Option<&'a MetalBuffer>,
+    pub(crate) k_norm: Option<&'a MetalBuffer>,
+    pub(crate) rope_cos: &'a MetalBuffer,
+    pub(crate) rope_sin: &'a MetalBuffer,
+    pub(crate) nh: u32,
+    pub(crate) nkv: u32,
+    pub(crate) hd: u32,
+    pub(crate) seq_pos: usize,
+    pub(crate) token_count: usize,
+    pub(crate) eps: f32,
+}
+
 pub(crate) fn encode_qk_norm_and_rope(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
-    bufs: &IntermediateBuffers,
-    q_norm: Option<&MetalBuffer>,
-    k_norm: Option<&MetalBuffer>,
-    rope_cos: &MetalBuffer,
-    rope_sin: &MetalBuffer,
-    nh: u32,
-    nkv: u32,
-    hd: u32,
-    seq_pos: usize,
-    token_count: usize,
-    eps: f32,
+    params: &QkNormAndRopeParams<'_>,
 ) -> Result<(), InferenceError> {
+    let QkNormAndRopeParams {
+        bufs,
+        q_norm,
+        k_norm,
+        rope_cos,
+        rope_sin,
+        nh,
+        nkv,
+        hd,
+        seq_pos,
+        token_count,
+        eps,
+    } = *params;
     if let (Some(q_norm_w), Some(k_norm_w)) = (q_norm, k_norm) {
         // Fused path: one dispatch does RMSNorm + RoPE for both Q and K.
         enc.set_pipeline(&pipelines.norm.fused_qk_norm_rope);
@@ -78,28 +94,50 @@ pub(crate) fn encode_qk_norm_and_rope(
 /// Encode KV cache write and attention dispatch.
 ///
 /// Handles TurboQuant (outlier and standard) and FP16 KV cache paths.
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct KvCacheAndAttentionParams<'a> {
+    pub(crate) bufs: &'a IntermediateBuffers,
+    pub(crate) turboquant: Option<&'a MetalTurboQuantModel>,
+    pub(crate) kv_cache: Option<&'a MetalKvCache>,
+    pub(crate) fp16_kv_cache: Option<&'a Fp16KvCache>,
+    pub(crate) max_seq_len: usize,
+    pub(crate) n_bits: usize,
+    pub(crate) layer_idx: usize,
+    pub(crate) seq_pos: usize,
+    pub(crate) token_count: usize,
+    pub(crate) nh: u32,
+    pub(crate) nkv: u32,
+    pub(crate) hd: u32,
+    pub(crate) enable_tq: bool,
+    pub(crate) is_anchor: bool,
+    pub(crate) window_size: usize,
+    pub(crate) attn_scale: f32,
+    pub(crate) gpu_max_threadgroups: usize,
+}
+
 pub(crate) fn encode_kv_cache_and_attention(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
-    bufs: &IntermediateBuffers,
-    turboquant: Option<&MetalTurboQuantModel>,
-    kv_cache: Option<&MetalKvCache>,
-    fp16_kv_cache: Option<&Fp16KvCache>,
-    max_seq_len: usize,
-    n_bits: usize,
-    layer_idx: usize,
-    seq_pos: usize,
-    token_count: usize,
-    nh: u32,
-    nkv: u32,
-    hd: u32,
-    enable_tq: bool,
-    is_anchor: bool,
-    window_size: usize,
-    attn_scale: f32,
-    gpu_max_threadgroups: usize,
+    params: &KvCacheAndAttentionParams<'_>,
 ) -> Result<(), InferenceError> {
+    let KvCacheAndAttentionParams {
+        bufs,
+        turboquant,
+        kv_cache,
+        fp16_kv_cache,
+        max_seq_len,
+        n_bits,
+        layer_idx,
+        seq_pos,
+        token_count,
+        nh,
+        nkv,
+        hd,
+        enable_tq,
+        is_anchor,
+        window_size,
+        attn_scale,
+        gpu_max_threadgroups,
+    } = *params;
     // For SWA layers, use window_size as the buffer stride and ring-buffer
     // write position. For full-attention layers, use the global max_seq_len.
     let effective_max = if window_size > 0 {

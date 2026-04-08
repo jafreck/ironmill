@@ -128,35 +128,35 @@ impl QuipPipelines {
 // ── Parameter structs ────────────────────────────────────────────
 
 /// Parameters for [`encode_gdn_batched_affine_matvec_int4`].
-pub(crate) struct GdnBatchedAffineInt4Params<'a> {
+pub struct GdnBatchedAffineInt4Params<'a> {
     /// Shared input buffer.
-    pub(crate) input: &'a MetalBuffer,
+    pub input: &'a MetalBuffer,
     /// Projection 0 (QKV) weight.
-    pub(crate) w0: &'a crate::metal::weights::AffineQuantizedWeight,
+    pub w0: &'a crate::metal::weights::AffineQuantizedWeight,
     /// Projection 0 output buffer.
-    pub(crate) out0: &'a MetalBuffer,
+    pub out0: &'a MetalBuffer,
     /// Projection 0 output dimension.
-    pub(crate) n0: u32,
+    pub n0: u32,
     /// Projection 1 (Z) weight.
-    pub(crate) w1: &'a crate::metal::weights::AffineQuantizedWeight,
+    pub w1: &'a crate::metal::weights::AffineQuantizedWeight,
     /// Projection 1 output buffer.
-    pub(crate) out1: &'a MetalBuffer,
+    pub out1: &'a MetalBuffer,
     /// Projection 1 output dimension.
-    pub(crate) n1: u32,
+    pub n1: u32,
     /// Projection 2 (A) weight.
-    pub(crate) w2: &'a crate::metal::weights::AffineQuantizedWeight,
+    pub w2: &'a crate::metal::weights::AffineQuantizedWeight,
     /// Projection 2 output buffer.
-    pub(crate) out2: &'a MetalBuffer,
+    pub out2: &'a MetalBuffer,
     /// Projection 2 output dimension.
-    pub(crate) n2: u32,
+    pub n2: u32,
     /// Projection 3 (B) weight.
-    pub(crate) w3: &'a crate::metal::weights::AffineQuantizedWeight,
+    pub w3: &'a crate::metal::weights::AffineQuantizedWeight,
     /// Projection 3 output buffer.
-    pub(crate) out3: &'a MetalBuffer,
+    pub out3: &'a MetalBuffer,
     /// Projection 3 output dimension.
-    pub(crate) n3: u32,
+    pub n3: u32,
     /// Input dimension (hidden size).
-    pub(crate) k: u32,
+    pub k: u32,
 }
 
 // ── Dispatch helpers ─────────────────────────────────────────────
@@ -245,7 +245,7 @@ pub fn encode_fused_ffn_gate_up_act_int4(
 ///
 /// Computes qkv = x·W0^T, z = x·W1^T, a = x·W2^T, b = x·W3^T concurrently.
 /// Saves 3 dispatches per GDN layer compared to 4 separate `affine_matvec_int4` calls.
-pub fn encode_gdn_batched_affine_matvec_int4(
+pub(crate) fn encode_gdn_batched_affine_matvec_int4(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
     params: &GdnBatchedAffineInt4Params<'_>,
