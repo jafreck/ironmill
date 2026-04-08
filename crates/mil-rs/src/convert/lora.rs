@@ -441,22 +441,17 @@ pub fn scalar_from_bytes(data: &[u8], dtype: ScalarType) -> Option<f64> {
     }
 }
 
-/// Merge in fp32: W += scale * B @ A.
-fn merge_f32(
-    base_data: &mut Vec<u8>,
+/// Core merge logic: W[i,j] += scale * sum_r(B[i,r] * A[r,j])
+/// Operates on f32 slices; callers handle byte encoding/decoding.
+fn merge_core(
+    w: &mut [f32],
+    a: &[f32],
+    b: &[f32],
     out_features: usize,
     in_features: usize,
-    adapter: &LoraAdapter,
-    scale: f64,
+    rank: usize,
+    scale: f32,
 ) {
-    let rank = adapter.a_shape[0];
-    let scale = scale as f32;
-
-    let a = bytes_to_f32(&adapter.a_data);
-    let b = bytes_to_f32(&adapter.b_data);
-    let mut w = bytes_to_f32(base_data);
-
-    // W[i, j] += scale * sum_r(B[i, r] * A[r, j])
     for i in 0..out_features {
         for j in 0..in_features {
             let mut dot = 0.0f32;
@@ -466,7 +461,29 @@ fn merge_f32(
             w[i * in_features + j] += scale * dot;
         }
     }
+}
 
+/// Merge in fp32: W += scale * B @ A.
+fn merge_f32(
+    base_data: &mut Vec<u8>,
+    out_features: usize,
+    in_features: usize,
+    adapter: &LoraAdapter,
+    scale: f64,
+) {
+    let rank = adapter.a_shape[0];
+    let a = bytes_to_f32(&adapter.a_data);
+    let b = bytes_to_f32(&adapter.b_data);
+    let mut w = bytes_to_f32(base_data);
+    merge_core(
+        &mut w,
+        &a,
+        &b,
+        out_features,
+        in_features,
+        rank,
+        scale as f32,
+    );
     *base_data = f32_to_bytes(&w);
 }
 
@@ -479,22 +496,18 @@ fn merge_f16(
     scale: f64,
 ) {
     let rank = adapter.a_shape[0];
-    let scale = scale as f32;
-
     let a = bytes_to_f16_as_f32(&adapter.a_data);
     let b = bytes_to_f16_as_f32(&adapter.b_data);
     let mut w = bytes_to_f16_as_f32(base_data);
-
-    for i in 0..out_features {
-        for j in 0..in_features {
-            let mut dot = 0.0f32;
-            for r in 0..rank {
-                dot += b[i * rank + r] * a[r * in_features + j];
-            }
-            w[i * in_features + j] += scale * dot;
-        }
-    }
-
+    merge_core(
+        &mut w,
+        &a,
+        &b,
+        out_features,
+        in_features,
+        rank,
+        scale as f32,
+    );
     *base_data = f32_to_f16_bytes(&w);
 }
 
@@ -511,17 +524,7 @@ fn merge_f32_raw(
     let a = bytes_to_f32(lora_a);
     let b = bytes_to_f32(lora_b);
     let mut w = bytes_to_f32(base_data);
-
-    for i in 0..out_features {
-        for j in 0..in_features {
-            let mut dot = 0.0f32;
-            for r in 0..rank {
-                dot += b[i * rank + r] * a[r * in_features + j];
-            }
-            w[i * in_features + j] += scale * dot;
-        }
-    }
-
+    merge_core(&mut w, &a, &b, out_features, in_features, rank, scale);
     *base_data = f32_to_bytes(&w);
 }
 
@@ -538,17 +541,7 @@ fn merge_f16_raw(
     let a = bytes_to_f16_as_f32(lora_a);
     let b = bytes_to_f16_as_f32(lora_b);
     let mut w = bytes_to_f16_as_f32(base_data);
-
-    for i in 0..out_features {
-        for j in 0..in_features {
-            let mut dot = 0.0f32;
-            for r in 0..rank {
-                dot += b[i * rank + r] * a[r * in_features + j];
-            }
-            w[i * in_features + j] += scale * dot;
-        }
-    }
-
+    merge_core(&mut w, &a, &b, out_features, in_features, rank, scale);
     *base_data = f32_to_f16_bytes(&w);
 }
 

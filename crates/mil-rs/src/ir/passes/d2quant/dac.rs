@@ -190,11 +190,8 @@ where
 mod tests {
     use super::*;
     use crate::ir::operation::Operation;
+    use crate::ir::passes::test_helpers::f32_bytes;
     use crate::ir::program::Function;
-
-    fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
 
     fn make_tensor(values: &[f32]) -> Value {
         Value::Tensor {

@@ -330,8 +330,8 @@ fn apply_fold(block: &mut Block, conv_idx: usize, bn_idx: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::passes::test_helpers::const_f32_tensor_op;
     use crate::ir::program::Function;
-    use crate::ir::tensor::ScalarType;
 
     /// Build a minimal program with a single "main" function.
     fn program_with_block(block: Block) -> Program {
@@ -344,20 +344,6 @@ mod tests {
 
     fn block_ops(program: &Program) -> &[Operation] {
         &program.functions["main"].body.operations
-    }
-
-    /// Helper: create a `const` op producing a tensor value.
-    fn const_tensor_op(name: &str, output: &str, data: &[f32], shape: Vec<usize>) -> Operation {
-        Operation::new("const", name)
-            .with_input(
-                "val",
-                Value::Tensor {
-                    data: TensorData::Inline(f32_slice_to_bytes(data)),
-                    shape,
-                    dtype: ScalarType::Float32,
-                },
-            )
-            .with_output(output)
     }
 
     /// Build a complete conv→BN subgraph.
@@ -375,34 +361,39 @@ mod tests {
         let mut block = Block::new();
 
         // Const ops for conv
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "w_const",
             "w_val",
             &[1.0, 2.0],
             vec![2, 1, 1, 1],
         ));
-        block.add_op(const_tensor_op("b_const", "b_val", &[0.5, 0.5], vec![2]));
+        block.add_op(const_f32_tensor_op(
+            "b_const",
+            "b_val",
+            &[0.5, 0.5],
+            vec![2],
+        ));
 
         // Const ops for BN
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "gamma_const",
             "gamma_val",
             &[1.0, 2.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "beta_const",
             "beta_val",
             &[0.0, 1.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "mean_const",
             "mean_val",
             &[0.0, 1.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "var_const",
             "var_val",
             &[1.0, 1.0],
@@ -477,28 +468,33 @@ mod tests {
     fn skip_non_const_bn_params() {
         let mut block = Block::new();
 
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "w_const",
             "w_val",
             &[1.0, 2.0],
             vec![2, 1, 1, 1],
         ));
-        block.add_op(const_tensor_op("b_const", "b_val", &[0.5, 0.5], vec![2]));
+        block.add_op(const_f32_tensor_op(
+            "b_const",
+            "b_val",
+            &[0.5, 0.5],
+            vec![2],
+        ));
 
         // Only gamma/beta/variance are const — mean is dynamic (not a const op).
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "gamma_const",
             "gamma_val",
             &[1.0, 2.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "beta_const",
             "beta_val",
             &[0.0, 1.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "var_const",
             "var_val",
             &[1.0, 1.0],
@@ -612,32 +608,32 @@ mod tests {
         let mut block = Block::new();
 
         // Conv without a bias input.
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "w_const",
             "w_val",
             &[1.0, 2.0],
             vec![2, 1, 1, 1],
         ));
 
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "gamma_const",
             "gamma_val",
             &[1.0, 2.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "beta_const",
             "beta_val",
             &[0.0, 1.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "mean_const",
             "mean_val",
             &[0.0, 1.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "var_const",
             "var_val",
             &[1.0, 1.0],
@@ -703,34 +699,39 @@ mod tests {
     fn skip_mismatched_bn_param_lengths() {
         let mut block = Block::new();
 
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "w_const",
             "w_val",
             &[1.0, 2.0],
             vec![2, 1, 1, 1],
         ));
-        block.add_op(const_tensor_op("b_const", "b_val", &[0.5, 0.5], vec![2]));
+        block.add_op(const_f32_tensor_op(
+            "b_const",
+            "b_val",
+            &[0.5, 0.5],
+            vec![2],
+        ));
 
         // gamma has 2 elements but mean has 3 — lengths don't match.
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "gamma_const",
             "gamma_val",
             &[1.0, 2.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "beta_const",
             "beta_val",
             &[0.0, 1.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "mean_const",
             "mean_val",
             &[0.0, 1.0, 2.0],
             vec![3],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "var_const",
             "var_val",
             &[1.0, 1.0],
@@ -775,38 +776,38 @@ mod tests {
         let mut block = Block::new();
 
         // Weight has shape [3,1,1,1] (Cout=3) but BN params have length 2.
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "w_const",
             "w_val",
             &[1.0, 2.0, 3.0],
             vec![3, 1, 1, 1],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "b_const",
             "b_val",
             &[0.5, 0.5, 0.5],
             vec![3],
         ));
 
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "gamma_const",
             "gamma_val",
             &[1.0, 2.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "beta_const",
             "beta_val",
             &[0.0, 1.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "mean_const",
             "mean_val",
             &[0.0, 1.0],
             vec![2],
         ));
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "var_const",
             "var_val",
             &[1.0, 1.0],

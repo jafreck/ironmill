@@ -391,7 +391,6 @@ pub fn mse(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::TensorData;
 
     #[test]
     fn root_vector_count() {

@@ -1,11 +1,15 @@
-//! Shared graph-walk utilities used by multiple MIL optimization passes.
+//! Shared graph-walk and mutation utilities used by multiple MIL optimization
+//! passes.
 //!
-//! These helpers query producer→consumer relationships in a [`Block`]'s
-//! operation list without mutating anything.
+//! Graph-query helpers (producer→consumer relationships, reference walking)
+//! and common mutation helpers (op insertion, reference patching, byte
+//! conversion, index packing) live here to avoid duplication across passes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use half::f16;
 
 use crate::error::MilError;
 use crate::ir::operation::Operation;
@@ -117,4 +121,94 @@ pub(crate) fn build_consumer_index_map(ops: &[Operation]) -> HashMap<String, Vec
         }
     }
     map
+}
+
+// ── Mutation helpers ────────────────────────────────────────────────────────
+
+/// Insert new operations after their anchor positions.
+///
+/// Each entry `(idx, new_ops)` inserts the operations in `new_ops` immediately
+/// after the operation at index `idx`, adjusting for the cumulative offset of
+/// prior insertions. Each insertion adds `new_ops.len()` to the offset.
+///
+/// **Note:** the offset increment is hard-coded to `new_ops.len()` which
+/// assumes every insertion batch inserts the same structural pattern (e.g.
+/// always 2 ops per insertion for a dequant+mul pair). Callers that insert
+/// varying numbers of ops per batch should verify correctness.
+pub(crate) fn apply_insertions(ops: &mut Vec<Operation>, insertions: &[(usize, Vec<Operation>)]) {
+    for (offset, (idx, new_ops)) in insertions.iter().enumerate() {
+        let insert_at = idx + 1 + offset * 2;
+        for (j, op) in new_ops.iter().enumerate() {
+            ops.insert(insert_at + j, op.clone());
+        }
+    }
+}
+
+/// Rewire downstream references from original const outputs to new outputs,
+/// then restore the new op's own `x` input back to the original.
+///
+/// For each `(old_name, new_name)` pair, all references to `old_name` in the
+/// block are rewritten to `new_name`. Then, any `mul` op whose output matches
+/// `new_name` has its `x` input restored to `old_name` (since `replace_reference`
+/// would have rewritten it too).
+pub(crate) fn patch_references(body: &mut Block, replacements: &[(String, String)]) {
+    for (old_name, new_name) in replacements {
+        super::replace_reference(body, old_name, new_name);
+        // The mul op's `x` input was also rewritten — fix it back.
+        for op in &mut body.operations {
+            if op.op_type == "mul" && op.outputs.iter().any(|o| o == new_name) {
+                if let Some(Value::Reference(r)) = op.inputs.get_mut("x") {
+                    if r == new_name {
+                        *r = old_name.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Byte conversion helpers ─────────────────────────────────────────────────
+
+/// Convert raw FP16 little-endian bytes to `Vec<f32>`.
+///
+/// # Panics
+///
+/// Debug-asserts that `data.len()` is a multiple of 2.
+pub(crate) fn fp16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
+    debug_assert!(
+        data.len() % 2 == 0,
+        "FP16 tensor data length must be a multiple of 2"
+    );
+    data.chunks_exact(2)
+        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
+/// Pack assignment indices into n-bit packed bytes (MSB-first).
+pub fn pack_indices(indices: &[usize], n_bits: u8) -> Vec<u8> {
+    if n_bits == 8 {
+        return indices.iter().map(|&i| i as u8).collect();
+    }
+
+    let mask = (1u16 << n_bits) - 1;
+    let total_bits = indices.len() * n_bits as usize;
+    let n_bytes = total_bits.div_ceil(8);
+    // Allocate one extra byte so the last value's lo byte always has a
+    // valid destination, then truncate back to the true output size.
+    let mut packed = vec![0u8; n_bytes + 1];
+
+    for (i, &idx) in indices.iter().enumerate() {
+        let bit_offset = i * n_bits as usize;
+        let byte_pos = bit_offset / 8;
+        let bit_in_byte = bit_offset % 8;
+        let val = (idx as u16) & mask;
+
+        let shifted = val << (16 - n_bits as usize - bit_in_byte);
+        let [hi, lo] = shifted.to_be_bytes();
+        packed[byte_pos] |= hi;
+        packed[byte_pos + 1] |= lo;
+    }
+
+    packed.truncate(n_bytes);
+    packed
 }

@@ -276,17 +276,8 @@ impl Pass for D2QuantPass {
 mod tests {
     use super::*;
     use crate::ir::operation::Operation;
+    use crate::ir::passes::test_helpers::{const_tensor_op, f32_bytes};
     use crate::ir::program::Function;
-
-    fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
-
-    fn const_tensor_op(name: &str, output: &str, value: Value) -> Operation {
-        Operation::new("const", name)
-            .with_input("val", value)
-            .with_output(output)
-    }
 
     #[test]
     fn pass_rewrites_const_to_dual_scale_dequantize() {

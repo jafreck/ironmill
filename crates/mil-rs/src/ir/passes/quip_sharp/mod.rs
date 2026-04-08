@@ -25,6 +25,7 @@ use crate::ir::types::{TensorData, Value};
 
 use super::rotation::{pad_to_power_of_two, rotate_rows_hadamard};
 use super::tensor_utils::tensor_as_f32_slice;
+use super::util::{apply_insertions, fp16_bytes_to_f32, patch_references};
 
 /// E8 codebook group dimension.
 const E8_DIM: usize = 8;
@@ -398,66 +399,14 @@ fn build_norm_mul_ops(
     (norms_op, mul_op, mul_output)
 }
 
-/// Insert new ops after their original positions, adjusting indices for
-/// prior insertions (each insertion adds 2 ops).
-fn apply_insertions(ops: &mut Vec<Operation>, insertions: &[(usize, Vec<Operation>)]) {
-    for (offset, (idx, new_ops)) in insertions.iter().enumerate() {
-        let insert_at = idx + 1 + offset * 2;
-        for (j, op) in new_ops.iter().enumerate() {
-            ops.insert(insert_at + j, op.clone());
-        }
-    }
-}
-
-/// Rewire downstream references from original const outputs to mul outputs,
-/// then restore the mul op's own `x` input back to the original.
-fn patch_references(body: &mut crate::ir::program::Block, replacements: &[(String, String)]) {
-    for (old_name, new_name) in replacements {
-        super::replace_reference(body, old_name, new_name);
-        // The mul op's `x` input was also rewritten — fix it back.
-        for op in &mut body.operations {
-            if op.op_type == "mul" && op.outputs.iter().any(|o| o == new_name) {
-                if let Some(Value::Reference(r)) = op.inputs.get_mut("x") {
-                    if r == new_name {
-                        *r = old_name.clone();
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Convert raw FP16 little-endian bytes to `Vec<f32>`.
-fn fp16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
-    debug_assert!(
-        data.len() % 2 == 0,
-        "FP16 tensor data length must be a multiple of 2"
-    );
-    data.chunks_exact(2)
-        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::e8_lattice::{mse, naive_scalar_2bit_quantize};
     use super::*;
-    use crate::ir::operation::Operation;
     use crate::ir::passes::rotation::unrotate_rows_hadamard;
+    use crate::ir::passes::test_helpers::{const_tensor_op, f32_bytes};
     use crate::ir::program::{Function, Program};
     use crate::ir::types::TensorData;
-
-    fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
-
-    fn const_tensor_op(name: &str, output: &str, value: Value) -> Operation {
-        Operation::new("const", name)
-            .with_input("val", value)
-            .with_output(output)
-    }
 
     #[test]
     fn quip_sharp_skips_small_tensors() {

@@ -588,6 +588,7 @@ mod tests {
     use super::*;
     use crate::ir::pass::Pass;
     use crate::ir::passes::affine_quantize::AffineQuantizePass;
+    use crate::ir::passes::test_helpers::{const_f32_tensor_op, f32_bytes};
     use crate::ir::program::{Block, Function};
     use crate::ir::tensor::TensorType;
     use crate::ir::types::TensorData;
@@ -596,23 +597,6 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     // -- Helpers ------------------------------------------------------------
-
-    fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
-
-    fn const_tensor_op(name: &str, output: &str, data: &[f32], shape: Vec<usize>) -> Operation {
-        Operation::new("const", name)
-            .with_input(
-                "val",
-                Value::Tensor {
-                    data: TensorData::Inline(f32_bytes(data)),
-                    shape,
-                    dtype: ScalarType::Float32,
-                },
-            )
-            .with_output(output)
-    }
 
     fn random_weight(rng: &mut StdRng, shape: &[usize]) -> Vec<f32> {
         let n: usize = shape.iter().product();
@@ -631,7 +615,7 @@ mod tests {
 
         // Embedding
         let data = random_weight(&mut rng, &[vocab, hidden]);
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "embed_const",
             "embed_weight",
             &data,
@@ -650,7 +634,7 @@ mod tests {
             let const_name = format!("{name}_const");
             let weight_name = format!("{name}_weight");
             let out_name = format!("{name}_out");
-            block.add_op(const_tensor_op(
+            block.add_op(const_f32_tensor_op(
                 &const_name,
                 &weight_name,
                 &w,
@@ -670,7 +654,7 @@ mod tests {
             let const_name = format!("{name}_const");
             let weight_name = format!("{name}_weight");
             let out_name = format!("{name}_out");
-            block.add_op(const_tensor_op(
+            block.add_op(const_f32_tensor_op(
                 &const_name,
                 &weight_name,
                 &w,
@@ -687,7 +671,7 @@ mod tests {
         // Layer 0: down_proj (intermediate → hidden)
         {
             let w = random_weight(&mut rng, &[hidden, intermediate]);
-            block.add_op(const_tensor_op(
+            block.add_op(const_f32_tensor_op(
                 "l0_down_proj_const",
                 "l0_down_proj_weight",
                 &w,
@@ -703,7 +687,7 @@ mod tests {
 
         // LM head
         let w = random_weight(&mut rng, &[vocab, hidden]);
-        block.add_op(const_tensor_op(
+        block.add_op(const_f32_tensor_op(
             "lm_head_const",
             "lm_head_weight",
             &w,

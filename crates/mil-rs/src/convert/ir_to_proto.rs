@@ -65,6 +65,65 @@ impl Default for UpdatableModelConfig {
 }
 
 /// Convert a MIL IR [`Program`] back into a protobuf [`Model`].
+/// Build input/output `FeatureDescription` lists from a MIL function's signature.
+fn build_feature_descriptions(
+    func: &Function,
+) -> (Vec<FeatureDescription>, Vec<FeatureDescription>) {
+    let input: Vec<FeatureDescription> = func
+        .inputs
+        .iter()
+        .map(|(name, tt)| FeatureDescription {
+            name: name.clone(),
+            short_description: String::new(),
+            r#type: Some(tensor_type_to_feature_type(tt)),
+        })
+        .collect();
+
+    let output: Vec<FeatureDescription> = func
+        .body
+        .outputs
+        .iter()
+        .map(|name| {
+            let feature_type = func
+                .body
+                .operations
+                .iter()
+                .rev()
+                .find_map(|op| {
+                    op.outputs.iter().enumerate().find_map(|(i, out_name)| {
+                        if out_name == name {
+                            op.output_types
+                                .get(i)
+                                .and_then(|ot| ot.as_ref())
+                                .map(tensor_type_to_feature_type)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_else(|| FeatureType {
+                    is_optional: false,
+                    r#type: Some(specification::feature_type::Type::MultiArrayType(
+                        ArrayFeatureType {
+                            shape: vec![],
+                            data_type: specification::array_feature_type::ArrayDataType::Float32
+                                as i32,
+                            shape_flexibility: None,
+                            default_optional_value: None,
+                        },
+                    )),
+                });
+            FeatureDescription {
+                name: name.clone(),
+                short_description: String::new(),
+                r#type: Some(feature_type),
+            }
+        })
+        .collect();
+
+    (input, output)
+}
+
 ///
 /// Creates an ML Program model wrapping the converted program.
 /// `spec_version` sets the `specification_version` field on the
@@ -77,77 +136,26 @@ pub fn program_to_model(program: &Program, spec_version: i32) -> Result<Model> {
     let proto_program = convert_program(program)?;
 
     // Build model description from the main function's inputs/outputs.
-    let description = if let Some(func) =
-        program.main().or_else(|| program.functions.values().next())
-    {
-        let input: Vec<FeatureDescription> = func
-            .inputs
-            .iter()
-            .map(|(name, tt)| FeatureDescription {
-                name: name.clone(),
-                short_description: String::new(),
-                r#type: Some(tensor_type_to_feature_type(tt)),
-            })
-            .collect();
+    let description =
+        if let Some(func) = program.main().or_else(|| program.functions.values().next()) {
+            let (input, output) = build_feature_descriptions(func);
 
-        let output: Vec<FeatureDescription> = func
-            .body
-            .outputs
-            .iter()
-            .map(|name| {
-                let feature_type = func
-                    .body
-                    .operations
-                    .iter()
-                    .rev()
-                    .find_map(|op| {
-                        op.outputs.iter().enumerate().find_map(|(i, out_name)| {
-                            if out_name == name {
-                                op.output_types
-                                    .get(i)
-                                    .and_then(|ot| ot.as_ref())
-                                    .map(tensor_type_to_feature_type)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or_else(|| FeatureType {
-                        is_optional: false,
-                        r#type: Some(specification::feature_type::Type::MultiArrayType(
-                            ArrayFeatureType {
-                                shape: vec![],
-                                data_type: specification::array_feature_type::ArrayDataType::Float32
-                                    as i32,
-                                shape_flexibility: None,
-                                default_optional_value: None,
-                            },
-                        )),
-                    });
-                FeatureDescription {
-                    name: name.clone(),
-                    short_description: String::new(),
-                    r#type: Some(feature_type),
-                }
-            })
-            .collect();
+            // Emit state descriptors for autoregressive models.
+            let state = if program.is_autoregressive() {
+                build_state_descriptors(func)
+            } else {
+                Vec::new()
+            };
 
-        // Emit state descriptors for autoregressive models.
-        let state = if program.is_autoregressive() {
-            build_state_descriptors(func)
+            Some(ModelDescription {
+                input,
+                output,
+                state,
+                ..Default::default()
+            })
         } else {
-            Vec::new()
+            Some(ModelDescription::default())
         };
-
-        Some(ModelDescription {
-            input,
-            output,
-            state,
-            ..Default::default()
-        })
-    } else {
-        Some(ModelDescription::default())
-    };
 
     Ok(Model {
         specification_version: spec_version,
@@ -172,57 +180,7 @@ pub fn program_to_updatable_model(
     let func = program.main().or_else(|| program.functions.values().next());
 
     let description = if let Some(func) = func {
-        let input: Vec<FeatureDescription> = func
-            .inputs
-            .iter()
-            .map(|(name, tt)| FeatureDescription {
-                name: name.clone(),
-                short_description: String::new(),
-                r#type: Some(tensor_type_to_feature_type(tt)),
-            })
-            .collect();
-
-        let output: Vec<FeatureDescription> = func
-            .body
-            .outputs
-            .iter()
-            .map(|name| {
-                let feature_type = func
-                    .body
-                    .operations
-                    .iter()
-                    .rev()
-                    .find_map(|op| {
-                        op.outputs.iter().enumerate().find_map(|(i, out_name)| {
-                            if out_name == name {
-                                op.output_types
-                                    .get(i)
-                                    .and_then(|ot| ot.as_ref())
-                                    .map(tensor_type_to_feature_type)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or_else(|| FeatureType {
-                        is_optional: false,
-                        r#type: Some(specification::feature_type::Type::MultiArrayType(
-                            ArrayFeatureType {
-                                shape: vec![],
-                                data_type: specification::array_feature_type::ArrayDataType::Float32
-                                    as i32,
-                                shape_flexibility: None,
-                                default_optional_value: None,
-                            },
-                        )),
-                    });
-                FeatureDescription {
-                    name: name.clone(),
-                    short_description: String::new(),
-                    r#type: Some(feature_type),
-                }
-            })
-            .collect();
+        let (input, output) = build_feature_descriptions(func);
 
         // Build training inputs from the updatable layers' inputs.
         let training_input = build_training_inputs(func, &config.updatable_layers);
@@ -574,57 +532,7 @@ pub fn program_to_multi_function_model(
 
     // Model description is derived from the shared "main" function.
     let description = if let Some(func) = split.shared.main() {
-        let input: Vec<FeatureDescription> = func
-            .inputs
-            .iter()
-            .map(|(name, tt)| FeatureDescription {
-                name: name.clone(),
-                short_description: String::new(),
-                r#type: Some(tensor_type_to_feature_type(tt)),
-            })
-            .collect();
-
-        let output: Vec<FeatureDescription> = func
-            .body
-            .outputs
-            .iter()
-            .map(|name| {
-                let feature_type = func
-                    .body
-                    .operations
-                    .iter()
-                    .rev()
-                    .find_map(|op| {
-                        op.outputs.iter().enumerate().find_map(|(i, out_name)| {
-                            if out_name == name {
-                                op.output_types
-                                    .get(i)
-                                    .and_then(|ot| ot.as_ref())
-                                    .map(tensor_type_to_feature_type)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or_else(|| FeatureType {
-                        is_optional: false,
-                        r#type: Some(specification::feature_type::Type::MultiArrayType(
-                            ArrayFeatureType {
-                                shape: vec![],
-                                data_type: specification::array_feature_type::ArrayDataType::Float32
-                                    as i32,
-                                shape_flexibility: None,
-                                default_optional_value: None,
-                            },
-                        )),
-                    });
-                FeatureDescription {
-                    name: name.clone(),
-                    short_description: String::new(),
-                    r#type: Some(feature_type),
-                }
-            })
-            .collect();
+        let (input, output) = build_feature_descriptions(func);
 
         Some(ModelDescription {
             input,

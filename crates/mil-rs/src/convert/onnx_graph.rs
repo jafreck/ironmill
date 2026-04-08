@@ -837,92 +837,13 @@ fn initializer_to_const(tensor: &TensorProto, model_dir: Option<&Path>) -> Resul
 }
 
 /// Extract raw bytes from an ONNX [`TensorProto`].
+/// Extract raw tensor data from a proto, consuming (taking) the proto's data fields.
+/// The `TensorProto`'s data fields will be empty afterwards.
 ///
 /// ONNX tensors store data either in `raw_data` or in typed fields
 /// (`float_data`, `int32_data`, etc.). This function normalises both
 /// representations into a single `Vec<u8>`.
-pub(crate) fn extract_tensor_raw_data(
-    tensor: &TensorProto,
-    dtype: ScalarType,
-    model_dir: Option<&Path>,
-) -> Vec<u8> {
-    // Handle external data (e.g., model.onnx_data sidecar files).
-    // data_location == 1 means EXTERNAL in the ONNX spec.
-    if tensor.data_location == 1 {
-        if let Some(dir) = model_dir {
-            return load_external_tensor_data(&tensor.external_data, dir);
-        } else {
-            eprintln!(
-                "warning: tensor '{}' uses external data but no model directory provided",
-                tensor.name
-            );
-            return Vec::new();
-        }
-    }
-
-    if !tensor.raw_data.is_empty() {
-        return tensor.raw_data.clone();
-    }
-
-    match dtype {
-        ScalarType::Float32 => tensor
-            .float_data
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        ScalarType::Float64 => tensor
-            .double_data
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        ScalarType::Int32 => tensor
-            .int32_data
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        ScalarType::Int64 => tensor
-            .int64_data
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        ScalarType::UInt64 => tensor
-            .uint64_data
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        // For types stored in int32_data (uint8, int8, uint16, int16, float16, bool).
-        ScalarType::UInt8 | ScalarType::Bool => tensor
-            .int32_data
-            .iter()
-            .flat_map(|v| (*v as u8).to_le_bytes())
-            .collect(),
-        ScalarType::Int8 => tensor
-            .int32_data
-            .iter()
-            .flat_map(|v| (*v as i8).to_le_bytes())
-            .collect(),
-        ScalarType::UInt16 => tensor
-            .int32_data
-            .iter()
-            .flat_map(|v| (*v as u16).to_le_bytes())
-            .collect(),
-        ScalarType::Int16 | ScalarType::Float16 => tensor
-            .int32_data
-            .iter()
-            .flat_map(|v| (*v as i16).to_le_bytes())
-            .collect(),
-        ScalarType::UInt32 => tensor
-            .int32_data
-            .iter()
-            .flat_map(|v| (*v as u32).to_le_bytes())
-            .collect(),
-    }
-}
-
-/// Like [`extract_tensor_raw_data`] but takes ownership of the proto's byte
-/// buffers via [`std::mem::take`], avoiding a full clone of the weight data.
-/// The `TensorProto`'s data fields will be empty afterwards.
-fn extract_tensor_raw_data_take(
+fn extract_tensor_raw_data_impl(
     tensor: &mut TensorProto,
     dtype: ScalarType,
     model_dir: Option<&Path>,
@@ -989,6 +910,25 @@ fn extract_tensor_raw_data_take(
             .flat_map(|v| (v as u32).to_le_bytes())
             .collect(),
     }
+}
+
+/// Extract raw tensor data without modifying the proto (clones internally).
+pub(crate) fn extract_tensor_raw_data(
+    tensor: &TensorProto,
+    dtype: ScalarType,
+    model_dir: Option<&Path>,
+) -> Vec<u8> {
+    extract_tensor_raw_data_impl(&mut tensor.clone(), dtype, model_dir)
+}
+
+/// Extract raw tensor data, taking ownership of the proto's byte buffers.
+/// More efficient than [`extract_tensor_raw_data`] when the proto is no longer needed.
+fn extract_tensor_raw_data_take(
+    tensor: &mut TensorProto,
+    dtype: ScalarType,
+    model_dir: Option<&Path>,
+) -> Vec<u8> {
+    extract_tensor_raw_data_impl(tensor, dtype, model_dir)
 }
 
 /// Load tensor data from an external file referenced by ONNX `external_data` entries.

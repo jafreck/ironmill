@@ -458,19 +458,8 @@ fn emit_gptq_result(
 mod tests {
     use super::*;
     use crate::ir::operation::Operation;
+    use crate::ir::passes::test_helpers::{const_tensor_op, f32_bytes};
     use crate::ir::program::Function;
-
-    /// Helper: build a `const` op with a tensor value.
-    fn const_tensor_op(name: &str, output: &str, value: Value) -> Operation {
-        Operation::new("const", name)
-            .with_input("val", value)
-            .with_output(output)
-    }
-
-    /// Create FP32 tensor bytes from a slice of f32 values.
-    fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
 
     /// Build a single-const-op program for testing.
     fn make_program(name: &str, values: &[f32], shape: Vec<usize>) -> Program {

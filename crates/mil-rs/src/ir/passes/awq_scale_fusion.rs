@@ -361,12 +361,8 @@ fn fuse_awq_scales(block: &mut crate::ir::program::Block) {
 mod tests {
     use super::*;
     use crate::ir::operation::Operation;
+    use crate::ir::passes::test_helpers::f32_bytes;
     use crate::ir::program::{Block, Function};
-
-    /// Create FP32 tensor bytes from a slice.
-    fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
 
     /// Helper: build a `const` op.
     fn const_op(name: &str, output: &str, values: &[f32]) -> Operation {

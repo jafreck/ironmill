@@ -32,7 +32,10 @@ pub mod rotation;
 pub mod shape_materialize;
 pub mod tensor_utils;
 pub mod type_repropagate;
-pub(crate) mod util;
+pub mod util;
+
+#[cfg(test)]
+pub(crate) mod test_helpers;
 
 #[cfg(feature = "gptq")]
 pub mod gptq;

@@ -13,6 +13,7 @@ use crate::ir::types::{TensorData, Value};
 
 use super::kmeans::kmeans;
 use super::tensor_utils::tensor_as_f32_slice;
+use super::util::{fp16_bytes_to_f32, pack_indices};
 
 /// Compress weights using k-means palettization.
 ///
@@ -116,7 +117,7 @@ impl Pass for PalettizePass {
                         let bytes = data.as_bytes().expect("tensor not materialized");
                         let f = match dtype {
                             ScalarType::Float32 => tensor_as_f32_slice(bytes),
-                            ScalarType::Float16 => fp16_bytes_to_f32(bytes)?,
+                            ScalarType::Float16 => fp16_bytes_to_f32(bytes),
                             other => {
                                 return Err(MilError::TypeMismatch {
                                     expected: "Float32 or Float16".into(),
@@ -223,7 +224,7 @@ impl Pass for GroupedPalettizePass {
                         let bytes = data.as_bytes().expect("tensor not materialized");
                         let f = match dtype {
                             ScalarType::Float32 => tensor_as_f32_slice(bytes),
-                            ScalarType::Float16 => fp16_bytes_to_f32(bytes)?,
+                            ScalarType::Float16 => fp16_bytes_to_f32(bytes),
                             other => {
                                 return Err(MilError::TypeMismatch {
                                     expected: "Float32 or Float16".into(),
@@ -415,73 +416,14 @@ fn bits_for(n: usize) -> u8 {
     }
 }
 
-/// Convert raw FP16 little-endian bytes to `Vec<f32>`.
-fn fp16_bytes_to_f32(data: &[u8]) -> Result<Vec<f32>> {
-    if data.len() % 2 != 0 {
-        return Err(MilError::Validation(format!(
-            "FP16 tensor data length must be a multiple of 2, got {}",
-            data.len()
-        )));
-    }
-    Ok(data
-        .chunks_exact(2)
-        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-        .collect())
-}
-
-/// Pack assignment indices into n-bit packed bytes.
-///
-/// Uses bit-level packing that works for all supported widths (1, 2, 4, 6, 8),
-/// including widths that cause indices to span byte boundaries (e.g. 6-bit).
-/// Bits are written MSB-first within each byte.
-fn pack_indices(indices: &[usize], n_bits: u8) -> Vec<u8> {
-    if n_bits == 8 {
-        return indices.iter().map(|&i| i as u8).collect();
-    }
-
-    let mask = (1u16 << n_bits) - 1;
-    let total_bits = indices.len() * n_bits as usize;
-    let n_bytes = total_bits.div_ceil(8);
-    // Allocate one extra byte so the last value's lo byte always has a
-    // valid destination, then truncate back to the true output size.
-    let mut packed = vec![0u8; n_bytes + 1];
-
-    for (i, &idx) in indices.iter().enumerate() {
-        let bit_offset = i * n_bits as usize;
-        let byte_pos = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-        let val = (idx as u16) & mask;
-
-        // Shift value so MSB aligns with bit_in_byte within a 16-bit window.
-        let shifted = val << (16 - n_bits as usize - bit_in_byte);
-        let [hi, lo] = shifted.to_be_bytes();
-        packed[byte_pos] |= hi;
-        packed[byte_pos + 1] |= lo;
-    }
-
-    packed.truncate(n_bytes);
-    packed
-}
-
 // ---- Tests ------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ir::operation::Operation;
+    use crate::ir::passes::test_helpers::{const_tensor_op, f32_bytes};
     use crate::ir::program::Function;
-
-    /// Create FP32 tensor bytes from a slice of f32 values.
-    fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
-
-    /// Helper: build a `const` op with a tensor value.
-    fn const_tensor_op(name: &str, output: &str, value: Value) -> Operation {
-        Operation::new("const", name)
-            .with_input("val", value)
-            .with_output(output)
-    }
 
     #[test]
     fn palettize_4bit_produces_16_centroids() {
