@@ -64,10 +64,11 @@ kernel void affine_matmul_int4(
                 uint n_loc = g_n % BLK_N;
                 uint k_blk = g_k / BLK_K;
                 uint k_loc = g_k % BLK_K;
-                uint byte_idx = (n_blk * total_k_blocks + k_blk) * blk_bytes
-                              + n_loc * (BLK_K / 2) + k_loc / 2;
-                uchar packed  = B_packed[byte_idx];
-                uchar nibble  = (k_loc % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+                // Word-aligned load: read the uint32 containing this nibble
+                uint word_idx = (n_blk * total_k_blocks + k_blk) * BLK_N + n_loc;
+                uint packed4 = ((device const uint*)B_packed)[word_idx];
+                uint shift = k_loc * 4;
+                uchar nibble = (packed4 >> shift) & 0xF;
                 uint grp = g_k / group_size;
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
@@ -108,10 +109,10 @@ kernel void affine_matmul_int4(
                     uint n_loc = g_n % BLK_N;
                     uint k_blk = g_k / BLK_K;
                     uint k_loc = g_k % BLK_K;
-                    uint byte_idx = (n_blk * total_k_blocks + k_blk) * blk_bytes
-                                  + n_loc * (BLK_K / 2) + k_loc / 2;
-                    uchar packed  = B_packed[byte_idx];
-                    uchar nibble  = (k_loc % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+                    uint word_idx = (n_blk * total_k_blocks + k_blk) * BLK_N + n_loc;
+                    uint packed4 = ((device const uint*)B_packed)[word_idx];
+                    uint shift = k_loc * 4;
+                    uchar nibble  = (packed4 >> shift) & 0xF;
                     uint grp = g_k / group_size;
                     float s = float(scales[g_n * num_groups + grp]);
                     float z = float(zeros[g_n * num_groups + grp]);
@@ -223,9 +224,12 @@ kernel void affine_matmul_int8(
                 uint n_loc = g_n % BLK_N;
                 uint k_blk = g_k / BLK_K;
                 uint k_loc = g_k % BLK_K;
-                uint byte_idx = (n_blk * total_k_blocks + k_blk) * blk_bytes
-                              + n_loc * BLK_K + k_loc;
-                uchar q = B_packed[byte_idx];
+                // Word-aligned load: read uint32 containing this byte
+                uint word_idx = (n_blk * total_k_blocks + k_blk) * (BLK_N * 2)
+                              + n_loc * 2 + k_loc / 4;
+                uint packed4 = ((device const uint*)B_packed)[word_idx];
+                uint shift = (k_loc % 4) * 8;
+                uchar q = (packed4 >> shift) & 0xFF;
                 uint grp = g_k / group_size;
                 float s = float(scales[g_n * num_groups + grp]);
                 float z = float(zeros[g_n * num_groups + grp]);
@@ -266,9 +270,11 @@ kernel void affine_matmul_int8(
                     uint n_loc = g_n % BLK_N;
                     uint k_blk = g_k / BLK_K;
                     uint k_loc = g_k % BLK_K;
-                    uint byte_idx = (n_blk * total_k_blocks + k_blk) * blk_bytes
-                                  + n_loc * BLK_K + k_loc;
-                    uchar q = B_packed[byte_idx];
+                    uint word_idx = (n_blk * total_k_blocks + k_blk) * (BLK_N * 2)
+                                  + n_loc * 2 + k_loc / 4;
+                    uint packed4 = ((device const uint*)B_packed)[word_idx];
+                    uint shift = (k_loc % 4) * 8;
+                    uchar q = (packed4 >> shift) & 0xFF;
                     uint grp = g_k / group_size;
                     float s = float(scales[g_n * num_groups + grp]);
                     float z = float(zeros[g_n * num_groups + grp]);

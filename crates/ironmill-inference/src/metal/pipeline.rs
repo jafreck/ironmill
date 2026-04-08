@@ -1026,6 +1026,20 @@ impl MetalInference {
                     "Metal command buffer execution failed".into(),
                 ));
             }
+
+            // Per-pipeline GPU timing instrumentation (Phase 0).
+            if self.config.kernel_timing {
+                let gpu_ms = (cmd_buf.gpu_end_time() - cmd_buf.gpu_start_time()) * 1000.0;
+                let mode = if token_count == 1 {
+                    "decode"
+                } else {
+                    "prefill"
+                };
+                log::info!(
+                    "[kernel-timing] {mode} tokens={token_count} gpu={gpu_ms:.3}ms layers={num_layers}",
+                    num_layers = mc.num_hidden_layers,
+                );
+            }
         }
 
         // Step 20: Read logits for the last token position → Vec<f32>.

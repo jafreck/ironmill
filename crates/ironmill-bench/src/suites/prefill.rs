@@ -44,7 +44,8 @@ impl BenchmarkSuite for MetalPrefillSuite {
 
         for model_cfg in &ctx.matrix.models {
             for opt_cfg in &ctx.matrix.optimizations {
-                let gpu_config = super::decode::build_metal_config(opt_cfg);
+                let mut gpu_config = super::decode::build_metal_config(opt_cfg);
+                gpu_config.kernel_timing = ctx.extra.contains_key("kernel_timing");
                 let config_name = &opt_cfg.name;
 
                 let mut handle = match super::decode::load_metal_engine(

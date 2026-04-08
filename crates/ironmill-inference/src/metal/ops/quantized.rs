@@ -26,6 +26,8 @@ pub struct AffinePipelines {
     pub fused_ffn_gate_up_act_int4: ComputePipeline,
     /// INT4×Q8 integer dot product matvec (decode path).
     pub matvec_int4xq8: ComputePipeline,
+    /// INT4 2-row matvec: 2 output rows per TG with 64 threads (2 simdgroups).
+    pub matvec_int4_2row: ComputePipeline,
     /// INT4 affine embedding lookup with on-the-fly dequantization.
     pub embedding_lookup_int4: ComputePipeline,
 }

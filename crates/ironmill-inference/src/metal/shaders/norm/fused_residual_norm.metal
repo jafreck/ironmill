@@ -242,12 +242,6 @@ kernel void fused_residual_norm_matvec(
 // Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads.
 // ============================================================================
 
-// ============================================================================
-// TODO: This kernel remains at 32 threads/TG (scalar, 1 row per TG).
-// It is a candidate for future AMX optimization, but the residual+norm
-// computation must happen before the matvec can use normed input, making
-// the 64-row AMX pattern less straightforward (each row needs its own rms_inv).
-
 constant constexpr uint FRN_BLK_N = 64;
 constant constexpr uint FRN_BLK_K = 8;
 
@@ -274,63 +268,71 @@ kernel void fused_residual_norm_affine_matvec_int4(
 
     if (tid >= N) return;
 
-    uint half_K = K / 2;
     uint num_groups = (K + group_size - 1) / group_size;
     uint scale_row = tid * num_groups;
 
-    // Blocked layout addressing
+    // Blocked layout: word-aligned addressing
     uint k_blocks      = (K + FRN_BLK_K - 1) / FRN_BLK_K;
-    uint local_k_bytes = FRN_BLK_K / 2;
-    uint block_bytes   = FRN_BLK_N * local_k_bytes;
     uint n_block = tid / FRN_BLK_N;
     uint n_local = tid % FRN_BLK_N;
 
-    // First pass: compute sum_sq for RMSNorm AND the un-normalized dot product.
-    // We factor rms_inv out: y = rms_inv * sum(normed_input * dequant_weight)
-    // where normed_input = (a+b) * norm_weight (without rms_inv).
     float dot_acc = 0.0f;
     float sq_acc = 0.0f;
 
-    for (uint k = lane; k < half_K; k += 32) {
-        uint kb = k / local_k_bytes;
-        uint b_idx = k % local_k_bytes;
-        uint byte_idx = (n_block * k_blocks + kb) * block_bytes
-                      + n_local * local_k_bytes + b_idx;
+    for (uint kb = lane; kb < k_blocks; kb += 32) {
+        uint word_idx = (n_block * k_blocks + kb) * FRN_BLK_N + n_local;
+        uint packed4 = ((device const uint*)B_packed)[word_idx];
 
-        uchar packed = B_packed[byte_idx];
-        uchar lo = packed & 0x0F;
-        uchar hi = (packed >> 4) & 0x0F;
+        uint k_elem = kb * FRN_BLK_K;
+        uint grp = k_elem / group_size;
+        float s = float(scales[scale_row + grp]);
+        float z = float(zeros[scale_row + grp]);
 
-        uint k2 = k * 2;
-        uint g0 = k2 / group_size;
-        uint g1 = (k2 + 1) / group_size;
+        float w0 = (float(packed4 & 0xF) - z) * s;
+        float w1 = (float((packed4 >> 4) & 0xF) - z) * s;
+        float w2 = (float((packed4 >> 8) & 0xF) - z) * s;
+        float w3 = (float((packed4 >> 12) & 0xF) - z) * s;
+        float w4 = (float((packed4 >> 16) & 0xF) - z) * s;
+        float w5 = (float((packed4 >> 20) & 0xF) - z) * s;
+        float w6 = (float((packed4 >> 24) & 0xF) - z) * s;
+        float w7 = (float((packed4 >> 28) & 0xF) - z) * s;
 
-        float s0 = float(scales[scale_row + g0]);
-        float z0 = float(zeros[scale_row + g0]);
-        float w0 = (float(lo) - z0) * s0;
+        float val0 = float(a[k_elem]) + float(b[k_elem]);
+        float val1 = float(a[k_elem + 1]) + float(b[k_elem + 1]);
+        float val2 = float(a[k_elem + 2]) + float(b[k_elem + 2]);
+        float val3 = float(a[k_elem + 3]) + float(b[k_elem + 3]);
+        float val4 = float(a[k_elem + 4]) + float(b[k_elem + 4]);
+        float val5 = float(a[k_elem + 5]) + float(b[k_elem + 5]);
+        float val6 = float(a[k_elem + 6]) + float(b[k_elem + 6]);
+        float val7 = float(a[k_elem + 7]) + float(b[k_elem + 7]);
 
-        float s1 = float(scales[scale_row + g1]);
-        float z1 = float(zeros[scale_row + g1]);
-        float w1 = (float(hi) - z1) * s1;
+        sq_acc += val0 * val0 + val1 * val1 + val2 * val2 + val3 * val3
+                + val4 * val4 + val5 * val5 + val6 * val6 + val7 * val7;
 
-        // Compute input values: (a + b) * norm_weight
-        float val0 = float(a[k2]) + float(b[k2]);
-        float val1 = float(a[k2 + 1]) + float(b[k2 + 1]);
-        sq_acc += val0 * val0 + val1 * val1;
-
-        float normed0 = val0 * float(norm_weight[k2]);
-        float normed1 = val1 * float(norm_weight[k2 + 1]);
+        float normed0 = val0 * float(norm_weight[k_elem]);
+        float normed1 = val1 * float(norm_weight[k_elem + 1]);
+        float normed2 = val2 * float(norm_weight[k_elem + 2]);
+        float normed3 = val3 * float(norm_weight[k_elem + 3]);
+        float normed4 = val4 * float(norm_weight[k_elem + 4]);
+        float normed5 = val5 * float(norm_weight[k_elem + 5]);
+        float normed6 = val6 * float(norm_weight[k_elem + 6]);
+        float normed7 = val7 * float(norm_weight[k_elem + 7]);
 
         if (has_awq) {
-            dot_acc += (normed0 / float(awq_scales[k2])) * w0;
-            dot_acc += (normed1 / float(awq_scales[k2 + 1])) * w1;
+            dot_acc += (normed0 / float(awq_scales[k_elem]))     * w0;
+            dot_acc += (normed1 / float(awq_scales[k_elem + 1])) * w1;
+            dot_acc += (normed2 / float(awq_scales[k_elem + 2])) * w2;
+            dot_acc += (normed3 / float(awq_scales[k_elem + 3])) * w3;
+            dot_acc += (normed4 / float(awq_scales[k_elem + 4])) * w4;
+            dot_acc += (normed5 / float(awq_scales[k_elem + 5])) * w5;
+            dot_acc += (normed6 / float(awq_scales[k_elem + 6])) * w6;
+            dot_acc += (normed7 / float(awq_scales[k_elem + 7])) * w7;
         } else {
-            dot_acc += normed0 * w0;
-            dot_acc += normed1 * w1;
+            dot_acc += normed0 * w0 + normed1 * w1 + normed2 * w2 + normed3 * w3
+                     + normed4 * w4 + normed5 * w5 + normed6 * w6 + normed7 * w7;
         }
     }
 
-    // Reduce across SIMD lanes
     sq_acc = simd_sum(sq_acc);
     dot_acc = simd_sum(dot_acc);
 

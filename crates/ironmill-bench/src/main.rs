@@ -148,6 +148,10 @@ struct Cli {
     /// List available benchmark suites and exit
     #[arg(long)]
     list_suites: bool,
+
+    /// Enable per-pipeline GPU timing instrumentation.
+    #[arg(long)]
+    kernel_timing: bool,
 }
 
 fn main() -> Result<()> {
@@ -290,6 +294,9 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(","),
         );
+    }
+    if cli.kernel_timing {
+        extra.insert("kernel_timing".to_string(), "true".to_string());
     }
 
     let ctx = BenchmarkContext {

@@ -203,7 +203,8 @@ impl BenchmarkSuite for MetalPerplexitySuite {
 
         for model_cfg in &ctx.matrix.models {
             for opt_cfg in &ctx.matrix.optimizations {
-                let gpu_config = super::decode::build_metal_config(opt_cfg);
+                let mut gpu_config = super::decode::build_metal_config(opt_cfg);
+                gpu_config.kernel_timing = ctx.extra.contains_key("kernel_timing");
                 let config_name = &opt_cfg.name;
                 eprintln!("  Evaluating {config_name}...");
 
@@ -283,7 +284,8 @@ impl BenchmarkSuite for MetalDecodePerplexitySuite {
 
         for model_cfg in &ctx.matrix.models {
             for opt_cfg in &ctx.matrix.optimizations {
-                let gpu_config = super::decode::build_metal_config(opt_cfg);
+                let mut gpu_config = super::decode::build_metal_config(opt_cfg);
+                gpu_config.kernel_timing = ctx.extra.contains_key("kernel_timing");
                 let config_name = &opt_cfg.name;
                 eprintln!("  Metal/{config_name}: {}...", model_cfg.name);
 

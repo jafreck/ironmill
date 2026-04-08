@@ -230,14 +230,20 @@ fn encode_affine_projection(
 ) -> Result<(), InferenceError> {
     let (n, k) = weight.shape;
 
-    let pipeline = pipelines
-        .affine_pipeline(weight.bit_width.into(), kind)
-        .ok_or_else(|| {
-            InferenceError::runtime(format!(
-                "unsupported affine bit_width: {}",
-                weight.bit_width
-            ))
-        })?;
+    // For INT4 decode, use the 2-row kernel for better TG scheduling
+    let use_2row = kind.is_decode() && weight.bit_width == 4;
+    let pipeline = if use_2row {
+        &pipelines.affine.matvec_int4_2row
+    } else {
+        pipelines
+            .affine_pipeline(weight.bit_width.into(), kind)
+            .ok_or_else(|| {
+                InferenceError::runtime(format!(
+                    "unsupported affine bit_width: {}",
+                    weight.bit_width
+                ))
+            })?
+    };
 
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(input, 0, 0);
@@ -259,8 +265,12 @@ fn encode_affine_projection(
             encoder.set_buffer(&weight.data, 0, 8);
         }
         encoder.set_bytes(&has_awq.to_le_bytes(), 9);
-        let threads_per_group = 32;
-        encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
+        if use_2row {
+            // 2-row: ceil(N/2) threadgroups × 64 threads (2 simdgroups)
+            encoder.dispatch_threadgroups((n.div_ceil(2), 1, 1), (64, 1, 1));
+        } else {
+            encoder.dispatch_threadgroups((n, 1, 1), (32, 1, 1));
+        }
     } else {
         encoder.set_bytes(&(token_count as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 6);

@@ -1,7 +1,7 @@
 // ============================================================================
 // Fused FFN gate+up+SiLU for INT4 decode (M=1)
 //
-// Computes output[i] = silu(x · W_gate^T[i]) * (x · W_up^T[i]) in one dispatch.
+// Computes output[i] = silu(x . W_gate^T[i]) * (x . W_up^T[i]) in one dispatch.
 // Eliminates the intermediate gate/up buffer writes and the separate activation
 // dispatch. Each threadgroup computes one output row by running BOTH the gate
 // and up dot products, then applies gated activation inline.
@@ -30,67 +30,79 @@ kernel void fused_ffn_gate_up_act_int4(
 {
     if (tid >= N) return;
 
-    uint half_K = K / 2;
     uint num_groups = (K + group_size - 1) / group_size;
     uint scale_row = tid * num_groups;
 
-    // Blocked layout constants
-    uint k_blocks      = (K + BLK_K - 1) / BLK_K;
-    uint local_k_bytes = BLK_K / 2;
-    uint block_bytes   = BLK_N * local_k_bytes;
+    // Blocked layout: word-aligned addressing
+    uint k_blocks = (K + BLK_K - 1) / BLK_K;
     uint n_block = tid / BLK_N;
     uint n_local = tid % BLK_N;
 
     float gate_acc = 0.0f;
     float up_acc   = 0.0f;
 
-    for (uint k = lane; k < half_K; k += 32) {
-        uint kb = k / local_k_bytes;
-        uint b  = k % local_k_bytes;
-        uint byte_idx = (n_block * k_blocks + kb) * block_bytes
-                      + n_local * local_k_bytes + b;
+    for (uint kb = lane; kb < k_blocks; kb += 32) {
+        uint word_idx = (n_block * k_blocks + kb) * BLK_N + n_local;
 
-        // Gate weight dequant
-        uchar g_packed = B_gate_packed[byte_idx];
-        uchar g_lo = g_packed & 0x0F;
-        uchar g_hi = (g_packed >> 4) & 0x0F;
+        // Gate weight: vectorized uint32 load
+        uint g_packed4 = ((device const uint*)B_gate_packed)[word_idx];
+        // Up weight: vectorized uint32 load
+        uint u_packed4 = ((device const uint*)B_up_packed)[word_idx];
 
-        // Up weight dequant
-        uchar u_packed = B_up_packed[byte_idx];
-        uchar u_lo = u_packed & 0x0F;
-        uchar u_hi = (u_packed >> 4) & 0x0F;
+        // Pre-fetch scale/zero per group
+        uint k_elem = kb * BLK_K;
+        uint grp = k_elem / group_size;
 
-        uint k2 = k * 2;
-        uint g0 = k2 / group_size;
-        uint g1 = (k2 + 1) / group_size;
+        float sg = float(scales_gate[scale_row + grp]);
+        float zg = float(zeros_gate[scale_row + grp]);
+        float su = float(scales_up[scale_row + grp]);
+        float zu = float(zeros_up[scale_row + grp]);
 
-        // Shared scale/zero (gate and up have same group structure)
-        float sg0 = float(scales_gate[scale_row + g0]);
-        float zg0 = float(zeros_gate[scale_row + g0]);
-        float sg1 = float(scales_gate[scale_row + g1]);
-        float zg1 = float(zeros_gate[scale_row + g1]);
+        // Unpack 8 nibbles from each weight stream
+        float gw0 = (float(g_packed4 & 0xF) - zg) * sg;
+        float gw1 = (float((g_packed4 >> 4) & 0xF) - zg) * sg;
+        float gw2 = (float((g_packed4 >> 8) & 0xF) - zg) * sg;
+        float gw3 = (float((g_packed4 >> 12) & 0xF) - zg) * sg;
+        float gw4 = (float((g_packed4 >> 16) & 0xF) - zg) * sg;
+        float gw5 = (float((g_packed4 >> 20) & 0xF) - zg) * sg;
+        float gw6 = (float((g_packed4 >> 24) & 0xF) - zg) * sg;
+        float gw7 = (float((g_packed4 >> 28) & 0xF) - zg) * sg;
 
-        float su0 = float(scales_up[scale_row + g0]);
-        float zu0 = float(zeros_up[scale_row + g0]);
-        float su1 = float(scales_up[scale_row + g1]);
-        float zu1 = float(zeros_up[scale_row + g1]);
+        float uw0 = (float(u_packed4 & 0xF) - zu) * su;
+        float uw1 = (float((u_packed4 >> 4) & 0xF) - zu) * su;
+        float uw2 = (float((u_packed4 >> 8) & 0xF) - zu) * su;
+        float uw3 = (float((u_packed4 >> 12) & 0xF) - zu) * su;
+        float uw4 = (float((u_packed4 >> 16) & 0xF) - zu) * su;
+        float uw5 = (float((u_packed4 >> 20) & 0xF) - zu) * su;
+        float uw6 = (float((u_packed4 >> 24) & 0xF) - zu) * su;
+        float uw7 = (float((u_packed4 >> 28) & 0xF) - zu) * su;
 
-        float gw0 = (float(g_lo) - zg0) * sg0;
-        float gw1 = (float(g_hi) - zg1) * sg1;
-        float uw0 = (float(u_lo) - zu0) * su0;
-        float uw1 = (float(u_hi) - zu1) * su1;
-
-        float x0, x1;
+        // Load 8 input values
+        float x0, x1, x2, x3, x4, x5, x6, x7;
         if (has_awq) {
-            x0 = float(A[k2])     / float(awq_scales[k2]);
-            x1 = float(A[k2 + 1]) / float(awq_scales[k2 + 1]);
+            x0 = float(A[k_elem])     / float(awq_scales[k_elem]);
+            x1 = float(A[k_elem + 1]) / float(awq_scales[k_elem + 1]);
+            x2 = float(A[k_elem + 2]) / float(awq_scales[k_elem + 2]);
+            x3 = float(A[k_elem + 3]) / float(awq_scales[k_elem + 3]);
+            x4 = float(A[k_elem + 4]) / float(awq_scales[k_elem + 4]);
+            x5 = float(A[k_elem + 5]) / float(awq_scales[k_elem + 5]);
+            x6 = float(A[k_elem + 6]) / float(awq_scales[k_elem + 6]);
+            x7 = float(A[k_elem + 7]) / float(awq_scales[k_elem + 7]);
         } else {
-            x0 = float(A[k2]);
-            x1 = float(A[k2 + 1]);
+            x0 = float(A[k_elem]);
+            x1 = float(A[k_elem + 1]);
+            x2 = float(A[k_elem + 2]);
+            x3 = float(A[k_elem + 3]);
+            x4 = float(A[k_elem + 4]);
+            x5 = float(A[k_elem + 5]);
+            x6 = float(A[k_elem + 6]);
+            x7 = float(A[k_elem + 7]);
         }
 
-        gate_acc += x0 * gw0 + x1 * gw1;
-        up_acc   += x0 * uw0 + x1 * uw1;
+        gate_acc += x0 * gw0 + x1 * gw1 + x2 * gw2 + x3 * gw3
+                  + x4 * gw4 + x5 * gw5 + x6 * gw6 + x7 * gw7;
+        up_acc   += x0 * uw0 + x1 * uw1 + x2 * uw2 + x3 * uw3
+                  + x4 * uw4 + x5 * uw5 + x6 * uw6 + x7 * uw7;
     }
 
     gate_acc = simd_sum(gate_acc);
@@ -110,14 +122,11 @@ kernel void fused_ffn_gate_up_act_int4(
     }
 }
 
-// ── INT4×Q8 integer dot product matvec (decode path, M=1) ───────
+// ---- INT4xQ8 integer dot product matvec (decode path, M=1) ----
 //
 // Uses pre-quantized INT8 input (from quantize_input_q8) to replace float
 // dequant with integer multiply-add. The per-group Q8 scale is combined
 // with the weight scale in the final reduction.
-//
-// B_packed is in blocked layout: [N_blocks, K_blocks, BLK_N, BLK_K/2]
-// (same as affine_matvec_int4).
 //
 // Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
 
@@ -137,14 +146,11 @@ kernel void affine_matvec_int4xq8(
 {
     if (tid >= N) return;
 
-    uint half_K = K / 2;
     uint num_groups = (K + group_size - 1) / group_size;
     uint scale_row = tid * num_groups;
 
-    // Blocked layout addressing (same as affine_matvec_int4)
-    uint k_blocks      = (K + BLK_K - 1) / BLK_K;
-    uint local_k_bytes = BLK_K / 2;             // 4
-    uint block_bytes   = BLK_N * local_k_bytes;  // 256
+    // Blocked layout: word-aligned addressing
+    uint k_blocks = (K + BLK_K - 1) / BLK_K;
     uint n_block = tid / BLK_N;
     uint n_local = tid % BLK_N;
 
@@ -152,44 +158,47 @@ kernel void affine_matvec_int4xq8(
     uint prev_wg = 0xFFFFFFFF;
     float ws = 0.0f;
     float wz = 0.0f;
+    int iz = 0;
 
-    for (uint k = lane; k < half_K; k += 32) {
-        uint kb = k / local_k_bytes;
-        uint b  = k % local_k_bytes;
-        uint byte_idx = (n_block * k_blocks + kb) * block_bytes
-                      + n_local * local_k_bytes + b;
+    for (uint kb = lane; kb < k_blocks; kb += 32) {
+        uint word_idx = (n_block * k_blocks + kb) * BLK_N + n_local;
+        uint packed4 = ((device const uint*)B_packed)[word_idx];
 
-        uchar packed = B_packed[byte_idx];
-        int lo = int(packed & 0x0F);
-        int hi = int((packed >> 4) & 0x0F);
+        uint k_elem = kb * BLK_K;
+        uint wg = k_elem / group_size;
 
-        uint k2 = k * 2;
-        uint wg0 = k2 / group_size;
-        uint wg1 = (k2 + 1) / group_size;
-        uint ag0 = k2 / q8_group_size;
-        uint ag1 = (k2 + 1) / q8_group_size;
-
-        // Weight group 0
-        if (wg0 != prev_wg) {
-            ws = float(w_scales[scale_row + wg0]);
-            wz = float(w_zeros[scale_row + wg0]);
-            prev_wg = wg0;
-        }
-        int iz = int(rint(wz));
-        int w0 = lo - iz;
-        float a_scale0 = A_scales[ag0];
-        acc += float(int(A_q8[k2])) * float(w0) * ws * a_scale0;
-
-        // Weight group 1 (may differ if crossing group boundary)
-        if (wg1 != wg0) {
-            ws = float(w_scales[scale_row + wg1]);
-            wz = float(w_zeros[scale_row + wg1]);
-            prev_wg = wg1;
+        // Cache weight scale/zero per group
+        if (wg != prev_wg) {
+            ws = float(w_scales[scale_row + wg]);
+            wz = float(w_zeros[scale_row + wg]);
             iz = int(rint(wz));
+            prev_wg = wg;
         }
-        int w1 = hi - iz;
-        float a_scale1 = A_scales[ag1];
-        acc += float(int(A_q8[k2 + 1])) * float(w1) * ws * a_scale1;
+
+        // Unpack 8 nibbles
+        int lo0 = int(packed4 & 0xF);
+        int lo1 = int((packed4 >> 4) & 0xF);
+        int lo2 = int((packed4 >> 8) & 0xF);
+        int lo3 = int((packed4 >> 12) & 0xF);
+        int lo4 = int((packed4 >> 16) & 0xF);
+        int lo5 = int((packed4 >> 20) & 0xF);
+        int lo6 = int((packed4 >> 24) & 0xF);
+        int lo7 = int((packed4 >> 28) & 0xF);
+
+        // Q8 input scale lookups
+        uint ag0 = k_elem / q8_group_size;
+        uint ag4 = (k_elem + 4) / q8_group_size;
+        float a_s0 = A_scales[ag0];
+        float a_s4 = (ag4 != ag0) ? A_scales[ag4] : a_s0;
+
+        acc += float(int(A_q8[k_elem]))     * float(lo0 - iz) * ws * a_s0;
+        acc += float(int(A_q8[k_elem + 1])) * float(lo1 - iz) * ws * a_s0;
+        acc += float(int(A_q8[k_elem + 2])) * float(lo2 - iz) * ws * a_s0;
+        acc += float(int(A_q8[k_elem + 3])) * float(lo3 - iz) * ws * a_s0;
+        acc += float(int(A_q8[k_elem + 4])) * float(lo4 - iz) * ws * a_s4;
+        acc += float(int(A_q8[k_elem + 5])) * float(lo5 - iz) * ws * a_s4;
+        acc += float(int(A_q8[k_elem + 6])) * float(lo6 - iz) * ws * a_s4;
+        acc += float(int(A_q8[k_elem + 7])) * float(lo7 - iz) * ws * a_s4;
     }
 
     acc = simd_sum(acc);

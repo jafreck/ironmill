@@ -50,47 +50,48 @@ kernel void batched_affine_matvec_int4(
 
     if (local_tid >= N_gate) return;
 
-    uint half_K = K / 2;
     uint num_groups = (K + group_size - 1) / group_size;
     uint scale_row = local_tid * num_groups;
 
-    // Blocked layout addressing
-    uint k_blocks      = (K + BLK_K - 1) / BLK_K;
-    uint local_k_bytes = BLK_K / 2;
-    uint block_bytes   = BLK_N * local_k_bytes;
+    // Blocked layout: word-aligned addressing
+    uint k_blocks = (K + BLK_K - 1) / BLK_K;
     uint n_block = local_tid / BLK_N;
     uint n_local = local_tid % BLK_N;
 
     float acc = 0.0f;
 
-    for (uint k = lane; k < half_K; k += 32) {
-        uint kb = k / local_k_bytes;
-        uint b  = k % local_k_bytes;
-        uint byte_idx = (n_block * k_blocks + kb) * block_bytes
-                      + n_local * local_k_bytes + b;
+    for (uint kb = lane; kb < k_blocks; kb += 32) {
+        uint word_idx = (n_block * k_blocks + kb) * BLK_N + n_local;
+        uint packed4 = ((device const uint*)B_packed)[word_idx];
 
-        uchar packed = B_packed[byte_idx];
-        uchar lo = packed & 0x0F;
-        uchar hi = (packed >> 4) & 0x0F;
+        uint k_elem = kb * BLK_K;
+        uint grp = k_elem / group_size;
+        float s = float(scales[scale_row + grp]);
+        float z = float(zeros[scale_row + grp]);
 
-        uint k2 = k * 2;
-        uint g0 = k2 / group_size;
-        uint g1 = (k2 + 1) / group_size;
-
-        float s0 = float(scales[scale_row + g0]);
-        float z0 = float(zeros[scale_row + g0]);
-        float w0 = (float(lo) - z0) * s0;
-
-        float s1 = float(scales[scale_row + g1]);
-        float z1 = float(zeros[scale_row + g1]);
-        float w1 = (float(hi) - z1) * s1;
+        float w0 = (float(packed4 & 0xF) - z) * s;
+        float w1 = (float((packed4 >> 4) & 0xF) - z) * s;
+        float w2 = (float((packed4 >> 8) & 0xF) - z) * s;
+        float w3 = (float((packed4 >> 12) & 0xF) - z) * s;
+        float w4 = (float((packed4 >> 16) & 0xF) - z) * s;
+        float w5 = (float((packed4 >> 20) & 0xF) - z) * s;
+        float w6 = (float((packed4 >> 24) & 0xF) - z) * s;
+        float w7 = (float((packed4 >> 28) & 0xF) - z) * s;
 
         if (has_awq) {
-            acc += (float(A[k2]) / float(awq_scales[k2])) * w0;
-            acc += (float(A[k2 + 1]) / float(awq_scales[k2 + 1])) * w1;
+            acc += (float(A[k_elem])     / float(awq_scales[k_elem]))     * w0;
+            acc += (float(A[k_elem + 1]) / float(awq_scales[k_elem + 1])) * w1;
+            acc += (float(A[k_elem + 2]) / float(awq_scales[k_elem + 2])) * w2;
+            acc += (float(A[k_elem + 3]) / float(awq_scales[k_elem + 3])) * w3;
+            acc += (float(A[k_elem + 4]) / float(awq_scales[k_elem + 4])) * w4;
+            acc += (float(A[k_elem + 5]) / float(awq_scales[k_elem + 5])) * w5;
+            acc += (float(A[k_elem + 6]) / float(awq_scales[k_elem + 6])) * w6;
+            acc += (float(A[k_elem + 7]) / float(awq_scales[k_elem + 7])) * w7;
         } else {
-            acc += float(A[k2])     * w0;
-            acc += float(A[k2 + 1]) * w1;
+            acc += float(A[k_elem])     * w0 + float(A[k_elem + 1]) * w1
+                 + float(A[k_elem + 2]) * w2 + float(A[k_elem + 3]) * w3
+                 + float(A[k_elem + 4]) * w4 + float(A[k_elem + 5]) * w5
+                 + float(A[k_elem + 6]) * w6 + float(A[k_elem + 7]) * w7;
         }
     }
 
@@ -176,47 +177,48 @@ kernel void gdn_batched_affine_matvec_int4(
 
     if (local_tid >= N_proj) return;
 
-    uint half_K = K / 2;
     uint num_groups = (K + group_size - 1) / group_size;
     uint scale_row = local_tid * num_groups;
 
-    // Blocked layout addressing (same as affine_matvec_int4)
-    uint k_blocks      = (K + BLK_K - 1) / BLK_K;
-    uint local_k_bytes = BLK_K / 2;
-    uint block_bytes   = BLK_N * local_k_bytes;
+    // Blocked layout: word-aligned addressing
+    uint k_blocks = (K + BLK_K - 1) / BLK_K;
     uint n_block = local_tid / BLK_N;
     uint n_local = local_tid % BLK_N;
 
     float acc = 0.0f;
 
-    for (uint k = lane; k < half_K; k += 32) {
-        uint kb = k / local_k_bytes;
-        uint b  = k % local_k_bytes;
-        uint byte_idx = (n_block * k_blocks + kb) * block_bytes
-                      + n_local * local_k_bytes + b;
+    for (uint kb = lane; kb < k_blocks; kb += 32) {
+        uint word_idx = (n_block * k_blocks + kb) * BLK_N + n_local;
+        uint packed4 = ((device const uint*)B_packed)[word_idx];
 
-        uchar packed = B_packed[byte_idx];
-        uchar lo = packed & 0x0F;
-        uchar hi = (packed >> 4) & 0x0F;
+        uint k_elem = kb * BLK_K;
+        uint grp = k_elem / group_size;
+        float s = float(scales[scale_row + grp]);
+        float z = float(zeros[scale_row + grp]);
 
-        uint k2 = k * 2;
-        uint g0 = k2 / group_size;
-        uint g1 = (k2 + 1) / group_size;
-
-        float s0 = float(scales[scale_row + g0]);
-        float z0 = float(zeros[scale_row + g0]);
-        float w0 = (float(lo) - z0) * s0;
-
-        float s1 = float(scales[scale_row + g1]);
-        float z1 = float(zeros[scale_row + g1]);
-        float w1 = (float(hi) - z1) * s1;
+        float w0 = (float(packed4 & 0xF) - z) * s;
+        float w1 = (float((packed4 >> 4) & 0xF) - z) * s;
+        float w2 = (float((packed4 >> 8) & 0xF) - z) * s;
+        float w3 = (float((packed4 >> 12) & 0xF) - z) * s;
+        float w4 = (float((packed4 >> 16) & 0xF) - z) * s;
+        float w5 = (float((packed4 >> 20) & 0xF) - z) * s;
+        float w6 = (float((packed4 >> 24) & 0xF) - z) * s;
+        float w7 = (float((packed4 >> 28) & 0xF) - z) * s;
 
         if (has_awq) {
-            acc += (float(A[k2]) / float(awq_scales[k2])) * w0;
-            acc += (float(A[k2 + 1]) / float(awq_scales[k2 + 1])) * w1;
+            acc += (float(A[k_elem])     / float(awq_scales[k_elem]))     * w0;
+            acc += (float(A[k_elem + 1]) / float(awq_scales[k_elem + 1])) * w1;
+            acc += (float(A[k_elem + 2]) / float(awq_scales[k_elem + 2])) * w2;
+            acc += (float(A[k_elem + 3]) / float(awq_scales[k_elem + 3])) * w3;
+            acc += (float(A[k_elem + 4]) / float(awq_scales[k_elem + 4])) * w4;
+            acc += (float(A[k_elem + 5]) / float(awq_scales[k_elem + 5])) * w5;
+            acc += (float(A[k_elem + 6]) / float(awq_scales[k_elem + 6])) * w6;
+            acc += (float(A[k_elem + 7]) / float(awq_scales[k_elem + 7])) * w7;
         } else {
-            acc += float(A[k2])     * w0;
-            acc += float(A[k2 + 1]) * w1;
+            acc += float(A[k_elem])     * w0 + float(A[k_elem + 1]) * w1
+                 + float(A[k_elem + 2]) * w2 + float(A[k_elem + 3]) * w3
+                 + float(A[k_elem + 4]) * w4 + float(A[k_elem + 5]) * w5
+                 + float(A[k_elem + 6]) * w6 + float(A[k_elem + 7]) * w7;
         }
     }
 

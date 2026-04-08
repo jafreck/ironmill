@@ -294,6 +294,8 @@ pub struct MetalConfig {
     pub cla_config: Option<ClaConfig>,
     /// Sliding window attention config. None = full attention for all layers.
     pub sliding_window: Option<SlidingWindowConfig>,
+    /// Enable per-pipeline GPU timing instrumentation.
+    pub kernel_timing: bool,
 }
 
 impl Default for MetalConfig {
@@ -310,6 +312,7 @@ impl Default for MetalConfig {
             fused_sdpa_tile_bc: None,
             cla_config: None,
             sliding_window: None,
+            kernel_timing: false,
         }
     }
 }
