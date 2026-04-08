@@ -326,7 +326,10 @@ impl Iterator for TokenStream<'_> {
 
         // ── Advance grammar ──
         if let Some(state) = &mut self.grammar_state {
-            state.advance(token);
+            if let Err(e) = state.advance(token) {
+                self.finished = true;
+                return Some(Err(InferenceError::Grammar(e)));
+            }
             if state.is_complete() {
                 self.finished = true;
                 self.position += 1;

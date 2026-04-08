@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::bnf::GrammarError;
 use super::compiler::{CompiledElement, CompiledGrammar};
 use super::mask::TokenMask;
 
@@ -108,20 +109,22 @@ impl GrammarState {
     /// Feeds each character of the token's text through the automaton
     /// and retains only branches that survive.
     ///
-    /// # Panics
-    /// Panics if `token_id` is out of range for the vocabulary.
-    pub fn advance(&mut self, token_id: u32) {
+    /// # Errors
+    /// Returns [`GrammarError::InvalidTokenId`] if `token_id` is out of
+    /// range for the vocabulary.
+    pub fn advance(&mut self, token_id: u32) -> Result<(), GrammarError> {
         let idx = token_id as usize;
-        assert!(
-            idx < self.grammar.vocab.len(),
-            "token_id {} out of range for vocabulary of size {}",
-            token_id,
-            self.grammar.vocab.len(),
-        );
+        if idx >= self.grammar.vocab.len() {
+            return Err(GrammarError::InvalidTokenId {
+                token_id,
+                vocab_size: self.grammar.vocab.len(),
+            });
+        }
         let text = self.grammar.vocab[idx].clone();
         for ch in text.chars() {
             self.advance_char(ch);
         }
+        Ok(())
     }
 
     /// Check if the grammar is in an accepting state.
@@ -359,7 +362,7 @@ mod tests {
         assert!(!state.is_complete());
 
         // Advance with "ok" token (id=2).
-        state.advance(2);
+        state.advance(2).unwrap();
         assert!(state.is_complete());
     }
 
@@ -367,9 +370,9 @@ mod tests {
     fn grammar_automaton_advance_char_by_char() {
         let mut state = make_state(r#"root ::= "ab""#, vec!["a", "b", "ab", "x"]);
         // Advance with "a" then "b".
-        state.advance(0); // "a"
+        state.advance(0).unwrap(); // "a"
         assert!(!state.is_complete());
-        state.advance(1); // "b"
+        state.advance(1).unwrap(); // "b"
         assert!(state.is_complete());
     }
 
@@ -418,7 +421,7 @@ mod tests {
         assert!(!mask.is_allowed(4)); // "x"
 
         // Advance with "-", then only digits should be valid.
-        state.advance(0);
+        state.advance(0).unwrap();
         let mask = state.token_mask();
         assert!(!mask.is_allowed(0)); // "-" not valid after "-"
         assert!(mask.is_allowed(1)); // "0"
@@ -500,7 +503,7 @@ value ::= "true" | "false"
         assert!(!mask.is_allowed(12)); // "x"
 
         // After "tr", only "u" and "ue" should be valid.
-        state.advance(10); // "tr"
+        state.advance(10).unwrap(); // "tr"
         let mask = state.token_mask();
         assert!(mask.is_allowed(2)); // "u"
         assert!(!mask.is_allowed(0)); // "t"

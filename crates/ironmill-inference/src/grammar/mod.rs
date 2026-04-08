@@ -37,7 +37,7 @@
 //! let mask = state.token_mask();
 //! apply_token_mask(&mut logits, &mask);
 //! let token = sample_token(&logits, temperature);
-//! state.advance(token);
+//! state.advance(token)?;
 //! ```
 
 pub mod automaton;

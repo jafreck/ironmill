@@ -42,6 +42,10 @@ pub enum InferenceError {
     /// A generic error from an underlying operation.
     #[error("{0}")]
     Other(#[from] anyhow::Error),
+
+    /// Grammar constraint error (e.g. invalid token ID).
+    #[error("grammar error: {0}")]
+    Grammar(#[from] crate::grammar::GrammarError),
 }
 
 impl InferenceError {
@@ -277,8 +281,9 @@ impl<'a, E: InferenceEngine> ConstrainedDecoder<'a, E> {
     /// Advances the pushdown automaton so the next call to
     /// [`constrained_decode_step`](Self::constrained_decode_step)
     /// produces an updated mask.
-    pub fn accept_token(&mut self, token_id: u32) {
-        self.grammar_state.advance(token_id);
+    pub fn accept_token(&mut self, token_id: u32) -> Result<(), InferenceError> {
+        self.grammar_state.advance(token_id)?;
+        Ok(())
     }
 
     /// Check if the grammar is in an accepting state.

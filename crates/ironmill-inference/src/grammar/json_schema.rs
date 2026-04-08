@@ -446,7 +446,7 @@ mod tests {
         // Generate "true" token by token.
         let mask = state.token_mask();
         assert!(mask.is_allowed(8)); // "true" is allowed
-        state.advance(8); // accept "true"
+        state.advance(8).unwrap(); // accept "true"
         assert!(state.is_complete());
     }
 

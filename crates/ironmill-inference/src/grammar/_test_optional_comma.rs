@@ -59,7 +59,7 @@ fn feed_tokens(state: &mut GrammarState, vocab: &[String], tokens: &[&str]) {
             mask.is_allowed(idx),
             "token {tok_text:?} (idx {idx}) was not allowed"
         );
-        state.advance(idx as u32);
+        state.advance(idx as u32).unwrap();
     }
 }
 
@@ -86,7 +86,7 @@ fn optional_before_required_no_leading_comma() {
     assert!(mask.is_allowed(0), "'{{' should be allowed to open object");
 
     // After "{", a property key should be allowed (no comma required).
-    state.advance(0); // "{"
+    state.advance(0).unwrap(); // "{"
     let mask = state.token_mask();
     // "\"b\"" is at index 27 in our vocab
     let b_key_idx = vocab.iter().position(|v| v == "\"b\"").unwrap();

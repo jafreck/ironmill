@@ -118,6 +118,13 @@ pub enum GrammarError {
     DuplicateRule(String),
     /// Unknown or unsupported JSON Schema type.
     UnsupportedType(String),
+    /// Token ID is out of range for the vocabulary.
+    InvalidTokenId {
+        /// The out-of-range token ID.
+        token_id: u32,
+        /// Size of the vocabulary.
+        vocab_size: usize,
+    },
 }
 
 impl fmt::Display for GrammarError {
@@ -155,6 +162,15 @@ impl fmt::Display for GrammarError {
             }
             Self::UnsupportedType(ty) => {
                 write!(f, "unsupported JSON Schema type: {ty}")
+            }
+            Self::InvalidTokenId {
+                token_id,
+                vocab_size,
+            } => {
+                write!(
+                    f,
+                    "token_id {token_id} out of range for vocabulary of size {vocab_size}"
+                )
             }
         }
     }
