@@ -8,12 +8,10 @@ use super::DEFAULT_THREADGROUP_WIDTH;
 pub struct FusedPipelines {
     /// Fused residual+RMSNorm+dense matvec in one dispatch.
     pub residual_norm_matvec: ComputePipeline,
-    /// Fused residual+RMSNorm+affine INT4 matvec in one dispatch (blocked layout — legacy).
-    pub residual_norm_affine_matvec_int4: ComputePipeline,
     /// INT4 dequantization kernel.
     pub int4_dequantize: ComputePipeline,
-    /// Superblock fused residual+RMSNorm+affine INT4 matvec.
-    pub sb_residual_norm_affine_matvec_int4: ComputePipeline,
+    /// Fused residual+RMSNorm+affine INT4 matvec.
+    pub residual_norm_affine_matvec_int4: ComputePipeline,
 }
 
 // ── Parameter structs ────────────────────────────────────────────

@@ -6,53 +6,32 @@ use super::{LinearKernelKind, METAL_MAX_THREADS_PER_THREADGROUP};
 
 /// Affine quantized pipeline states.
 pub struct AffinePipelines {
-    /// Affine INT4 matvec kernel (blocked layout — legacy/embedding).
-    pub matvec_int4: ComputePipeline,
-    /// Affine INT4 matmul kernel (blocked layout — legacy).
-    pub matmul_int4: ComputePipeline,
-    /// Affine INT8 matvec kernel.
-    pub matvec_int8: ComputePipeline,
-    /// Affine INT8 matmul kernel.
-    pub matmul_int8: ComputePipeline,
     /// AMX-accelerated INT4 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
     pub matvec_int4_amx: ComputePipeline,
     /// AMX-accelerated INT8 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
     pub matvec_int8_amx: ComputePipeline,
-    /// Batched affine INT4 matvec for FFN gate+up in one dispatch (blocked layout — legacy).
-    pub batched_matvec_int4: ComputePipeline,
-    /// Batched affine INT4 matvec for 4 GDN projections in one dispatch (blocked layout — legacy).
-    pub gdn_batched_matvec_int4: ComputePipeline,
-    /// Fused FFN gate+up+activation for INT4 decode (blocked layout — legacy).
-    pub fused_ffn_gate_up_act_int4: ComputePipeline,
-    /// INT4×Q8 integer dot product matvec (blocked layout — legacy).
-    pub matvec_int4xq8: ComputePipeline,
-    /// INT4 2-row matvec (blocked layout — legacy).
-    pub matvec_int4_2row: ComputePipeline,
-    /// INT4 coalesced matvec (blocked layout — legacy).
-    pub matvec_int4_coalesced: ComputePipeline,
     /// INT4 affine embedding lookup with on-the-fly dequantization.
     pub embedding_lookup_int4: ComputePipeline,
-    /// Superblock INT4 matvec: 8 rows/TG, 64 threads, inline scale/zero.
-    pub sb_matvec_int4: ComputePipeline,
-    /// Superblock INT4 matmul: tiled prefill with inline scale/zero.
-    pub sb_matmul_int4: ComputePipeline,
-    /// Superblock fused FFN gate+up+activation INT4.
-    pub sb_fused_ffn_gate_up_act_int4: ComputePipeline,
-    /// Superblock batched affine INT4 matvec (gate+up).
-    pub sb_batched_matvec_int4: ComputePipeline,
-    /// Superblock GDN batched affine INT4 matvec (4 projections).
-    pub sb_gdn_batched_matvec_int4: ComputePipeline,
-    /// Superblock INT4×Q8 integer dot product matvec.
-    pub sb_matvec_int4xq8: ComputePipeline,
-    /// Superblock INT8 matvec: 8 rows/TG, 64 threads, inline scale/zero.
-    pub sb_matvec_int8: ComputePipeline,
-    /// Superblock INT8 matmul: tiled prefill with inline scale/zero.
-    pub sb_matmul_int8: ComputePipeline,
+    /// INT4 matvec: 8 rows/TG, 64 threads, inline scale/zero.
+    pub matvec_int4: ComputePipeline,
+    /// INT4 matmul: tiled prefill with inline scale/zero.
+    pub matmul_int4: ComputePipeline,
+    /// Fused FFN gate+up+activation INT4.
+    pub fused_ffn_gate_up_act_int4: ComputePipeline,
+    /// Batched affine INT4 matvec (gate+up).
+    pub batched_matvec_int4: ComputePipeline,
+    /// GDN batched affine INT4 matvec (4 projections).
+    pub gdn_batched_matvec_int4: ComputePipeline,
+    /// INT4×Q8 integer dot product matvec.
+    pub matvec_int4xq8: ComputePipeline,
+    /// INT8 matvec: 8 rows/TG, 64 threads, inline scale/zero.
+    pub matvec_int8: ComputePipeline,
+    /// INT8 matmul: tiled prefill with inline scale/zero.
+    pub matmul_int8: ComputePipeline,
 }
 
 impl AffinePipelines {
     /// Select the affine-quantized pipeline for a given bit-width and phase.
-    /// Returns superblock pipelines for INT4 and INT8.
     #[inline]
     pub fn for_bits_and_kind(
         &self,
@@ -60,10 +39,10 @@ impl AffinePipelines {
         kind: LinearKernelKind,
     ) -> Option<&ComputePipeline> {
         match (bit_width, kind) {
-            (4, LinearKernelKind::Matvec) => Some(&self.sb_matvec_int4),
-            (4, LinearKernelKind::Matmul) => Some(&self.sb_matmul_int4),
-            (8, LinearKernelKind::Matvec) => Some(&self.sb_matvec_int8),
-            (8, LinearKernelKind::Matmul) => Some(&self.sb_matmul_int8),
+            (4, LinearKernelKind::Matvec) => Some(&self.matvec_int4),
+            (4, LinearKernelKind::Matmul) => Some(&self.matmul_int4),
+            (8, LinearKernelKind::Matvec) => Some(&self.matvec_int8),
+            (8, LinearKernelKind::Matmul) => Some(&self.matmul_int8),
             _ => None,
         }
     }

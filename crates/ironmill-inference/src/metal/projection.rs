@@ -125,7 +125,7 @@ pub(crate) fn encode_projection_q8(
                 if kernel_kind.is_decode() && aq.bit_width == 4 && aq.awq_scales.is_none() {
                     ops::encode_affine_matvec_int4xq8(
                         enc,
-                        &pipelines.affine.sb_matvec_int4xq8,
+                        &pipelines.affine.matvec_int4xq8,
                         q8_input.data,
                         q8_input.scales,
                         aq,
@@ -218,8 +218,8 @@ fn encode_polarquant_projection(
 ///
 /// Uses superblock layout for INT4 and INT8 weights (inline scale/zero).
 /// Dispatches to the correct Metal kernel based on `bit_width` and kernel kind:
-/// - Matvec (`LinearKernelKind::Matvec`): `sb_matvec_int{4,8}` with 8 rows/TG, 64 threads
-/// - Matmul (`LinearKernelKind::Matmul`): `sb_matmul_int{4,8}` tiled prefill
+/// - Matvec (`LinearKernelKind::Matvec`): `matvec_int{4,8}` with 8 rows/TG, 64 threads
+/// - Matmul (`LinearKernelKind::Matmul`): `matmul_int{4,8}` tiled prefill
 fn encode_affine_projection(
     encoder: &ironmill_metal_sys::ComputeEncoder,
     input: &MetalBuffer,
@@ -258,7 +258,7 @@ fn encode_affine_projection(
             encoder.set_buffer(&weight.data, 0, 6); // dummy
         }
         encoder.set_bytes(&has_awq.to_le_bytes(), 7);
-        // sb_matvec_int4: ceil(N/8) TGs × 64 threads (8 rows per TG)
+        // matvec_int4: ceil(N/8) TGs × 64 threads (8 rows per TG)
         encoder.dispatch_threadgroups((n.div_ceil(8), 1, 1), (64, 1, 1));
     } else {
         encoder.set_buffer(output, 0, 2);

@@ -436,7 +436,7 @@ pub(crate) fn encode_gdn_decode(
             // All 4 weights are INT4 affine: use batched INT4 matvec.
             ops::encode_gdn_batched_affine_matvec_int4(
                 enc,
-                &pipelines.affine.sb_gdn_batched_matvec_int4,
+                &pipelines.affine.gdn_batched_matvec_int4,
                 &ops::GdnBatchedAffineInt4Params {
                     input: &bufs.norm_out,
                     w0: aq_qkv,
