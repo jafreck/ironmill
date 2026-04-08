@@ -263,13 +263,7 @@ impl MetalInference {
                 let rb_start = Instant::now();
                 // Allocate as u16 to guarantee 2-byte alignment for f16 reinterpret.
                 let mut readback_u16 = vec![0u16; norm_readback_bytes / 2];
-                #[allow(unsafe_code)]
-                let readback = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        readback_u16.as_mut_ptr() as *mut u8,
-                        norm_readback_bytes,
-                    )
-                };
+                let readback = bytemuck::cast_slice_mut::<u16, u8>(&mut readback_u16);
                 bufs.norm_out
                     .read_bytes(readback, 0)
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -467,10 +461,7 @@ impl MetalInference {
                     let rb_bytes = token_count * attn_out_features_local * 2;
                     let rb_start = Instant::now();
                     let mut rb_u16 = vec![0u16; rb_bytes / 2];
-                    #[allow(unsafe_code)]
-                    let rb = unsafe {
-                        std::slice::from_raw_parts_mut(rb_u16.as_mut_ptr() as *mut u8, rb_bytes)
-                    };
+                    let rb = bytemuck::cast_slice_mut::<u16, u8>(&mut rb_u16);
                     calib_scratch
                         .read_bytes(rb, 0)
                         .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -573,13 +564,7 @@ impl MetalInference {
             {
                 let rb_start = Instant::now();
                 let mut readback_u16 = vec![0u16; norm_readback_bytes / 2];
-                #[allow(unsafe_code)]
-                let readback = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        readback_u16.as_mut_ptr() as *mut u8,
-                        norm_readback_bytes,
-                    )
-                };
+                let readback = bytemuck::cast_slice_mut::<u16, u8>(&mut readback_u16);
                 bufs.norm_out
                     .read_bytes(readback, 0)
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -629,10 +614,7 @@ impl MetalInference {
                 let rb_bytes = token_count * layer_inter * 2;
                 let rb_start = Instant::now();
                 let mut rb_u16 = vec![0u16; rb_bytes / 2];
-                #[allow(unsafe_code)]
-                let rb = unsafe {
-                    std::slice::from_raw_parts_mut(rb_u16.as_mut_ptr() as *mut u8, rb_bytes)
-                };
+                let rb = bytemuck::cast_slice_mut::<u16, u8>(&mut rb_u16);
                 calib_scratch
                     .read_bytes(rb, 0)
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
@@ -806,13 +788,7 @@ impl MetalInference {
 
                 let rb_start = Instant::now();
                 let mut readback_u16 = vec![0u16; norm_readback_bytes / 2];
-                #[allow(unsafe_code)]
-                let readback = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        readback_u16.as_mut_ptr() as *mut u8,
-                        norm_readback_bytes,
-                    )
-                };
+                let readback = bytemuck::cast_slice_mut::<u16, u8>(&mut readback_u16);
                 calib_scratch
                     .read_bytes(readback, 0)
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;

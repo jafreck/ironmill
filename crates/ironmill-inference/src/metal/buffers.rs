@@ -366,23 +366,7 @@ pub(crate) fn build_matmul_cache(
 /// Panics if `bytes.len()` is not a multiple of 2 or if the pointer is not
 /// 2-byte aligned. Both conditions are guaranteed for Metal buffer readbacks.
 pub(crate) fn bytes_as_f16(bytes: &[u8]) -> &[f16] {
-    let elem_size = std::mem::size_of::<f16>();
-    assert!(
-        bytes.len() % elem_size == 0,
-        "byte slice length {} is not a multiple of f16 size ({})",
-        bytes.len(),
-        elem_size,
-    );
-    assert!(
-        bytes.as_ptr() as usize % std::mem::align_of::<f16>() == 0,
-        "byte slice pointer is not aligned for f16",
-    );
-    // SAFETY: We have verified length and alignment. `f16` is `#[repr(transparent)]`
-    // over `u16` and has no invalid bit patterns.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr() as *const f16, bytes.len() / elem_size)
-    }
+    bytemuck::cast_slice::<u8, f16>(bytes)
 }
 
 // ── Helpers on ModelConfig ──────────────────────────────────────
