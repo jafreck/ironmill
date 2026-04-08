@@ -381,6 +381,8 @@ mod tests {
                     rms_norm_eps: 1e-5,
                     rope_theta: 10000.0,
                     tie_word_embeddings: false,
+                    query_pre_attn_scalar: 0,
+                    hidden_act: "silu".to_string(),
                     extra: Default::default(),
                 },
             }
@@ -649,6 +651,8 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 tie_word_embeddings: false,
+                query_pre_attn_scalar: 0,
+                hidden_act: "silu".to_string(),
                 extra: Default::default(),
             },
         }));

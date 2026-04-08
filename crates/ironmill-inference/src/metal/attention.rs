@@ -9,6 +9,7 @@ use super::turboquant::{MetalKvCache, MetalTurboQuantModel};
 use super::weights::WeightBuffer;
 use crate::engine::InferenceError;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_qk_norm_and_rope(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,

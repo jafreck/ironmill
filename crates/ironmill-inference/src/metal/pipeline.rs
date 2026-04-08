@@ -162,6 +162,7 @@ impl MetalInference {
     /// The hidden state is the output of the final RMSNorm (before the LM head
     /// projection), read back from `norm_out`. Used by EAGLE-3 speculative
     /// decoding where the draft head needs the target model's hidden state.
+    #[allow(dead_code)]
     pub(crate) fn decode_step_with_hidden(
         &mut self,
         token: u32,

@@ -671,7 +671,7 @@ fn magnitude_cache_key(magnitudes: &[f32]) -> u64 {
 ///
 /// Rows are processed in parallel via rayon. Large matrices sub-sample
 /// rows (cap 256) and broadcast the median clip value to all rows.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub(crate) fn search_clip_ranges(
     scaled_weights: &[f32],
     out_features: usize,
@@ -951,6 +951,7 @@ fn quantize_tensor_int8(
 ///
 /// The runtime kernel divides activations by `s_ch` to compensate, preserving
 /// the dot product:  dot(x, w) = dot(x / s, w * s)
+#[allow(clippy::too_many_arguments)]
 fn quantize_tensor_int4_awq(
     floats: &[f32],
     shape: &[usize],
@@ -1086,16 +1087,6 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
             QuantMethod::AffineInt4(config) => {
                 // Check if this is a sensitive layer → use INT8 instead of INT4.
                 if !config.sensitive_layers.is_empty() {
-                    // Embedding and lm_head tensors get INT8 when sensitive layers are configured.
-                    let is_embedding = name.contains("embed_tokens") || name.contains("embedding");
-                    let is_lm_head = name.contains("lm_head");
-                    if is_embedding || is_lm_head {
-                        let (packed_data, quant_info) =
-                            quantize_tensor_int8(&floats, &t.shape, config.group_size);
-                        return Ok(WeightTensor::owned(packed_data, t.shape, ScalarType::UInt8)
-                            .with_quant_info(quant_info));
-                    }
-
                     if let Some(layer_idx) = extract_layer_index(name) {
                         if config.sensitive_layers.contains(&layer_idx) {
                             let (packed_data, quant_info) =

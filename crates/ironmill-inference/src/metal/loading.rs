@@ -386,6 +386,7 @@ impl MetalInference {
     }
 
     /// JIT weight loading with on-the-fly transforms (not yet implemented).
+    #[allow(dead_code)]
     pub(crate) fn load_jit(
         _config: MetalConfig,
         _provider: &dyn mil_rs::weights::WeightProvider,

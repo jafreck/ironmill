@@ -38,3 +38,4 @@ optional = true
 [[example]]
 name = "ane_op_eval"
 path = "examples/ane_op_eval.rs"
+required-features = ["ane"]
