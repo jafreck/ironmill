@@ -28,6 +28,8 @@ pub struct AffinePipelines {
     pub matvec_int4xq8: ComputePipeline,
     /// INT4 2-row matvec: 2 output rows per TG with 64 threads (2 simdgroups).
     pub matvec_int4_2row: ComputePipeline,
+    /// INT4 coalesced matvec: 32 adjacent rows per TG, perfect memory coalescing.
+    pub matvec_int4_coalesced: ComputePipeline,
     /// INT4 affine embedding lookup with on-the-fly dequantization.
     pub embedding_lookup_int4: ComputePipeline,
 }

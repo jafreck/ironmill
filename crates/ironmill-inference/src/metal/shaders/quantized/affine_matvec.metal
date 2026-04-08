@@ -226,3 +226,141 @@ kernel void affine_matvec_int8(
         C[tid] = half(acc);
     }
 }
+
+
+// ── INT4 matvec coalesced (decode path, M=1) ────────────────────
+//
+// 32 adjacent output rows per threadgroup. Each lane handles one row.
+// All lanes in a simdgroup access CONSECUTIVE uint32s within the same
+// k-block, achieving perfect memory coalescing (128 bytes per cache
+// line transaction, 100% utilized vs 3% in the strided per-row kernel).
+//
+// Each lane iterates over ALL k-blocks sequentially — no simd_sum needed.
+// The input vector A is broadcast-read by all lanes (L1 cached).
+//
+// Dispatch: (ceil(N/32), 1, 1) threadgroups, (32, 1, 1) threads.
+
+kernel void affine_matvec_int4_coalesced(
+    device const half *A            [[buffer(0)]],   // [1, K]
+    device const uchar *B_packed    [[buffer(1)]],   // blocked [N_blk, K_blk, 64, 4]
+    device const half *scales       [[buffer(2)]],   // [N, num_groups]
+    device const half *zeros        [[buffer(3)]],   // [N, num_groups]
+    device half *C                  [[buffer(4)]],   // [1, N]
+    constant uint &N                [[buffer(5)]],
+    constant uint &K                [[buffer(6)]],
+    constant uint &group_size       [[buffer(7)]],
+    device const half *awq_scales   [[buffer(8)]],
+    constant uint &has_awq          [[buffer(9)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint row = tgid * 32 + lane;
+    if (row >= N) return;
+
+    uint num_groups = (K + group_size - 1) / group_size;
+    uint scale_row = row * num_groups;
+    uint k_blocks = (K + BLK_K - 1) / BLK_K;
+    uint n_block = row / BLK_N;
+    uint n_local = row % BLK_N;
+
+    // Base offset for this row's weight data across all k-blocks
+    uint row_base = n_block * k_blocks * BLK_N + n_local;
+
+    float acc = 0.0f;
+
+    // Process 4 k-blocks per iteration for instruction-level parallelism.
+    // All 32 lanes access consecutive addresses within each k-block (coalesced).
+    uint kb = 0;
+    uint k_blocks_4 = k_blocks & ~3u;  // round down to multiple of 4
+
+    for (; kb < k_blocks_4; kb += 4) {
+        uint base0 = row_base + kb * BLK_N;
+        uint p0 = ((device const uint*)B_packed)[base0];
+        uint p1 = ((device const uint*)B_packed)[base0 + BLK_N];
+        uint p2 = ((device const uint*)B_packed)[base0 + BLK_N * 2];
+        uint p3 = ((device const uint*)B_packed)[base0 + BLK_N * 3];
+
+        uint k0 = kb * BLK_K;
+
+        // Scale/zero for all 4 groups (may share if group_size >= 32)
+        uint g0 = k0 / group_size;
+        float s0 = float(scales[scale_row + g0]);
+        float z0 = float(zeros[scale_row + g0]);
+
+        uint g1 = (k0 + BLK_K) / group_size;
+        float s1 = (g1 != g0) ? float(scales[scale_row + g1]) : s0;
+        float z1 = (g1 != g0) ? float(zeros[scale_row + g1]) : z0;
+
+        uint g2 = (k0 + BLK_K * 2) / group_size;
+        float s2 = (g2 != g1) ? float(scales[scale_row + g2]) : s1;
+        float z2 = (g2 != g1) ? float(zeros[scale_row + g2]) : z1;
+
+        uint g3 = (k0 + BLK_K * 3) / group_size;
+        float s3 = (g3 != g2) ? float(scales[scale_row + g3]) : s2;
+        float z3 = (g3 != g2) ? float(zeros[scale_row + g3]) : z2;
+
+        // Dequant and dot product for k-block 0 (8 elements)
+        acc += float(A[k0])     * ((float(p0 & 0xF) - z0) * s0);
+        acc += float(A[k0 + 1]) * ((float((p0 >> 4) & 0xF) - z0) * s0);
+        acc += float(A[k0 + 2]) * ((float((p0 >> 8) & 0xF) - z0) * s0);
+        acc += float(A[k0 + 3]) * ((float((p0 >> 12) & 0xF) - z0) * s0);
+        acc += float(A[k0 + 4]) * ((float((p0 >> 16) & 0xF) - z0) * s0);
+        acc += float(A[k0 + 5]) * ((float((p0 >> 20) & 0xF) - z0) * s0);
+        acc += float(A[k0 + 6]) * ((float((p0 >> 24) & 0xF) - z0) * s0);
+        acc += float(A[k0 + 7]) * ((float((p0 >> 28) & 0xF) - z0) * s0);
+
+        // k-block 1
+        uint k1 = k0 + BLK_K;
+        acc += float(A[k1])     * ((float(p1 & 0xF) - z1) * s1);
+        acc += float(A[k1 + 1]) * ((float((p1 >> 4) & 0xF) - z1) * s1);
+        acc += float(A[k1 + 2]) * ((float((p1 >> 8) & 0xF) - z1) * s1);
+        acc += float(A[k1 + 3]) * ((float((p1 >> 12) & 0xF) - z1) * s1);
+        acc += float(A[k1 + 4]) * ((float((p1 >> 16) & 0xF) - z1) * s1);
+        acc += float(A[k1 + 5]) * ((float((p1 >> 20) & 0xF) - z1) * s1);
+        acc += float(A[k1 + 6]) * ((float((p1 >> 24) & 0xF) - z1) * s1);
+        acc += float(A[k1 + 7]) * ((float((p1 >> 28) & 0xF) - z1) * s1);
+
+        // k-block 2
+        uint k2 = k0 + BLK_K * 2;
+        acc += float(A[k2])     * ((float(p2 & 0xF) - z2) * s2);
+        acc += float(A[k2 + 1]) * ((float((p2 >> 4) & 0xF) - z2) * s2);
+        acc += float(A[k2 + 2]) * ((float((p2 >> 8) & 0xF) - z2) * s2);
+        acc += float(A[k2 + 3]) * ((float((p2 >> 12) & 0xF) - z2) * s2);
+        acc += float(A[k2 + 4]) * ((float((p2 >> 16) & 0xF) - z2) * s2);
+        acc += float(A[k2 + 5]) * ((float((p2 >> 20) & 0xF) - z2) * s2);
+        acc += float(A[k2 + 6]) * ((float((p2 >> 24) & 0xF) - z2) * s2);
+        acc += float(A[k2 + 7]) * ((float((p2 >> 28) & 0xF) - z2) * s2);
+
+        // k-block 3
+        uint k3 = k0 + BLK_K * 3;
+        acc += float(A[k3])     * ((float(p3 & 0xF) - z3) * s3);
+        acc += float(A[k3 + 1]) * ((float((p3 >> 4) & 0xF) - z3) * s3);
+        acc += float(A[k3 + 2]) * ((float((p3 >> 8) & 0xF) - z3) * s3);
+        acc += float(A[k3 + 3]) * ((float((p3 >> 12) & 0xF) - z3) * s3);
+        acc += float(A[k3 + 4]) * ((float((p3 >> 16) & 0xF) - z3) * s3);
+        acc += float(A[k3 + 5]) * ((float((p3 >> 20) & 0xF) - z3) * s3);
+        acc += float(A[k3 + 6]) * ((float((p3 >> 24) & 0xF) - z3) * s3);
+        acc += float(A[k3 + 7]) * ((float((p3 >> 28) & 0xF) - z3) * s3);
+    }
+
+    // Handle remaining k-blocks (0-3)
+    for (; kb < k_blocks; kb++) {
+        uint word_idx = row_base + kb * BLK_N;
+        uint packed4 = ((device const uint*)B_packed)[word_idx];
+        uint k_elem = kb * BLK_K;
+        uint grp = k_elem / group_size;
+        float s = float(scales[scale_row + grp]);
+        float z = float(zeros[scale_row + grp]);
+
+        acc += float(A[k_elem])     * ((float(packed4 & 0xF) - z) * s);
+        acc += float(A[k_elem + 1]) * ((float((packed4 >> 4) & 0xF) - z) * s);
+        acc += float(A[k_elem + 2]) * ((float((packed4 >> 8) & 0xF) - z) * s);
+        acc += float(A[k_elem + 3]) * ((float((packed4 >> 12) & 0xF) - z) * s);
+        acc += float(A[k_elem + 4]) * ((float((packed4 >> 16) & 0xF) - z) * s);
+        acc += float(A[k_elem + 5]) * ((float((packed4 >> 20) & 0xF) - z) * s);
+        acc += float(A[k_elem + 6]) * ((float((packed4 >> 24) & 0xF) - z) * s);
+        acc += float(A[k_elem + 7]) * ((float((packed4 >> 28) & 0xF) - z) * s);
+    }
+
+    C[row] = half(acc);
+}
