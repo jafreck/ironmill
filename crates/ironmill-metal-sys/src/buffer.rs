@@ -44,9 +44,9 @@ pub struct MetalBuffer {
     mode: StorageMode,
 }
 
-// SAFETY: Metal buffers are thread-safe once created.
+// SAFETY: Metal buffers can be moved between threads.
+// Not Sync: write_bytes/read_bytes mutate raw memory through &self.
 unsafe impl Send for MetalBuffer {}
-unsafe impl Sync for MetalBuffer {}
 
 impl MetalBuffer {
     /// Create a `MetalBuffer` from a raw pointer and known storage mode.

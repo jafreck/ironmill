@@ -147,9 +147,9 @@ pub struct FunctionConstantValues {
     raw: *mut c_void,
 }
 
-// SAFETY: MTLFunctionConstantValues is thread-safe once populated.
+// SAFETY: MTLFunctionConstantValues can be moved between threads.
+// Not Sync: set_u32 mutates ObjC state through &self.
 unsafe impl Send for FunctionConstantValues {}
-unsafe impl Sync for FunctionConstantValues {}
 
 impl FunctionConstantValues {
     /// Create a new empty set of function constant values.
