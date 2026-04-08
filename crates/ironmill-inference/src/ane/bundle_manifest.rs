@@ -10,42 +10,18 @@ use ironmill_iosurface::AneTensor;
 // Re-export canonical manifest types from core.
 // Type aliases preserve the names previously used within this crate.
 pub use ironmill_core::ane::bundle::{
-    BundleArchitecture as ArchitectureManifest, BundleInputPacking as InputPackingManifest,
-    BundleManifest, BundleModelType, BundleTensorDescriptor as TensorDescriptorManifest,
-    DecodeManifest, LayerManifest, LmHeadManifest, SubProgramManifest,
+    BundleArchitecture as ArchitectureManifest, BundleManifest, BundleModelType,
+    BundleTensorDescriptor as TensorDescriptorManifest, DecodeManifest, LayerManifest,
+    LmHeadManifest, SubProgramManifest,
 };
 
 // ---------------------------------------------------------------------------
 // Inference-side input packing
 // ---------------------------------------------------------------------------
 
-/// Inference-side input packing metadata (mirrors compile's InputPacking).
-#[derive(Debug, Clone)]
-pub struct InputPacking {
-    /// Byte offsets of each logical input within the packed tensor.
-    pub offsets: Vec<usize>,
-    /// Sizes (in elements) of each logical input.
-    pub sizes: Vec<usize>,
-}
-
-impl From<InputPackingManifest> for InputPacking {
-    fn from(m: InputPackingManifest) -> Self {
-        Self {
-            offsets: m.offsets,
-            sizes: m.sizes,
-        }
-    }
-}
-
-/// Convert core-crate InputPacking to inference-side InputPacking.
-impl From<ironmill_core::ane::packing::InputPacking> for InputPacking {
-    fn from(ip: ironmill_core::ane::packing::InputPacking) -> Self {
-        Self {
-            offsets: ip.offsets,
-            sizes: ip.sizes,
-        }
-    }
-}
+/// Re-export core's InputPacking directly — the struct is identical and
+/// avoids maintaining a parallel type with From conversions.
+pub use ironmill_core::ane::packing::InputPacking;
 
 // ---------------------------------------------------------------------------
 // Packed input writer
