@@ -2,7 +2,7 @@
 //!
 //! These are genuine correctness tests (not benchmarks) that verify
 //! Metal inference produces valid outputs. For performance benchmarks,
-//! use: `cargo run --release -p ironmill-bench --features metal -- --config configs/qwen35-bench.toml -b metal`
+//! use: `cargo run --release -p ironmill-bench --features metal -- --config configs/qwen35-4b-optimization-matrix.toml -b metal`
 //!
 //! Requires: Metal GPU, Qwen3.5-4B SafeTensors.
 //! Run: `cargo test -p ironmill-bench --features metal -- qwen35 --ignored --nocapture`

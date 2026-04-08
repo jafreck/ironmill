@@ -116,7 +116,7 @@ benchmark harness already has `--specbundle` support.
 
 ```bash
 cargo run --release -p ironmill-bench --features metal -- \
-  --config configs/qwen35-bench.toml -b metal \
+  --config configs/qwen35-4b-optimization-matrix.toml -b metal \
   --baseline fp16-baseline -i 20 -w 5 -r 3 \
   --perplexity --perplexity-sequences 1 \
   --perplexity-dataset tests/fixtures/quality/wikitext2-qwen35.json

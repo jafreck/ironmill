@@ -7,7 +7,7 @@
 #
 # Reproduce:
 #   cargo run --release -p ironmill-bench --features metal,gptq -- \
-#     --config configs/gptq-bench.toml -b metal \
+#     --config configs/qwen3-0.6b-gptq.toml -b metal \
 #     -i 20 -w 5 -r 3 \
 #     --perplexity --perplexity-sequences 5
 

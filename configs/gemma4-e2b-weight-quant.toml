@@ -5,7 +5,7 @@
 #
 # Reproduce:
 #   cargo run --release -p ironmill-bench --features metal -- \
-#     --config configs/gemma4-bench.toml -b metal \
+#     --config configs/gemma4-e2b-weight-quant.toml -b metal \
 #     -i 20 -w 5 -r 3
 
 [[model]]

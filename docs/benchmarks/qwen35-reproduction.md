@@ -90,11 +90,11 @@ numbers, use `--perplexity-sequences 50`.
 ## 2. Decode Speed at Long Context
 
 Uses FlashDecoding split-KV attention to parallelize decode across
-GPU cores. Config file (`configs/qwen35-turboquant-bench.toml`):
+GPU cores. Config file (`configs/qwen35-4b-kv-context-scaling.toml`):
 
 ```bash
 cargo run --release -p ironmill-bench --features metal -- \
-    --config configs/qwen35-turboquant-bench.toml -b metal \
+    --config configs/qwen35-4b-kv-context-scaling.toml -b metal \
     -i 20 -w 5 -r 1 \
     --context-lengths 128,1024,4096,16384
 ```
@@ -126,7 +126,7 @@ a mild slope from quantized attention's per-position dequant cost.
 
 ```bash
 cargo run --release -p ironmill-bench --features metal -- \
-    --config configs/qwen35-turboquant-bench.toml -b metal \
+    --config configs/qwen35-4b-kv-context-scaling.toml -b metal \
     -i 20 -w 5 -r 1 \
     --prefill-bench
 ```
@@ -149,13 +149,13 @@ from quantized KV cache writes.
 
 ## 4. Full Suite (all optimizations + PPL)
 
-The comprehensive config at `configs/qwen35-bench.toml` benchmarks
+The comprehensive config at `configs/qwen35-4b-optimization-matrix.toml` benchmarks
 all five configurations (FP16, FP16+TQ-INT8, FP16+TQ-INT4, D2Q3+TQ-INT8,
 INT4+TQ-INT8):
 
 ```bash
 cargo run --release -p ironmill-bench --features metal -- \
-    --config configs/qwen35-bench.toml -b metal \
+    --config configs/qwen35-4b-optimization-matrix.toml -b metal \
     -i 20 -w 5 -r 3 \
     --perplexity --perplexity-sequences 1 \
     --perplexity-dataset tests/fixtures/quality/wikitext2-qwen35.json

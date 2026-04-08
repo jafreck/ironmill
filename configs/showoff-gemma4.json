@@ -1,6 +1,0 @@
-{
-  "runtime": "metal",
-  "quantize": "d2quant",
-  "bits": 3,
-  "output": "gemma4-e2b-d2q3.ironml-gpu"
-}

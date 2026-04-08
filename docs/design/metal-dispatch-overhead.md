@@ -272,7 +272,7 @@ cargo test --release -p ironmill-bench --features metal --test qwen35_bench \
   -- qwen35_int4_tq_int8_ppl_regression --ignored --nocapture
 
 cargo run --release -p ironmill-bench --features metal -- \
-  --config configs/qwen35-bench.toml -b metal \
+  --config configs/qwen35-4b-optimization-matrix.toml -b metal \
   -i 20 -w 5 -r 3
 ```
 

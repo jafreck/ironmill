@@ -8,7 +8,7 @@
 #
 # Reproduce:
 #   cargo run --release -p ironmill-bench --features metal -- \
-#     --config configs/qwen35-turboquant-bench.toml -b metal \
+#     --config configs/qwen35-4b-kv-context-scaling.toml -b metal \
 #     --baseline fp16-2k
 
 [[model]]

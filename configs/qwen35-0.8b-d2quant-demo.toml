@@ -1,5 +1,5 @@
 # Baseline FP16 vs fully-optimized ironmill benchmark
-# Usage: cargo run --release -p ironmill-bench -- --config bench-showoff.toml -b metal
+# Usage: cargo run --release -p ironmill-bench -- --config configs/qwen35-0.8b-d2quant-demo.toml -b metal
 #
 # Optimized config uses D2Quant (SOTA 2-bit dual-scale quantization) for
 # weights plus TurboQuant INT8+QJL for KV cache compression. This represents

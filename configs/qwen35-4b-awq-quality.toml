@@ -9,7 +9,7 @@
 #
 # Reproduce (decode-ppl suite: single model load per config):
 #   cargo run --release -p ironmill-bench --features metal -- \
-#     --config configs/quant-quality-roadmap.toml \
+#     --config configs/qwen35-4b-awq-quality.toml \
 #     --perplexity --perplexity-sequences 8 \
 #     --perplexity-dataset tests/fixtures/quality/wikitext2-qwen35.json
 
