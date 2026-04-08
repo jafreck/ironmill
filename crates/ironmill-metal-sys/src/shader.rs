@@ -173,6 +173,7 @@ impl FunctionConstantValues {
         type InitFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         let init_sel = unsafe { objc::sel_registerName(sel!("init")) };
         let init_fn: InitFn = unsafe { std::mem::transmute(objc::objc_msgSend as *const ()) };
+        // Per ObjC convention, init releases self on failure, so no leak on nil.
         let obj = unsafe { init_fn(raw, init_sel) };
         if obj.is_null() {
             return Err(MetalSysError::InvalidArgument(

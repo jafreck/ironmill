@@ -310,6 +310,11 @@ impl MetalDevice {
             )
         };
         unsafe { objc::CFRelease(ns_data) };
+        if dispatch_data.is_null() {
+            return Err(MetalSysError::ShaderCompilation(
+                "dispatch_data_create failed".into(),
+            ));
+        }
 
         // -[MTLDevice newLibraryWithData:error:]
         let mut error: *mut c_void = std::ptr::null_mut();

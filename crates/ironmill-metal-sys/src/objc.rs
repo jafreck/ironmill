@@ -75,6 +75,7 @@ pub(crate) fn create_nsstring(s: &str) -> Result<*mut c_void, MetalSysError> {
     // SAFETY: transmute objc_msgSend to the correct signature.
     let init_fn: InitFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
     // SAFETY: raw is a valid allocated NSString; buf is null-terminated.
+    // Per ObjC convention, init releases self on failure, so no leak on nil.
     let obj = unsafe { init_fn(raw, init_sel, buf.as_ptr()) };
     if obj.is_null() {
         return Err(MetalSysError::InvalidArgument(
