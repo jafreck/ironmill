@@ -990,9 +990,9 @@ impl MetalPipelines {
         kind: LinearKernelKind,
     ) -> Option<&ComputePipeline> {
         match (bit_width, kind) {
-            (4, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int4_amx),
+            (4, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int4),
             (4, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int4),
-            (8, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int8_amx),
+            (8, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int8),
             (8, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int8),
             _ => None,
         }
@@ -1006,7 +1006,7 @@ impl MetalPipelines {
         kind: LinearKernelKind,
     ) -> Option<&ComputePipeline> {
         match (bit_width, kind) {
-            (3, LinearKernelKind::Matvec) => Some(&self.d2quant_matvec_3bit_amx),
+            (3, LinearKernelKind::Matvec) => Some(&self.d2quant_matvec_3bit),
             (3, LinearKernelKind::Matmul) => Some(&self.d2quant_matmul_3bit),
             _ => None,
         }
@@ -2117,11 +2117,8 @@ pub fn encode_batched_affine_matvec_int4(
         encoder.set_buffer(&gate_weight.data, 0, 12); // dummy
         encoder.set_bytes(&0u32.to_le_bytes(), 13);
     }
-    let amx_rows_per_tg = 64usize;
-    let n_gate_tgs = (n_gate as usize).div_ceil(amx_rows_per_tg);
-    let n_up_tgs = (n_gate as usize).div_ceil(amx_rows_per_tg); // N_up == N_gate
-    let tg_count = n_gate_tgs + n_up_tgs;
-    encoder.dispatch_threadgroups((tg_count, 1, 1), (256, 1, 1));
+    let tg_count = (2 * n_gate) as usize;
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
 }
 
 /// Encode fused FFN gate+up+activation for INT4 decode.
@@ -2161,9 +2158,7 @@ pub fn encode_fused_ffn_gate_up_act_int4(
         encoder.set_bytes(&0u32.to_le_bytes(), 12);
     }
     encoder.set_bytes(&(use_gelu as u32).to_le_bytes(), 13);
-    let amx_rows_per_tg = 64usize;
-    let tg_count = (n as usize).div_ceil(amx_rows_per_tg);
-    encoder.dispatch_threadgroups((tg_count, 1, 1), (256, 1, 1));
+    encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }
 ///
 /// Computes qkv = x·W0^T, z = x·W1^T, a = x·W2^T, b = x·W3^T concurrently.
@@ -2214,12 +2209,8 @@ pub fn encode_gdn_batched_affine_matvec_int4(
     } else {
         encoder.set_buffer(&w0.data, 0, 18); // dummy
     }
-    let amx_rows_per_tg = 64usize;
-    let tg_count = (n0 as usize).div_ceil(amx_rows_per_tg)
-        + (n1 as usize).div_ceil(amx_rows_per_tg)
-        + (n2 as usize).div_ceil(amx_rows_per_tg)
-        + (n3 as usize).div_ceil(amx_rows_per_tg);
-    encoder.dispatch_threadgroups((tg_count, 1, 1), (256, 1, 1));
+    let tg_count = (n0 + n1 + n2 + n3) as usize;
+    encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
 }
 
 /// Encode fused residual + RMSNorm + dense FP16 matvec.
@@ -2569,7 +2560,5 @@ pub fn encode_affine_matvec_int4xq8(
     encoder.set_bytes(&k.to_le_bytes(), 7);
     encoder.set_bytes(&weight.group_size.to_le_bytes(), 8);
     encoder.set_bytes(&q8_group_size.to_le_bytes(), 9);
-    let amx_rows_per_tg = 64usize;
-    let num_tgs = (n as usize).div_ceil(amx_rows_per_tg);
-    encoder.dispatch_threadgroups((num_tgs, 1, 1), (256, 1, 1));
+    encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }

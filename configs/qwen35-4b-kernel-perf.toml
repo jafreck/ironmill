@@ -25,17 +25,11 @@ int4 = true
 kv_quant = "turbo-int8"
 max_seq_len = 512
 
-# ── D2Quant 3-bit weights + TurboQuant INT8 KV cache ─────────────
-[[optimization]]
-name = "d2q3-tq-int8"
-d2quant = 3
-kv_quant = "turbo-int8"
-max_seq_len = 512
 
 [settings]
 iterations = 20
-warmup = 5
-runs = 3
+warmup = 2
+runs = 2
 backends = ["metal"]
 
 [benchmarks]

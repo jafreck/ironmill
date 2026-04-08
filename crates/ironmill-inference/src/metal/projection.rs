@@ -261,10 +261,8 @@ fn encode_affine_projection(
             encoder.set_buffer(&weight.data, 0, 8);
         }
         encoder.set_bytes(&has_awq.to_le_bytes(), 9);
-        let amx_rows_per_tg = 64usize;
-        let threads_per_group = 256;
-        let num_tgs = n.div_ceil(amx_rows_per_tg);
-        encoder.dispatch_threadgroups((num_tgs, 1, 1), (threads_per_group, 1, 1));
+        let threads_per_group = 32;
+        encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
     } else {
         encoder.set_bytes(&(token_count as u32).to_le_bytes(), 5);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 6);
@@ -331,10 +329,8 @@ fn encode_d2quant_projection(
         encoder.set_bytes(&(n as u32).to_le_bytes(), 8);
         encoder.set_bytes(&(k as u32).to_le_bytes(), 9);
         encoder.set_bytes(&weight.group_size.to_le_bytes(), 10);
-        let amx_rows_per_tg = 64usize;
-        let threads_per_group = 256;
-        let num_tgs = n.div_ceil(amx_rows_per_tg);
-        encoder.dispatch_threadgroups((num_tgs, 1, 1), (threads_per_group, 1, 1));
+        let threads_per_group = 32;
+        encoder.dispatch_threadgroups((n, 1, 1), (threads_per_group, 1, 1));
     } else {
         encoder.set_bytes(&(token_count as u32).to_le_bytes(), 8);
         encoder.set_bytes(&(n as u32).to_le_bytes(), 9);
