@@ -109,7 +109,7 @@ pub fn write_gpu_bundle(
                         shape: original_shape.clone(),
                         n_bits: *n_bits,
                         dtype: scalar_type_to_str(*lut_dtype)
-                            .map_err(|e| CompileError::Other(e.to_string()))?
+                            .map_err(|e| CompileError::UnsupportedScalarType(e.to_string()))?
                             .to_string(),
                         quip_sharp_seed: quip_sharp_seed.map(|s| s as u32),
                     },
@@ -125,7 +125,7 @@ pub fn write_gpu_bundle(
                         file,
                         shape: tensor.shape.clone(),
                         dtype: scalar_type_to_str(tensor.dtype)
-                            .map_err(|e| CompileError::Other(e.to_string()))?
+                            .map_err(|e| CompileError::UnsupportedScalarType(e.to_string()))?
                             .to_string(),
                     },
                 );
@@ -234,18 +234,22 @@ pub fn write_gpu_bundle(
                             group_size,
                             axis: axis as i64,
                             dtype: scalar_type_to_str(tensor.dtype)
-                                .map_err(|e| CompileError::Other(e.to_string()))?
+                                .map_err(|e| CompileError::UnsupportedScalarType(e.to_string()))?
                                 .to_string(),
                             awq_scales_file,
                             g_idx_file,
                             scale_dtype: Some(
                                 scalar_type_to_str(*scale_dtype)
-                                    .map_err(|e| CompileError::Other(e.to_string()))?
+                                    .map_err(|e| {
+                                        CompileError::UnsupportedScalarType(e.to_string())
+                                    })?
                                     .to_string(),
                             ),
                             zero_point_dtype: Some(
                                 scalar_type_to_str(*zero_point_dtype)
-                                    .map_err(|e| CompileError::Other(e.to_string()))?
+                                    .map_err(|e| {
+                                        CompileError::UnsupportedScalarType(e.to_string())
+                                    })?
                                     .to_string(),
                             ),
                         },
@@ -306,7 +310,7 @@ pub fn write_gpu_bundle(
                 );
             }
             other => {
-                return Err(CompileError::Other(format!(
+                return Err(CompileError::UnsupportedQuantization(format!(
                     "unsupported quantization info for tensor '{name}': {other:?}"
                 )));
             }
@@ -364,7 +368,7 @@ fn affine_dequantize_to_fp16(
     use mil_rs::ir::ScalarType;
 
     if bit_width != 8 {
-        return Err(CompileError::Other(format!(
+        return Err(CompileError::UnsupportedQuantization(format!(
             "affine dequantize to FP16: only INT8 is supported, got {bit_width}-bit"
         )));
     }
@@ -382,7 +386,7 @@ fn affine_dequantize_to_fp16(
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         _ => {
-            return Err(CompileError::Other(format!(
+            return Err(CompileError::UnsupportedQuantization(format!(
                 "unsupported scale dtype: {scale_dtype:?}"
             )));
         }
@@ -401,7 +405,7 @@ fn affine_dequantize_to_fp16(
             .collect(),
         ScalarType::Int8 => zero_point_bytes.iter().map(|&b| b as i8 as f32).collect(),
         _ => {
-            return Err(CompileError::Other(format!(
+            return Err(CompileError::UnsupportedQuantization(format!(
                 "unsupported zero_point dtype: {zero_point_dtype:?}"
             )));
         }

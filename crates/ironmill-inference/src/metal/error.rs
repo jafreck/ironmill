@@ -36,6 +36,10 @@ pub enum MetalError {
     },
 
     /// A generic error from an underlying operation.
+    ///
+    /// Prefer a more specific variant when one exists. This variant is an
+    /// escape hatch for errors that don't fit any structured variant (e.g.,
+    /// unexpected buffer layouts or other one-off edge cases).
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

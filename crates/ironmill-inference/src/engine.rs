@@ -39,7 +39,16 @@ pub enum InferenceError {
     #[error("sequence {0} not found")]
     SequenceNotFound(u64),
 
+    /// Calibration dataset loading or validation failed.
+    #[error("calibration data error: {0}")]
+    CalibrationData(String),
+
     /// A generic error from an underlying operation.
+    ///
+    /// Prefer a more specific variant when one exists. This variant is an
+    /// escape hatch for truly unpredictable errors (e.g., stub/unimplemented
+    /// code paths or test harnesses). New production code should add a
+    /// dedicated variant instead.
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 

@@ -76,27 +76,27 @@ impl TurboQuantConfig {
         num_layers: usize,
     ) -> Result<Self> {
         if !VALID_N_BITS.contains(&n_bits) {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(format!(
                 "invalid n_bits {n_bits}: must be one of {VALID_N_BITS:?}"
             )));
         }
         if max_seq_len == 0 {
-            return Err(AneError::Other(anyhow::anyhow!("max_seq_len must be > 0")));
+            return Err(AneError::Validation("max_seq_len must be > 0".into()));
         }
         if num_heads == 0 {
-            return Err(AneError::Other(anyhow::anyhow!("num_heads must be > 0")));
+            return Err(AneError::Validation("num_heads must be > 0".into()));
         }
         if num_kv_heads == 0 {
-            return Err(AneError::Other(anyhow::anyhow!("num_kv_heads must be > 0")));
+            return Err(AneError::Validation("num_kv_heads must be > 0".into()));
         }
         if head_dim == 0 {
-            return Err(AneError::Other(anyhow::anyhow!("head_dim must be > 0")));
+            return Err(AneError::Validation("head_dim must be > 0".into()));
         }
         if num_layers == 0 {
-            return Err(AneError::Other(anyhow::anyhow!("num_layers must be > 0")));
+            return Err(AneError::Validation("num_layers must be > 0".into()));
         }
         if num_heads % num_kv_heads != 0 {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(format!(
                 "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
             )));
         }
@@ -273,7 +273,7 @@ impl KvCacheManager {
         k_original: Option<&[f16]>,
     ) -> Result<()> {
         if layer >= self.config.num_layers {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(format!(
                 "layer index {layer} out of range (num_layers = {})",
                 self.config.num_layers
             )));
@@ -281,14 +281,14 @@ impl KvCacheManager {
 
         let token_elements = self.config.num_kv_heads * self.config.head_dim;
         if k_quantized.len() != token_elements {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(format!(
                 "k_quantized length {} != expected {} (num_kv_heads * head_dim)",
                 k_quantized.len(),
                 token_elements
             )));
         }
         if v_quantized.len() != token_elements {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(format!(
                 "v_quantized length {} != expected {} (num_kv_heads * head_dim)",
                 v_quantized.len(),
                 token_elements
@@ -296,10 +296,9 @@ impl KvCacheManager {
         }
 
         if self.seq_pos >= self.config.max_seq_len {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::CacheError(format!(
                 "KV cache full: seq_pos {} >= max_seq_len {}",
-                self.seq_pos,
-                self.config.max_seq_len
+                self.seq_pos, self.config.max_seq_len
             )));
         }
 
@@ -373,17 +372,16 @@ impl KvCacheManager {
         k_original: Option<&[f16]>,
     ) -> Result<()> {
         if layer >= self.config.num_layers {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(format!(
                 "layer index {layer} out of range (num_layers = {})",
                 self.config.num_layers
             )));
         }
 
         if self.seq_pos >= self.config.max_seq_len {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::CacheError(format!(
                 "KV cache full: seq_pos {} >= max_seq_len {}",
-                self.seq_pos,
-                self.config.max_seq_len
+                self.seq_pos, self.config.max_seq_len
             )));
         }
 
@@ -538,17 +536,18 @@ impl<D: AneDevice> TurboQuantModel<D> {
 
         // Validate asymmetric K/V constraints.
         if config.asymmetric_kv && config.n_bits < 2 {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(format!(
                 "asymmetric_kv requires n_bits >= 2 (got {}), \
                  so K can use at least 1-bit codebook",
                 config.n_bits
             )));
         }
         if config.asymmetric_kv && !config.enable_qjl {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(
                 "asymmetric K/V quantization requires QJL (enable_qjl=true) — \
                  K uses fewer bits and relies on QJL correction to compensate"
-            )));
+                    .into(),
+            ));
         }
 
         let mil_config = MilTextConfig::default();
@@ -574,9 +573,8 @@ impl<D: AneDevice> TurboQuantModel<D> {
                 &codebook_boundaries,
                 &codebook_levels,
             );
-            let (cw_mil, _) = program_to_mil_text(&cw_program, &mil_config).map_err(|e| {
-                AneError::Other(anyhow::anyhow!("cache-write MIL text failed: {e}"))
-            })?;
+            let (cw_mil, _) = program_to_mil_text(&cw_program, &mil_config)
+                .map_err(|e| AneError::CacheError(format!("cache-write MIL text failed: {e}")))?;
             // Weights are delivered as function inputs, not BLOBFILE — pass empty weights
             Some(device.compile(&cw_mil, &[], config.qos)?)
         } else {
@@ -591,18 +589,16 @@ impl<D: AneDevice> TurboQuantModel<D> {
             let (k_levels, k_boundaries) = lloyd_max_gaussian(head_dim, k_bits);
             let (k_program, _k_weights) =
                 mil_emitter::build_single_cache_write_program(&config, &k_boundaries, &k_levels);
-            let (k_mil, _) = program_to_mil_text(&k_program, &mil_config).map_err(|e| {
-                AneError::Other(anyhow::anyhow!("K cache-write MIL text failed: {e}"))
-            })?;
+            let (k_mil, _) = program_to_mil_text(&k_program, &mil_config)
+                .map_err(|e| AneError::CacheError(format!("K cache-write MIL text failed: {e}")))?;
             let k_compiled = device.compile(&k_mil, &[], config.qos)?;
 
             // V cache-write: n_bits-bit codebook.
             let (v_levels, v_boundaries) = lloyd_max_gaussian(head_dim, v_bits);
             let (v_program, _v_weights) =
                 mil_emitter::build_single_cache_write_program(&config, &v_boundaries, &v_levels);
-            let (v_mil, _) = program_to_mil_text(&v_program, &mil_config).map_err(|e| {
-                AneError::Other(anyhow::anyhow!("V cache-write MIL text failed: {e}"))
-            })?;
+            let (v_mil, _) = program_to_mil_text(&v_program, &mil_config)
+                .map_err(|e| AneError::CacheError(format!("V cache-write MIL text failed: {e}")))?;
             let v_compiled = device.compile(&v_mil, &[], config.qos)?;
 
             (Some(k_compiled), Some(v_compiled))
@@ -632,7 +628,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
         };
         let (attn_program, _attn_weights) = mil_emitter::build_attention_program(&attn_config);
         let (attn_mil, _) = program_to_mil_text(&attn_program, &mil_config)
-            .map_err(|e| AneError::Other(anyhow::anyhow!("attention MIL text failed: {e}")))?;
+            .map_err(|e| AneError::Validation(format!("attention MIL text failed: {e}")))?;
         let attention_program = device.compile(&attn_mil, &[], config.qos)?;
 
         // --- QJL correction sub-program (optional) ---
@@ -640,7 +636,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
             let (qjl_program, _qjl_weights) =
                 mil_emitter::build_qjl_program(&config, config.max_seq_len);
             let (qjl_mil, _) = program_to_mil_text(&qjl_program, &mil_config)
-                .map_err(|e| AneError::Other(anyhow::anyhow!("QJL MIL text failed: {e}")))?;
+                .map_err(|e| AneError::Validation(format!("QJL MIL text failed: {e}")))?;
             Some(device.compile(&qjl_mil, &[], config.qos)?)
         } else {
             None
@@ -792,7 +788,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
         );
         let mil_config = MilTextConfig::default();
         let (mil_text, weight_entries) = program_to_mil_text(&program, &mil_config)
-            .map_err(|e| AneError::Other(anyhow::anyhow!("fused FFN MIL text failed: {e}")))?;
+            .map_err(|e| AneError::Validation(format!("fused FFN MIL text failed: {e}")))?;
 
         let weight_slices: Vec<(&str, &[u8])> = weight_entries
             .iter()
@@ -818,7 +814,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
         projections: &[(AneTensor, AneTensor, AneTensor)],
     ) -> Result<Vec<AneTensor>> {
         if projections.len() != self.config.num_layers {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(format!(
                 "expected {} layer projections, got {}",
                 self.config.num_layers,
                 projections.len()
@@ -888,9 +884,10 @@ impl<D: AneDevice> TurboQuantModel<D> {
                 self.config.qos,
             )?;
         } else {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::CacheError(
                 "no cache-write program available: neither asymmetric nor fused program compiled"
-            )));
+                    .into(),
+            ));
         }
 
         // 2. Direct IOSurface-to-IOSurface copy: cache-write output → KV cache.
@@ -929,7 +926,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
             &self.mask_tensor,
         ) {
             let sign_tensor = self.cache.qjl_sign_tensors(layer).ok_or_else(|| {
-                AneError::Other(anyhow::anyhow!(
+                AneError::CacheError(format!(
                     "QJL enabled but sign cache missing for layer {layer}"
                 ))
             })?;
@@ -980,9 +977,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
         // 1. Direct IOSurface-to-IOSurface copy: pre_attn quantized output → KV cache.
         let k_orig_data = if self.config.enable_qjl {
             let t = k_original.ok_or_else(|| {
-                AneError::Other(anyhow::anyhow!(
-                    "QJL enabled but k_original not provided in fused mode"
-                ))
+                AneError::Validation("QJL enabled but k_original not provided in fused mode".into())
             })?;
             Some(t.read_f16()?)
         } else {
@@ -1008,7 +1003,7 @@ impl<D: AneDevice> TurboQuantModel<D> {
             &self.mask_tensor,
         ) {
             let sign_tensor = self.cache.qjl_sign_tensors(layer).ok_or_else(|| {
-                AneError::Other(anyhow::anyhow!(
+                AneError::CacheError(format!(
                     "QJL enabled but sign cache missing for layer {layer}"
                 ))
             })?;

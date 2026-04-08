@@ -482,12 +482,12 @@ impl<D: AneDevice> AneInference<D> {
 
         // 1. Read manifest.
         let manifest_json = std::fs::read_to_string(bundle_path.join("manifest.json"))
-            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to read manifest: {e}")))?;
+            .map_err(|e| AneError::ManifestError(format!("failed to read manifest: {e}")))?;
         let manifest: BundleManifest = serde_json::from_str(&manifest_json)
-            .map_err(|e| AneError::Other(anyhow::anyhow!("invalid manifest: {e}")))?;
+            .map_err(|e| AneError::ManifestError(format!("invalid manifest: {e}")))?;
         let decode = manifest
             .decode
-            .ok_or_else(|| AneError::Other(anyhow::anyhow!("not a decode bundle")))?;
+            .ok_or_else(|| AneError::ManifestError("not a decode bundle".into()))?;
         let arch = &decode.architecture;
 
         let programs_dir = bundle_path.join("programs");
@@ -603,9 +603,8 @@ impl<D: AneDevice> AneInference<D> {
         Vec<f16>,
         usize,
     )> {
-        let embed_data = std::fs::read(cpu_weights_dir.join("embedding.bin")).map_err(|e| {
-            AneError::Other(anyhow::anyhow!("failed to read embedding weights: {e}"))
-        })?;
+        let embed_data = std::fs::read(cpu_weights_dir.join("embedding.bin"))
+            .map_err(|e| AneError::IoError(format!("failed to read embedding weights: {e}")))?;
         let embed_weight = CpuWeight {
             data: embed_data,
             shape: [arch.vocab_size, arch.hidden_size],
@@ -629,9 +628,9 @@ impl<D: AneDevice> AneInference<D> {
 
         // Load RoPE caches.
         let rope_cos_data = std::fs::read(cpu_weights_dir.join("rope_cos.bin"))
-            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to read rope_cos: {e}")))?;
+            .map_err(|e| AneError::IoError(format!("failed to read rope_cos: {e}")))?;
         let rope_sin_data = std::fs::read(cpu_weights_dir.join("rope_sin.bin"))
-            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to read rope_sin: {e}")))?;
+            .map_err(|e| AneError::IoError(format!("failed to read rope_sin: {e}")))?;
         let rope_cos_cache: Vec<f16> = rope_cos_data
             .chunks_exact(2)
             .map(|c| f16::from_le_bytes([c[0], c[1]]))
@@ -867,7 +866,7 @@ impl<D: AneDevice> AneInference<D> {
             let attn_program = mil_emitter::build_fp16_attention_program(nh, nkv, hd, msl, msl);
             let mil_config = MilTextConfig::default();
             let (mil, _) = program_to_mil_text(&attn_program, &mil_config).map_err(|e| {
-                AneError::Other(anyhow::anyhow!("FP16 attention MIL text failed: {e}"))
+                AneError::Validation(format!("FP16 attention MIL text failed: {e}"))
             })?;
             let attn_compiled = device.compile(&mil, &[], qos)?;
 
@@ -953,7 +952,7 @@ impl<D: AneDevice> AneInference<D> {
                     .collect();
                 let hd = head_dim;
                 if hd == 0 || q_all.len() % hd != 0 || k_all.len() % hd != 0 {
-                    return Err(AneError::Other(anyhow::anyhow!(
+                    return Err(AneError::Validation(format!(
                         "QK norm weight size not divisible by head_dim \
                          (q={}, k={}, head_dim={})",
                         q_all.len(),
@@ -962,7 +961,7 @@ impl<D: AneDevice> AneInference<D> {
                     )));
                 }
                 if q_all.len() != k_all.len() {
-                    return Err(AneError::Other(anyhow::anyhow!(
+                    return Err(AneError::Validation(format!(
                         "QK norm Q/K size mismatch: q={} vs k={} \
                          (expected equal lengths for {} layers × head_dim={})",
                         q_all.len(),
@@ -973,11 +972,10 @@ impl<D: AneDevice> AneInference<D> {
                 }
                 let loaded_layers = q_all.len() / hd;
                 if loaded_layers != num_layers {
-                    return Err(AneError::Other(anyhow::anyhow!(
+                    return Err(AneError::Validation(format!(
                         "QK norm layer count mismatch: weights have {} layers \
                          but model has {} layers",
-                        loaded_layers,
-                        num_layers,
+                        loaded_layers, num_layers,
                     )));
                 }
                 let mut norms = Vec::with_capacity(loaded_layers);
@@ -988,10 +986,11 @@ impl<D: AneDevice> AneInference<D> {
                 }
                 Ok(Some(norms))
             }
-            _ => Err(AneError::Other(anyhow::anyhow!(
+            _ => Err(AneError::ManifestError(
                 "model requires QK norm but qk_norm_q.bin / qk_norm_k.bin \
                  not found in bundle"
-            ))),
+                    .into(),
+            )),
         }
     }
 
@@ -1240,9 +1239,7 @@ impl<D: AneDevice> AneInference<D> {
                 hw_pre_attn_ns,
             )
             .map_err(|e| {
-                AneError::Other(anyhow::anyhow!(
-                    "layer {layer_idx} pre_attn eval failed: {e}"
-                ))
+                AneError::Validation(format!("layer {layer_idx} pre_attn eval failed: {e}"))
             })?;
         }
         Ok(())
@@ -1313,7 +1310,7 @@ impl<D: AneDevice> AneInference<D> {
                 tq.step_attention(layer_idx, q, k_proj, v_proj)
             };
             let attn_tensor = attn_tensor.map_err(|e| {
-                AneError::Other(anyhow::anyhow!(
+                AneError::Validation(format!(
                     "layer {layer_idx} turboquant attention failed: {e}"
                 ))
             })?;
@@ -1379,9 +1376,7 @@ impl<D: AneDevice> AneInference<D> {
                     hw_attn_ns,
                 )
                 .map_err(|e| {
-                    AneError::Other(anyhow::anyhow!(
-                        "layer {layer_idx} fp16_attn eval failed: {e}"
-                    ))
+                    AneError::Validation(format!("layer {layer_idx} fp16_attn eval failed: {e}"))
                 })?;
             }
 
@@ -1482,9 +1477,7 @@ impl<D: AneDevice> AneInference<D> {
                     hw_attn_ns,
                 )
                 .map_err(|e| {
-                    AneError::Other(anyhow::anyhow!(
-                        "layer {layer_idx} fp16_attn eval failed: {e}"
-                    ))
+                    AneError::Validation(format!("layer {layer_idx} fp16_attn eval failed: {e}"))
                 })?;
                 read_f16_channels(out_staging, attn_out)?;
             } else {
@@ -1494,9 +1487,9 @@ impl<D: AneDevice> AneInference<D> {
                 *d_attn += t.elapsed();
             }
         } else {
-            return Err(AneError::Other(anyhow::anyhow!(
-                "no attention backend configured"
-            )));
+            return Err(AneError::Validation(
+                "no attention backend configured".into(),
+            ));
         }
         Ok(())
     }
@@ -1658,9 +1651,7 @@ impl<D: AneDevice> AneInference<D> {
                     hw_post_attn_ns,
                 )
                 .map_err(|e| {
-                    AneError::Other(anyhow::anyhow!(
-                        "layer {layer_idx} post_attn eval failed: {e}"
-                    ))
+                    AneError::Validation(format!("layer {layer_idx} post_attn eval failed: {e}"))
                 })?;
             }
             let mut new_hidden = Vec::new();
@@ -1903,9 +1894,9 @@ impl<D: AneDevice> AneInference<D> {
     /// single-token decode shapes.
     pub fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>> {
         if prompt_tokens.is_empty() {
-            return Err(AneError::Other(anyhow::anyhow!(
-                "prompt_tokens must not be empty"
-            )));
+            return Err(AneError::Validation(
+                "prompt_tokens must not be empty".into(),
+            ));
         }
 
         let mut logits = Vec::new();
@@ -1930,9 +1921,8 @@ impl<D: AneDevice> AneInference<D> {
         let mut generated = Vec::with_capacity(max_tokens);
 
         for _ in 0..max_tokens {
-            let token_id = sample_token(&logits, temperature).ok_or_else(|| {
-                AneError::Other(anyhow::anyhow!("sampling produced empty logits"))
-            })?;
+            let token_id = sample_token(&logits, temperature)
+                .ok_or_else(|| AneError::Validation("sampling produced empty logits".into()))?;
 
             // EOS detection — use model-specific EOS tokens.
             let eos = &self.model_info.eos_tokens;
@@ -2150,7 +2140,7 @@ fn compile_sub_from_bundle<D: AneDevice>(
 ) -> Result<LoadedSubProgram<D>> {
     let mil_text = std::fs::read_to_string(programs_dir.join(format!("{}.mil", manifest.name)))
         .map_err(|e| {
-            AneError::Other(anyhow::anyhow!(
+            AneError::IoError(format!(
                 "failed to read MIL text for {}: {e}",
                 manifest.name
             ))
@@ -2160,7 +2150,7 @@ fn compile_sub_from_bundle<D: AneDevice>(
         Ok(data) => data,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::IoError(format!(
                 "failed to read weights for {}: {e}",
                 manifest.name
             )));
@@ -2191,7 +2181,7 @@ fn compile_sub_from_bundle_with_donor<D: AneDevice>(
 ) -> Result<LoadedSubProgram<D>> {
     let mil_text = std::fs::read_to_string(programs_dir.join(format!("{}.mil", manifest.name)))
         .map_err(|e| {
-            AneError::Other(anyhow::anyhow!(
+            AneError::IoError(format!(
                 "failed to read MIL text for {}: {e}",
                 manifest.name
             ))
@@ -2201,7 +2191,7 @@ fn compile_sub_from_bundle_with_donor<D: AneDevice>(
         Ok(data) => data,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::IoError(format!(
                 "failed to read weights for {}: {e}",
                 manifest.name
             )));
@@ -2299,7 +2289,7 @@ fn cpu_embedding_lookup(weight: &CpuWeight, token_id: u32, out: &mut Vec<f16>) -
     let [vocab_size, hidden_size] = weight.shape;
     let idx = token_id as usize;
     if idx >= vocab_size {
-        return Err(AneError::Other(anyhow::anyhow!(
+        return Err(AneError::Validation(format!(
             "token_id {token_id} >= vocab_size {vocab_size}"
         )));
     }
@@ -2309,7 +2299,7 @@ fn cpu_embedding_lookup(weight: &CpuWeight, token_id: u32, out: &mut Vec<f16>) -
     let row_end = row_start + hidden_size * bytes_per_elem;
 
     if row_end > weight.data.len() {
-        return Err(AneError::Other(anyhow::anyhow!(
+        return Err(AneError::Validation(format!(
             "embedding weight data too short: need {} bytes, have {}",
             row_end,
             weight.data.len()
@@ -2331,7 +2321,7 @@ fn cpu_embedding_lookup(weight: &CpuWeight, token_id: u32, out: &mut Vec<f16>) -
 fn cpu_lm_head_matmul(weight: &CpuWeight, hidden: &[f16]) -> Result<Vec<f32>> {
     let [vocab_size, hidden_size] = weight.shape;
     if hidden.len() < hidden_size {
-        return Err(AneError::Other(anyhow::anyhow!(
+        return Err(AneError::Validation(format!(
             "hidden size mismatch: expected {hidden_size}, got {}",
             hidden.len()
         )));

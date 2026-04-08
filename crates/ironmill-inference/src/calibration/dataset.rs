@@ -46,8 +46,12 @@ pub struct CalibrationDataset {
 impl CalibrationDataset {
     /// Load from a pre-tokenized JSON file (same format as `PerplexityDataset`).
     pub fn load(path: &Path) -> Result<Self, InferenceError> {
-        let data = std::fs::read_to_string(path).map_err(|e| InferenceError::Other(e.into()))?;
-        let ds: Self = serde_json::from_str(&data).map_err(|e| InferenceError::Other(e.into()))?;
+        let data = std::fs::read_to_string(path).map_err(|e| {
+            InferenceError::CalibrationData(format!("failed to read {}: {e}", path.display()))
+        })?;
+        let ds: Self = serde_json::from_str(&data).map_err(|e| {
+            InferenceError::CalibrationData(format!("failed to parse {}: {e}", path.display()))
+        })?;
         ds.validate()?;
         Ok(ds)
     }
@@ -96,7 +100,7 @@ impl CalibrationDataset {
     /// Validate internal consistency of the loaded dataset.
     fn validate(&self) -> Result<(), InferenceError> {
         if self.sequences.len() != self.num_sequences {
-            return Err(InferenceError::Other(anyhow::anyhow!(
+            return Err(InferenceError::CalibrationData(format!(
                 "num_sequences mismatch: header says {} but found {} sequences",
                 self.num_sequences,
                 self.sequences.len()
@@ -104,7 +108,7 @@ impl CalibrationDataset {
         }
         for (i, seq) in self.sequences.iter().enumerate() {
             if seq.len() != self.seq_len {
-                return Err(InferenceError::Other(anyhow::anyhow!(
+                return Err(InferenceError::CalibrationData(format!(
                     "sequence {i} has {} tokens, expected {}",
                     seq.len(),
                     self.seq_len
@@ -112,7 +116,7 @@ impl CalibrationDataset {
             }
             for &tok in seq {
                 if (tok as usize) >= self.vocab_size {
-                    return Err(InferenceError::Other(anyhow::anyhow!(
+                    return Err(InferenceError::CalibrationData(format!(
                         "sequence {i} contains token {tok} >= vocab_size {}",
                         self.vocab_size
                     )));

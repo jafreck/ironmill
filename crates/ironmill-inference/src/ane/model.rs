@@ -150,13 +150,13 @@ impl<D: AneDevice> AneModel<D> {
         // 1. Read and parse manifest.json
         let manifest_path = bundle_path.join("manifest.json");
         let manifest_json = std::fs::read_to_string(&manifest_path)
-            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to read manifest: {e}")))?;
+            .map_err(|e| AneError::IoError(format!("failed to read manifest: {e}")))?;
         let manifest: BundleManifest = serde_json::from_str(&manifest_json)
-            .map_err(|e| AneError::Other(anyhow::anyhow!("invalid manifest: {e}")))?;
+            .map_err(|e| AneError::ManifestError(format!("invalid manifest: {e}")))?;
 
         // 2. Verify it's a simple bundle
         if !matches!(manifest.model_type, BundleModelType::Simple) {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::ManifestError(format!(
                 "AneModel::from_bundle only supports simple bundles, got {:?}",
                 manifest.model_type
             )));
@@ -164,7 +164,7 @@ impl<D: AneDevice> AneModel<D> {
 
         // 3. Initialize work directory
         let work_dir = tempfile::tempdir()
-            .map_err(|e| AneError::Other(anyhow::anyhow!("failed to create work dir: {e}")))?;
+            .map_err(|e| AneError::IoError(format!("failed to create work dir: {e}")))?;
 
         // 4. Process each sub-program from the manifest
         let mut loaded_subs = Vec::new();
@@ -175,7 +175,7 @@ impl<D: AneDevice> AneModel<D> {
                 .join("programs")
                 .join(format!("{}.mil", sub_manifest.name));
             let mil_text = std::fs::read_to_string(&mil_path).map_err(|e| {
-                AneError::Other(anyhow::anyhow!(
+                AneError::IoError(format!(
                     "failed to read MIL text for '{}': {e}",
                     sub_manifest.name
                 ))
@@ -186,7 +186,7 @@ impl<D: AneDevice> AneModel<D> {
                 .join("weights")
                 .join(format!("{}.bin", sub_manifest.name));
             let weight_blob = std::fs::read(&blob_path).map_err(|e| {
-                AneError::Other(anyhow::anyhow!(
+                AneError::IoError(format!(
                     "failed to read weight blob for '{}': {e}",
                     sub_manifest.name
                 ))
@@ -271,14 +271,14 @@ impl<D: AneDevice> AneModel<D> {
     /// into the next sub-program's inputs.
     pub fn predict(&mut self, inputs: &[AneTensor]) -> Result<Vec<AneTensor>> {
         if self.sub_programs.is_empty() {
-            return Err(AneError::Other(anyhow::anyhow!("no sub-programs loaded")));
+            return Err(AneError::Validation("no sub-programs loaded".into()));
         }
 
         // Copy user inputs into first sub-program's input tensors.
         {
             let first = &mut self.sub_programs[0];
             if inputs.len() != first.input_tensors.len() {
-                return Err(AneError::Other(anyhow::anyhow!(
+                return Err(AneError::Validation(format!(
                     "expected {} inputs, got {}",
                     first.input_tensors.len(),
                     inputs.len()
@@ -318,7 +318,7 @@ impl<D: AneDevice> AneModel<D> {
         let last = self
             .sub_programs
             .last()
-            .ok_or_else(|| AneError::Other(anyhow::anyhow!("no sub-programs loaded")))?;
+            .ok_or_else(|| AneError::Validation("no sub-programs loaded".into()))?;
         let mut results = Vec::with_capacity(last.output_tensors.len());
         for tensor in &last.output_tensors {
             let data = tensor.read_f16()?;
@@ -391,7 +391,7 @@ fn extract_weights_from_blob(mil_text: &str, weight_blob: &[u8]) -> Result<Vec<(
 
         let end = data_offset + byte_size;
         if end > raw_data.len() {
-            return Err(AneError::Other(anyhow::anyhow!(
+            return Err(AneError::Validation(format!(
                 "weight '{}' needs {} bytes at offset {}, but blob data section is only {} bytes",
                 path,
                 byte_size,

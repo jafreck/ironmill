@@ -108,7 +108,7 @@ fn map_sys_err(e: ironmill_ane_sys::AneSysError) -> AneError {
             used: count,
             limit: 119,
         },
-        other => AneError::Other(other.into()),
+        other => AneError::Other(anyhow::Error::from(other)),
     }
 }
 
@@ -121,9 +121,9 @@ impl HardwareAneDevice {
     /// Checks that the ANE framework is available; returns an error if not.
     pub fn new() -> Result<Self> {
         if !ironmill_ane_sys::model::is_available() {
-            return Err(AneError::Other(anyhow::anyhow!(
-                "ANE is not available on this system"
-            )));
+            return Err(AneError::PlatformUnavailable(
+                "ANE is not available on this system".into(),
+            ));
         }
         Ok(Self {
             eval_lock: Mutex::new(()),
@@ -240,9 +240,9 @@ impl AneDevice for HardwareAneDevice {
 impl HardwareAneDevice {
     /// ANE is not available on non-macOS platforms.
     pub fn new() -> Result<Self> {
-        Err(AneError::Other(anyhow::anyhow!(
-            "ANE runtime requires macOS"
-        )))
+        Err(AneError::PlatformUnavailable(
+            "ANE runtime requires macOS".into(),
+        ))
     }
 }
 
@@ -256,9 +256,9 @@ impl AneDevice for HardwareAneDevice {
         _weights: &[(&str, &[u8])],
         _qos: u32,
     ) -> Result<HardwareProgram> {
-        Err(AneError::Other(anyhow::anyhow!(
-            "ANE runtime requires macOS"
-        )))
+        Err(AneError::PlatformUnavailable(
+            "ANE runtime requires macOS".into(),
+        ))
     }
 
     fn compile_patched(
@@ -268,9 +268,9 @@ impl AneDevice for HardwareAneDevice {
         _weights: &[(&str, &[u8])],
         _qos: u32,
     ) -> Result<HardwareProgram> {
-        Err(AneError::Other(anyhow::anyhow!(
-            "ANE runtime requires macOS"
-        )))
+        Err(AneError::PlatformUnavailable(
+            "ANE runtime requires macOS".into(),
+        ))
     }
 
     fn eval(
@@ -280,9 +280,9 @@ impl AneDevice for HardwareAneDevice {
         _outputs: &mut [&mut AneTensor],
         _qos: u32,
     ) -> Result<()> {
-        Err(AneError::Other(anyhow::anyhow!(
-            "ANE runtime requires macOS"
-        )))
+        Err(AneError::PlatformUnavailable(
+            "ANE runtime requires macOS".into(),
+        ))
     }
 
     fn compile_count(&self) -> usize {

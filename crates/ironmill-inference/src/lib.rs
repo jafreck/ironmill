@@ -285,7 +285,31 @@ pub enum AneError {
         limit: usize,
     },
 
+    /// Validation error (invalid parameters, shape mismatches, out-of-range values).
+    #[error("ANE validation error: {0}")]
+    Validation(String),
+
+    /// I/O error during ANE operations (reading bundles, weights, temp files).
+    #[error("ANE I/O error: {0}")]
+    IoError(String),
+
+    /// KV cache or compilation cache error.
+    #[error("ANE cache error: {0}")]
+    CacheError(String),
+
+    /// The ANE runtime or hardware is not available on this platform.
+    #[error("ANE platform unavailable: {0}")]
+    PlatformUnavailable(String),
+
+    /// Bundle manifest parsing or validation failed.
+    #[error("ANE manifest error: {0}")]
+    ManifestError(String),
+
     /// A generic error from an underlying operation.
+    ///
+    /// Prefer a more specific variant when one exists. This variant is an
+    /// escape hatch for truly unpredictable errors (e.g., errors from
+    /// third-party FFI calls that don't map to a structured variant).
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

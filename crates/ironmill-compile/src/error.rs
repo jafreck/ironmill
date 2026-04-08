@@ -40,11 +40,19 @@ pub enum CompileError {
     #[error("unsupported architecture: {0}")]
     UnsupportedArchitecture(String),
 
+    /// A scalar type (dtype) is not supported in this context.
+    #[error("unsupported scalar type: {0}")]
+    UnsupportedScalarType(String),
+
     /// An error occurred while loading or processing weight tensors.
     #[error("weight load error: {0}")]
     WeightLoadError(String),
 
     /// A generic compilation error.
+    ///
+    /// Prefer a more specific variant when one exists. Use `Other` only for
+    /// errors that don't fit any structured variant (e.g., one-off edge cases
+    /// during prototyping or uncommon code paths).
     #[error("{0}")]
     Other(String),
 }
