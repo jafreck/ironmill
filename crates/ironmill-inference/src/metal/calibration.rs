@@ -1637,4 +1637,31 @@ impl MetalInference {
 
         Ok(())
     }
+
+    // ── Block-level calibration helpers ────────────────────────────
+
+    /// Swap a layer's projection weight, forwarding to [`MetalWeights::swap_layer_weight`].
+    ///
+    /// Returns `None` if the engine has no weights loaded or the projection
+    /// name is not recognised.
+    pub fn swap_layer_weight(
+        &mut self,
+        layer_idx: usize,
+        proj_name: &str,
+        new_weight: super::weights::WeightBuffer,
+    ) -> Option<super::weights::WeightBuffer> {
+        self.weights
+            .as_mut()?
+            .swap_layer_weight(layer_idx, proj_name, new_weight)
+    }
+
+    /// Create a Dense FP16 GPU buffer from CPU f32 data, forwarding to
+    /// [`super::weights::create_dense_f16_buffer`].
+    pub fn create_dense_f16_buffer(
+        &self,
+        data_f32: &[f32],
+    ) -> Result<super::weights::WeightBuffer, InferenceError> {
+        super::weights::create_dense_f16_buffer(&self.device, data_f32)
+            .map_err(|e| InferenceError::runtime(e.to_string()))
+    }
 }

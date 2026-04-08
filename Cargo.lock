@@ -996,6 +996,7 @@ dependencies = [
  "ironmill-iosurface",
  "ironmill-metal-sys",
  "mil-rs",
+ "rayon",
  "serde",
  "serde_json",
  "statrs",

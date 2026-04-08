@@ -80,31 +80,57 @@ pub(crate) fn load_metal_engine(
                 "    AWQ: loaded {} channel magnitude vectors",
                 magnitudes.len()
             );
-            let act_path = std::path::Path::new(awq_dir).join("awq_activations.json");
-            let tc_path = std::path::Path::new(awq_dir).join("awq_token_count.json");
-            if let (Ok(act_json), Ok(tc_json)) = (
-                std::fs::read_to_string(&act_path),
-                std::fs::read_to_string(&tc_path),
-            ) {
-                if let (Ok(activations), Ok(token_count)) = (
-                    serde_json::from_str::<std::collections::HashMap<String, Vec<f32>>>(&act_json),
-                    serde_json::from_str::<usize>(&tc_json),
+
+            if let Some(ref block_config_path) = opt.awq_block_config_path {
+                // Precomputed block config — no activations needed
+                let block_json = std::fs::read_to_string(block_config_path)
+                    .map_err(|e| anyhow::anyhow!("failed to read AWQ block config: {e}"))?;
+                let block_config: std::collections::HashMap<
+                    String,
+                    ironmill_compile::weights::quantized::AwqTensorConfig,
+                > = serde_json::from_str(&block_json)
+                    .map_err(|e| anyhow::anyhow!("failed to parse AWQ block config: {e}"))?;
+                eprintln!(
+                    "    AWQ: loaded block config for {} tensors",
+                    block_config.len()
+                );
+                ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq_block(
+                    128,
+                    magnitudes,
+                    block_config,
+                )
+            } else {
+                // Try loading activations for runtime search
+                let act_path = std::path::Path::new(awq_dir).join("awq_activations.json");
+                let tc_path = std::path::Path::new(awq_dir).join("awq_token_count.json");
+                if let (Ok(act_json), Ok(tc_json)) = (
+                    std::fs::read_to_string(&act_path),
+                    std::fs::read_to_string(&tc_path),
                 ) {
-                    eprintln!(
-                        "    AWQ: loaded {} activation matrices ({} tokens) — alpha grid search enabled",
-                        activations.len(),
-                        token_count,
-                    );
-                    ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq_with_activations(
-                        128, magnitudes, activations, token_count,
-                    )
+                    if let (Ok(activations), Ok(token_count)) = (
+                        serde_json::from_str::<std::collections::HashMap<String, Vec<f32>>>(
+                            &act_json,
+                        ),
+                        serde_json::from_str::<usize>(&tc_json),
+                    ) {
+                        eprintln!(
+                            "    AWQ: loaded {} activation matrices ({} tokens) — alpha grid search enabled",
+                            activations.len(),
+                            token_count,
+                        );
+                        ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq_with_activations(
+                            128, magnitudes, activations, token_count,
+                        )
+                    } else {
+                        ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(
+                            128, magnitudes,
+                        )
+                    }
                 } else {
                     ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(
                         128, magnitudes,
                     )
                 }
-            } else {
-                ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(128, magnitudes)
             }
         } else {
             ironmill_compile::weights::quantized::AffineQuantConfig::default()

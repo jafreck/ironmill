@@ -531,7 +531,7 @@ impl MetalWeights {
     }
 
     /// Temporarily replace a layer's projection weight buffer and return the original.
-    pub(crate) fn swap_layer_weight(
+    pub fn swap_layer_weight(
         &mut self,
         layer_idx: usize,
         proj_name: &str,
@@ -556,7 +556,7 @@ impl MetalWeights {
 }
 
 /// Create a Dense (row-major only) FP16 [`WeightBuffer`] from f32 data on CPU.
-pub(crate) fn create_dense_f16_buffer(
+pub fn create_dense_f16_buffer(
     device: &MetalDevice,
     data_f32: &[f32],
 ) -> Result<WeightBuffer, MetalError> {

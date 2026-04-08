@@ -78,6 +78,10 @@ pub struct OptConfig {
     /// When set with int4=true, applies activation-aware scaling.
     #[serde(default)]
     pub awq_calib_dir: Option<String>,
+    /// Path to precomputed AWQ block config JSON from `awq_block_calibrate`.
+    /// When set, uses precomputed alpha/clip values instead of runtime search.
+    #[serde(default)]
+    pub awq_block_config_path: Option<String>,
     /// Layer indices to keep at INT8 when int4=true.
     /// Common values: first/last 1-2 layers for best quality.
     #[serde(default)]
@@ -228,6 +232,7 @@ pub fn default_matrix() -> BenchMatrix {
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         },
         OptConfig {
@@ -242,6 +247,7 @@ pub fn default_matrix() -> BenchMatrix {
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         },
         OptConfig {
@@ -256,6 +262,7 @@ pub fn default_matrix() -> BenchMatrix {
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         },
         OptConfig {
@@ -270,6 +277,7 @@ pub fn default_matrix() -> BenchMatrix {
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         },
         OptConfig {
@@ -284,6 +292,7 @@ pub fn default_matrix() -> BenchMatrix {
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         },
         OptConfig {
@@ -298,6 +307,7 @@ pub fn default_matrix() -> BenchMatrix {
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         },
         OptConfig {
@@ -312,6 +322,7 @@ pub fn default_matrix() -> BenchMatrix {
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         },
         // TurboQuant INT8
@@ -327,6 +338,7 @@ pub fn default_matrix() -> BenchMatrix {
             kv_quant: KvQuantMode::TurboInt8,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         },
         // TurboQuant INT8 + QJL
@@ -342,6 +354,7 @@ pub fn default_matrix() -> BenchMatrix {
             kv_quant: KvQuantMode::TurboInt8Qjl,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         },
     ];
@@ -496,6 +509,7 @@ backends = ["cpu", "gpu"]
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         };
         let key1 = cache_key(&model, &opt);
@@ -524,6 +538,7 @@ backends = ["cpu", "gpu"]
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         };
         let opt2 = OptConfig {
@@ -538,6 +553,7 @@ backends = ["cpu", "gpu"]
             kv_quant: KvQuantMode::None,
             max_seq_len: default_max_seq_len(),
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         };
         assert_ne!(cache_key(&model, &opt1), cache_key(&model, &opt2));
@@ -563,6 +579,7 @@ backends = ["cpu", "gpu"]
             kv_quant: KvQuantMode::TurboInt8,
             max_seq_len: 4096,
             awq_calib_dir: None,
+            awq_block_config_path: None,
             sensitive_layers: vec![],
         };
         let key = cache_key(&model, &opt);
