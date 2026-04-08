@@ -127,7 +127,7 @@ pub(crate) fn encode_projection_q8(
                 if kernel_kind.is_decode() && aq.bit_width == 4 && aq.awq_scales.is_none() {
                     ops::encode_affine_matvec_int4xq8(
                         enc,
-                        &pipelines.affine_matvec_int4xq8,
+                        &pipelines.affine.matvec_int4xq8,
                         q8_input.data,
                         q8_input.scales,
                         aq,

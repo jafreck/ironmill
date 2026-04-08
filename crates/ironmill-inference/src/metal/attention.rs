@@ -27,7 +27,7 @@ pub(crate) fn encode_qk_norm_and_rope(
 ) -> Result<(), InferenceError> {
     if let (Some(q_norm_w), Some(k_norm_w)) = (q_norm, k_norm) {
         // Fused path: one dispatch does RMSNorm + RoPE for both Q and K.
-        enc.set_pipeline(&pipelines.fused_qk_norm_rope);
+        enc.set_pipeline(&pipelines.norm.fused_qk_norm_rope);
         enc.set_buffer(&bufs.q_proj, 0, 0);
         enc.set_buffer(&bufs.k_proj, 0, 1);
         enc.set_buffer(q_norm_w, 0, 2);
@@ -46,7 +46,7 @@ pub(crate) fn encode_qk_norm_and_rope(
         // No QK-norm — just RoPE.
         ops::encode_rope(
             enc,
-            &pipelines.rope,
+            &pipelines.rope.rope,
             &ops::RopeParams {
                 qk: &bufs.q_proj,
                 cos_cache: rope_cos,
@@ -59,7 +59,7 @@ pub(crate) fn encode_qk_norm_and_rope(
         );
         ops::encode_rope(
             enc,
-            &pipelines.rope,
+            &pipelines.rope.rope,
             &ops::RopeParams {
                 qk: &bufs.k_proj,
                 cos_cache: rope_cos,
@@ -152,7 +152,7 @@ pub(crate) fn encode_kv_cache_and_attention(
             // CLA: only anchor layers write to the KV cache.
             if is_anchor {
                 // K cache: (b-1)-bit codebook + QJL — batched over all tokens
-                enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
+                enc.set_pipeline(&pipelines.attention.turboquant_outlier_cache_write);
                 enc.set_buffer(&bufs.k_proj, 0, 0);
                 enc.set_buffer(&outlier.channel_indices, 0, 1);
                 enc.set_buffer(k_o_cache, 0, 2);
@@ -185,7 +185,7 @@ pub(crate) fn encode_kv_cache_and_attention(
                 );
 
                 // V cache: b-bit codebook, no QJL — batched over all tokens
-                enc.set_pipeline(&pipelines.turboquant_outlier_cache_write);
+                enc.set_pipeline(&pipelines.attention.turboquant_outlier_cache_write);
                 enc.set_buffer(&bufs.v_proj, 0, 0);
                 enc.set_buffer(&outlier.channel_indices, 0, 1);
                 enc.set_buffer(v_o_cache, 0, 2);
@@ -219,7 +219,7 @@ pub(crate) fn encode_kv_cache_and_attention(
             } // end is_anchor
 
             // Outlier attention — batched over all tokens
-            enc.set_pipeline(&pipelines.turboquant_outlier_attention);
+            enc.set_pipeline(&pipelines.attention.turboquant_outlier_attention);
             enc.set_buffer(&bufs.q_proj, 0, 0);
             enc.set_buffer(k_o_cache, 0, 1);
             enc.set_buffer(v_o_cache, 0, 2);
@@ -305,7 +305,7 @@ pub(crate) fn encode_kv_cache_and_attention(
             // CLA: only anchor layers write to the KV cache.
             if is_anchor {
                 // K cache write — batched over all tokens
-                enc.set_pipeline(&pipelines.turboquant_cache_write);
+                enc.set_pipeline(&pipelines.attention.turboquant_cache_write);
                 enc.set_buffer(&bufs.k_proj, 0, 0);
                 enc.set_buffer(rotation_signs, 0, 1);
                 enc.set_buffer(k_cache, 0, 2);
@@ -329,7 +329,7 @@ pub(crate) fn encode_kv_cache_and_attention(
                 );
 
                 // V cache write — batched over all tokens
-                enc.set_pipeline(&pipelines.turboquant_cache_write);
+                enc.set_pipeline(&pipelines.attention.turboquant_cache_write);
                 enc.set_buffer(&bufs.v_proj, 0, 0);
                 enc.set_buffer(rotation_signs, 0, 1);
                 enc.set_buffer(v_cache, 0, 2);
@@ -375,7 +375,7 @@ pub(crate) fn encode_kv_cache_and_attention(
                 };
 
                 // Single dispatch: grid (num_heads, token_count, num_splits).
-                enc.set_pipeline(&pipelines.turboquant_attention);
+                enc.set_pipeline(&pipelines.attention.turboquant_attention);
                 enc.set_buffer(&bufs.q_proj, 0, 0);
                 enc.set_buffer(k_cache, 0, 1);
                 enc.set_buffer(v_cache, 0, 2);
@@ -409,7 +409,7 @@ pub(crate) fn encode_kv_cache_and_attention(
                 enc.memory_barrier_with_resources(&[po, pm, ps]);
                 ops::encode_flash_decode_reduce(
                     enc,
-                    &pipelines.fused_sdpa_reduce,
+                    &pipelines.attention.fused_sdpa_reduce,
                     po,
                     pm,
                     ps,
@@ -421,7 +421,7 @@ pub(crate) fn encode_kv_cache_and_attention(
                 );
             } else {
                 // Standard single-pass TQ attention (short context or prefill).
-                enc.set_pipeline(&pipelines.turboquant_attention);
+                enc.set_pipeline(&pipelines.attention.turboquant_attention);
                 enc.set_buffer(&bufs.q_proj, 0, 0);
                 enc.set_buffer(k_cache, 0, 1);
                 enc.set_buffer(v_cache, 0, 2);
@@ -463,7 +463,7 @@ pub(crate) fn encode_kv_cache_and_attention(
             // Ring buffer: kv_scatter.metal handles modular write via % max_seq_len.
             ops::encode_kv_scatter(
                 enc,
-                &pipelines.kv_scatter,
+                &pipelines.kv.kv_scatter,
                 &ops::KvScatterParams {
                     proj: &bufs.k_proj,
                     cache: k_cache,
@@ -476,7 +476,7 @@ pub(crate) fn encode_kv_cache_and_attention(
             );
             ops::encode_kv_scatter(
                 enc,
-                &pipelines.kv_scatter,
+                &pipelines.kv.kv_scatter,
                 &ops::KvScatterParams {
                     proj: &bufs.v_proj,
                     cache: v_cache,
@@ -504,7 +504,7 @@ pub(crate) fn encode_kv_cache_and_attention(
             };
             ops::encode_v2_prefill_attention(
                 enc,
-                &pipelines.prefill_attention_v2,
+                &pipelines.attention.prefill_attention_v2,
                 &ops::PrefillAttentionParams {
                     q: &bufs.q_proj,
                     k_cache,
@@ -543,9 +543,9 @@ pub(crate) fn encode_kv_cache_and_attention(
             ) {
                 ops::encode_flash_decode(
                     enc,
-                    &pipelines.fused_sdpa_split,
-                    &pipelines.fused_sdpa_reduce,
-                    pipelines.fused_sdpa.as_ref(),
+                    &pipelines.attention.fused_sdpa_split,
+                    &pipelines.attention.fused_sdpa_reduce,
+                    pipelines.attention.fused_sdpa.as_ref(),
                     &sdpa_params,
                     po,
                     pm,
@@ -554,7 +554,7 @@ pub(crate) fn encode_kv_cache_and_attention(
                     bufs.flash_decode_max_splits,
                     gpu_max_threadgroups,
                 );
-            } else if let Some(ref sdpa) = pipelines.fused_sdpa {
+            } else if let Some(ref sdpa) = pipelines.attention.fused_sdpa {
                 ops::encode_fused_sdpa(enc, sdpa, &sdpa_params, None);
             } else {
                 // Neither FlashDecoding buffers nor fused_sdpa available.
@@ -592,7 +592,7 @@ pub(crate) fn encode_end_of_layer_residual(
                 if let Some(packed) = proj_weight.packed_buf() {
                     ops::encode_fused_residual_norm_matvec(
                         enc,
-                        &pipelines.fused_residual_norm_matvec,
+                        &pipelines.fused.residual_norm_matvec,
                         &bufs.residual,
                         &bufs.ffn_down,
                         norm_weight,
@@ -611,7 +611,7 @@ pub(crate) fn encode_end_of_layer_residual(
                     if aq.bit_width == 4 {
                         ops::encode_fused_residual_norm_affine_matvec_int4(
                             enc,
-                            &pipelines.fused_residual_norm_affine_matvec_int4,
+                            &pipelines.fused.residual_norm_affine_matvec_int4,
                             &bufs.residual,
                             &bufs.ffn_down,
                             norm_weight,
@@ -632,7 +632,7 @@ pub(crate) fn encode_end_of_layer_residual(
         // Fallback: standard fused residual + norm (writes norm_out for separate projection)
         ops::encode_fused_residual_rms_norm(
             enc,
-            &pipelines.fused_residual_rms_norm,
+            &pipelines.norm.fused_residual_rms_norm,
             &ops::FusedResidualRmsNormParams {
                 a: &bufs.residual,
                 b: &bufs.ffn_down,
@@ -647,7 +647,7 @@ pub(crate) fn encode_end_of_layer_residual(
     } else {
         ops::encode_residual_add(
             enc,
-            &pipelines.residual_add,
+            &pipelines.elementwise.residual_add,
             &bufs.residual,
             &bufs.ffn_down,
             &bufs.hidden_state,

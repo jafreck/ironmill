@@ -30,7 +30,7 @@ pub(crate) fn encode_ffn_block(
             if aq_gate.bit_width == 4 && aq_up.bit_width == 4 {
                 ops::encode_fused_ffn_gate_up_act_int4(
                     enc,
-                    &pipelines.fused_ffn_gate_up_act_int4,
+                    &pipelines.affine.fused_ffn_gate_up_act_int4,
                     &bufs.norm_out,
                     aq_gate,
                     aq_up,
@@ -59,7 +59,7 @@ pub(crate) fn encode_ffn_block(
                 if aq_gate.bit_width == 4 && aq_up.bit_width == 4 {
                     ops::encode_batched_affine_matvec_int4(
                         enc,
-                        &pipelines.batched_affine_matvec_int4,
+                        &pipelines.affine.batched_matvec_int4,
                         &bufs.norm_out,
                         aq_gate,
                         &bufs.ffn_gate,
@@ -105,9 +105,9 @@ pub(crate) fn encode_ffn_block(
         enc.memory_barrier_with_resources(&[&bufs.ffn_gate, &bufs.ffn_up]);
 
         let act_pipeline = if use_gelu {
-            &pipelines.ffn_gelu_gate
+            &pipelines.activation.ffn_gelu_gate
         } else {
-            &pipelines.silu_gate
+            &pipelines.activation.silu_gate
         };
         ops::encode_silu_gate(
             enc,
@@ -182,7 +182,7 @@ pub(crate) fn encode_moe_block(
     // 2. Softmax over router logits [token_count, num_experts]
     ops::encode_moe_softmax(
         enc,
-        &pipelines.moe_softmax,
+        &pipelines.moe.softmax,
         router_logits,
         num_experts as u32,
         token_count as u32,
@@ -224,7 +224,7 @@ pub(crate) fn encode_moe_block(
         // GELU activation on gate (in-place)
         ops::encode_moe_gelu(
             enc,
-            &pipelines.moe_gelu,
+            &pipelines.moe.gelu,
             expert_gate_buf,
             (token_count * moe_inter) as u32,
         );
@@ -233,7 +233,7 @@ pub(crate) fn encode_moe_block(
         // Element-wise multiply: gate *= up (in-place on gate)
         ops::encode_moe_mul(
             enc,
-            &pipelines.moe_mul,
+            &pipelines.moe.mul,
             expert_gate_buf,
             expert_up_buf,
             (token_count * moe_inter) as u32,
@@ -257,7 +257,7 @@ pub(crate) fn encode_moe_block(
         enc.memory_barrier_with_resources(&[moe_combined]);
 
         // Copy moe_combined → expert_outputs at offset [e * token_count * h]
-        enc.set_pipeline(&pipelines.copy_buffer);
+        enc.set_pipeline(&pipelines.elementwise.copy_buffer);
         enc.set_buffer(moe_combined, 0, 0);
         enc.set_buffer(expert_outputs, e * expert_slice_size * 2, 1);
         let copy_size = expert_slice_size as u32;
@@ -271,7 +271,7 @@ pub(crate) fn encode_moe_block(
     // 4. Weighted combine: top-k selection + weighted sum → moe_combined
     ops::encode_moe_weighted_combine(
         enc,
-        &pipelines.moe_weighted_combine,
+        &pipelines.moe.weighted_combine,
         router_logits,
         expert_outputs,
         moe_combined,
@@ -285,7 +285,7 @@ pub(crate) fn encode_moe_block(
     // 5. Add MoE output to dense MLP output: ffn_down += moe_combined
     ops::encode_residual_add(
         enc,
-        &pipelines.residual_add,
+        &pipelines.elementwise.residual_add,
         &bufs.ffn_down,
         moe_combined,
         &bufs.ffn_down,

@@ -69,7 +69,7 @@ pub(crate) fn encode_ple_model_level(
         WeightBuffer::Dense { buf: Some(buf), .. } => {
             ops::encode_embedding_lookup(
                 enc,
-                &pipelines.embedding_lookup,
+                &pipelines.embedding.embedding_lookup,
                 &ops::EmbeddingLookupParams {
                     token_ids: token_ids_buf,
                     embedding_table: buf,
@@ -83,7 +83,7 @@ pub(crate) fn encode_ple_model_level(
         WeightBuffer::DualScaleQuantized(dq) => {
             ops::encode_d2quant_embedding_lookup(
                 enc,
-                &pipelines.d2quant_embedding_lookup_3bit,
+                &pipelines.d2quant.embedding_lookup_3bit,
                 &ops::D2QuantEmbeddingLookupParams {
                     token_ids: token_ids_buf,
                     weight: dq,
@@ -113,7 +113,7 @@ pub(crate) fn encode_ple_model_level(
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
         ops::encode_scale_buffer(
             enc,
-            &pipelines.scale_buffer,
+            &pipelines.elementwise.scale_buffer,
             ple_buf,
             &scale_buf,
             (token_count * ple_total) as u32,
@@ -144,7 +144,7 @@ pub(crate) fn encode_ple_model_level(
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
         ops::encode_scale_buffer(
             enc,
-            &pipelines.scale_buffer,
+            &pipelines.elementwise.scale_buffer,
             &bufs.ffn_gate,
             &scale_buf,
             (token_count * ple_total) as u32,
@@ -162,7 +162,7 @@ pub(crate) fn encode_ple_model_level(
     };
     ops::encode_rms_norm(
         enc,
-        &pipelines.rms_norm,
+        &pipelines.norm.rms_norm,
         &ops::RmsNormParams {
             input: &bufs.ffn_gate,
             weight: ple_norm,
@@ -179,7 +179,7 @@ pub(crate) fn encode_ple_model_level(
     let ple_scale: f32 = std::f32::consts::FRAC_1_SQRT_2;
     ops::encode_add_scale(
         enc,
-        &pipelines.ple_add_scale,
+        &pipelines.activation.ple_add_scale,
         ple_buf,
         &bufs.ffn_up,
         ple_buf,
@@ -232,7 +232,7 @@ pub(crate) fn encode_ple_per_layer(
     // 1. Standalone FFN residual add: hidden_state = residual + ffn_down
     ops::encode_residual_add(
         enc,
-        &pipelines.residual_add,
+        &pipelines.elementwise.residual_add,
         &bufs.residual,
         &bufs.ffn_down,
         &bufs.hidden_state,
@@ -256,7 +256,7 @@ pub(crate) fn encode_ple_per_layer(
     // 3. GELU activation + multiply with per-layer input slice
     ops::encode_gelu_gate(
         enc,
-        &pipelines.ple_gelu_gate,
+        &pipelines.activation.ple_gelu_gate,
         ple_scratch,
         ple_buf,
         ple_scratch, // in-place
@@ -283,7 +283,7 @@ pub(crate) fn encode_ple_per_layer(
     // 5. RMSNorm the projected output
     ops::encode_rms_norm(
         enc,
-        &pipelines.rms_norm,
+        &pipelines.norm.rms_norm,
         &ops::RmsNormParams {
             input: &bufs.ffn_down,
             weight: ple_post_norm,
@@ -298,7 +298,7 @@ pub(crate) fn encode_ple_per_layer(
     // 6. PLE residual add: hidden_state += normed PLE output
     ops::encode_residual_add(
         enc,
-        &pipelines.residual_add,
+        &pipelines.elementwise.residual_add,
         &bufs.hidden_state,
         &bufs.ffn_up,
         &bufs.hidden_state, // in-place
@@ -311,7 +311,7 @@ pub(crate) fn encode_ple_per_layer(
     if let Some(ref scalar) = lw.layer_scalar {
         ops::encode_scale_buffer(
             enc,
-            &pipelines.scale_buffer,
+            &pipelines.elementwise.scale_buffer,
             &bufs.hidden_state,
             scalar,
             (token_count * h) as u32,
@@ -323,7 +323,7 @@ pub(crate) fn encode_ple_per_layer(
     if let Some(next_norm) = next_input_norm {
         ops::encode_rms_norm(
             enc,
-            &pipelines.rms_norm,
+            &pipelines.norm.rms_norm,
             &ops::RmsNormParams {
                 input: &bufs.hidden_state,
                 weight: next_norm,

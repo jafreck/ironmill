@@ -61,32 +61,36 @@ impl LinearKernelKind {
     }
 }
 
-/// All compiled Metal pipeline states for the Metal backend.
-pub struct MetalPipelines {
+/// Normalization pipeline states.
+pub struct NormPipelines {
     /// RMSNorm kernel.
     pub rms_norm: ComputePipeline,
+    /// Fused residual-add + RMSNorm kernel.
+    pub fused_residual_rms_norm: ComputePipeline,
+    /// Fused embedding lookup + first-layer norm kernel.
+    pub fused_embedding_norm: ComputePipeline,
+    /// Fused QK normalization + RoPE kernel.
+    pub fused_qk_norm_rope: ComputePipeline,
+    /// Fused softcapping kernel.
+    pub fused_softcap: ComputePipeline,
+}
+
+/// Activation pipeline states.
+pub struct ActivationPipelines {
     /// SiLU-gated activation kernel.
     pub silu_gate: ComputePipeline,
     /// GELU-gated activation kernel (Gemma 4).
     pub ffn_gelu_gate: ComputePipeline,
-    /// Rotary positional embedding kernel.
-    pub rope: ComputePipeline,
-    /// Element-wise residual addition kernel.
-    pub residual_add: ComputePipeline,
-    /// Broadcast bias add: data[i] += bias[i % H]. Used for DAC correction.
-    pub bias_add: ComputePipeline,
-    /// Buffer copy kernel (element-wise half → half).
-    pub copy_buffer: ComputePipeline,
-    /// Token embedding lookup kernel.
-    pub embedding_lookup: ComputePipeline,
-    /// TurboQuant KV cache write kernel.
-    pub turboquant_cache_write: ComputePipeline,
-    /// TurboQuant attention kernel.
-    pub turboquant_attention: ComputePipeline,
-    /// TurboQuant outlier KV cache write kernel.
-    pub turboquant_outlier_cache_write: ComputePipeline,
-    /// TurboQuant outlier attention kernel.
-    pub turboquant_outlier_attention: ComputePipeline,
+    /// PLE GELU-gated activation kernel.
+    pub ple_gelu_gate: ComputePipeline,
+    /// PLE add-and-scale kernel.
+    pub ple_add_scale: ComputePipeline,
+    /// Sigmoid gating kernel (Qwen3.5 attn_output_gate).
+    pub sigmoid_gate: ComputePipeline,
+}
+
+/// Attention pipeline states.
+pub struct AttentionPipelines {
     /// Standard FP16 attention (decode) kernel.
     pub standard_attention: ComputePipeline,
     /// Prefill attention kernel.
@@ -95,108 +99,194 @@ pub struct MetalPipelines {
     pub prefill_attention_fa2: ComputePipeline,
     /// Register-tiled FA2 prefill kernel (v2).
     pub prefill_attention_v2: ComputePipeline,
-    /// PolarQuant INT4 matvec kernel.
-    pub polarquant_matvec_int4: ComputePipeline,
-    /// PolarQuant INT4 matmul kernel.
-    pub polarquant_matmul_int4: ComputePipeline,
-    /// PolarQuant INT8 matvec kernel.
-    pub polarquant_matvec_int8: ComputePipeline,
-    /// PolarQuant INT8 matmul kernel.
-    pub polarquant_matmul_int8: ComputePipeline,
-    /// Affine INT4 matvec kernel.
-    pub affine_matvec_int4: ComputePipeline,
-    /// Affine INT4 matmul kernel.
-    pub affine_matmul_int4: ComputePipeline,
-    /// Affine INT8 matvec kernel.
-    pub affine_matvec_int8: ComputePipeline,
-    /// Affine INT8 matmul kernel.
-    pub affine_matmul_int8: ComputePipeline,
-    /// KV scatter (cache write) kernel.
-    pub kv_scatter: ComputePipeline,
-    /// Dense FP16 matvec kernel.
-    pub matvec: ComputePipeline,
-    /// Dense FP16 matmul kernel.
-    pub matmul: ComputePipeline,
-    /// Fused residual-add + RMSNorm kernel.
-    pub fused_residual_rms_norm: ComputePipeline,
-    /// Fused QK normalization + RoPE kernel.
-    pub fused_qk_norm_rope: ComputePipeline,
-    /// Fused embedding lookup + first-layer norm kernel.
-    pub fused_embedding_norm: ComputePipeline,
-    /// INT4 dequantization kernel.
-    pub int4_dequantize: ComputePipeline,
     /// Fused scaled dot-product attention kernel.
     /// `None` when the kernel exceeds threadgroup memory limits (head_dim ≥ 256).
     /// Decode uses FlashDecoding split+reduce instead.
     pub fused_sdpa: Option<ComputePipeline>,
-    /// QuIP# matvec kernel.
-    pub quip_sharp_matvec: ComputePipeline,
-    /// QuIP# matmul kernel.
-    pub quip_sharp_matmul: ComputePipeline,
-    /// Fused softcapping kernel.
-    pub fused_softcap: ComputePipeline,
-    /// PLE GELU-gated activation kernel.
-    pub ple_gelu_gate: ComputePipeline,
-    /// PLE add-and-scale kernel.
-    pub ple_add_scale: ComputePipeline,
-    /// Element-wise buffer scaling kernel.
-    pub scale_buffer: ComputePipeline,
-    /// MoE router softmax kernel.
-    pub moe_softmax: ComputePipeline,
-    /// MoE expert GELU activation kernel.
-    pub moe_gelu: ComputePipeline,
-    /// MoE element-wise multiply kernel.
-    pub moe_mul: ComputePipeline,
-    /// MoE weighted expert combination kernel.
-    pub moe_weighted_combine: ComputePipeline,
-    /// D2Quant 3-bit matvec kernel.
-    pub d2quant_matvec_3bit: ComputePipeline,
-    /// D2Quant 3-bit matmul kernel.
-    pub d2quant_matmul_3bit: ComputePipeline,
-    /// D2Quant 3-bit embedding lookup kernel.
-    pub d2quant_embedding_lookup_3bit: ComputePipeline,
-    /// Sigmoid gating kernel (Qwen3.5 attn_output_gate).
-    pub sigmoid_gate: ComputePipeline,
-    /// GDN conv1d + SiLU kernel.
-    pub gdn_conv1d_silu: ComputePipeline,
-    /// GDN recurrent state update kernel.
-    pub gdn_recurrent_update: ComputePipeline,
-    /// GDN per-head output gate (RMSNorm + silu(z)) kernel.
-    pub gdn_output_gate: ComputePipeline,
-    /// GDN prefill batched conv1d + SiLU kernel (all tokens, one dispatch).
-    pub gdn_prefill_conv1d_silu: ComputePipeline,
-    /// GDN prefill batched recurrent + norm + gate kernel (all tokens, one dispatch).
-    pub gdn_prefill_recurrent: ComputePipeline,
-    /// Fused GDN decode kernel: conv1d+SiLU+recurrent+output_gate in one dispatch.
-    pub gdn_fused_decode: ComputePipeline,
-    /// Batched dense FP16 matvec for 4 GDN projections in one dispatch.
-    pub gdn_batched_matvec: ComputePipeline,
-    /// Batched affine INT4 matvec for FFN gate+up in one dispatch.
-    pub batched_affine_matvec_int4: ComputePipeline,
-    /// Batched affine INT4 matvec for 4 GDN projections in one dispatch.
-    pub gdn_batched_affine_matvec_int4: ComputePipeline,
-    /// AMX-accelerated INT4 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
-    pub affine_matvec_int4_amx: ComputePipeline,
-    /// AMX-accelerated INT8 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
-    pub affine_matvec_int8_amx: ComputePipeline,
-    /// D2Quant AMX-accelerated 3-bit matvec: dual-scale dequant + simdgroup matrix multiply.
-    pub d2quant_matvec_3bit_amx: ComputePipeline,
-    /// Fused FFN gate+up+activation for INT4 decode: gate+up dot products + SiLU/GELU inline.
-    pub fused_ffn_gate_up_act_int4: ComputePipeline,
-    /// Fused residual+RMSNorm+dense matvec in one dispatch.
-    pub fused_residual_norm_matvec: ComputePipeline,
-    /// Fused residual+RMSNorm+affine INT4 matvec in one dispatch.
-    pub fused_residual_norm_affine_matvec_int4: ComputePipeline,
-    /// Q8 input quantization kernel: FP16 → INT8 with per-group scales.
-    pub quantize_input_q8: ComputePipeline,
-    /// INT4×Q8 integer dot product matvec (decode path).
-    pub affine_matvec_int4xq8: ComputePipeline,
-    /// INT4 affine embedding lookup with on-the-fly dequantization.
-    pub affine_embedding_lookup_int4: ComputePipeline,
     /// FlashDecoding split kernel: each threadgroup processes a KV slice.
     pub fused_sdpa_split: ComputePipeline,
     /// FlashDecoding reduce kernel: combines partial results across splits.
     pub fused_sdpa_reduce: ComputePipeline,
+    /// TurboQuant KV cache write kernel.
+    pub turboquant_cache_write: ComputePipeline,
+    /// TurboQuant attention kernel.
+    pub turboquant_attention: ComputePipeline,
+    /// TurboQuant outlier KV cache write kernel.
+    pub turboquant_outlier_cache_write: ComputePipeline,
+    /// TurboQuant outlier attention kernel.
+    pub turboquant_outlier_attention: ComputePipeline,
+}
+
+/// Dense FP16 linear pipeline states.
+pub struct LinearPipelines {
+    /// Dense FP16 matvec kernel.
+    pub matvec: ComputePipeline,
+    /// Dense FP16 matmul kernel.
+    pub matmul: ComputePipeline,
+}
+
+/// Affine quantized pipeline states.
+pub struct AffinePipelines {
+    /// Affine INT4 matvec kernel.
+    pub matvec_int4: ComputePipeline,
+    /// Affine INT4 matmul kernel.
+    pub matmul_int4: ComputePipeline,
+    /// Affine INT8 matvec kernel.
+    pub matvec_int8: ComputePipeline,
+    /// Affine INT8 matmul kernel.
+    pub matmul_int8: ComputePipeline,
+    /// AMX-accelerated INT4 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
+    pub matvec_int4_amx: ComputePipeline,
+    /// AMX-accelerated INT8 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
+    pub matvec_int8_amx: ComputePipeline,
+    /// Batched affine INT4 matvec for FFN gate+up in one dispatch.
+    pub batched_matvec_int4: ComputePipeline,
+    /// Batched affine INT4 matvec for 4 GDN projections in one dispatch.
+    pub gdn_batched_matvec_int4: ComputePipeline,
+    /// Fused FFN gate+up+activation for INT4 decode: gate+up dot products + SiLU/GELU inline.
+    pub fused_ffn_gate_up_act_int4: ComputePipeline,
+    /// INT4×Q8 integer dot product matvec (decode path).
+    pub matvec_int4xq8: ComputePipeline,
+    /// INT4 affine embedding lookup with on-the-fly dequantization.
+    pub embedding_lookup_int4: ComputePipeline,
+}
+
+/// PolarQuant pipeline states.
+pub struct PolarQuantPipelines {
+    /// PolarQuant INT4 matvec kernel.
+    pub matvec_int4: ComputePipeline,
+    /// PolarQuant INT4 matmul kernel.
+    pub matmul_int4: ComputePipeline,
+    /// PolarQuant INT8 matvec kernel.
+    pub matvec_int8: ComputePipeline,
+    /// PolarQuant INT8 matmul kernel.
+    pub matmul_int8: ComputePipeline,
+}
+
+/// D2Quant pipeline states.
+pub struct D2QuantPipelines {
+    /// D2Quant 3-bit matvec kernel.
+    pub matvec_3bit: ComputePipeline,
+    /// D2Quant 3-bit matmul kernel.
+    pub matmul_3bit: ComputePipeline,
+    /// D2Quant 3-bit embedding lookup kernel.
+    pub embedding_lookup_3bit: ComputePipeline,
+    /// D2Quant AMX-accelerated 3-bit matvec: dual-scale dequant + simdgroup matrix multiply.
+    pub matvec_3bit_amx: ComputePipeline,
+}
+
+/// QuIP# pipeline states.
+pub struct QuipPipelines {
+    /// QuIP# matvec kernel.
+    pub matvec: ComputePipeline,
+    /// QuIP# matmul kernel.
+    pub matmul: ComputePipeline,
+}
+
+/// Elementwise pipeline states.
+pub struct ElementwisePipelines {
+    /// Element-wise residual addition kernel.
+    pub residual_add: ComputePipeline,
+    /// Broadcast bias add: data[i] += bias[i % H]. Used for DAC correction.
+    pub bias_add: ComputePipeline,
+    /// Buffer copy kernel (element-wise half → half).
+    pub copy_buffer: ComputePipeline,
+    /// Element-wise buffer scaling kernel.
+    pub scale_buffer: ComputePipeline,
+    /// Q8 input quantization kernel: FP16 → INT8 with per-group scales.
+    pub quantize_input_q8: ComputePipeline,
+}
+
+/// Embedding pipeline states.
+pub struct EmbeddingPipelines {
+    /// Token embedding lookup kernel.
+    pub embedding_lookup: ComputePipeline,
+}
+
+/// KV cache pipeline states.
+pub struct KvPipelines {
+    /// KV scatter (cache write) kernel.
+    pub kv_scatter: ComputePipeline,
+}
+
+/// GDN recurrent pipeline states.
+pub struct GdnPipelines {
+    /// GDN conv1d + SiLU kernel.
+    pub conv1d_silu: ComputePipeline,
+    /// GDN recurrent state update kernel.
+    pub recurrent_update: ComputePipeline,
+    /// GDN per-head output gate (RMSNorm + silu(z)) kernel.
+    pub output_gate: ComputePipeline,
+    /// GDN prefill batched conv1d + SiLU kernel (all tokens, one dispatch).
+    pub prefill_conv1d_silu: ComputePipeline,
+    /// GDN prefill batched recurrent + norm + gate kernel (all tokens, one dispatch).
+    pub prefill_recurrent: ComputePipeline,
+    /// Fused GDN decode kernel: conv1d+SiLU+recurrent+output_gate in one dispatch.
+    pub fused_decode: ComputePipeline,
+    /// Batched dense FP16 matvec for 4 GDN projections in one dispatch.
+    pub batched_matvec: ComputePipeline,
+}
+
+/// MoE pipeline states.
+pub struct MoePipelines {
+    /// MoE router softmax kernel.
+    pub softmax: ComputePipeline,
+    /// MoE expert GELU activation kernel.
+    pub gelu: ComputePipeline,
+    /// MoE element-wise multiply kernel.
+    pub mul: ComputePipeline,
+    /// MoE weighted expert combination kernel.
+    pub weighted_combine: ComputePipeline,
+}
+
+/// Rope pipeline states.
+pub struct RopePipelines {
+    /// Rotary positional embedding kernel.
+    pub rope: ComputePipeline,
+}
+
+/// Fused operation pipeline states.
+pub struct FusedPipelines {
+    /// Fused residual+RMSNorm+dense matvec in one dispatch.
+    pub residual_norm_matvec: ComputePipeline,
+    /// Fused residual+RMSNorm+affine INT4 matvec in one dispatch.
+    pub residual_norm_affine_matvec_int4: ComputePipeline,
+    /// INT4 dequantization kernel.
+    pub int4_dequantize: ComputePipeline,
+}
+
+/// All compiled Metal pipeline states for the Metal backend.
+pub struct MetalPipelines {
+    /// Normalization pipelines.
+    pub norm: NormPipelines,
+    /// Activation pipelines.
+    pub activation: ActivationPipelines,
+    /// Attention pipelines.
+    pub attention: AttentionPipelines,
+    /// Dense FP16 linear pipelines.
+    pub linear: LinearPipelines,
+    /// Affine quantized pipelines.
+    pub affine: AffinePipelines,
+    /// PolarQuant pipelines.
+    pub polarquant: PolarQuantPipelines,
+    /// D2Quant pipelines.
+    pub d2quant: D2QuantPipelines,
+    /// QuIP# pipelines.
+    pub quip: QuipPipelines,
+    /// Elementwise pipelines.
+    pub elementwise: ElementwisePipelines,
+    /// Embedding pipelines.
+    pub embedding: EmbeddingPipelines,
+    /// KV cache pipelines.
+    pub kv: KvPipelines,
+    /// GDN recurrent pipelines.
+    pub gdn: GdnPipelines,
+    /// MoE pipelines.
+    pub moe: MoePipelines,
+    /// Rope pipelines.
+    pub rope: RopePipelines,
+    /// Fused operation pipelines.
+    pub fused: FusedPipelines,
 }
 
 /// Create a compute pipeline from a shader library function.
@@ -325,72 +415,93 @@ impl MetalPipelines {
         ) = Self::compile_gdn_shaders(device, &libs)?;
 
         Ok(Self {
-            rms_norm,
-            silu_gate,
-            ffn_gelu_gate,
-            rope,
-            residual_add,
-            bias_add,
-            copy_buffer,
-            embedding_lookup,
-            turboquant_cache_write,
-            turboquant_attention,
-            turboquant_outlier_cache_write,
-            turboquant_outlier_attention,
-            standard_attention,
-            prefill_attention,
-            prefill_attention_fa2,
-            prefill_attention_v2,
-            polarquant_matvec_int4,
-            polarquant_matmul_int4,
-            polarquant_matvec_int8,
-            polarquant_matmul_int8,
-            affine_matvec_int4,
-            affine_matmul_int4,
-            affine_matvec_int8,
-            affine_matmul_int8,
-            kv_scatter,
-            matvec,
-            matmul,
-            fused_residual_rms_norm,
-            fused_qk_norm_rope,
-            fused_embedding_norm,
-            int4_dequantize,
-            fused_sdpa,
-            quip_sharp_matvec,
-            quip_sharp_matmul,
-            fused_softcap,
-            ple_gelu_gate,
-            ple_add_scale,
-            scale_buffer,
-            moe_softmax,
-            moe_gelu,
-            moe_mul,
-            moe_weighted_combine,
-            d2quant_matvec_3bit,
-            d2quant_matmul_3bit,
-            d2quant_embedding_lookup_3bit,
-            sigmoid_gate,
-            gdn_conv1d_silu,
-            gdn_recurrent_update,
-            gdn_output_gate,
-            gdn_prefill_conv1d_silu,
-            gdn_prefill_recurrent,
-            gdn_fused_decode,
-            gdn_batched_matvec,
-            batched_affine_matvec_int4,
-            gdn_batched_affine_matvec_int4,
-            affine_matvec_int4_amx,
-            affine_matvec_int8_amx,
-            d2quant_matvec_3bit_amx,
-            fused_ffn_gate_up_act_int4,
-            fused_residual_norm_matvec,
-            fused_residual_norm_affine_matvec_int4,
-            quantize_input_q8,
-            affine_matvec_int4xq8,
-            affine_embedding_lookup_int4,
-            fused_sdpa_split,
-            fused_sdpa_reduce,
+            norm: NormPipelines {
+                rms_norm,
+                fused_residual_rms_norm,
+                fused_embedding_norm,
+                fused_qk_norm_rope,
+                fused_softcap,
+            },
+            activation: ActivationPipelines {
+                silu_gate,
+                ffn_gelu_gate,
+                ple_gelu_gate,
+                ple_add_scale,
+                sigmoid_gate,
+            },
+            attention: AttentionPipelines {
+                standard_attention,
+                prefill_attention,
+                prefill_attention_fa2,
+                prefill_attention_v2,
+                fused_sdpa,
+                fused_sdpa_split,
+                fused_sdpa_reduce,
+                turboquant_cache_write,
+                turboquant_attention,
+                turboquant_outlier_cache_write,
+                turboquant_outlier_attention,
+            },
+            linear: LinearPipelines { matvec, matmul },
+            affine: AffinePipelines {
+                matvec_int4: affine_matvec_int4,
+                matmul_int4: affine_matmul_int4,
+                matvec_int8: affine_matvec_int8,
+                matmul_int8: affine_matmul_int8,
+                matvec_int4_amx: affine_matvec_int4_amx,
+                matvec_int8_amx: affine_matvec_int8_amx,
+                batched_matvec_int4: batched_affine_matvec_int4,
+                gdn_batched_matvec_int4: gdn_batched_affine_matvec_int4,
+                fused_ffn_gate_up_act_int4,
+                matvec_int4xq8: affine_matvec_int4xq8,
+                embedding_lookup_int4: affine_embedding_lookup_int4,
+            },
+            polarquant: PolarQuantPipelines {
+                matvec_int4: polarquant_matvec_int4,
+                matmul_int4: polarquant_matmul_int4,
+                matvec_int8: polarquant_matvec_int8,
+                matmul_int8: polarquant_matmul_int8,
+            },
+            d2quant: D2QuantPipelines {
+                matvec_3bit: d2quant_matvec_3bit,
+                matmul_3bit: d2quant_matmul_3bit,
+                embedding_lookup_3bit: d2quant_embedding_lookup_3bit,
+                matvec_3bit_amx: d2quant_matvec_3bit_amx,
+            },
+            quip: QuipPipelines {
+                matvec: quip_sharp_matvec,
+                matmul: quip_sharp_matmul,
+            },
+            elementwise: ElementwisePipelines {
+                residual_add,
+                bias_add,
+                copy_buffer,
+                scale_buffer,
+                quantize_input_q8,
+            },
+            embedding: EmbeddingPipelines { embedding_lookup },
+            kv: KvPipelines { kv_scatter },
+            gdn: GdnPipelines {
+                conv1d_silu: gdn_conv1d_silu,
+                recurrent_update: gdn_recurrent_update,
+                output_gate: gdn_output_gate,
+                prefill_conv1d_silu: gdn_prefill_conv1d_silu,
+                prefill_recurrent: gdn_prefill_recurrent,
+                fused_decode: gdn_fused_decode,
+                batched_matvec: gdn_batched_matvec,
+            },
+            moe: MoePipelines {
+                softmax: moe_softmax,
+                gelu: moe_gelu,
+                mul: moe_mul,
+                weighted_combine: moe_weighted_combine,
+            },
+            rope: RopePipelines { rope },
+            fused: FusedPipelines {
+                residual_norm_matvec: fused_residual_norm_matvec,
+                residual_norm_affine_matvec_int4: fused_residual_norm_affine_matvec_int4,
+                int4_dequantize,
+            },
         })
     }
 
@@ -962,15 +1073,12 @@ impl MetalPipelines {
         }
     }
 
-    // ── Phase-aware pipeline selection ───────────────────────────
+    // ── Phase-aware pipeline selection (delegating to sub-structs) ──
 
     /// Select the FP16 dense linear pipeline (matvec or matmul) based on phase.
     #[inline]
     pub fn dense_linear_pipeline(&self, kind: LinearKernelKind) -> &ComputePipeline {
-        match kind {
-            LinearKernelKind::Matvec => &self.matvec,
-            LinearKernelKind::Matmul => &self.matmul,
-        }
+        self.linear.for_kind(kind)
     }
 
     /// Select the PolarQuant pipeline for a given bit-width and phase.
@@ -980,13 +1088,7 @@ impl MetalPipelines {
         n_bits: u32,
         kind: LinearKernelKind,
     ) -> Option<&ComputePipeline> {
-        match (n_bits, kind) {
-            (4, LinearKernelKind::Matvec) => Some(&self.polarquant_matvec_int4),
-            (4, LinearKernelKind::Matmul) => Some(&self.polarquant_matmul_int4),
-            (8, LinearKernelKind::Matvec) => Some(&self.polarquant_matvec_int8),
-            (8, LinearKernelKind::Matmul) => Some(&self.polarquant_matmul_int8),
-            _ => None,
-        }
+        self.polarquant.for_bits_and_kind(n_bits, kind)
     }
 
     /// Select the affine-quantized pipeline for a given bit-width and phase.
@@ -996,13 +1098,7 @@ impl MetalPipelines {
         bit_width: u32,
         kind: LinearKernelKind,
     ) -> Option<&ComputePipeline> {
-        match (bit_width, kind) {
-            (4, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int4),
-            (4, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int4),
-            (8, LinearKernelKind::Matvec) => Some(&self.affine_matvec_int8),
-            (8, LinearKernelKind::Matmul) => Some(&self.affine_matmul_int8),
-            _ => None,
-        }
+        self.affine.for_bits_and_kind(bit_width, kind)
     }
 
     /// Select the D2Quant dual-scale pipeline for a given bit-width and phase.
@@ -1012,19 +1108,86 @@ impl MetalPipelines {
         bit_width: u32,
         kind: LinearKernelKind,
     ) -> Option<&ComputePipeline> {
-        match (bit_width, kind) {
-            (3, LinearKernelKind::Matvec) => Some(&self.d2quant_matvec_3bit),
-            (3, LinearKernelKind::Matmul) => Some(&self.d2quant_matmul_3bit),
-            _ => None,
-        }
+        self.d2quant.for_bits_and_kind(bit_width, kind)
     }
 
     /// Select the QuIP# pipeline for the given phase.
     #[inline]
     pub fn quip_sharp_pipeline(&self, kind: LinearKernelKind) -> &ComputePipeline {
+        self.quip.for_kind(kind)
+    }
+}
+
+impl LinearPipelines {
+    /// Select the FP16 dense linear pipeline (matvec or matmul) based on phase.
+    #[inline]
+    pub fn for_kind(&self, kind: LinearKernelKind) -> &ComputePipeline {
         match kind {
-            LinearKernelKind::Matvec => &self.quip_sharp_matvec,
-            LinearKernelKind::Matmul => &self.quip_sharp_matmul,
+            LinearKernelKind::Matvec => &self.matvec,
+            LinearKernelKind::Matmul => &self.matmul,
+        }
+    }
+}
+
+impl PolarQuantPipelines {
+    /// Select the PolarQuant pipeline for a given bit-width and phase.
+    #[inline]
+    pub fn for_bits_and_kind(
+        &self,
+        n_bits: u32,
+        kind: LinearKernelKind,
+    ) -> Option<&ComputePipeline> {
+        match (n_bits, kind) {
+            (4, LinearKernelKind::Matvec) => Some(&self.matvec_int4),
+            (4, LinearKernelKind::Matmul) => Some(&self.matmul_int4),
+            (8, LinearKernelKind::Matvec) => Some(&self.matvec_int8),
+            (8, LinearKernelKind::Matmul) => Some(&self.matmul_int8),
+            _ => None,
+        }
+    }
+}
+
+impl AffinePipelines {
+    /// Select the affine-quantized pipeline for a given bit-width and phase.
+    #[inline]
+    pub fn for_bits_and_kind(
+        &self,
+        bit_width: u32,
+        kind: LinearKernelKind,
+    ) -> Option<&ComputePipeline> {
+        match (bit_width, kind) {
+            (4, LinearKernelKind::Matvec) => Some(&self.matvec_int4),
+            (4, LinearKernelKind::Matmul) => Some(&self.matmul_int4),
+            (8, LinearKernelKind::Matvec) => Some(&self.matvec_int8),
+            (8, LinearKernelKind::Matmul) => Some(&self.matmul_int8),
+            _ => None,
+        }
+    }
+}
+
+impl D2QuantPipelines {
+    /// Select the D2Quant dual-scale pipeline for a given bit-width and phase.
+    #[inline]
+    pub fn for_bits_and_kind(
+        &self,
+        bit_width: u32,
+        kind: LinearKernelKind,
+    ) -> Option<&ComputePipeline> {
+        match (bit_width, kind) {
+            (3, LinearKernelKind::Matvec) => Some(&self.matvec_3bit),
+            (3, LinearKernelKind::Matmul) => Some(&self.matmul_3bit),
+            _ => None,
+        }
+    }
+}
+
+impl QuipPipelines {
+    /// Select the QuIP# pipeline for the given phase.
+    #[inline]
+    pub fn for_kind(&self, kind: LinearKernelKind) -> &ComputePipeline {
+        match kind {
+            LinearKernelKind::Matvec => &self.matvec,
+            LinearKernelKind::Matmul => &self.matmul,
         }
     }
 }

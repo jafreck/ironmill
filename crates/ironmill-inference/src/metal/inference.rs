@@ -388,7 +388,7 @@ mod fa2_prefill_tests {
             let enc = cmd.compute_encoder().expect("enc");
             super::super::ops::encode_fa2_prefill_attention(
                 &enc,
-                &pipelines.prefill_attention_fa2,
+                &pipelines.attention.prefill_attention_fa2,
                 &super::super::ops::PrefillAttentionParams {
                     q: &q_buf,
                     k_cache: &k_buf,
@@ -416,7 +416,11 @@ mod fa2_prefill_tests {
             let total_seq = (seq_offset + token_count) as u32;
             super::super::ops::encode_fused_sdpa(
                 &enc,
-                pipelines.fused_sdpa.as_ref().expect("fused_sdpa pipeline"),
+                pipelines
+                    .attention
+                    .fused_sdpa
+                    .as_ref()
+                    .expect("fused_sdpa pipeline"),
                 &super::super::ops::FusedSdpaParams {
                     q: &q_buf,
                     k: &k_buf,
@@ -536,7 +540,7 @@ mod fa2_prefill_tests {
         let enc = cmd.compute_encoder().expect("enc");
         super::super::ops::encode_fa2_prefill_attention(
             &enc,
-            &pipelines.prefill_attention_fa2,
+            &pipelines.attention.prefill_attention_fa2,
             &super::super::ops::PrefillAttentionParams {
                 q: &q_buf,
                 k_cache: &k_buf,
@@ -640,7 +644,7 @@ mod fa2_prefill_tests {
         let enc = cmd.compute_encoder().expect("enc");
         super::super::ops::encode_fa2_prefill_attention(
             &enc,
-            &pipelines.prefill_attention_fa2,
+            &pipelines.attention.prefill_attention_fa2,
             &super::super::ops::PrefillAttentionParams {
                 q: &q_buf,
                 k_cache: &k_buf,
@@ -743,7 +747,7 @@ mod fa2_prefill_tests {
             let enc = cmd.compute_encoder().expect("enc");
             super::super::ops::encode_v2_prefill_attention(
                 &enc,
-                &pipelines.prefill_attention_v2,
+                &pipelines.attention.prefill_attention_v2,
                 &super::super::ops::PrefillAttentionParams {
                     q: &q_buf,
                     k_cache: &k_buf,
@@ -773,7 +777,7 @@ mod fa2_prefill_tests {
             let enc = cmd.compute_encoder().expect("enc");
             super::super::ops::encode_fa2_prefill_attention(
                 &enc,
-                &pipelines.prefill_attention_fa2,
+                &pipelines.attention.prefill_attention_fa2,
                 &super::super::ops::PrefillAttentionParams {
                     q: &q_buf,
                     k_cache: &k_buf,

@@ -157,7 +157,7 @@ impl MetalInference {
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             ops::encode_embedding_lookup(
                 &enc,
-                &self.pipelines()?.embedding_lookup,
+                &self.pipelines()?.embedding.embedding_lookup,
                 &ops::EmbeddingLookupParams {
                     token_ids: &bufs.token_ids_buf,
                     embedding_table: &weights.embedding,
@@ -180,7 +180,7 @@ impl MetalInference {
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 ops::encode_scale_buffer(
                     &enc,
-                    &self.pipelines()?.scale_buffer,
+                    &self.pipelines()?.elementwise.scale_buffer,
                     &bufs.hidden_state,
                     &scale_buf,
                     (token_count * h) as u32,
@@ -197,7 +197,7 @@ impl MetalInference {
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
-                &self.pipelines()?.rms_norm,
+                &self.pipelines()?.norm.rms_norm,
                 &ops::RmsNormParams {
                     input: &bufs.hidden_state,
                     weight: &lw0.input_norm,
@@ -434,7 +434,7 @@ impl MetalInference {
                     let gate_size = (token_count * mc.num_attention_heads * mc.head_dim) as u32;
                     ops::encode_sigmoid_gate(
                         &enc,
-                        &pipelines.sigmoid_gate,
+                        &pipelines.activation.sigmoid_gate,
                         &bufs.attn_out,
                         gate_buf,
                         gate_size,
@@ -449,7 +449,7 @@ impl MetalInference {
                     let copy_elems = (token_count * attn_out_features_local) as u32;
                     ops::encode_copy_buffer(
                         &enc,
-                        &pipelines.copy_buffer,
+                        &pipelines.elementwise.copy_buffer,
                         &bufs.attn_out,
                         &calib_scratch,
                         copy_elems,
@@ -497,7 +497,7 @@ impl MetalInference {
                     // Gemma 4: post_attention_layernorm on attn output before residual
                     ops::encode_rms_norm(
                         &enc,
-                        &pipelines.rms_norm,
+                        &pipelines.norm.rms_norm,
                         &ops::RmsNormParams {
                             input: &bufs.ffn_down,
                             weight: &lw.post_attn_norm,
@@ -510,7 +510,7 @@ impl MetalInference {
                     enc.memory_barrier_buffers();
                     ops::encode_residual_add(
                         &enc,
-                        &pipelines.residual_add,
+                        &pipelines.elementwise.residual_add,
                         &bufs.hidden_state,
                         &bufs.ffn_down,
                         &bufs.residual,
@@ -519,7 +519,7 @@ impl MetalInference {
                     enc.memory_barrier_buffers();
                     ops::encode_rms_norm(
                         &enc,
-                        &pipelines.rms_norm,
+                        &pipelines.norm.rms_norm,
                         &ops::RmsNormParams {
                             input: &bufs.residual,
                             weight: pre_ffn,
@@ -532,7 +532,7 @@ impl MetalInference {
                 } else {
                     ops::encode_fused_residual_rms_norm(
                         &enc,
-                        &pipelines.fused_residual_rms_norm,
+                        &pipelines.norm.fused_residual_rms_norm,
                         &ops::FusedResidualRmsNormParams {
                             a: &bufs.hidden_state,
                             b: &bufs.ffn_down,
@@ -602,7 +602,7 @@ impl MetalInference {
                 let copy_elems = (token_count * layer_inter) as u32;
                 ops::encode_copy_buffer(
                     &enc,
-                    &pipelines.copy_buffer,
+                    &pipelines.elementwise.copy_buffer,
                     &bufs.ffn_gate,
                     &calib_scratch,
                     copy_elems,
@@ -656,7 +656,7 @@ impl MetalInference {
             if let Some(ref post_ffn) = lw.post_ffn_norm {
                 ops::encode_rms_norm(
                     &enc,
-                    &pipelines.rms_norm,
+                    &pipelines.norm.rms_norm,
                     &ops::RmsNormParams {
                         input: &bufs.ffn_down,
                         weight: post_ffn,
@@ -669,7 +669,7 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
                 ops::encode_copy_buffer(
                     &enc,
-                    &pipelines.copy_buffer,
+                    &pipelines.elementwise.copy_buffer,
                     &bufs.ffn_gate,
                     &bufs.ffn_down,
                     (token_count * h) as u32,
@@ -702,7 +702,7 @@ impl MetalInference {
                 if let Some(scalar) = &lw.layer_scalar {
                     ops::encode_residual_add(
                         &enc,
-                        &pipelines.residual_add,
+                        &pipelines.elementwise.residual_add,
                         &bufs.residual,
                         &bufs.ffn_down,
                         &bufs.hidden_state,
@@ -711,7 +711,7 @@ impl MetalInference {
                     enc.memory_barrier_buffers();
                     ops::encode_scale_buffer(
                         &enc,
-                        &pipelines.scale_buffer,
+                        &pipelines.elementwise.scale_buffer,
                         &bufs.hidden_state,
                         scalar,
                         (token_count * h) as u32,
@@ -721,7 +721,7 @@ impl MetalInference {
                         let next_norm = &weights.layers[layer_idx + 1].input_norm;
                         ops::encode_rms_norm(
                             &enc,
-                            &pipelines.rms_norm,
+                            &pipelines.norm.rms_norm,
                             &ops::RmsNormParams {
                                 input: &bufs.hidden_state,
                                 weight: next_norm,
@@ -777,7 +777,7 @@ impl MetalInference {
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 ops::encode_copy_buffer(
                     &copy_enc,
-                    &pipelines.copy_buffer,
+                    &pipelines.elementwise.copy_buffer,
                     &bufs.hidden_state,
                     &calib_scratch,
                     (token_count * h) as u32,
@@ -828,7 +828,7 @@ impl MetalInference {
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             ops::encode_rms_norm(
                 &enc,
-                &self.pipelines()?.rms_norm,
+                &self.pipelines()?.norm.rms_norm,
                 &ops::RmsNormParams {
                     input: &bufs.hidden_state,
                     weight: &weights.final_norm,
@@ -1245,7 +1245,7 @@ impl MetalInference {
                 let gate_size = (token_count * mc.num_attention_heads * mc.head_dim) as u32;
                 ops::encode_sigmoid_gate(
                     &enc,
-                    &pipelines.sigmoid_gate,
+                    &pipelines.activation.sigmoid_gate,
                     &bufs.attn_out,
                     gate_buf,
                     gate_size,
@@ -1271,7 +1271,7 @@ impl MetalInference {
             if let Some(pre_ffn) = &lw.pre_ffn_norm {
                 ops::encode_rms_norm(
                     &enc,
-                    &pipelines.rms_norm,
+                    &pipelines.norm.rms_norm,
                     &ops::RmsNormParams {
                         input: &bufs.ffn_down,
                         weight: &lw.post_attn_norm,
@@ -1284,7 +1284,7 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
                 ops::encode_residual_add(
                     &enc,
-                    &pipelines.residual_add,
+                    &pipelines.elementwise.residual_add,
                     &bufs.hidden_state,
                     &bufs.ffn_down,
                     &bufs.residual,
@@ -1293,7 +1293,7 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
                 ops::encode_rms_norm(
                     &enc,
-                    &pipelines.rms_norm,
+                    &pipelines.norm.rms_norm,
                     &ops::RmsNormParams {
                         input: &bufs.residual,
                         weight: pre_ffn,
@@ -1306,7 +1306,7 @@ impl MetalInference {
             } else {
                 ops::encode_fused_residual_rms_norm(
                     &enc,
-                    &pipelines.fused_residual_rms_norm,
+                    &pipelines.norm.fused_residual_rms_norm,
                     &ops::FusedResidualRmsNormParams {
                         a: &bufs.hidden_state,
                         b: &bufs.ffn_down,
@@ -1408,7 +1408,7 @@ impl MetalInference {
         if let Some(ref post_ffn) = lw.post_ffn_norm {
             ops::encode_rms_norm(
                 &enc,
-                &pipelines.rms_norm,
+                &pipelines.norm.rms_norm,
                 &ops::RmsNormParams {
                     input: &bufs.ffn_down,
                     weight: post_ffn,
@@ -1421,7 +1421,7 @@ impl MetalInference {
             enc.memory_barrier_buffers();
             ops::encode_copy_buffer(
                 &enc,
-                &pipelines.copy_buffer,
+                &pipelines.elementwise.copy_buffer,
                 &bufs.ffn_gate,
                 &bufs.ffn_down,
                 (token_count * h) as u32,
@@ -1453,7 +1453,7 @@ impl MetalInference {
             if let Some(scalar) = &lw.layer_scalar {
                 ops::encode_residual_add(
                     &enc,
-                    &pipelines.residual_add,
+                    &pipelines.elementwise.residual_add,
                     &bufs.residual,
                     &bufs.ffn_down,
                     &bufs.hidden_state,
@@ -1462,7 +1462,7 @@ impl MetalInference {
                 enc.memory_barrier_buffers();
                 ops::encode_scale_buffer(
                     &enc,
-                    &pipelines.scale_buffer,
+                    &pipelines.elementwise.scale_buffer,
                     &bufs.hidden_state,
                     scalar,
                     (token_count * h) as u32,
@@ -1472,7 +1472,7 @@ impl MetalInference {
                     let next_norm = &weights.layers[layer_idx + 1].input_norm;
                     ops::encode_rms_norm(
                         &enc,
-                        &pipelines.rms_norm,
+                        &pipelines.norm.rms_norm,
                         &ops::RmsNormParams {
                             input: &bufs.hidden_state,
                             weight: next_norm,
@@ -1787,7 +1787,7 @@ impl GpuCalibrationEngine for MetalInference {
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             ops::encode_copy_buffer(
                 &enc,
-                &self.pipelines()?.copy_buffer,
+                &self.pipelines()?.elementwise.copy_buffer,
                 &scratch.staging_in,
                 &bufs.hidden_state,
                 (token_count * h) as u32,
@@ -1795,7 +1795,7 @@ impl GpuCalibrationEngine for MetalInference {
             enc.memory_barrier_buffers();
             ops::encode_rms_norm(
                 &enc,
-                &self.pipelines()?.rms_norm,
+                &self.pipelines()?.norm.rms_norm,
                 &ops::RmsNormParams {
                     input: &bufs.hidden_state,
                     weight: &lw.input_norm,
@@ -1830,7 +1830,7 @@ impl GpuCalibrationEngine for MetalInference {
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             ops::encode_copy_buffer(
                 &enc,
-                &self.pipelines()?.copy_buffer,
+                &self.pipelines()?.elementwise.copy_buffer,
                 &bufs.hidden_state,
                 &scratch.readback,
                 (token_count * h) as u32,

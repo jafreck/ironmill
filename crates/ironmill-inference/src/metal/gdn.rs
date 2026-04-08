@@ -279,7 +279,7 @@ pub(crate) fn encode_gdn_prefill(
     let layer_state = &gdn.layers[gdn_idx];
     ops::encode_gdn_prefill_conv1d_silu(
         enc,
-        &pipelines.gdn_prefill_conv1d_silu,
+        &pipelines.gdn.prefill_conv1d_silu,
         &gdn.gpu_temp_qkv,
         lw.gdn_conv1d_weight.as_ref().unwrap(),
         &layer_state.conv_state,
@@ -292,7 +292,7 @@ pub(crate) fn encode_gdn_prefill(
 
     ops::encode_gdn_prefill_recurrent(
         enc,
-        &pipelines.gdn_prefill_recurrent,
+        &pipelines.gdn.prefill_recurrent,
         &gdn.gpu_conv_out,
         &gdn.gpu_temp_a,
         &gdn.gpu_temp_b,
@@ -328,7 +328,7 @@ pub(crate) fn encode_gdn_prefill(
 
     ops::encode_fused_residual_rms_norm(
         enc,
-        &pipelines.fused_residual_rms_norm,
+        &pipelines.norm.fused_residual_rms_norm,
         &ops::FusedResidualRmsNormParams {
             a: &bufs.hidden_state,
             b: &gdn.scratch,
@@ -403,7 +403,7 @@ pub(crate) fn encode_gdn_decode(
         // All 4 weights are dense with packed buffers: use batched FP16 matvec.
         ops::encode_gdn_batched_matvec(
             enc,
-            &pipelines.gdn_batched_matvec,
+            &pipelines.gdn.batched_matvec,
             &bufs.norm_out,
             p_qkv,
             p_z,
@@ -434,7 +434,7 @@ pub(crate) fn encode_gdn_decode(
             // All 4 weights are INT4 affine: use batched INT4 matvec.
             ops::encode_gdn_batched_affine_matvec_int4(
                 enc,
-                &pipelines.gdn_batched_affine_matvec_int4,
+                &pipelines.affine.gdn_batched_matvec_int4,
                 &bufs.norm_out,
                 aq_qkv,
                 &gdn.gpu_temp_qkv,
@@ -503,7 +503,7 @@ pub(crate) fn encode_gdn_decode(
     let layer_state = &gdn.layers[gdn_idx];
     ops::encode_gdn_fused_decode(
         enc,
-        &pipelines.gdn_fused_decode,
+        &pipelines.gdn.fused_decode,
         &gdn.gpu_temp_qkv,
         lw.gdn_conv1d_weight.as_ref().unwrap(),
         &layer_state.conv_state,
@@ -542,7 +542,7 @@ pub(crate) fn encode_gdn_decode(
 
     ops::encode_fused_residual_rms_norm(
         enc,
-        &pipelines.fused_residual_rms_norm,
+        &pipelines.norm.fused_residual_rms_norm,
         &ops::FusedResidualRmsNormParams {
             a: &bufs.hidden_state,
             b: &gdn.scratch,

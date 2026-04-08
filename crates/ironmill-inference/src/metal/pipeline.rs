@@ -346,7 +346,7 @@ impl MetalInference {
 
             if let Some(ref aq) = weights.embedding_quantized {
                 // INT4 embedding: dequant-on-gather → hidden_state, then norm.
-                enc.set_pipeline(&pipelines.affine_embedding_lookup_int4);
+                enc.set_pipeline(&pipelines.affine.embedding_lookup_int4);
                 enc.set_buffer(active_token_buf, 0, 0);
                 enc.set_buffer(&aq.data, 0, 1);
                 enc.set_buffer(&aq.scales, 0, 2);
@@ -371,7 +371,7 @@ impl MetalInference {
                 // RMSNorm on dequanted embedding → norm_out.
                 ops::encode_rms_norm(
                     &enc,
-                    &pipelines.rms_norm,
+                    &pipelines.norm.rms_norm,
                     &ops::RmsNormParams {
                         input: &bufs.hidden_state,
                         weight: &lw0.input_norm,
@@ -383,7 +383,7 @@ impl MetalInference {
                 );
             } else {
                 // FP16 embedding: use fused embedding+norm kernel directly.
-                enc.set_pipeline(&pipelines.fused_embedding_norm);
+                enc.set_pipeline(&pipelines.norm.fused_embedding_norm);
                 enc.set_buffer(active_token_buf, 0, 0);
                 enc.set_buffer(&weights.embedding, 0, 1);
                 enc.set_buffer(&lw0.input_norm, 0, 2);
@@ -519,7 +519,7 @@ impl MetalInference {
                             let pipelines_ref = self.pipelines()?;
                             ops::encode_quantize_input_q8(
                                 &enc,
-                                &pipelines_ref.quantize_input_q8,
+                                &pipelines_ref.elementwise.quantize_input_q8,
                                 &bufs.norm_out,
                                 &bufs.q8_data,
                                 &bufs.q8_scales,
@@ -591,7 +591,7 @@ impl MetalInference {
                         if let Some(ref unit_w) = self.unit_norm_weight {
                             ops::encode_rms_norm(
                                 &enc,
-                                &pipelines.rms_norm,
+                                &pipelines.norm.rms_norm,
                                 &ops::RmsNormParams {
                                     input: &bufs.v_proj,
                                     weight: unit_w,
@@ -666,7 +666,7 @@ impl MetalInference {
                                 (token_count * mc.num_attention_heads * layer_hd as usize) as u32;
                             ops::encode_sigmoid_gate(
                                 &enc,
-                                &pipelines.sigmoid_gate,
+                                &pipelines.activation.sigmoid_gate,
                                 &bufs.attn_out,
                                 gate_buf,
                                 gate_size,
@@ -694,7 +694,7 @@ impl MetalInference {
                         // Gemma 4: post_attention_layernorm before residual add
                         ops::encode_rms_norm(
                             &enc,
-                            &pipelines.rms_norm,
+                            &pipelines.norm.rms_norm,
                             &ops::RmsNormParams {
                                 input: &bufs.ffn_down,
                                 weight: &lw.post_attn_norm,
@@ -708,7 +708,7 @@ impl MetalInference {
 
                         ops::encode_residual_add(
                             &enc,
-                            &pipelines.residual_add,
+                            &pipelines.elementwise.residual_add,
                             &bufs.hidden_state,
                             &bufs.ffn_down,
                             &bufs.residual,
@@ -718,7 +718,7 @@ impl MetalInference {
 
                         ops::encode_rms_norm(
                             &enc,
-                            &pipelines.rms_norm,
+                            &pipelines.norm.rms_norm,
                             &ops::RmsNormParams {
                                 input: &bufs.residual,
                                 weight: pre_ffn,
@@ -733,7 +733,7 @@ impl MetalInference {
                         // Standard pre-norm transformer: fused residual + norm
                         ops::encode_fused_residual_rms_norm(
                             &enc,
-                            &pipelines.fused_residual_rms_norm,
+                            &pipelines.norm.fused_residual_rms_norm,
                             &ops::FusedResidualRmsNormParams {
                                 a: &bufs.hidden_state,
                                 b: &bufs.ffn_down,
@@ -757,7 +757,7 @@ impl MetalInference {
                     let pipelines = self.pipelines()?;
                     ops::encode_bias_add(
                         &enc,
-                        &pipelines.bias_add,
+                        &pipelines.elementwise.bias_add,
                         &bufs.norm_out,
                         &dac[layer_idx],
                         h as u32,
@@ -810,7 +810,7 @@ impl MetalInference {
             if let Some(ref post_ffn) = lw.post_ffn_norm {
                 ops::encode_rms_norm(
                     &enc,
-                    &pipelines.rms_norm,
+                    &pipelines.norm.rms_norm,
                     &ops::RmsNormParams {
                         input: &bufs.ffn_down,
                         weight: post_ffn,
@@ -823,7 +823,7 @@ impl MetalInference {
                 enc.memory_barrier_with_resources(&[&bufs.ffn_gate]);
                 ops::encode_copy_buffer(
                     &enc,
-                    &pipelines.copy_buffer,
+                    &pipelines.elementwise.copy_buffer,
                     &bufs.ffn_gate,
                     &bufs.ffn_down,
                     (token_count * h) as u32,
@@ -861,7 +861,7 @@ impl MetalInference {
                     // HF: hidden_states = residual + hidden_states; hidden_states *= layer_scalar
                     ops::encode_residual_add(
                         &enc,
-                        &pipelines.residual_add,
+                        &pipelines.elementwise.residual_add,
                         &bufs.residual,
                         &bufs.ffn_down,
                         &bufs.hidden_state,
@@ -870,7 +870,7 @@ impl MetalInference {
                     enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
                     ops::encode_scale_buffer(
                         &enc,
-                        &pipelines.scale_buffer,
+                        &pipelines.elementwise.scale_buffer,
                         &bufs.hidden_state,
                         scalar,
                         (token_count * h) as u32,
@@ -880,7 +880,7 @@ impl MetalInference {
                         let next_norm = &weights.layers[layer_idx + 1].input_norm;
                         ops::encode_rms_norm(
                             &enc,
-                            &pipelines.rms_norm,
+                            &pipelines.norm.rms_norm,
                             &ops::RmsNormParams {
                                 input: &bufs.hidden_state,
                                 weight: next_norm,
@@ -950,7 +950,7 @@ impl MetalInference {
         }
         ops::encode_rms_norm(
             &enc,
-            &self.pipelines()?.rms_norm,
+            &self.pipelines()?.norm.rms_norm,
             &ops::RmsNormParams {
                 input: &bufs.hidden_state,
                 weight: &weights.final_norm,
@@ -997,7 +997,7 @@ impl MetalInference {
             let count = (token_count * vocab) as u32;
             ops::encode_fused_softcap(
                 &sc_enc,
-                &pipelines.fused_softcap,
+                &pipelines.norm.fused_softcap,
                 &bufs.logits,
                 softcap,
                 count,
