@@ -61,7 +61,7 @@ pub(crate) fn encode_ple_model_level(
 
     let ple_total = mc.num_hidden_layers * ple_h;
 
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
 
     // 1. Gather from ple_embed_tokens using token_ids → ple_per_layer_input
     //    Shape: [tokens, num_layers * ple_hidden]
@@ -101,7 +101,7 @@ pub(crate) fn encode_ple_model_level(
             )));
         }
     }
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[ple_buf]);
 
     // Scale PLE embeddings by sqrt(ple_hidden_size) to match HF
     // (only in normal inference; calibration skips this).
@@ -118,7 +118,7 @@ pub(crate) fn encode_ple_model_level(
             &scale_buf,
             (token_count * ple_total) as u32,
         );
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[ple_buf]);
     }
 
     // 2. Project hidden_state via ple_model_projection → ffn_gate (temp)
@@ -132,7 +132,7 @@ pub(crate) fn encode_ple_model_level(
         ple_total,
         h,
     )?;
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&bufs.ffn_gate]);
 
     // Scale projection output by 1/sqrt(hidden_size) to match HF's
     // per_layer_model_projection_scale (only in normal inference).
@@ -149,7 +149,7 @@ pub(crate) fn encode_ple_model_level(
             &scale_buf,
             (token_count * ple_total) as u32,
         );
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[&bufs.ffn_gate]);
     }
 
     // 3. RMSNorm the projection output.
@@ -172,7 +172,7 @@ pub(crate) fn encode_ple_model_level(
             eps,
         },
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&bufs.ffn_up]);
 
     // 4+5. Add embed (ple_buf) + normed projection (ffn_up), scale by 2^(-0.5)
     //       → store result back in ple_per_layer_input
@@ -186,7 +186,7 @@ pub(crate) fn encode_ple_model_level(
         (token_count * ple_total) as u32,
         ple_scale,
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[ple_buf]);
 
     Ok(())
 }
@@ -238,7 +238,7 @@ pub(crate) fn encode_ple_per_layer(
         &bufs.hidden_state,
         (token_count * h) as u32,
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
 
     // 2. PLE gate: linear(hidden_state → ple_scratch) [hidden → ple_hidden]
     encode_projection(
@@ -251,7 +251,7 @@ pub(crate) fn encode_ple_per_layer(
         ple_h,
         h,
     )?;
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[ple_scratch]);
 
     // 3. GELU activation + multiply with per-layer input slice
     ops::encode_gelu_gate(
@@ -265,7 +265,7 @@ pub(crate) fn encode_ple_per_layer(
         ple_total as u32,           // stride: full row width
         (layer_idx * ple_h) as u32, // offset: this layer's slice
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[ple_scratch]);
 
     // 4. Project back: linear(ple_scratch → ffn_down) [ple_hidden → hidden]
     encode_projection(
@@ -278,7 +278,7 @@ pub(crate) fn encode_ple_per_layer(
         h,
         ple_h,
     )?;
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
 
     // 5. RMSNorm the projected output
     ops::encode_rms_norm(
@@ -293,7 +293,7 @@ pub(crate) fn encode_ple_per_layer(
             eps,
         },
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&bufs.ffn_up]);
 
     // 6. PLE residual add: hidden_state += normed PLE output
     ops::encode_residual_add(
@@ -304,7 +304,7 @@ pub(crate) fn encode_ple_per_layer(
         &bufs.hidden_state, // in-place
         (token_count * h) as u32,
     );
-    enc.memory_barrier_buffers();
+    enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
 
     // 7. Layer scalar: HF applies hidden_states *= layer_scalar
     //    AFTER all residual adds (including PLE).
@@ -316,7 +316,7 @@ pub(crate) fn encode_ple_per_layer(
             scalar,
             (token_count * h) as u32,
         );
-        enc.memory_barrier_buffers();
+        enc.memory_barrier_with_resources(&[&bufs.hidden_state]);
     }
 
     // 8. Next layer's input norm (or skip for last layer)
@@ -333,8 +333,8 @@ pub(crate) fn encode_ple_per_layer(
                 eps,
             },
         );
+        enc.memory_barrier_with_resources(&[&bufs.norm_out]);
     }
-    enc.memory_barrier_buffers();
 
     Ok(true)
 }
