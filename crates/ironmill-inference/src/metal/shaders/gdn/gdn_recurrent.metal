@@ -1,5 +1,5 @@
 #include <metal_stdlib>
-#include "common/simdgroup_reduce.h"
+#include "common/simdgroup_reduce.metal"
 using namespace metal;
 
 // ── GDN Conv1d + SiLU kernel ────────────────────────────────────

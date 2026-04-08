@@ -86,7 +86,7 @@ kernel void d2quant_matvec_3bit(
 
 // ── Matmul tuning parameters (shared naming across all formats) ──
 
-#include "common/matmul_tile_constants.h"
+#include "common/matmul_tile_constants.metal"
 constant constexpr uint MATMUL_K_TILE  = 32;
 constant constexpr uint K_BLOCKS       = MATMUL_K_TILE / 8;  // 4 MMA ops per K-tile
 

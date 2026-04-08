@@ -29,7 +29,7 @@ using namespace metal;
 //  16 simdgroups (512 threads): larger tiles, better arithmetic intensity
 //
 // Profile on target hardware to determine the optimum.
-#include "common/matmul_tile_constants.h"
+#include "common/matmul_tile_constants.metal"
 constant constexpr uint MATMUL_K_TILE  = 32;
 constant constexpr uint K_BLOCKS       = MATMUL_K_TILE / 8;  // 4 MMA ops per K-tile
 

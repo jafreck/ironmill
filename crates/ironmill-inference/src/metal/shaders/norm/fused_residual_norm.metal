@@ -1,6 +1,6 @@
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
-#include "common/simdgroup_reduce.h"
+#include "common/simdgroup_reduce.metal"
 using namespace metal;
 
 // Fused residual add + RMSNorm: computes residual = a + b, then normalizes.

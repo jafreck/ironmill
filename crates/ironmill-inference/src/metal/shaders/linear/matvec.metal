@@ -95,7 +95,7 @@ kernel void matvec(
 // Dispatch: ((M+63)/64, (N+63)/64, 1) threadgroups, (256, 1, 1) threads.
 // ============================================================================
 
-#include "common/matmul_tile_constants.h"
+#include "common/matmul_tile_constants.metal"
 constant constexpr uint MATMUL_K_TILE  = 32;   // K-step (4 MMA ops per tile)
 constant constexpr uint K_BLOCKS       = MATMUL_K_TILE / 8;  // 4 MMA ops per K-tile
 

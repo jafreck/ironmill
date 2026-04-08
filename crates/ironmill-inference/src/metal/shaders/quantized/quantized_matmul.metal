@@ -22,7 +22,7 @@ using namespace metal;
 //  16 simdgroups (512 threads): larger tiles, better arithmetic intensity
 //
 // Profile on target hardware to determine the optimum.
-#include "common/matmul_tile_constants.h"
+#include "common/matmul_tile_constants.metal"
 constant constexpr uint MATMUL_K_TILE  = 8;
 
 // ── INT4 matvec (decode path, M=1) ──────────────────────────────
