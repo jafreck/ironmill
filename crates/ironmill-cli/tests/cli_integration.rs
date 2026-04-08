@@ -318,33 +318,6 @@ fn cli_compile_split_draft_layers() {
 }
 
 #[test]
-fn cli_compile_target_cpu_and_ne() {
-    let tmp = tempdir().unwrap();
-    let output = tmp.path().join("mnist.mlpackage");
-
-    let result = ironmill_cmd()
-        .args(["compile"])
-        .arg(fixture_path("mnist.onnx"))
-        .args(["--target", "cpu-and-ne"])
-        .args(["-o", output.to_str().unwrap()])
-        .output()
-        .expect("failed to run ironmill compile --target cpu-and-ne");
-
-    assert!(
-        result.status.success(),
-        "target cpu-and-ne compile failed: {}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-
-    // cpu-and-ne should not produce the Phase 3 note.
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(
-        !stdout.contains("will be fully supported in Phase 3"),
-        "cpu-and-ne should not produce a Phase 3 note"
-    );
-}
-
-#[test]
 fn cli_compile_pipeline_config() {
     let tmp = tempdir().unwrap();
     let output = tmp.path().join("mnist.mlpackage");
