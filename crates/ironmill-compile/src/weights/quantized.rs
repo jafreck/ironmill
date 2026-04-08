@@ -1155,7 +1155,12 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                 let resolved_alpha = precomputed_alpha.or_else(|| {
                     awq_mags.and_then(|mags| {
                         let cache_key = magnitude_cache_key(mags);
-                        if let Some(&alpha) = self.alpha_cache.lock().unwrap().get(&cache_key) {
+                        if let Some(&alpha) = self
+                            .alpha_cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&cache_key)
+                        {
                             return Some(alpha);
                         }
                         let tc = awq_tc?;
@@ -1165,7 +1170,10 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                         }
                         let alpha =
                             search_best_alpha(&floats, &t.shape, mags, acts, tc, config.group_size);
-                        self.alpha_cache.lock().unwrap().insert(cache_key, alpha);
+                        self.alpha_cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(cache_key, alpha);
                         Some(alpha)
                     })
                 });
