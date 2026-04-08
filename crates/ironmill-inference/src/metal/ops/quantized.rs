@@ -125,6 +125,40 @@ impl QuipPipelines {
     }
 }
 
+// ── Parameter structs ────────────────────────────────────────────
+
+/// Parameters for [`encode_gdn_batched_affine_matvec_int4`].
+pub(crate) struct GdnBatchedAffineInt4Params<'a> {
+    /// Shared input buffer.
+    pub(crate) input: &'a MetalBuffer,
+    /// Projection 0 (QKV) weight.
+    pub(crate) w0: &'a crate::metal::weights::AffineQuantizedWeight,
+    /// Projection 0 output buffer.
+    pub(crate) out0: &'a MetalBuffer,
+    /// Projection 0 output dimension.
+    pub(crate) n0: u32,
+    /// Projection 1 (Z) weight.
+    pub(crate) w1: &'a crate::metal::weights::AffineQuantizedWeight,
+    /// Projection 1 output buffer.
+    pub(crate) out1: &'a MetalBuffer,
+    /// Projection 1 output dimension.
+    pub(crate) n1: u32,
+    /// Projection 2 (A) weight.
+    pub(crate) w2: &'a crate::metal::weights::AffineQuantizedWeight,
+    /// Projection 2 output buffer.
+    pub(crate) out2: &'a MetalBuffer,
+    /// Projection 2 output dimension.
+    pub(crate) n2: u32,
+    /// Projection 3 (B) weight.
+    pub(crate) w3: &'a crate::metal::weights::AffineQuantizedWeight,
+    /// Projection 3 output buffer.
+    pub(crate) out3: &'a MetalBuffer,
+    /// Projection 3 output dimension.
+    pub(crate) n3: u32,
+    /// Input dimension (hidden size).
+    pub(crate) k: u32,
+}
+
 // ── Dispatch helpers ─────────────────────────────────────────────
 
 /// Encode batched affine INT4 matvec for FFN gate+up in a single dispatch.
@@ -211,53 +245,47 @@ pub fn encode_fused_ffn_gate_up_act_int4(
 ///
 /// Computes qkv = x·W0^T, z = x·W1^T, a = x·W2^T, b = x·W3^T concurrently.
 /// Saves 3 dispatches per GDN layer compared to 4 separate `affine_matvec_int4` calls.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_gdn_batched_affine_matvec_int4(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    input: &MetalBuffer,
-    w0: &crate::metal::weights::AffineQuantizedWeight,
-    out0: &MetalBuffer,
-    n0: u32,
-    w1: &crate::metal::weights::AffineQuantizedWeight,
-    out1: &MetalBuffer,
-    n1: u32,
-    w2: &crate::metal::weights::AffineQuantizedWeight,
-    out2: &MetalBuffer,
-    n2: u32,
-    w3: &crate::metal::weights::AffineQuantizedWeight,
-    out3: &MetalBuffer,
-    n3: u32,
-    k: u32,
+    params: &GdnBatchedAffineInt4Params<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(input, 0, 0);
-    encoder.set_buffer(&w0.data, 0, 1);
-    encoder.set_buffer(&w0.scales, 0, 2);
-    encoder.set_buffer(&w0.zeros, 0, 3);
-    encoder.set_buffer(out0, 0, 4);
-    encoder.set_buffer(&w1.data, 0, 5);
-    encoder.set_buffer(&w1.scales, 0, 6);
-    encoder.set_buffer(&w1.zeros, 0, 7);
-    encoder.set_buffer(out1, 0, 8);
-    encoder.set_buffer(&w2.data, 0, 9);
-    encoder.set_buffer(&w2.scales, 0, 10);
-    encoder.set_buffer(&w2.zeros, 0, 11);
-    encoder.set_buffer(out2, 0, 12);
-    encoder.set_buffer(&w3.data, 0, 13);
-    encoder.set_buffer(&w3.scales, 0, 14);
-    encoder.set_buffer(&w3.zeros, 0, 15);
-    encoder.set_buffer(out3, 0, 16);
-    let has_awq = w0.awq_scales.is_some() as u32;
-    let params_words: [u32; 7] = [n0, n1, n2, n3, k, w0.group_size, has_awq];
+    encoder.set_buffer(params.input, 0, 0);
+    encoder.set_buffer(&params.w0.data, 0, 1);
+    encoder.set_buffer(&params.w0.scales, 0, 2);
+    encoder.set_buffer(&params.w0.zeros, 0, 3);
+    encoder.set_buffer(params.out0, 0, 4);
+    encoder.set_buffer(&params.w1.data, 0, 5);
+    encoder.set_buffer(&params.w1.scales, 0, 6);
+    encoder.set_buffer(&params.w1.zeros, 0, 7);
+    encoder.set_buffer(params.out1, 0, 8);
+    encoder.set_buffer(&params.w2.data, 0, 9);
+    encoder.set_buffer(&params.w2.scales, 0, 10);
+    encoder.set_buffer(&params.w2.zeros, 0, 11);
+    encoder.set_buffer(params.out2, 0, 12);
+    encoder.set_buffer(&params.w3.data, 0, 13);
+    encoder.set_buffer(&params.w3.scales, 0, 14);
+    encoder.set_buffer(&params.w3.zeros, 0, 15);
+    encoder.set_buffer(params.out3, 0, 16);
+    let has_awq = params.w0.awq_scales.is_some() as u32;
+    let params_words: [u32; 7] = [
+        params.n0,
+        params.n1,
+        params.n2,
+        params.n3,
+        params.k,
+        params.w0.group_size,
+        has_awq,
+    ];
     let params_bytes: Vec<u8> = params_words.iter().flat_map(|v| v.to_le_bytes()).collect();
     encoder.set_bytes(&params_bytes, 17);
-    if let Some(ref awq) = w0.awq_scales {
+    if let Some(ref awq) = params.w0.awq_scales {
         encoder.set_buffer(awq, 0, 18);
     } else {
-        encoder.set_buffer(&w0.data, 0, 18); // dummy
+        encoder.set_buffer(&params.w0.data, 0, 18); // dummy
     }
-    let tg_count = (n0 + n1 + n2 + n3) as usize;
+    let tg_count = (params.n0 + params.n1 + params.n2 + params.n3) as usize;
     encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
 }
 

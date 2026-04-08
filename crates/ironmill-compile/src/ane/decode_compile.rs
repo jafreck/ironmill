@@ -14,6 +14,9 @@ use crate::ane::split::SubProgram;
 use ironmill_core::ane::TensorDescriptor;
 use ironmill_core::rope::RopeCacheData;
 
+/// Per-layer QK normalization weights: `(q_norm, k_norm)` indexed by layer.
+type QkNormWeights = Vec<(Vec<f16>, Vec<f16>)>;
+
 // ---------------------------------------------------------------------------
 // Shared tensor conversion helper
 // ---------------------------------------------------------------------------
@@ -137,8 +140,7 @@ pub fn precompute_rope_cache(head_dim: usize, max_pos: usize, theta: f32) -> Rop
 /// Returns an error if Q-norm weights are found but K-norm weights are
 /// missing for some layers (or vice-versa), which would cause silent
 /// truncation during serialization/deserialization.
-#[allow(clippy::type_complexity)]
-pub fn extract_qk_norm_weights(program: &Program) -> Result<Option<Vec<(Vec<f16>, Vec<f16>)>>> {
+pub fn extract_qk_norm_weights(program: &Program) -> Result<Option<QkNormWeights>> {
     let func = match program.main() {
         Some(f) => f,
         None => return Ok(None),

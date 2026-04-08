@@ -313,6 +313,28 @@ const FLASH_DECODE_MIN_SEQ: usize = 256;
 /// 256 gives good granularity: at 16K context with 256 per split = 64 splits.
 const FLASH_DECODE_KV_PER_SPLIT: usize = 256;
 
+/// Parameters for [`encode_flash_decode`] — FlashDecoding-specific buffers and config.
+pub(crate) struct FlashDecodeParams<'a> {
+    /// FlashDecoding split kernel pipeline.
+    pub(crate) split_pipeline: &'a ComputePipeline,
+    /// FlashDecoding reduce kernel pipeline.
+    pub(crate) reduce_pipeline: &'a ComputePipeline,
+    /// Single-pass fused SDPA fallback (used for short sequences).
+    pub(crate) sdpa_fallback: Option<&'a ComputePipeline>,
+    /// Partial output accumulator buffer (one per split × head).
+    pub(crate) partial_o: &'a MetalBuffer,
+    /// Partial softmax-max buffer (one per split × head).
+    pub(crate) partial_max: &'a MetalBuffer,
+    /// Partial softmax-sum buffer (one per split × head).
+    pub(crate) partial_sum: &'a MetalBuffer,
+    /// Per-head max hint from previous step.
+    pub(crate) max_hint: &'a MetalBuffer,
+    /// Maximum number of KV splits to launch.
+    pub(crate) max_splits: usize,
+    /// GPU limit on concurrent threadgroups.
+    pub(crate) gpu_max_threadgroups: usize,
+}
+
 /// Encode FlashDecoding++: persistent split kernel with max hint, then reduce.
 ///
 /// Improvements over basic FlashDecoding:
@@ -321,25 +343,16 @@ const FLASH_DECODE_KV_PER_SPLIT: usize = 256;
 /// - Unified max hint: passes the previous step's softmax max to the split
 ///   kernel so the O accumulator avoids rescaling when max hasn't changed.
 /// - Reduce kernel writes back the global max for the next step's hint.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_flash_decode(
     encoder: &ComputeEncoder,
-    split_pipeline: &ComputePipeline,
-    reduce_pipeline: &ComputePipeline,
-    sdpa_fallback: Option<&ComputePipeline>,
     params: &FusedSdpaParams<'_>,
-    partial_o: &MetalBuffer,
-    partial_max: &MetalBuffer,
-    partial_sum: &MetalBuffer,
-    max_hint: &MetalBuffer,
-    max_splits: usize,
-    gpu_max_threadgroups: usize,
+    flash: &FlashDecodeParams<'_>,
 ) {
     let seq_len = params.seq_len as usize;
 
     // Short sequences: use single-pass if available, otherwise still split.
     if seq_len < FLASH_DECODE_MIN_SEQ {
-        if let Some(sdpa) = sdpa_fallback {
+        if let Some(sdpa) = flash.sdpa_fallback {
             encode_fused_sdpa(encoder, sdpa, params, None);
             return;
         }
@@ -348,12 +361,15 @@ pub fn encode_flash_decode(
 
     let heads_per_group = (params.num_q_heads as usize) / (params.num_kv_heads as usize).max(1);
     let num_kv_groups = params.num_kv_heads as usize;
-    let target_splits = (gpu_max_threadgroups / num_kv_groups.max(1)).max(2);
+    let target_splits = (flash.gpu_max_threadgroups / num_kv_groups.max(1)).max(2);
     let splits_from_seq = seq_len.div_ceil(FLASH_DECODE_KV_PER_SPLIT);
-    let num_splits = target_splits.min(splits_from_seq).min(max_splits).max(2);
+    let num_splits = target_splits
+        .min(splits_from_seq)
+        .min(flash.max_splits)
+        .max(2);
 
     if num_splits <= 1 {
-        if let Some(sdpa) = sdpa_fallback {
+        if let Some(sdpa) = flash.sdpa_fallback {
             encode_fused_sdpa(encoder, sdpa, params, None);
             return;
         }
@@ -363,13 +379,13 @@ pub fn encode_flash_decode(
     let persistent_tgs = num_splits.min(target_splits);
     let threads_per_tg = (heads_per_group * 32).min(METAL_MAX_THREADS_PER_THREADGROUP);
 
-    encoder.set_pipeline(split_pipeline);
+    encoder.set_pipeline(flash.split_pipeline);
     encoder.set_buffer(params.q, 0, 0);
     encoder.set_buffer(params.k, 0, 1);
     encoder.set_buffer(params.v, 0, 2);
-    encoder.set_buffer(partial_o, 0, 3);
-    encoder.set_buffer(partial_max, 0, 4);
-    encoder.set_buffer(partial_sum, 0, 5);
+    encoder.set_buffer(flash.partial_o, 0, 3);
+    encoder.set_buffer(flash.partial_max, 0, 4);
+    encoder.set_buffer(flash.partial_sum, 0, 5);
     encoder.set_bytes(&params.seq_len.to_le_bytes(), 6);
     encoder.set_bytes(&params.head_dim.to_le_bytes(), 7);
     encoder.set_bytes(&params.num_q_heads.to_le_bytes(), 8);
@@ -384,19 +400,19 @@ pub fn encode_flash_decode(
     encoder.dispatch_threadgroups((num_kv_groups, persistent_tgs, 1), (threads_per_tg, 1, 1));
 
     // Barrier between split and reduce.
-    encoder.memory_barrier_with_resources(&[partial_o, partial_max, partial_sum]);
+    encoder.memory_barrier_with_resources(&[flash.partial_o, flash.partial_max, flash.partial_sum]);
 
     // Reduce kernel: grid (num_q_heads, 1, 1)
     let num_q = params.num_q_heads as usize;
-    encoder.set_pipeline(reduce_pipeline);
-    encoder.set_buffer(partial_o, 0, 0);
-    encoder.set_buffer(partial_max, 0, 1);
-    encoder.set_buffer(partial_sum, 0, 2);
+    encoder.set_pipeline(flash.reduce_pipeline);
+    encoder.set_buffer(flash.partial_o, 0, 0);
+    encoder.set_buffer(flash.partial_max, 0, 1);
+    encoder.set_buffer(flash.partial_sum, 0, 2);
     encoder.set_buffer(params.output, 0, 3);
     encoder.set_bytes(&params.num_q_heads.to_le_bytes(), 4);
     encoder.set_bytes(&params.head_dim.to_le_bytes(), 5);
     encoder.set_bytes(&(num_splits as u32).to_le_bytes(), 6);
-    encoder.set_buffer(max_hint, 0, 7);
+    encoder.set_buffer(flash.max_hint, 0, 7);
     encoder.dispatch_threadgroups((num_q, 1, 1), (32, 1, 1));
 }
 

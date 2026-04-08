@@ -543,16 +543,18 @@ pub(crate) fn encode_kv_cache_and_attention(
             ) {
                 ops::encode_flash_decode(
                     enc,
-                    &pipelines.attention.fused_sdpa_split,
-                    &pipelines.attention.fused_sdpa_reduce,
-                    pipelines.attention.fused_sdpa.as_ref(),
                     &sdpa_params,
-                    po,
-                    pm,
-                    ps,
-                    mh,
-                    bufs.flash_decode_max_splits,
-                    gpu_max_threadgroups,
+                    &ops::FlashDecodeParams {
+                        split_pipeline: &pipelines.attention.fused_sdpa_split,
+                        reduce_pipeline: &pipelines.attention.fused_sdpa_reduce,
+                        sdpa_fallback: pipelines.attention.fused_sdpa.as_ref(),
+                        partial_o: po,
+                        partial_max: pm,
+                        partial_sum: ps,
+                        max_hint: mh,
+                        max_splits: bufs.flash_decode_max_splits,
+                        gpu_max_threadgroups,
+                    },
                 );
             } else if let Some(ref sdpa) = pipelines.attention.fused_sdpa {
                 ops::encode_fused_sdpa(enc, sdpa, &sdpa_params, None);
@@ -573,7 +575,6 @@ pub(crate) fn encode_kv_cache_and_attention(
 ///
 /// When `next_first_proj` is provided and decode (token_count==1), the residual+norm
 /// is fused into the first projection of the next layer, saving 1 dispatch + 1 barrier.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_end_of_layer_residual(
     enc: &ComputeEncoder,
     pipelines: &super::ops::MetalPipelines,
@@ -593,16 +594,18 @@ pub(crate) fn encode_end_of_layer_residual(
                     ops::encode_fused_residual_norm_matvec(
                         enc,
                         &pipelines.fused.residual_norm_matvec,
-                        &bufs.residual,
-                        &bufs.ffn_down,
-                        norm_weight,
-                        &bufs.hidden_state,
-                        packed,
-                        proj_output,
-                        &bufs.norm_out,
-                        h as u32,
-                        out_features as u32,
-                        eps,
+                        &ops::FusedResidualNormMatvecParams {
+                            a: &bufs.residual,
+                            b: &bufs.ffn_down,
+                            norm_weight,
+                            residual_output: &bufs.hidden_state,
+                            w_packed: packed,
+                            y: proj_output,
+                            normed_output: &bufs.norm_out,
+                            k: h as u32,
+                            n: out_features as u32,
+                            eps,
+                        },
                     );
                     return Ok(true); // fused: caller should skip first projection
                 }
@@ -612,16 +615,18 @@ pub(crate) fn encode_end_of_layer_residual(
                         ops::encode_fused_residual_norm_affine_matvec_int4(
                             enc,
                             &pipelines.fused.residual_norm_affine_matvec_int4,
-                            &bufs.residual,
-                            &bufs.ffn_down,
-                            norm_weight,
-                            &bufs.hidden_state,
-                            aq,
-                            proj_output,
-                            &bufs.norm_out,
-                            out_features as u32,
-                            h as u32,
-                            eps,
+                            &ops::FusedResidualNormAffineInt4Params {
+                                a: &bufs.residual,
+                                b: &bufs.ffn_down,
+                                norm_weight,
+                                residual_output: &bufs.hidden_state,
+                                weight: aq,
+                                output: proj_output,
+                                normed_output: &bufs.norm_out,
+                                n: out_features as u32,
+                                k: h as u32,
+                                eps,
+                            },
                         );
                         return Ok(true); // fused: caller should skip first projection
                     }

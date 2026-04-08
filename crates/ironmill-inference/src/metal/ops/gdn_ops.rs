@@ -22,6 +22,156 @@ pub struct GdnPipelines {
     pub batched_matvec: ComputePipeline,
 }
 
+// ── Parameter structs ────────────────────────────────────────────
+
+/// Parameters for [`encode_gdn_recurrent_update`].
+pub(crate) struct GdnRecurrentUpdateParams<'a> {
+    /// Conv1d + SiLU output buffer.
+    pub(crate) conv_out: &'a MetalBuffer,
+    /// A projection buffer.
+    pub(crate) a_proj: &'a MetalBuffer,
+    /// B projection buffer.
+    pub(crate) b_proj: &'a MetalBuffer,
+    /// Log-space A parameter buffer.
+    pub(crate) a_log: &'a MetalBuffer,
+    /// Δt bias buffer.
+    pub(crate) dt_bias: &'a MetalBuffer,
+    /// Recurrent state matrix buffer (read/write).
+    pub(crate) recurrent_state: &'a MetalBuffer,
+    /// Output buffer.
+    pub(crate) output: &'a MetalBuffer,
+    /// Total key dimension.
+    pub(crate) key_dim: u32,
+    /// Total value dimension.
+    pub(crate) value_dim: u32,
+    /// Number of value heads.
+    pub(crate) num_v_heads: u32,
+    /// Per-head key dimension.
+    pub(crate) k_head_dim: u32,
+    /// Per-head value dimension.
+    pub(crate) v_head_dim: u32,
+    /// Number of key heads.
+    pub(crate) num_k_heads: u32,
+}
+
+/// Parameters for [`encode_gdn_fused_decode`].
+pub(crate) struct GdnFusedDecodeParams<'a> {
+    /// QKV input buffer.
+    pub(crate) input_qkv: &'a MetalBuffer,
+    /// Conv1d weight buffer.
+    pub(crate) conv_weight: &'a MetalBuffer,
+    /// Conv state buffer (read/write).
+    pub(crate) conv_state: &'a MetalBuffer,
+    /// A projection buffer.
+    pub(crate) a_proj: &'a MetalBuffer,
+    /// B projection buffer.
+    pub(crate) b_proj: &'a MetalBuffer,
+    /// Log-space A parameter buffer.
+    pub(crate) a_log: &'a MetalBuffer,
+    /// Δt bias buffer.
+    pub(crate) dt_bias: &'a MetalBuffer,
+    /// Recurrent state matrix buffer (read/write).
+    pub(crate) recurrent_state: &'a MetalBuffer,
+    /// Z (gate) projection buffer.
+    pub(crate) z_proj: &'a MetalBuffer,
+    /// RMSNorm weight buffer.
+    pub(crate) norm_weight: &'a MetalBuffer,
+    /// Output buffer.
+    pub(crate) output: &'a MetalBuffer,
+    /// Scratch buffer for intermediate conv1d output.
+    pub(crate) conv_out_scratch: &'a MetalBuffer,
+    /// Total QKV dimension.
+    pub(crate) qkv_dim: u32,
+    /// Conv1d kernel size.
+    pub(crate) kernel_size: u32,
+    /// Total key dimension.
+    pub(crate) key_dim: u32,
+    /// Total value dimension.
+    pub(crate) value_dim: u32,
+    /// Number of value heads.
+    pub(crate) num_v_heads: u32,
+    /// Per-head key dimension.
+    pub(crate) k_head_dim: u32,
+    /// Per-head value dimension.
+    pub(crate) v_head_dim: u32,
+    /// Number of key heads.
+    pub(crate) num_k_heads: u32,
+    /// RMSNorm epsilon.
+    pub(crate) eps: f32,
+}
+
+/// Parameters for [`encode_gdn_batched_matvec`].
+pub(crate) struct GdnBatchedMatvecParams<'a> {
+    /// Shared input buffer.
+    pub(crate) input: &'a MetalBuffer,
+    /// QKV weight matrix (packed FP16).
+    pub(crate) w_qkv: &'a MetalBuffer,
+    /// Z weight matrix.
+    pub(crate) w_z: &'a MetalBuffer,
+    /// A weight matrix.
+    pub(crate) w_a: &'a MetalBuffer,
+    /// B weight matrix.
+    pub(crate) w_b: &'a MetalBuffer,
+    /// QKV output buffer.
+    pub(crate) y_qkv: &'a MetalBuffer,
+    /// Z output buffer.
+    pub(crate) y_z: &'a MetalBuffer,
+    /// A output buffer.
+    pub(crate) y_a: &'a MetalBuffer,
+    /// B output buffer.
+    pub(crate) y_b: &'a MetalBuffer,
+    /// Input dimension (hidden size).
+    pub(crate) k: u32,
+    /// QKV output dimension.
+    pub(crate) n_qkv: u32,
+    /// Z output dimension.
+    pub(crate) n_z: u32,
+    /// A output dimension.
+    pub(crate) n_a: u32,
+    /// B output dimension.
+    pub(crate) n_b: u32,
+}
+
+/// Parameters for [`encode_gdn_prefill_recurrent`].
+pub(crate) struct GdnPrefillRecurrentParams<'a> {
+    /// All-token conv1d output buffer.
+    pub(crate) all_conv_out: &'a MetalBuffer,
+    /// All-token A projection buffer.
+    pub(crate) all_a: &'a MetalBuffer,
+    /// All-token B projection buffer.
+    pub(crate) all_b: &'a MetalBuffer,
+    /// Log-space A parameter buffer.
+    pub(crate) a_log: &'a MetalBuffer,
+    /// Δt bias buffer.
+    pub(crate) dt_bias: &'a MetalBuffer,
+    /// RMSNorm weight buffer.
+    pub(crate) norm_weight: &'a MetalBuffer,
+    /// All-token Z (gate) projection buffer.
+    pub(crate) all_z: &'a MetalBuffer,
+    /// Recurrent state matrix buffer (read/write).
+    pub(crate) recurrent_state: &'a MetalBuffer,
+    /// All-token output buffer.
+    pub(crate) all_output: &'a MetalBuffer,
+    /// Number of tokens in the prefill batch.
+    pub(crate) token_count: u32,
+    /// Total QKV dimension.
+    pub(crate) qkv_dim: u32,
+    /// Total key dimension.
+    pub(crate) key_dim: u32,
+    /// Total value dimension.
+    pub(crate) value_dim: u32,
+    /// Number of value heads.
+    pub(crate) num_v_heads: u32,
+    /// Per-head key dimension.
+    pub(crate) k_head_dim: u32,
+    /// Per-head value dimension.
+    pub(crate) v_head_dim: u32,
+    /// RMSNorm epsilon.
+    pub(crate) eps: f32,
+    /// Number of key heads.
+    pub(crate) num_k_heads: u32,
+}
+
 // ── Dispatch helpers ─────────────────────────────────────────────
 
 /// Encode GDN conv1d + SiLU.
@@ -57,44 +207,31 @@ pub fn encode_gdn_conv1d_silu(
 ///
 /// Per-head: compute gates, update state matrix S, compute o = S @ q.
 /// One threadgroup per head, v_head_dim threads per threadgroup.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_gdn_recurrent_update(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    conv_out: &MetalBuffer,
-    a_proj: &MetalBuffer,
-    b_proj: &MetalBuffer,
-    a_log: &MetalBuffer,
-    dt_bias: &MetalBuffer,
-    recurrent_state: &MetalBuffer,
-    output: &MetalBuffer,
-    key_dim: u32,
-    value_dim: u32,
-    num_v_heads: u32,
-    k_head_dim: u32,
-    v_head_dim: u32,
-    num_k_heads: u32,
+    params: &GdnRecurrentUpdateParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(conv_out, 0, 0);
-    encoder.set_buffer(a_proj, 0, 1);
-    encoder.set_buffer(b_proj, 0, 2);
-    encoder.set_buffer(a_log, 0, 3);
-    encoder.set_buffer(dt_bias, 0, 4);
-    encoder.set_buffer(recurrent_state, 0, 5);
-    encoder.set_buffer(output, 0, 6);
-    let params: [u32; 6] = [
-        key_dim,
-        value_dim,
-        num_v_heads,
-        k_head_dim,
-        v_head_dim,
-        num_k_heads,
+    encoder.set_buffer(params.conv_out, 0, 0);
+    encoder.set_buffer(params.a_proj, 0, 1);
+    encoder.set_buffer(params.b_proj, 0, 2);
+    encoder.set_buffer(params.a_log, 0, 3);
+    encoder.set_buffer(params.dt_bias, 0, 4);
+    encoder.set_buffer(params.recurrent_state, 0, 5);
+    encoder.set_buffer(params.output, 0, 6);
+    let gpu_params: [u32; 6] = [
+        params.key_dim,
+        params.value_dim,
+        params.num_v_heads,
+        params.k_head_dim,
+        params.v_head_dim,
+        params.num_k_heads,
     ];
-    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let params_bytes: Vec<u8> = gpu_params.iter().flat_map(|v| v.to_le_bytes()).collect();
     encoder.set_bytes(&params_bytes, 7);
-    let tg_size = (v_head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP);
-    encoder.dispatch_threadgroups((num_v_heads as usize, 1, 1), (tg_size, 1, 1));
+    let tg_size = (params.v_head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP);
+    encoder.dispatch_threadgroups((params.num_v_heads as usize, 1, 1), (tg_size, 1, 1));
 }
 
 /// Encode GDN output gating: per-head RMSNorm + silu(z) multiplication.
@@ -129,109 +266,81 @@ pub fn encode_gdn_output_gate(
 ///
 /// One threadgroup per value head. Threads cooperate on conv1d channels,
 /// then each thread handles one row of the recurrent state matrix.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_gdn_fused_decode(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    input_qkv: &MetalBuffer,
-    conv_weight: &MetalBuffer,
-    conv_state: &MetalBuffer,
-    a_proj: &MetalBuffer,
-    b_proj: &MetalBuffer,
-    a_log: &MetalBuffer,
-    dt_bias: &MetalBuffer,
-    recurrent_state: &MetalBuffer,
-    z_proj: &MetalBuffer,
-    norm_weight: &MetalBuffer,
-    output: &MetalBuffer,
-    conv_out_scratch: &MetalBuffer,
-    qkv_dim: u32,
-    kernel_size: u32,
-    key_dim: u32,
-    value_dim: u32,
-    num_v_heads: u32,
-    k_head_dim: u32,
-    v_head_dim: u32,
-    num_k_heads: u32,
-    eps: f32,
+    params: &GdnFusedDecodeParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(input_qkv, 0, 0);
-    encoder.set_buffer(conv_weight, 0, 1);
-    encoder.set_buffer(conv_state, 0, 2);
-    encoder.set_buffer(a_proj, 0, 3);
-    encoder.set_buffer(b_proj, 0, 4);
-    encoder.set_buffer(a_log, 0, 5);
-    encoder.set_buffer(dt_bias, 0, 6);
-    encoder.set_buffer(recurrent_state, 0, 7);
-    encoder.set_buffer(z_proj, 0, 8);
-    encoder.set_buffer(norm_weight, 0, 9);
-    encoder.set_buffer(output, 0, 10);
-    encoder.set_buffer(conv_out_scratch, 0, 11);
-    let params: [u32; 10] = [
-        qkv_dim,
-        kernel_size,
-        kernel_size - 1, // conv_state_len
-        key_dim,
-        value_dim,
-        num_v_heads,
-        k_head_dim,
-        v_head_dim,
-        num_k_heads,
-        eps.to_bits(),
+    encoder.set_buffer(params.input_qkv, 0, 0);
+    encoder.set_buffer(params.conv_weight, 0, 1);
+    encoder.set_buffer(params.conv_state, 0, 2);
+    encoder.set_buffer(params.a_proj, 0, 3);
+    encoder.set_buffer(params.b_proj, 0, 4);
+    encoder.set_buffer(params.a_log, 0, 5);
+    encoder.set_buffer(params.dt_bias, 0, 6);
+    encoder.set_buffer(params.recurrent_state, 0, 7);
+    encoder.set_buffer(params.z_proj, 0, 8);
+    encoder.set_buffer(params.norm_weight, 0, 9);
+    encoder.set_buffer(params.output, 0, 10);
+    encoder.set_buffer(params.conv_out_scratch, 0, 11);
+    let gpu_params: [u32; 10] = [
+        params.qkv_dim,
+        params.kernel_size,
+        params.kernel_size - 1, // conv_state_len
+        params.key_dim,
+        params.value_dim,
+        params.num_v_heads,
+        params.k_head_dim,
+        params.v_head_dim,
+        params.num_k_heads,
+        params.eps.to_bits(),
     ];
-    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let params_bytes: Vec<u8> = gpu_params.iter().flat_map(|v| v.to_le_bytes()).collect();
     encoder.set_bytes(&params_bytes, 12);
     // Thread count: need enough for both conv1d (qkv_dim/num_v_heads channels)
     // and recurrent (v_head_dim rows). Use the larger of the two.
-    let channels_per_head = qkv_dim.div_ceil(num_v_heads) as usize;
+    let channels_per_head = params.qkv_dim.div_ceil(params.num_v_heads) as usize;
     let tg_size = channels_per_head
-        .max(v_head_dim as usize)
+        .max(params.v_head_dim as usize)
         .min(METAL_MAX_THREADS_PER_THREADGROUP);
-    encoder.dispatch_threadgroups((num_v_heads as usize, 1, 1), (tg_size, 1, 1));
+    encoder.dispatch_threadgroups((params.num_v_heads as usize, 1, 1), (tg_size, 1, 1));
 }
 
 /// Encode batched dense FP16 matvec for 4 GDN projections in a single dispatch.
 ///
 /// Computes y_i = x · W_i^T for i in {QKV, Z, A, B}. All share the same input x.
 /// Saves 3 dispatches per GDN layer compared to 4 separate `encode_matvec` calls.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_gdn_batched_matvec(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    input: &MetalBuffer,
-    w_qkv: &MetalBuffer,
-    w_z: &MetalBuffer,
-    w_a: &MetalBuffer,
-    w_b: &MetalBuffer,
-    y_qkv: &MetalBuffer,
-    y_z: &MetalBuffer,
-    y_a: &MetalBuffer,
-    y_b: &MetalBuffer,
-    k: u32,
-    n_qkv: u32,
-    n_z: u32,
-    n_a: u32,
-    n_b: u32,
+    params: &GdnBatchedMatvecParams<'_>,
 ) {
     const ROWS_PER_TG: u32 = 64;
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(input, 0, 0);
-    encoder.set_buffer(w_qkv, 0, 1);
-    encoder.set_buffer(w_z, 0, 2);
-    encoder.set_buffer(w_a, 0, 3);
-    encoder.set_buffer(w_b, 0, 4);
-    encoder.set_buffer(y_qkv, 0, 5);
-    encoder.set_buffer(y_z, 0, 6);
-    encoder.set_buffer(y_a, 0, 7);
-    encoder.set_buffer(y_b, 0, 8);
-    let params: [u32; 6] = [k, n_qkv, n_z, n_a, n_b, 0];
-    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    encoder.set_buffer(params.input, 0, 0);
+    encoder.set_buffer(params.w_qkv, 0, 1);
+    encoder.set_buffer(params.w_z, 0, 2);
+    encoder.set_buffer(params.w_a, 0, 3);
+    encoder.set_buffer(params.w_b, 0, 4);
+    encoder.set_buffer(params.y_qkv, 0, 5);
+    encoder.set_buffer(params.y_z, 0, 6);
+    encoder.set_buffer(params.y_a, 0, 7);
+    encoder.set_buffer(params.y_b, 0, 8);
+    let gpu_params: [u32; 6] = [
+        params.k,
+        params.n_qkv,
+        params.n_z,
+        params.n_a,
+        params.n_b,
+        0,
+    ];
+    let params_bytes: Vec<u8> = gpu_params.iter().flat_map(|v| v.to_le_bytes()).collect();
     encoder.set_bytes(&params_bytes, 9);
-    let tg_count = n_qkv.div_ceil(ROWS_PER_TG)
-        + n_z.div_ceil(ROWS_PER_TG)
-        + n_a.div_ceil(ROWS_PER_TG)
-        + n_b.div_ceil(ROWS_PER_TG);
+    let tg_count = params.n_qkv.div_ceil(ROWS_PER_TG)
+        + params.n_z.div_ceil(ROWS_PER_TG)
+        + params.n_a.div_ceil(ROWS_PER_TG)
+        + params.n_b.div_ceil(ROWS_PER_TG);
     encoder.dispatch_threadgroups((tg_count as usize, 1, 1), (DEFAULT_THREADGROUP_WIDTH, 1, 1));
 }
 
@@ -269,52 +378,34 @@ pub fn encode_gdn_prefill_conv1d_silu(
 ///
 /// Processes ALL tokens sequentially per head in a single dispatch.
 /// One threadgroup per head, v_head_dim threads per threadgroup.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_gdn_prefill_recurrent(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
-    all_conv_out: &MetalBuffer,
-    all_a: &MetalBuffer,
-    all_b: &MetalBuffer,
-    a_log: &MetalBuffer,
-    dt_bias: &MetalBuffer,
-    norm_weight: &MetalBuffer,
-    all_z: &MetalBuffer,
-    recurrent_state: &MetalBuffer,
-    all_output: &MetalBuffer,
-    token_count: u32,
-    qkv_dim: u32,
-    key_dim: u32,
-    value_dim: u32,
-    num_v_heads: u32,
-    k_head_dim: u32,
-    v_head_dim: u32,
-    eps: f32,
-    num_k_heads: u32,
+    params: &GdnPrefillRecurrentParams<'_>,
 ) {
     encoder.set_pipeline(pipeline);
-    encoder.set_buffer(all_conv_out, 0, 0);
-    encoder.set_buffer(all_a, 0, 1);
-    encoder.set_buffer(all_b, 0, 2);
-    encoder.set_buffer(a_log, 0, 3);
-    encoder.set_buffer(dt_bias, 0, 4);
-    encoder.set_buffer(norm_weight, 0, 5);
-    encoder.set_buffer(all_z, 0, 6);
-    encoder.set_buffer(recurrent_state, 0, 7);
-    encoder.set_buffer(all_output, 0, 8);
-    let params: [u32; 9] = [
-        token_count,
-        qkv_dim,
-        key_dim,
-        value_dim,
-        num_v_heads,
-        k_head_dim,
-        v_head_dim,
-        eps.to_bits(),
-        num_k_heads,
+    encoder.set_buffer(params.all_conv_out, 0, 0);
+    encoder.set_buffer(params.all_a, 0, 1);
+    encoder.set_buffer(params.all_b, 0, 2);
+    encoder.set_buffer(params.a_log, 0, 3);
+    encoder.set_buffer(params.dt_bias, 0, 4);
+    encoder.set_buffer(params.norm_weight, 0, 5);
+    encoder.set_buffer(params.all_z, 0, 6);
+    encoder.set_buffer(params.recurrent_state, 0, 7);
+    encoder.set_buffer(params.all_output, 0, 8);
+    let gpu_params: [u32; 9] = [
+        params.token_count,
+        params.qkv_dim,
+        params.key_dim,
+        params.value_dim,
+        params.num_v_heads,
+        params.k_head_dim,
+        params.v_head_dim,
+        params.eps.to_bits(),
+        params.num_k_heads,
     ];
-    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let params_bytes: Vec<u8> = gpu_params.iter().flat_map(|v| v.to_le_bytes()).collect();
     encoder.set_bytes(&params_bytes, 9);
-    let tg_size = (v_head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP);
-    encoder.dispatch_threadgroups((num_v_heads as usize, 1, 1), (tg_size, 1, 1));
+    let tg_size = (params.v_head_dim as usize).min(METAL_MAX_THREADS_PER_THREADGROUP);
+    encoder.dispatch_threadgroups((params.num_v_heads as usize, 1, 1), (tg_size, 1, 1));
 }

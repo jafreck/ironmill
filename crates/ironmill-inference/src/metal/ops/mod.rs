@@ -32,6 +32,58 @@ use ironmill_metal_sys::{ComputePipeline, MetalDevice, ShaderLibrary};
 use self::library::ShaderLibraries;
 use super::error::MetalError;
 
+// Type aliases for shader compilation return types to reduce tuple complexity.
+type ElementwiseShaders = (
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+);
+type AttentionShaders = (
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    Option<ComputePipeline>,
+    ComputePipeline,
+    ComputePipeline,
+);
+type QuantizedMatmulShaders = (
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+);
+type AdvancedMatmulShaders = (
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+);
+type FusedShaders = (
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+);
+
 /// Maximum threads per threadgroup imposed by the Metal API.
 const METAL_MAX_THREADS_PER_THREADGROUP: usize = 1024;
 
@@ -333,23 +385,10 @@ impl MetalPipelines {
     }
 
     /// Compile element-wise, embedding, and utility pipelines.
-    #[allow(clippy::type_complexity)]
     fn compile_elementwise_shaders(
         device: &MetalDevice,
         libs: &ShaderLibraries,
-    ) -> Result<
-        (
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-        ),
-        MetalError,
-    > {
+    ) -> Result<ElementwiseShaders, MetalError> {
         Ok((
             make_pipeline(device, &libs.elem, "residual_add")?,
             make_pipeline(device, &libs.elem, "bias_add")?,
@@ -384,23 +423,10 @@ impl MetalPipelines {
     }
 
     /// Compile standard/prefill attention and fused SDPA pipelines.
-    #[allow(clippy::type_complexity)]
     fn compile_attention_shaders(
         device: &MetalDevice,
         libs: &ShaderLibraries,
-    ) -> Result<
-        (
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            Option<ComputePipeline>,
-            ComputePipeline,
-            ComputePipeline,
-        ),
-        MetalError,
-    > {
+    ) -> Result<AttentionShaders, MetalError> {
         let fused_sdpa = libs
             .sdpa
             .get_function("fused_sdpa")
@@ -419,23 +445,10 @@ impl MetalPipelines {
     }
 
     /// Compile PolarQuant and Affine quantized matmul pipelines.
-    #[allow(clippy::type_complexity)]
     fn compile_quantized_matmul_shaders(
         device: &MetalDevice,
         libs: &ShaderLibraries,
-    ) -> Result<
-        (
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-        ),
-        MetalError,
-    > {
+    ) -> Result<QuantizedMatmulShaders, MetalError> {
         Ok((
             make_pipeline(device, &libs.quantized, "polarquant_matvec_int4")?,
             make_pipeline(device, &libs.quantized, "polarquant_matmul_int4")?,
@@ -472,24 +485,10 @@ impl MetalPipelines {
     }
 
     /// Compile advanced matmul variants: batched, AMX, and fused.
-    #[allow(clippy::type_complexity)]
     fn compile_advanced_matmul_shaders(
         device: &MetalDevice,
         libs: &ShaderLibraries,
-    ) -> Result<
-        (
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-        ),
-        MetalError,
-    > {
+    ) -> Result<AdvancedMatmulShaders, MetalError> {
         Ok((
             make_pipeline(device, &libs.quantized, "int4_dequantize")?,
             make_pipeline(device, &libs.affine_mm, "batched_affine_matvec_int4")?,
@@ -504,22 +503,10 @@ impl MetalPipelines {
     }
 
     /// Compile fused residual-norm, embedding-norm, softcap, and PLE pipelines.
-    #[allow(clippy::type_complexity)]
     fn compile_fused_shaders(
         device: &MetalDevice,
         libs: &ShaderLibraries,
-    ) -> Result<
-        (
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-            ComputePipeline,
-        ),
-        MetalError,
-    > {
+    ) -> Result<FusedShaders, MetalError> {
         Ok((
             make_pipeline(device, &libs.norm, "fused_residual_rms_norm")?,
             make_pipeline(device, &libs.norm, "fused_embedding_norm")?,

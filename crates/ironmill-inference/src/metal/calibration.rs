@@ -7,7 +7,8 @@ use ironmill_metal_sys::{CommandBufferStatus, StorageMode};
 use mil_rs::weights::Architecture;
 
 use super::attention::{
-    encode_end_of_layer_residual, encode_kv_cache_and_attention, encode_qk_norm_and_rope,
+    KvCacheAndAttentionParams, QkNormAndRopeParams, encode_end_of_layer_residual,
+    encode_kv_cache_and_attention, encode_qk_norm_and_rope,
 };
 use super::buffers::{ModelConfigExt, build_matmul_cache, bytes_as_f16};
 use super::engine::MetalInference;
@@ -19,6 +20,9 @@ use super::projection::encode_projection;
 use crate::calibration::ActivationHook;
 use crate::engine::{InferenceEngine, InferenceError};
 use crate::types::Logits;
+
+/// Callback invoked per layer with `(layer_index, projection_name, raw_bytes, n_features)`.
+type CalibrationCallback<'a> = dyn FnMut(usize, &str, &[u8], usize) + 'a;
 
 impl MetalInference {
     // ── Calibration-mode pipeline ───────────────────────────────
@@ -38,11 +42,10 @@ impl MetalInference {
     /// - `n_features`: number of features per token for this capture point
     ///
     /// Returns the same logits as [`run_pipeline`].
-    #[allow(clippy::type_complexity)]
     pub(crate) fn run_pipeline_calibration(
         &mut self,
         token_ids: &[u32],
-        layer_callback: &mut dyn FnMut(usize, &str, &[u8], usize),
+        layer_callback: &mut CalibrationCallback<'_>,
         stop_after_layer: Option<usize>,
     ) -> Result<Logits, InferenceError> {
         let total_start = Instant::now();
@@ -212,17 +215,19 @@ impl MetalInference {
             ple::encode_ple_model_level(
                 &enc,
                 self.pipelines()?,
-                &self.device,
-                weights,
-                bufs,
-                &bufs.token_ids_buf,
-                &mc,
-                self.gemma4_config.as_ref(),
-                token_count,
-                h,
-                vocab,
-                eps,
-                false,
+                &ple::PleModelLevelParams {
+                    device: &self.device,
+                    weights,
+                    bufs,
+                    token_ids_buf: &bufs.token_ids_buf,
+                    mc: &mc,
+                    gemma4_config: self.gemma4_config.as_ref(),
+                    token_count,
+                    h,
+                    vocab,
+                    eps,
+                    apply_scaling: false,
+                },
             )?;
 
             enc.end_encoding();
@@ -371,17 +376,19 @@ impl MetalInference {
                 encode_qk_norm_and_rope(
                     &enc,
                     pipelines,
-                    bufs,
-                    lw.q_norm.as_ref(),
-                    lw.k_norm.as_ref(),
-                    layer_rope_cos,
-                    layer_rope_sin,
-                    nh,
-                    layer_nkv,
-                    layer_hd,
-                    seq_pos,
-                    token_count,
-                    eps,
+                    &QkNormAndRopeParams {
+                        bufs,
+                        q_norm: lw.q_norm.as_ref(),
+                        k_norm: lw.k_norm.as_ref(),
+                        rope_cos: layer_rope_cos,
+                        rope_sin: layer_rope_sin,
+                        nh,
+                        nkv: layer_nkv,
+                        hd: layer_hd,
+                        seq_pos,
+                        token_count,
+                        eps,
+                    },
                 )?;
                 enc.memory_barrier_buffers();
 
@@ -409,23 +416,25 @@ impl MetalInference {
                 encode_kv_cache_and_attention(
                     &enc,
                     pipelines,
-                    bufs,
-                    self.turboquant.as_ref(),
-                    self.kv_cache.as_ref(),
-                    self.fp16_kv_cache.as_ref(),
-                    self.config.max_seq_len,
-                    self.config.n_bits as usize,
-                    kv_cache_layer,
-                    seq_pos,
-                    token_count,
-                    nh,
-                    layer_nkv,
-                    layer_hd,
-                    enable_tq,
-                    is_anchor,
-                    layer_window,
-                    attn_scale,
-                    self.gpu_max_threadgroups,
+                    &KvCacheAndAttentionParams {
+                        bufs,
+                        turboquant: self.turboquant.as_ref(),
+                        kv_cache: self.kv_cache.as_ref(),
+                        fp16_kv_cache: self.fp16_kv_cache.as_ref(),
+                        max_seq_len: self.config.max_seq_len,
+                        n_bits: self.config.n_bits as usize,
+                        layer_idx: kv_cache_layer,
+                        seq_pos,
+                        token_count,
+                        nh,
+                        nkv: layer_nkv,
+                        hd: layer_hd,
+                        enable_tq,
+                        is_anchor,
+                        window_size: layer_window,
+                        attn_scale,
+                        gpu_max_threadgroups: self.gpu_max_threadgroups,
+                    },
                 )?;
                 enc.memory_barrier_buffers();
 
@@ -686,15 +695,17 @@ impl MetalInference {
             let ple_applied = ple::encode_ple_per_layer(
                 &enc,
                 pipelines,
-                bufs,
-                lw,
-                next_input_norm,
-                self.gemma4_config.as_ref(),
-                mc.num_hidden_layers,
-                layer_idx,
-                token_count,
-                h,
-                eps,
+                &ple::PlePerLayerParams {
+                    bufs,
+                    lw,
+                    next_input_norm,
+                    gemma4_config: self.gemma4_config.as_ref(),
+                    num_hidden_layers: mc.num_hidden_layers,
+                    layer_idx,
+                    token_count,
+                    h,
+                    eps,
+                },
             )?;
 
             if !ple_applied {
@@ -925,11 +936,10 @@ impl MetalInference {
     /// This is the calibration-mode equivalent of [`prefill`]. It processes
     /// all tokens in a single chunk (no chunking — calibration sequences are
     /// typically short).
-    #[allow(clippy::type_complexity)]
     pub(crate) fn prefill_calibration(
         &mut self,
         tokens: &[u32],
-        layer_callback: &mut dyn FnMut(usize, &str, &[u8], usize),
+        layer_callback: &mut CalibrationCallback<'_>,
     ) -> Result<Logits, InferenceError> {
         if tokens.is_empty() {
             return Err(InferenceError::Decode("empty calibration tokens".into()));
@@ -1184,17 +1194,19 @@ impl MetalInference {
             encode_qk_norm_and_rope(
                 &enc,
                 pipelines,
-                bufs,
-                lw.q_norm.as_ref(),
-                lw.k_norm.as_ref(),
-                layer_rope_cos,
-                layer_rope_sin,
-                nh,
-                layer_nkv,
-                layer_hd,
-                seq_pos,
-                token_count,
-                eps,
+                &QkNormAndRopeParams {
+                    bufs,
+                    q_norm: lw.q_norm.as_ref(),
+                    k_norm: lw.k_norm.as_ref(),
+                    rope_cos: layer_rope_cos,
+                    rope_sin: layer_rope_sin,
+                    nh,
+                    nkv: layer_nkv,
+                    hd: layer_hd,
+                    seq_pos,
+                    token_count,
+                    eps,
+                },
             )?;
             enc.memory_barrier_buffers();
 
@@ -1220,23 +1232,25 @@ impl MetalInference {
             encode_kv_cache_and_attention(
                 &enc,
                 pipelines,
-                bufs,
-                self.turboquant.as_ref(),
-                self.kv_cache.as_ref(),
-                self.fp16_kv_cache.as_ref(),
-                self.config.max_seq_len,
-                self.config.n_bits as usize,
-                kv_cache_layer,
-                seq_pos,
-                token_count,
-                nh,
-                layer_nkv,
-                layer_hd,
-                enable_tq,
-                is_anchor,
-                layer_window,
-                attn_scale,
-                self.gpu_max_threadgroups,
+                &KvCacheAndAttentionParams {
+                    bufs,
+                    turboquant: self.turboquant.as_ref(),
+                    kv_cache: self.kv_cache.as_ref(),
+                    fp16_kv_cache: self.fp16_kv_cache.as_ref(),
+                    max_seq_len: self.config.max_seq_len,
+                    n_bits: self.config.n_bits as usize,
+                    layer_idx: kv_cache_layer,
+                    seq_pos,
+                    token_count,
+                    nh,
+                    nkv: layer_nkv,
+                    hd: layer_hd,
+                    enable_tq,
+                    is_anchor,
+                    window_size: layer_window,
+                    attn_scale,
+                    gpu_max_threadgroups: self.gpu_max_threadgroups,
+                },
             )?;
             enc.memory_barrier_buffers();
 
@@ -1438,15 +1452,17 @@ impl MetalInference {
         let ple_applied = ple::encode_ple_per_layer(
             &enc,
             pipelines,
-            bufs,
-            lw,
-            next_input_norm,
-            self.gemma4_config.as_ref(),
-            mc.num_hidden_layers,
-            layer_idx,
-            token_count,
-            h,
-            eps,
+            &ple::PlePerLayerParams {
+                bufs,
+                lw,
+                next_input_norm,
+                gemma4_config: self.gemma4_config.as_ref(),
+                num_hidden_layers: mc.num_hidden_layers,
+                layer_idx,
+                token_count,
+                h,
+                eps,
+            },
         )?;
 
         if !ple_applied {
