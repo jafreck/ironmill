@@ -42,6 +42,20 @@ constant constexpr uint TN_BLOCKS      = TN_TILE / 8;
 constant constexpr uint BLK_N = 64;
 constant constexpr uint BLK_K = 8;
 
+// ── Superblock layout constants ──
+// Superblock = [scale:2B][zero:2B][data:group_size/elems_per_byte bytes]
+// For INT4 gs=128: sb_bytes = 4 + 64 = 68
+// For INT8 gs=128: sb_bytes = 4 + 128 = 132
+//
+// Layout: W[row * sb_stride + group * sb_bytes + offset]
+// where sb_stride = num_groups * sb_bytes
+constant constexpr uint SB_HEADER_BYTES = 4;  // 2B scale + 2B zero
+
+// Superblock decode constants
+constant constexpr uint SB_ROWS_PER_SG = 4;
+constant constexpr uint SB_NUM_SIMDGROUPS = 2;
+constant constexpr uint SB_ROWS_PER_TG = SB_NUM_SIMDGROUPS * SB_ROWS_PER_SG;  // 8
+
 // ── AMX decode constants (shared by all AMX matvec kernels) ──
 constant constexpr uint AMX_ROWS_PER_TG = 64;
 constant constexpr uint AMX_ROWS_PER_SG = 8;
