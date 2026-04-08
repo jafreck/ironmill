@@ -1,148 +1,19 @@
 //! Inference-side bundle manifest types and helpers.
 //!
-//! These types mirror the compile-crate's manifest types but are owned by
-//! inference, so loading a `.ironml` bundle does not require pulling in the
-//! full compile pipeline.
+//! Manifest types are defined canonically in [`ironmill_core::ane::bundle`] and
+//! re-exported here so that the rest of the inference crate can use them
+//! without pulling in the full compile pipeline.
 
 use half::f16;
-use ironmill_core::ane::bundle::LmHeadKind;
 use ironmill_iosurface::AneTensor;
-use mil_rs::ir::ScalarType;
-use serde::Deserialize;
 
-// ---------------------------------------------------------------------------
-// Manifest types (deserialized from manifest.json)
-// ---------------------------------------------------------------------------
-
-/// Top-level manifest for an `.ironml` ANE bundle.
-#[derive(Debug, Deserialize)]
-pub struct BundleManifest {
-    /// Manifest format version number.
-    pub format_version: u32,
-    /// Whether this is a simple or decode-style model.
-    pub model_type: BundleModelType,
-    /// Sub-programs contained in the bundle.
-    #[serde(default)]
-    pub sub_programs: Vec<SubProgramManifest>,
-    /// Decode-specific manifest (present only for decode models).
-    pub decode: Option<DecodeManifest>,
-}
-
-/// Model type discriminator for a bundle.
-#[non_exhaustive]
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BundleModelType {
-    /// A single-pass model (no autoregressive decoding).
-    Simple,
-    /// An autoregressive decode model with layer-by-layer execution.
-    Decode,
-}
-
-/// Manifest entry for a single ANE sub-program.
-#[derive(Debug, Deserialize)]
-pub struct SubProgramManifest {
-    /// Identifier for this sub-program (e.g. `"layer_0_pre_attn"`).
-    pub name: String,
-    /// Input tensor descriptors.
-    pub inputs: Vec<TensorDescriptorManifest>,
-    /// Output tensor descriptors.
-    pub outputs: Vec<TensorDescriptorManifest>,
-    /// Optional spatial packing metadata for fused inputs.
-    pub input_packing: Option<InputPackingManifest>,
-}
-
-/// Tensor descriptor as serialized in the manifest.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TensorDescriptorManifest {
-    /// Tensor name (e.g. `"hidden_states"`).
-    pub name: String,
-    /// NCHW shape of the tensor.
-    pub shape: [usize; 4],
-    /// Scalar element type.
-    pub dtype: ScalarType,
-}
-
-/// Spatial packing layout for fused sub-program inputs.
-#[derive(Debug, Clone, Deserialize)]
-pub struct InputPackingManifest {
-    /// Byte offsets of each logical input within the packed tensor.
-    pub offsets: Vec<usize>,
-    /// Sizes (in elements) of each logical input.
-    pub sizes: Vec<usize>,
-}
-
-/// Decode-mode manifest containing architecture, LM head, and layer info.
-#[derive(Debug, Deserialize)]
-pub struct DecodeManifest {
-    /// Model architecture hyperparameters.
-    pub architecture: ArchitectureManifest,
-    /// LM head configuration and sub-programs.
-    pub lm_head: LmHeadManifest,
-    /// Per-layer sub-program manifests.
-    pub layers: Vec<LayerManifest>,
-}
-
-/// Model architecture hyperparameters from the bundle manifest.
-#[derive(Debug, Deserialize)]
-pub struct ArchitectureManifest {
-    /// Total vocabulary size.
-    pub vocab_size: usize,
-    /// End-of-sequence token IDs.
-    pub eos_tokens: Vec<u32>,
-    /// Number of attention heads.
-    pub num_heads: usize,
-    /// Number of key-value heads (for GQA/MQA).
-    pub num_kv_heads: usize,
-    /// Dimension of each attention head.
-    pub head_dim: usize,
-    /// Hidden layer dimension.
-    pub hidden_size: usize,
-    /// RoPE base frequency.
-    pub rope_theta: f64,
-    /// Maximum supported sequence length.
-    pub max_seq_len: usize,
-    /// Whether QK normalization is enabled.
-    pub qk_norm: bool,
-}
-
-/// LM head configuration within a decode bundle.
-#[derive(Debug, Deserialize)]
-pub struct LmHeadManifest {
-    /// How the LM head is implemented (e.g. fused vs chunked).
-    pub kind: LmHeadKind,
-    /// Output vocabulary size.
-    pub vocab_size: usize,
-    /// Input hidden dimension to the LM head.
-    pub hidden_size: usize,
-    /// Sub-program chunks (for chunked LM heads).
-    #[serde(default)]
-    pub chunks: Vec<SubProgramManifest>,
-}
-
-/// Per-layer manifest describing the sub-programs for one transformer layer.
-#[derive(Debug, Deserialize)]
-pub struct LayerManifest {
-    /// Zero-based layer index.
-    pub index: usize,
-    /// Pre-attention sub-program (QKV projection + norm).
-    pub pre_attn: SubProgramManifest,
-    /// Optional post-attention sub-program (output projection + MLP).
-    pub post_attn: Option<SubProgramManifest>,
-    /// Optional fp16 attention sub-program variant.
-    pub fp16_attn: Option<SubProgramManifest>,
-    /// Whether the KV cache write is fused into the sub-program.
-    pub cache_write_fused: bool,
-    /// Whether this layer can share weights with a donor layer.
-    pub donor_compatible: bool,
-}
-
-impl TensorDescriptorManifest {
-    /// Returns the scalar type of this tensor.
-    pub fn scalar_type(&self) -> mil_rs::ir::ScalarType {
-        self.dtype
-    }
-}
+// Re-export canonical manifest types from core.
+// Type aliases preserve the names previously used within this crate.
+pub use ironmill_core::ane::bundle::{
+    BundleArchitecture as ArchitectureManifest, BundleInputPacking as InputPackingManifest,
+    BundleManifest, BundleModelType, BundleTensorDescriptor as TensorDescriptorManifest,
+    DecodeManifest, LayerManifest, LmHeadManifest, SubProgramManifest,
+};
 
 // ---------------------------------------------------------------------------
 // Inference-side input packing

@@ -65,6 +65,7 @@ pub struct BundleManifest {
 }
 
 /// Discriminator for the kind of model stored in a bundle.
+#[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BundleModelType {
@@ -140,6 +141,13 @@ pub struct LayerManifest {
     pub cache_write_fused: bool,
     /// Whether this layer is compatible with donor-based weight sharing.
     pub donor_compatible: bool,
+}
+
+impl BundleTensorDescriptor {
+    /// Returns the scalar type of this tensor.
+    pub fn scalar_type(&self) -> ScalarType {
+        self.dtype
+    }
 }
 
 impl From<&super::TensorDescriptor> for BundleTensorDescriptor {
