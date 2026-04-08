@@ -131,21 +131,21 @@ pub enum TensorManifest {
 // ── ScalarType string helpers ───────────────────────────────────────────
 
 /// Convert a [`ScalarType`] to a stable string representation for the manifest.
-pub fn scalar_type_to_str(dtype: ScalarType) -> &'static str {
+pub fn scalar_type_to_str(dtype: ScalarType) -> Result<&'static str> {
     match dtype {
-        ScalarType::Float16 => "float16",
-        ScalarType::Float32 => "float32",
-        ScalarType::Float64 => "float64",
-        ScalarType::Int8 => "int8",
-        ScalarType::Int16 => "int16",
-        ScalarType::Int32 => "int32",
-        ScalarType::Int64 => "int64",
-        ScalarType::UInt8 => "uint8",
-        ScalarType::UInt16 => "uint16",
-        ScalarType::UInt32 => "uint32",
-        ScalarType::UInt64 => "uint64",
-        ScalarType::Bool => "bool",
-        _ => panic!("unsupported scalar type: {dtype:?}"),
+        ScalarType::Float16 => Ok("float16"),
+        ScalarType::Float32 => Ok("float32"),
+        ScalarType::Float64 => Ok("float64"),
+        ScalarType::Int8 => Ok("int8"),
+        ScalarType::Int16 => Ok("int16"),
+        ScalarType::Int32 => Ok("int32"),
+        ScalarType::Int64 => Ok("int64"),
+        ScalarType::UInt8 => Ok("uint8"),
+        ScalarType::UInt16 => Ok("uint16"),
+        ScalarType::UInt32 => Ok("uint32"),
+        ScalarType::UInt64 => Ok("uint64"),
+        ScalarType::Bool => Ok("bool"),
+        _ => Err(anyhow!("unsupported scalar type: {dtype:?}")),
     }
 }
 

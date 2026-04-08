@@ -108,7 +108,9 @@ pub fn write_gpu_bundle(
                         norms_file,
                         shape: original_shape.clone(),
                         n_bits: *n_bits,
-                        dtype: scalar_type_to_str(*lut_dtype).to_string(),
+                        dtype: scalar_type_to_str(*lut_dtype)
+                            .map_err(|e| CompileError::Other(e.to_string()))?
+                            .to_string(),
                         quip_sharp_seed: quip_sharp_seed.map(|s| s as u32),
                     },
                 );
@@ -122,7 +124,9 @@ pub fn write_gpu_bundle(
                     TensorManifest::Dense {
                         file,
                         shape: tensor.shape.clone(),
-                        dtype: scalar_type_to_str(tensor.dtype).to_string(),
+                        dtype: scalar_type_to_str(tensor.dtype)
+                            .map_err(|e| CompileError::Other(e.to_string()))?
+                            .to_string(),
                     },
                 );
             }
@@ -229,12 +233,20 @@ pub fn write_gpu_bundle(
                             bit_width: *bit_width,
                             group_size,
                             axis: axis as i64,
-                            dtype: scalar_type_to_str(tensor.dtype).to_string(),
+                            dtype: scalar_type_to_str(tensor.dtype)
+                                .map_err(|e| CompileError::Other(e.to_string()))?
+                                .to_string(),
                             awq_scales_file,
                             g_idx_file,
-                            scale_dtype: Some(scalar_type_to_str(*scale_dtype).to_string()),
+                            scale_dtype: Some(
+                                scalar_type_to_str(*scale_dtype)
+                                    .map_err(|e| CompileError::Other(e.to_string()))?
+                                    .to_string(),
+                            ),
                             zero_point_dtype: Some(
-                                scalar_type_to_str(*zero_point_dtype).to_string(),
+                                scalar_type_to_str(*zero_point_dtype)
+                                    .map_err(|e| CompileError::Other(e.to_string()))?
+                                    .to_string(),
                             ),
                         },
                     );
@@ -696,7 +708,7 @@ mod tests {
             ScalarType::Bool,
         ];
         for ty in types {
-            let s = scalar_type_to_str(ty);
+            let s = scalar_type_to_str(ty).unwrap();
             let restored = str_to_scalar_type(s).unwrap();
             assert_eq!(restored, ty, "round-trip failed for {s}");
         }

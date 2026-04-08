@@ -195,12 +195,10 @@ impl<'a> MilTextEmitter<'a> {
         // Determine output type. If not explicitly stored, try to infer from
         // input types (most element-wise ops preserve the type of their first
         // tensor input).
-        let output_type = op
-            .output_types
-            .first()
-            .and_then(|t| t.as_ref())
-            .cloned()
-            .or_else(|| self.infer_output_type_from_inputs(op));
+        let output_type = match op.output_types.first().and_then(|t| t.as_ref()).cloned() {
+            Some(ty) => Some(ty),
+            None => self.infer_output_type_from_inputs(op)?,
+        };
         let type_str = match &output_type {
             Some(ty) => self.format_tensor_type(ty)?,
             None => {
@@ -297,10 +295,10 @@ impl<'a> MilTextEmitter<'a> {
             if is_int_param {
                 // Emit inline: tensor<int32, [N]>([v1, v2, ...])
                 let type_str = self.format_tensor_type_from(shape, *dtype)?;
-                let values = format_tensor_elements(
-                    data.as_bytes().expect("tensor not materialized"),
-                    *dtype,
-                )?;
+                let bytes = data
+                    .as_bytes()
+                    .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?;
+                let values = format_tensor_elements(bytes, *dtype)?;
                 let num_elements: usize = shape.iter().product();
 
                 writeln!(
@@ -315,7 +313,10 @@ impl<'a> MilTextEmitter<'a> {
                 self.weight_entries.push(WeightBlobEntry {
                     name: op.name.clone(),
                     path: weight_path.clone(),
-                    data: data.as_bytes().expect("tensor not materialized").to_vec(),
+                    data: data
+                        .as_bytes()
+                        .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?
+                        .to_vec(),
                     offset: WEIGHT_BLOB_HEADER_BYTES,
                     dtype: *dtype,
                     shape: shape.clone(),
@@ -386,10 +387,10 @@ impl<'a> MilTextEmitter<'a> {
                 let num_elements: usize = shape.iter().product();
                 let type_str = format!("tensor<{dtype_str}, [{num_elements}]>");
 
-                let values = format_tensor_elements(
-                    data.as_bytes().expect("tensor not materialized"),
-                    *dtype,
-                )?;
+                let bytes = data
+                    .as_bytes()
+                    .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?;
+                let values = format_tensor_elements(bytes, *dtype)?;
                 format!("{type_str}([{values}])")
             }
             _ => {
@@ -464,42 +465,42 @@ impl<'a> MilTextEmitter<'a> {
     /// Infer output type from input references using the type map.
     /// Most element-wise ops (add, mul, relu, etc.) preserve the type
     /// of their first tensor input.
-    fn infer_output_type_from_inputs(&self, op: &Operation) -> Option<TensorType> {
+    fn infer_output_type_from_inputs(&self, op: &Operation) -> Result<Option<TensorType>> {
         // First, check if any input is a reference we can look up in the type map.
         // Prefer "x" input (the primary operand for most ops).
         if let Some(Value::Reference(name)) = op.inputs.get("x") {
             if let Some(ty) = self.type_map.get(name) {
                 // For reduce ops, collapse the reduced axis.
                 if op.op_type.starts_with("reduce_") {
-                    return Some(self.reduce_output_type(ty, op));
+                    return Ok(Some(self.reduce_output_type(ty, op)?));
                 }
-                return Some(ty.clone());
+                return Ok(Some(ty.clone()));
             }
         }
         // Try any reference input.
         for val in op.inputs.values() {
             if let Value::Reference(name) = val {
                 if let Some(ty) = self.type_map.get(name) {
-                    return Some(ty.clone());
+                    return Ok(Some(ty.clone()));
                 }
             }
         }
         // Check for inline Tensor values.
         for val in op.inputs.values() {
             if let Value::Tensor { shape, dtype, .. } = val {
-                return Some(TensorType::new(*dtype, shape.clone()));
+                return Ok(Some(TensorType::new(*dtype, shape.clone())));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Compute the output type for a reduce op by collapsing the reduced
     /// axes to size 1 (when keep_dims=true, which is the default).
-    fn reduce_output_type(&self, input_ty: &TensorType, op: &Operation) -> TensorType {
+    fn reduce_output_type(&self, input_ty: &TensorType, op: &Operation) -> Result<TensorType> {
         // Extract axes from inputs (const reference) or attributes.
-        let axes = self.extract_reduce_axes(op);
+        let axes = self.extract_reduce_axes(op)?;
         if axes.is_empty() {
-            return input_ty.clone();
+            return Ok(input_ty.clone());
         }
 
         let mut shape = input_ty.shape.clone();
@@ -513,7 +514,7 @@ impl<'a> MilTextEmitter<'a> {
                          returning input type unchanged",
                         op.name, axis, rank
                     );
-                    return input_ty.clone();
+                    return Ok(input_ty.clone());
                 }
                 n as usize
             } else {
@@ -525,16 +526,16 @@ impl<'a> MilTextEmitter<'a> {
                      returning input type unchanged",
                     op.name, axis, normalized, rank
                 );
-                return input_ty.clone();
+                return Ok(input_ty.clone());
             }
             shape[normalized] = Some(1);
         }
 
-        TensorType::with_dynamic_shape(input_ty.scalar_type, shape)
+        Ok(TensorType::with_dynamic_shape(input_ty.scalar_type, shape))
     }
 
     /// Extract the axes values from a reduce op, resolving const references.
-    fn extract_reduce_axes(&self, op: &Operation) -> Vec<i64> {
+    fn extract_reduce_axes(&self, op: &Operation) -> Result<Vec<i64>> {
         // Check inputs first, then attributes.
         let axes_val = op.inputs.get("axes").or_else(|| op.attributes.get("axes"));
 
@@ -547,22 +548,25 @@ impl<'a> MilTextEmitter<'a> {
                 // However, we stored the axes data in the weight entries.
                 // For simplicity, just check common patterns.
                 let _ = name;
-                vec![]
+                Ok(vec![])
             }
-            Some(Value::List(items)) => items
+            Some(Value::List(items)) => Ok(items
                 .iter()
                 .filter_map(|v| match v {
                     Value::Int(n) => Some(*n),
                     _ => None,
                 })
-                .collect(),
-            Some(Value::Tensor { data, dtype, .. }) if *dtype == ScalarType::Int32 => data
-                .as_bytes()
-                .expect("tensor not materialized")
-                .chunks_exact(4)
-                .map(|c: &[u8]| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
-                .collect(),
-            _ => vec![],
+                .collect()),
+            Some(Value::Tensor { data, dtype, .. }) if *dtype == ScalarType::Int32 => {
+                let bytes = data
+                    .as_bytes()
+                    .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?;
+                Ok(bytes
+                    .chunks_exact(4)
+                    .map(|c: &[u8]| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+                    .collect())
+            }
+            _ => Ok(vec![]),
         }
     }
 }
