@@ -1,9 +1,10 @@
-//! GPU bundle manifest schema types.
+//! GPU bundle manifest schema types and I/O helpers.
 
 use std::collections::HashMap;
 
+use mil_rs::MilError;
 use mil_rs::ir::ScalarType;
-use mil_rs::weights::{Architecture, ModelConfig};
+use mil_rs::weights::{Architecture, ModelConfig, QuantizationInfo, WeightTensor};
 use serde::{Deserialize, Serialize};
 
 /// Errors from GPU bundle manifest operations.
@@ -290,4 +291,164 @@ pub fn deserialize_model_config(value: &serde_json::Value) -> Result<ModelConfig
                 .unwrap_or(false),
         )
         .with_extra(extra))
+}
+
+// ── Tensor I/O helpers ──────────────────────────────────────────────────
+
+/// Reconstruct a [`WeightTensor`] from a [`TensorManifest`] entry.
+///
+/// `read_file` is called for each file referenced by the manifest entry.
+/// It should return the raw bytes of that file. Errors from the reader are
+/// propagated as [`MilError::Validation`].
+///
+/// This function centralises the `TensorManifest → QuantizationInfo` dispatch
+/// so that bundle readers don't need to duplicate variant-matching logic.
+pub fn read_tensor_from_manifest<F>(
+    desc: &TensorManifest,
+    mut read_file: F,
+) -> std::result::Result<WeightTensor<'static>, MilError>
+where
+    F: FnMut(&str) -> std::result::Result<Vec<u8>, MilError>,
+{
+    match desc {
+        TensorManifest::LutToDense {
+            indices_file,
+            lut_file,
+            norms_file,
+            shape,
+            n_bits,
+            dtype,
+            quip_sharp_seed,
+        } => {
+            let indices = read_file(indices_file)?;
+            let lut = read_file(lut_file)?;
+            let row_norms = read_file(norms_file)?;
+            let dtype =
+                str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
+
+            Ok(
+                WeightTensor::owned(Vec::new(), shape.clone(), dtype).with_quant_info(
+                    QuantizationInfo::LutToDense {
+                        lut,
+                        lut_dtype: dtype,
+                        indices,
+                        original_shape: shape.clone(),
+                        n_bits: *n_bits,
+                        row_norms,
+                        norms_dtype: dtype,
+                        polar_quant_seed: None, // Bundle tensors are pre-unrotated
+                        quip_sharp_seed: quip_sharp_seed.map(|s| s as u64),
+                    },
+                ),
+            )
+        }
+        TensorManifest::Dense { file, shape, dtype } => {
+            let data = read_file(file)?;
+            let dtype =
+                str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
+
+            Ok(WeightTensor::owned(data, shape.clone(), dtype))
+        }
+        TensorManifest::AffineDequantize {
+            quantized_data_file,
+            scales_file,
+            zeros_file,
+            shape,
+            bit_width,
+            group_size,
+            axis,
+            dtype,
+            awq_scales_file,
+            scale_dtype,
+            zero_point_dtype,
+            ..
+        } => {
+            let quantized_data = read_file(quantized_data_file)?;
+            let scale = read_file(scales_file)?;
+            let zero_point = read_file(zeros_file)?;
+            let awq_scales = match awq_scales_file {
+                Some(f) => Some(read_file(f)?),
+                None => None,
+            };
+            let dtype =
+                str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
+
+            let s_dtype = scale_dtype
+                .as_ref()
+                .map(|s| {
+                    str_to_scalar_type(s)
+                        .map_err(|e| MilError::Validation(format!("invalid scale_dtype: {e}")))
+                })
+                .transpose()?
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "warning: scale_dtype not specified in bundle, defaulting to Float16"
+                    );
+                    ScalarType::Float16
+                });
+            let zp_dtype = zero_point_dtype
+                .as_ref()
+                .map(|s| {
+                    str_to_scalar_type(s)
+                        .map_err(|e| MilError::Validation(format!("invalid zero_point_dtype: {e}")))
+                })
+                .transpose()?
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "warning: zero_point_dtype not specified in bundle, defaulting to Float16"
+                    );
+                    ScalarType::Float16
+                });
+
+            Ok(
+                WeightTensor::owned(quantized_data, shape.clone(), dtype).with_quant_info(
+                    QuantizationInfo::AffineDequantize {
+                        scale,
+                        zero_point,
+                        scale_dtype: s_dtype,
+                        zero_point_dtype: zp_dtype,
+                        axis: Some(*axis as usize),
+                        bit_width: *bit_width,
+                        group_size: Some(*group_size),
+                        awq_scales,
+                        g_idx: None,
+                    },
+                ),
+            )
+        }
+        TensorManifest::DualScaleDequantize {
+            quantized_data_file,
+            normal_scale_file,
+            normal_zero_file,
+            outlier_scale_file,
+            outlier_zero_file,
+            outlier_mask_file,
+            shape,
+            bit_width,
+            group_size,
+        } => {
+            let quantized_data = read_file(quantized_data_file)?;
+            let normal_scale = read_file(normal_scale_file)?;
+            let normal_zero = read_file(normal_zero_file)?;
+            let outlier_scale = read_file(outlier_scale_file)?;
+            let outlier_zero = read_file(outlier_zero_file)?;
+            let outlier_mask = read_file(outlier_mask_file)?;
+
+            Ok(
+                WeightTensor::owned(Vec::new(), shape.clone(), ScalarType::UInt8).with_quant_info(
+                    QuantizationInfo::DualScaleDequantize {
+                        quantized_data,
+                        normal_scale,
+                        normal_zero,
+                        outlier_scale,
+                        outlier_zero,
+                        outlier_mask,
+                        original_shape: shape.clone(),
+                        bit_width: *bit_width,
+                        group_size: *group_size,
+                    },
+                ),
+            )
+        }
+    }
 }

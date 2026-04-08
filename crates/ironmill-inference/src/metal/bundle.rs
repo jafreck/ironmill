@@ -8,11 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ironmill_core::gpu::bundle::{
-    GpuBundleManifest, TensorManifest, deserialize_model_config, str_to_scalar_type,
+    GpuBundleManifest, deserialize_model_config, read_tensor_from_manifest,
 };
-use ironmill_core::weights::{ModelConfig, QuantizationInfo, WeightProvider, WeightTensor};
+use ironmill_core::weights::{ModelConfig, WeightProvider, WeightTensor};
 use mil_rs::MilError;
-use mil_rs::ir::ScalarType;
 
 use super::error::MetalError;
 
@@ -80,143 +79,7 @@ impl WeightProvider for MetalBundleProvider {
             MilError::UndefinedValue(format!("tensor not found in bundle: {name}"))
         })?;
 
-        match desc {
-            TensorManifest::LutToDense {
-                indices_file,
-                lut_file,
-                norms_file,
-                shape,
-                n_bits,
-                dtype,
-                quip_sharp_seed,
-            } => {
-                let indices = self.read_file(indices_file)?;
-                let lut = self.read_file(lut_file)?;
-                let row_norms = self.read_file(norms_file)?;
-                let dtype =
-                    str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
-
-                Ok(
-                    WeightTensor::owned(Vec::new(), shape.clone(), dtype).with_quant_info(
-                        QuantizationInfo::LutToDense {
-                            lut,
-                            lut_dtype: dtype,
-                            indices,
-                            original_shape: shape.clone(),
-                            n_bits: *n_bits,
-                            row_norms,
-                            norms_dtype: dtype,
-                            polar_quant_seed: None, // Bundle tensors are pre-unrotated
-                            quip_sharp_seed: quip_sharp_seed.map(|s| s as u64),
-                        },
-                    ),
-                )
-            }
-            TensorManifest::Dense { file, shape, dtype } => {
-                let data = self.read_file(file)?;
-                let dtype =
-                    str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
-
-                Ok(WeightTensor::owned(data, shape.clone(), dtype))
-            }
-            TensorManifest::AffineDequantize {
-                quantized_data_file,
-                scales_file,
-                zeros_file,
-                shape,
-                bit_width,
-                group_size,
-                axis,
-                dtype,
-                awq_scales_file,
-                scale_dtype,
-                zero_point_dtype,
-                ..
-            } => {
-                let quantized_data = self.read_file(quantized_data_file)?;
-                let scale = self.read_file(scales_file)?;
-                let zero_point = self.read_file(zeros_file)?;
-                let awq_scales = match awq_scales_file {
-                    Some(f) => Some(self.read_file(f)?),
-                    None => None,
-                };
-                let dtype =
-                    str_to_scalar_type(dtype).map_err(|e| MilError::Validation(e.to_string()))?;
-
-                let s_dtype = scale_dtype
-                    .as_ref()
-                    .map(|s| {
-                        str_to_scalar_type(s)
-                            .map_err(|e| MilError::Validation(format!("invalid scale_dtype: {e}")))
-                    })
-                    .transpose()?
-                    .unwrap_or_else(|| {
-                        eprintln!(
-                            "warning: scale_dtype not specified in bundle, defaulting to Float16"
-                        );
-                        ScalarType::Float16
-                    });
-                let zp_dtype = zero_point_dtype
-                    .as_ref()
-                    .map(|s| str_to_scalar_type(s).map_err(|e| MilError::Validation(
-                        format!("invalid zero_point_dtype: {e}")
-                    )))
-                    .transpose()?
-                    .unwrap_or_else(|| {
-                        eprintln!("warning: zero_point_dtype not specified in bundle, defaulting to Float16");
-                        ScalarType::Float16
-                    });
-
-                Ok(
-                    WeightTensor::owned(quantized_data, shape.clone(), dtype).with_quant_info(
-                        QuantizationInfo::AffineDequantize {
-                            scale,
-                            zero_point,
-                            scale_dtype: s_dtype,
-                            zero_point_dtype: zp_dtype,
-                            axis: Some(*axis as usize),
-                            bit_width: *bit_width,
-                            group_size: Some(*group_size),
-                            awq_scales,
-                            g_idx: None,
-                        },
-                    ),
-                )
-            }
-            TensorManifest::DualScaleDequantize {
-                quantized_data_file,
-                normal_scale_file,
-                normal_zero_file,
-                outlier_scale_file,
-                outlier_zero_file,
-                outlier_mask_file,
-                shape,
-                bit_width,
-                group_size,
-            } => {
-                let quantized_data = self.read_file(quantized_data_file)?;
-                let normal_scale = self.read_file(normal_scale_file)?;
-                let normal_zero = self.read_file(normal_zero_file)?;
-                let outlier_scale = self.read_file(outlier_scale_file)?;
-                let outlier_zero = self.read_file(outlier_zero_file)?;
-                let outlier_mask = self.read_file(outlier_mask_file)?;
-
-                Ok(
-                    WeightTensor::owned(Vec::new(), shape.clone(), ScalarType::UInt8)
-                        .with_quant_info(QuantizationInfo::DualScaleDequantize {
-                            quantized_data,
-                            normal_scale,
-                            normal_zero,
-                            outlier_scale,
-                            outlier_zero,
-                            outlier_mask,
-                            original_shape: shape.clone(),
-                            bit_width: *bit_width,
-                            group_size: *group_size,
-                        }),
-                )
-            }
-        }
+        read_tensor_from_manifest(desc, |path| self.read_file(path))
     }
 
     fn tensor_names(&self) -> Vec<&str> {
