@@ -8,6 +8,7 @@ use super::awq_store::AwqActivationStore;
 use super::dataset::CalibrationDataset;
 use super::gptq_store::GptqActivationStore;
 use super::hook::ActivationHook;
+use crate::engine::InferenceError;
 
 /// Hessian accumulator for QuIP# LDLQ rounding at a single capture point.
 ///
@@ -113,7 +114,7 @@ pub trait CalibratingEngine {
         &mut self,
         tokens: &[u32],
         hooks: &mut dyn ActivationHook,
-    ) -> Result<(), Box<dyn std::error::Error>>;
+    ) -> Result<(), InferenceError>;
 
     /// Reset engine state (KV cache, position) for a new sequence.
     fn reset(&mut self);
@@ -144,7 +145,7 @@ impl CalibrationRunner {
         &self,
         engine: &mut E,
         dataset: &CalibrationDataset,
-    ) -> Result<AwqActivationStore, Box<dyn std::error::Error>> {
+    ) -> Result<AwqActivationStore, InferenceError> {
         let mut store = AwqActivationStore::new();
         self.run_calibration(engine, dataset, &mut store)?;
         Ok(store)
@@ -157,7 +158,7 @@ impl CalibrationRunner {
         &self,
         engine: &mut E,
         dataset: &CalibrationDataset,
-    ) -> Result<GptqActivationStore, Box<dyn std::error::Error>> {
+    ) -> Result<GptqActivationStore, InferenceError> {
         let mut store = GptqActivationStore::new();
         self.run_calibration(engine, dataset, &mut store)?;
         Ok(store)
@@ -171,7 +172,7 @@ impl CalibrationRunner {
         &self,
         engine: &mut E,
         dataset: &CalibrationDataset,
-    ) -> Result<HessianHook, Box<dyn std::error::Error>> {
+    ) -> Result<HessianHook, InferenceError> {
         let mut hook = HessianHook::new();
         self.run_calibration(engine, dataset, &mut hook)?;
         Ok(hook)
@@ -184,7 +185,7 @@ impl CalibrationRunner {
         engine: &mut E,
         dataset: &CalibrationDataset,
         hook: &mut dyn ActivationHook,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), InferenceError> {
         let n_total = match self.max_sequences {
             Some(max) => max.min(dataset.sequences.len()),
             None => dataset.sequences.len(),
@@ -240,7 +241,7 @@ mod tests {
             &mut self,
             tokens: &[u32],
             hooks: &mut dyn ActivationHook,
-        ) -> Result<(), Box<dyn std::error::Error>> {
+        ) -> Result<(), InferenceError> {
             self.call_count += 1;
             let n_tokens = tokens.len();
             let activation: Vec<f16> = vec![f16::from_f32(1.0); n_tokens * self.n_features];
@@ -381,8 +382,8 @@ mod tests {
                 &mut self,
                 _tokens: &[u32],
                 _hooks: &mut dyn ActivationHook,
-            ) -> Result<(), Box<dyn std::error::Error>> {
-                Err("simulated failure".into())
+            ) -> Result<(), InferenceError> {
+                Err(InferenceError::Other(anyhow::anyhow!("simulated failure")))
             }
             fn reset(&mut self) {}
         }

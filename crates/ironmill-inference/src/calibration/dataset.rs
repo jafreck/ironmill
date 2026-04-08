@@ -8,6 +8,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::engine::InferenceError;
+
 /// A pre-tokenized calibration dataset.
 ///
 /// JSON schema (matches `PerplexityDataset`):
@@ -43,9 +45,9 @@ pub struct CalibrationDataset {
 
 impl CalibrationDataset {
     /// Load from a pre-tokenized JSON file (same format as `PerplexityDataset`).
-    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let data = std::fs::read_to_string(path)?;
-        let ds: Self = serde_json::from_str(&data)?;
+    pub fn load(path: &Path) -> Result<Self, InferenceError> {
+        let data = std::fs::read_to_string(path).map_err(|e| InferenceError::Other(e.into()))?;
+        let ds: Self = serde_json::from_str(&data).map_err(|e| InferenceError::Other(e.into()))?;
         ds.validate()?;
         Ok(ds)
     }
@@ -92,31 +94,28 @@ impl CalibrationDataset {
     }
 
     /// Validate internal consistency of the loaded dataset.
-    fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate(&self) -> Result<(), InferenceError> {
         if self.sequences.len() != self.num_sequences {
-            return Err(format!(
+            return Err(InferenceError::Other(anyhow::anyhow!(
                 "num_sequences mismatch: header says {} but found {} sequences",
                 self.num_sequences,
                 self.sequences.len()
-            )
-            .into());
+            )));
         }
         for (i, seq) in self.sequences.iter().enumerate() {
             if seq.len() != self.seq_len {
-                return Err(format!(
+                return Err(InferenceError::Other(anyhow::anyhow!(
                     "sequence {i} has {} tokens, expected {}",
                     seq.len(),
                     self.seq_len
-                )
-                .into());
+                )));
             }
             for &tok in seq {
                 if (tok as usize) >= self.vocab_size {
-                    return Err(format!(
+                    return Err(InferenceError::Other(anyhow::anyhow!(
                         "sequence {i} contains token {tok} >= vocab_size {}",
                         self.vocab_size
-                    )
-                    .into());
+                    )));
                 }
             }
         }

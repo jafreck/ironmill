@@ -278,7 +278,7 @@ impl crate::calibration::CalibratingEngine for MetalInference {
         &mut self,
         tokens: &[u32],
         hooks: &mut dyn ActivationHook,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), InferenceError> {
         self.prefill_with_hooks(tokens, hooks)?;
         Ok(())
     }
