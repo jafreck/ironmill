@@ -543,7 +543,9 @@ fn propagate_output_types(func_inputs: &[(String, TensorType)], block: &mut Bloc
                 }
                 let val = op.inputs.get("val").or_else(|| op.attributes.get("val"));
                 if let Some(Value::Tensor { dtype, data, .. }) = val {
-                    let bytes = data.as_bytes().expect("tensor not materialized");
+                    let Some(bytes) = data.as_bytes() else {
+                        continue;
+                    };
                     if *dtype == ScalarType::Int32 && data.byte_len() % 4 == 0 {
                         let dims: Vec<usize> = bytes
                             .chunks_exact(4)

@@ -181,16 +181,17 @@ impl MixedPrecisionPass {
     }
 
     /// Apply FP16 quantization to a single value (mirrors `fp16_quantize::quantize_value`).
-    fn quantize_value_fp16(value: &mut Value) {
+    fn quantize_value_fp16(value: &mut Value) -> Result<()> {
         match value {
             Value::Tensor {
                 data,
                 shape: _,
                 dtype,
             } if *dtype == ScalarType::Float32 => {
-                *data = mil_rs::ir::TensorData::Inline(fp32_to_fp16_bytes(
-                    data.as_bytes().expect("tensor not materialized"),
-                ));
+                let bytes = data
+                    .as_bytes()
+                    .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?;
+                *data = mil_rs::ir::TensorData::Inline(fp32_to_fp16_bytes(bytes));
                 *dtype = ScalarType::Float16;
             }
             Value::Type(ty) if ty.scalar_type == ScalarType::Float32 => {
@@ -198,11 +199,12 @@ impl MixedPrecisionPass {
             }
             Value::List(items) => {
                 for item in items {
-                    Self::quantize_value_fp16(item);
+                    Self::quantize_value_fp16(item)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 }
 
@@ -221,10 +223,10 @@ impl Pass for MixedPrecisionPass {
                     OpPrecision::Fp16 => {
                         // Apply FP16 quantization to this operation's values.
                         for value in op.inputs.values_mut() {
-                            Self::quantize_value_fp16(value);
+                            Self::quantize_value_fp16(value)?;
                         }
                         for value in op.attributes.values_mut() {
-                            Self::quantize_value_fp16(value);
+                            Self::quantize_value_fp16(value)?;
                         }
                         for tt in op.output_types.iter_mut().flatten() {
                             if tt.scalar_type == ScalarType::Float32 {
@@ -296,9 +298,10 @@ impl Pass for MixedPrecisionPass {
                             dtype: _,
                         } = val
                         {
-                            let floats = tensor_as_f32_slice(
-                                data.as_bytes().expect("tensor not materialized"),
-                            );
+                            let bytes = data.as_bytes().ok_or_else(|| {
+                                MilError::Validation("tensor not materialized".into())
+                            })?;
+                            let floats = tensor_as_f32_slice(bytes);
                             let (quantized, scale, zero_point) = quantize_f32_to_uint8(&floats);
 
                             let quantized_val = Value::Tensor {
@@ -568,14 +571,14 @@ impl PerExpertQuantPass {
     }
 
     /// Apply FP16 quantization to a single value.
-    fn apply_fp16(value: &mut Value) {
-        MixedPrecisionPass::quantize_value_fp16(value);
+    fn apply_fp16(value: &mut Value) -> Result<()> {
+        MixedPrecisionPass::quantize_value_fp16(value)
     }
 
     /// Apply palettization to a const FP32/FP16 tensor op in-place.
-    fn apply_palettize(op: &mut mil_rs::ir::Operation, n_bits: u8) {
+    fn apply_palettize(op: &mut mil_rs::ir::Operation, n_bits: u8) -> Result<()> {
         if op.op_type != "const" {
-            return;
+            return Ok(());
         }
 
         let in_inputs = matches!(
@@ -594,36 +597,42 @@ impl PerExpertQuantPass {
                 })
             );
         if !in_inputs && !in_attrs {
-            return;
+            return Ok(());
         }
 
         let val = if in_inputs {
             match op.inputs.remove("val") {
                 Some(v) => v,
-                None => return,
+                None => return Ok(()),
             }
         } else {
             match op.attributes.remove("val") {
                 Some(v) => v,
-                None => return,
+                None => return Ok(()),
             }
         };
 
         if let Value::Tensor { data, shape, dtype } = val {
             let floats = match dtype {
                 ScalarType::Float32 => {
-                    tensor_as_f32_slice(data.as_bytes().expect("tensor not materialized")).to_vec()
+                    let bytes = data
+                        .as_bytes()
+                        .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?;
+                    tensor_as_f32_slice(bytes).to_vec()
                 }
                 ScalarType::Float16 => {
-                    fp16_bytes_to_f32(data.as_bytes().expect("tensor not materialized"))
+                    let bytes = data
+                        .as_bytes()
+                        .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?;
+                    fp16_bytes_to_f32(bytes)
                 }
-                _ => return,
+                _ => return Ok(()),
             };
 
             let k = 1usize << n_bits;
             let (centroids, assignments) = match kmeans(&floats, k, 100) {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(_) => return Ok(()),
             };
 
             let lut_bytes: Vec<u8> = centroids.iter().flat_map(|c| c.to_le_bytes()).collect();
@@ -669,6 +678,7 @@ impl PerExpertQuantPass {
                 op.output_types.push(Some(out_type));
             }
         }
+        Ok(())
     }
 }
 
@@ -686,10 +696,10 @@ impl Pass for PerExpertQuantPass {
                     ExpertQuantStrategy::None => {}
                     ExpertQuantStrategy::Fp16 => {
                         for value in op.inputs.values_mut() {
-                            Self::apply_fp16(value);
+                            Self::apply_fp16(value)?;
                         }
                         for value in op.attributes.values_mut() {
-                            Self::apply_fp16(value);
+                            Self::apply_fp16(value)?;
                         }
                         for tt in op.output_types.iter_mut().flatten() {
                             if tt.scalar_type == ScalarType::Float32 {
@@ -755,9 +765,10 @@ impl Pass for PerExpertQuantPass {
                             dtype: _,
                         } = val
                         {
-                            let floats = tensor_as_f32_slice(
-                                data.as_bytes().expect("tensor not materialized"),
-                            );
+                            let bytes = data.as_bytes().ok_or_else(|| {
+                                MilError::Validation("tensor not materialized".into())
+                            })?;
+                            let floats = tensor_as_f32_slice(bytes);
                             let (quantized, scale, zero_point) = quantize_f32_to_uint8(&floats);
                             let quantized_val = Value::Tensor {
                                 data: mil_rs::ir::TensorData::Inline(quantized),
@@ -783,10 +794,10 @@ impl Pass for PerExpertQuantPass {
                         }
                     }
                     ExpertQuantStrategy::Palettize4Bit => {
-                        Self::apply_palettize(op, 4);
+                        Self::apply_palettize(op, 4)?;
                     }
                     ExpertQuantStrategy::Palettize2Bit => {
-                        Self::apply_palettize(op, 2);
+                        Self::apply_palettize(op, 2)?;
                     }
                 }
             }

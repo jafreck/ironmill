@@ -659,7 +659,7 @@ fn emit_sub_program_bundle(
 ) -> Result<SubProgramBundle> {
     let mut program = sub.program.clone();
 
-    convert_f32_consts_to_f16(&mut program);
+    convert_f32_consts_to_f16(&mut program)?;
     prune_unreferenced_inputs(&mut program);
 
     AneLayoutPass.run(&mut program)?;

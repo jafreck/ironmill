@@ -50,9 +50,17 @@ pub struct AwqQuantizePass {
 
 impl AwqQuantizePass {
     /// Create a new AWQ pass with default grid search parameters.
-    pub fn new(bits: u8, group_size: usize, channel_magnitudes: HashMap<String, Vec<f32>>) -> Self {
-        assert!(bits == 4 || bits == 8, "AWQ only supports 4-bit or 8-bit");
-        Self {
+    pub fn new(
+        bits: u8,
+        group_size: usize,
+        channel_magnitudes: HashMap<String, Vec<f32>>,
+    ) -> Result<Self> {
+        if bits != 4 && bits != 8 {
+            return Err(MilError::Validation(
+                "AWQ only supports 4-bit or 8-bit".into(),
+            ));
+        }
+        Ok(Self {
             bits,
             group_size,
             channel_magnitudes,
@@ -60,7 +68,7 @@ impl AwqQuantizePass {
             calibration_token_count: 0,
             grid_search_steps: 20,
             salient_percentile: 0.99,
-        }
+        })
     }
 
     /// Set raw calibration activations and token count for exact loss computation.
@@ -1130,7 +1138,7 @@ mod tests {
 
         // --- MinMax baseline ---
         let mut minmax_prog = make_program("weight", &weights, vec![out, inp]);
-        let minmax_pass = AwqQuantizePass::new(4, group_sz, HashMap::new());
+        let minmax_pass = AwqQuantizePass::new(4, group_sz, HashMap::new()).unwrap();
         minmax_pass.run(&mut minmax_prog).unwrap();
         let minmax_wmse = weighted_reconstruction_mse(&original, &minmax_prog, &magnitudes);
 
@@ -1141,6 +1149,7 @@ mod tests {
         awq_cal.insert("weight".to_string(), cal_act);
         let mut awq_prog = make_program("weight", &weights, vec![out, inp]);
         let awq_pass = AwqQuantizePass::new(4, group_sz, awq_mags)
+            .unwrap()
             .with_calibration_activations(awq_cal, n_tokens)
             .with_grid_steps(40);
         awq_pass.run(&mut awq_prog).unwrap();
@@ -1186,6 +1195,7 @@ mod tests {
 
         let mut prog = make_program("w", &weights, vec![out, inp]);
         let pass = AwqQuantizePass::new(4, group_sz, mags)
+            .unwrap()
             .with_calibration_activations(cal, n_tokens)
             .with_grid_steps(20);
         pass.run(&mut prog).unwrap();
@@ -1248,6 +1258,7 @@ mod tests {
 
         let mut prog = make_program("w", &weights, vec![out, inp]);
         let pass = AwqQuantizePass::new(4, group_sz, mags)
+            .unwrap()
             .with_calibration_activations(cal, n_tokens)
             .with_grid_steps(50);
         pass.run(&mut prog).unwrap();
@@ -1255,7 +1266,7 @@ mod tests {
 
         // Compare with plain MinMax (no calibration data).
         let mut plain_prog = make_program("w", &weights, vec![out, inp]);
-        let plain_pass = AwqQuantizePass::new(4, group_sz, HashMap::new());
+        let plain_pass = AwqQuantizePass::new(4, group_sz, HashMap::new()).unwrap();
         plain_pass.run(&mut plain_prog).unwrap();
         let plain_wmse = weighted_reconstruction_mse(&original, &plain_prog, &magnitudes);
 
@@ -1279,7 +1290,7 @@ mod tests {
         let mut prog = make_program("weight", &values, vec![out, inp]);
 
         // Empty magnitudes → no calibration data.
-        let pass = AwqQuantizePass::new(4, inp, HashMap::new());
+        let pass = AwqQuantizePass::new(4, inp, HashMap::new()).unwrap();
         pass.run(&mut prog).unwrap();
 
         let op = &prog.functions["main"].body.operations[0];
@@ -1315,7 +1326,9 @@ mod tests {
         cal.insert("w".to_string(), cal_act);
 
         let mut prog = make_program("w", &weights, vec![out, inp]);
-        let pass = AwqQuantizePass::new(8, inp, mags).with_calibration_activations(cal, n_tokens);
+        let pass = AwqQuantizePass::new(8, inp, mags)
+            .unwrap()
+            .with_calibration_activations(cal, n_tokens);
         pass.run(&mut prog).unwrap();
 
         let op = &prog.functions["main"].body.operations[0];
@@ -1344,7 +1357,7 @@ mod tests {
         let mut mags = HashMap::new();
         mags.insert("bias".to_string(), vec![5.0; 2048]);
 
-        let pass = AwqQuantizePass::new(4, 128, mags);
+        let pass = AwqQuantizePass::new(4, 128, mags).unwrap();
         pass.run(&mut prog).unwrap();
 
         // 1-D tensors (rank < 2) are skipped — op stays "const".

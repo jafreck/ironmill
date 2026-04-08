@@ -628,13 +628,14 @@ fn to_ane_weight_shape(shape: &[usize]) -> Vec<usize> {
 /// Used for inline tensor literals in op arguments (e.g., reshape shape).
 fn format_tensor_elements(data: &[u8], dtype: ScalarType) -> Result<String> {
     let elem_size = dtype.byte_size();
-    debug_assert!(
-        elem_size <= 1 || data.len() % elem_size == 0,
-        "data length {} is not divisible by dtype size {} for {:?}",
-        data.len(),
-        elem_size,
-        dtype,
-    );
+    if elem_size > 1 && data.len() % elem_size != 0 {
+        return Err(MilError::Validation(format!(
+            "data length {} is not divisible by dtype size {} for {:?}",
+            data.len(),
+            elem_size,
+            dtype,
+        )));
+    }
 
     let s = match dtype {
         ScalarType::Int32 => data

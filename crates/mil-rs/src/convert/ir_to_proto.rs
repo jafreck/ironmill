@@ -1590,7 +1590,7 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         ScalarType::Float32 => {
             let floats: Vec<f32> = data
                 .as_bytes()
-                .expect("tensor not materialized")
+                .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?
                 .chunks_exact(4)
                 .map(|c| -> Result<f32> {
                     let bytes: [u8; 4] = c.try_into().map_err(|_| {
@@ -1606,7 +1606,7 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         ScalarType::Float64 => {
             let doubles: Vec<f64> = data
                 .as_bytes()
-                .expect("tensor not materialized")
+                .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?
                 .chunks_exact(8)
                 .map(|c| -> Result<f64> {
                     let bytes: [u8; 8] = c.try_into().map_err(|_| {
@@ -1622,7 +1622,7 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         ScalarType::Int32 => {
             let ints: Vec<i32> = data
                 .as_bytes()
-                .expect("tensor not materialized")
+                .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?
                 .chunks_exact(4)
                 .map(|c| -> Result<i32> {
                     let bytes: [u8; 4] = c.try_into().map_err(|_| {
@@ -1638,7 +1638,7 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         ScalarType::Int64 | ScalarType::UInt64 => {
             let longs: Vec<i64> = data
                 .as_bytes()
-                .expect("tensor not materialized")
+                .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?
                 .chunks_exact(8)
                 .map(|c| -> Result<i64> {
                     let bytes: [u8; 8] = c.try_into().map_err(|_| {
@@ -1654,7 +1654,7 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         ScalarType::Bool => {
             let bools: Vec<bool> = data
                 .as_bytes()
-                .expect("tensor not materialized")
+                .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?
                 .iter()
                 .map(|&b| b != 0)
                 .collect();
@@ -1665,7 +1665,10 @@ fn convert_tensor_data(value: &Value) -> Result<mil_spec::TensorValue> {
         // For types without a dedicated repeated field (fp16, int8, etc.)
         // fall back to raw bytes.
         _ => mil_spec::tensor_value::Value::Bytes(mil_spec::tensor_value::RepeatedBytes {
-            values: data.as_bytes().expect("tensor not materialized").to_vec(),
+            values: data
+                .as_bytes()
+                .ok_or_else(|| MilError::Validation("tensor not materialized".into()))?
+                .to_vec(),
         }),
     };
 

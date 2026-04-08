@@ -645,7 +645,7 @@ impl PassPipeline {
         self.passes.insert(
             insert_pos,
             Box::new(
-                AwqQuantizePass::new(4, group_size, channel_magnitudes)
+                AwqQuantizePass::new(4, group_size, channel_magnitudes)?
                     .with_calibration_activations(calibration_activations, calibration_token_count),
             ),
         );

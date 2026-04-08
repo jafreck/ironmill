@@ -52,11 +52,7 @@ pub type RopeCacheData = (Vec<f16>, Vec<f16>, usize);
 /// Returns `(cos_values, sin_values, values_per_position)` where each
 /// value array is flat `[num_positions * values_per_position]` in fp16.
 ///
-/// # Panics
-///
-/// Panics if any tensor data is `TensorData::External` (not materialized).
-/// Callers must ensure all tensors are materialized (e.g. via
-/// `program.materialize_all()` in `compile_decode_bundle`).
+/// Skips tensors whose data is not materialized.
 pub fn extract_rope_caches(program: &Program) -> Option<RopeCacheData> {
     let func = program.main()?;
 
@@ -66,15 +62,10 @@ pub fn extract_rope_caches(program: &Program) -> Option<RopeCacheData> {
         if op.op_type == "const" {
             let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
             if let Some(Value::Tensor { data, shape, dtype }) = tensor {
-                for out in &op.outputs {
-                    const_map.insert(
-                        out.as_str(),
-                        (
-                            data.as_bytes().expect("tensor not materialized"),
-                            shape.as_slice(),
-                            *dtype,
-                        ),
-                    );
+                if let Some(bytes) = data.as_bytes() {
+                    for out in &op.outputs {
+                        const_map.insert(out.as_str(), (bytes, shape.as_slice(), *dtype));
+                    }
                 }
             }
         }
@@ -152,9 +143,7 @@ pub fn precompute_rope_cache(head_dim: usize, max_pos: usize, theta: f32) -> Rop
 /// Returns `Some(Vec<(q_norm, k_norm)>)` indexed by layer, or `None`
 /// if the model doesn't use QK normalization.
 ///
-/// # Panics
-///
-/// Panics if any tensor data is `TensorData::External` (not materialized).
+/// Skips tensors whose data is not materialized or has unsupported dtype.
 pub fn extract_qk_norm_weights(program: &Program) -> Option<Vec<(Vec<f16>, Vec<f16>)>> {
     let func = program.main()?;
 
@@ -180,9 +169,12 @@ pub fn extract_qk_norm_weights(program: &Program) -> Option<Vec<(Vec<f16>, Vec<f
         let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
         if let Some(Value::Tensor { data, shape, dtype }) = tensor {
             if shape.len() == 1 {
-                let data = data.as_bytes().expect("tensor not materialized");
-                let values = bytes_to_f16(data, *dtype)
-                    .expect("unsupported tensor dtype for qk norm weights");
+                let Some(data) = data.as_bytes() else {
+                    continue;
+                };
+                let Some(values) = bytes_to_f16(data, *dtype) else {
+                    continue;
+                };
                 if is_q_norm {
                     q_norms.insert(layer_idx, values);
                 } else {
@@ -564,11 +556,7 @@ pub struct CpuWeight {
 ///
 /// Walks the sub-program's ops looking for `const` ops with tensor values.
 /// Returns the largest one (embedding table or lm_head weight), converted
-/// to fp16 if needed.
-///
-/// # Panics
-///
-/// Panics if any tensor data is `TensorData::External` (not materialized).
+/// to fp16 if needed. Skips tensors whose data is not materialized.
 pub fn extract_cpu_weight(sub: &SubProgram, _label: &str) -> Option<CpuWeight> {
     let func = sub.program.main()?;
     let mut best: Option<(usize, Vec<u8>, [usize; 2], ScalarType)> = None;
@@ -578,40 +566,39 @@ pub fn extract_cpu_weight(sub: &SubProgram, _label: &str) -> Option<CpuWeight> {
             let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
             if let Some(Value::Tensor { data, shape, dtype }) = tensor {
                 if shape.len() >= 2 && data.byte_len() > best.as_ref().map_or(0, |b| b.0) {
-                    best = Some((
-                        data.byte_len(),
-                        data.as_bytes().expect("tensor not materialized").to_vec(),
-                        [shape[0], shape[1]],
-                        *dtype,
-                    ));
+                    if let Some(bytes) = data.as_bytes() {
+                        best = Some((
+                            data.byte_len(),
+                            bytes.to_vec(),
+                            [shape[0], shape[1]],
+                            *dtype,
+                        ));
+                    }
                 }
             }
         }
     }
 
-    best.map(|(_, data, shape, dtype)| {
+    best.and_then(|(_, data, shape, dtype)| {
         let fp16_data = if dtype == ScalarType::Float32 {
-            bytes_to_f16(&data, dtype)
-                .unwrap()
+            bytes_to_f16(&data, dtype)?
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect()
         } else {
             data
         };
-        CpuWeight {
+        Some(CpuWeight {
             data: fp16_data,
             shape,
-        }
+        })
     })
 }
 
 /// Extract a 1D weight (e.g., RMSNorm gamma) from a sub-program.
 /// Finds the smallest 1D const tensor whose name contains `hint`.
 ///
-/// # Panics
-///
-/// Panics if any tensor data is `TensorData::External` (not materialized).
+/// Skips tensors whose data is not materialized or has unsupported dtype.
 pub fn extract_1d_weight(sub: &SubProgram, hint: &str) -> Option<Vec<f16>> {
     let func = sub.program.main()?;
 
@@ -626,8 +613,12 @@ pub fn extract_1d_weight(sub: &SubProgram, hint: &str) -> Option<Vec<f16>> {
         let tensor = op.inputs.get("val").or_else(|| op.attributes.get("val"));
         if let Some(Value::Tensor { data, shape, dtype }) = tensor {
             if shape.len() == 1 {
-                let data = data.as_bytes().expect("tensor not materialized");
-                let values = bytes_to_f16(data, *dtype).expect("unsupported tensor dtype");
+                let Some(data) = data.as_bytes() else {
+                    continue;
+                };
+                let Some(values) = bytes_to_f16(data, *dtype) else {
+                    continue;
+                };
                 return Some(values);
             }
         }
@@ -638,10 +629,8 @@ pub fn extract_1d_weight(sub: &SubProgram, hint: &str) -> Option<Vec<f16>> {
 /// Convert Float32 const ops to Float16, materialize dynamic shapes,
 /// and decompose unsupported ops for ANE compatibility.
 ///
-/// # Panics
-///
-/// Panics if any tensor data is `TensorData::External` (not materialized).
-pub fn convert_f32_consts_to_f16(program: &mut Program) {
+/// Returns an error if any Float32 tensor data is not materialized.
+pub fn convert_f32_consts_to_f16(program: &mut Program) -> crate::error::Result<()> {
     for func in program.functions.values_mut() {
         // First pass: decompose unsupported ops.
         let mut new_ops = Vec::with_capacity(func.body.operations.len());
@@ -676,9 +665,12 @@ pub fn convert_f32_consts_to_f16(program: &mut Program) {
                 } = val
                 {
                     if *dtype == ScalarType::Float32 {
-                        let f32_values: Vec<f32> = data
-                            .as_bytes()
-                            .expect("tensor not materialized")
+                        let bytes = data.as_bytes().ok_or_else(|| {
+                            crate::error::CompileError::WeightLoadError(
+                                "tensor not materialized".into(),
+                            )
+                        })?;
+                        let f32_values: Vec<f32> = bytes
                             .chunks_exact(4)
                             .map(|b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                             .collect();
@@ -713,6 +705,7 @@ pub fn convert_f32_consts_to_f16(program: &mut Program) {
             }
         }
     }
+    Ok(())
 }
 
 /// Pad the S dimension (dim 3) to at least `min_seq` across function
