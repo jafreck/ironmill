@@ -1086,16 +1086,6 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
             QuantMethod::AffineInt4(config) => {
                 // Check if this is a sensitive layer → use INT8 instead of INT4.
                 if !config.sensitive_layers.is_empty() {
-                    // Embedding and lm_head tensors get INT8 when sensitive layers are configured.
-                    let is_embedding = name.contains("embed_tokens") || name.contains("embedding");
-                    let is_lm_head = name.contains("lm_head");
-                    if is_embedding || is_lm_head {
-                        let (packed_data, quant_info) =
-                            quantize_tensor_int8(&floats, &t.shape, config.group_size);
-                        return Ok(WeightTensor::owned(packed_data, t.shape, ScalarType::UInt8)
-                            .with_quant_info(quant_info));
-                    }
-
                     if let Some(layer_idx) = extract_layer_index(name) {
                         if config.sensitive_layers.contains(&layer_idx) {
                             let (packed_data, quant_info) =
