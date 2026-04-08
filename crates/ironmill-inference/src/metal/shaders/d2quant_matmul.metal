@@ -310,3 +310,138 @@ kernel void d2quant_embedding_lookup_3bit(
 
     output[tok * K + col] = half((q - z) * s);
 }
+
+
+// ============================================================================
+// AMX-accelerated D2Quant 3-bit matvec (decode path, M=1)
+//
+// Two-phase approach per K-tile:
+//   Phase 1: All 256 threads cooperatively dequant a [64 x TILE_K] 3-bit tile
+//            into FP16 threadgroup memory using dual-scale + outlier mask.
+//   Phase 2: Each of 8 simdgroups uses simdgroup_matrix_multiply_accumulate
+//            (Apple AMX hardware) on its 8-row slice.
+//
+// Uses D2Q_AMX_TILE_K=64 to keep threadgroup memory reasonable (D2Quant
+// dequant is more memory-intensive than INT4 due to dual-scale params).
+//
+// Same buffer layout as d2quant_matvec_3bit for drop-in replacement.
+// Dispatch: (ceil(N/64), 1, 1) threadgroups, (256, 1, 1) threads.
+// ============================================================================
+
+constant constexpr uint D2Q_AMX_ROWS_PER_TG = 64;
+constant constexpr uint D2Q_AMX_ROWS_PER_SG = 8;
+constant constexpr uint D2Q_AMX_SIMDGROUPS  = 8;
+constant constexpr uint D2Q_AMX_TILE_K      = 64;
+constant constexpr uint D2Q_AMX_TG_SIZE     = 256;
+
+kernel void d2quant_matvec_3bit_amx(
+    device const half *A              [[buffer(0)]],   // [1, K]
+    device const uchar *B_packed      [[buffer(1)]],   // [N, ceil(K/8)*3] row-major
+    device const float *normal_scale  [[buffer(2)]],   // [N, num_groups]
+    device const float *normal_zero   [[buffer(3)]],   // [N, num_groups]
+    device const float *outlier_scale [[buffer(4)]],   // [N, num_groups]
+    device const float *outlier_zero  [[buffer(5)]],   // [N, num_groups]
+    device const uchar *outlier_mask  [[buffer(6)]],   // [N, ceil(K/8)]
+    device half *C                    [[buffer(7)]],   // [1, N]
+    constant uint &N                  [[buffer(8)]],
+    constant uint &K                  [[buffer(9)]],
+    constant uint &group_size         [[buffer(10)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint sgid   [[simdgroup_index_in_threadgroup]],
+    uint lane   [[thread_index_in_simdgroup]])
+{
+    uint row_base = tgid * D2Q_AMX_ROWS_PER_TG;
+    if (row_base >= N) return;
+
+    uint rows_this_tg = min(D2Q_AMX_ROWS_PER_TG, N - row_base);
+    uint num_groups = (K + group_size - 1) / group_size;
+    uint bytes_per_row = ((K + 7) / 8) * 3;
+    uint mask_bytes_per_row = (K + 7) / 8;
+
+    threadgroup half tg_w[D2Q_AMX_ROWS_PER_TG * D2Q_AMX_TILE_K]; // 8 KB
+    threadgroup half tg_x[D2Q_AMX_TILE_K];                        // 128 B
+
+    simdgroup_matrix<float, 8, 8> acc_mat(0);
+
+    for (uint kt = 0; kt < K; kt += D2Q_AMX_TILE_K) {
+        uint tile_k = min(D2Q_AMX_TILE_K, K - kt);
+
+        // -- Phase 1a: Load x into threadgroup memory (no AWQ for D2Quant) --
+        for (uint i = tid; i < tile_k; i += D2Q_AMX_TG_SIZE) {
+            tg_x[i] = A[kt + i];
+        }
+
+        // -- Phase 1b: Cooperative 3-bit dequant with dual-scale --
+        uint total_elems = rows_this_tg * tile_k;
+        for (uint i = tid; i < total_elems; i += D2Q_AMX_TG_SIZE) {
+            uint n_local = i / tile_k;
+            uint k_elem  = i % tile_k;
+            uint k_abs   = kt + k_elem;
+            uint n_abs   = row_base + n_local;
+
+            // 3-bit unpack: 8 values → 3 bytes
+            uint group_of_8 = k_abs / 8;
+            uint offset = k_abs % 8;
+            uint byte_off = n_abs * bytes_per_row + group_of_8 * 3;
+            uint bits = uint(B_packed[byte_off])
+                      | (uint(B_packed[byte_off + 1]) << 8)
+                      | (uint(B_packed[byte_off + 2]) << 16);
+            float q = float((bits >> (offset * 3)) & 0x07);
+
+            // Dual-scale dequant with outlier mask
+            bool is_outlier = (outlier_mask[n_abs * mask_bytes_per_row + k_abs / 8] >> (k_abs % 8)) & 1;
+            uint grp = k_abs / group_size;
+            uint param_idx = n_abs * num_groups + grp;
+            float s = is_outlier ? outlier_scale[param_idx] : normal_scale[param_idx];
+            float z = is_outlier ? outlier_zero[param_idx]  : normal_zero[param_idx];
+
+            tg_w[n_local * D2Q_AMX_TILE_K + k_elem] = half((q - z) * s);
+        }
+        if (tile_k < D2Q_AMX_TILE_K) {
+            for (uint i = tid; i < rows_this_tg; i += D2Q_AMX_TG_SIZE) {
+                for (uint j = tile_k; j < D2Q_AMX_TILE_K; j++) {
+                    tg_w[i * D2Q_AMX_TILE_K + j] = 0;
+                }
+            }
+            for (uint i = tile_k + tid; i < D2Q_AMX_TILE_K; i += D2Q_AMX_TG_SIZE) {
+                tg_x[i] = 0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // -- Phase 2: simdgroup matrix multiply (AMX) --
+        uint sg_row = sgid * D2Q_AMX_ROWS_PER_SG;
+        if (sg_row < rows_this_tg) {
+            uint n_k_tiles = (tile_k + 7) / 8;
+            for (uint kb = 0; kb < n_k_tiles; kb++) {
+                simdgroup_matrix<half, 8, 8> w_T;
+                simdgroup_load(w_T, tg_w + sg_row * D2Q_AMX_TILE_K + kb * 8,
+                               D2Q_AMX_TILE_K, ulong2(0, 0), true);
+
+                simdgroup_matrix<half, 8, 8> x_mat;
+                simdgroup_load(x_mat, tg_x + kb * 8, 0);
+
+                simdgroup_multiply_accumulate(acc_mat, x_mat, w_T, acc_mat);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // -- Extract and store results --
+    uint sg_row = sgid * D2Q_AMX_ROWS_PER_SG;
+    if (sg_row >= rows_this_tg) return;
+
+    threadgroup float tg_result[D2Q_AMX_SIMDGROUPS * 64];
+    simdgroup_store(acc_mat, tg_result + sgid * 64, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        for (uint r = 0; r < D2Q_AMX_ROWS_PER_SG; r++) {
+            uint n_row = row_base + sg_row + r;
+            if (n_row < N) {
+                C[n_row] = half(tg_result[sgid * 64 + r]);
+            }
+        }
+    }
+}

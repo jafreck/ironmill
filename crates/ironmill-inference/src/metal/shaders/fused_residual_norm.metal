@@ -252,6 +252,12 @@ kernel void fused_residual_norm_matvec(
 // Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads.
 // ============================================================================
 
+// ============================================================================
+// TODO: This kernel remains at 32 threads/TG (scalar, 1 row per TG).
+// It is a candidate for future AMX optimization, but the residual+norm
+// computation must happen before the matvec can use normed input, making
+// the 64-row AMX pattern less straightforward (each row needs its own rms_inv).
+
 constant constexpr uint FRN_BLK_N = 64;
 constant constexpr uint FRN_BLK_K = 8;
 
