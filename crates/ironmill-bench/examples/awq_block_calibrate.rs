@@ -18,14 +18,12 @@ use serde_json;
 
 use ironmill_compile::weights::calibration::{
     ATTN_PROJS, AwqTensorConfig, FFN_PROJS, compute_awq_scales, compute_channel_magnitudes,
-    f16_slice_to_bytes, mse_f16_bytes, quantize_dequant_scaled, search_clip_ranges, weight_groups,
+    quantize_dequant_scaled, search_clip_ranges, weight_groups,
 };
 use ironmill_compile::weights::{SafeTensorsProvider, WeightProvider};
 use ironmill_inference::calibration::{ActivationHook, CalibrationDataset};
 use ironmill_inference::engine::InferenceEngine;
-use ironmill_inference::metal::{
-    GpuCalibrationEngine, MetalConfig, MetalInference, update_weight_buffer_f16,
-};
+use ironmill_inference::metal::{MetalConfig, MetalInference};
 use mil_rs::ir::ScalarType;
 
 // ── Custom hook: captures per-layer activation data ────────────
@@ -39,15 +37,14 @@ struct BlockCalibrationHook {
     /// Per-layer raw activations from the LAST sequence only, for clip search.
     attn_norm_acts_last: HashMap<usize, Vec<f32>>,
     ffn_norm_acts_last: HashMap<usize, Vec<f32>>,
-    /// Per-layer block output hidden states (FP16 bytes) from the LAST sequence,
-    /// used as MSE reference for the block-level alpha search.
-    block_outputs: HashMap<usize, Vec<u8>>,
 }
 
-/// Running mean accumulator for per-channel |activation| magnitudes.
+/// Running accumulator for per-channel activation statistics.
 struct ChannelMagAccum {
-    /// Running mean of |x| per channel.
+    /// Running mean of |x| per channel (for AWQ scale computation).
     mean_abs: Vec<f32>,
+    /// Running sum of x² per channel (for activation-weighted reconstruction loss).
+    sum_sq: Vec<f32>,
     /// Total tokens accumulated so far.
     sample_count: usize,
 }
@@ -56,6 +53,7 @@ impl ChannelMagAccum {
     fn new(n_features: usize) -> Self {
         Self {
             mean_abs: vec![0.0; n_features],
+            sum_sq: vec![0.0; n_features],
             sample_count: 0,
         }
     }
@@ -66,19 +64,19 @@ impl ChannelMagAccum {
         if n_tokens == 0 {
             return;
         }
-        // Compute per-channel sum of |x| for this batch.
-        let mut batch_sum = vec![0.0_f32; n_features];
+        let mut batch_abs_sum = vec![0.0_f32; n_features];
         for t in 0..n_tokens {
             let row = &data[t * n_features..(t + 1) * n_features];
             for (c, &val) in row.iter().enumerate() {
-                batch_sum[c] += val.abs();
+                batch_abs_sum[c] += val.abs();
+                self.sum_sq[c] += val * val;
             }
         }
-        // Weighted running mean update.
+        // Weighted running mean update for mean_abs.
         let old_count = self.sample_count as f32;
         let new_count = (self.sample_count + n_tokens) as f32;
         for c in 0..n_features {
-            self.mean_abs[c] = (self.mean_abs[c] * old_count + batch_sum[c]) / new_count;
+            self.mean_abs[c] = (self.mean_abs[c] * old_count + batch_abs_sum[c]) / new_count;
         }
         self.sample_count += n_tokens;
     }
@@ -91,7 +89,6 @@ impl BlockCalibrationHook {
             ffn_norm_mags: HashMap::new(),
             attn_norm_acts_last: HashMap::new(),
             ffn_norm_acts_last: HashMap::new(),
-            block_outputs: HashMap::new(),
         }
     }
 }
@@ -115,10 +112,6 @@ impl ActivationHook for BlockCalibrationHook {
                     .or_insert_with(|| ChannelMagAccum::new(n_features))
                     .accumulate(&f32_data, n_features);
                 self.ffn_norm_acts_last.insert(layer, f32_data);
-            }
-            "block_output" => {
-                let bytes = f16_slice_to_bytes(activation);
-                self.block_outputs.insert(layer, bytes);
             }
             _ => {}
         }
@@ -246,19 +239,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|a| a.len() / hidden_size)
         .unwrap_or(0);
     eprintln!(
-        "Phase 1 complete in {:.1}s — captured {} layers, {} total tokens/layer ({} in last seq)",
+        "Phase 1 complete in {:.1}s — {} layers, {} total tokens/layer ({} in last seq)",
         phase1_start.elapsed().as_secs_f64(),
-        hook.block_outputs.len(),
+        hook.attn_norm_mags.len().max(hook.ffn_norm_mags.len()),
         n_tokens,
         n_tokens_last_seq,
     );
 
-    // ── Phase 2: Block-level alpha search ─────────────────────
-    eprintln!("\n=== Phase 2: Block-level alpha search (coarse→fine) ===");
+    // ── Phase 2: Activation-weighted alpha search (CPU) ───────
+    eprintln!("\n=== Phase 2: Activation-weighted alpha search (reference AWQ) ===");
     let phase2_start = Instant::now();
 
-    // Coarse→fine: 6 coarse candidates, then ±0.1 fine around best (step 0.02).
-    let coarse_alphas: Vec<f32> = (0..=5).map(|i| i as f32 * 0.2).collect();
     let groups = weight_groups();
 
     let mut block_config: HashMap<String, AwqTensorConfig> = HashMap::new();
@@ -290,55 +281,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Reset engine once before the alpha search loop.
-    InferenceEngine::reset(&mut engine);
-
-    // Layers 1..N: full block-level alpha search
+    // Layers 1..N: activation-weighted alpha search (CPU, per reference AWQ)
     for layer_idx in 1..n_layers {
         let layer_start = Instant::now();
         let gdn = is_gdn_layer(&provider, layer_idx);
-
-        // Block input = block_output[layer_idx - 1]
-        let block_input = match hook.block_outputs.get(&(layer_idx - 1)) {
-            Some(inp) => inp,
-            None => {
-                eprintln!("[layer {layer_idx}] WARNING: no block input, using fallback alpha=0.5");
-                for proj in ATTN_PROJS.iter().chain(FFN_PROJS.iter()) {
-                    let key = format!("l{layer_idx}_{proj}_weight");
-                    block_config.insert(
-                        key,
-                        AwqTensorConfig {
-                            alpha: 0.5,
-                            clip_maxvals: None,
-                        },
-                    );
-                }
-                continue;
-            }
-        };
-
-        // Reference block output
-        let ref_output = match hook.block_outputs.get(&layer_idx) {
-            Some(out) => out,
-            None => {
-                eprintln!(
-                    "[layer {layer_idx}] WARNING: no reference output, using fallback alpha=0.5"
-                );
-                for proj in ATTN_PROJS.iter().chain(FFN_PROJS.iter()) {
-                    let key = format!("l{layer_idx}_{proj}_weight");
-                    block_config.insert(
-                        key,
-                        AwqTensorConfig {
-                            alpha: 0.5,
-                            clip_maxvals: None,
-                        },
-                    );
-                }
-                continue;
-            }
-        };
-
-        let token_count = block_input.len() / (hidden_size * 2);
 
         // Use accumulated magnitudes (running mean across all sequences)
         let attn_mags = hook
@@ -376,6 +322,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &ffn_mags
             };
 
+            // Get the per-channel activation power Σ_t X[t,c]² for this group's norm.
+            let act_sq = if group.norm_key == "attn" {
+                hook.attn_norm_mags
+                    .get(&layer_idx)
+                    .map(|a| a.sum_sq.clone())
+            } else {
+                hook.ffn_norm_mags.get(&layer_idx).map(|a| a.sum_sq.clone())
+            };
+
             // Load weights for all projections in this group and cache them.
             let mut proj_weights: Vec<(&str, Vec<f32>, [usize; 2])> = Vec::new();
             for &proj in &group.proj_names {
@@ -399,95 +354,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mags.clone()
             };
 
-            // Pre-allocate reusable GPU scratch buffers (one per projection).
-            let mut scratch_bufs: Vec<_> = proj_weights
-                .iter()
-                .map(|&(_, _, [out_f, in_f])| engine.create_dense_f16_buffer_sized(out_f, in_f))
-                .collect::<Result<Vec<_>, _>>()?;
+            // Per-channel activation power for the reconstruction loss.
+            // Fall back to uniform if not available or wrong dimension.
+            let effective_act_sq = match act_sq {
+                Some(ref sq) if sq.len() == in_features_for_scales => sq.clone(),
+                _ => vec![1.0_f32; in_features_for_scales],
+            };
 
-            // Helper: evaluate a single alpha candidate.
-            let eval_alpha =
-                |engine: &mut MetalInference,
-                 scratch_bufs: &mut [ironmill_inference::metal::weights::WeightBuffer],
-                 alpha: f32|
-                 -> Result<f64, Box<dyn std::error::Error>> {
-                    let scales = compute_awq_scales(&effective_mags, alpha);
-                    let mut swap_handles: Vec<(
-                        &str,
-                        Option<ironmill_inference::metal::weights::WeightBuffer>,
-                    )> = Vec::new();
+            // CPU activation-weighted reconstruction loss, matching reference AWQ:
+            //   loss = Σ_proj Σ_row Σ_c (W_dq[r,c] - W[r,c])² · act_sq[c]
+            //
+            // This evaluates weight quality directly using activation importance,
+            // rather than running a GPU block forward. The reference AWQ uses the
+            // same objective for single-linear groups (o_proj, down_proj) and a
+            // submodule forward for multi-linear groups — the activation-weighted
+            // reconstruction is a close approximation for both.
+            let eval_alpha = |alpha: f32| -> f64 {
+                let scales = compute_awq_scales(&effective_mags, alpha);
+                let mut total_loss = 0.0_f64;
 
-                    for (i, &(proj, ref w, [out_f, in_f])) in proj_weights.iter().enumerate() {
-                        if scales.len() != in_f {
-                            return Ok(f64::INFINITY);
-                        }
-                        let dq = quantize_dequant_scaled(w, out_f, in_f, &scales, group_size);
-                        update_weight_buffer_f16(&scratch_bufs[i], &dq, out_f, in_f)?;
-                        let scratch = std::mem::replace(
-                            &mut scratch_bufs[i],
-                            ironmill_inference::metal::weights::WeightBuffer::empty(),
-                        );
-                        let original = engine.swap_layer_weight(layer_idx, proj, scratch);
-                        swap_handles.push((proj, original));
+                for &(_, ref w, [out_f, in_f]) in &proj_weights {
+                    if scales.len() != in_f {
+                        return f64::INFINITY;
                     }
+                    let dq = quantize_dequant_scaled(w, out_f, in_f, &scales, group_size);
 
-                    let loss = match engine.run_single_layer(layer_idx, block_input, token_count) {
-                        Ok(output) => mse_f16_bytes(&output, ref_output),
-                        Err(e) => {
-                            eprintln!("[layer {layer_idx}] run_single_layer error: {e}");
-                            f64::INFINITY
-                        }
-                    };
-
-                    // Restore original weights, recovering scratch buffers.
-                    for (i, (proj, original)) in swap_handles.into_iter().enumerate().rev() {
-                        if let Some(orig) = original {
-                            let returned = engine.swap_layer_weight(layer_idx, proj, orig);
-                            if let Some(buf) = returned {
-                                scratch_bufs[i] = buf;
-                            }
+                    // Activation-weighted per-column MSE.
+                    for row in 0..out_f {
+                        for c in 0..in_f {
+                            let idx = row * in_f + c;
+                            let err = dq[idx] - w[idx];
+                            total_loss += (err * err * effective_act_sq[c]) as f64;
                         }
                     }
+                }
 
-                    Ok(loss)
-                };
+                total_loss
+            };
 
-            // ── Coarse pass ──
+            // ── Coarse pass (matching reference grid: 20 steps over 0..1) ──
+            let n_grid = 20_usize;
             let mut best_alpha = 0.5_f32;
             let mut best_loss = f64::INFINITY;
 
-            for &alpha in &coarse_alphas {
-                let loss = eval_alpha(&mut engine, &mut scratch_bufs, alpha)?;
+            for step in 0..n_grid {
+                let alpha = step as f32 / n_grid as f32;
+                let loss = eval_alpha(alpha);
                 if loss < best_loss {
                     best_loss = loss;
                     best_alpha = alpha;
                 }
-            }
-
-            // ── Fine pass ── ±0.1 around best, step 0.02.
-            // Early termination: stop if no improvement for 3 consecutive evals.
-            let fine_lo = (best_alpha - 0.1).max(0.0);
-            let fine_hi = (best_alpha + 0.1).min(1.0);
-            let mut fine_alpha = fine_lo;
-            let mut no_improve_count = 0_u32;
-            while fine_alpha <= fine_hi + 1e-6 {
-                let already_tested = coarse_alphas
-                    .iter()
-                    .any(|&c| (c - fine_alpha).abs() < 0.005);
-                if !already_tested {
-                    let loss = eval_alpha(&mut engine, &mut scratch_bufs, fine_alpha)?;
-                    if loss < best_loss {
-                        best_loss = loss;
-                        best_alpha = fine_alpha;
-                        no_improve_count = 0;
-                    } else {
-                        no_improve_count += 1;
-                        if no_improve_count >= 3 {
-                            break;
-                        }
-                    }
-                }
-                fine_alpha += 0.02;
             }
 
             for &proj in &group.proj_names {
