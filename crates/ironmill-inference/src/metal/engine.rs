@@ -89,8 +89,25 @@ pub struct MetalInference {
     /// Each buffer is `[hidden_size]` FP16. Added to post-attention LayerNorm
     /// output to compensate for quantization-induced mean shift.
     pub(crate) dac_biases: Option<Vec<MetalBuffer>>,
+    /// Reusable staging buffers for [`GpuCalibrationEngine::run_single_layer`].
+    /// Lazily allocated on first calibration call to avoid polluting the
+    /// default engine construction path.
+    pub(crate) calib_scratch: Option<CalibScratchBuffers>,
     /// Recommended total threadgroups to saturate this GPU (cached at init).
     pub(crate) gpu_max_threadgroups: usize,
+}
+
+/// Reusable Shared-mode buffers for `run_single_layer` staging.
+///
+/// Avoids allocating two new Metal buffers per GPU forward during
+/// calibration alpha search (~1000+ calls per model).
+pub(crate) struct CalibScratchBuffers {
+    /// Shared-mode buffer for uploading input hidden state to the GPU.
+    pub staging_in: MetalBuffer,
+    /// Shared-mode buffer for reading back output hidden state.
+    pub readback: MetalBuffer,
+    /// Capacity in bytes of each buffer.
+    pub capacity: usize,
 }
 
 impl MetalInference {
@@ -139,6 +156,7 @@ impl MetalInference {
             layer_plans: Vec::new(),
             model_plan: None,
             dac_biases: None,
+            calib_scratch: None,
             gpu_max_threadgroups,
         })
     }

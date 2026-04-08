@@ -344,6 +344,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mags.clone()
             };
 
+            // GDN layers have no attention projections — only FFN groups
+            // remain. Skip the expensive GPU alpha search and use a fixed
+            // alpha, which is close to optimal for FFN-only groups.
+            if gdn {
+                let best_alpha = 0.5_f32;
+                for &proj in &group.proj_names {
+                    let key = format!("l{layer_idx}_{proj}_weight");
+                    block_config.insert(
+                        key,
+                        AwqTensorConfig {
+                            alpha: best_alpha,
+                            clip_maxvals: None,
+                        },
+                    );
+                }
+                eprintln!(
+                    "  [layer {layer_idx}] {:?} → alpha={best_alpha:.2} (GDN, fixed)",
+                    group.proj_names,
+                );
+                continue;
+            }
+
             // Pre-allocate reusable GPU scratch buffers (one per projection).
             let mut scratch_bufs: Vec<_> = proj_weights
                 .iter()
@@ -409,12 +431,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // ── Fine pass ── ±0.1 around best, step 0.02 (up to 10 more evals)
+            // ── Fine pass ── ±0.1 around best, step 0.02.
+            // Early termination: stop if no improvement for 3 consecutive evals.
             let fine_lo = (best_alpha - 0.1).max(0.0);
             let fine_hi = (best_alpha + 0.1).min(1.0);
             let mut fine_alpha = fine_lo;
+            let mut no_improve_count = 0_u32;
             while fine_alpha <= fine_hi + 1e-6 {
-                // Skip if we already evaluated this candidate in the coarse pass.
                 let already_tested = coarse_alphas
                     .iter()
                     .any(|&c| (c - fine_alpha).abs() < 0.005);
@@ -423,6 +446,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if loss < best_loss {
                         best_loss = loss;
                         best_alpha = fine_alpha;
+                        no_improve_count = 0;
+                    } else {
+                        no_improve_count += 1;
+                        if no_improve_count >= 3 {
+                            break;
+                        }
                     }
                 }
                 fine_alpha += 0.02;

@@ -1658,8 +1658,6 @@ impl GpuCalibrationEngine for MetalInference {
         input_hidden_state: &[u8],
         token_count: usize,
     ) -> Result<Vec<u8>, InferenceError> {
-        // Lightweight reset: only seq_pos needs to be 0 for correct RoPE
-        // and KV cache addressing.
         self.seq_pos = 0;
 
         let mc = self
@@ -1673,49 +1671,63 @@ impl GpuCalibrationEngine for MetalInference {
             .ensure_capacity(&self.device, token_count, &mc, self.gemma4_config.as_ref())
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
-        // Write input to hidden_state (Private storage — stage via Shared).
+        let h = mc.hidden_size;
+        let io_bytes = token_count * h * 2; // FP16
+
+        // Lazily allocate (or grow) reusable staging buffers.
+        let need_alloc = self
+            .calib_scratch
+            .as_ref()
+            .is_none_or(|s| s.capacity < io_bytes);
+        if need_alloc {
+            let alloc_bytes = io_bytes.max(16);
+            let staging_in = self
+                .device
+                .create_buffer(alloc_bytes, StorageMode::Shared)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            let readback = self
+                .device
+                .create_buffer(alloc_bytes, StorageMode::Shared)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            self.calib_scratch = Some(super::engine::CalibScratchBuffers {
+                staging_in,
+                readback,
+                capacity: alloc_bytes,
+            });
+        }
+        let scratch = self.calib_scratch.as_ref().unwrap();
+
+        // Write input data to the reusable staging buffer.
+        scratch
+            .staging_in
+            .write_bytes(input_hidden_state, 0)
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        // Commit 1: copy-in + input norm (merged).
         let bufs = self
             .intermediate_buffers
             .as_ref()
             .ok_or(InferenceError::NotLoaded)?;
-        let h = mc.hidden_size;
-        let staging = self
-            .device
-            .create_buffer_with_data(input_hidden_state, StorageMode::Shared)
+        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let eps = mc.rms_norm_eps as f32;
+        let lw = &weights.layers[layer_idx];
+
+        let cmd = self
+            .queue
+            .command_buffer()
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
         {
-            let cmd = self
-                .queue
-                .command_buffer()
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
             let enc = cmd
                 .compute_encoder()
                 .map_err(|e| InferenceError::runtime(e.to_string()))?;
             ops::encode_copy_buffer(
                 &enc,
                 &self.pipelines()?.copy_buffer,
-                &staging,
+                &scratch.staging_in,
                 &bufs.hidden_state,
                 (token_count * h) as u32,
             );
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-        }
-
-        // Compute input norm for this layer.
-        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
-        let eps = mc.rms_norm_eps as f32;
-        let lw = &weights.layers[layer_idx];
-
-        let cmd_buf = self
-            .queue
-            .command_buffer()
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        {
-            let enc = cmd_buf
-                .compute_encoder()
-                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            enc.memory_barrier_buffers();
             ops::encode_rms_norm(
                 &enc,
                 &self.pipelines()?.rms_norm,
@@ -1730,22 +1742,19 @@ impl GpuCalibrationEngine for MetalInference {
             );
             enc.end_encoding();
         }
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        cmd.commit();
+        cmd.wait_until_completed();
 
+        // Commit 2+3: attention phase + FFN phase (inside the pipeline helper).
         self.run_pipeline_calibration_from_layer(layer_idx, token_count)?;
 
-        // Readback hidden_state (Private → Shared copy).
+        // Readback: copy hidden_state (Private) → reusable readback (Shared).
         self.seq_pos = 0;
         let bufs = self
             .intermediate_buffers
             .as_ref()
             .ok_or(InferenceError::NotLoaded)?;
-        let output_bytes = token_count * h * 2;
-        let scratch = self
-            .device
-            .create_buffer(output_bytes.max(16), StorageMode::Shared)
-            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        let scratch = self.calib_scratch.as_ref().unwrap();
         {
             let cmd = self
                 .queue
@@ -1758,15 +1767,16 @@ impl GpuCalibrationEngine for MetalInference {
                 &enc,
                 &self.pipelines()?.copy_buffer,
                 &bufs.hidden_state,
-                &scratch,
+                &scratch.readback,
                 (token_count * h) as u32,
             );
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
         }
-        let mut output = vec![0u8; output_bytes];
+        let mut output = vec![0u8; io_bytes];
         scratch
+            .readback
             .read_bytes(&mut output, 0)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
