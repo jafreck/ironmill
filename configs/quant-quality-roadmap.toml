@@ -7,11 +7,10 @@
 #   4. INT4 + AWQ block-level calibration — full block forward search
 #   5. INT4 + AWQ block-level + sensitive layers (P0+P2) — mixed precision
 #
-# Reproduce (combined decode + perplexity, loads model once per config):
+# Reproduce (decode-ppl suite: single model load per config):
 #   cargo run --release -p ironmill-bench --features metal -- \
-#     --config configs/quant-quality-roadmap.toml -b metal \
-#     -i 5 -w 2 -r 1 \
-#     --perplexity --perplexity-sequences 10 \
+#     --config configs/quant-quality-roadmap.toml \
+#     --perplexity --perplexity-sequences 8 \
 #     --perplexity-dataset tests/fixtures/quality/wikitext2-qwen35.json
 
 [[model]]
@@ -67,6 +66,10 @@ awq_block_config_path = "models/Qwen3.5-4B/awq_block_calib/awq_block_config.json
 sensitive_layers = [0, 31]
 kv_quant = "turbo-int8"
 max_seq_len = 2048
+
+[benchmarks]
+suites = ["decode-ppl"]
+perplexity = true
 
 [settings]
 iterations = 5

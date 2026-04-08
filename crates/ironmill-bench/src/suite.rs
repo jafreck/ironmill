@@ -147,6 +147,9 @@ impl SuiteRegistry {
     }
 
     /// Run only the suites matching the given IDs.
+    ///
+    /// Explicit selection bypasses `should_run()` — if the user asks for a
+    /// suite by name, we run it unconditionally.
     pub fn run_selected(
         &self,
         ids: &[&str],
@@ -154,7 +157,7 @@ impl SuiteRegistry {
     ) -> Result<Vec<BenchmarkResult>> {
         let mut all_results = Vec::new();
         for suite in &self.suites {
-            if ids.contains(&suite.id()) && suite.should_run(ctx) {
+            if ids.contains(&suite.id()) {
                 eprintln!("\n  {}", suite.name());
                 eprintln!("  {}", "─".repeat(40));
                 match suite.run(ctx) {

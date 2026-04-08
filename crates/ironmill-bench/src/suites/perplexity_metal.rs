@@ -189,9 +189,11 @@ impl BenchmarkSuite for MetalPerplexitySuite {
         &[BackendKind::Metal]
     }
 
-    fn should_run(&self, ctx: &BenchmarkContext) -> bool {
-        ctx.matrix.settings.backends.iter().any(|b| b == "metal")
-            && ctx.extra.contains_key("perplexity")
+    /// Only runs when explicitly selected via `--suite perplexity`.
+    /// When `run_all` is used with `--perplexity`, the combined `decode-ppl`
+    /// suite handles perplexity evaluation to avoid a redundant model load.
+    fn should_run(&self, _ctx: &BenchmarkContext) -> bool {
+        false
     }
 
     #[cfg(feature = "metal")]

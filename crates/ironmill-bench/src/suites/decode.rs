@@ -289,6 +289,7 @@ impl BenchmarkSuite for MetalDecodeSuite {
 
     fn should_run(&self, ctx: &BenchmarkContext) -> bool {
         ctx.matrix.settings.backends.iter().any(|b| b == "metal")
+            && !ctx.extra.contains_key("perplexity")
     }
 
     #[cfg(feature = "metal")]
