@@ -19,7 +19,7 @@ using namespace metal;
 //
 // Dispatch: one thread per element in output (token_count × ple_hidden).
 
-kernel void gelu_gate(
+kernel void ple_gelu_gate(
     device const half* gate        [[buffer(0)]],
     device const half* input       [[buffer(1)]],
     device half* output            [[buffer(2)]],

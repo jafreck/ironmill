@@ -720,7 +720,7 @@ impl MetalPipelines {
             make_pipeline(device, &libs.fused_rn, "fused_residual_rms_norm")?,
             make_pipeline(device, &libs.fused_en, "fused_embedding_norm")?,
             make_pipeline(device, &libs.fused_softcap, "fused_softcap")?,
-            make_pipeline(device, &libs.ple, "gelu_gate")?,
+            make_pipeline(device, &libs.ple, "ple_gelu_gate")?,
             make_pipeline(device, &libs.ple, "add_scale")?,
             make_pipeline(device, &libs.fused_rn, "fused_residual_norm_matvec")?,
             make_pipeline(
