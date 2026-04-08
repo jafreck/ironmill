@@ -347,7 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Pre-allocate reusable GPU scratch buffers (one per projection).
             let mut scratch_bufs: Vec<_> = proj_weights
                 .iter()
-                .map(|&(_, _, [out_f, in_f])| engine.create_dense_f16_buffer_sized(out_f * in_f))
+                .map(|&(_, _, [out_f, in_f])| engine.create_dense_f16_buffer_sized(out_f, in_f))
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Helper: evaluate a single alpha candidate.
@@ -367,7 +367,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return Ok(f64::INFINITY);
                         }
                         let dq = quantize_dequant_scaled(w, out_f, in_f, &scales, group_size);
-                        update_weight_buffer_f16(&scratch_bufs[i], &dq)?;
+                        update_weight_buffer_f16(&scratch_bufs[i], &dq, out_f, in_f)?;
                         let scratch = std::mem::replace(
                             &mut scratch_bufs[i],
                             ironmill_inference::metal::weights::WeightBuffer::empty(),

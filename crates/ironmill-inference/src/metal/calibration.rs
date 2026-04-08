@@ -1543,25 +1543,33 @@ pub trait GpuCalibrationEngine {
         data_f32: &[f32],
     ) -> Result<Self::WeightBuffer, InferenceError>;
 
-    /// Create an empty Dense FP16 GPU buffer sized for `n_elements` values.
+    /// Create an empty Dense FP16 GPU buffer for an `[n, k]` weight matrix.
     ///
-    /// Use [`update_weight_buffer_f16`] to populate it before dispatching.
+    /// Allocates both row-major and packed blocked buffers so the weight
+    /// is immediately usable by projection kernels. Use
+    /// [`update_weight_buffer_f16`] to populate it before dispatching.
     fn create_dense_f16_buffer_sized(
         &self,
-        n_elements: usize,
+        n: usize,
+        k: usize,
     ) -> Result<Self::WeightBuffer, InferenceError>;
 }
 
 /// Overwrite the contents of a Dense FP16 [`WeightBuffer`](super::weights::WeightBuffer)
 /// with new f32 data, avoiding a GPU allocation.
 ///
+/// Updates both the row-major and packed blocked buffers. `n` and `k`
+/// are the matrix dimensions (out_features, in_features).
+///
 /// This is a free function rather than a trait method because it
 /// operates on the buffer alone, without engine state.
 pub fn update_weight_buffer_f16(
     wb: &super::weights::WeightBuffer,
     data_f32: &[f32],
+    n: usize,
+    k: usize,
 ) -> Result<(), InferenceError> {
-    super::weights::update_dense_f16_data(wb, data_f32)
+    super::weights::update_dense_f16_data(wb, data_f32, n, k)
         .map_err(|e| InferenceError::runtime(e.to_string()))
 }
 
@@ -1804,9 +1812,10 @@ impl GpuCalibrationEngine for MetalInference {
 
     fn create_dense_f16_buffer_sized(
         &self,
-        n_elements: usize,
+        n: usize,
+        k: usize,
     ) -> Result<super::weights::WeightBuffer, InferenceError> {
-        super::weights::create_dense_f16_buffer_sized(&self.device, n_elements)
+        super::weights::create_dense_f16_buffer_sized(&self.device, n, k)
             .map_err(|e| InferenceError::runtime(e.to_string()))
     }
 }

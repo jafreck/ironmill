@@ -573,34 +573,58 @@ pub(crate) fn create_dense_f16_buffer(
     })
 }
 
-/// Create a Dense FP16 [`WeightBuffer`] with room for `n_elements` f16 values.
+/// Create a Dense FP16 [`WeightBuffer`] with room for an `[n, k]` matrix.
 ///
-/// The buffer is Shared-mode and zero-initialised. Use
-/// [`update_dense_f16_data`] to populate it before dispatching.
+/// Allocates both row-major (`buf`) and packed blocked (`packed`) buffers
+/// so the weight is usable by `encode_projection` immediately.
+/// Use [`update_dense_f16_data`] to populate it before dispatching.
 pub(crate) fn create_dense_f16_buffer_sized(
     device: &MetalDevice,
-    n_elements: usize,
+    n: usize,
+    k: usize,
 ) -> Result<WeightBuffer, MetalError> {
+    let n_elements = n * k;
     let buf = device
         .create_buffer(n_elements * 2, StorageMode::Shared)
         .map_err(MetalError::Metal)?;
+    let packed = if n % 8 == 0 && k % 8 == 0 {
+        Some(
+            device
+                .create_buffer(n_elements * 2, StorageMode::Shared)
+                .map_err(MetalError::Metal)?,
+        )
+    } else {
+        None
+    };
     Ok(WeightBuffer::Dense {
         buf: Some(buf),
-        packed: None,
+        packed,
     })
 }
 
 /// Overwrite the contents of a Dense FP16 [`WeightBuffer`] with new f32 data.
 ///
-/// Converts `data_f32` to FP16 on the CPU and writes directly into the
-/// existing Shared-mode Metal buffer, avoiding a new GPU allocation.
+/// Converts `data_f32` to FP16 on the CPU and writes into both the
+/// row-major and packed blocked buffers (if present), avoiding new GPU
+/// allocations.
+///
+/// `n` and `k` are the matrix dimensions (out_features, in_features),
+/// required for blocked layout repacking.
 ///
 /// # Errors
 /// Returns an error if `wb` is not a Dense buffer, has no row-major buffer,
 /// or the data is too large for the existing allocation.
-pub(crate) fn update_dense_f16_data(wb: &WeightBuffer, data_f32: &[f32]) -> Result<(), MetalError> {
-    let buf = match wb {
-        WeightBuffer::Dense { buf: Some(b), .. } => b,
+pub(crate) fn update_dense_f16_data(
+    wb: &WeightBuffer,
+    data_f32: &[f32],
+    n: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    let (row_buf, packed_buf) = match wb {
+        WeightBuffer::Dense {
+            buf: Some(b),
+            packed,
+        } => (b, packed.as_ref()),
         _ => {
             return Err(MetalError::Other(anyhow::anyhow!(
                 "update_dense_f16_data: expected Dense buffer with row-major allocation"
@@ -608,17 +632,27 @@ pub(crate) fn update_dense_f16_data(wb: &WeightBuffer, data_f32: &[f32]) -> Resu
         }
     };
     let byte_len = data_f32.len() * 2;
-    if byte_len > buf.length() {
+    if byte_len > row_buf.length() {
         return Err(MetalError::BufferSizeMismatch {
             expected: byte_len,
-            actual: buf.length(),
+            actual: row_buf.length(),
         });
     }
     let f16_bytes: Vec<u8> = data_f32
         .iter()
         .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
         .collect();
-    buf.write_bytes(&f16_bytes, 0).map_err(MetalError::Metal)?;
+    row_buf
+        .write_bytes(&f16_bytes, 0)
+        .map_err(MetalError::Metal)?;
+
+    // Update packed blocked buffer if present.
+    if let Some(pb) = packed_buf {
+        if let Some(packed_bytes) = pack_bytes_blocked(&f16_bytes, n, k) {
+            pb.write_bytes(&packed_bytes, 0)
+                .map_err(MetalError::Metal)?;
+        }
+    }
     Ok(())
 }
 
