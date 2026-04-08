@@ -2140,7 +2140,7 @@ mod tests {
             ),
         ];
 
-        let (_pre, attn, post) = split_at_attention_boundary(&ops);
+        let (pre, attn, post) = split_at_attention_boundary(&ops);
         let attn_names: Vec<&str> = attn.iter().map(|op| op.name.as_str()).collect();
         let post_names: Vec<&str> = post.iter().map(|op| op.name.as_str()).collect();
 

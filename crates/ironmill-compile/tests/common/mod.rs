@@ -489,7 +489,7 @@ pub fn build_moe_program(n_experts: usize) -> Program {
 /// Inputs: "input_ids" [1, seq_len], "past_key_values.{0..n}.key" and
 /// "past_key_values.{0..n}.value" with shape [1, heads, cache_len, head_dim].
 /// Contains attention ops that consume the cache tensors.
-pub fn build_autoregressive_program(_max_seq_len: usize) -> Program {
+pub fn build_autoregressive_program(max_seq_len: usize) -> Program {
     let heads = 4;
     let head_dim = 16;
     let hidden_dim = heads * head_dim;

@@ -299,7 +299,7 @@ mod tests {
         let target_log_probs: Vec<f32> = tree
             .candidates
             .iter()
-            .map(|_| -5.0f32) // exp(-5) ≈ 0.007, well below 0.99 threshold
+            .map(|_| (-5.0f32)) // exp(-5) ≈ 0.007, well below 0.99 threshold
             .collect();
 
         let accepted = tree.verify(&target_log_probs, &config);

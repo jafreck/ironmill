@@ -55,7 +55,7 @@ mod calibration_tests {
     /// compile and accept `&mut dyn ActivationHook`.
     #[test]
     fn hook_bridge_api_surface_compiles() {
-        use crate::calibration::AwqActivationStore;
+        use crate::calibration::{ActivationHook, AwqActivationStore};
 
         fn _assert_hook_methods(engine: &mut MetalInference) {
             let mut store = AwqActivationStore::new();

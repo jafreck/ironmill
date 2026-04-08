@@ -507,7 +507,9 @@ mod tests {
     fn quantize_dequantize_reduces_error_vs_naive() {
         // Random-ish test vector (deterministic).
         let n = 64;
-        let weights: Vec<f32> = (0..n).map(|i| (i as f32 * 0.7 + 1.3).sin() * 2.0).collect();
+        let weights: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.7 + 1.3).sin() * 2.0))
+            .collect();
 
         let cb = E8Codebook::new();
         let (indices, scales) = cb.quantize_matrix(&weights, n);
@@ -732,7 +734,9 @@ mod tests {
     fn reconstruction_mse_matches_manual_mse() {
         let cb = E8Codebook::new();
         let n = 64;
-        let weights: Vec<f32> = (0..n).map(|i| (i as f32 * 0.7 + 1.3).sin() * 2.0).collect();
+        let weights: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.7 + 1.3).sin() * 2.0))
+            .collect();
 
         let (indices, scales) = cb.quantize_matrix(&weights, n);
         let recon = cb.dequantize_matrix(&indices, &scales, n);
