@@ -135,7 +135,14 @@ pub(crate) fn load_metal_engine(
         } else {
             ironmill_compile::weights::quantized::AffineQuantConfig::default()
         };
-        let q_provider = QuantizedWeightProvider::new_int4(&provider, int4_config);
+        let q_provider = QuantizedWeightProvider::new_int4(&provider, {
+            let mut cfg = int4_config;
+            if !opt.sensitive_layers.is_empty() {
+                cfg.sensitive_layers = opt.sensitive_layers.clone();
+                eprintln!("    INT8 sensitive layers: {:?}", cfg.sensitive_layers);
+            }
+            cfg
+        });
         engine
             .load_weights(&q_provider, gpu_config.clone())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
