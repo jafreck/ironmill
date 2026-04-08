@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use anyhow::Result;
 use half::f16;
 use mil_rs::ir::{Operation, Program, ScalarType, TensorType, Value};
 
@@ -140,12 +141,20 @@ pub fn precompute_rope_cache(head_dim: usize, max_pos: usize, theta: f32) -> Rop
 /// Extract per-layer QK normalization weights from the original program.
 ///
 /// Qwen3 models apply per-head RMSNorm to Q and K after projection.
-/// Returns `Some(Vec<(q_norm, k_norm)>)` indexed by layer, or `None`
+/// Returns `Ok(Some(Vec<(q_norm, k_norm)>))` indexed by layer, or `Ok(None)`
 /// if the model doesn't use QK normalization.
 ///
-/// Skips tensors whose data is not materialized or has unsupported dtype.
-pub fn extract_qk_norm_weights(program: &Program) -> Option<Vec<(Vec<f16>, Vec<f16>)>> {
-    let func = program.main()?;
+/// # Errors
+///
+/// Returns an error if Q-norm weights are found but K-norm weights are
+/// missing for some layers (or vice-versa), which would cause silent
+/// truncation during serialization/deserialization.
+#[allow(clippy::type_complexity)]
+pub fn extract_qk_norm_weights(program: &Program) -> Result<Option<Vec<(Vec<f16>, Vec<f16>)>>> {
+    let func = match program.main() {
+        Some(f) => f,
+        None => return Ok(None),
+    };
 
     let mut q_norms: BTreeMap<usize, Vec<f16>> = BTreeMap::new();
     let mut k_norms: BTreeMap<usize, Vec<f16>> = BTreeMap::new();
@@ -184,18 +193,37 @@ pub fn extract_qk_norm_weights(program: &Program) -> Option<Vec<(Vec<f16>, Vec<f
         }
     }
 
-    if q_norms.is_empty() {
-        return None;
+    if q_norms.is_empty() && k_norms.is_empty() {
+        return Ok(None);
     }
 
-    let num_layers = q_norms.keys().last().map(|&k| k + 1).unwrap_or(0);
+    let num_layers = q_norms
+        .keys()
+        .chain(k_norms.keys())
+        .copied()
+        .max()
+        .map(|k| k + 1)
+        .unwrap_or(0);
+
     let mut result = Vec::with_capacity(num_layers);
     for i in 0..num_layers {
-        let q = q_norms.get(&i).cloned().unwrap_or_default();
-        let k = k_norms.get(&i).cloned().unwrap_or_default();
+        let q = q_norms.get(&i).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing Q-norm weights for layer {i} (found Q-norm for layers {:?}, K-norm for layers {:?})",
+                q_norms.keys().collect::<Vec<_>>(),
+                k_norms.keys().collect::<Vec<_>>(),
+            )
+        })?;
+        let k = k_norms.get(&i).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing K-norm weights for layer {i} (found Q-norm for layers {:?}, K-norm for layers {:?})",
+                q_norms.keys().collect::<Vec<_>>(),
+                k_norms.keys().collect::<Vec<_>>(),
+            )
+        })?;
         result.push((q, k));
     }
-    Some(result)
+    Ok(Some(result))
 }
 
 /// Extract a layer number from an operation name.

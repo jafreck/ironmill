@@ -789,20 +789,67 @@ impl<D: AneDevice> AneInference<D> {
             )
         };
 
-        // TODO(§4.10): Load per-layer QK norm weights from the ANE bundle.
-        //
-        // QK norm weights (q_norm, k_norm per layer) need to be serialized
-        // into the bundle by `compile_decode_bundle`. The bundle format must
-        // include these as additional tensors keyed by layer index. Once
-        // available, load them here as `Vec<(Vec<f16>, Vec<f16>)>` with one
-        // (q_norm, k_norm) pair per layer.
-        //
-        // Models that use QK norm (e.g. Qwen3) will produce incorrect
-        // attention scores without these weights.
-        // QK norm weight loading is not yet implemented. When the model
-        // architecture requires QK norm (e.g., Gemma), this will need to
-        // load per-layer weights from the bundle.
-        let qk_norm_weights: Option<Vec<(Vec<f16>, Vec<f16>)>> = None;
+        // Load per-layer QK norm weights from the bundle when present.
+        let qk_norm_weights: Option<Vec<(Vec<f16>, Vec<f16>)>> = if arch.qk_norm {
+            let q_path = cpu_weights_dir.join("qk_norm_q.bin");
+            let k_path = cpu_weights_dir.join("qk_norm_k.bin");
+            match (std::fs::read(&q_path), std::fs::read(&k_path)) {
+                (Ok(q_data), Ok(k_data)) => {
+                    let q_all: Vec<f16> = q_data
+                        .chunks_exact(2)
+                        .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    let k_all: Vec<f16> = k_data
+                        .chunks_exact(2)
+                        .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    let hd = head_dim;
+                    if hd == 0 || q_all.len() % hd != 0 || k_all.len() % hd != 0 {
+                        return Err(AneError::Other(anyhow::anyhow!(
+                            "QK norm weight size not divisible by head_dim \
+                             (q={}, k={}, head_dim={})",
+                            q_all.len(),
+                            k_all.len(),
+                            hd,
+                        )));
+                    }
+                    if q_all.len() != k_all.len() {
+                        return Err(AneError::Other(anyhow::anyhow!(
+                            "QK norm Q/K size mismatch: q={} vs k={} \
+                             (expected equal lengths for {} layers × head_dim={})",
+                            q_all.len(),
+                            k_all.len(),
+                            num_layers,
+                            hd,
+                        )));
+                    }
+                    let loaded_layers = q_all.len() / hd;
+                    if loaded_layers != num_layers {
+                        return Err(AneError::Other(anyhow::anyhow!(
+                            "QK norm layer count mismatch: weights have {} layers \
+                             but model has {} layers",
+                            loaded_layers,
+                            num_layers,
+                        )));
+                    }
+                    let mut norms = Vec::with_capacity(loaded_layers);
+                    for i in 0..loaded_layers {
+                        let q_w = q_all[i * hd..(i + 1) * hd].to_vec();
+                        let k_w = k_all[i * hd..(i + 1) * hd].to_vec();
+                        norms.push((q_w, k_w));
+                    }
+                    Some(norms)
+                }
+                _ => {
+                    return Err(AneError::Other(anyhow::anyhow!(
+                        "model requires QK norm but qk_norm_q.bin / qk_norm_k.bin \
+                         not found in bundle"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
 
         // Compute scratch buffer sizes from allocated tensors.
         let mut max_padded = 0usize;

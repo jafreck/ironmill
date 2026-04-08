@@ -86,6 +86,10 @@ pub struct AneDecodeBundle {
     pub final_norm_weight: Option<Vec<u8>>,
     /// Per-layer compiled transformer bundles, in order.
     pub layers: Vec<LayerBundle>,
+    /// Per-layer QK normalization weights (Qwen3 feature).
+    /// Each entry is `(q_norm_weights, k_norm_weights)` with shape `[head_dim]` as f16.
+    /// `None` when the model does not use QK normalization.
+    pub qk_norm_weights: Option<Vec<(Vec<f16>, Vec<f16>)>>,
 }
 
 /// Single transformer layer artifact.
@@ -194,7 +198,8 @@ pub fn compile_decode_bundle(
                 config.rope_theta as f32,
             )
         });
-    let has_qk_norm = extract_qk_norm_weights(&program).is_some();
+    let qk_norm_weights = extract_qk_norm_weights(&program)?;
+    let has_qk_norm = qk_norm_weights.is_some();
 
     // 2. Prepare program for single-token decode.
     if !program.is_autoregressive() {
@@ -293,6 +298,7 @@ pub fn compile_decode_bundle(
         },
         final_norm_weight: final_norm_bytes,
         layers: layer_bundles,
+        qk_norm_weights,
     })
 }
 
@@ -934,6 +940,35 @@ impl AneDecodeBundle {
         fs::write(cpu_weights_dir.join("rope_sin.bin"), &self.rope_sin)?;
         if let Some(norm) = &self.final_norm_weight {
             fs::write(cpu_weights_dir.join("final_norm.bin"), norm)?;
+        }
+        if let Some(ref qk_norms) = self.qk_norm_weights {
+            // Validate all weight vectors have consistent length before serializing.
+            if let Some((first_q, _first_k)) = qk_norms.first() {
+                let expected_len = first_q.len();
+                for (i, (q, k)) in qk_norms.iter().enumerate() {
+                    anyhow::ensure!(
+                        q.len() == expected_len,
+                        "QK norm layer {i}: Q-norm weight length {} != expected {expected_len}",
+                        q.len(),
+                    );
+                    anyhow::ensure!(
+                        k.len() == expected_len,
+                        "QK norm layer {i}: K-norm weight length {} != expected {expected_len}",
+                        k.len(),
+                    );
+                }
+            }
+            // Concatenate all layers' Q-norm weights: [num_layers × head_dim] f16 LE bytes.
+            let q_bytes: Vec<u8> = qk_norms
+                .iter()
+                .flat_map(|(q, _)| q.iter().flat_map(|v| v.to_le_bytes()))
+                .collect();
+            let k_bytes: Vec<u8> = qk_norms
+                .iter()
+                .flat_map(|(_, k)| k.iter().flat_map(|v| v.to_le_bytes()))
+                .collect();
+            fs::write(cpu_weights_dir.join("qk_norm_q.bin"), &q_bytes)?;
+            fs::write(cpu_weights_dir.join("qk_norm_k.bin"), &k_bytes)?;
         }
 
         // --- LM head ---
