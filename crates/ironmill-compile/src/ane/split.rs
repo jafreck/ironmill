@@ -835,7 +835,7 @@ fn build_sub_program(
         // Collect all references from ops NOT in this group.
         let external_refs: HashSet<String> = all
             .iter()
-            .filter(|op| !produced.contains(op.outputs.first().unwrap_or(&String::new())))
+            .filter(|op| !produced.contains(op.outputs.first().map_or("", String::as_str)))
             .flat_map(|op| op.inputs.values())
             .filter_map(|v| match v {
                 Value::Reference(r) if produced.contains(r) => Some(r.clone()),

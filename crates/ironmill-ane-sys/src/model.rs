@@ -552,6 +552,8 @@ impl InMemoryModel {
     }
 
     /// Model attributes dictionary (raw `NSDictionary` pointer).
+    // TODO: Replace `*mut c_void` return with a typed newtype (e.g., `NSDictionaryHandle`)
+    // to prevent accidental misuse of raw pointers in the public API.
     pub fn model_attributes(&self) -> *mut c_void {
         type PtrFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         let sel = unsafe { sel_registerName(sel!("modelAttributes")) };

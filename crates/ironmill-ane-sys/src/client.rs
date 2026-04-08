@@ -36,6 +36,8 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     /// Raw ObjC object pointer.
+    // TODO: Replace `*mut c_void` with a typed newtype (e.g., `pub struct AneClientHandle(*mut c_void)`)
+    // to prevent accidental misuse of raw pointers in the public API.
     pub fn as_raw(&self) -> *mut c_void {
         self.raw
     }

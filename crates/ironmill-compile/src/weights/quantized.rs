@@ -969,11 +969,11 @@ fn quantize_tensor_int4_awq(
     floats: &[f32],
     shape: &[usize],
     config: &AffineQuantConfig,
-    awq_magnitudes: Option<&Vec<f32>>,
+    awq_magnitudes: Option<&[f32]>,
     alpha: Option<f32>,
-    awq_activations: Option<&Vec<f32>>,
+    awq_activations: Option<&[f32]>,
     awq_token_count: Option<usize>,
-    precomputed_clips: Option<&Vec<f32>>,
+    precomputed_clips: Option<&[f32]>,
 ) -> (Vec<u8>, QuantizationInfo) {
     let awq_scales = if let Some(mags) = awq_magnitudes {
         let alpha = alpha.unwrap_or(0.5);
@@ -1194,11 +1194,11 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                     &floats,
                     &t.shape,
                     config,
-                    awq_mags,
+                    awq_mags.map(Vec::as_slice),
                     resolved_alpha,
-                    awq_acts,
+                    awq_acts.map(Vec::as_slice),
                     awq_tc,
-                    precomputed_clips,
+                    precomputed_clips.map(Vec::as_slice),
                 )
             }
         };
@@ -1341,7 +1341,7 @@ mod tests {
             &floats,
             &[out, inf],
             &config,
-            Some(&mags),
+            Some(mags.as_slice()),
             None,
             None,
             None,
@@ -1353,7 +1353,7 @@ mod tests {
             &floats,
             &[out, inf],
             &config,
-            Some(&mags),
+            Some(mags.as_slice()),
             None,
             None,
             None,

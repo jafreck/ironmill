@@ -106,6 +106,8 @@ impl std::fmt::Debug for VirtualClient {
 
 impl VirtualClient {
     /// Raw ObjC object pointer.
+    // TODO: Replace `*mut c_void` with a typed newtype (e.g., `pub struct AneVirtualClientHandle(*mut c_void)`)
+    // to prevent accidental misuse of raw pointers in the public API.
     pub fn as_raw(&self) -> *mut c_void {
         self.raw
     }

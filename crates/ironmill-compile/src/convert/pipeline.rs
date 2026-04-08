@@ -612,16 +612,16 @@ fn validate_inter_stage_tensors(
         for dep_name in &stage.depends_on {
             if let Some(dep_prog) = program_by_name.get(dep_name.as_str()) {
                 if let Some(func) = dep_prog.main() {
-                    let output_types: HashMap<&String, &mil_rs::ir::TensorType> = func
+                    let output_types: HashMap<&str, &mil_rs::ir::TensorType> = func
                         .body
                         .operations
                         .iter()
                         .flat_map(|op| op.outputs.iter().zip(&op.output_types))
-                        .filter_map(|(name, ty)| ty.as_ref().map(|t| (name, t)))
+                        .filter_map(|(name, ty)| ty.as_ref().map(|t| (name.as_str(), t)))
                         .collect();
 
                     for output_name in &func.body.outputs {
-                        if let Some(&ty) = output_types.get(output_name) {
+                        if let Some(&ty) = output_types.get(output_name.as_str()) {
                             dep_outputs.insert(output_name.clone(), ty.clone());
                         }
                     }
@@ -698,12 +698,12 @@ fn build_output_manifest(
                         })
                         .collect();
 
-                    let output_types: HashMap<&String, &mil_rs::ir::TensorType> = func
+                    let output_types: HashMap<&str, &mil_rs::ir::TensorType> = func
                         .body
                         .operations
                         .iter()
                         .flat_map(|op| op.outputs.iter().zip(&op.output_types))
-                        .filter_map(|(name, ty)| ty.as_ref().map(|t| (name, t)))
+                        .filter_map(|(name, ty)| ty.as_ref().map(|t| (name.as_str(), t)))
                         .collect();
 
                     let outs: Vec<TensorDescriptor> = func
@@ -711,7 +711,7 @@ fn build_output_manifest(
                         .outputs
                         .iter()
                         .map(|out_name| {
-                            if let Some(&ty) = output_types.get(out_name) {
+                            if let Some(&ty) = output_types.get(out_name.as_str()) {
                                 TensorDescriptor {
                                     name: out_name.clone(),
                                     scalar_type: format!("{:?}", ty.scalar_type),

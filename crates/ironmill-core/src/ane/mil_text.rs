@@ -221,10 +221,10 @@ impl<'a> MilTextEmitter<'a> {
         let mut params = Vec::new();
         // Emit input keys with "x" first (ANE expects the primary data
         // input before other parameters), then remaining keys sorted.
-        let mut input_keys: Vec<&String> = op.inputs.keys().collect();
+        let mut input_keys: Vec<&str> = op.inputs.keys().map(String::as_str).collect();
         input_keys.sort_by(|a, b| {
             // "x" sorts first, then alphabetical.
-            match (a.as_str(), b.as_str()) {
+            match (*a, *b) {
                 ("x", _) => std::cmp::Ordering::Less,
                 (_, "x") => std::cmp::Ordering::Greater,
                 _ => a.cmp(b),
@@ -236,10 +236,11 @@ impl<'a> MilTextEmitter<'a> {
         }
 
         // Emit non-skipped attributes as params.
-        let mut attr_keys: Vec<&String> = op
+        let mut attr_keys: Vec<&str> = op
             .attributes
             .keys()
             .filter(|k| !SKIP_ATTRIBUTES.contains(&k.as_str()))
+            .map(String::as_str)
             .collect();
         attr_keys.sort();
         for key in attr_keys {
