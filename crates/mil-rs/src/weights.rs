@@ -340,6 +340,88 @@ impl ModelConfig {
             .map(|v| v as usize)
             .unwrap_or(self.num_key_value_heads)
     }
+
+    /// Number of KV-shared layers (Gemma 4). `None` if absent.
+    pub fn num_kv_shared_layers(&self) -> Option<usize> {
+        self.extra
+            .get("num_kv_shared_layers")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Whether KV-shared layers use double-wide MLP (Gemma 4).
+    pub fn use_double_wide_mlp(&self) -> bool {
+        self.extra
+            .get("use_double_wide_mlp")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Per-Layer Embedding hidden size (Gemma 4). Returns 0 if absent.
+    pub fn ple_hidden_size(&self) -> usize {
+        self.extra
+            .get("hidden_size_per_layer_input")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize
+    }
+
+    /// Final logit softcapping value. `None` if absent.
+    pub fn final_logit_softcapping(&self) -> Option<f32> {
+        self.extra
+            .get("final_logit_softcapping")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+    }
+
+    /// Whether MoE blocks are enabled (Gemma 4).
+    pub fn enable_moe(&self) -> bool {
+        self.extra
+            .get("enable_moe_block")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Number of MoE experts. Returns 0 if absent.
+    pub fn num_experts(&self) -> usize {
+        self.extra
+            .get("num_experts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize
+    }
+
+    /// Number of top-k experts selected per token. Returns 0 if absent.
+    pub fn top_k_experts(&self) -> usize {
+        self.extra
+            .get("top_k_experts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize
+    }
+
+    /// MoE expert FFN intermediate size. Returns 0 if absent.
+    pub fn moe_intermediate_size(&self) -> usize {
+        self.extra
+            .get("moe_intermediate_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize
+    }
+
+    /// Extract Gated Delta Network (GDN) configuration from Qwen 3.5 metadata.
+    ///
+    /// Returns `None` if the required GDN fields are absent.
+    pub fn gdn_config(&self) -> Option<GdnConfig> {
+        let k_head_dim = self.extra.get("linear_key_head_dim")?.as_u64()? as usize;
+        let v_head_dim = self.extra.get("linear_value_head_dim")?.as_u64()? as usize;
+        let num_k_heads = self.extra.get("linear_num_key_heads")?.as_u64()? as usize;
+        let num_v_heads = self.extra.get("linear_num_value_heads")?.as_u64()? as usize;
+        let conv_kernel_size = self.extra.get("linear_conv_kernel_dim")?.as_u64()? as usize;
+        Some(GdnConfig {
+            k_head_dim,
+            v_head_dim,
+            num_k_heads,
+            num_v_heads,
+            conv_kernel_size,
+        })
+    }
 }
 
 /// Per-layer-type RoPE configuration for Gemma 4.
@@ -349,6 +431,42 @@ pub struct RopeLayerConfig {
     pub theta: f64,
     /// Fraction of head dimensions that receive rotation (1.0 = all).
     pub partial_rotary_factor: f64,
+}
+
+/// Gated Delta Network (GDN) configuration for Qwen 3.5 models.
+///
+/// Contains per-head dimensions and head counts for the linear attention
+/// layers. Derived dimensions can be computed via helper methods.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct GdnConfig {
+    /// Per-head key dimension for GDN layers.
+    pub k_head_dim: usize,
+    /// Per-head value dimension for GDN layers.
+    pub v_head_dim: usize,
+    /// Number of key/query heads in GDN layers.
+    pub num_k_heads: usize,
+    /// Number of value heads in GDN layers.
+    pub num_v_heads: usize,
+    /// Convolution kernel size for the causal conv1d.
+    pub conv_kernel_size: usize,
+}
+
+impl GdnConfig {
+    /// Total key dimension: `num_k_heads * k_head_dim`.
+    pub fn key_dim(&self) -> usize {
+        self.num_k_heads * self.k_head_dim
+    }
+
+    /// Total value dimension: `num_v_heads * v_head_dim`.
+    pub fn value_dim(&self) -> usize {
+        self.num_v_heads * self.v_head_dim
+    }
+
+    /// Total QKV dimension: `2 * key_dim + value_dim`.
+    pub fn qkv_dim(&self) -> usize {
+        2 * self.key_dim() + self.value_dim()
+    }
 }
 
 /// Multi-Head Latent Attention (MLA) configuration.

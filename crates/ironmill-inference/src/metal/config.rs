@@ -58,51 +58,19 @@ impl Gemma4Config {
         let num_global_kv_heads = mc.num_global_key_value_heads();
         let sliding_window = mc.sliding_window().unwrap_or(0);
 
-        let num_kv_shared = mc
-            .extra
-            .get("num_kv_shared_layers")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let num_kv_shared = mc.num_kv_shared_layers().unwrap_or(0);
         let first_shared_idx = mc.num_hidden_layers.saturating_sub(num_kv_shared);
 
-        let use_double_wide_mlp = mc
-            .extra
-            .get("use_double_wide_mlp")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let use_double_wide_mlp = mc.use_double_wide_mlp();
 
-        let ple_hidden_size = mc
-            .extra
-            .get("hidden_size_per_layer_input")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let ple_hidden_size = mc.ple_hidden_size();
 
-        let final_logit_softcapping = mc
-            .extra
-            .get("final_logit_softcapping")
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32);
+        let final_logit_softcapping = mc.final_logit_softcapping();
 
-        let enable_moe = mc
-            .extra
-            .get("enable_moe_block")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let num_experts = mc
-            .extra
-            .get("num_experts")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let top_k_experts = mc
-            .extra
-            .get("top_k_experts")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let moe_intermediate_size = mc
-            .extra
-            .get("moe_intermediate_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let enable_moe = mc.enable_moe();
+        let num_experts = mc.num_experts();
+        let top_k_experts = mc.top_k_experts();
+        let moe_intermediate_size = mc.moe_intermediate_size();
 
         // Build per-layer configs
         let prev_types = &layer_types[..first_shared_idx];
@@ -190,23 +158,18 @@ impl GdnModelConfig {
     ///
     /// Returns `None` if the required fields are absent (non-Qwen3.5 model).
     pub fn from_model_config(mc: &mil_rs::weights::ModelConfig) -> Option<Self> {
-        let k_head_dim = mc.extra.get("linear_key_head_dim")?.as_u64()? as usize;
-        let v_head_dim = mc.extra.get("linear_value_head_dim")?.as_u64()? as usize;
-        let num_k_heads = mc.extra.get("linear_num_key_heads")?.as_u64()? as usize;
-        let num_v_heads = mc.extra.get("linear_num_value_heads")?.as_u64()? as usize;
-        let conv_kernel_size = mc.extra.get("linear_conv_kernel_dim")?.as_u64()? as usize;
+        let gdn = mc.gdn_config()?;
 
-        let key_dim = num_k_heads * k_head_dim;
-        let value_dim = num_v_heads * v_head_dim;
-        let qkv_dim = 2 * key_dim + value_dim;
+        let key_dim = gdn.key_dim();
+        let value_dim = gdn.value_dim();
+        let qkv_dim = gdn.qkv_dim();
 
-        // Parse layer_types to determine which layers are GDN.
-        let layer_types = mc.extra.get("layer_types")?.as_array()?;
+        // Determine which layers are GDN from layer_types.
+        let layer_types = mc.layer_types()?;
         let gdn_layer_indices: Vec<usize> = layer_types
             .iter()
             .enumerate()
-            .filter_map(|(i, v)| {
-                let s = v.as_str()?;
+            .filter_map(|(i, s)| {
                 if s == "linear_attention" {
                     Some(i)
                 } else {
@@ -220,11 +183,11 @@ impl GdnModelConfig {
         }
 
         Some(Self {
-            k_head_dim,
-            v_head_dim,
-            num_k_heads,
-            num_v_heads,
-            conv_kernel_size,
+            k_head_dim: gdn.k_head_dim,
+            v_head_dim: gdn.v_head_dim,
+            num_k_heads: gdn.num_k_heads,
+            num_v_heads: gdn.num_v_heads,
+            conv_kernel_size: gdn.conv_kernel_size,
             qkv_dim,
             key_dim,
             value_dim,
