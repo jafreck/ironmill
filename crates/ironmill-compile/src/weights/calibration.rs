@@ -135,8 +135,8 @@ pub fn quantize_dequant_scaled(
                 let (scale, zp) = quantize_affine_into(&group_vals, qmax, &mut quant_buf[..gsize]);
 
                 // Dequantize and undo scaling
-                for (j, qval) in quant_buf.iter().enumerate().take(gsize) {
-                    let dequant = (*qval as f32 - zp) * scale;
+                for (j, &qb_val) in quant_buf[..gsize].iter().enumerate() {
+                    let dequant = (qb_val as f32 - zp) * scale;
                     let c = g_start + j;
                     result_row[c] = dequant / scales[c];
                 }

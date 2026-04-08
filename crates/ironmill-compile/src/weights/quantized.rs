@@ -719,6 +719,7 @@ pub(crate) fn search_clip_ranges(
                 }
 
                 let mut org_out = [0.0f32; 16];
+                #[allow(clippy::needless_range_loop)]
                 for si in 0..n_sample {
                     let mut dot = 0.0f32;
                     let ab = si * gsize;
@@ -742,12 +743,12 @@ pub(crate) fn search_clip_ranges(
 
                     let mut wmin = f32::INFINITY;
                     let mut wmax = f32::NEG_INFINITY;
-                    for j in 0..gsize {
-                        if clipped_buf[j] < wmin {
-                            wmin = clipped_buf[j];
+                    for &cb_val in clipped_buf.iter().take(gsize) {
+                        if cb_val < wmin {
+                            wmin = cb_val;
                         }
-                        if clipped_buf[j] > wmax {
-                            wmax = clipped_buf[j];
+                        if cb_val > wmax {
+                            wmax = cb_val;
                         }
                     }
                     let scale = ((wmax - wmin) / qmax).max(1e-10);
@@ -757,6 +758,7 @@ pub(crate) fn search_clip_ranges(
                     }
 
                     let mut err = 0.0f32;
+                    #[allow(clippy::needless_range_loop)]
                     for si in 0..n_sample {
                         let mut q_out = 0.0f32;
                         let ab = si * gsize;

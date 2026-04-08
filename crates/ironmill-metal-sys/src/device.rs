@@ -160,48 +160,20 @@ impl MetalDevice {
         self.raw
     }
 
+    /// Returns the number of GPU cores, queried from the IORegistry.
+    ///
+    /// Falls back to 10 (base-model Apple Silicon) if the query fails.
+    pub fn gpu_core_count(&self) -> usize {
+        query_gpu_core_count().unwrap_or(10)
+    }
+
     /// Recommended number of threadgroups for saturating the GPU.
     ///
-    /// Uses the device name heuristic to estimate core count, then
-    /// multiplies by an occupancy factor (4 threadgroups per core is
-    /// a good target for register-heavy kernels like attention).
-    /// Returns at least 32 for any Apple Silicon device.
+    /// Multiplies the detected core count by an occupancy factor
+    /// (4 threadgroups per core is a good target for register-heavy
+    /// kernels like attention). Returns at least 32.
     pub fn recommended_max_working_set_threadgroups(&self) -> usize {
-        // Apple doesn't expose core count directly. Estimate from device name.
-        let name = self.name();
-        let cores = if name.contains("Ultra") {
-            // M1/M2/M3/M4 Ultra: 2× Max die
-            if name.contains("M4") || name.contains("M3") {
-                80
-            } else if name.contains("M2") {
-                76
-            } else {
-                64
-            }
-        } else if name.contains("Max") {
-            if name.contains("M4") || name.contains("M3") {
-                40
-            } else if name.contains("M2") {
-                38
-            } else {
-                32
-            }
-        } else if name.contains("Pro") {
-            if name.contains("M4") {
-                20
-            } else if name.contains("M3") {
-                18
-            } else if name.contains("M2") {
-                19
-            } else {
-                16
-            }
-        } else {
-            // M1/M2/M3/M4 base
-            10
-        };
-        // 4 threadgroups per core gives good occupancy for attention kernels.
-        (cores * 4).max(32)
+        (self.gpu_core_count() * 4).max(32)
     }
 
     // -- Factory methods for other Metal objects --
@@ -445,6 +417,83 @@ impl MetalDevice {
             return Err(MetalSysError::PipelineCreation(desc));
         }
         Ok(ComputePipeline::from_raw(raw))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IOKit GPU core count query
+// ---------------------------------------------------------------------------
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IOServiceMatching(name: *const std::ffi::c_char) -> *mut c_void;
+    fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
+    fn IORegistryEntryCreateCFProperty(
+        entry: u32,
+        key: *mut c_void,
+        allocator: *mut c_void,
+        options: u32,
+    ) -> *mut c_void;
+    fn IOObjectRelease(object: u32) -> i32;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFNumberGetValue(number: *mut c_void, the_type: i32, value_ptr: *mut c_void) -> bool;
+}
+
+/// Query the actual GPU core count from the IORegistry.
+///
+/// Looks up the `gpu-core-count` property on the AGX accelerator service.
+/// Returns `None` if the property isn't found (e.g. non-Apple-Silicon hardware).
+fn query_gpu_core_count() -> Option<usize> {
+    // kIOMasterPortDefault / kIOMainPortDefault = 0
+    const MAIN_PORT: u32 = 0;
+    // kCFNumberSInt32Type
+    const CF_NUMBER_SINT32: i32 = 3;
+
+    // SAFETY: IOServiceMatching takes a C string class name and returns a
+    // CFMutableDictionary (consumed by IOServiceGetMatchingService).
+    let matching = unsafe { IOServiceMatching(c"AGXAccelerator".as_ptr()) };
+    if matching.is_null() {
+        return None;
+    }
+
+    // SAFETY: IOServiceGetMatchingService consumes `matching` (releases it)
+    // and returns a mach port for the first matching service, or 0 on failure.
+    let service = unsafe { IOServiceGetMatchingService(MAIN_PORT, matching) };
+    if service == 0 {
+        return None;
+    }
+
+    let key = objc::create_nsstring("gpu-core-count").ok()?;
+
+    // SAFETY: IORegistryEntryCreateCFProperty returns a retained CFType or null.
+    // We pass kNilOptions (0) and kCFAllocatorDefault (null).
+    let cf_num = unsafe { IORegistryEntryCreateCFProperty(service, key, std::ptr::null_mut(), 0) };
+    unsafe { objc::CFRelease(key) };
+    unsafe { IOObjectRelease(service) };
+
+    if cf_num.is_null() {
+        return None;
+    }
+
+    let mut value: i32 = 0;
+    // SAFETY: cf_num is a retained CFNumber. CFNumberGetValue reads it into
+    // our i32 buffer. We release cf_num afterward.
+    let ok = unsafe {
+        CFNumberGetValue(
+            cf_num,
+            CF_NUMBER_SINT32,
+            &mut value as *mut i32 as *mut c_void,
+        )
+    };
+    unsafe { objc::CFRelease(cf_num) };
+
+    if ok && value > 0 {
+        Some(value as usize)
+    } else {
+        None
     }
 }
 
