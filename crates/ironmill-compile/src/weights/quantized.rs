@@ -610,7 +610,7 @@ fn search_best_alpha(
 
 /// Quantize values into a pre-allocated buffer, returning (scale, zero_point).
 /// Avoids the heap allocation of [`quantize_affine`].
-pub fn quantize_affine_into(values: &[f32], qmax: f32, out: &mut [u8]) -> (f32, f32) {
+pub(crate) fn quantize_affine_into(values: &[f32], qmax: f32, out: &mut [u8]) -> (f32, f32) {
     debug_assert!(out.len() >= values.len());
     if values.is_empty() {
         return (1.0, 0.0);
@@ -672,7 +672,7 @@ fn magnitude_cache_key(magnitudes: &[f32]) -> u64 {
 /// Rows are processed in parallel via rayon. Large matrices sub-sample
 /// rows (cap 256) and broadcast the median clip value to all rows.
 #[allow(clippy::too_many_arguments)]
-pub fn search_clip_ranges(
+pub(crate) fn search_clip_ranges(
     scaled_weights: &[f32],
     out_features: usize,
     in_features: usize,
@@ -786,7 +786,7 @@ pub fn search_clip_ranges(
 }
 
 /// Apply per-group clipping to a weight matrix in-place.
-pub fn apply_clip(
+pub(crate) fn apply_clip(
     weights: &mut [f32],
     out_features: usize,
     in_features: usize,

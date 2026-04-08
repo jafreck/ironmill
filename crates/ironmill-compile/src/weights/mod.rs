@@ -9,6 +9,7 @@ pub use mil_rs::weights::{
     Architecture, ModelConfig, QuantizationInfo, WeightProvider, WeightTensor,
 };
 
+pub mod calibration;
 pub mod gguf;
 pub mod mil_provider;
 pub mod quantized;

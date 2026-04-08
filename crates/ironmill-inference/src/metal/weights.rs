@@ -573,6 +573,55 @@ pub fn create_dense_f16_buffer(
     })
 }
 
+/// Create a Dense FP16 [`WeightBuffer`] with room for `n_elements` f16 values.
+///
+/// The buffer is Shared-mode and zero-initialised. Use
+/// [`update_dense_f16_data`] to populate it before dispatching.
+pub fn create_dense_f16_buffer_sized(
+    device: &MetalDevice,
+    n_elements: usize,
+) -> Result<WeightBuffer, MetalError> {
+    let buf = device
+        .create_buffer(n_elements * 2, StorageMode::Shared)
+        .map_err(MetalError::Metal)?;
+    Ok(WeightBuffer::Dense {
+        buf: Some(buf),
+        packed: None,
+    })
+}
+
+/// Overwrite the contents of a Dense FP16 [`WeightBuffer`] with new f32 data.
+///
+/// Converts `data_f32` to FP16 on the CPU and writes directly into the
+/// existing Shared-mode Metal buffer, avoiding a new GPU allocation.
+///
+/// # Errors
+/// Returns an error if `wb` is not a Dense buffer, has no row-major buffer,
+/// or the data is too large for the existing allocation.
+pub fn update_dense_f16_data(wb: &WeightBuffer, data_f32: &[f32]) -> Result<(), MetalError> {
+    let buf = match wb {
+        WeightBuffer::Dense { buf: Some(b), .. } => b,
+        _ => {
+            return Err(MetalError::Other(anyhow::anyhow!(
+                "update_dense_f16_data: expected Dense buffer with row-major allocation"
+            )));
+        }
+    };
+    let byte_len = data_f32.len() * 2;
+    if byte_len > buf.length() {
+        return Err(MetalError::BufferSizeMismatch {
+            expected: byte_len,
+            actual: buf.length(),
+        });
+    }
+    let f16_bytes: Vec<u8> = data_f32
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+        .collect();
+    buf.write_bytes(&f16_bytes, 0).map_err(MetalError::Metal)?;
+    Ok(())
+}
+
 /// Apply D2Quant quantize→dequantize round-trip to a single weight buffer.
 ///
 /// Reads FP16 data from the buffer, converts to F32, runs dual-scale

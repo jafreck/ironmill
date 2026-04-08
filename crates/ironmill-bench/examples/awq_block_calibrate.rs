@@ -16,8 +16,9 @@ use std::time::Instant;
 use half::f16;
 use serde_json;
 
-use ironmill_compile::weights::quantized::{
-    AwqTensorConfig, quantize_affine_into, search_clip_ranges,
+use ironmill_compile::weights::calibration::{
+    ATTN_PROJS, AwqTensorConfig, FFN_PROJS, compute_awq_scales, compute_channel_magnitudes,
+    f16_slice_to_bytes, mse_f16_bytes, quantize_dequant_scaled, search_clip_ranges, weight_groups,
 };
 use ironmill_compile::weights::{SafeTensorsProvider, WeightProvider};
 use ironmill_inference::calibration::{ActivationHook, CalibrationDataset};
@@ -64,7 +65,7 @@ impl ActivationHook for BlockCalibrationHook {
                 self.ffn_norm_acts.insert(layer, f32_data);
             }
             "block_output" => {
-                let bytes = bytemuck_cast_f16_to_bytes(activation);
+                let bytes = f16_slice_to_bytes(activation);
                 self.block_outputs.insert(layer, bytes);
             }
             _ => {}
@@ -72,23 +73,7 @@ impl ActivationHook for BlockCalibrationHook {
     }
 }
 
-/// Reinterpret `&[f16]` as raw bytes without `unsafe` in the example crate
-/// (which has `#![deny(unsafe_code)]` in the main binary, but examples are
-/// separate compilation units). We just do a simple copy.
-fn bytemuck_cast_f16_to_bytes(data: &[f16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 2);
-    for v in data {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    bytes
-}
-
 // ── Weight loading helpers ─────────────────────────────────────
-
-/// Projection names that live under `self_attn` in the HuggingFace naming.
-const ATTN_PROJS: &[&str] = &["q_proj", "k_proj", "v_proj", "o_proj"];
-/// Projection names that live under `mlp`.
-const FFN_PROJS: &[&str] = &["gate_proj", "up_proj", "down_proj"];
 
 /// Build the HuggingFace tensor name for a layer projection weight.
 fn hf_weight_name(layer: usize, proj: &str) -> String {
@@ -98,6 +83,11 @@ fn hf_weight_name(layer: usize, proj: &str) -> String {
         "mlp"
     };
     format!("model.layers.{layer}.{block}.{proj}.weight")
+}
+
+/// Check if a layer is GDN (linear attention) by probing for self_attn.q_proj.
+fn is_gdn_layer(provider: &SafeTensorsProvider, layer: usize) -> bool {
+    !provider.has_tensor(&format!("model.layers.{layer}.self_attn.q_proj.weight"))
 }
 
 /// Load a weight tensor as f32 and return (data, [out_features, in_features]).
@@ -133,137 +123,6 @@ fn load_weight_f32(
     };
 
     Ok((f32_data, [out_features, in_features]))
-}
-
-// ── Quantize / dequantize round-trip ───────────────────────────
-
-/// Quantize-then-dequantize a weight matrix with AWQ scaling applied.
-///
-/// Returns the dequantized f32 weights with the inverse scale applied,
-/// i.e. the "approximated FP16 weights" that would result from quantization.
-fn quantize_dequant_scaled(
-    weights: &[f32],
-    out_features: usize,
-    in_features: usize,
-    scales: &[f32],
-    group_size: usize,
-) -> Vec<f32> {
-    let qmax = 15.0_f32; // INT4
-    let n_groups = in_features.div_ceil(group_size);
-    let mut result = vec![0.0f32; weights.len()];
-
-    let mut quant_buf = vec![0u8; group_size];
-
-    for row in 0..out_features {
-        for g in 0..n_groups {
-            let g_start = g * group_size;
-            let g_end = (g_start + group_size).min(in_features);
-            let gsize = g_end - g_start;
-
-            // Scale weights
-            let group_vals: Vec<f32> = (g_start..g_end)
-                .map(|c| weights[row * in_features + c] * scales[c])
-                .collect();
-
-            // Quantize
-            let (scale, zp) = quantize_affine_into(&group_vals, qmax, &mut quant_buf[..gsize]);
-
-            // Dequantize and undo scaling
-            for j in 0..gsize {
-                let dequant = (quant_buf[j] as f32 - zp) * scale;
-                let c = g_start + j;
-                result[row * in_features + c] = dequant / scales[c];
-            }
-        }
-    }
-
-    result
-}
-
-/// Compute MSE between two FP16 byte buffers.
-fn mse_f16_bytes(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    let n = a.len() / 2;
-    if n == 0 {
-        return 0.0;
-    }
-    let mut sum = 0.0_f64;
-    for i in 0..n {
-        let va = f16::from_le_bytes([a[i * 2], a[i * 2 + 1]]).to_f64();
-        let vb = f16::from_le_bytes([b[i * 2], b[i * 2 + 1]]).to_f64();
-        let d = va - vb;
-        sum += d * d;
-    }
-    sum / n as f64
-}
-
-// ── Alpha search ───────────────────────────────────────────────
-
-/// Compute AWQ scales from activation magnitudes and an alpha value.
-///
-/// Matches the reference AWQ normalization:
-///   scales[c] = x_max[c]^alpha
-///   scales /= sqrt(max(scales) * min(scales))
-fn compute_awq_scales(x_max: &[f32], alpha: f32) -> Vec<f32> {
-    if alpha == 0.0 {
-        return vec![1.0; x_max.len()];
-    }
-    let mut scales: Vec<f32> = x_max.iter().map(|&m| m.powf(alpha).max(1e-4)).collect();
-    let max_s = scales.iter().cloned().fold(0.0_f32, f32::max);
-    let min_s = scales.iter().cloned().fold(f32::INFINITY, f32::min);
-    let norm = (max_s * min_s).sqrt().max(1e-8);
-    for s in &mut scales {
-        *s /= norm;
-    }
-    scales
-}
-
-/// Compute per-channel mean absolute activation (x_max) from flat [tokens × features] data.
-fn compute_channel_magnitudes(activations: &[f32], n_features: usize) -> Vec<f32> {
-    if n_features == 0 || activations.is_empty() {
-        return Vec::new();
-    }
-    let n_tokens = activations.len() / n_features;
-    let mut mags = vec![0.0_f32; n_features];
-    for t in 0..n_tokens {
-        for c in 0..n_features {
-            mags[c] += activations[t * n_features + c].abs();
-        }
-    }
-    if n_tokens > 0 {
-        for m in &mut mags {
-            *m /= n_tokens as f32;
-        }
-    }
-    mags
-}
-
-// ── Weight group definitions ──────────────────────────────────
-
-struct WeightGroup {
-    proj_names: Vec<&'static str>,
-    norm_key: &'static str, // "attn" or "ffn"
-}
-
-fn weight_groups() -> Vec<WeightGroup> {
-    vec![
-        WeightGroup {
-            proj_names: vec!["q_proj", "k_proj", "v_proj"],
-            norm_key: "attn",
-        },
-        WeightGroup {
-            proj_names: vec!["o_proj"],
-            norm_key: "attn",
-        },
-        WeightGroup {
-            proj_names: vec!["gate_proj", "up_proj"],
-            norm_key: "ffn",
-        },
-        WeightGroup {
-            proj_names: vec!["down_proj"],
-            norm_key: "ffn",
-        },
-    ]
 }
 
 // ── Main ───────────────────────────────────────────────────────
@@ -336,14 +195,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ── Phase 2: Block-level alpha search ─────────────────────
-    eprintln!("\n=== Phase 2: Block-level alpha search ===");
+    eprintln!("\n=== Phase 2: Block-level alpha search (coarse→fine) ===");
     let phase2_start = Instant::now();
 
-    let alpha_candidates: Vec<f32> = (0..=20).map(|i| i as f32 * 0.05).collect();
+    // Coarse→fine: 6 coarse candidates, then ±0.1 fine around best (step 0.02).
+    let coarse_alphas: Vec<f32> = (0..=5).map(|i| i as f32 * 0.2).collect();
     let groups = weight_groups();
 
     let mut block_config: HashMap<String, AwqTensorConfig> = HashMap::new();
     let mut magnitudes_map: HashMap<String, Vec<f32>> = HashMap::new();
+    // Cache f32 weights loaded during Phase 2 for reuse in Phase 3.
+    let mut weight_cache: HashMap<(usize, String), (Vec<f32>, [usize; 2])> = HashMap::new();
 
     // Layer 0: skip block-level search, use per-tensor fallback alpha=0.5
     for proj in ATTN_PROJS.iter().chain(FFN_PROJS.iter()) {
@@ -360,20 +222,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Compute and store magnitudes for layer 0
     if let Some(acts) = hook.attn_norm_acts.get(&0) {
         let mags = compute_channel_magnitudes(acts, hidden_size);
-        for proj in &["q_proj", "k_proj", "v_proj", "o_proj"] {
+        for proj in ATTN_PROJS {
             magnitudes_map.insert(format!("l0_{proj}_weight"), mags.clone());
         }
     }
     if let Some(acts) = hook.ffn_norm_acts.get(&0) {
         let mags = compute_channel_magnitudes(acts, hidden_size);
-        for proj in &["gate_proj", "up_proj", "down_proj"] {
+        for proj in FFN_PROJS {
             magnitudes_map.insert(format!("l0_{proj}_weight"), mags.clone());
         }
     }
 
+    // Reset engine once before the alpha search loop.
+    InferenceEngine::reset(&mut engine);
+
     // Layers 1..N: full block-level alpha search
     for layer_idx in 1..n_layers {
         let layer_start = Instant::now();
+        let gdn = is_gdn_layer(&provider, layer_idx);
 
         // Block input = block_output[layer_idx - 1]
         let block_input = match hook.block_outputs.get(&(layer_idx - 1)) {
@@ -430,99 +296,134 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|a| compute_channel_magnitudes(a, hidden_size))
             .unwrap_or_else(|| vec![1.0; hidden_size]);
 
-        // Store magnitudes for output
-        for proj in &["q_proj", "k_proj", "v_proj", "o_proj"] {
-            magnitudes_map.insert(format!("l{layer_idx}_{proj}_weight"), attn_mags.clone());
+        // Store magnitudes for output (only for projections that exist)
+        if !gdn {
+            for proj in ATTN_PROJS {
+                magnitudes_map.insert(format!("l{layer_idx}_{proj}_weight"), attn_mags.clone());
+            }
         }
-        for proj in &["gate_proj", "up_proj", "down_proj"] {
+        for proj in FFN_PROJS {
             magnitudes_map.insert(format!("l{layer_idx}_{proj}_weight"), ffn_mags.clone());
         }
 
-        for group in &groups {
+        // Skip attention groups for GDN layers
+        let layer_groups: Vec<&_> = groups
+            .iter()
+            .filter(|g| !(gdn && g.norm_key == "attn"))
+            .collect();
+
+        for group in &layer_groups {
             let mags = if group.norm_key == "attn" {
                 &attn_mags
             } else {
                 &ffn_mags
             };
 
-            // Pre-load FP16 weights for all projections in this group
+            // Load weights for all projections in this group and cache them.
             let mut proj_weights: Vec<(&str, Vec<f32>, [usize; 2])> = Vec::new();
             for &proj in &group.proj_names {
-                let (w, shape) = load_weight_f32(&provider, layer_idx, proj)?;
+                let cache_key = (layer_idx, proj.to_string());
+                let (w, shape) = if let Some(cached) = weight_cache.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    let loaded = load_weight_f32(&provider, layer_idx, proj)?;
+                    weight_cache.insert(cache_key, loaded.clone());
+                    loaded
+                };
                 proj_weights.push((proj, w, shape));
             }
 
-            // Determine which in_features dimension to use for scales.
-            // All projections in a group share the same activation norm,
-            // so their in_features should match the norm dimension.
             let in_features_for_scales = proj_weights[0].2[1];
 
-            // Ensure magnitudes match the weight in_features dimension.
             // For o_proj and down_proj the in_features differ from hidden_size.
             let effective_mags = if mags.len() != in_features_for_scales {
-                // Activations don't match weight dim — this projection uses a
-                // different norm output size (e.g. o_proj has num_heads×head_dim).
-                // Fall back to uniform magnitudes.
                 vec![1.0_f32; in_features_for_scales]
             } else {
                 mags.clone()
             };
 
-            // Search alpha candidates — each can be evaluated independently.
-            // We must use sequential evaluation because `run_single_layer` is
-            // &mut self on the engine (not parallelizable across alphas).
-            let mut best_alpha = 0.5_f32;
-            let mut best_loss = f64::INFINITY;
+            // Pre-allocate reusable GPU scratch buffers (one per projection).
+            let mut scratch_bufs: Vec<_> = proj_weights
+                .iter()
+                .map(|&(_, _, [out_f, in_f])| engine.create_dense_f16_buffer_sized(out_f * in_f))
+                .collect::<Result<Vec<_>, _>>()?;
 
-            for &alpha in &alpha_candidates {
-                let scales = compute_awq_scales(&effective_mags, alpha);
+            // Helper: evaluate a single alpha candidate.
+            let eval_alpha =
+                |engine: &mut MetalInference,
+                 scratch_bufs: &mut [ironmill_inference::metal::weights::WeightBuffer],
+                 alpha: f32|
+                 -> Result<f64, Box<dyn std::error::Error>> {
+                    let scales = compute_awq_scales(&effective_mags, alpha);
+                    let mut swap_handles: Vec<(
+                        &str,
+                        Option<ironmill_inference::metal::weights::WeightBuffer>,
+                    )> = Vec::new();
 
-                // For each projection: quantize-dequant with these scales
-                let mut all_ok = true;
-                let mut swap_handles: Vec<(
-                    &str,
-                    Option<ironmill_inference::metal::weights::WeightBuffer>,
-                )> = Vec::new();
+                    for (i, &(proj, ref w, [out_f, in_f])) in proj_weights.iter().enumerate() {
+                        if scales.len() != in_f {
+                            return Ok(f64::INFINITY);
+                        }
+                        let dq = quantize_dequant_scaled(w, out_f, in_f, &scales, group_size);
+                        MetalInference::update_dense_f16_buffer(&scratch_bufs[i], &dq)?;
+                        let scratch = std::mem::replace(
+                            &mut scratch_bufs[i],
+                            ironmill_inference::metal::weights::WeightBuffer::empty(),
+                        );
+                        let original = engine.swap_layer_weight(layer_idx, proj, scratch);
+                        swap_handles.push((proj, original));
+                    }
 
-                for &(proj, ref w, [out_f, in_f]) in &proj_weights {
-                    // Scales may need adapting if in_features != scale length
-                    let proj_scales = if scales.len() == in_f {
-                        &scales
-                    } else {
-                        // Shouldn't happen given effective_mags, but guard
-                        all_ok = false;
-                        break;
-                    };
-                    let dq = quantize_dequant_scaled(w, out_f, in_f, proj_scales, group_size);
-                    let buf = engine.create_dense_f16_buffer(&dq)?;
-                    let original = engine.swap_layer_weight(layer_idx, proj, buf);
-                    swap_handles.push((proj, original));
-                }
-
-                let loss = if all_ok {
-                    // Run single layer forward
-                    match engine.run_single_layer(layer_idx, block_input, token_count) {
+                    let loss = match engine.run_single_layer(layer_idx, block_input, token_count) {
                         Ok(output) => mse_f16_bytes(&output, ref_output),
                         Err(e) => {
                             eprintln!("[layer {layer_idx}] run_single_layer error: {e}");
                             f64::INFINITY
                         }
+                    };
+
+                    // Restore original weights, recovering scratch buffers.
+                    for (i, (proj, original)) in swap_handles.into_iter().enumerate().rev() {
+                        if let Some(orig) = original {
+                            let returned = engine.swap_layer_weight(layer_idx, proj, orig);
+                            if let Some(buf) = returned {
+                                scratch_bufs[i] = buf;
+                            }
+                        }
                     }
-                } else {
-                    f64::INFINITY
+
+                    Ok(loss)
                 };
 
-                // Restore original weights
-                for (proj, original) in swap_handles.into_iter().rev() {
-                    if let Some(orig) = original {
-                        engine.swap_layer_weight(layer_idx, proj, orig);
-                    }
-                }
+            // ── Coarse pass ──
+            let mut best_alpha = 0.5_f32;
+            let mut best_loss = f64::INFINITY;
 
+            for &alpha in &coarse_alphas {
+                let loss = eval_alpha(&mut engine, &mut scratch_bufs, alpha)?;
                 if loss < best_loss {
                     best_loss = loss;
                     best_alpha = alpha;
                 }
+            }
+
+            // ── Fine pass ── ±0.1 around best, step 0.02 (up to 10 more evals)
+            let fine_lo = (best_alpha - 0.1).max(0.0);
+            let fine_hi = (best_alpha + 0.1).min(1.0);
+            let mut fine_alpha = fine_lo;
+            while fine_alpha <= fine_hi + 1e-6 {
+                // Skip if we already evaluated this candidate in the coarse pass.
+                let already_tested = coarse_alphas
+                    .iter()
+                    .any(|&c| (c - fine_alpha).abs() < 0.005);
+                if !already_tested {
+                    let loss = eval_alpha(&mut engine, &mut scratch_bufs, fine_alpha)?;
+                    if loss < best_loss {
+                        best_loss = loss;
+                        best_alpha = fine_alpha;
+                    }
+                }
+                fine_alpha += 0.02;
             }
 
             for &proj in &group.proj_names {
@@ -581,7 +482,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => continue,
             };
 
-            let (w, [out_features, in_features]) = load_weight_f32(&provider, layer_idx, proj)?;
+            // Use cached weights from Phase 2 when available, otherwise load.
+            let cache_key = (layer_idx, proj.to_string());
+            let (w, [out_features, in_features]) =
+                if let Some(cached) = weight_cache.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    load_weight_f32(&provider, layer_idx, proj)?
+                };
 
             // Activations must match in_features; if not, skip clip for this proj
             if activations.len() < n_tokens * in_features {

@@ -875,7 +875,26 @@ impl MetalInference {
             }
 
             // ── Capture block output (full hidden state after layer) ──
+            // hidden_state is in Private storage — copy to Shared scratch first.
             {
+                let copy_cmd = self
+                    .queue
+                    .command_buffer()
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                let copy_enc = copy_cmd
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                ops::encode_copy_buffer(
+                    &copy_enc,
+                    &pipelines.copy_buffer,
+                    &bufs.hidden_state,
+                    &calib_scratch,
+                    (token_count * h) as u32,
+                );
+                copy_enc.end_encoding();
+                copy_cmd.commit();
+                copy_cmd.wait_until_completed();
+
                 let rb_start = Instant::now();
                 let mut readback_u16 = vec![0u16; norm_readback_bytes / 2];
                 #[allow(unsafe_code)]
@@ -885,7 +904,7 @@ impl MetalInference {
                         norm_readback_bytes,
                     )
                 };
-                bufs.hidden_state
+                calib_scratch
                     .read_bytes(readback, 0)
                     .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
@@ -1078,15 +1097,20 @@ impl MetalInference {
     /// pipeline through just that one layer. Returns the output hidden
     /// state as raw FP16 bytes.
     ///
-    /// The engine is reset before execution (seq_pos = 0, KV cache cleared).
+    /// Uses a lightweight reset (seq_pos = 0) instead of a full engine
+    /// reset, and does not advance sequence position afterwards — this
+    /// makes it safe to call repeatedly for the same layer without
+    /// accumulating KV cache state.
     pub fn run_single_layer(
         &mut self,
         layer_idx: usize,
         input_hidden_state: &[u8],
         token_count: usize,
     ) -> Result<Vec<u8>, InferenceError> {
-        // 1. Reset engine state.
-        InferenceEngine::reset(self);
+        // 1. Lightweight reset: only seq_pos needs to be 0 for correct RoPE
+        //    and KV cache addressing. Skips full KV/GDN reset since the
+        //    layer forward will overwrite position 0 regardless.
+        self.seq_pos = 0;
 
         // 2. Ensure intermediate buffers are large enough for this token count.
         let mc = self
@@ -1144,6 +1168,9 @@ impl MetalInference {
         self.run_pipeline_calibration_from_layer(layer_idx, token_count)?;
 
         // 6. Readback hidden_state (block output).
+        //    Reset seq_pos so caller doesn't need to — the run above
+        //    advanced it by token_count.
+        self.seq_pos = 0;
         let bufs = self
             .intermediate_buffers
             .as_ref()
@@ -1662,6 +1689,28 @@ impl MetalInference {
         data_f32: &[f32],
     ) -> Result<super::weights::WeightBuffer, InferenceError> {
         super::weights::create_dense_f16_buffer(&self.device, data_f32)
+            .map_err(|e| InferenceError::runtime(e.to_string()))
+    }
+
+    /// Create an empty Dense FP16 GPU buffer sized for `n_elements` values.
+    ///
+    /// Use [`update_dense_f16_buffer`](Self::update_dense_f16_buffer) to
+    /// write data before dispatching.
+    pub fn create_dense_f16_buffer_sized(
+        &self,
+        n_elements: usize,
+    ) -> Result<super::weights::WeightBuffer, InferenceError> {
+        super::weights::create_dense_f16_buffer_sized(&self.device, n_elements)
+            .map_err(|e| InferenceError::runtime(e.to_string()))
+    }
+
+    /// Overwrite the contents of a Dense FP16 buffer with new f32 data,
+    /// avoiding a GPU allocation.
+    pub fn update_dense_f16_buffer(
+        wb: &super::weights::WeightBuffer,
+        data_f32: &[f32],
+    ) -> Result<(), InferenceError> {
+        super::weights::update_dense_f16_data(wb, data_f32)
             .map_err(|e| InferenceError::runtime(e.to_string()))
     }
 }
