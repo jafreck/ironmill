@@ -16,7 +16,7 @@
 use mil_rs::TensorData;
 use mil_rs::ir::{Block, Function, Operation, Program, ScalarType, TensorType, Value};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 // ── Model hyper-parameters ──────────────────────────────────────────────
 
@@ -242,7 +242,7 @@ pub fn create_test_calibration_data(
     (0..n_sequences)
         .map(|_| {
             (0..seq_len)
-                .map(|_| rng.gen_range(0..VOCAB_SIZE as u32))
+                .map(|_| rng.random_range(0..VOCAB_SIZE as u32))
                 .collect()
         })
         .collect()
@@ -313,7 +313,7 @@ fn emit_rms_norm(
 
     // Norm weights are typically initialized near 1.0
     let weight_data: Vec<f32> = (0..dim)
-        .map(|_| 1.0 + rng.gen_range(-0.01f32..0.01))
+        .map(|_| 1.0 + rng.random_range(-0.01f32..0.01))
         .collect();
     block.add_op(const_tensor_op(
         &weight_const,
@@ -338,7 +338,7 @@ fn emit_rms_norm(
 /// initialisation at small hidden sizes.
 fn random_weight(rng: &mut StdRng, shape: &[usize]) -> Vec<f32> {
     let n: usize = shape.iter().product();
-    (0..n).map(|_| rng.gen_range(-0.1f32..0.1)).collect()
+    (0..n).map(|_| rng.random_range(-0.1f32..0.1)).collect()
 }
 
 /// Convert an f32 slice to little-endian bytes.

@@ -4,7 +4,7 @@
 //! Walsh–Hadamard transform preceded by a random diagonal sign matrix.
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// Applies a seeded randomized Hadamard transform to a matrix in-place.
 ///
@@ -87,7 +87,7 @@ pub fn pad_to_power_of_two(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>,
 fn generate_signs(n: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
     (0..n)
-        .map(|_| if rng.gen_bool(0.5) { 1.0 } else { -1.0 })
+        .map(|_| if rng.random_bool(0.5) { 1.0 } else { -1.0 })
         .collect()
 }
 

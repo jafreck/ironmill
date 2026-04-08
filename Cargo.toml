@@ -19,8 +19,8 @@ ironmill-metal-sys = { path = "crates/ironmill-metal-sys", version = "0.1.0" }
 ironmill-coreml-sys = { path = "crates/ironmill-coreml-sys", version = "0.1.0" }
 ironmill-inference = { path = "crates/ironmill-inference", version = "0.1.0" }
 ironmill-torch = { path = "crates/ironmill-torch", version = "0.1.0", default-features = false }
-prost = "0.13"
-prost-build = "0.13"
+prost = "0.14"
+prost-build = "0.14"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
@@ -30,10 +30,10 @@ serde_json = "1"
 tempfile = "3"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = { version = "1.1", features = ["parse", "display"] }
 glob-match = "0.2"
 statrs = "0.18"
-rand = "0.8"
+rand = "0.10"
 log = "0.4"
 tracing = "0.1"
 rayon = "1.11"

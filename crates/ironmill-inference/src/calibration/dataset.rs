@@ -62,13 +62,13 @@ impl CalibrationDataset {
     /// Token IDs are drawn uniformly from `[0, vocab_size)`.
     pub fn random(vocab_size: usize, seq_len: usize, n_sequences: usize, seed: u64) -> Self {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         let mut rng = StdRng::seed_from_u64(seed);
         let sequences: Vec<Vec<u32>> = (0..n_sequences)
             .map(|_| {
                 (0..seq_len)
-                    .map(|_| rng.gen_range(0..vocab_size as u32))
+                    .map(|_| rng.random_range(0..vocab_size as u32))
                     .collect()
             })
             .collect();

@@ -22,7 +22,7 @@ glob-match = { workspace = true }
 rand = { workspace = true }
 statrs = { workspace = true }
 memmap2 = { workspace = true }
-faer = { version = "0.20", optional = true }
+faer = { version = "0.24", optional = true }
 rayon = "1.11"
 tempfile = { workspace = true }
 tracing = { workspace = true }

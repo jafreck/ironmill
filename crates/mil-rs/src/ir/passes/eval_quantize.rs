@@ -594,13 +594,13 @@ mod tests {
     use crate::ir::types::TensorData;
 
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     // -- Helpers ------------------------------------------------------------
 
     fn random_weight(rng: &mut StdRng, shape: &[usize]) -> Vec<f32> {
         let n: usize = shape.iter().product();
-        (0..n).map(|_| rng.gen_range(-0.1f32..0.1)).collect()
+        (0..n).map(|_| rng.random_range(-0.1f32..0.1)).collect()
     }
 
     /// Build a realistic multi-layer test program with 2D weight matrices

@@ -4,7 +4,7 @@
 //! little-endian bytes directly.
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// Generate the ±1 sign vector for the randomized Hadamard rotation.
 ///
@@ -13,7 +13,13 @@ use rand::{Rng, SeedableRng};
 pub fn generate_rotation_signs(dim: usize, seed: u64) -> Vec<u8> {
     let mut rng = StdRng::seed_from_u64(seed);
     let signs: Vec<f32> = (0..dim)
-        .map(|_| if rng.r#gen_bool(0.5) { 1.0f32 } else { -1.0f32 })
+        .map(|_| {
+            if rng.random_bool(0.5) {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
         .collect();
     signs.iter().flat_map(|&v| v.to_le_bytes()).collect()
 }
@@ -29,9 +35,9 @@ pub fn generate_qjl_matrix(dim: usize, seed: u64) -> Vec<u8> {
     let mut values = Vec::with_capacity(n);
 
     while values.len() < n {
-        let u1: f64 = rng.r#gen::<f64>().max(1e-300);
-        let u2: f64 = rng.r#gen::<f64>();
-        let r = (-2.0 * u1.ln()).sqrt();
+        let u1: f64 = rng.random::<f64>().max(1e-300);
+        let u2: f64 = rng.random::<f64>();
+        let r = (-2.0_f64 * u1.ln()).sqrt();
         let theta = 2.0 * std::f64::consts::PI * u2;
         values.push((r * theta.cos()) as f32);
         if values.len() < n {
@@ -39,7 +45,7 @@ pub fn generate_qjl_matrix(dim: usize, seed: u64) -> Vec<u8> {
         }
     }
 
-    values.iter().flat_map(|&v| v.to_le_bytes()).collect()
+    values.iter().flat_map(|&v: &f32| v.to_le_bytes()).collect()
 }
 
 /// Convert little-endian f32 bytes (as returned by [`generate_rotation_signs`])

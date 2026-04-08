@@ -4,7 +4,7 @@
 //! Cholesky decomposition, and row-wise or full inverse computation.
 //! All public items are gated behind the `gptq` feature flag.
 
-// faer::prelude::* is used in tests for the `.cholesky()` convenience method.
+// faer::prelude::* is used in tests for the `.llt()` convenience method.
 #[cfg(test)]
 use faer::prelude::*;
 
@@ -80,19 +80,19 @@ pub fn cholesky_decompose(h: &[f32], n: usize) -> crate::error::Result<Vec<f32>>
 
     let mat = faer::Mat::<f64>::from_fn(n, n, |i, j| h[i * n + j] as f64);
 
-    let cholesky = mat.cholesky(faer::Side::Lower).map_err(|e| {
+    let cholesky = mat.llt(faer::Side::Lower).map_err(|e| {
         MilError::Validation(format!(
-            "Cholesky decomposition failed: non-positive-definite minor at index {}",
-            e.non_positive_definite_minor
+            "Cholesky decomposition failed: non-positive-definite minor at index {:?}",
+            e
         ))
     })?;
 
-    let l = cholesky.compute_l();
+    let l = cholesky.L();
 
     let mut result = vec![0.0f32; n * n];
     for i in 0..n {
         for j in 0..n {
-            result[i * n + j] = l.read(i, j) as f32;
+            result[i * n + j] = l[(i, j)] as f32;
         }
     }
     Ok(result)
@@ -207,20 +207,20 @@ pub fn cholesky_inverse_factor(l: &[f32], n: usize) -> crate::error::Result<Vec<
     //    H⁻¹ = L Lᵀ = Uᵀ U where U = Lᵀ.
     let mat = faer::Mat::<f64>::from_fn(n, n, |i, j| h_inv[i * n + j] as f64);
 
-    let cholesky = mat.cholesky(faer::Side::Lower).map_err(|e| {
+    let cholesky = mat.llt(faer::Side::Lower).map_err(|e| {
         MilError::Validation(format!(
-            "Cholesky of H⁻¹ failed: non-positive-definite minor at index {}",
-            e.non_positive_definite_minor
+            "Cholesky of H⁻¹ failed: non-positive-definite minor at index {:?}",
+            e
         ))
     })?;
 
-    let l_mat = cholesky.compute_l();
+    let l_mat = cholesky.L();
 
     // U = Lᵀ (transpose to get upper triangular factor).
     let mut result = vec![0.0f32; n * n];
     for i in 0..n {
         for j in 0..n {
-            result[i * n + j] = l_mat.read(j, i) as f32;
+            result[i * n + j] = l_mat[(j, i)] as f32;
         }
     }
     Ok(result)
@@ -291,13 +291,13 @@ mod tests {
     #[test]
     fn faer_cholesky_smoke() {
         let mat = faer::mat![[4.0_f64, 2.0, 1.0], [2.0, 5.0, 3.0], [1.0, 3.0, 6.0],];
-        let cholesky = mat.cholesky(faer::Side::Lower).unwrap();
-        let l = cholesky.compute_l();
+        let cholesky = mat.llt(faer::Side::Lower).unwrap();
+        let l = cholesky.L();
         let reconstructed = &l * l.transpose();
         for i in 0..3 {
             for j in 0..3 {
                 assert!(
-                    (reconstructed.read(i, j) - mat.read(i, j)).abs() < 1e-10,
+                    (reconstructed[(i, j)] - mat[(i, j)]).abs() < 1e-10,
                     "Cholesky reconstruction failed at ({}, {})",
                     i,
                     j

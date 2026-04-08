@@ -7,7 +7,7 @@
 //! orthogonal.
 
 use faer::Mat;
-use faer::prelude::SpSolver;
+use faer::linalg::solvers::Solve;
 
 /// A rotation matrix parameterized via the Cayley transform.
 ///
@@ -64,8 +64,8 @@ impl CayleyRotation {
         let mut idx = 0;
         for i in 0..n {
             for j in (i + 1)..n {
-                a.write(i, j, self.params[idx]);
-                a.write(j, i, -self.params[idx]);
+                a[(i, j)] = self.params[idx];
+                a[(j, i)] = -self.params[idx];
                 idx += 1;
             }
         }
@@ -82,9 +82,9 @@ impl CayleyRotation {
         let eye = Mat::<f64>::identity(n, n);
 
         // I + A
-        let i_plus_a = Mat::from_fn(n, n, |i, j| eye.read(i, j) + a.read(i, j));
+        let i_plus_a = Mat::from_fn(n, n, |i, j| eye[(i, j)] + a[(i, j)]);
         // I - A
-        let i_minus_a = Mat::from_fn(n, n, |i, j| eye.read(i, j) - a.read(i, j));
+        let i_minus_a = Mat::from_fn(n, n, |i, j| eye[(i, j)] - a[(i, j)]);
 
         // Solve (I + A) * R = (I - A)  →  R = (I + A)^{-1} * (I - A)
         let lu = i_plus_a.partial_piv_lu();
@@ -94,7 +94,7 @@ impl CayleyRotation {
         let mut out = Vec::with_capacity(n * n);
         for i in 0..n {
             for j in 0..n {
-                out.push(r.read(i, j) as f32);
+                out.push(r[(i, j)] as f32);
             }
         }
         out
@@ -112,7 +112,7 @@ impl CayleyRotation {
         let mut frobenius_sq = 0.0;
         for i in 0..n {
             for j in 0..n {
-                let diff = rrt.read(i, j) - eye.read(i, j);
+                let diff = rrt[(i, j)] - eye[(i, j)];
                 frobenius_sq += diff * diff;
             }
         }
