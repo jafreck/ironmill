@@ -344,28 +344,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mags.clone()
             };
 
-            // GDN layers have no attention projections — only FFN groups
-            // remain. Skip the expensive GPU alpha search and use a fixed
-            // alpha, which is close to optimal for FFN-only groups.
-            if gdn {
-                let best_alpha = 0.5_f32;
-                for &proj in &group.proj_names {
-                    let key = format!("l{layer_idx}_{proj}_weight");
-                    block_config.insert(
-                        key,
-                        AwqTensorConfig {
-                            alpha: best_alpha,
-                            clip_maxvals: None,
-                        },
-                    );
-                }
-                eprintln!(
-                    "  [layer {layer_idx}] {:?} → alpha={best_alpha:.2} (GDN, fixed)",
-                    group.proj_names,
-                );
-                continue;
-            }
-
             // Pre-allocate reusable GPU scratch buffers (one per projection).
             let mut scratch_bufs: Vec<_> = proj_weights
                 .iter()
