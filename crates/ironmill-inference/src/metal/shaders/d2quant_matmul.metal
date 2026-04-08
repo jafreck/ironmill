@@ -91,7 +91,8 @@ constant constexpr uint THREADS_PER_TG = N_SIMDGROUPS * 32;
 constant constexpr uint TM_TILE        = N_SIMDGROUPS * 8;   // 64
 constant constexpr uint TN_TILE        = 64;
 constant constexpr uint TN_STRIDE      = TN_TILE + 1;
-constant constexpr uint MATMUL_K_TILE  = 8;
+constant constexpr uint MATMUL_K_TILE  = 32;
+constant constexpr uint K_BLOCKS       = MATMUL_K_TILE / 8;  // 4 MMA ops per K-tile
 constant constexpr uint TN_BLOCKS      = TN_TILE / 8;
 
 // ── D2Quant tiled GEMM (prefill path, M>1) ──────────────────────
@@ -216,13 +217,15 @@ kernel void d2quant_matmul_3bit(
             }
         }
 
-        // Compute on CURRENT tile
-        simdgroup_matrix<half, 8, 8> a_mat;
-        simdgroup_load(a_mat, tg_a[cur] + sgid * 8 * MATMUL_K_TILE, MATMUL_K_TILE);
-        for (uint j = 0; j < TN_BLOCKS; j++) {
-            simdgroup_matrix<half, 8, 8> bt_mat;
-            simdgroup_load(bt_mat, tg_bt[cur] + j * 8, TN_STRIDE);
-            simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
+        // Compute on CURRENT tile: K_BLOCKS MMA ops per K-tile
+        for (uint kbi = 0; kbi < K_BLOCKS; kbi++) {
+            simdgroup_matrix<half, 8, 8> a_mat;
+            simdgroup_load(a_mat, tg_a[cur] + sgid * 8 * MATMUL_K_TILE + kbi * 8, MATMUL_K_TILE);
+            for (uint j = 0; j < TN_BLOCKS; j++) {
+                simdgroup_matrix<half, 8, 8> bt_mat;
+                simdgroup_load(bt_mat, tg_bt[cur] + kbi * 8 * TN_STRIDE + j * 8, TN_STRIDE);
+                simdgroup_multiply_accumulate(acc[j], a_mat, bt_mat, acc[j]);
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
