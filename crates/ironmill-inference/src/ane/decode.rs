@@ -298,7 +298,7 @@ impl<D: AneDevice> AneLmHead<D> {
             let alloc = uniform_alloc_size(&[
                 ([1, hidden_size, 1, LM_HEAD_MIN_SEQ], ScalarType::Float16),
                 ([1, out_ch, 1, LM_HEAD_MIN_SEQ], ScalarType::Float16),
-            ]);
+            ])?;
 
             let input_tensor = AneTensor::new_with_min_alloc(
                 hidden_size,
@@ -562,7 +562,7 @@ impl<D: AneDevice> AneInference<D> {
                 ([1, kv_ch, 1, tc.max_seq_len], ScalarType::Int8),
                 ([1, kv_ch, 1, tc.max_seq_len], ScalarType::Int8),
                 ([1, 1, tc.head_dim, tc.head_dim], ScalarType::Float16),
-            ])
+            ])?
         } else {
             0
         };
@@ -739,7 +739,7 @@ impl<D: AneDevice> AneInference<D> {
                 ([1, kv_channels, 1, msl], ScalarType::Float16),
                 ([1, kv_channels, 1, msl], ScalarType::Float16),
                 ([1, 1, 1, msl], ScalarType::Float16),
-            ]);
+            ])?;
 
             let mut caches = Vec::with_capacity(num_layers);
             for _ in 0..num_layers {
@@ -2070,8 +2070,8 @@ fn allocate_io_from_manifest<D: AneDevice>(
         .map(|td| (td.shape, td.scalar_type()))
         .collect();
 
-    let input_alloc = uniform_alloc_size(&input_shapes);
-    let output_alloc = uniform_alloc_size(&output_shapes).max(min_output_alloc);
+    let input_alloc = uniform_alloc_size(&input_shapes)?;
+    let output_alloc = uniform_alloc_size(&output_shapes)?.max(min_output_alloc);
 
     let input_tensors: Vec<AneTensor> = manifest
         .inputs

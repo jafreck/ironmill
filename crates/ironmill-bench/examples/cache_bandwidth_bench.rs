@@ -208,12 +208,14 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
         ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Int8),
         ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Int8),
         ([1, 1, cfg.head_dim, cfg.head_dim], ScalarType::Float16),
-    ]);
+    ])
+    .map_err(|e| format!("{e}"))?;
     let fp16_alloc = uniform_alloc_size(&[
         ([1, q_ch, 1, 32], ScalarType::Float16),
         ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Float16),
         ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Float16),
-    ]);
+    ])
+    .map_err(|e| format!("{e}"))?;
 
     // INT8+TQ inputs: Q, K_cache(int8), V_cache(int8), rotation_matrix
     let q_int8 = AneTensor::new_with_min_alloc(q_ch, 32, ScalarType::Float16, int8_alloc)
@@ -235,7 +237,8 @@ fn bench_config(cfg: &BenchConfig) -> Result<(f64, f64, f64), String> {
         ([1, q_ch, 1, 32], ScalarType::Float16),
         ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Int8),
         ([1, kv_ch, 1, cfg.max_seq_len], ScalarType::Int8),
-    ]);
+    ])
+    .map_err(|e| format!("{e}"))?;
     let q_int8_raw = AneTensor::new_with_min_alloc(q_ch, 32, ScalarType::Float16, int8_raw_alloc)
         .map_err(|e| format!("{e}"))?;
     let k_cache_int8_raw =

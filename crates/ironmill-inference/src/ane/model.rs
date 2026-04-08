@@ -231,8 +231,8 @@ impl<D: AneDevice> AneModel<D> {
             // 4f. Pre-allocate I/O tensors with uniform sizing
             let input_shapes: Vec<_> = inputs.iter().map(|td| (td.shape, td.dtype)).collect();
             let output_shapes: Vec<_> = outputs.iter().map(|td| (td.shape, td.dtype)).collect();
-            let input_alloc = uniform_alloc_size(&input_shapes);
-            let output_alloc = uniform_alloc_size(&output_shapes);
+            let input_alloc = uniform_alloc_size(&input_shapes)?;
+            let output_alloc = uniform_alloc_size(&output_shapes)?;
 
             let input_tensors: Vec<AneTensor> = inputs
                 .iter()

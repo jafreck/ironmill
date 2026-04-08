@@ -12,6 +12,51 @@ use mil_rs::ir::ScalarType;
 use crate::surface::ffi;
 use crate::surface::{ANE_MIN_SURFACE_BYTES, IOSurfaceError};
 
+// ── RAII lock guard ──────────────────────────────────────────────
+
+/// RAII guard that ensures an IOSurface lock is released on drop,
+/// even if a panic occurs during the locked operation.
+#[cfg(target_os = "macos")]
+struct SurfaceLockGuard {
+    surface: *mut c_void,
+    options: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl SurfaceLockGuard {
+    /// Lock an IOSurface. Returns a guard that unlocks on drop.
+    fn new(surface: *mut c_void, options: u32) -> crate::Result<Self> {
+        // SAFETY: `surface` is a valid IOSurface pointer from IOSurfaceCreate.
+        let rc = unsafe { ffi::IOSurfaceLock(surface, options, std::ptr::null_mut()) };
+        if rc != 0 {
+            return Err(IOSurfaceError::LockFailed(format!(
+                "IOSurfaceLock failed (status {rc})"
+            )));
+        }
+        Ok(Self { surface, options })
+    }
+
+    /// Get the CPU-mapped base address of the locked surface.
+    fn base_address(&self) -> crate::Result<*mut c_void> {
+        // SAFETY: surface is locked (guard is alive).
+        let base = unsafe { ffi::IOSurfaceGetBaseAddress(self.surface) };
+        if base.is_null() {
+            return Err(IOSurfaceError::LockFailed(
+                "IOSurfaceGetBaseAddress returned null".into(),
+            ));
+        }
+        Ok(base)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SurfaceLockGuard {
+    fn drop(&mut self) {
+        // SAFETY: surface was successfully locked in `new()`.
+        unsafe { ffi::IOSurfaceUnlock(self.surface, self.options, std::ptr::null_mut()) };
+    }
+}
+
 // ── AneTensor ────────────────────────────────────────────────────
 
 /// An IOSurface-backed tensor for ANE I/O.
@@ -83,7 +128,7 @@ impl AneTensor {
                 self.dtype
             )));
         }
-        let expected = self.num_elements();
+        let expected = self.num_elements()?;
         if data.len() != expected {
             return Err(IOSurfaceError::CopyFailed(format!(
                 "expected {} f16 elements, got {}",
@@ -106,11 +151,14 @@ impl AneTensor {
                 self.dtype
             )));
         }
-        let byte_len = self.num_elements() * 2;
+        let n = self.num_elements()?;
+        let byte_len = n
+            .checked_mul(2)
+            .ok_or_else(|| IOSurfaceError::CopyFailed("read_f16: byte length overflow".into()))?;
         let bytes = self.read_bytes(byte_len)?;
-        let mut out = vec![f16::ZERO; self.num_elements()];
+        let mut out = vec![f16::ZERO; n];
         // SAFETY: `bytes` has exactly `byte_len` bytes and `out` has exactly
-        // `num_elements` f16 values (byte_len = num_elements * 2). Both
+        // `n` f16 values (byte_len = n * 2). Both
         // pointers are valid and non-overlapping.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, byte_len);
@@ -226,7 +274,7 @@ impl AneTensor {
                 self.dtype
             )));
         }
-        let expected = self.num_elements();
+        let expected = self.num_elements()?;
         if data.len() != expected {
             return Err(IOSurfaceError::CopyFailed(format!(
                 "expected {} f32 elements, got {}",
@@ -264,11 +312,14 @@ impl AneTensor {
                 self.dtype
             )));
         }
-        let byte_len = self.num_elements() * 4;
+        let n = self.num_elements()?;
+        let byte_len = n
+            .checked_mul(4)
+            .ok_or_else(|| IOSurfaceError::CopyFailed("read_f32: byte length overflow".into()))?;
         let bytes = self.read_bytes(byte_len)?;
-        let mut out = vec![0.0f32; self.num_elements()];
+        let mut out = vec![0.0f32; n];
         // SAFETY: `bytes` has exactly `byte_len` bytes and `out` has exactly
-        // `num_elements` f32 values (byte_len = num_elements * 4). Both
+        // `n` f32 values (byte_len = n * 4). Both
         // pointers are valid and non-overlapping.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, byte_len);
@@ -292,8 +343,13 @@ impl AneTensor {
     }
 
     /// Number of elements (`C * S` for `[1, C, 1, S]`).
-    pub fn num_elements(&self) -> usize {
-        self.shape[1] * self.shape[3]
+    pub fn num_elements(&self) -> crate::Result<usize> {
+        self.shape[1].checked_mul(self.shape[3]).ok_or_else(|| {
+            IOSurfaceError::CopyFailed(format!(
+                "num_elements overflow: {} * {}",
+                self.shape[1], self.shape[3]
+            ))
+        })
     }
 
     /// Copy column 0 from `src` into column 0 of `self`.
@@ -330,26 +386,30 @@ impl AneTensor {
         })?;
 
         // Verify that strided access stays within each surface's allocation.
-        let src_end = channels
-            .checked_sub(1)
-            .and_then(|last| last.checked_mul(src_stride))
-            .and_then(|off| off.checked_add(bpe));
-        if let Some(end) = src_end {
-            if end > src.alloc_size {
+        if channels > 0 {
+            let src_end = (channels - 1)
+                .checked_mul(src_stride)
+                .and_then(|off| off.checked_add(bpe))
+                .ok_or_else(|| {
+                    IOSurfaceError::CopyFailed("copy_column0_from: src offset overflow".into())
+                })?;
+            if src_end > src.alloc_size {
                 return Err(IOSurfaceError::CopyFailed(format!(
-                    "copy_column0_from: src access at byte {end} exceeds alloc {}",
+                    "copy_column0_from: src access at byte {src_end} exceeds alloc {}",
                     src.alloc_size
                 )));
             }
         }
-        let dst_end = channels
-            .checked_sub(1)
-            .and_then(|last| last.checked_mul(dst_stride))
-            .and_then(|off| off.checked_add(bpe));
-        if let Some(end) = dst_end {
-            if end > self.alloc_size {
+        if channels > 0 {
+            let dst_end = (channels - 1)
+                .checked_mul(dst_stride)
+                .and_then(|off| off.checked_add(bpe))
+                .ok_or_else(|| {
+                    IOSurfaceError::CopyFailed("copy_column0_from: dst offset overflow".into())
+                })?;
+            if dst_end > self.alloc_size {
                 return Err(IOSurfaceError::CopyFailed(format!(
-                    "copy_column0_from: dst access at byte {end} exceeds alloc {}",
+                    "copy_column0_from: dst access at byte {dst_end} exceeds alloc {}",
                     self.alloc_size
                 )));
             }
@@ -357,80 +417,18 @@ impl AneTensor {
 
         #[cfg(target_os = "macos")]
         {
-            // SAFETY: Both surfaces are locked before access, base addresses
-            // are verified non-null, and the strided copy stays within each
-            // surface's allocation bounds (channels * stride ≤ alloc_size).
-            let rc = unsafe {
-                ffi::IOSurfaceLock(
-                    src.surface,
-                    ffi::IOSURFACE_LOCK_READ_ONLY,
-                    std::ptr::null_mut(),
-                )
-            };
-            if rc != 0 {
-                return Err(IOSurfaceError::LockFailed(format!(
-                    "copy_column0_from: IOSurfaceLock(src) failed (status {rc})"
-                )));
-            }
-            // SAFETY: src.surface is locked read-only (lock succeeded above).
-            // IOSurfaceGetBaseAddress returns the CPU-mapped base or null.
-            let src_base = unsafe { ffi::IOSurfaceGetBaseAddress(src.surface) };
-            if src_base.is_null() {
-                // SAFETY: src.surface is locked; must unlock on error path.
-                unsafe {
-                    ffi::IOSurfaceUnlock(
-                        src.surface,
-                        ffi::IOSURFACE_LOCK_READ_ONLY,
-                        std::ptr::null_mut(),
-                    );
-                }
-                return Err(IOSurfaceError::LockFailed(
-                    "copy_column0_from: IOSurfaceGetBaseAddress(src) returned null".into(),
-                ));
-            }
+            let src_guard = SurfaceLockGuard::new(src.surface, ffi::IOSURFACE_LOCK_READ_ONLY)?;
+            let src_base = src_guard.base_address()?;
 
-            // SAFETY: self.surface is a valid IOSurface; locking read-write
-            // for the destination copy.
-            let rc = unsafe { ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut()) };
-            if rc != 0 {
-                // SAFETY: src.surface is still locked read-only; unlock on error.
-                unsafe {
-                    ffi::IOSurfaceUnlock(
-                        src.surface,
-                        ffi::IOSURFACE_LOCK_READ_ONLY,
-                        std::ptr::null_mut(),
-                    );
-                }
-                return Err(IOSurfaceError::LockFailed(format!(
-                    "copy_column0_from: IOSurfaceLock(dst) failed (status {rc})"
-                )));
-            }
-            // SAFETY: self.surface is locked read-write (lock succeeded above).
-            let dst_base = unsafe { ffi::IOSurfaceGetBaseAddress(self.surface) };
-            if dst_base.is_null() {
-                // SAFETY: Both surfaces are locked; unlock both on error.
-                unsafe { ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut()) };
-                unsafe {
-                    ffi::IOSurfaceUnlock(
-                        src.surface,
-                        ffi::IOSURFACE_LOCK_READ_ONLY,
-                        std::ptr::null_mut(),
-                    );
-                }
-                return Err(IOSurfaceError::LockFailed(
-                    "copy_column0_from: IOSurfaceGetBaseAddress(dst) returned null".into(),
-                ));
-            }
+            let dst_guard = SurfaceLockGuard::new(self.surface, 0)?;
+            let dst_base = dst_guard.base_address()?;
 
             let src_ptr = src_base as *const u8;
             let dst_ptr = dst_base as *mut u8;
             for c in 0..channels {
-                // SAFETY: Both surfaces are locked with verified non-null base
-                // addresses. Strided copy of `bpe` bytes per channel stays
-                // within bounds (channels * stride ≤ alloc_size for each
-                // surface). Note: stride arithmetic (c * src_stride, c *
-                // dst_stride) is unchecked — overflow is a known limitation
-                // for extremely large channel counts.
+                // SAFETY: Both surfaces are locked (guards alive) with
+                // verified non-null base addresses. Strided offsets are
+                // bounds-checked above; c < channels guarantees no overflow.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         src_ptr.add(c * src_stride),
@@ -440,24 +438,25 @@ impl AneTensor {
                 }
             }
 
-            // SAFETY: Unlock both surfaces in reverse order. self.surface was
-            // locked read-write, src.surface was locked read-only.
-            unsafe { ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut()) };
-            unsafe {
-                ffi::IOSurfaceUnlock(
-                    src.surface,
-                    ffi::IOSURFACE_LOCK_READ_ONLY,
-                    std::ptr::null_mut(),
-                );
-            }
+            // Guards drop here, unlocking both surfaces in reverse order.
+            drop(dst_guard);
+            drop(src_guard);
             Ok(())
         }
 
         #[cfg(not(target_os = "macos"))]
         {
             for c in 0..channels {
-                let src_off = c * src_stride;
-                let dst_off = c * dst_stride;
+                let src_off = c.checked_mul(src_stride).ok_or_else(|| {
+                    IOSurfaceError::CopyFailed(
+                        "copy_column0_from: src offset overflow in loop".into(),
+                    )
+                })?;
+                let dst_off = c.checked_mul(dst_stride).ok_or_else(|| {
+                    IOSurfaceError::CopyFailed(
+                        "copy_column0_from: dst offset overflow in loop".into(),
+                    )
+                })?;
                 self.buffer[dst_off..dst_off + bpe]
                     .copy_from_slice(&src.buffer[src_off..src_off + bpe]);
             }
@@ -617,8 +616,10 @@ impl AneTensor {
                 self.dtype
             )));
         }
-        let n = self.num_elements();
-        let byte_len = n * 2;
+        let n = self.num_elements()?;
+        let byte_len = n.checked_mul(2).ok_or_else(|| {
+            IOSurfaceError::CopyFailed("read_f16_into: byte length overflow".into())
+        })?;
 
         out.clear();
         out.resize(n, f16::ZERO);
@@ -746,7 +747,27 @@ impl AneTensor {
 
         let channels = self.shape[1];
         let src_s = self.shape[3];
-        let src_stride_bytes = src_s * 2; // FP16 = 2 bytes per element
+        let src_stride_bytes = src_s.checked_mul(2).ok_or_else(|| {
+            IOSurfaceError::CopyFailed("copy_column0_fp16_as_int8_to: src stride overflow".into())
+        })?;
+
+        // Verify src strided access stays within allocation.
+        if channels > 0 {
+            let src_end = (channels - 1)
+                .checked_mul(src_stride_bytes)
+                .and_then(|off| off.checked_add(2))
+                .ok_or_else(|| {
+                    IOSurfaceError::CopyFailed(
+                        "copy_column0_fp16_as_int8_to: src offset overflow".into(),
+                    )
+                })?;
+            if src_end > self.alloc_size {
+                return Err(IOSurfaceError::CopyFailed(format!(
+                    "copy_column0_fp16_as_int8_to: src access at byte {src_end} exceeds alloc {}",
+                    self.alloc_size
+                )));
+            }
+        }
 
         let end = dst_byte_offset.checked_add(channels).ok_or_else(|| {
             IOSurfaceError::CopyFailed(
@@ -762,69 +783,11 @@ impl AneTensor {
 
         #[cfg(target_os = "macos")]
         {
-            // Lock src read-only.
-            // SAFETY: self.surface is a valid IOSurface from IOSurfaceCreate.
-            // IOSurfaceLock acquires CPU access; return code is checked.
-            let rc = unsafe {
-                ffi::IOSurfaceLock(
-                    self.surface,
-                    ffi::IOSURFACE_LOCK_READ_ONLY,
-                    std::ptr::null_mut(),
-                )
-            };
-            if rc != 0 {
-                return Err(IOSurfaceError::LockFailed(format!(
-                    "copy_column0_fp16_as_int8_to: IOSurfaceLock(src) failed (status {rc})"
-                )));
-            }
-            // SAFETY: self.surface is locked; get CPU-mapped base address.
-            let src_base = unsafe { ffi::IOSurfaceGetBaseAddress(self.surface) };
-            if src_base.is_null() {
-                // SAFETY: self.surface is locked; must unlock on error path.
-                unsafe {
-                    ffi::IOSurfaceUnlock(
-                        self.surface,
-                        ffi::IOSURFACE_LOCK_READ_ONLY,
-                        std::ptr::null_mut(),
-                    );
-                }
-                return Err(IOSurfaceError::LockFailed(
-                    "copy_column0_fp16_as_int8_to: src base address null".into(),
-                ));
-            }
+            let src_guard = SurfaceLockGuard::new(self.surface, ffi::IOSURFACE_LOCK_READ_ONLY)?;
+            let src_base = src_guard.base_address()?;
 
-            // Lock dst read-write.
-            // SAFETY: dst.surface is a valid IOSurface.
-            let rc = unsafe { ffi::IOSurfaceLock(dst.surface, 0, std::ptr::null_mut()) };
-            if rc != 0 {
-                // SAFETY: self.surface is still locked; unlock on error.
-                unsafe {
-                    ffi::IOSurfaceUnlock(
-                        self.surface,
-                        ffi::IOSURFACE_LOCK_READ_ONLY,
-                        std::ptr::null_mut(),
-                    );
-                }
-                return Err(IOSurfaceError::LockFailed(format!(
-                    "copy_column0_fp16_as_int8_to: IOSurfaceLock(dst) failed (status {rc})"
-                )));
-            }
-            // SAFETY: dst.surface is locked read-write; get base address.
-            let dst_base = unsafe { ffi::IOSurfaceGetBaseAddress(dst.surface) };
-            if dst_base.is_null() {
-                // SAFETY: Both surfaces locked; unlock both on error.
-                unsafe { ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut()) };
-                unsafe {
-                    ffi::IOSurfaceUnlock(
-                        self.surface,
-                        ffi::IOSURFACE_LOCK_READ_ONLY,
-                        std::ptr::null_mut(),
-                    );
-                }
-                return Err(IOSurfaceError::LockFailed(
-                    "copy_column0_fp16_as_int8_to: dst base address null".into(),
-                ));
-            }
+            let dst_guard = SurfaceLockGuard::new(dst.surface, 0)?;
+            let dst_base = dst_guard.base_address()?;
 
             let src_ptr = src_base as *const u8;
             // SAFETY: dst_base is non-null (verified above). dst_byte_offset
@@ -833,11 +796,9 @@ impl AneTensor {
 
             for c in 0..channels {
                 let mut fp16_bytes = [0u8; 2];
-                // SAFETY: src is locked with non-null base. Each strided read
-                // of 2 bytes at c * src_stride_bytes is within the src surface
-                // allocation. Note: c * src_stride_bytes arithmetic is
-                // unchecked — overflow is a known limitation for very large
-                // channel counts.
+                // SAFETY: Both surfaces are locked (guards alive). Strided
+                // offsets are bounds-checked above; c < channels guarantees
+                // no overflow.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         src_ptr.add(c * src_stride_bytes),
@@ -846,28 +807,25 @@ impl AneTensor {
                     );
                 }
                 let val = f16::from_le_bytes(fp16_bytes);
-                // Values are already rounded/clamped to [-128, 127] by MIL program.
                 // SAFETY: dst_ptr.add(c) is within dst allocation (offset +
                 // channels ≤ alloc_size, verified above).
                 unsafe { *dst_ptr.add(c) = val.to_f32() as i8 as u8 };
             }
 
-            // SAFETY: Unlock both surfaces in reverse order.
-            unsafe { ffi::IOSurfaceUnlock(dst.surface, 0, std::ptr::null_mut()) };
-            unsafe {
-                ffi::IOSurfaceUnlock(
-                    self.surface,
-                    ffi::IOSURFACE_LOCK_READ_ONLY,
-                    std::ptr::null_mut(),
-                );
-            }
+            // Guards drop here, unlocking both surfaces in reverse order.
+            drop(dst_guard);
+            drop(src_guard);
             Ok(())
         }
 
         #[cfg(not(target_os = "macos"))]
         {
             for c in 0..channels {
-                let src_off = c * src_stride_bytes;
+                let src_off = c.checked_mul(src_stride_bytes).ok_or_else(|| {
+                    IOSurfaceError::CopyFailed(
+                        "copy_column0_fp16_as_int8_to: src offset overflow in loop".into(),
+                    )
+                })?;
                 let bytes = [self.buffer[src_off], self.buffer[src_off + 1]];
                 let val = f16::from_le_bytes(bytes);
                 dst.buffer[dst_byte_offset + c] = val.to_f32() as i8 as u8;
@@ -943,24 +901,10 @@ impl AneTensor {
     where
         F: FnOnce(*mut c_void),
     {
-        // SAFETY: `self.surface` is a valid IOSurface pointer obtained from
-        // IOSurfaceCreate and not yet released. Lock/unlock pairs are
-        // correctly matched, and base address is verified non-null.
-        let rc = unsafe { ffi::IOSurfaceLock(self.surface, options, std::ptr::null_mut()) };
-        if rc != 0 {
-            return Err(IOSurfaceError::LockFailed(format!(
-                "IOSurfaceLock failed (status {rc})"
-            )));
-        }
-        let base = unsafe { ffi::IOSurfaceGetBaseAddress(self.surface) };
-        if base.is_null() {
-            unsafe { ffi::IOSurfaceUnlock(self.surface, options, std::ptr::null_mut()) };
-            return Err(IOSurfaceError::LockFailed(
-                "IOSurfaceGetBaseAddress returned null".into(),
-            ));
-        }
+        let guard = SurfaceLockGuard::new(self.surface, options)?;
+        let base = guard.base_address()?;
         f(base);
-        unsafe { ffi::IOSurfaceUnlock(self.surface, options, std::ptr::null_mut()) };
+        drop(guard);
         Ok(())
     }
 }
@@ -987,15 +931,23 @@ impl Drop for AneTensor {
 ///
 /// All tensors in a program's input (or output) set must use this size
 /// (ANE constraints #2 & #12).
-pub fn uniform_alloc_size(shapes: &[([usize; 4], ScalarType)]) -> usize {
-    shapes
-        .iter()
-        .map(|(shape, dtype)| {
-            let data_size = shape[1] * shape[3] * dtype.byte_size();
-            data_size.max(ANE_MIN_SURFACE_BYTES)
-        })
-        .max()
-        .unwrap_or(ANE_MIN_SURFACE_BYTES)
+pub fn uniform_alloc_size(shapes: &[([usize; 4], ScalarType)]) -> crate::Result<usize> {
+    let mut max_size = ANE_MIN_SURFACE_BYTES;
+    for &(shape, dtype) in shapes {
+        let data_size = shape[1]
+            .checked_mul(shape[3])
+            .and_then(|v| v.checked_mul(dtype.byte_size()))
+            .ok_or_else(|| {
+                IOSurfaceError::AllocFailed(format!(
+                    "uniform_alloc_size overflow: {} * {} * {}",
+                    shape[1],
+                    shape[3],
+                    dtype.byte_size()
+                ))
+            })?;
+        max_size = max_size.max(data_size.max(ANE_MIN_SURFACE_BYTES));
+    }
+    Ok(max_size)
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -1068,7 +1020,7 @@ mod tests {
             ([1, 64, 1, 512], ScalarType::Float16), // 64*512*2 = 65536
             ([1, 16, 1, 64], ScalarType::Float16),  // 16*64*2  = 2048 → 16384 (ANE min)
         ];
-        assert_eq!(uniform_alloc_size(&shapes), 65536);
+        assert_eq!(uniform_alloc_size(&shapes).unwrap(), 65536);
     }
 
     #[test]

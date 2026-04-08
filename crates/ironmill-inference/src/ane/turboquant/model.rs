@@ -676,13 +676,13 @@ impl<D: AneDevice> TurboQuantModel<D> {
             ));
         }
 
-        let tq_alloc_size = ironmill_iosurface::uniform_alloc_size(&alloc_shapes);
+        let tq_alloc_size = ironmill_iosurface::uniform_alloc_size(&alloc_shapes)?;
 
         // Cache-write outputs only need to be uniform with each other.
         let cw_output_alloc_size = ironmill_iosurface::uniform_alloc_size(&[
             ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
             ([1, kv_ch, 1, MIN_IO_SEQ], ScalarType::Float16),
-        ]);
+        ])?;
 
         // --- KV cache with uniform alloc ---
         let cache = KvCacheManager::new_with_alloc(config.clone(), tq_alloc_size)?;
