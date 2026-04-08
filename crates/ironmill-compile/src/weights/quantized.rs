@@ -1086,39 +1086,22 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                     .and_then(|a| a.get(&awq_key));
                 let awq_tc = config.awq_token_count;
 
-                // Resolve alpha: check cache first, then search if needed.
-                // Projections sharing identical magnitude vectors (e.g. Q/K/V
-                // from the same layer norm) reuse a single search result.
-                let resolved_alpha = if let Some(mags) = awq_mags {
+                // Resolve alpha: check cache, then search, then fall back to None (→ 0.5).
+                let resolved_alpha = awq_mags.and_then(|mags| {
                     let cache_key = magnitude_cache_key(mags);
-                    let cached = self.alpha_cache.lock().unwrap().get(&cache_key).copied();
-                    if let Some(alpha) = cached {
-                        Some(alpha)
-                    } else if let Some(acts) = awq_acts {
-                        if let Some(tc) = awq_tc {
-                            if t.shape.len() == 2 && tc > 0 && acts.len() >= tc * last_dim {
-                                let alpha = search_best_alpha(
-                                    &floats,
-                                    &t.shape,
-                                    mags,
-                                    acts,
-                                    tc,
-                                    config.group_size,
-                                );
-                                self.alpha_cache.lock().unwrap().insert(cache_key, alpha);
-                                Some(alpha)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+                    if let Some(&alpha) = self.alpha_cache.lock().unwrap().get(&cache_key) {
+                        return Some(alpha);
                     }
-                } else {
-                    None
-                };
+                    let tc = awq_tc?;
+                    let acts = awq_acts?;
+                    if t.shape.len() != 2 || tc == 0 || acts.len() < tc * last_dim {
+                        return None;
+                    }
+                    let alpha =
+                        search_best_alpha(&floats, &t.shape, mags, acts, tc, config.group_size);
+                    self.alpha_cache.lock().unwrap().insert(cache_key, alpha);
+                    Some(alpha)
+                });
 
                 quantize_tensor_int4_awq(
                     &floats,
