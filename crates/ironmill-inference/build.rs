@@ -40,7 +40,6 @@ fn main() {
         "fused_residual_norm",
         "fused_embedding_norm",
         "int4_dequant",
-        "affine_matmul",
         "d2quant_matmul",
         "quip_sharp",
         "gdn_recurrent",
@@ -53,6 +52,28 @@ fn main() {
         let src = shader_dir.join(format!("{name}.metal"));
         let lib = out_dir.join(format!("{name}.metallib"));
         compile_shader(&src, &lib, &[]);
+    }
+
+    // ── Affine matmul: concatenate common + split files into one metallib ──
+    {
+        let affine_common =
+            std::fs::read_to_string(shader_dir.join("affine_common.metal")).unwrap();
+        let affine_parts = [
+            "affine_matmul",
+            "affine_matvec",
+            "affine_batched",
+            "affine_amx",
+            "affine_fused",
+        ];
+        let mut combined = affine_common;
+        for part in &affine_parts {
+            let src = std::fs::read_to_string(shader_dir.join(format!("{part}.metal"))).unwrap();
+            combined.push('\n');
+            combined.push_str(&src);
+        }
+        let affine_tmp = out_dir.join("_affine_combined.metal");
+        std::fs::write(&affine_tmp, &combined).unwrap();
+        compile_shader(&affine_tmp, &out_dir.join("affine_matmul.metallib"), &[]);
     }
 
     // ── HEAD_DIM-dependent shaders (per-variant) ────────────────
