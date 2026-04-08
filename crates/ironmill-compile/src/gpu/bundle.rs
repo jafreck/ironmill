@@ -22,8 +22,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use half::f16;
-
 use crate::error::CompileError;
 use crate::weights::{QuantizationInfo, WeightProvider};
 
@@ -31,6 +29,8 @@ use ironmill_core::gpu::bundle::{
     GpuBundleManifest, QuantizationManifest, TensorManifest, scalar_type_to_str,
     serialize_model_config,
 };
+
+use ironmill_core::dequant::dequant_affine;
 
 // ── Filename helpers ────────────────────────────────────────────────────
 
@@ -147,16 +147,18 @@ pub fn write_gpu_bundle(
                 // small tensors (RoPE tables, norm weights) where the size
                 // impact is negligible.
                 if group_size.is_none() || axis.is_none() {
-                    let fp16_data = affine_dequantize_to_fp16(
+                    let fp16_data = dequant_affine(
                         &tensor.data,
                         scale,
                         zero_point,
                         *scale_dtype,
                         *zero_point_dtype,
                         *axis,
-                        *bit_width,
                         &tensor.shape,
-                    )?;
+                        *bit_width,
+                        *group_size,
+                    )
+                    .map_err(|e| CompileError::Other(e.to_string()))?;
                     eprintln!(
                         "Note: tensor '{name}' has per-channel INT{bit_width} quantization; \
                          storing as FP16 in GPU bundle."
@@ -345,96 +347,6 @@ pub fn write_gpu_bundle(
     fs::write(output_dir.join("manifest.json"), json)?;
 
     Ok(())
-}
-
-// ── Affine dequantization helper ────────────────────────────────────────
-
-/// Dequantize per-tensor/per-channel INT8 data back to FP16.
-///
-/// Used when writing GPU bundles for tensors that have per-channel
-/// quantization (group_size=None), which the bundle format does not support.
-/// These are typically small tensors (RoPE tables, norm weights).
-#[allow(clippy::too_many_arguments)]
-fn affine_dequantize_to_fp16(
-    quantized_data: &[u8],
-    scale_bytes: &[u8],
-    zero_point_bytes: &[u8],
-    scale_dtype: mil_rs::ir::ScalarType,
-    zero_point_dtype: mil_rs::ir::ScalarType,
-    axis: Option<usize>,
-    bit_width: u8,
-    shape: &[usize],
-) -> Result<Vec<u8>, CompileError> {
-    use mil_rs::ir::ScalarType;
-
-    if bit_width != 8 {
-        return Err(CompileError::UnsupportedQuantization(format!(
-            "affine dequantize to FP16: only INT8 is supported, got {bit_width}-bit"
-        )));
-    }
-
-    let num_elements: usize = shape.iter().product();
-
-    // Read scales as f32
-    let scales: Vec<f32> = match scale_dtype {
-        ScalarType::Float16 => scale_bytes
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect(),
-        ScalarType::Float32 => scale_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        _ => {
-            return Err(CompileError::UnsupportedQuantization(format!(
-                "unsupported scale dtype: {scale_dtype:?}"
-            )));
-        }
-    };
-
-    // Read zero points as f32
-    let zeros: Vec<f32> = match zero_point_dtype {
-        ScalarType::UInt8 => zero_point_bytes.iter().map(|&b| b as f32).collect(),
-        ScalarType::Float16 => zero_point_bytes
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect(),
-        ScalarType::Float32 => zero_point_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        ScalarType::Int8 => zero_point_bytes.iter().map(|&b| b as i8 as f32).collect(),
-        _ => {
-            return Err(CompileError::UnsupportedQuantization(format!(
-                "unsupported zero_point dtype: {zero_point_dtype:?}"
-            )));
-        }
-    };
-
-    let axis = axis.unwrap_or(0);
-
-    // Compute stride along the quantization axis
-    let stride: usize = shape[axis + 1..].iter().product();
-    let dim_size = shape[axis];
-
-    if scales.len() != dim_size || zeros.len() != dim_size {
-        return Err(CompileError::Other(format!(
-            "scale/zero_point length ({}/{}) doesn't match axis dimension ({dim_size})",
-            scales.len(),
-            zeros.len()
-        )));
-    }
-
-    let mut fp16_out = Vec::with_capacity(num_elements * 2);
-    for (i, &q_byte) in quantized_data.iter().enumerate().take(num_elements) {
-        let channel_idx = (i / stride) % dim_size;
-        let q_val = q_byte as f32;
-        let dequantized = (q_val - zeros[channel_idx]) * scales[channel_idx];
-        let h = f16::from_f32(dequantized);
-        fp16_out.extend_from_slice(&h.to_le_bytes());
-    }
-
-    Ok(fp16_out)
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ rust-version.workspace = true
 hf-tokenizer = ["dep:tokenizers"]
 
 [dependencies]
+anyhow = { workspace = true }
 bytemuck = { workspace = true }
 mil-rs = { workspace = true }
 serde = { workspace = true }

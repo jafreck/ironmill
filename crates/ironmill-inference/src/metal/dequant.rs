@@ -3,12 +3,20 @@
 //! Used by [`super::weights::MetalWeights::load`] to convert LUT-palettized
 //! and affine-quantized tensors into dense FP16 buffers before uploading
 //! to Metal.
+//!
+//! Generic routines (affine, dual-scale, parameter conversion) are shared
+//! via [`ironmill_core::dequant`].  This module re-exports them and adds
+//! inference-specific variants (QuIP#, LUT-to-dense).
 
 use anyhow::bail;
 use half::f16;
 use mil_rs::ir::ScalarType;
 
 use crate::dequant::{read_typed_f32, unpack_indices};
+
+// Re-export shared dequant functions from core so callers in this crate
+// can continue to use `super::dequant::dequant_affine` etc.
+pub use ironmill_core::dequant::{convert_params_to_f16, dequant_affine, dequant_dual_scale};
 
 // ── E8 codebook constants ────────────────────────────────────────
 
@@ -164,205 +172,6 @@ pub fn dequant_lut_to_dense(
     Ok(output)
 }
 
-/// Dequantize an affine-quantized tensor to FP16 bytes.
-///
-/// Applies `(quantized - zero_point) * scale` element-wise.
-/// For INT8 (`bit_width=8`), each byte is one element.
-/// For INT4 (`bit_width=4`), elements are packed 2 per byte (low nibble first).
-///
-/// When `group_size` is `Some(gs)`, scales/zeros are per-group along the last
-/// axis: there are `ceil(K / gs)` groups per row.
-#[allow(clippy::too_many_arguments)]
-pub fn dequant_affine(
-    quantized_data: &[u8],
-    scale: &[u8],
-    zero_point: &[u8],
-    scale_dtype: ScalarType,
-    zero_point_dtype: ScalarType,
-    axis: Option<usize>,
-    shape: &[usize],
-    bit_width: u8,
-    group_size: Option<usize>,
-) -> anyhow::Result<Vec<u8>> {
-    let total_elements: usize = shape.iter().product();
-    let scale_elem_size = scale_dtype.byte_size();
-    let zp_elem_size = zero_point_dtype.byte_size();
-
-    // Helper: extract the i-th quantized value, handling INT4 packing.
-    // Both INT4 and INT8 values are unsigned (0..qmax range).
-    let read_q = |i: usize| -> f32 {
-        if bit_width == 4 {
-            let byte = quantized_data[i / 2];
-            if i % 2 == 0 {
-                (byte & 0x0F) as f32
-            } else {
-                ((byte >> 4) & 0x0F) as f32
-            }
-        } else {
-            quantized_data[i] as f32
-        }
-    };
-
-    let mut output = Vec::with_capacity(total_elements * 2);
-
-    if let Some(gs) = group_size {
-        // Per-group: scales/zeros have one entry per group of `gs` elements
-        // along the last axis. Layout: [N, num_groups] where num_groups = ceil(K/gs).
-        if shape.is_empty() {
-            bail!("dequant_affine: shape must be non-empty");
-        }
-        let k = *shape.last().unwrap();
-        let n: usize = shape[..shape.len().saturating_sub(1)]
-            .iter()
-            .product::<usize>()
-            .max(1);
-        let num_groups = k.div_ceil(gs);
-
-        for row in 0..n {
-            for col in 0..k {
-                let group_idx = col / gs;
-                let param_idx = row * num_groups + group_idx;
-                let s = read_typed_f32(scale, param_idx * scale_elem_size, scale_dtype)?;
-                let z = read_typed_f32(zero_point, param_idx * zp_elem_size, zero_point_dtype)?;
-                let elem_idx = row * k + col;
-                let q = read_q(elem_idx);
-                let result = f16::from_f32((q - z) * s);
-                output.extend_from_slice(&result.to_le_bytes());
-            }
-        }
-    } else {
-        match axis {
-            Some(ax) => {
-                if ax >= shape.len() {
-                    bail!(
-                        "dequant_affine: axis {} is out of bounds for shape with {} dimensions",
-                        ax,
-                        shape.len()
-                    );
-                }
-                // Per-axis: scale and zero_point have one entry per slice along `ax`.
-                let stride: usize = shape[ax + 1..].iter().product();
-                let axis_size = shape[ax];
-
-                for i in 0..total_elements {
-                    let axis_idx = (i / stride) % axis_size;
-                    let s = read_typed_f32(scale, axis_idx * scale_elem_size, scale_dtype)?;
-                    let z = read_typed_f32(zero_point, axis_idx * zp_elem_size, zero_point_dtype)?;
-                    let q = read_q(i);
-                    let result = f16::from_f32((q - z) * s);
-                    output.extend_from_slice(&result.to_le_bytes());
-                }
-            }
-            None => {
-                // Per-tensor: single scale and zero_point.
-                let s = read_typed_f32(scale, 0, scale_dtype)?;
-                let z = read_typed_f32(zero_point, 0, zero_point_dtype)?;
-
-                for i in 0..total_elements {
-                    let q = read_q(i);
-                    let result = f16::from_f32((q - z) * s);
-                    output.extend_from_slice(&result.to_le_bytes());
-                }
-            }
-        }
-    }
-
-    Ok(output)
-}
-
-/// Convert per-group quantization parameters (scale or zero_point) from
-/// their native dtype to FP16 bytes suitable for upload to Metal.
-///
-/// For per-group INT4 quantization, there is one scale/zero per group.
-/// The number of groups is `ceil(elements_along_axis / group_size)` for
-/// per-axis quantization, or `ceil(total_elements / group_size)` for
-/// per-tensor.
-pub fn convert_params_to_f16(
-    params: &[u8],
-    dtype: ScalarType,
-    axis: Option<usize>,
-    shape: &[usize],
-    group_size: usize,
-) -> anyhow::Result<Vec<u8>> {
-    let elem_size = dtype.byte_size();
-    let num_params = params.len() / elem_size;
-
-    let mut output = Vec::with_capacity(num_params * 2);
-    for i in 0..num_params {
-        let val = read_typed_f32(params, i * elem_size, dtype)?;
-        let fp16 = f16::from_f32(val);
-        output.extend_from_slice(&fp16.to_le_bytes());
-    }
-
-    // Sanity check: the number of params should match the expected group count.
-    let total_elements: usize = shape.iter().product();
-    let expected_groups = match axis {
-        Some(ax) => {
-            // For per-group along an axis, total groups = groups_per_slice * product(other dims)
-            // But typically the params are just stored as [groups_per_slice * other_leading_dims].
-            // We trust the caller provided the right number of params.
-            shape[ax].div_ceil(group_size)
-        }
-        None => total_elements.div_ceil(group_size),
-    };
-    let _ = expected_groups; // Used for documentation; actual count comes from params.len()
-
-    Ok(output)
-}
-
-/// Dequantize a D2Quant dual-scale tensor to FP16 bytes.
-///
-/// Each group has separate scale/zero for normal and outlier partitions,
-/// selected by a per-weight bit mask. The formula for each weight `i` in
-/// group `g` is:
-/// - If `outlier_mask[i]` is 1: `(quantized[i] - outlier_zero[g]) * outlier_scale[g]`
-/// - If `outlier_mask[i]` is 0: `(quantized[i] - normal_zero[g]) * normal_scale[g]`
-#[allow(clippy::too_many_arguments)]
-pub fn dequant_dual_scale(
-    quantized_data: &[u8],
-    normal_scale: &[u8],
-    normal_zero: &[u8],
-    outlier_scale: &[u8],
-    outlier_zero: &[u8],
-    outlier_mask: &[u8],
-    original_shape: &[usize],
-    bit_width: u8,
-    group_size: usize,
-) -> anyhow::Result<Vec<u8>> {
-    use mil_rs::ir::passes::d2quant::dual_scale::{unpack_2bit, unpack_3bit};
-
-    let total_elements: usize = original_shape.iter().product();
-
-    // Unpack quantized values based on bit width.
-    let unpacked = match bit_width {
-        2 => unpack_2bit(quantized_data, total_elements),
-        3 => unpack_3bit(quantized_data, total_elements),
-        _ => bail!("unsupported D2Quant bit_width: {bit_width} (expected 2 or 3)"),
-    };
-
-    let mut output = Vec::with_capacity(total_elements * 2);
-
-    for (i, &q) in unpacked.iter().enumerate() {
-        let group = i / group_size;
-        let is_outlier = (outlier_mask[i / 8] >> (i % 8)) & 1 == 1;
-
-        let (scale_buf, zero_buf) = if is_outlier {
-            (outlier_scale, outlier_zero)
-        } else {
-            (normal_scale, normal_zero)
-        };
-
-        let s = read_typed_f32(scale_buf, group * 4, ScalarType::Float32)?;
-        let z = read_typed_f32(zero_buf, group * 4, ScalarType::Float32)?;
-
-        let val = (q as f32 - z) * s;
-        let h = f16::from_f32(val);
-        output.extend_from_slice(&h.to_le_bytes());
-    }
-
-    Ok(output)
-}
-
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -380,43 +189,7 @@ mod tests {
         f16::from_le_bytes([data[off], data[off + 1]]).to_f32()
     }
 
-    // ── Index unpacking ──────────────────────────────────────────
-
-    #[test]
-    fn unpack_4bit_indices() {
-        // Two values per byte: lo nibble first, hi nibble second.
-        // Byte 0xA3 → indices 3 (0x03), 10 (0x0A)
-        // Byte 0x51 → indices 1 (0x01), 5  (0x05)
-        let packed = vec![0xA3, 0x51];
-        let result = unpack_indices(&packed, 4, 4);
-        assert_eq!(result, vec![10, 3, 5, 1]);
-    }
-
-    #[test]
-    fn unpack_2bit_indices() {
-        // Four values per byte, shifts 0/2/4/6.
-        // Byte 0b_11_10_01_00 = 0xE4 → indices 0, 1, 2, 3
-        let packed = vec![0xE4];
-        let result = unpack_indices(&packed, 2, 4);
-        assert_eq!(result, vec![3, 2, 1, 0]);
-    }
-
-    #[test]
-    fn unpack_8bit_indices() {
-        let packed = vec![7, 0, 15, 3];
-        let result = unpack_indices(&packed, 8, 4);
-        assert_eq!(result, vec![7, 0, 15, 3]);
-    }
-
-    #[test]
-    fn unpack_truncates_to_total() {
-        // Ask for fewer elements than the packed data contains.
-        let packed = vec![0xA3, 0x51];
-        let result = unpack_indices(&packed, 4, 3);
-        assert_eq!(result, vec![10, 3, 5]);
-    }
-
-    // ── LUT dequantization ───────────────────────────────────────
+    // ── LUT dequantization (inference-specific) ─────────────────
 
     #[test]
     fn dequant_lut_4bit_fp16_2x4() {
@@ -502,139 +275,7 @@ mod tests {
         assert!((read_f16(&output, 3) - 9.0).abs() < 1e-2);
     }
 
-    // ── Affine dequantization ────────────────────────────────────
-
-    #[test]
-    fn dequant_affine_per_tensor_int8() {
-        // 4 unsigned INT8 values: [0, 1, 128, 255] stored as u8.
-        let quantized: Vec<u8> = vec![0u8, 1u8, 128u8, 255u8];
-        let shape = vec![2, 2];
-
-        // Per-tensor: scale = 0.5, zero_point = 0.0 (FP32).
-        let scale = 0.5f32.to_le_bytes().to_vec();
-        let zero_point = 0.0f32.to_le_bytes().to_vec();
-
-        let output = dequant_affine(
-            &quantized,
-            &scale,
-            &zero_point,
-            ScalarType::Float32,
-            ScalarType::Float32,
-            None,
-            &shape,
-            8,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(output.len(), 4 * 2);
-
-        // Expected: (q - 0) * 0.5 → [0.0, 0.5, 64.0, 127.5]
-        assert!((read_f16(&output, 0) - 0.0).abs() < 1e-3);
-        assert!((read_f16(&output, 1) - 0.5).abs() < 1e-3);
-        assert!((read_f16(&output, 2) - 64.0).abs() < 1e-1);
-        assert!((read_f16(&output, 3) - 127.5).abs() < 1.0);
-    }
-
-    #[test]
-    fn dequant_affine_per_axis() {
-        // 2×3 matrix, axis=0 → scale/zero_point have 2 entries.
-        // Row 0 values: [10, 20, 30]  with scale=0.1, zp=10
-        // Row 1 values: [5, 10, 15]   with scale=0.5, zp=5
-        let quantized: Vec<u8> = vec![10, 20, 30, 5, 10, 15];
-        let shape = vec![2, 3];
-
-        let mut scale = Vec::new();
-        scale.extend_from_slice(&f16_bytes(0.1));
-        scale.extend_from_slice(&f16_bytes(0.5));
-
-        let mut zero_point = Vec::new();
-        zero_point.extend_from_slice(&f16_bytes(10.0));
-        zero_point.extend_from_slice(&f16_bytes(5.0));
-
-        let output = dequant_affine(
-            &quantized,
-            &scale,
-            &zero_point,
-            ScalarType::Float16,
-            ScalarType::Float16,
-            Some(0),
-            &shape,
-            8,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(output.len(), 6 * 2);
-
-        // Row 0: (q - 10) * 0.1 → [0.0, 1.0, 2.0]
-        assert!((read_f16(&output, 0) - 0.0).abs() < 1e-2);
-        assert!((read_f16(&output, 1) - 1.0).abs() < 1e-2);
-        assert!((read_f16(&output, 2) - 2.0).abs() < 1e-2);
-
-        // Row 1: (q - 5) * 0.5 → [0.0, 2.5, 5.0]
-        assert!((read_f16(&output, 3) - 0.0).abs() < 1e-2);
-        assert!((read_f16(&output, 4) - 2.5).abs() < 1e-1);
-        assert!((read_f16(&output, 5) - 5.0).abs() < 1e-1);
-    }
-
-    #[test]
-    fn dequant_affine_with_nonzero_zero_point() {
-        // Verify zero_point offset works correctly.
-        // u8 value 128 with unsigned interpretation → 128.0
-        let quantized: Vec<u8> = vec![128u8];
-        let shape = vec![1];
-
-        let scale = 1.0f32.to_le_bytes().to_vec();
-        let zero_point = 0.0f32.to_le_bytes().to_vec();
-
-        let output = dequant_affine(
-            &quantized,
-            &scale,
-            &zero_point,
-            ScalarType::Float32,
-            ScalarType::Float32,
-            None,
-            &shape,
-            8,
-            None,
-        )
-        .unwrap();
-        // (128 - 0) * 1.0 = 128.0
-        assert!((read_f16(&output, 0) - 128.0).abs() < 1.0);
-    }
-
-    // ── convert_params_to_f16 ────────────────────────────────────
-
-    #[test]
-    fn convert_fp32_params_to_f16() {
-        // 2 FP32 values: 0.5, 1.5
-        let mut params = Vec::new();
-        params.extend_from_slice(&0.5f32.to_le_bytes());
-        params.extend_from_slice(&1.5f32.to_le_bytes());
-
-        let result = convert_params_to_f16(&params, ScalarType::Float32, None, &[4], 2).unwrap();
-
-        assert_eq!(result.len(), 4); // 2 × 2 bytes FP16
-        assert!((read_f16(&result, 0) - 0.5).abs() < 1e-3);
-        assert!((read_f16(&result, 1) - 1.5).abs() < 1e-3);
-    }
-
-    #[test]
-    fn convert_fp16_params_to_f16() {
-        // Already FP16: should pass through identically.
-        let mut params = Vec::new();
-        params.extend_from_slice(&f16_bytes(2.0));
-        params.extend_from_slice(&f16_bytes(3.0));
-
-        let result = convert_params_to_f16(&params, ScalarType::Float16, None, &[8], 4).unwrap();
-
-        assert_eq!(result.len(), 4);
-        assert!((read_f16(&result, 0) - 2.0).abs() < 1e-3);
-        assert!((read_f16(&result, 1) - 3.0).abs() < 1e-3);
-    }
-
-    // ── INT4 shader source ───────────────────────────────────────
+    // ── INT4 shader source (inference-specific) ────────────────
 
     #[test]
     fn int4_dequant_shader_source_is_valid_metal() {

@@ -7,6 +7,8 @@
 
 /// Apple Neural Engine bundle types and utilities.
 pub mod ane;
+/// Shared CPU dequantization routines (affine, dual-scale, parameter conversion).
+pub mod dequant;
 pub mod device;
 /// Shared f16 ↔ byte conversion utilities.
 pub mod f16_utils;
