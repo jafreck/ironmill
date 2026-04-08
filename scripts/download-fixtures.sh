@@ -43,6 +43,13 @@ if [ ! -f "$FIXTURE_DIR/squeezenet1.1.onnx" ]; then
         "https://github.com/onnx/models/raw/main/validated/vision/classification/squeezenet/model/squeezenet1.1-7.onnx"
 fi
 
+# MNIST ONNX (~26KB) — used by ironmill-bench inference_e2e tests
+if [ ! -f "$FIXTURE_DIR/mnist.onnx" ]; then
+    echo "  mnist.onnx..."
+    curl -sL -o "$FIXTURE_DIR/mnist.onnx" \
+        "https://github.com/onnx/models/raw/main/validated/vision/classification/mnist/model/mnist-12.onnx"
+fi
+
 # MobileNet CoreML (.mlmodel, ~16MB)
 if [ ! -f "$FIXTURE_DIR/MobileNet.mlmodel" ]; then
     echo "  MobileNet.mlmodel..."
