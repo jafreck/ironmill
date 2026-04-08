@@ -323,21 +323,16 @@ mod tests {
         // Provide no tensors — everything will be missing.
         let provider = StubProvider::new(config);
         let result = build_program(&provider);
-        // Missing weights produce warnings (not errors) so templates can handle
-        // optional weights for architectures like Gemma 4.
+        // Missing weights produce errors (not warnings) to prevent silent
+        // generation of incorrect programs with dummy tensors.
         assert!(
-            result.is_ok(),
-            "build_program should succeed with warnings for missing weights"
+            result.is_err(),
+            "build_program should fail when weights are missing"
         );
-        let cr = result.unwrap();
+        let err_msg = result.unwrap_err().to_string();
         assert!(
-            !cr.warnings.is_empty(),
-            "should have warnings about missing weights"
-        );
-        assert!(
-            cr.warnings.iter().any(|w| w.contains("missing weight")),
-            "warnings should mention missing weight, got: {:?}",
-            cr.warnings
+            err_msg.contains("missing weight"),
+            "error should mention missing weight, got: {err_msg}"
         );
     }
     #[test]

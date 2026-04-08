@@ -111,7 +111,15 @@ pub fn write_gpu_bundle(
                         dtype: scalar_type_to_str(*lut_dtype)
                             .map_err(|e| CompileError::UnsupportedScalarType(e.to_string()))?
                             .to_string(),
-                        quip_sharp_seed: quip_sharp_seed.map(|s| s as u32),
+                        quip_sharp_seed: quip_sharp_seed.map(|s| {
+                            u32::try_from(s).unwrap_or_else(|_| {
+                                eprintln!(
+                                    "Warning: tensor '{name}': quip_sharp_seed {s} exceeds u32::MAX, \
+                                     truncating to {}", s as u32
+                                );
+                                s as u32
+                            })
+                        }),
                     },
                 );
             }
@@ -176,12 +184,9 @@ pub fn write_gpu_bundle(
                         },
                     );
                 } else {
-                    let group_size = group_size.ok_or_else(|| {
-                        CompileError::Other(format!("tensor '{name}': missing group_size"))
-                    })?;
-                    let axis = axis.ok_or_else(|| {
-                        CompileError::Other(format!("tensor '{name}': missing axis"))
-                    })?;
+                    // Both group_size and axis are Some (guaranteed by the if-guard above).
+                    let group_size = group_size.unwrap();
+                    let axis = axis.unwrap();
 
                     methods_seen.insert("affine");
 

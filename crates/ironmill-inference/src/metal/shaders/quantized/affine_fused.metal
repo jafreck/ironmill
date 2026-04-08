@@ -7,6 +7,9 @@
 // and up dot products, then applies gated activation inline.
 //
 // Same buffer layout as batched_affine_matvec_int4, plus an activation mode flag.
+// B_packed blocked layout guarantees 4-byte alignment per (n_local, k_block)
+// slot, making the uint32 cast safe. Assumes group_size >= BLK_K.
+//
 // Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads.
 // ============================================================================
 

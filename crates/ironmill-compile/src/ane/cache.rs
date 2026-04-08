@@ -125,13 +125,18 @@ impl ProgramCache {
     /// Evict the least-recently-used entries (from the front of `entries`).
     pub fn evict(&mut self, count: usize) {
         let to_remove = count.min(self.entries.len());
-        for _ in 0..to_remove {
-            let entry = self.entries.remove(0);
+        if to_remove == 0 {
+            return;
+        }
+        // Remove all evicted keys from the index.
+        for entry in &self.entries[..to_remove] {
             self.index.remove(&entry.key);
-            // Rebuild indices: every remaining entry shifted left by 1
-            for (_, idx) in self.index.iter_mut() {
-                *idx -= 1;
-            }
+        }
+        // Drain evicted entries in one shot (O(n) shift instead of O(n²)).
+        self.entries.drain(..to_remove);
+        // Rebuild all indices after the bulk removal.
+        for (i, entry) in self.entries.iter().enumerate() {
+            self.index.insert(entry.key.clone(), i);
         }
     }
 
@@ -161,6 +166,11 @@ impl ProgramCache {
     }
 
     /// Generate a cache key from MIL text and weight data.
+    ///
+    /// **Note:** Uses `DefaultHasher`, which is not guaranteed to be stable
+    /// across Rust versions. Disk-persisted caches may miss after a toolchain
+    /// upgrade. This is acceptable because cache misses only trigger a
+    /// recompilation (no correctness impact).
     pub fn make_key(mil_text: &str, weight_data: &[u8]) -> ProgramKey {
         let mut hasher = DefaultHasher::new();
         mil_text.hash(&mut hasher);

@@ -123,7 +123,11 @@ pub(super) fn emit_moe_block(
         });
     }
 
-    let moe_out = accumulated.expect("num_experts must be > 0");
+    let moe_out = accumulated.ok_or_else(|| {
+        MilError::Validation(format!(
+            "MoE block at layer {layer_idx}: num_experts must be > 0"
+        ))
+    })?;
     Ok(moe_out)
 }
 

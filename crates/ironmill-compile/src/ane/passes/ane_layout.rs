@@ -268,11 +268,11 @@ fn reshape_tensor_type(ty: &mut TensorType) {
         return;
     }
 
-    // is_static() guarantees all dims are Some.
+    // is_static() guarantees all dims are Some — unwrap is safe here.
     let static_shape: Vec<usize> = ty
         .shape
         .iter()
-        .map(|d| d.expect("is_static checked"))
+        .map(|d| d.expect("is_static() guarantees all dims are Some"))
         .collect();
     let new = to_ane_shape_static(&static_shape);
     ty.shape = new.into_iter().map(Some).collect();

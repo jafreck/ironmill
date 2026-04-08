@@ -60,11 +60,9 @@ fn convert_matmul_to_conv(block: &mut Block) {
             if o.op_type == "const" && o.outputs.first().map(|s| s.as_str()) == Some(&y_ref) {
                 let val = o.inputs.get("val").or_else(|| o.attributes.get("val"));
                 match val {
-                    Some(Value::Tensor { data, shape, dtype }) => Some((
-                        data.as_bytes().expect("tensor not materialized").to_vec(),
-                        shape.clone(),
-                        *dtype,
-                    )),
+                    Some(Value::Tensor { data, shape, dtype }) => data
+                        .as_bytes()
+                        .map(|bytes| (bytes.to_vec(), shape.clone(), *dtype)),
                     _ => None,
                 }
             } else {

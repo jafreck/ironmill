@@ -624,19 +624,13 @@ fn emit_gdn_layer(
     // 4. Depthwise causal conv1d
     let conv_weight_name = format!("{attn_prefix}.conv1d.weight");
     let conv_weight_const = format!("l{li}_conv1d_weight");
-    emit_weight_const(
-        block,
-        provider,
-        &conv_weight_name,
-        &conv_weight_const,
-        warnings,
-    )?;
+    emit_weight_const(block, provider, &conv_weight_name, &conv_weight_const)?;
 
     let conv_bias_name = format!("{attn_prefix}.conv1d.bias");
     let conv_bias_const = format!("l{li}_conv1d_bias");
     let has_conv_bias = provider.has_tensor(&conv_bias_name);
     if has_conv_bias {
-        emit_weight_const(block, provider, &conv_bias_name, &conv_bias_const, warnings)?;
+        emit_weight_const(block, provider, &conv_bias_name, &conv_bias_const)?;
     }
 
     let conv_out = {
@@ -778,7 +772,7 @@ fn emit_gdn_layer(
     // A_log and dt_bias as const tensors — reshape to rank 3 for CoreML broadcast
     let a_log_name = format!("{attn_prefix}.A_log");
     let a_log_const = format!("l{li}_A_log");
-    emit_weight_const(block, provider, &a_log_name, &a_log_const, warnings)?;
+    emit_weight_const(block, provider, &a_log_name, &a_log_const)?;
     let a_log_3d = emit_reshape(
         block,
         &a_log_const,
@@ -788,7 +782,7 @@ fn emit_gdn_layer(
 
     let dt_bias_name = format!("{attn_prefix}.dt_bias");
     let dt_bias_const = format!("l{li}_dt_bias");
-    emit_weight_const(block, provider, &dt_bias_name, &dt_bias_const, warnings)?;
+    emit_weight_const(block, provider, &dt_bias_name, &dt_bias_const)?;
     let dt_bias_3d = emit_reshape(
         block,
         &dt_bias_const,

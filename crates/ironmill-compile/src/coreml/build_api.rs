@@ -90,6 +90,7 @@ pub struct CompileBuilder {
     palettize_bits: Option<u8>,
     no_fusion: bool,
     compile_mlmodelc: bool,
+    cargo_rerun: bool,
 }
 
 /// Output produced by [`CompileBuilder::build`].
@@ -119,6 +120,7 @@ impl CompileBuilder {
             palettize_bits: None,
             no_fusion: false,
             compile_mlmodelc: false,
+            cargo_rerun: false,
         }
     }
 
@@ -175,6 +177,15 @@ impl CompileBuilder {
     /// This is a no-op on non-macOS platforms or when Xcode is not installed.
     pub fn compile(mut self) -> Self {
         self.compile_mlmodelc = true;
+        self
+    }
+
+    /// Emit `cargo::rerun-if-changed` to stdout for `build.rs` integration.
+    ///
+    /// Only enable this when calling from a Cargo build script. When disabled
+    /// (the default), no cargo directives are printed.
+    pub fn cargo_rerun(mut self, enable: bool) -> Self {
+        self.cargo_rerun = enable;
         self
     }
 
@@ -298,7 +309,9 @@ impl CompileBuilder {
         };
 
         // 8. Print cargo::rerun-if-changed for build.rs integration
-        println!("cargo::rerun-if-changed={}", input.display());
+        if self.cargo_rerun {
+            println!("cargo::rerun-if-changed={}", input.display());
+        }
 
         Ok(BuildOutput {
             mlpackage: output_path,

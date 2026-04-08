@@ -7,6 +7,9 @@
 // Both projections share the same input x. Threadgroup index determines
 // which projection: tid < N_gate → gate, else → up.
 //
+// B_packed blocked layout guarantees 4-byte alignment per (n_local, k_block)
+// slot, making the uint32 cast safe. Assumes group_size >= BLK_K.
+//
 // Dispatch: (N_gate + N_up, 1, 1) threadgroups, (32, 1, 1) threads.
 
 kernel void batched_affine_matvec_int4(

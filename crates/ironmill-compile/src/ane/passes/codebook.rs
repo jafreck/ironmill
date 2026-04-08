@@ -407,7 +407,8 @@ fn stack_codebook_tensors(block: &Block, gathers: &[CodebookGather]) -> Option<V
                 } else {
                     first_dtype = Some(*dtype);
                 }
-                all_data.extend_from_slice(data.as_bytes().expect("tensor not materialized"));
+                let bytes = data.as_bytes()?; // unmaterialized tensor → skip
+                all_data.extend_from_slice(bytes);
             }
             _ => return None,
         }

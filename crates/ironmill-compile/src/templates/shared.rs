@@ -46,7 +46,6 @@ pub(super) fn emit_weight_const(
     provider: &dyn WeightProvider,
     weight_name: &str,
     const_name: &str,
-    warnings: &mut Vec<String>,
 ) -> Result<(), MilError> {
     match provider.tensor(weight_name) {
         Ok(tensor) => {
@@ -71,23 +70,9 @@ pub(super) fn emit_weight_const(
             block.add_op(op);
             Ok(())
         }
-        Err(e) => {
-            warnings.push(format!("missing weight '{weight_name}': {e}"));
-            let data = TensorData::inline(vec![0u8; 4]);
-            let op = Operation::new("const", const_name)
-                .with_attr(
-                    "val",
-                    Value::Tensor {
-                        data,
-                        shape: vec![1],
-                        dtype: ScalarType::Float32,
-                    },
-                )
-                .with_attr("onnx_name", Value::String(weight_name.to_string()))
-                .with_output(const_name);
-            block.add_op(op);
-            Ok(())
-        }
+        Err(e) => Err(MilError::Validation(format!(
+            "missing weight '{weight_name}': {e}"
+        ))),
     }
 }
 
@@ -103,17 +88,17 @@ pub(super) fn emit_linear(
     weight_prefix: &str,
     input: &str,
     op_prefix: &str,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let weight_name = format!("{weight_prefix}.weight");
     let weight_const = format!("{op_prefix}_weight");
-    emit_weight_const(block, provider, &weight_name, &weight_const, warnings)?;
+    emit_weight_const(block, provider, &weight_name, &weight_const)?;
 
     let bias_name = format!("{weight_prefix}.bias");
     let has_bias = provider.has_tensor(&bias_name);
     if has_bias {
         let bias_const = format!("{op_prefix}_bias");
-        emit_weight_const(block, provider, &bias_name, &bias_const, warnings)?;
+        emit_weight_const(block, provider, &bias_name, &bias_const)?;
     }
 
     let out_name = format!("{op_prefix}_out");
@@ -138,7 +123,7 @@ pub(super) fn emit_gather(
     weight_name: &str,
     indices: &str,
     out_name: &str,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let const_name = format!("{out_name}_table");
     emit_weight_const(
@@ -146,7 +131,6 @@ pub(super) fn emit_gather(
         provider,
         &format!("{weight_name}.weight"),
         &const_name,
-        warnings,
     )?;
     let gathered_name = format!("{out_name}_gathered");
     let op = Operation::new("gather", format!("{out_name}_gather_op"))
@@ -170,11 +154,11 @@ pub(super) fn emit_rms_norm(
     weight_prefix: &str,
     input: &str,
     op_prefix: &str,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let weight_name = format!("{weight_prefix}.weight");
     let weight_const = format!("{op_prefix}_weight");
-    emit_weight_const(block, provider, &weight_name, &weight_const, warnings)?;
+    emit_weight_const(block, provider, &weight_name, &weight_const)?;
 
     let out_name = format!("{op_prefix}_out");
     let op = Operation::new("rms_norm", format!("{op_prefix}_op"))
@@ -623,11 +607,11 @@ pub(super) fn emit_embedding(
     block: &mut Block,
     provider: &dyn WeightProvider,
     _config: &ModelConfig,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<String, MilError> {
     let weight_name = "model.embed_tokens.weight";
     let const_name = "embed_tokens_weight";
-    emit_weight_const(block, provider, weight_name, const_name, warnings)?;
+    emit_weight_const(block, provider, weight_name, const_name)?;
 
     let out_name = "embed_out".to_string();
     let gather = Operation::new("gather", "embed_gather")

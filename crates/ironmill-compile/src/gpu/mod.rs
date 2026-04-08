@@ -324,12 +324,10 @@ fn extract_layer_index(name: &str) -> Option<usize> {
             return rest[..dot_pos].parse().ok();
         }
     }
-    // "/layers/N/" pattern (ONNX naming)
-    for segment in name.split('/') {
-        if !segment.is_empty()
-            && segment.chars().all(|c| c.is_ascii_digit())
-            && name.contains("/layers/")
-        {
+    // "/layers/N/" pattern (ONNX naming) — match only the segment immediately after "/layers/"
+    if let Some(rest) = name.split("/layers/").nth(1) {
+        let segment = rest.split('/').next().unwrap_or("");
+        if !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()) {
             return segment.parse().ok();
         }
     }

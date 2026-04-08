@@ -5,7 +5,10 @@
 //
 // B_packed is in blocked layout: [N_blocks, K_blocks, BLK_N, BLK_K/2]
 // produced by pack_quantized_blocked(). BLK_K=8 elements → 4 packed bytes
-// = 1 uint32 per (n_local, k_block).
+// = 1 uint32 per (n_local, k_block). The blocked layout guarantees 4-byte
+// alignment for each (n_local, k_block) slot, so the uint32 cast is safe.
+//
+// Assumes group_size >= BLK_K (true for all practical group sizes: 32, 64, 128).
 //
 // Dispatch: (N, 1, 1) threadgroups, (32, 1, 1) threads per group.
 

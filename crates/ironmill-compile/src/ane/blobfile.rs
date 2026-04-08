@@ -62,7 +62,17 @@ impl BlobFileWriter {
     ///
     /// MIL text references use `offset=uint64(64)` pointing to the chunk
     /// descriptor at byte 64, matching Orion's BLOBFILE format.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once — the BLOBFILE format supports only a
+    /// single weight per file (each weight gets its own BLOBFILE in practice).
     pub fn add_weight(&mut self, name: &str, data: &[u8], dtype: ScalarType) -> u64 {
+        assert!(
+            self.entries.is_empty(),
+            "BlobFileWriter supports only one weight per file; \
+             attempted to add '{name}' but a weight was already added"
+        );
         self.entries.push(BlobEntry {
             name: name.to_string(),
             offset: 64,
@@ -108,6 +118,11 @@ impl BlobFileWriter {
         // Byte 68: 1
         buf[68] = 1;
         // Bytes 72-75: data size (u32 LE)
+        assert!(
+            data_size <= u32::MAX as usize,
+            "BLOBFILE data size {data_size} exceeds u32::MAX; \
+             weight data too large for BLOBFILE format"
+        );
         buf[72..76].copy_from_slice(&(data_size as u32).to_le_bytes());
         // Bytes 80-83: data offset = 128 (u32 LE)
         buf[80..84].copy_from_slice(&(DATA_START as u32).to_le_bytes());
@@ -151,20 +166,11 @@ mod tests {
     }
 
     #[test]
-    fn blobfile_multiple_weights() {
+    #[should_panic(expected = "BlobFileWriter supports only one weight per file")]
+    fn blobfile_multiple_weights_panics() {
         let mut writer = BlobFileWriter::new();
-
-        let off1 = writer.add_weight("w1", &[0u8; 16], ScalarType::Float16);
-        let off2 = writer.add_weight("w2", &[0u8; 32], ScalarType::Float32);
-
-        // All offsets are 64 (each weight gets its own BLOBFILE in practice)
-        assert_eq!(off1, 64);
-        assert_eq!(off2, 64);
-        assert_eq!(writer.entries().len(), 2);
-
-        // Combined BLOBFILE has all data at byte 128
-        let bytes = writer.as_bytes();
-        assert_eq!(bytes.len(), DATA_START + 16 + 32);
+        writer.add_weight("w1", &[0u8; 16], ScalarType::Float16);
+        writer.add_weight("w2", &[0u8; 32], ScalarType::Float32);
     }
 
     #[test]

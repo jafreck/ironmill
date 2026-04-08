@@ -90,7 +90,9 @@ pub fn pack_inputs(sub: &mut SubProgram) -> Option<InputPacking> {
 
         // Const for begin: [0, 0, 0, offset_i]
         let begin_name = format!("_pack_begin_{i}");
-        let begin_data: Vec<u8> = [0i32, 0, 0, off_i as i32]
+        let off_i32 = i32::try_from(off_i)
+            .expect("spatial offset exceeds i32::MAX — model too large for ANE packing");
+        let begin_data: Vec<u8> = [0i32, 0, 0, off_i32]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
@@ -108,7 +110,11 @@ pub fn pack_inputs(sub: &mut SubProgram) -> Option<InputPacking> {
         // Const for size: [1, C_i, 1, S_i]
         let size_name = format!("_pack_size_{i}");
         let c_i = channel_counts[i];
-        let size_data: Vec<u8> = [1i32, c_i as i32, 1, s_i as i32]
+        let c_i32 = i32::try_from(c_i)
+            .expect("channel count exceeds i32::MAX — model too large for ANE packing");
+        let s_i32 = i32::try_from(s_i)
+            .expect("spatial size exceeds i32::MAX — model too large for ANE packing");
+        let size_data: Vec<u8> = [1i32, c_i32, 1, s_i32]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();

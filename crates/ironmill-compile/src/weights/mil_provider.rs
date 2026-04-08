@@ -206,7 +206,7 @@ fn handle_lut_to_dense(
             "LUT element count {lut_elements} is not a power of two for tensor '{name}'"
         )));
     }
-    let n_bits = (lut_elements as f64).log2() as u8;
+    let n_bits = lut_elements.trailing_zeros() as u8;
 
     // Look up the corresponding row norms.
     let output_name: &str = op.outputs.first().map(String::as_str).unwrap_or("");

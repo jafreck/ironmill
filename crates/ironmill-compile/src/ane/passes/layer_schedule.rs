@@ -244,8 +244,8 @@ pub fn detect_layers(ops: &[mil_rs::ir::Operation]) -> Vec<DetectedLayer> {
     let mut layers = Vec::new();
     let mut start = 0;
     while start < n {
-        // Every slot filled by pass 6 above.
-        let ty = assigned[start].expect("assigned by pass 6");
+        // Every slot is filled by pass 6 above — unwrap is safe.
+        let ty = assigned[start].expect("every slot assigned by pass 6");
         let mut end = start + 1;
         while end < n && assigned[end] == Some(ty) {
             end += 1;

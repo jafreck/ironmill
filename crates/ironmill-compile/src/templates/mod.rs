@@ -146,7 +146,9 @@ fn extract_component(
                         || name.starts_with("embed_norm")
                 }
                 ModelComponent::Transformer => {
-                    name.starts_with("l") && !name.starts_with("lm_head")
+                    (name.starts_with("l")
+                        && name.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
+                        && !name.starts_with("lm_head")
                         || name.starts_with("rope_")
                 }
                 ModelComponent::LmHead => {

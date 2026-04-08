@@ -66,7 +66,11 @@ pub fn quantize_dequant_scaled(
                 for (j, &qb_val) in quant_buf[..gsize].iter().enumerate() {
                     let dequant = (qb_val as f32 - zp) * scale;
                     let c = g_start + j;
-                    result_row[c] = dequant / scales[c];
+                    result_row[c] = if scales[c] != 0.0 {
+                        dequant / scales[c]
+                    } else {
+                        0.0
+                    };
                 }
             }
         });

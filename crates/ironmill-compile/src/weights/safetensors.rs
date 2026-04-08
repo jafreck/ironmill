@@ -134,10 +134,17 @@ impl SafeTensorsProvider {
                     shard_paths[shard_idx].display()
                 ))
             })?;
+            // SAFETY: `data` is a sub-slice of `mmap`, so pointer subtraction
+            // gives the byte offset within the mmap. This relies on safetensors
+            // returning views into the mmap (guaranteed by its zero-copy design).
             let mmap_ptr = mmap.as_ptr() as usize;
             for (name, view) in st.tensors() {
                 let data = view.data();
                 let data_start = data.as_ptr() as usize - mmap_ptr;
+                debug_assert!(
+                    data_start + data.len() <= mmap.len(),
+                    "safetensors view extends beyond mmap bounds"
+                );
                 let data_len = data.len();
                 let st_dtype = view.dtype();
                 let needs_bf16 = st_dtype == safetensors::Dtype::BF16;
