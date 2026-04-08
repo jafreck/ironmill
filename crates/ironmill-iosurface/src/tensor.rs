@@ -42,7 +42,15 @@ impl AneTensor {
         dtype: ScalarType,
         min_alloc: usize,
     ) -> crate::Result<Self> {
-        let data_size = channels * seq_len * dtype.byte_size();
+        let data_size = channels
+            .checked_mul(seq_len)
+            .and_then(|v| v.checked_mul(dtype.byte_size()))
+            .ok_or_else(|| {
+                IOSurfaceError::AllocFailed(format!(
+                    "tensor size overflow: {channels} * {seq_len} * {}",
+                    dtype.byte_size()
+                ))
+            })?;
         let alloc_size = data_size.max(min_alloc).max(ANE_MIN_SURFACE_BYTES);
 
         #[cfg(target_os = "macos")]
@@ -314,8 +322,38 @@ impl AneTensor {
         let bpe = self.dtype.byte_size();
         let src_s = src.shape[3];
         let dst_s = self.shape[3];
-        let src_stride = src_s * bpe;
-        let dst_stride = dst_s * bpe;
+        let src_stride = src_s.checked_mul(bpe).ok_or_else(|| {
+            IOSurfaceError::CopyFailed("copy_column0_from: src stride overflow".into())
+        })?;
+        let dst_stride = dst_s.checked_mul(bpe).ok_or_else(|| {
+            IOSurfaceError::CopyFailed("copy_column0_from: dst stride overflow".into())
+        })?;
+
+        // Verify that strided access stays within each surface's allocation.
+        let src_end = channels
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(src_stride))
+            .and_then(|off| off.checked_add(bpe));
+        if let Some(end) = src_end {
+            if end > src.alloc_size {
+                return Err(IOSurfaceError::CopyFailed(format!(
+                    "copy_column0_from: src access at byte {end} exceeds alloc {}",
+                    src.alloc_size
+                )));
+            }
+        }
+        let dst_end = channels
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(dst_stride))
+            .and_then(|off| off.checked_add(bpe));
+        if let Some(end) = dst_end {
+            if end > self.alloc_size {
+                return Err(IOSurfaceError::CopyFailed(format!(
+                    "copy_column0_from: dst access at byte {end} exceeds alloc {}",
+                    self.alloc_size
+                )));
+            }
+        }
 
         #[cfg(target_os = "macos")]
         {
@@ -433,6 +471,13 @@ impl AneTensor {
     /// bytes at strided positions `c * S * 2` rather than the entire surface.
     /// When `S == 1`, equivalent to [`read_f16`].
     pub fn read_column0_f16(&self) -> crate::Result<Vec<f16>> {
+        if self.dtype != ScalarType::Float16 {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "read_column0_f16 requires Float16 dtype, got {:?}",
+                self.dtype
+            )));
+        }
+
         let channels = self.shape[1];
         let seq_len = self.shape[3];
 
@@ -440,7 +485,25 @@ impl AneTensor {
             return self.read_f16();
         }
 
-        let stride_bytes = seq_len * 2; // 2 bytes per f16
+        let stride_bytes = seq_len.checked_mul(2).ok_or_else(|| {
+            IOSurfaceError::CopyFailed("read_column0_f16: stride overflow".into())
+        })?;
+
+        // Verify strided access stays within allocation.
+        if channels > 0 {
+            let end = (channels - 1)
+                .checked_mul(stride_bytes)
+                .and_then(|off| off.checked_add(2))
+                .ok_or_else(|| {
+                    IOSurfaceError::CopyFailed("read_column0_f16: offset overflow".into())
+                })?;
+            if end > self.alloc_size {
+                return Err(IOSurfaceError::CopyFailed(format!(
+                    "read_column0_f16: access at byte {end} exceeds alloc {}",
+                    self.alloc_size
+                )));
+            }
+        }
         let mut out = vec![f16::ZERO; channels];
 
         #[cfg(target_os = "macos")]
@@ -477,6 +540,13 @@ impl AneTensor {
     /// Read column 0 of each channel row into a caller-provided buffer,
     /// avoiding per-call heap allocation. The buffer is resized to `channels`.
     pub fn read_column0_f16_into(&self, out: &mut Vec<f16>) -> crate::Result<()> {
+        if self.dtype != ScalarType::Float16 {
+            return Err(IOSurfaceError::CopyFailed(format!(
+                "read_column0_f16_into requires Float16 dtype, got {:?}",
+                self.dtype
+            )));
+        }
+
         let channels = self.shape[1];
         let seq_len = self.shape[3];
 
@@ -487,7 +557,25 @@ impl AneTensor {
             return self.read_f16_into(out);
         }
 
-        let stride_bytes = seq_len * 2;
+        let stride_bytes = seq_len.checked_mul(2).ok_or_else(|| {
+            IOSurfaceError::CopyFailed("read_column0_f16_into: stride overflow".into())
+        })?;
+
+        // Verify strided access stays within allocation.
+        if channels > 0 {
+            let end = (channels - 1)
+                .checked_mul(stride_bytes)
+                .and_then(|off| off.checked_add(2))
+                .ok_or_else(|| {
+                    IOSurfaceError::CopyFailed("read_column0_f16_into: offset overflow".into())
+                })?;
+            if end > self.alloc_size {
+                return Err(IOSurfaceError::CopyFailed(format!(
+                    "read_column0_f16_into: access at byte {end} exceeds alloc {}",
+                    self.alloc_size
+                )));
+            }
+        }
 
         #[cfg(target_os = "macos")]
         {
