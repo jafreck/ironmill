@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "common/simdgroup_reduce.h"
 using namespace metal;
 
 // ── GDN Conv1d + SiLU kernel ────────────────────────────────────
@@ -312,20 +313,9 @@ kernel void gdn_prefill_recurrent(
 
         // Per-head RMSNorm on output
         float sq = o_sum * o_sum;
-        float simd_total = simd_sum(sq);
-        uint sg_idx = tid / 32;
-        if (tid % 32 == 0) sg_partial[sg_idx] = simd_total;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float rms_sum = threadgroup_reduce_sum(sq, tid, tg_size, sg_partial);
 
-        if (tid == 0) {
-            uint num_sg = (tg_size + 31) / 32;
-            float total = 0.0f;
-            for (uint i = 0; i < num_sg; i++) total += sg_partial[i];
-            sg_partial[0] = total;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float rms_inv = rsqrt(sg_partial[0] / float(v_head_dim) + eps);
+        float rms_inv = rsqrt(rms_sum / float(v_head_dim) + eps);
         float normed = o_sum * rms_inv * float(norm_weight[vi]);
 
         // silu(z) gating
@@ -380,20 +370,9 @@ kernel void gdn_output_gate(
     float sq = val * val;
 
     // Reduce across threads using simd_sum + threadgroup reduction.
-    float simd_total = simd_sum(sq);
-    uint sg_idx = tid / 32;
-    if (tid % 32 == 0) sg_partial[sg_idx] = simd_total;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms_sum = threadgroup_reduce_sum(sq, tid, tg_size, sg_partial);
 
-    if (tid == 0) {
-        uint num_sg = (tg_size + 31) / 32;
-        float total = 0.0f;
-        for (uint i = 0; i < num_sg; i++) total += sg_partial[i];
-        sg_partial[0] = total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float rms_inv = rsqrt(sg_partial[0] / float(v_head_dim) + eps);
+    float rms_inv = rsqrt(rms_sum / float(v_head_dim) + eps);
 
     // Step 2: RMSNorm + silu(z) gating.
     float normed = val * rms_inv * float(norm_weight[tid]);
@@ -573,21 +552,10 @@ kernel void gdn_fused_decode(
     threadgroup float sg_partial[32];
 
     float sq = o_sum * o_sum;
-    float simd_total = simd_sum(sq);
-    uint sg_idx = tid / 32;
-    if (tid % 32 == 0) sg_partial[sg_idx] = simd_total;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        uint num_sg = (tg_size + 31) / 32;
-        float total = 0.0f;
-        for (uint i = 0; i < num_sg; i++) total += sg_partial[i];
-        sg_partial[0] = total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms_sum = threadgroup_reduce_sum(sq, tid, tg_size, sg_partial);
 
     if (vi < v_head_dim) {
-        float rms_inv = rsqrt(sg_partial[0] / float(v_head_dim) + eps);
+        float rms_inv = rsqrt(rms_sum / float(v_head_dim) + eps);
         float normed = o_sum * rms_inv * float(norm_weight[vi]);
 
         uint head_base = h_idx * v_head_dim;

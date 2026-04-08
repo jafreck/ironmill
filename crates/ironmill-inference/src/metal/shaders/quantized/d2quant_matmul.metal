@@ -86,14 +86,9 @@ kernel void d2quant_matvec_3bit(
 
 // ── Matmul tuning parameters (shared naming across all formats) ──
 
-constant constexpr uint N_SIMDGROUPS   = 8;
-constant constexpr uint THREADS_PER_TG = N_SIMDGROUPS * 32;
-constant constexpr uint TM_TILE        = N_SIMDGROUPS * 8;   // 64
-constant constexpr uint TN_TILE        = 64;
-constant constexpr uint TN_STRIDE      = TN_TILE + 1;
+#include "common/matmul_tile_constants.h"
 constant constexpr uint MATMUL_K_TILE  = 32;
 constant constexpr uint K_BLOCKS       = MATMUL_K_TILE / 8;  // 4 MMA ops per K-tile
-constant constexpr uint TN_BLOCKS      = TN_TILE / 8;
 
 // ── D2Quant tiled GEMM (prefill path, M>1) ──────────────────────
 //

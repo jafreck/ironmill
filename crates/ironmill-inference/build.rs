@@ -26,6 +26,10 @@ fn main() {
     let shader_dir = Path::new("src/metal/shaders");
     let helpers_dir = Path::new("src/shaders");
 
+    // Absolute include path so #include "common/..." works from temp files in OUT_DIR.
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let shader_include_dir = manifest_dir.join("src/metal/shaders");
+
     // ── HEAD_DIM-independent shaders (compiled once) ────────────
     let independent: &[(&str, &str)] = &[
         ("normalization", "norm"),
@@ -51,7 +55,7 @@ fn main() {
     for &(name, subdir) in independent {
         let src = shader_dir.join(subdir).join(format!("{name}.metal"));
         let lib = out_dir.join(format!("{name}.metallib"));
-        compile_shader(&src, &lib, &[]);
+        compile_shader(&src, &lib, &[], &shader_include_dir);
     }
 
     // ── Affine matmul: concatenate common + split files into one metallib ──
@@ -74,7 +78,12 @@ fn main() {
         }
         let affine_tmp = out_dir.join("_affine_combined.metal");
         std::fs::write(&affine_tmp, &combined).unwrap();
-        compile_shader(&affine_tmp, &out_dir.join("affine_matmul.metallib"), &[]);
+        compile_shader(
+            &affine_tmp,
+            &out_dir.join("affine_matmul.metallib"),
+            &[],
+            &shader_include_dir,
+        );
     }
 
     // ── HEAD_DIM-dependent shaders (per-variant) ────────────────
@@ -105,6 +114,7 @@ fn main() {
             &attn_tmp,
             &out_dir.join(format!("attention_hd{hd}.metallib")),
             &[],
+            &shader_include_dir,
         );
 
         // Fused SDPA — reduce tile sizes for large head dims to fit in 32KB threadgroup memory.
@@ -119,6 +129,7 @@ fn main() {
             &sdpa_tmp,
             &out_dir.join(format!("fused_sdpa_hd{hd}.metallib")),
             &[],
+            &shader_include_dir,
         );
 
         // FlashDecoding split+reduce (separate metallib to avoid inflating
@@ -136,6 +147,7 @@ fn main() {
             &fd_tmp,
             &out_dir.join(format!("flash_decode_hd{hd}.metallib")),
             &[],
+            &shader_include_dir,
         );
 
         // Turboquant (helpers + main, with defines prepended)
@@ -146,15 +158,17 @@ fn main() {
             &tq_tmp,
             &out_dir.join(format!("turboquant_hd{hd}.metallib")),
             &defines,
+            &shader_include_dir,
         );
     }
 
     // Rerun when shader sources change.
     println!("cargo:rerun-if-changed=src/metal/shaders");
+    println!("cargo:rerun-if-changed=src/metal/shaders/common");
     println!("cargo:rerun-if-changed=src/shaders");
 }
 
-fn compile_shader(src: &Path, output: &Path, extra_args: &[String]) {
+fn compile_shader(src: &Path, output: &Path, extra_args: &[String], include_dir: &Path) {
     let air = output.with_extension("air");
 
     // Step 1: .metal → .air (intermediate representation)
@@ -162,6 +176,8 @@ fn compile_shader(src: &Path, output: &Path, extra_args: &[String]) {
     cmd.arg("metal")
         .arg("-c")
         .arg("-Wno-unused-variable")
+        .arg("-I")
+        .arg(include_dir)
         .arg(src)
         .arg("-o")
         .arg(&air);

@@ -29,14 +29,9 @@ using namespace metal;
 //  16 simdgroups (512 threads): larger tiles, better arithmetic intensity
 //
 // Profile on target hardware to determine the optimum.
-constant constexpr uint N_SIMDGROUPS   = 8;
-constant constexpr uint THREADS_PER_TG = N_SIMDGROUPS * 32;
-constant constexpr uint TM_TILE        = N_SIMDGROUPS * 8;   // 64 for 8 SG, 128 for 16 SG
-constant constexpr uint TN_TILE        = 64;
-constant constexpr uint TN_STRIDE      = TN_TILE + 1;
+#include "common/matmul_tile_constants.h"
 constant constexpr uint MATMUL_K_TILE  = 32;
 constant constexpr uint K_BLOCKS       = MATMUL_K_TILE / 8;  // 4 MMA ops per K-tile
-constant constexpr uint TN_BLOCKS      = TN_TILE / 8;
 
 // ── Blocked-layout constants (must match pack_quantized_blocked) ─
 constant constexpr uint BLK_N = 64;

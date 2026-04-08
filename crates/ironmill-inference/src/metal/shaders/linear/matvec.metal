@@ -95,14 +95,9 @@ kernel void matvec(
 // Dispatch: ((M+63)/64, (N+63)/64, 1) threadgroups, (256, 1, 1) threads.
 // ============================================================================
 
-constant constexpr uint TM_TILE        = 64;   // output rows per threadgroup
-constant constexpr uint TN_TILE        = 64;   // output cols per threadgroup
+#include "common/matmul_tile_constants.h"
 constant constexpr uint MATMUL_K_TILE  = 32;   // K-step (4 MMA ops per tile)
 constant constexpr uint K_BLOCKS       = MATMUL_K_TILE / 8;  // 4 MMA ops per K-tile
-constant constexpr uint N_SIMDGROUPS   = 8;
-constant constexpr uint THREADS_PER_TG = N_SIMDGROUPS * 32;  // 256
-constant constexpr uint TN_BLOCKS      = TN_TILE / 8;        // 8
-constant constexpr uint TN_STRIDE      = TN_TILE + 1;        // 65, bank-conflict-free
 
 kernel void matmul(
     device const half* A          [[buffer(0)]],   // [M, K] activations

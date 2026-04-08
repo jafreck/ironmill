@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "common/simdgroup_reduce.h"
 using namespace metal;
 
 // Fused embedding lookup + RMSNorm: look up token embeddings and normalize
@@ -59,20 +60,9 @@ kernel void fused_embedding_norm(
     }
 
     // Step 2: Reduce
-    float simd_total = simd_sum(local_sum);
-    uint sg_idx = tid / 32;
-    if (tid % 32 == 0) sg_partial[sg_idx] = simd_total;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = threadgroup_reduce_sum(local_sum, tid, tg_size, sg_partial);
 
-    if (tid == 0) {
-        uint num_sg = (tg_size + 31) / 32;
-        float total = 0.0f;
-        for (uint i = 0; i < num_sg; i++) total += sg_partial[i];
-        sg_partial[0] = total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float rms_inv = rsqrt(sg_partial[0] / float(hidden_size) + eps);
+    float rms_inv = rsqrt(sum / float(hidden_size) + eps);
 
     // Step 3: Normalize and write
     for (uint i = tid; i < hidden_size; i += tg_size) {
