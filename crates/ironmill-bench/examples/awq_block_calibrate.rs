@@ -31,40 +31,90 @@ use mil_rs::ir::ScalarType;
 // ── Custom hook: captures per-layer activation data ────────────
 
 struct BlockCalibrationHook {
-    /// Per-layer attn_norm activations as f32: layer_idx → [tokens × hidden_size].
-    attn_norm_acts: HashMap<usize, Vec<f32>>,
-    /// Per-layer ffn_norm activations as f32: layer_idx → [tokens × hidden_size].
-    ffn_norm_acts: HashMap<usize, Vec<f32>>,
-    /// Per-layer block output hidden states (FP16 bytes): layer_idx → bytes.
+    /// Per-layer running mean of |activation| per channel (attn_norm).
+    /// Accumulated across all calibration sequences per reference AWQ.
+    attn_norm_mags: HashMap<usize, ChannelMagAccum>,
+    /// Per-layer running mean of |activation| per channel (ffn_norm).
+    ffn_norm_mags: HashMap<usize, ChannelMagAccum>,
+    /// Per-layer raw activations from the LAST sequence only, for clip search.
+    attn_norm_acts_last: HashMap<usize, Vec<f32>>,
+    ffn_norm_acts_last: HashMap<usize, Vec<f32>>,
+    /// Per-layer block output hidden states (FP16 bytes) from the LAST sequence,
+    /// used as MSE reference for the block-level alpha search.
     block_outputs: HashMap<usize, Vec<u8>>,
+}
+
+/// Running mean accumulator for per-channel |activation| magnitudes.
+struct ChannelMagAccum {
+    /// Running mean of |x| per channel.
+    mean_abs: Vec<f32>,
+    /// Total tokens accumulated so far.
+    sample_count: usize,
+}
+
+impl ChannelMagAccum {
+    fn new(n_features: usize) -> Self {
+        Self {
+            mean_abs: vec![0.0; n_features],
+            sample_count: 0,
+        }
+    }
+
+    /// Accumulate a batch of activations: [n_tokens × n_features].
+    fn accumulate(&mut self, data: &[f32], n_features: usize) {
+        let n_tokens = data.len() / n_features;
+        if n_tokens == 0 {
+            return;
+        }
+        // Compute per-channel sum of |x| for this batch.
+        let mut batch_sum = vec![0.0_f32; n_features];
+        for t in 0..n_tokens {
+            let row = &data[t * n_features..(t + 1) * n_features];
+            for (c, &val) in row.iter().enumerate() {
+                batch_sum[c] += val.abs();
+            }
+        }
+        // Weighted running mean update.
+        let old_count = self.sample_count as f32;
+        let new_count = (self.sample_count + n_tokens) as f32;
+        for c in 0..n_features {
+            self.mean_abs[c] = (self.mean_abs[c] * old_count + batch_sum[c]) / new_count;
+        }
+        self.sample_count += n_tokens;
+    }
 }
 
 impl BlockCalibrationHook {
     fn new() -> Self {
         Self {
-            attn_norm_acts: HashMap::new(),
-            ffn_norm_acts: HashMap::new(),
+            attn_norm_mags: HashMap::new(),
+            ffn_norm_mags: HashMap::new(),
+            attn_norm_acts_last: HashMap::new(),
+            ffn_norm_acts_last: HashMap::new(),
             block_outputs: HashMap::new(),
         }
     }
 }
 
 impl ActivationHook for BlockCalibrationHook {
-    fn on_linear_input(
-        &mut self,
-        layer: usize,
-        name: &str,
-        activation: &[f16],
-        _n_features: usize,
-    ) {
+    fn on_linear_input(&mut self, layer: usize, name: &str, activation: &[f16], n_features: usize) {
         match name {
             "attn_norm" => {
                 let f32_data: Vec<f32> = activation.iter().map(|v| v.to_f32()).collect();
-                self.attn_norm_acts.insert(layer, f32_data);
+                self.attn_norm_mags
+                    .entry(layer)
+                    .or_insert_with(|| ChannelMagAccum::new(n_features))
+                    .accumulate(&f32_data, n_features);
+                // Keep last sequence's raw activations for clip search.
+                self.attn_norm_acts_last.insert(layer, f32_data);
             }
             "ffn_norm" => {
                 let f32_data: Vec<f32> = activation.iter().map(|v| v.to_f32()).collect();
-                self.ffn_norm_acts.insert(layer, f32_data);
+                self.ffn_norm_mags
+                    .entry(layer)
+                    .or_insert_with(|| ChannelMagAccum::new(n_features))
+                    .accumulate(&f32_data, n_features);
+                self.ffn_norm_acts_last.insert(layer, f32_data);
             }
             "block_output" => {
                 let bytes = f16_slice_to_bytes(activation);
@@ -184,16 +234,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let n_tokens = hook
-        .attn_norm_acts
+        .attn_norm_mags
+        .values()
+        .next()
+        .map(|a| a.sample_count)
+        .unwrap_or(0);
+    let n_tokens_last_seq = hook
+        .attn_norm_acts_last
         .values()
         .next()
         .map(|a| a.len() / hidden_size)
         .unwrap_or(0);
     eprintln!(
-        "Phase 1 complete in {:.1}s — captured {} layers, {} tokens/layer",
+        "Phase 1 complete in {:.1}s — captured {} layers, {} total tokens/layer ({} in last seq)",
         phase1_start.elapsed().as_secs_f64(),
         hook.block_outputs.len(),
         n_tokens,
+        n_tokens_last_seq,
     );
 
     // ── Phase 2: Block-level alpha search ─────────────────────
@@ -221,17 +278,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Compute and store magnitudes for layer 0
-    if let Some(acts) = hook.attn_norm_acts.get(&0) {
-        let mags = compute_channel_magnitudes(acts, hidden_size);
+    // Compute and store magnitudes for layer 0 (from accumulated stats)
+    if let Some(mags) = hook.attn_norm_mags.get(&0) {
         for proj in ATTN_PROJS {
-            magnitudes_map.insert(format!("l0_{proj}_weight"), mags.clone());
+            magnitudes_map.insert(format!("l0_{proj}_weight"), mags.mean_abs.clone());
         }
     }
-    if let Some(acts) = hook.ffn_norm_acts.get(&0) {
-        let mags = compute_channel_magnitudes(acts, hidden_size);
+    if let Some(mags) = hook.ffn_norm_mags.get(&0) {
         for proj in FFN_PROJS {
-            magnitudes_map.insert(format!("l0_{proj}_weight"), mags.clone());
+            magnitudes_map.insert(format!("l0_{proj}_weight"), mags.mean_abs.clone());
         }
     }
 
@@ -285,17 +340,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let token_count = block_input.len() / (hidden_size * 2);
 
-        // Compute magnitudes for this layer
+        // Use accumulated magnitudes (running mean across all sequences)
         let attn_mags = hook
-            .attn_norm_acts
+            .attn_norm_mags
             .get(&layer_idx)
-            .map(|a| compute_channel_magnitudes(a, hidden_size))
+            .map(|a| a.mean_abs.clone())
             .unwrap_or_else(|| vec![1.0; hidden_size]);
 
         let ffn_mags = hook
-            .ffn_norm_acts
+            .ffn_norm_mags
             .get(&layer_idx)
-            .map(|a| compute_channel_magnitudes(a, hidden_size))
+            .map(|a| a.mean_abs.clone())
             .unwrap_or_else(|| vec![1.0; hidden_size]);
 
         // Store magnitudes for output (only for projections that exist)
@@ -480,16 +535,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key = format!("l{layer_idx}_{proj}_weight");
             let alpha = block_config.get(&key).map(|c| c.alpha).unwrap_or(0.5);
 
-            // Get activations for this projection's norm
+            // Get raw activations (last sequence) and accumulated magnitudes.
             let norm_key = if ATTN_PROJS.contains(&proj) {
                 "attn"
             } else {
                 "ffn"
             };
             let activations = if norm_key == "attn" {
-                hook.attn_norm_acts.get(&layer_idx)
+                hook.attn_norm_acts_last.get(&layer_idx)
             } else {
-                hook.ffn_norm_acts.get(&layer_idx)
+                hook.ffn_norm_acts_last.get(&layer_idx)
             };
             let activations = match activations {
                 Some(a) => a,
@@ -505,13 +560,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     load_weight_f32(&provider, layer_idx, proj)?
                 };
 
-            // Activations must match in_features; if not, skip clip for this proj
-            if activations.len() < n_tokens * in_features {
+            let clip_n_tokens = activations.len() / in_features;
+            if clip_n_tokens == 0 {
                 continue;
             }
 
-            // Compute magnitudes for this projection's norm
-            let mags = compute_channel_magnitudes(activations, in_features);
+            // Use accumulated magnitudes for AWQ scales (all sequences).
+            let mags_accum = if norm_key == "attn" {
+                hook.attn_norm_mags.get(&layer_idx)
+            } else {
+                hook.ffn_norm_mags.get(&layer_idx)
+            };
+            let mags = match mags_accum {
+                Some(a) if a.mean_abs.len() == in_features => a.mean_abs.clone(),
+                _ => compute_channel_magnitudes(activations, in_features),
+            };
             let scales = compute_awq_scales(&mags, alpha);
 
             // Apply AWQ scaling to weights
@@ -529,7 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 group_size,
                 15.0,
                 activations,
-                n_tokens,
+                clip_n_tokens,
                 20,  // clip_grid
                 0.5, // max_shrink
             );

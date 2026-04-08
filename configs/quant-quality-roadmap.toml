@@ -4,7 +4,8 @@
 #   1. INT4 naive (no AWQ) — baseline quality gap
 #   2. INT4 + AWQ fixed α=0.5 — magnitude-only scaling
 #   3. INT4 + AWQ alpha grid search (P0) — per-tensor optimal scaling
-#   4. INT4 + AWQ alpha search + sensitive layers (P0+P2) — mixed precision
+#   4. INT4 + AWQ block-level calibration — full block forward search
+#   5. INT4 + AWQ block-level + sensitive layers (P0+P2) — mixed precision
 #
 # Reproduce (combined decode + perplexity, loads model once per config):
 #   cargo run --release -p ironmill-bench --features metal -- \
@@ -36,11 +37,11 @@ max_seq_len = 2048
 [[optimization]]
 name = "int4-awq-fixed"
 int4 = true
-awq_calib_dir = "/tmp/awq_calib_mags_only"
+awq_calib_dir = "models/Qwen3.5-4B/awq_block_calib"
 kv_quant = "turbo-int8"
 max_seq_len = 2048
 
-# ── 3. INT4 + AWQ alpha grid search (P0) + TQ-INT8 ─────────────
+# ── 3. INT4 + AWQ per-tensor alpha grid search (P0) + TQ-INT8 ───
 [[optimization]]
 name = "int4-awq-alpha"
 int4 = true
@@ -48,11 +49,21 @@ awq_calib_dir = "/tmp/awq_calib"
 kv_quant = "turbo-int8"
 max_seq_len = 2048
 
-# ── 4. INT4 + AWQ alpha + sensitive layers 0,31 (P0+P2) + TQ-INT8
+# ── 4. INT4 + AWQ block-level calibration + TQ-INT8 ─────────────
 [[optimization]]
-name = "int4-awq-alpha-sensitive"
+name = "int4-awq-block"
 int4 = true
-awq_calib_dir = "/tmp/awq_calib"
+awq_calib_dir = "models/Qwen3.5-4B/awq_block_calib"
+awq_block_config_path = "models/Qwen3.5-4B/awq_block_calib/awq_block_config.json"
+kv_quant = "turbo-int8"
+max_seq_len = 2048
+
+# ── 5. INT4 + AWQ block-level + sensitive layers 0,31 (P0+P2) + TQ-INT8
+[[optimization]]
+name = "int4-awq-block-sensitive"
+int4 = true
+awq_calib_dir = "models/Qwen3.5-4B/awq_block_calib"
+awq_block_config_path = "models/Qwen3.5-4B/awq_block_calib/awq_block_config.json"
 sensitive_layers = [0, 31]
 kv_quant = "turbo-int8"
 max_seq_len = 2048
