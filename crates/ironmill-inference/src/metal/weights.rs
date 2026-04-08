@@ -1282,3 +1282,180 @@ fn pack_quantized_blocked(data: &[u8], n: usize, k: usize, bit_width: usize) -> 
     }
     out
 }
+
+/// Pack quantized weights into row-major inline superblocks.
+///
+/// Each superblock contains inline scale and zero-point metadata followed by
+/// packed weight data for one quantization group:
+///
+/// ```text
+/// [scale: 2B fp16] [zero: 2B fp16] [data: group_size/elems_per_byte bytes]
+/// ```
+///
+/// Full row:  [SB_0][SB_1]...[SB_{G-1}]  where G = K / group_size
+/// Full matrix: row_0 | row_1 | ... | row_{N-1}  contiguous in memory
+///
+/// # Arguments
+/// - `data`: Row-major packed quantized bytes `[N, K / elems_per_byte]`
+/// - `scales`: Per-group FP16 scale bytes `[N * num_groups * 2]` (little-endian)
+/// - `zeros`: Per-group FP16 zero-point bytes `[N * num_groups * 2]` (little-endian)
+/// - `n`: Number of output features (rows)
+/// - `k`: Number of input features (columns, in elements)
+/// - `group_size`: Elements per quantization group
+/// - `bit_width`: Quantization bit width (4 or 8)
+///
+/// # Returns
+/// Packed superblock buffer `[N, num_groups, sb_bytes]` where
+/// `sb_bytes = 4 + group_size * bit_width / 8`
+fn pack_superblocks(
+    data: &[u8],
+    scales: &[u8],
+    zeros: &[u8],
+    n: usize,
+    k: usize,
+    group_size: usize,
+    bit_width: usize,
+) -> Vec<u8> {
+    let elems_per_byte = 8 / bit_width;
+    let num_groups = k / group_size;
+    let data_bytes_per_group = group_size / elems_per_byte;
+    let sb_bytes = 4 + data_bytes_per_group; // 2B scale + 2B zero + data
+    let row_bytes = num_groups * sb_bytes;
+
+    let mut out = vec![0u8; n * row_bytes];
+
+    for row in 0..n {
+        for g in 0..num_groups {
+            let sb_offset = row * row_bytes + g * sb_bytes;
+
+            // Copy inline scale (2 bytes FP16)
+            let scale_src = (row * num_groups + g) * 2;
+            out[sb_offset..sb_offset + 2].copy_from_slice(&scales[scale_src..scale_src + 2]);
+
+            // Copy inline zero (2 bytes FP16)
+            let zero_src = (row * num_groups + g) * 2;
+            out[sb_offset + 2..sb_offset + 4].copy_from_slice(&zeros[zero_src..zero_src + 2]);
+
+            // Copy weight data for this group
+            let data_src = row * (k / elems_per_byte) + g * data_bytes_per_group;
+            out[sb_offset + 4..sb_offset + sb_bytes]
+                .copy_from_slice(&data[data_src..data_src + data_bytes_per_group]);
+        }
+    }
+    out
+}
+
+/// Unpack superblock buffer back into separate data, scales, zeros arrays.
+/// Inverse of `pack_superblocks()`.
+#[cfg(test)]
+fn unpack_superblocks(
+    packed: &[u8],
+    n: usize,
+    k: usize,
+    group_size: usize,
+    bit_width: usize,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let elems_per_byte = 8 / bit_width;
+    let num_groups = k / group_size;
+    let data_bytes_per_group = group_size / elems_per_byte;
+    let sb_bytes = 4 + data_bytes_per_group;
+    let row_bytes = num_groups * sb_bytes;
+
+    let bytes_per_row = k / elems_per_byte;
+    let mut data = vec![0u8; n * bytes_per_row];
+    let mut scales = vec![0u8; n * num_groups * 2];
+    let mut zeros = vec![0u8; n * num_groups * 2];
+
+    for row in 0..n {
+        for g in 0..num_groups {
+            let sb_offset = row * row_bytes + g * sb_bytes;
+
+            let scale_dst = (row * num_groups + g) * 2;
+            scales[scale_dst..scale_dst + 2].copy_from_slice(&packed[sb_offset..sb_offset + 2]);
+
+            let zero_dst = (row * num_groups + g) * 2;
+            zeros[zero_dst..zero_dst + 2].copy_from_slice(&packed[sb_offset + 2..sb_offset + 4]);
+
+            let data_dst = row * bytes_per_row + g * data_bytes_per_group;
+            data[data_dst..data_dst + data_bytes_per_group]
+                .copy_from_slice(&packed[sb_offset + 4..sb_offset + sb_bytes]);
+        }
+    }
+    (data, scales, zeros)
+}
+
+#[cfg(test)]
+mod superblock_tests {
+    use super::*;
+
+    #[test]
+    fn test_pack_unpack_int4_roundtrip() {
+        let n = 4;
+        let k = 256;
+        let group_size = 128;
+        let bit_width = 4;
+        let elems_per_byte = 2;
+        let num_groups = k / group_size;
+
+        let data: Vec<u8> = (0..n * k / elems_per_byte)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let scales: Vec<u8> = (0..n * num_groups * 2).map(|i| (i % 256) as u8).collect();
+        let zeros: Vec<u8> = (0..n * num_groups * 2)
+            .map(|i| ((i + 1) % 256) as u8)
+            .collect();
+
+        let packed = pack_superblocks(&data, &scales, &zeros, n, k, group_size, bit_width);
+
+        let sb_bytes = 4 + group_size / elems_per_byte;
+        assert_eq!(packed.len(), n * num_groups * sb_bytes);
+
+        let (data2, scales2, zeros2) = unpack_superblocks(&packed, n, k, group_size, bit_width);
+        assert_eq!(data, data2);
+        assert_eq!(scales, scales2);
+        assert_eq!(zeros, zeros2);
+    }
+
+    #[test]
+    fn test_pack_unpack_int8_roundtrip() {
+        let n = 2;
+        let k = 256;
+        let group_size = 128;
+        let bit_width = 8;
+        let num_groups = k / group_size;
+
+        let data: Vec<u8> = (0..n * k).map(|i| (i % 256) as u8).collect();
+        let scales: Vec<u8> = (0..n * num_groups * 2).map(|i| (i % 256) as u8).collect();
+        let zeros: Vec<u8> = (0..n * num_groups * 2)
+            .map(|i| ((i + 1) % 256) as u8)
+            .collect();
+
+        let packed = pack_superblocks(&data, &scales, &zeros, n, k, group_size, bit_width);
+
+        let sb_bytes = 4 + group_size;
+        assert_eq!(packed.len(), n * num_groups * sb_bytes);
+
+        let (data2, scales2, zeros2) = unpack_superblocks(&packed, n, k, group_size, bit_width);
+        assert_eq!(data, data2);
+        assert_eq!(scales, scales2);
+        assert_eq!(zeros, zeros2);
+    }
+
+    #[test]
+    fn test_superblock_layout_structure() {
+        let n = 1;
+        let k = 128;
+        let group_size = 128;
+        let bit_width = 4;
+
+        let data = vec![0xABu8; k / 2];
+        let scales = vec![0x00, 0x3C]; // FP16 1.0
+        let zeros = vec![0x00, 0x00]; // FP16 0.0
+
+        let packed = pack_superblocks(&data, &scales, &zeros, n, k, group_size, bit_width);
+
+        assert_eq!(&packed[0..2], &[0x00, 0x3C]);
+        assert_eq!(&packed[2..4], &[0x00, 0x00]);
+        assert!(packed[4..].iter().all(|&b| b == 0xAB));
+    }
+}
