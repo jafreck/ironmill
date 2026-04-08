@@ -12,6 +12,7 @@ use half::f16;
 use rayon::prelude::*;
 
 use super::quantized::quantize_affine_into;
+use crate::error::{CompileError, Result};
 
 pub use super::quantized::AwqTensorConfig;
 
@@ -147,11 +148,17 @@ pub fn quantize_dequant_scaled(
 }
 
 /// Compute MSE between two FP16 byte buffers.
-pub fn mse_f16_bytes(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
+pub fn mse_f16_bytes(a: &[u8], b: &[u8]) -> Result<f64> {
+    if a.len() != b.len() {
+        return Err(CompileError::Other(format!(
+            "mse_f16_bytes: mismatched buffer lengths ({} vs {})",
+            a.len(),
+            b.len(),
+        )));
+    }
     let n = a.len() / 2;
     if n == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     let mut sum = 0.0_f64;
     for i in 0..n {
@@ -160,7 +167,7 @@ pub fn mse_f16_bytes(a: &[u8], b: &[u8]) -> f64 {
         let d = va - vb;
         sum += d * d;
     }
-    sum / n as f64
+    Ok(sum / n as f64)
 }
 
 /// Reinterpret `&[f16]` as raw little-endian bytes.
@@ -266,7 +273,7 @@ mod tests {
             .iter()
             .flat_map(|&v| f16::from_f32(v).to_le_bytes())
             .collect();
-        assert!((mse_f16_bytes(&data, &data)).abs() < 1e-12);
+        assert!((mse_f16_bytes(&data, &data).unwrap()).abs() < 1e-12);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use prost::Message;
 
-use crate::error::{MilError, Result};
+use crate::error::Result;
 use crate::proto::onnx::ModelProto;
 
 /// Read an ONNX `.onnx` file and deserialize it into a [`ModelProto`].
@@ -32,7 +32,7 @@ pub fn read_onnx(path: impl AsRef<Path>) -> Result<ModelProto> {
     let file = std::fs::File::open(path.as_ref())?;
     // SAFETY: the file is read-only and the mmap is dropped after decoding.
     let mmap = unsafe { Mmap::map(&file)? };
-    let model = ModelProto::decode(&mmap[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
+    let model = ModelProto::decode(&mmap[..])?;
     Ok(model)
 }
 
@@ -47,7 +47,7 @@ pub fn read_onnx_with_dir(path: impl AsRef<Path>) -> Result<(ModelProto, PathBuf
     let file = std::fs::File::open(path)?;
     // SAFETY: the file is read-only and the mmap is dropped after decoding.
     let mmap = unsafe { Mmap::map(&file)? };
-    let model = ModelProto::decode(&mmap[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
+    let model = ModelProto::decode(&mmap[..])?;
     Ok((model, dir))
 }
 
@@ -121,6 +121,7 @@ fn value_info_summary(vi: &crate::proto::onnx::ValueInfoProto) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::MilError;
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
         let manifest = env!("CARGO_MANIFEST_DIR");
@@ -191,8 +192,8 @@ mod tests {
         let result = read_onnx(&path);
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), MilError::Protobuf(_)),
-            "expected Protobuf error"
+            matches!(result.unwrap_err(), MilError::ProtobufDecode(_)),
+            "expected ProtobufDecode error"
         );
     }
 }

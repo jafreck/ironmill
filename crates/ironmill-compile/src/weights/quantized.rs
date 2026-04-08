@@ -354,7 +354,9 @@ fn tensor_name_to_awq_key(name: &str) -> String {
 fn to_f32_vec(data: &[u8], dtype: ScalarType) -> Option<Vec<f32>> {
     match dtype {
         ScalarType::Float32 => {
-            assert!(data.len() % 4 == 0);
+            if data.len() % 4 != 0 {
+                return None;
+            }
             Some(
                 data.chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -362,7 +364,9 @@ fn to_f32_vec(data: &[u8], dtype: ScalarType) -> Option<Vec<f32>> {
             )
         }
         ScalarType::Float16 => {
-            assert!(data.len() % 2 == 0);
+            if data.len() % 2 != 0 {
+                return None;
+            }
             Some(
                 data.chunks_exact(2)
                     .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -380,7 +384,7 @@ fn quantize_tensor(
     floats: &[f32],
     shape: &[usize],
     config: &D2QuantConfig,
-) -> (Vec<u8>, QuantizationInfo) {
+) -> crate::error::Result<(Vec<u8>, QuantizationInfo)> {
     let last_dim = shape[shape.len() - 1];
     let outer_count: usize = if shape.len() > 1 {
         shape[..shape.len() - 1].iter().product()
@@ -410,7 +414,14 @@ fn quantize_tensor(
             let packed = match config.bits {
                 2 => pack_2bit(&quantized),
                 3 => pack_3bit(&quantized),
-                _ => unreachable!("bits validated on construction"),
+                _ => {
+                    return Err(crate::error::CompileError::UnsupportedQuantization(
+                        format!(
+                            "D2Quant bit width {} not supported (expected 2 or 3)",
+                            config.bits
+                        ),
+                    ));
+                }
             };
             all_quantized_packed.extend_from_slice(&packed);
 
@@ -438,7 +449,7 @@ fn quantize_tensor(
     };
 
     // The primary data becomes the packed quantized bytes.
-    (all_quantized_packed, quant_info)
+    Ok((all_quantized_packed, quant_info))
 }
 
 /// Quantize a float tensor using INT4 affine per-group quantization.
@@ -1085,7 +1096,8 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
         })?;
 
         let (packed_data, quant_info) = match &self.method {
-            QuantMethod::D2Quant(config) => quantize_tensor(&floats, &t.shape, config),
+            QuantMethod::D2Quant(config) => quantize_tensor(&floats, &t.shape, config)
+                .map_err(|e| MilError::Validation(e.to_string()))?,
             QuantMethod::AffineInt4(config) => {
                 // Check if this is a sensitive layer → use INT8 instead of INT4.
                 if !config.sensitive_layers.is_empty() {

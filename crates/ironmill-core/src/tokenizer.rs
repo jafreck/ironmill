@@ -111,11 +111,11 @@ impl ChatMessage {
 pub enum TokenizerError {
     /// Failed to encode text into tokens.
     #[error("encoding error: {0}")]
-    Encode(String),
+    Encode(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// Failed to decode tokens back into text.
     #[error("decoding error: {0}")]
-    Decode(String),
+    Decode(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// Failed to load a tokenizer from disk.
     #[error("load error: {0}")]
@@ -269,13 +269,13 @@ mod hf_impl {
             self.inner
                 .encode(text, false)
                 .map(|enc| enc.get_ids().to_vec())
-                .map_err(|e| TokenizerError::Encode(e.to_string()))
+                .map_err(TokenizerError::Encode)
         }
 
         fn decode(&self, tokens: &[u32]) -> Result<String, TokenizerError> {
             self.inner
                 .decode(tokens, true)
-                .map_err(|e| TokenizerError::Decode(e.to_string()))
+                .map_err(TokenizerError::Decode)
         }
 
         fn vocab_size(&self) -> usize {

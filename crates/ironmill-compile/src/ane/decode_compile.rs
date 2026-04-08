@@ -13,6 +13,30 @@ use crate::ane::split::SubProgram;
 use ironmill_core::ane::TensorDescriptor;
 
 // ---------------------------------------------------------------------------
+// Shared tensor conversion helper
+// ---------------------------------------------------------------------------
+
+/// Convert materialized tensor bytes to `Vec<f16>`.
+///
+/// Supports `Float32` → fp16 conversion and `Float16` passthrough.
+/// Returns `None` for other scalar types.
+fn bytes_to_f16(data: &[u8], dtype: ScalarType) -> Option<Vec<f16>> {
+    match dtype {
+        ScalarType::Float32 => Some(
+            data.chunks_exact(4)
+                .map(|b| f16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                .collect(),
+        ),
+        ScalarType::Float16 => Some(
+            data.chunks_exact(2)
+                .map(|b| f16::from_le_bytes([b[0], b[1]]))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RoPE cache extraction
 // ---------------------------------------------------------------------------
 
@@ -76,16 +100,9 @@ pub fn extract_rope_caches(program: &Program) -> Option<RopeCacheData> {
                 if shape.len() < 2 {
                     continue;
                 }
-                let f16_values: Vec<f16> = match dtype {
-                    ScalarType::Float32 => data
-                        .chunks_exact(4)
-                        .map(|b| f16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-                        .collect(),
-                    ScalarType::Float16 => data
-                        .chunks_exact(2)
-                        .map(|b| f16::from_le_bytes([b[0], b[1]]))
-                        .collect(),
-                    _ => continue,
+                let f16_values = match bytes_to_f16(data, dtype) {
+                    Some(v) => v,
+                    None => continue,
                 };
                 let num_pos = shape[0];
                 let dim = shape[1];
@@ -164,15 +181,8 @@ pub fn extract_qk_norm_weights(program: &Program) -> Option<Vec<(Vec<f16>, Vec<f
         if let Some(Value::Tensor { data, shape, dtype }) = tensor {
             if shape.len() == 1 {
                 let data = data.as_bytes().expect("tensor not materialized");
-                let values: Vec<f16> = if *dtype == ScalarType::Float32 {
-                    data.chunks_exact(4)
-                        .map(|b| f16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-                        .collect()
-                } else {
-                    data.chunks_exact(2)
-                        .map(|b| f16::from_le_bytes([b[0], b[1]]))
-                        .collect()
-                };
+                let values = bytes_to_f16(data, *dtype)
+                    .expect("unsupported tensor dtype for qk norm weights");
                 if is_q_norm {
                     q_norms.insert(layer_idx, values);
                 } else {
@@ -581,11 +591,10 @@ pub fn extract_cpu_weight(sub: &SubProgram, _label: &str) -> Option<CpuWeight> {
 
     best.map(|(_, data, shape, dtype)| {
         let fp16_data = if dtype == ScalarType::Float32 {
-            data.chunks_exact(4)
-                .flat_map(|b| {
-                    let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                    f16::from_f32(v).to_le_bytes()
-                })
+            bytes_to_f16(&data, dtype)
+                .unwrap()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
                 .collect()
         } else {
             data
@@ -618,18 +627,7 @@ pub fn extract_1d_weight(sub: &SubProgram, hint: &str) -> Option<Vec<f16>> {
         if let Some(Value::Tensor { data, shape, dtype }) = tensor {
             if shape.len() == 1 {
                 let data = data.as_bytes().expect("tensor not materialized");
-                let values: Vec<f16> = if *dtype == ScalarType::Float32 {
-                    data.chunks_exact(4)
-                        .map(|b| {
-                            let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                            f16::from_f32(v)
-                        })
-                        .collect()
-                } else {
-                    data.chunks_exact(2)
-                        .map(|b| f16::from_le_bytes([b[0], b[1]]))
-                        .collect()
-                };
+                let values = bytes_to_f16(data, *dtype).expect("unsupported tensor dtype");
                 return Some(values);
             }
         }

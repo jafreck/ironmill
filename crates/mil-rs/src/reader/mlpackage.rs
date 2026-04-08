@@ -82,7 +82,7 @@ pub fn read_mlpackage(path: impl AsRef<Path>) -> Result<Model> {
     }
 
     let bytes = std::fs::read(&model_path)?;
-    let model = Model::decode(&bytes[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
+    let model = Model::decode(&bytes[..])?;
     Ok(model)
 }
 

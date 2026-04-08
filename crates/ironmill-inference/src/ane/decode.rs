@@ -1056,6 +1056,387 @@ impl<D: AneDevice> AneInference<D> {
     // Decode helpers
     // -----------------------------------------------------------------------
 
+    /// Execute the pre-attention sub-program (norm → Q/K/V projection) for one layer.
+    fn run_pre_attn_layer(
+        &mut self,
+        layer_idx: usize,
+        hidden: &[f16],
+        hw_profiling: bool,
+        hw_pre_attn_ns: &mut u64,
+    ) -> Result<()> {
+        let layer = &mut self.layers[layer_idx];
+        write_f16_padded(
+            &mut layer.pre_attn.input_tensors[0],
+            hidden,
+            &mut self.scratch.padded,
+        )?;
+        {
+            let in_refs: Vec<&AneTensor> = layer.pre_attn.input_tensors.iter().collect();
+            let mut out_refs: Vec<&mut AneTensor> =
+                layer.pre_attn.output_tensors.iter_mut().collect();
+            ane_eval(
+                &*self.device,
+                &layer.pre_attn.program,
+                &in_refs,
+                &mut out_refs,
+                self.qos,
+                hw_profiling,
+                hw_pre_attn_ns,
+            )
+            .map_err(|e| {
+                AneError::Other(anyhow::anyhow!(
+                    "layer {layer_idx} pre_attn eval failed: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Execute the attention step for one layer.
+    ///
+    /// Dispatches to the appropriate attention backend:
+    /// - TurboQuant INT8 attention (when `self.turboquant` is configured)
+    /// - Per-layer FP16 attention sub-program (when `layer.fp16_attn` exists)
+    /// - Shared FP16 attention with CPU-managed KV cache (fallback)
+    ///
+    /// Writes the attention output into `attn_out`. The `q_buf`/`k_buf`/`v_buf`
+    /// scratch buffers are only used by the shared FP16 cache path.
+    #[allow(clippy::too_many_arguments)]
+    fn run_attention_layer(
+        &mut self,
+        layer_idx: usize,
+        attn_out: &mut Vec<f16>,
+        q_buf: &mut Vec<f16>,
+        k_buf: &mut Vec<f16>,
+        v_buf: &mut Vec<f16>,
+        profiling: bool,
+        hw_profiling: bool,
+        hw_attn_ns: &mut u64,
+        d_attn: &mut std::time::Duration,
+        d_read_qkv: &mut std::time::Duration,
+    ) -> Result<()> {
+        let layer = &mut self.layers[layer_idx];
+        let num_pre_outputs = layer.pre_attn.output_tensors.len();
+
+        if let Some(tq) = &mut self.turboquant {
+            // TurboQuant INT8 attention path.
+            let t0 = if profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let q = &layer.pre_attn.output_tensors[0];
+            let attn_tensor = if self.cache_write_fused {
+                let k_quant = if num_pre_outputs > 1 {
+                    &layer.pre_attn.output_tensors[1]
+                } else {
+                    &layer.pre_attn.output_tensors[0]
+                };
+                let v_quant = if num_pre_outputs > 2 {
+                    &layer.pre_attn.output_tensors[2]
+                } else {
+                    &layer.pre_attn.output_tensors[0]
+                };
+                let k_original = if tq.config().enable_qjl && num_pre_outputs > 3 {
+                    Some(&layer.pre_attn.output_tensors[3])
+                } else {
+                    None
+                };
+                tq.step_attention_fused(layer_idx, q, k_quant, v_quant, k_original)
+            } else {
+                let k_proj = if num_pre_outputs > 1 {
+                    &layer.pre_attn.output_tensors[1]
+                } else {
+                    &layer.pre_attn.output_tensors[0]
+                };
+                let v_proj = if num_pre_outputs > 2 {
+                    &layer.pre_attn.output_tensors[2]
+                } else {
+                    &layer.pre_attn.output_tensors[0]
+                };
+                tq.step_attention(layer_idx, q, k_proj, v_proj)
+            };
+            let attn_tensor = attn_tensor.map_err(|e| {
+                AneError::Other(anyhow::anyhow!(
+                    "layer {layer_idx} turboquant attention failed: {e}"
+                ))
+            })?;
+            read_f16_channels(&attn_tensor, attn_out)?;
+            if let Some(t) = t0 {
+                *d_attn += t.elapsed();
+            }
+        } else if let Some(ref mut attn) = layer.fp16_attn {
+            // Per-layer FP16 attention sub-program path.
+            let t0 = if profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            if let Some(ref map) = layer.attn_input_map {
+                layer.pre_attn.output_tensors[map.q_idx].read_f16_into(&mut self.scratch.q_data)?;
+                attn.input_tensors[map.q_idx].write_f16(&self.scratch.q_data)?;
+
+                layer.pre_attn.output_tensors[map.k_idx].read_f16_into(&mut self.scratch.k_data)?;
+                attn.input_tensors[map.k_idx].write_f16(&self.scratch.k_data)?;
+
+                layer.pre_attn.output_tensors[map.v_idx].read_f16_into(&mut self.scratch.v_data)?;
+                attn.input_tensors[map.v_idx].write_f16(&self.scratch.v_data)?;
+
+                for &cos_idx in &map.rope_cos_indices {
+                    let cos_slice = &self.rope_cos_cache[self.seq_pos * self.rope_cache_dim
+                        ..(self.seq_pos + 1) * self.rope_cache_dim];
+                    write_f16_padded(
+                        &mut attn.input_tensors[cos_idx],
+                        cos_slice,
+                        &mut self.scratch.padded,
+                    )?;
+                }
+                for &sin_idx in &map.rope_sin_indices {
+                    let sin_slice = &self.rope_sin_cache[self.seq_pos * self.rope_cache_dim
+                        ..(self.seq_pos + 1) * self.rope_cache_dim];
+                    write_f16_padded(
+                        &mut attn.input_tensors[sin_idx],
+                        sin_slice,
+                        &mut self.scratch.padded,
+                    )?;
+                }
+            } else {
+                for (i, src) in layer.pre_attn.output_tensors.iter().enumerate() {
+                    if i < attn.input_tensors.len() {
+                        src.read_f16_into(&mut self.scratch.q_data)?;
+                        attn.input_tensors[i].write_f16(&self.scratch.q_data)?;
+                    }
+                }
+            }
+
+            {
+                let in_refs: Vec<&AneTensor> = attn.input_tensors.iter().collect();
+                let mut out_refs: Vec<&mut AneTensor> = attn.output_tensors.iter_mut().collect();
+                ane_eval(
+                    &*self.device,
+                    &attn.program,
+                    &in_refs,
+                    &mut out_refs,
+                    self.qos,
+                    hw_profiling,
+                    hw_attn_ns,
+                )
+                .map_err(|e| {
+                    AneError::Other(anyhow::anyhow!(
+                        "layer {layer_idx} fp16_attn eval failed: {e}"
+                    ))
+                })?;
+            }
+
+            read_f16_channels(&attn.output_tensors[0], attn_out)?;
+            if let Some(t) = t0 {
+                *d_attn += t.elapsed();
+            }
+        } else if let Some(ref mut caches) = self.fp16_kv_caches {
+            // Shared FP16 attention with CPU-managed KV cache.
+            let t0 = if profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let _real_q_ch = (self.num_kv_heads * self.head_dim).max(self.head_dim);
+            let gqa = if self.num_kv_heads > 0 {
+                let q_ane_ch = layer
+                    .pre_attn
+                    .output_tensors
+                    .get(1)
+                    .map(|t| t.shape()[1])
+                    .unwrap_or(0);
+                let k_ane_ch = layer.pre_attn.output_tensors[0].shape()[1];
+                if k_ane_ch > 0 { q_ane_ch / k_ane_ch } else { 1 }
+            } else {
+                1
+            };
+            let real_kv_ch = self.num_kv_heads * self.head_dim;
+            let real_q_ch = real_kv_ch * gqa;
+
+            if num_pre_outputs > 1 {
+                read_f16_channels(&layer.pre_attn.output_tensors[1], q_buf)?;
+            } else {
+                read_f16_channels(&layer.pre_attn.output_tensors[0], q_buf)?;
+            }
+            read_f16_channels(&layer.pre_attn.output_tensors[0], k_buf)?;
+            if num_pre_outputs > 2 {
+                read_f16_channels(&layer.pre_attn.output_tensors[2], v_buf)?;
+            } else {
+                v_buf.clear();
+                v_buf.extend_from_slice(k_buf);
+            }
+            q_buf.truncate(real_q_ch);
+            k_buf.truncate(real_kv_ch);
+            v_buf.truncate(real_kv_ch);
+
+            if let Some(ref norms) = self.qk_norm_weights {
+                if let Some((q_norm_w, k_norm_w)) = norms.get(layer_idx) {
+                    apply_per_head_rms_norm(q_buf, q_norm_w, self.head_dim);
+                    apply_per_head_rms_norm(k_buf, k_norm_w, self.head_dim);
+                }
+            }
+
+            if self.rope_cache_dim > 0 {
+                let pos = self.seq_pos;
+                let cos_start = pos * self.rope_cache_dim;
+                let cos_end = cos_start + self.rope_cache_dim;
+                let cos = &self.rope_cos_cache[cos_start..cos_end];
+                let sin = &self.rope_sin_cache[cos_start..cos_end];
+                apply_rope_rotation(q_buf, cos, sin, self.head_dim);
+                apply_rope_rotation(k_buf, cos, sin, self.head_dim);
+            }
+            if let Some(t) = t0 {
+                *d_read_qkv += t.elapsed();
+            }
+
+            let t0 = if profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            caches[layer_idx]
+                .0
+                .write_column_f16(self.seq_pos, k_buf, self.max_seq_len)?;
+            caches[layer_idx]
+                .1
+                .write_column_f16(self.seq_pos, v_buf, self.max_seq_len)?;
+
+            if let Some(ref fp16_program) = self.fp16_attn_program {
+                let q_staging = self.fp16_attn_q_staging.as_mut().ok_or_else(|| {
+                    AneError::Other(anyhow::anyhow!("fp16_attn_q_staging not initialized"))
+                })?;
+                let out_staging = self.fp16_attn_out_staging.as_mut().ok_or_else(|| {
+                    AneError::Other(anyhow::anyhow!("fp16_attn_out_staging not initialized"))
+                })?;
+                let mask = self.fp16_attn_mask.as_ref().ok_or_else(|| {
+                    AneError::Other(anyhow::anyhow!("fp16_attn_mask not initialized"))
+                })?;
+                write_f16_padded(q_staging, q_buf, &mut self.scratch.padded)?;
+                let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
+                ane_eval(
+                    &*self.device,
+                    fp16_program,
+                    &[q_staging, k_cache, v_cache, mask],
+                    &mut [out_staging],
+                    self.qos,
+                    hw_profiling,
+                    hw_attn_ns,
+                )
+                .map_err(|e| {
+                    AneError::Other(anyhow::anyhow!(
+                        "layer {layer_idx} fp16_attn eval failed: {e}"
+                    ))
+                })?;
+                read_f16_channels(out_staging, attn_out)?;
+            } else {
+                std::mem::swap(attn_out, q_buf);
+            }
+            if let Some(t) = t0 {
+                *d_attn += t.elapsed();
+            }
+        } else {
+            return Err(AneError::Other(anyhow::anyhow!(
+                "no attention backend configured"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply final RMSNorm and project hidden state to vocabulary logits.
+    fn decode_lm_head(
+        &mut self,
+        hidden: &mut Vec<f16>,
+        hw_profiling: bool,
+        hw_lm_head_ns: &mut u64,
+    ) -> Result<Vec<f32>> {
+        if let Some(norm_w) = &self.final_norm_weight {
+            cpu_rms_norm(hidden, norm_w);
+        }
+
+        if self.seq_pos <= 3 && std::env::var("IRONMILL_TRACE_LAST").is_ok() {
+            let f32s: Vec<f32> = hidden.iter().map(|x| x.to_f32()).collect();
+            let absmax = f32s.iter().map(|x| x.abs()).fold(0f32, f32::max);
+            eprintln!(
+                "  [norm] absmax={:.4} first3=[{:.4},{:.4},{:.4}]",
+                absmax, f32s[0], f32s[1], f32s[2]
+            );
+        }
+
+        let logits = match &mut self.lm_head {
+            LmHead::Ane(ane_lm_head) if hw_profiling => {
+                ane_lm_head.forward_profiled(hidden, hw_lm_head_ns)
+            }
+            LmHead::Ane(ane_lm_head) => ane_lm_head.forward(hidden),
+            LmHead::Cpu(weight) => cpu_lm_head_matmul(weight, hidden),
+        };
+
+        if self.seq_pos <= 3 && std::env::var("IRONMILL_TRACE_LAST").is_ok() {
+            if let Ok(ref l) = logits {
+                let max = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let argmax = l
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                eprintln!(
+                    "  [logits] max={:.4} argmax={} len={}",
+                    max,
+                    argmax,
+                    l.len()
+                );
+            }
+        }
+
+        logits
+    }
+
+    /// Print profiling and HW profiling statistics for one decode step.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_print_profiling(
+        t_total: Option<std::time::Instant>,
+        d_embed: Option<std::time::Duration>,
+        d_pre_attn: std::time::Duration,
+        d_read_qkv: std::time::Duration,
+        d_attn: std::time::Duration,
+        d_post_attn: std::time::Duration,
+        d_lm_head: Option<std::time::Duration>,
+        hw_profiling: bool,
+        seq_pos: usize,
+        hw_pre_attn_ns: u64,
+        hw_attn_ns: u64,
+        hw_post_attn_ns: u64,
+        hw_lm_head_ns: u64,
+    ) {
+        let total = t_total.map(|t| t.elapsed()).unwrap_or_default();
+        eprintln!(
+            "[profile] decode token 0: embed={:.2}ms pre_attn={:.1}ms read_qkv={:.1}ms attn={:.1}ms post_attn={:.1}ms lm_head={:.1}ms total={:.1}ms",
+            d_embed.unwrap_or_default().as_secs_f64() * 1000.0,
+            d_pre_attn.as_secs_f64() * 1000.0,
+            d_read_qkv.as_secs_f64() * 1000.0,
+            d_attn.as_secs_f64() * 1000.0,
+            d_post_attn.as_secs_f64() * 1000.0,
+            d_lm_head.unwrap_or_default().as_secs_f64() * 1000.0,
+            total.as_secs_f64() * 1000.0,
+        );
+
+        if hw_profiling {
+            let hw_total = hw_pre_attn_ns + hw_attn_ns + hw_post_attn_ns + hw_lm_head_ns;
+            eprintln!(
+                "[hw_profile] token {}: pre_attn={:.1}µs attn={:.1}µs post_attn={:.1}µs lm_head={:.1}µs total={:.1}µs",
+                seq_pos,
+                hw_pre_attn_ns as f64 / 1000.0,
+                hw_attn_ns as f64 / 1000.0,
+                hw_post_attn_ns as f64 / 1000.0,
+                hw_lm_head_ns as f64 / 1000.0,
+                hw_total as f64 / 1000.0,
+            );
+        }
+    }
+
     /// Execute the post-attention sub-program (O proj + residual + FFN) for one layer.
     fn run_post_attn_layer(
         &mut self,
@@ -1218,7 +1599,6 @@ impl<D: AneDevice> AneInference<D> {
             match self.try_chained_pre_attn(&hidden, effective_layers) {
                 Ok(()) => true,
                 Err(e) => {
-                    // Log and fall back to per-layer eval.
                     eprintln!("[chaining] pre_attn chain failed, falling back: {e}");
                     false
                 }
@@ -1229,17 +1609,13 @@ impl<D: AneDevice> AneInference<D> {
 
         for layer_idx in 0..effective_layers {
             // Experimental: attempt hybrid ANE↔GPU execution for this layer.
-            // When enabled, GPU computes projections and signals the ANE via
-            // a shared event fence, bypassing CPU synchronization.
             if self.enable_hybrid {
                 match self.try_hybrid_layer(&hidden, layer_idx) {
                     Ok(layer_out) => {
                         hidden = layer_out;
-                        continue; // Skip the standard per-layer path.
+                        continue;
                     }
                     Err(_e) => {
-                        // Fall through to standard per-layer eval.
-                        // Only log on first failure to avoid spam.
                         if layer_idx == 0 {
                             eprintln!(
                                 "[hybrid] ANE↔GPU handoff not available, \
@@ -1250,7 +1626,7 @@ impl<D: AneDevice> AneInference<D> {
                 }
             }
 
-            // Pre-attention: norm → Q/K/V projection
+            // Pre-attention: norm → Q/K/V projection.
             // Skip if chained pre_attn already dispatched all layers.
             if !chained_pre_attn_ok {
                 let t0 = if profiling {
@@ -1258,304 +1634,26 @@ impl<D: AneDevice> AneInference<D> {
                 } else {
                     None
                 };
-                let layer = &mut self.layers[layer_idx];
-                write_f16_padded(
-                    &mut layer.pre_attn.input_tensors[0],
-                    &hidden,
-                    &mut self.scratch.padded,
-                )?;
-                {
-                    let in_refs: Vec<&AneTensor> = layer.pre_attn.input_tensors.iter().collect();
-                    let mut out_refs: Vec<&mut AneTensor> =
-                        layer.pre_attn.output_tensors.iter_mut().collect();
-                    ane_eval(
-                        &*self.device,
-                        &layer.pre_attn.program,
-                        &in_refs,
-                        &mut out_refs,
-                        self.qos,
-                        hw_profiling,
-                        &mut hw_pre_attn_ns,
-                    )
-                    .map_err(|e| {
-                        AneError::Other(anyhow::anyhow!(
-                            "layer {layer_idx} pre_attn eval failed: {e}"
-                        ))
-                    })?;
-                }
+                self.run_pre_attn_layer(layer_idx, &hidden, hw_profiling, &mut hw_pre_attn_ns)?;
                 if let Some(t) = t0 {
                     d_pre_attn += t.elapsed();
                 }
             }
 
-            // Re-borrow layer for output reads (needed whether chained or not).
-            let layer = &mut self.layers[layer_idx];
-            // With cache-write fusion, outputs are [Q, K_quant, V_quant, ...]
-            // K_quant/V_quant are already rotated + quantized (fp16 with INT8-range values).
-            // When QJL is enabled, an extra output carries the original K_proj.
-            // Read Q/K/V from pre_attn outputs.
-            // Outputs are sorted lexicographically by name (k_proj < q_proj < v_proj),
-            // NOT in Q/K/V order. Identify Q by channel count: Q has num_heads * head_dim
-            // channels while K/V have num_kv_heads * head_dim (smaller for GQA models).
-            let num_pre_outputs = layer.pre_attn.output_tensors.len();
-
             // Attention (divergent path) — writes into attn_out scratch buffer.
-            if let Some(tq) = &mut self.turboquant {
-                let t0 = if profiling {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                let q = &layer.pre_attn.output_tensors[0];
-                let attn_tensor = if self.cache_write_fused {
-                    // Fused path: pre_attn already produced K_quant/V_quant
-                    let k_quant = if num_pre_outputs > 1 {
-                        &layer.pre_attn.output_tensors[1]
-                    } else {
-                        &layer.pre_attn.output_tensors[0]
-                    };
-                    let v_quant = if num_pre_outputs > 2 {
-                        &layer.pre_attn.output_tensors[2]
-                    } else {
-                        &layer.pre_attn.output_tensors[0]
-                    };
-                    // When QJL is enabled, output[3] is the original K_proj
-                    let k_original = if tq.config().enable_qjl && num_pre_outputs > 3 {
-                        Some(&layer.pre_attn.output_tensors[3])
-                    } else {
-                        None
-                    };
-                    tq.step_attention_fused(layer_idx, q, k_quant, v_quant, k_original)
-                } else {
-                    // Non-fused path: pre_attn outputs raw K_proj/V_proj.
-                    // When asymmetric K/V quantization is enabled,
-                    // step_attention() internally dispatches separate K and V
-                    // cache-write evals with different codebook bit-widths.
-                    let k_proj = if num_pre_outputs > 1 {
-                        &layer.pre_attn.output_tensors[1]
-                    } else {
-                        &layer.pre_attn.output_tensors[0]
-                    };
-                    let v_proj = if num_pre_outputs > 2 {
-                        &layer.pre_attn.output_tensors[2]
-                    } else {
-                        &layer.pre_attn.output_tensors[0]
-                    };
-                    tq.step_attention(layer_idx, q, k_proj, v_proj)
-                };
-                let attn_tensor = attn_tensor.map_err(|e| {
-                    AneError::Other(anyhow::anyhow!(
-                        "layer {layer_idx} turboquant attention failed: {e}"
-                    ))
-                })?;
-                read_f16_channels(&attn_tensor, &mut attn_out)?;
-                if let Some(t) = t0 {
-                    d_attn += t.elapsed();
-                }
-            } else if let Some(ref mut attn) = layer.fp16_attn {
-                // Per-layer fp16_attn from the splitter: execute directly.
-                // Inputs match pre_attn outputs (same ANE layout, same shapes).
-                let t0 = if profiling {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-
-                if let Some(ref map) = layer.attn_input_map {
-                    // Copy Q/K/V from pre_attn outputs to fp16_attn inputs.
-                    layer.pre_attn.output_tensors[map.q_idx]
-                        .read_f16_into(&mut self.scratch.q_data)?;
-                    attn.input_tensors[map.q_idx].write_f16(&self.scratch.q_data)?;
-
-                    layer.pre_attn.output_tensors[map.k_idx]
-                        .read_f16_into(&mut self.scratch.k_data)?;
-                    attn.input_tensors[map.k_idx].write_f16(&self.scratch.k_data)?;
-
-                    layer.pre_attn.output_tensors[map.v_idx]
-                        .read_f16_into(&mut self.scratch.v_data)?;
-                    attn.input_tensors[map.v_idx].write_f16(&self.scratch.v_data)?;
-
-                    // Fill RoPE cos/sin from CPU cache.
-                    for &cos_idx in &map.rope_cos_indices {
-                        let cos_slice = &self.rope_cos_cache[self.seq_pos * self.rope_cache_dim
-                            ..(self.seq_pos + 1) * self.rope_cache_dim];
-                        write_f16_padded(
-                            &mut attn.input_tensors[cos_idx],
-                            cos_slice,
-                            &mut self.scratch.padded,
-                        )?;
-                    }
-                    for &sin_idx in &map.rope_sin_indices {
-                        let sin_slice = &self.rope_sin_cache[self.seq_pos * self.rope_cache_dim
-                            ..(self.seq_pos + 1) * self.rope_cache_dim];
-                        write_f16_padded(
-                            &mut attn.input_tensors[sin_idx],
-                            sin_slice,
-                            &mut self.scratch.padded,
-                        )?;
-                    }
-                } else {
-                    // No input map — copy pre_attn outputs to fp16_attn inputs.
-                    for (i, src) in layer.pre_attn.output_tensors.iter().enumerate() {
-                        if i < attn.input_tensors.len() {
-                            src.read_f16_into(&mut self.scratch.q_data)?;
-                            attn.input_tensors[i].write_f16(&self.scratch.q_data)?;
-                        }
-                    }
-                }
-
-                // Eval fp16_attn on ANE.
-                {
-                    let in_refs: Vec<&AneTensor> = attn.input_tensors.iter().collect();
-                    let mut out_refs: Vec<&mut AneTensor> =
-                        attn.output_tensors.iter_mut().collect();
-                    ane_eval(
-                        &*self.device,
-                        &attn.program,
-                        &in_refs,
-                        &mut out_refs,
-                        self.qos,
-                        hw_profiling,
-                        &mut hw_attn_ns,
-                    )
-                    .map_err(|e| {
-                        AneError::Other(anyhow::anyhow!(
-                            "layer {layer_idx} fp16_attn eval failed: {e}"
-                        ))
-                    })?;
-                }
-
-                read_f16_channels(&attn.output_tensors[0], &mut attn_out)?;
-                if let Some(t) = t0 {
-                    d_attn += t.elapsed();
-                }
-            } else if let Some(ref mut caches) = self.fp16_kv_caches {
-                let t0 = if profiling {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                // Outputs are lexicographically sorted: [k_proj, q_proj, v_proj]
-                // Index 0 = K, index 1 = Q, index 2 = V
-                // ANE layout pass doubles channel dimensions. Truncate to the
-                // real model dimensions (num_heads * head_dim for Q,
-                // num_kv_heads * head_dim for K/V).
-                let _real_q_ch = (self.num_kv_heads * self.head_dim).max(self.head_dim); // at least head_dim
-                // Q has more heads than K/V in GQA — compute from num_kv_heads ratio
-                let gqa = if self.num_kv_heads > 0 {
-                    // num_heads / num_kv_heads, but we only have num_kv_heads stored
-                    // Infer: Q output channels / K output channels = GQA ratio
-                    let q_ane_ch = layer
-                        .pre_attn
-                        .output_tensors
-                        .get(1)
-                        .map(|t| t.shape()[1])
-                        .unwrap_or(0);
-                    let k_ane_ch = layer.pre_attn.output_tensors[0].shape()[1];
-                    if k_ane_ch > 0 { q_ane_ch / k_ane_ch } else { 1 }
-                } else {
-                    1
-                };
-                let real_kv_ch = self.num_kv_heads * self.head_dim;
-                let real_q_ch = real_kv_ch * gqa;
-
-                // Read Q/K/V projections into scratch buffers.
-                if num_pre_outputs > 1 {
-                    read_f16_channels(&layer.pre_attn.output_tensors[1], &mut q_buf)?;
-                } else {
-                    read_f16_channels(&layer.pre_attn.output_tensors[0], &mut q_buf)?;
-                }
-                read_f16_channels(&layer.pre_attn.output_tensors[0], &mut k_buf)?;
-                if num_pre_outputs > 2 {
-                    read_f16_channels(&layer.pre_attn.output_tensors[2], &mut v_buf)?;
-                } else {
-                    v_buf.clear();
-                    v_buf.extend_from_slice(&k_buf);
-                }
-                // Truncate to real model dimensions (undo ANE layout doubling).
-                q_buf.truncate(real_q_ch);
-                k_buf.truncate(real_kv_ch);
-                v_buf.truncate(real_kv_ch);
-
-                // Apply per-head QK normalization (Qwen3 feature).
-                if let Some(ref norms) = self.qk_norm_weights {
-                    if let Some((q_norm_w, k_norm_w)) = norms.get(layer_idx) {
-                        apply_per_head_rms_norm(&mut q_buf, q_norm_w, self.head_dim);
-                        apply_per_head_rms_norm(&mut k_buf, k_norm_w, self.head_dim);
-                    }
-                }
-
-                // Apply RoPE rotation on CPU. Pre_attn outputs unrotated Q/K
-                // because RoPE gather ops were stripped during compilation.
-                if self.rope_cache_dim > 0 {
-                    let pos = self.seq_pos;
-                    let cos_start = pos * self.rope_cache_dim;
-                    let cos_end = cos_start + self.rope_cache_dim;
-                    let cos = &self.rope_cos_cache[cos_start..cos_end];
-                    let sin = &self.rope_sin_cache[cos_start..cos_end];
-                    apply_rope_rotation(&mut q_buf, cos, sin, self.head_dim);
-                    apply_rope_rotation(&mut k_buf, cos, sin, self.head_dim);
-                }
-                if let Some(t) = t0 {
-                    d_read_qkv += t.elapsed();
-                }
-
-                let t0 = if profiling {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                // Write K/V to persistent FP16 cache at current position.
-                // Uses write_column_f16 for single-lock strided writes: one
-                // IOSurface lock/unlock per cache tensor instead of per-channel.
-                // Zero heap allocations.
-                caches[layer_idx]
-                    .0
-                    .write_column_f16(self.seq_pos, &k_buf, self.max_seq_len)?;
-                caches[layer_idx]
-                    .1
-                    .write_column_f16(self.seq_pos, &v_buf, self.max_seq_len)?;
-
-                // Hand-written FP16 attention: Q + K_cache + V_cache + mask → attn_output
-                if let Some(ref fp16_program) = self.fp16_attn_program {
-                    let q_staging = self.fp16_attn_q_staging.as_mut().ok_or_else(|| {
-                        AneError::Other(anyhow::anyhow!("fp16_attn_q_staging not initialized"))
-                    })?;
-                    let out_staging = self.fp16_attn_out_staging.as_mut().ok_or_else(|| {
-                        AneError::Other(anyhow::anyhow!("fp16_attn_out_staging not initialized"))
-                    })?;
-                    let mask = self.fp16_attn_mask.as_ref().ok_or_else(|| {
-                        AneError::Other(anyhow::anyhow!("fp16_attn_mask not initialized"))
-                    })?;
-                    write_f16_padded(q_staging, &q_buf, &mut self.scratch.padded)?;
-                    let (k_cache, v_cache) = (&caches[layer_idx].0, &caches[layer_idx].1);
-                    ane_eval(
-                        &*self.device,
-                        fp16_program,
-                        &[q_staging, k_cache, v_cache, mask],
-                        &mut [out_staging],
-                        self.qos,
-                        hw_profiling,
-                        &mut hw_attn_ns,
-                    )
-                    .map_err(|e| {
-                        AneError::Other(anyhow::anyhow!(
-                            "layer {layer_idx} fp16_attn eval failed: {e}"
-                        ))
-                    })?;
-                    read_f16_channels(out_staging, &mut attn_out)?;
-                } else {
-                    // No compiled attention — use Q as pass-through.
-                    std::mem::swap(&mut attn_out, &mut q_buf);
-                }
-                if let Some(t) = t0 {
-                    d_attn += t.elapsed();
-                }
-            } else {
-                return Err(AneError::Other(anyhow::anyhow!(
-                    "no attention backend configured"
-                )));
-            }
+            let num_pre_outputs = self.layers[layer_idx].pre_attn.output_tensors.len();
+            self.run_attention_layer(
+                layer_idx,
+                &mut attn_out,
+                &mut q_buf,
+                &mut k_buf,
+                &mut v_buf,
+                profiling,
+                hw_profiling,
+                &mut hw_attn_ns,
+                &mut d_attn,
+                &mut d_read_qkv,
+            )?;
 
             // Post-attention: O proj → residual → FFN → residual
             let t0 = if profiling {
@@ -1589,74 +1687,40 @@ impl<D: AneDevice> AneInference<D> {
         } else {
             None
         };
-
-        // Apply final RMSNorm before projecting to vocab logits.
-        if let Some(norm_w) = &self.final_norm_weight {
-            cpu_rms_norm(&mut hidden, norm_w);
-        }
-
-        // Debug: trace post-norm hidden and logits
-        if self.seq_pos <= 3 && std::env::var("IRONMILL_TRACE_LAST").is_ok() {
-            let f32s: Vec<f32> = hidden.iter().map(|x| x.to_f32()).collect();
-            let absmax = f32s.iter().map(|x| x.abs()).fold(0f32, f32::max);
-            eprintln!(
-                "  [norm] absmax={:.4} first3=[{:.4},{:.4},{:.4}]",
-                absmax, f32s[0], f32s[1], f32s[2]
-            );
-        }
-
-        let logits = match &mut self.lm_head {
-            LmHead::Ane(ane_lm_head) if hw_profiling => {
-                ane_lm_head.forward_profiled(&hidden, &mut hw_lm_head_ns)
-            }
-            LmHead::Ane(ane_lm_head) => ane_lm_head.forward(&hidden),
-            LmHead::Cpu(weight) => cpu_lm_head_matmul(weight, &hidden),
-        };
-
-        if self.seq_pos <= 3 && std::env::var("IRONMILL_TRACE_LAST").is_ok() {
-            if let Ok(ref l) = logits {
-                let max = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let argmax = l
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                eprintln!(
-                    "  [logits] max={:.4} argmax={} len={}",
-                    max,
-                    argmax,
-                    l.len()
-                );
-            }
-        }
-
+        let logits = self.decode_lm_head(&mut hidden, hw_profiling, &mut hw_lm_head_ns);
         let d_lm_head = t0.map(|t| t.elapsed());
 
         if profiling {
-            let total = t_total.map(|t| t.elapsed()).unwrap_or_default();
-            eprintln!(
-                "[profile] decode token 0: embed={:.2}ms pre_attn={:.1}ms read_qkv={:.1}ms attn={:.1}ms post_attn={:.1}ms lm_head={:.1}ms total={:.1}ms",
-                d_embed.unwrap_or_default().as_secs_f64() * 1000.0,
-                d_pre_attn.as_secs_f64() * 1000.0,
-                d_read_qkv.as_secs_f64() * 1000.0,
-                d_attn.as_secs_f64() * 1000.0,
-                d_post_attn.as_secs_f64() * 1000.0,
-                d_lm_head.unwrap_or_default().as_secs_f64() * 1000.0,
-                total.as_secs_f64() * 1000.0,
-            );
-        }
-
-        if hw_profiling {
-            let hw_total = hw_pre_attn_ns + hw_attn_ns + hw_post_attn_ns + hw_lm_head_ns;
-            eprintln!(
-                "[hw_profile] token {}: pre_attn={:.1}µs attn={:.1}µs post_attn={:.1}µs lm_head={:.1}µs total={:.1}µs",
+            Self::decode_print_profiling(
+                t_total,
+                d_embed,
+                d_pre_attn,
+                d_read_qkv,
+                d_attn,
+                d_post_attn,
+                d_lm_head,
+                hw_profiling,
                 self.seq_pos - 1,
-                hw_pre_attn_ns as f64 / 1000.0,
-                hw_attn_ns as f64 / 1000.0,
-                hw_post_attn_ns as f64 / 1000.0,
-                hw_lm_head_ns as f64 / 1000.0,
-                hw_total as f64 / 1000.0,
+                hw_pre_attn_ns,
+                hw_attn_ns,
+                hw_post_attn_ns,
+                hw_lm_head_ns,
+            );
+        } else if hw_profiling {
+            Self::decode_print_profiling(
+                None,
+                None,
+                d_pre_attn,
+                d_read_qkv,
+                d_attn,
+                d_post_attn,
+                None,
+                hw_profiling,
+                self.seq_pos - 1,
+                hw_pre_attn_ns,
+                hw_attn_ns,
+                hw_post_attn_ns,
+                hw_lm_head_ns,
             );
         }
 

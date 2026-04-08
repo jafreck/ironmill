@@ -25,6 +25,10 @@ pub enum MilError {
     #[error("protobuf error: {0}")]
     Protobuf(String),
 
+    /// A prost decode error occurred during protobuf deserialization.
+    #[error("protobuf decode error: {0}")]
+    ProtobufDecode(#[from] prost::DecodeError),
+
     /// An `.mlpackage` directory is malformed or missing required files.
     #[error("invalid package: {0}")]
     InvalidPackage(String),

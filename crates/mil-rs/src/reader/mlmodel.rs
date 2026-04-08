@@ -4,7 +4,7 @@ use std::path::Path;
 
 use prost::Message;
 
-use crate::error::{MilError, Result};
+use crate::error::Result;
 use crate::proto::specification::{Model, ModelDescription};
 
 /// Read a `.mlmodel` file and deserialize it into a [`Model`] struct.
@@ -27,7 +27,7 @@ use crate::proto::specification::{Model, ModelDescription};
 /// ```
 pub fn read_mlmodel(path: impl AsRef<Path>) -> Result<Model> {
     let bytes = std::fs::read(path.as_ref())?;
-    let model = Model::decode(&bytes[..]).map_err(|e| MilError::Protobuf(e.to_string()))?;
+    let model = Model::decode(&bytes[..])?;
     Ok(model)
 }
 
@@ -112,6 +112,7 @@ fn model_type_name(ty: &crate::proto::specification::model::Type) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::MilError;
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
         let manifest = env!("CARGO_MANIFEST_DIR");
@@ -168,8 +169,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, MilError::Protobuf(_)),
-            "expected Protobuf error, got: {err}"
+            matches!(err, MilError::ProtobufDecode(_)),
+            "expected ProtobufDecode error, got: {err}"
         );
     }
 }
