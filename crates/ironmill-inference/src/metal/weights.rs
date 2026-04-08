@@ -284,8 +284,8 @@ impl MetalWeights {
                 .get("attn_output_gate")
                 .and_then(|v| v.as_bool())
                 .unwrap_or_else(|| {
-                    eprintln!(
-                        "warning: Qwen 3.5 model missing 'attn_output_gate' config, defaulting to disabled"
+                    tracing::warn!(
+                        "Qwen 3.5 model missing 'attn_output_gate' config, defaulting to disabled"
                     );
                     false
                 });
@@ -683,7 +683,7 @@ fn d2quant_round_trip_weight_buffer(wb: &mut WeightBuffer, bits: u8) {
         let n = buf.length() / 2;
         let mut raw = vec![0u8; buf.length()];
         if let Err(e) = buf.read_bytes(&mut raw, 0) {
-            eprintln!("d2quant round-trip: failed to read buffer: {e}");
+            tracing::error!("d2quant round-trip: failed to read buffer: {e}");
             return;
         }
         let f32_weights: Vec<f32> = raw
@@ -704,7 +704,7 @@ fn d2quant_round_trip_weight_buffer(wb: &mut WeightBuffer, bits: u8) {
             raw[i * 2 + 1] = bytes[1];
         }
         if let Err(e) = buf.write_bytes(&raw, 0) {
-            eprintln!("d2quant round-trip: failed to write buffer: {e}");
+            tracing::error!("d2quant round-trip: failed to write buffer: {e}");
         }
     };
 
@@ -722,7 +722,7 @@ fn offset_norm_weight(buf: &MetalBuffer) {
     let n = buf.length() / 2;
     let mut data = vec![0u8; buf.length()];
     if let Err(e) = buf.read_bytes(&mut data, 0) {
-        eprintln!("offset_norm_weight: failed to read buffer: {e}");
+        tracing::error!("offset_norm_weight: failed to read buffer: {e}");
         return;
     }
     for i in 0..n {
@@ -734,7 +734,7 @@ fn offset_norm_weight(buf: &MetalBuffer) {
         data[off + 1] = bytes[1];
     }
     if let Err(e) = buf.write_bytes(&data, 0) {
-        eprintln!("offset_norm_weight: failed to write buffer: {e}");
+        tracing::error!("offset_norm_weight: failed to write buffer: {e}");
     }
 }
 
@@ -1052,9 +1052,10 @@ fn load_weight_buffer(
                 let gs = match group_size {
                     Some(g) => *g,
                     None => {
-                        eprintln!(
-                            "warning: {name}: group_size metadata missing, defaulting to tensor size {}",
-                            total_elements
+                        tracing::warn!(
+                            name = %name,
+                            total_elements,
+                            "group_size metadata missing, defaulting to tensor size"
                         );
                         total_elements
                     }

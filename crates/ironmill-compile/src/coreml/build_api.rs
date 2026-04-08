@@ -300,7 +300,7 @@ impl CompileBuilder {
             match compile_model(&output_path, output_dir) {
                 Ok(path) => Some(path),
                 Err(e) => {
-                    eprintln!("Warning: model compilation failed: {e}");
+                    tracing::warn!("model compilation failed: {e}");
                     None
                 }
             }
@@ -310,7 +310,7 @@ impl CompileBuilder {
 
         // 8. Print cargo::rerun-if-changed for build.rs integration
         if self.cargo_rerun {
-            println!("cargo::rerun-if-changed={}", input.display());
+            tracing::info!("cargo::rerun-if-changed={}", input.display());
         }
 
         Ok(BuildOutput {

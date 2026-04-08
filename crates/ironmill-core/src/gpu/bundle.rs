@@ -381,9 +381,7 @@ where
                 })
                 .transpose()?
                 .unwrap_or_else(|| {
-                    eprintln!(
-                        "warning: scale_dtype not specified in bundle, defaulting to Float16"
-                    );
+                    tracing::warn!("scale_dtype not specified in bundle, defaulting to Float16");
                     ScalarType::Float16
                 });
             let zp_dtype = zero_point_dtype
@@ -394,8 +392,8 @@ where
                 })
                 .transpose()?
                 .unwrap_or_else(|| {
-                    eprintln!(
-                        "warning: zero_point_dtype not specified in bundle, defaulting to Float16"
+                    tracing::warn!(
+                        "zero_point_dtype not specified in bundle, defaulting to Float16"
                     );
                     ScalarType::Float16
                 });

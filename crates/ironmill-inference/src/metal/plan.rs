@@ -76,8 +76,8 @@ impl LayerPlan {
             .get("attn_output_gate")
             .and_then(|v| v.as_bool())
             .unwrap_or_else(|| {
-                eprintln!(
-                    "debug: 'attn_output_gate' not found in model config, defaulting to false"
+                tracing::debug!(
+                    "'attn_output_gate' not found in model config, defaulting to false"
                 );
                 false
             });

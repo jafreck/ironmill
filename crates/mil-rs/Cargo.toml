@@ -25,6 +25,7 @@ memmap2 = { workspace = true }
 faer = { version = "0.20", optional = true }
 rayon = "1.11"
 tempfile = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

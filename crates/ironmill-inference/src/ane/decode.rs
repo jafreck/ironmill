@@ -328,9 +328,12 @@ impl<D: AneDevice> AneLmHead<D> {
         } else {
             0
         };
-        eprintln!(
-            "ANE lm_head: {vocab_size} vocab × {hidden_size} hidden → {num_chunks} chunks \
-             (max {LM_HEAD_MAX_CHUNK_CH} channels each, {patched_chunks} patched)"
+        tracing::debug!(
+            vocab_size,
+            hidden_size,
+            num_chunks,
+            patched_chunks,
+            "ANE lm_head chunked"
         );
 
         // Compute scratch sizes from the chunks.
@@ -649,7 +652,7 @@ impl<D: AneDevice> AneInference<D> {
         let lm_head = match AneLmHead::compile(device, &lm_head_cpu_weight, qos) {
             Ok(ane_lm_head) => LmHead::Ane(ane_lm_head),
             Err(e) => {
-                eprintln!("warning: ANE lm_head compilation failed: {e}");
+                tracing::warn!("ANE lm_head compilation failed: {e}");
                 LmHead::Cpu(lm_head_cpu_weight)
             }
         };
@@ -718,10 +721,9 @@ impl<D: AneDevice> AneInference<D> {
                 ) {
                     Ok(loaded) => loaded,
                     Err(e) => {
-                        eprintln!(
-                            "warning: layer {} pre_attn donor patch failed, \
-                             falling back to full compile: {e}",
-                            layer_manifest.index
+                        tracing::warn!(
+                            layer = layer_manifest.index,
+                            "pre_attn donor patch failed, falling back to full compile: {e}"
                         );
                         compile_sub_from_bundle(
                             &layer_manifest.pre_attn,
@@ -757,10 +759,9 @@ impl<D: AneDevice> AneInference<D> {
                     ) {
                         Ok(loaded) => Some(loaded),
                         Err(e) => {
-                            eprintln!(
-                                "warning: layer {} post_attn donor patch failed, \
-                                 falling back to full compile: {e}",
-                                layer_manifest.index
+                            tracing::warn!(
+                                layer = layer_manifest.index,
+                                "post_attn donor patch failed, falling back to full compile: {e}"
                             );
                             Some(compile_sub_from_bundle(
                                 post_manifest,
@@ -797,9 +798,9 @@ impl<D: AneDevice> AneInference<D> {
                 ) {
                     Ok(loaded) => Some(loaded),
                     Err(e) => {
-                        eprintln!(
-                            "warning: layer {} fp16_attn compilation failed: {e}",
-                            layer_manifest.index
+                        tracing::warn!(
+                            layer = layer_manifest.index,
+                            "fp16_attn compilation failed: {e}"
                         );
                         None
                     }
@@ -818,10 +819,9 @@ impl<D: AneDevice> AneInference<D> {
 
         if num_layers > 1 {
             let patched = (num_layers - 1) * if layers[0].post_attn.is_some() { 2 } else { 1 };
-            eprintln!(
-                "donor/patch: compiled 1 donor layer, patched {patched} sub-programs \
-                 ({} compilations saved)",
-                patched
+            tracing::info!(
+                patched,
+                "donor/patch: compiled 1 donor layer, patched {patched} sub-programs"
             );
         }
 
@@ -1506,9 +1506,12 @@ impl<D: AneDevice> AneInference<D> {
         if self.seq_pos <= 3 && std::env::var("IRONMILL_TRACE_LAST").is_ok() {
             let f32s: Vec<f32> = hidden.iter().map(|x| x.to_f32()).collect();
             let absmax = f32s.iter().map(|x| x.abs()).fold(0f32, f32::max);
-            eprintln!(
+            tracing::debug!(
                 "  [norm] absmax={:.4} first3=[{:.4},{:.4},{:.4}]",
-                absmax, f32s[0], f32s[1], f32s[2]
+                absmax,
+                f32s[0],
+                f32s[1],
+                f32s[2]
             );
         }
 
@@ -1529,7 +1532,7 @@ impl<D: AneDevice> AneInference<D> {
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, _)| i)
                     .unwrap_or(0);
-                eprintln!(
+                tracing::debug!(
                     "  [logits] max={:.4} argmax={} len={}",
                     max,
                     argmax,
@@ -1558,7 +1561,7 @@ impl<D: AneDevice> AneInference<D> {
         hw_lm_head_ns: u64,
     ) {
         let total = t_total.map(|t| t.elapsed()).unwrap_or_default();
-        eprintln!(
+        tracing::debug!(
             "[profile] decode token 0: embed={:.2}ms pre_attn={:.1}ms read_qkv={:.1}ms attn={:.1}ms post_attn={:.1}ms lm_head={:.1}ms total={:.1}ms",
             d_embed.unwrap_or_default().as_secs_f64() * 1000.0,
             d_pre_attn.as_secs_f64() * 1000.0,
@@ -1571,7 +1574,7 @@ impl<D: AneDevice> AneInference<D> {
 
         if hw_profiling {
             let hw_total = hw_pre_attn_ns + hw_attn_ns + hw_post_attn_ns + hw_lm_head_ns;
-            eprintln!(
+            tracing::debug!(
                 "[hw_profile] token {}: pre_attn={:.1}µs attn={:.1}µs post_attn={:.1}µs lm_head={:.1}µs total={:.1}µs",
                 seq_pos,
                 hw_pre_attn_ns as f64 / 1000.0,
@@ -1661,9 +1664,15 @@ impl<D: AneDevice> AneInference<D> {
                 let absmax = f32s.iter().map(|x| x.abs()).fold(0f32, f32::max);
                 let has_nan = f32s.iter().any(|x| x.is_nan());
                 let has_inf = f32s.iter().any(|x| x.is_infinite());
-                eprintln!(
+                tracing::debug!(
                     "  [L{:2}] absmax={:.2} nan={} inf={} first3=[{:.4},{:.4},{:.4}]",
-                    layer_idx, absmax, has_nan, has_inf, f32s[0], f32s[1], f32s[2]
+                    layer_idx,
+                    absmax,
+                    has_nan,
+                    has_inf,
+                    f32s[0],
+                    f32s[1],
+                    f32s[2]
                 );
             }
             Ok(new_hidden)
@@ -1743,7 +1752,7 @@ impl<D: AneDevice> AneInference<D> {
             match self.try_chained_pre_attn(&hidden, effective_layers) {
                 Ok(()) => true,
                 Err(e) => {
-                    eprintln!("[chaining] pre_attn chain failed, falling back: {e}");
+                    tracing::warn!("[chaining] pre_attn chain failed, falling back: {e}");
                     false
                 }
             }
@@ -1761,7 +1770,7 @@ impl<D: AneDevice> AneInference<D> {
                     }
                     Err(_e) => {
                         if layer_idx == 0 {
-                            eprintln!(
+                            tracing::debug!(
                                 "[hybrid] ANE↔GPU handoff not available, \
                                  falling back to standard eval"
                             );

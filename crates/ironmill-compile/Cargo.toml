@@ -22,6 +22,7 @@ safetensors = { workspace = true }
 memmap2 = { workspace = true }
 glob-match = { workspace = true }
 toml = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 gptq = ["mil-rs/gptq"]

@@ -542,8 +542,8 @@ fn build_stage_pipeline(stage: &StageConfig, base_dir: &Path) -> Result<PassPipe
     match stage.quantize {
         StageQuantize::Fp16 => {
             if stage.cal_data.is_some() {
-                eprintln!(
-                    "Warning: stage '{}': calibration data is ignored for Fp16 quantization \
+                tracing::warn!(
+                    "stage '{}': calibration data is ignored for Fp16 quantization \
                      (only used for Int8).",
                     stage.name
                 );
@@ -556,8 +556,8 @@ fn build_stage_pipeline(stage: &StageConfig, base_dir: &Path) -> Result<PassPipe
         }
         StageQuantize::QuipSharp => {
             if stage.cal_data.is_some() {
-                eprintln!(
-                    "Warning: stage '{}': calibration data is ignored for QuipSharp quantization \
+                tracing::warn!(
+                    "stage '{}': calibration data is ignored for QuipSharp quantization \
                      (only used for Int8).",
                     stage.name
                 );
@@ -570,10 +570,11 @@ fn build_stage_pipeline(stage: &StageConfig, base_dir: &Path) -> Result<PassPipe
         }
         _ => {
             if stage.cal_data.is_some() {
-                eprintln!(
-                    "Warning: stage '{}': calibration data is ignored for {:?} quantization \
+                tracing::warn!(
+                    "stage '{}': calibration data is ignored for {:?} quantization \
                      (only used for Int8).",
-                    stage.name, stage.quantize
+                    stage.name,
+                    stage.quantize
                 );
             }
         }

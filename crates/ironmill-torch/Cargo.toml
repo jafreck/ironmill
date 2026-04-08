@@ -18,3 +18,4 @@ ironmill-compile = { workspace = true }
 ironmill-inference = { workspace = true }
 mil-rs = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -853,8 +853,8 @@ fn extract_tensor_raw_data_impl(
         if let Some(dir) = model_dir {
             return load_external_tensor_data(&tensor.external_data, dir);
         } else {
-            eprintln!(
-                "warning: tensor '{}' uses external data but no model directory provided",
+            tracing::warn!(
+                "tensor '{}' uses external data but no model directory provided",
                 tensor.name
             );
             return Vec::new();
@@ -947,7 +947,7 @@ fn load_external_tensor_data(
                 offset = match entry.value.parse() {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("error: invalid external data offset '{}': {e}", entry.value);
+                        tracing::warn!("invalid external data offset '{}': {e}", entry.value);
                         return Vec::new();
                     }
                 };
@@ -958,7 +958,7 @@ fn load_external_tensor_data(
     }
 
     let Some(file_name) = location else {
-        eprintln!("warning: external_data has no 'location' key");
+        tracing::warn!("external_data has no 'location' key");
         return Vec::new();
     };
 
@@ -966,8 +966,8 @@ fn load_external_tensor_data(
     let file = match std::fs::File::open(&file_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
-                "warning: failed to open external data file '{}': {e}",
+            tracing::warn!(
+                "failed to open external data file '{}': {e}",
                 file_path.display()
             );
             return Vec::new();
@@ -978,7 +978,7 @@ fn load_external_tensor_data(
     let mut reader = std::io::BufReader::new(file);
     if offset > 0 {
         if let Err(e) = reader.seek(SeekFrom::Start(offset)) {
-            eprintln!("warning: failed to seek in external data file: {e}");
+            tracing::warn!("failed to seek in external data file: {e}");
             return Vec::new();
         }
     }
@@ -986,14 +986,14 @@ fn load_external_tensor_data(
     if let Some(len) = length {
         let mut buf = vec![0u8; len as usize];
         if let Err(e) = reader.read_exact(&mut buf) {
-            eprintln!("warning: failed to read external data: {e}");
+            tracing::warn!("failed to read external data: {e}");
             return Vec::new();
         }
         buf
     } else {
         let mut buf = Vec::new();
         if let Err(e) = reader.read_to_end(&mut buf) {
-            eprintln!("warning: failed to read external data: {e}");
+            tracing::warn!("failed to read external data: {e}");
             return Vec::new();
         }
         buf

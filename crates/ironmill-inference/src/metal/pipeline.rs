@@ -90,7 +90,7 @@ impl MetalInference {
                         } else {
                             0.0
                         };
-                        eprintln!(
+                        tracing::debug!(
                             "  [SAVE] pos={pos} target={target} ce={ce:.4} max={max_val:.3} l[target]={:.3} mean={mean:.3} std={:.3} len={}",
                             if target < l.len() { l[target] } else { 0.0 },
                             {
@@ -131,15 +131,18 @@ impl MetalInference {
                     debug_total_ce += ce;
                     debug_count += 1;
                     if t < 20 || t >= n - 3 {
-                        eprintln!(
+                        tracing::debug!(
                             "  [im] pos={:>2} argmax={:>6} max={:>7.3} ce={:>7.3}",
-                            t, argmax, max_val, ce
+                            t,
+                            argmax,
+                            max_val,
+                            ce
                         );
                     }
                 }
                 if debug_count > 0 {
                     let avg = debug_total_ce / debug_count as f64;
-                    eprintln!(
+                    tracing::debug!(
                         "  [im] DEBUG PPL from logits: {:.2} (avg CE={:.4}, n={})",
                         avg.exp(),
                         avg,
@@ -1035,7 +1038,7 @@ impl MetalInference {
                 } else {
                     "prefill"
                 };
-                log::info!(
+                tracing::info!(
                     "[kernel-timing] {mode} tokens={token_count} gpu={gpu_ms:.3}ms layers={num_layers}",
                     num_layers = mc.num_hidden_layers,
                 );

@@ -906,10 +906,14 @@ impl MetalInference {
         let total_captures = num_layers * captures_per_layer;
         // 3 command buffers per layer (embedding, attn, ffn) + 1 final
         let total_commits = 1 + num_layers * 2 + 1;
-        eprintln!(
-            "[calibration] {num_layers} layers, {total_captures} captures, \
-             {total_commits} commits | GPU: {gpu_time_ms:.1}ms, \
-             readback: {readback_time_ms:.1}ms, total: {total_ms:.1}ms"
+        tracing::info!(
+            num_layers,
+            total_captures,
+            total_commits,
+            gpu_ms = format_args!("{gpu_time_ms:.1}"),
+            readback_ms = format_args!("{readback_time_ms:.1}"),
+            total_ms = format_args!("{total_ms:.1}"),
+            "calibration pass complete"
         );
 
         // Advance sequence position.

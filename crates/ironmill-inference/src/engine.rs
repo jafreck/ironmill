@@ -170,7 +170,7 @@ pub fn prefill_with_cache(
             }
         } else {
             // Backend doesn't support KV restore — re-prefill the prefix.
-            log::warn!("KV restore not supported by backend, re-prefilling prefix");
+            tracing::warn!("KV restore not supported by backend, re-prefilling prefix");
             if matched < tokens.len() {
                 engine.prefill(&tokens[..matched])?;
                 engine.prefill(&tokens[matched..])?
@@ -181,13 +181,13 @@ pub fn prefill_with_cache(
     } else {
         // No cache hit — full prefill.
         if matched > 0 && kv_slices.is_empty() {
-            log::warn!(
+            tracing::warn!(
                 "prefix cache metadata matched {} tokens but KV slices are empty; \
                  falling back to full prefill",
                 matched,
             );
         } else if matched == 0 {
-            log::warn!(
+            tracing::warn!(
                 "prefix cache miss for {} token prompt; performing full prefill",
                 tokens.len(),
             );

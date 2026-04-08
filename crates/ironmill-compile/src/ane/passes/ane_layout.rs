@@ -217,8 +217,8 @@ fn to_ane_shape_static(shape: &[usize]) -> Vec<usize> {
             } else if b == 1 {
                 vec![1, m, 1, n]
             } else {
-                eprintln!(
-                    "Warning: ANE layout: collapsing 3D shape [{b}, {m}, {n}] to \
+                tracing::warn!(
+                    "ANE layout: collapsing 3D shape [{b}, {m}, {n}] to \
                      [1, {}, 1, {n}] by merging batch and sequence dims.",
                     b * m
                 );
@@ -231,8 +231,8 @@ fn to_ane_shape_static(shape: &[usize]) -> Vec<usize> {
             if b == 1 && h == 1 {
                 vec![1, c, 1, w]
             } else {
-                eprintln!(
-                    "Warning: ANE layout: collapsing 4D shape [{b}, {c}, {h}, {w}] to \
+                tracing::warn!(
+                    "ANE layout: collapsing 4D shape [{b}, {c}, {h}, {w}] to \
                      [1, {c}, 1, {}] by merging spatial dims.",
                     h * w
                 );
@@ -243,8 +243,8 @@ fn to_ane_shape_static(shape: &[usize]) -> Vec<usize> {
             // 5D+ — collapse all dims after the second into the sequence dim.
             let c = shape[1];
             let s: usize = shape[2..].iter().product();
-            eprintln!(
-                "Warning: ANE layout: collapsing {}D shape {shape:?} to \
+            tracing::warn!(
+                "ANE layout: collapsing {}D shape {shape:?} to \
                  [1, {c}, 1, {s}]. This may produce incorrect results for \
                  tensors with meaningful higher-rank structure.",
                 shape.len()
@@ -259,8 +259,8 @@ fn reshape_tensor_type(ty: &mut TensorType) {
     // Only reshape when all dims are static.
     if !ty.is_static() {
         // Best-effort: if rank != 4, pad/fold what we can.
-        eprintln!(
-            "Warning: ANE layout: reshaping dynamic tensor type with shape {:?}. \
+        tracing::warn!(
+            "ANE layout: reshaping dynamic tensor type with shape {:?}. \
              Result may be incorrect.",
             ty.shape
         );
@@ -292,8 +292,8 @@ fn to_ane_shape_dynamic(shape: &[Option<usize>]) -> Vec<Option<usize>> {
                 vec![Some(1), shape[1], Some(1), shape[2]]
             } else {
                 // Cannot statically compute B*M — keep channel as dynamic.
-                eprintln!(
-                    "Warning: ANE layout: cannot statically collapse dynamic 3D shape {shape:?}; \
+                tracing::warn!(
+                    "ANE layout: cannot statically collapse dynamic 3D shape {shape:?}; \
                      channel dim set to None."
                 );
                 vec![Some(1), None, Some(1), shape[2]]
@@ -305,16 +305,16 @@ fn to_ane_shape_dynamic(shape: &[Option<usize>]) -> Vec<Option<usize>> {
                 vec![Some(1), shape[1], Some(1), shape[3]]
             } else {
                 // Cannot statically compute H*W — keep seq as dynamic.
-                eprintln!(
-                    "Warning: ANE layout: cannot statically collapse dynamic 4D shape {shape:?}; \
+                tracing::warn!(
+                    "ANE layout: cannot statically collapse dynamic 4D shape {shape:?}; \
                      sequence dim set to None."
                 );
                 vec![Some(1), shape[1], Some(1), None]
             }
         }
         _ => {
-            eprintln!(
-                "Warning: ANE layout: collapsing dynamic {}D shape {shape:?} to 4D; \
+            tracing::warn!(
+                "ANE layout: collapsing dynamic {}D shape {shape:?} to 4D; \
                  sequence dim set to None. This is a best-effort heuristic.",
                 shape.len()
             );

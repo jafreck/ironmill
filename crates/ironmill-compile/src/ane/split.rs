@@ -218,8 +218,8 @@ fn classify_ops(operations: &[Operation]) -> Vec<(String, Vec<Operation>)> {
 
     if !has_layers {
         // Fallback: single group with all ops.
-        eprintln!(
-            "Warning: ANE split: no layer-numbering pattern found in operation names. \
+        tracing::warn!(
+            "ANE split: no layer-numbering pattern found in operation names. \
              Falling back to legacy single 'main' group. This may produce suboptimal \
              ANE splitting for models that don't follow the 'layerN' naming convention."
         );
@@ -545,9 +545,9 @@ fn split_at_attention_boundary(
     ops: &[Operation],
 ) -> (Vec<Operation>, Vec<Operation>, Vec<Operation>) {
     if std::env::var("IRONMILL_SPLIT_DEBUG").is_ok() {
-        eprintln!("split_at_attention_boundary: {} ops", ops.len());
+        tracing::debug!("split_at_attention_boundary: {} ops", ops.len());
         for (i, op) in ops.iter().enumerate() {
-            eprintln!("  [{i}] {} (type: {})", op.name, op.op_type);
+            tracing::debug!("  [{i}] {} (type: {})", op.name, op.op_type);
         }
     }
 
@@ -556,8 +556,8 @@ fn split_at_attention_boundary(
     }
 
     // Fallback: legacy name-based heuristic.
-    eprintln!(
-        "warning: structural attention split failed, falling back to name heuristic ({} ops)",
+    tracing::warn!(
+        "structural attention split failed, falling back to name heuristic ({} ops)",
         ops.len()
     );
     split_at_attention_boundary_by_name(ops)
@@ -874,7 +874,7 @@ fn build_sub_program(
         for out in &mut op.outputs {
             if seen_outputs.contains(out.as_str()) {
                 // Collision — generate a unique name.
-                eprintln!("  [dedup] collision on '{}' in sub-program", out);
+                tracing::debug!("  [dedup] collision on '{}' in sub-program", out);
                 let mut suffix = 1;
                 let base = out.clone();
                 loop {

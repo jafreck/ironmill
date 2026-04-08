@@ -202,9 +202,10 @@ impl<'a> MilTextEmitter<'a> {
         let type_str = match &output_type {
             Some(ty) => self.format_tensor_type(ty)?,
             None => {
-                eprintln!(
-                    "error: could not infer output type for op '{}' (type: {})",
-                    op.name, op.op_type
+                tracing::error!(
+                    "could not infer output type for op '{}' (type: {})",
+                    op.name,
+                    op.op_type
                 );
                 return Err(MilError::Validation(format!(
                     "cannot infer output type for op '{}' (type: {})",
@@ -510,10 +511,12 @@ impl<'a> MilTextEmitter<'a> {
             let normalized = if axis < 0 {
                 let n = rank + axis;
                 if n < 0 {
-                    eprintln!(
-                        "warning: reduce op '{}' has axis {} out of range for rank {}; \
+                    tracing::warn!(
+                        "reduce op '{}' has axis {} out of range for rank {}; \
                          returning input type unchanged",
-                        op.name, axis, rank
+                        op.name,
+                        axis,
+                        rank
                     );
                     return Ok(input_ty.clone());
                 }
@@ -522,10 +525,13 @@ impl<'a> MilTextEmitter<'a> {
                 axis as usize
             };
             if normalized >= shape.len() {
-                eprintln!(
-                    "warning: reduce op '{}' has axis {} (normalized {}) out of range for rank {}; \
+                tracing::warn!(
+                    "reduce op '{}' has axis {} (normalized {}) out of range for rank {}; \
                      returning input type unchanged",
-                    op.name, axis, normalized, rank
+                    op.name,
+                    axis,
+                    normalized,
+                    rank
                 );
                 return Ok(input_ty.clone());
             }

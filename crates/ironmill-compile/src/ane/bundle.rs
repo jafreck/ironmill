@@ -187,10 +187,12 @@ pub fn compile_decode_bundle(
     let original_arch = mil_rs::analysis::arch::detect_model_arch(&program);
     let (rope_cos_cache, rope_sin_cache, _rope_cache_dim) = extract_rope_caches(&program)
         .unwrap_or_else(|| {
-            eprintln!(
-                "Warning: RoPE caches not found in program; using precomputed fallback \
+            tracing::warn!(
+                "RoPE caches not found in program; using precomputed fallback \
                  (head_dim={}, max_seq_len={}, theta={})",
-                config.head_dim, config.max_seq_len, config.rope_theta
+                config.head_dim,
+                config.max_seq_len,
+                config.rope_theta
             );
             precompute_rope_cache(
                 config.head_dim,
@@ -592,7 +594,7 @@ fn extract_bundle_weights(classified: &ClassifiedSubprograms<'_>) -> Result<Extr
 
     let lm_head_weight = extract_cpu_weight(classified.lm_head, "lm_head").unwrap_or_else(|| {
         // Tied embeddings: lm_head reuses embedding weight.
-        eprintln!("Warning: lm_head weight not found; falling back to tied embeddings");
+        tracing::warn!("lm_head weight not found; falling back to tied embeddings");
         CpuWeight {
             data: embed_weight.data.clone(),
             shape: embed_weight.shape,

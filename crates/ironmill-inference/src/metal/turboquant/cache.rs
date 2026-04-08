@@ -142,9 +142,10 @@ impl MetalKvCache {
                 .map(|lc| lc.head_dim)
                 .unwrap_or_else(|| {
                     if !config.layer_configs.is_empty() {
-                        eprintln!(
-                            "Warning: layer {} has no per-layer config; defaulting to global head_dim={}",
-                            layer, config.head_dim
+                        tracing::warn!(
+                            layer,
+                            head_dim = config.head_dim,
+                            "no per-layer config; defaulting to global head_dim"
                         );
                     }
                     config.head_dim
@@ -155,9 +156,10 @@ impl MetalKvCache {
                 .map(|lc| lc.num_kv_heads)
                 .unwrap_or_else(|| {
                     if !config.layer_configs.is_empty() {
-                        eprintln!(
-                            "Warning: layer {} has no per-layer config; defaulting to global num_kv_heads={}",
-                            layer, config.num_kv_heads
+                        tracing::warn!(
+                            layer,
+                            num_kv_heads = config.num_kv_heads,
+                            "no per-layer config; defaulting to global num_kv_heads"
                         );
                     }
                     config.num_kv_heads
@@ -236,9 +238,10 @@ impl MetalKvCache {
                 .map(|lc| lc.head_dim)
                 .unwrap_or_else(|| {
                     if !config.layer_configs.is_empty() {
-                        eprintln!(
-                            "Warning: layer {} has no per-layer config; defaulting to global head_dim={}",
-                            layer, config.head_dim
+                        tracing::warn!(
+                            layer,
+                            head_dim = config.head_dim,
+                            "no per-layer config; defaulting to global head_dim"
                         );
                     }
                     config.head_dim
@@ -249,9 +252,10 @@ impl MetalKvCache {
                 .map(|lc| lc.num_kv_heads)
                 .unwrap_or_else(|| {
                     if !config.layer_configs.is_empty() {
-                        eprintln!(
-                            "Warning: layer {} has no per-layer config; defaulting to global num_kv_heads={}",
-                            layer, config.num_kv_heads
+                        tracing::warn!(
+                            layer,
+                            num_kv_heads = config.num_kv_heads,
+                            "no per-layer config; defaulting to global num_kv_heads"
                         );
                     }
                     config.num_kv_heads

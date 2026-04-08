@@ -713,7 +713,7 @@ pub fn compile_mil_text(
         let inner = (|| -> Result<InMemoryModel, AneSysError> {
             // 1. Create descriptor
             #[cfg(debug_assertions)]
-            eprintln!(
+            tracing::debug!(
                 "[ane] creating descriptor from MIL text ({} bytes), {} weight(s)...",
                 mil_text.len(),
                 weights.len()
@@ -722,7 +722,7 @@ pub fn compile_mil_text(
 
             // 2. Create model
             #[cfg(debug_assertions)]
-            eprintln!("[ane] descriptor created, creating in-memory model...");
+            tracing::debug!("[ane] descriptor created, creating in-memory model...");
             let model = InMemoryModel::from_descriptor(&desc)?;
 
             // 3. Pre-populate temp directory
@@ -732,7 +732,7 @@ pub fn compile_mil_text(
 
             // 4. Compile
             #[cfg(debug_assertions)]
-            eprintln!("[ane] compiling with QoS={qos}...");
+            tracing::debug!("[ane] compiling with QoS={qos}...");
             model.compile(qos)?;
 
             // 5. Load
@@ -805,7 +805,7 @@ pub fn patch_weights(
         std::fs::copy(&donor_net_plist, &new_net_plist)?;
 
         #[cfg(debug_assertions)]
-        eprintln!("[ane] patch_weights: copied net.plist from {donor_hex} → {new_hex}");
+        tracing::debug!("[ane] patch_weights: copied net.plist from {donor_hex} → {new_hex}");
 
         // 5. Load (NO compile!)
         model.load(qos)?;
@@ -1255,7 +1255,7 @@ fn populate_tmp_dir(
     let weights_dir = tmp_dir.join("weights");
 
     #[cfg(debug_assertions)]
-    eprintln!("[ane] hexId={hex_id}, tmp_dir={}", tmp_dir.display());
+    tracing::debug!("[ane] hexId={hex_id}, tmp_dir={}", tmp_dir.display());
 
     std::fs::create_dir_all(&weights_dir)?;
     std::fs::write(tmp_dir.join("model.mil"), mil_text.as_bytes())?;
@@ -1266,7 +1266,7 @@ fn populate_tmp_dir(
             std::fs::create_dir_all(parent)?;
         }
         #[cfg(debug_assertions)]
-        eprintln!(
+        tracing::debug!(
             "[ane] writing weight {} ({} bytes) → {}",
             path_key,
             data.len(),

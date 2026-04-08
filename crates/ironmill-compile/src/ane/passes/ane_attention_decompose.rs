@@ -44,9 +44,10 @@ fn decompose_in_block(block: &mut Block) {
         let new_ops = match new_ops {
             Some(ops) => ops,
             None => {
-                eprintln!(
-                    "warning: skipping decomposition of '{}' ({}): missing required input",
-                    block.operations[i].name, block.operations[i].op_type
+                tracing::warn!(
+                    "skipping decomposition of '{}' ({}): missing required input",
+                    block.operations[i].name,
+                    block.operations[i].op_type
                 );
                 i += 1;
                 continue;

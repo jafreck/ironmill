@@ -271,8 +271,8 @@ fn handle_affine_dequant(
     let bit_width = match op.attributes.get("bit_width") {
         Some(Value::Int(v)) => *v as u8,
         _ => {
-            eprintln!(
-                "Warning: legacy INT8 defaulting: tensor has no explicit bit_width \
+            tracing::warn!(
+                "legacy INT8 defaulting: tensor has no explicit bit_width \
                  attribute, defaulting to 8. This behavior is deprecated; \
                  quantized models should specify bit_width explicitly."
             );

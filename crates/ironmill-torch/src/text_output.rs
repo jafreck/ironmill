@@ -83,7 +83,7 @@ impl Iterator for TextStream<'_> {
                 let text = match self.tokenizer.decode(&[token]) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("warning: token decode failed for token {token}: {e}");
+                        tracing::warn!("token decode failed for token {token}: {e}");
                         "\u{FFFD}".to_string()
                     }
                 };

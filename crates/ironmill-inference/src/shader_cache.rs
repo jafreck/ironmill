@@ -56,9 +56,9 @@ impl ShaderCache {
             Ok(data) => Some(data),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                eprintln!(
-                    "Warning: shader cache read failed for {}: {e}",
-                    path.display()
+                tracing::warn!(
+                    path = %path.display(),
+                    "shader cache read failed: {e}"
                 );
                 None
             }
@@ -145,9 +145,9 @@ fn dir_size(dir: &Path) -> u64 {
             .sum(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => {
-            eprintln!(
-                "Warning: failed to read shader cache directory {}: {e}",
-                dir.display()
+            tracing::warn!(
+                path = %dir.display(),
+                "failed to read shader cache directory: {e}"
             );
             0
         }

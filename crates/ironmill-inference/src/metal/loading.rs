@@ -95,7 +95,7 @@ impl MetalInference {
                     .and_then(|v| v.as_f64())
             })
             .unwrap_or_else(|| {
-                eprintln!(
+                tracing::warn!(
                     "partial_rotary_factor not specified, defaulting to 1.0 (full-head RoPE)"
                 );
                 1.0
@@ -309,8 +309,9 @@ impl MetalInference {
                         {
                             weight_data.push((k_t.data.to_vec(), v_t.data.to_vec()));
                         } else {
-                            eprintln!(
-                                "warning: TurboQuant outlier config: skipping layer {layer} (missing k_proj or v_proj tensor)"
+                            tracing::warn!(
+                                layer = layer,
+                                "TurboQuant outlier config: skipping layer (missing k_proj or v_proj tensor)"
                             );
                         }
                     }
@@ -335,10 +336,10 @@ impl MetalInference {
                                 .to_string(),
                         ));
                     } else {
-                        eprintln!(
-                            "warning: TurboQuant outlier config: only {}/{} layers loaded, proceeding with partial data",
-                            weight_data.len(),
-                            mc.num_hidden_layers,
+                        tracing::warn!(
+                            loaded = weight_data.len(),
+                            total = mc.num_hidden_layers,
+                            "TurboQuant outlier config: partial layer data, proceeding"
                         );
                         let refs: Vec<(&[u8], &[u8])> = weight_data
                             .iter()

@@ -17,7 +17,7 @@ ironmill-metal-sys = { workspace = true, optional = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-log = { workspace = true }
+tracing = { workspace = true }
 half = { workspace = true }
 bytemuck = { workspace = true }
 serde = { workspace = true }

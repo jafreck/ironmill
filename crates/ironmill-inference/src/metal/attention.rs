@@ -309,11 +309,11 @@ pub(crate) fn encode_kv_cache_and_attention(
             if dim_cb.is_none() && !tq.config.layer_configs.is_empty() {
                 if let Some(lc) = tq.config.layer_configs.get(layer_idx) {
                     if lc.head_dim != tq.config.head_dim {
-                        eprintln!(
-                            "Warning: layer {} has head_dim {} but no per-layer codebooks found; \
-                             falling back to global codebooks (head_dim={}). \
-                             Attention quality may be degraded.",
-                            layer_idx, lc.head_dim, tq.config.head_dim
+                        tracing::warn!(
+                            layer = layer_idx,
+                            layer_head_dim = lc.head_dim,
+                            global_head_dim = tq.config.head_dim,
+                            "no per-layer codebooks found; falling back to global codebooks. Attention quality may be degraded"
                         );
                     }
                 }

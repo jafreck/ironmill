@@ -63,9 +63,9 @@ impl InferenceBatch {
                 SequenceStatus::Decoding => {
                     // Only the last token is needed for autoregressive decode.
                     if seq.tokens.is_empty() {
-                        eprintln!(
-                            "warning: sequence {} has no tokens during decode, using token 0",
-                            id
+                        tracing::warn!(
+                            sequence_id = %id,
+                            "sequence has no tokens during decode, using token 0"
                         );
                     }
                     let last = seq.tokens.last().copied().unwrap_or(0);

@@ -444,8 +444,8 @@ fn extract_weight_byte_size(line: &str) -> Option<usize> {
         "int16" => 2,
         "int32" => 4,
         other => {
-            eprintln!(
-                "warning: unknown dtype '{other}' in tensor type annotation, defaulting to fp16 (2 bytes)"
+            tracing::warn!(
+                "unknown dtype '{other}' in tensor type annotation, defaulting to fp16 (2 bytes)"
             );
             2
         }

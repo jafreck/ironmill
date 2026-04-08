@@ -81,8 +81,8 @@ impl Pass for ShapeMaterializePass {
 
                 // Warn if all dimensions are already static.
                 if tensor_type.is_static() {
-                    eprintln!(
-                        "warning: shape-materialization: input '{}' already has a fully static shape, skipping",
+                    tracing::warn!(
+                        "shape-materialization: input '{}' already has a fully static shape, skipping",
                         input_name,
                     );
                     continue;

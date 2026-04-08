@@ -156,18 +156,18 @@ pub fn validate_ane_compatibility(program: &Program) -> ValidationReport {
 
 /// Print a human-readable validation report to stdout.
 pub fn print_validation_report(report: &ValidationReport) {
-    println!("ANE Compatibility Report");
-    println!("========================");
-    println!("  Compatible ops : {}", report.ane_compatible.len());
-    println!("  Fallback ops   : {}", report.fallback_ops.len());
-    println!("  Compatibility  : {:.1}%", report.compatibility_pct);
-    println!(
+    tracing::info!("ANE Compatibility Report");
+    tracing::info!("========================");
+    tracing::info!("  Compatible ops : {}", report.ane_compatible.len());
+    tracing::info!("  Fallback ops   : {}", report.fallback_ops.len());
+    tracing::info!("  Compatibility  : {:.1}%", report.compatibility_pct);
+    tracing::info!(
         "  ANE compute    : {:.1}% of estimated FLOPs",
         report.ane_compute_pct
     );
 
     if report.total_estimated_flops > 0 {
-        println!(
+        tracing::info!(
             "  Total FLOPs    : {} (ANE: {}, fallback: {})",
             report.total_estimated_flops,
             report.ane_estimated_flops,
@@ -176,11 +176,11 @@ pub fn print_validation_report(report: &ValidationReport) {
     }
 
     if !report.fallback_ops.is_empty() {
-        println!();
-        println!("Fallback operations (will run on CPU/GPU):");
+        tracing::info!("");
+        tracing::info!("Fallback operations (will run on CPU/GPU):");
         for op in &report.fallback_ops {
             let reason = op.reason.as_deref().unwrap_or("unknown");
-            println!("  • {} ({}): {}", op.name, op.op_type, reason);
+            tracing::info!("  • {} ({}): {}", op.name, op.op_type, reason);
         }
     }
 
@@ -193,20 +193,20 @@ pub fn print_validation_report(report: &ValidationReport) {
         .collect();
 
     if !annotated.is_empty() {
-        println!();
-        println!("Performance annotations:");
+        tracing::info!("");
+        tracing::info!("Performance annotations:");
         for op in annotated {
             for ann in &op.performance_annotations {
-                println!("  ⚡ {} ({}): {}", op.name, op.op_type, ann);
+                tracing::info!("  ⚡ {} ({}): {}", op.name, op.op_type, ann);
             }
         }
     }
 
     if !report.warnings.is_empty() {
-        println!();
-        println!("Warnings:");
+        tracing::info!("");
+        tracing::info!("Warnings:");
         for w in &report.warnings {
-            println!("  ⚠ {w}");
+            tracing::info!("  ⚠ {w}");
         }
     }
 }

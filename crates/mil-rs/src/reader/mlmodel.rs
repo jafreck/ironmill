@@ -33,47 +33,47 @@ pub fn read_mlmodel(path: impl AsRef<Path>) -> Result<Model> {
 
 /// Print a human-readable summary of a CoreML model to stdout.
 pub fn print_model_summary(model: &Model) {
-    println!("CoreML Model Summary");
-    println!("====================");
-    println!("Specification version: {}", model.specification_version);
-    println!("Updatable: {}", model.is_updatable);
+    tracing::info!("CoreML Model Summary");
+    tracing::info!("====================");
+    tracing::info!("Specification version: {}", model.specification_version);
+    tracing::info!("Updatable: {}", model.is_updatable);
 
     if let Some(desc) = &model.description {
         print_description(desc);
     }
 
     if let Some(ref ty) = model.r#type {
-        println!("\nModel type: {}", model_type_name(ty));
+        tracing::info!("Model type: {}", model_type_name(ty));
     }
 }
 
 fn print_description(desc: &ModelDescription) {
     if let Some(meta) = &desc.metadata {
         if !meta.short_description.is_empty() {
-            println!("Description: {}", meta.short_description);
+            tracing::info!("Description: {}", meta.short_description);
         }
         if !meta.author.is_empty() {
-            println!("Author: {}", meta.author);
+            tracing::info!("Author: {}", meta.author);
         }
         if !meta.version_string.is_empty() {
-            println!("Version: {}", meta.version_string);
+            tracing::info!("Version: {}", meta.version_string);
         }
         if !meta.license.is_empty() {
-            println!("License: {}", meta.license);
+            tracing::info!("License: {}", meta.license);
         }
     }
 
     if !desc.input.is_empty() {
-        println!("\nInputs ({}):", desc.input.len());
+        tracing::info!("Inputs ({}):", desc.input.len());
         for f in &desc.input {
-            println!("  - {}", feature_summary(f));
+            tracing::info!("  - {}", feature_summary(f));
         }
     }
 
     if !desc.output.is_empty() {
-        println!("\nOutputs ({}):", desc.output.len());
+        tracing::info!("Outputs ({}):", desc.output.len());
         for f in &desc.output {
-            println!("  - {}", feature_summary(f));
+            tracing::info!("  - {}", feature_summary(f));
         }
     }
 }

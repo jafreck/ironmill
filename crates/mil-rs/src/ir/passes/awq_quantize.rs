@@ -242,7 +242,7 @@ impl Pass for AwqQuantizePass {
                 group_map.entry(eop.mag_key.clone()).or_default().push(i);
             }
 
-            eprintln!(
+            tracing::debug!(
                 "[awq] {} eligible ops, {} fallback ops, {} groups",
                 eligible.len(),
                 fallback_ops.len(),
@@ -320,7 +320,7 @@ impl Pass for AwqQuantizePass {
                 );
 
                 group_best_alpha.insert(mag_key.clone(), best_alpha);
-                eprintln!(
+                tracing::debug!(
                     "[awq] group {}/{}: α={:.2}, {} projections, {:.1}ms",
                     group_idx + 1,
                     group_map.len(),
@@ -385,7 +385,7 @@ impl Pass for AwqQuantizePass {
                     &channel_scales,
                     self.bits,
                 );
-                eprintln!(
+                tracing::debug!(
                     "[awq] phase3 {}/{}: {}x{}, {:.1}ms",
                     eop_idx + 1,
                     eligible.len(),

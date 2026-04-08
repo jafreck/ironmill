@@ -341,8 +341,8 @@ fn build_training_inputs(func: &Function, updatable_layers: &[String]) -> Vec<Fe
     // NOTE: This is a legacy fallback for updatable models. The synthesized
     // training inputs may not match the actual training data format.
     if training_inputs.is_empty() {
-        eprintln!(
-            "warning: updatable model has no matching updatable layers; \
+        tracing::warn!(
+            "updatable model has no matching updatable layers; \
              falling back to function inputs as training inputs (legacy behavior)"
         );
         for (name, tt) in &func.inputs {
@@ -421,8 +421,8 @@ fn build_update_params(
             .unwrap_or_else(|| first_layer.clone());
         (output_name.clone(), format!("{output_name}_target"))
     } else {
-        eprintln!(
-            "warning: updatable model config has no updatable layers; \
+        tracing::warn!(
+            "updatable model config has no updatable layers; \
              using default loss input/target names (legacy behavior)"
         );
         ("output".to_string(), "target".to_string())

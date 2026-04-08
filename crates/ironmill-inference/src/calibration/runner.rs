@@ -201,7 +201,11 @@ impl CalibrationRunner {
                 engine.prefill_with_hooks(seq, hook)?;
                 processed += 1;
             }
-            eprintln!("[calibration] {processed}/{n_total} sequences processed");
+            tracing::info!(
+                processed,
+                total = n_total,
+                "calibration sequences processed"
+            );
         }
 
         Ok(())

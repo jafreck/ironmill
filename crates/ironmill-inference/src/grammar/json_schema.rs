@@ -159,18 +159,18 @@ impl ConvertCtx {
 
         // Warn about unsupported constraints.
         if schema.get("uniqueItems").is_some() {
-            eprintln!(
-                "warning: JSON Schema 'uniqueItems' constraint is not supported and will be ignored"
+            tracing::warn!(
+                "JSON Schema 'uniqueItems' constraint is not supported and will be ignored"
             );
         }
         if schema.get("minProperties").is_some() {
-            eprintln!(
-                "warning: JSON Schema 'minProperties' constraint is not supported and will be ignored"
+            tracing::warn!(
+                "JSON Schema 'minProperties' constraint is not supported and will be ignored"
             );
         }
         if schema.get("maxProperties").is_some() {
-            eprintln!(
-                "warning: JSON Schema 'maxProperties' constraint is not supported and will be ignored"
+            tracing::warn!(
+                "JSON Schema 'maxProperties' constraint is not supported and will be ignored"
             );
         }
 

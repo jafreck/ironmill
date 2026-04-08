@@ -163,8 +163,8 @@ fn extract_component(
     if component == ModelComponent::Transformer {
         let has_embed_out = ops.iter().any(|op| op.name == "embed_out");
         if has_embed_out {
-            eprintln!(
-                "Warning: extract_component(Transformer): dropping 'embed_out' op. \
+            tracing::warn!(
+                "extract_component(Transformer): dropping 'embed_out' op. \
                  The Transformer component will not include the embedding output projection. \
                  This may break dataflow if downstream components depend on it."
             );
@@ -193,10 +193,11 @@ fn extract_component(
         // [1, max_position_embeddings, hidden_size]. This is a heuristic;
         // the actual hidden-state shape depends on the transformer output
         // and may differ for non-standard sequence lengths.
-        eprintln!(
-            "Warning: extract_component(LmHead): fabricating hidden-state input with fixed shape \
+        tracing::warn!(
+            "extract_component(LmHead): fabricating hidden-state input with fixed shape \
              [1, {}, {}]. Actual shape may differ at runtime.",
-            config.max_position_embeddings, config.hidden_size
+            config.max_position_embeddings,
+            config.hidden_size
         );
         use mil_rs::ir::{ScalarType, TensorType};
         let hidden_ty = TensorType::new(

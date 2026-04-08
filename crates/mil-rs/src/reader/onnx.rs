@@ -68,57 +68,57 @@ fn mmap_read_only(file: &std::fs::File) -> std::io::Result<Mmap> {
 /// Displays IR version, opset imports, producer info, graph inputs/outputs,
 /// node count, and initializer count.
 pub fn print_onnx_summary(model: &ModelProto) {
-    println!("ONNX Model Summary");
-    println!("===================");
-    println!("IR version: {}", model.ir_version);
+    tracing::info!("ONNX Model Summary");
+    tracing::info!("===================");
+    tracing::info!("IR version: {}", model.ir_version);
 
     if !model.producer_name.is_empty() {
-        println!("Producer: {}", model.producer_name);
+        tracing::info!("Producer: {}", model.producer_name);
     }
     if !model.producer_version.is_empty() {
-        println!("Producer version: {}", model.producer_version);
+        tracing::info!("Producer version: {}", model.producer_version);
     }
     if !model.domain.is_empty() {
-        println!("Domain: {}", model.domain);
+        tracing::info!("Domain: {}", model.domain);
     }
     if model.model_version != 0 {
-        println!("Model version: {}", model.model_version);
+        tracing::info!("Model version: {}", model.model_version);
     }
     if !model.doc_string.is_empty() {
-        println!("Doc: {}", model.doc_string);
+        tracing::info!("Doc: {}", model.doc_string);
     }
 
     if !model.opset_import.is_empty() {
-        println!("\nOpset imports:");
+        tracing::info!("Opset imports:");
         for opset in &model.opset_import {
             let domain = if opset.domain.is_empty() {
                 "ai.onnx"
             } else {
                 &opset.domain
             };
-            println!("  - {} v{}", domain, opset.version);
+            tracing::info!("  - {} v{}", domain, opset.version);
         }
     }
 
     if let Some(graph) = &model.graph {
-        println!("\nGraph: {}", graph.name);
+        tracing::info!("Graph: {}", graph.name);
 
         if !graph.input.is_empty() {
-            println!("\nInputs ({}):", graph.input.len());
+            tracing::info!("Inputs ({}):", graph.input.len());
             for input in &graph.input {
-                println!("  - {}", value_info_summary(input));
+                tracing::info!("  - {}", value_info_summary(input));
             }
         }
 
         if !graph.output.is_empty() {
-            println!("\nOutputs ({}):", graph.output.len());
+            tracing::info!("Outputs ({}):", graph.output.len());
             for output in &graph.output {
-                println!("  - {}", value_info_summary(output));
+                tracing::info!("  - {}", value_info_summary(output));
             }
         }
 
-        println!("\nNodes: {}", graph.node.len());
-        println!("Initializers: {}", graph.initializer.len());
+        tracing::info!("Nodes: {}", graph.node.len());
+        tracing::info!("Initializers: {}", graph.initializer.len());
     }
 }
 

@@ -63,7 +63,7 @@ fn bytes_per_element(dtype: &str) -> usize {
         "fp32" | "int32" => 4,
         "int8" | "uint8" | "bool" => 1,
         other => {
-            eprintln!("warning: unknown dtype '{other}', defaulting to fp16 (2 bytes)");
+            tracing::warn!("unknown dtype '{other}', defaulting to fp16 (2 bytes)");
             2
         }
     }

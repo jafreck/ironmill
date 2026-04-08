@@ -84,8 +84,8 @@ pub fn write_gpu_bundle(
                 match global_n_bits {
                     None => global_n_bits = Some(*n_bits),
                     Some(prev) if prev != *n_bits => {
-                        eprintln!(
-                            "Warning: tensor '{name}' has n_bits={} but global_n_bits is already {prev}",
+                        tracing::warn!(
+                            "tensor '{name}' has n_bits={} but global_n_bits is already {prev}",
                             n_bits
                         );
                     }
@@ -113,9 +113,10 @@ pub fn write_gpu_bundle(
                             .to_string(),
                         quip_sharp_seed: quip_sharp_seed.map(|s| {
                             u32::try_from(s).unwrap_or_else(|_| {
-                                eprintln!(
-                                    "Warning: tensor '{name}': quip_sharp_seed {s} exceeds u32::MAX, \
-                                     truncating to {}", s as u32
+                                tracing::warn!(
+                                    "tensor '{name}': quip_sharp_seed {s} exceeds u32::MAX, \
+                                     truncating to {}",
+                                    s as u32
                                 );
                                 s as u32
                             })
@@ -167,8 +168,8 @@ pub fn write_gpu_bundle(
                         *group_size,
                     )
                     .map_err(|e| CompileError::Other(e.to_string()))?;
-                    eprintln!(
-                        "Note: tensor '{name}' has per-channel INT{bit_width} quantization; \
+                    tracing::info!(
+                        "tensor '{name}' has per-channel INT{bit_width} quantization; \
                          storing as FP16 in GPU bundle."
                     );
 
@@ -193,8 +194,8 @@ pub fn write_gpu_bundle(
                     match global_n_bits {
                         None => global_n_bits = Some(*bit_width),
                         Some(prev) if prev != *bit_width => {
-                            eprintln!(
-                                "Warning: tensor '{name}' has bit_width={} but global_n_bits is already {prev}",
+                            tracing::warn!(
+                                "tensor '{name}' has bit_width={} but global_n_bits is already {prev}",
                                 bit_width
                             );
                         }
@@ -279,8 +280,8 @@ pub fn write_gpu_bundle(
                 match global_n_bits {
                     None => global_n_bits = Some(*bit_width),
                     Some(prev) if prev != *bit_width => {
-                        eprintln!(
-                            "Warning: tensor '{name}' has bit_width={} but global_n_bits is already {prev}",
+                        tracing::warn!(
+                            "tensor '{name}' has bit_width={} but global_n_bits is already {prev}",
                             bit_width
                         );
                     }

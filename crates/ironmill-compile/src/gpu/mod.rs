@@ -226,7 +226,7 @@ fn collect_supplement_tensors(
         .filter_map(|name| match provider.tensor(name) {
             Ok(t) => Some((name.to_string(), (t.data.into_owned(), t.shape, t.dtype))),
             Err(e) => {
-                eprintln!("Warning: failed to load supplement tensor '{name}': {e}");
+                tracing::warn!("failed to load supplement tensor '{name}': {e}");
                 None
             }
         })

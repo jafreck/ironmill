@@ -237,7 +237,7 @@ impl InferenceEngine for MetalInference {
         }
         if let Some(gdn) = self.gdn_state.as_ref() {
             if let Err(e) = gdn.reset() {
-                eprintln!("warning: GDN state reset failed: {e}");
+                tracing::warn!("GDN state reset failed: {e}");
             }
         }
     }
