@@ -27,11 +27,9 @@ use crate::proto::onnx::ModelProto;
 /// let model = read_onnx("model.onnx").unwrap();
 /// println!("IR version: {}", model.ir_version);
 /// ```
-#[allow(unsafe_code)]
 pub fn read_onnx(path: impl AsRef<Path>) -> Result<ModelProto> {
     let file = std::fs::File::open(path.as_ref())?;
-    // SAFETY: the file is read-only and the mmap is dropped after decoding.
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = mmap_read_only(&file)?;
     let model = ModelProto::decode(&mmap[..])?;
     Ok(model)
 }
@@ -40,15 +38,29 @@ pub fn read_onnx(path: impl AsRef<Path>) -> Result<ModelProto> {
 ///
 /// The directory is needed to resolve external data files referenced by
 /// `TensorProto.data_location == EXTERNAL`.
-#[allow(unsafe_code)]
 pub fn read_onnx_with_dir(path: impl AsRef<Path>) -> Result<(ModelProto, PathBuf)> {
     let path = path.as_ref();
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let file = std::fs::File::open(path)?;
-    // SAFETY: the file is read-only and the mmap is dropped after decoding.
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = mmap_read_only(&file)?;
     let model = ModelProto::decode(&mmap[..])?;
     Ok((model, dir))
+}
+
+/// Memory-maps a file for read-only access.
+///
+/// # Safety
+///
+/// This function assumes the file will not be modified or truncated while the
+/// mapping is alive. This is acceptable here because model files are
+/// read-only assets that are never modified during loading.
+#[allow(unsafe_code)]
+fn mmap_read_only(file: &std::fs::File) -> std::io::Result<Mmap> {
+    // SAFETY: We use mmap for zero-copy access to large model files.  The
+    // safety invariant is that the underlying file must not be modified or
+    // truncated while the mapping exists.  Model weight files are read-only
+    // assets that are not mutated during loading, so this invariant holds.
+    unsafe { Mmap::map(file) }
 }
 
 /// Print a human-readable summary of an ONNX model to stdout.
