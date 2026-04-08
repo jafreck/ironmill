@@ -81,6 +81,8 @@ type AdvancedMatmulShaders = (
     ComputePipeline,
     ComputePipeline,
     ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
 );
 type FusedShaders = (
     ComputePipeline,
@@ -307,6 +309,8 @@ impl MetalPipelines {
             sb_batched_matvec_int4,
             sb_gdn_batched_matvec_int4,
             sb_matvec_int4xq8,
+            sb_matvec_int8,
+            sb_matmul_int8,
         ) = adv_result?;
         let (
             fused_residual_rms_norm,
@@ -378,6 +382,8 @@ impl MetalPipelines {
                 sb_batched_matvec_int4,
                 sb_gdn_batched_matvec_int4,
                 sb_matvec_int4xq8,
+                sb_matvec_int8,
+                sb_matmul_int8,
             },
             polarquant: PolarQuantPipelines {
                 matvec_int4: polarquant_matvec_int4,
@@ -586,6 +592,8 @@ impl MetalPipelines {
                 "superblock_gdn_batched_affine_matvec_int4",
             )?,
             make_pipeline(device, &libs.affine_mm, "superblock_affine_matvec_int4xq8")?,
+            make_pipeline(device, &libs.affine_mm, "superblock_matvec_int8")?,
+            make_pipeline(device, &libs.affine_mm, "superblock_matmul_int8")?,
         ))
     }
 

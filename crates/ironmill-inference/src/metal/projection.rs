@@ -216,10 +216,10 @@ fn encode_polarquant_projection(
 
 /// Encode a fused affine quantized projection via compute kernel.
 ///
-/// Uses superblock layout for INT4 weights (inline scale/zero).
+/// Uses superblock layout for INT4 and INT8 weights (inline scale/zero).
 /// Dispatches to the correct Metal kernel based on `bit_width` and kernel kind:
-/// - Matvec (`LinearKernelKind::Matvec`): `sb_matvec_int4` with 8 rows/TG, 64 threads
-/// - Matmul (`LinearKernelKind::Matmul`): `sb_matmul_int4` tiled prefill
+/// - Matvec (`LinearKernelKind::Matvec`): `sb_matvec_int{4,8}` with 8 rows/TG, 64 threads
+/// - Matmul (`LinearKernelKind::Matmul`): `sb_matmul_int{4,8}` tiled prefill
 fn encode_affine_projection(
     encoder: &ironmill_metal_sys::ComputeEncoder,
     input: &MetalBuffer,

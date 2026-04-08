@@ -44,11 +44,15 @@ pub struct AffinePipelines {
     pub sb_gdn_batched_matvec_int4: ComputePipeline,
     /// Superblock INT4×Q8 integer dot product matvec.
     pub sb_matvec_int4xq8: ComputePipeline,
+    /// Superblock INT8 matvec: 8 rows/TG, 64 threads, inline scale/zero.
+    pub sb_matvec_int8: ComputePipeline,
+    /// Superblock INT8 matmul: tiled prefill with inline scale/zero.
+    pub sb_matmul_int8: ComputePipeline,
 }
 
 impl AffinePipelines {
     /// Select the affine-quantized pipeline for a given bit-width and phase.
-    /// Returns superblock pipelines for INT4.
+    /// Returns superblock pipelines for INT4 and INT8.
     #[inline]
     pub fn for_bits_and_kind(
         &self,
@@ -58,8 +62,8 @@ impl AffinePipelines {
         match (bit_width, kind) {
             (4, LinearKernelKind::Matvec) => Some(&self.sb_matvec_int4),
             (4, LinearKernelKind::Matmul) => Some(&self.sb_matmul_int4),
-            (8, LinearKernelKind::Matvec) => Some(&self.matvec_int8),
-            (8, LinearKernelKind::Matmul) => Some(&self.matmul_int8),
+            (8, LinearKernelKind::Matvec) => Some(&self.sb_matvec_int8),
+            (8, LinearKernelKind::Matmul) => Some(&self.sb_matmul_int8),
             _ => None,
         }
     }
