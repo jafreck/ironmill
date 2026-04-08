@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use crate::error::AneSysError;
 #[cfg(target_os = "macos")]
 use crate::objc::{
-    CFRelease, create_nsarray, create_nsnumber_i64, get_class, objc_msgSend, objc_retain, sel,
+    create_nsarray, create_nsnumber_i64, get_class, objc_msgSend, objc_retain, safe_release, sel,
     sel_registerName,
 };
 
@@ -520,8 +520,8 @@ impl AneRequest {
 impl Drop for AneRequest {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            // SAFETY: CFRelease on a retained ObjC object.
-            unsafe { CFRelease(self.raw) };
+            // Exception-safe release to avoid ObjC exception aborts.
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }
@@ -755,8 +755,8 @@ impl ChainingRequest {
 impl Drop for ChainingRequest {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            // SAFETY: CFRelease on a retained ObjC object.
-            unsafe { CFRelease(self.raw) };
+            // Exception-safe release to avoid ObjC exception aborts.
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }

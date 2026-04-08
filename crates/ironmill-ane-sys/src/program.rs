@@ -8,7 +8,7 @@
 use std::ffi::c_void;
 
 use crate::error::AneSysError;
-use crate::objc::{CFRelease, get_class, objc_msgSend, objc_retain, sel, sel_registerName};
+use crate::objc::{get_class, objc_msgSend, objc_retain, safe_release, sel, sel_registerName};
 
 // ---------------------------------------------------------------------------
 // ProgramForEvaluation — wraps _ANEProgramForEvaluation
@@ -185,7 +185,7 @@ impl ProgramForEvaluation {
 impl Drop for ProgramForEvaluation {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }

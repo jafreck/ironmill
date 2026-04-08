@@ -10,8 +10,8 @@ use std::ffi::c_void;
 
 use crate::error::AneSysError;
 use crate::objc::{
-    CFRelease, create_nsstring, get_class, nsstring_to_string, objc_msgSend, objc_retain, sel,
-    sel_registerName,
+    CFRelease, create_nsstring, get_class, nsstring_to_string, objc_msgSend, objc_retain,
+    safe_release, sel, sel_registerName,
 };
 
 // ===========================================================================
@@ -176,7 +176,7 @@ impl Weight {
 impl Drop for Weight {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }
@@ -260,7 +260,7 @@ impl ProcedureData {
 impl Drop for ProcedureData {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }
@@ -344,7 +344,7 @@ impl ModelInstanceParameters {
 impl Drop for ModelInstanceParameters {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }

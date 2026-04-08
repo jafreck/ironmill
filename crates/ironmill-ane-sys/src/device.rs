@@ -9,7 +9,8 @@ use std::ffi::c_void;
 
 use crate::error::AneSysError;
 use crate::objc::{
-    CFRelease, create_nsstring, get_class, nsstring_to_string, objc_msgSend, sel, sel_registerName,
+    CFRelease, create_nsstring, get_class, nsstring_to_string, objc_msgSend, safe_release, sel,
+    sel_registerName,
 };
 
 // ---------------------------------------------------------------------------
@@ -342,7 +343,7 @@ impl DeviceController {
 impl Drop for DeviceController {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }

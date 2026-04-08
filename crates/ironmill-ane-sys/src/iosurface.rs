@@ -7,7 +7,9 @@
 use std::ffi::c_void;
 
 use crate::error::AneSysError;
-use crate::objc::{CFRelease, get_class, objc_msgSend, objc_retain, sel, sel_registerName};
+use crate::objc::{
+    ane_safe_cfrelease, get_class, objc_msgSend, objc_retain, sel, sel_registerName,
+};
 
 // ───────────────────────────────────────────────────────────────────
 // AneIOSurfaceObject
@@ -28,7 +30,7 @@ impl Drop for AneIOSurfaceObject {
         if !self.raw.is_null() {
             // SAFETY: CFRelease on a retained ObjC object.
             unsafe {
-                CFRelease(self.raw);
+                ane_safe_cfrelease(self.raw as *const c_void);
             }
             self.raw = std::ptr::null_mut();
         }
@@ -283,7 +285,7 @@ impl Drop for AneBuffer {
         if !self.raw.is_null() {
             // SAFETY: CFRelease on a retained ObjC object.
             unsafe {
-                CFRelease(self.raw);
+                ane_safe_cfrelease(self.raw as *const c_void);
             }
             self.raw = std::ptr::null_mut();
         }
@@ -395,7 +397,7 @@ impl Drop for IOSurfaceOutputSets {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             unsafe {
-                CFRelease(self.raw);
+                ane_safe_cfrelease(self.raw as *const c_void);
             }
             self.raw = std::ptr::null_mut();
         }

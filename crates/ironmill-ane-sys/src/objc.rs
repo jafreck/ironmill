@@ -34,6 +34,20 @@ unsafe extern "C" {
     pub(crate) fn CFRelease(cf: *mut c_void);
 }
 
+// Exception-safe CFRelease compiled from objc/safe_release.m.
+// Wraps CFRelease in @try/@catch so ObjC exceptions during dealloc
+// don't abort the process with "Rust cannot catch foreign exceptions".
+unsafe extern "C" {
+    pub(crate) fn ane_safe_cfrelease(cf: *const c_void);
+}
+
+/// Drop-safe release: catches any ObjC exception thrown by dealloc.
+pub(crate) fn safe_release(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        unsafe { ane_safe_cfrelease(ptr as *const c_void) };
+    }
+}
+
 // Mach kernel APIs for process information.
 unsafe extern "C" {
     pub(crate) fn mach_task_self() -> u32;

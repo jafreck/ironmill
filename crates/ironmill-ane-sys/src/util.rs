@@ -8,7 +8,10 @@
 use std::ffi::c_void;
 
 use crate::error::AneSysError;
-use crate::objc::{CFRelease, create_nsstring, get_class, objc_msgSend, sel, sel_registerName};
+use crate::objc::{
+    CFRelease, create_nsstring, get_class, objc_msgSend, responds_to_selector, sel,
+    sel_registerName,
+};
 
 // ---------------------------------------------------------------------------
 // AneLog — wraps _ANELog (all class methods, returns os_log handles)
@@ -98,10 +101,15 @@ impl AneErrors {
     /// Calls `+[_ANEErrors createErrorWithCode:description:]`.
     pub fn create_error(code: i64, desc: &str) -> Result<*mut c_void, AneSysError> {
         let cls = get_class("_ANEErrors")?;
+        let sel = unsafe { sel_registerName(sel!("createErrorWithCode:description:")) };
+        if !responds_to_selector(cls, sel) {
+            return Err(AneSysError::ClassNotFound(
+                "_ANEErrors does not respond to +createErrorWithCode:description:".into(),
+            ));
+        }
         let ns_desc = create_nsstring(desc)?;
         type FactoryFn =
             unsafe extern "C" fn(*mut c_void, *mut c_void, i64, *mut c_void) -> *mut c_void;
-        let sel = unsafe { sel_registerName(sel!("createErrorWithCode:description:")) };
         let f: FactoryFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
         let obj = unsafe { f(cls, sel, code, ns_desc) };
         unsafe { CFRelease(ns_desc) };
@@ -150,12 +158,17 @@ impl AneErrors {
         factory_selector: &str,
     ) -> Result<*mut c_void, AneSysError> {
         let cls = get_class("_ANEErrors")?;
-        let ns_method = create_nsstring(method_name)?;
-        type MsgFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
         let mut sel_buf = Vec::with_capacity(factory_selector.len() + 1);
         sel_buf.extend_from_slice(factory_selector.as_bytes());
         sel_buf.push(0);
         let sel = unsafe { sel_registerName(sel_buf.as_ptr()) };
+        if !responds_to_selector(cls, sel) {
+            return Err(AneSysError::ClassNotFound(format!(
+                "_ANEErrors does not respond to +{factory_selector}"
+            )));
+        }
+        let ns_method = create_nsstring(method_name)?;
+        type MsgFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
         let f: MsgFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
         let obj = unsafe { f(cls, sel, ns_method) };
         unsafe { CFRelease(ns_method) };
@@ -173,10 +186,15 @@ impl AneErrors {
         code: i64,
     ) -> Result<*mut c_void, AneSysError> {
         let cls = get_class("_ANEErrors")?;
+        let sel = unsafe { sel_registerName(sel!("programLoadErrorForMethod:code:")) };
+        if !responds_to_selector(cls, sel) {
+            return Err(AneSysError::ClassNotFound(
+                "_ANEErrors does not respond to +programLoadErrorForMethod:code:".into(),
+            ));
+        }
         let ns_method = create_nsstring(method)?;
         type MsgFn =
             unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i64) -> *mut c_void;
-        let sel = unsafe { sel_registerName(sel!("programLoadErrorForMethod:code:")) };
         let f: MsgFn = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
         let obj = unsafe { f(cls, sel, ns_method, code) };
         unsafe { CFRelease(ns_method) };

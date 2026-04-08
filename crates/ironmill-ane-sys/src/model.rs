@@ -12,7 +12,7 @@ use crate::objc::{
     extract_nserror_description, get_class, ns_array_add, ns_dict_set, ns_empty_dict,
     ns_empty_dict_unchecked, ns_mutable_array, ns_mutable_dict, ns_number_autoreleased,
     nsstring_to_string, objc_autoreleasePoolPop, objc_autoreleasePoolPush, objc_msgSend,
-    objc_retain, responds_to_selector, sel, sel_registerName,
+    objc_retain, responds_to_selector, safe_release, sel, sel_registerName,
 };
 
 // ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ impl std::fmt::Debug for InMemoryModelDescriptor {
 impl Drop for InMemoryModelDescriptor {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }
@@ -673,7 +673,7 @@ impl std::fmt::Debug for InMemoryModel {
 impl Drop for InMemoryModel {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }

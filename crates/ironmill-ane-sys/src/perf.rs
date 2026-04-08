@@ -8,7 +8,7 @@
 use std::ffi::c_void;
 
 use crate::error::AneSysError;
-use crate::objc::{CFRelease, get_class, objc_msgSend, sel, sel_registerName};
+use crate::objc::{get_class, objc_msgSend, safe_release, sel, sel_registerName};
 
 // ---------------------------------------------------------------------------
 // PerformanceStats — wraps _ANEPerformanceStats
@@ -92,7 +92,7 @@ impl PerformanceStats {
 impl Drop for PerformanceStats {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }
@@ -176,7 +176,7 @@ impl PerformanceStatsIOSurface {
 impl Drop for PerformanceStatsIOSurface {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }

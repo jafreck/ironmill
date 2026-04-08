@@ -10,8 +10,8 @@ use std::ffi::c_void;
 
 use crate::error::AneSysError;
 use crate::objc::{
-    CFRelease, extract_nserror_description, get_class, nsstring_to_string, objc_msgSend,
-    objc_retain, sel, sel_registerName,
+    extract_nserror_description, get_class, nsstring_to_string, objc_msgSend, objc_retain,
+    safe_release, sel, sel_registerName,
 };
 
 // ---------------------------------------------------------------------------
@@ -1016,7 +1016,7 @@ impl VirtualClient {
 impl Drop for VirtualClient {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }

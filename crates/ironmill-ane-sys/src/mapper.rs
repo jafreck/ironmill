@@ -8,7 +8,7 @@ use std::ffi::c_void;
 
 use crate::error::AneSysError;
 use crate::objc::{
-    CFRelease, extract_nserror_description, get_class, objc_msgSend, objc_retain, sel,
+    ane_safe_cfrelease, extract_nserror_description, get_class, objc_msgSend, objc_retain, sel,
     sel_registerName,
 };
 
@@ -30,7 +30,7 @@ impl Drop for ProgramIOSurfacesMapper {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             unsafe {
-                CFRelease(self.raw);
+                ane_safe_cfrelease(self.raw as *const c_void);
             }
             self.raw = std::ptr::null_mut();
         }

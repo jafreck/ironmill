@@ -977,6 +977,7 @@ dependencies = [
 name = "ironmill-ane-sys"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "thiserror 2.0.18",
 ]
 

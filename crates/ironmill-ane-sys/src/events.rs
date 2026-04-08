@@ -10,7 +10,7 @@ use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use crate::error::AneSysError;
 #[cfg(target_os = "macos")]
-use crate::objc::{CFRelease, get_class, objc_msgSend, objc_retain, sel, sel_registerName};
+use crate::objc::{get_class, objc_msgSend, objc_retain, safe_release, sel, sel_registerName};
 
 // ---------------------------------------------------------------------------
 // SharedEvents
@@ -132,8 +132,8 @@ impl SharedEvents {
 impl Drop for SharedEvents {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            // SAFETY: CFRelease on a retained ObjC object.
-            unsafe { CFRelease(self.raw) };
+            // Exception-safe release to avoid ObjC exception aborts.
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }
@@ -306,8 +306,8 @@ impl SharedSignalEvent {
 impl Drop for SharedSignalEvent {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            // SAFETY: CFRelease on a retained ObjC object.
-            unsafe { CFRelease(self.raw) };
+            // Exception-safe release to avoid ObjC exception aborts.
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }
@@ -453,8 +453,8 @@ impl SharedWaitEvent {
 impl Drop for SharedWaitEvent {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            // SAFETY: CFRelease on a retained ObjC object.
-            unsafe { CFRelease(self.raw) };
+            // Exception-safe release to avoid ObjC exception aborts.
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }

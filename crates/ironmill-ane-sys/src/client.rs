@@ -12,7 +12,7 @@
 use std::ffi::c_void;
 
 use crate::error::AneSysError;
-use crate::objc::{CFRelease, get_class, objc_msgSend, objc_retain, sel, sel_registerName};
+use crate::objc::{get_class, objc_msgSend, objc_retain, safe_release, sel, sel_registerName};
 
 // ---------------------------------------------------------------------------
 // _ANEClient
@@ -542,7 +542,7 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }
@@ -907,7 +907,7 @@ impl DaemonConnection {
 impl Drop for DaemonConnection {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { CFRelease(self.raw) };
+            safe_release(self.raw);
             self.raw = std::ptr::null_mut();
         }
     }

@@ -38,6 +38,7 @@ log = "0.4"
 rayon = "1.11"
 safetensors = "0.7"
 memmap2 = "0.9"
+cc = "1"
 
 # Optimize all dependencies in dev/test builds so that weight loading,
 # quantization, and inference aren't 10-50× slower than release.
