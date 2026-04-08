@@ -17,6 +17,7 @@
 use std::path::Path;
 
 pub use ironmill_inference::coreml_runtime::ComputeUnits;
+pub use ironmill_inference::coreml_runtime::CoreMlError;
 use ironmill_inference::coreml_runtime::CoreMlSession;
 
 pub use ironmill_inference::coreml_runtime::SessionInputDesc as InputTensorDesc;
@@ -35,7 +36,7 @@ pub use ironmill_inference::coreml_runtime::SessionOutput as OutputTensor;
 /// let model = CoreMlModel::load("model.mlmodelc", ComputeUnits::All)?;
 /// let desc = model.input_description()?;
 /// println!("inputs: {desc:?}");
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), CoreMlError>(())
 /// ```
 pub struct CoreMlModel {
     session: CoreMlSession,
@@ -47,13 +48,13 @@ impl CoreMlModel {
     /// # Errors
     ///
     /// Returns an error if the path does not exist or the model cannot be loaded.
-    pub fn load(path: impl AsRef<Path>, compute_units: ComputeUnits) -> anyhow::Result<Self> {
+    pub fn load(path: impl AsRef<Path>, compute_units: ComputeUnits) -> Result<Self, CoreMlError> {
         let session = CoreMlSession::load(path.as_ref(), compute_units)?;
         Ok(Self { session })
     }
 
     /// Get the model's input descriptions.
-    pub fn input_description(&self) -> anyhow::Result<Vec<InputTensorDesc>> {
+    pub fn input_description(&self) -> Result<Vec<InputTensorDesc>, CoreMlError> {
         self.session.input_description()
     }
 
@@ -74,7 +75,7 @@ impl CoreMlModel {
     pub fn predict(
         &self,
         inputs: &[(&str, &[usize], &[f32])],
-    ) -> anyhow::Result<Vec<OutputTensor>> {
+    ) -> Result<Vec<OutputTensor>, CoreMlError> {
         self.session.predict(inputs)
     }
 }

@@ -7,7 +7,6 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{Context, bail};
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -16,6 +15,48 @@ use objc2_core_ml::{
     MLModel, MLModelConfiguration, MLMultiArray, MLMultiArrayDataType as ObjcMLMultiArrayDataType,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
+
+// ── Error type ────────────────────────────────────────────────────
+
+/// Errors from the CoreML sys layer.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum CoreMlError {
+    /// Model path is not valid UTF-8.
+    #[error("model path is not valid UTF-8")]
+    InvalidPath,
+
+    /// Failed to load a CoreML model.
+    #[error("failed to load CoreML model: {0}")]
+    ModelLoad(String),
+
+    /// A feature description or constraint was missing / invalid.
+    #[error("{0}")]
+    FeatureDescription(String),
+
+    /// Prediction failed.
+    #[error("prediction failed: {0}")]
+    Prediction(String),
+
+    /// Failed to create an Objective-C resource.
+    #[error("{0}")]
+    ObjcCreate(String),
+
+    /// Unsupported `MLMultiArrayDataType`.
+    #[error("unsupported MLMultiArrayDataType: {0}")]
+    UnsupportedDataType(String),
+
+    /// Unknown compute-unit string.
+    #[error("unknown compute units: {0:?} (expected cpu, gpu, ane, or all)")]
+    UnknownComputeUnits(String),
+
+    /// Tensor shape / data mismatch or overflow.
+    #[error("{0}")]
+    Shape(String),
+}
+
+/// Result type for CoreML sys operations.
+pub type Result<T> = std::result::Result<T, CoreMlError>;
 
 // ── ComputeUnits ──────────────────────────────────────────────────
 
@@ -41,15 +82,15 @@ impl fmt::Display for ComputeUnits {
 }
 
 impl FromStr for ComputeUnits {
-    type Err = anyhow::Error;
+    type Err = CoreMlError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "cpu" => Ok(ComputeUnits::CpuOnly),
             "gpu" => Ok(ComputeUnits::CpuAndGpu),
             "ane" => Ok(ComputeUnits::CpuAndNeuralEngine),
             "all" => Ok(ComputeUnits::All),
-            _ => bail!("unknown compute units: {s:?} (expected cpu, gpu, ane, or all)"),
+            _ => Err(CoreMlError::UnknownComputeUnits(s.to_owned())),
         }
     }
 }
@@ -86,13 +127,13 @@ impl MultiArrayDataType {
         }
     }
 
-    fn from_objc(dt: ObjcMLMultiArrayDataType) -> anyhow::Result<Self> {
+    fn from_objc(dt: ObjcMLMultiArrayDataType) -> Result<Self> {
         match dt {
             ObjcMLMultiArrayDataType::Float32 => Ok(MultiArrayDataType::Float32),
             ObjcMLMultiArrayDataType::Float16 => Ok(MultiArrayDataType::Float16),
             ObjcMLMultiArrayDataType::Int32 => Ok(MultiArrayDataType::Int32),
             ObjcMLMultiArrayDataType::Double => Ok(MultiArrayDataType::Double),
-            other => bail!("unsupported MLMultiArrayDataType: {other:?}"),
+            other => Err(CoreMlError::UnsupportedDataType(format!("{other:?}"))),
         }
     }
 }
@@ -126,8 +167,8 @@ pub struct Model {
 
 impl Model {
     /// Load a compiled CoreML model (.mlmodelc) with the specified compute units.
-    pub fn load(path: &Path, compute_units: ComputeUnits) -> anyhow::Result<Self> {
-        let path_str = path.to_str().context("model path is not valid UTF-8")?;
+    pub fn load(path: &Path, compute_units: ComputeUnits) -> Result<Self> {
+        let path_str = path.to_str().ok_or(CoreMlError::InvalidPath)?;
         let ns_path = NSString::from_str(path_str);
         let url = NSURL::fileURLWithPath(&ns_path);
 
@@ -139,13 +180,13 @@ impl Model {
         // SAFETY: Loading a model from a file URL with a valid configuration.
         // The URL and config are valid ObjC objects created above.
         let model = unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &config) }
-            .map_err(|e| anyhow::anyhow!("failed to load CoreML model: {e}"))?;
+            .map_err(|e| CoreMlError::ModelLoad(e.to_string()))?;
 
         Ok(Self { inner: model })
     }
 
     /// Query the model's input description.
-    pub fn input_description(&self) -> anyhow::Result<InputDescription> {
+    pub fn input_description(&self) -> Result<InputDescription> {
         // SAFETY: Accessing the model description from a successfully loaded model.
         let desc = unsafe { self.inner.modelDescription() };
         // SAFETY: Accessing inputDescriptionsByName from a valid model description.
@@ -156,9 +197,9 @@ impl Model {
         let all_keys = inputs.allKeys();
         for i in 0..all_keys.count() {
             let key: &NSString = &all_keys.objectAtIndex(i);
-            let feat_desc = inputs
-                .objectForKey(key)
-                .context("missing feature description")?;
+            let feat_desc = inputs.objectForKey(key).ok_or_else(|| {
+                CoreMlError::FeatureDescription("missing feature description".into())
+            })?;
 
             // SAFETY: Querying the feature type enum from a valid feature description.
             if unsafe { feat_desc.r#type() } != MLFeatureType::MultiArray {
@@ -166,8 +207,9 @@ impl Model {
             }
 
             // SAFETY: Accessing the multi-array constraint from a multi-array feature.
-            let constraint = unsafe { feat_desc.multiArrayConstraint() }
-                .context("multi-array feature missing constraint")?;
+            let constraint = unsafe { feat_desc.multiArrayConstraint() }.ok_or_else(|| {
+                CoreMlError::FeatureDescription("multi-array feature missing constraint".into())
+            })?;
 
             // SAFETY: Accessing the shape array from a valid constraint.
             let shape_arr = unsafe { constraint.shape() };
@@ -176,7 +218,10 @@ impl Model {
                 let num: &NSNumber = &shape_arr.objectAtIndex(j);
                 let dim = num.as_isize();
                 if dim < 0 {
-                    bail!("invalid negative dimension {} in output shape", dim);
+                    return Err(CoreMlError::Shape(format!(
+                        "invalid negative dimension {} in output shape",
+                        dim
+                    )));
                 }
                 shape.push(dim as usize);
             }
@@ -195,13 +240,13 @@ impl Model {
     }
 
     /// Run prediction with the given feature provider input.
-    pub fn predict(&self, input: &PredictionInput) -> anyhow::Result<PredictionOutput> {
+    pub fn predict(&self, input: &PredictionInput) -> Result<PredictionOutput> {
         let provider: &ProtocolObject<dyn MLFeatureProvider> =
             ProtocolObject::from_ref(&*input.inner);
         // SAFETY: Running prediction with a valid model and feature provider.
         // The model was successfully loaded, and the input was constructed via safe API.
         let result = unsafe { self.inner.predictionFromFeatures_error(provider) }
-            .map_err(|e| anyhow::anyhow!("prediction failed: {e}"))?;
+            .map_err(|e| CoreMlError::Prediction(e.to_string()))?;
 
         Ok(PredictionOutput { inner: result })
     }
@@ -211,10 +256,7 @@ impl Model {
     /// Uses the model's output description to discover output feature names,
     /// then extracts each multi-array output into an [`OutputTensorData`].
     /// Non-multi-array outputs (e.g. dictionaries, images) are skipped.
-    pub fn extract_outputs(
-        &self,
-        output: &PredictionOutput,
-    ) -> anyhow::Result<Vec<OutputTensorData>> {
+    pub fn extract_outputs(&self, output: &PredictionOutput) -> Result<Vec<OutputTensorData>> {
         // SAFETY: Accessing the model description from a successfully loaded model.
         let desc = unsafe { self.inner.modelDescription() };
         // SAFETY: Accessing outputDescriptionsByName from a valid model description.
@@ -227,9 +269,9 @@ impl Model {
             let key: &NSString = &all_keys.objectAtIndex(i);
             let name = key.to_string();
 
-            let feat_value = output
-                .feature_value(&name)
-                .with_context(|| format!("missing output feature: {name}"))?;
+            let feat_value = output.feature_value(&name).ok_or_else(|| {
+                CoreMlError::FeatureDescription(format!("missing output feature: {name}"))
+            })?;
 
             // SAFETY: Querying the feature type enum from a valid feature value.
             if unsafe { feat_value.r#type() } != MLFeatureType::MultiArray {
@@ -237,8 +279,11 @@ impl Model {
             }
 
             // SAFETY: Accessing the multi-array value from a multi-array feature value.
-            let multi_array = unsafe { feat_value.multiArrayValue() }
-                .with_context(|| format!("output feature '{name}' has no multi-array value"))?;
+            let multi_array = unsafe { feat_value.multiArrayValue() }.ok_or_else(|| {
+                CoreMlError::FeatureDescription(format!(
+                    "output feature '{name}' has no multi-array value"
+                ))
+            })?;
 
             // SAFETY: Accessing the shape array from a valid multi-array.
             let shape_arr = unsafe { multi_array.shape() };
@@ -247,7 +292,10 @@ impl Model {
                 let num: &NSNumber = &shape_arr.objectAtIndex(j);
                 let dim = num.as_isize();
                 if dim < 0 {
-                    bail!("invalid negative dimension {} in output shape", dim);
+                    return Err(CoreMlError::Shape(format!(
+                        "invalid negative dimension {} in output shape",
+                        dim
+                    )));
                 }
                 shape.push(dim as usize);
             }
@@ -277,7 +325,7 @@ pub struct PredictionInput {
 
 impl PredictionInput {
     /// Create an empty prediction input.
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new() -> Result<Self> {
         let empty_dict: Retained<NSDictionary<NSString, objc2::runtime::AnyObject>> =
             NSDictionary::new();
         // SAFETY: Creating a dictionary feature provider from a valid (empty) NSDictionary.
@@ -287,7 +335,11 @@ impl PredictionInput {
                 &empty_dict,
             )
         }
-        .map_err(|e| anyhow::anyhow!("failed to create empty MLDictionaryFeatureProvider: {e}"))?;
+        .map_err(|e| {
+            CoreMlError::ObjcCreate(format!(
+                "failed to create empty MLDictionaryFeatureProvider: {e}"
+            ))
+        })?;
 
         Ok(Self { inner: provider })
     }
@@ -299,18 +351,20 @@ impl PredictionInput {
         shape: &[usize],
         data_type: MultiArrayDataType,
         data: &[f32],
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let total_elements: usize = shape
             .iter()
             .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-            .ok_or_else(|| anyhow::anyhow!("tensor shape {:?} causes size overflow", shape))?;
+            .ok_or_else(|| {
+                CoreMlError::Shape(format!("tensor shape {:?} causes size overflow", shape))
+            })?;
         if data.len() != total_elements {
-            bail!(
+            return Err(CoreMlError::Shape(format!(
                 "data length {} does not match shape {:?} (expected {})",
                 data.len(),
                 shape,
                 total_elements
-            );
+            )));
         }
 
         // Build NSArray<NSNumber> for shape
@@ -328,7 +382,7 @@ impl PredictionInput {
                 data_type.to_objc(),
             )
         }
-        .map_err(|e| anyhow::anyhow!("failed to create MLMultiArray: {e}"))?;
+        .map_err(|e| CoreMlError::ObjcCreate(format!("failed to create MLMultiArray: {e}")))?;
 
         // Fill the multi-array with data via indexed subscript (flat/linear indexing)
         for (i, &val) in data.iter().enumerate() {
@@ -376,7 +430,9 @@ impl PredictionInput {
                 &merged,
             )
         }
-        .map_err(|e| anyhow::anyhow!("failed to create MLDictionaryFeatureProvider: {e}"))?;
+        .map_err(|e| {
+            CoreMlError::ObjcCreate(format!("failed to create MLDictionaryFeatureProvider: {e}"))
+        })?;
 
         self.inner = provider;
         Ok(())
@@ -431,7 +487,7 @@ impl PredictionOutput {
     ///
     /// Non-multi-array features are skipped. Each element is extracted
     /// via indexed subscript from the underlying `MLMultiArray`.
-    pub fn extract_multi_arrays(&self) -> anyhow::Result<Vec<ExtractedOutput>> {
+    pub fn extract_multi_arrays(&self) -> Result<Vec<ExtractedOutput>> {
         let names = self.feature_names();
         let mut outputs = Vec::new();
 
@@ -456,7 +512,10 @@ impl PredictionOutput {
                 let num: &NSNumber = &shape_arr.objectAtIndex(j);
                 let dim = num.as_isize();
                 if dim < 0 {
-                    bail!("invalid negative dimension {} in output shape", dim);
+                    return Err(CoreMlError::Shape(format!(
+                        "invalid negative dimension {} in output shape",
+                        dim
+                    )));
                 }
                 shape.push(dim as usize);
             }
@@ -464,7 +523,9 @@ impl PredictionOutput {
             let total: usize = shape
                 .iter()
                 .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                .ok_or_else(|| anyhow::anyhow!("tensor shape {:?} causes size overflow", shape))?;
+                .ok_or_else(|| {
+                    CoreMlError::Shape(format!("tensor shape {:?} causes size overflow", shape))
+                })?;
             let mut data = Vec::with_capacity(total);
             for idx in 0..total {
                 // SAFETY: Accessing elements by index within the valid range [0, total).
@@ -499,14 +560,19 @@ pub struct OutputTensorData {
 // ── build_dummy_input ─────────────────────────────────────────────
 
 /// Build a dummy input (zeros) from a model's input description, suitable for benchmarking.
-pub fn build_dummy_input(desc: &InputDescription) -> anyhow::Result<PredictionInput> {
+pub fn build_dummy_input(desc: &InputDescription) -> Result<PredictionInput> {
     let mut input = PredictionInput::new()?;
     for feat in &desc.features {
         let total: usize = feat
             .shape
             .iter()
             .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-            .ok_or_else(|| anyhow::anyhow!("tensor shape {:?} causes size overflow", feat.shape))?;
+            .ok_or_else(|| {
+                CoreMlError::Shape(format!(
+                    "tensor shape {:?} causes size overflow",
+                    feat.shape
+                ))
+            })?;
         let data = vec![0.0f32; total];
         input.add_multi_array(&feat.name, &feat.shape, feat.data_type, &data)?;
     }

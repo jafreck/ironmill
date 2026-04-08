@@ -2,10 +2,29 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, anyhow};
 use mil_rs::ir::ScalarType;
 use mil_rs::weights::{Architecture, ModelConfig};
 use serde::{Deserialize, Serialize};
+
+/// Errors from GPU bundle manifest operations.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum GpuBundleError {
+    /// Unsupported or unknown scalar type.
+    #[error("{0}")]
+    ScalarType(String),
+
+    /// Invalid or missing manifest field.
+    #[error("{0}")]
+    Manifest(String),
+
+    /// Error parsing model architecture.
+    #[error("architecture parse error: {0}")]
+    Architecture(#[source] mil_rs::MilError),
+}
+
+/// Result type for GPU bundle operations.
+pub type Result<T> = std::result::Result<T, GpuBundleError>;
 
 // ── Manifest types ──────────────────────────────────────────────────────
 
@@ -145,7 +164,9 @@ pub fn scalar_type_to_str(dtype: ScalarType) -> Result<&'static str> {
         ScalarType::UInt32 => Ok("uint32"),
         ScalarType::UInt64 => Ok("uint64"),
         ScalarType::Bool => Ok("bool"),
-        _ => Err(anyhow!("unsupported scalar type: {dtype:?}")),
+        _ => Err(GpuBundleError::ScalarType(format!(
+            "unsupported scalar type: {dtype:?}"
+        ))),
     }
 }
 
@@ -164,7 +185,9 @@ pub fn str_to_scalar_type(s: &str) -> Result<ScalarType> {
         "uint32" => Ok(ScalarType::UInt32),
         "uint64" => Ok(ScalarType::UInt64),
         "bool" => Ok(ScalarType::Bool),
-        _ => Err(anyhow!("unknown scalar type: {s}")),
+        _ => Err(GpuBundleError::ScalarType(format!(
+            "unknown scalar type: {s}"
+        ))),
     }
 }
 
@@ -219,30 +242,30 @@ pub fn serialize_model_config(config: &ModelConfig) -> serde_json::Value {
 pub fn deserialize_model_config(value: &serde_json::Value) -> Result<ModelConfig> {
     let obj = value
         .as_object()
-        .ok_or_else(|| anyhow!("model_config must be an object"))?;
+        .ok_or_else(|| GpuBundleError::Manifest("model_config must be an object".into()))?;
 
     let get_str = |key: &str| -> Result<&str> {
         obj.get(key)
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing string field: {key}"))
+            .ok_or_else(|| GpuBundleError::Manifest(format!("missing string field: {key}")))
     };
 
     let get_usize = |key: &str| -> Result<usize> {
         obj.get(key)
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
-            .ok_or_else(|| anyhow!("missing integer field: {key}"))
+            .ok_or_else(|| GpuBundleError::Manifest(format!("missing integer field: {key}")))
     };
 
     let get_f64 = |key: &str| -> Result<f64> {
         obj.get(key)
             .and_then(|v| v.as_f64())
-            .ok_or_else(|| anyhow!("missing float field: {key}"))
+            .ok_or_else(|| GpuBundleError::Manifest(format!("missing float field: {key}")))
     };
 
     let architecture: Architecture = get_str("architecture")?
         .parse()
-        .map_err(|e: mil_rs::MilError| anyhow!(e.to_string()))?;
+        .map_err(GpuBundleError::Architecture)?;
 
     let extra = obj
         .get("extra")

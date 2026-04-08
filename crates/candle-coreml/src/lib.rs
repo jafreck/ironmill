@@ -15,7 +15,7 @@
 //!
 //! let result = convert_onnx("model.onnx", "model.mlpackage", ConvertOptions::default())?;
 //! println!("converted to {}", result.mlpackage.display());
-//! # Ok::<(), anyhow::Error>(())
+//! # Ok::<(), ironmill_compile::error::CompileError>(())
 //! ```
 
 #![forbid(unsafe_code)]

@@ -82,8 +82,8 @@ pub mod coreml_runtime {
     use std::path::Path;
 
     pub use ironmill_coreml_sys::{
-        ComputeUnits, ExtractedOutput, InputDescription, InputFeature, Model, MultiArrayDataType,
-        OutputTensorData, PredictionInput, PredictionOutput, build_dummy_input,
+        ComputeUnits, CoreMlError, ExtractedOutput, InputDescription, InputFeature, Model,
+        MultiArrayDataType, OutputTensorData, PredictionInput, PredictionOutput, build_dummy_input,
     };
 
     /// Build a [`PredictionInput`] from named f32 tensor slices.
@@ -91,7 +91,9 @@ pub mod coreml_runtime {
     /// This is the common input-building pattern shared by framework bridge
     /// crates (`burn-coreml`, `candle-coreml`). Each entry is
     /// `(name, shape, data)`.
-    pub fn build_f32_input(inputs: &[(&str, &[usize], &[f32])]) -> anyhow::Result<PredictionInput> {
+    pub fn build_f32_input(
+        inputs: &[(&str, &[usize], &[f32])],
+    ) -> Result<PredictionInput, CoreMlError> {
         let mut pi = PredictionInput::new()?;
         for &(name, shape, data) in inputs {
             pi.add_multi_array(name, shape, MultiArrayDataType::Float32, data)?;
@@ -131,13 +133,13 @@ pub mod coreml_runtime {
 
     impl CoreMlSession {
         /// Load a compiled CoreML model (`.mlmodelc` or `.mlpackage`).
-        pub fn load(path: &Path, compute_units: ComputeUnits) -> anyhow::Result<Self> {
+        pub fn load(path: &Path, compute_units: ComputeUnits) -> Result<Self, CoreMlError> {
             let model = Model::load(path, compute_units)?;
             Ok(Self { model })
         }
 
         /// Get descriptions of the model's expected inputs.
-        pub fn input_description(&self) -> anyhow::Result<Vec<SessionInputDesc>> {
+        pub fn input_description(&self) -> Result<Vec<SessionInputDesc>, CoreMlError> {
             let desc = self.model.input_description()?;
             Ok(desc
                 .features
@@ -156,7 +158,7 @@ pub mod coreml_runtime {
         pub fn predict(
             &self,
             inputs: &[(&str, &[usize], &[f32])],
-        ) -> anyhow::Result<Vec<SessionOutput>> {
+        ) -> Result<Vec<SessionOutput>, CoreMlError> {
             let output = self.predict_raw(inputs)?;
             let extracted = self.model.extract_outputs(&output)?;
 
@@ -176,7 +178,7 @@ pub mod coreml_runtime {
         pub fn predict_raw(
             &self,
             inputs: &[(&str, &[usize], &[f32])],
-        ) -> anyhow::Result<PredictionOutput> {
+        ) -> Result<PredictionOutput, CoreMlError> {
             let pi = build_f32_input(inputs)?;
             self.model.predict(&pi)
         }

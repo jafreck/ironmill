@@ -11,6 +11,7 @@ use std::path::Path;
 
 use ironmill_compile::coreml::build_api::convert_to_coreml;
 pub use ironmill_compile::coreml::build_api::{Quantization, TargetComputeUnit};
+pub use ironmill_compile::error::CompileError;
 
 /// Options for exporting to CoreML.
 ///
@@ -44,18 +45,14 @@ pub type ExportResult = ironmill_compile::coreml::build_api::ConvertOutput;
 ///     ExportOptions::default(),
 /// )?;
 /// println!("exported to {}", result.mlpackage.display());
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), CompileError>(())
 /// ```
 pub fn export_to_coreml(
     onnx_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     options: ExportOptions,
-) -> anyhow::Result<ExportResult> {
-    Ok(convert_to_coreml(
-        onnx_path.as_ref(),
-        output_path.as_ref(),
-        options,
-    )?)
+) -> Result<ExportResult, CompileError> {
+    convert_to_coreml(onnx_path.as_ref(), output_path.as_ref(), options)
 }
 
 #[cfg(test)]

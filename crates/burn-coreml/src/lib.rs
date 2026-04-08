@@ -25,7 +25,7 @@
 //!
 //! let result = export_to_coreml("model.onnx", "model.mlpackage", ExportOptions::default())?;
 //! println!("exported to {}", result.mlpackage.display());
-//! # Ok::<(), anyhow::Error>(())
+//! # Ok::<(), ironmill_compile::error::CompileError>(())
 //! ```
 
 #![forbid(unsafe_code)]

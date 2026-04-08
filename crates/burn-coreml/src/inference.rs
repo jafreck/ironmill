@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use ironmill_inference::coreml_runtime::{ComputeUnits, CoreMlSession};
+use ironmill_inference::coreml_runtime::{ComputeUnits, CoreMlError, CoreMlSession};
 
 pub use ironmill_inference::coreml_runtime::SessionInputDesc as InputDesc;
 pub use ironmill_inference::coreml_runtime::SessionOutput as InferenceOutput;
@@ -28,7 +28,7 @@ pub use ironmill_inference::coreml_runtime::SessionOutput as InferenceOutput;
 /// for output in &outputs {
 ///     println!("{}: shape {:?}, {} values", output.name, output.shape, output.data.len());
 /// }
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), CoreMlError>(())
 /// ```
 pub struct CoreMlInference {
     session: CoreMlSession,
@@ -41,13 +41,13 @@ impl CoreMlInference {
     ///
     /// * `path` — Path to a compiled `.mlmodelc` bundle
     /// * `compute_units` — Which hardware to use for inference
-    pub fn load(path: impl AsRef<Path>, compute_units: ComputeUnits) -> anyhow::Result<Self> {
+    pub fn load(path: impl AsRef<Path>, compute_units: ComputeUnits) -> Result<Self, CoreMlError> {
         let session = CoreMlSession::load(path.as_ref(), compute_units)?;
         Ok(Self { session })
     }
 
     /// Get descriptions of the model's expected inputs.
-    pub fn input_description(&self) -> anyhow::Result<Vec<InputDesc>> {
+    pub fn input_description(&self) -> Result<Vec<InputDesc>, CoreMlError> {
         self.session.input_description()
     }
 
@@ -58,7 +58,7 @@ impl CoreMlInference {
     pub fn predict(
         &self,
         inputs: &[(&str, &[usize], &[f32])],
-    ) -> anyhow::Result<Vec<InferenceOutput>> {
+    ) -> Result<Vec<InferenceOutput>, CoreMlError> {
         self.session.predict(inputs)
     }
 
@@ -69,7 +69,7 @@ impl CoreMlInference {
     pub fn predict_raw(
         &self,
         inputs: &[(&str, &[usize], &[f32])],
-    ) -> anyhow::Result<ironmill_inference::coreml_runtime::PredictionOutput> {
+    ) -> Result<ironmill_inference::coreml_runtime::PredictionOutput, CoreMlError> {
         self.session.predict_raw(inputs)
     }
 }

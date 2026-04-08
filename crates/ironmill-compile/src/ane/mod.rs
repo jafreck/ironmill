@@ -37,6 +37,18 @@ pub enum AneCompileError {
         /// Maximum compilations allowed per process.
         limit: usize,
     },
+    /// I/O error during ANE bundle operations.
+    #[error("ANE I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// JSON serialization/deserialization error.
+    #[error("ANE serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    /// Error from the MIL IR layer.
+    #[error(transparent)]
+    Mil(#[from] mil_rs::error::MilError),
+    /// Error from the compilation pipeline.
+    #[error(transparent)]
+    Compile(#[from] crate::error::CompileError),
     /// Opaque error forwarded from an underlying subsystem.
     #[error(transparent)]
     Other(#[from] anyhow::Error),

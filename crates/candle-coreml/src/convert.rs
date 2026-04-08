@@ -18,13 +18,14 @@
 //!     ..Default::default()
 //! };
 //! let result = convert_onnx("model.onnx", "model.mlpackage", opts)?;
-//! # Ok::<(), anyhow::Error>(())
+//! # Ok::<(), ironmill_compile::error::CompileError>(())
 //! ```
 
 use std::path::Path;
 
 use ironmill_compile::coreml::build_api::convert_to_coreml;
 pub use ironmill_compile::coreml::build_api::{Quantization, TargetComputeUnit};
+pub use ironmill_compile::error::CompileError;
 
 /// Options for ONNX → CoreML conversion.
 ///
@@ -53,15 +54,14 @@ pub type ConvertResult = ironmill_compile::coreml::build_api::ConvertOutput;
 ///
 /// let result = convert_onnx("model.onnx", "out.mlpackage", ConvertOptions::default())?;
 /// println!("wrote {}", result.mlpackage.display());
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), CompileError>(())
 /// ```
 pub fn convert_onnx(
     onnx_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     options: ConvertOptions,
-) -> anyhow::Result<ConvertResult> {
+) -> Result<ConvertResult, CompileError> {
     convert_to_coreml(onnx_path.as_ref(), output_path.as_ref(), options)
-        .map_err(|e| anyhow::anyhow!("ONNX to CoreML conversion failed: {e}"))
 }
 
 #[cfg(test)]

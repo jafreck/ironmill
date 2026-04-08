@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
+use super::Result;
 use half::f16;
 
 use mil_rs::ir::passes::{
@@ -556,7 +556,9 @@ fn classify_subprograms(programs: &[SubProgram]) -> Result<ClassifiedSubprograms
 
     let layer_numbers: Vec<usize> = pre_attn.keys().copied().collect();
     if layer_numbers.is_empty() {
-        anyhow::bail!("no layer sub-programs found after attention splitting");
+        return Err(
+            anyhow::anyhow!("no layer sub-programs found after attention splitting").into(),
+        );
     }
 
     Ok(ClassifiedSubprograms {
@@ -946,16 +948,20 @@ impl AneDecodeBundle {
             if let Some((first_q, _first_k)) = qk_norms.first() {
                 let expected_len = first_q.len();
                 for (i, (q, k)) in qk_norms.iter().enumerate() {
-                    anyhow::ensure!(
-                        q.len() == expected_len,
-                        "QK norm layer {i}: Q-norm weight length {} != expected {expected_len}",
-                        q.len(),
-                    );
-                    anyhow::ensure!(
-                        k.len() == expected_len,
-                        "QK norm layer {i}: K-norm weight length {} != expected {expected_len}",
-                        k.len(),
-                    );
+                    if q.len() != expected_len {
+                        return Err(anyhow::anyhow!(
+                            "QK norm layer {i}: Q-norm weight length {} != expected {expected_len}",
+                            q.len(),
+                        )
+                        .into());
+                    }
+                    if k.len() != expected_len {
+                        return Err(anyhow::anyhow!(
+                            "QK norm layer {i}: K-norm weight length {} != expected {expected_len}",
+                            k.len(),
+                        )
+                        .into());
+                    }
                 }
             }
             // Concatenate all layers' Q-norm weights: [num_layers × head_dim] f16 LE bytes.

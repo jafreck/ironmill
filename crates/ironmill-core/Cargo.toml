@@ -16,5 +16,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 half = { workspace = true }
-anyhow = { workspace = true }
 tokenizers = { version = "0.21", optional = true }
