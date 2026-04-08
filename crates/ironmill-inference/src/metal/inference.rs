@@ -42,7 +42,7 @@ mod calibration_tests {
             };
             // These calls would fail at runtime (no model loaded), but they
             // prove the API compiles.
-            let _ = engine.run_pipeline_calibration(&[1, 2, 3], &mut callback);
+            let _ = engine.run_pipeline_calibration(&[1, 2, 3], &mut callback, None);
             let _ = engine.prefill_calibration(&[1, 2, 3], &mut callback);
         }
 

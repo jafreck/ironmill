@@ -80,10 +80,28 @@ pub struct AffineQuantConfig {
     /// GPTQ Hessian dampening factor (default: 0.01).
     #[cfg(feature = "gptq")]
     pub gptq_dampening: f64,
+    /// Precomputed per-tensor AWQ configs from block-level calibration.
+    /// When present, bypasses both alpha search and clip search at load time.
+    /// Keyed by AWQ key format (e.g. "l0_q_proj_weight").
+    pub awq_block_config: Option<std::collections::HashMap<String, AwqTensorConfig>>,
     /// Layer indices to quantize at INT8 instead of INT4.
     /// Typically the first and last 1-2 layers, which handle the
     /// embedding→hidden and hidden→logit transformations.
     pub sensitive_layers: Vec<usize>,
+}
+
+/// Precomputed per-tensor AWQ parameters from block-level calibration.
+///
+/// Produced by the `awq_block_calibrate` tool which runs full transformer
+/// block forwards on GPU to find optimal scaling and clipping parameters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AwqTensorConfig {
+    /// Optimal alpha from block-level search.
+    pub alpha: f32,
+    /// Per-(row, group) clip max values, flattened as `[out_features × n_groups]`.
+    /// `None` means no clipping (e.g. for Q/K projections per reference AWQ).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_maxvals: Option<Vec<f32>>,
 }
 
 impl AffineQuantConfig {
@@ -94,6 +112,7 @@ impl AffineQuantConfig {
             awq_magnitudes: None,
             awq_activations: None,
             awq_token_count: None,
+            awq_block_config: None,
             #[cfg(feature = "gptq")]
             hessian_data: None,
             #[cfg(feature = "gptq")]
@@ -114,6 +133,7 @@ impl AffineQuantConfig {
             awq_magnitudes: Some(magnitudes),
             awq_activations: None,
             awq_token_count: None,
+            awq_block_config: None,
             #[cfg(feature = "gptq")]
             hessian_data: None,
             #[cfg(feature = "gptq")]
@@ -136,6 +156,32 @@ impl AffineQuantConfig {
             awq_magnitudes: Some(magnitudes),
             awq_activations: Some(activations),
             awq_token_count: Some(token_count),
+            awq_block_config: None,
+            #[cfg(feature = "gptq")]
+            hessian_data: None,
+            #[cfg(feature = "gptq")]
+            gptq_block_size: 128,
+            #[cfg(feature = "gptq")]
+            gptq_dampening: 0.01,
+            sensitive_layers: Vec::new(),
+        }
+    }
+
+    /// INT4 with precomputed AWQ block-level config.
+    ///
+    /// Uses pre-calibrated alpha and clip values from block-level search,
+    /// bypassing load-time alpha search and clip search entirely.
+    pub fn int4_awq_block(
+        group_size: usize,
+        magnitudes: std::collections::HashMap<String, Vec<f32>>,
+        block_config: std::collections::HashMap<String, AwqTensorConfig>,
+    ) -> Self {
+        Self {
+            group_size,
+            awq_magnitudes: Some(magnitudes),
+            awq_activations: None,
+            awq_token_count: None,
+            awq_block_config: Some(block_config),
             #[cfg(feature = "gptq")]
             hessian_data: None,
             #[cfg(feature = "gptq")]
@@ -208,6 +254,7 @@ impl Default for AffineQuantConfig {
             awq_magnitudes: None,
             awq_activations: None,
             awq_token_count: None,
+            awq_block_config: None,
             #[cfg(feature = "gptq")]
             hessian_data: None,
             #[cfg(feature = "gptq")]
@@ -912,6 +959,7 @@ fn quantize_tensor_int4_awq(
     alpha: Option<f32>,
     awq_activations: Option<&Vec<f32>>,
     awq_token_count: Option<usize>,
+    precomputed_clips: Option<&Vec<f32>>,
 ) -> (Vec<u8>, QuantizationInfo) {
     let awq_scales = if let Some(mags) = awq_magnitudes {
         let alpha = alpha.unwrap_or(0.5);
@@ -946,9 +994,20 @@ fn quantize_tensor_int4_awq(
     // This is where most of AWQ's quality gain comes from — outliers in a
     // 128-element group force a wide quantization range, wasting precision.
     if awq_magnitudes.is_some() && shape.len() == 2 {
-        if let (Some(acts), Some(tc)) = (awq_activations, awq_token_count) {
-            let out_features = shape[0];
-            let in_features = shape[1];
+        let out_features = shape[0];
+        let in_features = shape[1];
+
+        if let Some(clips) = precomputed_clips {
+            // Use precomputed clip values directly
+            apply_clip(
+                &mut scaled_floats,
+                out_features,
+                in_features,
+                config.group_size,
+                clips,
+            );
+        } else if let (Some(acts), Some(tc)) = (awq_activations, awq_token_count) {
+            // Fall back to runtime clip search
             if tc > 0 && acts.len() >= tc * in_features {
                 let clip_maxvals = search_clip_ranges(
                     &scaled_floats,
@@ -1091,21 +1150,31 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                     .and_then(|a| a.get(&awq_key));
                 let awq_tc = config.awq_token_count;
 
-                // Resolve alpha: check cache, then search, then fall back to None (→ 0.5).
-                let resolved_alpha = awq_mags.and_then(|mags| {
-                    let cache_key = magnitude_cache_key(mags);
-                    if let Some(&alpha) = self.alpha_cache.lock().unwrap().get(&cache_key) {
-                        return Some(alpha);
-                    }
-                    let tc = awq_tc?;
-                    let acts = awq_acts?;
-                    if t.shape.len() != 2 || tc == 0 || acts.len() < tc * last_dim {
-                        return None;
-                    }
-                    let alpha =
-                        search_best_alpha(&floats, &t.shape, mags, acts, tc, config.group_size);
-                    self.alpha_cache.lock().unwrap().insert(cache_key, alpha);
-                    Some(alpha)
+                // Check for precomputed block-level config first.
+                let (precomputed_alpha, precomputed_clips) = config
+                    .awq_block_config
+                    .as_ref()
+                    .and_then(|bc| bc.get(&awq_key))
+                    .map(|tc| (Some(tc.alpha), tc.clip_maxvals.as_ref()))
+                    .unwrap_or((None, None));
+
+                // Resolve alpha: precomputed > cache > search > default 0.5
+                let resolved_alpha = precomputed_alpha.or_else(|| {
+                    awq_mags.and_then(|mags| {
+                        let cache_key = magnitude_cache_key(mags);
+                        if let Some(&alpha) = self.alpha_cache.lock().unwrap().get(&cache_key) {
+                            return Some(alpha);
+                        }
+                        let tc = awq_tc?;
+                        let acts = awq_acts?;
+                        if t.shape.len() != 2 || tc == 0 || acts.len() < tc * last_dim {
+                            return None;
+                        }
+                        let alpha =
+                            search_best_alpha(&floats, &t.shape, mags, acts, tc, config.group_size);
+                        self.alpha_cache.lock().unwrap().insert(cache_key, alpha);
+                        Some(alpha)
+                    })
                 });
 
                 quantize_tensor_int4_awq(
@@ -1116,6 +1185,7 @@ impl<P: WeightProvider> WeightProvider for QuantizedWeightProvider<P> {
                     resolved_alpha,
                     awq_acts,
                     awq_tc,
+                    precomputed_clips,
                 )
             }
         };
@@ -1254,12 +1324,28 @@ mod tests {
         let config = AffineQuantConfig::int4(128);
 
         // Call without activations.
-        let (packed1, _info1) =
-            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None, None, None);
+        let (packed1, _info1) = quantize_tensor_int4_awq(
+            &floats,
+            &[out, inf],
+            &config,
+            Some(&mags),
+            None,
+            None,
+            None,
+            None,
+        );
 
         // Call again — should be deterministic with same fixed alpha.
-        let (packed2, _info2) =
-            quantize_tensor_int4_awq(&floats, &[out, inf], &config, Some(&mags), None, None, None);
+        let (packed2, _info2) = quantize_tensor_int4_awq(
+            &floats,
+            &[out, inf],
+            &config,
+            Some(&mags),
+            None,
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(packed1, packed2, "fixed-alpha path should be deterministic");
     }
@@ -1427,8 +1513,7 @@ mod tests {
         // RTN path (no AWQ scales).
         let config_rtn = AffineQuantConfig::int4(group_size);
         let (rtn_packed, _) =
-            quantize_tensor_int4_awq(&floats, &shape, &config_rtn, None, None, None, None);
-
+            quantize_tensor_int4_awq(&floats, &shape, &config_rtn, None, None, None, None, None);
         // They should produce different packed bytes.
         assert_ne!(
             gptq_packed, rtn_packed,
@@ -1471,8 +1556,16 @@ mod tests {
 
         // Also get RTN result for comparison.
         let config_rtn = AffineQuantConfig::int4(128);
-        let (rtn_packed, _) =
-            quantize_tensor_int4_awq(&floats, &[out, inf], &config_rtn, None, None, None, None);
+        let (rtn_packed, _) = quantize_tensor_int4_awq(
+            &floats,
+            &[out, inf],
+            &config_rtn,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         // Simulate the dispatch logic from WeightProvider::tensor().
         let shape = vec![out, inf];

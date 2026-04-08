@@ -125,7 +125,7 @@ impl MetalInference {
     /// The `layer_callback` is invoked after each transformer layer with:
     /// - `layer_index`: the 0-based layer number
     /// - `projection_name`: one of `"attn_norm"`, `"ffn_norm"`, `"o_proj_input"`,
-    ///   or `"down_proj_input"`
+    ///   `"down_proj_input"`, or `"block_output"`
     /// - `raw_bytes`: the FP16 activation data (token_count × n_features × 2 bytes)
     /// - `n_features`: number of features per token for this capture point
     ///
@@ -134,6 +134,7 @@ impl MetalInference {
         &mut self,
         token_ids: &[u32],
         layer_callback: &mut dyn FnMut(usize, &str, &[u8], usize),
+        stop_after_layer: Option<usize>,
     ) -> Result<Logits, InferenceError> {
         let total_start = Instant::now();
 
@@ -872,6 +873,42 @@ impl MetalInference {
                     "Metal command buffer failed (layer {layer_idx} FFN phase)"
                 )));
             }
+
+            // ── Capture block output (full hidden state after layer) ──
+            {
+                let rb_start = Instant::now();
+                let mut readback_u16 = vec![0u16; norm_readback_bytes / 2];
+                #[allow(unsafe_code)]
+                let readback = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        readback_u16.as_mut_ptr() as *mut u8,
+                        norm_readback_bytes,
+                    )
+                };
+                bufs.hidden_state
+                    .read_bytes(readback, 0)
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                readback_time_ms += rb_start.elapsed().as_secs_f64() * 1000.0;
+                layer_callback(layer_idx, "block_output", readback, h);
+            }
+
+            // ── Stop after specified layer (skip final norm + LM head) ──
+            if stop_after_layer == Some(layer_idx) {
+                self.seq_pos += token_count;
+                if enable_tq {
+                    if let Some(kv) = self.kv_cache.as_mut() {
+                        kv.advance_by(token_count)?;
+                    }
+                } else if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
+                    fp16_kv.seq_pos += token_count;
+                }
+                if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
+                    mla_kv
+                        .advance_by(token_count)
+                        .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                }
+                return Ok(Vec::new());
+            }
         }
 
         // ── Final norm + LM head ────────────────────────────────
@@ -949,8 +986,8 @@ impl MetalInference {
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         let num_layers = mc.num_hidden_layers;
-        // 2 captures per layer: attn_norm + ffn_norm
-        let captures_per_layer = 2;
+        // 3 captures per layer: attn_norm + ffn_norm + block_output
+        let captures_per_layer = 3;
         let total_captures = num_layers * captures_per_layer;
         // 3 command buffers per layer (embedding, attn, ffn) + 1 final
         let total_commits = 1 + num_layers * 2 + 1;
@@ -992,7 +1029,7 @@ impl MetalInference {
         if tokens.is_empty() {
             return Err(InferenceError::Decode("empty calibration tokens".into()));
         }
-        self.run_pipeline_calibration(tokens, layer_callback)
+        self.run_pipeline_calibration(tokens, layer_callback, None)
     }
 
     /// Run the full forward pass with [`ActivationHook`] callbacks.
@@ -1007,10 +1044,14 @@ impl MetalInference {
         token_ids: &[u32],
         hooks: &mut dyn ActivationHook,
     ) -> Result<Logits, InferenceError> {
-        self.run_pipeline_calibration(token_ids, &mut |layer, name, raw_bytes, n_features| {
-            let f16_data = bytes_as_f16(raw_bytes);
-            hooks.on_linear_input(layer, name, f16_data, n_features);
-        })
+        self.run_pipeline_calibration(
+            token_ids,
+            &mut |layer, name, raw_bytes, n_features| {
+                let f16_data = bytes_as_f16(raw_bytes);
+                hooks.on_linear_input(layer, name, f16_data, n_features);
+            },
+            None,
+        )
     }
 
     /// Prefill with [`ActivationHook`] callbacks — the calibration-mode
@@ -1028,5 +1069,572 @@ impl MetalInference {
             return Err(InferenceError::Decode("empty calibration tokens".into()));
         }
         self.run_pipeline_with_hooks(tokens, hooks)
+    }
+
+    /// Run a single transformer layer forward on GPU.
+    ///
+    /// Writes `input_hidden_state` to the engine's hidden_state buffer,
+    /// computes the input norm for `layer_idx`, then runs the calibration
+    /// pipeline through just that one layer. Returns the output hidden
+    /// state as raw FP16 bytes.
+    ///
+    /// The engine is reset before execution (seq_pos = 0, KV cache cleared).
+    pub fn run_single_layer(
+        &mut self,
+        layer_idx: usize,
+        input_hidden_state: &[u8],
+        token_count: usize,
+    ) -> Result<Vec<u8>, InferenceError> {
+        // 1. Reset engine state.
+        InferenceEngine::reset(self);
+
+        // 2. Ensure intermediate buffers are large enough for this token count.
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
+        self.intermediate_buffers
+            .as_mut()
+            .ok_or(InferenceError::NotLoaded)?
+            .ensure_capacity(&self.device, token_count, &mc, self.gemma4_config.as_ref())
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        // 3. Write input to hidden_state buffer.
+        let bufs = self
+            .intermediate_buffers
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?;
+        bufs.hidden_state
+            .write_bytes(input_hidden_state, 0)
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        // 4. Compute input norm for this layer.
+        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let h = mc.hidden_size;
+        let eps = mc.rms_norm_eps as f32;
+        let lw = &weights.layers[layer_idx];
+
+        let cmd_buf = self
+            .queue
+            .command_buffer()
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        {
+            let enc = cmd_buf
+                .compute_encoder()
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            ops::encode_rms_norm(
+                &enc,
+                &self.pipelines()?.rms_norm,
+                &ops::RmsNormParams {
+                    input: &bufs.hidden_state,
+                    weight: &lw.input_norm,
+                    output: &bufs.norm_out,
+                    hidden_size: h as u32,
+                    token_count: token_count as u32,
+                    eps,
+                },
+            );
+            enc.end_encoding();
+        }
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        // 5. Run one layer via the calibration pipeline.
+        self.run_pipeline_calibration_from_layer(layer_idx, token_count)?;
+
+        // 6. Readback hidden_state (block output).
+        let bufs = self
+            .intermediate_buffers
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?;
+        let output_bytes = token_count * h * 2; // FP16
+        let mut output = vec![0u8; output_bytes];
+        bufs.hidden_state
+            .read_bytes(&mut output, 0)
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        Ok(output)
+    }
+
+    /// Run a single transformer layer's forward pass (attention + FFN +
+    /// residual), assuming `hidden_state` and `norm_out` are already
+    /// populated by the caller.
+    fn run_pipeline_calibration_from_layer(
+        &mut self,
+        layer_idx: usize,
+        token_count: usize,
+    ) -> Result<(), InferenceError> {
+        let weights = self.weights.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let mc = self
+            .model_config
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?
+            .clone();
+
+        self.intermediate_buffers
+            .as_mut()
+            .ok_or(InferenceError::NotLoaded)?
+            .ensure_capacity(&self.device, token_count, &mc, self.gemma4_config.as_ref())
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        let bufs = self
+            .intermediate_buffers
+            .as_ref()
+            .ok_or(InferenceError::NotLoaded)?;
+        let rope_cos = self.rope_cos.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let rope_sin = self.rope_sin.as_ref().ok_or(InferenceError::NotLoaded)?;
+        let seq_pos = self.seq_pos;
+
+        let h = mc.hidden_size;
+        let nh = mc.num_attention_heads as u32;
+        let nkv = mc.num_kv_heads() as u32;
+        let hd = mc.head_dim as u32;
+        let inter = mc.intermediate_size;
+        let eps = mc.rms_norm_eps as f32;
+        let enable_tq = self.config.enable_turboquant && self.turboquant.is_some();
+
+        // Build or reuse MPS matmul cache for this token count.
+        let need_rebuild = self
+            .decode_matmuls
+            .as_ref()
+            .is_none_or(|c| c.token_count != token_count);
+        if need_rebuild {
+            let cache = build_matmul_cache(
+                &self.device,
+                &mc,
+                self.gemma4_config.as_ref(),
+                weights,
+                token_count,
+            )
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            self.decode_matmuls = Some(cache);
+        }
+
+        let lw = &weights.layers[layer_idx];
+
+        // Gemma 4: use per-layer config if available.
+        let (layer_hd, layer_nkv, layer_window, layer_inter) =
+            if let Some(ref g4) = self.gemma4_config {
+                let lc = &g4.layer_configs[layer_idx];
+                (
+                    lc.head_dim as u32,
+                    lc.num_kv_heads as u32,
+                    lc.window_size,
+                    lc.intermediate_size,
+                )
+            } else {
+                (hd, nkv, self.config.layer_window_size(layer_idx), inter)
+            };
+
+        let is_gdn = lw.gdn_in_proj_qkv.is_some();
+
+        // GDN layers need scratch capacity grown before taking immutable borrows.
+        if is_gdn {
+            let gdn_mut = self
+                .gdn_state
+                .as_mut()
+                .ok_or_else(|| InferenceError::runtime("GDN state not initialized"))?;
+            gdn_mut
+                .ensure_scratch_capacity(&self.device, token_count, h)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        }
+
+        // ── Attention phase ─────────────────────────────────────
+        let mut cmd_buf = self
+            .queue
+            .command_buffer()
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        let mut enc = cmd_buf
+            .compute_encoder()
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        let default_pipelines = self.pipelines()?;
+
+        let pipelines = if self.global_head_dim > 0
+            && layer_hd as usize == self.global_head_dim
+            && self.global_head_dim != mc.head_dim
+        {
+            self.global_pipelines.as_ref().unwrap_or(default_pipelines)
+        } else {
+            default_pipelines
+        };
+
+        if is_gdn {
+            let gdn = self
+                .gdn_state
+                .as_ref()
+                .ok_or_else(|| InferenceError::runtime("GDN state not initialized"))?;
+            let gdn_idx = gdn.gdn_index_for_layer(layer_idx).ok_or_else(|| {
+                InferenceError::runtime(format!("layer {layer_idx} is not a GDN layer"))
+            })?;
+            encode_gdn_prefill(&enc, bufs, gdn, lw, pipelines, gdn_idx, token_count, h, eps)?;
+            enc.memory_barrier_buffers();
+        } else {
+            // Standard attention: Q/K/V projections.
+            let qkv_out_features = mc.num_attention_heads * layer_hd as usize;
+            let kv_out_features = layer_nkv as usize * layer_hd as usize;
+            for (weight, output_buf, out_features) in [
+                (&lw.q_proj, &bufs.q_proj, qkv_out_features),
+                (&lw.k_proj, &bufs.k_proj, kv_out_features),
+                (&lw.v_proj, &bufs.v_proj, kv_out_features),
+            ] {
+                encode_projection(
+                    &enc,
+                    &bufs.norm_out,
+                    weight,
+                    output_buf,
+                    pipelines,
+                    token_count,
+                    out_features,
+                    h,
+                )?;
+            }
+            enc.memory_barrier_buffers();
+
+            // Qwen3.5 attn_output_gate.
+            if let (Some(gate_w), Some(gate_buf)) = (&lw.attn_output_gate, &bufs.q_gate) {
+                encode_projection(
+                    &enc,
+                    &bufs.norm_out,
+                    gate_w,
+                    gate_buf,
+                    pipelines,
+                    token_count,
+                    qkv_out_features,
+                    h,
+                )?;
+                enc.memory_barrier_buffers();
+            }
+
+            // QK normalization + RoPE.
+            let (layer_rope_cos, layer_rope_sin) = if let Some(ref g4) = self.gemma4_config {
+                let lc = &g4.layer_configs[layer_idx];
+                if lc.is_global {
+                    (
+                        self.global_rope_cos.as_ref().unwrap_or(rope_cos),
+                        self.global_rope_sin.as_ref().unwrap_or(rope_sin),
+                    )
+                } else {
+                    (rope_cos, rope_sin)
+                }
+            } else {
+                (rope_cos, rope_sin)
+            };
+            encode_qk_norm_and_rope(
+                &enc,
+                pipelines,
+                bufs,
+                lw.q_norm.as_ref(),
+                lw.k_norm.as_ref(),
+                layer_rope_cos,
+                layer_rope_sin,
+                nh,
+                layer_nkv,
+                layer_hd,
+                seq_pos,
+                token_count,
+                eps,
+            )?;
+            enc.memory_barrier_buffers();
+
+            // KV cache write + attention.
+            let is_anchor = self
+                .config
+                .cla_config
+                .as_ref()
+                .is_none_or(|cla| cla.is_anchor(layer_idx));
+
+            let (is_anchor, kv_cache_layer) = if let Some(ref g4) = self.gemma4_config {
+                if let Some(anchor) = g4.layer_configs[layer_idx].kv_anchor {
+                    (false, anchor)
+                } else {
+                    (is_anchor, layer_idx)
+                }
+            } else {
+                (is_anchor, layer_idx)
+            };
+
+            let attn_scale = mc.attn_scale();
+
+            encode_kv_cache_and_attention(
+                &enc,
+                pipelines,
+                bufs,
+                self.turboquant.as_ref(),
+                self.kv_cache.as_ref(),
+                self.fp16_kv_cache.as_ref(),
+                self.config.max_seq_len,
+                self.config.n_bits as usize,
+                kv_cache_layer,
+                seq_pos,
+                token_count,
+                nh,
+                layer_nkv,
+                layer_hd,
+                enable_tq,
+                is_anchor,
+                layer_window,
+                attn_scale,
+                self.gpu_max_threadgroups,
+            )?;
+            enc.memory_barrier_buffers();
+
+            // Qwen3.5 attn_output_gate: apply sigmoid(gate).
+            if let Some(gate_buf) = &bufs.q_gate {
+                let gate_size = (token_count * mc.num_attention_heads * mc.head_dim) as u32;
+                ops::encode_sigmoid_gate(
+                    &enc,
+                    &pipelines.sigmoid_gate,
+                    &bufs.attn_out,
+                    gate_buf,
+                    gate_size,
+                );
+                enc.memory_barrier_buffers();
+            }
+
+            // Output projection.
+            let attn_out_features = mc.num_attention_heads * layer_hd as usize;
+            encode_projection(
+                &enc,
+                &bufs.attn_out,
+                &lw.o_proj,
+                &bufs.ffn_down,
+                pipelines,
+                token_count,
+                h,
+                attn_out_features,
+            )?;
+            enc.memory_barrier_buffers();
+
+            // Residual add + post-attention RMSNorm.
+            if let Some(pre_ffn) = &lw.pre_ffn_norm {
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.ffn_down,
+                        weight: &lw.post_attn_norm,
+                        output: &bufs.ffn_down,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+                enc.memory_barrier_buffers();
+                ops::encode_residual_add(
+                    &enc,
+                    &pipelines.residual_add,
+                    &bufs.hidden_state,
+                    &bufs.ffn_down,
+                    &bufs.residual,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+                ops::encode_rms_norm(
+                    &enc,
+                    &pipelines.rms_norm,
+                    &ops::RmsNormParams {
+                        input: &bufs.residual,
+                        weight: pre_ffn,
+                        output: &bufs.norm_out,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                        eps,
+                    },
+                );
+            } else {
+                ops::encode_fused_residual_rms_norm(
+                    &enc,
+                    &pipelines.fused_residual_rms_norm,
+                    &ops::FusedResidualRmsNormParams {
+                        a: &bufs.hidden_state,
+                        b: &bufs.ffn_down,
+                        weight: &lw.post_attn_norm,
+                        normed_output: &bufs.norm_out,
+                        residual_output: &bufs.residual,
+                        eps,
+                        hidden_size: h as u32,
+                        token_count: token_count as u32,
+                    },
+                );
+            }
+        }
+
+        enc.end_encoding();
+
+        // Mid-layer commit: attention block done.
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+        if cmd_buf.status() == CommandBufferStatus::Error {
+            return Err(InferenceError::Decode(format!(
+                "Metal command buffer failed (layer {layer_idx} attention phase)"
+            )));
+        }
+
+        // ── FFN phase ───────────────────────────────────────────
+        let cmd_buf = self
+            .queue
+            .command_buffer()
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        let enc = cmd_buf
+            .compute_encoder()
+            .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        let pipelines = self.pipelines()?;
+
+        let use_gelu = mc.use_gelu();
+        encode_ffn_block(
+            &enc,
+            pipelines,
+            bufs,
+            lw,
+            h,
+            layer_inter,
+            token_count,
+            use_gelu,
+        )?;
+        enc.memory_barrier_buffers();
+
+        // MoE block (Gemma 4).
+        if let Some(ref g4) = self.gemma4_config {
+            let lc = &g4.layer_configs[layer_idx];
+            if lc.enable_moe && g4.num_experts > 0 && !lw.expert_gate_projs.is_empty() {
+                encode_moe_block(
+                    &enc,
+                    pipelines,
+                    bufs,
+                    lw,
+                    h,
+                    g4.moe_intermediate_size,
+                    token_count,
+                    g4.num_experts,
+                    g4.top_k_experts,
+                )?;
+            }
+        }
+
+        // Post-FFN norm (Gemma 4).
+        if let Some(ref post_ffn) = lw.post_ffn_norm {
+            ops::encode_rms_norm(
+                &enc,
+                &pipelines.rms_norm,
+                &ops::RmsNormParams {
+                    input: &bufs.ffn_down,
+                    weight: post_ffn,
+                    output: &bufs.ffn_gate,
+                    hidden_size: h as u32,
+                    token_count: token_count as u32,
+                    eps,
+                },
+            );
+            enc.memory_barrier_buffers();
+            ops::encode_copy_buffer(
+                &enc,
+                &pipelines.copy_buffer,
+                &bufs.ffn_gate,
+                &bufs.ffn_down,
+                (token_count * h) as u32,
+            );
+            enc.memory_barrier_buffers();
+        }
+
+        // PLE per-layer dispatch.
+        let next_input_norm = if layer_idx + 1 < mc.num_hidden_layers {
+            Some(&weights.layers[layer_idx + 1].input_norm)
+        } else {
+            None
+        };
+        let ple_applied = ple::encode_ple_per_layer(
+            &enc,
+            pipelines,
+            bufs,
+            lw,
+            next_input_norm,
+            self.gemma4_config.as_ref(),
+            mc.num_hidden_layers,
+            layer_idx,
+            token_count,
+            h,
+            eps,
+        )?;
+
+        if !ple_applied {
+            if let Some(scalar) = &lw.layer_scalar {
+                ops::encode_residual_add(
+                    &enc,
+                    &pipelines.residual_add,
+                    &bufs.residual,
+                    &bufs.ffn_down,
+                    &bufs.hidden_state,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+                ops::encode_scale_buffer(
+                    &enc,
+                    &pipelines.scale_buffer,
+                    &bufs.hidden_state,
+                    scalar,
+                    (token_count * h) as u32,
+                );
+                enc.memory_barrier_buffers();
+                if layer_idx + 1 < mc.num_hidden_layers {
+                    let next_norm = &weights.layers[layer_idx + 1].input_norm;
+                    ops::encode_rms_norm(
+                        &enc,
+                        &pipelines.rms_norm,
+                        &ops::RmsNormParams {
+                            input: &bufs.hidden_state,
+                            weight: next_norm,
+                            output: &bufs.norm_out,
+                            hidden_size: h as u32,
+                            token_count: token_count as u32,
+                            eps,
+                        },
+                    );
+                }
+            } else {
+                let next_norm = if layer_idx + 1 < mc.num_hidden_layers {
+                    Some(&weights.layers[layer_idx + 1].input_norm)
+                } else {
+                    None
+                };
+                encode_end_of_layer_residual(
+                    &enc,
+                    pipelines,
+                    bufs,
+                    next_norm,
+                    None,
+                    h,
+                    token_count,
+                    eps,
+                )?;
+            }
+        }
+        enc.end_encoding();
+
+        // End-of-layer commit.
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+        if cmd_buf.status() == CommandBufferStatus::Error {
+            return Err(InferenceError::Decode(format!(
+                "Metal command buffer failed (layer {layer_idx} FFN phase)"
+            )));
+        }
+
+        // Advance sequence position.
+        self.seq_pos += token_count;
+        if enable_tq {
+            if let Some(kv) = self.kv_cache.as_mut() {
+                kv.advance_by(token_count)?;
+            }
+        } else if let Some(fp16_kv) = self.fp16_kv_cache.as_mut() {
+            fp16_kv.seq_pos += token_count;
+        }
+        if let Some(mla_kv) = self.mla_kv_cache.as_mut() {
+            mla_kv
+                .advance_by(token_count)
+                .map_err(|e| InferenceError::runtime(e.to_string()))?;
+        }
+
+        Ok(())
     }
 }

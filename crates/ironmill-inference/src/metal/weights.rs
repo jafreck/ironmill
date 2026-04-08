@@ -529,6 +529,48 @@ impl MetalWeights {
             }
         }
     }
+
+    /// Temporarily replace a layer's projection weight buffer and return the original.
+    pub(crate) fn swap_layer_weight(
+        &mut self,
+        layer_idx: usize,
+        proj_name: &str,
+        new_weight: WeightBuffer,
+    ) -> Option<WeightBuffer> {
+        if layer_idx >= self.layers.len() {
+            return None;
+        }
+        let layer = &mut self.layers[layer_idx];
+        let field = match proj_name {
+            "q_proj" => &mut layer.q_proj,
+            "k_proj" => &mut layer.k_proj,
+            "v_proj" => &mut layer.v_proj,
+            "o_proj" => &mut layer.o_proj,
+            "gate_proj" => &mut layer.gate_proj,
+            "up_proj" => &mut layer.up_proj,
+            "down_proj" => &mut layer.down_proj,
+            _ => return None,
+        };
+        Some(std::mem::replace(field, new_weight))
+    }
+}
+
+/// Create a Dense (row-major only) FP16 [`WeightBuffer`] from f32 data on CPU.
+pub(crate) fn create_dense_f16_buffer(
+    device: &MetalDevice,
+    data_f32: &[f32],
+) -> Result<WeightBuffer, MetalError> {
+    let f16_bytes: Vec<u8> = data_f32
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+        .collect();
+    let buf = device
+        .create_buffer_with_data(&f16_bytes, StorageMode::Shared)
+        .map_err(MetalError::Metal)?;
+    Ok(WeightBuffer::Dense {
+        buf: Some(buf),
+        packed: None,
+    })
 }
 
 /// Apply D2Quant quantize→dequantize round-trip to a single weight buffer.
