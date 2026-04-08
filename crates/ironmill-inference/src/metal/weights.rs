@@ -117,16 +117,23 @@ pub struct QuantizedWeight {
     pub shape: (usize, usize),
 }
 
-/// Affine-quantized weight (INT4 or INT8) stored as packed bytes with
-/// per-group scales and zero points on GPU. Dequantized inline during
-/// matmul via fused Metal compute kernels.
+/// Affine-quantized weight (INT4 or INT8) stored on GPU.
+///
+/// For **projection weights**: `data` holds the superblock layout
+/// `[N, G, 4 + group_size/elems_per_byte]` with inline scale/zero.
+/// `scales` and `zeros` are `None`.
+///
+/// For **embedding weights**: `data` holds row-major packed data for
+/// gather (not blocked). `scales` and `zeros` hold separate FP16
+/// per-group parameters for the embedding lookup kernel.
 pub struct AffineQuantizedWeight {
-    /// Packed quantized data in blocked layout for matmul: [N/64, K/8, 64, BLK_K/2].
+    /// Primary weight data buffer.
+    /// Superblock layout for projection weights; row-major for embedding.
     pub data: MetalBuffer,
-    /// Per-group FP16 scales.
-    pub scales: MetalBuffer,
-    /// Per-group FP16 zero points.
-    pub zeros: MetalBuffer,
+    /// Per-group FP16 scales. `None` for superblock-packed projection weights.
+    pub scales: Option<MetalBuffer>,
+    /// Per-group FP16 zero points. `None` for superblock-packed projection weights.
+    pub zeros: Option<MetalBuffer>,
     /// Number of elements sharing one scale/zero pair.
     pub group_size: u32,
     /// Quantization bit width (4 or 8).
@@ -352,8 +359,8 @@ impl MetalWeights {
                     scratch,
                     Some(AffineQuantizedWeight {
                         data: data_buf, // row-major for embedding gather
-                        scales: scales_buf,
-                        zeros: zeros_buf,
+                        scales: Some(scales_buf),
+                        zeros: Some(zeros_buf),
                         group_size: gs as u32,
                         bit_width: *bit_width,
                         shape: (n, k),
@@ -1040,8 +1047,8 @@ fn load_weight_buffer(
             awq_scales,
             g_idx: _,
         } => {
-            // INT4/INT8 with per-group quantization: keep packed on GPU and
-            // dequantize inline during matmul via fused affine kernels.
+            // INT4/INT8 with per-group quantization: pack into superblock layout
+            // with inline scale/zero for fused Metal compute kernels.
             if (*bit_width == 4 || *bit_width == 8) && !force_cpu_dequant {
                 let (n, k) = dense_shape(&tensor.shape);
                 let total_elements = n * k;
@@ -1056,12 +1063,7 @@ fn load_weight_buffer(
                     }
                 };
 
-                let repacked = pack_quantized_blocked(&tensor.data, n, k, *bit_width as usize);
-                let data_buf = device
-                    .create_buffer_with_data(&repacked, StorageMode::Shared)
-                    .map_err(MetalError::Metal)?;
-
-                // Convert scales and zeros to FP16 bytes for the GPU.
+                // Convert scales and zeros to FP16 bytes (needed as input to pack_superblocks).
                 let scales_f16 = super::dequant::convert_params_to_f16(
                     scale,
                     *scale_dtype,
@@ -1077,11 +1079,18 @@ fn load_weight_buffer(
                     gs,
                 )?;
 
-                let scales_buf = device
-                    .create_buffer_with_data(&scales_f16, StorageMode::Shared)
-                    .map_err(MetalError::Metal)?;
-                let zeros_buf = device
-                    .create_buffer_with_data(&zeros_f16, StorageMode::Shared)
+                // Pack into superblock layout with inline scale/zero.
+                let repacked = pack_superblocks(
+                    &tensor.data,
+                    &scales_f16,
+                    &zeros_f16,
+                    n,
+                    k,
+                    gs,
+                    *bit_width as usize,
+                );
+                let data_buf = device
+                    .create_buffer_with_data(&repacked, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;
 
                 // Upload AWQ per-column scales if present.
@@ -1097,8 +1106,8 @@ fn load_weight_buffer(
 
                 return Ok(WeightBuffer::AffineQuantized(AffineQuantizedWeight {
                     data: data_buf,
-                    scales: scales_buf,
-                    zeros: zeros_buf,
+                    scales: None,
+                    zeros: None,
                     group_size: gs as u32,
                     bit_width: *bit_width,
                     shape: (n, k),

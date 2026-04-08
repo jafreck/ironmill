@@ -6,9 +6,9 @@ use super::{LinearKernelKind, METAL_MAX_THREADS_PER_THREADGROUP};
 
 /// Affine quantized pipeline states.
 pub struct AffinePipelines {
-    /// Affine INT4 matvec kernel.
+    /// Affine INT4 matvec kernel (blocked layout — legacy/embedding).
     pub matvec_int4: ComputePipeline,
-    /// Affine INT4 matmul kernel.
+    /// Affine INT4 matmul kernel (blocked layout — legacy).
     pub matmul_int4: ComputePipeline,
     /// Affine INT8 matvec kernel.
     pub matvec_int8: ComputePipeline,
@@ -18,24 +18,37 @@ pub struct AffinePipelines {
     pub matvec_int4_amx: ComputePipeline,
     /// AMX-accelerated INT8 matvec: dequant to threadgroup memory + simdgroup matrix multiply.
     pub matvec_int8_amx: ComputePipeline,
-    /// Batched affine INT4 matvec for FFN gate+up in one dispatch.
+    /// Batched affine INT4 matvec for FFN gate+up in one dispatch (blocked layout — legacy).
     pub batched_matvec_int4: ComputePipeline,
-    /// Batched affine INT4 matvec for 4 GDN projections in one dispatch.
+    /// Batched affine INT4 matvec for 4 GDN projections in one dispatch (blocked layout — legacy).
     pub gdn_batched_matvec_int4: ComputePipeline,
-    /// Fused FFN gate+up+activation for INT4 decode: gate+up dot products + SiLU/GELU inline.
+    /// Fused FFN gate+up+activation for INT4 decode (blocked layout — legacy).
     pub fused_ffn_gate_up_act_int4: ComputePipeline,
-    /// INT4×Q8 integer dot product matvec (decode path).
+    /// INT4×Q8 integer dot product matvec (blocked layout — legacy).
     pub matvec_int4xq8: ComputePipeline,
-    /// INT4 2-row matvec: 2 output rows per TG with 64 threads (2 simdgroups).
+    /// INT4 2-row matvec (blocked layout — legacy).
     pub matvec_int4_2row: ComputePipeline,
-    /// INT4 coalesced matvec: 32 adjacent rows per TG, perfect memory coalescing.
+    /// INT4 coalesced matvec (blocked layout — legacy).
     pub matvec_int4_coalesced: ComputePipeline,
     /// INT4 affine embedding lookup with on-the-fly dequantization.
     pub embedding_lookup_int4: ComputePipeline,
+    /// Superblock INT4 matvec: 8 rows/TG, 64 threads, inline scale/zero.
+    pub sb_matvec_int4: ComputePipeline,
+    /// Superblock INT4 matmul: tiled prefill with inline scale/zero.
+    pub sb_matmul_int4: ComputePipeline,
+    /// Superblock fused FFN gate+up+activation INT4.
+    pub sb_fused_ffn_gate_up_act_int4: ComputePipeline,
+    /// Superblock batched affine INT4 matvec (gate+up).
+    pub sb_batched_matvec_int4: ComputePipeline,
+    /// Superblock GDN batched affine INT4 matvec (4 projections).
+    pub sb_gdn_batched_matvec_int4: ComputePipeline,
+    /// Superblock INT4×Q8 integer dot product matvec.
+    pub sb_matvec_int4xq8: ComputePipeline,
 }
 
 impl AffinePipelines {
     /// Select the affine-quantized pipeline for a given bit-width and phase.
+    /// Returns superblock pipelines for INT4.
     #[inline]
     pub fn for_bits_and_kind(
         &self,
@@ -43,8 +56,8 @@ impl AffinePipelines {
         kind: LinearKernelKind,
     ) -> Option<&ComputePipeline> {
         match (bit_width, kind) {
-            (4, LinearKernelKind::Matvec) => Some(&self.matvec_int4),
-            (4, LinearKernelKind::Matmul) => Some(&self.matmul_int4),
+            (4, LinearKernelKind::Matvec) => Some(&self.sb_matvec_int4),
+            (4, LinearKernelKind::Matmul) => Some(&self.sb_matmul_int4),
             (8, LinearKernelKind::Matvec) => Some(&self.matvec_int8),
             (8, LinearKernelKind::Matmul) => Some(&self.matmul_int8),
             _ => None,
@@ -167,8 +180,8 @@ pub struct GdnBatchedAffineInt4Params<'a> {
 
 /// Encode batched affine INT4 matvec for FFN gate+up in a single dispatch.
 ///
+/// Uses superblock layout: W_gate and W_up contain inline scale/zero.
 /// Computes gate = x · W_gate^T and up = x · W_up^T concurrently.
-/// Saves 1 dispatch per layer compared to 2 separate `affine_matvec_int4` calls.
 pub fn encode_batched_affine_matvec_int4(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -182,24 +195,20 @@ pub fn encode_batched_affine_matvec_int4(
 ) {
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(input, 0, 0);
-    encoder.set_buffer(&gate_weight.data, 0, 1);
-    encoder.set_buffer(&gate_weight.scales, 0, 2);
-    encoder.set_buffer(&gate_weight.zeros, 0, 3);
-    encoder.set_buffer(gate_output, 0, 4);
-    encoder.set_buffer(&up_weight.data, 0, 5);
-    encoder.set_buffer(&up_weight.scales, 0, 6);
-    encoder.set_buffer(&up_weight.zeros, 0, 7);
-    encoder.set_buffer(up_output, 0, 8);
-    encoder.set_bytes(&n_gate.to_le_bytes(), 9);
-    encoder.set_bytes(&k.to_le_bytes(), 10);
-    encoder.set_bytes(&gate_weight.group_size.to_le_bytes(), 11);
+    encoder.set_buffer(&gate_weight.data, 0, 1); // superblock
+    encoder.set_buffer(gate_output, 0, 2);
+    encoder.set_buffer(&up_weight.data, 0, 3); // superblock
+    encoder.set_buffer(up_output, 0, 4);
+    encoder.set_bytes(&n_gate.to_le_bytes(), 5);
+    encoder.set_bytes(&k.to_le_bytes(), 6);
+    encoder.set_bytes(&gate_weight.group_size.to_le_bytes(), 7);
     // AWQ scales: use gate_weight's (shared between gate/up)
     if let Some(ref awq) = gate_weight.awq_scales {
-        encoder.set_buffer(awq, 0, 12);
-        encoder.set_bytes(&1u32.to_le_bytes(), 13);
+        encoder.set_buffer(awq, 0, 8);
+        encoder.set_bytes(&1u32.to_le_bytes(), 9);
     } else {
-        encoder.set_buffer(&gate_weight.data, 0, 12); // dummy
-        encoder.set_bytes(&0u32.to_le_bytes(), 13);
+        encoder.set_buffer(&gate_weight.data, 0, 8); // dummy
+        encoder.set_bytes(&0u32.to_le_bytes(), 9);
     }
     let tg_count = (2 * n_gate) as usize;
     encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
@@ -207,9 +216,8 @@ pub fn encode_batched_affine_matvec_int4(
 
 /// Encode fused FFN gate+up+activation for INT4 decode.
 ///
+/// Uses superblock layout: gate/up weights contain inline scale/zero.
 /// Computes output[i] = activation(x · W_gate^T[i]) * (x · W_up^T[i]) in one dispatch.
-/// Eliminates gate/up intermediate writes + the separate activation dispatch.
-/// Saves 1 dispatch + 1 barrier per layer compared to batched_affine_matvec_int4 + silu_gate.
 pub fn encode_fused_ffn_gate_up_act_int4(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -223,30 +231,26 @@ pub fn encode_fused_ffn_gate_up_act_int4(
 ) {
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(input, 0, 0);
-    encoder.set_buffer(&gate_weight.data, 0, 1);
-    encoder.set_buffer(&gate_weight.scales, 0, 2);
-    encoder.set_buffer(&gate_weight.zeros, 0, 3);
-    encoder.set_buffer(&up_weight.data, 0, 4);
-    encoder.set_buffer(&up_weight.scales, 0, 5);
-    encoder.set_buffer(&up_weight.zeros, 0, 6);
-    encoder.set_buffer(output, 0, 7);
-    encoder.set_bytes(&n.to_le_bytes(), 8);
-    encoder.set_bytes(&k.to_le_bytes(), 9);
-    encoder.set_bytes(&gate_weight.group_size.to_le_bytes(), 10);
+    encoder.set_buffer(&gate_weight.data, 0, 1); // superblock
+    encoder.set_buffer(&up_weight.data, 0, 2); // superblock
+    encoder.set_buffer(output, 0, 3);
+    encoder.set_bytes(&n.to_le_bytes(), 4);
+    encoder.set_bytes(&k.to_le_bytes(), 5);
+    encoder.set_bytes(&gate_weight.group_size.to_le_bytes(), 6);
     if let Some(ref awq) = gate_weight.awq_scales {
-        encoder.set_buffer(awq, 0, 11);
-        encoder.set_bytes(&1u32.to_le_bytes(), 12);
+        encoder.set_buffer(awq, 0, 7);
+        encoder.set_bytes(&1u32.to_le_bytes(), 8);
     } else {
-        encoder.set_buffer(&gate_weight.data, 0, 11); // dummy
-        encoder.set_bytes(&0u32.to_le_bytes(), 12);
+        encoder.set_buffer(&gate_weight.data, 0, 7); // dummy
+        encoder.set_bytes(&0u32.to_le_bytes(), 8);
     }
-    encoder.set_bytes(&(use_gelu as u32).to_le_bytes(), 13);
+    encoder.set_bytes(&(use_gelu as u32).to_le_bytes(), 9);
     encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }
 
 ///
+/// Uses superblock layout: all weights contain inline scale/zero.
 /// Computes qkv = x·W0^T, z = x·W1^T, a = x·W2^T, b = x·W3^T concurrently.
-/// Saves 3 dispatches per GDN layer compared to 4 separate `affine_matvec_int4` calls.
 pub(crate) fn encode_gdn_batched_affine_matvec_int4(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -254,22 +258,14 @@ pub(crate) fn encode_gdn_batched_affine_matvec_int4(
 ) {
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(params.input, 0, 0);
-    encoder.set_buffer(&params.w0.data, 0, 1);
-    encoder.set_buffer(&params.w0.scales, 0, 2);
-    encoder.set_buffer(&params.w0.zeros, 0, 3);
-    encoder.set_buffer(params.out0, 0, 4);
-    encoder.set_buffer(&params.w1.data, 0, 5);
-    encoder.set_buffer(&params.w1.scales, 0, 6);
-    encoder.set_buffer(&params.w1.zeros, 0, 7);
-    encoder.set_buffer(params.out1, 0, 8);
-    encoder.set_buffer(&params.w2.data, 0, 9);
-    encoder.set_buffer(&params.w2.scales, 0, 10);
-    encoder.set_buffer(&params.w2.zeros, 0, 11);
-    encoder.set_buffer(params.out2, 0, 12);
-    encoder.set_buffer(&params.w3.data, 0, 13);
-    encoder.set_buffer(&params.w3.scales, 0, 14);
-    encoder.set_buffer(&params.w3.zeros, 0, 15);
-    encoder.set_buffer(params.out3, 0, 16);
+    encoder.set_buffer(&params.w0.data, 0, 1); // superblock
+    encoder.set_buffer(params.out0, 0, 2);
+    encoder.set_buffer(&params.w1.data, 0, 3); // superblock
+    encoder.set_buffer(params.out1, 0, 4);
+    encoder.set_buffer(&params.w2.data, 0, 5); // superblock
+    encoder.set_buffer(params.out2, 0, 6);
+    encoder.set_buffer(&params.w3.data, 0, 7); // superblock
+    encoder.set_buffer(params.out3, 0, 8);
     let has_awq = params.w0.awq_scales.is_some() as u32;
     let params_words: [u32; 7] = [
         params.n0,
@@ -281,11 +277,11 @@ pub(crate) fn encode_gdn_batched_affine_matvec_int4(
         has_awq,
     ];
     let params_bytes: Vec<u8> = params_words.iter().flat_map(|v| v.to_le_bytes()).collect();
-    encoder.set_bytes(&params_bytes, 17);
+    encoder.set_bytes(&params_bytes, 9);
     if let Some(ref awq) = params.w0.awq_scales {
-        encoder.set_buffer(awq, 0, 18);
+        encoder.set_buffer(awq, 0, 10);
     } else {
-        encoder.set_buffer(&params.w0.data, 0, 18); // dummy
+        encoder.set_buffer(&params.w0.data, 0, 10); // dummy
     }
     let tg_count = (params.n0 + params.n1 + params.n2 + params.n3) as usize;
     encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
@@ -317,8 +313,8 @@ pub fn encode_quantize_input_q8(
 
 /// Encode INT4×Q8 integer dot product matvec for decode.
 ///
+/// Uses superblock layout: weight contains inline scale/zero.
 /// Uses pre-quantized INT8 input and per-group scales instead of FP16 input.
-/// The integer multiply-add inner loop is ~2× faster than float dequant.
 pub fn encode_affine_matvec_int4xq8(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,
@@ -333,13 +329,11 @@ pub fn encode_affine_matvec_int4xq8(
     encoder.set_pipeline(pipeline);
     encoder.set_buffer(q8_data, 0, 0);
     encoder.set_buffer(q8_scales, 0, 1);
-    encoder.set_buffer(&weight.data, 0, 2);
-    encoder.set_buffer(&weight.scales, 0, 3);
-    encoder.set_buffer(&weight.zeros, 0, 4);
-    encoder.set_buffer(output, 0, 5);
-    encoder.set_bytes(&n.to_le_bytes(), 6);
-    encoder.set_bytes(&k.to_le_bytes(), 7);
-    encoder.set_bytes(&weight.group_size.to_le_bytes(), 8);
-    encoder.set_bytes(&q8_group_size.to_le_bytes(), 9);
+    encoder.set_buffer(&weight.data, 0, 2); // superblock
+    encoder.set_buffer(output, 0, 3);
+    encoder.set_bytes(&n.to_le_bytes(), 4);
+    encoder.set_bytes(&k.to_le_bytes(), 5);
+    encoder.set_bytes(&weight.group_size.to_le_bytes(), 6);
+    encoder.set_bytes(&q8_group_size.to_le_bytes(), 7);
     encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }

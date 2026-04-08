@@ -8,10 +8,12 @@ use super::DEFAULT_THREADGROUP_WIDTH;
 pub struct FusedPipelines {
     /// Fused residual+RMSNorm+dense matvec in one dispatch.
     pub residual_norm_matvec: ComputePipeline,
-    /// Fused residual+RMSNorm+affine INT4 matvec in one dispatch.
+    /// Fused residual+RMSNorm+affine INT4 matvec in one dispatch (blocked layout — legacy).
     pub residual_norm_affine_matvec_int4: ComputePipeline,
     /// INT4 dequantization kernel.
     pub int4_dequantize: ComputePipeline,
+    /// Superblock fused residual+RMSNorm+affine INT4 matvec.
+    pub sb_residual_norm_affine_matvec_int4: ComputePipeline,
 }
 
 // ── Parameter structs ────────────────────────────────────────────
@@ -95,7 +97,7 @@ pub(crate) fn encode_fused_residual_norm_matvec(
 
 /// Encode fused residual + RMSNorm + affine INT4 matvec.
 ///
-/// Same fusion as `encode_fused_residual_norm_matvec` but for INT4 weights.
+/// Uses superblock layout: weight contains inline scale/zero.
 /// One threadgroup per output row, 32 threads per group.
 /// Also writes `normed_output` for subsequent projections.
 pub(crate) fn encode_fused_residual_norm_affine_matvec_int4(
@@ -108,10 +110,8 @@ pub(crate) fn encode_fused_residual_norm_affine_matvec_int4(
     encoder.set_buffer(params.b, 0, 1);
     encoder.set_buffer(params.norm_weight, 0, 2);
     encoder.set_buffer(params.residual_output, 0, 3);
-    encoder.set_buffer(&params.weight.data, 0, 4);
-    encoder.set_buffer(&params.weight.scales, 0, 5);
-    encoder.set_buffer(&params.weight.zeros, 0, 6);
-    encoder.set_buffer(params.output, 0, 7);
+    encoder.set_buffer(&params.weight.data, 0, 4); // superblock
+    encoder.set_buffer(params.output, 0, 5);
     let gpu_params: [u32; 4] = [
         params.n,
         params.k,
@@ -119,14 +119,14 @@ pub(crate) fn encode_fused_residual_norm_affine_matvec_int4(
         params.eps.to_bits(),
     ];
     let params_bytes: Vec<u8> = gpu_params.iter().flat_map(|v| v.to_le_bytes()).collect();
-    encoder.set_bytes(&params_bytes, 8);
+    encoder.set_bytes(&params_bytes, 6);
     if let Some(ref awq) = params.weight.awq_scales {
-        encoder.set_buffer(awq, 0, 9);
-        encoder.set_bytes(&1u32.to_le_bytes(), 10);
+        encoder.set_buffer(awq, 0, 7);
+        encoder.set_bytes(&1u32.to_le_bytes(), 8);
     } else {
-        encoder.set_buffer(&params.weight.data, 0, 9); // dummy
-        encoder.set_bytes(&0u32.to_le_bytes(), 10);
+        encoder.set_buffer(&params.weight.data, 0, 7); // dummy
+        encoder.set_bytes(&0u32.to_le_bytes(), 8);
     }
-    encoder.set_buffer(params.normed_output, 0, 11);
+    encoder.set_buffer(params.normed_output, 0, 9);
     encoder.dispatch_threadgroups((params.n as usize, 1, 1), (32, 1, 1));
 }

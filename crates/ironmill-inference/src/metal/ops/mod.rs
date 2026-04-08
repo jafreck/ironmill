@@ -75,8 +75,15 @@ type AdvancedMatmulShaders = (
     ComputePipeline,
     ComputePipeline,
     ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
 );
 type FusedShaders = (
+    ComputePipeline,
     ComputePipeline,
     ComputePipeline,
     ComputePipeline,
@@ -253,6 +260,12 @@ impl MetalPipelines {
             affine_matvec_int4xq8,
             affine_matvec_int4_2row,
             affine_matvec_int4_coalesced,
+            sb_matvec_int4,
+            sb_matmul_int4,
+            sb_fused_ffn_gate_up_act_int4,
+            sb_batched_matvec_int4,
+            sb_gdn_batched_matvec_int4,
+            sb_matvec_int4xq8,
         ) = Self::compile_advanced_matmul_shaders(device, &libs)?;
         let (
             fused_residual_rms_norm,
@@ -262,6 +275,7 @@ impl MetalPipelines {
             ple_add_scale,
             fused_residual_norm_matvec,
             fused_residual_norm_affine_matvec_int4,
+            sb_fused_residual_norm_affine_matvec_int4,
         ) = Self::compile_fused_shaders(device, &libs)?;
         let (moe_softmax, moe_gelu, moe_mul, moe_weighted_combine) =
             Self::compile_moe_shaders(device)?;
@@ -319,6 +333,12 @@ impl MetalPipelines {
                 matvec_int4_2row: affine_matvec_int4_2row,
                 matvec_int4_coalesced: affine_matvec_int4_coalesced,
                 embedding_lookup_int4: affine_embedding_lookup_int4,
+                sb_matvec_int4,
+                sb_matmul_int4,
+                sb_fused_ffn_gate_up_act_int4,
+                sb_batched_matvec_int4,
+                sb_gdn_batched_matvec_int4,
+                sb_matvec_int4xq8,
             },
             polarquant: PolarQuantPipelines {
                 matvec_int4: polarquant_matvec_int4,
@@ -365,6 +385,7 @@ impl MetalPipelines {
                 residual_norm_matvec: fused_residual_norm_matvec,
                 residual_norm_affine_matvec_int4: fused_residual_norm_affine_matvec_int4,
                 int4_dequantize,
+                sb_residual_norm_affine_matvec_int4: sb_fused_residual_norm_affine_matvec_int4,
             },
         })
     }
@@ -490,7 +511,7 @@ impl MetalPipelines {
         ))
     }
 
-    /// Compile advanced matmul variants: batched, AMX, and fused.
+    /// Compile advanced matmul variants: batched, AMX, fused, and superblock.
     fn compile_advanced_matmul_shaders(
         device: &MetalDevice,
         libs: &ShaderLibraries,
@@ -507,6 +528,25 @@ impl MetalPipelines {
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int4xq8")?,
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int4_2row")?,
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int4_coalesced")?,
+            // Superblock pipelines
+            make_pipeline(device, &libs.affine_mm, "superblock_matvec_int4")?,
+            make_pipeline(device, &libs.affine_mm, "superblock_matmul_int4")?,
+            make_pipeline(
+                device,
+                &libs.affine_mm,
+                "superblock_fused_ffn_gate_up_act_int4",
+            )?,
+            make_pipeline(
+                device,
+                &libs.affine_mm,
+                "superblock_batched_affine_matvec_int4",
+            )?,
+            make_pipeline(
+                device,
+                &libs.affine_mm,
+                "superblock_gdn_batched_affine_matvec_int4",
+            )?,
+            make_pipeline(device, &libs.affine_mm, "superblock_affine_matvec_int4xq8")?,
         ))
     }
 
@@ -523,6 +563,11 @@ impl MetalPipelines {
             make_pipeline(device, &libs.ple, "add_scale")?,
             make_pipeline(device, &libs.norm, "fused_residual_norm_matvec")?,
             make_pipeline(device, &libs.norm, "fused_residual_norm_affine_matvec_int4")?,
+            make_pipeline(
+                device,
+                &libs.norm,
+                "superblock_fused_residual_norm_affine_matvec_int4",
+            )?,
         ))
     }
 

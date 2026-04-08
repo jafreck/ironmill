@@ -350,8 +350,8 @@ impl MetalInference {
                 enc.set_pipeline(&pipelines.affine.embedding_lookup_int4);
                 enc.set_buffer(active_token_buf, 0, 0);
                 enc.set_buffer(&aq.data, 0, 1);
-                enc.set_buffer(&aq.scales, 0, 2);
-                enc.set_buffer(&aq.zeros, 0, 3);
+                enc.set_buffer(aq.scales.as_ref().expect("embedding requires scales"), 0, 2);
+                enc.set_buffer(aq.zeros.as_ref().expect("embedding requires zeros"), 0, 3);
                 enc.set_buffer(&bufs.hidden_state, 0, 4);
                 enc.set_bytes(&(h as u32).to_le_bytes(), 5);
                 enc.set_bytes(&(token_count as u32).to_le_bytes(), 6);
