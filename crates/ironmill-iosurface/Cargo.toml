@@ -11,4 +11,5 @@ rust-version.workspace = true
 ironmill-core = { path = "../ironmill-core" }
 thiserror = { workspace = true }
 half = { workspace = true }
+bytemuck = { workspace = true }
 mil-rs = { workspace = true }

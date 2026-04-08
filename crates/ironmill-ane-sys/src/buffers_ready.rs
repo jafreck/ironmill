@@ -22,6 +22,8 @@ pub struct InputBuffersReady {
     raw: *mut c_void,
 }
 
+// SAFETY: The raw ObjC handle is only accessed through &self methods and
+// ownership is exclusive (no aliasing).
 #[cfg(target_os = "macos")]
 unsafe impl Send for InputBuffersReady {}
 
@@ -171,6 +173,8 @@ pub struct OutputSetEnqueue {
     raw: *mut c_void,
 }
 
+// SAFETY: The raw ObjC handle is only accessed through &self methods and
+// ownership is exclusive (no aliasing).
 #[cfg(target_os = "macos")]
 unsafe impl Send for OutputSetEnqueue {}
 

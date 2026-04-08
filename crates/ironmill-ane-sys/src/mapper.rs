@@ -24,6 +24,8 @@ pub struct ProgramIOSurfacesMapper {
     raw: *mut c_void,
 }
 
+// SAFETY: The raw ObjC handle is only accessed through &self methods and
+// ownership is exclusive (no aliasing).
 unsafe impl Send for ProgramIOSurfacesMapper {}
 
 impl Drop for ProgramIOSurfacesMapper {

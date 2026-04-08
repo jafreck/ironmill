@@ -456,7 +456,7 @@ impl GgufProvider {
 
         for (shard_idx, shard_path) in shard_paths.iter().enumerate() {
             let file = std::fs::File::open(shard_path)?;
-            let mmap = mmap_read_only(&file)?;
+            let mmap = super::mmap_read_only(&file)?;
             let data: &[u8] = &mmap;
 
             let mut reader = BinReader::new(data);
@@ -1430,26 +1430,6 @@ fn align_offset(offset: usize, alignment: usize) -> Result<usize, MilError> {
         .checked_add(alignment - 1)
         .ok_or_else(|| MilError::Validation("GGUF: alignment offset overflow".into()))?;
     Ok(aligned & !(alignment - 1))
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Memory-maps a file for read-only access.
-///
-/// # Safety
-///
-/// This function assumes the file will not be modified or truncated while the
-/// mapping is alive. This is acceptable here because model weight
-/// files are read-only assets that are never modified during loading.
-#[allow(unsafe_code)]
-fn mmap_read_only(file: &std::fs::File) -> std::io::Result<Mmap> {
-    // SAFETY: We use mmap for zero-copy access to large model files.  The
-    // safety invariant is that the underlying file must not be modified or
-    // truncated while the mapping exists.  Model weight files are read-only
-    // assets that are not mutated during loading, so this invariant holds.
-    unsafe { Mmap::map(file) }
 }
 
 // ---------------------------------------------------------------------------

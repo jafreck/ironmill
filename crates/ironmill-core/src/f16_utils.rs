@@ -33,12 +33,7 @@ pub fn copy_bytes_to_f16(bytes: &[u8], out: &mut [f16]) {
         out.len() * 2,
         "byte length must be exactly 2× element count"
     );
-    // SAFETY: Both slices are valid with matching lengths, and f16 has no
-    // invalid bit patterns (it is `Pod`). Pointers are non-overlapping
-    // because `bytes` and `out` come from distinct allocations.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
-    }
+    bytemuck::cast_slice_mut::<f16, u8>(out).copy_from_slice(bytes);
 }
 
 #[cfg(test)]

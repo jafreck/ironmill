@@ -23,6 +23,9 @@ pub struct AneIOSurfaceObject {
     raw: *mut c_void,
 }
 
+// SAFETY: The raw ObjC handle is only accessed through &self methods and
+// ownership is exclusive (no aliasing). IOSurface objects can be safely
+// transferred between threads.
 unsafe impl Send for AneIOSurfaceObject {}
 
 impl Drop for AneIOSurfaceObject {
@@ -278,6 +281,8 @@ pub struct AneBuffer {
     raw: *mut c_void,
 }
 
+// SAFETY: The raw ObjC handle is only accessed through &self methods and
+// ownership is exclusive (no aliasing).
 unsafe impl Send for AneBuffer {}
 
 impl Drop for AneBuffer {
@@ -391,6 +396,8 @@ pub struct IOSurfaceOutputSets {
     raw: *mut c_void,
 }
 
+// SAFETY: The raw ObjC handle is only accessed through &self methods and
+// ownership is exclusive (no aliasing).
 unsafe impl Send for IOSurfaceOutputSets {}
 
 impl Drop for IOSurfaceOutputSets {

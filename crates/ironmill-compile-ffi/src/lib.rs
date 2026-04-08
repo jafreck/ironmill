@@ -3,6 +3,7 @@
 // individual function.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(deprecated)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 //! C-compatible FFI API for `mil-rs`.
 //!
@@ -83,6 +84,9 @@ fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
     if ptr.is_null() {
         return None;
     }
+    // SAFETY: Caller ensures `ptr` points to a valid NUL-terminated C string
+    // that outlives `'a`. All public C API callers pass CString-owned or
+    // string-literal pointers.
     unsafe { CStr::from_ptr(ptr) }.to_str().ok()
 }
 
@@ -152,6 +156,9 @@ pub extern "C" fn mil_read_mlpackage(path: *const c_char) -> *mut MilModel {
 #[unsafe(no_mangle)]
 pub extern "C" fn mil_model_free(model: *mut MilModel) {
     if !model.is_null() {
+        // SAFETY: `model` was allocated by `Box::into_raw` in one of the
+        // `mil_read_*` functions. The C API contract guarantees it is only
+        // freed once.
         drop(unsafe { Box::from_raw(model) });
     }
 }
@@ -172,6 +179,9 @@ pub extern "C" fn mil_onnx_to_program(model: *mut MilModel) -> *mut MilProgram {
         set_last_error("mil_onnx_to_program: model is null");
         return std::ptr::null_mut();
     }
+    // SAFETY: `model` is non-null and was allocated by `Box::into_raw` in a
+    // `mil_read_*` function. We take `&mut` to access the inner proto; no
+    // aliasing is possible because only one call at a time holds this pointer.
     let model = unsafe { &mut *model };
     let onnx = match &mut model.0 {
         MilModelInner::Onnx(proto) => proto,
@@ -203,6 +213,8 @@ pub extern "C" fn mil_program_to_model(
         set_last_error("mil_program_to_model: program is null");
         return std::ptr::null_mut();
     }
+    // SAFETY: `program` is non-null and was allocated by `Box::into_raw` in
+    // `mil_onnx_to_program`. We only take a shared reference.
     let program = unsafe { &*program };
     match ironmill_compile::mil::program_to_model(&program.0, spec_version) {
         Ok(model) => Box::into_raw(Box::new(MilModel(MilModelInner::CoreMl(Box::new(model))))),
@@ -219,6 +231,8 @@ pub extern "C" fn mil_program_to_model(
 #[unsafe(no_mangle)]
 pub extern "C" fn mil_program_free(program: *mut MilProgram) {
     if !program.is_null() {
+        // SAFETY: `program` was allocated by `Box::into_raw` in
+        // `mil_onnx_to_program`. The C API contract guarantees single free.
         drop(unsafe { Box::from_raw(program) });
     }
 }
@@ -242,6 +256,8 @@ pub extern "C" fn mil_write_mlmodel(model: *const MilModel, path: *const c_char)
         set_last_error("mil_write_mlmodel: path is null or invalid UTF-8");
         return -1;
     };
+    // SAFETY: `model` is non-null (checked above) and was allocated by
+    // `Box::into_raw` in a `mil_read_*` function.
     let model = unsafe { &*model };
     let coreml = match &model.0 {
         MilModelInner::CoreMl(m) => m,
@@ -273,6 +289,8 @@ pub extern "C" fn mil_write_mlpackage(model: *const MilModel, path: *const c_cha
         set_last_error("mil_write_mlpackage: path is null or invalid UTF-8");
         return -1;
     };
+    // SAFETY: `model` is non-null (checked above) and was allocated by
+    // `Box::into_raw` in a `mil_read_*` function.
     let model = unsafe { &*model };
     let coreml = match &model.0 {
         MilModelInner::CoreMl(m) => m,
@@ -346,6 +364,8 @@ pub extern "C" fn mil_validate_ane(program: *const MilProgram) -> *mut MilValida
         set_last_error("mil_validate_ane: program is null");
         return std::ptr::null_mut();
     }
+    // SAFETY: `program` is non-null (checked above) and was allocated by
+    // `Box::into_raw` in `mil_onnx_to_program`.
     let program = unsafe { &*program };
     let report = ironmill_compile::ane::validate::validate_ane_compatibility(&program.0);
     Box::into_raw(Box::new(MilValidationReport(report)))
@@ -362,6 +382,8 @@ pub extern "C" fn mil_validation_report_to_json(report: *const MilValidationRepo
         return std::ptr::null_mut();
     }
     let result = std::panic::catch_unwind(|| {
+        // SAFETY: `report` is non-null (checked above) and was allocated by
+        // `Box::into_raw` in `mil_validate_ane`.
         let report = unsafe { &*report };
         let json = ironmill_compile::ane::validate::validation_report_to_json(&report.0);
         let json = match json {
@@ -406,6 +428,8 @@ pub extern "C" fn mil_validation_report_to_json(report: *const MilValidationRepo
 #[unsafe(no_mangle)]
 pub extern "C" fn mil_validation_report_free(report: *mut MilValidationReport) {
     if !report.is_null() {
+        // SAFETY: `report` was allocated by `Box::into_raw` in
+        // `mil_validate_ane`. The C API contract guarantees single free.
         drop(unsafe { Box::from_raw(report) });
     }
 }
@@ -434,6 +458,9 @@ pub extern "C" fn mil_last_error() -> *const c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn mil_string_free(s: *mut c_char) {
     if !s.is_null() {
+        // SAFETY: `s` was allocated by `CString::into_raw` in
+        // `mil_compile_model` or `mil_validation_report_to_json`.
+        // The C API contract guarantees single free.
         drop(unsafe { CString::from_raw(s) });
     }
 }
@@ -446,6 +473,26 @@ pub extern "C" fn mil_string_free(s: *mut c_char) {
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    /// Read the thread-local error string set by the last failing C API call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no error has been recorded or if the string is not valid UTF-8.
+    fn last_error_str() -> String {
+        let ptr = mil_last_error();
+        assert!(
+            !ptr.is_null(),
+            "expected an error but mil_last_error() is null"
+        );
+        // SAFETY: `ptr` is the `as_ptr()` of a thread-local `CString` owned
+        // by `LAST_ERROR` — it is NUL-terminated and valid for the duration
+        // of this borrow (no intervening failing calls).
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        cstr.to_str()
+            .expect("error message is not valid UTF-8")
+            .to_owned()
+    }
 
     // -- Error lifecycle ------------------------------------------------------
 
@@ -462,7 +509,7 @@ mod tests {
         // Error should be readable.
         let err = mil_last_error();
         assert!(!err.is_null());
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        let msg = last_error_str();
         assert!(msg.contains("null"), "unexpected error: {msg}");
 
         // A second failing call overwrites the previous error.
@@ -470,9 +517,7 @@ mod tests {
         let result = mil_read_onnx(bad_path.as_ptr());
         assert!(result.is_null());
 
-        let err = mil_last_error();
-        assert!(!err.is_null());
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        let msg = last_error_str();
         assert!(msg.contains("mil_read_onnx"), "unexpected error: {msg}");
     }
 
@@ -600,9 +645,7 @@ mod tests {
         let p = mil_read_onnx(path.as_ptr());
         assert!(p.is_null());
 
-        let err = mil_last_error();
-        assert!(!err.is_null());
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        let msg = last_error_str();
         assert!(msg.contains("mil_read_onnx"), "unexpected error: {msg}");
     }
 
@@ -612,9 +655,7 @@ mod tests {
         let p = mil_read_mlmodel(path.as_ptr());
         assert!(p.is_null());
 
-        let err = mil_last_error();
-        assert!(!err.is_null());
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        let msg = last_error_str();
         assert!(msg.contains("mil_read_mlmodel"), "unexpected error: {msg}");
     }
 
@@ -624,9 +665,7 @@ mod tests {
         let p = mil_read_mlpackage(path.as_ptr());
         assert!(p.is_null());
 
-        let err = mil_last_error();
-        assert!(!err.is_null());
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        let msg = last_error_str();
         assert!(
             msg.contains("mil_read_mlpackage"),
             "unexpected error: {msg}"
@@ -650,9 +689,7 @@ mod tests {
         let p = mil_onnx_to_program(model);
         assert!(p.is_null());
 
-        let err = mil_last_error();
-        assert!(!err.is_null());
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        let msg = last_error_str();
         assert!(msg.contains("not ONNX"), "unexpected error: {msg}");
 
         mil_model_free(model);
@@ -667,9 +704,7 @@ mod tests {
         let rc = mil_write_mlmodel(model, path.as_ptr());
         assert_eq!(rc, -1);
 
-        let err = mil_last_error();
-        assert!(!err.is_null());
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        let msg = last_error_str();
         assert!(msg.contains("not CoreML"), "unexpected error: {msg}");
 
         mil_model_free(model);
@@ -684,9 +719,7 @@ mod tests {
         let rc = mil_write_mlpackage(model, path.as_ptr());
         assert_eq!(rc, -1);
 
-        let err = mil_last_error();
-        assert!(!err.is_null());
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        let msg = last_error_str();
         assert!(msg.contains("not CoreML"), "unexpected error: {msg}");
 
         mil_model_free(model);

@@ -273,9 +273,13 @@ impl InMemoryModel {
     ///
     /// # Safety
     ///
-    /// `ptr` must be a valid, retained `_ANEInMemoryModel` handle.
+    /// `ptr` must be a non-null, valid, retained `_ANEInMemoryModel` handle.
     /// The caller transfers ownership — `Drop` will call `CFRelease`.
     pub unsafe fn from_raw(ptr: *mut c_void) -> Self {
+        assert!(
+            !ptr.is_null(),
+            "InMemoryModel::from_raw called with null pointer"
+        );
         Self { raw: ptr }
     }
 

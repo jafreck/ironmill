@@ -269,20 +269,12 @@ impl AneTensor {
         }
         match self.dtype {
             ScalarType::Float32 => {
-                let byte_len = data.len() * 4;
-                // SAFETY: `data` is a valid f32 slice; reinterpreting as bytes
-                // is sound because we only read within the slice bounds.
-                let src =
-                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+                let src = bytemuck::cast_slice::<f32, u8>(data);
                 self.write_bytes(src)
             }
             ScalarType::Float16 => {
                 let f16_data: Vec<f16> = data.iter().map(|&v| f16::from_f32(v)).collect();
-                let byte_len = f16_data.len() * 2;
-                // SAFETY: `f16_data` is a valid f16 slice; reinterpreting as
-                // bytes is sound.
-                let src =
-                    unsafe { std::slice::from_raw_parts(f16_data.as_ptr() as *const u8, byte_len) };
+                let src = bytemuck::cast_slice::<f16, u8>(&f16_data);
                 self.write_bytes(src)
             }
             _ => unreachable!(), // guarded by the dtype check above

@@ -22,6 +22,8 @@ pub struct SharedEvents {
     raw: *mut c_void,
 }
 
+// SAFETY: The raw ObjC handle is only accessed through &self methods and
+// ownership is exclusive (no aliasing).
 #[cfg(target_os = "macos")]
 unsafe impl Send for SharedEvents {}
 
@@ -149,6 +151,8 @@ pub struct SharedSignalEvent {
     raw: *mut c_void,
 }
 
+// SAFETY: The raw ObjC handle is only accessed through &self methods and
+// ownership is exclusive (no aliasing).
 #[cfg(target_os = "macos")]
 unsafe impl Send for SharedSignalEvent {}
 
@@ -323,6 +327,8 @@ pub struct SharedWaitEvent {
     raw: *mut c_void,
 }
 
+// SAFETY: The raw ObjC handle is only accessed through &self methods and
+// ownership is exclusive (no aliasing).
 #[cfg(target_os = "macos")]
 unsafe impl Send for SharedWaitEvent {}
 

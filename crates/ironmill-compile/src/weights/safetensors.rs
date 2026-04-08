@@ -96,7 +96,7 @@ impl SafeTensorsProvider {
         let mut mmaps = Vec::with_capacity(shard_paths.len());
         for path in &shard_paths {
             let file = fs::File::open(path)?;
-            let mmap = mmap_read_only(&file)?;
+            let mmap = super::mmap_read_only(&file)?;
             mmaps.push(mmap);
         }
 
@@ -651,26 +651,6 @@ fn json_f64(json: &serde_json::Value, key: &str) -> Option<f64> {
 }
 
 use std::str::FromStr;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Memory-maps a file for read-only access.
-///
-/// # Safety
-///
-/// This function assumes the file will not be modified or truncated while the
-/// mapping is alive. This is acceptable here because model weight
-/// files are read-only assets that are never modified during loading.
-#[allow(unsafe_code)]
-fn mmap_read_only(file: &std::fs::File) -> std::io::Result<Mmap> {
-    // SAFETY: We use mmap for zero-copy access to large model files.  The
-    // safety invariant is that the underlying file must not be modified or
-    // truncated while the mapping exists.  Model weight files are read-only
-    // assets that are not mutated during loading, so this invariant holds.
-    unsafe { Mmap::map(file) }
-}
 
 // ---------------------------------------------------------------------------
 // Tests

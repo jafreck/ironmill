@@ -215,8 +215,13 @@ impl CommandBuffer {
 
         unsafe extern "C" fn invoke_block(block: *mut BlockLiteral, _cmd_buf: *mut c_void) {
             // SAFETY: `block.closure` is a valid leaked Box<dyn Fn()>.
-            // Metal calls the completion handler exactly once, so we
-            // reclaim ownership of the Box to free it after invocation.
+            // Metal calls the completion handler exactly once per command
+            // buffer (per Apple Metal docs: "The command buffer calls this
+            // block after the device finishes executing all commands in the
+            // buffer"). We reclaim ownership of the Box to free it after
+            // invocation. If Metal were to violate this contract and call the
+            // handler again, this would double-free — but that would be a
+            // Metal framework bug, not ours.
             let closure = unsafe { Box::from_raw((*block).closure) };
             closure();
         }

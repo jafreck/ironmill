@@ -1097,6 +1097,7 @@ dependencies = [
 name = "ironmill-iosurface"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "half",
  "ironmill-core",
  "mil-rs",
