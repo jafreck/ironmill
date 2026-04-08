@@ -1118,20 +1118,95 @@ fn wrap_iosurface(aio_cls: *mut c_void, surface: *mut c_void) -> Result<*mut c_v
 }
 
 /// Build the weight dictionary in Orion's format with multiple entries.
+///
+/// # Ownership
+///
+/// Each `create_*` / `ns_mutable_dict` call returns a +1 retained ObjC object.
+/// `ns_dict_set` retains the key and value, so we release our reference
+/// immediately after insertion. On any error path we must release every
+/// object allocated so far in this iteration **and** the outer dictionary
+/// (which transitively releases all previously-inserted entries).
 fn build_multi_weight_dict(weights: &[(&str, &[u8])]) -> Result<*mut c_void, AneSysError> {
     let outer_dict = ns_mutable_dict()?;
 
     for (path_key, data) in weights {
-        let blob = make_blobfile(data)?;
-        let data_nsdata = create_nsdata(&blob)?;
-        let offset_num = create_nsnumber(64)?;
+        // make_blobfile returns a Rust Vec — no ObjC object to release.
+        let blob = match make_blobfile(data) {
+            Ok(b) => b,
+            Err(e) => {
+                unsafe { CFRelease(outer_dict) };
+                return Err(e);
+            }
+        };
 
-        let inner_dict = ns_mutable_dict()?;
-        let data_key = create_nsstring("data")?;
-        let offset_key = create_nsstring("offset")?;
+        // Live retained: data_nsdata
+        let data_nsdata = match create_nsdata(&blob) {
+            Ok(d) => d,
+            Err(e) => {
+                unsafe { CFRelease(outer_dict) };
+                return Err(e);
+            }
+        };
+
+        // Live retained: data_nsdata, offset_num
+        let offset_num = match create_nsnumber(64) {
+            Ok(n) => n,
+            Err(e) => {
+                unsafe {
+                    CFRelease(data_nsdata);
+                    CFRelease(outer_dict);
+                }
+                return Err(e);
+            }
+        };
+
+        // Live retained: data_nsdata, offset_num, inner_dict
+        let inner_dict = match ns_mutable_dict() {
+            Ok(d) => d,
+            Err(e) => {
+                unsafe {
+                    CFRelease(offset_num);
+                    CFRelease(data_nsdata);
+                    CFRelease(outer_dict);
+                }
+                return Err(e);
+            }
+        };
+
+        // Live retained: data_nsdata, offset_num, inner_dict, data_key
+        let data_key = match create_nsstring("data") {
+            Ok(k) => k,
+            Err(e) => {
+                unsafe {
+                    CFRelease(inner_dict);
+                    CFRelease(offset_num);
+                    CFRelease(data_nsdata);
+                    CFRelease(outer_dict);
+                }
+                return Err(e);
+            }
+        };
+
+        // Live retained: data_nsdata, offset_num, inner_dict, data_key, offset_key
+        let offset_key = match create_nsstring("offset") {
+            Ok(k) => k,
+            Err(e) => {
+                unsafe {
+                    CFRelease(data_key);
+                    CFRelease(inner_dict);
+                    CFRelease(offset_num);
+                    CFRelease(data_nsdata);
+                    CFRelease(outer_dict);
+                }
+                return Err(e);
+            }
+        };
+
+        // Insert into inner_dict — dict retains both key and value.
         ns_dict_set(inner_dict, data_key, data_nsdata);
         ns_dict_set(inner_dict, offset_key, offset_num);
 
+        // Release our +1 references; inner_dict now owns them.
         unsafe {
             CFRelease(data_key);
             CFRelease(offset_key);
@@ -1139,9 +1214,22 @@ fn build_multi_weight_dict(weights: &[(&str, &[u8])]) -> Result<*mut c_void, Ane
             CFRelease(offset_num);
         }
 
-        let outer_key = create_nsstring(path_key)?;
+        // Live retained: inner_dict (+ outer_key about to be created)
+        let outer_key = match create_nsstring(path_key) {
+            Ok(k) => k,
+            Err(e) => {
+                unsafe {
+                    CFRelease(inner_dict);
+                    CFRelease(outer_dict);
+                }
+                return Err(e);
+            }
+        };
+
+        // Insert into outer_dict — dict retains both key and value.
         ns_dict_set(outer_dict, outer_key, inner_dict);
 
+        // Release our +1 references; outer_dict now owns them.
         unsafe {
             CFRelease(outer_key);
             CFRelease(inner_dict);
