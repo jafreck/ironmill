@@ -38,6 +38,7 @@ impl MetalInference {
     /// - `n_features`: number of features per token for this capture point
     ///
     /// Returns the same logits as [`run_pipeline`].
+    #[allow(clippy::type_complexity)]
     pub(crate) fn run_pipeline_calibration(
         &mut self,
         token_ids: &[u32],
@@ -948,6 +949,7 @@ impl MetalInference {
     /// This is the calibration-mode equivalent of [`prefill`]. It processes
     /// all tokens in a single chunk (no chunking — calibration sequences are
     /// typically short).
+    #[allow(clippy::type_complexity)]
     pub(crate) fn prefill_calibration(
         &mut self,
         tokens: &[u32],
@@ -1082,11 +1084,11 @@ impl MetalInference {
         }
 
         // ── Attention phase ─────────────────────────────────────
-        let mut cmd_buf = self
+        let cmd_buf = self
             .queue
             .command_buffer()
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        let mut enc = cmd_buf
+        let enc = cmd_buf
             .compute_encoder()
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
         let default_pipelines = self.pipelines()?;

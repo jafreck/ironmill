@@ -671,7 +671,7 @@ fn magnitude_cache_key(magnitudes: &[f32]) -> u64 {
 ///
 /// Rows are processed in parallel via rayon. Large matrices sub-sample
 /// rows (cap 256) and broadcast the median clip value to all rows.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub(crate) fn search_clip_ranges(
     scaled_weights: &[f32],
     out_features: usize,
@@ -951,6 +951,7 @@ fn quantize_tensor_int8(
 ///
 /// The runtime kernel divides activations by `s_ch` to compensate, preserving
 /// the dot product:  dot(x, w) = dot(x / s, w * s)
+#[allow(clippy::too_many_arguments)]
 fn quantize_tensor_int4_awq(
     floats: &[f32],
     shape: &[usize],

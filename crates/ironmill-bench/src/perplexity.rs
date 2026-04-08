@@ -108,10 +108,14 @@ pub fn sliding_window_schedule(
         }
         let trg_len = end - prev_end;
         // loss_start is the position within this window where we begin
-        // counting losses. Positions before this were already evaluated
-        // in the previous window.
+        // counting losses.  In a causal LM the loss at position p predicts
+        // the token at p+1 (labels are shifted by 1).  The first new target
+        // token is at window position (window_len - trg_len), so the first
+        // loss position that predicts a new token is (window_len - trg_len - 1).
+        // For the first window (trg_len == window_len) this naturally clamps
+        // to 0 via saturating_sub.
         let window_len = end - begin;
-        let loss_start = window_len.saturating_sub(trg_len);
+        let loss_start = window_len.saturating_sub(trg_len + 1);
 
         steps.push(WindowStep {
             begin,
@@ -377,8 +381,8 @@ mod tests {
     fn sliding_window_overlapping() {
         // 10 tokens, window=6, stride=3
         // Window 0: [0,6), all tokens new, loss_start=0
-        // Window 1: [3,9), new tokens=[6,9), loss_start=3
-        // Window 2: [6,10), new tokens=[9,10), loss_start=3
+        // Window 1: [3,9), new tokens=[6,9), loss_start=2
+        // Window 2: [6,10), new tokens=[9,10), loss_start=2
         let steps = sliding_window_schedule(10, 6, 3);
         assert_eq!(steps.len(), 3);
         assert_eq!(
@@ -387,11 +391,11 @@ mod tests {
         );
         assert_eq!(
             (steps[1].begin, steps[1].end, steps[1].loss_start),
-            (3, 9, 3)
+            (3, 9, 2)
         );
         assert_eq!(
             (steps[2].begin, steps[2].end, steps[2].loss_start),
-            (6, 10, 3)
+            (6, 10, 2)
         );
     }
 
@@ -414,7 +418,7 @@ mod tests {
         // ...continuing until end
         let steps = sliding_window_schedule(4096, 2048, 512);
         assert_eq!(steps[0].loss_start, 0);
-        assert_eq!(steps[1].loss_start, 2048 - 512);
+        assert_eq!(steps[1].loss_start, 2048 - 512 - 1);
         // Total tokens counted should equal total - 1 (no target for last token)
         // Each counted token appears exactly once
         let total_counted: usize = steps

@@ -171,9 +171,7 @@ impl MetalDevice {
         let name = self.name();
         let cores = if name.contains("Ultra") {
             // M1/M2/M3/M4 Ultra: 2× Max die
-            if name.contains("M4") {
-                80
-            } else if name.contains("M3") {
+            if name.contains("M4") || name.contains("M3") {
                 80
             } else if name.contains("M2") {
                 76
@@ -181,9 +179,7 @@ impl MetalDevice {
                 64
             }
         } else if name.contains("Max") {
-            if name.contains("M4") {
-                40
-            } else if name.contains("M3") {
+            if name.contains("M4") || name.contains("M3") {
                 40
             } else if name.contains("M2") {
                 38

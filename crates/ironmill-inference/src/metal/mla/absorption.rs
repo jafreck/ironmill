@@ -142,6 +142,7 @@ pub fn absorb_weights(
 /// reads the current Q and O weights from the Metal buffers, performs the
 /// absorption matrix multiplies, and replaces the Q and O Metal buffers with
 /// the absorbed versions.
+#[allow(dead_code)]
 pub(crate) fn absorb_mla_weights(
     device: &MetalDevice,
     weights: &mut MetalWeights,
@@ -254,6 +255,7 @@ pub(crate) fn absorb_mla_weights(
 /// For Dense weights, reads directly from the underlying Metal buffer.
 /// Returns an error for quantized weights (MLA absorption requires dense
 /// weights as input).
+#[allow(dead_code)]
 fn read_f16_buffer(weight: &WeightBuffer, num_elements: usize) -> Result<Vec<u8>, MetalError> {
     let buf = weight.as_dense().map_err(|e| {
         MetalError::WeightLoading(format!(

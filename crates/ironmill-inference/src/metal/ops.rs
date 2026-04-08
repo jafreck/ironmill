@@ -1646,6 +1646,7 @@ const FLASH_DECODE_KV_PER_SPLIT: usize = 256;
 /// - Unified max hint: passes the previous step's softmax max to the split
 ///   kernel so the O accumulator avoids rescaling when max hasn't changed.
 /// - Reduce kernel writes back the global max for the next step's hint.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_flash_decode(
     encoder: &ComputeEncoder,
     split_pipeline: &ComputePipeline,
@@ -2545,6 +2546,7 @@ pub fn encode_quantize_input_q8(
 ///
 /// Uses pre-quantized INT8 input and per-group scales instead of FP16 input.
 /// The integer multiply-add inner loop is ~2× faster than float dequant.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_affine_matvec_int4xq8(
     encoder: &ComputeEncoder,
     pipeline: &ComputePipeline,

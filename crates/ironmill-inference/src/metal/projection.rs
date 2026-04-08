@@ -2,7 +2,7 @@
 
 use ironmill_metal_sys::{ComputeEncoder, MetalBuffer};
 
-use super::buffers::{IntermediateBuffers, Q8_GROUP_SIZE};
+use super::buffers::Q8_GROUP_SIZE;
 use super::ops;
 use super::ops::LinearKernelKind;
 use super::weights::{

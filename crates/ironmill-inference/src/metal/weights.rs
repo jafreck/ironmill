@@ -92,14 +92,12 @@ impl WeightBuffer {
     /// - **Dense:** drops the row-major `buf` when a packed blocked copy exists.
     /// - **Other variants:** no-op (no redundant copies).
     pub fn compact(&mut self) {
-        match self {
-            WeightBuffer::Dense {
-                buf,
-                packed: Some(_),
-            } => {
-                *buf = None;
-            }
-            _ => {}
+        if let WeightBuffer::Dense {
+            buf,
+            packed: Some(_),
+        } = self
+        {
+            *buf = None;
         }
     }
 }
