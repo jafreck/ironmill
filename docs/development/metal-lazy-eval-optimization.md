@@ -215,12 +215,18 @@ The root cause is the small K=2560 dimension: each thread reads only
 pipeline latency. This limits throughput regardless of how many memory
 streams are active.
 
-Four optimization approaches were tested and rejected:
+Five optimization approaches were tested and rejected:
 1. Batched 1-row kernel — 32% regression (lost 2-row efficiency)
 2. Individual 2-row for GDN — neutral (lost batching benefit)
 3. Q8 skip for AWQ — neutral
 4. **Fused dual-matrix shader — neutral** (per-thread dual-stream
    doesn't improve over 8-row's 4-address diversity at K=2560)
+5. **Superblock AMX kernel — 3× regression** (67.9ms vs 22.7ms).
+   Cooperative dequant to threadgroup memory + 2 barriers per K-tile
+   × 20 tiles = 40 synchronization points per dispatch. For M=1
+   matvec at K=2560, the barrier/SRAM overhead dwarfs the AMX matmul
+   throughput advantage. Only 64 TGs (vs 512 for scalar) further
+   limits GPU occupancy.
 
 The key insight is that the FFN's 3.8× bandwidth advantage comes from
 having more total threadgroups (N=9216 vs N≤4096), not from its
@@ -245,18 +251,11 @@ same memory pressure.
 ## Phase 3: Future Work
 
 The profiling + optimization work eliminated several hypotheses about the
-2.16× MLX gap. The remaining avenues require fundamentally different
-kernel architectures, not just parameter tuning.
+2.16× MLX gap. Five approaches were tested across kernel fusion,
+dispatch restructuring, and hardware acceleration — none improved decode
+throughput for Qwen3.5-4B INT4 AWQ on M2 Max.
 
-### Priority 1: AMX-accelerated INT4 projection path
-
-The existing `affine_matvec_int4_amx` kernel (256 threads, 64 rows/TG,
-cooperative dequant → threadgroup memory → simdgroup MMA) is not used
-for INT4 AWQ projections. Testing this path for AWQ weights could unlock
-wider memory loads via the Apple Matrix coprocessor. This is the lowest
-risk / highest leverage change: the kernel already exists.
-
-### Priority 2: Multi-row fused dual-stream kernel
+### Priority 1: Multi-row fused dual-stream kernel
 
 Combine the 8-row kernel's address diversity with the fused kernel's
 dual-matrix reads. Each simdgroup would process 4 rows from matrix A
@@ -267,11 +266,28 @@ AND 4 rows from matrix B simultaneously:
 
 This requires a more complex shader with 8 accumulators per thread.
 
+### Priority 2: Kernel launch pipelining
+
+Submit multiple command buffers concurrently instead of one sequential
+encoder. Metal can overlap kernel dispatch from different command
+buffers. This may reduce the 0.43ms inter-dispatch idle time and allow
+the GPU to begin the next layer while the current one drains.
+
+### Priority 3: Profile MLX kernels directly
+
+Use Metal System Trace (Instruments) to capture MLX's actual dispatch
+structure, kernel configurations, and memory bandwidth per dispatch.
+This would reveal whether MLX uses fundamentally different kernel
+parameters (e.g., larger K-tiles, different thread counts) or achieves
+better bandwidth through a mechanism not yet considered.
+
 ### Not recommended (tested and rejected)
 
-- **Fused dual-matrix 32-thread kernel**: Matches FFN fused pattern but
-  neutral at K=2560. The FFN's 3.8× BW advantage comes from N=9216
-  (more TGs for sustained pressure), not from dual-stream structure.
+- **Superblock AMX kernel**: 3× regression. Cooperative dequant + 40
+  threadgroup barriers per dispatch overwhelms AMX matmul benefit
+  for M=1 matvec at K=2560.
+- **Fused dual-matrix 32-thread kernel**: Neutral. FFN's BW advantage
+  comes from N=9216 (more TGs), not from dual-stream structure.
 - **Batched 1-row kernels for Standard layers**: 32% regression.
 - **Individual 2-row for GDN**: Neutral (lost batching benefit).
 - **Split-K**: Already tested separately — GPU occupancy saturated.
