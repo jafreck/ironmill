@@ -1,12 +1,15 @@
 // ── INT4 superblock matvec (decode path, M=1) ──────────────────
 //
-// 8 output rows per threadgroup (2 simdgroups × 4 rows/sg). Each lane
-// processes one uint32 (8 nibbles) per iteration, striding by 32 across K.
+// 8 output rows per threadgroup (2 simdgroups × 4 rows/sg).
+// Word-iteration with MLX-style pre-scaled input trick.
 //
-// Optimizations:
-// 1. Power-of-2 fast path: bitwise shift/AND replaces integer division
-// 2. Coalesced reads: consecutive lanes access consecutive superblock data
-// 3. Multi-row amortization: input load shared across 4 rows per simdgroup
+// Pre-scaled trick: divide input by positional powers (÷1, ÷16, ÷256, ÷4096)
+// so that raw masked nibbles × pre-scaled input = correct product.
+// Eliminates ALL bit-shift operations from the hot loop.
+//
+// Zero correction via scale * accum + bias * x_sum (1 FMA per word per row).
+// Group boundaries align with 8-element lane boundaries (GS >= 8 always),
+// so each lane's x_sum pairs with the correct group's bias.
 //
 // Dispatch: (ceil(N/8), 1, 1) threadgroups × (64, 1, 1) threads
 
@@ -29,34 +32,48 @@ kernel void superblock_matvec_int4(
 
     float result[SB_ROWS_PER_SG] = {0};
 
-    uint k_words = K / 8;
+    uint k_words = K / 8;  // uint32 words across K
 
     for (uint w = lane; w < k_words; w += 32) {
         uint k_elem = w * 8;
 
+        // Group index (compile-time shift since GS is #define'd)
         uint g = k_elem / GS;
-        uint word_in_data = (k_elem % GS) / 8;
+        // uint16 index within the group's data section (2 uint16s per uint32)
+        uint u16_in_data = (k_elem % GS) / 4;
 
-        // Load 8 input values (shared across all rows)
-        float a0 = float(A[k_elem]);
-        float a1 = float(A[k_elem + 1]);
-        float a2 = float(A[k_elem + 2]);
-        float a3 = float(A[k_elem + 3]);
-        float a4 = float(A[k_elem + 4]);
-        float a5 = float(A[k_elem + 5]);
-        float a6 = float(A[k_elem + 6]);
-        float a7 = float(A[k_elem + 7]);
+        // ── Pre-scale 8 input values (2 × 4-element pattern) ──
+        float v0 = float(A[k_elem]);
+        float v1 = float(A[k_elem + 1]);
+        float v2 = float(A[k_elem + 2]);
+        float v3 = float(A[k_elem + 3]);
+        float v4 = float(A[k_elem + 4]);
+        float v5 = float(A[k_elem + 5]);
+        float v6 = float(A[k_elem + 6]);
+        float v7 = float(A[k_elem + 7]);
 
         if (has_awq) {
-            a0 /= float(awq_scales[k_elem]);
-            a1 /= float(awq_scales[k_elem + 1]);
-            a2 /= float(awq_scales[k_elem + 2]);
-            a3 /= float(awq_scales[k_elem + 3]);
-            a4 /= float(awq_scales[k_elem + 4]);
-            a5 /= float(awq_scales[k_elem + 5]);
-            a6 /= float(awq_scales[k_elem + 6]);
-            a7 /= float(awq_scales[k_elem + 7]);
+            v0 /= float(awq_scales[k_elem]);
+            v1 /= float(awq_scales[k_elem + 1]);
+            v2 /= float(awq_scales[k_elem + 2]);
+            v3 /= float(awq_scales[k_elem + 3]);
+            v4 /= float(awq_scales[k_elem + 4]);
+            v5 /= float(awq_scales[k_elem + 5]);
+            v6 /= float(awq_scales[k_elem + 6]);
+            v7 /= float(awq_scales[k_elem + 7]);
         }
+
+        float x_sum = v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7;
+
+        // Pre-divide by positional powers: ÷1, ÷16, ÷256, ÷4096
+        float xp0 = v0;
+        float xp1 = v1 * (1.0f / 16.0f);
+        float xp2 = v2 * (1.0f / 256.0f);
+        float xp3 = v3 * (1.0f / 4096.0f);
+        float xp4 = v4;
+        float xp5 = v5 * (1.0f / 16.0f);
+        float xp6 = v6 * (1.0f / 256.0f);
+        float xp7 = v7 * (1.0f / 4096.0f);
 
         for (uint r = 0; r < SB_ROWS_PER_SG; r++) {
             uint row = base_row + r;
@@ -64,24 +81,26 @@ kernel void superblock_matvec_int4(
 
             device const uchar *sb = W + row * sb_stride + g * SB_BYTES_INT4;
             float scale = float(*(device const half *)(sb));
-            float zero  = float(*(device const half *)(sb + 2));
+            float bias  = float(*(device const half *)(sb + 2));
 
-            uint packed4 = ((device const uint *)(sb + SB_HEADER_BYTES))[word_in_data];
+            // Read 2 uint16s (= 8 nibbles) from data section — NO shifts needed
+            device const uint16_t *ws =
+                (device const uint16_t *)(sb + SB_HEADER_BYTES) + u16_in_data;
 
-            float w0 = (float(packed4 & 0xF) - zero) * scale;
-            float w1 = (float((packed4 >> 4) & 0xF) - zero) * scale;
-            float w2 = (float((packed4 >> 8) & 0xF) - zero) * scale;
-            float w3 = (float((packed4 >> 12) & 0xF) - zero) * scale;
-            float w4 = (float((packed4 >> 16) & 0xF) - zero) * scale;
-            float w5 = (float((packed4 >> 20) & 0xF) - zero) * scale;
-            float w6 = (float((packed4 >> 24) & 0xF) - zero) * scale;
-            float w7 = (float((packed4 >> 28) & 0xF) - zero) * scale;
+            float accum = xp0 * float(ws[0] & 0x000f)
+                        + xp1 * float(ws[0] & 0x00f0)
+                        + xp2 * float(ws[0] & 0x0f00)
+                        + xp3 * float(ws[0] & 0xf000)
+                        + xp4 * float(ws[1] & 0x000f)
+                        + xp5 * float(ws[1] & 0x00f0)
+                        + xp6 * float(ws[1] & 0x0f00)
+                        + xp7 * float(ws[1] & 0xf000);
 
-            result[r] += a0*w0 + a1*w1 + a2*w2 + a3*w3
-                       + a4*w4 + a5*w5 + a6*w6 + a7*w7;
+            result[r] += scale * accum + bias * x_sum;
         }
     }
 
+    // Reduce across SIMD lanes
     for (uint r = 0; r < SB_ROWS_PER_SG; r++) {
         result[r] = simd_sum(result[r]);
         if (lane == 0 && base_row + r < N) {
