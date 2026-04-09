@@ -323,3 +323,65 @@ cargo run --release -p ironmill-bench --features metal -- \
 
 Apple M2 Max, 64 GB unified memory, macOS 15.x.
 Peak memory bandwidth: 400 GB/s. Metal GPU Family: Apple 8.
+
+---
+
+## Results (April 2025)
+
+### Status: ❌ Split-K does not help on M2 Max for K ≤ 9216
+
+Phase 1 was fully implemented and benchmarked. Two approaches tested:
+
+| Approach | Decode | PPL | Δ vs baseline |
+|----------|--------|-----|---------------|
+| **Baseline** (no split-K) | **45 tok/s** | 9.42 | — |
+| Two-dispatch (partial → barrier → reduce) | 44.9 tok/s | 9.42 | ≈ 0% |
+| Wider TG (512 threads, intra-TG reduce) | 39.5 tok/s | 9.42 | **−14%** |
+
+### Why split-K doesn't help
+
+The original analysis assumed the M2 Max was occupancy-limited with 320 TGs.
+In practice, the M2 Max has 38 CUs × 16 TGs/CU = **608 concurrent TGs**. With
+only 320 TGs for a typical projection (N=2560), **all TGs are already active
+simultaneously** — there is no queuing.
+
+Split-K adds more TGs but the GPU is already saturated:
+- **Two-dispatch:** The barrier + extra dispatch adds ~10-30 μs overhead per
+  projection, negating any marginal occupancy benefit. Net: zero change.
+- **Wider TGs:** 512 threads/TG limits concurrent TGs to 2 per CU (76 total),
+  reducing inter-TG parallelism. Net: 14% regression.
+
+### Corrected root cause analysis
+
+The 2.2× gap to MLX is NOT primarily occupancy. The actual bottleneck
+breakdown:
+
+1. **Lazy evaluation / dispatch overhead** — MLX batches entire compute graphs
+   before committing, amortizing per-dispatch overhead across many operations.
+   ironmill dispatches each projection individually (5-7 per layer × 36
+   layers = 180-250 dispatches per token). Each dispatch has ~5-20 μs
+   scheduling overhead. See `metal-lazy-eval-optimization.md`.
+2. **16 vals/thread (Phase A)** — MLX processes 16 elements per lane per
+   iteration vs ironmill's 8, halving loop overhead and doubling memory
+   throughput per instruction.
+3. **Quad-group parallelism** — MLX uses quad-group operations for additional
+   SIMD-level parallelism.
+
+### What was committed
+
+Split-K infrastructure committed but disabled (`select_split_k` returns 1):
+- `shaders/quantized/split_k_matvec.metal` — wider-TG kernel with intra-TG
+  reduction
+- `ops/quantized.rs` — `SplitKPipelines` struct
+- `ops/mod.rs` — pipeline compilation
+- `projection.rs` — dispatch routing (gated by `select_split_k`)
+
+Infrastructure may become relevant for:
+- Larger models with K > 16384
+- GPUs with fewer compute units where 320 TGs cause genuine queuing
+
+### Phases 2–3: Not pursued
+
+Given Phase 1 results, extending split-K to batched/fused kernels (Phase 2) and
+16 vals/thread (Phase 3) would not improve decode throughput. Effort redirected
+to lazy evaluation and dispatch overhead reduction.
