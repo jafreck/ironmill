@@ -221,10 +221,6 @@ kernel void fused_residual_norm_matvec(
 constant constexpr uint FRN_BLK_K = 8;
 constant constexpr uint FRN_SB_HEADER_BYTES = 4;  // 2B scale + 2B zero
 
-// ── Superblock group_size specialization for fused norm kernel ──
-constant uint GS [[function_constant(0)]];
-constant uint FRN_SB_BYTES_INT4 = FRN_SB_HEADER_BYTES + GS / 2;
-
 kernel void superblock_fused_residual_norm_affine_matvec_int4(
     device const half* a               [[buffer(0)]],
     device const half* b               [[buffer(1)]],
@@ -241,12 +237,13 @@ kernel void superblock_fused_residual_norm_affine_matvec_int4(
 {
     uint N = params[0];
     uint K = params[1];
-    float eps = as_type<float>(params[2]);
+    uint group_size = params[2];
+    float eps = as_type<float>(params[3]);
 
     if (tid >= N) return;
 
-    uint num_groups = K / GS;
-    uint sb_bytes = FRN_SB_BYTES_INT4;
+    uint num_groups = K / group_size;
+    uint sb_bytes = FRN_SB_HEADER_BYTES + group_size / 2;
     uint sb_stride = num_groups * sb_bytes;
 
     float dot_acc = 0.0f;
@@ -257,9 +254,9 @@ kernel void superblock_fused_residual_norm_affine_matvec_int4(
         float s = float(*(device const half *)(sb));
         float z = float(*(device const half *)(sb + 2));
 
-        uint k_base = g * GS;
+        uint k_base = g * group_size;
 
-        for (uint i = lane * FRN_BLK_K; i < GS; i += 32 * FRN_BLK_K) {
+        for (uint i = lane * FRN_BLK_K; i < group_size; i += 32 * FRN_BLK_K) {
             uint k_elem = k_base + i;
             uint word_idx = i / 8;
             uint packed4 = ((device const uint*)(sb + FRN_SB_HEADER_BYTES))[word_idx];

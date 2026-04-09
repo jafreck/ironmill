@@ -10,8 +10,9 @@ kernel void superblock_batched_affine_matvec_int4(
     device half *C_up               [[buffer(4)]],
     constant uint &N_gate           [[buffer(5)]],
     constant uint &K                [[buffer(6)]],
-    device const half *awq_scales   [[buffer(7)]],
-    constant uint &has_awq          [[buffer(8)]],
+    constant uint &group_size       [[buffer(7)]],
+    device const half *awq_scales   [[buffer(8)]],
+    constant uint &has_awq          [[buffer(9)]],
     uint tid  [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -31,8 +32,8 @@ kernel void superblock_batched_affine_matvec_int4(
 
     if (local_tid >= N_gate) return;
 
-    uint num_groups = K / GS;
-    uint sb_bytes = SB_BYTES_INT4;
+    uint num_groups = K / group_size;
+    uint sb_bytes = SB_HEADER_BYTES + group_size / 2;
     uint sb_stride = num_groups * sb_bytes;
 
     float acc = 0.0f;
@@ -42,9 +43,9 @@ kernel void superblock_batched_affine_matvec_int4(
         float s = float(*(device const half *)(sb));
         float z = float(*(device const half *)(sb + 2));
 
-        uint k_base = g * GS;
+        uint k_base = g * group_size;
 
-        for (uint i = lane * BLK_K; i < GS; i += 32 * BLK_K) {
+        for (uint i = lane * BLK_K; i < group_size; i += 32 * BLK_K) {
             uint k_elem = k_base + i;
             uint word_idx = i / 8;
             uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_idx];
@@ -106,6 +107,7 @@ kernel void superblock_gdn_batched_affine_matvec_int4(
     uint N1 = params.N1;
     uint N2 = params.N2;
     uint K  = params.K;
+    uint group_size = params.group_size;
     uint has_awq = params.has_awq;
 
     uint local_tid;
@@ -133,8 +135,8 @@ kernel void superblock_gdn_batched_affine_matvec_int4(
 
     if (local_tid >= N_proj) return;
 
-    uint num_groups = K / GS;
-    uint sb_bytes = SB_BYTES_INT4;
+    uint num_groups = K / group_size;
+    uint sb_bytes = SB_HEADER_BYTES + group_size / 2;
     uint sb_stride = num_groups * sb_bytes;
 
     float acc = 0.0f;
@@ -144,9 +146,9 @@ kernel void superblock_gdn_batched_affine_matvec_int4(
         float s = float(*(device const half *)(sb));
         float z = float(*(device const half *)(sb + 2));
 
-        uint k_base = g * GS;
+        uint k_base = g * group_size;
 
-        for (uint i = lane * BLK_K; i < GS; i += 32 * BLK_K) {
+        for (uint i = lane * BLK_K; i < group_size; i += 32 * BLK_K) {
             uint k_elem = k_base + i;
             uint word_idx = i / 8;
             uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_idx];

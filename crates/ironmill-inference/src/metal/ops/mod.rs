@@ -27,7 +27,7 @@ pub use self::norm::*;
 pub use self::quantized::*;
 pub use self::rope::*;
 
-use ironmill_metal_sys::{ComputePipeline, FunctionConstantValues, MetalDevice, ShaderLibrary};
+use ironmill_metal_sys::{ComputePipeline, MetalDevice, ShaderLibrary};
 
 use self::library::ShaderLibraries;
 use super::error::MetalError;
@@ -65,14 +65,14 @@ type AdvancedMatmulShaders = (
     ComputePipeline,
     ComputePipeline,
     ComputePipeline,
-    GroupSizePipelines,
-    GroupSizePipelines,
-    GroupSizePipelines,
-    GroupSizePipelines,
-    GroupSizePipelines,
-    GroupSizePipelines,
-    GroupSizePipelines,
-    GroupSizePipelines,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
+    ComputePipeline,
 );
 type FusedShaders = (
     ComputePipeline,
@@ -81,7 +81,7 @@ type FusedShaders = (
     ComputePipeline,
     ComputePipeline,
     ComputePipeline,
-    GroupSizePipelines,
+    ComputePipeline,
 );
 
 /// Maximum threads per threadgroup imposed by the Metal API.
@@ -182,27 +182,6 @@ fn make_pipeline(
     device
         .create_compute_pipeline(&lib.get_function(name).map_err(MetalError::Metal)?)
         .map_err(MetalError::Metal)
-}
-
-/// Create group-size-specialized pipeline variants for a superblock kernel.
-fn make_gs_pipelines(
-    device: &MetalDevice,
-    lib: &ShaderLibrary,
-    name: &str,
-) -> Result<GroupSizePipelines, MetalError> {
-    let mut variants = std::collections::HashMap::new();
-    for &gs in &[32u32, 64, 128, 256] {
-        let constants = FunctionConstantValues::new().map_err(MetalError::Metal)?;
-        constants.set_u32(gs, 0); // index 0 = GS
-        let func = lib
-            .get_function_with_constants(name, &constants)
-            .map_err(MetalError::Metal)?;
-        let pipeline = device
-            .create_compute_pipeline(&func)
-            .map_err(MetalError::Metal)?;
-        variants.insert(gs, pipeline);
-    }
-    Ok(GroupSizePipelines { variants })
 }
 
 impl MetalPipelines {
@@ -551,27 +530,27 @@ impl MetalPipelines {
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int4_amx")?,
             make_pipeline(device, &libs.affine_mm, "affine_matvec_int8_amx")?,
             make_pipeline(device, &libs.quantized, "d2quant_matvec_3bit_amx")?,
-            // Superblock pipelines (group-size specialized)
-            make_gs_pipelines(device, &libs.affine_mm, "superblock_matvec_int4")?,
-            make_gs_pipelines(device, &libs.affine_mm, "superblock_matmul_int4")?,
-            make_gs_pipelines(
+            // Superblock pipelines
+            make_pipeline(device, &libs.affine_mm, "superblock_matvec_int4")?,
+            make_pipeline(device, &libs.affine_mm, "superblock_matmul_int4")?,
+            make_pipeline(
                 device,
                 &libs.affine_mm,
                 "superblock_fused_ffn_gate_up_act_int4",
             )?,
-            make_gs_pipelines(
+            make_pipeline(
                 device,
                 &libs.affine_mm,
                 "superblock_batched_affine_matvec_int4",
             )?,
-            make_gs_pipelines(
+            make_pipeline(
                 device,
                 &libs.affine_mm,
                 "superblock_gdn_batched_affine_matvec_int4",
             )?,
-            make_gs_pipelines(device, &libs.affine_mm, "superblock_affine_matvec_int4xq8")?,
-            make_gs_pipelines(device, &libs.affine_mm, "superblock_matvec_int8")?,
-            make_gs_pipelines(device, &libs.affine_mm, "superblock_matmul_int8")?,
+            make_pipeline(device, &libs.affine_mm, "superblock_affine_matvec_int4xq8")?,
+            make_pipeline(device, &libs.affine_mm, "superblock_matvec_int8")?,
+            make_pipeline(device, &libs.affine_mm, "superblock_matmul_int8")?,
         ))
     }
 
@@ -587,7 +566,7 @@ impl MetalPipelines {
             make_pipeline(device, &libs.ple, "ple_gelu_gate")?,
             make_pipeline(device, &libs.ple, "add_scale")?,
             make_pipeline(device, &libs.norm, "fused_residual_norm_matvec")?,
-            make_gs_pipelines(
+            make_pipeline(
                 device,
                 &libs.norm,
                 "superblock_fused_residual_norm_affine_matvec_int4",
@@ -673,15 +652,14 @@ impl MetalPipelines {
         self.polarquant.for_bits_and_kind(n_bits, kind)
     }
 
-    /// Select the affine-quantized pipeline for a given bit-width, phase, and group size.
+    /// Select the affine-quantized pipeline for a given bit-width and phase.
     #[inline]
     pub fn affine_pipeline(
         &self,
         bit_width: u32,
         kind: LinearKernelKind,
-        group_size: u32,
     ) -> Option<&ComputePipeline> {
-        self.affine.for_bits_kind_gs(bit_width, kind, group_size)
+        self.affine.for_bits_and_kind(bit_width, kind)
     }
 
     /// Select the D2Quant dual-scale pipeline for a given bit-width and phase.
