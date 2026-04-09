@@ -10,6 +10,20 @@
 
 ironmill is 2.5× behind MLX on identical quantization (INT4 gs=128) and 1.8× behind llama.cpp.
 
+### Hot Kernel Under Test
+
+The target configuration is **AWQ-INT4** (INT4 with activation-aware weight
+quantization). During decode, this takes the following dispatch path in
+`projection.rs`:
+
+1. `WeightBuffer::AffineQuantized` with `awq_scales.is_some() == true`
+2. Skips the `int4xq8` fast-path (that path requires `awq_scales.is_none()`)
+3. Falls through to `encode_affine_projection` → **`superblock_matvec_int4`**
+
+The `superblock_matvec_int4` kernel at line 265 of `projection.rs` is the hot
+kernel for ALL experiments below. The `int4xq8` kernel is NOT exercised with
+AWQ weights.
+
 ## What We Already Ruled Out
 
 ### ✅ ALU / Compute Bottleneck — NOT the issue
@@ -106,19 +120,40 @@ remain 9.39 ± 0.05.
 ```
 Benchmark command:
   cargo run --release -p ironmill-bench --features metal -- \
-    --config configs/qwen35-4b-kernel-perf.toml
+    --config configs/qwen35-4b-decode-perf.toml
 ```
 
 ### Step 1: Occupancy sweep (isolates thread structure)
 
-**What to change**: Only the constants in `superblock_header.metal`:
-```metal
-constant constexpr uint SB_ROWS_PER_SG = <vary>;
-constant constexpr uint SB_NUM_SIMDGROUPS = <vary>;
-```
-And the dispatch in `projection.rs` (TG size and grid size).
+**What to change**: The constants are defined in TWO shader files — BOTH must
+be updated for each config:
 
-**Configs to test** (change, build, bench, record — one at a time):
+1. `crates/ironmill-inference/src/metal/shaders/quantized/superblock_header.metal` (lines 25-26):
+```metal
+constant constexpr uint SB_ROWS_PER_SG = <vary>;     // line 25
+constant constexpr uint SB_NUM_SIMDGROUPS = <vary>;   // line 26
+// SB_ROWS_PER_TG is derived (line 27): SB_NUM_SIMDGROUPS * SB_ROWS_PER_SG
+```
+
+2. `crates/ironmill-inference/src/metal/shaders/quantized/affine_common.metal` (lines 55-56):
+```metal
+constant constexpr uint SB_ROWS_PER_SG = <vary>;     // line 55
+constant constexpr uint SB_NUM_SIMDGROUPS = <vary>;   // line 56
+// SB_ROWS_PER_TG is derived (line 57): SB_NUM_SIMDGROUPS * SB_ROWS_PER_SG
+```
+
+3. The dispatch in `crates/ironmill-inference/src/metal/projection.rs` (line 265):
+```rust
+// Current: ceil(N/8) TGs × 64 threads (8 rows per TG)
+encoder.dispatch_threadgroups((n.div_ceil(8), 1, 1), (64, 1, 1));
+// Change to match new SB_ROWS_PER_TG and SB_NUM_SIMDGROUPS × 32:
+encoder.dispatch_threadgroups(
+    (n.div_ceil(NEW_ROWS_PER_TG), 1, 1),
+    (NEW_NUM_SIMDGROUPS * 32, 1, 1),
+);
+```
+
+**Configs to test** (change all THREE locations, build, bench, record — one at a time):
 
 | Config | SGs/TG | Rows/SG | Threads/TG | Rows/TG | Expected TGs (N=2560) |
 |--------|--------|---------|------------|---------|----------------------|
@@ -143,7 +178,7 @@ is small (< 10%). Run Metal System Trace on the best config from Step 1:
 ```bash
 xctrace record --template 'Metal System Trace' --launch -- \
   cargo run --release -p ironmill-bench --features metal -- \
-    --config configs/qwen35-4b-kernel-perf.toml
+    --config configs/qwen35-4b-decode-perf.toml
 ```
 
 Open in Instruments. For the `superblock_matvec_int4` shader, record:
@@ -217,9 +252,11 @@ benchmark it.
 
 ### ironmill
 - Current decode kernel: `crates/ironmill-inference/src/metal/shaders/quantized/affine_matvec.metal`
-- Dispatch: `crates/ironmill-inference/src/metal/projection.rs` (encode_affine_projection)
-- Superblock header: `crates/ironmill-inference/src/metal/shaders/quantized/superblock_header.metal`
+- Dispatch: `crates/ironmill-inference/src/metal/projection.rs` (encode_affine_projection, **line 265** = decode dispatch)
+- Superblock header (has SB_ROWS_PER_SG): `crates/ironmill-inference/src/metal/shaders/quantized/superblock_header.metal`
+- Affine common (ALSO has SB_ROWS_PER_SG): `crates/ironmill-inference/src/metal/shaders/quantized/affine_common.metal`
 - Build system: `crates/ironmill-inference/build.rs` (superblock metallib compilation)
+- Benchmark config: `configs/qwen35-4b-decode-perf.toml` (AWQ-INT4, decode-only)
 
 ### MLX (GitHub: ml-explore/mlx)
 - QMV kernel: `mlx/backend/metal/kernels/quantized_nax.h` (search for `affine_qmv_fast` and `affine_qmv_quad`)
