@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the same checks as CI (.github/workflows/ci.yml).
+# Prevents pushing code that will fail the CI pipeline.
+#
+# CI steps reproduced:
+#   1. cargo build --workspace
+#   2. cargo test --workspace
+#   3. cargo clippy --workspace -- -D warnings
+#   4. cargo fmt --all -- --check
+#   5. cargo doc --workspace --no-deps
+
+set -e
+
+echo "pre-push: running CI checks..."
+
+echo "pre-push: building workspace..."
+cargo build --workspace || {
+    echo "error: cargo build failed. Fix build errors before pushing."
+    exit 1
+}
+
+echo "pre-push: running tests..."
+cargo test --workspace || {
+    echo "error: cargo test failed. Fix test failures before pushing."
+    exit 1
+}
+
+echo "pre-push: running clippy..."
+cargo clippy --workspace -- -D warnings || {
+    echo "error: clippy found warnings. Fix them before pushing."
+    exit 1
+}
+
+echo "pre-push: checking formatting..."
+cargo fmt --all -- --check || {
+    echo "error: cargo fmt found diffs. Run 'cargo fmt --all' before pushing."
+    exit 1
+}
+
+echo "pre-push: checking docs..."
+cargo doc --workspace --no-deps 2>&1 | grep -q "^error" && {
+    echo "error: cargo doc failed. Fix doc errors before pushing."
+    exit 1
+}
+
+echo "pre-push: all CI checks passed ✓"
