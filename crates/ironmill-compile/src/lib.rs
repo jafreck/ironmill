@@ -3,6 +3,22 @@
 //! This crate brings together ANE lowering passes, CoreML build-time compilation,
 //! architecture templates, and weight providers. It depends on [`mil_rs`] for the
 //! core MIL IR but owns all backend-specific compilation logic.
+//!
+//! # Example: compile ONNX → CoreML mlpackage
+//!
+//! ```no_run
+//! use ironmill_compile::CompileBuilder;
+//! use ironmill_compile::coreml::build_api::Quantization;
+//!
+//! let output = CompileBuilder::new("model.onnx")
+//!     .quantize(Quantization::Fp16)
+//!     .output("resources/model.mlpackage")
+//!     .compile()
+//!     .build()?;
+//!
+//! println!("wrote {}", output.mlpackage.display());
+//! # Ok::<(), ironmill_compile::CompileError>(())
+//! ```
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

@@ -3,6 +3,24 @@
 //! This crate consolidates all inference-related code: autoregressive
 //! decode loops, KV cache management, token sampling, and the runtime
 //! types shared across backends.
+//!
+//! # Example: generate tokens
+//!
+//! ```ignore
+//! use ironmill_inference::{GenerateRequest, TokenStream, CancellationToken, GenerateEvent};
+//!
+//! let cancel = CancellationToken::new();
+//! let request = GenerateRequest::new(prompt_tokens);
+//! let stream = TokenStream::new(&mut engine, request, &cancel);
+//!
+//! for event in stream {
+//!     match event? {
+//!         GenerateEvent::Token { token, .. } => print!("{token}"),
+//!         GenerateEvent::Finished { .. } => break,
+//!         _ => {}
+//!     }
+//! }
+//! ```
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
