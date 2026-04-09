@@ -891,13 +891,15 @@ impl MetalInference {
             .read_bytes(&mut logits_fp16, last_token_offset)
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
-        let logits: Vec<f32> = logits_fp16
-            .chunks_exact(2)
-            .map(|chunk| {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                f16::from_bits(bits).to_f32()
-            })
-            .collect();
+        let logits: Logits = Logits::new(
+            logits_fp16
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    f16::from_bits(bits).to_f32()
+                })
+                .collect(),
+        );
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         let num_layers = mc.num_hidden_layers;

@@ -56,10 +56,12 @@ impl MetalInference {
         let all_logits: Vec<Logits> = (0..n)
             .map(|t| {
                 let offset = t * vocab * 2;
-                fp16_buf[offset..offset + vocab * 2]
-                    .chunks_exact(2)
-                    .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                    .collect()
+                Logits::new(
+                    fp16_buf[offset..offset + vocab * 2]
+                        .chunks_exact(2)
+                        .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                        .collect(),
+                )
             })
             .collect();
 
@@ -1049,8 +1051,8 @@ impl MetalInference {
         // When skip_logits is set (non-last prefill chunks), skip the
         // expensive GPU readback + f16→f32 conversion since the logits
         // are immediately discarded.
-        let logits: Vec<f32> = if skip_logits {
-            Vec::new()
+        let logits: Logits = if skip_logits {
+            Logits::new(Vec::new())
         } else {
             let last_token_offset = (token_count - 1) * vocab * 2; // FP16 offset in bytes
             let logits_byte_count = vocab * 2;
@@ -1070,7 +1072,7 @@ impl MetalInference {
             let f16_slice: &[f16] = u16_slice.reinterpret_cast();
             let mut logits_f32 = vec![0.0f32; f16_slice.len()];
             f16_slice.convert_to_f32_slice(&mut logits_f32);
-            logits_f32
+            Logits::new(logits_f32)
         };
 
         self.seq_pos += token_count;

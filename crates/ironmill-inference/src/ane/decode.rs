@@ -1992,11 +1992,14 @@ impl<D: AneDevice> AneInference<D> {
 
 impl<D: AneDevice + Send + 'static> InferenceEngine for AneInference<D> {
     fn prefill(&mut self, tokens: &[u32]) -> std::result::Result<Logits, InferenceError> {
-        AneInference::prefill(self, tokens).map_err(|e| InferenceError::Runtime(e.into()))
+        AneInference::prefill(self, tokens)
+            .map(Logits::new)
+            .map_err(|e| InferenceError::Runtime(e.into()))
     }
 
     fn decode_step(&mut self, token: u32) -> std::result::Result<Logits, InferenceError> {
         self.decode(token)
+            .map(Logits::new)
             .map_err(|e| InferenceError::Runtime(e.into()))
     }
 

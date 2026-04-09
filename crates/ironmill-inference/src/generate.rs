@@ -236,7 +236,7 @@ impl<'a> TokenStream<'a> {
             prefilled: false,
             finished: false,
             pending_finish: None,
-            logits: Vec::new(),
+            logits: Logits::new(Vec::new()),
             generated_tokens: Vec::new(),
             effective_stop_tokens: Vec::new(),
         }
@@ -621,7 +621,7 @@ mod tests {
             if self.vocab_size > 1 {
                 logits[1] = 5.0;
             }
-            Ok(logits)
+            Ok(Logits::new(logits))
         }
 
         fn decode_step(&mut self, _token: u32) -> Result<Logits, InferenceError> {
@@ -630,7 +630,7 @@ mod tests {
             if self.vocab_size > 1 {
                 logits[1] = 5.0;
             }
-            Ok(logits)
+            Ok(Logits::new(logits))
         }
 
         fn reset(&mut self) {
@@ -677,13 +677,13 @@ mod tests {
                 self.pos += tokens.len();
                 let mut logits = vec![0.0f32; 10];
                 logits[2] = 10.0; // EOS token
-                Ok(logits)
+                Ok(Logits::new(logits))
             }
             fn decode_step(&mut self, _: u32) -> Result<Logits, InferenceError> {
                 self.pos += 1;
                 let mut logits = vec![0.0f32; 10];
                 logits[2] = 10.0;
-                Ok(logits)
+                Ok(Logits::new(logits))
             }
             fn reset(&mut self) {
                 self.pos = 0;

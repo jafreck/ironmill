@@ -20,6 +20,7 @@
 use half::f16;
 
 use crate::engine::{InferenceEngine, InferenceError};
+use crate::types::Logits;
 
 // ── Configuration ───────────────────────────────────────────────
 
@@ -278,7 +279,7 @@ impl<E: InferenceEngine> SpeculativeStreaming<E> {
     }
 
     /// Fallback: standard single-token decode (no MSA heads).
-    pub fn standard_step(&mut self, token: u32) -> Result<Vec<f32>, InferenceError> {
+    pub fn standard_step(&mut self, token: u32) -> Result<Logits, InferenceError> {
         self.engine.decode_step(token)
     }
 
@@ -384,7 +385,7 @@ mod tests {
             if (self.favored_token as usize) < self.vocab_size {
                 logits[self.favored_token as usize] = 5.0;
             }
-            Ok(logits)
+            Ok(Logits::new(logits))
         }
 
         fn decode_step(&mut self, _token: u32) -> Result<Logits, InferenceError> {
@@ -393,7 +394,7 @@ mod tests {
             if (self.favored_token as usize) < self.vocab_size {
                 logits[self.favored_token as usize] = 5.0;
             }
-            Ok(logits)
+            Ok(Logits::new(logits))
         }
 
         fn reset(&mut self) {

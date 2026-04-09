@@ -218,7 +218,7 @@ impl<E: InferenceEngine> SpeculativeEngine<E> {
     ) -> Result<Vec<Logits>, InferenceError> {
         let base_pos = self.engine.seq_pos();
         let n = candidates.len();
-        let mut all_logits: Vec<Logits> = vec![Vec::new(); n];
+        let mut all_logits: Vec<Logits> = (0..n).map(|_| Logits::new(Vec::new())).collect();
 
         let order = dfs_order_best_last(candidates);
 
@@ -372,7 +372,7 @@ mod tests {
             if !logits.is_empty() {
                 logits[0] = 1.0;
             }
-            Ok(logits)
+            Ok(Logits::new(logits))
         }
 
         fn decode_step(&mut self, _token: u32) -> Result<Logits, InferenceError> {
@@ -382,7 +382,7 @@ mod tests {
             if self.vocab_size > 1 {
                 logits[1] = 2.0;
             }
-            Ok(logits)
+            Ok(Logits::new(logits))
         }
 
         fn reset(&mut self) {
