@@ -2,333 +2,372 @@
 
 ## Problem
 
-Qwen 3.5-4B INT4+TQ-INT8 decode on M2 Max 64 GB:
+Qwen 3.5-4B INT4 gs=128 decode on M2 Max 64 GB:
 
-| Framework | Decode | Prefill | Bandwidth Utilization |
-|-----------|--------|---------|----------------------|
-| **ironmill** | **19 tok/s (52 ms)** | **228 tok/s** | **5% (20 GB/s)** |
-| MLX | 40–60 tok/s | ~800 tok/s | ~75–85% |
-| llama.cpp | 50–90 tok/s | ~1100 tok/s | ~80–90% |
-| Theoretical floor | 152 tok/s (6.6 ms) | — | 100% (400 GB/s) |
+| Framework | Quantization | Decode | Prefill | BW Util |
+|-----------|-------------|--------|---------|---------|
+| **ironmill** | **INT4 superblock gs=128** | **38 tok/s** | **242 tok/s** | **~10%** |
+| MLX | INT4 gs=128 | 97 tok/s | — | ~50% |
+| llama.cpp | Q4_K_M gs=64 | 67 tok/s | 1066 tok/s | ~35% |
+| Theoretical floor | — | 152 tok/s | — | 100% (400 GB/s) |
 
-ironmill reads 1.02 GB of INT4 weights per token. The M2 Max delivers
-400 GB/s peak bandwidth, giving a 6.6 ms theoretical floor. The entire
-52 ms decode latency is GPU-side (confirmed: GPU time = 51.0 ms, wall
-time = 51.9 ms — 98% GPU-bound). No CPU overhead, no dispatch gap. The
-problem is purely **on-GPU memory bandwidth utilization at 5%**.
+ironmill is **2.5× behind MLX** on identical quantization and **1.8× behind
+llama.cpp**. The problem is purely on-GPU memory bandwidth utilization.
+No CPU overhead (GPU time ≈ wall time, 98% GPU-bound).
 
-## Previous Approach (Failed)
+## Progress Summary
+
+### Original Bottlenecks (from 19 tok/s baseline)
+
+The original plan (written at 19 tok/s) identified three structural problems.
+Here is their current status:
+
+| Original Problem | Status | What Was Done | Impact |
+|-----------------|--------|---------------|--------|
+| Byte-by-byte nibble unpacking | ✅ **Fixed** | Superblock migration + uint16/uint32 vectorized loads | 19 → 31 tok/s |
+| Scattered scale/zero metadata | ✅ **Fixed** | Inline superblock headers (scale+bias in 4B prefix) | Included above |
+| Tiny 1-row TGs (2560 TGs/proj) | ✅ **Fixed** | 8 rows/TG (2 SGs × 4 rows/SG), 320 TGs/proj | 31 → 36 tok/s |
+
+Additional optimizations landed:
+
+| Optimization | Impact |
+|-------------|--------|
+| Compile-time `#define GS` specialization (÷ → >>) | 36 → 38 tok/s |
+| MLX-style pre-scaled input trick (eliminates 8 shifts+subs) | No change (memory-bound) |
+| Kernel fusion: residual+RMSNorm+projection (3-way) | In place for decode |
+| Kernel fusion: gate+up+activation (FFN) | In place for decode |
+
+**Net result: 19 → 38 tok/s (2× improvement). But MLX is at 97 tok/s.**
+
+### Previous Approach (Failed)
 
 The prior plan (`metal-kernel-performance.md`) misdiagnosed the bottleneck
-as "kernel inefficiency" and "lack of simdgroup MMA." It proposed 4 phases:
+as "kernel inefficiency" and "lack of simdgroup MMA." Its 4 phases all failed
+or had no effect. MMA is wrong for M=1 decode — both MLX and llama.cpp use
+scalar dot products with SIMD reduction, the same algorithm ironmill uses.
 
-| Phase | What it did | Result |
-|-------|-------------|--------|
-| P1: K-tile=32 prefill | Increased MMA ops per barrier | ✅ Landed, **no effect** on prefill (228 tok/s unchanged) |
-| P2: AMX decode matvec | Replaced scalar kernels with MMA | ❌ Slower (9→13 tok/s), reverted |
-| P3: Barrier cleanup | Converted PLE barriers to resource-specific | ✅ Landed, **no measurable effect** |
-| P4: Q8 integer dot | AMX-based integer accumulation | ❌ Never attempted |
+---
 
-**Why it failed:** MMA is wrong for M=1 decode. Both MLX and llama.cpp use
-scalar dot products with SIMD reduction for decode — the same pattern
-ironmill already uses. The speed difference is not the algorithm but
-**how memory is accessed**: coalesced wide loads vs scattered byte reads,
-inline metadata vs separate arrays, fused dispatches vs individual kernels.
-
-## Root Cause Analysis
+## Current Root Cause Analysis
 
 ### Profiled Data
 
 ```
-Total weight reads per token:     1.02 GB
+Weights per token (INT4 gs=128):  1.02 GB
 M2 Max peak bandwidth:            400 GB/s
 Theoretical minimum latency:      2.56 ms
-Measured GPU time:                 51.0 ms
-Achieved bandwidth:               20.1 GB/s
-Bandwidth utilization:            5.0%
+Measured decode latency:          ~26 ms
+Achieved bandwidth:               ~40 GB/s
+Bandwidth utilization:            ~10%
 ```
 
-### Why 5% Bandwidth
+### Why 2.5× Behind MLX
 
-Three structural problems in the current kernel design:
+Two structural problems remain after the superblock migration. Both were
+identified by comparing ironmill's `superblock_matvec_int4` kernel against
+MLX's `qmv_fast_impl` (in `mlx/backend/metal/kernels/quantized.h`).
 
-#### 1. Byte-by-byte nibble unpacking
+#### 1. Superblock header cache waste (~33% bandwidth loss)
 
-Current code reads one `uchar` at a time:
-```metal
-uchar packed = B_packed[byte_idx];     // 1-byte load
-uchar lo = packed & 0x0F;
-uchar hi = (packed >> 4) & 0x0F;
+ironmill's superblock format places a 4-byte header (2B scale + 2B bias)
+before every group's packed data. For INT4 gs=128, each superblock is
+68 bytes: 4 header + 64 data.
+
+In the decode kernel, 32 SIMD lanes read from 2 consecutive groups per
+K-iteration. The memory span per row is:
+
+```
+Group 0: [sb+4 .. sb+67]     64 bytes data (lanes 0–15)
+          [sb+68 .. sb+71]    4 bytes header (GROUP 1 — GAP)
+Group 1: [sb+72 .. sb+135]   64 bytes data (lanes 16–31)
 ```
 
-This generates 1-byte device memory transactions. Metal's memory subsystem
-coalesces adjacent accesses within a simdgroup into 32-byte or 128-byte
-cache-line transactions. With 32 lanes each reading 1 byte at stride > 1,
-every transaction wastes 97% of the loaded cache line.
+Total span: 132 bytes across 3 cache lines (192 bytes fetched).
+Useful data: 128 bytes → **67% cache utilization**.
 
-**MLX approach:** Reads `uint32_t` or `uint64_t` (4–8 bytes per load),
-unpacking 8–16 nibbles in registers. This fills cache lines efficiently.
+MLX uses **separate contiguous arrays** for weights, scales, and biases.
+32 lanes × 8 packed bytes = 256 contiguous bytes per row → 4 cache lines,
+**100% utilization**. No gaps.
 
-#### 2. Scattered scale/zero metadata reads
-
-Current code looks up scale/zero from separate arrays per element:
-```metal
-float s0 = float(scales[scale_row + g0]);   // random access into [N, groups]
-float z0 = float(zeros[scale_row + g0]);    // random access into [N, groups]
+```
+ironmill:  128 useful / 192 fetched = 67% utilization
+MLX:       256 useful / 256 fetched = 100% utilization
+Ratio:     0.67×
 ```
 
-For group_size=128, each output row reads K/128 = 20 scale+zero pairs from
-arrays laid out as `[N, num_groups]`. Adjacent threadgroups read adjacent rows,
-but the scale array has stride `num_groups` = 20 — so adjacent TGs access
-addresses 40 bytes apart. With `N=2560` threadgroups, this scatters across
-51 KB of scale data per projection.
+#### 2. Half the values per thread (~2× loop overhead)
 
-**llama.cpp approach:** Q4_K_M packs scales inline with quantized data in
-144-byte super-blocks. Scale reads are sequential with weight reads — zero
-extra cache lines.
+ironmill loads **8 elements per thread** per K-iteration (2 × uint16 = 4
+packed bytes). MLX loads **16 elements per thread** (4 × uint16 = 8 packed
+bytes). With 32 lanes per simdgroup:
 
-**MLX approach:** Still uses separate scale arrays but processes multiple
-groups per simdgroup with vectorized loads, amortizing the cost.
+```
+ironmill:  8 × 32 = 256 elements per K block
+MLX:       16 × 32 = 512 elements per K block
+```
 
-#### 3. Tiny threadgroups with no data reuse
+For K=2560, ironmill needs 10 K-iterations vs MLX's 5. Each iteration
+incurs pointer arithmetic (group index, superblock offset), branch checks,
+and per-row metadata reads. **2× more iterations = 2× more overhead per
+useful byte.**
 
-Each threadgroup processes 1 output row with 32 threads. Per-TG weight
-data read is only ~1.3 KB (K/2 = 1280 bytes for K=2560). The input vector
-x (5 KB) is read by every TG but cached in L2 after the first read.
+#### Combined Impact
 
-With 2560 TGs per projection and 7 projections per layer, there are
-~18,000 TGs per layer × 28 layers = ~500,000 TGs per token. Each TG
-reads a tiny amount of data before terminating, causing constant TG
-scheduling overhead and preventing the memory subsystem from building
-sustained streaming bandwidth.
+```
+Cache efficiency:   0.67× (superblock headers)
+Values per thread:  0.50× (half the elements)
+Combined:           0.67 × 0.50 = 0.33×
+Predicted:          97 × 0.33 = 32 tok/s
+Measured:           38 tok/s
+```
 
-**MLX approach:** Also uses ~1 row per TG for QMV, but compensates with
-wide vectorized loads and kernel fusion to reduce total dispatch count.
+The model predicts ~33% of MLX throughput; measured is ~39%. The small
+overestimate is explained by ironmill's inline scale reads being slightly
+cheaper than MLX's separate-array lookups (better spatial locality per group).
+
+#### Additional MLX Advantages (Secondary)
+
+- **Split-K dispatch**: MLX splits the K dimension across multiple TGs
+  (split_k=8 for K≤8192), launching 8× more TGs for better occupancy
+  and memory-latency hiding. ironmill processes full K per TG.
+- **Contiguous row-major weights**: MLX's weight array has zero gaps,
+  enabling maximum memory streaming bandwidth.
 
 ---
 
-## Optimization Plan
+## Remaining Optimization Plan
 
-### Strategy: Match MLX's bandwidth patterns, not llama.cpp's data format
+### Strategy: Close the 2.5× MLX gap via cache efficiency + per-thread throughput
 
-Adopting llama.cpp's Q4_K_M super-block format would require rewriting
-the quantization pipeline, weight packing, and all kernels. Instead, we
-adopt MLX's approach: keep the current group-quantized layout but fix
-how the GPU reads it.
+The original 4-phase plan is largely completed. The remaining gap requires
+two targeted changes that address the specific root causes above, plus
+the occupancy sweep from `decode-perf-investigation.md`.
 
-### Phase 1: Vectorized Wide Loads (Target: 15–20% bandwidth → 40+ tok/s)
+### Phase A: Double Values Per Thread (Target: ~55 tok/s)
 
-**The single highest-impact change.** Replace byte-by-byte weight reads
-with vectorized loads that fill cache lines efficiently.
+**Highest-confidence change.** Load 16 elements per thread per K-iteration
+instead of 8, matching MLX's `qmv_fast_impl`. This halves the number of
+K loop iterations and doubles the useful bytes per memory request.
 
-#### 1a. Pack 8 nibbles per uint32 load
-
+#### Current code (8 elements/thread):
 ```metal
-// BEFORE: 1 byte per load, 2 nibbles
-uchar packed = B_packed[byte_idx];
-
-// AFTER: 4 bytes per load, 8 nibbles
-uint packed4 = ((device const uint*)B_packed)[word_idx];
-// Unpack 8 nibbles from the 32-bit word
-float w0 = (float(packed4 & 0xF) - z) * s;
-float w1 = (float((packed4 >> 4) & 0xF) - z) * s;
-float w2 = (float((packed4 >> 8) & 0xF) - z) * s;
-// ... 8 values from one 4-byte load
+// 2 × uint16 = 4 packed bytes = 8 nibbles per lane per iteration
+device const uint16_t *ws = (device const uint16_t *)(sb + SB_HEADER_BYTES) + u16_in_data;
+float accum = xp0 * float(ws[0] & 0x000f) + xp1 * float(ws[0] & 0x00f0)
+            + xp2 * float(ws[0] & 0x0f00) + xp3 * float(ws[0] & 0xf000)
+            + xp4 * float(ws[1] & 0x000f) + xp5 * float(ws[1] & 0x00f0)
+            + xp6 * float(ws[1] & 0x0f00) + xp7 * float(ws[1] & 0xf000);
 ```
 
-This increases the effective memory transaction size by 4× and improves
-cache-line utilization from ~3% to ~12% per load.
-
-#### 1b. Pre-fetch scale/zero per group
-
-Instead of looking up scale/zero per element pair, load them once per
-group and reuse across all elements in that group:
-
+#### Proposed (16 elements/thread):
 ```metal
-// Load scale/zero once per group (every 128 elements)
-float s = float(scales[scale_row + grp]);
-float z = float(zeros[scale_row + grp]);
+// 4 × uint16 = 8 packed bytes = 16 nibbles per lane per iteration
+uint k_words = K / 16;  // half as many iterations
+for (uint w = lane; w < k_words; w += 32) {
+    uint k_elem = w * 16;
+    uint g = k_elem / GS;
+    uint u16_in_data = (k_elem % GS) / 4;
 
-// Process all 64 element pairs in this group with cached s/z
-for (uint k = lane; k < group_half; k += 32) {
-    uint packed4 = ((device const uint*)B_group)[k];
-    // Unpack and accumulate using cached s, z
-}
-```
+    // Pre-scale 16 input values (4 × 4-element pattern)
+    // ... xp0..xp15 with ÷1, ÷16, ÷256, ÷4096 pattern ...
 
-#### 1c. Align loads to blocked layout boundaries
+    for (uint r = 0; r < SB_ROWS_PER_SG; r++) {
+        device const uchar *sb = W + row * sb_stride + g * SB_BYTES_INT4;
+        float scale = float(*(device const half *)(sb));
+        float bias  = float(*(device const half *)(sb + 2));
 
-The current blocked layout `[N/64, K/8, 64, 4]` stores 4 packed bytes
-(8 nibbles) per innermost dimension — exactly one `uint32_t`. The byte
-indexing arithmetic should be replaced with word-aligned indexing:
+        device const uint16_t *ws =
+            (device const uint16_t *)(sb + SB_HEADER_BYTES) + u16_in_data;
 
-```metal
-// BEFORE: complex byte indexing with division
-uint byte_idx = (n_block * k_blocks + kb) * block_bytes
-              + n_local * local_k_bytes + b;
+        float accum = xp0 * float(ws[0] & 0x000f) + xp1 * float(ws[0] & 0x00f0)
+                    + xp2 * float(ws[0] & 0x0f00) + xp3 * float(ws[0] & 0xf000)
+                    + xp4 * float(ws[1] & 0x000f) + xp5 * float(ws[1] & 0x00f0)
+                    + xp6 * float(ws[1] & 0x0f00) + xp7 * float(ws[1] & 0xf000)
+                    + xp8  * float(ws[2] & 0x000f) + xp9  * float(ws[2] & 0x00f0)
+                    + xp10 * float(ws[2] & 0x0f00) + xp11 * float(ws[2] & 0xf000)
+                    + xp12 * float(ws[3] & 0x000f) + xp13 * float(ws[3] & 0x00f0)
+                    + xp14 * float(ws[3] & 0x0f00) + xp15 * float(ws[3] & 0xf000);
 
-// AFTER: word-aligned block indexing
-uint word_idx = (n_block * k_blocks + kb) * (BLK_N)
-              + n_local;  // one uint32 per (n_local, k_block)
-uint packed4 = ((device const uint*)B_packed)[word_idx];
-```
-
-**Expected impact:** 3–4× bandwidth improvement (20 → 60–80 GB/s).
-This alone should reach 35–45 tok/s.
-
-**Files changed:**
-- `shaders/quantized/affine_matvec.metal` — `affine_matvec_int4`
-- `shaders/quantized/affine_batched.metal` — `batched_affine_matvec_int4`, `gdn_batched_affine_matvec_int4`
-- `shaders/quantized/affine_fused.metal` — `fused_ffn_gate_up_act_int4`, `affine_matvec_int4xq8`
-- No Rust dispatch changes needed — same TG counts, same buffer bindings.
-
-### Phase 2: Kernel Fusion (Target: 25–35% bandwidth → 50–60 tok/s)
-
-Reduce Metal dispatch count by fusing adjacent kernels that share buffers.
-Each dispatch boundary costs ~2–5 µs of scheduling overhead plus a full
-L2 cache flush via the inter-dispatch memory barrier. With ~500,000 TGs
-per token, even small per-TG overhead accumulates.
-
-#### 2a. Fuse RMSNorm + First Projection
-
-Currently: `encode_rms_norm` → barrier → `encode_projection` (Q or QKV).
-
-Fused: Single kernel reads input, computes RMSNorm inline, then does the
-matvec — eliminating the intermediate buffer write and the barrier.
-
-This pattern already partially exists in `fused_residual_norm_affine_matvec_int4`
-for end-of-layer P1 fusion. Extend it to cover layer-start norm + first
-projection as well.
-
-**Impact:** Eliminates 28 dispatches + 28 barriers (one per layer).
-Saves the norm_out intermediate buffer write (28 × 2560 × 2 = 140 KB/token).
-
-#### 2b. Fuse Residual + RMSNorm + Projection (3-way)
-
-Currently: `encode_residual_add` → barrier → `encode_rms_norm` → barrier →
-`encode_projection`.
-
-Fused: Single kernel that reads hidden_state + residual, computes
-`hidden = hidden + residual`, normalizes, and feeds directly into the
-matvec. Eliminates 2 barriers and 2 intermediate buffer round-trips.
-
-**Impact:** Eliminates 56 dispatches + 56 barriers (two per layer).
-
-#### 2c. Fuse Gate+Up+Activation+Down (FFN mega-kernel)
-
-Currently the FFN block dispatches:
-1. `batched_affine_matvec_int4` or `fused_ffn_gate_up_act_int4` (gate+up)
-2. barrier
-3. `affine_matvec_int4` (down projection)
-
-The fused FFN kernel would do gate+up+activation+down in a single dispatch
-by writing the intermediate `silu(gate) * up` result to threadgroup memory
-and immediately reading it back for the down projection. This only works
-if `intermediate_size` (6912) fits in threadgroup memory — it does not
-(6912 × 2 = 13.8 KB for one row, but we need the full intermediate
-vector for the down projection).
-
-**Alternative:** Fuse gate+up+activation (already done) and keep down
-as a separate dispatch, but eliminate the barrier between them by using
-`threadgroup_barrier` only within the fused kernel.
-
-**Impact:** Already partially realized by `fused_ffn_gate_up_act_int4`.
-Focus fusion effort on 2a and 2b instead.
-
-**Files changed:**
-- `shaders/quantized/affine_fused.metal` — new fused norm+matvec kernel
-- `metal/pipeline.rs` — rewire encode calls to use fused paths
-- `metal/ops/quantized.rs` — new encode function for fused kernel
-
-### Phase 3: Multi-Row Threadgroups (Target: 40–50% bandwidth → 60–75 tok/s)
-
-Process 2–4 output rows per threadgroup to amortize TG scheduling overhead
-and improve memory streaming.
-
-#### Design
-
-```metal
-// 2 rows per TG: 64 threads (2 simdgroups)
-// Each simdgroup handles 1 output row
-kernel void affine_matvec_int4_2row(
-    ...,
-    uint tgid [[threadgroup_position_in_grid]],
-    uint sgid [[simdgroup_index_in_threadgroup]],
-    uint lane  [[thread_index_in_simdgroup]])
-{
-    uint row = tgid * 2 + sgid;
-    if (row >= N) return;
-
-    // Both simdgroups read the same input x (shared in L1)
-    // Each reads different weight rows (adjacent in blocked layout)
-    float acc = 0.0f;
-    for (uint k = lane; k < half_K; k += 32) {
-        uint packed4 = load_weight_word(row, k);
-        // ... vectorized dequant + dot product
+        result[r] += scale * accum + bias * x_sum;
     }
-    acc = simd_sum(acc);
-    if (lane == 0) C[row] = half(acc);
 }
 ```
 
-- Dispatch: `(ceil(N/2), 1, 1)` TGs × `(64, 1, 1)` threads
-- Halves TG count → halves scheduling overhead
-- Adjacent rows in the same N-block read adjacent memory → better
-  coalescing within the blocked layout
-- Input vector `x` is shared across simdgroups in L1 cache
+**Constraint:** 16 elements spans either 1 or 2 groups depending on alignment.
+For GS=128, 16 elements is always within a single group (16 < 128), so the
+scale/bias lookup stays simple. For GS=32, 16 elements spans exactly 1 group
+(16 < 32), also safe.
 
-**Why not 64 rows (AMX style)?** The failed Phase 2 showed that
-cooperative dequant into threadgroup memory + MMA adds more overhead
-than it saves for M=1. The sweet spot is 2–4 rows with independent
-scalar dot products sharing only the input vector through cache.
+**Note on cross-group spanning:** Each lane processes 16 consecutive K elements
+starting at `k_elem = lane * 16`. With 32 lanes × 16 = 512 elements per
+K block, and GS=128, this spans 4 groups per iteration. Each lane stays
+within its own group. The lane→group mapping is `g = (lane * 16) / GS`.
+Groups change at lane boundaries (lane 0-7 → g, lane 8-15 → g+1, etc.),
+so scale/bias must be looked up per-lane, which is already the case.
 
-**Files changed:**
-- `shaders/quantized/affine_matvec.metal` — new `_2row` variant
-- `shaders/quantized/affine_batched.metal` — update batched kernels
-- `shaders/quantized/affine_fused.metal` — update fused kernels
-- `metal/ops/quantized.rs` — update dispatch to (ceil(N/2), 1, 1) × (64, 1, 1)
-- `metal/projection.rs` — update decode dispatch
+**Expected impact:** ~1.5–2× decode improvement (38 → 55–70 tok/s).
+Halving K iterations reduces per-iteration overhead and doubles useful
+bytes per memory transaction.
 
-### Phase 4: Prefill Dequant Optimization (Target: 500+ tok/s prefill)
+**Files to change:**
+- `shaders/quantized/affine_matvec.metal` — `superblock_matvec_int4`
+- `shaders/quantized/affine_batched.metal` — `batched_affine_matvec_int4`
+- `shaders/quantized/affine_fused.metal` — all INT4 kernels
+- No Rust dispatch changes (same TG count, same buffer bindings).
 
-The prefill matmul kernels already have correct structure (K-tile=32,
-double-buffered, simdgroup MMA) but still achieve only 228 tok/s. The
-bottleneck is the same: the B-tile load phase uses byte-by-byte dequant.
+### Phase B: Separate Scale/Bias Arrays (Target: ~75 tok/s)
 
-Apply the same vectorized load pattern from Phase 1 to the B-tile load
-functions in all prefill matmul kernels:
+Replace superblock inline headers with MLX-style separate contiguous arrays.
+This eliminates the 4-byte gaps that waste ~33% of cache fetches.
 
-- `affine_matmul_int4` — vectorize the B-tile dequant loop
-- `affine_matmul_int8` — same pattern, byte loads → uint32 loads
-- `d2quant_matmul_3bit` — vectorize 3-bit unpacking (3 bytes → 8 values)
+#### Layout change:
+```
+BEFORE (superblock):
+  W[row][group] = [scale:2B][bias:2B][data:GS/2 bytes]
+  68 bytes per superblock for INT4 gs=128
 
-**Expected impact:** 2–3× prefill improvement (228 → 500–700 tok/s).
+AFTER (separate arrays):
+  W_data[row][K/2]     — contiguous packed nibbles, no gaps
+  W_scales[row][K/GS]  — separate half array
+  W_biases[row][K/GS]  — separate half array
+```
 
-**Files changed:**
-- `shaders/quantized/affine_matmul.metal`
-- `shaders/quantized/d2quant_matmul.metal`
+This changes the weight packing format and adds 2 buffer bindings per kernel.
+
+#### Kernel change:
+```metal
+// BEFORE: inline header read
+device const uchar *sb = W + row * sb_stride + g * SB_BYTES_INT4;
+float scale = float(*(device const half *)(sb));
+float bias  = float(*(device const half *)(sb + 2));
+device const uint16_t *ws = (device const uint16_t *)(sb + SB_HEADER_BYTES) + ...;
+
+// AFTER: separate array read
+float scale = float(scales[row * num_groups + g]);
+float bias  = float(biases[row * num_groups + g]);
+device const uint16_t *ws = (device const uint16_t *)(W_data + row * k_half) + ...;
+```
+
+**Trade-off:** Separate scale/bias reads lose superblock spatial locality
+(scale is no longer in the same cache line as its data). However, with
+K/GS = 20 groups per row, the scale/bias arrays are only 80 bytes per row
+— easily cached in L2 after the first group iteration. The net effect is
+positive because the weight data array becomes gap-free.
+
+**Expected impact:** ~1.3–1.5× on top of Phase A (55 → 70–80 tok/s).
+Eliminates 33% cache waste from superblock headers.
+
+**Files to change:**
+- `metal/weights.rs` — add `scales`/`biases` buffer fields, update packing
+- `shaders/quantized/affine_matvec.metal` — read from separate arrays
+- `shaders/quantized/affine_batched.metal` — same
+- `shaders/quantized/affine_fused.metal` — same
+- `shaders/quantized/affine_matmul.metal` — prefill kernels too
+- `metal/projection.rs` — add buffer bindings for scales/biases
+- `metal/ops/quantized.rs` — update encode helpers
+
+### Phase C: Occupancy Sweep (Target: find optimal TG config)
+
+Run the 6-config occupancy experiment from `decode-perf-investigation.md`
+to determine if the current 2 SG × 4 rows/SG structure is optimal.
+
+| Config | SGs/TG | Rows/SG | Threads/TG | Rows/TG | Expected TGs |
+|--------|--------|---------|------------|---------|-------------|
+| A | 1 | 2 | 32 | 2 | 1280 |
+| B | 1 | 4 | 32 | 4 | 640 |
+| C | 1 | 8 | 32 | 8 | 320 |
+| D | 2 | 2 | 64 | 4 | 640 |
+| **E (current)** | **2** | **4** | **64** | **8** | **320** |
+| F | 2 | 8 | 64 | 16 | 160 |
+
+**Decision rule:** If any config wins by ≥ 5% over current, adopt it.
+Run this AFTER Phase A to test with the improved kernel.
+
+**Files to change:**
+- `shaders/quantized/superblock_header.metal` — `SB_ROWS_PER_SG`, `SB_NUM_SIMDGROUPS`
+- `shaders/quantized/affine_common.metal` — same constants
+- `metal/projection.rs` — dispatch grid/thread counts
+
+### Phase D: INT8 + 3-bit Prefill Vectorization (Target: 400+ tok/s prefill)
+
+INT4 prefill is already vectorized (uint32 loads in B-tile load). But INT8
+and 3-bit paths still use byte-by-byte reads:
+
+```metal
+// INT8 prefill — still byte-by-byte:
+uchar q = sb[SB_HEADER_BYTES + sb_offset];
+
+// 3-bit prefill — 3 byte reads per 8 values:
+uint bits = uint(B_packed[off]) | (uint(B_packed[off+1]) << 8)
+          | (uint(B_packed[off+2]) << 16);
+```
+
+**INT8 fix:** Replace with uint32 loads (4 bytes = 4 INT8 values per load).
+**3-bit fix:** Replace 3-byte concatenation with a single uint32 load
+(read 4 bytes, mask to 24 useful bits, unpack 8 3-bit values).
+
+**Files to change:**
+- `shaders/quantized/affine_matmul.metal` — `superblock_matmul_int8` B-tile load
+- `shaders/quantized/d2quant_matmul.metal` — `d2quant_matmul_3bit` B-tile load
 
 ---
 
 ## Expected Impact
 
-| Phase | Decode (tok/s) | Prefill (tok/s) | BW Util | Key Change |
-|-------|---------------|-----------------|---------|------------|
-| Baseline | 19 | 228 | 5% | — |
-| Phase 1: Wide loads | ~40 | ~300 | ~20% | uint32 reads, cached scale/zero |
-| Phase 2: Kernel fusion | ~55 | ~400 | ~28% | −56 barriers, −56 dispatches |
-| Phase 3: Multi-row TG | ~65 | ~400 | ~33% | 2 rows/TG, halved TG count |
-| Phase 4: Prefill dequant | ~65 | ~600 | ~33% | Vectorized B-tile loads |
-| **Total** | **~65** | **~600** | **~33%** | |
-| MLX reference | 40–60 | ~800 | ~75–85% | |
-| llama.cpp reference | 50–90 | ~1100 | ~80–90% | |
+| Phase | Decode (tok/s) | Prefill (tok/s) | Key Change |
+|-------|---------------|-----------------|------------|
+| Baseline (current) | 38 | 242 | Superblock + pre-scaled input |
+| Phase A: 16 vals/thread | ~55 | ~300 | Half K iterations, 2× useful bytes/request |
+| Phase B: Separate arrays | ~75 | ~400 | Eliminate 33% cache waste |
+| Phase C: Occupancy sweep | ~80 | ~400 | Optimal TG configuration |
+| Phase D: INT8/3-bit prefill | ~80 | ~500 | Vectorize remaining prefill paths |
+| **Projected total** | **~80** | **~500** | |
+| MLX reference | 97 | — | |
+| llama.cpp reference | 67 | 1066 | |
 
-The remaining gap to MLX after all phases (~0–35%) would require:
-- **Inline scale packing** (format change, not just kernel change)
+The remaining gap to MLX after all phases (~17%) would require:
+- **Split-K dispatch** (multiple TGs per output row, final reduction)
 - **Auto-specialized kernel variants** per group-size/dim/dtype
 - **Lazy evaluation / compute graph batching** (framework-level change)
 
 These are larger architectural investments beyond kernel optimization.
+
+---
+
+## Completed Work (Historical)
+
+The following phases from the original plan have been implemented:
+
+### ✅ Phase 1: Vectorized Wide Loads → DONE (19 → 31 tok/s)
+
+Migrated from byte-by-byte blocked layout to row-major superblock format
+with uint16/uint32 vectorized loads. Scale/bias read inline from 4-byte
+superblock headers. All decode, batched, and fused kernels updated.
+
+Commits: `617280a`, `50cb934`, `312683b`, `970b81e`.
+
+### ✅ Phase 2: Kernel Fusion → DONE (decode path)
+
+- 3-way residual+RMSNorm+projection fusion via
+  `encode_fused_residual_norm_affine_matvec_int4` (used at end of each
+  layer to fuse with next layer's first projection).
+- Gate+up+activation fusion via `superblock_fused_ffn_gate_up_act_int4`
+  (eliminates separate activation dispatch).
+- Down projection remains separate (intermediate vector too large for TG
+  memory).
+- Prefill still uses separate dispatches (room for future improvement).
+
+### ✅ Phase 3: Multi-Row Threadgroups → DONE (8 rows/TG)
+
+Implemented 2 simdgroups × 4 rows/SG = 8 rows/TG, dispatching
+`ceil(N/8)` TGs × 64 threads. Optimal configuration TBD via Phase C
+occupancy sweep.
+
+### ⚠️ Phase 4: Prefill Dequant → PARTIAL
+
+INT4 prefill matmul (`superblock_matmul_int4`) uses uint32 vectorized
+B-tile loads. INT8 and 3-bit paths still use byte-by-byte reads (see
+Phase D above).
 
 ---
 
@@ -354,15 +393,23 @@ cargo run --release -p ironmill-bench --features metal -- \
 
 | Phase | Decode minimum | Prefill minimum | PPL |
 |-------|---------------|-----------------|-----|
-| Phase 1 | ≥ 30 tok/s | ≥ 250 tok/s | = baseline |
-| Phase 2 | ≥ 45 tok/s | ≥ 350 tok/s | = baseline |
-| Phase 3 | ≥ 55 tok/s | ≥ 350 tok/s | = baseline |
-| Phase 4 | ≥ 55 tok/s | ≥ 500 tok/s | = baseline |
+| Phase A: 16 vals/thread | ≥ 48 tok/s | ≥ 250 tok/s | = baseline |
+| Phase B: Separate arrays | ≥ 65 tok/s | ≥ 350 tok/s | = baseline |
+| Phase C: Occupancy sweep | ≥ 65 tok/s | ≥ 350 tok/s | = baseline |
+| Phase D: INT8/3-bit | ≥ 65 tok/s | ≥ 400 tok/s | = baseline |
+
+### Decode Benchmark
+
+Use the AWQ-INT4 decode config (this exercises `superblock_matvec_int4`):
+```bash
+cargo run --release -p ironmill-bench --features metal -- \
+  --config configs/qwen35-4b-decode-perf.toml
+```
 
 ### GPU Profiling
 
-Use the `gpu_start_time()`/`gpu_end_time()` API (added to
-`ironmill-metal-sys::CommandBuffer`) to verify GPU time tracks wall time:
+Use the `gpu_start_time()`/`gpu_end_time()` API to verify GPU time tracks
+wall time:
 ```rust
 cmd_buf.commit();
 cmd_buf.wait_until_completed();
@@ -374,6 +421,14 @@ If wall time decreases but GPU time doesn't, the improvement is CPU-side
 (not bandwidth) and the phase hasn't addressed the real bottleneck.
 
 ---
+
+## Related Documents
+
+- `decode-perf-investigation.md` — Detailed investigation brief with 5
+  concrete experiments (occupancy sweep, Xcode profiling, separate arrays
+  test, dispatch overhead, MLX source analysis).
+- `metal-kernel-performance.md` — Original (failed) kernel optimization
+  plan that misdiagnosed the bottleneck as MMA/ALU.
 
 ## Hardware
 
