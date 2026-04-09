@@ -123,113 +123,65 @@ impl AffineQuantConfig {
         }
     }
 
-    /// INT4 with AWQ channel scales loaded from calibration output.
-    pub fn int4_awq(
-        group_size: usize,
+    /// Add AWQ (Activation-aware Weight Quantization) calibration data.
+    ///
+    /// `magnitudes` are per-channel activation scales keyed by layer weight name.
+    /// `activations` are optional raw calibration activations for alpha grid search.
+    /// `token_count` is the number of calibration tokens in each activation snapshot.
+    pub fn with_awq(
+        mut self,
         magnitudes: std::collections::HashMap<String, Vec<f32>>,
-    ) -> Self {
-        Self {
-            group_size,
-            awq_magnitudes: Some(magnitudes),
-            awq_activations: None,
-            awq_token_count: None,
-            awq_block_config: None,
-            #[cfg(feature = "gptq")]
-            hessian_data: None,
-            #[cfg(feature = "gptq")]
-            gptq_block_size: 128,
-            #[cfg(feature = "gptq")]
-            gptq_dampening: 0.01,
-            sensitive_layers: Vec::new(),
-        }
-    }
-
-    /// INT4 with AWQ magnitudes and raw calibration activations for alpha grid search.
-    pub fn int4_awq_with_activations(
-        group_size: usize,
-        magnitudes: std::collections::HashMap<String, Vec<f32>>,
-        activations: std::collections::HashMap<String, Vec<f32>>,
+        activations: Option<std::collections::HashMap<String, Vec<f32>>>,
         token_count: usize,
     ) -> Self {
-        Self {
-            group_size,
-            awq_magnitudes: Some(magnitudes),
-            awq_activations: Some(activations),
-            awq_token_count: Some(token_count),
-            awq_block_config: None,
-            #[cfg(feature = "gptq")]
-            hessian_data: None,
-            #[cfg(feature = "gptq")]
-            gptq_block_size: 128,
-            #[cfg(feature = "gptq")]
-            gptq_dampening: 0.01,
-            sensitive_layers: Vec::new(),
-        }
+        self.awq_magnitudes = Some(magnitudes);
+        self.awq_activations = activations;
+        self.awq_token_count = Some(token_count);
+        self
     }
 
-    /// INT4 with precomputed AWQ block-level config.
+    /// Add GPTQ (second-order) calibration data.
     ///
-    /// Uses pre-calibrated alpha and clip values from block-level search,
-    /// bypassing load-time alpha search and clip search entirely.
-    pub fn int4_awq_block(
-        group_size: usize,
-        magnitudes: std::collections::HashMap<String, Vec<f32>>,
-        block_config: std::collections::HashMap<String, AwqTensorConfig>,
-    ) -> Self {
-        Self {
-            group_size,
-            awq_magnitudes: Some(magnitudes),
-            awq_activations: None,
-            awq_token_count: None,
-            awq_block_config: Some(block_config),
-            #[cfg(feature = "gptq")]
-            hessian_data: None,
-            #[cfg(feature = "gptq")]
-            gptq_block_size: 128,
-            #[cfg(feature = "gptq")]
-            gptq_dampening: 0.01,
-            sensitive_layers: Vec::new(),
-        }
-    }
-
-    /// INT4 with GPTQ Hessian-guided quantization.
+    /// `hessian_data` maps AWQ key → (xtx_flat, n_features, sample_count).
+    /// `block_size` controls the column-block processing width (default: 128).
+    /// `dampening` is the Hessian dampening factor (default: 0.01).
     #[cfg(feature = "gptq")]
-    pub fn int4_gptq(
-        group_size: usize,
+    pub fn with_gptq(
+        mut self,
         hessian_data: std::collections::HashMap<String, (Vec<f32>, usize, usize)>,
+        block_size: usize,
+        dampening: f64,
     ) -> Self {
-        Self {
-            group_size,
-            hessian_data: Some(hessian_data),
-            gptq_block_size: 128,
-            gptq_dampening: 0.01,
-            ..Default::default()
-        }
+        self.hessian_data = Some(hessian_data);
+        self.gptq_block_size = block_size;
+        self.gptq_dampening = dampening;
+        self
     }
 
-    /// INT4 with AWQ channel scales and GPTQ Hessian-guided quantization.
-    #[cfg(feature = "gptq")]
-    pub fn int4_awq_gptq(
-        group_size: usize,
-        magnitudes: std::collections::HashMap<String, Vec<f32>>,
-        hessian_data: std::collections::HashMap<String, (Vec<f32>, usize, usize)>,
-    ) -> Self {
-        Self {
-            group_size,
-            awq_magnitudes: Some(magnitudes),
-            hessian_data: Some(hessian_data),
-            gptq_block_size: 128,
-            gptq_dampening: 0.01,
-            ..Default::default()
-        }
+    /// Mark specific layer indices as sensitive (quantize at INT8 instead of INT4).
+    ///
+    /// Typically the first and last 1-2 layers, which handle the
+    /// embedding→hidden and hidden→logit transformations.
+    pub fn with_sensitive_layers(mut self, layers: Vec<usize>) -> Self {
+        self.sensitive_layers = layers;
+        self
     }
 
-    /// INT4 with first/last N layers at INT8 (most common configuration).
-    pub fn int4_with_sensitive(
-        group_size: usize,
-        num_layers: usize,
-        sensitive_count: usize,
+    /// Add precomputed AWQ block-level configuration.
+    ///
+    /// When present, bypasses both alpha search and clip search at load time.
+    pub fn with_block_config(
+        mut self,
+        config: std::collections::HashMap<String, AwqTensorConfig>,
     ) -> Self {
+        self.awq_block_config = Some(config);
+        self
+    }
+
+    /// Compute first/last N sensitive layer indices for a model with `num_layers` layers.
+    ///
+    /// Helper that builds the sensitive layer list and calls [`with_sensitive_layers`].
+    pub fn with_sensitive_bookend(self, num_layers: usize, sensitive_count: usize) -> Self {
         let mut layers = Vec::new();
         for i in 0..sensitive_count.min(num_layers) {
             layers.push(i);
@@ -239,11 +191,7 @@ impl AffineQuantConfig {
                 layers.push(i);
             }
         }
-        Self {
-            group_size,
-            sensitive_layers: layers,
-            ..Default::default()
-        }
+        self.with_sensitive_layers(layers)
     }
 }
 
@@ -1561,7 +1509,7 @@ mod tests {
         let mut hessian_data = HashMap::new();
         hessian_data.insert(awq_key.clone(), (xtx, inf, sample_count));
 
-        let config = AffineQuantConfig::int4_gptq(128, hessian_data);
+        let config = AffineQuantConfig::int4(128).with_gptq(hessian_data, 128, 0.01);
 
         // Also get RTN result for comparison.
         let config_rtn = AffineQuantConfig::int4(128);
@@ -1614,22 +1562,22 @@ mod tests {
     }
 
     #[test]
-    fn test_int4_with_sensitive_constructor() {
+    fn test_int4_with_sensitive_builder() {
         // 32 layers, sensitive_count=2 → layers 0, 1, 30, 31.
-        let config = AffineQuantConfig::int4_with_sensitive(128, 32, 2);
+        let config = AffineQuantConfig::int4(128).with_sensitive_bookend(32, 2);
         assert_eq!(config.group_size, 128);
         assert_eq!(config.sensitive_layers, vec![0, 1, 30, 31]);
 
         // Edge case: sensitive_count >= num_layers → all layers sensitive.
-        let config2 = AffineQuantConfig::int4_with_sensitive(128, 4, 4);
+        let config2 = AffineQuantConfig::int4(128).with_sensitive_bookend(4, 4);
         assert_eq!(config2.sensitive_layers, vec![0, 1, 2, 3]);
 
         // sensitive_count=0 → no sensitive layers.
-        let config3 = AffineQuantConfig::int4_with_sensitive(128, 32, 0);
+        let config3 = AffineQuantConfig::int4(128).with_sensitive_bookend(32, 0);
         assert!(config3.sensitive_layers.is_empty());
 
         // sensitive_count=1 with 1 layer → just layer 0.
-        let config4 = AffineQuantConfig::int4_with_sensitive(128, 1, 1);
+        let config4 = AffineQuantConfig::int4(128).with_sensitive_bookend(1, 1);
         assert_eq!(config4.sensitive_layers, vec![0]);
     }
 }

@@ -94,11 +94,9 @@ pub(crate) fn load_metal_engine(
                     "    AWQ: loaded block config for {} tensors",
                     block_config.len()
                 );
-                ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq_block(
-                    128,
-                    magnitudes,
-                    block_config,
-                )
+                ironmill_compile::weights::quantized::AffineQuantConfig::int4(128)
+                    .with_awq(magnitudes, None, 0)
+                    .with_block_config(block_config)
             } else {
                 // Try loading activations for runtime search
                 let act_path = std::path::Path::new(awq_dir).join("awq_activations.json");
@@ -118,29 +116,28 @@ pub(crate) fn load_metal_engine(
                             activations.len(),
                             token_count,
                         );
-                        ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq_with_activations(
-                            128, magnitudes, activations, token_count,
-                        )
+                        ironmill_compile::weights::quantized::AffineQuantConfig::int4(128)
+                            .with_awq(magnitudes, Some(activations), token_count)
                     } else {
-                        ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(
-                            128, magnitudes,
-                        )
+                        ironmill_compile::weights::quantized::AffineQuantConfig::int4(128)
+                            .with_awq(magnitudes, None, 0)
                     }
                 } else {
-                    ironmill_compile::weights::quantized::AffineQuantConfig::int4_awq(
-                        128, magnitudes,
-                    )
+                    ironmill_compile::weights::quantized::AffineQuantConfig::int4(128)
+                        .with_awq(magnitudes, None, 0)
                 }
             }
         } else {
             ironmill_compile::weights::quantized::AffineQuantConfig::default()
         };
+
         let q_provider = QuantizedWeightProvider::new_int4(&provider, {
-            let mut cfg = int4_config;
-            if !opt.sensitive_layers.is_empty() {
-                cfg.sensitive_layers = opt.sensitive_layers.clone();
-                eprintln!("    INT8 sensitive layers: {:?}", cfg.sensitive_layers);
-            }
+            let cfg = if !opt.sensitive_layers.is_empty() {
+                eprintln!("    INT8 sensitive layers: {:?}", opt.sensitive_layers);
+                int4_config.with_sensitive_layers(opt.sensitive_layers.clone())
+            } else {
+                int4_config
+            };
             cfg
         });
         engine

@@ -37,6 +37,7 @@ pub struct SubProgram {
 
 /// Configuration for the model splitter.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SplitConfig {
     /// Maximum weight data size per sub-program (bytes).
     /// Sub-programs exceeding this are further chunked.
