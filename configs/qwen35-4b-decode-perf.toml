@@ -1,0 +1,36 @@
+# Qwen 3.5-4B AWQ-INT4 decode performance investigation
+#
+# Dedicated config for the decode throughput investigation. Uses AWQ-INT4
+# weights (the production configuration) so the hot kernel is
+# superblock_matvec_int4 with AWQ scale support enabled.
+#
+# Run:
+#   cargo run --release -p ironmill-bench --features metal -- \
+#     --config configs/qwen35-4b-decode-perf.toml
+
+[[model]]
+name = "Qwen3.5-4B"
+path = "unused-for-template-mode"
+model_dir = "models/Qwen3.5-4B"
+
+# ── INT4 + AWQ block-level + TQ-INT8 KV cache ─────────────────
+[[optimization]]
+name = "int4-awq"
+int4 = true
+awq_calib_dir = "models/Qwen3.5-4B/awq_block_calib"
+awq_block_config_path = "models/Qwen3.5-4B/awq_block_calib/awq_block_config.json"
+kv_quant = "turbo-int8"
+max_seq_len = 512
+
+[settings]
+iterations = 20
+warmup = 2
+runs = 3
+backends = ["metal"]
+
+[benchmarks]
+decode = true
+prefill = false
+perplexity = true
+perplexity_sequences = 1
+perplexity_dataset = "tests/fixtures/quality/wikitext2-qwen35.json"
