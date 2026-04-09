@@ -54,7 +54,7 @@ impl LayerType {
 
 /// A detected logical layer — a contiguous group of ops sharing a layer type.
 #[derive(Debug, Clone)]
-pub struct DetectedLayer {
+pub(crate) struct DetectedLayer {
     /// The layer type.
     pub layer_type: LayerType,
     /// Index range of operations within the function body (start inclusive, end exclusive).
@@ -101,7 +101,7 @@ fn op_category(op_type: &str) -> &'static str {
 /// - **FFN block**: `linear → activation → linear` (without softmax).
 /// - **Norm**: Standalone normalization ops not already consumed by another pattern.
 /// - **Other**: Anything left over.
-pub fn detect_layers(ops: &[mil_rs::ir::Operation]) -> Vec<DetectedLayer> {
+pub(crate) fn detect_layers(ops: &[mil_rs::ir::Operation]) -> Vec<DetectedLayer> {
     let n = ops.len();
     if n == 0 {
         return Vec::new();

@@ -19,9 +19,9 @@ pub const MAX_COMPILE_BUDGET: usize = 119;
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct ProgramKey {
     /// Hash of the MIL text IR for this program.
-    pub mil_text_hash: u64,
+    pub(crate) mil_text_hash: u64,
     /// Hash of the weight blob baked into this program.
-    pub weight_hash: u64,
+    pub(crate) weight_hash: u64,
 }
 
 /// Compiled program cache with disk persistence and LRU eviction.
@@ -146,12 +146,12 @@ impl ProgramCache {
     }
 
     /// Increment the session compile count.
-    pub fn record_compilation(&mut self) {
+    pub(crate) fn record_compilation(&mut self) {
         self.session_compile_count += 1;
     }
 
     /// Remaining compile budget (~119 limit).
-    pub fn remaining_budget(&self) -> usize {
+    pub(crate) fn remaining_budget(&self) -> usize {
         MAX_COMPILE_BUDGET.saturating_sub(self.session_compile_count)
     }
 

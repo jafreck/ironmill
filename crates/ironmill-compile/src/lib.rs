@@ -24,3 +24,11 @@ pub mod gpu;
 pub mod templates;
 /// Weight providers for SafeTensors and GGUF formats.
 pub mod weights;
+
+// ── Convenience re-exports ────────────────────────────────────────────
+
+pub use coreml::build_api::CompileBuilder;
+pub use error::{CompileError, Result};
+pub use gpu::GpuCompileBuilder;
+pub use templates::weights_to_program;
+pub use weights::{GgufProvider, ModelConfig, SafeTensorsProvider, WeightProvider};

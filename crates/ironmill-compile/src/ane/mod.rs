@@ -1,10 +1,10 @@
 //! ANE compilation pipeline: passes, splitting, packing, validation, and caching.
 
-pub mod blobfile;
+pub(crate) mod blobfile;
 pub mod bundle;
 pub mod cache;
-pub mod decode_compile;
-pub mod packing;
+pub(crate) mod decode_compile;
+pub(crate) mod packing;
 pub mod passes;
 pub mod split;
 pub mod validate;

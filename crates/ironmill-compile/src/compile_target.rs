@@ -32,8 +32,8 @@ pub trait CompileTarget {
         &self,
         _source: &dyn mil_rs::weights::WeightProvider,
         _config: &CompileConfig,
-    ) -> Result<usize, CompileError> {
-        Ok(0) // default: unknown
+    ) -> Result<Option<usize>, CompileError> {
+        Ok(None) // default: unknown
     }
 }
 
@@ -80,52 +80,4 @@ pub struct ArtifactMetadata {
     pub architecture: String,
     /// Quantization scheme applied (e.g. "q4_k", "f16").
     pub quantization: String,
-}
-
-// ---------------------------------------------------------------------------
-// Stub backends
-// ---------------------------------------------------------------------------
-
-/// Metal-direct compilation target (not yet implemented).
-pub struct MetalCompileTarget;
-
-impl CompileTarget for MetalCompileTarget {
-    fn name(&self) -> &str {
-        "metal-direct"
-    }
-
-    fn compile(
-        &self,
-        _source: &dyn mil_rs::weights::WeightProvider,
-        _config: &CompileConfig,
-        _progress: &dyn ProgressSink,
-    ) -> Result<CompileOutput, CompileError> {
-        Err(CompileError::Other(
-            "MetalCompileTarget is not yet implemented. \
-             Use GpuCompileTarget for GPU bundle output."
-                .into(),
-        ))
-    }
-}
-
-/// CoreML compilation target (not yet implemented).
-pub struct CoremlCompileTarget;
-
-impl CompileTarget for CoremlCompileTarget {
-    fn name(&self) -> &str {
-        "coreml"
-    }
-
-    fn compile(
-        &self,
-        _source: &dyn mil_rs::weights::WeightProvider,
-        _config: &CompileConfig,
-        _progress: &dyn ProgressSink,
-    ) -> Result<CompileOutput, CompileError> {
-        Err(CompileError::Other(
-            "CoremlCompileTarget is not yet implemented. \
-             Use the coreml::build_api::CompileBuilder for CoreML compilation."
-                .into(),
-        ))
-    }
 }
