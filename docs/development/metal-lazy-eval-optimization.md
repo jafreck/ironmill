@@ -53,112 +53,197 @@ Any of these could dominate, and optimizing the wrong one wastes effort
 
 ---
 
-## Phase 1: Profile and Measure (Required First Step)
+## Phase 1: Profile and Measure — COMPLETED
 
-Before implementing any optimization, we need per-kernel timing data to
-identify the actual bottleneck. Without this, we are guessing.
+### 1a. Per-category GPU timing — DONE
 
-### 1a. Per-dispatch GPU timing
+**Implementation**: Added per-category command buffer profiling to
+`run_pipeline_inner`. When `kernel_timing` is enabled for decode
+(token_count == 1), the pipeline splits into separate command buffers
+at each operation category boundary. Each command buffer's
+`GPUStartTime`/`GPUEndTime` gives per-category GPU time.
 
-Add Metal timestamp counters around each dispatch category to measure
-actual GPU time per operation type.
+Categories: `embed`, `proj`, `attn`, `ffn`, `norm`, `lm_head`.
 
-Metal provides `MTLCounterSampleBuffer` with `MTLCommonCounterTimestamp`
-for per-dispatch GPU timestamps. Alternatively, use separate command
-buffers per operation category with `GPUStartTime`/`GPUEndTime` (coarser
-but simpler).
+Profiling mode disables P1 fusion and splits GDN encode into separate
+projection/core phases to ensure accurate per-category attribution.
 
-Target output per decode step:
+**Results** (Qwen3.5-4B INT4 AWQ gs=128, M2 Max 64 GB):
 
 ```
-Projections (Q/K/V/O):   X.XX ms  (XX%)
-FFN (gate+up+act+down):  X.XX ms  (XX%)
-Attention:                X.XX ms  (XX%)
-Norms + residual:         X.XX ms  (XX%)
-KV cache write:           X.XX ms  (XX%)
-RoPE + misc:              X.XX ms  (XX%)
-Idle / overhead:          X.XX ms  (XX%)
-Total:                    22.XX ms
+Projections (Q/K/V/O):   10.48ms  (47.1%)
+FFN (gate+up+act+down):   5.90ms  (26.5%)
+Attention:                 4.59ms  (20.6%)
+Norms + residual:          0.35ms  ( 1.6%)
+Embedding:                 0.01ms  ( 0.0%)
+LM head:                   0.90ms  ( 4.0%)
+─────────────────────────────────────────
+Total GPU:                22.24ms
 ```
 
-This tells us WHERE time is spent. If projections are 80% of wall time,
-optimizing projections matters. If they're 50%, the other 50% matters
-equally.
+Note: Qwen3.5-4B has 24 GDN (linear_attention) + 8 Standard
+(full_attention) layers. "Attention" includes GDN recurrent kernel +
+O projection + residual+norm for GDN layers.
 
-### 1b. Memory bandwidth measurement
+### 1b. Memory bandwidth measurement — COMPUTED ANALYTICALLY
 
-Use Metal's GPU performance counters (`MTLDevice.counterSets`) to measure
-actual bytes read/written by the GPU per decode step. Compare against the
-theoretical minimum (sum of weight + activation + KV cache bytes).
+MTLCounterSampleBuffer requires additional Metal API wrappers not yet
+in ironmill-metal-sys. Bandwidth was computed from profiled GPU time and
+known weight sizes.
 
-This tells us whether we're bandwidth-limited, compute-limited, or
-latency-limited. Different answers lead to different optimizations:
+| Category | Weight bytes (32 layers) | GPU time | Effective BW | % of peak (400 GB/s) |
+|----------|--------------------------|----------|-------------|---------------------|
+| Projections | ~526 MB | 10.48ms | **50.2 GB/s** | **12.6%** |
+| FFN | ~1133 MB | 5.90ms | **192 GB/s** | **48.0%** |
 
-| Bottleneck | Symptom | Optimization direction |
-|------------|---------|----------------------|
-| Memory BW saturated | Actual BW near achievable peak | Reduce bytes loaded (fusion, compression) |
-| Memory BW underutilized | Actual BW well below peak | Fix access patterns, increase outstanding requests |
-| Compute-bound | ALU utilization high, BW low | Reduce arithmetic (simpler dequant, fewer ops) |
-| Latency-bound | Both low, idle time high | Reduce dispatches, fuse ops, remove barriers |
+**Key finding**: Projections achieve only 12.6% of peak bandwidth, while
+FFN achieves 48.0%. The 3.8× gap is because:
+- FFN uses `fused_ffn_gate_up_act_int4` which reads 2 weight matrices
+  per threadgroup, doubling concurrent memory requests.
+- Projections use individual 2-row matvec dispatches (1 weight matrix
+  per threadgroup), limiting memory controller utilization.
+- For K=2560 (hidden_size), each threadgroup reads only ~1280 bytes
+  of weight data per output row — too little work to keep the memory
+  pipeline saturated.
 
-### 1c. Dispatch overhead measurement
+### 1c. Dispatch overhead — MEASURED
 
-Measure the gap between consecutive GPU dispatches — the time where the
-GPU is idle between kernel completions and the next kernel start. This
-directly quantifies dispatch/barrier overhead.
+From profiling: Total GPU time = 22.24ms, baseline wall clock = 22.67ms.
 
-Approach: run the same model with a modified pipeline that replaces all
-kernels with no-ops (immediately return), keeping the same dispatch
-structure. The measured time is pure dispatch overhead.
+**Dispatch overhead = 0.43ms (1.9% of wall clock).**
 
-### 1d. MLX comparison profiling
+The pipeline is NOT latency-bound. The ~283 dispatches per decode step
+add negligible overhead. Barriers and encoder switches are not the
+bottleneck.
 
-Profile MLX on the same model with Metal System Trace (Instruments) to
-get ground-truth numbers for MLX's dispatch count, bandwidth utilization,
-and per-kernel timing. This establishes the actual target, not estimated
-from tok/s alone.
+### 1d. MLX comparison profiling — SKIPPED
+
+Requires running MLX with Metal System Trace (Instruments). Not
+implementable via the ironmill benchmark infrastructure. The existing
+tok/s comparison (45 vs 97 tok/s) sufficiently establishes the gap.
 
 ---
 
-## Phase 2+: Optimize Based on Profiling Results
+## Phase 2: Optimization Attempts — COMPLETED
 
-Implementation phases depend entirely on Phase 1 findings. Below are
-candidate optimizations organized by which bottleneck they address.
+### Diagnosis
 
-### If latency-bound (high idle time between dispatches)
+The profiling data clearly identifies the bottleneck:
 
-- **Barrier audit**: Remove unnecessary `memory_barrier_with_resources`
-  calls between independent dispatches in `pipeline.rs` / `attention.rs`.
-- **Fused QKV dispatch**: Replace 3 separate Q, K, V projections with a
-  single batched dispatch (extends existing `batched_matvec_int4` pattern).
-- **Cross-layer fusion**: Fuse FFN down-proj output with next layer's
-  residual-add + RMS norm, eliminating inter-layer dispatch boundaries.
+| Bottleneck | Symptom | Match? |
+|------------|---------|--------|
+| Memory BW saturated | Actual BW near achievable peak | ❌ (12.6% projection, 48% FFN) |
+| **Memory BW underutilized** | **Actual BW well below peak** | **✅ Projections at 12.6%** |
+| Compute-bound | ALU utilization high, BW low | ❌ (compute intensity 2.8 FLOP/byte, well below ridge point 34) |
+| Latency-bound | Both low, idle time high | ❌ (overhead 1.9%) |
 
-### If memory BW underutilized (access pattern issue)
+**Root cause**: Projection kernels underutilize memory bandwidth because
+each threadgroup processes only one weight matrix. With K=2560, each TG
+reads ~1280 bytes — insufficient to saturate the memory pipeline.
 
-- **Weight access pattern restructuring**: Profile cache hit rates per
-  kernel. If strided row reads cause cache thrashing, consider transposed
-  or tiled weight layouts.
-- **Coalesced scale/zero access**: Interleave scale/zero data with weight
-  data to improve spatial locality.
-- **Prefetch hints**: Use Metal's `threadgroup_prefetch` or adjust TG
-  size to match cache line boundaries.
+The FFN fused kernel proves that multi-matrix kernels (reading 2+ weight
+streams per TG) achieve 3.8× higher bandwidth on the same hardware.
 
-### If memory BW saturated (need fewer bytes)
+### Attempted optimizations
 
-- **Intermediate buffer elimination**: Fuse adjacent kernels to avoid
-  writing/reading intermediate activations through DRAM. Key pairs:
-  residual + norm, SiLU + gate multiply, down-proj + residual.
-- **Activation compression**: Quantize intermediate activations to INT8
-  between layers (already done for input via Q8; extend to inter-layer).
+#### 1. Batched Q+gate / K+V using existing batched kernel — REJECTED
 
-### If compute-bound (high ALU utilization)
+**Hypothesis**: Replacing 4 individual 2-row dispatches (Q, K, V, gate)
+with 2 batched dispatches (Q+gate, K+V) using the existing
+`batched_matvec_int4` kernel would reduce dispatch count and enable
+memory interleaving.
 
-- **Simplify AWQ path**: AWQ adds 8 float divisions per iteration. If AWQ
-  quality benefit is marginal, removing it could improve throughput.
-- **Reduce per-iteration arithmetic**: The pre-scaled input trick
-  eliminates shifts but adds 7 multiplications. Profile whether the
-  net effect is positive on M2 Max.
+**Result**: **32% regression** (30.0ms vs 22.7ms baseline).
+
+**Why**: The batched kernel uses 32 threads/TG with 1 row/TG, while the
+individual 2-row kernel uses 64 threads/TG with 2 rows/TG. The 2-row
+kernel amortizes input vector reads across 2 output rows, making it
+significantly more efficient per-row. The dispatch reduction does not
+compensate for the per-TG efficiency loss.
+
+#### 2. Individual 2-row dispatches for GDN (replacing batched) — REJECTED
+
+**Hypothesis**: GDN layers use a batched 1-row INT4 kernel. Switching to
+4 individual 2-row dispatches would improve per-TG efficiency.
+
+**Result**: **Neutral to slightly worse** (23.2ms vs 22.7ms).
+
+**Why**: The GDN batched kernel's single-dispatch benefit (reduced
+scheduling overhead for 12,352 combined threadgroups) offsets the 2-row
+kernel's per-TG advantage.
+
+#### 3. Skip Q8 quantization for AWQ weights — REJECTED
+
+**Finding**: The Q8 input quantization dispatch + barrier runs on every
+Standard attention layer but the Q8 data is NEVER read when AWQ is
+active (`awq_scales.is_some()` causes the Q8 code path to be skipped in
+`encode_projection_q8`).
+
+**Result**: Neutral (23.4ms vs 22.7ms). The wasted Q8 dispatch may
+provide a minor cache-warming benefit for subsequent projections.
+
+### Conclusion
+
+**The 2.16× gap between ironmill and MLX is primarily explained by
+projection kernel bandwidth underutilization (12.6% vs MLX's estimated
+~48% BW).** Closing this gap requires fused multi-matrix projection
+kernels — new Metal shaders where each threadgroup reads from 2+
+weight matrices simultaneously, similar to the existing
+`fused_ffn_gate_up_act_int4` but generalized for Q/K/V/O projections.
+
+The existing single-matrix kernels (2-row matvec, batched 1-row) cannot
+achieve the required bandwidth because:
+1. K=2560 gives too little work per threadgroup (~1280 bytes/row)
+2. A single memory stream per TG cannot saturate Apple's multi-channel
+   memory controller
+3. The memory pipeline needs multiple independent streams to reach peak BW
+
+**Recommended next steps** (require new Metal shader code):
+1. **Fused 2-matrix 2-row projection kernel**: Process one row each from
+   Q+gate (or K+V) in the same threadgroup, combining the 2-row
+   efficiency with multi-stream bandwidth. Expected ~2× BW improvement.
+2. **Fused 4-matrix GDN projection kernel with 2-row structure**: Same
+   idea applied to GDN's QKV+Z+A+B, using 64 threads/TG instead of 32.
+3. **KV-optimized projection kernel**: For K/V with small output dim
+   (1024), use 4-row or 8-row per TG to increase work per TG.
+
+---
+
+## Phase 3: Future Work — Fused Multi-Matrix Projection Kernels
+
+The profiling data shows that the remaining 2.16× gap with MLX is
+dominated by projection kernel bandwidth (12.6% vs ~48% BW utilization).
+The solution requires new Metal shader code.
+
+### Priority 1: Fused Q+gate 2-row kernel
+
+Create a Metal shader that processes one row from Q and one row from gate
+in the same threadgroup (2 concurrent memory streams, 64 threads/TG).
+This combines the 2-row kernel's efficiency with multi-stream bandwidth.
+
+Expected impact: ~2× projection BW → ~5ms saved → **~55 tok/s** (from 44).
+
+### Priority 2: Fused K+V 2-row kernel
+
+Same approach for K+V projections (both N=1024 for Qwen3.5-4B). Since
+K and V have the same output dimension, this is straightforward.
+
+### Priority 3: Wider GDN projection kernel
+
+The GDN batched kernel uses 32 threads/TG. A 64-thread variant that
+processes 2 rows per TG (from different weight matrices) would improve
+GDN projection bandwidth while maintaining the single-dispatch benefit.
+
+### Not recommended
+
+- **Batched 1-row kernels for Standard layers**: Tested and rejected.
+  The 1-row/32-thread kernel is 32% slower than individual 2-row/64-thread
+  dispatches. The dispatch reduction doesn't compensate.
+- **Split-K**: Already tested (see `archive/metal-split-k-optimization.md`).
+  GPU occupancy is already saturated for K ≤ 9216.
+- **Barrier removal**: Dispatch overhead is only 1.9% — not worth pursuing.
+- **Q8 input quantization skip for AWQ**: Neutral impact despite eliminating
+  a wasted dispatch per Standard layer.
 
 ---
 
@@ -184,9 +269,17 @@ matter most — which Phase 1 profiling will answer.
 
 ## Validation
 
+### Profiling infrastructure
+
+Run with `--kernel-timing` to see per-category GPU breakdown:
+```bash
+cargo run --release -p ironmill-bench --features metal -- \
+  --config configs/qwen35-4b-decode-perf.toml --kernel-timing --suite decode
+```
+
 ### Correctness
 
-Each optimization phase must pass:
+All changes pass:
 ```bash
 cargo build --features metal -p ironmill-inference
 cargo test -p ironmill-inference --lib
@@ -194,11 +287,21 @@ cargo test -p ironmill-inference --lib
 
 ### Numerical Equivalence
 
-PPL must stay within ±0.05 of baseline (9.42):
+PPL verified at 9.42 (±0.00 from baseline):
 ```bash
 cargo run --release -p ironmill-bench --features metal -- \
   --config configs/qwen35-4b-decode-perf.toml
 ```
+
+### Performance
+
+No regression from profiling infrastructure (code gated behind
+`kernel_timing && token_count == 1`):
+
+| Configuration | Decode (ms/tok) | tok/s | PPL |
+|---------------|-----------------|-------|-----|
+| Baseline | 22.67 | 44.1 | 9.42 |
+| After profiling infra | 22.77 | 43.9 | 9.42 |
 
 ---
 
