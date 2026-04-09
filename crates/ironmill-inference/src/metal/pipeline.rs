@@ -593,148 +593,43 @@ impl MetalInference {
                         None
                     };
 
-                    // Batched QKV projection: for decode with INT4, batch K+V into a
-                    // single dispatch for better memory bandwidth interleaving.
-                    // When gate is present AND Q/gate have the same output dim, also
-                    // batch Q+gate. This reduces 4-5 dispatches to 2-3.
-                    let used_batched_qkv = if token_count == 1 && !p1_skip {
-                        if let (
-                            WeightBuffer::AffineQuantized(aq_q),
-                            WeightBuffer::AffineQuantized(aq_k),
-                            WeightBuffer::AffineQuantized(aq_v),
-                        ) = (&lw.q_proj, &lw.k_proj, &lw.v_proj)
-                        {
-                            if aq_q.bit_width == 4
-                                && aq_k.bit_width == 4
-                                && aq_v.bit_width == 4
-                                && kv_out_features == aq_v.shape.0
-                            {
-                                // Try batching Q+gate if gate exists and has same output dim as Q.
-                                let batched_q_gate = if let (
-                                    Some(WeightBuffer::AffineQuantized(aq_gate)),
-                                    Some(gate_buf),
-                                ) = (&lw.attn_output_gate, &bufs.q_gate)
-                                {
-                                    if aq_gate.bit_width == 4 && aq_gate.shape.0 == qkv_out_features
-                                    {
-                                        ops::encode_batched_affine_matvec_int4(
-                                            &enc,
-                                            pipelines.affine.batched_matvec_int4.get(aq_q.group_size)
-                                                .expect("unsupported group_size for batched_matvec_int4"),
-                                            &bufs.norm_out,
-                                            aq_q,
-                                            &bufs.q_proj,
-                                            aq_gate,
-                                            gate_buf,
-                                            qkv_out_features as u32,
-                                            h as u32,
-                                        );
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
+                    // Build the projection list: skip Q if P1 fusion already computed it.
+                    let mut projections: Vec<(&WeightBuffer, &MetalBuffer, usize)> = Vec::new();
+                    if !p1_skip {
+                        projections.push((&lw.q_proj, &bufs.q_proj, qkv_out_features));
+                    }
+                    projections.push((&lw.k_proj, &bufs.k_proj, kv_out_features));
+                    projections.push((&lw.v_proj, &bufs.v_proj, kv_out_features));
+                    for (weight, output_buf, out_features) in &projections {
+                        encode_projection_q8(
+                            &enc,
+                            &bufs.norm_out,
+                            weight,
+                            output_buf,
+                            pipelines,
+                            token_count,
+                            *out_features,
+                            h,
+                            q8_input.as_ref(),
+                        )?;
+                    }
 
-                                if !batched_q_gate {
-                                    // Q alone (no gate or incompatible gate).
-                                    encode_projection_q8(
-                                        &enc,
-                                        &bufs.norm_out,
-                                        &lw.q_proj,
-                                        &bufs.q_proj,
-                                        pipelines,
-                                        token_count,
-                                        qkv_out_features,
-                                        h,
-                                        q8_input.as_ref(),
-                                    )?;
-                                }
-
-                                // Batch K+V (same output dim).
-                                ops::encode_batched_affine_matvec_int4(
-                                    &enc,
-                                    pipelines
-                                        .affine
-                                        .batched_matvec_int4
-                                        .get(aq_k.group_size)
-                                        .expect("unsupported group_size for batched_matvec_int4"),
-                                    &bufs.norm_out,
-                                    aq_k,
-                                    &bufs.k_proj,
-                                    aq_v,
-                                    &bufs.v_proj,
-                                    kv_out_features as u32,
-                                    h as u32,
-                                );
-
-                                // If gate wasn't batched with Q, dispatch it individually.
-                                if !batched_q_gate {
-                                    if let (Some(gate_w), Some(gate_buf)) =
-                                        (&lw.attn_output_gate, &bufs.q_gate)
-                                    {
-                                        encode_projection_q8(
-                                            &enc,
-                                            &bufs.norm_out,
-                                            gate_w,
-                                            gate_buf,
-                                            pipelines,
-                                            token_count,
-                                            qkv_out_features,
-                                            h,
-                                            q8_input.as_ref(),
-                                        )?;
-                                    }
-                                }
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                    if !used_batched_qkv {
-                        // Fallback: individual Q/K/V + gate dispatches.
-                        let mut projections: Vec<(&WeightBuffer, &MetalBuffer, usize)> = Vec::new();
-                        if !p1_skip {
-                            projections.push((&lw.q_proj, &bufs.q_proj, qkv_out_features));
-                        }
-                        projections.push((&lw.k_proj, &bufs.k_proj, kv_out_features));
-                        projections.push((&lw.v_proj, &bufs.v_proj, kv_out_features));
-                        for (weight, output_buf, out_features) in &projections {
-                            encode_projection_q8(
-                                &enc,
-                                &bufs.norm_out,
-                                weight,
-                                output_buf,
-                                pipelines,
-                                token_count,
-                                *out_features,
-                                h,
-                                q8_input.as_ref(),
-                            )?;
-                        }
-
-                        // Qwen3.5 attn_output_gate: dispatch gate projection alongside Q/K/V
-                        if let (Some(gate_w), Some(gate_buf)) = (&lw.attn_output_gate, &bufs.q_gate)
-                        {
-                            encode_projection_q8(
-                                &enc,
-                                &bufs.norm_out,
-                                gate_w,
-                                gate_buf,
-                                pipelines,
-                                token_count,
-                                qkv_out_features,
-                                h,
-                                q8_input.as_ref(),
-                            )?;
-                        }
+                    // Qwen3.5 attn_output_gate: dispatch gate projection alongside Q/K/V
+                    // (reads norm_out, writes q_gate — independent of Q/K/V outputs).
+                    // The gate result is only consumed later by sigmoid_gate after attention,
+                    // so no separate barrier is needed here.
+                    if let (Some(gate_w), Some(gate_buf)) = (&lw.attn_output_gate, &bufs.q_gate) {
+                        encode_projection_q8(
+                            &enc,
+                            &bufs.norm_out,
+                            gate_w,
+                            gate_buf,
+                            pipelines,
+                            token_count,
+                            qkv_out_features,
+                            h,
+                            q8_input.as_ref(),
+                        )?;
                     }
                     // Barrier for Q/K/V/gate projection outputs.
                     {
