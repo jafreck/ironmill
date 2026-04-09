@@ -60,12 +60,12 @@ mod weight_loading;
 pub use engine::{BatchInferenceEngine, InferenceEngine, InferenceError, SequenceId};
 
 // Generation (primary high-level API)
+#[cfg(feature = "async")]
+pub use generate::generate_async;
 pub use generate::{
     CancellationToken, FinishReason, GenerateEvent, GenerateRequest, GenerateResult, TokenStream,
     generate, generate_with_callback,
 };
-#[cfg(feature = "async")]
-pub use generate::generate_async;
 
 // Sampling
 pub use sampling::{Sampler, SamplerConfig};

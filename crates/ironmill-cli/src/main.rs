@@ -14,6 +14,8 @@ use ironmill_compile::convert::pipeline::{convert_pipeline, parse_pipeline_manif
 use ironmill_compile::coreml::compiler::{compile_model, is_compiler_available};
 use ironmill_compile::gpu::GpuCompileBuilder;
 use ironmill_compile::gpu::bundle::write_gpu_bundle;
+use ironmill_compile::templates::{TemplateOptions, weights_to_program_with_options};
+use ironmill_compile::weights::{GgufProvider, SafeTensorsProvider, WeightProvider};
 use mil_rs::ir::{PassPipeline, PipelineReport};
 use mil_rs::reader::{print_model_summary, print_onnx_summary};
 use mil_rs::{
@@ -21,8 +23,6 @@ use mil_rs::{
     onnx_to_program_with_config, program_to_model, program_to_multi_function_model,
     program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx, write_mlpackage,
 };
-use ironmill_compile::templates::{TemplateOptions, weights_to_program_with_options};
-use ironmill_compile::weights::{GgufProvider, SafeTensorsProvider, WeightProvider};
 
 /// CoreML specification version used for all model serialization.
 ///

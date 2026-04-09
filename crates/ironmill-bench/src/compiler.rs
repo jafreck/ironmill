@@ -78,10 +78,7 @@ fn parse_model_from_template(model_dir: &Path) -> Result<mil_rs::ir::Program> {
 }
 
 /// Apply the optimization pipeline to a program in-place.
-pub fn optimize_program(
-    program: &mut mil_rs::ir::Program,
-    opt: &OptConfig,
-) -> Result<()> {
+pub fn optimize_program(program: &mut mil_rs::ir::Program, opt: &OptConfig) -> Result<()> {
     let pipeline = build_pipeline(opt)?;
     pipeline.run(program)?;
     Ok(())

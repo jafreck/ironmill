@@ -994,7 +994,6 @@ fn test_turboquant_int8_cache_pipeline() -> (bool, bool) {
 // These test that the actual MIL text produced by the turboquant_mil emitters
 // compiles successfully on ANE (not just the hand-crafted pipeline above).
 
-
 fn test_generated_attention_mil() -> (bool, bool) {
     use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
     use ironmill_inference::ane::turboquant::mil_emitter::{

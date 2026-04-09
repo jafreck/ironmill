@@ -116,8 +116,11 @@ pub(crate) fn load_metal_engine(
                             activations.len(),
                             token_count,
                         );
-                        ironmill_compile::weights::quantized::AffineQuantConfig::int4(128)
-                            .with_awq(magnitudes, Some(activations), token_count)
+                        ironmill_compile::weights::quantized::AffineQuantConfig::int4(128).with_awq(
+                            magnitudes,
+                            Some(activations),
+                            token_count,
+                        )
                     } else {
                         ironmill_compile::weights::quantized::AffineQuantConfig::int4(128)
                             .with_awq(magnitudes, None, 0)

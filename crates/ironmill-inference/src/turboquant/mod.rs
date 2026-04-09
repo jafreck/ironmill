@@ -13,9 +13,9 @@ pub mod rotation;
 #[cfg(test)]
 #[cfg(all(feature = "ane", target_os = "macos"))]
 mod tests {
-    use crate::ane::turboquant::mil_emitter::build_cache_write_program;
-    use crate::ane::turboquant::TurboQuantConfig;
     use crate::ane::HardwareAneDevice;
+    use crate::ane::turboquant::TurboQuantConfig;
+    use crate::ane::turboquant::mil_emitter::build_cache_write_program;
     use crate::turboquant::codebook::lloyd_max_gaussian;
     use ironmill_core::ane::mil_text::{MilTextConfig, program_to_mil_text};
 
