@@ -61,9 +61,7 @@ kernel void d2quant_matvec_3bit(
         uint group_of_8 = elem / 8;
         uint offset = elem % 8;
         uint byte_offset = data_row + group_of_8 * 3;
-        uint bits = uint(B_packed[byte_offset])
-                  | (uint(B_packed[byte_offset + 1]) << 8)
-                  | (uint(B_packed[byte_offset + 2]) << 16);
+        uint bits = (*(device const uint*)(B_packed + byte_offset)) & 0x00FFFFFF;
         float q = float((bits >> (offset * 3)) & 0x07);
 
         // Read mask bit
@@ -155,9 +153,7 @@ kernel void d2quant_matmul_3bit(
                 uint group_of_8 = g_k / 8;
                 uint offset = g_k % 8;
                 uint byte_off = g_n * bytes_per_row + group_of_8 * 3;
-                uint bits = uint(B_packed[byte_off])
-                          | (uint(B_packed[byte_off + 1]) << 8)
-                          | (uint(B_packed[byte_off + 2]) << 16);
+                uint bits = (*(device const uint*)(B_packed + byte_off)) & 0x00FFFFFF;
                 float q = float((bits >> (offset * 3)) & 0x07);
                 bool is_out = (outlier_mask[g_n * mask_bytes_per_row + g_k / 8] >> (g_k % 8)) & 1;
                 uint grp = g_k / group_size;
@@ -198,9 +194,7 @@ kernel void d2quant_matmul_3bit(
                     uint group_of_8 = g_k / 8;
                     uint offset = g_k % 8;
                     uint byte_off = g_n * bytes_per_row + group_of_8 * 3;
-                    uint bits = uint(B_packed[byte_off])
-                              | (uint(B_packed[byte_off + 1]) << 8)
-                              | (uint(B_packed[byte_off + 2]) << 16);
+                    uint bits = (*(device const uint*)(B_packed + byte_off)) & 0x00FFFFFF;
                     float q = float((bits >> (offset * 3)) & 0x07);
                     bool is_out = (outlier_mask[g_n * mask_bytes_per_row + g_k / 8] >> (g_k % 8)) & 1;
                     uint grp = g_k / group_size;
@@ -289,9 +283,7 @@ kernel void d2quant_embedding_lookup_3bit(
     uint group_of_8 = col / 8;
     uint offset = col % 8;
     uint byte_off = token_id * bytes_per_row + group_of_8 * 3;
-    uint bits = uint(packed_table[byte_off])
-              | (uint(packed_table[byte_off + 1]) << 8)
-              | (uint(packed_table[byte_off + 2]) << 16);
+    uint bits = (*(device const uint*)(packed_table + byte_off)) & 0x00FFFFFF;
     float q = float((bits >> (offset * 3)) & 0x07);
 
     // Read outlier mask bit
@@ -379,9 +371,7 @@ kernel void d2quant_matvec_3bit_amx(
             uint group_of_8 = k_abs / 8;
             uint offset = k_abs % 8;
             uint byte_off = n_abs * bytes_per_row + group_of_8 * 3;
-            uint bits = uint(B_packed[byte_off])
-                      | (uint(B_packed[byte_off + 1]) << 8)
-                      | (uint(B_packed[byte_off + 2]) << 16);
+            uint bits = (*(device const uint*)(B_packed + byte_off)) & 0x00FFFFFF;
             float q = float((bits >> (offset * 3)) & 0x07);
 
             // Dual-scale dequant with outlier mask

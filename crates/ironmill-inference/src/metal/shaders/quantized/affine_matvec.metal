@@ -15,12 +15,14 @@
 
 kernel void superblock_matvec_int4(
     device const half *A            [[buffer(0)]],   // [1, K]
-    device const uchar *W           [[buffer(1)]],   // [N, G, sb_bytes] superblocks
+    device const uchar *W           [[buffer(1)]],   // [N, K/2] contiguous packed nibbles
     device half *C                  [[buffer(2)]],   // [1, N]
     constant uint &N                [[buffer(3)]],
     constant uint &K                [[buffer(4)]],
     device const half *awq_scales   [[buffer(5)]],   // [K] or dummy
     constant uint &has_awq          [[buffer(6)]],
+    device const half *W_scales     [[buffer(7)]],   // [N, K/GS]
+    device const half *W_zeros      [[buffer(8)]],   // [N, K/GS]
     uint tgid  [[threadgroup_position_in_grid]],
     uint sgid  [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]])
@@ -79,13 +81,12 @@ kernel void superblock_matvec_int4(
             uint row = base_row + r;
             if (row >= N) break;
 
-            device const uchar *sb = W + row * sb_stride + g * SB_BYTES_INT4;
-            float scale = float(*(device const half *)(sb));
-            float bias  = float(*(device const half *)(sb + 2));
+            float scale = float(W_scales[row * num_groups + g]);
+            float bias  = float(W_zeros[row * num_groups + g]);
 
-            // Read 2 uint16s (= 8 nibbles) from data section — NO shifts needed
+            // Read 2 uint16s (= 8 nibbles) from contiguous data — NO shifts needed
             device const uint16_t *ws =
-                (device const uint16_t *)(sb + SB_HEADER_BYTES) + u16_in_data;
+                (device const uint16_t *)(W + row * sb_stride + g * SB_BYTES_INT4) + u16_in_data;
 
             float accum = xp0 * float(ws[0] & 0x000f)
                         + xp1 * float(ws[0] & 0x00f0)
@@ -121,12 +122,14 @@ kernel void superblock_matvec_int4(
 
 kernel void superblock_matvec_int8(
     device const half *A            [[buffer(0)]],
-    device const uchar *W           [[buffer(1)]],
+    device const uchar *W           [[buffer(1)]],   // [N, K] contiguous packed bytes
     device half *C                  [[buffer(2)]],
     constant uint &N                [[buffer(3)]],
     constant uint &K                [[buffer(4)]],
     device const half *awq_scales   [[buffer(5)]],
     constant uint &has_awq          [[buffer(6)]],
+    device const half *W_scales     [[buffer(7)]],   // [N, K/GS]
+    device const half *W_zeros      [[buffer(8)]],   // [N, K/GS]
     uint tgid  [[threadgroup_position_in_grid]],
     uint sgid  [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]])
@@ -163,11 +166,10 @@ kernel void superblock_matvec_int8(
             uint row = base_row + r;
             if (row >= N) break;
 
-            device const uchar *sb = W + row * sb_stride + g * SB_BYTES_INT8;
-            float scale = float(*(device const half *)(sb));
-            float zero  = float(*(device const half *)(sb + 2));
+            float scale = float(W_scales[row * num_groups + g]);
+            float zero  = float(W_zeros[row * num_groups + g]);
 
-            uint packed4 = ((device const uint *)(sb + SB_HEADER_BYTES))[word_in_data];
+            uint packed4 = ((device const uint *)(W + row * sb_stride + g * SB_BYTES_INT8))[word_in_data];
 
             float w0 = (float(packed4 & 0xFF) - zero) * scale;
             float w1 = (float((packed4 >> 8) & 0xFF) - zero) * scale;

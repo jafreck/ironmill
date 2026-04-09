@@ -208,6 +208,11 @@ pub fn encode_batched_affine_matvec_int4(
         encoder.set_buffer(&gate_weight.data, 0, 7); // dummy
         encoder.set_bytes(&0u32.to_le_bytes(), 8);
     }
+    // Separate scale/zero arrays for gate and up
+    encoder.set_buffer(gate_weight.scales.as_ref().unwrap(), 0, 9);
+    encoder.set_buffer(gate_weight.zeros.as_ref().unwrap(), 0, 10);
+    encoder.set_buffer(up_weight.scales.as_ref().unwrap(), 0, 11);
+    encoder.set_buffer(up_weight.zeros.as_ref().unwrap(), 0, 12);
     let tg_count = (2 * n_gate) as usize;
     encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
 }
@@ -242,6 +247,11 @@ pub fn encode_fused_ffn_gate_up_act_int4(
         encoder.set_bytes(&0u32.to_le_bytes(), 7);
     }
     encoder.set_bytes(&(use_gelu as u32).to_le_bytes(), 8);
+    // Separate scale/zero arrays for gate and up
+    encoder.set_buffer(gate_weight.scales.as_ref().unwrap(), 0, 9);
+    encoder.set_buffer(gate_weight.zeros.as_ref().unwrap(), 0, 10);
+    encoder.set_buffer(up_weight.scales.as_ref().unwrap(), 0, 11);
+    encoder.set_buffer(up_weight.zeros.as_ref().unwrap(), 0, 12);
     encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }
 
@@ -274,6 +284,15 @@ pub(crate) fn encode_gdn_batched_affine_matvec_int4(
     } else {
         encoder.set_buffer(&params.w0.data, 0, 10); // dummy
     }
+    // Separate scale/zero arrays for 4 projections
+    encoder.set_buffer(params.w0.scales.as_ref().unwrap(), 0, 11);
+    encoder.set_buffer(params.w0.zeros.as_ref().unwrap(), 0, 12);
+    encoder.set_buffer(params.w1.scales.as_ref().unwrap(), 0, 13);
+    encoder.set_buffer(params.w1.zeros.as_ref().unwrap(), 0, 14);
+    encoder.set_buffer(params.w2.scales.as_ref().unwrap(), 0, 15);
+    encoder.set_buffer(params.w2.zeros.as_ref().unwrap(), 0, 16);
+    encoder.set_buffer(params.w3.scales.as_ref().unwrap(), 0, 17);
+    encoder.set_buffer(params.w3.zeros.as_ref().unwrap(), 0, 18);
     let tg_count = (params.n0 + params.n1 + params.n2 + params.n3) as usize;
     encoder.dispatch_threadgroups((tg_count, 1, 1), (32, 1, 1));
 }
@@ -325,5 +344,8 @@ pub fn encode_affine_matvec_int4xq8(
     encoder.set_bytes(&n.to_le_bytes(), 4);
     encoder.set_bytes(&k.to_le_bytes(), 5);
     encoder.set_bytes(&q8_group_size.to_le_bytes(), 6);
+    // Separate scale/zero arrays
+    encoder.set_buffer(weight.scales.as_ref().unwrap(), 0, 7);
+    encoder.set_buffer(weight.zeros.as_ref().unwrap(), 0, 8);
     encoder.dispatch_threadgroups((n as usize, 1, 1), (32, 1, 1));
 }

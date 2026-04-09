@@ -4,29 +4,39 @@
 
 kernel void superblock_batched_affine_matvec_int4(
     device const half *A            [[buffer(0)]],   // [1, K] shared input
-    device const uchar *W_gate      [[buffer(1)]],   // gate superblocks
+    device const uchar *W_gate      [[buffer(1)]],   // gate data [N, K/2]
     device half *C_gate             [[buffer(2)]],
-    device const uchar *W_up        [[buffer(3)]],   // up superblocks
+    device const uchar *W_up        [[buffer(3)]],   // up data [N, K/2]
     device half *C_up               [[buffer(4)]],
     constant uint &N_gate           [[buffer(5)]],
     constant uint &K                [[buffer(6)]],
     device const half *awq_scales   [[buffer(7)]],
     constant uint &has_awq          [[buffer(8)]],
+    device const half *gate_scales  [[buffer(9)]],   // [N, K/GS]
+    device const half *gate_zeros   [[buffer(10)]],  // [N, K/GS]
+    device const half *up_scales    [[buffer(11)]],   // [N, K/GS]
+    device const half *up_zeros     [[buffer(12)]],   // [N, K/GS]
     uint tid  [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
     uint local_tid;
     device const uchar *W;
     device half *C;
+    device const half *sc;
+    device const half *zr;
 
     if (tid < N_gate) {
         local_tid = tid;
         W = W_gate;
         C = C_gate;
+        sc = gate_scales;
+        zr = gate_zeros;
     } else {
         local_tid = tid - N_gate;
         W = W_up;
         C = C_up;
+        sc = up_scales;
+        zr = up_zeros;
     }
 
     if (local_tid >= N_gate) return;
@@ -43,11 +53,10 @@ kernel void superblock_batched_affine_matvec_int4(
         uint g = k_elem / GS;
         uint word_idx = (k_elem % GS) / 8;
 
-        device const uchar *sb = W + local_tid * sb_stride + g * SB_BYTES_INT4;
-        float s = float(*(device const half *)(sb));
-        float z = float(*(device const half *)(sb + 2));
+        float s = float(sc[local_tid * num_groups + g]);
+        float z = float(zr[local_tid * num_groups + g]);
 
-        uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_idx];
+        uint packed4 = ((device const uint*)(W + local_tid * sb_stride + g * SB_BYTES_INT4))[word_idx];
 
         float w0 = (float(packed4 & 0xF) - z) * s;
         float w1 = (float((packed4 >> 4) & 0xF) - z) * s;
@@ -83,21 +92,29 @@ kernel void superblock_batched_affine_matvec_int4(
 
 // ── Superblock GDN batched INT4 matvec for 4 projections (M=1) ──
 //
-// Superblock params struct replaces the separate N/K/has_awq params.
+// Params struct replaces the separate N/K/has_awq params.
 // Dispatch: (N0+N1+N2+N3, 1, 1) threadgroups, (32, 1, 1) threads.
 
 kernel void superblock_gdn_batched_affine_matvec_int4(
     device const half *A            [[buffer(0)]],
-    device const uchar *W0          [[buffer(1)]],   // qkv superblocks
+    device const uchar *W0          [[buffer(1)]],   // qkv data
     device half *C0                 [[buffer(2)]],
-    device const uchar *W1          [[buffer(3)]],   // z superblocks
+    device const uchar *W1          [[buffer(3)]],   // z data
     device half *C1                 [[buffer(4)]],
-    device const uchar *W2          [[buffer(5)]],   // a superblocks
+    device const uchar *W2          [[buffer(5)]],   // a data
     device half *C2                 [[buffer(6)]],
-    device const uchar *W3          [[buffer(7)]],   // b superblocks
+    device const uchar *W3          [[buffer(7)]],   // b data
     device half *C3                 [[buffer(8)]],
     constant GdnBatchedInt4Params &params [[buffer(9)]],
     device const half *awq_scales   [[buffer(10)]],
+    device const half *sc0          [[buffer(11)]],  // scales for each proj
+    device const half *zr0          [[buffer(12)]],
+    device const half *sc1          [[buffer(13)]],
+    device const half *zr1          [[buffer(14)]],
+    device const half *sc2          [[buffer(15)]],
+    device const half *zr2          [[buffer(16)]],
+    device const half *sc3          [[buffer(17)]],
+    device const half *zr3          [[buffer(18)]],
     uint tid  [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -111,6 +128,8 @@ kernel void superblock_gdn_batched_affine_matvec_int4(
     uint N_proj;
     device const uchar *W;
     device half *C;
+    device const half *sc;
+    device const half *zr;
 
     uint t0 = N0;
     uint t1 = t0 + N1;
@@ -118,16 +137,16 @@ kernel void superblock_gdn_batched_affine_matvec_int4(
 
     if (tid < t0) {
         local_tid = tid; N_proj = N0;
-        W = W0; C = C0;
+        W = W0; C = C0; sc = sc0; zr = zr0;
     } else if (tid < t1) {
         local_tid = tid - t0; N_proj = N1;
-        W = W1; C = C1;
+        W = W1; C = C1; sc = sc1; zr = zr1;
     } else if (tid < t2) {
         local_tid = tid - t1; N_proj = N2;
-        W = W2; C = C2;
+        W = W2; C = C2; sc = sc2; zr = zr2;
     } else {
         local_tid = tid - t2; N_proj = params.N3;
-        W = W3; C = C3;
+        W = W3; C = C3; sc = sc3; zr = zr3;
     }
 
     if (local_tid >= N_proj) return;
@@ -144,11 +163,10 @@ kernel void superblock_gdn_batched_affine_matvec_int4(
         uint g = k_elem / GS;
         uint word_idx = (k_elem % GS) / 8;
 
-        device const uchar *sb = W + local_tid * sb_stride + g * SB_BYTES_INT4;
-        float s = float(*(device const half *)(sb));
-        float z = float(*(device const half *)(sb + 2));
+        float s = float(sc[local_tid * num_groups + g]);
+        float z = float(zr[local_tid * num_groups + g]);
 
-        uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_idx];
+        uint packed4 = ((device const uint*)(W + local_tid * sb_stride + g * SB_BYTES_INT4))[word_idx];
 
         float w0 = (float(packed4 & 0xF) - z) * s;
         float w1 = (float((packed4 >> 4) & 0xF) - z) * s;

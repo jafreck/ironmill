@@ -122,5 +122,8 @@ pub(crate) fn encode_fused_residual_norm_affine_matvec_int4(
         encoder.set_bytes(&0u32.to_le_bytes(), 8);
     }
     encoder.set_buffer(params.normed_output, 0, 9);
+    // Separate scale/zero arrays
+    encoder.set_buffer(params.weight.scales.as_ref().unwrap(), 0, 10);
+    encoder.set_buffer(params.weight.zeros.as_ref().unwrap(), 0, 11);
     encoder.dispatch_threadgroups((params.n as usize, 1, 1), (32, 1, 1));
 }

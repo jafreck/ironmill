@@ -43,13 +43,9 @@ constant constexpr uint BLK_N = 64;
 constant constexpr uint BLK_K = 8;
 
 // ── Superblock layout constants ──
-// Superblock = [scale:2B][zero:2B][data:group_size/elems_per_byte bytes]
-// For INT4 gs=128: sb_bytes = 4 + 64 = 68
-// For INT8 gs=128: sb_bytes = 4 + 128 = 132
-//
-// Layout: W[row * sb_stride + group * sb_bytes + offset]
-// where sb_stride = num_groups * sb_bytes
-constant constexpr uint SB_HEADER_BYTES = 4;  // 2B scale + 2B zero
+// Separate-array layout: data is contiguous (no inline headers).
+// Scales and zeros are passed as separate buffer arguments.
+constant constexpr uint SB_HEADER_BYTES = 0;  // no inline headers
 
 // Superblock decode constants
 constant constexpr uint SB_ROWS_PER_SG = 4;

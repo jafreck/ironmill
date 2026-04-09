@@ -14,8 +14,8 @@ using namespace metal;
 #error "GS must be defined by build.rs"
 #endif
 
-constant constexpr uint FRN_SB_HEADER_BYTES = 4;  // 2B scale + 2B zero
-constant constexpr uint FRN_SB_BYTES_INT4 = FRN_SB_HEADER_BYTES + GS / 2;
+constant constexpr uint FRN_SB_HEADER_BYTES = 0;  // separate arrays
+constant constexpr uint FRN_SB_BYTES_INT4 = GS / 2;
 constant constexpr uint FRN_BLK_K = 8;
 
 kernel void superblock_fused_residual_norm_affine_matvec_int4(
@@ -23,12 +23,14 @@ kernel void superblock_fused_residual_norm_affine_matvec_int4(
     device const half* b               [[buffer(1)]],
     device const half* norm_weight      [[buffer(2)]],
     device half* residual_output       [[buffer(3)]],
-    device const uchar* W              [[buffer(4)]],   // superblocks
+    device const uchar* W              [[buffer(4)]],   // data [N, K/2]
     device half* C                     [[buffer(5)]],
     constant uint* params              [[buffer(6)]],
     device const half* awq_scales      [[buffer(7)]],
     constant uint& has_awq             [[buffer(8)]],
     device half* normed_output         [[buffer(9)]],
+    device const half* W_scales        [[buffer(10)]],  // [N, K/GS]
+    device const half* W_zeros         [[buffer(11)]],  // [N, K/GS]
     uint tid  [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -51,11 +53,11 @@ kernel void superblock_fused_residual_norm_affine_matvec_int4(
         uint g = k_elem / GS;
         uint word_idx = (k_elem % GS) / 8;
 
-        device const uchar *sb = W + tid * sb_stride + g * FRN_SB_BYTES_INT4;
-        float s = float(*(device const half *)(sb));
-        float z = float(*(device const half *)(sb + 2));
+        device const uchar *data_ptr = W + tid * sb_stride + g * FRN_SB_BYTES_INT4;
+        float s = float(W_scales[tid * num_groups + g]);
+        float z = float(W_zeros[tid * num_groups + g]);
 
-        uint packed4 = ((device const uint*)(sb + FRN_SB_HEADER_BYTES))[word_idx];
+        uint packed4 = ((device const uint*)(data_ptr))[word_idx];
 
         float w0 = (float(packed4 & 0xF) - z) * s;
         float w1 = (float((packed4 >> 4) & 0xF) - z) * s;

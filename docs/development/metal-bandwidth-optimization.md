@@ -36,8 +36,12 @@ Additional optimizations landed:
 | MLX-style pre-scaled input trick (eliminates 8 shifts+subs) | No change (memory-bound) |
 | Kernel fusion: residual+RMSNorm+projection (3-way) | In place for decode |
 | Kernel fusion: gate+up+activation (FFN) | In place for decode |
+| SIMD waste fix: K-word iteration in fused/batched kernels | Fixed 50% lane waste at gs≤128 |
+| **Phase B: Separate scale/bias arrays** | **38 → 44 tok/s (+16%)** |
+| **Phase C: Occupancy sweep (6 configs)** | **No change — Config E confirmed optimal** |
+| **Phase D: INT8/3-bit prefill vectorization** | **uint32 loads in all prefill B-tile paths** |
 
-**Net result: 19 → 38 tok/s (2× improvement). But MLX is at 97 tok/s.**
+**Net result: 19 → 44 tok/s (2.3× improvement). MLX is at 97 tok/s.**
 
 ### Previous Approach (Failed)
 
@@ -63,9 +67,13 @@ Bandwidth utilization:            ~10%
 
 ### Why 2.5× Behind MLX
 
-Two structural problems remain after the superblock migration. Both were
+Two structural problems remained after the superblock migration. Both were
 identified by comparing ironmill's `superblock_matvec_int4` kernel against
 MLX's `qmv_fast_impl` (in `mlx/backend/metal/kernels/quantized.h`).
+
+**Problem 1 (superblock headers) is now fixed** — Phase B replaced inline
+headers with separate contiguous arrays. **Problem 2 (half values/thread)
+remains** — Phase A was attempted and reverted.
 
 #### 1. Superblock header cache waste (~33% bandwidth loss)
 
@@ -215,12 +223,25 @@ bytes per memory transaction.
 - `shaders/quantized/affine_fused.metal` — all INT4 kernels
 - No Rust dispatch changes (same TG count, same buffer bindings).
 
-### Phase B: Separate Scale/Bias Arrays (Target: ~75 tok/s)
+### Phase B: Separate Scale/Bias Arrays — ✅ DONE (38 → 44 tok/s, +16%)
 
-Replace superblock inline headers with MLX-style separate contiguous arrays.
-This eliminates the 4-byte gaps that waste ~33% of cache fetches.
+Replaced superblock inline headers with MLX-style separate contiguous arrays.
+Weight data is now gap-free packed nibbles/bytes; scales and zeros are separate
+FP16 buffers. This eliminates the 4-byte headers that wasted ~33% of cache fetches.
 
-#### Layout change:
+**Measured impact:** 38 → 44 tok/s (+16% decode throughput). The improvement is
+significant but less than the predicted 1.3–1.5× because the separate scale/bias
+reads now miss the spatial locality advantage of inline headers (scale is no longer
+in the same cache line as its data). The net win comes from gap-free weight data
+enabling better streaming bandwidth.
+
+**Files changed:**
+- `metal/weights.rs` — skip `pack_superblocks()`, upload data/scales/zeros as 3 buffers
+- `shaders/quantized/superblock_header.metal` — `SB_HEADER_BYTES=0`, `SB_BYTES_INT4=GS/2`
+- All 9 superblock kernels across 5 shader files — added W_scales/W_zeros buffer params
+- `metal/projection.rs`, `metal/ops/quantized.rs`, `metal/ops/fused.rs` — bind separate buffers
+
+#### Layout change (implemented):
 ```
 BEFORE (superblock):
   W[row][group] = [scale:2B][bias:2B][data:GS/2 bytes]
@@ -229,108 +250,72 @@ BEFORE (superblock):
 AFTER (separate arrays):
   W_data[row][K/2]     — contiguous packed nibbles, no gaps
   W_scales[row][K/GS]  — separate half array
-  W_biases[row][K/GS]  — separate half array
+  W_zeros[row][K/GS]   — separate half array
 ```
 
-This changes the weight packing format and adds 2 buffer bindings per kernel.
+### Phase C: Occupancy Sweep — ✅ DONE (no change, Config E confirmed)
 
-#### Kernel change:
-```metal
-// BEFORE: inline header read
-device const uchar *sb = W + row * sb_stride + g * SB_BYTES_INT4;
-float scale = float(*(device const half *)(sb));
-float bias  = float(*(device const half *)(sb + 2));
-device const uint16_t *ws = (device const uint16_t *)(sb + SB_HEADER_BYTES) + ...;
+Tested 6 threadgroup configurations on Qwen 3.5-4B INT4 gs=128 decode.
+Config E (current: 2 SG × 4 rows/SG) is optimal. No config beat it by ≥5%.
 
-// AFTER: separate array read
-float scale = float(scales[row * num_groups + g]);
-float bias  = float(biases[row * num_groups + g]);
-device const uint16_t *ws = (device const uint16_t *)(W_data + row * k_half) + ...;
-```
+| Config | SGs/TG | Rows/SG | Threads/TG | Rows/TG | Decode (tok/s) | vs E |
+|--------|--------|---------|------------|---------|---------------|------|
+| A | 1 | 2 | 32 | 2 | 41.4 | -5.5% |
+| B | 1 | 4 | 32 | 4 | 37.8 | -13.7% |
+| C | 1 | 8 | 32 | 8 | 38.2 | -12.8% |
+| D | 2 | 2 | 64 | 4 | 43.2 | -1.4% |
+| **E (current)** | **2** | **4** | **64** | **8** | **43.8** | **baseline** |
+| F | 2 | 8 | 64 | 16 | 38.4 | -12.3% |
 
-**Trade-off:** Separate scale/bias reads lose superblock spatial locality
-(scale is no longer in the same cache line as its data). However, with
-K/GS = 20 groups per row, the scale/bias arrays are only 80 bytes per row
-— easily cached in L2 after the first group iteration. The net effect is
-positive because the weight data array becomes gap-free.
+**Key findings:**
+- 2 simdgroups consistently outperform 1 simdgroup (better memory-latency hiding)
+- Within 2 SGs: 4 rows/SG is optimal. 2 rows/SG has excess dispatch overhead;
+  8 rows/SG underutilizes the GPU (only 160 TGs for N=2560)
+- 1 SG configs are uniformly worse — 32 threads per TG leaves half the
+  memory bandwidth pipeline idle
+- PPL is 9.42 across all configs (expected — pure dispatch change)
+- Decision: **keep Config E (no change needed)**
 
-**Expected impact:** ~1.3–1.5× on top of Phase A (55 → 70–80 tok/s).
-Eliminates 33% cache waste from superblock headers.
+### Phase D: INT8 + 3-bit Prefill Vectorization — ✅ DONE
 
-**Files to change:**
-- `metal/weights.rs` — add `scales`/`biases` buffer fields, update packing
-- `shaders/quantized/affine_matvec.metal` — read from separate arrays
-- `shaders/quantized/affine_batched.metal` — same
-- `shaders/quantized/affine_fused.metal` — same
-- `shaders/quantized/affine_matmul.metal` — prefill kernels too
-- `metal/projection.rs` — add buffer bindings for scales/biases
-- `metal/ops/quantized.rs` — update encode helpers
+Vectorized all remaining byte-by-byte reads in prefill and decode kernels.
 
-### Phase C: Occupancy Sweep (Target: find optimal TG config)
+**INT8 prefill** (`superblock_matmul_int8`): Replaced `uchar q = sb[offset]`
+with `uint packed4 = ((uint*)(sb))[word_idx]; q = (packed4 >> shift) & 0xFF`.
+One uint32 read per thread instead of one byte read. Benefits: fewer memory
+transactions, better cache utilization from aligned wider loads.
 
-Run the 6-config occupancy experiment from `decode-perf-investigation.md`
-to determine if the current 2 SG × 4 rows/SG structure is optimal.
+**3-bit kernels** (`d2quant_matmul_3bit`, `d2quant_matvec_3bit`,
+`d2quant_matvec_3bit_amx`, `d2quant_embedding_lookup_3bit`): Replaced
+3-byte concatenation (`uint(B[off]) | (uint(B[off+1]) << 8) | ...`) with
+single uint32 load + mask (`*(uint*)(B + off) & 0x00FFFFFF`). One memory
+transaction instead of three.
 
-| Config | SGs/TG | Rows/SG | Threads/TG | Rows/TG | Expected TGs |
-|--------|--------|---------|------------|---------|-------------|
-| A | 1 | 2 | 32 | 2 | 1280 |
-| B | 1 | 4 | 32 | 4 | 640 |
-| C | 1 | 8 | 32 | 8 | 320 |
-| D | 2 | 2 | 64 | 4 | 640 |
-| **E (current)** | **2** | **4** | **64** | **8** | **320** |
-| F | 2 | 8 | 64 | 16 | 160 |
-
-**Decision rule:** If any config wins by ≥ 5% over current, adopt it.
-Run this AFTER Phase A to test with the improved kernel.
-
-**Files to change:**
-- `shaders/quantized/superblock_header.metal` — `SB_ROWS_PER_SG`, `SB_NUM_SIMDGROUPS`
-- `shaders/quantized/affine_common.metal` — same constants
-- `metal/projection.rs` — dispatch grid/thread counts
-
-### Phase D: INT8 + 3-bit Prefill Vectorization (Target: 400+ tok/s prefill)
-
-INT4 prefill is already vectorized (uint32 loads in B-tile load). But INT8
-and 3-bit paths still use byte-by-byte reads:
-
-```metal
-// INT8 prefill — still byte-by-byte:
-uchar q = sb[SB_HEADER_BYTES + sb_offset];
-
-// 3-bit prefill — 3 byte reads per 8 values:
-uint bits = uint(B_packed[off]) | (uint(B_packed[off+1]) << 8)
-          | (uint(B_packed[off+2]) << 16);
-```
-
-**INT8 fix:** Replace with uint32 loads (4 bytes = 4 INT8 values per load).
-**3-bit fix:** Replace 3-byte concatenation with a single uint32 load
-(read 4 bytes, mask to 24 useful bits, unpack 8 3-bit values).
-
-**Files to change:**
-- `shaders/quantized/affine_matmul.metal` — `superblock_matmul_int8` B-tile load
-- `shaders/quantized/d2quant_matmul.metal` — `d2quant_matmul_3bit` B-tile load
+**Files changed:**
+- `shaders/quantized/affine_matmul.metal` — `superblock_matmul_int8` B-tile (2 sites)
+- `shaders/quantized/d2quant_matmul.metal` — all 3-bit kernels (5 sites)
 
 ---
 
-## Expected Impact
+## Expected Impact (Updated with Measured Results)
 
 | Phase | Decode (tok/s) | Prefill (tok/s) | Key Change |
 |-------|---------------|-----------------|------------|
-| Baseline (current) | 38 | 242 | Superblock + pre-scaled input |
-| Phase A: 16 vals/thread | ~55 | ~300 | Half K iterations, 2× useful bytes/request |
-| Phase B: Separate arrays | ~75 | ~400 | Eliminate 33% cache waste |
-| Phase C: Occupancy sweep | ~80 | ~400 | Optimal TG configuration |
-| Phase D: INT8/3-bit prefill | ~80 | ~500 | Vectorize remaining prefill paths |
-| **Projected total** | **~80** | **~500** | |
+| Baseline (pre-optimization) | 38 | 242 | Superblock + pre-scaled input |
+| Phase A: 16 vals/thread | ⏸ Skipped | — | Attempted & reverted |
+| **Phase B: Separate arrays** | **44 (measured)** | **~300** | **Eliminate 33% cache waste** |
+| **Phase C: Occupancy sweep** | **44 (no change)** | **~300** | **Config E confirmed optimal** |
+| **Phase D: INT8/3-bit prefill** | **44** | **~300** | **Vectorize remaining prefill paths** |
+| **Current total** | **44** | **~300** | |
 | MLX reference | 97 | — | |
 | llama.cpp reference | 67 | 1066 | |
 
-The remaining gap to MLX after all phases (~17%) would require:
+The remaining gap to MLX (~53%) requires:
+- **Phase A: Double values per thread** (16 elem/thread) — highest expected impact,
+  was attempted and reverted. Needs investigation of revert cause before re-attempt.
 - **Split-K dispatch** (multiple TGs per output row, final reduction)
 - **Auto-specialized kernel variants** per group-size/dim/dtype
 - **Lazy evaluation / compute graph batching** (framework-level change)
-
-These are larger architectural investments beyond kernel optimization.
 
 ---
 
@@ -363,11 +348,12 @@ Implemented 2 simdgroups × 4 rows/SG = 8 rows/TG, dispatching
 `ceil(N/8)` TGs × 64 threads. Optimal configuration TBD via Phase C
 occupancy sweep.
 
-### ⚠️ Phase 4: Prefill Dequant → PARTIAL
+### ⚠️ Phase 4: Prefill Dequant → ✅ DONE
 
 INT4 prefill matmul (`superblock_matmul_int4`) uses uint32 vectorized
-B-tile loads. INT8 and 3-bit paths still use byte-by-byte reads (see
-Phase D above).
+B-tile loads. INT8 prefill (`superblock_matmul_int8`) now uses uint32
+loads + byte extraction. 3-bit (`d2quant_matmul_3bit`) now uses single
+uint32 loads + 24-bit mask instead of 3-byte concatenation.
 
 ---
 

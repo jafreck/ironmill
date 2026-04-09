@@ -1077,18 +1077,18 @@ fn load_weight_buffer(
                     gs,
                 )?;
 
-                // Pack into superblock layout with inline scale/zero.
-                let repacked = pack_superblocks(
-                    &tensor.data,
-                    &scales_f16,
-                    &zeros_f16,
-                    n,
-                    k,
-                    gs,
-                    *bit_width as usize,
-                );
+                // Separate-array layout: upload data, scales, zeros as 3 buffers.
+                // Data is contiguous packed nibbles/bytes (no inline headers).
                 let data_buf = device
-                    .create_buffer_with_data(&repacked, StorageMode::Shared)
+                    .create_buffer_with_data(&tensor.data, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+
+                let scales_buf = device
+                    .create_buffer_with_data(&scales_f16, StorageMode::Shared)
+                    .map_err(MetalError::Metal)?;
+
+                let zeros_buf = device
+                    .create_buffer_with_data(&zeros_f16, StorageMode::Shared)
                     .map_err(MetalError::Metal)?;
 
                 // Upload AWQ per-column scales if present.
@@ -1104,8 +1104,8 @@ fn load_weight_buffer(
 
                 return Ok(WeightBuffer::AffineQuantized(AffineQuantizedWeight {
                     data: data_buf,
-                    scales: None,
-                    zeros: None,
+                    scales: Some(scales_buf),
+                    zeros: Some(zeros_buf),
                     group_size: gs as u32,
                     bit_width: *bit_width,
                     shape: (n, k),

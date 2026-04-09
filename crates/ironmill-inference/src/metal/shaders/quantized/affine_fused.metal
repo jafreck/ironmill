@@ -8,14 +8,18 @@
 
 kernel void superblock_fused_ffn_gate_up_act_int4(
     device const half *A            [[buffer(0)]],   // [1, K] shared input
-    device const uchar *W_gate      [[buffer(1)]],   // gate superblocks
-    device const uchar *W_up        [[buffer(2)]],   // up superblocks
+    device const uchar *W_gate      [[buffer(1)]],   // gate data [N, K/2]
+    device const uchar *W_up        [[buffer(2)]],   // up data [N, K/2]
     device half *C                  [[buffer(3)]],   // [1, N] fused output
     constant uint &N                [[buffer(4)]],
     constant uint &K                [[buffer(5)]],
     device const half *awq_scales   [[buffer(6)]],
     constant uint &has_awq          [[buffer(7)]],
     constant uint &use_gelu         [[buffer(8)]],
+    device const half *gate_scales  [[buffer(9)]],   // [N, K/GS]
+    device const half *gate_zeros   [[buffer(10)]],  // [N, K/GS]
+    device const half *up_scales    [[buffer(11)]],   // [N, K/GS]
+    device const half *up_zeros     [[buffer(12)]],   // [N, K/GS]
     uint tid  [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -34,16 +38,16 @@ kernel void superblock_fused_ffn_gate_up_act_int4(
         uint g = k_elem / GS;
         uint word_idx = (k_elem % GS) / 8;
 
-        device const uchar *sb_gate = W_gate + tid * sb_stride + g * SB_BYTES_INT4;
-        device const uchar *sb_up   = W_up   + tid * sb_stride + g * SB_BYTES_INT4;
+        device const uchar *data_gate = W_gate + tid * sb_stride + g * SB_BYTES_INT4;
+        device const uchar *data_up   = W_up   + tid * sb_stride + g * SB_BYTES_INT4;
 
-        float sg = float(*(device const half *)(sb_gate));
-        float zg = float(*(device const half *)(sb_gate + 2));
-        float su = float(*(device const half *)(sb_up));
-        float zu = float(*(device const half *)(sb_up + 2));
+        float sg = float(gate_scales[tid * num_groups + g]);
+        float zg = float(gate_zeros[tid * num_groups + g]);
+        float su = float(up_scales[tid * num_groups + g]);
+        float zu = float(up_zeros[tid * num_groups + g]);
 
-        uint g_packed4 = ((device const uint*)(sb_gate + SB_HEADER_BYTES))[word_idx];
-        uint u_packed4 = ((device const uint*)(sb_up + SB_HEADER_BYTES))[word_idx];
+        uint g_packed4 = ((device const uint*)(data_gate))[word_idx];
+        uint u_packed4 = ((device const uint*)(data_up))[word_idx];
 
         float gw0 = (float(g_packed4 & 0xF) - zg) * sg;
         float gw1 = (float((g_packed4 >> 4) & 0xF) - zg) * sg;
@@ -111,11 +115,13 @@ kernel void superblock_fused_ffn_gate_up_act_int4(
 kernel void superblock_affine_matvec_int4xq8(
     device const char *A_q8         [[buffer(0)]],   // [K] int8
     device const float *A_scales    [[buffer(1)]],   // [K/q8_group_size] float
-    device const uchar *W           [[buffer(2)]],   // [N, G, sb_bytes] superblocks
+    device const uchar *W           [[buffer(2)]],   // [N, K/2] contiguous data
     device half *C                  [[buffer(3)]],   // [1, N]
     constant uint &N                [[buffer(4)]],
     constant uint &K                [[buffer(5)]],
     constant uint &q8_group_size    [[buffer(6)]],
+    device const half *W_scales     [[buffer(7)]],   // [N, K/GS]
+    device const half *W_zeros      [[buffer(8)]],   // [N, K/GS]
     uint tid  [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -133,12 +139,11 @@ kernel void superblock_affine_matvec_int4xq8(
         uint g = k_elem / GS;
         uint word_idx = (k_elem % GS) / 8;
 
-        device const uchar *sb = W + tid * sb_stride + g * SB_BYTES_INT4;
-        float ws = float(*(device const half *)(sb));
-        float wz = float(*(device const half *)(sb + 2));
+        float ws = float(W_scales[tid * num_groups + g]);
+        float wz = float(W_zeros[tid * num_groups + g]);
         int iz = int(rint(wz));
 
-        uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_idx];
+        uint packed4 = ((device const uint*)(W + tid * sb_stride + g * SB_BYTES_INT4))[word_idx];
 
         int lo0 = int(packed4 & 0xF);
         int lo1 = int((packed4 >> 4) & 0xF);

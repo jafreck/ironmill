@@ -19,9 +19,11 @@ constant constexpr uint K_BLOCKS       = MATMUL_K_TILE / 8;
 constant constexpr uint TN_BLOCKS      = TN_TILE / 8;
 
 // ── Superblock layout constants (compile-time) ──
-constant constexpr uint SB_HEADER_BYTES = 4;
-constant constexpr uint SB_BYTES_INT4 = SB_HEADER_BYTES + GS / 2;
-constant constexpr uint SB_BYTES_INT8 = SB_HEADER_BYTES + GS;
+// Separate-array layout: data is contiguous (no inline headers).
+// Scales and zeros are passed as separate buffer arguments.
+constant constexpr uint SB_HEADER_BYTES = 0;
+constant constexpr uint SB_BYTES_INT4 = GS / 2;
+constant constexpr uint SB_BYTES_INT8 = GS;
 constant constexpr uint SB_ROWS_PER_SG = 4;
 constant constexpr uint SB_NUM_SIMDGROUPS = 2;
 constant constexpr uint SB_ROWS_PER_TG = SB_NUM_SIMDGROUPS * SB_ROWS_PER_SG;

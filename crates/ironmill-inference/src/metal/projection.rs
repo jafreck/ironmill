@@ -261,6 +261,9 @@ fn encode_affine_projection(
             encoder.set_buffer(&weight.data, 0, 5); // dummy
         }
         encoder.set_bytes(&has_awq.to_le_bytes(), 6);
+        // Separate scale/zero arrays
+        encoder.set_buffer(weight.scales.as_ref().unwrap(), 0, 7);
+        encoder.set_buffer(weight.zeros.as_ref().unwrap(), 0, 8);
         // matvec_int4: ceil(N/8) TGs × 64 threads (8 rows per TG)
         encoder.dispatch_threadgroups((n.div_ceil(8), 1, 1), (64, 1, 1));
     } else {
@@ -275,6 +278,9 @@ fn encode_affine_projection(
             encoder.set_buffer(&weight.data, 0, 6); // dummy
         }
         encoder.set_bytes(&has_awq.to_le_bytes(), 7);
+        // Separate scale/zero arrays
+        encoder.set_buffer(weight.scales.as_ref().unwrap(), 0, 8);
+        encoder.set_buffer(weight.zeros.as_ref().unwrap(), 0, 9);
         encoder.dispatch_threadgroups(
             (
                 token_count.div_ceil(MATMUL_TM_TILE),

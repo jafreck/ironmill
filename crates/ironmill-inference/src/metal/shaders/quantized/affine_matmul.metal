@@ -9,13 +9,15 @@
 
 kernel void superblock_matmul_int4(
     device const half *A            [[buffer(0)]],   // [M, K]
-    device const uchar *W           [[buffer(1)]],   // [N, G, sb_bytes] superblocks
+    device const uchar *W           [[buffer(1)]],   // [N, K/2] contiguous data
     device half *C                  [[buffer(2)]],   // [M, N]
     constant uint &M                [[buffer(3)]],
     constant uint &N                [[buffer(4)]],
     constant uint &K                [[buffer(5)]],
     device const half *awq_scales   [[buffer(6)]],   // [K] or dummy
     constant uint &has_awq          [[buffer(7)]],
+    device const half *W_scales     [[buffer(8)]],   // [N, K/GS]
+    device const half *W_zeros      [[buffer(9)]],   // [N, K/GS]
     uint2 group_id [[threadgroup_position_in_grid]],
     uint tid   [[thread_index_in_threadgroup]],
     uint sgid  [[simdgroup_index_in_threadgroup]],
@@ -60,13 +62,13 @@ kernel void superblock_matmul_int4(
             if (g_n < N && g_k < K) {
                 uint sb_idx = g_k / GS;
                 uint sb_offset = g_k % GS;
-                device const uchar *sb = W + g_n * sb_stride + sb_idx * SB_BYTES_INT4;
+                device const uchar *data_ptr = W + g_n * sb_stride + sb_idx * SB_BYTES_INT4;
                 uint word_offset = sb_offset / 8;
                 uint nibble_pos = sb_offset % 8;
-                uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_offset];
+                uint packed4 = ((device const uint*)(data_ptr))[word_offset];
                 uchar nibble = (packed4 >> (nibble_pos * 4)) & 0xF;
-                float s = float(*(device const half *)(sb));
-                float z = float(*(device const half *)(sb + 2));
+                float s = float(W_scales[g_n * num_groups + sb_idx]);
+                float z = float(W_zeros[g_n * num_groups + sb_idx]);
                 val = half((float(nibble) - z) * s);
             }
             tg_bt[0][k * TN_STRIDE + n] = val;
@@ -101,13 +103,13 @@ kernel void superblock_matmul_int4(
                 if (g_n < N && g_k < K) {
                     uint sb_idx = g_k / GS;
                     uint sb_offset = g_k % GS;
-                    device const uchar *sb = W + g_n * sb_stride + sb_idx * SB_BYTES_INT4;
+                    device const uchar *data_ptr = W + g_n * sb_stride + sb_idx * SB_BYTES_INT4;
                     uint word_offset = sb_offset / 8;
                     uint nibble_pos = sb_offset % 8;
-                    uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_offset];
+                    uint packed4 = ((device const uint*)(data_ptr))[word_offset];
                     uchar nibble = (packed4 >> (nibble_pos * 4)) & 0xF;
-                    float s = float(*(device const half *)(sb));
-                    float z = float(*(device const half *)(sb + 2));
+                    float s = float(W_scales[g_n * num_groups + sb_idx]);
+                    float z = float(W_zeros[g_n * num_groups + sb_idx]);
                     val = half((float(nibble) - z) * s);
                 }
                 tg_bt[nxt][k * TN_STRIDE + n] = val;
@@ -152,13 +154,15 @@ kernel void superblock_matmul_int4(
 // ── INT8 superblock tiled GEMM (prefill path, M>1) ──────────────
 kernel void superblock_matmul_int8(
     device const half *A            [[buffer(0)]],
-    device const uchar *W           [[buffer(1)]],
+    device const uchar *W           [[buffer(1)]],   // [N, K] contiguous data
     device half *C                  [[buffer(2)]],
     constant uint &M                [[buffer(3)]],
     constant uint &N                [[buffer(4)]],
     constant uint &K                [[buffer(5)]],
     device const half *awq_scales   [[buffer(6)]],
     constant uint &has_awq          [[buffer(7)]],
+    device const half *W_scales     [[buffer(8)]],   // [N, K/GS]
+    device const half *W_zeros      [[buffer(9)]],   // [N, K/GS]
     uint2 group_id [[threadgroup_position_in_grid]],
     uint tid   [[thread_index_in_threadgroup]],
     uint sgid  [[simdgroup_index_in_threadgroup]],
@@ -201,10 +205,13 @@ kernel void superblock_matmul_int8(
             if (g_n < N && g_k < K) {
                 uint sb_idx = g_k / GS;
                 uint sb_offset = g_k % GS;
-                device const uchar *sb = W + g_n * sb_stride + sb_idx * SB_BYTES_INT8;
-                uchar q = sb[SB_HEADER_BYTES + sb_offset];
-                float s = float(*(device const half *)(sb));
-                float z = float(*(device const half *)(sb + 2));
+                device const uchar *data_ptr = W + g_n * sb_stride + sb_idx * SB_BYTES_INT8;
+                uint word_in_data = sb_offset / 4;
+                uint byte_in_word = sb_offset % 4;
+                uint packed4 = ((device const uint*)(data_ptr))[word_in_data];
+                uchar q = (packed4 >> (byte_in_word * 8)) & 0xFF;
+                float s = float(W_scales[g_n * num_groups + sb_idx]);
+                float z = float(W_zeros[g_n * num_groups + sb_idx]);
                 val = half((float(q) - z) * s);
             }
             tg_bt[0][k * TN_STRIDE + n] = val;
@@ -238,10 +245,13 @@ kernel void superblock_matmul_int8(
                 if (g_n < N && g_k < K) {
                     uint sb_idx = g_k / GS;
                     uint sb_offset = g_k % GS;
-                    device const uchar *sb = W + g_n * sb_stride + sb_idx * SB_BYTES_INT8;
-                    uchar q = sb[SB_HEADER_BYTES + sb_offset];
-                    float s = float(*(device const half *)(sb));
-                    float z = float(*(device const half *)(sb + 2));
+                    device const uchar *data_ptr = W + g_n * sb_stride + sb_idx * SB_BYTES_INT8;
+                    uint word_in_data = sb_offset / 4;
+                    uint byte_in_word = sb_offset % 4;
+                    uint packed4 = ((device const uint*)(data_ptr))[word_in_data];
+                    uchar q = (packed4 >> (byte_in_word * 8)) & 0xFF;
+                    float s = float(W_scales[g_n * num_groups + sb_idx]);
+                    float z = float(W_zeros[g_n * num_groups + sb_idx]);
                     val = half((float(q) - z) * s);
                 }
                 tg_bt[nxt][k * TN_STRIDE + n] = val;
