@@ -9,7 +9,6 @@
 //! sample) matching the llama.cpp `llama_sampler` default ordering.
 
 use std::collections::VecDeque;
-use std::fmt;
 
 // ---------------------------------------------------------------------------
 // Sampling errors
@@ -17,24 +16,15 @@ use std::fmt;
 
 /// Errors that can occur during token sampling.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SamplingError {
     /// The caller supplied an empty logits slice.
+    #[error("logits slice must not be empty")]
     EmptyLogits,
     /// No valid (finite-logit) tokens remain after filtering.
+    #[error("no valid tokens remain after filtering")]
     EmptyDistribution,
 }
-
-impl fmt::Display for SamplingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyLogits => write!(f, "logits slice must not be empty"),
-            Self::EmptyDistribution => write!(f, "no valid tokens remain after filtering"),
-        }
-    }
-}
-
-impl std::error::Error for SamplingError {}
 
 // ---------------------------------------------------------------------------
 // Legacy single-shot sampler (kept for backward compatibility)
