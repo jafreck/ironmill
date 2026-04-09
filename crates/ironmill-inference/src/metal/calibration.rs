@@ -822,7 +822,7 @@ impl MetalInference {
                         .advance_by(token_count)
                         .map_err(|e| InferenceError::runtime(e.to_string()))?;
                 }
-                return Ok(Logits::new(Vec::new()));
+                return Ok(Vec::new());
             }
         }
 
