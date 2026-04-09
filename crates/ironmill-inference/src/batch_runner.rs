@@ -3,6 +3,8 @@
 //! [`BatchRunner`] wraps a [`BatchInferenceEngine`] and drives
 //! continuous-batching generation with configurable scheduling.
 
+#![allow(dead_code)]
+
 use crate::engine::{BatchInferenceEngine, InferenceError};
 use crate::generate::{GenerateEvent, GenerateRequest};
 

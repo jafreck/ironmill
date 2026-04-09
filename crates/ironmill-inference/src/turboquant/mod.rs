@@ -5,6 +5,8 @@
 //! - Rotation sign and QJL matrix generation
 //! - Outlier channel detection from weight norms
 
+#![allow(dead_code)]
+
 pub mod cache_layout;
 pub mod codebook;
 pub mod outlier;

@@ -21,5 +21,7 @@ pub use hook::ActivationHook;
 pub use runner::{CalibratingEngine, CalibrationRunner, HessianHook, QuipHessianAccumulator};
 
 // Internal only
+#[allow(unused_imports)]
 pub(crate) use awq_store::{AwqActivationStore, ChannelMagnitudes};
+#[allow(unused_imports)]
 pub(crate) use gptq_store::{GptqActivationStore, HessianAccumulator};

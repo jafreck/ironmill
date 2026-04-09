@@ -14,6 +14,7 @@ use mil_rs::ir::{Operation, ScalarType, TensorType, Value};
 use crate::ane::split::SubProgram;
 
 /// Recursively rewrite `Value::Reference` names in a value tree.
+#[allow(dead_code)]
 fn rewrite_refs(val: &mut Value, rename_map: &HashMap<String, String>) {
     match val {
         Value::Reference(r) => {
@@ -45,6 +46,7 @@ use ironmill_core::ane::packing::InputPacking;
 /// 2. Inserts `slice_by_size` ops to extract each original input
 /// 3. Replaces references in the function body
 /// 4. Updates `SubProgram.inputs` to reflect the single packed input
+#[allow(dead_code)]
 pub fn pack_inputs(sub: &mut SubProgram) -> Option<InputPacking> {
     // Skip sub-programs with 0 or 1 input — nothing to pack.
     if sub.inputs.len() <= 1 {

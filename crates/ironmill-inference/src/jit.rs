@@ -4,6 +4,8 @@
 //! applying quantization / casting transforms to weight tensors during
 //! model loading. Actual GPU kernel compilation is future work.
 
+#![allow(dead_code)]
+
 use mil_rs::ir::ScalarType;
 use mil_rs::weights::{ModelConfig, QuantizationInfo, WeightTensor};
 

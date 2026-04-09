@@ -24,6 +24,7 @@ const DATA_START: usize = 128;
 
 /// Metadata for a weight entry in the BLOBFILE.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BlobEntry {
     /// Weight tensor name (e.g., `"attn.qkv_proj.weight"`).
     pub name: String,
@@ -85,11 +86,13 @@ impl BlobFileWriter {
     }
 
     /// Get the list of blob entries (for validation/debugging).
+    #[allow(dead_code)]
     pub fn entries(&self) -> &[BlobEntry] {
         &self.entries
     }
 
     /// Write the complete BLOBFILE to disk.
+    #[allow(dead_code)]
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
         std::fs::write(path, self.build())
     }

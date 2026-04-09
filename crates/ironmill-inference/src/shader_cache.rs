@@ -4,6 +4,8 @@
 //! specialization constants, avoiding redundant GPU shader compilation
 //! across runs.
 
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
 /// Persistent shader pipeline cache.

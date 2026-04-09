@@ -1312,6 +1312,7 @@ fn pack_quantized_blocked(data: &[u8], n: usize, k: usize, bit_width: usize) -> 
 /// # Returns
 /// Packed superblock buffer `[N, num_groups, sb_bytes]` where
 /// `sb_bytes = 4 + group_size * bit_width / 8`
+#[cfg(test)]
 fn pack_superblocks(
     data: &[u8],
     scales: &[u8],

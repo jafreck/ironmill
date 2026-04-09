@@ -49,6 +49,7 @@ fn checked_mul3(
 /// Construct via [`TurboQuantCacheLayout::new`] from model parameters;
 /// then use the public fields when allocating Metal buffers.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TurboQuantCacheLayout {
     /// Number of KV heads.
     pub num_kv_heads: usize,

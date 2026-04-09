@@ -146,11 +146,13 @@ impl ProgramCache {
     }
 
     /// Increment the session compile count.
+    #[allow(dead_code)]
     pub(crate) fn record_compilation(&mut self) {
         self.session_compile_count += 1;
     }
 
     /// Remaining compile budget (~119 limit).
+    #[allow(dead_code)]
     pub(crate) fn remaining_budget(&self) -> usize {
         MAX_COMPILE_BUDGET.saturating_sub(self.session_compile_count)
     }
