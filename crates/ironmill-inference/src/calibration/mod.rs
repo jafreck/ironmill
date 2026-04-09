@@ -15,8 +15,11 @@ mod gptq_store;
 mod hook;
 mod runner;
 
-pub use awq_store::{AwqActivationStore, ChannelMagnitudes};
+// Public API
 pub use dataset::CalibrationDataset;
-pub use gptq_store::{GptqActivationStore, HessianAccumulator};
 pub use hook::ActivationHook;
 pub use runner::{CalibratingEngine, CalibrationRunner, HessianHook, QuipHessianAccumulator};
+
+// Internal only
+pub(crate) use awq_store::{AwqActivationStore, ChannelMagnitudes};
+pub(crate) use gptq_store::{GptqActivationStore, HessianAccumulator};

@@ -8,21 +8,20 @@
 #![warn(missing_docs)]
 
 // Core — always available, any platform
-pub mod batch_runner;
+pub(crate) mod batch_runner;
 pub mod cache;
 pub mod calibration;
 pub mod engine;
 pub mod generate;
 pub mod grammar;
-pub mod jit;
+pub(crate) mod jit;
 
 pub mod memory;
-pub mod model_info;
 pub mod sampling;
-pub mod serving;
-pub mod shader_cache;
+pub(crate) mod serving;
+pub(crate) mod shader_cache;
 pub mod speculative;
-pub mod turboquant;
+pub(crate) mod turboquant;
 pub mod types;
 
 // Platform-specific backends — feature + OS gated
@@ -40,7 +39,6 @@ mod weight_loading;
 // Re-exports for convenience.
 #[cfg(all(feature = "ane", target_os = "macos"))]
 pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
-pub use batch_runner::{BatchRunner, BatchRunnerConfig, SchedulingPolicy, SequenceHandle};
 pub use cache::{KvCacheSlice, KvLayerSlice, LinearPrefixCache, LruPolicy, PrefixCache, RadixTree};
 pub use engine::{
     BatchInferenceEngine, ConstrainedDecoder, InferenceEngine, InferenceError, SequenceId,
@@ -54,8 +52,6 @@ pub use generate::{
 };
 pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
 pub use memory::{KvQuantLevel, MemoryEstimator, MemoryUsage, QuantLevel};
-#[allow(deprecated)]
-pub use model_info::ModelInfo;
 pub use sampling::{
     DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, SamplingError, apply_token_mask, is_eos_token,
     sample_token,
