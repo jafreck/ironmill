@@ -350,6 +350,235 @@ pub(crate) fn encode_gdn_prefill(
 /// output gate → output projection → residual + post-attention RMSNorm.
 ///
 /// Shared between `run_pipeline_inner` and `run_pipeline_calibration`.
+/// Encode GDN input projections (QKV, Z, A, B) for a single decode step.
+///
+/// This is the first phase of GDN decode, split out to allow profiling
+/// boundaries between projection and recurrent phases.
+pub(crate) fn encode_gdn_projections(
+    enc: &ComputeEncoder,
+    bufs: &IntermediateBuffers,
+    gdn: &GdnState,
+    lw: &super::weights::LayerWeights,
+    pipelines: &super::ops::MetalPipelines,
+    h: usize,
+    skip_qkv: bool,
+) -> Result<(), InferenceError> {
+    let gdn_cfg = &gdn.config;
+    let qkv_dim = gdn_cfg.qkv_dim;
+    let value_dim = gdn_cfg.value_dim;
+    let num_v_heads = gdn_cfg.num_v_heads;
+
+    let w_qkv = lw.gdn_in_proj_qkv.as_ref().unwrap();
+    let w_z = lw.gdn_in_proj_z.as_ref().unwrap();
+    let w_a = lw.gdn_in_proj_a.as_ref().unwrap();
+    let w_b = lw.gdn_in_proj_b.as_ref().unwrap();
+
+    if skip_qkv {
+        for (weight, output_buf, out_features) in [
+            (w_z, &gdn.gpu_temp_z, value_dim),
+            (w_a, &gdn.gpu_temp_a, num_v_heads),
+            (w_b, &gdn.gpu_temp_b, num_v_heads),
+        ] {
+            encode_projection(
+                enc,
+                &bufs.norm_out,
+                weight,
+                output_buf,
+                pipelines,
+                1,
+                out_features,
+                h,
+            )?;
+        }
+    } else if let (Some(p_qkv), Some(p_z), Some(p_a), Some(p_b)) = (
+        w_qkv.packed_buf(),
+        w_z.packed_buf(),
+        w_a.packed_buf(),
+        w_b.packed_buf(),
+    ) {
+        ops::encode_gdn_batched_matvec(
+            enc,
+            &pipelines.gdn.batched_matvec,
+            &ops::GdnBatchedMatvecParams {
+                input: &bufs.norm_out,
+                w_qkv: p_qkv,
+                w_z: p_z,
+                w_a: p_a,
+                w_b: p_b,
+                y_qkv: &gdn.gpu_temp_qkv,
+                y_z: &gdn.gpu_temp_z,
+                y_a: &gdn.gpu_temp_a,
+                y_b: &gdn.gpu_temp_b,
+                k: h as u32,
+                n_qkv: qkv_dim as u32,
+                n_z: value_dim as u32,
+                n_a: num_v_heads as u32,
+                n_b: num_v_heads as u32,
+            },
+        );
+    } else if let (
+        WeightBuffer::AffineQuantized(aq_qkv),
+        WeightBuffer::AffineQuantized(aq_z),
+        WeightBuffer::AffineQuantized(aq_a),
+        WeightBuffer::AffineQuantized(aq_b),
+    ) = (w_qkv, w_z, w_a, w_b)
+    {
+        if aq_qkv.bit_width == 4
+            && aq_z.bit_width == 4
+            && aq_a.bit_width == 4
+            && aq_b.bit_width == 4
+        {
+            ops::encode_gdn_batched_affine_matvec_int4(
+                enc,
+                pipelines
+                    .affine
+                    .gdn_batched_matvec_int4
+                    .get(aq_qkv.group_size)
+                    .expect("unsupported group_size for gdn_batched_matvec_int4"),
+                &ops::GdnBatchedAffineInt4Params {
+                    input: &bufs.norm_out,
+                    w0: aq_qkv,
+                    out0: &gdn.gpu_temp_qkv,
+                    n0: qkv_dim as u32,
+                    w1: aq_z,
+                    out1: &gdn.gpu_temp_z,
+                    n1: value_dim as u32,
+                    w2: aq_a,
+                    out2: &gdn.gpu_temp_a,
+                    n2: num_v_heads as u32,
+                    w3: aq_b,
+                    out3: &gdn.gpu_temp_b,
+                    n3: num_v_heads as u32,
+                    k: h as u32,
+                },
+            );
+        } else {
+            for (weight, output_buf, out_features) in [
+                (w_qkv as &WeightBuffer, &gdn.gpu_temp_qkv, qkv_dim),
+                (w_z as &WeightBuffer, &gdn.gpu_temp_z, value_dim),
+                (w_a as &WeightBuffer, &gdn.gpu_temp_a, num_v_heads),
+                (w_b as &WeightBuffer, &gdn.gpu_temp_b, num_v_heads),
+            ] {
+                encode_projection(
+                    enc,
+                    &bufs.norm_out,
+                    weight,
+                    output_buf,
+                    pipelines,
+                    1,
+                    out_features,
+                    h,
+                )?;
+            }
+        }
+    } else {
+        for (weight, output_buf, out_features) in [
+            (w_qkv, &gdn.gpu_temp_qkv, qkv_dim),
+            (w_z, &gdn.gpu_temp_z, value_dim),
+            (w_a, &gdn.gpu_temp_a, num_v_heads),
+            (w_b, &gdn.gpu_temp_b, num_v_heads),
+        ] {
+            encode_projection(
+                enc,
+                &bufs.norm_out,
+                weight,
+                output_buf,
+                pipelines,
+                1,
+                out_features,
+                h,
+            )?;
+        }
+    }
+    enc.memory_barrier_with_resources(&[
+        &gdn.gpu_temp_qkv,
+        &gdn.gpu_temp_z,
+        &gdn.gpu_temp_a,
+        &gdn.gpu_temp_b,
+    ]);
+    Ok(())
+}
+
+/// Encode GDN recurrent core + output projection + post-attention residual+norm.
+///
+/// This is the second phase of GDN decode, after projections and their barrier.
+pub(crate) fn encode_gdn_core_and_output(
+    enc: &ComputeEncoder,
+    bufs: &IntermediateBuffers,
+    gdn: &GdnState,
+    lw: &super::weights::LayerWeights,
+    pipelines: &super::ops::MetalPipelines,
+    gdn_idx: usize,
+    h: usize,
+    eps: f32,
+) -> Result<(), InferenceError> {
+    let gdn_cfg = &gdn.config;
+    let qkv_dim = gdn_cfg.qkv_dim;
+    let value_dim = gdn_cfg.value_dim;
+    let num_v_heads = gdn_cfg.num_v_heads;
+    let k_head_dim = gdn_cfg.k_head_dim;
+    let v_head_dim = gdn_cfg.v_head_dim;
+    let key_dim = gdn_cfg.key_dim;
+
+    let layer_state = &gdn.layers[gdn_idx];
+    ops::encode_gdn_fused_decode(
+        enc,
+        &pipelines.gdn.fused_decode,
+        &ops::GdnFusedDecodeParams {
+            input_qkv: &gdn.gpu_temp_qkv,
+            conv_weight: lw.gdn_conv1d_weight.as_ref().unwrap(),
+            conv_state: &layer_state.conv_state,
+            a_proj: &gdn.gpu_temp_a,
+            b_proj: &gdn.gpu_temp_b,
+            a_log: lw.gdn_a_log.as_ref().unwrap(),
+            dt_bias: lw.gdn_dt_bias.as_ref().unwrap(),
+            recurrent_state: &layer_state.recurrent_state,
+            z_proj: &gdn.gpu_temp_z,
+            norm_weight: lw.gdn_norm.as_ref().unwrap(),
+            output: &gdn.gpu_gated_output,
+            conv_out_scratch: &gdn.gpu_conv_out,
+            qkv_dim: qkv_dim as u32,
+            kernel_size: gdn_cfg.conv_kernel_size as u32,
+            key_dim: key_dim as u32,
+            value_dim: value_dim as u32,
+            num_v_heads: num_v_heads as u32,
+            k_head_dim: k_head_dim as u32,
+            v_head_dim: v_head_dim as u32,
+            num_k_heads: gdn_cfg.num_k_heads as u32,
+            eps,
+        },
+    );
+    enc.memory_barrier_with_resources(&[&gdn.gpu_gated_output]);
+
+    encode_projection(
+        enc,
+        &gdn.gpu_gated_output,
+        lw.gdn_out_proj.as_ref().unwrap(),
+        &gdn.scratch,
+        pipelines,
+        1,
+        h,
+        value_dim,
+    )?;
+    enc.memory_barrier_with_resources(&[&gdn.scratch]);
+
+    ops::encode_fused_residual_rms_norm(
+        enc,
+        &pipelines.norm.fused_residual_rms_norm,
+        &ops::FusedResidualRmsNormParams {
+            a: &bufs.hidden_state,
+            b: &gdn.scratch,
+            weight: &lw.post_attn_norm,
+            normed_output: &bufs.norm_out,
+            residual_output: &bufs.residual,
+            eps,
+            hidden_size: h as u32,
+            token_count: 1,
+        },
+    );
+    Ok(())
+}
+
 pub(crate) fn encode_gdn_decode(
     enc: &ComputeEncoder,
     bufs: &IntermediateBuffers,

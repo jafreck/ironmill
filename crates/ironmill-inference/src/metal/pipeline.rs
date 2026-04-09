@@ -11,7 +11,9 @@ use super::attention::{
 use super::buffers::{ModelConfigExt, Q8_GROUP_SIZE, build_matmul_cache};
 use super::engine::MetalInference;
 use super::ffn::{encode_ffn_block, encode_moe_block};
-use super::gdn::{encode_gdn_decode, encode_gdn_prefill};
+use super::gdn::{
+    encode_gdn_core_and_output, encode_gdn_decode, encode_gdn_prefill, encode_gdn_projections,
+};
 use super::ops;
 use super::plan::{AttentionKind, RopeTable};
 use super::ple;
@@ -327,13 +329,40 @@ impl MetalInference {
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
 
         // Create command buffer and single shared compute encoder.
-        let cmd_buf = self
+        let mut cmd_buf = self
             .queue
             .command_buffer()
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
-        let enc = cmd_buf
+        let mut enc = cmd_buf
             .compute_encoder()
             .map_err(|e| InferenceError::runtime(e.to_string()))?;
+
+        // Per-category GPU timing (Phase 1a profiling).
+        // When enabled, we split the pipeline into separate command buffers per
+        // operation category, committing and waiting at each boundary to collect
+        // per-category GPU time. This adds overhead but gives accurate breakdowns.
+        let profiling = self.config.kernel_timing && token_count == 1;
+        let mut category_timings: Vec<(&str, f64)> = Vec::new();
+        let wall_start = std::time::Instant::now();
+
+        /// End the current encoder + command buffer, record its GPU time under
+        /// `$cat`, and create a fresh command buffer + encoder for the next
+        /// category.
+        macro_rules! profile_boundary {
+            ($queue:expr, $cmd:ident, $enc:ident, $timings:ident, $cat:expr) => {{
+                $enc.end_encoding();
+                $cmd.commit();
+                $cmd.wait_until_completed();
+                let gpu_ms = ($cmd.gpu_end_time() - $cmd.gpu_start_time()) * 1000.0;
+                $timings.push(($cat, gpu_ms));
+                $cmd = $queue
+                    .command_buffer()
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+                $enc = $cmd
+                    .compute_encoder()
+                    .map_err(|e| InferenceError::runtime(e.to_string()))?;
+            }};
+        }
 
         // Step 0: Fused embedding lookup + first-layer RMSNorm.
         // Writes both hidden_state (raw embedding for residual) and
@@ -405,6 +434,10 @@ impl MetalInference {
             }
         }
         enc.memory_barrier_with_resources(&[&bufs.norm_out, &bufs.hidden_state]);
+
+        if profiling {
+            profile_boundary!(self.queue, cmd_buf, enc, category_timings, "embed");
+        }
 
         // PLE model-level computation: compute per-layer embeddings before the layer loop.
         // Result lives in ple_per_layer_input for the duration of all layers.
@@ -491,6 +524,16 @@ impl MetalInference {
                             h,
                             eps,
                         )?;
+                    } else if profiling {
+                        // Profiling: split GDN into projection + core phases
+                        // for accurate per-category timing.
+                        encode_gdn_projections(&enc, bufs, gdn, lw, pipelines, h, p1_skip)?;
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj");
+                        encode_gdn_core_and_output(
+                            &enc, bufs, gdn, lw, pipelines, gdn_idx, h, eps,
+                        )?;
+                        // GDN core includes: recurrent attn + O proj + residual+norm.
+                        // Count it as "attn" since the recurrent kernel dominates.
                     } else {
                         encode_gdn_decode(
                             &enc, bufs, gdn, lw, pipelines, gdn_idx, h, eps, p1_skip,
@@ -501,6 +544,10 @@ impl MetalInference {
                         &bufs.residual,
                         &bufs.hidden_state,
                     ]);
+                    if profiling {
+                        // Record GDN core+output as "attn" category.
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "attn");
+                    }
                 }
                 AttentionKind::Standard {
                     has_output_gate,
@@ -546,43 +593,148 @@ impl MetalInference {
                         None
                     };
 
-                    // Build the projection list: skip Q if P1 fusion already computed it.
-                    let mut projections: Vec<(&WeightBuffer, &MetalBuffer, usize)> = Vec::new();
-                    if !p1_skip {
-                        projections.push((&lw.q_proj, &bufs.q_proj, qkv_out_features));
-                    }
-                    projections.push((&lw.k_proj, &bufs.k_proj, kv_out_features));
-                    projections.push((&lw.v_proj, &bufs.v_proj, kv_out_features));
-                    for (weight, output_buf, out_features) in &projections {
-                        encode_projection_q8(
-                            &enc,
-                            &bufs.norm_out,
-                            weight,
-                            output_buf,
-                            pipelines,
-                            token_count,
-                            *out_features,
-                            h,
-                            q8_input.as_ref(),
-                        )?;
-                    }
+                    // Batched QKV projection: for decode with INT4, batch K+V into a
+                    // single dispatch for better memory bandwidth interleaving.
+                    // When gate is present AND Q/gate have the same output dim, also
+                    // batch Q+gate. This reduces 4-5 dispatches to 2-3.
+                    let used_batched_qkv = if token_count == 1 && !p1_skip {
+                        if let (
+                            WeightBuffer::AffineQuantized(aq_q),
+                            WeightBuffer::AffineQuantized(aq_k),
+                            WeightBuffer::AffineQuantized(aq_v),
+                        ) = (&lw.q_proj, &lw.k_proj, &lw.v_proj)
+                        {
+                            if aq_q.bit_width == 4
+                                && aq_k.bit_width == 4
+                                && aq_v.bit_width == 4
+                                && kv_out_features == aq_v.shape.0
+                            {
+                                // Try batching Q+gate if gate exists and has same output dim as Q.
+                                let batched_q_gate = if let (
+                                    Some(WeightBuffer::AffineQuantized(aq_gate)),
+                                    Some(gate_buf),
+                                ) = (&lw.attn_output_gate, &bufs.q_gate)
+                                {
+                                    if aq_gate.bit_width == 4 && aq_gate.shape.0 == qkv_out_features
+                                    {
+                                        ops::encode_batched_affine_matvec_int4(
+                                            &enc,
+                                            pipelines.affine.batched_matvec_int4.get(aq_q.group_size)
+                                                .expect("unsupported group_size for batched_matvec_int4"),
+                                            &bufs.norm_out,
+                                            aq_q,
+                                            &bufs.q_proj,
+                                            aq_gate,
+                                            gate_buf,
+                                            qkv_out_features as u32,
+                                            h as u32,
+                                        );
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
 
-                    // Qwen3.5 attn_output_gate: dispatch gate projection alongside Q/K/V
-                    // (reads norm_out, writes q_gate — independent of Q/K/V outputs).
-                    // The gate result is only consumed later by sigmoid_gate after attention,
-                    // so no separate barrier is needed here.
-                    if let (Some(gate_w), Some(gate_buf)) = (&lw.attn_output_gate, &bufs.q_gate) {
-                        encode_projection_q8(
-                            &enc,
-                            &bufs.norm_out,
-                            gate_w,
-                            gate_buf,
-                            pipelines,
-                            token_count,
-                            qkv_out_features,
-                            h,
-                            q8_input.as_ref(),
-                        )?;
+                                if !batched_q_gate {
+                                    // Q alone (no gate or incompatible gate).
+                                    encode_projection_q8(
+                                        &enc,
+                                        &bufs.norm_out,
+                                        &lw.q_proj,
+                                        &bufs.q_proj,
+                                        pipelines,
+                                        token_count,
+                                        qkv_out_features,
+                                        h,
+                                        q8_input.as_ref(),
+                                    )?;
+                                }
+
+                                // Batch K+V (same output dim).
+                                ops::encode_batched_affine_matvec_int4(
+                                    &enc,
+                                    pipelines
+                                        .affine
+                                        .batched_matvec_int4
+                                        .get(aq_k.group_size)
+                                        .expect("unsupported group_size for batched_matvec_int4"),
+                                    &bufs.norm_out,
+                                    aq_k,
+                                    &bufs.k_proj,
+                                    aq_v,
+                                    &bufs.v_proj,
+                                    kv_out_features as u32,
+                                    h as u32,
+                                );
+
+                                // If gate wasn't batched with Q, dispatch it individually.
+                                if !batched_q_gate {
+                                    if let (Some(gate_w), Some(gate_buf)) =
+                                        (&lw.attn_output_gate, &bufs.q_gate)
+                                    {
+                                        encode_projection_q8(
+                                            &enc,
+                                            &bufs.norm_out,
+                                            gate_w,
+                                            gate_buf,
+                                            pipelines,
+                                            token_count,
+                                            qkv_out_features,
+                                            h,
+                                            q8_input.as_ref(),
+                                        )?;
+                                    }
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !used_batched_qkv {
+                        // Fallback: individual Q/K/V + gate dispatches.
+                        let mut projections: Vec<(&WeightBuffer, &MetalBuffer, usize)> = Vec::new();
+                        if !p1_skip {
+                            projections.push((&lw.q_proj, &bufs.q_proj, qkv_out_features));
+                        }
+                        projections.push((&lw.k_proj, &bufs.k_proj, kv_out_features));
+                        projections.push((&lw.v_proj, &bufs.v_proj, kv_out_features));
+                        for (weight, output_buf, out_features) in &projections {
+                            encode_projection_q8(
+                                &enc,
+                                &bufs.norm_out,
+                                weight,
+                                output_buf,
+                                pipelines,
+                                token_count,
+                                *out_features,
+                                h,
+                                q8_input.as_ref(),
+                            )?;
+                        }
+
+                        // Qwen3.5 attn_output_gate: dispatch gate projection alongside Q/K/V
+                        if let (Some(gate_w), Some(gate_buf)) = (&lw.attn_output_gate, &bufs.q_gate)
+                        {
+                            encode_projection_q8(
+                                &enc,
+                                &bufs.norm_out,
+                                gate_w,
+                                gate_buf,
+                                pipelines,
+                                token_count,
+                                qkv_out_features,
+                                h,
+                                q8_input.as_ref(),
+                            )?;
+                        }
                     }
                     // Barrier for Q/K/V/gate projection outputs.
                     {
@@ -592,6 +744,10 @@ impl MetalInference {
                             barrier_bufs.push(gate_buf);
                         }
                         enc.memory_barrier_with_resources(&barrier_bufs);
+                    }
+
+                    if profiling {
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj");
                     }
 
                     // Gemma 4 V-norm: scale-free RMSNorm on V projections.
@@ -687,6 +843,10 @@ impl MetalInference {
                         }
                     }
 
+                    if profiling {
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "attn");
+                    }
+
                     // Step 9: Output projection
                     let attn_out_features = mc.num_attention_heads * layer_hd as usize;
                     encode_projection(
@@ -700,6 +860,10 @@ impl MetalInference {
                         attn_out_features,
                     )?;
                     enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
+
+                    if profiling {
+                        profile_boundary!(self.queue, cmd_buf, enc, category_timings, "proj");
+                    }
 
                     // Step 10-11: Residual add + post-attention RMSNorm
                     if let Some(pre_ffn) = &lw.pre_ffn_norm {
@@ -787,6 +951,10 @@ impl MetalInference {
                 default_pipelines
             };
 
+            if profiling {
+                profile_boundary!(self.queue, cmd_buf, enc, category_timings, "norm");
+            }
+
             // Steps 12-15: FFN block (gate + up + activation + down)
             let use_gelu = plan.use_gelu;
             encode_ffn_block(
@@ -800,6 +968,10 @@ impl MetalInference {
                 use_gelu,
             )?;
             enc.memory_barrier_with_resources(&[&bufs.ffn_down]);
+
+            if profiling {
+                profile_boundary!(self.queue, cmd_buf, enc, category_timings, "ffn");
+            }
 
             // MoE block: when enabled, dense MLP output is combined
             // with MoE expert outputs via router → expert FFNs → weighted combine.
@@ -915,7 +1087,9 @@ impl MetalInference {
                     };
 
                     // Determine next layer's first projection for P1 fusion.
-                    let next_first_proj = if token_count == 1
+                    // Disabled when profiling to get accurate per-category timing.
+                    let next_first_proj = if !profiling
+                        && token_count == 1
                         && layer_idx + 1 < mc.num_hidden_layers
                         && next_norm.is_some()
                     {
@@ -960,8 +1134,18 @@ impl MetalInference {
                     skip_first_proj = fused;
                 }
                 enc.memory_barrier_with_resources(&[&bufs.hidden_state, &bufs.norm_out]);
+
+                if profiling {
+                    profile_boundary!(self.queue, cmd_buf, enc, category_timings, "norm");
+                }
             }
         }
+
+        if profiling && category_timings.last().map(|t| t.0) != Some("norm") {
+            // Last layer's end-of-layer residual+norm is captured here.
+            profile_boundary!(self.queue, cmd_buf, enc, category_timings, "norm");
+        }
+
         ops::encode_rms_norm(
             &enc,
             &self.pipelines()?.norm.rms_norm,
@@ -1032,8 +1216,65 @@ impl MetalInference {
                 ));
             }
 
-            // Per-pipeline GPU timing instrumentation (Phase 0).
-            if self.config.kernel_timing {
+            if profiling {
+                // Record the final command buffer's GPU time (LM head).
+                let gpu_ms = (cmd_buf.gpu_end_time() - cmd_buf.gpu_start_time()) * 1000.0;
+                category_timings.push(("lm_head", gpu_ms));
+                let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
+
+                // Aggregate per-category totals.
+                let mut proj_ms = 0.0f64;
+                let mut attn_ms = 0.0f64;
+                let mut ffn_ms = 0.0f64;
+                let mut norm_ms = 0.0f64;
+                let mut embed_ms = 0.0f64;
+                let mut lm_head_ms = 0.0f64;
+                for &(cat, ms) in &category_timings {
+                    match cat {
+                        "proj" => proj_ms += ms,
+                        "attn" => attn_ms += ms,
+                        "ffn" => ffn_ms += ms,
+                        "norm" => norm_ms += ms,
+                        "embed" => embed_ms += ms,
+                        "lm_head" => lm_head_ms += ms,
+                        _ => {}
+                    }
+                }
+                let total_gpu_ms = proj_ms + attn_ms + ffn_ms + norm_ms + embed_ms + lm_head_ms;
+                let overhead_ms = wall_ms - total_gpu_ms;
+
+                // Log the profiling breakdown.
+                eprintln!(
+                    "[kernel-timing] decode breakdown:\n\
+                     Projections (Q/K/V/O):  {:>6.2}ms  ({:>4.1}%)\n\
+                     FFN (gate+up+act+down): {:>6.2}ms  ({:>4.1}%)\n\
+                     Attention:              {:>6.2}ms  ({:>4.1}%)\n\
+                     Norms + residual:       {:>6.2}ms  ({:>4.1}%)\n\
+                     Embedding:              {:>6.2}ms  ({:>4.1}%)\n\
+                     LM head:                {:>6.2}ms  ({:>4.1}%)\n\
+                     ─────────────────────────────────\n\
+                     Total GPU:              {:>6.2}ms\n\
+                     Wall clock:             {:>6.2}ms\n\
+                     Overhead (idle/CPU):    {:>6.2}ms  ({:>4.1}%)",
+                    proj_ms,
+                    proj_ms / wall_ms * 100.0,
+                    ffn_ms,
+                    ffn_ms / wall_ms * 100.0,
+                    attn_ms,
+                    attn_ms / wall_ms * 100.0,
+                    norm_ms,
+                    norm_ms / wall_ms * 100.0,
+                    embed_ms,
+                    embed_ms / wall_ms * 100.0,
+                    lm_head_ms,
+                    lm_head_ms / wall_ms * 100.0,
+                    total_gpu_ms,
+                    wall_ms,
+                    overhead_ms,
+                    overhead_ms / wall_ms * 100.0,
+                );
+            } else if self.config.kernel_timing {
+                // Non-profiling kernel_timing: just log total GPU time.
                 let gpu_ms = (cmd_buf.gpu_end_time() - cmd_buf.gpu_start_time()) * 1000.0;
                 let mode = if token_count == 1 {
                     "decode"
