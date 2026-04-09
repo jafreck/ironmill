@@ -82,6 +82,11 @@ pub struct OptConfig {
     /// When set, uses precomputed alpha/clip values instead of runtime search.
     #[serde(default)]
     pub awq_block_config_path: Option<String>,
+    /// GPTQ calibration directory containing gptq_hessians.json.
+    /// When set with int4=true, uses Hessian-guided GPTQ rounding instead
+    /// of round-to-nearest. Can be combined with awq_calib_dir for AWQ+GPTQ.
+    #[serde(default)]
+    pub gptq_calib_dir: Option<String>,
     /// Layer indices to keep at INT8 when int4=true.
     /// Common values: first/last 1-2 layers for best quality.
     #[serde(default)]
@@ -264,6 +269,7 @@ pub fn default_matrix() -> BenchMatrix {
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         },
         OptConfig {
             name: "default".to_string(),
@@ -279,6 +285,7 @@ pub fn default_matrix() -> BenchMatrix {
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         },
         OptConfig {
             name: "fp16".to_string(),
@@ -294,6 +301,7 @@ pub fn default_matrix() -> BenchMatrix {
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         },
         OptConfig {
             name: "int8".to_string(),
@@ -309,6 +317,7 @@ pub fn default_matrix() -> BenchMatrix {
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         },
         OptConfig {
             name: "palettize-4".to_string(),
@@ -324,6 +333,7 @@ pub fn default_matrix() -> BenchMatrix {
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         },
         OptConfig {
             name: "polar-4".to_string(),
@@ -339,6 +349,7 @@ pub fn default_matrix() -> BenchMatrix {
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         },
         OptConfig {
             name: "polar-3".to_string(),
@@ -354,6 +365,7 @@ pub fn default_matrix() -> BenchMatrix {
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         },
         // TurboQuant INT8
         OptConfig {
@@ -370,6 +382,7 @@ pub fn default_matrix() -> BenchMatrix {
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         },
         // TurboQuant INT8 + QJL
         OptConfig {
@@ -386,6 +399,7 @@ pub fn default_matrix() -> BenchMatrix {
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         },
     ];
 
@@ -541,6 +555,7 @@ backends = ["cpu", "gpu"]
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         };
         let key1 = cache_key(&model, &opt);
         let key2 = cache_key(&model, &opt);
@@ -570,6 +585,7 @@ backends = ["cpu", "gpu"]
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         };
         let opt2 = OptConfig {
             name: "fp16".to_string(),
@@ -585,6 +601,7 @@ backends = ["cpu", "gpu"]
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         };
         assert_ne!(cache_key(&model, &opt1), cache_key(&model, &opt2));
     }
@@ -611,6 +628,7 @@ backends = ["cpu", "gpu"]
             awq_calib_dir: None,
             awq_block_config_path: None,
             sensitive_layers: vec![],
+            gptq_calib_dir: None,
         };
         let key = cache_key(&model, &opt);
         assert!(key.contains("_kv-turbo-int8_seq-4096"));

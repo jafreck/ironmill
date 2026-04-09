@@ -1,9 +1,18 @@
 # GPTQ Quantization Benchmark — Qwen3-0.6B
 #
-# Replaces the former tests/gptq_bench.rs test file.
-# Benchmarks GPTQ-quantized model decode throughput and perplexity.
+# End-to-end AWQ+GPTQ INT4 benchmark with FP16 baseline comparison.
+# Benchmarks decode throughput and perplexity.
 #
 # Requires: --features metal,gptq
+#
+# Prerequisites:
+#   1. Download model: ./scripts/download-fixtures.sh
+#   2. Run AWQ calibration:
+#      cargo run --release --example awq_calibrate --features metal -p ironmill-bench -- \
+#        models/Qwen3-0.6B tests/fixtures/quality/wikitext2-qwen3.json /tmp/awq_calib
+#   3. Run GPTQ Hessian collection (produces gptq_hessians.json):
+#      cargo run --release --example awq_calibrate --features metal -p ironmill-bench -- \
+#        --gptq models/Qwen3-0.6B tests/fixtures/quality/wikitext2-qwen3.json /tmp/gptq_calib
 #
 # Reproduce:
 #   cargo run --release -p ironmill-bench --features metal,gptq -- \
@@ -23,10 +32,27 @@ no_fusion = false
 kv_quant = "none"
 max_seq_len = 2048
 
-# ── GPTQ INT4 ──────────────────────────────────────────────────
+# ── INT4 naive (round-to-nearest, no calibration) ──────────────
 [[optimization]]
-name = "int4"
+name = "int4-rtn"
 int4 = true
+kv_quant = "none"
+max_seq_len = 2048
+
+# ── INT4 + AWQ (activation-aware scaling with alpha grid search) ─
+[[optimization]]
+name = "int4-awq"
+int4 = true
+awq_calib_dir = "/tmp/awq_calib"
+kv_quant = "none"
+max_seq_len = 2048
+
+# ── INT4 + AWQ + GPTQ (Hessian-guided optimal rounding) ────────
+[[optimization]]
+name = "int4-awq-gptq"
+int4 = true
+awq_calib_dir = "/tmp/awq_calib"
+gptq_calib_dir = "/tmp/gptq_calib"
 kv_quant = "none"
 max_seq_len = 2048
 

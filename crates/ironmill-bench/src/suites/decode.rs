@@ -135,6 +135,31 @@ pub(crate) fn load_metal_engine(
         } else {
             ironmill_compile::weights::quantized::AffineQuantConfig::default()
         };
+
+        // Layer GPTQ Hessian data on top of the AWQ config (if available).
+        #[cfg(feature = "gptq")]
+        let int4_config = if let Some(ref gptq_dir) = opt.gptq_calib_dir {
+            let hessian_path = std::path::Path::new(gptq_dir).join("gptq_hessians.json");
+            let hessian_json = std::fs::read_to_string(&hessian_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read GPTQ Hessians from {}: {e}",
+                    hessian_path.display()
+                )
+            })?;
+            let hessian_data: std::collections::HashMap<String, (Vec<f32>, usize, usize)> =
+                serde_json::from_str(&hessian_json)
+                    .map_err(|e| anyhow::anyhow!("failed to parse GPTQ Hessians: {e}"))?;
+            eprintln!(
+                "    GPTQ: loaded Hessian data for {} layers",
+                hessian_data.len()
+            );
+            let mut cfg = int4_config;
+            cfg.hessian_data = Some(hessian_data);
+            cfg
+        } else {
+            int4_config
+        };
+
         let q_provider = QuantizedWeightProvider::new_int4(&provider, {
             let mut cfg = int4_config;
             if !opt.sensitive_layers.is_empty() {
