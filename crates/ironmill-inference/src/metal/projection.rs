@@ -222,7 +222,7 @@ fn encode_polarquant_projection(
 ///
 /// Uses superblock layout for INT4 and INT8 weights (inline scale/zero).
 /// Dispatches to the correct Metal kernel based on `bit_width` and kernel kind:
-/// - Matvec (`LinearKernelKind::Matvec`): `matvec_int{4,8}` with 8 rows/TG, 64 threads
+/// - Matvec (`LinearKernelKind::Matvec`): split-K dispatch for INT4, or `matvec_int{4,8}` fallback
 /// - Matmul (`LinearKernelKind::Matmul`): `matmul_int{4,8}` tiled prefill
 fn encode_affine_projection(
     encoder: &ironmill_metal_sys::ComputeEncoder,
@@ -234,6 +234,24 @@ fn encode_affine_projection(
     token_count: usize,
 ) -> Result<(), InferenceError> {
     let (n, k) = weight.shape;
+
+    if kind.is_decode() && weight.bit_width == 4 {
+        let split_k = select_split_k(k);
+        if split_k > 1 {
+            if let Some(sk_pipeline) = pipelines.split_k.matvec_int4.get(weight.group_size) {
+                return encode_split_k_affine_int4(
+                    encoder,
+                    input,
+                    weight,
+                    output,
+                    sk_pipeline,
+                    n,
+                    k,
+                    split_k,
+                );
+            }
+        }
+    }
 
     // Use superblock pipeline for INT4 (handles both decode and prefill)
     let pipeline = pipelines
@@ -290,6 +308,53 @@ fn encode_affine_projection(
             (MATMUL_THREADS_PER_TG, 1, 1),
         );
     }
+    Ok(())
+}
+
+/// Select the split-K factor for a given K dimension.
+///
+/// Currently disabled (returns 1) — benchmarks show the M2 Max GPU achieves
+/// full occupancy with the baseline dispatch at K≤9216, so split-K adds
+/// overhead without benefit. Infrastructure kept for future models/GPUs
+/// where occupancy is genuinely the bottleneck.
+fn select_split_k(_k: usize) -> u32 {
+    1
+}
+
+/// Dispatch split-K affine INT4 matvec: single dispatch with wider TGs.
+///
+/// Uses `64 * split_k` threads per TG. Each pair of SIMDgroups handles
+/// the same rows but different K-slices. Intra-TG reduction via
+/// threadgroup_barrier produces the final half output directly.
+fn encode_split_k_affine_int4(
+    encoder: &ironmill_metal_sys::ComputeEncoder,
+    input: &MetalBuffer,
+    weight: &AffineQuantizedWeight,
+    output: &MetalBuffer,
+    sk_pipeline: &ironmill_metal_sys::ComputePipeline,
+    n: usize,
+    k: usize,
+    split_k: u32,
+) -> Result<(), InferenceError> {
+    encoder.set_pipeline(sk_pipeline);
+    encoder.set_buffer(input, 0, 0);
+    encoder.set_buffer(&weight.data, 0, 1);
+    encoder.set_buffer(output, 0, 2); // direct half output
+    encoder.set_bytes(&(n as u32).to_le_bytes(), 3);
+    encoder.set_bytes(&(k as u32).to_le_bytes(), 4);
+    let has_awq: u32 = if weight.awq_scales.is_some() { 1 } else { 0 };
+    if let Some(ref awq_buf) = weight.awq_scales {
+        encoder.set_buffer(awq_buf, 0, 5);
+    } else {
+        encoder.set_buffer(&weight.data, 0, 5); // dummy
+    }
+    encoder.set_bytes(&has_awq.to_le_bytes(), 6);
+    encoder.set_buffer(weight.scales.as_ref().unwrap(), 0, 7);
+    encoder.set_buffer(weight.zeros.as_ref().unwrap(), 0, 8);
+    encoder.set_bytes(&split_k.to_le_bytes(), 9);
+    // Same TG count as non-split, but wider: 64 * split_k threads per TG
+    encoder.dispatch_threadgroups((n.div_ceil(8), 1, 1), (64 * split_k as usize, 1, 1));
+
     Ok(())
 }
 

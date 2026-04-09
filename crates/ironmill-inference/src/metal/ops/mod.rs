@@ -75,6 +75,7 @@ type AdvancedMatmulShaders = (
     GroupSizePipelines,
     GroupSizePipelines,
     GroupSizePipelines,
+    GroupSizePipelines,
 );
 type FusedShaders = (
     ComputePipeline,
@@ -173,6 +174,8 @@ pub struct MetalPipelines {
     pub rope: RopePipelines,
     /// Fused operation pipelines.
     pub fused: FusedPipelines,
+    /// Split-K dispatch resources for INT4 decode occupancy optimization.
+    pub split_k: SplitKPipelines,
 }
 
 /// Create a compute pipeline from a shader library function.
@@ -308,6 +311,7 @@ impl MetalPipelines {
             matvec_int4xq8,
             matvec_int8,
             matmul_int8,
+            split_k_matvec_int4,
         ) = adv_result?;
         let (
             fused_residual_rms_norm,
@@ -416,6 +420,9 @@ impl MetalPipelines {
                 residual_norm_matvec: fused_residual_norm_matvec,
                 int4_dequantize,
                 residual_norm_affine_matvec_int4: fused_residual_norm_affine_matvec_int4,
+            },
+            split_k: SplitKPipelines {
+                matvec_int4: split_k_matvec_int4,
             },
         })
     }
@@ -580,6 +587,10 @@ impl MetalPipelines {
                 l.superblock_lib(gs)
             })?,
             make_gs_pipelines(device, libs, "superblock_matmul_int8", |l, gs| {
+                l.superblock_lib(gs)
+            })?,
+            // Split-K pipeline for INT4 decode occupancy optimization
+            make_gs_pipelines(device, libs, "split_k_matvec_int4", |l, gs| {
                 l.superblock_lib(gs)
             })?,
         ))

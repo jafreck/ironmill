@@ -141,6 +141,20 @@ impl QuipPipelines {
     }
 }
 
+/// Split-K dispatch resources for INT4 decode occupancy optimization.
+///
+/// Uses wider threadgroups with intra-TG reduction: each TG has
+/// `SB_NUM_SIMDGROUPS * split_k` SIMDgroups processing different K-slices,
+/// with a cheap threadgroup_barrier + reduction in shared memory.
+/// Single dispatch, no separate reduce kernel or scratch buffer needed.
+pub struct SplitKPipelines {
+    /// Split-K partial matvec INT4 pipelines per group_size variant.
+    pub matvec_int4: GroupSizePipelines,
+}
+
+/// Maximum split-K factor used for dispatch.
+pub const SPLIT_K_MAX: u32 = 8;
+
 // ── Parameter structs ────────────────────────────────────────────
 
 /// Parameters for [`encode_gdn_batched_affine_matvec_int4`].

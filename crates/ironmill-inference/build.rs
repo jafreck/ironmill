@@ -118,6 +118,7 @@ fn main() {
             "affine_matmul",
             "affine_batched",
             "affine_fused",
+            "split_k_matvec",
         ];
         let mut sb_body = String::new();
         for part in &sb_parts {
