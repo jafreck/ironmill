@@ -83,6 +83,7 @@ fn main() {
         ("gdn_recurrent", "gdn"),
         ("ple_kernels", "ple"),
         ("moe", "moe"),
+        ("superblock_norm", "norm"),
     ];
 
     for &(name, subdir) in individual {
@@ -91,29 +92,45 @@ fn main() {
         compile_shader(&src, &lib, &[], &shader_include_dir);
     }
 
-    // ── Affine matmul: concatenate common + split files into one metallib ──
+    // ── Affine matmul: AMX kernels (no function constants) ──
     {
         let quantized_dir = shader_dir.join("quantized");
         let affine_common =
             std::fs::read_to_string(quantized_dir.join("affine_common.metal")).unwrap();
-        let affine_parts = [
-            "affine_matmul",
+        let amx_src = std::fs::read_to_string(quantized_dir.join("affine_amx.metal")).unwrap();
+        let combined = format!("{affine_common}\n{amx_src}");
+        let tmp = out_dir.join("_affine_combined.metal");
+        std::fs::write(&tmp, &combined).unwrap();
+        compile_shader(
+            &tmp,
+            &out_dir.join("affine_matmul.metallib"),
+            &[],
+            &shader_include_dir,
+        );
+    }
+
+    // ── Superblock kernels (with GS function constant) ──
+    {
+        let quantized_dir = shader_dir.join("quantized");
+        let sb_common =
+            std::fs::read_to_string(quantized_dir.join("superblock_common.metal")).unwrap();
+        let sb_parts = [
             "affine_matvec",
+            "affine_matmul",
             "affine_batched",
-            "affine_amx",
             "affine_fused",
         ];
-        let mut combined = affine_common;
-        for part in &affine_parts {
+        let mut combined = sb_common;
+        for part in &sb_parts {
             let src = std::fs::read_to_string(quantized_dir.join(format!("{part}.metal"))).unwrap();
             combined.push('\n');
             combined.push_str(&src);
         }
-        let affine_tmp = out_dir.join("_affine_combined.metal");
-        std::fs::write(&affine_tmp, &combined).unwrap();
+        let tmp = out_dir.join("_superblock_combined.metal");
+        std::fs::write(&tmp, &combined).unwrap();
         compile_shader(
-            &affine_tmp,
-            &out_dir.join("affine_matmul.metallib"),
+            &tmp,
+            &out_dir.join("superblock.metallib"),
             &[],
             &shader_include_dir,
         );

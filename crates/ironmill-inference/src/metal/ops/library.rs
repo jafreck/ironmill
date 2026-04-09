@@ -13,6 +13,8 @@ pub(super) struct ShaderLibraries {
     pub kv_scatter: ShaderLibrary,
     pub matvec: ShaderLibrary,
     pub affine_mm: ShaderLibrary,
+    pub superblock: ShaderLibrary,
+    pub superblock_norm: ShaderLibrary,
     pub gdn: ShaderLibrary,
     pub ple: ShaderLibrary,
     pub attn: ShaderLibrary,
@@ -61,6 +63,18 @@ impl ShaderLibraries {
                 .load_library_from_data(include_bytes!(concat!(
                     env!("OUT_DIR"),
                     "/affine_matmul.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            superblock: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/superblock.metallib"
+                )))
+                .map_err(MetalError::Metal)?,
+            superblock_norm: device
+                .load_library_from_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/superblock_norm.metallib"
                 )))
                 .map_err(MetalError::Metal)?,
             gdn: device

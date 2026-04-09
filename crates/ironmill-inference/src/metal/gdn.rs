@@ -434,9 +434,14 @@ pub(crate) fn encode_gdn_decode(
             && aq_b.bit_width == 4
         {
             // All 4 weights are INT4 affine: use batched INT4 matvec.
+            let pipeline = pipelines
+                .affine
+                .gdn_batched_matvec_int4
+                .get(aq_qkv.group_size)
+                .expect("unsupported group_size for gdn_batched_matvec_int4");
             ops::encode_gdn_batched_affine_matvec_int4(
                 enc,
-                &pipelines.affine.gdn_batched_matvec_int4,
+                pipeline,
                 &ops::GdnBatchedAffineInt4Params {
                     input: &bufs.norm_out,
                     w0: aq_qkv,
