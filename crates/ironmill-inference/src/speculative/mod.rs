@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn speculative_compute_target_log_probs_basic() {
-        let logits = vec![vec![1.0, 2.0, 3.0]];
+        let logits = vec![Logits::new(vec![1.0, 2.0, 3.0])];
         let candidates = vec![DraftCandidate {
             token_id: 2,
             log_prob: -0.5,
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn speculative_compute_target_log_probs_out_of_range() {
-        let logits = vec![vec![1.0, 2.0]];
+        let logits = vec![Logits::new(vec![1.0, 2.0])];
         let candidates = vec![DraftCandidate {
             token_id: 99, // out of range
             log_prob: -0.5,
