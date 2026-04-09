@@ -182,68 +182,101 @@ active (`awq_scales.is_some()` causes the Q8 code path to be skipped in
 **Result**: Neutral (23.4ms vs 22.7ms). The wasted Q8 dispatch may
 provide a minor cache-warming benefit for subsequent projections.
 
+#### 4. Fused dual-matrix per-thread kernel (new shader) — REJECTED
+
+**Hypothesis**: A new Metal shader (`superblock_fused_dual_matvec_int4`)
+where each thread reads from both weight matrices per iteration (matching
+the FFN fused kernel's per-thread dual-stream pattern) would improve
+projection bandwidth. Two variants tested:
+
+- **Simdgroup-split** (v1): 64 threads/TG, 2 simdgroups each handling 4
+  rows from a different matrix. Dispatch: `max(ceil(N0/4), ceil(N1/4))`.
+- **Per-thread dual-stream** (v2): 32 threads/TG, each thread reads from
+  both matrices per iteration. Dispatch: `max(N0, N1)`.
+
+Applied to both Standard (Q+gate, K+V) and GDN (QKV+Z) layers.
+
+**Result**: **Neutral** (23.0-23.2ms vs 22.7ms baseline). PPL=9.42 ✓.
+
+**Why**: The bottleneck at K=2560 is not about per-TG memory stream
+count. The 8-row individual kernel already generates 4 independent row
+addresses per thread (high address diversity), while the fused kernel
+only generates 2 addresses from different buffers. Both saturate the
+GPU's per-thread memory request queue similarly. The FFN fused kernel
+achieves higher bandwidth because N=9216 gives 9216 TGs (sustained
+memory pressure), not because of its dual-stream structure.
+
 ### Conclusion
 
 **The 2.16× gap between ironmill and MLX is primarily explained by
-projection kernel bandwidth underutilization (12.6% vs MLX's estimated
-~48% BW).** Closing this gap requires fused multi-matrix projection
-kernels — new Metal shaders where each threadgroup reads from 2+
-weight matrices simultaneously, similar to the existing
-`fused_ffn_gate_up_act_int4` but generalized for Q/K/V/O projections.
+projection kernel bandwidth underutilization (12.6% vs FFN's 48% BW).**
+The root cause is the small K=2560 dimension: each thread reads only
+~40 bytes per iteration, completing quickly relative to instruction
+pipeline latency. This limits throughput regardless of how many memory
+streams are active.
 
-The existing single-matrix kernels (2-row matvec, batched 1-row) cannot
-achieve the required bandwidth because:
-1. K=2560 gives too little work per threadgroup (~1280 bytes/row)
-2. A single memory stream per TG cannot saturate Apple's multi-channel
-   memory controller
-3. The memory pipeline needs multiple independent streams to reach peak BW
+Four optimization approaches were tested and rejected:
+1. Batched 1-row kernel — 32% regression (lost 2-row efficiency)
+2. Individual 2-row for GDN — neutral (lost batching benefit)
+3. Q8 skip for AWQ — neutral
+4. **Fused dual-matrix shader — neutral** (per-thread dual-stream
+   doesn't improve over 8-row's 4-address diversity at K=2560)
 
-**Recommended next steps** (require new Metal shader code):
-1. **Fused 2-matrix 2-row projection kernel**: Process one row each from
-   Q+gate (or K+V) in the same threadgroup, combining the 2-row
-   efficiency with multi-stream bandwidth. Expected ~2× BW improvement.
-2. **Fused 4-matrix GDN projection kernel with 2-row structure**: Same
-   idea applied to GDN's QKV+Z+A+B, using 64 threads/TG instead of 32.
-3. **KV-optimized projection kernel**: For K/V with small output dim
-   (1024), use 4-row or 8-row per TG to increase work per TG.
+The key insight is that the FFN's 3.8× bandwidth advantage comes from
+having more total threadgroups (N=9216 vs N≤4096), not from its
+dual-stream structure. Projections with smaller N cannot sustain the
+same memory pressure.
+
+**Remaining optimization directions** (untested):
+1. **AMX-accelerated matvec**: The existing `affine_matvec_int4_amx`
+   kernel uses simdgroup matrix multiply (256 threads, 64 rows/TG,
+   cooperative dequant to threadgroup memory). This was not benchmarked
+   for the INT4 AWQ path. The wider memory loads of AMX operations may
+   better saturate bandwidth for small K.
+2. **Kernel launch pipelining**: Submit multiple command buffers
+   concurrently instead of one sequential encoder. Metal can overlap
+   kernel dispatch from different command buffers.
+3. **Weight layout transposition**: Rearranging weight data so that
+   threads read from contiguous cache lines across rows rather than
+   within a row may improve L2 cache hit rates.
 
 ---
 
-## Phase 3: Future Work — Fused Multi-Matrix Projection Kernels
+## Phase 3: Future Work
 
-The profiling data shows that the remaining 2.16× gap with MLX is
-dominated by projection kernel bandwidth (12.6% vs ~48% BW utilization).
-The solution requires new Metal shader code.
+The profiling + optimization work eliminated several hypotheses about the
+2.16× MLX gap. The remaining avenues require fundamentally different
+kernel architectures, not just parameter tuning.
 
-### Priority 1: Fused Q+gate 2-row kernel
+### Priority 1: AMX-accelerated INT4 projection path
 
-Create a Metal shader that processes one row from Q and one row from gate
-in the same threadgroup (2 concurrent memory streams, 64 threads/TG).
-This combines the 2-row kernel's efficiency with multi-stream bandwidth.
+The existing `affine_matvec_int4_amx` kernel (256 threads, 64 rows/TG,
+cooperative dequant → threadgroup memory → simdgroup MMA) is not used
+for INT4 AWQ projections. Testing this path for AWQ weights could unlock
+wider memory loads via the Apple Matrix coprocessor. This is the lowest
+risk / highest leverage change: the kernel already exists.
 
-Expected impact: ~2× projection BW → ~5ms saved → **~55 tok/s** (from 44).
+### Priority 2: Multi-row fused dual-stream kernel
 
-### Priority 2: Fused K+V 2-row kernel
+Combine the 8-row kernel's address diversity with the fused kernel's
+dual-matrix reads. Each simdgroup would process 4 rows from matrix A
+AND 4 rows from matrix B simultaneously:
+- 64 threads/TG, 2 simdgroups
+- Each SG: 4 rows × 2 matrices = 8 addresses per thread per iteration
+- This maximizes both per-thread address diversity and per-TG work
 
-Same approach for K+V projections (both N=1024 for Qwen3.5-4B). Since
-K and V have the same output dimension, this is straightforward.
+This requires a more complex shader with 8 accumulators per thread.
 
-### Priority 3: Wider GDN projection kernel
+### Not recommended (tested and rejected)
 
-The GDN batched kernel uses 32 threads/TG. A 64-thread variant that
-processes 2 rows per TG (from different weight matrices) would improve
-GDN projection bandwidth while maintaining the single-dispatch benefit.
-
-### Not recommended
-
-- **Batched 1-row kernels for Standard layers**: Tested and rejected.
-  The 1-row/32-thread kernel is 32% slower than individual 2-row/64-thread
-  dispatches. The dispatch reduction doesn't compensate.
-- **Split-K**: Already tested (see `archive/metal-split-k-optimization.md`).
-  GPU occupancy is already saturated for K ≤ 9216.
-- **Barrier removal**: Dispatch overhead is only 1.9% — not worth pursuing.
-- **Q8 input quantization skip for AWQ**: Neutral impact despite eliminating
-  a wasted dispatch per Standard layer.
+- **Fused dual-matrix 32-thread kernel**: Matches FFN fused pattern but
+  neutral at K=2560. The FFN's 3.8× BW advantage comes from N=9216
+  (more TGs for sustained pressure), not from dual-stream structure.
+- **Batched 1-row kernels for Standard layers**: 32% regression.
+- **Individual 2-row for GDN**: Neutral (lost batching benefit).
+- **Split-K**: Already tested separately — GPU occupancy saturated.
+- **Barrier removal**: Overhead is only 1.9%.
+- **Q8 skip for AWQ**: Neutral.
 
 ---
 
