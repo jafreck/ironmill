@@ -650,14 +650,9 @@ pub(crate) fn encode_end_of_layer_residual(
                 // Affine INT4: fuse with affine matvec
                 if let WeightBuffer::AffineQuantized(aq) = proj_weight {
                     if aq.bit_width == 4 {
-                        let pipeline = pipelines
-                            .fused
-                            .residual_norm_affine_matvec_int4
-                            .get(aq.group_size)
-                            .expect("unsupported group_size for residual_norm_affine_matvec_int4");
                         ops::encode_fused_residual_norm_affine_matvec_int4(
                             enc,
-                            pipeline,
+                            &pipelines.fused.residual_norm_affine_matvec_int4,
                             &ops::FusedResidualNormAffineInt4Params {
                                 a: &bufs.residual,
                                 b: &bufs.ffn_down,

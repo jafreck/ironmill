@@ -14,8 +14,9 @@ kernel void superblock_matmul_int4(
     constant uint &M                [[buffer(3)]],
     constant uint &N                [[buffer(4)]],
     constant uint &K                [[buffer(5)]],
-    device const half *awq_scales   [[buffer(6)]],   // [K] or dummy
-    constant uint &has_awq          [[buffer(7)]],
+    constant uint &group_size       [[buffer(6)]],
+    device const half *awq_scales   [[buffer(7)]],   // [K] or dummy
+    constant uint &has_awq          [[buffer(8)]],
     uint2 group_id [[threadgroup_position_in_grid]],
     uint tid   [[thread_index_in_threadgroup]],
     uint sgid  [[simdgroup_index_in_threadgroup]],
@@ -27,12 +28,17 @@ kernel void superblock_matmul_int4(
     threadgroup half tg_a[2][TM_TILE * MATMUL_K_TILE];
     threadgroup half tg_bt[2][MATMUL_K_TILE * TN_STRIDE];
 
-    uint num_groups = K / GS;
+    uint num_groups = K / group_size;
     uint num_k_steps = (K + MATMUL_K_TILE - 1) / MATMUL_K_TILE;
 
     // Superblock layout constants
-    uint sb_bytes = SB_HEADER_BYTES + GS / 2;
+    uint sb_bytes = SB_HEADER_BYTES + group_size / 2;
     uint sb_stride = num_groups * sb_bytes;  // bytes per row
+
+    // Precompute power-of-2 shift (hoisted outside all loops)
+    uint gs_shift = 0;
+    { uint tmp = group_size; while (tmp > 1) { tmp >>= 1; gs_shift++; } }
+    uint gs_mask = group_size - 1;
 
     simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
     for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
@@ -60,10 +66,12 @@ kernel void superblock_matmul_int4(
             uint g_k = k_base + k;
             half val = half(0);
             if (g_n < N && g_k < K) {
-                uint sb_idx = g_k / GS;
-                uint sb_offset = g_k % GS;
+                // Bitwise fast path for power-of-2 group sizes
+                uint sb_idx = g_k >> gs_shift;
+                uint sb_offset = g_k & gs_mask;
                 device const uchar *sb = W + g_n * sb_stride + sb_idx * sb_bytes;
-                uint word_offset = sb_offset >> 3;
+                // Word-aligned load + nibble extraction (vs per-byte load)
+                uint word_offset = sb_offset >> 3;  // 8 nibbles per uint32
                 uint nibble_pos = sb_offset & 7;
                 uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_offset];
                 uchar nibble = (packed4 >> (nibble_pos * 4)) & 0xF;
@@ -101,8 +109,8 @@ kernel void superblock_matmul_int4(
                 uint g_k = k_base + k;
                 half val = half(0);
                 if (g_n < N && g_k < K) {
-                    uint sb_idx = g_k / GS;
-                    uint sb_offset = g_k % GS;
+                    uint sb_idx = g_k >> gs_shift;
+                    uint sb_offset = g_k & gs_mask;
                     device const uchar *sb = W + g_n * sb_stride + sb_idx * sb_bytes;
                     uint word_offset = sb_offset >> 3;
                     uint nibble_pos = sb_offset & 7;
@@ -159,8 +167,9 @@ kernel void superblock_matmul_int8(
     constant uint &M                [[buffer(3)]],
     constant uint &N                [[buffer(4)]],
     constant uint &K                [[buffer(5)]],
-    device const half *awq_scales   [[buffer(6)]],
-    constant uint &has_awq          [[buffer(7)]],
+    constant uint &group_size       [[buffer(6)]],
+    device const half *awq_scales   [[buffer(7)]],
+    constant uint &has_awq          [[buffer(8)]],
     uint2 group_id [[threadgroup_position_in_grid]],
     uint tid   [[thread_index_in_threadgroup]],
     uint sgid  [[simdgroup_index_in_threadgroup]],
@@ -172,11 +181,15 @@ kernel void superblock_matmul_int8(
     threadgroup half tg_a[2][TM_TILE * MATMUL_K_TILE];
     threadgroup half tg_bt[2][MATMUL_K_TILE * TN_STRIDE];
 
-    uint num_groups = K / GS;
+    uint num_groups = K / group_size;
     uint num_k_steps = (K + MATMUL_K_TILE - 1) / MATMUL_K_TILE;
 
-    uint sb_bytes = SB_HEADER_BYTES + GS;
+    uint sb_bytes = SB_HEADER_BYTES + group_size;
     uint sb_stride = num_groups * sb_bytes;
+
+    uint gs_shift = 0;
+    { uint tmp = group_size; while (tmp > 1) { tmp >>= 1; gs_shift++; } }
+    uint gs_mask = group_size - 1;
 
     simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
     for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
@@ -202,8 +215,8 @@ kernel void superblock_matmul_int8(
             uint g_k = k_base + k;
             half val = half(0);
             if (g_n < N && g_k < K) {
-                uint sb_idx = g_k / GS;
-                uint sb_offset = g_k % GS;
+                uint sb_idx = g_k >> gs_shift;
+                uint sb_offset = g_k & gs_mask;
                 device const uchar *sb = W + g_n * sb_stride + sb_idx * sb_bytes;
                 uchar q = sb[SB_HEADER_BYTES + sb_offset];
                 float s = float(*(device const half *)(sb));
@@ -239,8 +252,8 @@ kernel void superblock_matmul_int8(
                 uint g_k = k_base + k;
                 half val = half(0);
                 if (g_n < N && g_k < K) {
-                    uint sb_idx = g_k / GS;
-                    uint sb_offset = g_k % GS;
+                    uint sb_idx = g_k >> gs_shift;
+                    uint sb_offset = g_k & gs_mask;
                     device const uchar *sb = W + g_n * sb_stride + sb_idx * sb_bytes;
                     uchar q = sb[SB_HEADER_BYTES + sb_offset];
                     float s = float(*(device const half *)(sb));
