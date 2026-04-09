@@ -252,7 +252,7 @@ fn run_inference_on_model(
 /// the ironmill-ane crate.
 #[cfg(feature = "ane-direct")]
 pub fn run_ane_direct_inference(
-    program: &ironmill_compile::mil::Program,
+    program: &mil_rs::ir::Program,
     config: ironmill_inference::AneConfig,
     warmup: usize,
     iterations: usize,

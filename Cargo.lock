@@ -1098,6 +1098,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ironmill-compile",
+ "mil-rs",
  "serde",
  "serde_json",
  "tempfile",
@@ -1131,6 +1132,7 @@ name = "ironmill-compile-ffi"
 version = "0.1.0"
 dependencies = [
  "ironmill-compile",
+ "mil-rs",
 ]
 
 [[package]]

@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use crate::config::{ModelConfig, OptConfig, cache_key};
 
 /// Build the optimization pipeline from an [`OptConfig`].
-fn build_pipeline(opt: &OptConfig) -> Result<ironmill_compile::mil::PassPipeline> {
-    let mut pipeline = ironmill_compile::mil::PassPipeline::default();
+fn build_pipeline(opt: &OptConfig) -> Result<mil_rs::ir::PassPipeline> {
+    let mut pipeline = mil_rs::ir::PassPipeline::default();
     if opt.no_fusion {
         pipeline = pipeline.without_fusion();
     }
@@ -36,7 +36,7 @@ fn build_pipeline(opt: &OptConfig) -> Result<ironmill_compile::mil::PassPipeline
 /// When `model.model_dir` is set, loads weights from SafeTensors files and
 /// builds MIL IR using the architecture template. Otherwise falls back to
 /// ONNX parsing.
-pub fn parse_model(model: &ModelConfig) -> Result<ironmill_compile::mil::Program> {
+pub fn parse_model(model: &ModelConfig) -> Result<mil_rs::ir::Program> {
     if let Some(model_dir) = &model.model_dir {
         parse_model_from_template(model_dir)
     } else {
@@ -45,16 +45,16 @@ pub fn parse_model(model: &ModelConfig) -> Result<ironmill_compile::mil::Program
 }
 
 /// Parse an ONNX model into MIL IR.
-fn parse_model_from_onnx(model: &ModelConfig) -> Result<ironmill_compile::mil::Program> {
-    let (mut onnx, model_dir) = ironmill_compile::mil::read_onnx_with_dir(&model.path)?;
-    let mut config = ironmill_compile::mil::ConversionConfig::default();
+fn parse_model_from_onnx(model: &ModelConfig) -> Result<mil_rs::ir::Program> {
+    let (mut onnx, model_dir) = mil_rs::read_onnx_with_dir(&model.path)?;
+    let mut config = mil_rs::ConversionConfig::default();
     config.model_dir = Some(model_dir);
-    let result = ironmill_compile::mil::onnx_to_program_with_config(&mut onnx, &config)?;
+    let result = mil_rs::onnx_to_program_with_config(&mut onnx, &config)?;
     Ok(result.program)
 }
 
 /// Build MIL IR from SafeTensors weights using the architecture template.
-fn parse_model_from_template(model_dir: &Path) -> Result<ironmill_compile::mil::Program> {
+fn parse_model_from_template(model_dir: &Path) -> Result<mil_rs::ir::Program> {
     use std::sync::Arc;
 
     let config_path = model_dir.join("config.json");
@@ -79,7 +79,7 @@ fn parse_model_from_template(model_dir: &Path) -> Result<ironmill_compile::mil::
 
 /// Apply the optimization pipeline to a program in-place.
 pub fn optimize_program(
-    program: &mut ironmill_compile::mil::Program,
+    program: &mut mil_rs::ir::Program,
     opt: &OptConfig,
 ) -> Result<()> {
     let pipeline = build_pipeline(opt)?;
@@ -118,10 +118,10 @@ pub fn compile_model(
         program.materialize_all()?;
     }
 
-    let model_proto = ironmill_compile::mil::program_to_model(&program, 7)?;
+    let model_proto = mil_rs::program_to_model(&program, 7)?;
 
     let mlpackage_path = entry_dir.join("model.mlpackage");
-    ironmill_compile::mil::write_mlpackage(&model_proto, &mlpackage_path)?;
+    mil_rs::write_mlpackage(&model_proto, &mlpackage_path)?;
 
     let compiled_path =
         ironmill_compile::coreml::compiler::compile_model(&mlpackage_path, &entry_dir)?;
@@ -133,7 +133,7 @@ pub fn compile_model(
 ///
 /// Clones the program internally so the caller's copy is not modified.
 pub fn compile_model_from_program(
-    program: &ironmill_compile::mil::Program,
+    program: &mil_rs::ir::Program,
     model: &ModelConfig,
     opt: &OptConfig,
     cache_dir: &Path,
@@ -160,10 +160,10 @@ pub fn compile_model_from_program(
         prog.materialize_all()?;
     }
 
-    let model_proto = ironmill_compile::mil::program_to_model(&prog, 7)?;
+    let model_proto = mil_rs::program_to_model(&prog, 7)?;
 
     let mlpackage_path = entry_dir.join("model.mlpackage");
-    ironmill_compile::mil::write_mlpackage(&model_proto, &mlpackage_path)?;
+    mil_rs::write_mlpackage(&model_proto, &mlpackage_path)?;
 
     let compiled_path =
         ironmill_compile::coreml::compiler::compile_model(&mlpackage_path, &entry_dir)?;
@@ -178,7 +178,7 @@ pub fn compile_model_from_program(
 pub fn build_optimized_program(
     model: &ModelConfig,
     opt: &OptConfig,
-) -> Result<ironmill_compile::mil::Program> {
+) -> Result<mil_rs::ir::Program> {
     let mut program = parse_model(model)?;
     optimize_program(&mut program, opt)?;
     Ok(program)
@@ -188,9 +188,9 @@ pub fn build_optimized_program(
 ///
 /// Clones the program so the caller's copy is not modified.
 pub fn build_optimized_program_from(
-    program: &ironmill_compile::mil::Program,
+    program: &mil_rs::ir::Program,
     opt: &OptConfig,
-) -> Result<ironmill_compile::mil::Program> {
+) -> Result<mil_rs::ir::Program> {
     let mut prog = program.clone();
     optimize_program(&mut prog, opt)?;
     Ok(prog)
@@ -204,7 +204,7 @@ pub fn build_optimized_program_from(
 pub fn build_optimized_program_ane(
     model: &ModelConfig,
     opt: &OptConfig,
-) -> Result<ironmill_compile::mil::Program> {
+) -> Result<mil_rs::ir::Program> {
     build_optimized_program(model, opt)
 }
 

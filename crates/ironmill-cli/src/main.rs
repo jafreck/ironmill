@@ -14,14 +14,13 @@ use ironmill_compile::convert::pipeline::{convert_pipeline, parse_pipeline_manif
 use ironmill_compile::coreml::compiler::{compile_model, is_compiler_available};
 use ironmill_compile::gpu::GpuCompileBuilder;
 use ironmill_compile::gpu::bundle::write_gpu_bundle;
-use ironmill_compile::mil::PassPipeline;
-use ironmill_compile::mil::PipelineReport;
-use ironmill_compile::mil::{
+use mil_rs::ir::{PassPipeline, PipelineReport};
+use mil_rs::reader::{print_model_summary, print_onnx_summary};
+use mil_rs::{
     ConversionConfig, LossFunction, UpdatableModelConfig, UpdateOptimizer,
     onnx_to_program_with_config, program_to_model, program_to_multi_function_model,
     program_to_updatable_model, read_mlmodel, read_mlpackage, read_onnx, write_mlpackage,
 };
-use ironmill_compile::mil::{print_model_summary, print_onnx_summary};
 use ironmill_compile::templates::{TemplateOptions, weights_to_program_with_options};
 use ironmill_compile::weights::{GgufProvider, SafeTensorsProvider, WeightProvider};
 
@@ -312,7 +311,7 @@ enum Commands {
 }
 
 /// Count total operations across all functions in a program.
-fn count_ops(program: &ironmill_compile::mil::Program) -> usize {
+fn count_ops(program: &mil_rs::ir::Program) -> usize {
     program
         .functions
         .values()
@@ -955,7 +954,7 @@ fn resolve_output_path(output: Option<&str>, input_path: &Path, default_suffix: 
 
 /// Convert a MIL program to CoreML, write as .mlpackage, and print status.
 fn write_coreml_package(
-    program: &ironmill_compile::mil::Program,
+    program: &mil_rs::ir::Program,
     output_path: &str,
     label: &str,
 ) -> Result<()> {
@@ -970,7 +969,7 @@ fn write_coreml_package(
 /// MoE split: write per-expert .mlpackage files and a manifest.
 /// Returns `Ok(true)` if MoE was detected and handled.
 fn emit_moe_split(
-    program: &mut ironmill_compile::mil::Program,
+    program: &mut mil_rs::ir::Program,
     input_path: &Path,
     opts: &CompileOpts,
 ) -> Result<bool> {
@@ -1021,7 +1020,7 @@ fn emit_moe_split(
 /// MoE bundle: write a single multi-function .mlpackage with all experts.
 /// Returns `Ok(true)` if MoE was detected and handled.
 fn emit_moe_bundle(
-    program: &mut ironmill_compile::mil::Program,
+    program: &mut mil_rs::ir::Program,
     input_path: &Path,
     opts: &CompileOpts,
 ) -> Result<bool> {
@@ -1081,7 +1080,7 @@ fn emit_moe_bundle(
 /// MoE top-K fusion: fuse the most frequently activated experts into a dense model.
 /// Returns `Ok(true)` if fusion was performed.
 fn emit_topk_fusion(
-    program: &mut ironmill_compile::mil::Program,
+    program: &mut mil_rs::ir::Program,
     input_path: &Path,
     opts: &CompileOpts,
 ) -> Result<bool> {
@@ -1149,7 +1148,7 @@ fn emit_topk_fusion(
 
 /// Speculative decoding split: produce draft and verifier .mlpackage files.
 fn emit_speculative_split(
-    program: &mut ironmill_compile::mil::Program,
+    program: &mut mil_rs::ir::Program,
     input_path: &Path,
     opts: &CompileOpts,
     n_layers: usize,
@@ -1197,7 +1196,7 @@ fn emit_speculative_split(
 
 /// Standard CoreML output: produce a single .mlpackage (optionally updatable).
 fn emit_coreml(
-    program: &mut ironmill_compile::mil::Program,
+    program: &mut mil_rs::ir::Program,
     input_path: &Path,
     opts: &CompileOpts,
 ) -> Result<()> {
@@ -1257,7 +1256,7 @@ fn emit_coreml(
 
 /// ANE-direct output: compile to a `.ironml` bundle for the direct ANE runtime.
 fn emit_ane_direct(
-    program: &mut ironmill_compile::mil::Program,
+    program: &mut mil_rs::ir::Program,
     input_path: &Path,
     opts: &CompileOpts,
 ) -> Result<()> {
@@ -1295,7 +1294,7 @@ fn emit_ane_direct(
 /// Run the pass pipeline, dispatch to the appropriate output handler, and
 /// print warnings. Shared by both ONNX and weights compilation paths.
 fn compile_and_emit(
-    program: &mut ironmill_compile::mil::Program,
+    program: &mut mil_rs::ir::Program,
     input_path: &Path,
     opts: &CompileOpts,
     warnings: Vec<String>,
@@ -1610,7 +1609,7 @@ fn cmd_validate(input: &str, format: &str, lenient: bool) -> Result<()> {
                 eprintln!("✓ CoreML model (.mlmodel) parsed successfully");
             }
 
-            match ironmill_compile::mil::model_to_program(&model) {
+            match mil_rs::model_to_program(&model) {
                 Ok(program) => {
                     if is_text {
                         eprintln!();
@@ -1640,7 +1639,7 @@ fn cmd_validate(input: &str, format: &str, lenient: bool) -> Result<()> {
                 eprintln!("✓ CoreML package (.mlpackage) parsed successfully");
             }
 
-            match ironmill_compile::mil::model_to_program(&model) {
+            match mil_rs::model_to_program(&model) {
                 Ok(program) => {
                     if is_text {
                         eprintln!();

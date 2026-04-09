@@ -6,10 +6,11 @@ use std::path::PathBuf;
 
 use ironmill_compile::coreml::compiler::compile_model;
 #[allow(deprecated)]
-use ironmill_compile::mil::passes::{
+use mil_rs::ir::passes::{
     ConstantFoldPass, DeadCodeEliminationPass, IdentityEliminationPass,
 };
-use ironmill_compile::mil::{Pass, onnx_to_program, program_to_model, read_onnx, write_mlpackage};
+use mil_rs::ir::Pass;
+use mil_rs::{onnx_to_program, program_to_model, read_onnx, write_mlpackage};
 
 use ironmill_inference::coreml_runtime::{ComputeUnits, Model, build_dummy_input};
 

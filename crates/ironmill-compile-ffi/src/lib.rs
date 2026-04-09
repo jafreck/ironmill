@@ -39,8 +39,8 @@ use std::ffi::{CStr, CString, c_char};
 
 /// Internal discriminant for [`MilModel`].
 enum MilModelInner {
-    CoreMl(Box<ironmill_compile::mil::proto::specification::Model>),
-    Onnx(Box<ironmill_compile::mil::proto::onnx::ModelProto>),
+    CoreMl(Box<mil_rs::proto::specification::Model>),
+    Onnx(Box<mil_rs::proto::onnx::ModelProto>),
 }
 
 /// Opaque handle representing a loaded ML model.
@@ -54,7 +54,7 @@ pub struct MilModel(MilModelInner);
 ///
 /// Created by [`mil_onnx_to_program`]. Must be freed with
 /// [`mil_program_free`].
-pub struct MilProgram(ironmill_compile::mil::Program);
+pub struct MilProgram(mil_rs::ir::Program);
 
 /// Opaque handle to an ANE validation report.
 ///
@@ -103,7 +103,7 @@ pub extern "C" fn mil_read_onnx(path: *const c_char) -> *mut MilModel {
         set_last_error("mil_read_onnx: path is null or invalid UTF-8");
         return std::ptr::null_mut();
     };
-    match ironmill_compile::mil::read_onnx(path_str) {
+    match mil_rs::read_onnx(path_str) {
         Ok(proto) => Box::into_raw(Box::new(MilModel(MilModelInner::Onnx(Box::new(proto))))),
         Err(e) => {
             set_last_error(&format!("mil_read_onnx: {e}"));
@@ -122,7 +122,7 @@ pub extern "C" fn mil_read_mlmodel(path: *const c_char) -> *mut MilModel {
         set_last_error("mil_read_mlmodel: path is null or invalid UTF-8");
         return std::ptr::null_mut();
     };
-    match ironmill_compile::mil::read_mlmodel(path_str) {
+    match mil_rs::read_mlmodel(path_str) {
         Ok(model) => Box::into_raw(Box::new(MilModel(MilModelInner::CoreMl(Box::new(model))))),
         Err(e) => {
             set_last_error(&format!("mil_read_mlmodel: {e}"));
@@ -140,7 +140,7 @@ pub extern "C" fn mil_read_mlpackage(path: *const c_char) -> *mut MilModel {
         set_last_error("mil_read_mlpackage: path is null or invalid UTF-8");
         return std::ptr::null_mut();
     };
-    match ironmill_compile::mil::read_mlpackage(path_str) {
+    match mil_rs::read_mlpackage(path_str) {
         Ok(model) => Box::into_raw(Box::new(MilModel(MilModelInner::CoreMl(Box::new(model))))),
         Err(e) => {
             set_last_error(&format!("mil_read_mlpackage: {e}"));
@@ -190,7 +190,7 @@ pub extern "C" fn mil_onnx_to_program(model: *mut MilModel) -> *mut MilProgram {
             return std::ptr::null_mut();
         }
     };
-    match ironmill_compile::mil::onnx_to_program(onnx) {
+    match mil_rs::onnx_to_program(onnx) {
         Ok(result) => Box::into_raw(Box::new(MilProgram(result.program))),
         Err(e) => {
             set_last_error(&format!("mil_onnx_to_program: {e}"));
@@ -216,7 +216,7 @@ pub extern "C" fn mil_program_to_model(
     // SAFETY: `program` is non-null and was allocated by `Box::into_raw` in
     // `mil_onnx_to_program`. We only take a shared reference.
     let program = unsafe { &*program };
-    match ironmill_compile::mil::program_to_model(&program.0, spec_version) {
+    match mil_rs::program_to_model(&program.0, spec_version) {
         Ok(model) => Box::into_raw(Box::new(MilModel(MilModelInner::CoreMl(Box::new(model))))),
         Err(e) => {
             set_last_error(&format!("mil_program_to_model: {e}"));
@@ -266,7 +266,7 @@ pub extern "C" fn mil_write_mlmodel(model: *const MilModel, path: *const c_char)
             return -1;
         }
     };
-    match ironmill_compile::mil::write_mlmodel(coreml, path_str) {
+    match mil_rs::write_mlmodel(coreml, path_str) {
         Ok(()) => 0,
         Err(e) => {
             set_last_error(&format!("mil_write_mlmodel: {e}"));
@@ -299,7 +299,7 @@ pub extern "C" fn mil_write_mlpackage(model: *const MilModel, path: *const c_cha
             return -1;
         }
     };
-    match ironmill_compile::mil::write_mlpackage(coreml, path_str) {
+    match mil_rs::write_mlpackage(coreml, path_str) {
         Ok(()) => 0,
         Err(e) => {
             set_last_error(&format!("mil_write_mlpackage: {e}"));
@@ -591,7 +591,7 @@ mod tests {
         // We need a non-null but valid MilModel to test the path check.
         // Construct a dummy CoreML model.
         let model = Box::into_raw(Box::new(MilModel(MilModelInner::CoreMl(Box::new(
-            ironmill_compile::mil::proto::specification::Model::default(),
+            mil_rs::proto::specification::Model::default(),
         )))));
         let rc = mil_write_mlmodel(model, std::ptr::null());
         assert_eq!(rc, -1);
@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn onnx_to_program_rejects_coreml_model() {
         let model = Box::into_raw(Box::new(MilModel(MilModelInner::CoreMl(Box::new(
-            ironmill_compile::mil::proto::specification::Model::default(),
+            mil_rs::proto::specification::Model::default(),
         )))));
         let p = mil_onnx_to_program(model);
         assert!(p.is_null());
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn write_mlmodel_rejects_onnx_model() {
         let model = Box::into_raw(Box::new(MilModel(MilModelInner::Onnx(Box::new(
-            ironmill_compile::mil::proto::onnx::ModelProto::default(),
+            mil_rs::proto::onnx::ModelProto::default(),
         )))));
         let path = CString::new("out.mlmodel").unwrap();
         let rc = mil_write_mlmodel(model, path.as_ptr());
@@ -713,7 +713,7 @@ mod tests {
     #[test]
     fn write_mlpackage_rejects_onnx_model() {
         let model = Box::into_raw(Box::new(MilModel(MilModelInner::Onnx(Box::new(
-            ironmill_compile::mil::proto::onnx::ModelProto::default(),
+            mil_rs::proto::onnx::ModelProto::default(),
         )))));
         let path = CString::new("out.mlpackage").unwrap();
         let rc = mil_write_mlpackage(model, path.as_ptr());

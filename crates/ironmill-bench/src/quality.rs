@@ -5,10 +5,10 @@
 
 use half::f16;
 #[allow(deprecated)]
-use ironmill_compile::mil::passes::PolarQuantPass;
+use mil_rs::ir::passes::PolarQuantPass;
 #[allow(deprecated)]
-use ironmill_compile::mil::passes::tensor_utils::tensor_as_f32_slice;
-use ironmill_compile::mil::{Pass, Program, ScalarType, Value};
+use mil_rs::ir::passes::tensor_utils::tensor_as_f32_slice;
+use mil_rs::ir::{Pass, Program, ScalarType, Value};
 
 /// Result of a quality benchmark for one (model, method) pair.
 #[derive(Debug, Clone)]
@@ -68,7 +68,7 @@ fn unpack_indices(packed: &[u8], n_bits: u8, count: usize) -> Vec<usize> {
 
 /// Reconstruct dequantized f32 values from a constexpr_lut_to_dense op.
 fn reconstruct_from_lut_op(
-    op: &ironmill_compile::mil::Operation,
+    op: &mil_rs::ir::Operation,
     original_shape: &[usize],
 ) -> Option<Vec<f32>> {
     let lut = op.attributes.get("lut")?;

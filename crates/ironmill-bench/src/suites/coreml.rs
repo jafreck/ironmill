@@ -70,7 +70,7 @@ impl BenchmarkSuite for CoremlSuite {
         }
 
         // Pre-parse ONNX models once
-        let mut parsed_programs: HashMap<String, ironmill_compile::mil::Program> = HashMap::new();
+        let mut parsed_programs: HashMap<String, mil_rs::ir::Program> = HashMap::new();
         for model_cfg in &ctx.matrix.models {
             if !model_cfg.path.exists() {
                 continue;

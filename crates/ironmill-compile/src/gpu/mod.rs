@@ -39,7 +39,7 @@ use crate::weights::{MilWeightProvider, ModelConfig, WeightProvider};
 ///
 /// ```no_run
 /// use ironmill_compile::gpu::GpuCompileBuilder;
-/// use ironmill_compile::mil::PassPipeline;
+/// use mil_rs::ir::PassPipeline;
 ///
 /// // INT4 affine quantization
 /// let pipeline = PassPipeline::new()

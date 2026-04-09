@@ -11,7 +11,7 @@ use std::sync::Arc;
 use common::*;
 use ironmill_compile::gpu::GpuCompileBuilder;
 use ironmill_compile::gpu::bundle::write_gpu_bundle;
-use ironmill_compile::mil::{Pass, PassPipeline};
+use mil_rs::ir::{Pass, PassPipeline};
 use ironmill_compile::templates::weights_to_program;
 use ironmill_compile::weights::safetensors::SafeTensorsProvider;
 use ironmill_compile::weights::{MilWeightProvider, WeightProvider};
