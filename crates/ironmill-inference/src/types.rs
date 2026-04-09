@@ -156,20 +156,32 @@ pub struct Logits(Vec<f32>);
 
 impl Logits {
     /// Create a new `Logits` from a raw vector of scores.
-    pub fn new(data: Vec<f32>) -> Self { Self(data) }
+    pub fn new(data: Vec<f32>) -> Self {
+        Self(data)
+    }
     /// Consume the newtype and return the inner vector.
-    pub fn into_inner(self) -> Vec<f32> { self.0 }
+    pub fn into_inner(self) -> Vec<f32> {
+        self.0
+    }
     /// Number of logit scores.
-    pub fn len(&self) -> usize { self.0.len() }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
     /// Returns `true` if there are no logit scores.
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl std::ops::Deref for Logits {
     type Target = [f32];
-    fn deref(&self) -> &[f32] { &self.0 }
+    fn deref(&self) -> &[f32] {
+        &self.0
+    }
 }
 
 impl std::ops::DerefMut for Logits {
-    fn deref_mut(&mut self) -> &mut [f32] { &mut self.0 }
+    fn deref_mut(&mut self) -> &mut [f32] {
+        &mut self.0
+    }
 }

@@ -43,34 +43,55 @@ kernel void superblock_batched_affine_matvec_int4(
 
         uint k_base = g * GS;
 
-        for (uint i = lane * BLK_K; i < GS; i += 32 * BLK_K) {
+        for (uint i = lane * 16; i < GS; i += 32 * 16) {
             uint k_elem = k_base + i;
-            uint word_idx = i / 8;
-            uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_idx];
+            uint w_idx0 = i / 8;
+            uint packed4a = ((device const uint*)(sb + SB_HEADER_BYTES))[w_idx0];
+            uint packed4b = ((device const uint*)(sb + SB_HEADER_BYTES))[w_idx0 + 1];
 
-            float w0 = (float(packed4 & 0xF) - z) * s;
-            float w1 = (float((packed4 >> 4) & 0xF) - z) * s;
-            float w2 = (float((packed4 >> 8) & 0xF) - z) * s;
-            float w3 = (float((packed4 >> 12) & 0xF) - z) * s;
-            float w4 = (float((packed4 >> 16) & 0xF) - z) * s;
-            float w5 = (float((packed4 >> 20) & 0xF) - z) * s;
-            float w6 = (float((packed4 >> 24) & 0xF) - z) * s;
-            float w7 = (float((packed4 >> 28) & 0xF) - z) * s;
+            float w0  = (float(packed4a & 0xF) - z) * s;
+            float w1  = (float((packed4a >> 4) & 0xF) - z) * s;
+            float w2  = (float((packed4a >> 8) & 0xF) - z) * s;
+            float w3  = (float((packed4a >> 12) & 0xF) - z) * s;
+            float w4  = (float((packed4a >> 16) & 0xF) - z) * s;
+            float w5  = (float((packed4a >> 20) & 0xF) - z) * s;
+            float w6  = (float((packed4a >> 24) & 0xF) - z) * s;
+            float w7  = (float((packed4a >> 28) & 0xF) - z) * s;
+            float w8  = (float(packed4b & 0xF) - z) * s;
+            float w9  = (float((packed4b >> 4) & 0xF) - z) * s;
+            float w10 = (float((packed4b >> 8) & 0xF) - z) * s;
+            float w11 = (float((packed4b >> 12) & 0xF) - z) * s;
+            float w12 = (float((packed4b >> 16) & 0xF) - z) * s;
+            float w13 = (float((packed4b >> 20) & 0xF) - z) * s;
+            float w14 = (float((packed4b >> 24) & 0xF) - z) * s;
+            float w15 = (float((packed4b >> 28) & 0xF) - z) * s;
 
             if (has_awq) {
-                acc += (float(A[k_elem])     / float(awq_scales[k_elem]))     * w0;
-                acc += (float(A[k_elem + 1]) / float(awq_scales[k_elem + 1])) * w1;
-                acc += (float(A[k_elem + 2]) / float(awq_scales[k_elem + 2])) * w2;
-                acc += (float(A[k_elem + 3]) / float(awq_scales[k_elem + 3])) * w3;
-                acc += (float(A[k_elem + 4]) / float(awq_scales[k_elem + 4])) * w4;
-                acc += (float(A[k_elem + 5]) / float(awq_scales[k_elem + 5])) * w5;
-                acc += (float(A[k_elem + 6]) / float(awq_scales[k_elem + 6])) * w6;
-                acc += (float(A[k_elem + 7]) / float(awq_scales[k_elem + 7])) * w7;
+                acc += (float(A[k_elem])      / float(awq_scales[k_elem]))      * w0;
+                acc += (float(A[k_elem + 1])  / float(awq_scales[k_elem + 1]))  * w1;
+                acc += (float(A[k_elem + 2])  / float(awq_scales[k_elem + 2]))  * w2;
+                acc += (float(A[k_elem + 3])  / float(awq_scales[k_elem + 3]))  * w3;
+                acc += (float(A[k_elem + 4])  / float(awq_scales[k_elem + 4]))  * w4;
+                acc += (float(A[k_elem + 5])  / float(awq_scales[k_elem + 5]))  * w5;
+                acc += (float(A[k_elem + 6])  / float(awq_scales[k_elem + 6]))  * w6;
+                acc += (float(A[k_elem + 7])  / float(awq_scales[k_elem + 7]))  * w7;
+                acc += (float(A[k_elem + 8])  / float(awq_scales[k_elem + 8]))  * w8;
+                acc += (float(A[k_elem + 9])  / float(awq_scales[k_elem + 9]))  * w9;
+                acc += (float(A[k_elem + 10]) / float(awq_scales[k_elem + 10])) * w10;
+                acc += (float(A[k_elem + 11]) / float(awq_scales[k_elem + 11])) * w11;
+                acc += (float(A[k_elem + 12]) / float(awq_scales[k_elem + 12])) * w12;
+                acc += (float(A[k_elem + 13]) / float(awq_scales[k_elem + 13])) * w13;
+                acc += (float(A[k_elem + 14]) / float(awq_scales[k_elem + 14])) * w14;
+                acc += (float(A[k_elem + 15]) / float(awq_scales[k_elem + 15])) * w15;
             } else {
-                acc += float(A[k_elem])     * w0 + float(A[k_elem + 1]) * w1
-                     + float(A[k_elem + 2]) * w2 + float(A[k_elem + 3]) * w3
-                     + float(A[k_elem + 4]) * w4 + float(A[k_elem + 5]) * w5
-                     + float(A[k_elem + 6]) * w6 + float(A[k_elem + 7]) * w7;
+                acc += float(A[k_elem])      * w0  + float(A[k_elem + 1])  * w1
+                     + float(A[k_elem + 2])  * w2  + float(A[k_elem + 3])  * w3
+                     + float(A[k_elem + 4])  * w4  + float(A[k_elem + 5])  * w5
+                     + float(A[k_elem + 6])  * w6  + float(A[k_elem + 7])  * w7
+                     + float(A[k_elem + 8])  * w8  + float(A[k_elem + 9])  * w9
+                     + float(A[k_elem + 10]) * w10 + float(A[k_elem + 11]) * w11
+                     + float(A[k_elem + 12]) * w12 + float(A[k_elem + 13]) * w13
+                     + float(A[k_elem + 14]) * w14 + float(A[k_elem + 15]) * w15;
             }
         }
     }
@@ -144,34 +165,55 @@ kernel void superblock_gdn_batched_affine_matvec_int4(
 
         uint k_base = g * GS;
 
-        for (uint i = lane * BLK_K; i < GS; i += 32 * BLK_K) {
+        for (uint i = lane * 16; i < GS; i += 32 * 16) {
             uint k_elem = k_base + i;
-            uint word_idx = i / 8;
-            uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_idx];
+            uint w_idx0 = i / 8;
+            uint packed4a = ((device const uint*)(sb + SB_HEADER_BYTES))[w_idx0];
+            uint packed4b = ((device const uint*)(sb + SB_HEADER_BYTES))[w_idx0 + 1];
 
-            float w0 = (float(packed4 & 0xF) - z) * s;
-            float w1 = (float((packed4 >> 4) & 0xF) - z) * s;
-            float w2 = (float((packed4 >> 8) & 0xF) - z) * s;
-            float w3 = (float((packed4 >> 12) & 0xF) - z) * s;
-            float w4 = (float((packed4 >> 16) & 0xF) - z) * s;
-            float w5 = (float((packed4 >> 20) & 0xF) - z) * s;
-            float w6 = (float((packed4 >> 24) & 0xF) - z) * s;
-            float w7 = (float((packed4 >> 28) & 0xF) - z) * s;
+            float w0  = (float(packed4a & 0xF) - z) * s;
+            float w1  = (float((packed4a >> 4) & 0xF) - z) * s;
+            float w2  = (float((packed4a >> 8) & 0xF) - z) * s;
+            float w3  = (float((packed4a >> 12) & 0xF) - z) * s;
+            float w4  = (float((packed4a >> 16) & 0xF) - z) * s;
+            float w5  = (float((packed4a >> 20) & 0xF) - z) * s;
+            float w6  = (float((packed4a >> 24) & 0xF) - z) * s;
+            float w7  = (float((packed4a >> 28) & 0xF) - z) * s;
+            float w8  = (float(packed4b & 0xF) - z) * s;
+            float w9  = (float((packed4b >> 4) & 0xF) - z) * s;
+            float w10 = (float((packed4b >> 8) & 0xF) - z) * s;
+            float w11 = (float((packed4b >> 12) & 0xF) - z) * s;
+            float w12 = (float((packed4b >> 16) & 0xF) - z) * s;
+            float w13 = (float((packed4b >> 20) & 0xF) - z) * s;
+            float w14 = (float((packed4b >> 24) & 0xF) - z) * s;
+            float w15 = (float((packed4b >> 28) & 0xF) - z) * s;
 
             if (has_awq) {
-                acc += (float(A[k_elem])     / float(awq_scales[k_elem]))     * w0;
-                acc += (float(A[k_elem + 1]) / float(awq_scales[k_elem + 1])) * w1;
-                acc += (float(A[k_elem + 2]) / float(awq_scales[k_elem + 2])) * w2;
-                acc += (float(A[k_elem + 3]) / float(awq_scales[k_elem + 3])) * w3;
-                acc += (float(A[k_elem + 4]) / float(awq_scales[k_elem + 4])) * w4;
-                acc += (float(A[k_elem + 5]) / float(awq_scales[k_elem + 5])) * w5;
-                acc += (float(A[k_elem + 6]) / float(awq_scales[k_elem + 6])) * w6;
-                acc += (float(A[k_elem + 7]) / float(awq_scales[k_elem + 7])) * w7;
+                acc += (float(A[k_elem])      / float(awq_scales[k_elem]))      * w0;
+                acc += (float(A[k_elem + 1])  / float(awq_scales[k_elem + 1]))  * w1;
+                acc += (float(A[k_elem + 2])  / float(awq_scales[k_elem + 2]))  * w2;
+                acc += (float(A[k_elem + 3])  / float(awq_scales[k_elem + 3]))  * w3;
+                acc += (float(A[k_elem + 4])  / float(awq_scales[k_elem + 4]))  * w4;
+                acc += (float(A[k_elem + 5])  / float(awq_scales[k_elem + 5]))  * w5;
+                acc += (float(A[k_elem + 6])  / float(awq_scales[k_elem + 6]))  * w6;
+                acc += (float(A[k_elem + 7])  / float(awq_scales[k_elem + 7]))  * w7;
+                acc += (float(A[k_elem + 8])  / float(awq_scales[k_elem + 8]))  * w8;
+                acc += (float(A[k_elem + 9])  / float(awq_scales[k_elem + 9]))  * w9;
+                acc += (float(A[k_elem + 10]) / float(awq_scales[k_elem + 10])) * w10;
+                acc += (float(A[k_elem + 11]) / float(awq_scales[k_elem + 11])) * w11;
+                acc += (float(A[k_elem + 12]) / float(awq_scales[k_elem + 12])) * w12;
+                acc += (float(A[k_elem + 13]) / float(awq_scales[k_elem + 13])) * w13;
+                acc += (float(A[k_elem + 14]) / float(awq_scales[k_elem + 14])) * w14;
+                acc += (float(A[k_elem + 15]) / float(awq_scales[k_elem + 15])) * w15;
             } else {
-                acc += float(A[k_elem])     * w0 + float(A[k_elem + 1]) * w1
-                     + float(A[k_elem + 2]) * w2 + float(A[k_elem + 3]) * w3
-                     + float(A[k_elem + 4]) * w4 + float(A[k_elem + 5]) * w5
-                     + float(A[k_elem + 6]) * w6 + float(A[k_elem + 7]) * w7;
+                acc += float(A[k_elem])      * w0  + float(A[k_elem + 1])  * w1
+                     + float(A[k_elem + 2])  * w2  + float(A[k_elem + 3])  * w3
+                     + float(A[k_elem + 4])  * w4  + float(A[k_elem + 5])  * w5
+                     + float(A[k_elem + 6])  * w6  + float(A[k_elem + 7])  * w7
+                     + float(A[k_elem + 8])  * w8  + float(A[k_elem + 9])  * w9
+                     + float(A[k_elem + 10]) * w10 + float(A[k_elem + 11]) * w11
+                     + float(A[k_elem + 12]) * w12 + float(A[k_elem + 13]) * w13
+                     + float(A[k_elem + 14]) * w14 + float(A[k_elem + 15]) * w15;
             }
         }
     }
