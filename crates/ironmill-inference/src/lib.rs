@@ -36,31 +36,27 @@ pub mod metal;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod weight_loading;
 
-// Re-exports for convenience.
-#[cfg(all(feature = "ane", target_os = "macos"))]
-pub use ane::model::{AneConfig, AneDirectBackend, AneModel, AneRuntimeModel};
-pub use cache::{KvCacheSlice, KvLayerSlice, LinearPrefixCache, LruPolicy, PrefixCache, RadixTree};
-pub use engine::{
-    BatchInferenceEngine, ConstrainedDecoder, InferenceEngine, InferenceError, SequenceId,
-    prefill_with_cache,
+// ── Focused re-exports (§2.4) ────────────────────────────────────
+
+// Core engine
+pub use engine::{BatchInferenceEngine, InferenceEngine, InferenceError, SequenceId};
+
+// Generation (primary high-level API)
+pub use generate::{
+    CancellationToken, FinishReason, GenerateEvent, GenerateRequest, GenerateResult, TokenStream,
+    generate, generate_with_callback,
 };
 #[cfg(feature = "async")]
 pub use generate::generate_async;
-pub use generate::{
-    CancellationToken, FinishReason, GenerateError, GenerateEvent, GenerateRequest, GenerateResult,
-    TokenStream, generate, generate_with_callback,
-};
-pub use grammar::{CompiledGrammar, GrammarState, TokenMask};
-pub use memory::{KvQuantLevel, MemoryEstimator, MemoryUsage, QuantLevel};
-pub use sampling::{
-    DEFAULT_EOS_TOKENS, Sampler, SamplerConfig, SamplingError, apply_token_mask, is_eos_token,
-    sample_token,
-};
-pub use speculative::{
-    DraftCandidate, DraftHead, MsaHeadWeights, SpecConfig, SpeculativeEngine, SpeculativeStreaming,
-    StreamingConfig, speculative_decode,
-};
-pub use types::{ElementType, InputFeatureDesc, RuntimeBackend, RuntimeModel, RuntimeTensor};
+
+// Sampling
+pub use sampling::{Sampler, SamplerConfig};
+
+// Types
+pub use types::{ElementType, Logits, RuntimeTensor};
+
+// Memory estimation
+pub use memory::{MemoryEstimator, MemoryUsage, QuantLevel};
 
 /// **Internal** — CoreML sys-layer types re-exported for sibling crates.
 ///
