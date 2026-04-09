@@ -42,6 +42,11 @@ constant constexpr uint TN_BLOCKS      = TN_TILE / 8;
 constant constexpr uint BLK_N = 64;
 constant constexpr uint BLK_K = 8;
 
+// ── Superblock group_size specialization ──
+// Set via FunctionConstantValues at pipeline creation time.
+// Enables compile-time division optimization (/ GS → >> log2(GS)).
+constant uint GS [[function_constant(0)]];
+
 // ── Superblock layout constants ──
 // Superblock = [scale:2B][zero:2B][data:group_size/elems_per_byte bytes]
 // For INT4 gs=128: sb_bytes = 4 + 64 = 68
@@ -50,6 +55,10 @@ constant constexpr uint BLK_K = 8;
 // Layout: W[row * sb_stride + group * sb_bytes + offset]
 // where sb_stride = num_groups * sb_bytes
 constant constexpr uint SB_HEADER_BYTES = 4;  // 2B scale + 2B zero
+constant uint SB_DATA_BYTES_INT4 = GS / 2;   // data bytes per superblock for INT4
+constant uint SB_DATA_BYTES_INT8 = GS;        // data bytes per superblock for INT8
+constant uint SB_BYTES_INT4 = SB_HEADER_BYTES + SB_DATA_BYTES_INT4;  // total superblock size
+constant uint SB_BYTES_INT8 = SB_HEADER_BYTES + SB_DATA_BYTES_INT8;
 
 // Superblock decode constants
 constant constexpr uint SB_ROWS_PER_SG = 4;
@@ -73,6 +82,5 @@ struct GdnBatchedInt4Params {
     uint N2;           // a output dim
     uint N3;           // b output dim
     uint K;            // input dim (shared)
-    uint group_size;
     uint has_awq;
 };

@@ -29,7 +29,11 @@ pub(crate) fn encode_ffn_block(
             if aq_gate.bit_width == 4 && aq_up.bit_width == 4 {
                 ops::encode_fused_ffn_gate_up_act_int4(
                     enc,
-                    &pipelines.affine.fused_ffn_gate_up_act_int4,
+                    pipelines
+                        .affine
+                        .fused_ffn_gate_up_act_int4
+                        .get(aq_gate.group_size)
+                        .unwrap(),
                     &bufs.norm_out,
                     aq_gate,
                     aq_up,
@@ -58,7 +62,11 @@ pub(crate) fn encode_ffn_block(
                 if aq_gate.bit_width == 4 && aq_up.bit_width == 4 {
                     ops::encode_batched_affine_matvec_int4(
                         enc,
-                        &pipelines.affine.batched_matvec_int4,
+                        pipelines
+                            .affine
+                            .batched_matvec_int4
+                            .get(aq_gate.group_size)
+                            .unwrap(),
                         &bufs.norm_out,
                         aq_gate,
                         &bufs.ffn_gate,

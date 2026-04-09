@@ -3,6 +3,7 @@
 use ironmill_metal_sys::{ComputeEncoder, ComputePipeline, MetalBuffer};
 
 use super::DEFAULT_THREADGROUP_WIDTH;
+use super::quantized::GroupSizePipelines;
 
 /// Fused operation pipeline states.
 pub struct FusedPipelines {
@@ -10,8 +11,8 @@ pub struct FusedPipelines {
     pub residual_norm_matvec: ComputePipeline,
     /// INT4 dequantization kernel.
     pub int4_dequantize: ComputePipeline,
-    /// Fused residual+RMSNorm+affine INT4 matvec.
-    pub residual_norm_affine_matvec_int4: ComputePipeline,
+    /// Fused residual+RMSNorm+affine INT4 matvec (group-size specialized).
+    pub residual_norm_affine_matvec_int4: GroupSizePipelines,
 }
 
 // ── Parameter structs ────────────────────────────────────────────
@@ -113,8 +114,8 @@ pub(crate) fn encode_fused_residual_norm_affine_matvec_int4(
     let gpu_params: [u32; 4] = [
         params.n,
         params.k,
-        params.weight.group_size,
         params.eps.to_bits(),
+        0, // padding
     ];
     let params_bytes: Vec<u8> = gpu_params.iter().flat_map(|v| v.to_le_bytes()).collect();
     encoder.set_bytes(&params_bytes, 6);
