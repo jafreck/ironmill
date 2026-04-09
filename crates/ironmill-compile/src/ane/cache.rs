@@ -145,18 +145,6 @@ impl ProgramCache {
         self.session_compile_count
     }
 
-    /// Increment the session compile count.
-    #[allow(dead_code)]
-    pub(crate) fn record_compilation(&mut self) {
-        self.session_compile_count += 1;
-    }
-
-    /// Remaining compile budget (~119 limit).
-    #[allow(dead_code)]
-    pub(crate) fn remaining_budget(&self) -> usize {
-        MAX_COMPILE_BUDGET.saturating_sub(self.session_compile_count)
-    }
-
     /// Number of entries currently cached.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -360,29 +348,6 @@ mod tests {
         assert_ne!(k1, k3);
         assert_eq!(k1.mil_text_hash, k3.mil_text_hash);
         assert_ne!(k1.weight_hash, k3.weight_hash);
-    }
-
-    #[test]
-    fn cache_budget_tracking() {
-        let mut cache = ProgramCache::default();
-        assert_eq!(cache.session_compile_count(), 0);
-        cache.record_compilation();
-        cache.record_compilation();
-        assert_eq!(cache.session_compile_count(), 2);
-    }
-
-    #[test]
-    fn cache_remaining_budget() {
-        let mut cache = ProgramCache::default();
-        assert_eq!(cache.remaining_budget(), MAX_COMPILE_BUDGET);
-        cache.record_compilation();
-        assert_eq!(cache.remaining_budget(), MAX_COMPILE_BUDGET - 1);
-
-        // Exhaust budget
-        for _ in 0..MAX_COMPILE_BUDGET {
-            cache.record_compilation();
-        }
-        assert_eq!(cache.remaining_budget(), 0);
     }
 
     #[test]

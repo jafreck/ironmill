@@ -4,7 +4,6 @@ pub(crate) mod blobfile;
 pub mod bundle;
 pub mod cache;
 pub(crate) mod decode_compile;
-pub(crate) mod packing;
 pub mod passes;
 pub mod split;
 pub mod validate;

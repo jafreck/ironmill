@@ -15,26 +15,10 @@
 //! **chunk header** at byte 64, NOT byte 0. This satisfies critical
 //! constraint #8.
 
-use std::path::Path;
-
 use mil_rs::ir::ScalarType;
 
 /// Offset where weight data begins (after header + chunk descriptor).
 const DATA_START: usize = 128;
-
-/// Metadata for a weight entry in the BLOBFILE.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct BlobEntry {
-    /// Weight tensor name (e.g., `"attn.qkv_proj.weight"`).
-    pub name: String,
-    /// Byte offset of this entry's data within the BLOBFILE.
-    pub offset: u64,
-    /// Size of the weight data in bytes.
-    pub size: u64,
-    /// Scalar element type of the weight tensor.
-    pub dtype: ScalarType,
-}
 
 /// Builds a BLOBFILE matching the format used by Orion/ANE.
 ///
@@ -47,7 +31,7 @@ pub struct BlobEntry {
 /// - Bytes 128+: Weight data
 pub struct BlobFileWriter {
     data: Vec<u8>,
-    entries: Vec<BlobEntry>,
+    has_entry: bool,
 }
 
 impl BlobFileWriter {
@@ -55,7 +39,7 @@ impl BlobFileWriter {
     pub fn new() -> Self {
         Self {
             data: Vec::new(),
-            entries: Vec::new(),
+            has_entry: false,
         }
     }
 
@@ -68,33 +52,16 @@ impl BlobFileWriter {
     ///
     /// Panics if called more than once — the BLOBFILE format supports only a
     /// single weight per file (each weight gets its own BLOBFILE in practice).
-    pub fn add_weight(&mut self, name: &str, data: &[u8], dtype: ScalarType) -> u64 {
+    pub fn add_weight(&mut self, name: &str, data: &[u8], _dtype: ScalarType) -> u64 {
         assert!(
-            self.entries.is_empty(),
+            !self.has_entry,
             "BlobFileWriter supports only one weight per file; \
              attempted to add '{name}' but a weight was already added"
         );
-        self.entries.push(BlobEntry {
-            name: name.to_string(),
-            offset: 64,
-            size: data.len() as u64,
-            dtype,
-        });
+        self.has_entry = true;
         self.data.extend_from_slice(data);
 
         64
-    }
-
-    /// Get the list of blob entries (for validation/debugging).
-    #[allow(dead_code)]
-    pub fn entries(&self) -> &[BlobEntry] {
-        &self.entries
-    }
-
-    /// Write the complete BLOBFILE to disk.
-    #[allow(dead_code)]
-    pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path, self.build())
     }
 
     /// Get the raw BLOBFILE bytes.
@@ -184,7 +151,7 @@ mod tests {
         let mut writer = BlobFileWriter::new();
         let data = vec![0xAB; 64];
         writer.add_weight("test_weight", &data, ScalarType::Float16);
-        writer.write(&path).unwrap();
+        std::fs::write(&path, writer.as_bytes()).unwrap();
 
         let read_back = std::fs::read(&path).unwrap();
         assert_eq!(read_back, writer.as_bytes());
@@ -196,7 +163,6 @@ mod tests {
         let bytes = writer.as_bytes();
 
         assert_eq!(bytes.len(), DATA_START);
-        assert!(writer.entries().is_empty());
     }
 
     #[test]

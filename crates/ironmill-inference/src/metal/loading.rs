@@ -491,18 +491,6 @@ impl MetalInference {
         self.init_model_state(weights, provider, true)
     }
 
-    /// JIT weight loading with on-the-fly transforms (not yet implemented).
-    #[allow(dead_code)]
-    pub(crate) fn load_jit(
-        _config: MetalConfig,
-        _provider: &dyn mil_rs::weights::WeightProvider,
-        _transforms: &crate::jit::TransformPipeline,
-    ) -> Result<Self, crate::engine::InferenceError> {
-        Err(crate::engine::InferenceError::Other(anyhow::anyhow!(
-            "JIT loading not yet implemented"
-        )))
-    }
-
     /// Load model from pre-built [`MetalArtifacts`].
     pub fn load(&mut self, artifacts: &MetalArtifacts<'_>) -> Result<(), InferenceError> {
         self.config = artifacts.config.clone();

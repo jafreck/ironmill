@@ -26,19 +26,16 @@
 #![warn(missing_docs)]
 
 // Core — always available, any platform
-pub(crate) mod batch_runner;
 pub mod cache;
 pub mod calibration;
 pub mod engine;
 pub mod generate;
 pub mod grammar;
-pub(crate) mod jit;
 
 pub mod memory;
 pub mod sampling;
-pub(crate) mod serving;
-pub(crate) mod shader_cache;
 pub mod speculative;
+#[cfg(all(any(feature = "metal", feature = "ane"), target_os = "macos"))]
 pub(crate) mod turboquant;
 pub mod types;
 

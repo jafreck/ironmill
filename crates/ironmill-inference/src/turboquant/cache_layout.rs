@@ -49,19 +49,7 @@ fn checked_mul3(
 /// Construct via [`TurboQuantCacheLayout::new`] from model parameters;
 /// then use the public fields when allocating Metal buffers.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TurboQuantCacheLayout {
-    /// Number of KV heads.
-    pub num_kv_heads: usize,
-    /// Per-head dimension.
-    pub head_dim: usize,
-    /// Maximum sequence length the cache can hold.
-    pub max_seq_len: usize,
-    /// Number of transformer layers.
-    pub num_layers: usize,
-    /// Quantization bit-width (e.g. 4 or 8).
-    pub n_bits: u8,
-
     // ── Per-layer sizes ────────────────────────────────────────────
     /// Byte size of one K or V cache buffer (packed uint8).
     /// `num_kv_heads × max_seq_len × elements_per_pos`
@@ -96,7 +84,7 @@ impl TurboQuantCacheLayout {
         num_kv_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
-        num_layers: usize,
+        _num_layers: usize,
         n_bits: u8,
         outlier: Option<&OutlierConfig>,
     ) -> Result<Self, CacheLayoutOverflow> {
@@ -109,7 +97,6 @@ impl TurboQuantCacheLayout {
         let scale_count = checked_mul(num_kv_heads, max_seq_len, "scale_count")?;
         let qjl_signs_bytes =
             checked_mul3(num_kv_heads, max_seq_len, head_dim / 8, "qjl_signs_bytes")?;
-
         let outlier_layout = match outlier {
             Some(cfg) => {
                 let n_outlier = cfg.outlier_channels.len();
@@ -147,11 +134,6 @@ impl TurboQuantCacheLayout {
         };
 
         Ok(Self {
-            num_kv_heads,
-            head_dim,
-            max_seq_len,
-            num_layers,
-            n_bits,
             cache_bytes,
             scale_count,
             qjl_signs_bytes,

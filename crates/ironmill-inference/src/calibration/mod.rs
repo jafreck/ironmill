@@ -20,8 +20,6 @@ pub use dataset::CalibrationDataset;
 pub use hook::ActivationHook;
 pub use runner::{CalibratingEngine, CalibrationRunner, HessianHook, QuipHessianAccumulator};
 
-// Internal only
-#[allow(unused_imports)]
-pub(crate) use awq_store::{AwqActivationStore, ChannelMagnitudes};
-#[allow(unused_imports)]
-pub(crate) use gptq_store::{GptqActivationStore, HessianAccumulator};
+// Internal only — re-export for test use in metal backend
+#[cfg(test)]
+pub(crate) use awq_store::AwqActivationStore;
