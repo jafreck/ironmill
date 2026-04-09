@@ -58,19 +58,15 @@ pub use types::{ElementType, Logits, RuntimeTensor};
 // Memory estimation
 pub use memory::{MemoryEstimator, MemoryUsage, QuantLevel};
 
-/// **Internal** — CoreML sys-layer types re-exported for sibling crates.
+/// Shared CoreML inference session API for framework bridge crates.
 ///
-/// These re-exports exist so that `burn-coreml` and `candle-coreml` can
-/// consume `ironmill_coreml_sys` types without adding a direct dependency on
-/// the sys crate.  **External consumers should not rely on this module.**
-/// Its contents may change or be removed without a semver bump.
+/// Provides [`CoreMlSession`], [`SessionOutput`], and [`SessionInputDesc`]
+/// used by `burn-coreml` and `candle-coreml` to run CoreML models without
+/// depending on the sys crate directly.
 ///
-/// Prefer the [`ComputeDevice`] abstraction enum (defined below) over
-/// [`ComputeUnits`] when writing new code.
-#[doc(hidden)]
+/// This module is feature-gated behind `coreml` + `target_os = "macos"`.
 #[cfg(all(feature = "coreml", target_os = "macos"))]
 pub mod coreml_runtime {
-    #[doc(hidden)]
     use std::path::Path;
 
     pub use ironmill_coreml_sys::{
