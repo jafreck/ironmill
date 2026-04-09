@@ -3,11 +3,9 @@
 // 8 output rows per threadgroup (2 simdgroups × 4 rows/sg). Each lane
 // processes one uint32 (8 nibbles) per iteration, striding by 32 across K.
 //
-// Key optimizations:
-// 1. Coalesced reads: consecutive lanes read consecutive uint32s within
-//    superblock data — contiguous for group_size >= 256, near-contiguous
-//    (4B header gaps) for group_size = 128
-// 2. Inline scale/zero: fetched from superblock header, cached per group
+// Optimizations:
+// 1. Power-of-2 fast path: bitwise shift/AND replaces integer division
+// 2. Coalesced reads: consecutive lanes access consecutive superblock data
 // 3. Multi-row amortization: input load shared across 4 rows per simdgroup
 //
 // Dispatch: (ceil(N/8), 1, 1) threadgroups × (64, 1, 1) threads
@@ -29,23 +27,24 @@ kernel void superblock_matvec_int4(
 
     uint num_groups = K / group_size;
     uint sb_bytes = SB_HEADER_BYTES + group_size / 2;
-    uint sb_stride = num_groups * sb_bytes;  // bytes per row
+    uint sb_stride = num_groups * sb_bytes;
+
+    // Precompute power-of-2 shift for bitwise division/modulo
+    uint gs_shift = 0;
+    { uint tmp = group_size; while (tmp > 1) { tmp >>= 1; gs_shift++; } }
+    uint gs_mask = group_size - 1;
 
     float result[SB_ROWS_PER_SG] = {0};
 
-    // Process K in chunks of 8 elements (1 uint32 = 8 nibbles) per lane,
-    // 32 lanes process 256 elements per iteration.
-    uint k_words = K / 8;  // total uint32 words across K dimension
+    uint k_words = K / 8;
 
     for (uint w = lane; w < k_words; w += 32) {
         uint k_elem = w * 8;
 
-        // Which group and position within group
-        uint g = k_elem / group_size;
-        uint k_in_group = k_elem % group_size;
-        uint word_in_data = k_in_group / 8;
+        uint g = k_elem >> gs_shift;
+        uint word_in_data = (k_elem & gs_mask) >> 3;
 
-        // Load 8 input values (shared across 4 rows)
+        // Load 8 input values (shared across all rows)
         float a0 = float(A[k_elem]);
         float a1 = float(A[k_elem + 1]);
         float a2 = float(A[k_elem + 2]);
@@ -70,15 +69,12 @@ kernel void superblock_matvec_int4(
             uint row = base_row + r;
             if (row >= N) break;
 
-            // Superblock pointer: scale + zero + weight data inline
             device const uchar *sb = W + row * sb_stride + g * sb_bytes;
             float scale = float(*(device const half *)(sb));
             float zero  = float(*(device const half *)(sb + 2));
 
-            // Read uint32 from data portion of the superblock
             uint packed4 = ((device const uint *)(sb + SB_HEADER_BYTES))[word_in_data];
 
-            // Dequantize 8 nibbles
             float w0 = (float(packed4 & 0xF) - zero) * scale;
             float w1 = (float((packed4 >> 4) & 0xF) - zero) * scale;
             float w2 = (float((packed4 >> 8) & 0xF) - zero) * scale;
@@ -93,7 +89,6 @@ kernel void superblock_matvec_int4(
         }
     }
 
-    // Reduce across SIMD lanes
     for (uint r = 0; r < SB_ROWS_PER_SG; r++) {
         result[r] = simd_sum(result[r]);
         if (lane == 0 && base_row + r < N) {

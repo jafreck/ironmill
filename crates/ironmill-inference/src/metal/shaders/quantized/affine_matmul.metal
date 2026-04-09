@@ -35,6 +35,11 @@ kernel void superblock_matmul_int4(
     uint sb_bytes = SB_HEADER_BYTES + group_size / 2;
     uint sb_stride = num_groups * sb_bytes;  // bytes per row
 
+    // Precompute power-of-2 shift (hoisted outside all loops)
+    uint gs_shift = 0;
+    { uint tmp = group_size; while (tmp > 1) { tmp >>= 1; gs_shift++; } }
+    uint gs_mask = group_size - 1;
+
     simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
     for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
 
@@ -53,7 +58,7 @@ kernel void superblock_matmul_int4(
             }
             tg_a[0][i] = a_val;
         }
-        // B-tile load from superblock layout
+        // B-tile load from superblock layout (vectorized word loads)
         for (uint i = tid; i < TN_TILE * MATMUL_K_TILE; i += THREADS_PER_TG) {
             uint n = i / MATMUL_K_TILE;
             uint k = i % MATMUL_K_TILE;
@@ -61,12 +66,15 @@ kernel void superblock_matmul_int4(
             uint g_k = k_base + k;
             half val = half(0);
             if (g_n < N && g_k < K) {
-                uint sb_idx = g_k / group_size;
-                uint sb_offset = g_k % group_size;
-                uint byte_in_sb = SB_HEADER_BYTES + sb_offset / 2;
+                // Bitwise fast path for power-of-2 group sizes
+                uint sb_idx = g_k >> gs_shift;
+                uint sb_offset = g_k & gs_mask;
                 device const uchar *sb = W + g_n * sb_stride + sb_idx * sb_bytes;
-                uchar packed = sb[byte_in_sb];
-                uchar nibble = (sb_offset % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+                // Word-aligned load + nibble extraction (vs per-byte load)
+                uint word_offset = sb_offset >> 3;  // 8 nibbles per uint32
+                uint nibble_pos = sb_offset & 7;
+                uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_offset];
+                uchar nibble = (packed4 >> (nibble_pos * 4)) & 0xF;
                 float s = float(*(device const half *)(sb));
                 float z = float(*(device const half *)(sb + 2));
                 val = half((float(nibble) - z) * s);
@@ -101,12 +109,13 @@ kernel void superblock_matmul_int4(
                 uint g_k = k_base + k;
                 half val = half(0);
                 if (g_n < N && g_k < K) {
-                    uint sb_idx = g_k / group_size;
-                    uint sb_offset = g_k % group_size;
-                    uint byte_in_sb = SB_HEADER_BYTES + sb_offset / 2;
+                    uint sb_idx = g_k >> gs_shift;
+                    uint sb_offset = g_k & gs_mask;
                     device const uchar *sb = W + g_n * sb_stride + sb_idx * sb_bytes;
-                    uchar packed = sb[byte_in_sb];
-                    uchar nibble = (sb_offset % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+                    uint word_offset = sb_offset >> 3;
+                    uint nibble_pos = sb_offset & 7;
+                    uint packed4 = ((device const uint*)(sb + SB_HEADER_BYTES))[word_offset];
+                    uchar nibble = (packed4 >> (nibble_pos * 4)) & 0xF;
                     float s = float(*(device const half *)(sb));
                     float z = float(*(device const half *)(sb + 2));
                     val = half((float(nibble) - z) * s);
@@ -178,6 +187,10 @@ kernel void superblock_matmul_int8(
     uint sb_bytes = SB_HEADER_BYTES + group_size;
     uint sb_stride = num_groups * sb_bytes;
 
+    uint gs_shift = 0;
+    { uint tmp = group_size; while (tmp > 1) { tmp >>= 1; gs_shift++; } }
+    uint gs_mask = group_size - 1;
+
     simdgroup_matrix<float, 8, 8> acc[TN_BLOCKS];
     for (uint j = 0; j < TN_BLOCKS; j++) acc[j] = simdgroup_matrix<float, 8, 8>(0);
 
@@ -202,8 +215,8 @@ kernel void superblock_matmul_int8(
             uint g_k = k_base + k;
             half val = half(0);
             if (g_n < N && g_k < K) {
-                uint sb_idx = g_k / group_size;
-                uint sb_offset = g_k % group_size;
+                uint sb_idx = g_k >> gs_shift;
+                uint sb_offset = g_k & gs_mask;
                 device const uchar *sb = W + g_n * sb_stride + sb_idx * sb_bytes;
                 uchar q = sb[SB_HEADER_BYTES + sb_offset];
                 float s = float(*(device const half *)(sb));
@@ -239,8 +252,8 @@ kernel void superblock_matmul_int8(
                 uint g_k = k_base + k;
                 half val = half(0);
                 if (g_n < N && g_k < K) {
-                    uint sb_idx = g_k / group_size;
-                    uint sb_offset = g_k % group_size;
+                    uint sb_idx = g_k >> gs_shift;
+                    uint sb_offset = g_k & gs_mask;
                     device const uchar *sb = W + g_n * sb_stride + sb_idx * sb_bytes;
                     uchar q = sb[SB_HEADER_BYTES + sb_offset];
                     float s = float(*(device const half *)(sb));
