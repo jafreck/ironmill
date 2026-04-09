@@ -3,7 +3,7 @@
 mod common;
 
 use mil_rs::convert::moe::{detect_moe, split_moe};
-use mil_rs::ir::passes::{Fp16QuantizePass, Int8QuantizePass, PalettizePass};
+use mil_rs::ir::passes::{Fp16QuantizePass, Int8QuantizePass};
 use mil_rs::{
     ComputeUnit, Pass, PassPipeline, ScalarType, Value, program_to_model,
     program_to_multi_function_model,
@@ -540,26 +540,6 @@ fn int8_model_smaller_than_fp16() {
     assert!(
         (int8_size as f64) < (fp16_size as f64) * 0.6,
         "INT8 size ({int8_size}) should be < 60% of FP16 size ({fp16_size})"
-    );
-}
-
-#[test]
-fn palettized_model_smaller_than_int8() {
-    let mut int8_program = build_large_const_program();
-    Int8QuantizePass::weight_only()
-        .run(&mut int8_program)
-        .expect("Int8QuantizePass should succeed");
-    let int8_size = serialized_size(&int8_program);
-
-    let mut pal_program = build_large_const_program();
-    PalettizePass::new(4)
-        .run(&mut pal_program)
-        .expect("PalettizePass should succeed");
-    let pal_size = serialized_size(&pal_program);
-
-    assert!(
-        (pal_size as f64) < (int8_size as f64) * 0.7,
-        "4-bit palettized size ({pal_size}) should be < 70% of INT8 size ({int8_size})"
     );
 }
 

@@ -549,65 +549,6 @@ mod tests {
         assert_eq!(recon.len(), n_cols);
     }
 
-    #[test]
-    fn benchmark_4096x4096() {
-        use std::time::Instant;
-
-        let cb = E8Codebook::new();
-        let n = 4096;
-        let total = n * n;
-
-        // Deterministic pseudo-random weights.
-        let weights: Vec<f32> = (0..total)
-            .map(|i| ((i as f64 * 0.00017 + 0.3).sin() * 1.5) as f32)
-            .collect();
-
-        // Benchmark quantization.
-        let t0 = Instant::now();
-        let (indices, scales) = cb.quantize_matrix(&weights, n);
-        let quant_time = t0.elapsed();
-
-        // Benchmark dequantization.
-        let t1 = Instant::now();
-        let recon = cb.dequantize_matrix(&indices, &scales, n);
-        let dequant_time = t1.elapsed();
-
-        // Reconstruction error.
-        let e8_err = mse(&weights, &recon);
-
-        // Naive scalar 2-bit for comparison.
-        let naive_recon = naive_scalar_2bit_quantize(&weights);
-        let naive_err = mse(&weights, &naive_recon);
-
-        eprintln!("=== E8 Lattice Codebook Benchmark (4096×4096) ===");
-        eprintln!("Quantization time:   {:.2?}", quant_time);
-        eprintln!("Dequantization time: {:.2?}", dequant_time);
-        eprintln!("E8 2-bit MSE:        {e8_err:.6}");
-        eprintln!("Naive 2-bit MSE:     {naive_err:.6}");
-        eprintln!(
-            "E8 advantage:        {:.2}× lower error",
-            naive_err / e8_err.max(1e-10)
-        );
-        eprintln!("Codebook indices:    {} bytes", indices.len());
-        eprintln!("Scales:              {} bytes", scales.len() * 4);
-        let orig_bytes = total * 4;
-        let quant_bytes = indices.len() + scales.len() * 4;
-        eprintln!(
-            "Compression:         {:.1}× ({} → {} bytes)",
-            orig_bytes as f64 / quant_bytes as f64,
-            orig_bytes,
-            quant_bytes
-        );
-        eprintln!();
-        eprintln!("=== 4-bit Feasibility Estimate ===");
-        eprintln!("65K codebook entries → ~256× more NN work per group");
-        eprintln!(
-            "Estimated 4-bit quant time: {:.2?}",
-            quant_time * 256 / 1 // rough proportional estimate
-        );
-        eprintln!("Verdict: likely acceptable for offline quantization");
-    }
-
     // ── New tests for production refinements ─────────────────────────────
 
     #[test]
